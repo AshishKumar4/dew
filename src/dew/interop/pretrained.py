@@ -6,6 +6,7 @@ import json
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
@@ -16,7 +17,7 @@ from flax import linen as nn
 
 from dew.artifacts import agree_process_phase
 from dew.interop import hf_decoders as decoders
-from dew.interop.quantized import dequantize_checkpoint, fp8_block, pack_fp8, scaled_names
+from dew.interop.quantized import dequantize_checkpoint, fp8_format, pack_fp8, scaled_names
 from dew.inference import BlockGeneration, TextGeneration
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.gpt_oss import mxfp4_stems, pack_mxfp4, unpack_mxfp4
@@ -502,6 +503,14 @@ def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]
     return path, None
 
 
+_SPLIT_GATE_UP = ("llama4_text", "gemma4_text", "qwen3_5_moe_text")
+"""Families whose fused `experts.gate_up_proj` loads as two stacked kernels;
+GPT OSS keeps the reference's fused leaf and maps the name itself."""
+
+_TRANSPOSED_EXPERTS = ("gemma4_text", "qwen3_5_moe_text")
+"""Families whose expert matrices are stored [E, out, in]."""
+
+
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
                      config, model_type: str, component: str | None = None) -> WeightLayout | None:
     """The text family's existing leaf map plus its inverse storage operations."""
@@ -515,7 +524,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
     expert_index = None
     if text_name == "lm_head.weight" and config["tie_embeddings"]:
         paths = (nested(("params", "embed_tokens", "embedding")),)
-    elif text_name.endswith(".experts.gate_up_proj") and model_type != "gpt_oss":
+    elif text_name.endswith(".experts.gate_up_proj") and model_type in _SPLIT_GATE_UP:
         names = [text_name.removesuffix("gate_up_proj") + projection for projection in ("gate_proj", "up_proj")]
         paths_list = []
         for key in names:
@@ -525,7 +534,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
             paths_list.append(nested(path))
         paths = tuple(paths_list)
         concatenate = -1
-        if model_type in ("gemma4_text", "qwen3_5_moe_text"):
+        if model_type in _TRANSPOSED_EXPERTS:
             transpose = (0, 2, 1)
     else:
         path = family.weight_path(text_name, config)
@@ -535,7 +544,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         paths = (nested(path),)
         if path[-1] == "kernel" and tensor.ndim == 2:
             transpose = (1, 0)
-        elif text_name.endswith(".experts.down_proj") and model_type in ("gemma4_text", "qwen3_5_moe_text"):
+        elif text_name.endswith(".experts.down_proj") and model_type in _TRANSPOSED_EXPERTS:
             transpose = (0, 2, 1)
     return WeightLayout(name, paths, tensor.shape, transpose, concatenate, expert_index)
 
@@ -611,6 +620,38 @@ def _wrapper_layouts(tensors, record):
     return tuple(bindings), retained
 
 
+@dataclass(frozen=True)
+class _SourceQuantization:
+    """A source format the loader undoes and `Pretrained.save` restores.
+
+    `names` reads which tensors arrived quantized off the raw checkpoint,
+    before `dequantize` replaces them with dense float32 weights;
+    `requantize` writes those names back in the format.
+    """
+
+    names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
+    dequantize: Callable[[Mapping[str, np.ndarray]], dict[str, np.ndarray]]
+    requantize: Callable[[Mapping[str, np.ndarray], tuple[str, ...]], dict[str, np.ndarray]]
+
+
+def _source_quantization(config: Mapping[str, object]) -> _SourceQuantization | None:
+    """The format a config's `quantization_config` declares, or None for a dense source."""
+    quantization = config.get("quantization_config")
+    if quantization is None:
+        return None
+    if not isinstance(quantization, Mapping):
+        raise ValueError(f"quantization_config must be an object, got {quantization!r}")
+    method = quantization.get("quant_method")
+    if method == "fp8":
+        block, ue8m0 = fp8_format(quantization)
+        return _SourceQuantization(scaled_names, partial(dequantize_checkpoint, block=block),
+                                   partial(pack_fp8, block=block, ue8m0=ue8m0))
+    if method == "mxfp4":
+        return _SourceQuantization(mxfp4_stems, unpack_mxfp4, pack_mxfp4)
+    raise ValueError(
+        f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
+        f"fp8 blocks and GPT OSS's mxfp4 and nothing else")
+
 
 @dataclass(frozen=True)
 class Pretrained:
@@ -636,7 +677,7 @@ class Pretrained:
     autoencoder: AutoEncoder | None = None
     schedule: SourceSchedule | None = None
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
-    quantized_tensors: tuple[str, ...] = field(default=(), kw_only=True)
+    quantized_tensors: tuple[str, ...] = ()
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Use the source policy, or an explicit supported policy supplied by the caller."""
@@ -675,9 +716,11 @@ class Pretrained:
         """Write trained variables back to the source layout with its tokenizer assets."""
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
-        quantization = self.config.get("quantization_config")
-        if quantization is not None and (not isinstance(quantization, Mapping) or not self.quantized_tensors):
-            raise ValueError("quantization_config export requires recorded source tensor pairs")
+        quantization = _source_quantization(self.config)
+        if quantization is not None and not self.quantized_tensors:
+            raise ValueError(
+                "this source's config declares a quantization_config and the loader recorded "
+                "no quantized tensors to write back in it")
         destination = Path(directory)
         generation_config = dict(self.generation_config)
         if self.schedule is not None:
@@ -687,7 +730,7 @@ class Pretrained:
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif self.weight_layouts:
-            # Preserve source names and geometry before restoring any packed format.
+            # Source names and geometry first; the packed format goes back over them.
             text = self.model.language_model if isinstance(self.model, MultimodalTransformer) else self.model
             scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
             tensors = {**self.retained_tensors,
@@ -705,13 +748,7 @@ class Pretrained:
         else:
             raise ValueError("this source has no reversible weight layout")
         if quantization is not None:
-            method = quantization.get("quant_method")
-            if method == "fp8":
-                tensors = pack_fp8(tensors, self.quantized_tensors, self.config)
-            elif method == "mxfp4":
-                tensors = pack_mxfp4(tensors, self.quantized_tensors)
-            else:
-                raise ValueError(f"unsupported source quantization method {method!r}")
+            tensors = quantization.requantize(tensors, self.quantized_tensors)
         save_hf_layout(tensors, dict(self.config), destination)
         decoders.save_export_assets(destination, tokenizer=self.processor,
                                     generation_config=generation_config)
@@ -1000,13 +1037,10 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         config = json.load(handle)
     tensors = decoders._load_shards(directory)
     family = config.get("model_type")
-    quantization = config.get("quantization_config")
-    method = quantization.get("quant_method") if isinstance(quantization, Mapping) else None
-    quantized_tensors = scaled_names(tensors) if method == "fp8" else (
-        mxfp4_stems(tensors) if method == "mxfp4" else ())
-    tensors = dequantize_checkpoint(tensors, fp8_block(config))
-    if method == "mxfp4":
-        tensors = unpack_mxfp4(tensors)
+    quantization = _source_quantization(config)
+    quantized_tensors = () if quantization is None else quantization.names(tensors)
+    if quantization is not None:
+        tensors = quantization.dequantize(tensors)
     layouts: tuple[WeightLayout, ...] = ()
     retained: dict[str, np.ndarray] = {}
     export_adapter = None
