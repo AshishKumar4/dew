@@ -116,9 +116,9 @@ def test_every_declared_sd3_tensor_is_mapped_or_a_named_buffer(source):
     assert set(buffers) == {"pos_embed"}
     leaves = len(jax.tree.leaves(params)) + 1
     assert leaves == len(tensors)
-    from dew.interop.diffusion import _sd3_path
-    with pytest.raises(ValueError, match="unknown tensor name"):
-        _sd3_path("transformer_blocks.0.attn.to_out.1.weight")
+    foreign = "transformer_blocks.0.attn.to_out.1.weight"
+    with pytest.raises(ValueError, match=f"unknown tensor name '{foreign}'"):
+        translate_sd3_weights({**tensors, foreign: tensors["transformer_blocks.0.attn.to_out.0.weight"]})
 
 
 def test_unsupported_sd3_controls_are_refused():

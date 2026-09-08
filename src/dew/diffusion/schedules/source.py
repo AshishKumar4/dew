@@ -617,7 +617,7 @@ class SourceSchedule:
                 f"({times[0]}), which the source scheduler cannot walk: it "
                 "looks its starting step up by that value and finds the second")
 
-    def _flow_grid(self, steps: int, tokens: int | None,
+    def _flow_grid(self, flow: _Flow, steps: int, tokens: int | None,
                    origin: Origin) -> tuple[np.ndarray, np.ndarray, float]:
         """`FlowMatchEulerDiscreteScheduler.set_timesteps` in its own order.
 
@@ -628,8 +628,7 @@ class SourceSchedule:
         appended zero.
         """
         policy = self.policy
-        flow, count = policy.flow, policy.train_steps
-        assert flow is not None
+        count = policy.train_steps
         if origin == "linspace":
             sigmas = np.linspace(1.0, 1.0 / steps, steps, dtype=np.float64)
         else:
@@ -673,8 +672,8 @@ class SourceSchedule:
         policy = self.policy
         if type(steps) is not int or steps < 1:
             raise ValueError("The sampling count must be a positive integer")
-        if policy.family == "flow":
-            sigmas, times, prior = self._flow_grid(steps, tokens, origin)
+        if policy.flow is not None:
+            sigmas, times, prior = self._flow_grid(policy.flow, steps, tokens, origin)
             schedule = FlowGrid(sigmas, np.append(times, 0.0), prior)
             return (Process(schedule, self.prediction),
                     jnp.arange(len(sigmas) - 1, -1, -1, dtype=jnp.float32))
@@ -786,6 +785,21 @@ def _x0_limit(kind: str, declared: Mapping[str, object], value: Callable[..., ob
     return None, None
 
 
+def _flow_controls(value: Callable[..., object]) -> _Flow:
+    """A flow file's shift controls, checked and turned into numbers."""
+    terminal = value("shift_terminal")
+    return _Flow(
+        shift=_number(value("shift", 1.0), "shift"),
+        dynamic=_boolean(value("use_dynamic_shifting", False), "use_dynamic_shifting"),
+        base_shift=_number(value("base_shift", 0.5), "base_shift"),
+        max_shift=_number(value("max_shift", 1.15), "max_shift"),
+        base_tokens=_integer(value("base_image_seq_len", 256), "base_image_seq_len"),
+        max_tokens=_integer(value("max_image_seq_len", 4096), "max_image_seq_len"),
+        terminal=None if terminal is None else _number(terminal, "shift_terminal"),
+        kind=_choice(value("time_shift_type", "exponential"), "time_shift_type",
+                     ("exponential", "linear")))
+
+
 def _resolve(kind: str, source: _Class, value: Callable[..., object],
              betas: np.ndarray) -> tuple[_Policy, Solver]:
     """Every control the class declares, checked and turned into a number."""
@@ -827,7 +841,6 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
         lambdas = 0.5 * (np.log(alphas) - np.log(1 - alphas))
         lambda_clipped = int(np.searchsorted(np.flip(lambdas),
                                              _number(limit, "lambda_min_clipped")))
-    terminal_shift = value("shift_terminal")
     original_steps = _integer(value("original_inference_steps", train_steps),
                               "original_inference_steps")
     if not 0 < original_steps <= train_steps:
@@ -837,19 +850,7 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
         raise ValueError("disable_corrector must be a sequence of step indices")
     sigma_min, sigma_max = value("sigma_min"), value("sigma_max")
     order = _integer(value("solver_order", 2), "solver_order")
-    flow = None
-    if family == "flow":
-        terminal_shift = value("shift_terminal")
-        flow = _Flow(
-            shift=_number(value("shift", 1.0), "shift"),
-            dynamic=_boolean(value("use_dynamic_shifting", False), "use_dynamic_shifting"),
-            base_shift=_number(value("base_shift", 0.5), "base_shift"),
-            max_shift=_number(value("max_shift", 1.15), "max_shift"),
-            base_tokens=_integer(value("base_image_seq_len", 256), "base_image_seq_len"),
-            max_tokens=_integer(value("max_image_seq_len", 4096), "max_image_seq_len"),
-            terminal=None if terminal_shift is None else _number(terminal_shift, "shift_terminal"),
-            kind=_choice(value("time_shift_type", "exponential"), "time_shift_type",
-                         ("exponential", "linear")))
+    flow = _flow_controls(value) if family == "flow" else None
     policy = _Policy(
         kind=kind, family=family, train_steps=train_steps,
         spacing=spacing,

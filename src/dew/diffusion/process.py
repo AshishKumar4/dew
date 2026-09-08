@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping
 
 import jax
@@ -28,7 +28,7 @@ class DenoisingCondition:
     time_ids: jax.Array | None = None
     guidance: jax.Array | None = None
 
-    def aligned(self, given: "DenoisingCondition") -> "DenoisingCondition":
+    def aligned(self, given: DenoisingCondition) -> DenoisingCondition:
         """This conditioning with `given`'s own model inputs.
 
         A distilled guidance value belongs to the row rather than to its
@@ -38,7 +38,7 @@ class DenoisingCondition:
         conditional record with an unconditional one align them here first,
         so both keep each row's own scalar.
         """
-        return self.replace(guidance=given.guidance)
+        return replace(self, guidance=given.guidance)
 
 
 def aligned_conditions(conditions: Mapping[str, Any],

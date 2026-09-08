@@ -29,13 +29,13 @@ def _insert(tree: TensorTree, path: tuple[str, ...], value: np.ndarray) -> None:
             raise ValueError(f"Tensor path crosses an existing leaf: {path}")
         node = child
     held = node.get(path[-1])
-    if held is not None:
-        # A tied tensor a checkpoint stores under two names is one parameter,
-        # and each name is still bound for export. Two different arrays under
-        # one path are two parameters and one of them would be lost.
-        if not np.array_equal(held, value):
-            raise ValueError(f"Two source tensors map to {path}")
+    # A tied tensor a checkpoint stores under two names is one parameter,
+    # and each name is still bound for export. Two different arrays under
+    # one path are two parameters and one of them would be lost.
+    if isinstance(held, np.ndarray) and np.array_equal(held, value):
         return
+    if held is not None:
+        raise ValueError(f"Two source tensors map to {path}")
     node[path[-1]] = value
 
 
@@ -309,16 +309,52 @@ _SD3_EMBEDDERS = {
     "time_text_embed.text_embedder.linear_1": ("text_embedder_linear_1",),
     "time_text_embed.text_embedder.linear_2": ("text_embedder_linear_2",),
 }
-_SD3_ATTENTION = ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj",
-                  "to_add_out", "norm_q", "norm_k", "norm_added_q", "norm_added_k")
+# The MM-DiT tensors SD3 and Flux share: the modulation linear of each
+# stream, the joint attention's projections, output projections and per-head
+# norms, and the two feed-forwards. The attention's own name is the caller's,
+# since SD3.5's dual-attention blocks carry a second one.
+_JOINT_ATTENTION = ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj",
+                    "to_add_out", "norm_q", "norm_k", "norm_added_q", "norm_added_k")
+_SINGLE_ATTENTION = ("to_q", "to_k", "to_v", "norm_q", "norm_k")
 
 
-def _sd3_leaf(leaf: str) -> str:
+def _dit_leaf(leaf: str) -> str:
     if leaf == "weight":
         return "kernel"
-    if leaf == "bias":
-        return "bias"
-    raise ValueError(f"unknown tensor leaf {leaf!r}")
+    if leaf != "bias":
+        raise ValueError(f"unknown tensor leaf {leaf!r}")
+    return "bias"
+
+
+def _dit_attention(block: tuple[str, ...], attention: str, inner: list[str], leaf: str,
+                   name: str, *, joint: bool) -> tuple[str, ...]:
+    """One attention tensor: a projection, the output projection a joint
+    attention holds, or a per-head norm's scale."""
+    if joint and inner == ["to_out", "0"]:
+        return (*block, attention, "to_out_0", _dit_leaf(leaf))
+    if len(inner) == 1 and inner[0] in (_JOINT_ATTENTION if joint else _SINGLE_ATTENTION):
+        if inner[0].startswith("norm"):
+            if leaf != "weight":
+                raise ValueError(f"unknown tensor name {name!r}")
+            return (*block, attention, inner[0], "scale")
+        return (*block, attention, inner[0], _dit_leaf(leaf))
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def _dit_block(block: tuple[str, ...], rest: list[str], leaf: str, name: str, *,
+               attentions: tuple[str, ...]) -> tuple[str, ...]:
+    """A joint block's tensor: either stream's modulation, one of its
+    attentions, or either stream's feed-forward."""
+    if rest in (["norm1", "linear"], ["norm1_context", "linear"]):
+        return (*block, rest[0], "linear", _dit_leaf(leaf))
+    if len(rest) > 1 and rest[0] in attentions:
+        return _dit_attention(block, rest[0], rest[1:], leaf, name, joint=True)
+    if len(rest) > 1 and rest[0] in ("ff", "ff_context"):
+        if rest[1:] == ["net", "0", "proj"]:
+            return (*block, rest[0], "net_0_proj", _dit_leaf(leaf))
+        if rest[1:] == ["net", "2"]:
+            return (*block, rest[0], "net_2", _dit_leaf(leaf))
+    raise ValueError(f"unknown tensor name {name!r}")
 
 
 def _sd3_path(name: str) -> tuple[str, ...] | None:
@@ -333,28 +369,10 @@ def _sd3_path(name: str) -> tuple[str, ...] | None:
     parts = name.split(".")
     leaf, stem = parts[-1], ".".join(parts[:-1])
     if stem in _SD3_EMBEDDERS:
-        return (*_SD3_EMBEDDERS[stem], _sd3_leaf(leaf))
+        return (*_SD3_EMBEDDERS[stem], _dit_leaf(leaf))
     if parts[0] == "transformer_blocks" and parts[1].isdigit():
-        block = (f"transformer_blocks_{parts[1]}",)
-        rest = parts[2:-1]
-        if rest in (["norm1", "linear"], ["norm1_context", "linear"]):
-            return (*block, rest[0], "linear", _sd3_leaf(leaf))
-        if rest[0] in ("attn", "attn2"):
-            inner = rest[1:]
-            if inner == ["to_out", "0"]:
-                return (*block, rest[0], "to_out_0", _sd3_leaf(leaf))
-            if len(inner) == 1 and inner[0] in _SD3_ATTENTION:
-                if inner[0].startswith("norm"):
-                    if leaf != "weight":
-                        raise ValueError(f"unknown tensor name {name!r}")
-                    return (*block, rest[0], inner[0], "scale")
-                return (*block, rest[0], inner[0], _sd3_leaf(leaf))
-        if rest[0] in ("ff", "ff_context"):
-            inner = rest[1:]
-            if inner == ["net", "0", "proj"]:
-                return (*block, rest[0], "net_0_proj", _sd3_leaf(leaf))
-            if inner == ["net", "2"]:
-                return (*block, rest[0], "net_2", _sd3_leaf(leaf))
+        return _dit_block((f"transformer_blocks_{parts[1]}",), parts[2:-1], leaf, name,
+                          attentions=("attn", "attn2"))
     raise ValueError(f"unknown tensor name {name!r}")
 
 
@@ -420,35 +438,6 @@ _FLUX_EMBEDDERS = {
     "time_text_embed.text_embedder.linear_1": ("text_embedder_linear_1",),
     "time_text_embed.text_embedder.linear_2": ("text_embedder_linear_2",),
 }
-# A double-stream block's attention projects both streams and both outputs; a
-# single-stream block's is `pre_only`, so it holds neither the context
-# projections nor any output of its own.
-_FLUX_ATTENTION = ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj",
-                   "to_add_out", "norm_q", "norm_k", "norm_added_q", "norm_added_k")
-_FLUX_SINGLE_ATTENTION = ("to_q", "to_k", "to_v", "norm_q", "norm_k")
-
-
-def _flux_leaf(leaf: str) -> str:
-    if leaf == "weight":
-        return "kernel"
-    if leaf != "bias":
-        raise ValueError(f"unknown tensor leaf {leaf!r}")
-    return "bias"
-
-
-def _flux_attention(block: tuple[str, ...], inner: list[str], leaf: str, name: str, *,
-                    joint: bool) -> tuple[str, ...]:
-    """One attention tensor, in the names the block's own kind carries."""
-    if joint and inner == ["to_out", "0"]:
-        return (*block, "attn", "to_out_0", _flux_leaf(leaf))
-    allowed = _FLUX_ATTENTION if joint else _FLUX_SINGLE_ATTENTION
-    if len(inner) == 1 and inner[0] in allowed:
-        if inner[0].startswith("norm"):
-            if leaf != "weight":
-                raise ValueError(f"unknown tensor name {name!r}")
-            return (*block, "attn", inner[0], "scale")
-        return (*block, "attn", inner[0], _flux_leaf(leaf))
-    raise ValueError(f"unknown tensor name {name!r}")
 
 
 def _flux_path(name: str) -> tuple[str, ...]:
@@ -457,36 +446,27 @@ def _flux_path(name: str) -> tuple[str, ...]:
     A single-stream block's fused output projection is `proj_out` in the
     source, inside its own block; here it is `proj_fused`, since the model's
     own `proj_out` runs the other way round and one name carries one pair of
-    axes.
+    axes. Its attention is `pre_only`: it holds neither the context
+    projections nor any output of its own.
     """
     parts = name.split(".")
     leaf, stem = parts[-1], ".".join(parts[:-1])
     if stem in _FLUX_EMBEDDERS:
-        return (*_FLUX_EMBEDDERS[stem], _flux_leaf(leaf))
+        return (*_FLUX_EMBEDDERS[stem], _dit_leaf(leaf))
     if parts[0] == "transformer_blocks" and parts[1].isdigit():
-        block = (f"transformer_blocks_{parts[1]}",)
-        rest = parts[2:-1]
-        if rest in (["norm1", "linear"], ["norm1_context", "linear"]):
-            return (*block, rest[0], "linear", _flux_leaf(leaf))
-        if rest[0] == "attn":
-            return _flux_attention(block, rest[1:], leaf, name, joint=True)
-        if rest[0] in ("ff", "ff_context"):
-            inner = rest[1:]
-            if inner == ["net", "0", "proj"]:
-                return (*block, rest[0], "net_0_proj", _flux_leaf(leaf))
-            if inner == ["net", "2"]:
-                return (*block, rest[0], "net_2", _flux_leaf(leaf))
+        return _dit_block((f"transformer_blocks_{parts[1]}",), parts[2:-1], leaf, name,
+                          attentions=("attn",))
     if parts[0] == "single_transformer_blocks" and parts[1].isdigit():
         block = (f"single_transformer_blocks_{parts[1]}",)
         rest = parts[2:-1]
         if rest == ["norm", "linear"]:
-            return (*block, "norm", "linear", _flux_leaf(leaf))
+            return (*block, "norm", "linear", _dit_leaf(leaf))
         if rest == ["proj_mlp"]:
-            return (*block, "proj_mlp", _flux_leaf(leaf))
+            return (*block, "proj_mlp", _dit_leaf(leaf))
         if rest == ["proj_out"]:
-            return (*block, "proj_fused", _flux_leaf(leaf))
-        if rest[0] == "attn":
-            return _flux_attention(block, rest[1:], leaf, name, joint=False)
+            return (*block, "proj_fused", _dit_leaf(leaf))
+        if len(rest) > 1 and rest[0] == "attn":
+            return _dit_attention(block, "attn", rest[1:], leaf, name, joint=False)
     raise ValueError(f"unknown tensor name {name!r}")
 
 
@@ -646,9 +626,8 @@ def save_source(source, values, destination: Path) -> None:
         tokenizer.save_pretrained(folder)
         # A CLIP tokenizer's own vocabulary and merges beside its config.
         tokenizer.backend_tokenizer.model.save(str(folder))
-    if encoder.t5_tokenizer is not None:
+    if encoder.t5 is not None:
         # The T5 tokenizer ships one file, which `save_pretrained` writes, in
-        # the slot its own family keeps it: an SD3 directory's third, a Flux
-        # directory's second.
-        slot = "tokenizer" + encoder.t5_name.removeprefix("text_encoder")
-        encoder.t5_tokenizer.save_pretrained(destination / slot)
+        # the slot its own family keeps it.
+        encoder.t5.tokenizer.save_pretrained(
+            destination / ("tokenizer" + encoder.t5.name.removeprefix("text_encoder")))

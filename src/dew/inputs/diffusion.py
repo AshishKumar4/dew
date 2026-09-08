@@ -77,6 +77,19 @@ Composition = Literal["clip", "clip_pooled", "sd3", "flux"]
 """
 
 
+@dataclass(frozen=True, eq=False)
+class T5Segment:
+    """The T5 tower a family reads beside its CLIP ones: the tower, its
+    tokenizer, the component name its parameters and tokenizer live under -
+    an SD3 directory's third text encoder, a Flux directory's second - and
+    the sequence budget its pipeline pads to."""
+
+    tower: T5EncoderTransformer
+    tokenizer: PreTrainedTokenizerBase
+    name: str
+    tokens: int
+
+
 @encoders("diffusion_text")
 @dataclass(eq=False)
 class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
@@ -97,14 +110,15 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     checkpoint: str
     height: int
     width: int
+    context_width: int
+    """The width of the token sequence the denoiser reads: the UNet's
+    `cross_attention_dim`, the joint transformers' `joint_attention_dim`. The
+    SD3 composition pads its CLIP states out to it and writes the zero segment
+    its pipeline substitutes for an absent third encoder at it."""
     composition: Composition = "clip"
     aesthetics: bool = False
-    t5: T5EncoderTransformer | None = None
-    t5_tokenizer: PreTrainedTokenizerBase | None = None
-    t5_name: str = "text_encoder_3"
+    t5: T5Segment | None = None
     guidance: float | None = None
-    t5_tokens: int = 256
-    t5_width: int = 4096
 
     @classmethod
     def from_pretrained(cls, checkpoint: str, **kwargs):
@@ -132,16 +146,15 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
             raise ValueError(f"{self.composition} conditioning runs "
                              f"{'-'.join(str(bound) for bound in sorted(set(expected)))} "
                              f"CLIP towers, not {towers}")
-        if t5 and self.composition not in ("sd3", "flux"):
-            raise ValueError(f"{self.composition} conditioning has no T5 segment")
         if self.guidance is not None and self.composition != "flux":
             raise ValueError(f"{self.composition} conditioning carries no guidance input")
-        if not t5 and self.composition == "flux":
+        if self.composition not in ("sd3", "flux"):
+            if t5:
+                raise ValueError(f"{self.composition} conditioning has no T5 segment")
+        elif self.composition == "flux" and not t5:
             # SD3's pipeline writes a zero segment for an absent third encoder;
             # Flux's `_get_t5_prompt_embeds` has no such path.
             raise ValueError("Flux conditioning needs its T5 encoder")
-        if (self.t5_tokenizer is None) != (self.t5 is None):
-            raise ValueError("A T5 tower and its tokenizer arrive together")
 
     def tokenize(self, data: Sequence[str | Mapping[str, object]]):
         """One row per item, with each text slot routed to the tower whose
@@ -167,10 +180,10 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
                   "zero_condition": np.asarray(zero, bool), "negative": np.asarray(negative, bool)}
         if self.guidance is not None:
             tokens["guidance"] = np.asarray(guidance, np.float32)
-        if self.t5_tokenizer is not None:
-            tokens["t5_input_ids"] = self.t5_tokenizer(
+        if self.t5 is not None:
+            tokens["t5_input_ids"] = self.t5.tokenizer(
                 third if self.composition == "sd3" else second, padding="max_length",
-                max_length=self.t5_tokens, truncation=True, add_special_tokens=True,
+                max_length=self.t5.tokens, truncation=True, add_special_tokens=True,
                 return_tensors="np").input_ids
         return tokens
 
@@ -211,10 +224,10 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         third encoder is absent, which is `tokenizer_max_length` long - the
         CLIP tokenizer's window, not the T5 sequence the call asked for."""
         if self.t5 is None:
-            return jnp.zeros((rows, self.tokenizers[0].model_max_length, self.t5_width), dtype)
+            return jnp.zeros((rows, self.tokenizers[0].model_max_length, self.context_width), dtype)
         # The SD3 and Flux pipelines call their T5 encoder with ids only.
-        states = self.t5.apply({"params": params[self.t5_name]},
-                               jnp.asarray(tokens["t5_input_ids"]))
+        states = self.t5.tower.apply({"params": params[self.t5.name]},
+                                     jnp.asarray(tokens["t5_input_ids"]))
         assert isinstance(states, jax.Array)
         return states
 
@@ -247,14 +260,15 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
                         else jnp.asarray(tokens["guidance"], hidden.dtype))
             return DenoisingCondition(self._zeroed(hidden, zero),
                                       self._zeroed(pooled, zero), guidance=guidance)
-        else:
-            clip = jnp.concatenate([value.penultimate for value in outputs], axis=-1)
-            padded = jnp.pad(clip, ((0, 0), (0, 0), (0, self.t5_width - clip.shape[-1])))
-            hidden = jnp.concatenate(
-                [padded, self._t5_states(params, tokens, rows, clip.dtype)], axis=1)
-            pooled = jnp.concatenate(
-                [self._projected(params, name, value.pooled)
-                 for name, value in zip(self.names, outputs)], axis=-1)
+        # sd3: the CLIP states padded out to the joint width, the T5 segment
+        # after them along the sequence, and both projected pooled vectors.
+        clip = jnp.concatenate([value.penultimate for value in outputs], axis=-1)
+        padded = jnp.pad(clip, ((0, 0), (0, 0), (0, self.context_width - clip.shape[-1])))
+        hidden = jnp.concatenate(
+            [padded, self._t5_states(params, tokens, rows, clip.dtype)], axis=1)
+        pooled = jnp.concatenate(
+            [self._projected(params, name, value.pooled)
+             for name, value in zip(self.names, outputs)], axis=-1)
         return DenoisingCondition(self._zeroed(hidden, zero), self._zeroed(pooled, zero))
 
     def captions(self, tokens):
