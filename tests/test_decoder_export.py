@@ -260,28 +260,36 @@ def test_the_export_carries_the_sources_tokenizer(tmp_path):
 
 
 def test_a_quantized_source_loads_and_refuses_to_write_its_own_config(tmp_path):
-    """A checkpoint that ships fp8 blocks arrives dequantized, so its
-    weights no longer hold the format its config declares. Training on it
-    works; writing it back under that config is refused."""
+    """Real FP8 bytes dequantize and train, but cannot be mislabeled on export."""
+    import torch
+    from safetensors.torch import save_file
+
     directory = tmp_path / "fp8"
     source = FIXTURES / "deepseek-v3-tiny"
     tensors = tool.source_tensors(source)
     config = json.loads((source / "config.json").read_text())
-    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
-                                     "weight_block_size": [128, 128]}
     scaled = "model.layers.0.self_attn.o_proj.weight"
-    tensors[scaled + "_scale_inv"] = np.ones((1, 1), np.float32)
-    save_hf_layout(tensors, config, directory)
-
-    quantized = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+    rounded = torch.from_numpy(tensors[scaled]).to(torch.float8_e4m3fn)
+    dense_tensors = {**tensors, scaled: rounded.float().numpy()}
+    expected_directory = tmp_path / "dequantized"
+    save_hf_layout(dense_tensors, config, expected_directory)
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+    directory.mkdir()
+    (directory / "config.json").write_text(json.dumps(config))
+    packed = {name: torch.from_numpy(value) for name, value in tensors.items()}
+    packed[scaled] = rounded
+    packed[scaled + "_scale_inv"] = torch.ones((1, 1), dtype=torch.float32)
+    save_file(packed, str(directory / "model.safetensors"))
+    quantized = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    expected = load_pretrained(expected_directory, dtype="float32", attention_impl="reference")
     ids = np.load(source / "input_ids.npy")
-    reference = np.load(source / "logits.npy")
-
-    np.testing.assert_allclose(
-        tool.logits(quantized, quantized.variables, ids), reference, atol=LOGITS, rtol=0)
-    assert quantized.weight_layouts, "the quantized source bound no tensor to train"
+    np.testing.assert_array_equal(tool.logits(quantized, quantized.variables, ids),
+                                  tool.logits(expected, expected.variables, ids))
+    state = tool.train(CASES["deepseek_v3"], quantized, ids)
+    assert all(bool(np.isfinite(np.asarray(leaf)).all()) for leaf in jax.tree.leaves(state.params))
     with pytest.raises(ValueError, match="quantization_config"):
-        quantized.save(tmp_path / "refused")
+        quantized.save(tmp_path / "refused", variables=state.params)
+
 
 
 def test_an_mtp_copy_that_differs_from_the_trunk_names_the_tensor(tmp_path):
@@ -297,3 +305,16 @@ def test_an_mtp_copy_that_differs_from_the_trunk_names_the_tensor(tmp_path):
 
     with pytest.raises(ValueError, match=copy.replace(".", r"\.")):
         load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+
+
+def test_a_shared_copy_cannot_hide_an_undeclared_prediction_depth(tmp_path):
+    source = FIXTURES / "glm4-moe-tiny"
+    config = json.loads((source / "config.json").read_text())
+    tensors = tool.source_tensors(source)
+    first_absent = config["num_hidden_layers"] + config["num_nextn_predict_layers"]
+    name = f"model.layers.{first_absent}.embed_tokens.weight"
+    tensors[name] = tensors["model.embed_tokens.weight"]
+    directory = tmp_path / "undeclared-depth"
+    save_hf_layout(tensors, config, directory)
+    with pytest.raises(ValueError, match="undeclared prediction depth"):
+        load_pretrained(directory, dtype="float32", attention_impl="reference")

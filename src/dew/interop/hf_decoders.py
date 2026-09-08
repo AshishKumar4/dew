@@ -2540,6 +2540,8 @@ def _glm4_moe_path(name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, 
     if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
             and int(parts[2]) >= int(config['num_layers'])):
         return _dew_path(name, config)
+    if int(parts[2]) >= int(config["num_layers"]) + int(config.get("num_nextn_predict_layers", 0)):
+        raise ValueError(f"{name} names an undeclared prediction depth")
     depth = f"mtp_{int(parts[2]) - int(config['num_layers'])}"
     tail = parts[3:]
     if tail == ['embed_tokens', 'weight']:

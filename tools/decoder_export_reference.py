@@ -121,8 +121,23 @@ def reference_logits(directory: Path, ids: np.ndarray) -> np.ndarray:
     import torch
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=torch.float32,
-                                                 local_files_only=True)
+    loaded = AutoModelForCausalLM.from_pretrained(
+        str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True)
+    if not isinstance(loaded, tuple) or len(loaded) != 2:
+        raise TypeError("output_loading_info must return a model and its loading report")
+    model, report = loaded
+    for category in ("missing_keys", "mismatched_keys", "error_msgs"):
+        if report.get(category):
+            raise ValueError(f"reference load {category}: {report[category]}")
+    unexpected = report.get("unexpected_keys", [])
+    # Transformers has no GLM prediction module. Only its declared MTP
+    # depths may remain unconsumed; an unrelated tensor is an export bug.
+    config = model.config
+    prefixes = (tuple(f"model.layers.{config.num_hidden_layers + depth}."
+                      for depth in range(config.num_nextn_predict_layers))
+                if config.model_type == "glm4_moe" else ())
+    if any(not name.startswith(prefixes) for name in unexpected):
+        raise ValueError(f"reference load unexpected tensors: {unexpected}")
     model.eval()
     model.set_attn_implementation("eager")
     with torch.no_grad():
