@@ -229,6 +229,38 @@ def main(destination: str) -> None:
     print(f"{root}: {size / 1e6:.2f} MB, {len(CASES)} cases")
 
 
+def reload(directory: str, recorded: str) -> None:
+    """Read a native export with the actual source classes.
+
+    `directory` is a directory Dew wrote after a native training step and
+    `recorded` the arrays that step left behind. The published pipeline is
+    loaded from those files - the transformer, both CLIP towers, the T5 tower,
+    its tokenizer and the scheduler - and the actual transformer recomputes
+    the forward the native model computed with the trained weights.
+    """
+    from diffusers import StableDiffusion3Pipeline
+
+    arrays = np.load(recorded)
+    pipe = StableDiffusion3Pipeline.from_pretrained(directory, torch_dtype=torch.float32,
+                                                   local_files_only=True)
+    model = pipe.transformer.eval()
+    with torch.no_grad():
+        output = model(hidden_states=torch.from_numpy(arrays["latent"]).permute(0, 3, 1, 2),
+                       encoder_hidden_states=torch.from_numpy(arrays["context"]),
+                       pooled_projections=torch.from_numpy(arrays["pooled"]),
+                       timestep=torch.from_numpy(arrays["times"]), return_dict=False)[0]
+    native = arrays["native"]
+    theirs = output.permute(0, 2, 3, 1).numpy()
+    gap = float(np.abs(theirs - native).max() / max(1.0, float(np.abs(native).max())))
+    buffer = float(np.abs(model.pos_embed.pos_embed.detach().numpy() - arrays["buffer"]).max())
+    trained = float(np.abs(model.proj_out.weight.detach().numpy().T - arrays["proj_out"]).max())
+    print(f"reimported forward gap {gap:.3g}; position buffer gap {buffer:.3g}; "
+          f"trained kernel gap {trained:.3g}")
+    if not (gap < 1e-5 and buffer == 0.0 and trained == 0.0):
+        raise SystemExit("the source did not read the native update")
+    print("the source reads the native update")
+
+
 def bundle(directory: str, destination: str) -> None:
     """Pack the saved transformers and the recorded arrays for the suite."""
     import tarfile
@@ -404,5 +436,7 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "bundle":
         bundle(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 2 and sys.argv[1] == "reload":
+        reload(sys.argv[2], sys.argv[3])
     else:
         main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-sd3-reference")

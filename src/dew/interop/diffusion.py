@@ -499,4 +499,8 @@ def save_source(source, values, destination: Path) -> None:
     for name, tokenizer in zip(encoder.names, encoder.tokenizers):
         folder = destination / ("tokenizer" + name.removeprefix("text_encoder"))
         tokenizer.save_pretrained(folder)
+        # A CLIP tokenizer's own vocabulary and merges beside its config.
         tokenizer.backend_tokenizer.model.save(str(folder))
+    if encoder.t5_tokenizer is not None:
+        # The T5 tokenizer ships one file, which `save_pretrained` writes.
+        encoder.t5_tokenizer.save_pretrained(destination / "tokenizer_3")
