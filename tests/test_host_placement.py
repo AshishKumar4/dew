@@ -49,11 +49,12 @@ BANKS = Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",))
 
 
 def fit(layout, directory, steps):
+    checkpoints = Checkpoints(str(directory), keep=3)
     trainer = Trainer(Regression(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
-                      checkpoints=Checkpoints(str(directory), keep=3), tracker=RecordingTracker())
+                      checkpoints=checkpoints, tracker=RecordingTracker())
     state = trainer.fit(Data(val=val_batches()), steps=steps, log_every=1, eval_every=2,
                         checkpoint_every=2)
-    trainer.checkpoints.wait()
+    checkpoints.wait()
     return state
 
 
