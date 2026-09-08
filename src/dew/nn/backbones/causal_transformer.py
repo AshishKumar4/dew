@@ -71,6 +71,10 @@ class LayerKind:
     rope_theta: Optional[float] = None  # set: this kind takes this base over the model's
     rope_scaling: Optional[RopeScaling] = None
     """This kind's llama3 ramp or its record; None rides the model's."""
+    yarn: Optional[YarnScaling] = None
+    """This kind's YaRN ramp or its record; None rides the model's. OLMo 3
+    scales its full-attention layers alone (configuration_olmo3.py:110-113),
+    so a YaRN ramp is a kind's as much as the model's."""
     head_dim: Optional[int] = None
     mixer: Optional[MixerBase] = None
     """This kind's mixer value or its record; None is the model's mixer."""
@@ -86,6 +90,8 @@ class LayerKind:
                 f"not {self.mixer!r}")
         if isinstance(self.rope_scaling, Mapping):
             object.__setattr__(self, "rope_scaling", RopeScaling(**self.rope_scaling))
+        if isinstance(self.yarn, Mapping):
+            object.__setattr__(self, "yarn", YarnScaling(**self.yarn))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,6 +109,7 @@ class ResolvedKind:
     num_kv_heads: int
     rope_theta: float
     rope_scaling: Optional[RopeScaling]
+    yarn: Optional[YarnScaling]
     head_dim: int
     mixer: Optional[MixerBase]
 
@@ -1121,6 +1128,7 @@ class CausalTransformer(nn.Module):
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
+            yarn=self.yarn if kind.yarn is None else kind.yarn,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             mixer=kind.mixer)
 
@@ -1172,11 +1180,12 @@ class CausalTransformer(nn.Module):
                       kv_shared: bool) -> MixerContext:
         """One layer's mixer geometry: the kind's resolved values as a context.
 
-        `head_dim`, `rope_theta` and `window` already carry the layer kind's
-        overrides; a windowed kind rotates every dimension, so the partial
-        rotary belongs to the kinds that attend the whole sequence, where
-        Gemma 4 puts it. A kind builds its `DecoderBlock` factory from this
-        and its own record; `setup` chooses the mixer there and nowhere else.
+        `head_dim`, `rope_theta`, `window` and the two rotary ramps already
+        carry the layer kind's overrides; a windowed kind rotates every
+        dimension, so the partial rotary belongs to the kinds that attend the
+        whole sequence, where Gemma 4 puts it. A kind builds its
+        `DecoderBlock` factory from this and its own record; `setup` chooses
+        the mixer there and nowhere else.
         """
         return MixerContext(
             emb_features=self.emb_features,
@@ -1201,7 +1210,7 @@ class CausalTransformer(nn.Module):
             o_proj_bias=self.o_proj_bias,
             attention_scale=self.attention_scale,
             attention_sinks=self.attention_sinks,
-            yarn=self.yarn,
+            yarn=kind.yarn,
             attn_logit_softcap=self.attn_logit_softcap,
             output_gate=self.output_gate,
             dtype=self.dtype,
