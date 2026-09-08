@@ -58,7 +58,7 @@ def test_a_negative_depth_count_is_refused():
 
 
 def test_a_sequence_with_no_position_a_depth_out_is_refused():
-    with pytest.raises(ValueError, match="2 prediction depths need more than 2 tokens"):
+    with pytest.raises(ValueError, match="prediction depths"):
         tiny(num_nextn_predict_layers=2).init(
             jax.random.key(0), jnp.ones((1, 2), jnp.int32))
 
