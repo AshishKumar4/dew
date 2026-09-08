@@ -82,7 +82,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
         if temporal is not None:
             x = temporal(x, f"up_{i}_temporal")
         if i != len(feature_depths) - 1:
-            x = Upsample(features=feature_depths[-i], scale=2, name=f"up_{i}_upsample",
+            x = Upsample(features=feature_depths[-i - 2], scale=2, name=f"up_{i}_upsample",
                          dtype=model.dtype, precision=model.precision)(x)
 
     x = conv(features=feature_depths[0])(x)

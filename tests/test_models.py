@@ -338,6 +338,25 @@ def test_stages_that_do_not_match_the_feature_depths_are_refused(rng):
             rng, jax.random.normal(rng, (2, 3, 16, 16, 3)), temb, textcontext)
 
 
+@pytest.mark.parametrize("video", [False, True])
+def test_upsampling_reaches_the_next_decoder_stage_width(rng, video):
+    from dew.nn.backbones.unet3d import UNet3D
+    from dew.nn.blocks import Upsample
+
+    depths = (8, 16, 32)
+    model_type = UNet3D if video else Unet
+    model = model_type(emb_features=16, feature_depths=depths,
+                       attention_configs=(None,) * len(depths),
+                       num_res_blocks=1, num_middle_res_blocks=1, dtype=jnp.float32)
+    shape = (1, 2, 16, 16, 3) if video else (1, 16, 16, 3)
+    _, variables = model.init_with_output(
+        rng, jax.random.normal(rng, shape), jnp.ones((1,)),
+        capture_intermediates=lambda module, method: isinstance(module, Upsample))
+    transitions = [values["__call__"][0].shape[-3:]
+                   for _, values in sorted(variables["intermediates"].items())]
+    assert transitions == [(8, 8, 16), (16, 16, 8)]
+
+
 def test_a_stage_with_an_unknown_field_is_refused():
     """Design rule 6: an unknown field raises ValueError naming it, so a
     misspelled dial fails at build and the dial it meant is never left at
