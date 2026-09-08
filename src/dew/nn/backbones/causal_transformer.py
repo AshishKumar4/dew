@@ -42,7 +42,7 @@ from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
-from ..mla import YarnScaling
+from ..mla import INDEXER_COLLECTION, YarnScaling
 from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
 from dew.registry import models
 
@@ -141,17 +141,25 @@ class LayerSpec:
     a layer runs unrolled, since what it stashes leaves the stack's loop."""
 
 
-def scan_groups(specs: Sequence[LayerSpec]) -> Tuple[Tuple[int, int], ...]:
+def scan_groups(specs: Sequence[LayerSpec],
+                bank_layers: Optional[int] = None) -> Tuple[Tuple[int, int], ...]:
     """The stack as runs of layers, `(first, count)` each, in order.
 
     Consecutive layers with equal specs form one run, which a scan runs as
     iterations of one body; a layer with no equal neighbour is a run of one,
     which stays unrolled. The grouping is read off the specs, never written
     by hand, so a model's pattern decides what scans.
+
+    `bank_layers` caps how many layers one run holds, which is how many a
+    parameter bank stacks: a longer run splits into consecutive runs of at
+    most that many layers. A host-resident bank is built and read one bank
+    at a time, so the cap is what bounds the memory either costs.
     """
+    if bank_layers is not None and bank_layers < 1:
+        raise ValueError(f"bank_layers counts the layers one run holds, got {bank_layers}")
     groups: list[Tuple[int, int]] = []
     for index, spec in enumerate(specs):
-        if groups and specs[groups[-1][0]] == spec:
+        if groups and specs[groups[-1][0]] == spec and groups[-1][1] != bank_layers:
             first, count = groups[-1]
             groups[-1] = (first, count + 1)
         else:
@@ -684,9 +692,46 @@ Block = Callable[[int, str], DecoderBlock]
 build their layers from, so one factory describes every view of them."""
 
 
+def _fetched(tree):
+    """`tree` in device memory, the copy issued and not waited for.
+
+    `jax.device_put` to a memory space alone keeps each leaf's sharding and
+    dtype, so a fetched shard is the shard the layout placed on the host and
+    the collectives its layer issues are the ones a resident run issues. A
+    leaf already in device memory is not moved, so a bank the layout left
+    resident reads the same way and gives the same values.
+    """
+    return jax.tree.map(lambda leaf: jax.device_put(leaf, jax.memory.Space.Device), tree)
+
+
+def _on_host(tree) -> bool:
+    """Whether any leaf of `tree` sits in host memory."""
+    return any(jax.typeof(leaf).memory_space is jax.memory.Space.Host
+               for leaf in jax.tree.leaves(tree))
+
+
+def _layer_slice(tree, index):
+    return jax.tree.map(
+        lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, 0, keepdims=False), tree)
+
+
+def _layer_written(tree, values, index):
+    return jax.tree.map(
+        lambda bank, leaf: jax.lax.dynamic_update_index_in_dim(bank, leaf, index, 0),
+        tree, values)
+
+
+WRITTEN = ('cache', 'router', 'qk', INDEXER_COLLECTION)
+"""The collections a decoder block writes: its decode cache, and what its
+router, its attention and its sparse indexer sow. A run whose parameters are
+fetched is applied in a scope of its own, so these are the names whose values
+the loop has to carry back out to the scope that asked for them."""
+
+
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
               groups: Sequence[Tuple[int, int]], x, *, train: bool, decode: bool,
-              positions, segment_ids, kv_store, per_layer_input, attention_metadata=None):
+              positions, segment_ids, kv_store, per_layer_input, attention_metadata=None,
+              banked: bool = False):
     """The layers over `x`, one run at a time as `groups` says.
 
     A run of one layer is `layers[first]`, called as the plain loop calls it.
@@ -700,27 +745,148 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     closes over. Owning layers would write into it from inside the loop,
     where a Python dict cannot follow, so they get no store; nothing reads
     what they would have written, because a provider is always a run of one.
+
+    `banked` says the store holds each run's parameters as one array already
+    (`dew.inference.banks`) rather than as the layers the view stacked. Those
+    runs, and any run the layout left in host memory, are read one layer at a
+    time, in `_prefetched_run`: the loop holds the layer it is about to
+    compute with and the one after it, the copy of the next layer is issued
+    before the current layer computes, and the parameters a layer has been
+    computed with are dropped. So at most two layers of one run are in device
+    memory, whatever the depth, and the last layer of the stack is the last
+    copy issued: nothing is fetched that nothing computes with. Staging
+    crosses the runs' boundaries, so a stack of single layers, of unequal
+    runs, or of both is pipelined the same way, and no run's fetch can be
+    hoisted above the layer before it, because it is issued inside that
+    layer's scan iteration or ordered after it by the carry it lands in.
+    Where a bank sits changes nothing here: a leaf in device memory is not
+    moved, so a resident bank and a host-resident one are read by the same
+    loop and give the same values.
     """
-    for first, count in groups:
+    runs = [layers[first] if count == 1 else block(first, group_name(first, count))
+            for first, count in groups]
+    fetching = banked or any(_on_host(run.variables.get('params', {})) for run in runs)
+    if fetching and train:
+        raise ValueError(
+            "a banked or host-resident store is read for a forward pass; a training "
+            "step reads every layer again in its backward pass, which this staging "
+            "does not cover, and dropout under it has no rng of its own")
+    if not fetching:
+        for run, (first, count) in zip(runs, groups):
+            inputs = (None if per_layer_input is None
+                      else per_layer_input[:, :, first:first + count, :])
+            if count == 1:
+                x = run(x, train=train, decode=decode, positions=positions,
+                        segment_ids=segment_ids, kv_store=kv_store,
+                        per_layer_input=None if inputs is None else inputs[:, :, 0, :],
+                        attention_metadata=attention_metadata)
+                continue
+            store = kv_store if specs[first].kv_shared else None
+
+            def step(layer, carry, per_layer_input):
+                return layer(carry, train=train, decode=decode, positions=positions,
+                             segment_ids=segment_ids, kv_store=store,
+                             per_layer_input=per_layer_input,
+                             attention_metadata=attention_metadata), None
+
+            x, _ = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
+                           in_axes=2, length=count)(run, x, inputs)
+        return x
+
+    def read_only(run: DecoderBlock) -> list[str]:
+        """The collections a run reads and does not write: its parameters and
+        whatever else it was given, all of which a bank holds per layer."""
+        return [name for name in run.variables
+                if not run.is_mutable_collection(name) or name not in WRITTEN]
+
+    def first_of(index: int):
+        """Run `index`'s first layer's read-only variables, fetched, or None
+        past the last run: the copy nothing computes with is the one not
+        issued."""
+        if index >= len(runs):
+            return None
+        held = {name: runs[index].variables[name] for name in read_only(runs[index])}
+        return _fetched(held if groups[index][1] == 1 else _layer_slice(held, 0))
+
+    staged = first_of(0)
+    for index, (run, (first, count)) in enumerate(zip(runs, groups)):
         inputs = (None if per_layer_input is None
                   else per_layer_input[:, :, first:first + count, :])
+        store = kv_store if count == 1 or specs[first].kv_shared else None
+        mutable = [name for name in WRITTEN if run.is_mutable_collection(name)]
+
+        def layer(read, cache, hidden, per_layer_slice):
+            variables = dict(read) if cache is None else {**read, 'cache': cache}
+            if not mutable:
+                return run.apply(
+                    variables, hidden, train=train, decode=decode, positions=positions,
+                    segment_ids=segment_ids, kv_store=store,
+                    per_layer_input=per_layer_slice,
+                    attention_metadata=attention_metadata), {}
+            hidden, changed = run.apply(
+                variables, hidden, mutable=mutable, train=train, decode=decode,
+                positions=positions, segment_ids=segment_ids, kv_store=store,
+                per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
+            return hidden, dict(changed)
+
+        cached = (run.variables.get('cache') or None) if 'cache' in mutable else None
         if count == 1:
-            x = layers[first](x, train=train, decode=decode, positions=positions,
-                              segment_ids=segment_ids, kv_store=kv_store,
-                              per_layer_input=None if inputs is None else inputs[:, :, 0, :],
-                              attention_metadata=attention_metadata)
-            continue
-        store = kv_store if specs[first].kv_shared else None
-
-        def step(layer, carry, per_layer_input):
-            return layer(carry, train=train, decode=decode, positions=positions,
-                         segment_ids=segment_ids, kv_store=store,
-                         per_layer_input=per_layer_input, attention_metadata=attention_metadata), None
-
-        scanned = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
-                          in_axes=2, length=count)
-        x, _ = scanned(block(first, group_name(first, count)), x, inputs)
+            following = first_of(index + 1)
+            x, changed = layer(staged, cached, x,
+                               None if inputs is None else inputs[:, :, 0, :])
+        else:
+            banks = {name: run.variables[name] for name in read_only(run)}
+            x, changed, following = _prefetched_run(
+                banks, staged, cached, x, inputs, layer, count,
+                following=functools.partial(first_of, index + 1))
+        staged = following
+        for collection, tree in changed.items():
+            for name, value in tree.items():
+                run.put_variable(collection, name, value)
     return x
+
+
+def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, following):
+    """One run of `count` layers under `jax.lax.scan`, read one layer at a time.
+
+    `primed` is layer 0's read-only variables, already in device memory.
+    Iteration `i` issues the copy of layer `i + 1` and then computes layer
+    `i`, so the copy has that layer's compute to overlap and the carry hands
+    its result to the iteration that reads it. The loop runs `count - 1`
+    iterations and the last layer is computed after it, out of what the carry
+    brought out; `following` stages the next run's first layer in place of
+    the copy the last layer does not need, and its result goes back to the
+    caller.
+
+    The cache stays in the carry and is written in place, one layer's slice
+    per iteration, so a decode step holds one banked cache and not two. A
+    cache the layers create instead comes out per iteration, like everything
+    else they sow, stacked on a leading layer axis the way flax's own scan
+    hands them out.
+    """
+    def body(carry, index):
+        hidden, current, held = carry
+        staged = _fetched(_layer_slice(banks, index + 1))
+        per_layer_slice = (None if inputs is None else
+                           jax.lax.dynamic_index_in_dim(inputs, index, 2, keepdims=False))
+        hidden, changed = layer(current, None if held is None else _layer_slice(held, index),
+                                hidden, per_layer_slice)
+        if held is not None:
+            held = _layer_written(held, changed.pop('cache'), index)
+        return (hidden, staged, held), changed
+
+    (x, current, cache), sown = jax.lax.scan(body, (x, primed, cache), jnp.arange(count - 1))
+    last = count - 1
+    staged = following()
+    x, changed = layer(current, None if cache is None else _layer_slice(cache, last), x,
+                       None if inputs is None else inputs[:, :, last, :])
+    if cache is not None:
+        cache = _layer_written(cache, changed.pop('cache'), last)
+    changed = jax.tree.map(
+        lambda rows, final: jnp.concatenate([rows, final[None]]), sown, changed)
+    if cache is not None:
+        changed['cache'] = cache
+    return x, changed, staged
 
 
 class PipelineStage(nn.Module):
@@ -766,6 +932,14 @@ class StackView:
     from the inside, so what a run reads, sows and caches lands leaf for
     leaf where the plain loop puts it.
 
+    `banked` names the collections a store already holds the inside way, one
+    array per run with the layer axis in it. Those the view leaves alone in
+    both directions: the bank a run scans is the one array the store holds,
+    with no copy of it under either name and no per-layer mirror beside it.
+    The stored identity is still `layers_N`: `bank_names` says which bank a
+    run's layers are in, and `unstack` on a banked store outside a scope is
+    what a save or an export reads, one layer's slice of one bank at a time.
+
     `groups` are the runs of one stage (of the whole stack without a
     pipeline). A collection that entered the pipeline's loop keeps `[stage,
     ...]` leaves; one the loop created (what the routers sow) keeps
@@ -776,6 +950,7 @@ class StackView:
     stages: int = 1
     microbatches: int = 1
     broadcast: Tuple[str, ...] = ()
+    banked: Tuple[str, ...] = ()
 
     @property
     def per_stage(self) -> int:
@@ -792,10 +967,18 @@ class StackView:
         return [[f'layers_{stage * self.per_stage + first + offset}' for offset in range(count)]
                 for stage in range(self.stages)]
 
+    def bank_names(self) -> list[str]:
+        """Every run's stored name, in order: what a banked store's keys are."""
+        return [self._inside_name(first, count) or f'layers_{first}'
+                for first, count in self.groups]
+
     def stack(self, variables: Mapping[str, Mapping]) -> dict:
         inside = {}
         for collection, tree in variables.items():
             tree = dict(tree)
+            if collection in self.banked:
+                inside[collection] = tree
+                continue
             stages = {}
             for first, count in self.groups:
                 name = self._inside_name(first, count)
@@ -825,6 +1008,9 @@ class StackView:
         outside = {}
         for collection, tree in variables.items():
             tree = dict(tree)
+            if collection in self.banked:
+                outside[collection] = tree
+                continue
             stages = dict(tree.pop('stages', {})) if self.stages > 1 else tree
             for first, count in self.groups:
                 name = self._inside_name(first, count)
@@ -842,9 +1028,17 @@ class StackView:
         return outside
 
     def _leaf(self, stage: int, offset: Optional[int], broadcast: bool, leaf):
-        """One layer's leaf out of a run's stacked one."""
+        """One layer's leaf out of a run's stacked one.
+
+        The row is taken with `index_in_dim`, a slice of a known position, so
+        the read is expressible wherever the bank sits: an index array would
+        be a gather, and a gather over a host-resident operand needs its
+        indices in host memory too, which is not what a save or an export
+        holds.
+        """
         if self.stages == 1:
-            return leaf[offset]
+            assert offset is not None, "a run of one is not stacked, so the view keeps it"
+            return jax.lax.index_in_dim(leaf, offset, axis=0, keepdims=False)
         if broadcast:
             leaf = leaf[stage]
             return leaf if offset is None else leaf[offset]
@@ -1035,6 +1229,13 @@ class CausalTransformer(nn.Module):
     activation_sparsity_pattern: Optional[Tuple[float, ...]] = None  # Gemma 3n's gaussian top-k, one fraction per layer
     mask_token_id: Optional[int] = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
     scan_layers: bool = False                 # runs of like layers under flax's scan
+    bank_layers: Optional[int] = None
+    """The most layers one scanned run holds, which is how many its parameter
+    bank stacks. A longer run of like layers splits into consecutive runs of
+    at most this many, each its own bank under its own name; None puts a
+    whole run in one bank. Only `scan_layers` reads it, and the split is
+    what bounds the memory that building a host-resident bank and reading it
+    back cost, so a deep stack offloaded to the host sets it."""
     remat: Optional[RematPolicy] = None
     """Recompute each block in the backward pass, keeping its inputs, any K/V
     supplied to later layers and the residuals the policy names. A name from
@@ -1432,7 +1633,7 @@ class CausalTransformer(nn.Module):
         self.specs = specs
         self.block = block
         self.layers = [block(index, f'layers_{index}') for index in range(self.num_layers)]
-        self.groups = scan_groups(specs) if self.scan_layers else tuple(
+        self.groups = scan_groups(specs, self.bank_layers) if self.scan_layers else tuple(
             (index, 1) for index in range(self.num_layers))
         # Prediction depths mirror whole-sequence hidden states, so their
         # mixer builds from the full-attention kind where the pattern has
@@ -1705,6 +1906,11 @@ class CausalTransformer(nn.Module):
         loops' axes while the loops run and unstacked on the way out. The
         loops carry the residual stream in one dtype, so it enters them in
         the dtype it settles in (`residual_dtype`).
+
+        A store built bank by bank (`dew.inference.banks`) already holds the
+        parameters the way the runs read them, one array per run, so the view
+        leaves that collection alone in both directions and the run scans the
+        one array the store holds.
         """
         stages = pipeline_stages()
         if self.is_initializing() or (stages == 1 and not self.scan_layers):
@@ -1714,13 +1920,20 @@ class CausalTransformer(nn.Module):
                 train=train, decode=decode, positions=positions, segment_ids=segment_ids,
                 kv_store={} if self.num_kv_shared_layers else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+        banked = self.banked_collections()
         if stages == 1:
-            view = StackView(self.groups)
+            view = StackView(self.groups, banked=banked)
         else:
             if decode:
                 raise ValueError(
                     "decoding appends one token at a time to the cache, which no "
                     "pipeline over the stage axis runs; decode outside jax.set_mesh")
+            if banked:
+                raise ValueError(
+                    f"a pipeline over the stage axis stacks every stage's copy of a "
+                    f"layer, which a store already banked by run cannot be reshaped "
+                    f"into; {list(banked)} arrived banked. Place the weights per layer "
+                    f"for a pipeline, or run the stack whole")
             count = self.stage_layers(stages)
             batch_axis = 1 if self.altup is not None else 0
             rows, count_microbatches = x.shape[batch_axis], microbatches()
@@ -1730,7 +1943,7 @@ class CausalTransformer(nn.Module):
                     f"count that divides the rows and is a multiple of the stages, "
                     f"got {count_microbatches}")
             view = StackView(
-                scan_groups(self.specs[:count]) if self.scan_layers
+                scan_groups(self.specs[:count], self.bank_layers) if self.scan_layers
                 else tuple((index, 1) for index in range(count)),
                 stages=stages, microbatches=count_microbatches,
                 # What enters the loop is read on every iteration; what the
@@ -1742,6 +1955,34 @@ class CausalTransformer(nn.Module):
         run = nn.map_variables(type(self)._stacked, True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
         return run(self, view, x, train, decode, positions, segment_ids, per_layer_input, attention_metadata)
+
+    def banked_collections(self) -> Tuple[str, ...]:
+        """The collections whose layer subtrees the store holds as banks.
+
+        A store built per layer holds `layers_0`; one built bank by bank
+        holds the name of each run of more than one layer, `layers_0_15`. A
+        run of one is the same tree either way, so it says nothing about
+        which of the two a store is and neither form has to be converted for
+        it. A collection holding a run's bank and that run's layers, or some
+        of the banks and not the others, is refused: which of the two the run
+        would read is not a question this answers by guessing.
+        """
+        banks = {group_name(first, count) for first, count in self.groups if count > 1}
+        inside = {f'layers_{index}' for first, count in self.groups if count > 1
+                  for index in range(first, first + count)}
+        banked = []
+        for collection, tree in self.variables.items():
+            names = set(tree)
+            if not names & banks:
+                continue
+            if not banks <= names or names & inside:
+                raise ValueError(
+                    f"collection {collection!r} holds the banks {sorted(names & banks)} "
+                    f"of the runs {sorted(banks)} and the layers "
+                    f"{sorted(names & inside)}; a store holds every run's bank or "
+                    f"every layer's own subtree, never a mixture")
+            banked.append(collection)
+        return tuple(banked)
 
     def residual_dtype(self, x, *, train: bool, decode: bool, positions, segment_ids,
                        per_layer_input, attention_metadata=None) -> jnp.dtype:
@@ -1756,17 +1997,48 @@ class CausalTransformer(nn.Module):
         runs abstractly, in a scope of its own, so it writes no cache and
         sows nothing here, and its RNG streams take placeholder keys, since
         a shape needs a key of each name and no value.
+
+        Only the shapes and dtypes matter, so a banked store answers this
+        from the first row of its first bank, without fetching it: the layer
+        the plain loop would read is not in that store under a name of its
+        own.
         """
         layer, scope = self.layers[0], self.layers[0].scope
         assert scope is not None
         rngs = {name: jax.random.key(0) for name in scope.rngs}
-        output = jax.eval_shape(lambda: layer.apply(
-            layer.variables, x, mutable=True, rngs=rngs,
+        output = jax.eval_shape(lambda held: layer.apply(
+            held, x, mutable=True, rngs=rngs,
             train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             kv_store={} if self.num_kv_shared_layers else None,
             per_layer_input=None if per_layer_input is None else per_layer_input[:, :, 0, :],
-            attention_metadata=attention_metadata)[0])
+            attention_metadata=attention_metadata)[0], self.first_layer_shapes())
         return jnp.result_type(x.dtype, output.dtype)
+
+    def first_layer_shapes(self) -> dict:
+        """The stack's first layer's variables as shape/dtype structs.
+
+        A store holding one subtree per layer answers with layer 0's; one
+        holding banks answers with the first row of the first bank's, the
+        layer axis dropped. Nothing is read, fetched or sliced: this is what
+        an abstract run of one layer needs and no more, and a bank's first
+        row is a shape, not a copy.
+        """
+        banked = self.banked_collections()
+        first = StackView(self.groups).bank_names()[0]
+        stacked = self.groups[0][1] > 1
+
+        def shapes(leaf, drop: bool):
+            return jax.ShapeDtypeStruct(leaf.shape[1:] if drop else leaf.shape, leaf.dtype)
+
+        variables = {}
+        for collection, tree in self.variables.items():
+            if collection in banked:
+                variables[collection] = jax.tree.map(
+                    functools.partial(shapes, drop=stacked), tree[first])
+            elif 'layers_0' in tree:
+                variables[collection] = jax.tree.map(
+                    functools.partial(shapes, drop=False), tree['layers_0'])
+        return variables
 
     def stage_layers(self, stages: int) -> int:
         """Layers per stage when the stack splits into `stages`, or why it cannot.
@@ -1806,7 +2078,8 @@ class CausalTransformer(nn.Module):
                 self.layers, self.block, self.specs, view.groups, x,
                 train=train, decode=decode, positions=positions, segment_ids=segment_ids,
                 kv_store={} if self.num_kv_shared_layers else None,
-                per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+                per_layer_input=per_layer_input, attention_metadata=attention_metadata,
+                banked='params' in view.banked)
         return self._pipeline(view, x, train=train, positions=positions,
                               segment_ids=segment_ids, per_layer_input=per_layer_input, attention_metadata=attention_metadata)
 
