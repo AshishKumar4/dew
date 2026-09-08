@@ -290,7 +290,6 @@ def host_banked(model: CausalTransformer, source: LayerBanks, *,
             _bank_placement(one_layer(placement, first), stacked=count > 1)))
         for collection, tree in bank.items():
             store[collection][name] = tree
-        del bank
     return {collection: tree for collection, tree in store.items() if tree}
 
 

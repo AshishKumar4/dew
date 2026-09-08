@@ -829,15 +829,15 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
                 per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
             return hidden, dict(changed)
 
-        cached = run.variables.get('cache') if 'cache' in mutable else None
+        cached = (run.variables.get('cache') or None) if 'cache' in mutable else None
         if count == 1:
             following = first_of(index + 1)
-            x, changed = layer(staged, cached or None, x,
+            x, changed = layer(staged, cached, x,
                                None if inputs is None else inputs[:, :, 0, :])
         else:
             banks = {name: run.variables[name] for name in read_only(run)}
             x, changed, following = _prefetched_run(
-                banks, staged, cached or None, x, inputs, layer, count,
+                banks, staged, cached, x, inputs, layer, count,
                 following=functools.partial(first_of, index + 1))
         staged = following
         for collection, tree in changed.items():
