@@ -13,7 +13,7 @@ additive loss statistics with Aux reports. These values are JAX PyTrees.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeAlias
 from typing_extensions import TypeVar
@@ -102,6 +102,21 @@ class Aux(Generic[Effects]):
     collection, in which case the clip steps aside."""
     effects: Effects | None = None
     """Additive observations applied once on a supported optimizer commit."""
+
+
+@struct.dataclass
+class Prediction:
+    """What a token objective scored a batch with, for a teacher to compare.
+
+    `logits` are the `[B, S, vocab]` fp32 scores the model's forward
+    produces, `losses` and `weights` the `[B, S]` per-position loss the
+    objective sums and the weight it gives each position, and `hidden` the
+    `[B, S, D]` states of the layers a caller asked for, in the order asked.
+    """
+    logits: jax.Array
+    losses: jax.Array
+    weights: jax.Array
+    hidden: tuple[jax.Array, ...]
 
 
 def everything(path: Path) -> bool:
@@ -226,6 +241,19 @@ class Objective(ABC, Generic[Loss, Effects]):
     def apply_effects(self, variables: Variables, effects: Effects) -> Variables:
         """Nonparameter replacements from accepted-window observations."""
         raise TypeError("deferred effects require Objective.apply_effects")
+
+    def predict(self, params: Variables, batch: Batch, step: Step, *, train: bool,
+                layers: Sequence[int] = ()) -> tuple[Mean, Aux[Effects], Prediction]:
+        """The loss over `batch` as `loss` computes it, with the prediction
+        behind it: the statistics, the reports, and the token logits with the
+        weight of every position and the hidden states of `layers`.
+
+        The statistics are one `Mean` over the positions the weights count,
+        so a distillation can mix in terms over the same mass. `train` gates
+        dropout the way `loss` has it on; a frozen teacher scores with it
+        off. Objectives that score no token logits raise.
+        """
+        raise TypeError(f"{type(self).__name__} scores no token logits")
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Artifacts | None:
         """Scoring artifacts for every row of the coordinated global batch.
