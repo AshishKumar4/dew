@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
@@ -28,11 +29,14 @@ def sinusoidal_time(time, features: int, *, shift: float = 0, cosine_first: bool
     half = features // 2
     if features % 2 or half <= shift:
         raise ValueError("Time embedding width must be even and exceed twice the frequency shift")
-    # The published models scale the whole exponent and then divide, and a
-    # float32 log times a timestep near a thousand keeps that ulp: dividing
-    # the constant first moves the sine by 1e-5 and the timestep embedder's
-    # own gradient with it.
-    frequencies = jnp.exp(-math.log(10000.0) * jnp.arange(half, dtype=jnp.float32) / (half - shift))
+    # The exponent is the published models' own float32 arithmetic (the whole
+    # exponent scaled, then divided; the other order moves a sine by 1e-5 at a
+    # timestep near a thousand). Its exponential is taken on the host in
+    # float64 and rounded once: no backend's float32 `exp` is correctly rounded
+    # everywhere, and one ulp of a frequency is one ulp of a thousand-radian
+    # angle, so a device table would make the embedding depend on the backend.
+    exponent = np.arange(half, dtype=np.float32) * np.float32(-math.log(10000.0)) / np.float32(half - shift)
+    frequencies = jnp.asarray(np.exp(exponent.astype(np.float64)).astype(np.float32))
     phase = jnp.asarray(time, jnp.float32).reshape(-1, 1) * frequencies[None]
     first, second = (jnp.cos(phase), jnp.sin(phase)) if cosine_first else (jnp.sin(phase), jnp.cos(phase))
     return jnp.concatenate([first, second], axis=-1)
