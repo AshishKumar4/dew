@@ -435,6 +435,17 @@ class MultiHeadLatentAttention(nn.Module):
     frozen model. Whenever the indexer is present and the `indexer`
     collection is open, a training pass sows the per-query `indexer_kl`
     under `kl`, over the keys the attention itself used.
+
+    `attention_impl` reaches the shared kernel path, which pads these
+    values to the query's width for a fused kernel and hands back their own
+    columns (`widen_value_heads`), so `auto` picks cudnn or xla off the
+    query width like any other layer's: `qk_nope_head_dim +
+    qk_rope_head_dim`, 192 in the released V3 configs, which is past the
+    width cudnn tiles, so those run on xla. A mask this layer materializes
+    outside decode (packed documents, row validity, the indexer's
+    selection) takes 'auto' and 'cudnn' to xla, since cudnn reads a bool
+    mask as an additive bias and refuses one at an odd length while
+    training.
     """
 
     emb_features: int
@@ -661,8 +672,6 @@ class MultiHeadLatentAttention(nn.Module):
                         inside, causal_attention_mask(
                             jnp.arange(length), length))
                 causal = False
-                if implementation in ('auto', 'cudnn'):
-                    implementation = 'xla'
             if self.indexed:
                 assert q_resid is not None
                 # The keys a query may attend before selection: the rows'
@@ -694,6 +703,16 @@ class MultiHeadLatentAttention(nn.Module):
             mask = queries_valid if mask is None else mask & queries_valid
             if not decode:
                 mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
+        if mask is not None and not decode and implementation in ('auto', 'cudnn'):
+            # cudnn has no mask argument: jax hands its kernel a bool mask as
+            # an additive bias, which check_is_flash_attention then refuses at
+            # an odd query or key length while training
+            # (jax/_src/cudnn/fused_attention_stablehlo.py). Packed documents,
+            # row validity and the indexer's selection all materialize a mask
+            # on the training path, so they take the xla kernel, the way the
+            # standard mixer's own masks do. Decoding runs no backward pass, so
+            # its cache mask keeps the fused path.
+            implementation = 'xla'
         scale = self.query_scale
         query = jnp.concatenate([q_pass, q_rot], axis=-1)
         if scale != 1.0:

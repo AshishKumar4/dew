@@ -295,10 +295,8 @@ claimed, and more than one prediction layer is refused.
 | Dream | `dream`, `Dream` | Export writer, training seam |
 | Kimi K2 | `kimi_k2` | Config translation only, no weights |
 
-DeepSeek's MLA layers need `attention_impl="reference"`; `auto` rejects their
-query and value head widths. `MaskedDiffusionObjective` takes no `pretrained`
-argument, so LLaDA and Dream train from a fresh init rather than from their
-released weights.
+`MaskedDiffusionObjective` takes no `pretrained` argument, so LLaDA and Dream
+train from a fresh init rather than from their released weights.
 
 Video inputs are qualified on Qwen 3.5 only; the other processors are
 exercised for text, images and waveforms. Native checkpoint loading covers

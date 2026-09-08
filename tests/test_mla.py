@@ -5,10 +5,13 @@ blocks with and without the query LoRA (YaRN rope at the released
 spelling, interleaved pairs), a tiny DeepseekV32Attention with its DSA
 indexer and biased projections, and the YaRN derivation standalone.
 Everything runs at fp32 on CPU, and each parity test states its tolerance
-and the largest difference observed. The last section trains the V3.2
-stack, mixer and routed experts together, on the simulated mesh.
+and the largest difference observed. The middle section runs the same
+blocks under `attention_impl='auto'`, whose kernels take one head width for
+the keys and the values where MLA's differ. The last section trains the
+V3.2 stack, mixer and routed experts together, on the simulated mesh.
 """
 
+import functools
 import json
 import math
 from pathlib import Path
@@ -21,6 +24,7 @@ import pytest
 from jax.sharding import PartitionSpec as P
 
 from dew.interop.hf_decoders import _yarn_record, translate_weights
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import mixers
 from dew.nn.mla import (
@@ -53,7 +57,8 @@ def yarn_of(settings: dict) -> YarnScaling:
     return YarnScaling(**record)
 
 
-def mla_module(settings: dict, max_seq_len: int = 64
+def mla_module(settings: dict, max_seq_len: int = 64,
+               attention_impl: str | None = None
                ) -> MultiHeadLatentAttention:
     """The fixture's reference config as a dew mixer."""
     return MultiHeadLatentAttention(
@@ -72,7 +77,8 @@ def mla_module(settings: dict, max_seq_len: int = 64
         attention_bias=bool(settings["attention_bias"]),
         index_topk=settings.get("index_topk"),
         index_n_heads=settings.get("index_n_heads"),
-        index_head_dim=settings.get("index_head_dim"))
+        index_head_dim=settings.get("index_head_dim"),
+        attention_impl=attention_impl)
 
 
 def block_variables(tensors: dict) -> dict:
@@ -89,10 +95,11 @@ def block_variables(tensors: dict) -> dict:
     return {"params": tree["layers_0"]["self_attn"]}
 
 
-def block_output(name: str, settings: dict) -> float:
+def block_output(name: str, settings: dict,
+                 attention_impl: str | None = None) -> float:
     """Largest difference between the dew mixer and the fixture block."""
     tensors = fixture(name)
-    module = mla_module(settings)
+    module = mla_module(settings, attention_impl=attention_impl)
     output = module.apply(block_variables(tensors),
                           jnp.asarray(tensors["hidden"]))
     return float(np.max(np.abs(np.asarray(output) - tensors["output"])))
@@ -192,6 +199,84 @@ def test_mla_reproduces_the_v32_block():
     dense = dict(CONFIG["v32"], index_topk=None, index_n_heads=None,
                  index_head_dim=None)
     assert block_output("mla_v32", dense) > 1.0
+
+
+# --------------------------------------------------------------------------
+# The kernel the head widths select
+# --------------------------------------------------------------------------
+
+
+def readout_gradients(module, variables, hidden):
+    """Gradients of one fixed non-uniform readout of the block's output, so a
+    value column that came back in the wrong place moves them."""
+    def loss(params):
+        out = module.apply(params, hidden)
+        weights = jax.random.normal(jax.random.key(0), out.shape, out.dtype)
+        return jnp.sum(out * weights)
+    return jax.grad(loss)(variables)
+
+
+@pytest.mark.parametrize("name", ["mla_v3", "mla_v3n", "mla_v32"])
+def test_auto_takes_the_unequal_query_and_value_head_widths(name):
+    """`attention_impl='auto'` computes the reference block on the shape it
+    used to refuse.
+
+    MLA's values are narrower than its queries (`v_head_dim` 8 against
+    `qk_nope_head_dim + qk_rope_head_dim` 16 in these fixtures, 128 against
+    192 in every released V3 config), and `jax.nn.dot_product_attention`
+    checks the value against the key's whole shape, so both fused paths
+    raised before the value was padded to the query's width. Tolerance 2e-5,
+    the bound of the parity tests above; observed 2.9e-6 (v3) and 1.9e-6
+    (v3n, v32) on CPU, where `auto` resolves to the xla kernel.
+    """
+    assert block_output(name, CONFIG[SETTINGS[name]], attention_impl="auto") < 2e-5
+
+
+@pytest.mark.parametrize("name", ["mla_v3", "mla_v3n", "mla_v32"])
+def test_auto_and_the_reference_agree_on_the_mla_gradients(name):
+    """One backward pass through each implementation on the same weights.
+
+    The trees hold gradients up to 4.7e+01, so the bound is relative to the
+    largest of them: tolerance 1e-6, observed 1.6e-7 (v3), 7.7e-8 (v3n) and
+    1.6e-7 (v32) on CPU. A crop that kept the padded columns instead of the
+    value's own moves these by their own size.
+    """
+    settings = CONFIG[SETTINGS[name]]
+    tensors = fixture(name)
+    variables, hidden = block_variables(tensors), jnp.asarray(tensors["hidden"])
+    reference = jax.tree.leaves(
+        readout_gradients(mla_module(settings), variables, hidden))
+    auto = jax.tree.leaves(readout_gradients(
+        mla_module(settings, attention_impl="auto"), variables, hidden))
+    largest = max(float(np.max(np.abs(np.asarray(leaf)))) for leaf in reference)
+    difference = max(float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
+                     for a, b in zip(reference, auto))
+    assert difference < 1e-6 * largest
+
+
+def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
+    """A value narrower than the query rides into the fused kernel padded to
+    the query's width, so the call has to hand back the value's own columns:
+    the same numbers as the call where the caller writes that padding out,
+    and the reference kernel's answer within fp32 rounding (tolerance 1e-6,
+    observed 1.2e-7). A value wider than the query has no such rewrite,
+    since padding the query would move the kernel's own 1/sqrt(d) scale, and
+    is refused.
+    """
+    rng = np.random.default_rng(0)
+    query = jnp.asarray(rng.standard_normal((2, 7, 4, 16)), jnp.float32)
+    key = jnp.asarray(rng.standard_normal((2, 7, 4, 16)), jnp.float32)
+    value = jnp.asarray(rng.standard_normal((2, 7, 4, 8)), jnp.float32)
+    fused = functools.partial(
+        scaled_dot_product_attention, query, key, implementation="xla", causal=True)
+    narrow = fused(value)
+    assert narrow.shape == (2, 7, 4, 8)
+    assert jnp.array_equal(
+        narrow, fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 8))))[..., :8])
+    reference = scaled_dot_product_attention(query, key, value, causal=True)
+    assert float(jnp.max(jnp.abs(narrow - reference))) < 1e-6
+    with pytest.raises(ValueError):
+        fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 16))))
 
 
 def mla_record(settings: dict) -> dict:
