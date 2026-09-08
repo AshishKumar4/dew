@@ -31,8 +31,9 @@ from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
 from dew.registry import models, resolve_dtype, with_precision
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.source import SourceSchedule
+from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inputs import Condition, Field, InputSpec
+from dew.inputs.diffusion import Composition
 from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling.guidance import CFG
@@ -955,12 +956,13 @@ class _Denoiser:
     layouts: tuple[WeightLayout, ...]
     built: Mapping[str, object]
     config: Mapping[str, object]
-    composition: str
+    composition: Composition
     towers: tuple[str, ...]
     patch: int
     latent_input: int
+    sample_size: int
     pipeline: str
-    origin: str = "scheduler"
+    origin: Origin = "scheduler"
 
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,
@@ -987,8 +989,8 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
         t5, t5_tokenizer, t5_params, recorded, t5_config = _t5_tower(directory, compute)
         text_params["text_encoder_3"] = t5_params
         text_layouts += recorded
-    sample_size = int(denoiser.config["sample_size"]) * autoencoder.downscale_factor
-    height, width = index.get("dew_height", sample_size), index.get("dew_width", sample_size)
+    size = denoiser.sample_size * autoencoder.downscale_factor
+    height, width = index.get("dew_height", size), index.get("dew_width", size)
     if type(height) is not int or type(width) is not int or height < 1 or width < 1:
         raise ValueError("Image geometry must contain positive integer dimensions")
     encoder = _conditioner(denoiser, index, directory, towers, tokenizers, names, text_params,
@@ -1027,6 +1029,7 @@ def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str) -> _Deno
     """The published UNet: cross attention over one or two CLIP towers, whose
     pooled text conditioning is the one its added time features ask for."""
     from dew.interop import diffusion
+    from dew.interop.diffusion import _integer
     from dew.nn.backbones.unet_condition import UNet2DCondition
 
     config = _component_config(directory, "unet")
@@ -1041,6 +1044,7 @@ def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str) -> _Deno
     return _Denoiser("unet", model, {"params": params}, layouts, built, config,
                      "clip_pooled" if pooled else "clip",
                      ("text_encoder", "text_encoder_2"), 1, model.in_channels,
+                     _integer(config["sample_size"], "sample_size"),
                      "StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline")
 
 
@@ -1048,6 +1052,7 @@ def _transformer_denoiser(directory: Path, *, dtype: str, attention_impl: str) -
     """The published MM-DiT: both CLIP towers and the T5 tower read jointly,
     with the stored position buffer in its own frozen collection."""
     from dew.interop import diffusion
+    from dew.interop.diffusion import _integer
     from dew.nn.backbones.sd3 import SD3Transformer
 
     config = _component_config(directory, "transformer")
@@ -1064,7 +1069,8 @@ def _transformer_denoiser(directory: Path, *, dtype: str, attention_impl: str) -
                         "dual_attention_layers": list(fields["dual_attention_layers"])}}
     return _Denoiser("transformer", model, {"params": params, "buffers": buffers}, layouts, built,
                      config, "sd3", ("text_encoder", "text_encoder_2"), fields["patch_size"],
-                     fields["in_channels"], "StableDiffusion3Pipeline")
+                     fields["in_channels"], _integer(config["sample_size"], "sample_size"),
+                     "StableDiffusion3Pipeline")
 
 
 def _component_config(directory: Path, name: str) -> dict:
@@ -1142,11 +1148,13 @@ def _conditioner(denoiser: _Denoiser, index: Mapping[str, object], directory: Pa
                  t5, t5_tokenizer):
     """The text conditioning this family composes, at this source's geometry."""
     from dew.inputs.diffusion import DiffusionConditioner
+    from dew.interop.diffusion import _integer
 
     return DiffusionConditioner(
         towers, tokenizers, names, text_params, str(directory), height, width,
         composition=denoiser.composition, t5=t5, t5_tokenizer=t5_tokenizer,
-        t5_width=denoiser.config.get("joint_attention_dim", 4096),
+        t5_width=_integer(denoiser.config.get("joint_attention_dim", 4096),
+                          "joint_attention_dim"),
         aesthetics=bool(index.get("requires_aesthetics_score", False)))
 
 
