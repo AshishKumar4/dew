@@ -41,6 +41,7 @@ class HostProcessor(Protocol):
 
     def __call__(self, **kwargs: object) -> Mapping[str, object]: ...
     def save_pretrained(self, save_directory: str) -> object: ...
+    def apply_chat_template(self, conversation: Sequence[Mapping[str, object]], **kwargs: object) -> object: ...
     def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]: ...
 
 
@@ -59,8 +60,11 @@ class Processor:
     vocab_size: int
 
     def __call__(self, text: str | Sequence[str], *, images: object | None = None,
-                 audio: object | None = None) -> ModelInputs:
-        if images is None and audio is None:
+                 audio: object | None = None, videos: object | None = None,
+                 video_metadata: object | None = None) -> ModelInputs:
+        if images is None and audio is None and videos is None:
+            if video_metadata is not None:
+                raise ValueError("video_metadata requires videos")
             rows = [text] if isinstance(text, str) else list(text)
             values = self.reference(text=rows, padding=False, truncation=False, return_tensors=None)
             tokenizer = getattr(self.reference, "tokenizer", self.reference)
@@ -75,8 +79,6 @@ class Processor:
             tokens, fields = pad_token_rows(ids, pad_id=0 if pad_id is None else pad_id,
                                            padding_side=side, fields=fields)
             return self.from_hf({"input_ids": tokens, **fields})
-        import torch
-
         # truncation is off for text anyway; reloaded Gemma processors forward
         # the tokenizer's unset max_length into audio kwargs otherwise.
         arguments: dict[str, object] = {
@@ -86,19 +88,47 @@ class Processor:
             arguments["images"] = images
         if audio is not None:
             arguments["audio"] = audio
+        if videos is not None:
+            arguments["videos"] = videos
+        if video_metadata is not None:
+            if videos is None:
+                raise ValueError("video_metadata requires videos")
+            arguments["video_metadata"] = video_metadata
+        return self._from_tensors(self.reference(**arguments))
+
+    def chat(self, messages: Sequence[Mapping[str, object]], *, add_generation_prompt: bool = True,
+             **template_options: object) -> ModelInputs:
+        """Run the source's actual chat template and processor into numeric inputs.
+
+        Template controls such as reasoning_effort and preserve_thinking are
+        interpreted by the checkpoint template. Media-bearing content uses
+        the same reference processor and numeric normalization as plain text.
+        """
+        values = self.reference.apply_chat_template(
+            messages, tokenize=True, return_dict=True, return_tensors="pt",
+            add_generation_prompt=add_generation_prompt, **template_options)
+        if not isinstance(values, Mapping):
+            raise TypeError("the source chat processor must return named numeric inputs")
+        return self._from_tensors(values)
+
+    def _from_tensors(self, values: Mapping[str, object]) -> ModelInputs:
+        import torch
+
         arrays: dict[str, np.ndarray] = {}
-        for name, value in self.reference(**arguments).items():
+        for name, value in values.items():
             if not isinstance(value, torch.Tensor):
                 raise TypeError(f"processor field {name!r} is not a tensor")
-            # Llama 4 normalizes pixels in bfloat16 as its original
-            # implementation does; widening to float32 is exact.
+            # Llama 4's processor emits bf16; float32 widening is exact.
             arrays[name] = (value.float() if value.dtype == torch.bfloat16 else value).numpy()
         return self.from_hf(arrays)
+
+
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Validate and normalize actual processor outputs before device use."""
         known = {"input_ids", "attention_mask", "pixel_values", "token_type_ids", "mm_token_type_ids",
-                 "image_position_ids", "image_grid_thw", "input_features", "input_features_mask"}
+                 "image_position_ids", "image_grid_thw", "input_features", "input_features_mask",
+                 "pixel_values_videos", "video_grid_thw"}
         unknown = set(values) - known
         if unknown:
             raise ValueError(f"processor fields {sorted(unknown)} have no native model input")
@@ -111,7 +141,9 @@ class Processor:
         positions = np.maximum(np.cumsum(valid, axis=1) - 1, 0).astype(np.int32)
         token_fields = {"attention_mask": jnp.asarray(valid), "positions": jnp.asarray(positions)}
         conditioning: dict[str, jax.Array] = {}
-        if "pixel_values" in values:
+        if "pixel_values" in values or "pixel_values_videos" in values:
+            if "pixel_values_videos" in values and self.config.get("model_type") != "qwen3_5":
+                raise ValueError("video patch inputs require the Qwen3.5 visual tower")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
             if self.config.get("model_type") == "qwen3_5":
@@ -134,37 +166,28 @@ class Processor:
         image_id = self.record.get("image_token_id", self.config.get("image_token_id"))
         if type(image_id) is not int:
             raise ValueError("image_token_id must be an integer")
-        pixels = np.asarray(values["pixel_values"])
-        if pixels.ndim not in (2, 3, 4):
-            raise ValueError("pixel_values must contain image tensors or patch vectors")
-        if not np.issubdtype(pixels.dtype, np.floating):
-            raise ValueError("pixel_values must be floating processor output")
+        qwen = self.config.get("model_type") == "qwen3_5"
+        video_id = self.config.get("video_token_id") if qwen else None
+        pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
+        if pixels.ndim not in (2, 3, 4) or not np.issubdtype(pixels.dtype, np.floating):
+            raise ValueError("pixel_values must contain floating image tensors or patch vectors")
         runs = []
         for row in tokens:
-            locations = np.flatnonzero(row == image_id)
-            runs.append([] if not len(locations) else np.split(locations, np.flatnonzero(np.diff(locations) != 1) + 1))
+            locations = np.flatnonzero((row == image_id) | (row == video_id if video_id is not None else False))
+            boundaries = np.flatnonzero((np.diff(locations) != 1) | (row[locations[1:]] != row[locations[:-1]])) + 1
+            runs.append([] if not len(locations) else np.split(locations, boundaries))
         image_counts = np.array([len(row) for row in runs], np.int32)
         patch_positions = None
         grid = None
         merge = 1
-        if "image_grid_thw" in values:
-            vision = self.config.get("vision_config")
-            if not isinstance(vision, Mapping):
-                raise ValueError("image_grid_thw requires a vision config")
-            merge = vision.get("spatial_merge_size")
-            if type(merge) is not int or merge < 1:
-                raise ValueError("spatial_merge_size must be a positive integer")
-            grid = np.asarray(values["image_grid_thw"])
-            if (grid.ndim != 2 or grid.shape[1] != 3 or not np.issubdtype(grid.dtype, np.integer)
-                    or np.any(grid <= 0) or np.any(grid[:, 1:] % merge)):
-                raise ValueError("image_grid_thw must contain positive integer grids tiled by spatial_merge_size")
-            counts = np.prod(grid, axis=1)
-            if pixels.ndim != 2 or int(counts.sum()) != pixels.shape[0]:
-                raise ValueError("packed pixel_values do not match image_grid_thw")
-            offsets = np.concatenate([[0], np.cumsum(counts)])
-            chunks = [pixels[start:stop] for start, stop in zip(offsets[:-1], offsets[1:])]
-            shape = (int(counts.max()), pixels.shape[-1])
-            lengths = counts // merge ** 2
+        if qwen:
+            expected_types = np.where(tokens == image_id, 1, np.where(tokens == video_id, 2, 0))
+            supplied_types = np.asarray(values.get("mm_token_type_ids"))
+            if not np.array_equal(supplied_types, expected_types):
+                raise ValueError("mm_token_type_ids must identify each image and video placeholder")
+            chunks, grid, merge = self._qwen_frames(values, tokens, runs)
+            shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
+            lengths = np.prod(grid, axis=1) // merge ** 2
             capacity = shape[0] // merge ** 2
         elif "image_position_ids" in values:
             vision = self.config.get("vision_config")
@@ -293,6 +316,66 @@ class Processor:
 
 
 
+    def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
+        """Views of packed image/video patches in text order, one item per frame.
+
+        Qwen3.5 get_rope_index repeats video grids by their temporal count and
+        resets each frame's temporal coordinate to zero. The processor places
+        timestamps between frames. Attention never crosses a frame, so these
+        views share the existing visual tower and merger without new weights.
+        """
+        vision = self.config.get("vision_config")
+        if not isinstance(vision, Mapping):
+            raise ValueError("packed visual inputs require a vision config")
+        merge = vision.get("spatial_merge_size")
+        if type(merge) is not int or merge < 1:
+            raise ValueError("spatial_merge_size must be a positive integer")
+        streams = {}
+        for pixel_name, grid_name, token_name, split in (
+                ("pixel_values", "image_grid_thw", "image_token_id", False),
+                ("pixel_values_videos", "video_grid_thw", "video_token_id", True)):
+            if (pixel_name in values) != (grid_name in values):
+                raise ValueError(f"{pixel_name} and {grid_name} arrive together")
+            if pixel_name not in values:
+                continue
+            pixels, grid = np.asarray(values[pixel_name]), np.asarray(values[grid_name])
+            if (grid.ndim != 2 or grid.shape[1] != 3 or not np.issubdtype(grid.dtype, np.integer)
+                    or np.any(grid <= 0) or np.any(grid[:, 1:] % merge)):
+                raise ValueError(f"{grid_name} requires positive integer grids tiled by spatial_merge_size")
+            if pixels.ndim != 2 or not np.issubdtype(pixels.dtype, np.floating):
+                raise ValueError(f"{pixel_name} must be floating packed patch vectors")
+            if int(np.prod(grid, axis=1).sum()) != pixels.shape[0]:
+                raise ValueError(f"{pixel_name} does not match {grid_name}")
+            items = []
+            offset = 0
+            for time, height, width in grid:
+                count = int(height * width)
+                for _ in range(int(time) if split else 1):
+                    frames = 1 if split else int(time)
+                    items.append((pixels[offset:offset + frames * count], (frames, int(height), int(width))))
+                    offset += frames * count
+            token_id = self.config[token_name]
+            if type(token_id) is not int:
+                raise ValueError(f"{token_name} must be an integer")
+            streams[token_id] = items
+        offsets = dict.fromkeys(streams, 0)
+        ordered = []
+        for row, spans in enumerate(runs):
+            for span in spans:
+                token = int(tokens[row, span[0]])
+                if token not in streams or offsets[token] == len(streams[token]):
+                    raise ValueError("visual placeholders exceed their image/video frame payloads")
+                ordered.append(streams[token][offsets[token]])
+                offsets[token] += 1
+        if not ordered or any(offsets[token] != len(items) for token, items in streams.items()):
+            raise ValueError("visual payloads and placeholder frame counts disagree")
+        chunks, grids = zip(*ordered)
+        widths = {chunk.shape[-1] for chunk in chunks}
+        if len(widths) != 1:
+            raise ValueError("image and video patch widths must agree")
+        return list(chunks), np.asarray(grids, np.int32), merge
+
+
     def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
                                 groups: jax.Array, grids: jax.Array) -> jax.Array:
         """Qwen3.5's get_rope_index on host-normalized image grids.
@@ -395,7 +478,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
             paths_list.append(nested(path))
         paths = tuple(paths_list)
         concatenate = -1
-        if model_type == "gemma4_text":
+        if model_type in ("gemma4_text", "qwen3_5_moe_text"):
             transpose = (0, 2, 1)
     else:
         path = family.weight_path(text_name, config)
@@ -404,7 +487,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         paths = (nested(path),)
         if path[-1] == "kernel" and tensor.ndim == 2:
             transpose = (1, 0)
-        elif text_name.endswith(".experts.down_proj") and model_type == "gemma4_text":
+        elif text_name.endswith(".experts.down_proj") and model_type in ("gemma4_text", "qwen3_5_moe_text"):
             transpose = (0, 2, 1)
     return WeightLayout(name, paths, tensor.shape, transpose, concatenate)
 
@@ -459,7 +542,7 @@ def _wrapper_layouts(tensors, record):
             if path[-1] == "kernel":
                 # Kernels store [*window, in, out]; the source keeps [out, in, *window].
                 transpose = {2: (1, 0), 3: (2, 1, 0), 4: (3, 2, 0, 1)}[tensor.ndim]
-        elif bare.startswith("language_model.") or bare == "lm_head.weight":
+        elif bare.startswith(("language_model.", "mtp.")) or bare == "lm_head.weight":
             tail = bare.removeprefix("language_model.")
             text_name = tail if tail.startswith(("model.", "lm_head.", "mtp.")) else "model." + tail
             layout = _language_layout(name, text_name, tensor, record["text"],
@@ -617,7 +700,6 @@ def _generation_limit(config: Mapping[str, object], generation_config: Mapping[s
     if type(value) is not int or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer")
     return value
-
 def _probability_control(config: Mapping[str, object], generation_config: Mapping[str, object],
                          name: str, default: float) -> float:
     value = _generation_value(config, generation_config, name, default)
@@ -628,10 +710,16 @@ def _probability_control(config: Mapping[str, object], generation_config: Mappin
     return float(value)
 
 
-# Checkpoint generation_config.json is data; interpreting it must not run
-# Transformers generation code. Neutral values follow Transformers 5.16.1
-# generation/utils.py::_get_logits_processor and get_generation_mode in
-# generation/configuration_utils.py. Other active controls are refused.
+# Transformers 5.16.1 generation controls (GenerationConfig.to_dict keys) by
+# what they do to the token distribution. Checkpoint generation_config.json
+# is data; interpreting it must not run Transformers generation code.
+# SUPPORTED: the native Sampling value carries them. TASK_OWNED: prompt
+# creation, output size, execution and metadata; they leave the distribution
+# alone. NEUTRAL: unset or the value at which generate() adds no processor,
+# criterion or search mode (utils._get_logits_processor,
+# configuration_utils.get_generation_mode); any other value is an active
+# control the native sampler cannot honor, and is refused. BEAM_ONLY matter
+# only when num_beams is active.
 _SUPPORTED_CONTROLS = frozenset({"do_sample", "temperature", "top_k", "top_p", "min_p",
                                  "eos_token_id", "pad_token_id"})
 _TASK_OWNED_CONTROLS = frozenset({
@@ -902,7 +990,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         model = models.build("causal_transformer", **built)
         variables = decoders.translate_weights(tensors, record)
         decoders._check_tree(variables, model)
-        if family in ("gemma4_text", "gemma3n_text", "qwen3_5_text"):
+        if family in ("gemma4_text", "gemma3n_text", "qwen3_5_text", "qwen3_5_moe_text"):
             bindings = []
             for name, tensor in tensors.items():
                 layout = _language_layout(name, name, tensor, record, family)
@@ -912,7 +1000,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
                     bindings.append(layout)
             layouts = tuple(bindings)
     processor = None
-    if (directory / "processor_config.json").exists():
+    if any((directory / name).exists() for name in ("processor_config.json", "preprocessor_config.json")):
         from transformers import AutoProcessor
         options = {"backend": "pil"} if family == "gemma3" else {}
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)

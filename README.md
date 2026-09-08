@@ -229,6 +229,7 @@ and exported through Dew's public APIs.
 | Mistral | `mistral` |
 | Qwen 2, Qwen 3 | `qwen2`, `qwen3` |
 | Qwen 3.5 text | `qwen3_5_text` |
+| Qwen 3.5 MoE text | `qwen3_5_moe_text` |
 | Gemma 1, Gemma 2, Gemma 3 text | `gemma`, `gemma2`, `gemma3_text` |
 | Gemma 3n text, Gemma 4 text | `gemma3n_text`, `gemma4_text` |
 | OLMo 3 | `olmo3` |
@@ -245,10 +246,29 @@ carries the processor and tokenizer files beside the weights.
 |---|---|---|
 | Gemma 3 | `gemma3` | Images |
 | Gemma 4 | `gemma4` | Images; waveforms |
-| Qwen 3.5 | `qwen3_5` | Images, with M-RoPE positions |
+| Qwen 3.5 | `qwen3_5` | Images and timestamped videos, with M-RoPE positions |
 | Llama 4 | `llama4` | Tiled images |
 
-Available image and audio inputs follow the checkpoint's modality configuration.
+Available image, video and audio inputs follow the checkpoint's modality
+configuration. `Processor.__call__` takes `text`, `images`, `audio`, `videos`
+and `video_metadata`, and `Processor.chat` runs the checkpoint's own chat
+template, so template controls such as `reasoning_effort` and
+`preserve_thinking` are interpreted by the checkpoint. The checkpoint's own
+processor still performs the raw image, video and waveform preprocessing;
+Dew lays its outputs out row by row rather than reimplementing them.
+
+Qwen 3.8 ships under these Qwen 3.5 model types: `Qwen/Qwen3.8-27B` loads as
+a `qwen3_5` conditional model with a dense hybrid decoder, images and videos,
+and the text-only `Qwen/Qwen3.8-2.4T-A95B` loads as `qwen3_5_moe_text` with
+normalized top-k routing and a sigmoid-gated shared expert.
+`tests/fixtures/hf/qwen38-source/source.json` pins both revisions and every
+tensor name in their indexes maps, including the shipped prediction (MTP)
+layer, which shares the target embedding and head, trains as an auxiliary
+loss, and decodes candidate steps from its own cache. The released weights
+were not downloaded: the qualification runs tiny source-shaped fixtures on
+CPU in float32. Full-size memory use, bf16 parity, accelerator throughput,
+multi-host placement and a speculative accept/reject scheduler are not
+claimed, and more than one prediction layer is refused.
 
 ### Block-diffusion decoders
 
@@ -281,8 +301,9 @@ model even though its gradients are finite. `MaskedDiffusionObjective` takes no
 `pretrained` argument, so LLaDA and Dream train from a fresh init rather than
 from their released weights.
 
-No processor takes video: `Processor.__call__` accepts `text`, `images` and
-`audio`. Diffusers pipelines such as SDXL, SD3 and Flux have no loader.
+Video inputs are qualified on Qwen 3.5 only; the other processors are
+exercised for text, images and waveforms. Diffusers pipelines such as SDXL,
+SD3 and Flux have no loader.
 
 ### Diffusion and representation models
 

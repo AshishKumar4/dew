@@ -268,7 +268,7 @@ def test_audio_only_processor_forward_and_greedy_continuation_match_reference(au
     valid = np.asarray(inputs.token_fields["attention_mask"])
     logits = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
     np.testing.assert_allclose(np.asarray(logits)[valid], reference["logits"][valid], atol=1e-4, rtol=0)
-    generated = loaded.generate(inputs, 3, key=jax.random.key(1), generation=Sampling(temperature=0))
+    generated = loaded.text_generation()(inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(generated.tokens[:, -3:], reference["generated"][:, -3:])
 
 

@@ -569,6 +569,12 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                     precision=self.model.precision)
                 depth_weights = self._target_weights(
                     targets[:, depth:], segment_ids, losses.dtype, depth)
+                if valid is not None:
+                    span = tokens.shape[1] - depth - 1
+                    admitted = jnp.ones((tokens.shape[0], span), dtype=bool)
+                    for offset in range(depth + 2):
+                        admitted = admitted & valid[:, offset:offset + span]
+                    depth_weights = depth_weights * admitted.astype(depth_weights.dtype)
                 if roles is not None and self.loss_role is not None:
                     depth_weights = depth_weights * (roles[:, depth + 1:] == int(self.loss_role))
                 depth_scores.append((depth_losses, depth_weights))
