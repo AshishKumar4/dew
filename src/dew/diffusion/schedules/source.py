@@ -727,8 +727,9 @@ class SourceSchedule:
 
 def _algorithm(kind: str, family: str, declared: Mapping[str, object],
                value: Callable[..., object]) -> Algorithm:
-    """The class's `algorithm_type` after its own coercions: each pinned class
-    rewrites a few foreign names to its own before refusing the rest."""
+    """The algorithm this class integrates with, after its own coercions: each
+    pinned class rewrites a few foreign names to its own before refusing the
+    rest, and the EDM class refuses the two non-++ ones outright."""
     if "algorithm_type" not in declared:
         return "dpmsolver++"
     algorithm = str(value("algorithm_type"))
@@ -742,26 +743,22 @@ def _algorithm(kind: str, family: str, declared: Mapping[str, object],
                                       "sde-dpmsolver")
     if family == "edm":
         allowed = ("dpmsolver++", "sde-dpmsolver++")
-    elif kind == "DPMSolverSinglestep":
-        allowed = ("dpmsolver++", "dpmsolver", "sde-dpmsolver++")
     return _choice(algorithm, "algorithm_type", allowed)
 
 
-def _solver_type(kind: str, declared: Mapping[str, object],
-                 value: Callable[..., object]) -> str:
-    """The class's `solver_type` after its own coercions."""
-    if "solver_type" not in declared:
-        return "midpoint"
+def _solver_type[SolverT: str](kind: str, value: Callable[..., object],
+                               allowed: tuple[SolverT, ...]) -> SolverT:
+    """The class's `solver_type` after its own coercions, in the names the
+    class this is being built for takes."""
     solver_type = str(value("solver_type"))
     if kind == "UniPCMultistep":
         return _choice("bh2" if solver_type in ("midpoint", "heun", "logrho") else solver_type,
-                       "solver_type", ("bh1", "bh2"))
+                       "solver_type", allowed)
     if kind == "DEISMultistep":
-        _choice("logrho" if solver_type in ("midpoint", "heun", "bh1", "bh2") else solver_type,
-                "solver_type", ("logrho",))
-        return "midpoint"
+        return _choice("logrho" if solver_type in ("midpoint", "heun", "bh1", "bh2")
+                       else solver_type, "solver_type", allowed)
     return _choice("midpoint" if solver_type in ("logrho", "bh1", "bh2") else solver_type,
-                   "solver_type", ("midpoint", "heun"))
+                   "solver_type", allowed)
 
 
 def _x0_limit(kind: str, declared: Mapping[str, object], value: Callable[..., object],
@@ -801,10 +798,9 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
     transform: Transform = active[0] if active else "none"
     if family == "edm":
         transform = _choice(value("sigma_schedule"), "sigma_schedule", _SIGMA_SCHEDULES)
+    algorithm = _algorithm(kind, family, declared, value)
     spacing: Spacing = _choice(value("timestep_spacing", "linspace"), "timestep_spacing",
                                _SPACINGS)
-    algorithm = _algorithm(kind, family, declared, value)
-    solver_type = _solver_type(kind, declared, value)
     terminal: Terminal = "zero" if family in ("sigma", "stage") else "sigma_min"
     if "final_sigmas_type" in declared:
         terminal = _choice(value("final_sigmas_type"), "final_sigmas_type", _TERMINALS)
@@ -879,12 +875,12 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
         original_steps=original_steps,
         timestep_scaling=_number(value("timestep_scaling", 10.0), "timestep_scaling"),
         flow=flow)
-    return policy, _build_solver(kind, family, value, order, algorithm, solver_type, terminal,
+    return policy, _build_solver(kind, value, order, algorithm, terminal,
                                  variance, tuple(corrector))
 
 
-def _build_solver(kind: str, family: str, value: Callable[..., object], order: int,
-                  algorithm: Algorithm, solver_type: str, terminal: Terminal, variance: Variance,
+def _build_solver(kind: str, value: Callable[..., object], order: int, algorithm: Algorithm,
+                  terminal: Terminal, variance: Variance,
                   corrector: tuple[int, ...]) -> Solver:
     """The native solver this class and its controls name, built once.
 
@@ -913,6 +909,9 @@ def _build_solver(kind: str, family: str, value: Callable[..., object], order: i
         return DPMSolverSDE(seed=None if seed is None
                             else _integer(seed, "noise_sampler_seed"))
     if kind == "DEISMultistep":
+        # The class rewrites the two DPM names to its own and refuses the
+        # rest; its native integrator carries neither control.
+        _solver_type(kind, value, ("logrho",))
         return DEIS(order, _boolean(value("lower_order_final"), "lower_order_final"))
     if kind == "LCM":
         return Consistency()
@@ -922,14 +921,20 @@ def _build_solver(kind: str, family: str, value: Callable[..., object], order: i
         return TCD()
     lower_order_final = _boolean(value("lower_order_final"), "lower_order_final")
     if kind == "UniPCMultistep":
-        return UniPC(order, solver_type, _boolean(value("predict_x0"), "predict_x0"),
-                     lower_order_final, corrector)
+        return UniPC(order, _solver_type(kind, value, ("bh1", "bh2")),
+                     _boolean(value("predict_x0"), "predict_x0"), lower_order_final, corrector)
     if kind == "DPMSolverSinglestep":
         # `set_timesteps` rewrites this control for a zero terminal, so the
         # reconstruction reads the value the source would walk with.
-        return DPMSolverSinglestep(order, algorithm, solver_type,
-                                   lower_order_final or terminal == "zero")
-    return DPMSolverMultistep(order, algorithm, solver_type, lower_order_final,
+        return DPMSolverSinglestep(
+            # The class's own `step` has no noise term for the SDE algorithm.
+            order, _choice(algorithm, "algorithm_type",
+                           ("dpmsolver++", "dpmsolver", "sde-dpmsolver++")),
+            _solver_type(kind, value, ("midpoint", "heun")),
+            lower_order_final or terminal == "zero")
+    return DPMSolverMultistep(order, algorithm,
+                              _solver_type(kind, value, ("midpoint", "heun")),
+                              lower_order_final,
                               _boolean(value("euler_at_final"), "euler_at_final"))
 
 
