@@ -2137,6 +2137,77 @@ def test_the_released_diffusiongemma_26b_builds_its_split_global_geometry():
     assert "lm_head" not in params
 
 
+def gated_text_config(repo: str):
+    """The text_config of a gated release, from the runner's own hub access.
+
+    google gates the Gemma 4 repositories, so the config cannot be committed
+    as a fixture the way a mirrored one is. These two shapes are covered
+    portably nowhere else: E2B is the only Gemma 4 that shares key/value
+    layers and carries per-layer inputs at released width, and the dense 31B
+    is the only released Gemma 4 with no routed branch.
+    """
+    from huggingface_hub import hf_hub_download
+
+    return json.loads(Path(hf_hub_download(repo, "config.json")).read_text())["text_config"]
+
+
+def gemma4_release_is_available(repo: str) -> bool:
+    if os.environ.get("DEW_NETWORK_TESTS") == "1":
+        return True
+    from huggingface_hub import try_to_load_from_cache
+
+    return isinstance(try_to_load_from_cache(repo, "config.json"), str)
+
+
+@pytest.mark.network
+@pytest.mark.skipif(not gemma4_release_is_available("google/gemma-4-E2B"),
+                    reason="google/gemma-4-E2B is gated: neither cached nor DEW_NETWORK_TESTS=1")
+def test_the_released_e2b_config_translates_and_shares_the_layers_it_names():
+    """google/gemma-4-E2B: partial rotary 0.25, head dims 256 and 512, 20
+    shared key/value layers, per-layer inputs of 256, the double-wide MLP,
+    scale 1.0 and softcap 30. The shared layers then own no k_proj, v_proj or
+    k_norm in the built tree, which is what makes the count load-bearing."""
+    config = translate_config(gated_text_config("google/gemma-4-E2B"))
+
+    assert config["partial_rotary_factor"] == 0.25
+    assert config["head_dim"] == 256
+    assert config["num_kv_heads"] == 1
+    assert config["kinds"]["full_attention"] == {"head_dim": 512}
+    assert config["kinds"]["sliding_attention"] == {"window": 512, "rope_theta": 10000.0}
+    assert config["num_kv_shared_layers"] == 20
+    assert config["per_layer_input_dim"] == 256
+    assert config["use_double_wide_mlp"]
+    assert config["attention_scale"] == 1.0
+    assert config["final_logit_softcap"] == 30.0
+    assert config["rope_theta"] == 1000000.0
+
+    model = models.build("causal_transformer", **with_precision(
+        "causal_transformer", config, dtype="bfloat16", attention_impl="reference"))
+    params = jax.eval_shape(
+        lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))["params"]
+    shared = [index for index in range(config["num_layers"])
+              if set(params[f"layers_{index}"]["self_attn"]) == {"q_proj", "o_proj", "q_norm"}]
+    assert shared == sorted(model.kv_sharing)
+    assert len(shared) == config["num_kv_shared_layers"]
+
+
+@pytest.mark.network
+@pytest.mark.skipif(not gemma4_release_is_available("google/gemma-4-31B"),
+                    reason="google/gemma-4-31B is gated: neither cached nor DEW_NETWORK_TESTS=1")
+def test_the_released_dense_31b_config_translates_without_a_routed_branch():
+    """The dense 31B: 60 layers, 32 query heads of 256 with 16 key/value
+    heads, the global layers reading their values off 4 key/value heads of
+    512, no routed branch and no per-layer inputs."""
+    config = translate_config(gated_text_config("google/gemma-4-31B"))
+
+    assert config["num_layers"] == 60
+    assert config["num_heads"] == 32 and config["num_kv_heads"] == 16
+    assert config["head_dim"] == 256
+    assert config["kinds"]["full_attention"] == {"head_dim": 512, "num_kv_heads": 4}
+    assert config["attention_k_eq_v"] and config["layer_scalar"]
+    assert "mixture" not in config
+    assert config["per_layer_input_dim"] is None
+
 
 def test_gemma4_moe_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 4.9e-06
