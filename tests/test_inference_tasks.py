@@ -1,6 +1,7 @@
 """Generation tasks bind a model, its weights and its host processing."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -76,6 +77,47 @@ def test_a_loaded_source_generates_from_text_with_its_own_policy():
     assert task.decode(generated) == tuple(loaded.processor.decode(generated.tokens[:, -3:]))
     with pytest.raises(TypeError):
         loaded.block_generation()
+
+
+def test_media_prompts_are_processed_once_and_keep_their_continuations():
+    """Text and images reach the processor once per request, whatever the
+    continuation count, and the continuations expand afterwards: each row
+    carries the prompt, the image features and the conditioned continuation of
+    the prompt it sits under."""
+    loaded = load_pretrained(FIXTURES / "gemma3-native-tiny", dtype="float32", attention_impl="reference")
+    images = np.load(FIXTURES / "gemma3-native-tiny" / "raw_images.npy")
+    prompts = json.loads((FIXTURES / "gemma3-native-tiny" / "prompts.json").read_text())
+    expected = np.load(FIXTURES / "gemma3-native-tiny" / "continuation.npy")
+    requests = []
+
+    class Counted:
+        """The source processor, with the requests it was handed."""
+
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __call__(self, text, *, images=None):
+            requests.append((tuple(text), None if images is None else len(images)))
+            return self.inner(text, images=images)
+
+        def decode(self, tokens):
+            return self.inner.decode(tokens)
+
+    assert loaded.processor is not None
+    task = replace(loaded.text_generation(), processor=Counted(loaded.processor), n=3)
+    generated = task(prompts, 3, key=jax.random.key(1), images=[[images[0]], [images[1], images[2]]])
+
+    assert requests == [(tuple(prompts), 2)]
+    rows = generated.host()
+    assert rows.tokens.shape[0] == 3 * len(prompts)
+    np.testing.assert_array_equal(rows.tokens[:, -3:], np.repeat(expected, 3, axis=0))
+    for prompt in range(len(prompts)):
+        group = rows.tokens[prompt * 3:(prompt + 1) * 3, :-3]
+        np.testing.assert_array_equal(group, np.repeat(group[:1], 3, axis=0))
+    text = generated.text
+    assert text == task.decode(generated) and len(text) == 3 * len(prompts)
+    for prompt in range(len(prompts)):
+        assert len(set(text[prompt * 3:(prompt + 1) * 3])) == 1
 
 
 def test_a_diffusion_gemma_source_generates_canvases_without_likelihood_claims():

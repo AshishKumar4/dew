@@ -121,9 +121,11 @@ class TextGeneration:
     A call runs the shared cached prefill and decode; the result is the
     `Generation` a training rollout consumes, with the actual and raw-policy
     likelihood of every drawn action. `sampling` is the policy a call uses
-    when it passes none, and `max_new_tokens` the budget; a loaded source
-    fills both from its generation config. Weights keep their placement: on
-    a mesh, rows split over its batch axes and results keep that sharding.
+    when it passes none, `max_new_tokens` the budget and `n` the number of
+    continuations per prompt; a loaded source fills all three from its
+    generation config. `n` continuations of a prompt leave as `n` consecutive
+    rows, in prompt order. Weights keep their placement: on a mesh, rows
+    split over its batch axes and results keep that sharding.
     """
 
     model: nn.Module
@@ -132,6 +134,7 @@ class TextGeneration:
     sampling: Sampling = Sampling()
     max_new_tokens: int | None = None
     max_length: int | None = None
+    n: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "variables", freeze(dict(self.variables)))
@@ -141,22 +144,25 @@ class TextGeneration:
         return replace(self, variables=variables)
 
     @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: jax.Array, sampling: Sampling | None = None, images: object | None = None) -> Generation: ...
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
+                 n: int | None = None, sampling: Sampling | None = None,
+                 images: object | None = None) -> Generation: ...
 
     @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 seed: int, sampling: Sampling | None = None, images: object | None = None) -> Generation: ...
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
+                 n: int | None = None, sampling: Sampling | None = None,
+                 images: object | None = None) -> Generation: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: jax.Array | None = None, seed: int | None = None,
+                 key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
                  sampling: Sampling | None = None, images: object | None = None) -> Generation:
         inputs, budget, random_key = _task_inputs(self.processor, request, images=images,
                                       collective=mesh_of(self.variables) is not None,
                                       max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                       max_length=self.max_length, key=key, seed=seed)
-        result = generate(self.model, self.variables, inputs, budget,
-                          key=random_key, sampling=self.sampling if sampling is None else sampling)
+        result = generate(self.model, self.variables, inputs, budget, key=random_key,
+                          sampling=self.sampling if sampling is None else sampling,
+                          n=self.n if n is None else n)
         decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
         return replace(result, decoder=decoder)
 
@@ -173,7 +179,9 @@ class BlockGeneration:
     A call runs prefill, refinement and clean-token commits as one device
     computation; the `CanvasGeneration` result carries no autoregressive
     likelihoods. `process` is the published sampler configuration used when
-    a call passes none, and `max_new_tokens` the budget a call omits.
+    a call passes none, `max_new_tokens` the budget a call omits and `n` the
+    number of continuations per prompt, which leave as `n` consecutive rows
+    in prompt order.
     """
 
     model: DiffusionGemma
@@ -184,6 +192,7 @@ class BlockGeneration:
     pad_token_id: int = 0
     max_new_tokens: int | None = None
     max_length: int | None = None
+    n: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "variables", freeze(dict(self.variables)))
@@ -193,22 +202,25 @@ class BlockGeneration:
         return replace(self, variables=variables)
 
     @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: jax.Array, process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration: ...
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
+                 n: int | None = None, process: BlockProcess | None = None,
+                 images: object | None = None) -> CanvasGeneration: ...
 
     @overload
-    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 seed: int, process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration: ...
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
+                 n: int | None = None, process: BlockProcess | None = None,
+                 images: object | None = None) -> CanvasGeneration: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
-                 key: jax.Array | None = None, seed: int | None = None,
+                 key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
                  process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration:
         inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
                                       max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                       max_length=self.max_length, key=key, seed=seed)
         result = (self.process if process is None else process).generate(
-            self.model, self.variables, inputs, budget,
-            key=random_key, eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+            self.model, self.variables, inputs, budget, key=random_key,
+            n=self.n if n is None else n,
+            eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
         decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
         return replace(result, decoder=decoder)
 

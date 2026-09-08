@@ -1245,8 +1245,84 @@ def mode_inference_pipeline(args) -> dict:
     }
 
 
+def continuation_prompts() -> tuple[np.ndarray, np.ndarray]:
+    """Six left-padded prompts of different real lengths.
+
+    Rows 0-2 belong to process zero and rows 3-5 to process one. Three rows
+    per process do not fill the two local devices of a four-device mesh, so
+    each process also places a padded prompt row, and the continuations of
+    that padded prompt must not reach anybody's result.
+    """
+    prompts = np.array([[3, 4, 5, 6], [0, 9, 10, 5], [1, 2, 3, 4],
+                        [0, 0, 7, 8], [7, 8, 9, 1], [0, 0, 0, 2]], np.int32)
+    return prompts, np.array([4, 3, 4, 2, 4, 1], np.int32)
+
+
+def mode_continuations(args) -> dict:
+    """Several continuations per prompt over a pool, with padded prompt rows.
+
+    Each process hands in its own prompts and asks for the same count. The
+    result stays row-sharded and prompt major, and a process reads back its
+    own prompts' continuations. A rank asking for a different count has to be
+    refused on both ranks, before either issues a decode collective.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import multihost_utils
+    from dew.inference import TextGeneration
+    from dew.inference.pipeline import place
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec
+
+    rank, processes = jax.process_index(), jax.process_count()
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=12,
+                              dtype="float32", attention_impl="xla")
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
+    prompts, lengths = continuation_prompts()
+    rows = len(prompts) // processes
+    local = slice(rank * rows, (rank + 1) * rows)
+
+    def inputs_for(tokens, real):
+        mask = np.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - real[:, None]
+        return ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(mask)})
+
+    task = TextGeneration(model, placed, sampling=Sampling(temperature=0.9, top_k=5,
+                                                           eos_id=11, pad_id=12), n=3)
+    request = inputs_for(prompts[local], lengths[local])
+    result = task(request, 4, seed=7)
+    host = result.host()
+    rejected = []
+    if processes > 1:
+        try:
+            task(request, 4, seed=7, n=2 if rank == 1 else 3)
+        except (ValueError, RuntimeError, AssertionError) as failure:
+            rejected.append(str(failure)[:160])
+        else:
+            raise AssertionError("a peer's different continuation count was accepted")
+        # A rank stranded in a collective never reaches this rendezvous.
+        arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
+        if arrivals.tolist() != list(range(processes)):
+            raise AssertionError("a rank did not return from the rejected request")
+    return {
+        "process_count": processes,
+        "spec": str(result.tokens.sharding.spec),
+        "global_rows": int(result.tokens.shape[0]),
+        "rows": result.rows,
+        "rejected": rejected,
+        "tokens": np.asarray(host.tokens).tolist(),
+        "lengths": np.asarray(host.lengths).tolist(),
+        "terminated": np.asarray(host.terminated).tolist(),
+        "behavior": np.asarray(host.behavior_log_probs).tolist(),
+    }
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "inference_pipeline": mode_inference_pipeline,
+         "continuations": mode_continuations,
          "rollout": mode_rollout,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
