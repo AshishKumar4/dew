@@ -74,6 +74,9 @@ def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
                         block_pattern: Optional[Sequence[str]] = None):
     """Per-layer mixer choice from a ratio string like '3:1', 'all-ssm', 'all-attn'."""
     if block_pattern is not None:
+        if len(block_pattern) != num_layers:
+            raise ValueError("block_pattern names every layer's mixer; got "
+                             f"{len(block_pattern)} entries for {num_layers} layers")
         return list(block_pattern)
     if ssm_attention_ratio == "all-ssm":
         return ['ssm'] * num_layers
