@@ -124,10 +124,14 @@ class PPOObjective(Objective[Mean, Variables]):
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         start = ids.shape[1] - mask.shape[1] - 1
-        padding = (jnp.zeros(ids.shape[0], jnp.int32) if LENGTH_KEY not in batch else
-                   start + 1 - jnp.asarray(batch[LENGTH_KEY], jnp.int32))
+        lengths = LENGTH_KEY in batch
+        padding = (start + 1 - jnp.asarray(batch[LENGTH_KEY], jnp.int32) if lengths
+                   else jnp.zeros(ids.shape[0], jnp.int32))
         aligned = _shift_rows(ids, padding)[:, :-1]
-        valid = jnp.arange(aligned.shape[1])[None, :] < aligned.shape[1] - padding[:, None]
+        # A rollout without lengths padded nothing, so every slot is real and
+        # the critic reads the rows with no validity at all.
+        valid = (jnp.arange(aligned.shape[1])[None, :] < aligned.shape[1] - padding[:, None]
+                 if lengths else None)
         values = self.critic.apply(_part(variables, "critic"), aligned, attention_mask=valid)
         if not isinstance(values, jax.Array) or values.shape != aligned.shape:
             raise ValueError("PPO critic must return one scalar value per input position")

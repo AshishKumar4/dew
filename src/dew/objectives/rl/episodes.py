@@ -344,7 +344,10 @@ class EpisodeRollout:
                 # Keep global row indices and collective shapes stable. The
                 # draw for a finished slot is discarded, never executed or trained.
                 valid[row, -1] = True
-        return ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
+        # Contexts that fill the width leave no padded slot, and a cohort of
+        # those carries no validity field at all.
+        fields = {} if valid.all() else {"attention_mask": jnp.asarray(valid)}
+        return ModelInputs(jnp.asarray(tokens), fields)
 
     def _advance(self, slots: list[_Session], result: Generation, policy_step: int,
                  binding_id: str, turn: int, run: JournalRun | None) -> None:

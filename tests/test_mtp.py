@@ -254,6 +254,27 @@ def test_a_packed_batch_keeps_the_depths_inside_their_documents():
     assert np.isfinite(float(loss)) and float(aux.metrics["mtp_ce"]) > 0
 
 
+def test_a_depth_keeps_the_fused_kernel_when_nothing_restricts_its_view():
+    """An unpacked, unpadded batch restricts no depth's view, so a depth runs
+    the kernel its layer asked for rather than dropping to xla behind an
+    all-true mask. Pinning cudnn proves it on a host without cudnn: the
+    refusal is the depth reaching the fused path, and a packed batch, whose
+    depths do restrict their keys, runs instead.
+    """
+    model = tiny(num_nextn_predict_layers=1, attention_impl='cudnn')
+    ids = jnp.ones((1, SEQ + 1), jnp.int32)
+    params = tiny(num_nextn_predict_layers=1).init(jax.random.key(0), ids)
+    hidden = jnp.ones((1, SEQ + 1, 32), jnp.float32)
+
+    with pytest.raises(ValueError, match="cudnn attention needs bf16"):
+        model.apply(params, hidden, ids, method=CausalTransformer.mtp_hidden_states)
+
+    segments = jnp.asarray([[1, 1, 1, 1, 2, 2, 2, 0, 0]], jnp.int32)
+    states = model.apply(params, hidden, ids, segment_ids=segments,
+                         method=CausalTransformer.mtp_hidden_states)
+    assert states[0].shape == (1, SEQ, 32)
+
+
 def test_mtp_weight_needs_depths_and_a_positive_weight():
     with pytest.raises(ValueError, match="num_nextn_predict_layers"):
         LMObjective(tiny(), SEQ, mtp_weight=0.3)

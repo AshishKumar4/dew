@@ -28,7 +28,11 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
                    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Pad ragged token rows and their scalar token fields on the host.
 
-    Filler IDs carry no content; attention_mask alone marks real slots.
+    Filler IDs carry no content; attention_mask alone marks real slots. Rows
+    that all fill the width take no filler, so no attention_mask comes back.
+    Absent validity is how a host says every slot is real. An all-true mask
+    would say the same thing in a form the model cannot read the contents
+    of, and it would cost it the fused attention kernel.
     Tokenizer state is not involved in this numeric layout operation.
     """
     if padding_side not in ("left", "right"):
@@ -60,6 +64,8 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
         for index, (row, slot) in enumerate(zip(aligned, slots)):
             value[index, slot] = row
         padded[name] = value
+    if padded["attention_mask"].all():
+        del padded["attention_mask"]
     return tokens, padded
 
 

@@ -1531,13 +1531,20 @@ class CausalTransformer(nn.Module):
             raise ValueError("prediction depths need a sequence longer than their depth count")
         embeds = self._scatter_inputs(self.embed_tokens(tokens), tokens,
                                       input_embeddings, embedding_positions)
-        valid = jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
+        # A depth restricts its keys only where the caller's validity or a
+        # document boundary does. With neither, every shifted pair is real,
+        # and no validity says that: an all-true array would make the depth
+        # build a mask and drop off the fused kernel.
+        restricted = attention_mask is not None or segment_ids is not None
+        valid = (jnp.ones(tokens.shape, bool) if attention_mask is None else attention_mask
+                 ) if restricted else None
         states = []
         for depth, block in enumerate(self.mtp, start=1):
-            valid = valid[:, :-1] & (jnp.ones(tokens[:, depth:].shape, bool)
-                                     if attention_mask is None else attention_mask[:, depth:])
-            if segment_ids is not None:
-                valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
+            if valid is not None:
+                valid = valid[:, :-1] & (jnp.ones(tokens[:, depth:].shape, bool)
+                                         if attention_mask is None else attention_mask[:, depth:])
+                if segment_ids is not None:
+                    valid = valid & (segment_ids[:, :-depth] == segment_ids[:, depth:])
             metadata = AttentionMetadata(
                 valid=valid,
                 image_groups=None if image_groups is None else image_groups[:, depth:],

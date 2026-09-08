@@ -735,6 +735,71 @@ def test_a_segment_masked_batch_leaves_the_cudnn_kernel(rng):
         params, ids, positions=positions, segment_ids=segment_ids))
 
 
+def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(rng):
+    """Rotary positions rotate q and k and narrow nobody's view, so a batch
+    that carries them keeps causality as a kernel flag. Pinning cudnn is what
+    proves the routing, as in the packed case above: this host has no cudnn,
+    so a call that reaches it is refused, and a call a mask sent to xla runs.
+
+    Validity is the other half of the contract. An array is opaque at trace
+    time, so an all-true one still builds the mask and still rides xla."""
+    model = tiny(attention_impl='cudnn')
+    ids = tokens(rng)
+    params = tiny().init(rng, ids)
+    rotary = jnp.tile(jnp.arange(ids.shape[1]), (ids.shape[0], 1))
+
+    with pytest.raises(ValueError, match="cudnn attention needs bf16"):
+        model.apply(params, ids, rotary_positions=rotary)
+
+    valid = jnp.ones(ids.shape, bool)
+    assert jnp.array_equal(model.apply(params, ids, attention_mask=valid),
+                           tiny(attention_impl='xla').apply(params, ids, attention_mask=valid))
+
+
+def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
+    """The rotary positions of an unpacked row are its row indices, so a batch
+    that spells them out has to score exactly as a batch that omits them,
+    gradients included. Both sides run the same kernel with the same flags."""
+    model = tiny(attention_impl='xla')
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    rotary = jnp.tile(jnp.arange(ids.shape[1]), (ids.shape[0], 1))
+
+    def scored(**metadata):
+        return jax.grad(lambda tree: jnp.sum(model.apply(tree, ids, **metadata) ** 2))(params)
+
+    assert jnp.array_equal(model.apply(params, ids),
+                           model.apply(params, ids, rotary_positions=rotary))
+    plain, spelled = scored(), scored(rotary_positions=rotary)
+    for left, right in zip(jax.tree.leaves(plain), jax.tree.leaves(spelled)):
+        assert jnp.array_equal(left, right)
+
+
+def test_a_padded_slot_reaches_no_query(rng):
+    """Validity still excludes what it excludes. The padding has to sit where
+    causality does not already hide it, so this row is padded on the left and
+    holed in the middle: rewriting those slots cannot move a real token's
+    logits, and no row comes back non-finite.
+
+    A rule that read an opaque validity array as all-true would pass a
+    right-padded row and fail here, which is why the padding is not on the
+    right.
+    """
+    model = tiny()
+    ids = tokens(rng, length=8)
+    padded = [False] * 2 + [True] * 2 + [False] + [True] * 3
+    valid = jnp.asarray([padded] * ids.shape[0])
+    slots = jnp.asarray([index for index, real in enumerate(padded) if not real])
+    real = jnp.asarray([index for index, real in enumerate(padded) if real])
+    params = model.init(rng, ids)
+    baseline = model.apply(params, ids, attention_mask=valid)
+
+    changed = model.apply(params, ids.at[:, slots].set((ids[:, slots] + 11) % VOCAB),
+                          attention_mask=valid)
+    assert jnp.array_equal(baseline[:, real], changed[:, real])
+    assert jnp.all(jnp.isfinite(changed))
+
+
 @pytest.mark.parametrize("overrides", [
     {"attention_impl": 'xla'},
     {"num_kv_heads": 2, "attention_impl": 'xla'},
