@@ -6,6 +6,16 @@ residual blocks, spatial multi-query attention and a multiscale adapter.
 Timm has no Flax implementation. Convolutions use Linen; attention uses
 Dew's kernel seam. Inputs are processor-ready NCHW pixels and outputs are
 row-major spatial tokens, [batch, resolution**2, 2048].
+
+Every parameter's logical axes are declared with `@logical_axes` on the module
+that names the submodule holding it, the way the rest of dew.nn declares
+them. A convolution kernel is `[kh, kw, in, out]`, and its matrix is the
+flattened receptive field contracted into the output channels, so only the
+output side is named and the three leading dimensions stay unnamed: the form
+`PatchSequenceEmbed` already declares for its patch embedding, and the one
+both readers of the table can use, the layout to place the kernel and Muon to
+orthogonalize it. A norm or a bias beside a kernel is that same output width,
+which the trailing names its rank can hold gives it for free.
 """
 
 from __future__ import annotations
@@ -19,6 +29,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .attention import scaled_dot_product_attention
+from .sharding import logical_axes
 
 
 def _divisible(channels: float) -> int:
@@ -118,6 +129,25 @@ _ARCHITECTURE = (
 )
 
 
+# The expanded middle of an inverted bottleneck is an MLP width and the block's
+# own channels are the model width, which is what the two names say. A
+# depthwise kernel holds one input channel per group, so its input side is
+# unnamed for the same reason the spatial dimensions are.
+@logical_axes({
+    ("conv_exp",): (None, None, None, "mlp"),
+    ("bn1",): ("mlp",),
+    ("conv_pwl",): (None, None, None, "embed"),
+    ("bn2",): ("embed",),
+    ("dw_start", "conv"): (None, None, None, "embed"),
+    ("dw_start", "bn"): ("embed",),
+    ("pw_exp", "conv"): (None, None, None, "mlp"),
+    ("pw_exp", "bn"): ("mlp",),
+    ("dw_mid", "conv"): (None, None, None, "mlp"),
+    ("dw_mid", "bn"): ("mlp",),
+    ("pw_proj", "conv"): (None, None, None, "embed"),
+    ("pw_proj", "bn"): ("embed",),
+    ("layer_scale",): ("embed",),
+})
 class MobileResidual(nn.Module):
     spec: _Block
     features: int
@@ -199,6 +229,20 @@ class MobileKVProjection(nn.Module):
                      precision=self.precision, name="proj")(x)
 
 
+# `MobileKVProjection` names its convolutions `proj`, which a router already
+# declares elsewhere, so the projections are declared here under the role the
+# attention gives each one: the query holds every head, a multi-query key and
+# value hold one, and the output maps the head space back to the block width.
+@logical_axes({
+    ("query", "proj"): (None, None, None, "heads"),
+    ("key", "down_conv"): (None, None, None, "embed"),
+    ("key", "norm"): ("embed",),
+    ("key", "proj"): (None, None, None, "kv"),
+    ("value", "down_conv"): (None, None, None, "embed"),
+    ("value", "norm"): ("embed",),
+    ("value", "proj"): (None, None, None, "kv"),
+    ("output", "proj"): (None, None, None, "embed"),
+})
 class MobileMultiQueryAttention(nn.Module):
     spec: _Block
     features: int
@@ -256,6 +300,11 @@ class MobileAttention(nn.Module):
         return x + shortcut
 
 
+# An attention block's pre-norm is the one parameter in the tower whose module
+# path carries no role name, only the numbered block this stage mints. It is a
+# rank-one scale over the block width, which the shape heuristic places the way
+# it places the decoder's own `norm`, so it is left to it here on purpose.
+@logical_axes({}, heuristic=(("blocks_*", "norm"),))
 class MobileStage(nn.Module):
     index: int
     multiplier: float
@@ -322,6 +371,14 @@ class MobileMultiScaleFusion(nn.Module):
                           dtype=self.dtype, name="norm")(x)
 
 
+# The stem reads three image channels, which is no width worth naming, and the
+# adapter's own norm sits under the name this encoder gives it; its inverted
+# bottleneck is a `MobileResidual` and carries that class's declarations.
+@logical_axes({
+    ("conv_stem", "conv"): (None, None, None, "embed"),
+    ("conv_stem", "bn"): ("embed",),
+    ("msfa", "norm"): ("embed",),
+})
 class MobileNetV5Encoder(nn.Module):
     """The mobilenetv5_300m_enc graph, with timm's construction controls.
 
