@@ -561,9 +561,9 @@ def served():
         thread.join(timeout=5)
 
 
-def _prefetchers() -> int:
-    return sum(1 for thread in threading.enumerate()
-               if "prefetch" in thread.name.lower())
+def _prefetchers() -> set[threading.Thread]:
+    return {thread for thread in threading.enumerate()
+            if "prefetch" in thread.name.lower()}
 
 
 def test_a_streamed_read_over_http_is_bounded_and_its_reader_is_joined(served):
@@ -586,20 +586,18 @@ def test_a_streamed_read_over_http_is_bounded_and_its_reader_is_joined(served):
 
     stream = data.train()
     read = indices(stream, 1)
-    during = _prefetchers()
+    readers = _prefetchers() - before
     time.sleep(0.5)
     settled = len(seen)
     time.sleep(0.5)
     stream.close()
-    for _ in range(100):
-        if _prefetchers() == before:
-            break
-        time.sleep(0.05)
+    for reader in readers:
+        reader.join(timeout=5)
 
     assert read == [[0, 1, 2, 3]]
-    assert during > before, "the read runs ahead of the step in a thread"
+    assert readers, "the read runs ahead of the step in a thread"
     # One batch handed out, `ahead` buffered, one being filled behind them.
     assert settled == len(seen) <= (ahead + 2) * batch, (
         f"the read ran {len(seen)} rows ahead of one batch")
-    assert _prefetchers() == before, "the streamed reader was not joined"
+    assert not any(reader.is_alive() for reader in readers), "the streamed reader was not joined"
     assert _Rows.served >= 1, "nothing was read over the network"
