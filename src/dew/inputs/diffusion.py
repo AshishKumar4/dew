@@ -12,7 +12,7 @@ import numpy as np
 from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
 from dew.inputs.encoders import ConditionEncoder
-from dew.nn.backbones.unet_condition import DenoisingCondition
+from dew.diffusion.process import DenoisingCondition
 from dew.nn.text_encoders import CLIPTextTransformer, T5EncoderTransformer
 from dew.nn.safety import CLIPSafetyHead
 from dew.objectives.base import Variables

@@ -28,8 +28,14 @@ def _insert(tree: TensorTree, path: tuple[str, ...], value: np.ndarray) -> None:
         if not isinstance(child, dict):
             raise ValueError(f"Tensor path crosses an existing leaf: {path}")
         node = child
-    if path[-1] in node:
-        raise ValueError(f"Two source tensors map to {path}")
+    held = node.get(path[-1])
+    if held is not None:
+        # A tied tensor a checkpoint stores under two names is one parameter,
+        # and each name is still bound for export. Two different arrays under
+        # one path are two parameters and one of them would be lost.
+        if not np.array_equal(held, value):
+            raise ValueError(f"Two source tensors map to {path}")
+        return
     node[path[-1]] = value
 
 
