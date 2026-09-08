@@ -97,7 +97,7 @@ from dew.interop import load_pretrained
 from dew.interop.hf_decoders import (
     save_pretrained_decoder, translate_config, translate_weights,
 )
-from dew.nn.gpt_oss import dequantize_mxfp4
+from dew.nn.gpt_oss import dequantize_mxfp4, quantize_mxfp4
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -1754,8 +1754,7 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
         if not (name.endswith("gate_up_proj") or name.endswith("down_proj")):
             packed[name] = tensor
             continue
-        rounded = jnp.asarray(tensor, jnp.bfloat16).astype(jnp.float32)
-        blocks, scales = quantize_mxfp4(np.asarray(rounded))
+        blocks, scales = (np.asarray(part) for part in quantize_mxfp4(jnp.asarray(tensor)))
         packed[name + "_blocks"], packed[name + "_scales"] = blocks, scales
         tensors[name] = np.asarray(dequantize_mxfp4(jnp.asarray(blocks), jnp.asarray(scales))
                                    .astype(jnp.float32))
@@ -1770,24 +1769,6 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
     expected = translate_weights(tensors, translate_config(fixture_config("gpt-oss-tiny")))
     for path, leaf in flat_tree(variables["params"]).items():
         assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
-
-
-def quantize_mxfp4(matrix):
-    """[expert, input, output] fp32 into the released blocks and scales.
-
-    Every value is scaled to a representable E2M1 magnitude by a shared
-    power-of-two exponent per 32 inputs. The test pins the sign nibble order
-    and the transpose back to the input axis.
-    """
-    values = np.ascontiguousarray(matrix.transpose(0, 2, 1))
-    groups = values.reshape(values.shape[0], values.shape[1], -1, 32)
-    magnitude = np.max(np.abs(groups), axis=-1, keepdims=True)
-    exponent = np.where(magnitude > 0, np.floor(np.log2(np.maximum(magnitude, 1e-30))) - 2, 0)
-    scaled = groups / np.exp2(exponent)
-    table = np.asarray([0, 0.5, 1, 1.5, 2, 3, 4, 6], np.float32)
-    codes = np.abs(scaled[..., None] - table).argmin(-1) + 8 * (scaled < 0)
-    blocks = (codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8)
-    return blocks, (exponent[..., 0] + 127).astype(np.uint8)
 
 
 @pytest.mark.network
