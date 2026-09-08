@@ -300,8 +300,9 @@ argument, so LLaDA and Dream train from a fresh init rather than from their
 released weights.
 
 Video inputs are qualified on Qwen 3.5 only; the other processors are
-exercised for text, images and waveforms. Diffusers pipelines such as SDXL,
-SD3 and Flux have no loader.
+exercised for text, images and waveforms. Native checkpoint loading covers
+SD and SDXL, including img2img, inpainting and the SDXL refiner.
+SD3 and Flux do not yet have loaders.
 
 ### Diffusion and representation models
 
