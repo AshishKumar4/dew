@@ -697,12 +697,17 @@ class Trainer(Generic[Loss, Effects]):
                         f"resume. Train it with checkpoint_every=None "
                         f"(--trainer.checkpoint-every None)")
                 stages = source.stages if isinstance(source, RampedStream) else None
-                if stages is not None and self.accumulation > 1:
-                    raise ValueError(
-                        f"a batch ramp grows the records a step reads, and an "
-                        f"accumulation window of {self.accumulation} pools "
-                        f"microbatches of one shape into one update; ramp the batch "
-                        f"or accumulate, not both")
+                if stages is not None:
+                    if self.accumulation > 1:
+                        raise ValueError(
+                            f"a batch ramp grows the records a step reads, and an "
+                            f"accumulation window of {self.accumulation} pools "
+                            f"microbatches of one shape into one update; ramp the "
+                            f"batch or accumulate, not both")
+                    # Before the prefetch worker places a batch, which is
+                    # where a stage the mesh cannot hold would otherwise
+                    # surface -- for a later stage, an hour into the run.
+                    self._check_stages(stages, mesh)
                 train = DevicePrefetchIterator(source, mesh, source_state=position)
                 source = None  # Lifetime transferred to the prefetch worker.
 
@@ -730,11 +735,6 @@ class Trainer(Generic[Loss, Effects]):
                     rollout_seconds += time.perf_counter() - began
                 shapes = batch_shapes(batch)
                 if shapes not in compiled:
-                    if not compiled and stages is not None:
-                        # The first batch is where the shardings a stage's rows
-                        # would take exist, so it is where every stage of the
-                        # ramp is answered for.
-                        self._check_stages(stages, batch, mesh)
                     compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
                     if len(compiled) == 1:
                         last_log_time = time.time()
@@ -1007,25 +1007,19 @@ class Trainer(Generic[Loss, Effects]):
             scalars["train/mfu"] = mfu
         return scalars
 
-    def _check_stages(self, stages: Sequence[Stage], batch: Batch, mesh: Mesh) -> None:
+    def _check_stages(self, stages: Sequence[Stage], mesh: Mesh) -> None:
         """Refuse a batch ramp with a stage this mesh cannot hold, before the
-        run reaches it.
+        run reads anything.
 
         A stage's rows are sharded over the mesh's batch axes like any other
-        batch's, so a stage those axes do not divide fails when it is placed,
-        which for a later stage is an hour into the run. The first batch's own
-        placement says how many shards the rows are cut into, and that answers
-        every stage at once.
+        batch's, so a stage those axes do not divide fails where it is
+        placed, which for a later stage is an hour into the run. How many
+        shards those axes cut a batch into is a fact about the mesh, read
+        here off the placement a row-shaped field would take.
         """
-        shardings = batch_shardings(mesh, batch)
-        rows, held = next(
-            ((np.shape(leaf)[0], sharding.shard_shape(np.shape(leaf))[0])
-             for leaf, sharding in zip(jax.tree.leaves(batch), jax.tree.leaves(shardings))
-             if np.shape(leaf)),
-            (0, 0))
-        if not held:
-            return
-        shards = rows // held
+        devices = mesh.devices.size
+        rows = batch_shardings(mesh, np.zeros(devices)).shard_shape((devices,))[0]
+        shards = devices // rows
         refused = [stage.batch for stage in stages if stage.batch % shards]
         if refused:
             raise ValueError(
