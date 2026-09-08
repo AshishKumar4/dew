@@ -24,8 +24,8 @@ from jax.experimental import multihost_utils
 from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import (
-    ArrayT, ModelInputs, RowPlan, agreed_validity, generation_signature, local_rows,
-    mesh_of, request_key,
+    ArrayT, ModelInputs, RowPlan, agreed_validity, continuation_keys, generation_signature,
+    local_rows, mesh_of, prompt_major, request_key,
 )
 from dew.objectives.base import Variables
 
@@ -36,7 +36,9 @@ class CanvasGeneration(Generic[ArrayT]):
 
     ``lengths`` counts response tokens including the first EOS, not prompt
     tokens. ``decoder_steps`` counts useful refinements per row across canvases.
-    ``terminated`` distinguishes EOS from the requested token limit. Arrays
+    ``terminated`` distinguishes EOS from the requested token limit. A request
+    for ``n`` continuations per prompt gives every array ``[B * n, ...]``
+    rows, each prompt's continuations together and in prompt order. Arrays
     keep the placement the task ran with; ``host()`` reads this process's
     ``rows`` real rows back, and ``text`` decodes them through the bound
     processor.
@@ -185,19 +187,19 @@ class BlockProcess:
     @overload
     def generate(self, model: DiffusionGemma, variables: Variables,
                  inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: jax.Array, seed: None = None,
+                 max_new_tokens: int, *, key: jax.Array, seed: None = None, n: int = 1,
                  eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration: ...
 
     @overload
     def generate(self, model: DiffusionGemma, variables: Variables,
                  inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
-                 max_new_tokens: int, *, key: None = None, seed: int,
+                 max_new_tokens: int, *, key: None = None, seed: int, n: int = 1,
                  eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration: ...
 
     def generate(self, model: DiffusionGemma, variables: Variables,
                  inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
                  max_new_tokens: int, *, key: jax.Array | None = None, seed: int | None = None,
-                 eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
+                 n: int = 1, eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
         """Run prefill, refinement and clean-token commits as one device computation.
 
         The last canvas is fully refined even when only part is requested;
@@ -207,6 +209,11 @@ class BlockProcess:
         axes and the result keeps that sharding. The canvas sampler draws
         one batch-wide key per refinement, so a row's draw depends on the
         rows placed with it.
+
+        ``n`` continuations of each prompt share its prefill and refine
+        independently from it. They leave as ``n`` consecutive rows per
+        prompt, in prompt order. Continuation zero refines with the
+        request's own key, so it is what a single continuation draws.
         """
         prepared = None
         error = None
@@ -215,13 +222,13 @@ class BlockProcess:
             request = request_key(key, seed)
             canonical = ModelInputs.from_value(inputs)
             prepared = jax.tree.map(local_rows, canonical)
-            _validated(model, self, prepared, max_new_tokens, eos_token_ids, pad_token_id)
+            _validated(model, self, prepared, max_new_tokens, eos_token_ids, pad_token_id, n)
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="canvas generation setup")
         assert prepared is not None and request is not None
         if jax.process_count() > 1:
-            controls = (max_new_tokens, self, eos_token_ids, pad_token_id, model)
+            controls = (max_new_tokens, n, self, eos_token_ids, pad_token_id, model)
             # A process whose own rows needed no padding carries no validity,
             # so the pool agrees one validity schema before the digest reads it.
             prepared = agreed_validity(prepared, jax.process_count(), controls=controls,
@@ -231,9 +238,10 @@ class BlockProcess:
                 "canvas input schemas, model geometry and generation policy must agree")
         plan = RowPlan.over(mesh_of(variables), prepared.tokens.shape[0])
         placed = plan.place(plan.pad(prepared))
-        result = _compiled(plan.sharding)(model, variables, placed, request,
-                                          CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens))
-        return replace(result, rows=plan.rows, prompt_width=prepared.tokens.shape[1])
+        result = _compiled(plan.sharding)(
+            model, variables, placed, request,
+            CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
+        return replace(result, rows=plan.rows * n, prompt_width=prepared.tokens.shape[1])
 
 
 @dataclass(frozen=True)
@@ -265,10 +273,12 @@ class CanvasDecodeState:
 
 
 def _validated(model: DiffusionGemma, process: BlockProcess, inputs: ModelInputs, max_new_tokens: int,
-               eos_token_ids: tuple[int, ...], pad_token_id: int) -> None:
+               eos_token_ids: tuple[int, ...], pad_token_id: int, n: int) -> None:
     """Host checks before the compiled loop."""
     if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
         raise ValueError("max_new_tokens must be a nonnegative integer")
+    if type(n) is not int or n < 1:
+        raise ValueError("n must be a positive integer number of continuations")
     if process.vocab_size != model.vocab_size or process.canvas_length != model.canvas_length:
         raise ValueError("BlockProcess geometry must match the loaded model")
     if not 0 <= pad_token_id < process.vocab_size:
@@ -340,19 +350,30 @@ def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: i
 
 
 def _generate(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
-              key: jax.Array, plan: CanvasPlan) -> CanvasGeneration:
+              key: jax.Array, plan: CanvasPlan, n: int) -> CanvasGeneration:
     initial = _begin(model, variables, inputs, plan)
-    if plan.blocks == 0:
-        return _materialize(initial, inputs.tokens.shape[1], plan.max_new_tokens)
+    prompt_length = inputs.tokens.shape[1]
 
-    def step(_, state):
-        return _advance(model, variables, state, key, plan)
+    def continued(canvas_key: jax.Array) -> CanvasGeneration:
+        if plan.blocks == 0:
+            return _materialize(initial, prompt_length, plan.max_new_tokens)
 
-    final = jax.lax.fori_loop(0, plan.blocks, step, initial)
-    return _materialize(final, inputs.tokens.shape[1], plan.max_new_tokens)
+        def step(_, state):
+            return _advance(model, variables, state, canvas_key, plan)
+
+        return _materialize(jax.lax.fori_loop(0, plan.blocks, step, initial),
+                            prompt_length, plan.max_new_tokens)
+
+    if n == 1:
+        return continued(key)
+    # A mapped loop over the continuations, not a wider batch: each one
+    # refines the shared prefill state over the original prompt rows, so a
+    # row's draws depend on the rows placed with it exactly as they do for
+    # one continuation.
+    return prompt_major(jax.lax.map(continued, continuation_keys(key, n)))
 
 
 @functools.lru_cache(maxsize=None)
 def _compiled(rows: jax.sharding.NamedSharding | None):
-    return jax.jit(_generate, static_argnames=("model", "plan"),
+    return jax.jit(_generate, static_argnames=("model", "plan", "n"),
                    in_shardings=(None, rows, None), out_shardings=rows)

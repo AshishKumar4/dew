@@ -322,6 +322,31 @@ def request_key(key: jax.Array | None, seed: int | None) -> jax.Array:
     return typed
 
 
+def continuation_keys(key: jax.Array, n: int) -> jax.Array:
+    """``n`` keys on a new leading axis, the first one being ``key`` itself.
+
+    Independent continuations of one request draw from these. Continuation
+    zero keeps the request's own key, so a single continuation draws what an
+    unrepeated request draws, and no fold depends on ``n``, so asking for more
+    continuations leaves the ones already drawn alone. ``key`` is one key or a
+    batch of them; a batch folds row by row.
+    """
+    fold = jax.random.fold_in if key.shape == () else jax.vmap(jax.random.fold_in, in_axes=(0, None))
+    indices = jnp.arange(1, n, dtype=jnp.uint32)
+    folded = jax.vmap(lambda index: fold(key, index))(indices)
+    return jnp.concatenate((key[None], folded), axis=0)
+
+
+def prompt_major(tree):
+    """Mapped continuations as rows: ``[n, B, ...]`` leaves become ``[B * n, ...]``.
+
+    Each prompt's continuations stay together and the prompts keep their
+    request order, which is also the order a row plan pads and reads back.
+    """
+    return jax.tree.map(
+        lambda leaf: jnp.swapaxes(leaf, 0, 1).reshape((-1, *leaf.shape[2:])), tree)
+
+
 def mesh_of(tree) -> jax.sharding.Mesh | None:
     """The mesh the tree's leaves sit on, or None for single-device arrays."""
     for leaf in jax.tree.leaves(tree):

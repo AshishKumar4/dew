@@ -121,6 +121,29 @@ def test_cached_generation_records_the_transformers_filtered_distribution(task, 
     np.testing.assert_array_equal(repeated.tokens, actual.tokens)
 
 
+def test_every_continuation_records_the_likelihoods_of_its_own_draw(task):
+    """One row's likelihoods describe that row's action under that row's
+    prefix. Rebuilt from a full forward over each realized sequence, the six
+    rows of two prompts agree to 3e-6 on both the filtered and the raw
+    distribution, which a row paired with another continuation's prefix or
+    another prompt's logits cannot do."""
+    sampling = Sampling(temperature=0.8, top_k=9, top_p=0.8)
+    inputs = jnp.array([[1, 2], [4, 5]])
+
+    actual = task(inputs, 3, key=jax.random.key(1), sampling=sampling, n=3)
+
+    assert actual.tokens.shape == (6, 5)
+    rows = np.arange(6)
+    for step in range(3):
+        logits = task.model.apply(task.variables, actual.tokens[:, :2 + step])[:, -1]
+        selected = np.asarray(actual.tokens[:, 2 + step])
+        expected = warped(logits, sampling)[rows, selected]
+        assert np.all(np.isfinite(expected))
+        np.testing.assert_allclose(actual.behavior_log_probs[:, step], expected, atol=3e-6, rtol=0)
+        raw = torch.tensor(np.asarray(logits).copy()).log_softmax(-1).numpy()[rows, selected]
+        np.testing.assert_allclose(actual.raw_log_probs[:, step], raw, atol=3e-6, rtol=0)
+
+
 @pytest.mark.parametrize("sampling", [Sampling(top_p=0), Sampling(min_p=1), Sampling(top_k=1, top_p=0.1)])
 def test_filters_keep_the_best_token_at_the_boundary(sampling):
     logits = jnp.array([[1.0, 3.0, -2.0]])
@@ -164,9 +187,33 @@ def test_neutral_source_controls_are_accepted_and_active_unsupported_controls_ra
     assert replace(source, generation_config=neutral).text_generation().sampling.temperature == 1.0
     for active in ({"stop_strings": ["END"]}, {"num_beams": 2}, {"num_beams": 2, "length_penalty": 0.8},
                    {"do_sample": True, "penalty_alpha": 0.6, "top_k": 4}, {"a_future_control": 3},
-                   {"remove_invalid_values": True}, {"num_return_sequences": 4}, {"max_time": 5.0}):
+                   {"remove_invalid_values": True}, {"max_time": 5.0}):
         with pytest.raises(ValueError, match="cannot honor"):
             replace(source, generation_config=active).text_generation()
+
+
+def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(task):
+    """num_return_sequences counts continuations rather than filtering the
+    distribution, so the loaded task draws that many rows per prompt. An
+    explicit call count overrides it in either direction, an explicit
+    sampling policy leaves it alone, and beam search stays refused."""
+    from pathlib import Path
+    from dew.interop.pretrained import Pretrained
+
+    source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
+                        generation_config={"do_sample": True, "temperature": 0.9,
+                                           "num_return_sequences": 3})
+    policy = source.text_generation()
+    assert policy.n == 3
+    rows = policy([[1, 2], [3, 4]], 4, seed=5).host()
+    assert rows.tokens.shape == (6, 6) and rows.lengths.shape == (6,)
+    np.testing.assert_array_equal(rows.tokens[:, :2], np.repeat([[1, 2], [3, 4]], 3, axis=0))
+    assert policy([[1, 2], [3, 4]], 4, n=1, seed=5).host().tokens.shape == (2, 6)
+    assert source.text_generation(sampling=Sampling(temperature=0)).n == 3
+    with pytest.raises(ValueError, match="cannot honor"):
+        replace(source, generation_config={**source.generation_config, "num_beams": 4}).text_generation()
+    with pytest.raises(ValueError, match="num_return_sequences"):
+        replace(source, generation_config={"num_return_sequences": 0}).text_generation()
 
 
 def test_source_total_length_and_explicit_continuation_budget_have_defined_precedence(task):
