@@ -104,11 +104,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
         raise ValueError("run.json lacks the sampling policy for its text previews")
     if controls is not None and not isinstance(controls, dict):
         raise ValueError("the run's sampling policy must be a Sampling record")
-    if budget:
-        assert controls is not None
-        sampling = Sampling(**controls)
-    else:
-        sampling = Sampling()
+    sampling = Sampling() if controls is None else Sampling(**controls)
     return TextGeneration(model, model_variables(variables), RunProcessor(tokenizer), sampling=sampling,
                           max_new_tokens=budget if budget else None)
 

@@ -349,7 +349,8 @@ class TextToImage:
                     if leaf.ndim < 1 or leaf.shape[0] != plan.global_rows:
                         raise ValueError("prepared conditions must match the noise batch")
             controls = (count, times, solver, chosen, self.final_denoise, decode,
-                        tuple(np.asarray(jax.random.key_data(request))), prepared is not None)
+                        tuple(np.asarray(jax.random.key_data(request))), prepared is not None,
+                        None if prepared is None else prepared.rows)
             arrays = None if prepared is None else (prepared.noise, prepared.conditions, prepared.unconditional)
             signature = generation_signature(arrays, controls)
             settings = prepared, request, count, process, times, solver, chosen, signature

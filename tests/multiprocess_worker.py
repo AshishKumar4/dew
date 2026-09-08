@@ -1210,6 +1210,7 @@ def mode_inference_pipeline(args) -> dict:
         from jax.experimental import multihost_utils
 
         prepared = images.prepare(prompts, steps=3, seed=5)
+        padded_one = images.prepare(prompts[:1], steps=3, seed=5)
         calls = {
             "prompts": lambda: images.prepare([] if rank == 1 else prompts, steps=3, seed=5),
             "guidance": lambda: images(prompts, steps=3, seed=5, guidance="invalid" if rank == 1 else 3.0),
@@ -1217,6 +1218,7 @@ def mode_inference_pipeline(args) -> dict:
             "row_count": lambda: images.prepare(prompts[:1] if rank == 1 else prompts, steps=3, seed=5),
             "prepared": lambda: images(replace(prepared, noise=prepared.noise[:, :-1]) if rank == 1 else prepared,
                                         steps=3, seed=5),
+            "prepared_rows": lambda: images(replace(padded_one, rows=rank + 1), steps=3, seed=5),
             "request_kind": lambda: images(prepared if rank == 1 else prompts, steps=3, seed=5),
             "budget": lambda: replace(text, max_new_tokens=None if rank == 1 else 4)(requests, seed=5),
         }
