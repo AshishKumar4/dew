@@ -1018,8 +1018,8 @@ class Trainer(Generic[Loss, Effects]):
         here off the placement a row-shaped field would take.
         """
         devices = mesh.devices.size
-        rows = batch_shardings(mesh, np.zeros(devices)).shard_shape((devices,))[0]
-        shards = devices // rows
+        placed = batch_shardings(mesh, {"rows": np.zeros(devices)})["rows"]
+        shards = devices // placed.shard_shape((devices,))[0]
         refused = [stage.batch for stage in stages if stage.batch % shards]
         if refused:
             raise ValueError(
