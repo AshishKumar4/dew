@@ -6,7 +6,9 @@ them into a duplicated and reordered set, keep decoding, and require every
 gathered row to produce what the prompt it came from produces on its own.
 Every mixer keeps different state, so each one is exercised: dense attention
 scanned and unscanned, a gated delta net's convolution and recurrent summary,
-latent attention's compressed cache, and a multimodal wrapper's next position.
+latent attention's compressed cache and the sparse indexer's keys beside it,
+an image-aware attention's cached groups, and a multimodal wrapper's next
+position.
 """
 
 import jax
@@ -35,13 +37,35 @@ def multimodal():
         family="gemma3", image_token_id=1)
 
 
+def sparse_mla():
+    """Latent attention with the V3.2 indexer: its cache adds the index keys."""
+    from dew.nn.mla import MLAMixer
+
+    return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
+                             head_dim=8, mlp_features=32, max_seq_len=12, dtype="float32",
+                             mixer=MLAMixer(q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4,
+                                            qk_rope_head_dim=4, v_head_dim=8, index_n_heads=2,
+                                            index_head_dim=8, index_topk=4))
+
+
+def image_aware():
+    """Attention that makes image blocks bidirectional: its cache adds the groups."""
+    from dew.nn.mixers.attention import AttentionMixer
+
+    return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
+                             head_dim=8, mlp_features=32, max_seq_len=12, dtype="float32",
+                             mixer=AttentionMixer(bidirectional_images=True))
+
+
 MODELS = {
     "attention": lambda: decoder(),
     "scanned": lambda: CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2,
                                          num_heads=2, head_dim=8, mlp_features=32, max_seq_len=12,
                                          dtype="float32", scan_layers=True),
     "mla": lambda: decoder("mla"),
+    "sparse_mla": sparse_mla,
     "recurrent": lambda: decoder("recurrent"),
+    "image_aware": image_aware,
     "multimodal": multimodal,
 }
 
