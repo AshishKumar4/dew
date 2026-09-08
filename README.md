@@ -1139,6 +1139,73 @@ CUDA_VISIBLE_DEVICES=0,1 JAX_PLATFORMS=cuda python train_multihost.py
 
 `batch=16` is global, so each process reads eight rows. To rehearse the launch on one machine, point the coordinator at `127.0.0.1`, set `XLA_FLAGS=--xla_force_host_platform_device_count=2` and `JAX_PLATFORMS=cpu`, and start rank 0 and rank 1 side by side: two processes of two simulated devices fill the same `MeshSpec(fsdp=4)`, and each prints `20 updates` for `DEW_STEPS=20`.
 
+### Generating text with Gemma 4 on one GPU
+
+`dew.pipeline` loads a published checkpoint, places its weights on the visible devices, and returns a callable task. Gemma 4 repositories are gated: accept the license on the Hub and log in with `hf auth login` (or set `HF_TOKEN`) before the first download. On a single GPU, use `JAX_PLATFORMS=cuda`.
+
+```python
+import dew
+
+chat = dew.pipeline("google/gemma-4-E2B-it", dtype="bfloat16")
+result = chat(
+    ["Explain gradient accumulation in one paragraph.",
+     "Name three uses of a JEPA encoder."],
+    128,
+    seed=0,
+)
+for text in result.text:
+    print(text)
+```
+
+The task carries the checkpoint's processor, so it accepts strings and `result.text` returns decoded continuations. The second positional argument is the token budget; a checkpoint's `generation_config.json` supplies a default when it declares one. `n=4` draws four continuations per prompt. The prompts above go through the tokenizer directly; use `task.processor.chat(messages)` to apply the checkpoint's chat template and pass the returned `ModelInputs` to the same call.
+
+E2B is a multimodal wrapper, so the same task takes `images=` beside the text when the checkpoint declares a vision tower. A `bfloat16` E2B needs roughly 11 GB of device memory for its weights, plus the KV cache for the prompt and budget; the dense 31B does not fit one 16 GB GPU and needs the mesh path below.
+
+### Generating text with a large decoder on a TPU slice
+
+The same `dew.pipeline` call serves a checkpoint too large for one device by sharding its weights over a mesh. Every process in the pool runs the same script and supplies its own prompts; results stay row-sharded and `result.host()` returns this process's rows. This recipe is written against the documented multi-process contract and the CPU process-pool tests; Dew has not yet been run on a real TPU slice, so treat it as the launch shape to verify, not as a measured deployment.
+
+Save as `generate_tpu.py`:
+
+```python
+import os
+
+import jax
+
+
+def main():
+    jax.distributed.initialize()  # Cloud TPU workers discover the coordinator
+    try:
+        import dew
+        from dew.training import Layout, MeshSpec
+
+        task = dew.pipeline(
+            os.environ.get("DEW_MODEL", "google/gemma-4-31B-it"),
+            mesh=MeshSpec(fsdp=jax.device_count()),
+            layout=Layout(min_shard=2**16),
+            dtype="bfloat16",
+        )
+        rank = jax.process_index()
+        result = task([f"Process {rank}: write one sentence about tensors."], 64, seed=rank)
+        for text in result.host().text:
+            print(rank, text)
+    finally:
+        jax.distributed.shutdown()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+`MeshSpec(fsdp=jax.device_count())` shards every eligible weight over the whole slice; `Layout(min_shard=...)` keeps small leaves replicated instead of splitting them. `jax.distributed.initialize()` with no arguments reads the coordinator from the Cloud TPU environment; on a GPU cluster pass `coordinator_address`, `num_processes` and `process_id` as in the training example above. Launch on every worker with the [TPU command](docs/tpu.md):
+
+```bash
+dew-tpu run dew-16 --zone us-central2-b -- \
+    env DEW_MODEL=google/gemma-4-31B-it HF_TOKEN="$HF_TOKEN" python generate_tpu.py
+```
+
+Each worker downloads the checkpoint into its own Hub cache unless the cache directory is on shared storage; a 31B `bfloat16` checkpoint is about 62 GB. A v5e-16 slice holds those weights sharded 16 ways at under 4 GB per chip, leaving room for the cache. Row counts and controls must agree across processes; a mismatch is rejected before any collective runs. To rehearse the launch without a slice, run two processes on one machine with `JAX_PLATFORMS=cpu`, `XLA_FLAGS=--xla_force_host_platform_device_count=2` and an explicit coordinator, using a tiny checkpoint such as `HuggingFaceTB/SmolLM2-135M`.
+
 ## Data and configuration
 
 Dew's data specifications prepare batches through Grain. Token loaders support fixed windows and packed documents; chat, preference, and prompt loaders provide post-training data. Image/video sources include local files, Hugging Face datasets, TFDS, ArrayRecord shards, and URL streams.
