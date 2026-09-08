@@ -34,6 +34,7 @@ from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Stra
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
+Components = tuple[tuple[LogitsTransform, ...], tuple[Stopping, ...], Strategy]
 
 
 @dataclass(frozen=True)
@@ -355,8 +356,7 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
 
 
 def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | None,
-            strategy: Strategy | None
-            ) -> tuple[tuple[LogitsTransform, ...], tuple[Stopping, ...], Strategy]:
+            strategy: Strategy | None) -> Components:
     """The one chain, criterion and strategy a request runs.
 
     `logits=None` runs the policy's own filtering tail. An explicit sequence
@@ -461,6 +461,31 @@ def _digest(components: object) -> tuple[object, ...]:
     return (_stable(components), payload.hexdigest())
 
 
+def _request(model: nn.Module, params: Variables,
+             inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
+             key: jax.Array | None, seed: int | None, sampling: Sampling, n: int,
+             logits: Transforms | None, stopping: Criteria | None, strategy: Strategy | None,
+             *, pooled: bool) -> tuple[ModelInputs, jax.Array, Components, tuple[object, ...]]:
+    """This process's validated request and the controls a pool compares.
+
+    Everything a rank can get wrong on its own is raised from here, the
+    component digest included, so a pool agrees on the failure before any
+    rank enters a collective. A single process never digests: refusing a
+    component only a pool could disagree about would cost it nothing.
+    """
+    random_key = request_key(key, seed)
+    canonical = ModelInputs.from_value(inputs)
+    ids = local_rows(canonical.tokens)
+    fields = {name: local_rows(value) for name, value in canonical.token_fields.items()}
+    conditioning = {name: local_rows(value) for name, value in canonical.conditioning.items()}
+    if "params" not in params:
+        raise ValueError("generate takes the full variables dict ({'params': ...})")
+    prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling, n)
+    components = resolve(sampling, logits, stopping, strategy)
+    controls = (max_new_tokens, n, sampling.pad_id) + ((_digest(components),) if pooled else ())
+    return prepared, random_key, components, controls
+
+
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
              max_new_tokens: int, pad_id: int, n: int,
              transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
@@ -538,19 +563,10 @@ def generate(model: nn.Module, params: Variables,
     mesh = mesh_of(params)
     processes = jax.process_count() if mesh is not None else 1
     error = None
-    prepared = None
-    random_key = None
-    components = None
+    request = None
     try:
-        random_key = request_key(key, seed)
-        canonical = ModelInputs.from_value(inputs)
-        ids = local_rows(canonical.tokens)
-        fields = {name: local_rows(value) for name, value in canonical.token_fields.items()}
-        conditioning = {name: local_rows(value) for name, value in canonical.conditioning.items()}
-        if "params" not in params:
-            raise ValueError("generate takes the full variables dict ({'params': ...})")
-        prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling, n)
-        components = resolve(sampling, logits, stopping, strategy)
+        request = _request(model, params, inputs, max_new_tokens, key, seed, sampling, n,
+                           logits, stopping, strategy, pooled=processes > 1)
     except BaseException as failure:
         error = failure
     if processes > 1:
@@ -558,9 +574,9 @@ def generate(model: nn.Module, params: Variables,
         agree_process_phase(error, phase="generation input validation")
     elif error is not None:
         raise error
-    assert prepared is not None and random_key is not None and components is not None
+    assert request is not None
+    prepared, random_key, components, controls = request
     if processes > 1:
-        controls = (max_new_tokens, n, sampling.pad_id, _digest(components))
         # Whether this process's own prompts needed padding is rank-local, and
         # the digest below would refuse a pool that disagrees only about that,
         # so the pool agrees one validity schema first.
