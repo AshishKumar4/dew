@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, NamedTuple, Protocol
+from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +33,7 @@ from dew.registry import models, resolve_dtype, with_precision
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inputs import Condition, Field, InputSpec
-from dew.inputs.diffusion import Composition
+from dew.inputs.diffusion import Composition, DiffusionConditioner, T5Segment
 from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling.guidance import CFG
@@ -984,9 +984,10 @@ class _Denoiser:
 
     The native model and the variables its component's tensors translate to,
     and the reading conventions the rest of the source follows from it: which
-    text towers it takes and how they compose, how many latent pixels one of
-    its positions covers, its own input channel count, the pipeline class its
-    family's call policy comes from and where that pipeline's sigmas start.
+    text towers it takes and how they compose, the width it reads their
+    sequence at, how many latent pixels one of its positions covers, its own
+    input channel count, the pipeline class its family's call policy comes
+    from and where that pipeline's sigmas start.
     """
 
     component: str
@@ -1000,6 +1001,7 @@ class _Denoiser:
     patch: int
     latent_input: int
     sample_size: int
+    context_width: int
     pipeline: str
     origin: Origin = "scheduler"
     embeds_guidance: bool = False
@@ -1020,46 +1022,50 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     compute = resolve_dtype(dtype)
     denoiser = (_transformer_denoiser if (directory / "transformer" / "config.json").is_file()
                 else _unet_denoiser)(directory, dtype=dtype, attention_impl=attention_impl)
+    policy = _call_policy(index, denoiser)
     autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(directory, compute)
     names = tuple(name for name in denoiser.towers if _present(index, name))
     if not names:
         raise ValueError("A latent diffusion source needs at least one text encoder")
     towers, tokenizers, text_params, text_layouts = _clip_towers(directory, names, compute)
-    t5, t5_tokenizer, t5_config = None, None, None
+    components = {denoiser.component: denoiser.config, "vae": vae_config,
+                  **{name: _component_config(directory, name) for name in names}}
+    t5 = None
     if denoiser.t5_tower is not None and _present(index, denoiser.t5_tower):
-        t5, t5_tokenizer, t5_params, recorded, t5_config = _t5_tower(
-            directory, compute, denoiser.t5_tower)
+        t5, t5_params, t5_layouts, components[denoiser.t5_tower] = _t5_tower(
+            directory, compute, denoiser.t5_tower, policy.sequence)
         text_params[denoiser.t5_tower] = t5_params
-        text_layouts += recorded
+        text_layouts += t5_layouts
     size = denoiser.sample_size * autoencoder.downscale_factor
     height, width = index.get("dew_height", size), index.get("dew_width", size)
     if type(height) is not int or type(width) is not int or height < 1 or width < 1:
         raise ValueError("Image geometry must contain positive integer dimensions")
-    policy = _call_policy(index, denoiser)
-    encoder = _conditioner(denoiser, index, directory, towers, tokenizers, names, text_params,
-                           height, width, t5=t5, t5_tokenizer=t5_tokenizer,
-                           guidance=None if policy.guided else policy.guidance,
-                           sequence=policy.sequence)
+    # A guidance-embedded model takes the pipeline's scale as an input; a
+    # model that reads none carries nothing.
+    encoder = DiffusionConditioner(
+        towers, tokenizers, names, text_params, str(directory), height, width,
+        denoiser.context_width, composition=denoiser.composition, t5=t5,
+        guidance=policy.guidance if denoiser.embeds_guidance and not policy.guided else None,
+        aesthetics=bool(index.get("requires_aesthetics_score", False)))
     inpaint = denoiser.latent_input == autoencoder.latent_channels * 2 + 1
     inputs = InputSpec(Field("image", (height, width, 3)),
                        {"conditioning": Condition(encoder, unconditional=_unconditional(
                            denoiser.composition, index))},
                        mask=Field("mask", (height, width, 1)) if inpaint else None)
     encoders: dict[str, object] = {"conditioning": text_params}
-    finish, safety_layouts, safety_configs = _image_safety(directory, index, compute, encoders)
+    finish, safety_layouts = None, ()
+    if _present(index, "safety_checker"):
+        finish, encoders["safety"], safety_layouts, safety_configs = _image_safety(
+            directory, compute)
+        components.update(safety_configs)
     schedule = SourceSchedule.from_config(_component_config(directory, "scheduler"))
+    components["scheduler"] = dict(schedule.config)
     patch = denoiser.patch * autoencoder.downscale_factor
     task = SourceTask(min(policy.steps, schedule.train_steps),
                       CFG(policy.guidance) if policy.guided and policy.guidance > 1 else None,
                       functools.partial(schedule.sampling, origin=denoiser.origin,
                                         tokens=(height // patch) * (width // patch)))
     variables = {**denoiser.variables, "encoders": encoders, "autoencoder": vae_params}
-    components = {denoiser.component: denoiser.config, "vae": vae_config,
-                  "scheduler": dict(schedule.config),
-                  **{name: _component_config(directory, name) for name in names}}
-    if t5_config is not None and denoiser.t5_tower is not None:
-        components[denoiser.t5_tower] = t5_config
-    components.update(safety_configs)
     config = {"model_index": {**index, "dew_height": height, "dew_width": width}, **components}
     return Pretrained(denoiser.model, variables, None, config, directory, denoiser.built,
                       weight_layouts=denoiser.layouts + vae_layouts + text_layouts + safety_layouts,
@@ -1083,11 +1089,13 @@ def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str) -> _Deno
     built = {"name": "unet_2d_condition",
              "fields": {**fields, "dtype": dtype,
                         "stages": [asdict(stage) for stage in model.stages]}}
-    return _Denoiser("unet", model, {"params": params}, layouts, built, config,
-                     "clip_pooled" if pooled else "clip",
-                     ("text_encoder", "text_encoder_2"), 1, model.in_channels,
-                     _integer(config["sample_size"], "sample_size"),
-                     "StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline")
+    return _Denoiser(
+        component="unet", model=model, variables={"params": params}, layouts=layouts,
+        built=built, config=config, composition="clip_pooled" if pooled else "clip",
+        towers=("text_encoder", "text_encoder_2"), patch=1, latent_input=model.in_channels,
+        sample_size=_integer(config["sample_size"], "sample_size"),
+        context_width=_integer(config.get("cross_attention_dim", 1280), "cross_attention_dim"),
+        pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline")
 
 
 def _transformer_denoiser(directory: Path, *, dtype: str, attention_impl: str) -> _Denoiser:
@@ -1116,10 +1124,13 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: 
     built = {"name": "sd3_transformer",
              "fields": {**fields, "dtype": dtype,
                         "dual_attention_layers": list(fields["dual_attention_layers"])}}
-    return _Denoiser("transformer", model, {"params": params, "buffers": buffers}, layouts, built,
-                     config, "sd3", ("text_encoder", "text_encoder_2"), fields["patch_size"],
-                     fields["in_channels"], _integer(config["sample_size"], "sample_size"),
-                     "StableDiffusion3Pipeline", t5_tower="text_encoder_3")
+    return _Denoiser(
+        component="transformer", model=model, variables={"params": params, "buffers": buffers},
+        layouts=layouts, built=built, config=config, composition="sd3",
+        towers=("text_encoder", "text_encoder_2"), patch=fields["patch_size"],
+        latent_input=fields["in_channels"], sample_size=_integer(config["sample_size"], "sample_size"),
+        context_width=fields["joint_attention_dim"], pipeline="StableDiffusion3Pipeline",
+        t5_tower="text_encoder_3")
 
 
 def _flux_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: str) -> _Denoiser:
@@ -1141,11 +1152,13 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl:
     built = {"name": "flux_transformer",
              "fields": {**fields, "dtype": dtype,
                         "axes_dims_rope": list(fields["axes_dims_rope"])}}
-    return _Denoiser("transformer", model, {"params": params}, layouts, built, config, "flux",
-                     ("text_encoder",), 2, fields["in_channels"] // 4,
-                     _integer(config.get("sample_size", 128), "sample_size"), "FluxPipeline",
-                     origin="linspace", embeds_guidance=fields["guidance_embeds"],
-                     t5_tower="text_encoder_2")
+    return _Denoiser(
+        component="transformer", model=model, variables={"params": params}, layouts=layouts,
+        built=built, config=config, composition="flux", towers=("text_encoder",), patch=2,
+        latent_input=fields["in_channels"] // 4,
+        sample_size=_integer(config.get("sample_size", 128), "sample_size"),
+        context_width=fields["joint_attention_dim"], pipeline="FluxPipeline",
+        origin="linspace", embeds_guidance=fields["guidance_embeds"], t5_tower="text_encoder_2")
 
 
 def _component_config(directory: Path, name: str) -> dict:
@@ -1204,11 +1217,13 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute):
     return tuple(towers), tuple(tokenizers), params, layouts
 
 
-def _t5_tower(directory: Path, compute, component: str):
-    """The published T5 encoder, its tokenizer, parameters, layouts and config.
+def _t5_tower(directory: Path, compute, component: str, tokens: int):
+    """The published T5 encoder as the conditioner's segment, with its
+    parameters, their layouts and its config.
 
     `component` is where the family keeps it: an SD3 directory's third text
-    encoder, a Flux directory's second one.
+    encoder, a Flux directory's second one; `tokens` is the sequence budget
+    the pipeline pads to.
     """
     from transformers import AutoTokenizer
     from dew.interop import diffusion
@@ -1223,28 +1238,7 @@ def _t5_tower(directory: Path, compute, component: str):
         component, tensors, _t5_path, ("encoders", "conditioning", component))
     tokenizer = AutoTokenizer.from_pretrained(
         directory / ("tokenizer" + component.removeprefix("text_encoder")))
-    return tower, tokenizer, params, layouts, config
-
-
-def _conditioner(denoiser: _Denoiser, index: Mapping[str, object], directory: Path, towers,
-                 tokenizers, names: tuple[str, ...], text_params, height: int, width: int, *,
-                 t5, t5_tokenizer, guidance: float | None, sequence: int):
-    """The text conditioning this family composes, at this source's geometry.
-
-    `guidance` is the value a guidance-embedded model takes as an input; a
-    model that reads none refuses to carry it.
-    """
-    from dew.inputs.diffusion import DiffusionConditioner
-    from dew.interop.diffusion import _integer
-
-    return DiffusionConditioner(
-        towers, tokenizers, names, text_params, str(directory), height, width,
-        composition=denoiser.composition, t5=t5, t5_tokenizer=t5_tokenizer,
-        t5_name=denoiser.t5_tower or "text_encoder_3", t5_tokens=sequence,
-        t5_width=_integer(denoiser.config.get("joint_attention_dim", 4096),
-                          "joint_attention_dim"),
-        guidance=guidance if denoiser.embeds_guidance else None,
-        aesthetics=bool(index.get("requires_aesthetics_score", False)))
+    return T5Segment(tower, tokenizer, component, tokens), params, layouts, config
 
 
 def _unconditional(composition: str, index: Mapping[str, object]) -> dict:
@@ -1255,24 +1249,22 @@ def _unconditional(composition: str, index: Mapping[str, object]) -> dict:
     return {"text": "", "negative": True, "zero": zero}
 
 
-def _image_safety(directory: Path, index: Mapping[str, object], compute,
-                  encoders: dict[str, object]):
-    """The safety head a file declares, its parameters placed in `encoders`."""
+def _image_safety(directory: Path, compute):
+    """The safety head a file declares: the finish, its parameters, their
+    layouts and the two configs it ships."""
     from dew.inputs.diffusion import CLIPImageTransform, CLIPSafetyHead, ImageSafety
     from dew.interop import diffusion
     from dew.nn.text_encoders import CLIPVisionTransformer, translate_vision_config
 
-    if not _present(index, "safety_checker"):
-        return None, (), {}
     config = _component_config(directory, "safety_checker")
     with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
         transform = json.load(handle)
-    encoders["safety"], layouts = diffusion.record_layouts(
+    params, layouts = diffusion.record_layouts(
         "safety_checker", diffusion.component_tensors(directory, "safety_checker"), _safety_path,
         ("encoders", "safety"))
     head = CLIPSafetyHead(CLIPVisionTransformer(**translate_vision_config(config), dtype=compute),
                           int(config["projection_dim"]), dtype=compute)
-    return (ImageSafety(head, CLIPImageTransform.from_config(transform)), layouts,
+    return (ImageSafety(head, CLIPImageTransform.from_config(transform)), params, layouts,
             {"safety_checker": config, "feature_extractor": transform})
 
 

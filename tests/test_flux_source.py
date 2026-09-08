@@ -142,17 +142,16 @@ def test_every_declared_flux_tensor_is_mapped(source):
     """Every tensor the source stores lands in the native tree, and a name
     this translation does not know raises with that name rather than loading a
     checkpoint that means something else."""
-    from dew.interop.diffusion import _flux_path
-
     tensors = component_tensors(source / "dev", "transformer")
     params, layouts = translate_flux_weights(tensors)
     assert len(layouts) == len(tensors)
     leaves = {"/".join(entry.paths[0]) for entry in layouts}
     assert len(leaves) == len(tensors)
-    with pytest.raises(ValueError, match="unknown tensor name"):
-        _flux_path("transformer_blocks.0.attn.to_out.1.weight")
-    with pytest.raises(ValueError, match="unknown tensor name"):
-        _flux_path("single_transformer_blocks.0.attn.to_add_out.weight")
+    weight = tensors["transformer_blocks.0.attn.to_out.0.weight"]
+    for foreign in ("transformer_blocks.0.attn.to_out.1.weight",
+                    "single_transformer_blocks.0.attn.to_add_out.weight"):
+        with pytest.raises(ValueError, match=f"unknown tensor name '{foreign}'"):
+            translate_flux_weights({foreign: weight})
 
 
 def test_the_guidance_input_follows_the_checkpoints_own_embedder(source):
@@ -417,7 +416,7 @@ def test_the_tied_t5_embedding_maps_under_either_name(source):
     carrying neither is refused rather than initialized.
     """
     from dew.interop.diffusion import component_tensors, record_layouts
-    from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_weights
+    from dew.nn.text_encoders import _t5_path, translate_t5_weights
 
     tensors = dict(component_tensors(source / "pipeline", "text_encoder_2"))
     embedding = next(tensors[name] for name in
@@ -438,7 +437,7 @@ def test_the_tied_t5_embedding_maps_under_either_name(source):
     disagreeing["shared.weight"] = np.asarray(embedding) + 1.0
     disagreeing["encoder.embed_tokens.weight"] = np.asarray(embedding)
     with pytest.raises(ValueError, match="two copies differ"):
-        t5_embedding(disagreeing)
+        translate_t5_weights(disagreeing)
     with pytest.raises(ValueError, match="stores its token embedding"):
-        t5_embedding({name: value for name, value in tensors.items()
-                      if name not in ("shared.weight", "encoder.embed_tokens.weight")})
+        translate_t5_weights({name: value for name, value in tensors.items()
+                              if name not in ("shared.weight", "encoder.embed_tokens.weight")})
