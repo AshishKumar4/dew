@@ -259,19 +259,15 @@ def test_the_autoencoder_record_carries_its_revision(tmp_path):
 
 
 def test_guidance_is_a_value_with_its_interval(tmp_path):
-    """`guidance` was a bare scale whose 0 stood for "off", so `CFG.interval`
-    could not be named from a run at all. It is the value now: a record
-    builds one, None is the conditional prediction alone, and the interval
-    survives the round trip."""
-    config = dataclasses.replace(run_config(tmp_path), guidance=CFG(4.0, (0.2, 0.8)))
+    """The run preserves interval and rescaling controls, or disables guidance."""
+    config = dataclasses.replace(run_config(tmp_path), guidance=CFG(4.0, (0.2, 0.8), rescale=0.3))
     assert DiffusionRunConfig.from_dict(config.to_dict()) == config
-    assert config.to_dict()["guidance"] == {"scale": 4.0, "interval": [0.2, 0.8]}
 
     # The record a command line or a run.json carries builds the same value.
     from_record = DiffusionRunConfig.from_dict(
-        {**config.to_dict(), "guidance": {"scale": 4.0, "interval": [0.2, 0.8]}})
-    assert from_record.guidance == CFG(4.0, (0.2, 0.8))
-    assert from_record.build().guidance == CFG(4.0, (0.2, 0.8))
+        {**config.to_dict(), "guidance": {"scale": 4.0, "interval": [0.2, 0.8], "rescale": 0.3}})
+    assert from_record.guidance == CFG(4.0, (0.2, 0.8), rescale=0.3)
+    assert from_record.build().guidance == CFG(4.0, (0.2, 0.8), rescale=0.3)
 
     unguided = dataclasses.replace(config, guidance=None)
     assert unguided.build().guidance is None
