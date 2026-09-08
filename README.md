@@ -1157,7 +1157,7 @@ CUDA_VISIBLE_DEVICES=0,1 JAX_PLATFORMS=cuda python train_multihost.py
 
 ### Generating text with Gemma 4 on one GPU
 
-`dew.pipeline` loads a published checkpoint, places its weights on the visible devices, and returns a callable task. Gemma 4 repositories are gated: accept the license on the Hub and log in with `hf auth login` (or set `HF_TOKEN`) before the first download. On a single GPU, use `JAX_PLATFORMS=cuda`.
+`dew.pipeline` loads a published checkpoint and returns a callable task. For gated Gemma 4 repositories, obtain access and authenticate before downloading. Set `JAX_PLATFORMS=cuda` before starting Python. I have not run this released Gemma 4 checkpoint on the 4080; check loading memory before attempting it.
 
 ```python
 import dew
@@ -1175,11 +1175,11 @@ for text in result.text:
 
 The task carries the checkpoint's processor, so it accepts strings and `result.text` returns decoded continuations. The second positional argument is the token budget; a checkpoint's `generation_config.json` supplies a default when it declares one. `n=4` draws four continuations per prompt. The prompts above go through the tokenizer directly; use `task.processor.chat(messages)` to apply the checkpoint's chat template and pass the returned `ModelInputs` to the same call.
 
-E2B is a multimodal wrapper, so the same task takes `images=` beside the text when the checkpoint declares a vision tower. A `bfloat16` E2B needs roughly 11 GB of device memory for its weights, plus the KV cache for the prompt and budget; the dense 31B does not fit one 16 GB GPU and needs the mesh path below.
+E2B is a multimodal wrapper; the task also accepts `images=` when the checkpoint declares a vision tower. Here, `dtype="bfloat16"` selects computation, not weight storage. The Gemma 4 loader retains FP32 parameters, and loading also needs host buffers, device temporaries, and the KV cache. This example does not establish that E2B fits a 16 GB GPU.
 
 ### Generating text with a large decoder on a TPU slice
 
-The same `dew.pipeline` call serves a checkpoint too large for one device by sharding its weights over a mesh. Every process in the pool runs the same script and supplies its own prompts; results stay row-sharded and `result.host()` returns this process's rows. This recipe is written against the documented multi-process contract and the CPU process-pool tests; Dew has not yet been run on a real TPU slice, so treat it as the launch shape to verify, not as a measured deployment.
+Every process runs the same script and supplies its own prompts. `result.host()` returns only that process's real rows. I have not verified this deployment on a real TPU slice. The current pipeline loads the checkpoint before sharding it, so aggregate device memory alone does not establish that loading succeeds.
 
 Save as `generate_tpu.py`:
 
@@ -1202,7 +1202,7 @@ def main():
             dtype="bfloat16",
         )
         rank = jax.process_index()
-        result = task([f"Process {rank}: write one sentence about tensors."], 64, seed=rank)
+        result = task([f"Process {rank}: write one sentence about tensors."], 64, seed=0)
         for text in result.host().text:
             print(rank, text)
     finally:
@@ -1213,14 +1213,14 @@ if __name__ == "__main__":
     main()
 ```
 
-`MeshSpec(fsdp=jax.device_count())` shards every eligible weight over the whole slice; `Layout(min_shard=...)` keeps small leaves replicated instead of splitting them. `jax.distributed.initialize()` with no arguments reads the coordinator from the Cloud TPU environment; on a GPU cluster pass `coordinator_address`, `num_processes` and `process_id` as in the training example above. Launch on every worker with the [TPU command](docs/tpu.md):
+`MeshSpec(fsdp=jax.device_count())` distributes eligible weights over the slice; small or indivisible leaves may remain replicated. Cloud TPU environments can supply coordinator discovery for `jax.distributed.initialize()`. For manual clusters, pass the coordinator address, process count, and process ID as in the training example. Authenticate on each worker through its environment or credential store; do not put tokens in launch arguments. Save the script on every worker and preview the launch with the [TPU command](docs/tpu.md):
 
 ```bash
-dew-tpu run dew-16 --zone us-central2-b -- \
-    env DEW_MODEL=google/gemma-4-31B-it HF_TOKEN="$HF_TOKEN" python generate_tpu.py
+dew-tpu run dew-16 --zone us-central2-b --dry-run -- \
+    env DEW_MODEL=google/gemma-4-31B-it python generate_tpu.py
 ```
 
-Each worker downloads the checkpoint into its own Hub cache unless the cache directory is on shared storage; a 31B `bfloat16` checkpoint is about 62 GB. A v5e-16 slice holds those weights sharded 16 ways at under 4 GB per chip, leaving room for the cache. Row counts and controls must agree across processes; a mismatch is rejected before any collective runs. To rehearse the launch without a slice, run two processes on one machine with `JAX_PLATFORMS=cpu`, `XLA_FLAGS=--xla_force_host_platform_device_count=2` and an explicit coordinator, using a tiny checkpoint such as `HuggingFaceTB/SmolLM2-135M`.
+Each worker needs access to the checkpoint and tokenizer files. A shared download cache does not eliminate per-process loading buffers. Budget for the stored weight dtype, replicated leaves, loading peaks, and KV cache; dividing checkpoint bytes by device count is insufficient. Row counts, tokenized shapes, and execution controls must agree across processes. Use the same seed on every rank; Dew derives global row keys. Rehearse on a small checkpoint and CPU process pool before an authorized TPU run.
 
 ## Data and configuration
 
