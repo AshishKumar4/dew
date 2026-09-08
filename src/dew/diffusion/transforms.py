@@ -223,6 +223,8 @@ class SourceLimitedPrediction(PredictionTransform):
             level = jnp.quantile(jnp.abs(flat), ratio, axis=1)
             level = expand(jnp.clip(level, 1.0, maximum), x_0)
             return jnp.clip(x_0, -level, level) / level
+        if self.clip is None:
+            raise ValueError("a limited prediction needs a clip range or a thresholding ratio")
         return jnp.clip(x_0, -self.clip, self.clip)
 
     def pred_transform(self, x_t, preds, rates, t):

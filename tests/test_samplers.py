@@ -9,7 +9,6 @@ form x(sigma) = x(sigma_max) sqrt(s^2 + sigma^2) / sqrt(s^2 + sigma_max^2).
 Each solver's order of accuracy is measured against that closed form.
 """
 
-import contextlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -849,27 +848,6 @@ def source_case(name: str):
     return schedule, process, times, jnp.asarray(SOURCE_ARRAYS[f"{name}.x_T"])
 
 
-@contextlib.contextmanager
-def double_sample(active: bool):
-    """The sample a walk carries in double, beside the scheduler's own float32
-    buffers, which is the arrangement the reference records its gradient in.
-
-    A grid whose trajectory multiplies its input by tens of thousands has a
-    Jacobian float32 cannot hold to a part in ten thousand, on either side;
-    the reference states which grids those are by recording its own float32
-    gradient beside its float64 one. Where they part company the comparison
-    moves to the precision that determines the answer, at the same bound.
-    """
-    if not active:
-        yield
-        return
-    jax.config.update("jax_enable_x64", True)
-    try:
-        yield
-    finally:
-        jax.config.update("jax_enable_x64", False)
-
-
 @pytest.mark.parametrize("name", sorted(SOURCE["cases"]))
 def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     """Every published scheduler file the reference tool saved, rebuilt from
@@ -885,15 +863,13 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     A stochastic class integrates the exact draws `sample` folds per step, and
     `DPMSolverSDEScheduler`'s walk integrates the draws its own `torchsde`
     tree answered, whose interval the reconstruction is checked to prepare.
-    Observed at most 4.0e-5 of a latent's own scale, on the zero-terminal-SNR
-    Euler grid whose substituted terminal alpha of 2^-24 puts sigma near 4e3,
-    and 3.2e-6 for the gradients; the model times land within 1.8e-4 of the
-    source's, which shifts this model's output by under 2e-7.
+    Every native walk and VJP runs in float32. Gradients compare directly to
+    the actual source float32 VJP at the same 1e-4 bound as trajectories.
+    The retained float64 source gradients provide additional diagnostic data;
+    they never select a tolerance or change native execution precision.
     """
     schedule, process, times, x_T = source_case(name)
     rescale = SOURCE["cases"][name]["guidance"]
-    stiff = relative_gap(SOURCE_ARRAYS[f"{name}.grad_float32"][None],
-                         SOURCE_ARRAYS[f"{name}.grad"][None]) > 1e-5
     if f"{name}.betas" in SOURCE_ARRAYS:
         np.testing.assert_allclose(schedule.betas, SOURCE_ARRAYS[f"{name}.betas"],
                                    atol=1e-5, rtol=1e-5)
@@ -929,23 +905,8 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
                           key=jax.random.PRNGKey(0), times=times, final_denoise=False)
 
         assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
-    with double_sample(stiff):
-        start = x_T.astype(jnp.float64) if stiff else x_T
-        (gradient,) = jax.vjp(final, start)[1](cotangent.astype(start.dtype))
-    assert relative_gap(gradient[None], SOURCE_ARRAYS[f"{name}.grad"][None]) < 1e-4
-
-
-@pytest.mark.parametrize("name", sorted(SOURCE["cases"]))
-def test_the_reference_float32_gradient_tracks_its_float64_one(name):
-    """How far the reference's own float32 trajectory gradient sits from its
-    float64 one, which is what a float32 reconstruction can be held to. Every
-    case but one is within 1e-6 of its own scale; the cosine table's
-    exponential grid reaches 8.6e-5, because its largest sigma is about 2e4
-    and the Jacobian through five stiff steps reaches 4e4."""
-    exact = SOURCE_ARRAYS[f"{name}.grad"]
-    single = SOURCE_ARRAYS[f"{name}.grad_float32"]
-    gap = relative_gap(single[None], exact[None])
-    assert gap < 1e-4, (name, gap)
+    (gradient,) = jax.vjp(final, x_T)[1](cotangent)
+    assert relative_gap(gradient[None], SOURCE_ARRAYS[f"{name}.grad_float32"][None]) < 1e-4
 
 
 def source_bridge(depth=None):
