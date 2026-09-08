@@ -68,6 +68,7 @@ Kind = Literal[
 ]
 Family = Literal["tabulated", "lambda", "sigma", "stage", "edm", "flow"]
 Origin = Literal["scheduler", "linspace"]
+ModelTime = Literal["timesteps", "sigma"]
 Spacing = Literal["leading", "linspace", "trailing"]
 Transform = Literal["none", "karras", "exponential", "beta"]
 Terminal = Literal["zero", "sigma_min"]
@@ -617,8 +618,8 @@ class SourceSchedule:
                 f"({times[0]}), which the source scheduler cannot walk: it "
                 "looks its starting step up by that value and finds the second")
 
-    def _flow_grid(self, steps: int, tokens: int | None,
-                   origin: Origin) -> tuple[np.ndarray, np.ndarray, float]:
+    def _flow_grid(self, steps: int, tokens: int | None, origin: Origin,
+                   model_time: ModelTime) -> tuple[np.ndarray, np.ndarray, float]:
         """`FlowMatchEulerDiscreteScheduler.set_timesteps` in its own order.
 
         `origin` is where the sigmas start, which is a pipeline fact rather
@@ -626,6 +627,11 @@ class SourceSchedule:
         sigma extremes, and Flux hands it `linspace(1, 1/N, N)`. Then comes the
         file's shift, then whichever sigma conversion it asks for, then the
         appended zero.
+
+        `model_time` is the unit the calling pipeline hands its own model: the
+        scheduler's timesteps, which are the sigmas times the training count,
+        or the sigma itself, which is what Flux passes after dividing them
+        back down.
         """
         policy = self.policy
         flow, count = policy.flow, policy.train_steps
@@ -646,7 +652,8 @@ class SourceSchedule:
         if policy.transform != "none":
             sigmas = _transformed_sigmas(policy.transform, float(sigmas[-1]), float(sigmas[0]),
                                          steps, policy.rho)
-        return np.append(sigmas, 0.0), np.asarray(sigmas, np.float64) * count, 1.0
+        scaled = np.asarray(sigmas, np.float64) * (1.0 if model_time == "sigma" else count)
+        return np.append(sigmas, 0.0), scaled, 1.0
 
     def _edm_grid(self, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
         """EDM's own grid: rho spacing or an exponential one between sigma_min
@@ -663,18 +670,20 @@ class SourceSchedule:
 
     @lru_cache(maxsize=32)
     def sampling(self, steps: int, *, tokens: int | None = None,
-                 origin: Origin = "scheduler") -> tuple[Process, jax.Array]:
+                 origin: Origin = "scheduler",
+                 model_time: ModelTime = "timesteps") -> tuple[Process, jax.Array]:
         """The process and the explicit descending grid a `steps` walk takes.
 
         `tokens` is the latent token count a resolution-dependent flow shift
-        reads, and `origin` where a flow file's sigmas start; both are the
-        calling pipeline's, bound through the task's grid callable.
+        reads, `origin` where a flow file's sigmas start and `model_time` the
+        unit its model is called with; all three are the calling pipeline's,
+        bound through the task's grid callable.
         """
         policy = self.policy
         if type(steps) is not int or steps < 1:
             raise ValueError("The sampling count must be a positive integer")
         if policy.family == "flow":
-            sigmas, times, prior = self._flow_grid(steps, tokens, origin)
+            sigmas, times, prior = self._flow_grid(steps, tokens, origin, model_time)
             schedule = FlowGrid(sigmas, np.append(times, 0.0), prior)
             return (Process(schedule, self.prediction),
                     jnp.arange(len(sigmas) - 1, -1, -1, dtype=jnp.float32))

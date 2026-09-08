@@ -414,8 +414,12 @@ _FLUX_EMBEDDERS = {
     "time_text_embed.text_embedder.linear_1": ("text_embedder_linear_1",),
     "time_text_embed.text_embedder.linear_2": ("text_embedder_linear_2",),
 }
+# A double-stream block's attention projects both streams and both outputs; a
+# single-stream block's is `pre_only`, so it holds neither the context
+# projections nor any output of its own.
 _FLUX_ATTENTION = ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj",
                    "to_add_out", "norm_q", "norm_k", "norm_added_q", "norm_added_k")
+_FLUX_SINGLE_ATTENTION = ("to_q", "to_k", "to_v", "norm_q", "norm_k")
 
 
 def _flux_leaf(leaf: str) -> str:
@@ -426,13 +430,13 @@ def _flux_leaf(leaf: str) -> str:
     return "bias"
 
 
-def _flux_attention(block: tuple[str, ...], inner: list[str], leaf: str, name: str
-                    ) -> tuple[str, ...]:
-    """One attention tensor of either block, whose projections a single-stream
-    block leaves unprojected and so does not carry."""
-    if inner == ["to_out", "0"]:
+def _flux_attention(block: tuple[str, ...], inner: list[str], leaf: str, name: str, *,
+                    joint: bool) -> tuple[str, ...]:
+    """One attention tensor, in the names the block's own kind carries."""
+    if joint and inner == ["to_out", "0"]:
         return (*block, "attn", "to_out_0", _flux_leaf(leaf))
-    if len(inner) == 1 and inner[0] in _FLUX_ATTENTION:
+    allowed = _FLUX_ATTENTION if joint else _FLUX_SINGLE_ATTENTION
+    if len(inner) == 1 and inner[0] in allowed:
         if inner[0].startswith("norm"):
             if leaf != "weight":
                 raise ValueError(f"unknown tensor name {name!r}")
@@ -459,7 +463,7 @@ def _flux_path(name: str) -> tuple[str, ...]:
         if rest in (["norm1", "linear"], ["norm1_context", "linear"]):
             return (*block, rest[0], "linear", _flux_leaf(leaf))
         if rest[0] == "attn":
-            return _flux_attention(block, rest[1:], leaf, name)
+            return _flux_attention(block, rest[1:], leaf, name, joint=True)
         if rest[0] in ("ff", "ff_context"):
             inner = rest[1:]
             if inner == ["net", "0", "proj"]:
@@ -476,7 +480,7 @@ def _flux_path(name: str) -> tuple[str, ...]:
         if rest == ["proj_out"]:
             return (*block, "proj_fused", _flux_leaf(leaf))
         if rest[0] == "attn":
-            return _flux_attention(block, rest[1:], leaf, name)
+            return _flux_attention(block, rest[1:], leaf, name, joint=False)
     raise ValueError(f"unknown tensor name {name!r}")
 
 
