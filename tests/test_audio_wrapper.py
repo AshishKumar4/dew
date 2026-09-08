@@ -19,7 +19,7 @@ from safetensors.numpy import load_file
 from dew.data.audio import AudioProcessor
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn import vision as V
-from dew.nn.audio import AudioEncoding, Gemma3nAudio, audio_config, audio_weights
+from dew.nn.audio import Gemma3nAudio, audio_config, audio_weights
 from dew.registry import models, with_precision
 
 
@@ -69,7 +69,6 @@ class _Wrapper:
     def logits(self, params, tokens, valid, features, feature_mask):
         """Reference order: hard vocabularies, then soft audio, then the decoder."""
         encoded = self.encoder.apply({**self.encoder_variables, "params": params["encoder"]}, features, feature_mask)
-        assert isinstance(encoded, AudioEncoding)
         projector_variables = {"params": params["projector"]}
         audio_id = self.config["audio_token_id"]
         rows = jnp.arange(tokens.shape[0])[:, None]
