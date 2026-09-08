@@ -572,8 +572,7 @@ class Unet(nn.Module):
             self.up_blocks.append(blocks)
             self.up_attn.append(CrossAttentionBlock(ch, h, attention) if h else nn.Identity())
             if i != len(depths) - 1:
-                # Dew: Upsample(features=feature_depths[-i]); for i == 0 that is depths[0]
-                up_features = depths[-i]
+                up_features = depths[-i - 2]
                 self.upsamples.append(Conv(ch, up_features))
                 ch = up_features
         self.pre_final = Conv(ch, depths[0])
