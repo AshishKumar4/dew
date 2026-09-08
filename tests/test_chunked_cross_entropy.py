@@ -47,7 +47,7 @@ def test_loss_and_prediction_match_the_full_vocabulary_pass(chunks, dtype):
     hidden, head, targets = inputs(dtype=dtype)
     expected_losses, expected_top1 = reference(hidden, head, targets)
 
-    losses, predicted = chunked_cross_entropy(hidden, head, targets, chunks)
+    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
 
     assert losses.shape == targets.shape and losses.dtype == jnp.float32
     assert jnp.abs(losses - expected_losses).max() <= 1e-5 * jnp.abs(expected_losses).max()
@@ -60,7 +60,7 @@ def test_the_softcap_is_applied_inside_the_chunk(chunks):
     hidden, head, targets = inputs()
     expected_losses, expected_top1 = reference(hidden, head, targets, softcap=2.0)
 
-    losses, predicted = chunked_cross_entropy(hidden, head, targets, chunks,
+    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks,
                                               softcap=2.0)
 
     assert jnp.abs(losses - expected_losses).max() <= 1e-5 * jnp.abs(expected_losses).max()
@@ -100,7 +100,7 @@ def test_a_tie_goes_to_the_lowest_column_across_chunk_boundaries():
     assert int(expected_top1[0, 0]) == 5, "the reference argmax did not tie-break low"
 
     for chunks in CHUNKS + [6]:
-        _, predicted = chunked_cross_entropy(hidden, head, targets, chunks)
+        _, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
         assert jnp.array_equal(predicted, expected_top1), chunks
 
 
@@ -109,7 +109,7 @@ def test_a_flat_head_predicts_the_first_column():
     hidden, head, targets = inputs()
     flat = jnp.zeros_like(head)
 
-    _, predicted = chunked_cross_entropy(hidden, flat, targets, 4)
+    _, predicted, _ = chunked_cross_entropy(hidden, flat, targets, 4)
 
     assert jnp.array_equal(predicted, jnp.zeros_like(targets))
     assert jnp.array_equal(predicted, reference(hidden, flat, targets)[1])
@@ -141,7 +141,7 @@ def test_dropping_the_target_term_fails_the_parity_check(monkeypatch):
         monkeypatch,
         lambda terms, start, stop: (terms[0], jnp.zeros_like(terms[1]), *terms[2:]))
 
-    losses, _ = chunked_cross_entropy(hidden, head, targets, 4)
+    losses, _, _ = chunked_cross_entropy(hidden, head, targets, 4)
 
     assert jnp.abs(losses - expected).max() > 1e-5 * jnp.abs(expected).max()
 
@@ -162,7 +162,7 @@ def test_dropping_one_chunk_fails_the_parity_check(monkeypatch, dropped):
 
     mutating_chunk_terms(monkeypatch, skip)
 
-    losses, _ = chunked_cross_entropy(hidden, head, targets, 4)
+    losses, _, _ = chunked_cross_entropy(hidden, head, targets, 4)
 
     assert jnp.abs(losses - expected).max() > 1e-5 * jnp.abs(expected).max()
 
@@ -191,7 +191,7 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
     hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
     head = model.apply(variables, variables['params'],
                        method=CausalTransformer.head_weight)
-    losses, predicted = chunked_cross_entropy(hidden, head, targets, chunks)
+    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
 
     assert hidden.dtype == jnp.bfloat16
     assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()

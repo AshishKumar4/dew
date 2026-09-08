@@ -110,7 +110,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
         hidden = self.model.apply(params, masked, train=True, rngs={"dropout": dropout_key},
                                   method=type(self.model).hidden_states)
         head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
-        losses, predicted = chunked_cross_entropy(
+        losses, predicted, _ = chunked_cross_entropy(
             hidden, head, tokens, self.head_chunks,
             softcap=self.model.final_logit_softcap, precision=self.model.precision)
 

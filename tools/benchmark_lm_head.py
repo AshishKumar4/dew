@@ -62,7 +62,7 @@ def baseline(states, table, targets, variant: Variant):
 
 def stored(states, table, targets, variant: Variant):
     """The shipped kernel: the tiles stay live for the backward pass."""
-    losses, predicted = chunked_cross_entropy(states, table.T, targets, variant.chunks)
+    losses, predicted, _ = chunked_cross_entropy(states, table.T, targets, variant.chunks)
     if not variant.accuracy:
         return jnp.mean(losses), jnp.zeros(())
     return jnp.mean(losses), jnp.mean((predicted == targets).astype(losses.dtype))

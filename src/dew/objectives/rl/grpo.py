@@ -185,7 +185,7 @@ class GRPOObjective(LMObjective):
                                   method=type(self.model).hidden_states)
         head = self.model.apply(params, params["params"],
                                 method=type(self.model).head_weight)
-        losses, _ = chunked_cross_entropy(
+        losses, _, _ = chunked_cross_entropy(
             hidden, head, aligned[:, 1:], self.head_chunks,
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision)
