@@ -4,19 +4,27 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from collections.abc import Mapping
-from typing import NamedTuple, Sequence
+from typing import Literal, NamedTuple, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from transformers import CLIPTokenizer
+from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
 from dew.inputs.encoders import ConditionEncoder
 from dew.nn.backbones.unet_condition import DenoisingCondition
-from dew.nn.text_encoders import CLIPTextTransformer
+from dew.nn.text_encoders import CLIPTextTransformer, T5EncoderTransformer
 from dew.nn.safety import CLIPSafetyHead
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, encoders
+
+def _prompt(record: Mapping[str, object], key: str, default: str) -> str:
+    """One text slot of a conditioning record."""
+    text = record.get(key, default)
+    if not isinstance(text, str):
+        raise ValueError(f"A text-conditioning record's {key} must be a string")
+    return text
+
 
 def latent_image_conditions(autoencoder, params, pixels, mask, key):
     """Normalized image pixels and a binary pixel mask to native UNet inputs.
@@ -53,9 +61,35 @@ def _text_features(tower, ids):
     return _TextFeatures(hidden, penultimate, hidden[jnp.arange(ids.shape[0]), index])
 
 
-@encoders("clip_diffusion")
+Composition = Literal["clip", "clip_pooled", "sd3", "flux"]
+"""How a checkpoint family composes its text towers into one conditioning.
+
+- `clip`: one CLIP tower's last hidden states, which is Stable Diffusion 1
+  and 2.
+- `clip_pooled`: two towers' penultimate states concatenated along the width,
+  the second tower's projected pooled vector and the size/crop time ids,
+  which is SDXL and its refiner.
+- `sd3`: the same width concatenation padded out to the T5 width, with the T5
+  tower's final states concatenated along the sequence, and BOTH towers'
+  projected pooled vectors concatenated as the pooled one.
+- `flux`: the T5 tower's final states alone, with the first tower's pooled
+  vector unprojected and no CLIP tokens in the sequence.
+"""
+
+
+@encoders("diffusion_text")
 @dataclass(eq=False)
-class CLIPConditioner(ConditionEncoder[str | Mapping[str, object]]):
+class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
+    """The text conditioning of a published latent diffusion checkpoint.
+
+    One encoder owns every family's composition: which towers run, which of
+    their states the model reads, and how the pooled vector is built. The
+    towers themselves are the native CLIP and T5 towers, called the way their
+    own source pipelines call them - the SD3 and Flux pipelines pass their T5
+    ids with no attention mask, which is what `T5EncoderTransformer` does
+    with none, and no generic T5 default changes for it.
+    """
+
     towers: tuple[CLIPTextTransformer, ...]
     tokenizers: tuple[CLIPTokenizer, ...]
     names: tuple[str, ...]
@@ -63,8 +97,13 @@ class CLIPConditioner(ConditionEncoder[str | Mapping[str, object]]):
     checkpoint: str
     height: int
     width: int
-    pooled: bool = False
+    composition: Composition = "clip"
     aesthetics: bool = False
+    t5: T5EncoderTransformer | None = None
+    t5_tokenizer: PreTrainedTokenizerBase | None = None
+    t5_name: str = "text_encoder_3"
+    t5_tokens: int = 256
+    t5_width: int = 4096
 
     @classmethod
     def from_pretrained(cls, checkpoint: str, **kwargs):
@@ -74,24 +113,60 @@ class CLIPConditioner(ConditionEncoder[str | Mapping[str, object]]):
             raise TypeError("This checkpoint has no image conditioning specification")
         return source.inputs.conditions["conditioning"].encoder
 
-    def tokenize(self, data: Sequence[str | Mapping[str, object]], second=None):
-        rows, secondary, zero, negative = [], [], [], []
+    @property
+    def stacked(self) -> bool:
+        """Whether the CLIP ids ride one array with a tower axis, which every
+        family but plain Stable Diffusion does: the XL refiner carries a
+        single tower that way too, since its pipeline still writes a tower's
+        row rather than a bare batch."""
+        return self.composition != "clip"
+
+    def __post_init__(self):
+        towers, t5 = len(self.towers), self.t5 is not None
+        if towers != len(self.tokenizers) or towers != len(self.names):
+            raise ValueError("Every text tower needs its own tokenizer and its own name")
+        expected = {"clip": (1, 1), "clip_pooled": (1, 2), "sd3": (2, 2), "flux": (1, 1)}[
+            self.composition]
+        if not expected[0] <= towers <= expected[1]:
+            raise ValueError(f"{self.composition} conditioning runs "
+                             f"{'-'.join(str(bound) for bound in sorted(set(expected)))} "
+                             f"CLIP towers, not {towers}")
+        if t5 and self.composition not in ("sd3", "flux"):
+            raise ValueError(f"{self.composition} conditioning has no T5 segment")
+        if not t5 and self.composition == "flux":
+            # SD3's pipeline writes a zero segment for an absent third encoder;
+            # Flux's `_get_t5_prompt_embeds` has no such path.
+            raise ValueError("Flux conditioning needs its T5 encoder")
+        if (self.t5_tokenizer is None) != (self.t5 is None):
+            raise ValueError("A T5 tower and its tokenizer arrive together")
+
+    def tokenize(self, data: Sequence[str | Mapping[str, object]]):
+        """One row per item, with each text slot routed to the tower whose
+        source pipeline reads it: `text` to the first CLIP tower, `second` to
+        the second one, and the T5 tower's own slot, which is `third` where a
+        family has two CLIP towers beside it and `second` where it has one.
+        """
+        rows, second, third, zero, negative = [], [], [], [], []
         for item in data:
-            record = {"text": item} if isinstance(item, str) else item
-            text = record.get("text", "")
-            if not isinstance(text, str):
-                raise ValueError("A text-conditioning record needs string text")
+            record: Mapping[str, object] = {"text": item} if isinstance(item, str) else item
+            text = _prompt(record, "text", "")
             rows.append(text)
-            secondary.append(record.get("second", text))
+            second.append(_prompt(record, "second", text))
+            third.append(_prompt(record, "third", text))
             zero.append(bool(record.get("zero", False)))
             negative.append(bool(record.get("negative", False)))
-        ids = []
-        for index, tokenizer in enumerate(self.tokenizers):
-            text = (secondary if second is None else second) if len(self.towers) == 2 and index == 1 else rows
-            ids.append(tokenizer(list(text), padding="max_length", max_length=tokenizer.model_max_length,
-                                 truncation=True, return_tensors="np").input_ids)
-        return {"input_ids": np.stack(ids, axis=1) if self.pooled else ids[0],
-                "zero_condition": np.asarray(zero, bool), "negative": np.asarray(negative, bool)}
+        ids = [tokenizer(second if index == 1 else rows, padding="max_length",
+                         max_length=tokenizer.model_max_length, truncation=True,
+                         return_tensors="np").input_ids
+               for index, tokenizer in enumerate(self.tokenizers)]
+        tokens = {"input_ids": np.stack(ids, axis=1) if self.stacked else ids[0],
+                  "zero_condition": np.asarray(zero, bool), "negative": np.asarray(negative, bool)}
+        if self.t5_tokenizer is not None:
+            tokens["t5_input_ids"] = self.t5_tokenizer(
+                third if self.composition == "sd3" else second, padding="max_length",
+                max_length=self.t5_tokens, truncation=True, add_special_tokens=True,
+                return_tensors="np").input_ids
+        return tokens
 
     def time_ids(self, count, dtype, *, original_size=None, crops_coords_top_left=(0, 0),
                  target_size=None, aesthetic_score=6.0):
@@ -100,30 +175,66 @@ class CLIPConditioner(ConditionEncoder[str | Mapping[str, object]]):
                   *((aesthetic_score,) if self.aesthetics else (target_size or size)))
         return jnp.broadcast_to(jnp.asarray(values, dtype), (count, len(values)))
 
-    def encode(self, params, tokens) -> DenoisingCondition:
-        ids = tokens["input_ids"]
+    def _clip(self, params, ids) -> list[_TextFeatures]:
         outputs = []
         for index, (name, tower) in enumerate(zip(self.names, self.towers)):
             output = tower.apply({"params": params[name]["text_model"]},
-                                 ids[:, index] if self.pooled else ids, method=_text_features)
+                                 ids[:, index] if self.stacked else ids, method=_text_features)
             assert isinstance(output, _TextFeatures)
             outputs.append(output)
-        hidden = jnp.concatenate([value.penultimate for value in outputs], axis=-1) if self.pooled else outputs[0].last
-        zero = jnp.asarray(tokens["zero_condition"])
-        hidden = jnp.where(zero[:, None, None], jnp.zeros_like(hidden), hidden)
-        if not self.pooled:
-            return DenoisingCondition(hidden)
-        pooled = outputs[-1].pooled @ params[self.names[-1]]["text_projection"]["kernel"]
-        pooled = jnp.where(zero[:, None], jnp.zeros_like(pooled), pooled)
-        time_ids = tokens.get("time_ids")
-        if time_ids is None:
-            time_ids = self.time_ids(ids.shape[0], hidden.dtype)
-            if self.aesthetics:
-                time_ids = time_ids.at[:, -1].set(jnp.where(tokens["negative"], 2.5, 6.0))
-        return DenoisingCondition(hidden, pooled, time_ids)
+        return outputs
+
+    def _projected(self, params, name: str, pooled):
+        return pooled @ params[name]["text_projection"]["kernel"]
+
+    def _t5_states(self, params, tokens, rows: int, dtype) -> jax.Array:
+        """The T5 segment, or the zero segment the SD3 pipeline writes when its
+        third encoder is absent, which is `tokenizer_max_length` long - the
+        CLIP tokenizer's window, not the T5 sequence the call asked for."""
+        if self.t5 is None:
+            return jnp.zeros((rows, self.tokenizers[0].model_max_length, self.t5_width), dtype)
+        # The SD3 and Flux pipelines call their T5 encoder with ids only.
+        states = self.t5.apply({"params": params[self.t5_name]},
+                               jnp.asarray(tokens["t5_input_ids"]))
+        assert isinstance(states, jax.Array)
+        return states
+
+    def _zeroed(self, value, zero):
+        """A dropped row's conditioning is zeros, in the shape it arrives."""
+        return jnp.where(zero.reshape(zero.shape + (1,) * (value.ndim - 1)),
+                         jnp.zeros_like(value), value)
+
+    def encode(self, params, tokens) -> DenoisingCondition:
+        ids = tokens["input_ids"]
+        rows, zero = ids.shape[0], jnp.asarray(tokens["zero_condition"])
+        outputs = self._clip(params, ids)
+        if self.composition == "clip":
+            return DenoisingCondition(self._zeroed(outputs[0].last, zero))
+        if self.composition == "clip_pooled":
+            hidden = jnp.concatenate([value.penultimate for value in outputs], axis=-1)
+            pooled = self._projected(params, self.names[-1], outputs[-1].pooled)
+            time_ids = tokens.get("time_ids")
+            if time_ids is None:
+                time_ids = self.time_ids(rows, hidden.dtype)
+                if self.aesthetics:
+                    time_ids = time_ids.at[:, -1].set(jnp.where(tokens["negative"], 2.5, 6.0))
+            return DenoisingCondition(self._zeroed(hidden, zero),
+                                      self._zeroed(pooled, zero), time_ids)
+        if self.composition == "flux":
+            hidden = self._t5_states(params, tokens, rows, outputs[0].pooled.dtype)
+            pooled = outputs[0].pooled
+        else:
+            clip = jnp.concatenate([value.penultimate for value in outputs], axis=-1)
+            padded = jnp.pad(clip, ((0, 0), (0, 0), (0, self.t5_width - clip.shape[-1])))
+            hidden = jnp.concatenate(
+                [padded, self._t5_states(params, tokens, rows, clip.dtype)], axis=1)
+            pooled = jnp.concatenate(
+                [self._projected(params, name, value.pooled)
+                 for name, value in zip(self.names, outputs)], axis=-1)
+        return DenoisingCondition(self._zeroed(hidden, zero), self._zeroed(pooled, zero))
 
     def captions(self, tokens):
-        ids = tokens["input_ids"][:, 0] if self.pooled else tokens["input_ids"]
+        ids = tokens["input_ids"][:, 0] if self.stacked else tokens["input_ids"]
         return tuple(self.tokenizers[0].batch_decode(np.asarray(ids), skip_special_tokens=True))
 
     def to_json(self):

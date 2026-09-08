@@ -207,17 +207,18 @@ class SD3Block(nn.Module):
         shift, scale, gate, shift_mlp, scale_mlp, gate_mlp = modulation[:6]
         normalized = _layer_norm(self.dtype)(image)
         image_input = _modulate(normalized, shift, scale)
-        if self.context_pre_only:
-            context_scale, context_shift = _Modulation(
-                self.features, 2, dtype=self.dtype, precision=self.precision,
-                name="norm1_context")(conditioning)
-            context_input = _modulate(_layer_norm(self.dtype)(context), context_shift, context_scale)
-        else:
-            (context_shift, context_scale, context_gate, context_shift_mlp,
-             context_scale_mlp, context_gate_mlp) = _Modulation(
-                self.features, 6, dtype=self.dtype, precision=self.precision,
-                name="norm1_context")(conditioning)
-            context_input = _modulate(_layer_norm(self.dtype)(context), context_shift, context_scale)
+        # A last block's context is read and dropped, so it takes a shift and a
+        # scale; a continuing one also takes the gates its own residual and
+        # feed-forward use.
+        context_chunks = _Modulation(
+            self.features, 2 if self.context_pre_only else 6, dtype=self.dtype,
+            precision=self.precision, name="norm1_context")(conditioning)
+        # The last block's continuous norm emits its scale before its shift;
+        # the zero-initialized one emits shift, scale and then the gates.
+        context_scale, context_shift = (context_chunks[:2] if self.context_pre_only
+                                        else context_chunks[1::-1])
+        context_rest = None if self.context_pre_only else context_chunks[2:]
+        context_input = _modulate(_layer_norm(self.dtype)(context), context_shift, context_scale)
 
         attention = _JointAttention(
             self.heads, self.head_dim, self.qk_norm, not self.context_pre_only, dtype=self.dtype,
@@ -234,8 +235,11 @@ class SD3Block(nn.Module):
         image_mlp = _modulate(_layer_norm(self.dtype)(image), shift_mlp, scale_mlp)
         image = image + gate_mlp[:, None] * _FeedForward(
             self.features, dtype=self.dtype, precision=self.precision, name="ff")(image_mlp)
-        if self.context_pre_only:
+        if context_rest is None:
             return image, None
+        # A block that keeps its context is the one whose attention returns it.
+        assert context_attended is not None
+        context_gate, context_shift_mlp, context_scale_mlp, context_gate_mlp = context_rest
         context = context + context_gate[:, None] * context_attended
         context_mlp = _modulate(_layer_norm(self.dtype)(context), context_shift_mlp, context_scale_mlp)
         context = context + context_gate_mlp[:, None] * _FeedForward(

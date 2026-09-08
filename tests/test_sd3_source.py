@@ -287,3 +287,72 @@ def test_native_sd3_agrees_across_a_sequence_sharded_mesh(source):
     gaps = [relative_gap(a, b) for a, b in zip(jax.tree.leaves(split[1]),
                                                jax.tree.leaves(whole[1]))]
     assert max(gaps) < 1e-5, max(gaps)
+
+
+# The tiny pipeline the reference tool saves and walks: two CLIP towers, a T5
+# tower and the transformer, in a real published directory layout.
+PIPELINE_CASES = ("pipeline", "pipeline_no_t5")
+
+
+@pytest.fixture(scope="module")
+def pipeline_record(source):
+    return json.loads((source / "sd3_transformer.json").read_text())["pipeline"]
+
+
+@pytest.mark.parametrize("case", PIPELINE_CASES)
+def test_published_prompt_encoding_matches_the_source_pipeline(source, pipeline_record, case):
+    """The conditioner composes what `encode_prompt` composes.
+
+    Every text slot carries different words, so a native encoder that routed
+    `prompt_2` to T5 or dropped the third slot would not land here: the CLIP
+    towers' penultimate states pad out to the T5 width, the T5 states follow
+    them along the sequence, and the pooled vector is both projections. The
+    second case ships no third encoder, whose segment is the zero block the
+    source writes at its CLIP window rather than at the sequence it asked for.
+    """
+    from dew.interop.pretrained import load_pretrained
+
+    arrays = np.load(source / "sd3_pipeline.npz")
+    loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
+    encoder = loaded.inputs.conditions["conditioning"].encoder
+    params = loaded.variables["encoders"]["conditioning"]
+    for prefix, rows in (("", pipeline_record["prompts"]), ("negative_", pipeline_record["negatives"])):
+        condition = encoder.encode(params, encoder.tokenize(rows))
+        expected = arrays[f"{case}.{prefix}context"]
+        assert condition.context.shape == expected.shape
+        # Observed 2.5e-6 with the T5 segment and 6e-7 without it, which is
+        # float32 reassociation across the towers' matmuls.
+        assert relative_gap(condition.context, expected) < 1e-5
+        assert relative_gap(condition.pooled, arrays[f"{case}.{prefix}pooled"]) < 1e-6
+    # Crossing the slots is what the distinct words rule out.
+    crossed = encoder.encode(params, encoder.tokenize(
+        [{"text": row["second"], "second": row["text"], "third": row["third"]}
+         for row in pipeline_record["prompts"]]))
+    assert relative_gap(crossed.context, arrays[f"{case}.context"]) > 1e-3
+
+
+@pytest.mark.parametrize("case", PIPELINE_CASES)
+def test_published_pipeline_walk_matches_the_source(source, pipeline_record, case):
+    """`load_pretrained().text_to_image()` reproduces the source's own call.
+
+    The published directory decides everything: the transformer, the wide
+    latent VAE with its shift and scale, the flow schedule's shifted sigmas,
+    the guidance the call applies to the raw velocity, and the geometry the
+    grid is bound to. The walk starts from the source's own latents so only
+    the trajectory is under test.
+    """
+    from dew.interop.pretrained import load_pretrained
+    from dew.sampling.guidance import CFG
+
+    arrays = np.load(source / "sd3_pipeline.npz")
+    loaded = load_pretrained(str(source / case), dtype="float32", attention_impl="xla")
+    task = loaded.text_to_image()
+    prepared = task.prepare(pipeline_record["prompts"], unconditional=pipeline_record["negatives"],
+                            initial=arrays[f"{case}.x_T"], steps=pipeline_record["steps"], seed=0)
+    # The flow walk is an Euler integration with no noise draw; the key is
+    # the call's contract, not a source of difference.
+    walked = task(prepared, guidance=CFG(pipeline_record["guidance"]),
+                  key=jax.random.PRNGKey(0)).host()
+    assert relative_gap(walked.latents, arrays[f"{case}.latents"]) < 2e-5
+    images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
+    assert relative_gap(images, arrays[f"{case}.images"]) < 2e-5

@@ -211,6 +211,11 @@ def main(destination: str) -> None:
             flow[f"{name}.{key}"] = value
     record["flow"] = {"cases": sorted(FLOW_CASES), "steps": list(FLOW_STEPS),
                       "tokens": list(FLOW_TOKENS), "data_std": DATA_STD}
+    pipeline = pipeline_record(root)
+    record["pipeline"] = {"config": PIPELINE, "prompts": PROMPTS, "negatives": NEGATIVES,
+                          "t5_tokens": T5_TOKENS, "steps": PIPELINE_STEPS,
+                          "guidance": PIPELINE_GUIDANCE, "size": PIPELINE_SIZE}
+    np.savez_compressed(root / "sd3_pipeline.npz", allow_pickle=False, **pipeline)
     np.savez_compressed(root / "sd3_flow.npz", allow_pickle=False, **flow)
     np.savez_compressed(root / "sd3_transformer.npz", allow_pickle=False, **arrays)
     (root / "sd3_transformer.json").write_text(json.dumps(record, indent=1) + "\n")
@@ -229,6 +234,154 @@ def bundle(directory: str, destination: str) -> None:
                 archive.add(path, arcname=path.name)
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
+
+
+
+# G2/G4/G5: one tiny SD3 pipeline, saved the way a published checkpoint is
+# saved, walked through the source's own prompt encoding and its own call.
+PIPELINE = dict(sample_size=8, patch_size=2, in_channels=16, num_layers=2, attention_head_dim=8,
+                num_attention_heads=2, joint_attention_dim=32, caption_projection_dim=16,
+                pooled_projection_dim=10, out_channels=16, pos_embed_max_size=16,
+                qk_norm="rms_norm", dual_attention_layers=(0,))
+# Distinct text in every slot: the source routes `prompt` to CLIP-L,
+# `prompt_2` to CLIP-G and `prompt_3` to T5, so identical prompts would hide a
+# native encoder that crossed them.
+PROMPTS = [{"text": "a red cat", "second": "a blue dog", "third": "a green bird"},
+           {"text": "tiny photo", "second": "a red dog", "third": "a blue cat"}]
+NEGATIVES = [{"text": "", "second": "", "third": ""},
+             {"text": "a green cat", "second": "tiny dog", "third": "a red bird"}]
+T5_WORDS = ("<pad>", "</s>", "<unk>", "a", "red", "blue", "green", "cat", "dog", "bird",
+            "tiny", "photo")
+T5_TOKENS = 256  # the source's own `max_sequence_length` default
+PIPELINE_STEPS = 3
+PIPELINE_GUIDANCE = 3.5
+PIPELINE_SIZE = 16
+
+
+def clip_tokenizers(root: Path):
+    """The committed tiny CLIP tokenizer files, which are real published
+    byte-level BPE vocabularies rather than anything this tool invents."""
+    import tarfile
+    from transformers import CLIPTokenizer
+
+    fixture = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "tiny_diffusers.tar.xz"
+    with tarfile.open(fixture) as archive:
+        for name, source in (("tokenizer", "xl/tokenizer"), ("tokenizer_2", "xl/tokenizer_2")):
+            members = [member for member in archive.getmembers()
+                       if member.name.startswith(source + "/")]
+            for member in members:
+                member.name = name + "/" + member.name.split("/")[-1]
+            archive.extractall(root, members=members, filter="data")
+    return [CLIPTokenizer.from_pretrained(root / name) for name in ("tokenizer", "tokenizer_2")]
+
+
+def t5_tokenizer():
+    """A T5-style fast tokenizer over a fixed word vocabulary: whitespace
+    pieces and the sentinel the source's `add_special_tokens` appends."""
+    from tokenizers import Tokenizer, models, pre_tokenizers, processors
+    from transformers import PreTrainedTokenizerFast
+
+    vocab = {word: index for index, word in enumerate(T5_WORDS)}
+    inner = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
+    inner.pre_tokenizer = pre_tokenizers.Whitespace()
+    inner.post_processor = processors.TemplateProcessing(
+        single="$A </s>", special_tokens=[("</s>", vocab["</s>"])])
+    return PreTrainedTokenizerFast(tokenizer_object=inner, eos_token="</s>", unk_token="<unk>",
+                                   pad_token="<pad>", model_max_length=T5_TOKENS)
+
+
+def build_pipeline(root: Path, *, t5: bool):
+    from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, StableDiffusion3Pipeline
+    from diffusers.models.transformers.transformer_sd3 import SD3Transformer2DModel
+    from transformers import (CLIPTextConfig, CLIPTextModelWithProjection, T5Config,
+                              T5EncoderModel)
+
+    directory = root / ("pipeline" if t5 else "pipeline_no_t5")
+    tokenizers = clip_tokenizers(directory)
+    torch.manual_seed(SEED + 5)
+    widths = (8, 12)
+    towers = [CLIPTextModelWithProjection(CLIPTextConfig(
+        vocab_size=len(tokenizer.get_vocab()), hidden_size=width, intermediate_size=2 * width,
+        num_hidden_layers=2, num_attention_heads=2, projection_dim=5,
+        max_position_embeddings=tokenizer.model_max_length)).eval()
+        for tokenizer, width in zip(tokenizers, widths)]
+    encoder_3 = tokenizer_3 = None
+    if t5:
+        tokenizer_3 = t5_tokenizer()
+        encoder_3 = T5EncoderModel(T5Config(
+            vocab_size=len(T5_WORDS), d_model=PIPELINE["joint_attention_dim"], d_ff=64,
+            num_layers=2, num_heads=2, d_kv=16, relative_attention_num_buckets=8,
+            feed_forward_proj="gated-gelu")).eval()
+    vae = AutoencoderKL(in_channels=3, out_channels=3, block_out_channels=(4, 8),
+                        down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D"),
+                        up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D"),
+                        layers_per_block=1, latent_channels=PIPELINE["in_channels"],
+                        norm_num_groups=2, sample_size=PIPELINE_SIZE, shift_factor=0.0609,
+                        scaling_factor=1.5305, use_quant_conv=False,
+                        use_post_quant_conv=False).eval()
+    transformer = SD3Transformer2DModel(**PIPELINE).eval()
+    with torch.no_grad():
+        transformer.pos_embed.pos_embed.add_(
+            torch.randn_like(transformer.pos_embed.pos_embed, dtype=torch.float32) * 0.05)
+    pipe = StableDiffusion3Pipeline(
+        transformer=transformer, scheduler=FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=1000, shift=3.0),
+        vae=vae, text_encoder=towers[0], tokenizer=tokenizers[0],
+        text_encoder_2=towers[1], tokenizer_2=tokenizers[1],
+        text_encoder_3=encoder_3, tokenizer_3=tokenizer_3)
+    pipe.save_pretrained(directory, safe_serialization=True)
+    pipe.set_progress_bar_config(disable=True)
+    return pipe, directory
+
+
+def pipeline_record(root: Path) -> dict[str, np.ndarray]:
+    arrays: dict[str, np.ndarray] = {}
+    for t5 in (True, False):
+        label = "pipeline" if t5 else "pipeline_no_t5"
+        pipe, directory = build_pipeline(root, t5=t5)
+        with torch.no_grad():
+            embeds, negative_embeds, pooled, negative_pooled = pipe.encode_prompt(
+                prompt=[row["text"] for row in PROMPTS],
+                prompt_2=[row["second"] for row in PROMPTS],
+                prompt_3=[row["third"] for row in PROMPTS],
+                negative_prompt=[row["text"] for row in NEGATIVES],
+                negative_prompt_2=[row["second"] for row in NEGATIVES],
+                negative_prompt_3=[row["third"] for row in NEGATIVES],
+                device=torch.device("cpu"), num_images_per_prompt=1,
+                do_classifier_free_guidance=True)
+        arrays[f"{label}.context"] = embeds.numpy()
+        arrays[f"{label}.pooled"] = pooled.numpy()
+        arrays[f"{label}.negative_context"] = negative_embeds.numpy()
+        arrays[f"{label}.negative_pooled"] = negative_pooled.numpy()
+        generator = torch.Generator().manual_seed(SEED + 7)
+        latents = torch.randn((len(PROMPTS), PIPELINE["in_channels"],
+                               PIPELINE_SIZE // 2 // PIPELINE["patch_size"] * PIPELINE["patch_size"],
+                               PIPELINE_SIZE // 2), generator=generator, dtype=torch.float32)
+        with torch.no_grad():
+            walked = pipe(prompt=[row["text"] for row in PROMPTS],
+                          prompt_2=[row["second"] for row in PROMPTS],
+                          prompt_3=[row["third"] for row in PROMPTS],
+                          negative_prompt=[row["text"] for row in NEGATIVES],
+                          negative_prompt_2=[row["second"] for row in NEGATIVES],
+                          negative_prompt_3=[row["third"] for row in NEGATIVES],
+                          num_inference_steps=PIPELINE_STEPS, guidance_scale=PIPELINE_GUIDANCE,
+                          height=PIPELINE_SIZE, width=PIPELINE_SIZE,
+                          latents=latents.clone(), output_type="latent").images
+            images = pipe(prompt=[row["text"] for row in PROMPTS],
+                          prompt_2=[row["second"] for row in PROMPTS],
+                          prompt_3=[row["third"] for row in PROMPTS],
+                          negative_prompt=[row["text"] for row in NEGATIVES],
+                          negative_prompt_2=[row["second"] for row in NEGATIVES],
+                          negative_prompt_3=[row["third"] for row in NEGATIVES],
+                          num_inference_steps=PIPELINE_STEPS, guidance_scale=PIPELINE_GUIDANCE,
+                          height=PIPELINE_SIZE, width=PIPELINE_SIZE,
+                          latents=latents.clone(), output_type="np").images
+        arrays[f"{label}.x_T"] = latents.permute(0, 2, 3, 1).numpy()
+        arrays[f"{label}.latents"] = walked.permute(0, 2, 3, 1).numpy()
+        arrays[f"{label}.images"] = images
+        print(f"{label}: context {tuple(embeds.shape)} pooled {tuple(pooled.shape)} "
+              f"latents {tuple(walked.shape)} |image| <= {float(np.abs(images).max()):.4g}")
+    return arrays
 
 if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[1] == "bundle":
