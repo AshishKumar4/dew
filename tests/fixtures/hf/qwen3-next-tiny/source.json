@@ -1,0 +1,14 @@
+{
+ "released": {
+  "repo": "Qwen/Qwen3-Next-80B-A3B-Instruct",
+  "revision": "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7"
+ },
+ "transformers": {
+  "version": "5.16.1",
+  "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"
+ },
+ "vllm": {
+  "revision": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
+  "mtp_file": "vllm/model_executor/models/qwen3_next_mtp.py"
+ }
+}

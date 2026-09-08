@@ -94,6 +94,7 @@ from transformers import (
     DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma3nTextConfig, Gemma4TextConfig, Glm4MoeConfig, Glm4MoeForCausalLM,
     GlmMoeDsaConfig, GlmMoeDsaForCausalLM, Llama4TextConfig,
+    Qwen3NextConfig, Qwen3NextForCausalLM,
 )
 from transformers.masking_utils import create_causal_mask, create_chunked_causal_mask
 from transformers.models.gemma3n.modeling_gemma3n import (
@@ -116,6 +117,7 @@ from hf_reference import (  # noqa: E402
     write_tiny,
 )
 from moe_reference import expert_tensors  # noqa: E402
+from qwen_mtp_reference import QwenMTP  # noqa: E402
 
 
 def tiny_deepseek_v2() -> DeepseekV2ForCausalLM:
@@ -427,6 +429,86 @@ def write_glm_moe_dsa_head_dim(name: str) -> None:
           f"{saved['qk_rope_head_dim']} reloads bit for bit")
 
 
+# Qwen/Qwen3-Next-80B-A3B-Instruct at revision 9c7f2fbe, scaled to a
+# fixture. The release's proportions at a hidden width of 64: the dense
+# intermediate_size 2.5x that width (160), the routed and shared expert
+# widths 0.25x (16), the attention's q heads spanning 2x the width (8 heads
+# of 16) over one key/value head (the release's 16:2), the delta net with
+# twice as many value heads as key heads and a 3:1 linear-to-full pattern
+# derived from full_attention_interval 4, as the release leaves layer_types
+# unset. Its own values, unscaled: rope_theta 1e7 with partial_rotary_factor
+# 0.25, every layer routed (mlp_only_layers [], decoder_sparse_step 1),
+# norm_topk_prob, rms_norm_eps 1e-6, untied embeddings. 512 experts with 10
+# per token do not survive a fixture; eight with two per token keep a
+# routed layer whose renormalised top-k the reference computes.
+# `num_nextn_predict_layers` declares the prediction layer the release ships
+# as mtp.* tensors (vllm qwen3_next_mtp.py:59 reads it, defaulting to 1);
+# the released config leaves it unset and transformers ignores the tensors.
+QWEN3_NEXT_TINY = dict(
+    vocab_size=256, hidden_size=64, intermediate_size=160, moe_intermediate_size=16,
+    shared_expert_intermediate_size=16, num_hidden_layers=4, num_attention_heads=8,
+    num_key_value_heads=1, head_dim=16, linear_num_key_heads=2, linear_num_value_heads=4,
+    linear_key_head_dim=8, linear_value_head_dim=12, linear_conv_kernel_dim=4,
+    num_experts=8, num_experts_per_tok=2, decoder_sparse_step=1, mlp_only_layers=[],
+    norm_topk_prob=True, full_attention_interval=4, rope_theta=1e7, partial_rotary_factor=0.25,
+    hidden_act="silu", max_position_embeddings=64, rms_norm_eps=1e-6,
+    tie_word_embeddings=False, attention_bias=False, num_nextn_predict_layers=1,
+)
+
+
+def tiny_qwen3_next() -> Qwen3NextForCausalLM:
+    torch.manual_seed(0)
+    return Qwen3NextForCausalLM(Qwen3NextConfig.from_dict(dict(QWEN3_NEXT_TINY)))
+
+
+def write_qwen3_next_mtp(name: str, model: Qwen3NextForCausalLM, repo: str,
+                         seed: int = 2027) -> None:
+    """The prediction layer's tensors under vLLM's mtp.* names beside the
+    fixture's, its logits over the trunk's hidden states, and the release
+    the fixture was scaled from.
+
+    The trunk's experts are one tensor per expert, the release's layout,
+    which `save_pretrained` writes by reversing its load-time packing; the
+    depth's are written the same way. `Qwen3NextConfig` neither declares nor
+    writes `num_nextn_predict_layers`, so the saved config gets it back, and
+    `full_attention_interval` beside the derived layer_types, the way the
+    release spells its pattern.
+    """
+    from huggingface_hub import model_info
+
+    directory = FIXTURES / name
+    depth = QwenMTP(model.config).eval()
+    scatter_weights(depth, seed)
+    ids = torch.from_numpy(np.load(directory / "input_ids.npy").astype(np.int64))
+    with torch.no_grad():
+        hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state
+        embeddings = model.model.embed_tokens(ids)
+        positions = torch.arange(ids.shape[1])[None].expand(ids.shape[0], -1)
+        valid = torch.ones(ids.shape[0], ids.shape[1] - 1, dtype=torch.bool)
+        logits = model.lm_head(depth(hidden[:, :-1], embeddings[:, 1:], positions[:, 1:], valid))
+    tensors = load_file(str(directory / "model.safetensors"))
+    for tensor_name, tensor in depth.state_dict().items():
+        if not tensor_name.startswith("layers.0.mlp.experts."):
+            tensors["mtp." + tensor_name] = tensor.to(torch.float32).numpy()
+    for tensor_name, tensor in expert_tensors(depth.layers[0].get_submodule("mlp.experts")).items():
+        tensors["mtp.layers.0." + tensor_name] = tensor
+    save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+    np.savez(directory / "mtp_reference.npz", logits=logits.numpy(), hidden=hidden.numpy(),
+             embeddings=embeddings.numpy(), positions=positions.numpy(), valid=valid.numpy())
+    config = json.loads((directory / "config.json").read_text())
+    config.update(num_nextn_predict_layers=QWEN3_NEXT_TINY["num_nextn_predict_layers"],
+                  full_attention_interval=QWEN3_NEXT_TINY["full_attention_interval"])
+    (directory / "config.json").write_text(json.dumps(dict(sorted(config.items())), indent=1) + "\n")
+    (directory / "source.json").write_text(json.dumps({
+        "released": {"repo": repo, "revision": model_info(repo).sha},
+        "transformers": {"version": transformers.__version__,
+                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
+        "vllm": {"revision": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
+                 "mtp_file": "vllm/model_executor/models/qwen3_next_mtp.py"},
+    }, indent=1) + "\n")
+    print(f"{directory}: mtp.* depth with {len(tensors)} tensors, mtp logits {tuple(logits.shape)}")
+
+
 def llama4_tiny_config() -> Llama4TextConfig:
     """Every fourth layer global, so the pattern holds one of each kind;
     floor_scale 4 makes the temperature bite inside twelve positions."""
@@ -634,6 +716,10 @@ def main() -> None:
     write_tiny("glm-moe-dsa-tiny", dsa, seed=GLM_MOE_DSA_SEED)
     write_glm_mtp("glm-moe-dsa-tiny", dsa, glm_moe_dsa_mtp(dsa.config))
     write_glm_moe_dsa_head_dim("glm-moe-dsa-tiny")
+    qwen3_next = tiny_qwen3_next()
+    write_tiny("qwen3-next-tiny", qwen3_next)
+    write_qwen3_next_mtp("qwen3-next-tiny", qwen3_next, "Qwen/Qwen3-Next-80B-A3B-Instruct")
+    write_released_config("qwen3-next-80b-a3b", "Qwen/Qwen3-Next-80B-A3B-Instruct")
     write_tiny("llama4-tiny", tiny_llama4())
     write_llama4_blocks(FIXTURES.parent / "llama4")
     write_mirrored_config("llama-4-scout", "unsloth/Llama-4-Scout-17B-16E")

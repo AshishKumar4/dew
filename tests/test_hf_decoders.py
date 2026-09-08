@@ -58,6 +58,11 @@ Tolerances and the differences actually observed, fp32 on CPU:
   magnitude 6.8. Three gated delta net layers and one gated attention layer
   with a sliced quarter-head rope; the delta net's own numbers are in
   tests/test_linear_attention.py.
+- qwen3-next-tiny: max |logit difference| 2.3e-05 on the trunk and 1.8e-05
+  on the MTP layer, on logits of magnitude 6.6, tolerance 1e-4 scaled by
+  that magnitude. The Qwen3.5 hybrid with the delta net's projections fused
+  and grouped by key head, and every layer routing softmax top-2 over eight
+  experts beside a sigmoid-gated shared expert.
 - gpt-oss-tiny: max |logit difference| 2.5e-06, tolerance 1e-4. Sink
   attention on a sliding and a full layer, YaRN over grouped-query heads,
   the biased router and the clamped interleaved experts; the block's own
@@ -1649,6 +1654,207 @@ def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
 
     difference = float(jnp.abs(full[:, 3:] - incremental).max())
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
+
+
+# --------------------------------------------------------------------------
+# Qwen3-Next: the Qwen3.5 hybrid with fused delta net projections and MoE
+# --------------------------------------------------------------------------
+
+QWEN3_NEXT = FIXTURES / "qwen3-next-tiny"
+QWEN3_NEXT_REAL = FIXTURES / "qwen3-next-80b-a3b"
+
+
+def scaled_difference(ours, theirs) -> float:
+    return float(np.max(np.abs(ours - theirs)) / np.max(np.abs(theirs)))
+
+
+def test_qwen3_next_config_translates_field_by_field():
+    """The delta net kind carries `fused_in_proj`, every layer routes with
+    the shared expert gated, the dense width stays the model's, and the rest
+    is the Qwen3.5 hybrid."""
+    config = translate_config(fixture_config("qwen3-next-tiny"))
+
+    assert config["layer_types"] == ("linear_attention",) * 3 + ("full_attention",)
+    assert config["kinds"] == {"linear_attention": {"mixer": {
+        "kind": "gated_delta_net", "linear_num_key_heads": 2,
+        "linear_num_value_heads": 4, "linear_key_head_dim": 8,
+        "linear_value_head_dim": 12, "linear_conv_kernel_dim": 4, "fused_in_proj": True}}}
+    assert config["mixture"] == {"experts": 8, "top_k": 2, "layers": (0, 1, 2, 3),
+                                 "norm_topk_prob": True, "expert_features": 16,
+                                 "shared_features": 16, "shared_gate": True}
+    assert config["mlp_features"] == 160
+    assert config["output_gate"] and config["scale_offset"] and config["qk_norm"]
+    assert config["partial_rotary_factor"] == 0.25 and config["partial_rotary_type"] == "default"
+    assert config["rope_theta"] == 1e7 and not config["tie_embeddings"]
+    assert config["num_nextn_predict_layers"] == 1
+
+
+def test_the_real_qwen3_next_80b_config_translates():
+    """Qwen/Qwen3-Next-80B-A3B-Instruct's config, field for field: 48 layers
+    in the 3:1 pattern derived from full_attention_interval, 16 key and 32
+    value heads of 128 in the delta net, 16 query and 2 key/value heads of
+    256 with a 64-dim rope at theta 1e7, 512 experts with 10 per token
+    beside a 512-wide shared expert on every layer, and no prediction layer
+    declared."""
+    config = translate_config(json.loads((QWEN3_NEXT_REAL / "config.json").read_text()))
+
+    assert config["num_layers"] == 48 and config["layer_types"][3::4] == ("full_attention",) * 12
+    assert config["kinds"]["linear_attention"]["mixer"] == {
+        "kind": "gated_delta_net", "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32, "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128, "linear_conv_kernel_dim": 4, "fused_in_proj": True}
+    assert config["num_heads"] == 16 and config["num_kv_heads"] == 2 and config["head_dim"] == 256
+    assert int(config["head_dim"] * config["partial_rotary_factor"]) == 64
+    assert config["rope_theta"] == 1e7 and config["mlp_features"] == 5120
+    assert config["mixture"] == {"experts": 512, "top_k": 10, "layers": tuple(range(48)),
+                                 "norm_topk_prob": True, "expert_features": 512,
+                                 "shared_features": 512, "shared_gate": True}
+    assert config["num_nextn_predict_layers"] == 0 and not config["tie_embeddings"]
+
+
+def test_qwen3_next_logits_match_the_reference_implementation():
+    """Full-model parity on the tiny hybrid: three fused delta net layers,
+    the gated attention, and softmax top-2 routing with the gated shared
+    expert on every layer. Largest observed max |logit difference| 2.3e-05
+    on logits of magnitude 6.6, every argmax equal."""
+    model, variables = fp32_decoder(QWEN3_NEXT)
+    ids = np.load(QWEN3_NEXT / "input_ids.npy")
+    reference = np.load(QWEN3_NEXT / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    assert scaled_difference(logits, reference) < 1e-4
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_qwen3_next_prediction_layer_matches_the_published_composition():
+    """The mtp.* tensors compose as vLLM's Qwen3NextMultiTokenPredictor does
+    over the trunk's hidden states; the fixture records that composition
+    run on the reference's own decoder layer. Largest observed difference
+    1.8e-05."""
+    model, variables = fp32_decoder(QWEN3_NEXT)
+    ids = jnp.asarray(np.load(QWEN3_NEXT / "input_ids.npy"), jnp.int32)
+    reference = np.load(QWEN3_NEXT / "mtp_reference.npz")
+
+    hidden = model.apply(variables, ids, method=model.hidden_states)
+    predictions = model.apply(variables, hidden, ids, method=model.mtp_logits)[0]
+
+    assert scaled_difference(np.asarray(predictions), reference["logits"]) < 1e-4
+
+
+def test_qwen3_next_weights_are_exactly_the_models_param_tree(rng):
+    """The fused in_proj_qkvz and in_proj_ba land under self_attn at the
+    checkpoint's widths, the packed experts unpack into stacked kernels, and
+    nothing is left over or missing."""
+    from dew.interop.hf_decoders import _load_shards
+
+    config = translate_config(fixture_config("qwen3-next-tiny"))
+    built = with_precision("causal_transformer", dict(config),
+                           dtype="float32", attention_impl="reference")
+    model = models.build("causal_transformer", **built)
+    expected = flat_tree(model.init(rng, jnp.ones((1, 4), jnp.int32))["params"])
+    loaded = flat_tree(translate_weights(_load_shards(QWEN3_NEXT), config)["params"])
+
+    assert set(loaded) == set(expected)
+    assert {name: leaf.shape for name, leaf in loaded.items()} == {
+        name: leaf.shape for name, leaf in expected.items()}
+    assert loaded["layers_0.self_attn.in_proj_qkvz.kernel"].shape == (64, 2 * 16 + 2 * 48)
+    assert loaded["layers_0.self_attn.in_proj_ba.kernel"].shape == (64, 8)
+    assert loaded["layers_0.mlp.experts.gate_proj.kernel"].shape == (8, 64, 16)
+    assert loaded["layers_3.self_attn.q_proj.kernel"].shape == (64, 2 * 8 * 16)
+
+
+def test_the_fused_delta_net_projection_is_read_by_key_head_group():
+    """`fix_query_key_value_ordering` (modeling_qwen3_next.py:558-586) splits
+    each key head's row group into its q, k and the v and z of the value
+    heads it serves, so the fused kernel is not q|k|v|z stacked whole. The
+    split-projection model on the regrouped rows must compute the same
+    layer; on the rows stacked whole it must not."""
+    from dew.nn.linear import GatedDeltaNet
+
+    def net(fused: bool) -> GatedDeltaNet:
+        return GatedDeltaNet(emb_features=16, num_k_heads=2, num_v_heads=4, head_k_dim=4,
+                             head_v_dim=6, fused_in_proj=fused)
+
+    fused, split = net(True), net(False)
+    x = jax.random.normal(jax.random.key(0), (1, 5, 16))
+    variables = fused.init(jax.random.key(1), x)
+    params = dict(variables["params"])
+    qkvz_kernel = np.asarray(params.pop("in_proj_qkvz")["kernel"])
+    ba_kernel = np.asarray(params.pop("in_proj_ba")["kernel"])
+    q, k, v, z = np.split(qkvz_kernel.reshape(16, 2, 2 * 4 + 2 * 2 * 6), [4, 8, 8 + 12], axis=-1)
+    ba = ba_kernel.reshape(16, 2, 4)
+    regrouped = {**params,
+                 "in_proj_qkv": {"kernel": np.concatenate([q.reshape(16, -1), k.reshape(16, -1), v.reshape(16, -1)], -1)},
+                 "in_proj_z": {"kernel": z.reshape(16, -1)},
+                 "in_proj_b": {"kernel": ba[..., :2].reshape(16, -1)},
+                 "in_proj_a": {"kernel": ba[..., 2:].reshape(16, -1)}}
+    whole = {**regrouped,
+             "in_proj_qkv": {"kernel": qkvz_kernel[:, :2 * 8 + 24]},
+             "in_proj_z": {"kernel": qkvz_kernel[:, 2 * 8 + 24:]}}
+
+    wanted = np.asarray(fused.apply(variables, x))
+    np.testing.assert_allclose(np.asarray(split.apply({"params": regrouped}, x)), wanted, atol=1e-6, rtol=0)
+    assert float(np.abs(np.asarray(split.apply({"params": whole}, x)) - wanted).max()) > 1e-2
+
+
+def test_a_qwen3_next_config_derives_the_reference_pattern_and_routed_layers():
+    """Without layer_types the 3:1 pattern comes from full_attention_interval
+    (configuration_qwen3_next.py:131-136), and mlp_only_layers with
+    decoder_sparse_step pick the routed layers the way the reference does
+    (modeling_qwen3_next.py:813-818); the expected pattern comes from the
+    reference class, not from a copy of the rule."""
+    from transformers.models.qwen3_next.configuration_qwen3_next import Qwen3NextConfig
+
+    config = {**fixture_config("qwen3-next-tiny"), "num_hidden_layers": 6,
+              "full_attention_interval": 3, "decoder_sparse_step": 2, "mlp_only_layers": [3]}
+    del config["layer_types"]
+
+    translated = translate_config(config)
+
+    reference = Qwen3NextConfig(**{**config, "layer_types": None}).layer_types
+    assert list(translated["layer_types"]) == reference
+    assert translated["layer_types"] == ("linear_attention", "linear_attention", "full_attention") * 2
+    assert translated["mixture"]["layers"] == (1, 5)
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("rope_scaling", {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 64},
+     "rope_scaling"),
+    ("num_nextn_predict_layers", 2, "num_nextn_predict_layers"),
+    ("decoder_sparse_step", 0, "decoder_sparse_step"),
+    ("layer_types", ["mamba"] * 4, "linear_attention or full_attention"),
+])
+def test_a_qwen3_next_field_with_no_counterpart_is_refused(field, value, message):
+    """The YaRN the model card suggests past 256K, more than the one
+    prediction layer vLLM builds, a zero sparse step and a foreign layer kind
+    each refuse by name."""
+    config = {**fixture_config("qwen3-next-tiny"), field: value}
+    with pytest.raises(ValueError, match=message):
+        translate_config(config)
+
+
+def test_a_qwen3_next_checkpoint_decodes_as_it_scores_in_parallel():
+    """The fused delta net's conv and recurrent states through the cache: a
+    prefill and single-token steps against the parallel forward, every
+    argmax equal."""
+    model, variables = fp32_decoder(QWEN3_NEXT, max_seq_len=16)
+    ids = jnp.asarray(np.load(QWEN3_NEXT / "input_ids.npy"), jnp.int32)
+    full = jnp.asarray(model.apply(variables, ids))
+
+    cache = model.apply(variables, ids.shape[0], method="init_cache",
+                        mutable=["cache"])[1]["cache"]
+    logits, mutated = model.apply({**variables, "cache": cache}, ids[:, :4],
+                                  decode=True, mutable=["cache"])
+    steps = [logits[:, -1]]
+    for position in range(4, ids.shape[1]):
+        logits, mutated = model.apply({**variables, **mutated}, ids[:, position:position + 1],
+                                      decode=True, mutable=["cache"])
+        steps.append(logits[:, -1])
+    incremental = jnp.stack(steps, axis=1)
+
+    assert scaled_difference(np.asarray(incremental), np.asarray(full[:, 3:])) < 1e-4
     assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
 
 
