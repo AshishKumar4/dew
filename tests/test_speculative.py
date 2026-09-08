@@ -258,7 +258,7 @@ def test_a_rejected_prefix_leaves_the_prediction_cache_teacher_forced():
         model.apply(params, emitted, method=model.token_embeddings),
         jnp.ones((2, 2), bool),
         jnp.broadcast_to(jnp.arange(prompt.shape[1], width)[None, :], (2, 2)),
-        jnp.ones(2, jnp.int32))
+        jnp.ones(2, jnp.int32), prior_tokens=jnp.full(2, prompt.shape[1], jnp.int32))
     _, cached, _ = ops.propose(state, ahead[:, -1:], jnp.asarray([[7], [7]], jnp.int32), None,
                                jnp.ones((2, 1), bool), jnp.full((2, 1), width, jnp.int32), 0)
 
@@ -337,7 +337,7 @@ def test_the_prediction_cache_matches_a_teacher_forced_reference():
     full = reseed(ops, full, (states[:, width - 1],), states[:, width - 1:width],
                   model.apply(params, grown[:, width:width + 1], method=model.token_embeddings),
                   jnp.ones((2, 1), bool), jnp.full((2, 1), width, jnp.int32),
-                  jnp.zeros(2, jnp.int32))[0]
+                  jnp.zeros(2, jnp.int32), prior_tokens=jnp.full(2, width, jnp.int32))[0]
     _, after, _ = ops.propose(full, ahead[:, width:width + 1], jnp.asarray([[5], [5]], jnp.int32),
                               None, jnp.ones((2, 1), bool),
                               jnp.full((2, 1), width + 1, jnp.int32), 0)
@@ -373,7 +373,7 @@ def test_a_second_prediction_depth_is_seeded_the_way_the_model_trains_it():
         model.apply(params, prompt[:, 1:], method=model.token_embeddings),
         jnp.ones((2, width - 1), bool),
         jnp.broadcast_to(jnp.arange(1, width)[None, :], (2, width - 1)),
-        jnp.full(2, width - 2, jnp.int32))
+        jnp.full(2, width - 2, jnp.int32), prior_tokens=jnp.ones(2, jnp.int32))
 
     assert len(produced) == 2 == len(trained)
     for depth, (cached, reference) in enumerate(zip(produced, trained)):
@@ -547,7 +547,41 @@ def test_a_cold_prompt_holds_its_second_depth_back_until_it_has_a_predecessor():
                             states[:, 1:], model.apply(params, emitted,
                                                        method=model.token_embeddings),
                             jnp.ones((1, 2), bool), jnp.asarray([[1, 2]], jnp.int32),
-                            jnp.ones(1, jnp.int32))
+                            jnp.ones(1, jnp.int32), prior_tokens=jnp.ones(1, jnp.int32))
     # Depth two's only entry is at coordinate two, and it is the trained one.
     largest = float(np.max(np.abs(np.asarray(produced[1])[:, 1] - np.asarray(trained[1])[:, -1])))
     assert largest < 3e-5, f"largest difference {largest:g}"
+
+
+@pytest.mark.parametrize("prefix, coordinates", [(1, "offset"), (2, "ordinary"), (4, "repeated")])
+def test_prediction_depths_resume_from_real_history_not_rotary_coordinates(prefix, coordinates):
+    """Cached proposal logits match training across depth-readiness boundaries.
+
+    Rotary offsets and repeated image coordinates do not create or remove
+    predecessors. A depth that just became valid must also reach the next
+    depth across a block boundary.
+    """
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.strategies import reseed
+    from dew.sampling.text import _operations, _prefill
+
+    model = predictor(num_nextn_predict_layers=2)
+    whole = jnp.arange(1, prefix + 4, dtype=jnp.int32)[None, :]
+    positions = (jnp.zeros_like(whole) if coordinates == "repeated" else
+                 jnp.arange(whole.shape[1], dtype=jnp.int32)[None, :]
+                 + (20 if coordinates == "offset" else 0))
+    params = model.init(jax.random.key(13), whole)
+    hidden = model.apply(params, whole, positions=positions, method=model.hidden_states)
+    reference = model.apply(params, hidden, whole, positions=positions, method=model.mtp_logits)[1]
+    ops = _operations(model, params, 0, 2)
+    state, _ = _prefill(model, params,
+                         ModelInputs(whole[:, :prefix], {"positions": positions[:, :prefix]}), ops)
+    emitted = whole[:, prefix:-1]
+    state, _, carried = reseed(
+        ops, state, (state.hidden,) + state.drafts[1:], hidden[:, prefix:-1],
+        ops.embed(emitted), jnp.ones(emitted.shape, bool), positions[:, prefix:-1],
+        jnp.asarray([emitted.shape[1] - 1], jnp.int32),
+        prior_tokens=jnp.asarray([prefix], jnp.int32))
+    _, proposed, _ = ops.propose(state, carried[1][:, None], whole[:, -1:], None,
+                                 jnp.ones((1, 1), bool), positions[:, -1:], 1)
+    np.testing.assert_allclose(proposed[:, 0], reference[:, -1], atol=3e-6, rtol=0)

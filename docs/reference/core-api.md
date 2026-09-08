@@ -293,7 +293,24 @@ Speculative(block=4, confidence=0.0)
 
 The target cache is saved before a block and the accepted prefix is replayed into it, because a recurrent mixer keeps a running summary no cursor can rewind. The prediction cache is rebuilt on the same invariant: depth `d`'s entry for token `t` reads depth `d - 1`'s hidden state at `t - 1` and `t`'s own prepared embedding, at `t`'s own coordinate, with the target as depth zero's predecessor. That is what `mtp_hidden_states` trains the depths on, what `MTPCandidateGenerator` corrects with and what `Qwen3_5MultiTokenPredictor.forward` takes. Each depth carries its last state across blocks, so a boundary loses no entry, and the prompt seeds every depth from the embeddings the prefill already prepared, media replacements included, without running an encoder again.
 
-A block emits at least two tokens, so `ceil(budget / 2)` iterations always reach the budget, and a block costs two target forwards whatever its size. Once every row has finished or spent its budget the remaining iterations run no model call at all; the predicate is a reduction over the whole batch, so a pool skips the same blocks.
+A depth becomes usable after enough real tokens have preceded it. Rotary offsets and repeated image coordinates do not change that count. A newly available predecessor is retained even if its next depth cannot yet write a cache entry.
+
+A continuing block emits at least two tokens when the remaining budget allows it. An EOS or the budget can truncate the block earlier. Thus `ceil(budget / 2)` iterations bound the loop. Each active block uses two target forwards. Once every row has finished, later iterations run no model call. The predicate reduces the whole batch, so every rank skips the same blocks.
+
+#### Existing JAX decoding
+
+[T5X decoding](https://t5x.readthedocs.io/en/latest/api_reference/t5x.decoding.html) provides JAX sampling and beam search with model callbacks and explicit cache state. Its [upstream tests](https://github.com/google-research/t5x/blob/0e2a6a810179baf684c0d3a74ffaacdbe9bd305c/t5x/decoding_test.py) cover uneven prefixes, cached starts, callbacks and probability scores. The comparison below uses that pinned revision.
+
+| Capability | T5X contract | Fit for Dew |
+| --- | --- | --- |
+| Model callback | [`DecodingState` and `tokens_to_logits`](https://github.com/google-research/t5x/blob/0e2a6a810179baf684c0d3a74ffaacdbe9bd305c/t5x/decoding.py#L34-L127) separate the loop from model execution. | Adapt this separation. `Strategy` receives model operations; parameters stay outside the row carry. |
+| Likelihoods | [`temperature_sample`](https://github.com/google-research/t5x/blob/0e2a6a810179baf684c0d3a74ffaacdbe9bd305c/t5x/decoding.py#L530-L584) returns one cumulative score per continuation. `rescale_log_probs=False` still scores logits after the logit callback. | Reference only. Rollouts need both original-model and actual-policy log probabilities for every emitted token. |
+| Multiple continuations | [Expansion and final sorting](https://github.com/google-research/t5x/blob/0e2a6a810179baf684c0d3a74ffaacdbe9bd305c/t5x/decoding.py#L351-L402) duplicate the cache and order each prompt’s samples by score. | Reference only. Dew preserves continuation identities and their row-owned keys. `Sample` shares prefill and reuses its working cache across continuations. |
+| Cache reparenting | [`cache_map` and `cache_gather_beams`](https://github.com/google-research/t5x/blob/0e2a6a810179baf684c0d3a74ffaacdbe9bd305c/t5x/decoding.py#L727-L854) use named exclusions and an axis offset for scanned caches. | Adapt the operation, not the leaf rules. Dew’s public cache has row axis zero, including GDN recurrence, MLA buffers and multimodal coordinates. |
+| Beam ranking | [`brevity_penalty`](https://github.com/google-research/t5x/blob/0e2a6a810179baf684c0d3a74ffaacdbe9bd305c/t5x/decoding.py#L713-L725) uses `((5 + length) / 6) ** alpha`. | Reference only for source parity. Transformers uses generated length raised to `length_penalty`; the rankings can differ. |
+| Ordered transforms | The [logit callback precedes T5X’s temperature and top-k/top-p processing](https://github.com/google-research/t5x/blob/0e2a6a810179baf684c0d3a74ffaacdbe9bd305c/t5x/decoding.py#L424-L557). | A complete callback chain can adapt this interface by disabling that processing. It does not supply Dew’s two likelihood tracks or speculative verification. |
+
+The fit is reference and oracle use, with selective adaptation of the state and cache operations. T5X is not a runtime dependency. Its JAX loops are not inherently incompatible with ragged MoE. Dew still owns row placement, inactive-row masks and collective agreement around model calls. The public T5X return contract does not replace those responsibilities.
 
 #### Source generation controls
 

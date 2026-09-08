@@ -103,7 +103,8 @@ class Strategy(Protocol):
 
 def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None],
            states: jax.Array, embeds: jax.Array, valid: jax.Array, positions: jax.Array,
-           last: jax.Array) -> tuple[DecoderState, list[jax.Array], tuple[jax.Array, ...]]:
+           last: jax.Array, *, prior_tokens: jax.Array
+           ) -> tuple[DecoderState, list[jax.Array], tuple[jax.Array, ...]]:
     """Write the prediction cache a stretch of history leaves behind.
 
     One invariant covers every depth: the entry for token `t` at depth `d`
@@ -115,12 +116,11 @@ def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None
 
     `carry` holds each depth's predecessor state at the position before this
     stretch, so a block continues where the last one stopped instead of losing
-    the entry on the boundary. Depth `d` first has an entry at position
-    `d + 1`, because that is the first token with `d + 1` tokens behind it, so
-    the coordinates decide which slots a depth writes rather than any count of
-    calls: a row with a one-token prompt starts its second depth two tokens
-    later than a row with a long one. `embeds` are the prepared embeddings, so
-    a media replacement reaches the depths without running its encoder again.
+    the entry on the boundary. `prior_tokens` counts the real tokens before
+    this stretch. Depth `d` needs `d + 1` predecessors; rotary coordinates
+    cannot determine that count. A newly available predecessor is retained
+    even when its next depth cannot write an entry yet. `embeds` are the
+    prepared embeddings, including media replacements from the first prefill.
     `last` is each row's final written slot, and a row that wrote nothing
     keeps its carry.
     """
@@ -128,18 +128,19 @@ def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None
     produced: list[jax.Array] = []
     if propose is None:
         return state, produced, tuple(item for item in carry if item is not None)
+    ordinal = prior_tokens[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
     upstream, tails = states, []
     for depth in range(ops.depths):
         head = carry[depth] if depth < len(carry) else None
         before = jnp.concatenate(
             [(jnp.zeros_like(upstream[:, 0]) if head is None else head)[:, None],
              upstream[:, :-1]], axis=1)
-        reached = positions if positions.ndim == 2 else jnp.max(positions, axis=-1)
-        ready = valid & (reached >= depth + 1)
+        ready = valid & (ordinal > depth)
         state, _, out = propose(state, before, None, embeds, ready, positions, depth)
         produced.append(out)
-        held = out[:, 0] if head is None else head
-        tails.append(jnp.where(jnp.any(ready, axis=1)[:, None],
+        held = jnp.zeros_like(upstream[:, 0]) if head is None else head
+        predecessor_ready = jnp.any(valid & (ordinal >= depth), axis=1)
+        tails.append(jnp.where(predecessor_ready[:, None],
                                jnp.take_along_axis(upstream, last[:, None, None], axis=1)[:, 0],
                                held))
         upstream = out
@@ -436,8 +437,8 @@ class Speculative:
     target cache is saved before the block and the accepted prefix is replayed
     into it, because a recurrent mixer's state is a running summary that no
     cursor can rewind, and the prediction cache is rebuilt the same way. A
-    block emits at least two tokens, so `ceil(budget / 2)` iterations always
-    reach the budget.
+    continuing block emits two or more tokens unless the budget ends first,
+    so `ceil(budget / 2)` iterations bound the loop.
 
     `confidence` stops the draft after the first candidate the draft itself is
     less sure of than that, as the reference's `ConfidenceCriteria` does. The
@@ -612,7 +613,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
         assert ops.embed is not None
         following, _, carried = reseed(
             ops, following, (state.hidden,) + tuple(state.drafts[1:]), seen, ops.embed(emitted),
-            keep, base, jnp.maximum(count - 1, 0))
+            keep, base, jnp.maximum(count - 1, 0), prior_tokens=step.total())
         following = dataclasses.replace(following, drafts=carried)
         return (following, committed, terminated, out), None
 
