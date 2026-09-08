@@ -1,6 +1,7 @@
-"""Trained source-format exports of the routed decoder families.
+"""Trained source-format exports of the routed and per-kind-rope decoder
+families.
 
-`load_pretrained` binds every tensor of a routed checkpoint to the leaf it
+`load_pretrained` binds every tensor of these checkpoints to the leaf it
 loaded into, so a trained model writes back into the source's own tensor
 names beside the config and generation config it came with, rather than a
 config derived from the built model. These cases run that path end to end
@@ -24,12 +25,17 @@ Observed on CPU in fp32, every position's argmax equal and the tolerance
 | deepseek_v3  |             53 |         24 |                  5.1e-06 |
 | deepseek_v32 |             63 |         24 |                  3.4e-06 |
 | llama4_text  |             45 |          0 |                  4.2e-06 |
+| olmo3        |             47 |          0 |                  3.6e-06 |
 
 Llama 4 ships one fused `experts.gate_up_proj` per routed layer instead of
 one tensor per expert, so its export runs the fused path and holds no
 indexed binding. transformers' Glm4Moe has no MTP depth and ignores those
 tensors of the GLM checkpoint, so the reference agrees on the trunk and the
-depth's own weights are held to account through the dew reload.
+depth's own weights are held to account through the dew reload. OLMo 3 is
+the dense case, and the one whose rotary differs between its layer kinds:
+its fixture carries the released 7B YaRN on the full-attention layers
+alone, so the export has to write that per-kind rope back and not one
+table for the model.
 
 The tiny checkpoints carry no tokenizer, so the tokenizer half of an export
 is exercised on a copy of one with the committed byte-level BPE beside it.
@@ -121,11 +127,15 @@ def test_every_source_tensor_is_bound_or_retained_and_written_back(trip):
 
 
 def test_the_export_carries_the_trained_weights_not_the_loaded_ones(trip):
-    """One SGD step moves the embedding, the routed experts and the router,
-    and it is the moved values the source layout writes back."""
+    """One SGD step moves every tensor kind the checkpoint holds, and it is
+    the moved values the source layout writes back. Every decoder holds an
+    embedding and attention projections; a routed one holds its experts and
+    router besides."""
     distances = tool.moved(trip)
+    routed = trip.source.model.mixture is not None
 
-    assert set(distances) >= {"embedding", "expert", "router"}
+    assert set(distances) >= {"embedding", "attention"} | (
+        {"expert", "router"} if routed else {"feedforward"})
     for kind, distance in distances.items():
         assert distance > MOVEMENT, f"{kind} moved {distance:.3e}"
 

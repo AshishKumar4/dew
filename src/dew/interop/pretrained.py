@@ -509,7 +509,7 @@ def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]
 _SOURCE_LAYOUT_FAMILIES = frozenset({
     "gemma4_text", "gemma3n_text", "qwen3_5_text", "qwen3_5_moe_text",
     "mixtral", "qwen3_moe", "glm4_moe", "deepseek_v2", "deepseek_v3",
-    "deepseek_v32", "llama4_text"})
+    "deepseek_v32", "llama4_text", "olmo3"})
 
 
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,

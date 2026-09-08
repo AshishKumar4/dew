@@ -11,7 +11,9 @@ Each family is one DecoderFamily entry in _FAMILY_ENTRIES, keyed by its
 model_type: the config translation, the tensor path rule and the export
 vocabulary. Entries cover llama (Llama 2, 3 and 3.1's rope_scaling),
 mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma, gemma2, gemma3_text,
-gemma3n_text, gemma4_text (the dense sizes and the routed 26B-A4B), olmo3, qwen3_5_text
+gemma3n_text, gemma4_text (the dense sizes and the routed 26B-A4B), olmo3
+(one rotary table per layer kind, the released YaRN on the full-attention
+layers alone), qwen3_5_text
 (the hybrid of gated delta net layers and gated full-attention layers, whose
 linear_attn layers land on the gated_delta_net mixer kind), gpt_oss, llama4_text,
 glm4_moe, deepseek_v2, deepseek_v2_lite, kimi_k2, deepseek_v3 and deepseek_v32,
@@ -103,18 +105,25 @@ def _refuse(field: str, detail: str) -> NoReturn:
 _LLAMA3_FIELDS: Tuple[str, ...] = ('factor', 'low_freq_factor', 'high_freq_factor',
                                    'original_max_position_embeddings')
 
+# Which model or kind field holds a ramp record, by the rope_type it names:
+# `rope_scaling` is the llama3 ramp the mixer applies over its plain
+# frequencies, `yarn` is the frequency table that replaces them.
+_RAMP_FIELDS = {'llama3': 'rope_scaling', 'yarn': 'yarn'}
+
 
 @dataclass(frozen=True)
 class _Rope:
-    """One rope entry as read: its base and, for a llama3 entry, the ramp
+    """One rope entry as read: its base and, for a scaled entry, the ramp
     record under the reference's names. `theta` is None where the entry
-    names no base of its own."""
+    names no base of its own, and a ramp record carries the `rope_type`
+    that says which ramp it is."""
 
     theta: Optional[float] = None
     scaling: Optional[Dict[str, Any]] = None
 
 
-def _rope_entry(entry: Optional[Mapping[str, Any]], field: str) -> _Rope:
+def _rope_entry(entry: Optional[Mapping[str, Any]], field: str,
+                yarn_max_pos: Optional[int] = None) -> _Rope:
     """One rope_parameters entry, if it names a base or a ramp.
 
     Plain rope ('default' or 'none') and Llama 3.1's 'llama3' map; any other
@@ -125,6 +134,11 @@ def _rope_entry(entry: Optional[Mapping[str, Any]], field: str) -> _Rope:
     (modeling_rope_utils.py:850-857), so a 'factor' or an
     'original_max_position_embeddings' names a scaling whatever the type
     says; llama3 takes exactly its four (modeling_rope_utils.py:987-995).
+
+    `yarn_max_pos` is the caller's max_position_embeddings, which a YaRN
+    entry needs for the factor the reference falls back to. Passing it is
+    how a family whose attention builds the YaRN frequencies opts in; the
+    families that only rotate plainly leave it None and refuse the type.
     """
     if entry is None:
         return _Rope()
@@ -145,6 +159,13 @@ def _rope_entry(entry: Optional[Mapping[str, Any]], field: str) -> _Rope:
             'high_freq_factor': float(entry['high_freq_factor']),
             'original_max_position_embeddings': int(entry['original_max_position_embeddings']),
         })
+    if rope_type == 'yarn' and yarn_max_pos is not None:
+        # The base an entry names, or the shared default until `_at_base`
+        # stamps in the one the entry's layers resolved to: a released
+        # config states it once beside rope_scaling, not inside it.
+        entry_theta = theta if theta is not None else 10000.0
+        return _Rope(theta, _yarn_record(dict(entry, rope_theta=entry_theta), field,
+                                         entry_theta, yarn_max_pos))
     if rope_type not in ('default', 'none'):
         _refuse(f"{field} (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta, "
@@ -180,7 +201,21 @@ class _Ropes:
     full_only: bool = False
 
 
-def _rope(hf_config: Mapping[str, Any], used: set) -> _Ropes:
+def _at_base(scaling: Optional[Dict[str, Any]], theta: float) -> Optional[Dict[str, Any]]:
+    """A ramp record at the base the layers it rides on rotate at.
+
+    A YaRN record repeats that base (the mixer's `YarnScaling.rope_theta`),
+    and a released config states it once beside `rope_scaling` rather than
+    inside it, so the resolved base is stamped in here. The llama3 ramp
+    names no base and passes through.
+    """
+    if scaling is None or scaling['rope_type'] != 'yarn':
+        return scaling
+    return {**scaling, 'rope_theta': theta}
+
+
+def _rope(hf_config: Mapping[str, Any], used: set,
+          yarn_max_pos: Optional[int] = None) -> _Ropes:
     """The rope of any of the three HF spellings.
 
     Flat rope_theta with rope_scaling beside it, gemma3 text configs with
@@ -188,19 +223,23 @@ def _rope(hf_config: Mapping[str, Any], used: set) -> _Ropes:
     here. A nested config's full_attention entry is the model's
     rope and its sliding_attention entry the sliding kind's, base and ramp
     alike (OLMo 3 puts its rope_scaling on full_attention alone,
-    configuration_olmo3.py:110-113).
+    configuration_olmo3.py:110-113). `yarn_max_pos` opts the caller's
+    family into the YaRN ramp, as `_rope_entry` describes.
     """
     used.update(('rope_theta', 'rope_local_base_freq', 'rope_parameters', 'rope_scaling'))
     rope_parameters = hf_config.get('rope_parameters')
 
     if isinstance(rope_parameters, Mapping) and 'rope_theta' not in rope_parameters:
-        full = _rope_entry(rope_parameters.get('full_attention'), 'rope_parameters.full_attention')
+        full = _rope_entry(rope_parameters.get('full_attention'),
+                           'rope_parameters.full_attention', yarn_max_pos)
         sliding = _rope_entry(rope_parameters.get('sliding_attention'),
-                              'rope_parameters.sliding_attention')
+                              'rope_parameters.sliding_attention', yarn_max_pos)
         theta = full.theta or 10000.0
         local = sliding.theta or theta
-        return _Ropes(theta, full.scaling, None if local == theta else local,
-                      None if sliding.scaling == full.scaling else sliding.scaling,
+        full_ramp = _at_base(full.scaling, theta)
+        sliding_ramp = _at_base(sliding.scaling, local)
+        return _Ropes(theta, full_ramp, None if local == theta else local,
+                      None if sliding_ramp == full_ramp else sliding_ramp,
                       full_only=full.scaling is not None and sliding.scaling is None)
 
     # Either flat field may carry the base frequency and the ramp;
@@ -210,13 +249,14 @@ def _rope(hf_config: Mapping[str, Any], used: set) -> _Ropes:
     for field in ('rope_parameters', 'rope_scaling'):
         entry = hf_config.get(field)
         if isinstance(entry, Mapping):
-            rope = _rope_entry(entry, field)
+            rope = _rope_entry(entry, field, yarn_max_pos)
             theta = rope.theta or theta
             scaling = rope.scaling or scaling
     if theta is None:
         theta = float(hf_config.get('rope_theta', 10000.0))
     local = hf_config.get('rope_local_base_freq')
-    return _Ropes(theta, scaling, None if local is None else float(local))
+    return _Ropes(theta, _at_base(scaling, theta),
+                  None if local is None else float(local))
 
 
 def _specified_layer_types(hf_config: Mapping[str, Any], used: set[str],
@@ -646,13 +686,17 @@ def _base_config(hf_config: Mapping[str, Any], used: set[str], *,
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
                  'rms_norm_eps', 'attention_bias', 'tie_word_embeddings'))
 
+    # A ramp lands under the field whose record it is: `rope_scaling` reads
+    # the llama3 ramp over the plain frequencies, `yarn` replaces them.
     if ropes.scaling is not None:
+        field = _RAMP_FIELDS[ropes.scaling['rope_type']]
         if ropes.full_only and 'sliding_attention' in layer_types:
-            config['kinds'].setdefault('full_attention', {})['rope_scaling'] = ropes.scaling
+            config['kinds'].setdefault('full_attention', {})[field] = ropes.scaling
         else:
-            config['rope_scaling'] = ropes.scaling
+            config[field] = ropes.scaling
     if ropes.local_scaling is not None:
-        config['kinds']['sliding_attention']['rope_scaling'] = ropes.local_scaling
+        field = _RAMP_FIELDS[ropes.local_scaling['rope_type']]
+        config['kinds']['sliding_attention'][field] = ropes.local_scaling
     return config
 
 
@@ -978,17 +1022,22 @@ def _olmo3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any
     (modeling_olmo3.py:259-266, the sandwich pair without the input pair),
     q/k RMSNorms over the whole projection before the head split
     (:162-163, :178-179), three sliding layers to one full
-    (configuration_olmo3.py:96-98), and one rope base for both kinds. A flat
-    `rope_scaling` is the full-attention layers' alone, where the reference
-    moves it (configuration_olmo3.py:110-113), so a llama3 ramp lands on the
-    full kind; the released checkpoints carry a YaRN there, which the
-    attention has no per-kind ramp for, so that entry raises a ValueError
-    naming the field."""
+    (configuration_olmo3.py:96-98), and one rope base for both kinds.
+
+    `Olmo3RotaryEmbedding` builds one frequency table per layer kind and
+    calls `ROPE_INIT_FUNCTIONS[rope_type]` for the kinds whose entry names
+    a type of its own (modeling_olmo3.py:277-291), so a ramp is a kind's,
+    not the model's. A flat `rope_scaling` is the full-attention layers'
+    alone, where the reference moves it (configuration_olmo3.py:110-113):
+    the released 7B checkpoints put a YaRN there and the sliding layers
+    keep rotating plainly at rope_theta.
+    """
     layers = int(hf_config['num_hidden_layers'])
     layer_types = _specified_layer_types(hf_config, used, tuple(
         'sliding_attention' if (index + 1) % 4 else 'full_attention'
         for index in range(layers)))
-    ropes = _rope(hf_config, used)
+    ropes = _rope(hf_config, used, int(hf_config.get(
+        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN)))
     if ropes.scaling is not None and not isinstance(hf_config.get('rope_parameters'), Mapping):
         ropes = dataclasses.replace(ropes, full_only=True)
     config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types,
@@ -2333,6 +2382,31 @@ def _export_config(model) -> Dict[str, Any]:
     ramp = model.kind_of(types[0]).rope_scaling
     if ramp is not None:
         config['rope_scaling'] = dataclasses.asdict(ramp)
+    # A YaRN table replaces the frequencies rather than riding over them.
+    # One table the whole model shares writes flat beside rope_theta, which
+    # is where the single-table references read it. A table that differs
+    # between the kinds is what Olmo3RotaryEmbedding builds, one per kind
+    # out of nested rope_parameters (modeling_olmo3.py:277-291, the
+    # spelling Olmo3Config.to_dict writes); a reference with one table for
+    # the whole model cannot say it, so that is refused naming the kinds.
+    yarns = {kind: model.kind_of(kind).yarn for kind in sorted(set(types))}
+    ramped = {kind: yarn for kind, yarn in yarns.items() if yarn is not None}
+    per_kind = bool(ramped) and (set(ramped) != set(yarns)
+                                 or len(set(ramped.values())) > 1
+                                 or local_theta is not None)
+    if per_kind:
+        if not sandwich:
+            raise ValueError(
+                f"the yarn table differs between the layer kinds {sorted(yarns)}, "
+                f"and the {family.export_model_type} reference rotates every layer "
+                "at one table; the model cannot be written back")
+        config['rope_parameters'] = {
+            kind: (dataclasses.asdict(yarn) if yarn is not None else
+                   {'rope_type': 'default', 'rope_theta': model.kind_of(kind).rope_theta})
+            for kind, yarn in yarns.items()}
+        config.pop('rope_local_base_freq', None)
+    elif ramped:
+        config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
     config.update(family.export_fields(model))
     return {key: value for key, value in config.items() if value is not None}
 

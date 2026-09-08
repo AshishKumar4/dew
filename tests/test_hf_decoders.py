@@ -24,6 +24,12 @@ Tolerances and the differences actually observed, fp32 on CPU:
 - olmo3-tiny  : max |logit difference| 4.77e-06, tolerance 1e-4, logits up to
   6.2; the post-norm block, q/k norms over the whole projection and three
   sliding layers to one full (per-head norms of the same scale miss by 0.1).
+- olmo3-yarn-tiny: max |logit difference| 4.53e-06, tolerance 1e-4, logits
+  up to 5.5; allenai/Olmo-3-1025-7B's rope_scaling record (yarn, factor 8
+  off 8192 pretraining positions, the explicit attention_factor) on the one
+  full-attention layer of its 3:1 pattern, the three sliding layers plain
+  at rope_theta. Plain rope everywhere misses by 0.35, the same YaRN on
+  every layer by 1.70, and an attention_factor of 1 by 0.35.
 - llama31-tiny: max |logit difference| 9.89e-06, tolerance 1e-4, logits up to
   6.4; Llama 3.1's rope_scaling (factor 8 over 64 pretraining positions, so
   the ramp moves 7 of 8 pairs), and plain rope on the same weights misses
@@ -98,7 +104,8 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 # The committed byte-level BPE an export can name without a download.
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-tools"
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
-        "gemma-tiny", "gemma2-tiny", "olmo3-tiny", "llama31-tiny")
+        "gemma-tiny", "gemma2-tiny", "olmo3-tiny", "olmo3-yarn-tiny",
+        "llama31-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = DEEPSEEK + ("mixtral-tiny", "qwen3-moe-tiny")
 TORCH_VENV = Path("/tmp/hfref/bin/python")
@@ -323,27 +330,99 @@ def test_olmo3_norms_the_whole_projection_and_no_input():
     assert difference > 0.1
 
 
-def test_the_released_olmo_3_7b_config_refuses_its_full_layer_yarn_by_name():
+RELEASED_OLMO3_YARN = {
+    'rope_type': 'yarn', 'rope_theta': 5e5, 'factor': 8.0,
+    'original_max_position_embeddings': 8192, 'beta_fast': 32.0,
+    'beta_slow': 1.0, 'mscale': None, 'mscale_all_dim': None,
+    'truncate': True, 'attention_factor': 1.2079441541679836,
+}
+
+
+def test_the_released_olmo_3_7b_config_puts_its_yarn_on_the_full_layers():
     """allenai/Olmo-3-1025-7B carries a rope_scaling of type yarn that the
     reference applies to its full-attention layers alone
-    (configuration_olmo3.py:110-113). The attention has no per-kind ramp,
-    so the entry is refused naming it, and the rest of the config
-    translates field for field once it is gone."""
-    released = fixture_config("olmo-3-7b")
-    with pytest.raises(ValueError, match="rope_scaling \\(rope_type 'yarn'\\)"):
-        translate_config(released)
-    del released['rope_scaling']
-    config = translate_config(released)
+    (configuration_olmo3.py:110-113), so it lands on that kind and the
+    sliding layers keep rotating plainly at rope_theta. Everything else
+    translates field for field."""
+    config = translate_config(fixture_config("olmo-3-7b"))
     assert config == {
         'vocab_size': 100278, 'emb_features': 4096, 'num_layers': 32,
         'num_heads': 32, 'num_kv_heads': 32, 'head_dim': 128, 'mlp': 'swiglu',
         'mlp_features': 11008, 'max_seq_len': 8192, 'rope_theta': 5e5,
         'layer_types': (('sliding_attention',) * 3 + ('full_attention',)) * 8,
-        'kinds': {'sliding_attention': {'window': 4096}},
+        'kinds': {'sliding_attention': {'window': 4096},
+                  'full_attention': {'yarn': RELEASED_OLMO3_YARN}},
         'norm_eps': 1e-6, 'scale_after_cast': False, 'qk_norm': True,
         'attention_bias': False, 'tie_embeddings': False,
         'sandwich_norms': True, 'pre_norms': False, 'qk_norm_scope': 'projection',
     }
+
+
+def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
+    """The rotary rule, on the release's own geometry and without its
+    weights: `Olmo3RotaryEmbedding` calls `ROPE_INIT_FUNCTIONS['yarn']` for
+    a kind whose entry names a type (modeling_olmo3.py:277-291) and scales
+    that kind's cos/sin by the returned factor, while the kinds at
+    'default' keep the plain table. Both halves are checked against the
+    reference's own functions at head_dim 128 and base 5e5: the YaRN table,
+    the attention factor, and that the reference leaves the sliding entry
+    plain. Observed frequency difference 0.0 with 46 of 64 pairs moved."""
+    from transformers import Olmo3Config
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    from dew.nn.mla import YarnScaling, yarn_attention_factor, yarn_inv_freq
+
+    released = fixture_config("olmo-3-7b")
+    reference = Olmo3Config.from_dict(released)
+    assert reference.rope_parameters['sliding_attention']['rope_type'] == 'default'
+    assert reference.rope_parameters['full_attention']['rope_type'] == 'yarn'
+
+    expected, attention_factor = ROPE_INIT_FUNCTIONS['yarn'](
+        reference, None, layer_type='full_attention')
+    record = translate_config(released)['kinds']['full_attention']['yarn']
+    scaling = YarnScaling(**record)
+    scaled = np.asarray(yarn_inv_freq(128, 5e5, scaling))
+    plain = 1.0 / (5e5 ** (np.arange(0, 128, 2, dtype=np.float32) / 128))
+
+    assert np.max(np.abs(scaled - expected.numpy())) < 1e-7
+    assert yarn_attention_factor(scaling) == pytest.approx(attention_factor)
+    assert np.sum(scaled != plain) >= 32
+
+
+def test_the_olmo3_yarn_scales_the_full_layers_and_no_other():
+    """The fixture's config is the release's rope at toy width: the yarn on
+    the one full-attention layer of its 3:1 pattern, the three sliding
+    layers plain. Three loads that read the same record and use it
+    differently leave the reference by more than any tolerance here: plain
+    rope on every layer by 0.35, the same yarn on every layer by 1.70, and
+    the yarn frequencies rotated at unit amplitude, without the record's
+    attention_factor, by 0.35. So the fixture holds the placement, the
+    frequency ramp and the amplitude to account, not the presence of a ramp.
+
+    The record's explicit attention_factor is the value
+    `_compute_yarn_parameters` derives for factor 8 anyway
+    (0.1 * ln(8) + 1), so dropping the field alone changes nothing; what
+    the reference would disagree with is not applying the amplitude.
+    """
+    model, variables = fp32_decoder(FIXTURES / 'olmo3-yarn-tiny')
+    ids = np.load(FIXTURES / 'olmo3-yarn-tiny' / 'input_ids.npy')
+    reference = np.load(FIXTURES / 'olmo3-yarn-tiny' / 'logits.npy')
+    kinds = dict(model.kinds or {})
+    yarn = kinds['full_attention'].yarn
+    assert yarn is not None and kinds['sliding_attention'].yarn is None
+
+    def moved(**replaced):
+        clone = model.clone(kinds={**kinds, **replaced})
+        return np.max(np.abs(np.asarray(clone.apply(variables, ids)) - reference))
+
+    plain = moved(full_attention=dataclasses.replace(kinds['full_attention'], yarn=None))
+    everywhere = moved(
+        sliding_attention=dataclasses.replace(kinds['sliding_attention'], yarn=yarn))
+    unscaled = moved(full_attention=dataclasses.replace(
+        kinds['full_attention'],
+        yarn=dataclasses.replace(yarn, attention_factor=1.0)))
+    assert plain > 0.1 and everywhere > 0.1 and unscaled > 0.1
+
 
 def test_mistral_window_changes_the_reference_logits():
     model, variables = fp32_decoder(FIXTURES / 'mistral-tiny')
