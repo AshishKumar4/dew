@@ -132,6 +132,23 @@ def dumped_params(out: Path) -> dict:
         return {name: dump[name] for name in dump.files}
 
 
+def updates_of(out: Path) -> dict:
+    """The per-parameter update a worker's step took, next to its report."""
+    with np.load(out.with_suffix(".update.npz")) as dump:
+        return {name: dump[name] for name in dump.files}
+
+
+def relative_difference(left: dict, right: dict) -> float:
+    """The largest disagreement over the scale of `right`.
+
+    Gradients of different runs are compared this way, so a difference is
+    read against the size of the gradient itself and not an absolute bound
+    that a rate or a batch size would move.
+    """
+    scale = max(float(np.max(np.abs(leaf))) for leaf in right.values())
+    return largest_difference(left, right) / scale
+
+
 def largest_difference(left: dict, right: dict) -> float:
     assert set(left) == set(right), "the two runs do not even hold the same parameters"
     return max(float(np.max(np.abs(left[name] - right[name]))) for name in left)
@@ -943,13 +960,24 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     assembly seams have to hand every rank the same tree: generation agrees
     the schema before it digests the request, and placement materializes the
     field before it assembles the batch. The run then has to be the run with
-    the mask spelled out on every row, token for token and parameter for
-    parameter.
+    the mask spelled out on every row: the same draws, and the same gradient.
+
+    The step is plain unclipped SGD, so each parameter's update is the rate
+    times its gradient and comparing updates compares gradient magnitudes.
+    Adam's first step would divide them away and pass on a wrong gradient.
+    Observed on CPU: the largest update is 1.85e-02, the pool sits 1.6e-06 of
+    that from the explicit-mask reference (parameters 3.0e-08 apart), and the
+    same batch with no validity anywhere, which counts the padded targets,
+    sits 3.4e-01 away. That last number is why the comparison means
+    something, and the loss shows why it has to be the gradient: masked
+    4.419333 against unmasked 4.421612, three digits apart.
 
     Without the agreement this fails in generation with "generation input
     shapes and sampling must agree across processes", which is also how
     test_a_pool_samples_rollouts_with_different_lengths_and_eos fails, since
-    `SampledRollout` omits validity for a rank whose prompts are whole.
+    `SampledRollout` omits validity for a rank whose prompts are whole. With
+    generation agreed but placement left alone, a rank dies inside the step
+    and the coordination service takes the pool down with it.
     """
     reports = run_pool("mixed_validity", tmp_path / "pool", 2, fsdp_size=2, timeout=180)
     single = run_worker("mixed_validity", tmp_path / "single.json", fsdp_size=2,
@@ -971,6 +999,23 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
         "rel": PARITY["rtol"], "abs": PARITY["atol"]})
     assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
                            dumped_params(tmp_path / "single.json"))
+
+    # The gradient itself, normalized by its own scale.
+    pooled = updates_of(tmp_path / "pool" / "process0.json")
+    reference = updates_of(tmp_path / "single.json")
+    scale = max(float(np.max(np.abs(leaf))) for leaf in reference.values())
+    assert scale == pytest.approx(single["update_scale"]) and scale > 1e-3
+    assert relative_difference(pooled, reference) < 1e-4
+
+    # A step that ignored validity is a different gradient, so the comparison
+    # above is sensitive to the term the field controls.
+    import jax.numpy as jnp
+    from dew.nn.inputs import ModelInputs
+
+    unmasked = worker.mixed_validity_step(
+        worker.mixed_validity_trainer(2),
+        {"text": ModelInputs(jnp.asarray(worker.token_batch()))})["update"]
+    assert relative_difference(unmasked, reference) > 1e-2
 
 
 @pytest.mark.distributed

@@ -1286,6 +1286,51 @@ def mixed_validity_batch(rows: slice, *, explicit: bool) -> dict:
     return {"text": ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(mask)})}
 
 
+MIXED_RATE = 0.1
+"""The learning rate of the mixed-validity step. Plain unclipped SGD, so the
+update is the rate times the gradient and comparing updates compares gradient
+magnitudes; Adam's first step would normalize them away."""
+
+
+def mixed_validity_trainer(fsdp: int):
+    """The pipeline model under plain SGD, for the mixed-validity regression."""
+    import jax
+    import optax
+    import dew.nn.backbones.causal_transformer  # registers the model built below
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Layout, MeshSpec, Trainer
+
+    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
+                         num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
+    return Trainer(LMObjective(model, SEQ_LEN), optax.sgd(MIXED_RATE), key=jax.random.key(0),
+                   mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY),
+                   checkpoints=None, tracker=None)
+
+
+def mixed_validity_step(trainer, batch: dict, out: Path | None = None) -> dict:
+    """One step over `batch`, with the update each parameter took.
+
+    The update is the gradient scaled by the rate, so a caller can compare
+    gradients between topologies instead of the state an optimizer with
+    memory would have reached.
+    """
+    from dew.training.distributed import shard_batch
+
+    state, _, _ = trainer.place()
+    placed = shard_batch(trainer.device_mesh, batch)
+    compiled = trainer.compile(state, placed)
+    updated, loss, _, _, _ = compiled(state, placed)
+    before, after = params_dict(state.params), params_dict(updated.params)
+    update = {name: after[name] - before[name] for name in after}
+    if out is not None:
+        np.savez(out.with_suffix(".npz"), **after)
+        np.savez(out.with_suffix(".update.npz"), **update)
+    return {"placed_fields": sorted(placed["text"].token_fields),
+            "loss": float(as_numpy(loss)), "batch_sharding": sharding_facts(placed),
+            "update": update}
+
+
 def mode_mixed_validity(args) -> dict:
     """Generation and one training step where only some processes padded.
 
@@ -1298,7 +1343,6 @@ def mode_mixed_validity(args) -> dict:
     import jax
     from dew.nn.inputs import agreed_validity
     from dew.sampling import Sampling, generate
-    from dew.training.distributed import shard_batch
 
     rank, processes = jax.process_index(), jax.process_count()
     prompts = rollout_prompts()
@@ -1306,27 +1350,25 @@ def mode_mixed_validity(args) -> dict:
     mine = slice(rank * rows, (rank + 1) * rows)
     local = mixed_validity_inputs(prompts["prompt"][mine], prompts["prompt_length"][mine],
                                   explicit=args.explicit)
-    trainer = pipeline_trainer(1, None, args.fsdp_size)
+    trainer = mixed_validity_trainer(args.fsdp_size)
     state, _, _ = trainer.place()
     agreed = agreed_validity(local, processes, phase="mixed validity request")
     drawn = generate(trainer.objective.model, state.params, local, MIXED_NEW, seed=3,
                      sampling=Sampling(temperature=0)).host()
-    placed = shard_batch(trainer.device_mesh,
-                         mixed_validity_batch(mine, explicit=args.explicit))
-    compiled = trainer.compile(state, placed)
-    updated, loss, _, _, _ = compiled(state, placed)
-    dump_params(args.out.with_suffix(".npz"), updated.params)
+    trained = mixed_validity_step(
+        trainer, mixed_validity_batch(mine, explicit=args.explicit), args.out)
     return {
         "process_index": rank,
         "local_fields": sorted(local.token_fields),
         "agreed_fields": sorted(agreed.token_fields),
         "agreed_all_true": (None if not agreed.token_fields else
                             bool(np.all(np.asarray(agreed.token_fields["attention_mask"])))),
-        "placed_fields": sorted(placed["text"].token_fields),
+        "placed_fields": trained["placed_fields"],
         "tokens": np.asarray(drawn.tokens).tolist(),
         "raw_log_probs": np.asarray(drawn.raw_log_probs, np.float64).tolist(),
-        "loss": float(as_numpy(loss)),
-        "batch_sharding": sharding_facts(placed),
+        "loss": trained["loss"],
+        "update_scale": max(float(np.max(np.abs(leaf))) for leaf in trained["update"].values()),
+        "batch_sharding": trained["batch_sharding"],
     }
 
 
