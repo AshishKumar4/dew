@@ -13,7 +13,7 @@ and nothing else: no registry, no server object, no model access.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Protocol
 
 import jax
@@ -41,6 +41,7 @@ class DecoderState:
     logits: jax.Array
     positions: jax.Array | None = None
     hidden: jax.Array | None = None
+    drafts: tuple[jax.Array, ...] = ()
 
 
 @struct.dataclass
@@ -64,8 +65,8 @@ Advance = Callable[[DecoderState, jax.Array, jax.Array], DecoderState]
 Reindex = Callable[[DecoderState, jax.Array], DecoderState]
 Verify = Callable[[DecoderState, jax.Array, jax.Array],
                   tuple[DecoderState, jax.Array, jax.Array | None]]
-Propose = Callable[[DecoderState, jax.Array, jax.Array, jax.Array, jax.Array, int],
-                   tuple[DecoderState, jax.Array, jax.Array]]
+Propose = Callable[[DecoderState, jax.Array, jax.Array | None, jax.Array | None, jax.Array,
+                    jax.Array, int], tuple[DecoderState, jax.Array, jax.Array]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,6 +87,7 @@ class DecodeOps:
     reindex: Reindex
     verify: Verify | None = None
     propose: Propose | None = None
+    embed: Callable[[jax.Array], jax.Array] | None = None
     depths: int = 0
 
 
@@ -98,24 +100,49 @@ class Strategy(Protocol):
                  budget: int, n: int, /) -> Draws: ...
 
 
-def reseed(ops: DecodeOps, state: DecoderState, previous: jax.Array, tokens: jax.Array,
-           valid: jax.Array, positions: jax.Array) -> DecoderState:  # noqa: D401
-    """Write the prediction cache a stretch of accepted history leaves behind.
+def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None],
+           states: jax.Array, embeds: jax.Array, valid: jax.Array, positions: jax.Array,
+           last: jax.Array) -> tuple[DecoderState, list[jax.Array], tuple[jax.Array, ...]]:
+    """Write the prediction cache a stretch of history leaves behind.
 
-    A depth consumes the target's hidden state at the position before a token
-    together with that token, at the token's own target position. That is the
-    pairing `MTPCandidateGenerator` corrects its cache with and the one
-    `Qwen3_5MultiTokenPredictor.forward` takes, so a cache built any other way
-    drafts from a history the checkpoint was never trained on. Every depth
-    gets the same target-aligned history; a chained draft then differs only in
-    the hidden state each step receives.
+    One invariant covers every depth: the entry for token `t` at depth `d`
+    consumes depth `d - 1`'s hidden state at `t - 1` together with `t`'s own
+    embedding, at `t`'s own target coordinate, and depth zero's predecessor is
+    the target model. That is what `mtp_hidden_states` does when it trains the
+    depths, what `MTPCandidateGenerator` corrects its cache with, and what
+    `Qwen3_5MultiTokenPredictor.forward` takes.
+
+    `carry` holds each depth's predecessor state at the position before this
+    stretch, so a block continues where the last one stopped instead of losing
+    the entry on the boundary; `None` means a depth has no predecessor yet,
+    which shifts its first entry one further on, as the training pass does
+    over a prompt. `embeds` are the prepared embeddings, so a media
+    replacement reaches the depths without running its encoder again. `last`
+    is each row's final written slot, and a row that wrote nothing keeps its
+    carry.
     """
     propose = ops.propose
+    produced: list[jax.Array] = []
     if propose is None:
-        return state
+        return state, produced, tuple(item for item in carry if item is not None)
+    width = embeds.shape[1]
+    upstream, offset, tails = states, 0, []
     for depth in range(ops.depths):
-        state = propose(state, previous, tokens, valid, positions, depth)[0]
-    return state
+        head = carry[depth] if depth < len(carry) else None
+        offset = offset + 1 if head is None else 0
+        before = jnp.concatenate(
+            [(jnp.zeros_like(upstream[:, 0]) if head is None else head)[:, None],
+             upstream[:, :-1]], axis=1)
+        ready = valid & (jnp.arange(width)[None, :] >= offset)
+        state, _, out = propose(state, before, None, embeds, ready, positions, depth)
+        produced.append(out)
+        previous = carry[depth] if depth < len(carry) else None
+        held = out[:, 0] if previous is None else previous
+        tails.append(jnp.where(jnp.any(ready, axis=1)[:, None],
+                               jnp.take_along_axis(upstream, last[:, None, None], axis=1)[:, 0],
+                               held))
+        upstream = out
+    return state, produced, tuple(tails)
 
 
 def as_pytree(value: Strategy) -> Strategy:
@@ -297,8 +324,14 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
 
     def step(carry, position):
         state, beams, live, drawn, scored, open_, done = carry
+        genuine = real.reshape(prompts, width) & (live > DEAD / 2) & open_
+        checkify.check(jnp.all(wellformed(state.logits.astype(jnp.float32)).reshape(
+            prompts, width) | ~genuine),
+            "the model produced a live beam without a distribution to score")
         raw = jax.nn.log_softmax(state.logits.astype(jnp.float32))
         scores = transform(beams, raw)
+        checkify.check(jnp.all(wellformed(scores).reshape(prompts, width) | ~genuine),
+                       "the transform chain left a live beam without a distribution to search")
         vocab = scores.shape[-1]
         best, index = lax.top_k((scores.reshape(prompts, width, vocab)
                                  + live[:, :, None]).reshape(prompts, width * vocab), keep)
@@ -424,7 +457,7 @@ class Speculative:
                  transform: Callable[[StepState, jax.Array], jax.Array],
                  stopping: Callable[[StepState, jax.Array], jax.Array],
                  budget: int, n: int) -> Draws:
-        if ops.propose is None or ops.verify is None or not ops.depths:
+        if ops.propose is None or ops.verify is None or ops.embed is None or not ops.depths:
             raise ValueError("speculative decoding drafts with the model's prediction depths, and "
                              "this model declares none; load a checkpoint with MTP weights or "
                              "choose another strategy")
@@ -447,11 +480,11 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
     slots = jnp.arange(gamma + 1)[None, :]
     index = jnp.arange(rows)[:, None]
 
-    def block(carry, _):
+    def block(carry):
         state, step, terminated, out = carry
         active = step.active
         saved = state.cache
-        base = step.total()
+        base = step.total() if state.positions is None else state.positions
         keys = jax.vmap(lambda key, count: jax.random.split(
             jax.random.fold_in(key, count), 2 * gamma + 1))(step.keys, step.step)
 
@@ -471,7 +504,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
             live = live & ~ending[depth - 1] & asked(depth)
             states[depth] = dataclasses.replace(states[depth], active=live)
             drafting, logits, produced = propose(
-                drafting, hidden[:, None], candidates[depth - 1][:, None], active[:, None],
+                drafting, hidden[:, None], candidates[depth - 1][:, None], None, live[:, None],
                 (base + depth - 1)[:, None], (depth - 1) % ops.depths)
             hidden = produced[:, 0]
             scores = transform(states[depth], logits[:, 0].astype(jnp.float32))
@@ -485,7 +518,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
 
         proposed = jnp.stack(candidates, axis=1)
         drafting, verified, _ = verify(
-            drafting, proposed, jnp.broadcast_to(active[:, None], (rows, gamma)))
+            drafting, proposed, jnp.stack([asked(at) for at in range(gamma)], axis=1))
         assert state.hidden is not None
         raw = [state.logits.astype(jnp.float32)] + [verified[:, at].astype(jnp.float32)
                                                     for at in range(gamma)]
@@ -545,7 +578,8 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
         committed = step
         for at in range(gamma + 1):
             committed = committed.commit(emitted[:, at], keep[:, at])
-        committed = dataclasses.replace(committed, active=active & ~terminated)
+        committed = dataclasses.replace(
+            committed, active=active & ~terminated & (step.step + count < budget))
 
         landing = jnp.where(keep, step.step[:, None] + slots, budget)
         out = (out[0].at[index, landing].set(emitted, mode="drop"),
@@ -562,14 +596,22 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                              jnp.take_along_axis(again, last, axis=1)[:, 0], state.logits),
             hidden=jnp.where((count > 0)[:, None],
                              jnp.take_along_axis(seen, last, axis=1)[:, 0], state.hidden))
-        following = reseed(ops, following,
-                           jnp.concatenate([state.hidden[:, None], seen[:, :-1]], axis=1),
-                           emitted, keep, base[:, None] + slots)
+        assert ops.embed is not None
+        following, _, carried = reseed(
+            ops, following, (state.hidden,) + tuple(state.drafts[1:]), seen, ops.embed(emitted),
+            keep, base[:, None] + slots, jnp.maximum(count - 1, 0))
+        following = dataclasses.replace(following, drafts=carried)
         return (following, committed, terminated, out), None
+
+    def outer(carry, _):
+        # Every rank reduces the same global mask, so the pool skips the same
+        # blocks. A skipped block runs no model call at all, which is where
+        # the saved target forwards come from.
+        return lax.cond(jnp.any(carry[1].active), block, lambda held: (held, None), carry)
 
     empty = (jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
              jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32))
     (_, _, terminated, out), _ = lax.scan(
-        block, (state, start, jnp.zeros(rows, bool), empty), None, length=-(-budget // 2))
+        outer, (state, start, jnp.zeros(rows, bool), empty), None, length=-(-budget // 2))
     return Draws(out[0], out[1], jnp.where(out[1], out[2], 0.0), jnp.where(out[1], out[3], 0.0),
                  terminated)

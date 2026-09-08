@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.sampling import Beam, Sampling, generate
+from dew.sampling import Beam, Sampling, decoding, generate
 from test_text_rollout_contract import decoder
 
 VOCAB = 13
@@ -160,3 +160,69 @@ def test_asking_for_more_hypotheses_than_the_width_is_refused(model):
     with pytest.raises(ValueError, match="at most its width"):
         generate(module, params, jnp.asarray([[1, 2, 3]], jnp.int32), 2, key=jax.random.key(0),
                  strategy=Beam(width=2), n=3)
+
+
+def shaped(model, params, rows, entries, renormalize):
+    """The log probabilities a source chain of a sequence bias and a
+    renormalization produces, written out in numpy."""
+    scores = np.array(next_log_probs(model, params, rows), np.float32)
+    for tokens, bias in entries:
+        prefix, last = tokens[:-1], tokens[-1]
+        for index, row in enumerate(rows):
+            if len(tokens) <= len(row) and (not prefix or list(row[-len(prefix):]) == list(prefix)):
+                scores[index, last] += bias
+    if renormalize:
+        scores = scores - np.log(np.exp(scores - scores.max(-1, keepdims=True)).sum(
+            -1, keepdims=True)) - scores.max(-1, keepdims=True)
+    return scores
+
+
+def host_beam_shaped(model, params, prompt, budget, width, eos_ids, penalty, early, entries,
+                     renormalize):
+    """`host_beam` over a shaped distribution instead of the plain policy."""
+    keep = max(2, 1 + len(eos_ids)) * width
+    running, finished, open_ = [([], 0.0)], [], True
+    for position in range(budget):
+        rows = [list(prompt) + seq for seq, _ in running]
+        scores = shaped(model, params, rows, entries, renormalize)
+        candidates = sorted(
+            ((seq + [token], float(total + scores[index, token]), token)
+             for index, (seq, total) in enumerate(running) for token in range(VOCAB)),
+            key=lambda entry: -entry[1])[:keep]
+        hits = [entry[2] in eos_ids or position + 1 == budget for entry in candidates]
+        recording = open_ and not (early is True and len(finished) >= width)
+        for slot, (entry, hit) in enumerate(zip(candidates, hits)):
+            if recording and slot < width and hit:
+                finished.append((entry[0], entry[1] / (position + 1) ** penalty,
+                                 entry[2] in eos_ids, position + 1))
+        finished = sorted(finished, key=lambda entry: -entry[1])[:width]
+        running = [(entry[0], entry[1]) for entry, hit in zip(candidates, hits) if not hit][:width]
+        if not running:
+            break
+        reach = budget if (early == "never" and penalty > 0) else position + 1
+        worst = min(entry[1] for entry in finished) if len(finished) >= width else DEAD
+        open_ = open_ and running[0][1] / reach ** penalty > worst
+    return finished
+
+
+def test_a_renormalized_biased_search_matches_the_host_search(model):
+    """A sequence bias followed by a renormalization is what a source with
+    both controls compiles to, and the reference appends the renormalization
+    even for a search. Every returned path has to match a host beam search
+    over the same shaped distribution."""
+    module, params = model
+    entries = [([9], -0.1906398587), ([8, 4], 1.0661105421)]
+    penalty = 2.6265404784
+    chain = (decoding.sequence_bias(entries), decoding.Renormalize())
+    eos = int(np.argsort(next_log_probs(module, params, [PROMPT])[0])[-3])
+
+    found = generate(module, params, jnp.asarray([PROMPT], jnp.int32), 4, key=jax.random.key(0),
+                     sampling=Sampling(eos_id=eos, pad_id=0), logits=chain, n=2,
+                     strategy=Beam(width=3, length_penalty=penalty, early_stopping="never",
+                                   stop_ids=1))
+    expected = host_beam_shaped(module, params, PROMPT, 4, 3, (eos,), penalty, "never",
+                                entries, True)
+    for row, (tokens, _, terminated, length) in enumerate(expected[:2]):
+        assert int(found.lengths[row]) == length, (row, np.asarray(found.tokens)[row])
+        np.testing.assert_array_equal(np.asarray(found.tokens)[row, 3:3 + length], tokens)
+        assert bool(found.terminated[row]) == terminated

@@ -1099,11 +1099,10 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
     if (value := read("forced_bos_token_id")) is not None:
         transforms.append(decoding.ForcedBOS(_as_int("forced_bos_token_id", value)))
     if (value := read("forced_eos_token_id")) is not None:
-        total = _generation_limit(config, generation_config, "max_length")
-        if total is None:
-            raise ValueError("forced_eos_token_id needs the source's max_length; the token budget "
-                             "is per call, so the position to force at is not known at load time")
-        transforms.append(decoding.ForcedEOS(_as_int("forced_eos_token_id", value), total))
+        # The reference forces at the effective end of the request, and a call
+        # may set its own budget, so the control stays request relative.
+        transforms.append(decoding.ForcedEOS(
+            jnp.asarray(_token_list(value, "forced_eos_token_id"), jnp.int32)))
     if read("remove_invalid_values") is not None:
         transforms.append(decoding.RemoveInvalidValues())
     if (value := read("exponential_decay_length_penalty")) is not None:
@@ -1117,6 +1116,8 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
             jnp.asarray(_token_list(value, "begin_suppress_tokens"), jnp.int32),
             read("forced_bos_token_id") is not None))
     if searching:
+        if read("renormalize_logits") is not None:
+            transforms.append(decoding.Renormalize())
         return tuple(transforms)
     if not do_sample:
         transforms.append(decoding.Greedy())

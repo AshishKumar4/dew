@@ -625,13 +625,25 @@ class ForcedBOS:
 
 @struct.dataclass
 class ForcedEOS:
-    """Force EOS one step before the length limit, as `ForcedEOSTokenLogitsProcessor`."""
+    """Force EOS one step before the end, as `ForcedEOSTokenLogitsProcessor`.
 
-    token: int = struct.field(pytree_node=False, default=0)
-    max_length: int = struct.field(pytree_node=False, default=1)
+    `eos` may name several ids, all of which the forced step allows, as the
+    reference allows every id its tensor holds. `max_length` counts prompt and
+    generated tokens together; left as None the end is the request's own, the
+    prompt width plus the token budget, so a caller that changes the budget
+    per call forces at the new end rather than at a length the task was built
+    with.
+    """
+
+    eos: jax.Array = struct.field(default_factory=lambda: jnp.zeros((0,), jnp.int32))
+    max_length: int | None = struct.field(pytree_node=False, default=None)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        return _forced(logits, self.token, state.total() == self.max_length - 1)
+        budget = state.width - state.prompt_width
+        rows = (state.step == budget - 1 if self.max_length is None
+                else state.total() == self.max_length - 1)
+        only = jnp.where(_membership(self.eos, logits.shape[-1])[None, :], 0.0, FILTER)
+        return jnp.where(rows[:, None], only, logits)
 
 
 def _forced(logits: jax.Array, token: int, rows: jax.Array) -> jax.Array:

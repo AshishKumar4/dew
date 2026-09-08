@@ -1488,13 +1488,14 @@ def mode_decoding_components(args) -> dict:
     from dew.inference.pipeline import place
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.inputs import ModelInputs
-    from dew.sampling import Sampling, decoding
+    from dew.sampling import Beam, Sampling, Speculative, decoding
     from dew.training import Layout, MeshSpec
 
     rank, processes = jax.process_index(), jax.process_count()
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=12,
-                              dtype="float32", attention_impl="xla")
+                              dtype="float32", attention_impl="xla",
+                              num_nextn_predict_layers=1)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
     prompts, lengths = continuation_prompts()
@@ -1541,6 +1542,26 @@ def mode_decoding_components(args) -> dict:
                       stopping=(decoding.EndOfSequence(jnp.asarray([5], jnp.int32)),)).host()
         if int(agreed.lengths.sum()) < 1:
             raise AssertionError("the agreed request emitted nothing")
+    # Ragged rows: a criterion ends some of them early, so the search and the
+    # speculative block both have to finish while their peers keep going.
+    # A token the greedy walk of the global prompts reaches at different
+    # steps, so the rows end raggedly. It is read from the whole batch on
+    # unsharded weights, so every process resolves the same component.
+    walked = jnp.asarray(prompts)
+    for _ in range(3):
+        step = jnp.argmax(model.apply(params, walked)[:, -1], axis=-1)[:, None].astype(jnp.int32)
+        walked = jnp.concatenate([walked, step], axis=1)
+    early = (decoding.EndOfSequence(jnp.asarray([int(walked[0, -1])], jnp.int32)),)
+    searched = TextGeneration(model, placed, sampling=Sampling(pad_id=12), stopping=early,
+                              strategy=Beam(width=3, length_penalty=0.7), n=2)(
+                                  request, 4, seed=7).host()
+    drafted = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_id=12),
+                             stopping=early, strategy=Speculative(block=3))(
+                                 request, 5, seed=7).host()
+    plain = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_id=12),
+                           stopping=early)(request, 5, seed=7).host()
+    if not np.array_equal(drafted.tokens, plain.tokens):
+        raise AssertionError("speculation and sampling disagreed on a greedy pool run")
     return {
         "process_index": rank,
         "rows": int(result.rows),
@@ -1548,6 +1569,10 @@ def mode_decoding_components(args) -> dict:
         "lengths": result.lengths.tolist(),
         "behavior": np.round(result.behavior_log_probs, 5).tolist(),
         "refused": refused,
+        "beam_tokens": searched.tokens.tolist(),
+        "beam_lengths": searched.lengths.tolist(),
+        "draft_tokens": drafted.tokens.tolist(),
+        "draft_lengths": drafted.lengths.tolist(),
     }
 
 

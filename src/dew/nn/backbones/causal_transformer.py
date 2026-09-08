@@ -1602,6 +1602,14 @@ class CausalTransformer(nn.Module):
                                                                     rotary_positions=rotary_positions))
         return self._logits(state), state
 
+    def token_embeddings(self, tokens):
+        """The embeddings a prediction depth pairs with `tokens`.
+
+        `mtp_hidden_states` reads the unscaled table, so this is that lookup
+        and nothing else: a drawn token is text, and media never reaches it.
+        """
+        return self.embed_tokens(tokens)
+
     def init_mtp_cache(self, batch_size: int):
         """Allocate only prediction-layer caches; ordinary generation does not pay for them."""
         for block in self.mtp:
@@ -1657,6 +1665,18 @@ class CausalTransformer(nn.Module):
                                      self.embed_tokens.embedding.dtype)
             x = scaled.astype(x.dtype)
         x = self._scatter_inputs(x, tokens, input_embeddings, embedding_positions)
+        # A prediction depth reads the embeddings `mtp_hidden_states` pairs
+        # with, which are the unscaled ones with any media replacement already
+        # in place. A decoder that fused another encoder's outputs cannot
+        # rebuild those from token ids, and rebuilding them would run that
+        # encoder again. Sowing costs nothing unless a caller asks for the
+        # collection, and init leaves it out so the variables tree a caller
+        # keeps holds parameters and nothing else.
+        if not self.is_initializing():
+            self.sow("embeddings", "prepared",
+                     self._scatter_inputs(self.embed_tokens(tokens), tokens,
+                                          input_embeddings, embedding_positions),
+                     reduce_fn=lambda _, value: value, init_fn=lambda: None)
         ple = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
         if self.altup is not None:
             # The embeddings and, rescaled to their magnitude, each projected
