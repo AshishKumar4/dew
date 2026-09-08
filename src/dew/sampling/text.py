@@ -43,10 +43,10 @@ class Sampling:
     ``top_k=None`` keeps the vocabulary. EOS counts as a sampled action;
     subsequent output slots contain ``pad_id`` and have no likelihood.
 
-    A ``Sampling`` value is a convenience over the general decoding
-    components: it compiles to the temperature, top-k, top-p and min-p
-    transforms in that order plus an EOS criterion, which `generate` appends
-    after any transforms and criteria a caller passes.
+    A ``Sampling`` value compiles to temperature, top-k, top-p and min-p
+    transforms when a request has no explicit logits chain. An explicit
+    chain replaces those transforms. The EOS criterion still joins the
+    request's stopping criteria.
     """
 
     temperature: float = 1.0
@@ -73,7 +73,7 @@ class Sampling:
             object.__setattr__(self, "eos_id", stops)
 
     def transforms(self) -> tuple[LogitsTransform, ...]:
-        """The filtering tail this policy adds after a caller's transforms.
+        """The complete default chain for a request without explicit transforms.
 
         Zero temperature is the argmax, and the sample-only filters are
         inactive there, which is what `generate()` does with `do_sample=False`.
@@ -287,7 +287,7 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
 
 
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
-              max_new_tokens: int, sampling: Sampling, n: int,
+              max_new_tokens: int, pad_id: int, n: int,
               transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
               strategy: Strategy) -> Generation:
     """One fixed compiled loop; finished rows do not mutate their cache state.
@@ -303,7 +303,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         empty = jnp.zeros((batch * n, 0), jnp.float32)
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
                           jnp.zeros(batch * n, bool), empty, empty)
-    ops = _operations(model, params, sampling.pad_id,
+    ops = _operations(model, params, pad_id,
                       int(getattr(model, "num_nextn_predict_layers", 0) or 0))
     state, real = _prefill(model, params, inputs, ops)
     start = StepState(
@@ -314,7 +314,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
     drawn: Draws = strategy(state, start, ops, decoding.chain(transforms),
                             decoding.criterion(stopping), max_new_tokens, n)
     return Generation(
-        jnp.concatenate([prompt, jnp.where(drawn.valid, drawn.tokens, sampling.pad_id)], axis=1),
+        jnp.concatenate([prompt, jnp.where(drawn.valid, drawn.tokens, pad_id)], axis=1),
         jnp.sum(drawn.valid, axis=1, dtype=jnp.int32), drawn.terminated,
         drawn.behavior_log_probs, drawn.raw_log_probs)
 
@@ -465,7 +465,7 @@ def _digest(components: object) -> tuple[object, ...]:
 
 
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
-             max_new_tokens: int, sampling: Sampling, n: int,
+             max_new_tokens: int, pad_id: int, n: int,
              transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
              strategy: Strategy) -> tuple[checkify.Error, Generation]:
     """`_generate` with its device checks discharged into a returned error.
@@ -477,7 +477,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
     """
 
     def run(params, inputs, keys, transforms, stopping, strategy):
-        return _generate(model, params, inputs, keys, max_new_tokens, sampling, n,
+        return _generate(model, params, inputs, keys, max_new_tokens, pad_id, n,
                          transforms, stopping, strategy)
 
     return checkify.checkify(run, errors=checkify.user_checks)(
@@ -486,7 +486,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
 
 @functools.lru_cache(maxsize=None)
 def _compiled(rows: jax.sharding.NamedSharding | None):
-    return jax.jit(_checked, static_argnames=("model", "max_new_tokens", "sampling", "n"),
+    return jax.jit(_checked, static_argnames=("model", "max_new_tokens", "pad_id", "n"),
                    in_shardings=(None, rows, rows, None, None, None),
                    out_shardings=(None, rows))
 
@@ -522,10 +522,10 @@ def generate(model: nn.Module, params: Variables,
     Parameters keep their placement. On a mesh, rows split over its batch
     axes and the result keeps that sharding; ``Generation.host()`` reads a
     process's own rows back. All cooperating processes use the same input
-    shapes, sampling value, decoding components and continuation count, and
-    execute a fixed decode trip count. Keys fold in the global row index and
-    the response position, so a pool draws what one process draws for the
-    same rows.
+    shapes, effective decoding components, padding id and continuation count.
+    Decode loops have fixed bounds; any skipped blocks are globally agreed.
+    Keys fold in the global row index and response position, so a pool draws
+    what one process draws for the same rows.
 
     ``n`` continuations of each prompt share its prefill and leave as ``n``
     consecutive rows of every array, in prompt order. Continuation zero of a
@@ -563,7 +563,7 @@ def generate(model: nn.Module, params: Variables,
         raise error
     assert prepared is not None and random_key is not None and components is not None
     if processes > 1:
-        controls = (max_new_tokens, n, sampling, _digest(components))
+        controls = (max_new_tokens, n, sampling.pad_id, _digest(components))
         # Whether this process's own prompts needed padding is rank-local, and
         # the digest below would refuse a pool that disagrees only about that,
         # so the pool agrees one validity schema first.
@@ -573,7 +573,7 @@ def generate(model: nn.Module, params: Variables,
         # alone; different traced shapes would issue mismatched collectives.
         digest = generation_signature(prepared, controls)
         multihost_utils.assert_equal(
-            digest, "generation input shapes, continuations, decoding components and sampling "
+            digest, "generation input shapes, continuations, decoding components and padding "
                     "must agree across processes")
     plan = RowPlan.over(mesh, prepared.tokens.shape[0])
     padded = plan.pad(prepared)
@@ -586,7 +586,7 @@ def generate(model: nn.Module, params: Variables,
         padded = replace(padded, token_fields={**padded.token_fields,
                                                "attention_mask": valid & ~plan.padding[:, None]})
     failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
-                                               plan.keys(random_key), max_new_tokens, sampling, n,
+                                               plan.keys(random_key), max_new_tokens, sampling.pad_id, n,
                                                *components)
     failure.throw()
     return replace(output, rows=plan.rows * n)

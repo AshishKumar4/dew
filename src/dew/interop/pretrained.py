@@ -8,7 +8,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -677,10 +677,8 @@ class Pretrained:
         rows = _return_sequences(self.config, self.generation_config)
         policy, logits, stopping, strategy = _source_decoding(
             self.config, self.generation_config, self.model, self.processor, rows,
-            sampling is not None)
-        chosen = sampling if sampling is not None else policy
-        assert chosen is not None
-        return TextGeneration(self.model, self.variables, self.processor, chosen,
+            sampling)
+        return TextGeneration(self.model, self.variables, self.processor, policy,
                               max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
                               max_length=_generation_limit(self.config, self.generation_config, "max_length"),
                               n=rows, logits=logits, stopping=stopping, strategy=strategy)
@@ -820,101 +818,153 @@ def _probability_control(config: Mapping[str, object], generation_config: Mappin
     return float(value)
 
 
-# Transformers 5.16.1 generation controls (GenerationConfig.to_dict keys),
-# classified by what Dew does with each one. Checkpoint
-# generation_config.json is data; interpreting it must not run Transformers
-# generation code. docs/reference/core-api.md carries the same classification
-# as a table for readers.
-#
-# POLICY: the native Sampling value carries it. TRANSFORM and CRITERION: a
-# built-in from dew.sampling.decoding carries it, built in
-# _get_logits_processor's order. TASK: prompt construction, output size and
-# row count, which the task owns. METADATA: it records provenance and does
-# not run. REFUSED: named with the reason. NEUTRAL is the value at which
-# generate() adds no processor, criterion or search mode
-# (utils._get_logits_processor, configuration_utils.get_generation_mode);
-# unset counts as neutral. BEAM_ONLY and SAMPLED_ONLY matter only when beam
-# search or sampling is active, as they do upstream.
-_POLICY_CONTROLS = frozenset({"do_sample", "temperature", "top_k", "top_p", "min_p",
-                              "eos_token_id", "pad_token_id"})
-_TASK_CONTROLS = frozenset({"bos_token_id", "decoder_start_token_id", "max_length",
-                            "max_new_tokens", "num_return_sequences", "max_cache_len"})
-_METADATA_CONTROLS = frozenset({"transformers_version", "_from_model_config", "_commit_hash",
-                                "tokenizer_name", "return_dict_in_generate"})
-_TRANSFORM_CONTROLS = frozenset({
-    "sequence_bias", "encoder_repetition_penalty", "repetition_penalty", "no_repeat_ngram_size",
-    "encoder_no_repeat_ngram_size", "bad_words_ids", "min_length", "min_new_tokens",
-    "forced_bos_token_id", "forced_eos_token_id", "remove_invalid_values",
-    "exponential_decay_length_penalty", "suppress_tokens", "begin_suppress_tokens",
-    "top_h", "typical_p", "epsilon_cutoff", "eta_cutoff", "renormalize_logits",
-})
-_CRITERION_CONTROLS = frozenset({"stop_strings"})
-_STRATEGY_CONTROLS = frozenset({"num_beams", "early_stopping", "length_penalty", "use_mtp",
-                                "speculation_type", "num_assistant_tokens",
-                                "assistant_confidence_threshold"})
-_REFUSED_CONTROLS: dict[str, str] = {
-    "max_time": "a host clock cannot stop a coordinated device loop",
-    "token_healing": "retokenizing the prompt is prompt construction, not decoding",
-    "guidance_scale": "classifier-free guidance evaluates the model a second time per step",
-    "penalty_alpha": "contrastive search is a decoding strategy that is not implemented",
-    "dola_layers": "DoLa is a decoding strategy that is not implemented",
-    "watermarking_config": "no watermarking transform is implemented",
-    "num_beam_groups": "diverse group beam search is not implemented",
-    "diversity_penalty": "diverse group beam search is not implemented",
-    "constraints": "constrained beam search is not implemented",
-    "force_words_ids": "constrained beam search is not implemented",
-    "prompt_lookup_num_tokens": "prompt lookup proposal is not implemented",
-    "max_matching_ngram_size": "prompt lookup proposal is not implemented",
-    "assistant_early_exit": "early-exit proposal is not implemented",
-    "assistant_ensemble_weight": "ensemble verification below one accepts a biased distribution",
-    "num_assistant_tokens_schedule": "only a constant proposal length fits a fixed device block",
-    "assistant_lookbehind": "translating between two tokenizers' token spaces is not implemented",
-    "target_lookbehind": "translating between two tokenizers' token spaces is not implemented",
-    "is_assistant": "a source loads as a target model, not as another model's assistant",
-    "use_cache": "native decoding always runs through its own cache",
-    "cache_implementation": "the native cache is the fixed-capacity static one",
-    "cache_config": "quantized and offloaded caches are not implemented",
-    "prefill_chunk_size": "the native prefill evaluates a prompt in one call",
-    "continuous_batching_config": "continuous batching is not implemented",
-    "compile_config": "the native decoder owns its compilation",
-    "disable_compile": "the native decoder always runs compiled",
-    "low_memory": "sequential beam evaluation is not implemented",
-    "output_attentions": "generation does not return attentions",
-    "output_hidden_states": "generation does not return hidden states",
-    "output_scores": "generation does not return per-step distributions",
-    "output_logits": "generation does not return per-step logits",
+@dataclass(frozen=True)
+class _Control:
+    """One source control's consumer, activation rule and unsupported case."""
+
+    owner: Literal["policy", "task", "metadata", "inapplicable", "transform",
+                   "criterion", "strategy", "capacity", "unsupported"]
+    neutral: tuple[object, ...] = ()
+    mode: Literal["always", "sampling", "beam"] = "always"
+    refusal: str | None = None
+
+
+# GenerationConfig is external data. Keep each control's disposition and
+# neutral values together; the native component constructors own their defaults.
+# Supplied-input causal tasks do not synthesize BOS/decoder-start tokens or
+# switch their native result type through return_dict_in_generate.
+_CONTROLS = {
+    "_commit_hash": _Control("metadata"),
+    "_from_model_config": _Control("metadata"),
+    "assistant_confidence_threshold": _Control("strategy"),
+    "assistant_early_exit": _Control("unsupported", refusal="early-exit proposal is not implemented"),
+    "assistant_ensemble_weight": _Control(
+        "unsupported",
+        neutral=(1.0,),
+        refusal="ensemble verification below one accepts a biased distribution"),
+    "assistant_lookbehind": _Control(
+        "unsupported",
+        refusal="translating between two tokenizers' token spaces is not implemented"),
+    "bad_words_ids": _Control("transform"),
+    "begin_suppress_tokens": _Control("transform"),
+    "bos_token_id": _Control("inapplicable"),
+    "cache_config": _Control("unsupported", refusal="quantized and offloaded caches are not implemented"),
+    "cache_implementation": _Control(
+        "unsupported",
+        neutral=('static',),
+        refusal="the native cache is the fixed-capacity static one"),
+    "compile_config": _Control("unsupported", refusal="the native decoder owns its compilation"),
+    "constraints": _Control("unsupported", refusal="constrained beam search is not implemented"),
+    "continuous_batching_config": _Control("unsupported", refusal="continuous batching is not implemented"),
+    "decoder_start_token_id": _Control("inapplicable"),
+    "disable_compile": _Control(
+        "unsupported",
+        neutral=(False,),
+        refusal="the native decoder always runs compiled"),
+    "diversity_penalty": _Control(
+        "unsupported",
+        neutral=(0.0,),
+        mode="beam",
+        refusal="diverse group beam search is not implemented"),
+    "do_sample": _Control("policy"),
+    "dola_layers": _Control("unsupported", refusal="DoLa is a decoding strategy that is not implemented"),
+    "early_stopping": _Control("strategy", neutral=(False,), mode="beam"),
+    "encoder_no_repeat_ngram_size": _Control("transform", neutral=(0,)),
+    "encoder_repetition_penalty": _Control("transform", neutral=(1.0,)),
+    "eos_token_id": _Control("policy"),
+    "epsilon_cutoff": _Control("transform", neutral=(0.0,), mode="sampling"),
+    "eta_cutoff": _Control("transform", neutral=(0.0,), mode="sampling"),
+    "exponential_decay_length_penalty": _Control("transform"),
+    "force_words_ids": _Control("unsupported", refusal="constrained beam search is not implemented"),
+    "forced_bos_token_id": _Control("transform"),
+    "forced_eos_token_id": _Control("transform"),
+    "guidance_scale": _Control(
+        "transform",
+        neutral=(1.0,),
+        refusal="classifier-free guidance evaluates the model a second time per step"),
+    "is_assistant": _Control(
+        "unsupported",
+        neutral=(False,),
+        refusal="a source loads as a target model, not as another model's assistant"),
+    "length_penalty": _Control("strategy", neutral=(1.0,), mode="beam"),
+    "low_memory": _Control(
+        "unsupported",
+        neutral=(False,),
+        refusal="sequential beam evaluation is not implemented"),
+    "max_cache_len": _Control("capacity"),
+    "max_length": _Control("task"),
+    "max_matching_ngram_size": _Control("unsupported", refusal="prompt lookup proposal is not implemented"),
+    "max_new_tokens": _Control("task"),
+    "max_time": _Control("unsupported", refusal="a host clock cannot stop a coordinated device loop"),
+    "min_length": _Control("transform", neutral=(0,)),
+    "min_new_tokens": _Control("transform", neutral=(0,)),
+    "min_p": _Control("policy", mode="sampling"),
+    "no_repeat_ngram_size": _Control("transform", neutral=(0,)),
+    "num_assistant_tokens": _Control("strategy"),
+    "num_assistant_tokens_schedule": _Control(
+        "unsupported",
+        neutral=('constant',),
+        refusal="only a constant proposal length fits a fixed device block"),
+    "num_beam_groups": _Control(
+        "unsupported",
+        neutral=(1,),
+        mode="beam",
+        refusal="diverse group beam search is not implemented"),
+    "num_beams": _Control("strategy", neutral=(1,)),
+    "num_return_sequences": _Control("task"),
+    "output_attentions": _Control(
+        "unsupported",
+        neutral=(False,),
+        refusal="generation does not return attentions"),
+    "output_hidden_states": _Control(
+        "unsupported",
+        neutral=(False,),
+        refusal="generation does not return hidden states"),
+    "output_logits": _Control(
+        "unsupported",
+        neutral=(False,),
+        refusal="generation does not return per-step logits"),
+    "output_scores": _Control(
+        "unsupported",
+        neutral=(False,),
+        refusal="generation does not return per-step distributions"),
+    "pad_token_id": _Control("policy"),
+    "penalty_alpha": _Control(
+        "unsupported",
+        neutral=(0.0,),
+        refusal="contrastive search is a decoding strategy that is not implemented"),
+    "prefill_chunk_size": _Control("unsupported", refusal="the native prefill evaluates a prompt in one call"),
+    "prompt_lookup_num_tokens": _Control("unsupported", refusal="prompt lookup proposal is not implemented"),
+    "remove_invalid_values": _Control("transform", neutral=(False,)),
+    "renormalize_logits": _Control("transform", neutral=(False,)),
+    "repetition_penalty": _Control("transform", neutral=(1.0,)),
+    "return_dict_in_generate": _Control("inapplicable"),
+    "sequence_bias": _Control("transform"),
+    "speculation_type": _Control("strategy"),
+    "stop_strings": _Control("criterion"),
+    "suppress_tokens": _Control("transform"),
+    "target_lookbehind": _Control(
+        "unsupported",
+        refusal="translating between two tokenizers' token spaces is not implemented"),
+    "temperature": _Control("policy"),
+    "token_healing": _Control(
+        "unsupported",
+        neutral=(False,),
+        refusal="retokenizing the prompt is prompt construction, not decoding"),
+    "tokenizer_name": _Control("metadata"),
+    "top_h": _Control("transform", mode="sampling"),
+    "top_k": _Control("policy"),
+    "top_p": _Control("policy", mode="sampling"),
+    "transformers_version": _Control("metadata"),
+    "typical_p": _Control("transform", neutral=(1.0,), mode="sampling"),
+    "use_cache": _Control(
+        "unsupported",
+        neutral=(True,),
+        refusal="native decoding always runs through its own cache"),
+    "use_mtp": _Control("strategy", neutral=(False,)),
+    "watermarking_config": _Control("transform", refusal="no watermarking transform is implemented"),
 }
-_NEUTRAL_CONTROLS: dict[str, tuple[object, ...]] = {
-    "max_time": (),
-    "repetition_penalty": (1.0,), "encoder_repetition_penalty": (1.0,),
-    "no_repeat_ngram_size": (0,), "encoder_no_repeat_ngram_size": (0,),
-    "min_length": (0,), "min_new_tokens": (0,), "num_beams": (1,), "penalty_alpha": (0.0,),
-    "typical_p": (1.0,), "epsilon_cutoff": (0.0,), "eta_cutoff": (0.0,), "top_h": (),
-    "guidance_scale": (1.0,), "remove_invalid_values": (False,), "renormalize_logits": (False,),
-    "token_healing": (False,), "sequence_bias": (), "bad_words_ids": (), "force_words_ids": (),
-    "constraints": (), "forced_bos_token_id": (), "forced_eos_token_id": (),
-    "exponential_decay_length_penalty": (), "suppress_tokens": (), "begin_suppress_tokens": (),
-    "watermarking_config": (), "dola_layers": (), "stop_strings": (),
-    "use_cache": (True,), "cache_implementation": ("static",), "cache_config": (),
-    "prefill_chunk_size": (), "continuous_batching_config": (), "compile_config": (),
-    "disable_compile": (False,), "low_memory": (False,),
-    "output_attentions": (False,), "output_hidden_states": (False,),
-    "output_scores": (False,), "output_logits": (False,),
-    "use_mtp": (False,), "speculation_type": (), "is_assistant": (False,),
-    "num_assistant_tokens": (), "num_assistant_tokens_schedule": ("constant",),
-    "assistant_confidence_threshold": (), "assistant_early_exit": (),
-    "assistant_lookbehind": (), "assistant_ensemble_weight": (1.0,), "target_lookbehind": (),
-    "prompt_lookup_num_tokens": (), "max_matching_ngram_size": (),
-}
-_BEAM_ONLY_CONTROLS: dict[str, tuple[object, ...]] = {
-    "early_stopping": (False,), "length_penalty": (1.0,), "num_beam_groups": (1,),
-    "diversity_penalty": (0.0,),
-}
-_SAMPLED_ONLY_CONTROLS = frozenset({"top_p", "min_p", "typical_p", "epsilon_cutoff",
-                                    "eta_cutoff", "top_h"})
-_SHAPING_REFUSALS = frozenset({"watermarking_config", "guidance_scale"})
-"""Refusals that only concern the token distribution, which an explicit policy
-replaces along with the chain."""
+
 
 
 def _neutral(value: object, neutral: tuple[object, ...]) -> bool:
@@ -929,58 +979,41 @@ def _active(config: Mapping[str, object], generation_config: Mapping[str, object
             name: str) -> object:
     """The control's value when it is active, None when it changes nothing."""
     value = _generation_value(config, generation_config, name)
-    return None if _neutral(value, _NEUTRAL_CONTROLS.get(name, ())) else value
+    rule = _CONTROLS.get(name)
+    return None if _neutral(value, () if rule is None else rule.neutral) else value
 
 
 def _audit(config: Mapping[str, object], generation_config: Mapping[str, object],
            model: nn.Module, do_sample: bool, beams: object, overridden: bool) -> None:
-    """Refuse every active control the native decoder does not implement.
-
-    A control is judged individually. Sampling-only and beam-only controls are
-    judged only when sampling or beam search is active, as `generate()` judges
-    them, and an unknown name is refused rather than ignored, because nothing
-    says who would own it.
-
-    `overridden` means the caller replaced the basic policy and the chain, so
-    the controls that would have built them are neither judged nor built. The
-    task still owns the criteria, the strategy and the row count, so those are
-    judged as always.
-    """
-    known = (_POLICY_CONTROLS | _TASK_CONTROLS | _METADATA_CONTROLS | _TRANSFORM_CONTROLS
-             | _CRITERION_CONTROLS | _STRATEGY_CONTROLS | set(_REFUSED_CONTROLS)
-             | set(_NEUTRAL_CONTROLS) | set(_BEAM_ONLY_CONTROLS))
-    replaced = _POLICY_CONTROLS | _TRANSFORM_CONTROLS | _SHAPING_REFUSALS
+    """Refuse active unsupported controls after applying the caller's override."""
     refused: list[str] = []
-    for name in sorted(known | set(generation_config)):
-        if name in _POLICY_CONTROLS or name in _METADATA_CONTROLS:
+    for name in sorted(_CONTROLS.keys() | generation_config.keys()):
+        rule = _CONTROLS.get(name)
+        if rule is not None:
+            if rule.owner in ("policy", "metadata", "inapplicable", "task"):
+                continue
+            if overridden and rule.owner == "transform":
+                continue
+            if rule.mode == "beam" and _neutral(beams, _CONTROLS["num_beams"].neutral):
+                continue
+            if rule.mode == "sampling" and not do_sample:
+                continue
+            if rule.owner == "capacity":
+                _cache_capacity(config, generation_config, model)
+                continue
+        if _active(config, generation_config, name) is None:
             continue
-        if overridden and name in replaced:
+        if rule is not None and rule.refusal is None:
             continue
-        if name in _BEAM_ONLY_CONTROLS and _neutral(beams, _NEUTRAL_CONTROLS["num_beams"]):
-            continue
-        if not do_sample and name in _SAMPLED_ONLY_CONTROLS:
-            continue
-        if name == "max_cache_len":
-            _cache_capacity(config, generation_config, model)
-            continue
-        if name in _TASK_CONTROLS:
-            continue
-        active = _active(config, generation_config, name)
-        if active is None:
-            continue
-        if name in _TRANSFORM_CONTROLS or name in _CRITERION_CONTROLS or name in _STRATEGY_CONTROLS:
-            continue
-        reason = _REFUSED_CONTROLS.get(name, "the native decoder does not know this control")
+        reason = rule.refusal if rule is not None else "the native decoder does not know this control"
         refused.append(f"{name} ({reason})")
-    if do_sample and not _neutral(beams, _NEUTRAL_CONTROLS["num_beams"]):
-        refused.append("do_sample with num_beams (a selected beam's marginal probability is not "
-                       "the per-step candidate probability, so no honest behaviour likelihood exists)")
     if refused:
         raise ValueError(
             f"native decoding cannot honor active source controls {refused}; "
             "text_generation(sampling=Sampling(...)) replaces the basic policy and the "
             "transform chain, and TextGeneration(model, variables, processor, logits=..., "
             "stopping=..., strategy=...) builds the task from components outright")
+
 
 
 def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str, object],
@@ -996,16 +1029,12 @@ def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str
         raise ValueError(f"max_cache_len {value} exceeds the model's max_seq_len {capacity}")
 
 
-def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object]) -> Sampling:
+def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object],
+                     do_sample: bool) -> Sampling:
     """The policy tail a source declares, whatever else it also declares."""
-    do_sample = _generation_value(config, generation_config, "do_sample", False)
-    if do_sample is None:
-        do_sample = False
-    if type(do_sample) is not bool:
-        raise ValueError("do_sample must be a boolean")
-    temperature = _generation_value(config, generation_config, "temperature", 1.0)
+    temperature = _generation_value(config, generation_config, "temperature", Sampling.temperature)
     if temperature is None:
-        temperature = 1.0
+        temperature = Sampling.temperature
     if not isinstance(temperature, (float, int)) or isinstance(temperature, bool):
         raise ValueError("temperature must be numeric")
     top_k = _generation_value(config, generation_config, "top_k")
@@ -1016,8 +1045,10 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
         top_k=top_k if do_sample and top_k else None,
         eos_id=(_eos_ids(config, generation_config) or None),
         pad_id=_pad_id(config, generation_config),
-        top_p=_probability_control(config, generation_config, "top_p", 1.0) if do_sample else 1.0,
-        min_p=_probability_control(config, generation_config, "min_p", 0.0) if do_sample else 0.0)
+        top_p=_probability_control(config, generation_config, "top_p", Sampling.top_p)
+        if do_sample else Sampling.top_p,
+        min_p=_probability_control(config, generation_config, "min_p", Sampling.min_p)
+        if do_sample else Sampling.min_p)
 
 
 def _token_list(value: object, name: str) -> list[int]:
@@ -1191,11 +1222,11 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
         early = _generation_value(config, generation_config, "early_stopping")
         penalty = _generation_value(config, generation_config, "length_penalty")
         if early is None:
-            early = False
+            early = Beam.early_stopping
         if early not in (True, False, "never"):
             raise ValueError("early_stopping is True, False or 'never'")
         return Beam(width=width,
-                    length_penalty=1.0 if penalty is None else _as_float("length_penalty", penalty),
+                    length_penalty=Beam.length_penalty if penalty is None else _as_float("length_penalty", penalty),
                     early_stopping=early is True if isinstance(early, bool) else "never",
                     stop_ids=len(_eos_ids(config, generation_config)))
     if not speculating:
@@ -1205,13 +1236,12 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
                          "checkpoint carries no prediction-depth weights")
     length = read("num_assistant_tokens")
     threshold = read("assistant_confidence_threshold")
-    if length is not None and _as_int("num_assistant_tokens", length) < 1:
+    drafted = Speculative.block - 1 if length is None else _as_int("num_assistant_tokens", length)
+    if drafted < 1:
         raise ValueError("num_assistant_tokens must draft at least one token")
-    # The source counts the tokens the proposer drafts; a block also holds the
-    # ordinary target draw the proposer chains from.
-    drafted = 3 if length is None else _as_int("num_assistant_tokens", length)
+    # The block includes the target draw the proposer chains from.
     return Speculative(block=drafted + 1,
-                       confidence=0.0 if threshold is None else
+                       confidence=Speculative.confidence if threshold is None else
                        _as_float("assistant_confidence_threshold", threshold))
 
 
@@ -1225,8 +1255,9 @@ def _mtp_mode(value: object) -> bool:
 
 
 def _source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],
-                     model: nn.Module, processor: Processor | None, rows: int, overridden: bool
-                     ) -> tuple[Sampling | None, tuple[decoding.LogitsTransform, ...] | None,
+                     model: nn.Module, processor: Processor | None, rows: int,
+                     override: Sampling | None
+                     ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...] | None,
                                 tuple[decoding.Stopping, ...], Strategy | None]:
     """The policy, chain, criteria and strategy a loaded source decodes with.
 
@@ -1234,19 +1265,19 @@ def _source_decoding(config: Mapping[str, object], generation_config: Mapping[st
     controls behind them are not judged: a watermark the caller just replaced
     cannot block the call.
     """
-    do_sample = _generation_value(config, generation_config, "do_sample", False) is True
+    requested_mode = _generation_value(config, generation_config, "do_sample")
+    if override is None and requested_mode is not None and type(requested_mode) is not bool:
+        raise ValueError("do_sample must be a boolean")
+    do_sample = requested_mode is True
     _audit(config, generation_config, model, do_sample,
-           _generation_value(config, generation_config, "num_beams"), overridden)
+           _generation_value(config, generation_config, "num_beams"), override is not None)
     strategy = _source_strategy(config, generation_config, model, do_sample, rows)
     criteria = _source_stopping(config, generation_config, processor,
                                 getattr(model, "vocab_size", None))
-    if overridden:
-        return None, None, criteria, strategy
-    sampling = _source_sampling(config, generation_config)
-    return (sampling,
-            _source_transforms(config, generation_config, sampling, do_sample,
-                               isinstance(strategy, Beam)),
-            criteria, strategy)
+    policy = override if override is not None else _source_sampling(config, generation_config, do_sample)
+    transforms = (None if override is not None else
+                  _source_transforms(config, generation_config, policy, do_sample, isinstance(strategy, Beam)))
+    return policy, transforms, criteria, strategy
 
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,

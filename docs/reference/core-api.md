@@ -316,13 +316,15 @@ The fit is reference and oracle use, with selective adaptation of the state and 
 
 A loaded source's `generation_config.json` is data. Every control Transformers 5.16.1 writes there is classified: the native policy carries it, a transform, criterion or strategy carries it, the task owns it, it is provenance, or `Pretrained.text_generation()` refuses it and says why. The transforms a source binds are the complete chain, built in `_get_logits_processor`'s order, so the policy tail lands where the reference puts it; a source running beam search ends its chain after the processors, because the search picks its own continuations. An unset control, or one at the value where `generate()` adds no processor, criterion or search mode, is inert. Beam-only and sampling-only controls are judged only when beam search or sampling is active, as they are upstream.
 
+Each source control has one rule for its consumer, neutral value, mode and refusal. Source value precedence remains `generation_config.json`, wrapper config, then text config. The source resolver selects the actual policy once. `Sampling` supplies convenience defaults at the request boundary; only resolved transforms, criteria, strategy and padding reach the compiled decoder. An explicit chain therefore has no unused sampling settings in its compilation or process-agreement identity.
+
 | Control | Native mapping | Refused because |
 | --- | --- | --- |
 | `do_sample`, `temperature`, `top_k`, `top_p`, `min_p`, `eos_token_id`, `pad_token_id` | `Sampling` | |
 | `max_length`, `max_new_tokens` | the task's token budget | |
 | `num_return_sequences` | the task's `n`, independent of any `sampling=` override | |
-| `bos_token_id`, `decoder_start_token_id` | prompt construction, outside decoding | |
-| `max_cache_len` | checked against the model's `max_seq_len` | a length above that capacity |
+| `bos_token_id`, `decoder_start_token_id` | inapplicable to supplied-input causal decoding; the tokenizer prepares special tokens | |
+| `max_cache_len` | capacity assertion only; it does not resize the cache or limit the request | a length above the model's `max_seq_len` |
 | `repetition_penalty` | `RepetitionPenalty` | |
 | `encoder_repetition_penalty` | `PromptRepetitionPenalty` | |
 | `no_repeat_ngram_size` | `NoRepeatNGram` | |
@@ -346,7 +348,7 @@ A loaded source's `generation_config.json` is data. Every control Transformers 5
 | `compile_config`, `disable_compile` | | the native decoder owns its compilation and always runs compiled |
 | `low_memory` | | sequential beam evaluation is not implemented |
 | `output_attentions`, `output_hidden_states`, `output_scores`, `output_logits` | | generation returns tokens, lengths, termination and both likelihood arrays, and none of these |
-| `return_dict_in_generate` | generation always returns a record | |
+| `return_dict_in_generate` | inapplicable to the native result type; generation always returns a record | |
 | `transformers_version`, `_from_model_config`, `_commit_hash`, `tokenizer_name` | provenance | |
 | `num_beams`, `early_stopping`, `length_penalty` | `Beam(width, length_penalty, early_stopping)`, with `stop_ids` from the EOS ids | |
 | `do_sample` with `num_beams` | | a selected beam's marginal probability is not the per-step candidate probability, so no honest behaviour likelihood exists |
