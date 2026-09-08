@@ -47,7 +47,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Annotated, Any, Iterator, Literal, Mapping
+from typing import Annotated, Any, Iterator, Literal, Mapping, Sequence
 
 import jax
 import numpy as np
@@ -56,6 +56,9 @@ import tyro
 
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
+from dew.inputs.encoders import ConditionEncoder
+from dew.nn.backbones.unet_condition import DenoisingCondition
+from dew.objectives.base import Variables
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
@@ -80,8 +83,32 @@ Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 Row = dict[str, object]
 
 
-def text_condition() -> Condition:
-    return Condition(CharTable.from_pretrained(tokens=TEXT_TOKENS, features=TEXT_FEATURES))
+class _UNetTextTable(ConditionEncoder[str]):
+    """The benchmark table in the native conditional UNet input format."""
+
+    def __init__(self, table: CharTable):
+        self.table = table
+        self.params = table.params
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = TEXT_TOKENS,
+                        features: int = TEXT_FEATURES, vocab: int = 130, seed: int = 0, dtype=None):
+        return cls(CharTable.from_pretrained(checkpoint, tokens=tokens, features=features,
+                                            vocab=vocab, seed=seed, dtype=dtype))
+
+    def tokenize(self, data: Sequence[str]) -> Mapping[str, np.ndarray]:
+        return self.table.tokenize(data)
+
+    def encode(self, params: Variables, tokens) -> DenoisingCondition:
+        return DenoisingCondition(self.table.encode(params, tokens).hidden)
+
+    def to_json(self) -> dict:
+        return self.table.to_json()
+
+
+def text_condition(architecture: str = "") -> Condition:
+    table = _UNetTextTable if architecture == "unet_2d_condition" else CharTable
+    return Condition(table.from_pretrained(tokens=TEXT_TOKENS, features=TEXT_FEATURES))
 
 
 @dataclass(frozen=True)
@@ -98,6 +125,8 @@ class Case:
     """Devices the expert dimension of an MoE layer is split over, as
     --trainer.expert-size; 1 replicates every expert."""
     image_size: int = 32
+    channels: int = 3
+    """Input channels, including four-channel latent diffusion inputs."""
     frames: int = 0
     """Video models take (frames, H, W, C) samples; 0 means images."""
     predictor: dict[str, object] | None = None
@@ -141,7 +170,7 @@ class Case:
 
     @property
     def sample_shape(self) -> tuple[int, ...]:
-        square = (self.image_size, self.image_size, 3)
+        square = (self.image_size, self.image_size, self.channels)
         return square if self.frames == 0 else (self.frames, *square)
 
     @property
@@ -272,6 +301,9 @@ def cpu_smoke_cases() -> list[Case]:
         Case("simple_dit", {"patch_size": 4, "emb_features": 64, "num_layers": 2,
                             "num_heads": 2, "mlp_ratio": 2},
              batch_size=8, image_size=16, fsdp_min_param_size=256),
+        Case("unet_2d_condition", {"stages": [{"features": 32, "heads": 2}, {"features": 64, "heads": 4}],
+                                    "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
+             batch_size=8, image_size=16, channels=4, fsdp_min_param_size=256),
         Case("jepa_encoder", {"patch_size": 4, "emb_features": 32, "num_layers": 2,
                               "num_heads": 2, "mlp_ratio": 2},
              predictor={"grid": (4, 4), "emb_features": 32, "predictor_features": 16,
@@ -318,6 +350,10 @@ def small_cases(dtype: str) -> list[Case]:
 
     cases = [
         Case("unet", unet, batch_size=16, image_size=64),
+        Case("unet_2d_condition", {"stages": [{"features": 64, "heads": 4}, {"features": 128, "heads": 4},
+                                              {"features": 256, "heads": 8, "cross_attention": False}],
+                                    "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
+             batch_size=4, image_size=32, channels=4),
         Case("uvit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
         Case("simple_udit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
         Case("simple_dit", dit, batch_size=16, image_size=64),
@@ -512,8 +548,9 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
             sample=Field(sample_key, case.sample_shape))
     else:
         model = built(case.architecture, case.config)
+        keyword = "conditioning" if case.architecture == "unet_2d_condition" else "textcontext"
         inputs = InputSpec(Field(sample_key, case.sample_shape),
-                           {"textcontext": text_condition()})
+                           {keyword: text_condition(case.architecture)})
         objective = DiffusionObjective(model, presets.EDM()(), inputs)
 
     return Trainer(
@@ -585,7 +622,7 @@ def batches(case: Case) -> Iterator[Batch]:
         batch[sample_key] = rng.integers(
             0, 256, size=(case.batch_size, *case.sample_shape)).astype(np.float32)
         if not case.is_jepa:
-            batch["text"] = text_condition().encoder.tokenize(["a flower"] * case.batch_size)
+            batch["text"] = text_condition(case.architecture).encoder.tokenize(["a flower"] * case.batch_size)
     while True:
         yield batch
 
