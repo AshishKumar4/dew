@@ -817,13 +817,26 @@ A `Process` combines a noise schedule, a prediction transform, and loss weightin
 | Presets | EDM, Karras, Cosine, Flow, Sqrt; MDLM for masked-token diffusion |
 | Prediction transforms | Noise, clean-sample, velocity, flow, Karras preconditioning |
 | Weighting | Schedule weighting, P2-related weighting, Min-SNR |
-| Solvers | DDPM, DDIM, Euler, Euler ancestral, Heun, RK4, MultiStepDPM |
-| Guidance | Classifier-free guidance with optional time interval |
+| Solvers | DDPM/DDIM, Euler/Heun/RK4, DPM-Solver and DPM-Solver++, DEIS, UniPC, PNDM, LMS, KDPM2, EDM-DPM, LCM, TCD, DPM-Solver SDE |
+| Guidance | Classifier-free guidance with an optional interval and rescaling |
 | Conditions | `InputSpec`/`Condition`, CLIP, T5, labels or custom encoders |
 
 Training and inference can use different schedules, as in EDM's log-normal training distribution and Karras sampling grid. The sampler uses `jax.lax.scan`, so changing the solver reuses the same trained weights. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
 
 `TextToImage` combines text encoding, denoising, and optional latent decoding. See [diffusion](docs/guides/diffusion.md) for text conditioning, latent models, and sampling.
+
+For SD/SDXL checkpoints, `dew.pipeline(source)` reconstructs the source scheduler
+instead of selecting a solver by name alone. Supported source policies include
+clipping, thresholding, timestep spacing, and Karras, exponential, and beta grids
+where the corresponding scheduler supports them. Unsupported active combinations
+raise rather than silently using different defaults.
+
+For a text-conditioned image task, pass
+`guidance=CFG(scale=7.5, interval=(0.0, 1.0), rescale=0.7)`
+after importing `CFG` from `dew.sampling`. Rescaling mixes the guided output
+with a version matched to the conditional output's standard deviation.
+`rescale=0.0` leaves it unchanged; `guidance=None` disables classifier-free guidance.
+The source-scheduler oracles use tiny synthetic trajectories, not released-model quality benchmarks.
 
 ## Generating and serving
 
@@ -870,7 +883,6 @@ restated at generation time.
 from pathlib import Path
 
 import jax
-import numpy as np
 import optax
 
 from dew import Checkpoints, Trainer
@@ -911,7 +923,7 @@ def main():
     task = TextToImage.from_run(str(run))
     images = task(["a flower", "another flower"], steps=20, sampler=Heun(),
                   key=jax.random.key(1))
-    print(np.asarray(images).shape, int(state.updates))
+    print(images.host().images.shape, int(state.updates))
 
 
 if __name__ == "__main__":
