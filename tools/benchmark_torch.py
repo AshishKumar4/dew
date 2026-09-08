@@ -527,6 +527,13 @@ class Unet(nn.Module):
         super().__init__()
         depths = cfg['feature_depths']
         heads = cfg['attention_heads']
+        if len(heads) != len(depths):
+            # The decoder walks the two reversed, so a disagreement does not drop
+            # the odd stage: it offsets the levels the decoder attends in from the
+            # ones the encoder does, and the halves stop mirroring silently.
+            raise ValueError(
+                "attention_heads names one stage per feature depth; got "
+                f"{len(heads)} stages for {len(depths)} depths")
         emb = cfg['emb_features']
         self.fourier = FourierEmbedding(emb)
         self.time_proj = TimeProjection(emb, emb)
