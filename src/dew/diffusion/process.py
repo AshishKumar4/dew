@@ -68,7 +68,17 @@ class Process:
 
 @dataclass(frozen=True)
 class Denoiser:
-    """A model, its parameters and its conditions as one denoising function."""
+    """A model, its parameters and its conditions as one denoising function.
+
+    A call is the model's raw output at `(x_t, t)` followed by the process's
+    conversion of it into `(x_0, epsilon)`. The two are separate because a
+    source's conversion is not always linear in the output: dynamic
+    thresholding and sample clipping limit x_0, and a consistency boundary
+    reads a function of it, so combining two raw outputs after conversion is
+    not combining them before it. Guidance therefore reads `raw_both`,
+    combines the raw outputs and converts once, the order a source pipeline
+    runs its scheduler in.
+    """
 
     process: Process
     model: nn.Module
@@ -76,21 +86,31 @@ class Denoiser:
     conditions: dict[str, Any]
     unconditional: dict[str, Any] | None = None
 
-    def _predict(self, x_t, t, conditions) -> tuple[jax.Array, jax.Array]:
+    def _raw(self, x_t, t, conditions) -> jax.Array:
+        """The model's own output at `(x_t, t)`, on the input scale and model
+        time the process's parameterization asks for."""
         process = self.process
         rates = broadcast_rates(process.sampler_schedule, t, x_t)
         c_in = process.prediction.get_input_scale(rates)
         output = self.model.apply(
             self.params, x_t * c_in, process.sampler_schedule.model_time(t), **conditions)
+        if not isinstance(output, jax.Array):
+            raise TypeError("A diffusion model must return one prediction array")
+        return output
+
+    def convert(self, x_t, t, output) -> tuple[jax.Array, jax.Array]:
+        """`(x_0, epsilon)` read out of a raw model output at `(x_t, t)`."""
+        process = self.process
+        rates = broadcast_rates(process.sampler_schedule, t, x_t)
         preds = process.prediction.pred_transform(x_t, output, rates, t)
         return process.prediction.backward_diffusion(x_t, preds, rates)
 
     def __call__(self, x_t, t) -> tuple[jax.Array, jax.Array]:
-        return self._predict(x_t, t, self.conditions)
+        return self.convert(x_t, t, self._raw(x_t, t, self.conditions))
 
-    def both(self, x_t, t) -> tuple[tuple[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]:
-        """The conditional and the unconditional prediction, in one model call
-        over the doubled batch."""
+    def raw_both(self, x_t, t) -> tuple[jax.Array, jax.Array]:
+        """The conditional and the unconditional raw outputs, in one model
+        call over the doubled batch."""
         if self.unconditional is None:
             raise ValueError("guidance needs the unconditional conditions; pass "
                              "`unconditional` to Process.denoiser")
@@ -99,9 +119,9 @@ class Denoiser:
             lambda given, null: jnp.concatenate(
                 [given, jnp.broadcast_to(null, given.shape)], axis=0),
             self.conditions, self.unconditional)
-        x_0, eps = self._predict(
+        output = self._raw(
             jnp.concatenate([x_t, x_t], axis=0), jnp.concatenate([t, t], axis=0), doubled)
-        return (x_0[:batch], eps[:batch]), (x_0[batch:], eps[batch:])
+        return output[:batch], output[batch:]
 
 
 __all__ = ["Process", "Denoiser"]

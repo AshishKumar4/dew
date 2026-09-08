@@ -69,7 +69,7 @@ def sample[StateT](denoise: Denoiser | DiscreteDenoiser, x_T: jax.Array, steps: 
         return predict(x_T, jnp.full((batch,), times[0]))[0] if final_denoise else x_T
 
     with jax.ensure_compile_time_eval():
-        initial = solver.init(x_T, times, process)
+        initial = solver.init(x_T, times, process, key=key)
 
     def body(carry, inputs):
         x, state = carry

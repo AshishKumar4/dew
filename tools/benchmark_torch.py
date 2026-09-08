@@ -527,6 +527,13 @@ class Unet(nn.Module):
         super().__init__()
         depths = cfg['feature_depths']
         heads = cfg['attention_heads']
+        if len(heads) != len(depths):
+            # The decoder walks the two reversed, so a disagreement does not drop
+            # the odd stage: it offsets the levels the decoder attends in from the
+            # ones the encoder does, and the halves stop mirroring silently.
+            raise ValueError(
+                "attention_heads names one stage per feature depth; got "
+                f"{len(heads)} stages for {len(depths)} depths")
         emb = cfg['emb_features']
         self.fourier = FourierEmbedding(emb)
         self.time_proj = TimeProjection(emb, emb)
@@ -536,7 +543,7 @@ class Unet(nn.Module):
         self.downsamples = nn.ModuleList()
         skips = [depths[0]]
         ch = depths[0]
-        for i, (dim_out, h) in enumerate(zip(depths, heads)):
+        for i, (dim_out, h) in enumerate(zip(depths, heads, strict=True)):
             blocks = nn.ModuleList()
             for j in range(cfg['num_res_blocks']):
                 blocks.append(ResidualBlock(ch, ch, emb))
@@ -557,7 +564,7 @@ class Unet(nn.Module):
         self.up_blocks = nn.ModuleList()
         self.up_attn = nn.ModuleList()
         self.upsamples = nn.ModuleList()
-        for i, (dim_out, h) in enumerate(zip(reversed(depths), reversed(heads))):
+        for i, (dim_out, h) in enumerate(zip(reversed(depths), reversed(heads), strict=True)):
             blocks = nn.ModuleList()
             for j in range(cfg['num_res_blocks']):
                 blocks.append(ResidualBlock(ch + skips.pop(), dim_out, emb))
@@ -565,8 +572,7 @@ class Unet(nn.Module):
             self.up_blocks.append(blocks)
             self.up_attn.append(CrossAttentionBlock(ch, h, attention) if h else nn.Identity())
             if i != len(depths) - 1:
-                # Dew: Upsample(features=feature_depths[-i]); for i == 0 that is depths[0]
-                up_features = depths[-i]
+                up_features = depths[-i - 2]
                 self.upsamples.append(Conv(ch, up_features))
                 ch = up_features
         self.pre_final = Conv(ch, depths[0])
