@@ -30,7 +30,8 @@ def test_public_pretrained_text_workflow_and_checkpoint_readback(tmp_path):
     trained = jax.tree.map(lambda leaf: leaf + np.float32(0.001), bundle.variables)
     bundle.save(str(tmp_path), variables=trained)
     restored = load_pretrained(str(tmp_path), dtype="float32", attention_impl="xla", max_seq_len=32)
-    for expected, actual in zip(jax.tree.leaves(trained), jax.tree.leaves(restored.variables)):
+    for expected, actual in zip(jax.tree.leaves(trained), jax.tree.leaves(restored.variables),
+                                strict=True):
         np.testing.assert_array_equal(actual, expected)
     restored_inputs = restored.processor(PROMPTS)
     np.testing.assert_array_equal(restored_inputs.tokens, inputs.tokens)
