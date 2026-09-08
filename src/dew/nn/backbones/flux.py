@@ -100,7 +100,6 @@ class _FluxAttention(nn.Module):
 
     heads: int
     head_dim: int
-    context: bool = True
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str | None = "auto"
@@ -166,6 +165,8 @@ class FluxBlock(nn.Module):
             attention_impl=self.attention_impl, name="attn")(
                 _modulate(_layer_norm(self.dtype)(image), shift, scale),
                 _modulate(_layer_norm(self.dtype)(context), text_shift, text_scale), cos, sin)
+        # A double-stream block's attention returns both streams.
+        assert text_attended is not None
         image = image + gate[:, None] * attended
         image = image + gate_mlp[:, None] * _FeedForward(
             self.features, dtype=self.dtype, precision=self.precision, name="ff")(
@@ -199,7 +200,7 @@ class FluxSingleBlock(nn.Module):
                                   precision=self.precision, name="proj_mlp")(normalized),
                          approximate=True)
         attended, _ = _FluxAttention(
-            self.heads, self.head_dim, context=False, dtype=self.dtype, precision=self.precision,
+            self.heads, self.head_dim, dtype=self.dtype, precision=self.precision,
             attention_impl=self.attention_impl, name="attn")(normalized, None, cos, sin)
         joined = jnp.concatenate([attended, hidden], axis=-1)
         # The source calls this `proj_out` inside its own block; the tree
@@ -221,9 +222,10 @@ class FluxSingleBlock(nn.Module):
 class FluxTransformer(nn.Module):
     """Diffusers 0.34.0's `FluxTransformer2DModel` over Dew's interface.
 
-    `__call__` takes NHWC latents, the model time in the source's own units -
-    the fraction its pipeline hands the transformer, which the model scales
-    by a thousand - and a `DenoisingCondition` whose `context` is the T5
+    `__call__` takes NHWC latents, the model time the schedule supplies -
+    the sigma times the training count, which is the product the source
+    reaches by dividing its timestep and multiplying it back - and a
+    `DenoisingCondition` whose `context` is the T5
     token states, whose `pooled` is the CLIP pooled vector and whose
     `guidance` is the distilled guidance value a guidance-embedded checkpoint
     reads. The 2x2 packing its pipeline performs is here, so a caller works
@@ -251,9 +253,16 @@ class FluxTransformer(nn.Module):
 
     def _conditioning(self, time, guidance, pooled):
         """`CombinedTimestepTextProjEmbeddings`, with the guidance embedder a
-        distilled checkpoint adds. The source scales both by a thousand."""
+        distilled checkpoint adds.
+
+        The model time arrives in the schedule's own units, which are the
+        sigmas times the training count: the source's pipeline divides those
+        by a thousand and its transformer multiplies them back, so the
+        product is what both embed. The distilled guidance is a scalar rather
+        than a time, and the source scales it by a thousand here.
+        """
         def embedder(values, name: str):
-            features = sinusoidal_time(values * 1000.0, 256).astype(pooled.dtype)
+            features = sinusoidal_time(values, 256).astype(pooled.dtype)
             hidden = nn.Dense(self.features, dtype=self.dtype, precision=self.precision,
                               name=f"{name}_linear_1")(features)
             return nn.Dense(self.features, dtype=self.dtype, precision=self.precision,
@@ -263,7 +272,7 @@ class FluxTransformer(nn.Module):
         if self.guidance_embeds:
             if guidance is None:
                 raise ValueError("This checkpoint embeds its guidance; conditioning needs it")
-            conditioning = conditioning + embedder(guidance, "guidance_embedder")
+            conditioning = conditioning + embedder(guidance * 1000.0, "guidance_embedder")
         elif guidance is not None:
             raise ValueError("This checkpoint has no guidance embedder")
         projected = nn.Dense(self.features, dtype=self.dtype, precision=self.precision,

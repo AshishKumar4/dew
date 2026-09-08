@@ -192,3 +192,129 @@ def test_the_rotary_table_is_the_sources_own_interleaved_pairs(source):
     rotated = apply_rotary(jnp.asarray([[[[1.0, 2.0]]]]), jnp.zeros((1, 1, 1, 2)) + 0.0,
                            jnp.ones((1, 1, 1, 2)) + quarter)
     np.testing.assert_allclose(np.asarray(rotated).ravel(), [-2.0, 1.0], atol=0)
+
+
+@pytest.fixture(scope="module")
+def pipeline_record(source):
+    return json.loads((source / "flux_transformer.json").read_text())["pipeline"]
+
+
+def test_published_flux_prompt_encoding_matches_the_source_pipeline(source, pipeline_record):
+    """The conditioner composes what `encode_prompt` composes.
+
+    Flux reads its T5 tower's states as the sequence and its CLIP tower's
+    pooled row unprojected, and its pipeline routes `prompt` to CLIP and
+    `prompt_2` to T5. The two slots carry different words, so a native
+    encoder that crossed them or projected the pooled row would not land here.
+    """
+    from dew.interop.pretrained import load_pretrained
+
+    with np.load(source / "flux_transformer.npz") as arrays:
+        loaded = load_pretrained(str(source / "pipeline"), dtype="float32",
+                                 attention_impl="xla")
+        encoder = loaded.inputs.conditions["conditioning"].encoder
+        params = loaded.variables["encoders"]["conditioning"]
+        condition = encoder.encode(params, encoder.tokenize(pipeline_record["prompts"]))
+        assert condition.context.shape == arrays["pipeline.context"].shape
+        assert relative_gap(condition.context, arrays["pipeline.context"]) < 1e-5
+        assert relative_gap(condition.pooled, arrays["pipeline.pooled"]) < 1e-6
+        # The distilled guidance rides in as a model input, at the value the
+        # pipeline defaults to, and guidance is not two branches here.
+        assert condition.guidance is not None
+        np.testing.assert_allclose(np.asarray(condition.guidance),
+                                   np.full(2, pipeline_record["default_guidance"]), atol=0)
+        crossed = encoder.encode(params, encoder.tokenize(
+            [{"text": row["second"], "second": row["text"]} for row in pipeline_record["prompts"]]))
+        assert relative_gap(crossed.context, arrays["pipeline.context"]) > 1e-3
+
+
+def test_published_flux_pipeline_walk_matches_the_source(source, pipeline_record):
+    """`load_pretrained().text_to_image()` reproduces the source's own call.
+
+    Nothing is passed in: the directory's declared pipeline carries the step
+    count, the guidance the transformer embeds and the sigma seed its call
+    lays out, and its own mu for this latent's packed token count.
+    """
+    from dew.interop.pretrained import load_pretrained
+
+    with np.load(source / "flux_transformer.npz") as arrays:
+        loaded = load_pretrained(str(source / "pipeline"), dtype="float32",
+                                 attention_impl="xla")
+        task = loaded.text_to_image()
+        assert task.steps == pipeline_record["default_steps"]
+        assert task.guidance is None and pipeline_record["true_cfg"] == 1.0
+        rows = pipeline_record["size"] // 4
+        initial = unpacked(arrays["pipeline.x_T"], rows, rows)
+        prepared = task.prepare(pipeline_record["prompts"], initial=initial, seed=0)
+        walked = task(prepared, key=jax.random.PRNGKey(0)).host()
+        assert relative_gap(packed(np.asarray(walked.latents)), arrays["pipeline.latents"]) < 2e-5
+        images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
+        assert relative_gap(images, arrays["pipeline.images"]) < 2e-5
+
+
+def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_path):
+    """A real coupled-loss step over the published Flux source, then a resume
+    and an export.
+
+    The objective runs the whole source: the VAE encodes the pixels, the CLIP
+    tower pools and the T5 tower encodes the prompt, and the transformer takes
+    the gradient with the distilled guidance its checkpoint embeds. The
+    released towers and the autoencoder are state, so every one of their
+    leaves survives the step, and the export reloads to the same forward.
+    """
+    import optax
+    from dew.checkpoints import Checkpoints
+    from dew.interop.pretrained import load_pretrained
+    from dew.objectives import Step
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.training import Trainer
+
+    loaded = load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    height, width = loaded.inputs.sample.shape[:2]
+    objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
+                                   autoencoder=loaded.autoencoder, pretrained=loaded.variables,
+                                   unconditional_prob=0.0, ema_decay=None, steps=2)
+    rows = jax.device_count()
+    pixels = np.tile(np.arange(height * width * 3, dtype=np.uint8).reshape(1, height, width, 3),
+                     (rows, 1, 1, 1))
+    batch = {"image": pixels, **loaded.inputs.tokenize(pipeline_record["prompts"] * (rows // 2))}
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3),
+                      checkpoints=checkpoints)
+    initial = trainer.initial_state()
+    fixed = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
+
+    def value(params) -> float:
+        loss, _ = objective.loss(params, batch, fixed)
+        return float(loss.total / loss.mass)
+
+    before = value(initial.params)
+    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    assert bool(accepted)
+    assert value(state.params) < before
+    assert not np.allclose(state.params["params"]["proj_out"]["kernel"],
+                           initial.params["params"]["proj_out"]["kernel"])
+    for held in ("encoders", "autoencoder"):
+        for got, want in zip(jax.tree.leaves(state.params[held]),
+                             jax.tree.leaves(initial.params[held]), strict=True):
+            np.testing.assert_array_equal(got, want)
+
+    checkpoints.save(1, state, None, {})
+    checkpoints.wait()
+    restored, _, _ = trainer.place()
+    for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
+        np.testing.assert_array_equal(got, want)
+
+    export = tmp_path / "export"
+    loaded.save(export, variables=state.params)
+    again = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    with np.load(source / "flux_transformer.npz") as arrays:
+        grid = pipeline_record["size"] // 4
+        latent = jnp.asarray(unpacked(arrays["pipeline.x_T"], grid, grid))
+        condition = DenoisingCondition(
+            jnp.asarray(arrays["pipeline.context"]), jnp.asarray(arrays["pipeline.pooled"]),
+            guidance=jnp.full((2,), pipeline_record["default_guidance"], jnp.float32))
+    times = jnp.asarray([500.0, 100.0])
+    trained = loaded.model.apply({"params": state.params["params"]}, latent, times, condition)
+    reloaded = again.model.apply({"params": again.variables["params"]}, latent, times, condition)
+    np.testing.assert_array_equal(reloaded, trained)
