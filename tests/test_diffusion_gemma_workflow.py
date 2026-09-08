@@ -7,7 +7,7 @@ import jax
 import numpy as np
 import pytest
 
-from dew.diffusion.block import BlockProcess, CanvasGeneration
+from dew.diffusion.block import BlockProcess
 from dew.interop import load_pretrained
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-workflow"
@@ -16,11 +16,9 @@ PROMPTS = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"]
 
 def test_public_pretrained_text_workflow_and_checkpoint_readback(tmp_path):
     bundle = load_pretrained(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
-    assert bundle.processor is not None
     inputs = bundle.processor(PROMPTS)
     task = bundle.block_generation()
     generated = task(PROMPTS, 7, key=jax.random.key(11))
-    assert isinstance(generated, CanvasGeneration)
     with np.load(FIXTURE / "reference.npz") as reference:
         np.testing.assert_array_equal(generated.tokens, reference["tokens"][:, :12])
         np.testing.assert_array_equal(generated.decoder_steps, reference["steps"])
@@ -32,24 +30,20 @@ def test_public_pretrained_text_workflow_and_checkpoint_readback(tmp_path):
     trained = jax.tree.map(lambda leaf: leaf + np.float32(0.001), bundle.variables)
     bundle.save(str(tmp_path), variables=trained)
     restored = load_pretrained(str(tmp_path), dtype="float32", attention_impl="xla", max_seq_len=32)
-    assert restored.processor is not None
     for expected, actual in zip(jax.tree.leaves(trained), jax.tree.leaves(restored.variables)):
         np.testing.assert_array_equal(actual, expected)
     restored_inputs = restored.processor(PROMPTS)
     np.testing.assert_array_equal(restored_inputs.tokens, inputs.tokens)
     result = restored.block_generation()(restored_inputs, 7, key=jax.random.key(11))
-    assert isinstance(result, CanvasGeneration)
     assert result.tokens.shape == (2, 12)
     np.testing.assert_array_equal(result.decoder_steps, [8, 8])
 
 
 def test_public_generation_override_keeps_canvas_semantics():
     bundle = load_pretrained(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
-    assert bundle.processor is not None
     process = BlockProcess(canvas_length=4, vocab_size=64, max_steps=4)
     process = replace(process, stability_threshold=0, confidence_threshold=10.0)
     result = bundle.block_generation()(PROMPTS, 7, key=jax.random.key(11), process=process)
-    assert isinstance(result, CanvasGeneration)
     with np.load(FIXTURE / "reference.npz") as reference:
         np.testing.assert_array_equal(result.tokens, reference["stopped"][:, :12])
         np.testing.assert_array_equal(result.decoder_steps, reference["stopped_steps"])

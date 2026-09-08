@@ -6,7 +6,6 @@ where the name route is under test. The file needs the `datasets` package
 itself, which is the streaming extra, so it skips without it.
 """
 
-import hashlib
 import pickle
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -25,7 +24,7 @@ import grain.python as pygrain
 
 datasets = pytest.importorskip("datasets")
 
-from dew.data import HFImages, Loading, images  # noqa: E402
+from dew.data import HFImages, Loading  # noqa: E402
 from dew.data.sources.hf import HFDatasetSource  # noqa: E402
 
 RECORDS = 16
@@ -103,7 +102,6 @@ def test_image_columns_come_back_as_arrays_not_pil_objects():
     expected = np.random.RandomState(0).randint(0, 256, (IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.uint8)
 
     assert isinstance(record["image"], np.ndarray)
-    assert record["image"].shape == (IMAGE_SIZE, IMAGE_SIZE, 3)
     assert record["image"].dtype == np.uint8
     assert np.array_equal(record["image"], expected)
 
