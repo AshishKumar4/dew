@@ -315,16 +315,34 @@ What the numbers mean case by case. Canonical metadata now runs the plain
 call, exactly: outputs bitwise equal to the no-metadata forward and
 parameter gradients within 2.4e-06 of it. The opaque all-true mask stays on
 the xla kernel, at the cost it always had, because nothing in the shape of
-a validity array says its contents are all true. The masked GDN conv is
-3.3 times faster forward and 3.0 times faster with the gradient, and 22
-times fewer kernel launches a call: the scan's `while` loop is gone from
-the HLO and the `__cudnn$convForward` of the unmasked path is there
+a validity array says its contents are all true. The GDN rows time the whole
+mixer, projections, gates, rule, norm and all, and the masked conv is the
+only part of it that changed: the mixer with a mask is 3.3 times faster
+forward and 3.0 times faster with the gradient, which is what the conv was
+costing it, and it now runs within 11 percent of the same mixer with no mask
+at all. Its launches drop 22.8 times forward (10707 to 470 a call) and 19.5
+times with the gradient (36700 to 1884): the scan's `while` loop is gone
+from the HLO and the `__cudnn$convForward` of the unmasked path is there
 instead. Against the reference it is exact where it has to be: on
 lengths 2048 and 1537 the outputs agree with row-by-row evaluation to
 2.4e-04 (the layer's 5e-4 bound), the padded row's input gradients are
 exactly zero and its outputs exactly zero, and against the token scan on
 CPU at fp32 the largest difference over left, right, interior and paused
 padding at kernels 2, 4 and 8 is 4.8e-07.
+
+Omission is a schema, so a pool has to agree on it. Whether a process's own
+rows needed padding is rank-local, and one process omitting the field while
+another carries it would hand the same step two different pytrees. A
+generation request agrees the validity-agnostic signature first and then one
+fixed-size presence vector, so every process runs the same collectives in
+the same order whatever it holds, and materializes the field wherever any
+process carries it; where none does, the omission stays and the fused kernel
+with it. `shard_batch` cannot agree anything, because placement runs on
+`DevicePrefetchIterator`'s worker thread while the step's collectives run on
+the caller's, so a pool materializes the field at every `ModelInputs` of a
+training batch that lacks one. Single-process runs, which is what the table
+measures, and batches of plain token arrays, which carry no validity
+anywhere, are untouched.
 
 Head-chunk and head-dimension-256 cases were not rerun; nothing here
 reaches them. Reproduce with `run_batch.sh` in

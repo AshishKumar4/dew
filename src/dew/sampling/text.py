@@ -16,7 +16,10 @@ from jax import lax
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
-from dew.nn.inputs import ArrayT, ModelInputs, RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.inputs import (
+    ArrayT, ModelInputs, RowPlan, agreed_validity, generation_signature, local_rows,
+    mesh_of, request_key,
+)
 from dew.objectives.base import Variables
 
 
@@ -308,6 +311,12 @@ def generate(model: nn.Module, params: Variables,
         raise error
     assert prepared is not None and random_key is not None
     if processes > 1:
+        # Whether this process's own prompts needed padding is rank-local, and
+        # the digest below would refuse a pool that disagrees only about that,
+        # so the pool agrees one validity schema first.
+        prepared = agreed_validity(prepared, processes,
+                                   controls=(max_new_tokens, sampling),
+                                   phase="generation input")
         # Compare fixed-size hashes before creating distributed input arrays.
         # The schema covers all conditioning and token fields, not token length
         # alone; different traced shapes would issue mismatched collectives.
