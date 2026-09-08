@@ -30,7 +30,7 @@ from dew.sampling.decoding import (
     EndOfSequence, Greedy, LogitsTransform, MinP, StepState, Stopping, Temperature, TopK, TopP,
 )
 from dew.sampling import strategies
-from dew.sampling.strategies import Beam, DecodeOps, DecoderState, Draws, Sample, Strategy
+from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Strategy
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
@@ -209,7 +209,8 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
             ops, state, (compact[:, 0],) + (None,) * (ops.depths - 1), compact[:, 1:],
             jnp.take_along_axis(prepared[0], order, axis=1)[:, 1:],
             jnp.arange(width - 1)[None, :] < (lengths - 1)[:, None],
-            coordinates[:, 1:], jnp.maximum(lengths - 2, 0))
+            coordinates[:, 1:], jnp.maximum(lengths - 2, 0),
+            prior_tokens=jnp.ones(batch, jnp.int32))
         state = dataclasses.replace(state, drafts=carried)
     return state, last >= 0
 
@@ -370,11 +371,6 @@ def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | 
     EOS criterion rather than replacing it, so naming a criterion cannot drop
     termination by accident. No strategy means `Sample`.
     """
-    if isinstance(strategy, Beam) and logits is None and sampling.temperature == 0:
-        raise ValueError(
-            "a zero-temperature policy compiles to a point mass on the argmax, which would "
-            "give a search nothing to rank; pass the chain the search should score with, as "
-            "logits=(...), or a policy that keeps the distribution")
     return (sampling.transforms() if logits is None else decoding.components(logits, "logits"),
             (() if stopping is None else decoding.components(stopping, "stopping"))
             + sampling.criteria(),
