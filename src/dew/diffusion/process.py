@@ -92,8 +92,11 @@ class Denoiser:
         process = self.process
         rates = broadcast_rates(process.sampler_schedule, t, x_t)
         c_in = process.prediction.get_input_scale(rates)
-        return self.model.apply(
+        output = self.model.apply(
             self.params, x_t * c_in, process.sampler_schedule.model_time(t), **conditions)
+        if not isinstance(output, jax.Array):
+            raise TypeError("A diffusion model must return one prediction array")
+        return output
 
     def convert(self, x_t, t, output) -> tuple[jax.Array, jax.Array]:
         """`(x_0, epsilon)` read out of a raw model output at `(x_t, t)`."""

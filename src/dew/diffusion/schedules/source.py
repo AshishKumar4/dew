@@ -71,6 +71,10 @@ Variance = Literal["small", "large"]
 _SPACINGS: tuple[Spacing, ...] = ("leading", "linspace", "trailing")
 _TERMINALS: tuple[Terminal, ...] = ("zero", "sigma_min")
 _SIGMA_SCHEDULES: tuple[Transform, ...] = ("karras", "exponential")
+_DPM_TYPES: tuple[Literal["midpoint", "heun"], ...] = ("midpoint", "heun")
+_UNIPC_TYPES: tuple[Literal["bh1", "bh2"], ...] = ("bh1", "bh2")
+_SINGLE_ALGORITHMS: tuple[Literal["dpmsolver++", "dpmsolver", "sde-dpmsolver++"], ...] = (
+    "dpmsolver++", "dpmsolver", "sde-dpmsolver++")
 # Each sigma transformation with the control that turns it on.
 _TRANSFORM_CONTROLS: tuple[tuple[Transform, str], ...] = (
     ("karras", "use_karras_sigmas"), ("exponential", "use_exponential_sigmas"),
@@ -245,7 +249,9 @@ class VPGrid(_PairedGrid, NoiseScheduler):
 
     def rates(self, t):
         sigma = self.sigmas(t)
-        alpha = jax.lax.rsqrt(1 + sigma ** 2)
+        # The source rounds sqrt before its reciprocal. Fusing to rsqrt moves
+        # stiff cosine-grid VJPs beyond the float32 source-parity bound.
+        alpha = 1 / jax.lax.optimization_barrier(jnp.sqrt(1 + sigma ** 2))
         return alpha, sigma * alpha
 
     def sample_t(self, key, n: int):
@@ -555,20 +561,22 @@ class SourceSchedule:
         if kind == "DPMSolverSDE":
             return DPMSolverSDE(seed=policy.seed)
         if kind == "DPMSolverSinglestep":
-            return DPMSolverSinglestep(policy.order, policy.algorithm, policy.solver_type,
-                                       policy.lower_order_final)
+            return DPMSolverSinglestep(
+                policy.order, _choice(policy.algorithm, "algorithm_type", _SINGLE_ALGORITHMS),
+                _choice(policy.solver_type, "solver_type", _DPM_TYPES), policy.lower_order_final)
         if kind == "DEISMultistep":
             return DEIS(policy.order, policy.lower_order_final)
         if kind == "UniPCMultistep":
-            return UniPC(policy.order, policy.solver_type, policy.predict_x0,
-                         policy.lower_order_final, policy.disable_corrector)
+            return UniPC(policy.order, _choice(policy.solver_type, "solver_type", _UNIPC_TYPES),
+                         policy.predict_x0, policy.lower_order_final, policy.disable_corrector)
         if kind == "LCM":
             return Consistency()
         if kind == "TCD":
             # The source takes eta as a step argument, not a checkpoint field,
             # so this is the step signature's own default.
             return TCD()
-        return DPMSolverMultistep(policy.order, policy.algorithm, policy.solver_type,
+        return DPMSolverMultistep(policy.order, policy.algorithm,
+                                  _choice(policy.solver_type, "solver_type", _DPM_TYPES),
                                   policy.lower_order_final, policy.euler_at_final)
 
     def _training_sigmas(self) -> tuple[np.ndarray, np.ndarray]:
@@ -824,7 +832,7 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
     """Every control the class declares, checked and turned into a number."""
     declared, family = source.fields, source.family
     train_steps = _integer(value("num_train_timesteps"), "num_train_timesteps")
-    active = [name for name, key in _TRANSFORM_CONTROLS
+    active: list[Transform] = [name for name, key in _TRANSFORM_CONTROLS
               if key in declared and _boolean(value(key), key)]
     if len(active) > 1:
         raise ValueError("Only one of the Karras, exponential and beta sigma grids can be used")
