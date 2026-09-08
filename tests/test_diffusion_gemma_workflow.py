@@ -24,7 +24,7 @@ def test_public_pretrained_text_workflow_and_checkpoint_readback(tmp_path):
     with np.load(FIXTURE / "reference.npz") as reference:
         np.testing.assert_array_equal(generated.tokens, reference["tokens"][:, :12])
         np.testing.assert_array_equal(generated.decoder_steps, reference["steps"])
-    assert task.decode(generated, inputs.tokens.shape[1]) == (
+    assert task.decode(generated) == (
         "t37 t49 t62 t14 t23 t49 t34", "t39 t55 t53 t39 t31 t29 t58")
     with pytest.raises(TypeError):
         bundle.text_generation()

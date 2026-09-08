@@ -13,6 +13,7 @@ import pytest
 from dew import models
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.dit import TextContext
+from dew.nn.backbones.unet_condition import DenoisingCondition
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
@@ -92,6 +93,8 @@ UNET = {"output_channels": 3, "feature_depths": [8, 16],
 LM = {"num_layers": 1, "num_heads": 2, "vocab_size": 32, "max_seq_len": 16}
 PER_ARCH = {
     "unet": UNET,
+    "unet_2d_condition": {"stages": [{"features": 32, "heads": 2}, {"features": 64, "heads": 4}],
+                           "blocks_per_level": 1, "precision": "default"},
     "unet_3d": {**UNET, "temporal_heads": 2},
     "uvit": {**DIT, "num_layers": 2},
     "simple_udit": {**DIT, "num_layers": 2},
@@ -115,8 +118,9 @@ def build_model(architecture, dtype="bfloat16"):
     it enters: leaf models through `with_precision`; the composites wrap a
     language model built that way, so the compute dtype reaches their trunk."""
     if architecture not in COMPOSITES:
+        fields = PER_ARCH[architecture] if architecture == "unet_2d_condition" else {**TINY, **PER_ARCH[architecture]}
         return models.build(architecture, **with_precision(
-            architecture, {**TINY, **PER_ARCH[architecture]}, dtype=dtype, attention_impl="auto"))
+            architecture, fields, dtype=dtype, attention_impl="auto"))
     text = models.build("causal_transformer", **with_precision(
         "causal_transformer", {**TINY, **LM, "mlp_features": 64}, dtype=dtype, attention_impl="auto"))
     if architecture == "diffusion_gemma":
@@ -136,6 +140,9 @@ def tiny_inputs(architecture, rng):
     text = TextContext(jnp.ones((1, 7, 768)), jnp.ones((1, 7), bool))
     if architecture in ("unet_3d", "video_dit"):
         return video, jnp.ones((1,)), text
+    if architecture == "unet_2d_condition":
+        latents = jax.random.normal(rng, (1, RES, RES, 4))
+        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(text.hidden)}
     if architecture == "jepa_encoder":
         return (image,)
     if architecture == "causal_transformer":
@@ -177,3 +184,5 @@ def test_default_policy_computes_in_bf16_and_keeps_params_fp32(architecture, rng
 
     out = model.apply(variables, *args, **kwargs)
     assert jnp.all(jnp.isfinite(out.astype(jnp.float32)))
+    if architecture == "unet_2d_condition":
+        assert out.dtype == jnp.bfloat16
