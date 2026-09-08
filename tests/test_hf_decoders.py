@@ -2078,6 +2078,66 @@ def test_the_real_gemma_4_26b_a4b_text_config_translates():
     assert config["per_layer_input_dim"] is None and config["num_kv_shared_layers"] == 0
 
 
+def test_the_released_diffusiongemma_26b_text_config_derives_what_it_does_not_name():
+    """google/diffusiongemma-26B-A4B-it's text_config is the only committed
+    DiffusionGemma config whose global geometry differs from its sliding one:
+    every tiny fixture sets global_head_dim and num_global_key_value_heads to
+    the sliding values, so none of them can tell the two apart.
+
+    The three decisions this family makes for itself, none of them a field of
+    the config: the reference builds v_proj only where a layer slides, so the
+    record reads values off keys and its global layers take the global key
+    count; it names no enable_moe_block, so the three routed widths route
+    every layer beside the dense MLP; and the canvas decoder is bidirectional.
+    """
+    config = translate_config(fixture_config("diffusiongemma-26b")["text_config"])
+
+    assert config["attention_k_eq_v"] and not config["causal"]
+    assert config["kinds"]["full_attention"] == {"head_dim": 512, "num_kv_heads": 2}
+    assert config["kinds"]["sliding_attention"] == {"window": 1024, "rope_theta": 10000.0}
+    assert config["layer_types"] == (("sliding_attention",) * 5 + ("full_attention",)) * 5
+    assert config["mixture"] == {"experts": 128, "top_k": 8, "expert_features": 704,
+                                 "parallel": True}
+    assert config["final_logit_softcap"] == 30.0
+    assert config["partial_rotary_factor"] == 0.25 and config["rope_theta"] == 1000000.0
+
+
+def test_the_released_diffusiongemma_26b_builds_its_split_global_geometry():
+    """The released config as a model, shapes only, no weights and no
+    download: the sliding layers project 16 heads of 256 and keep their own
+    values, the global layers project 16 of 512 and read values off 2 key
+    heads, and every layer routes 128 experts of 704 beside its dense 2112.
+
+    These are the shapes a released checkpoint's tensors have to land in, so a
+    translation that carried the model's 8 key/value heads onto the global
+    layers, or lost the routed branch the config never flags, builds a tree
+    the checkpoint cannot load.
+    """
+    config = translate_config(fixture_config("diffusiongemma-26b")["text_config"])
+    model = models.build("causal_transformer", **with_precision(
+        "causal_transformer", config, dtype="bfloat16", attention_impl="reference"))
+    params = jax.eval_shape(
+        lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))["params"]
+
+    sliding, full = params["layers_0"], params["layers_5"]
+    assert config["layer_types"][0] == "sliding_attention"
+    assert config["layer_types"][5] == "full_attention"
+    assert sliding["self_attn"]["q_proj"]["kernel"].shape == (2816, 16 * 256)
+    assert sliding["self_attn"]["k_proj"]["kernel"].shape == (2816, 8 * 256)
+    assert sliding["self_attn"]["v_proj"]["kernel"].shape == (2816, 8 * 256)
+    assert full["self_attn"]["q_proj"]["kernel"].shape == (2816, 16 * 512)
+    assert full["self_attn"]["k_proj"]["kernel"].shape == (2816, 2 * 512)
+    assert "v_proj" not in full["self_attn"]
+    experts = full["moe"]["experts"]
+    assert experts["gate_proj"]["kernel"].shape == (128, 2816, 704)
+    assert experts["down_proj"]["kernel"].shape == (128, 704, 2816)
+    assert full["moe"]["router"]["proj"]["kernel"].shape == (2816, 128)
+    assert full["mlp"]["gate_proj"]["kernel"].shape == (2816, 2112)
+    assert params["embed_tokens"]["embedding"].shape == (262144, 2816)
+    assert "lm_head" not in params
+
+
+
 def test_gemma4_moe_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 4.9e-06
     with identical argmax. The fused expert kernels arrive split in place,

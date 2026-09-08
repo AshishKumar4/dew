@@ -851,12 +851,14 @@ def _diffusion_gemma_text_config(hf_config: Mapping[str, Any], used: set[str]) -
     block-diffusion Process and objective that are not landed here; the report
     names them.
     """
-    config = _gemma4_config(hf_config, used)
     # The reference builds no v_proj on full layers whatever the config says
     # (modeling_diffusion_gemma.py, DiffusionGemmaEncoderTextAttention: v_proj
     # only if the layer slides), so the record always reads values off keys
-    # there; the sliding layers keep their own v_proj.
-    config["attention_k_eq_v"] = True
+    # there; the sliding layers keep their own v_proj. The family declares it
+    # rather than setting it afterwards, because the global key count is read
+    # under it: gemma4 spells the same regime as an attention_k_eq_v field,
+    # and DiffusionGemma carries the behaviour in its modules instead.
+    config = _gemma4_config(hf_config, used, k_eq_v=True)
     if config.get("mixture") is None and all(
             hf_config.get(field) is not None
             for field in ("num_experts", "top_k_experts", "moe_intermediate_size")):
@@ -1140,14 +1142,15 @@ def _gemma3n_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str
     return _dew_path(name, config)
 
 
-def _gemma4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+def _gemma4_config(hf_config: Mapping[str, Any], used: set[str], *,
+                   k_eq_v: bool = False) -> Dict[str, Any]:
     layer_types = _gemma_layer_types(hf_config, used, last_full=True)
     config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types, rope=_Ropes(10000.0))
     # The reference's final-layer rewrite takes precedence over an explicit pattern.
     config['layer_types'] = layer_types
     sliding_dim, kv_heads = config['head_dim'], config['num_kv_heads']
-    k_eq_v = bool(hf_config.get('attention_k_eq_v', False))
+    k_eq_v = k_eq_v or bool(hf_config.get('attention_k_eq_v', False))
     used.update(('attention_k_eq_v', 'enable_moe_block', 'per_layer_config',
                  'global_head_dim', 'num_global_key_value_heads'))
     # Every layer reads its geometry from per_layer_config
