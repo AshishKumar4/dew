@@ -187,10 +187,11 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     state = DecoderState(updated["cache"], logits[rows, slot], positions,
                          None if states is None else states[rows, slot])
     prepared = jax.tree.leaves(updated.get("embeddings", {}))
-    if ops.depths and states is not None:
-        # Every depth needs a predecessor slot in the carry from the start,
-        # so a block's loop keeps one structure whatever the prompt held.
-        state = dataclasses.replace(state, drafts=(states[rows, slot],) * ops.depths)
+    if ops.depths > 1 and states is not None:
+        # Every later depth needs a predecessor slot in the carry from the
+        # start, so a block's loop keeps one structure whatever the prompt
+        # held; a depth without enough history never reads it.
+        state = dataclasses.replace(state, drafts=(states[rows, slot],) * (ops.depths - 1))
     if ops.depths and width > 1 and states is not None and prepared:
         order = jnp.argsort(~real, axis=1, stable=True)[..., None]
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
@@ -209,7 +210,7 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
             jnp.arange(width - 1)[None, :] < (lengths - 1)[:, None],
             coordinates[:, 1:], jnp.maximum(lengths - 2, 0),
             prior_tokens=jnp.ones(batch, jnp.int32))
-        state = dataclasses.replace(state, drafts=carried)
+        state = dataclasses.replace(state, drafts=carried[1:])
     return state, last >= 0
 
 

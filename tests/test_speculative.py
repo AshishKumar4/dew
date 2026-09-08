@@ -68,8 +68,7 @@ def run(target, drafts, rows, budget, block, seed=0, stopping=(), transforms=())
 def run_with(plan, target, drafts, rows, budget, seed=0, stopping=(), transforms=()):
     """One run of a given speculative plan over fixed distributions."""
     state = DecoderState(cache={}, logits=jnp.broadcast_to(target, (rows, VOCAB)),
-                         positions=None, hidden=jnp.zeros((rows, HIDDEN), jnp.float32),
-                         drafts=(jnp.zeros((rows, HIDDEN), jnp.float32),))
+                         positions=None, hidden=jnp.zeros((rows, HIDDEN), jnp.float32))
     start = StepState(tokens=jnp.zeros((rows, 1 + budget), jnp.int32),
                       valid=jnp.concatenate([jnp.ones((rows, 1), bool),
                                              jnp.zeros((rows, budget), bool)], axis=1),
@@ -600,7 +599,7 @@ def test_a_cold_prompt_holds_its_second_depth_back_until_it_has_a_predecessor():
 
     ops = _operations(model, params, 0, 2)
     state, _ = _prefill(model, params, ModelInputs(cold), ops)
-    _, produced, _ = reseed(ops, state, (state.hidden,) + tuple(state.drafts[1:]),
+    _, produced, _ = reseed(ops, state, (state.hidden,) + state.drafts,
                             states[:, 1:], model.apply(params, emitted,
                                                        method=model.token_embeddings),
                             jnp.ones((1, 2), bool), jnp.asarray([[1, 2]], jnp.int32),
@@ -635,7 +634,7 @@ def test_prediction_depths_resume_from_real_history_not_rotary_coordinates(prefi
                          ModelInputs(whole[:, :prefix], {"positions": positions[:, :prefix]}), ops)
     emitted = whole[:, prefix:-1]
     state, _, carried = reseed(
-        ops, state, (state.hidden,) + state.drafts[1:], hidden[:, prefix:-1],
+        ops, state, (state.hidden,) + state.drafts, hidden[:, prefix:-1],
         ops.embed(emitted), jnp.ones(emitted.shape, bool), positions[:, prefix:-1],
         jnp.asarray([emitted.shape[1] - 1], jnp.int32),
         prior_tokens=jnp.asarray([prefix], jnp.int32))

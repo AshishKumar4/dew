@@ -44,6 +44,9 @@ class DecoderState:
     positions: jax.Array | None = None
     hidden: jax.Array | None = None
     drafts: tuple[jax.Array, ...] = ()
+    """Each later prediction depth's predecessor state at the last real token:
+    entry `d` feeds depth `d + 1`, as `reseed` carries them; `hidden` is
+    depth zero's."""
 
 
 @struct.dataclass
@@ -604,19 +607,20 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                out[3].at[index, landing].set(original, mode="drop"))
 
         following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
-        assert seen is not None
-        last = jnp.maximum(count - 1, 0)[:, None, None]
+        assert seen is not None and ops.embed is not None
+        last = jnp.maximum(count - 1, 0)
+        # The tails reseed hands back are every depth's predecessor at the
+        # last emitted slot, the target's own state first; a row that emitted
+        # nothing keeps what it had.
+        following, _, carried = reseed(
+            ops, following, (state.hidden,) + state.drafts, seen, ops.embed(emitted),
+            keep, base, last, prior_tokens=step.total())
         following = dataclasses.replace(
             following,
             logits=jnp.where((count > 0)[:, None],
-                             jnp.take_along_axis(again, last, axis=1)[:, 0], state.logits),
-            hidden=jnp.where((count > 0)[:, None],
-                             jnp.take_along_axis(seen, last, axis=1)[:, 0], state.hidden))
-        assert ops.embed is not None
-        following, _, carried = reseed(
-            ops, following, (state.hidden,) + tuple(state.drafts[1:]), seen, ops.embed(emitted),
-            keep, base, jnp.maximum(count - 1, 0), prior_tokens=step.total())
-        following = dataclasses.replace(following, drafts=carried)
+                             jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
+                             state.logits),
+            hidden=carried[0], drafts=carried[1:])
         return (following, committed, terminated, out), None
 
     def outer(carry, _):
