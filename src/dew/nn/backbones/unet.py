@@ -48,7 +48,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
     x = conv(features=feature_depths[0])(x)
     downs = [x]
 
-    for i, (dim_out, stage) in enumerate(zip(feature_depths, attention_configs)):
+    for i, (dim_out, stage) in enumerate(zip(feature_depths, attention_configs, strict=True)):
         dim_in = x.shape[-1]
         for j in range(model.num_res_blocks):
             x = residual(features=dim_in, name=f"down_{i}_residual_{j}")(x, temb)
@@ -73,7 +73,8 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
             x = temporal(x, f"middle_temporal_{j}")
         x = residual(features=middle_dim_out, name=f"middle_res2_{j}")(x, temb)
 
-    for i, (dim_out, stage) in enumerate(zip(reversed(feature_depths), reversed(attention_configs))):
+    for i, (dim_out, stage) in enumerate(
+            zip(reversed(feature_depths), reversed(attention_configs), strict=True)):
         for j in range(model.num_res_blocks):
             x = jnp.concatenate([x, downs.pop()], axis=-1)
             x = residual(features=dim_out, name=f"up_{i}_residual_{j}")(x, temb)
