@@ -357,6 +357,42 @@ def test_upsampling_reaches_the_next_decoder_stage_width(rng, video):
     assert transitions == [(8, 8, 16), (16, 16, 8)]
 
 
+def test_benchmark_unet_resampling_matches_the_native_model(rng, tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    from dew.nn.blocks import Upsample
+
+    for name in ("TMPDIR", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    from tools.benchmark_torch import Unet as TorchUnet
+
+    depths = (8, 16, 32)
+    native = Unet(emb_features=16, feature_depths=depths,
+                  attention_configs=(None,) * len(depths),
+                  num_res_blocks=1, num_middle_res_blocks=1, dtype=jnp.float32)
+    image = jnp.ones((1, 16, 16, 3))
+    _, variables = native.init_with_output(
+        rng, image, jnp.ones((1,)),
+        capture_intermediates=lambda module, method: isinstance(module, Upsample))
+    expected = [values["__call__"][0].shape[-3:]
+                for _, values in sorted(variables["intermediates"].items())]
+    twin = TorchUnet({"feature_depths": depths, "attention_heads": (None,) * len(depths),
+                      "emb_features": 16, "num_res_blocks": 1, "num_middle_res_blocks": 1},
+                     "reference")
+    observed = []
+
+    def record_shape(module, arguments, output):
+        observed.append((output.shape[2], output.shape[3], output.shape[1]))
+
+    handles = [layer.register_forward_hook(record_shape) for layer in twin.upsamples]
+    try:
+        with torch.no_grad():
+            twin(torch.ones(1, 16, 16, 3), torch.ones(1), None)
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert observed == expected
+
+
 def test_a_stage_with_an_unknown_field_is_refused():
     """Design rule 6: an unknown field raises ValueError naming it, so a
     misspelled dial fails at build and the dial it meant is never left at

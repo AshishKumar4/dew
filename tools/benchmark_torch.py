@@ -543,7 +543,7 @@ class Unet(nn.Module):
         self.downsamples = nn.ModuleList()
         skips = [depths[0]]
         ch = depths[0]
-        for i, (dim_out, h) in enumerate(zip(depths, heads)):
+        for i, (dim_out, h) in enumerate(zip(depths, heads, strict=True)):
             blocks = nn.ModuleList()
             for j in range(cfg['num_res_blocks']):
                 blocks.append(ResidualBlock(ch, ch, emb))
@@ -564,7 +564,7 @@ class Unet(nn.Module):
         self.up_blocks = nn.ModuleList()
         self.up_attn = nn.ModuleList()
         self.upsamples = nn.ModuleList()
-        for i, (dim_out, h) in enumerate(zip(reversed(depths), reversed(heads))):
+        for i, (dim_out, h) in enumerate(zip(reversed(depths), reversed(heads), strict=True)):
             blocks = nn.ModuleList()
             for j in range(cfg['num_res_blocks']):
                 blocks.append(ResidualBlock(ch + skips.pop(), dim_out, emb))
