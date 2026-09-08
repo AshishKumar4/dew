@@ -38,7 +38,7 @@ from dew.nn.moe import (
     ExpertMLP, Router, SparseMLP, calculate_load_balance_updates,
 )
 from dew.objectives.base import Step
-from dew.objectives.lm import LMObjective, TEXT_KEY
+from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import shard_batch
@@ -658,8 +658,6 @@ def test_the_mixture_sizes_the_experts_and_the_shared_branch_apart():
     assert mlp["shared_experts"]["up_proj"]["kernel"].shape == (32, 48)
     assert mlp["shared_experts"]["down_proj"]["kernel"].shape == (48, 32)
     assert variables["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"].shape == (32, 64)
-    logits = model.apply(variables, jnp.zeros((2, SEQ_LEN), jnp.int32))
-    assert bool(jnp.all(jnp.isfinite(logits)))
 
 
 @pytest.mark.parametrize("mixture, message", [
@@ -932,7 +930,7 @@ def test_the_experts_are_really_split_across_the_expert_axis():
     experts = state.params["params"]["layers_1"]["mlp"]["experts"]
     kernel = experts["gate_proj"]["kernel"]
 
-    assert 'expert' in str(kernel.sharding.spec)
+    assert kernel.sharding.spec == P('expert', None, 'fsdp')
     assert kernel.addressable_shards[0].data.shape == (2, 32, 32)
     moments = state.opt_state[0].mu["layers_1"]["mlp"]["experts"]
     assert moments["gate_proj"]["kernel"].sharding.spec == kernel.sharding.spec

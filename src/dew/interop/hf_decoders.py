@@ -70,7 +70,6 @@ _HF_ACTIVATIONS['swigluoai'] = 'silu'
 
 _GEMMA = 'gemma3_text'
 _QWEN35 = 'qwen3_5_text'
-_DEEPSEEK = ('deepseek_v3', 'deepseek_v32')
 # A multimodal repo's config.json is a wrapper whose model_type names the
 # whole model and whose text_config holds the decoder. Its own weights live
 # under model.language_model.*, next to vision and audio towers this has no

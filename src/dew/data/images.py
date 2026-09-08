@@ -24,7 +24,6 @@ from typing import Any, Literal
 
 import grain.python as pygrain
 import numpy as np
-from etils import epath
 
 from dew.registry import datasets
 
