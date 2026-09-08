@@ -241,10 +241,146 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
     return parameters, tuple(layouts)
 
 
+
+class SD3Fields(TypedDict):
+    patch_size: int
+    in_channels: int
+    out_channels: int
+    num_layers: int
+    heads: int
+    head_dim: int
+    joint_attention_dim: int
+    caption_projection_dim: int
+    pooled_projection_dim: int
+    sample_size: int
+    pos_embed_max_size: int
+    dual_attention_layers: tuple[int, ...]
+    qk_norm: str | None
+    dtype: object
+    attention_impl: str | None
+
+
+def sd3_fields(config: Mapping[str, object], *, dtype="float32",
+               attention_impl="auto") -> SD3Fields:
+    """A published `SD3Transformer2DModel` config as native model fields.
+
+    Every geometry control the source declares is read; a control whose
+    active meaning this model does not carry is refused rather than dropped,
+    so a checkpoint that means something else cannot load as if it did not.
+    """
+    from dew.interop.pretrained import resolve_dtype
+
+    heads = _integer(config["num_attention_heads"], "num_attention_heads")
+    head_dim = _integer(config["attention_head_dim"], "attention_head_dim")
+    channels = _integer(config["in_channels"], "in_channels")
+    out_channels = config.get("out_channels")
+    dual = config.get("dual_attention_layers") or ()
+    if not isinstance(dual, (list, tuple)) or any(type(index) is not int for index in dual):
+        raise ValueError("dual_attention_layers must be a sequence of block indices")
+    qk_norm = config.get("qk_norm")
+    if qk_norm not in (None, "rms_norm"):
+        raise ValueError(f"Native SD3 implements qk_norm 'rms_norm', not {qk_norm!r}")
+    return SD3Fields(
+        patch_size=_integer(config["patch_size"], "patch_size"), in_channels=channels,
+        out_channels=channels if out_channels is None else _integer(out_channels, "out_channels"),
+        num_layers=_integer(config["num_layers"], "num_layers"), heads=heads, head_dim=head_dim,
+        joint_attention_dim=_integer(config["joint_attention_dim"], "joint_attention_dim"),
+        caption_projection_dim=_integer(config["caption_projection_dim"], "caption_projection_dim"),
+        pooled_projection_dim=_integer(config["pooled_projection_dim"], "pooled_projection_dim"),
+        sample_size=_integer(config["sample_size"], "sample_size"),
+        pos_embed_max_size=_integer(config["pos_embed_max_size"], "pos_embed_max_size"),
+        dual_attention_layers=tuple(dual), qk_norm=qk_norm, dtype=resolve_dtype(dtype),
+        attention_impl=None if attention_impl == "reference" else attention_impl)
+
+
+_SD3_EMBEDDERS = {
+    "pos_embed.proj": ("pos_embed_proj",),
+    "context_embedder": ("context_embedder",),
+    "proj_out": ("proj_out",),
+    "norm_out.linear": ("norm_out", "linear"),
+    "time_text_embed.timestep_embedder.linear_1": ("timestep_embedder_linear_1",),
+    "time_text_embed.timestep_embedder.linear_2": ("timestep_embedder_linear_2",),
+    "time_text_embed.text_embedder.linear_1": ("text_embedder_linear_1",),
+    "time_text_embed.text_embedder.linear_2": ("text_embedder_linear_2",),
+}
+_SD3_ATTENTION = ("to_q", "to_k", "to_v", "add_q_proj", "add_k_proj", "add_v_proj",
+                  "to_add_out", "norm_q", "norm_k", "norm_added_q", "norm_added_k")
+
+
+def _sd3_leaf(leaf: str) -> str:
+    if leaf == "weight":
+        return "kernel"
+    if leaf == "bias":
+        return "bias"
+    raise ValueError(f"unknown tensor leaf {leaf!r}")
+
+
+def _sd3_path(name: str) -> tuple[str, ...] | None:
+    """One published SD3 tensor name as its path in `SD3Transformer`.
+
+    The position buffer is not a parameter and comes back as None; every
+    other declared tensor maps, and an unknown name raises with that name so
+    a checkpoint carrying something else cannot load silently.
+    """
+    if name == "pos_embed.pos_embed":
+        return None
+    parts = name.split(".")
+    leaf, stem = parts[-1], ".".join(parts[:-1])
+    if stem in _SD3_EMBEDDERS:
+        return (*_SD3_EMBEDDERS[stem], _sd3_leaf(leaf))
+    if parts[0] == "transformer_blocks" and parts[1].isdigit():
+        block = (f"transformer_blocks_{parts[1]}",)
+        rest = parts[2:-1]
+        if rest in (["norm1", "linear"], ["norm1_context", "linear"]):
+            return (*block, rest[0], "linear", _sd3_leaf(leaf))
+        if rest[0] in ("attn", "attn2"):
+            inner = rest[1:]
+            if inner == ["to_out", "0"]:
+                return (*block, rest[0], "to_out_0", _sd3_leaf(leaf))
+            if len(inner) == 1 and inner[0] in _SD3_ATTENTION:
+                if inner[0].startswith("norm"):
+                    if leaf != "weight":
+                        raise ValueError(f"unknown tensor name {name!r}")
+                    return (*block, rest[0], inner[0], "scale")
+                return (*block, rest[0], inner[0], _sd3_leaf(leaf))
+        if rest[0] in ("ff", "ff_context"):
+            inner = rest[1:]
+            if inner == ["net", "0", "proj"]:
+                return (*block, rest[0], "net_0_proj", _sd3_leaf(leaf))
+            if inner == ["net", "2"]:
+                return (*block, rest[0], "net_2", _sd3_leaf(leaf))
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def translate_sd3_weights(tensors: Mapping[str, np.ndarray]
+                          ) -> tuple[TensorTree, TensorTree, tuple[WeightLayout, ...]]:
+    """Native parameters, frozen buffers and reversible source layouts.
+
+    The source's position embedding is a persistent sin/cos-initialized
+    buffer, so its stored values land in the `buffers` collection: an
+    optimizer and an EMA see only `params`, and export writes the stored
+    array back unchanged.
+    """
+    from dew.interop.pretrained import WeightLayout
+
+    parameters, layouts = record_layouts("transformer", tensors, _sd3_path, ("params",))
+    buffers: TensorTree = {}
+    position = tensors.get("pos_embed.pos_embed")
+    if position is None:
+        raise ValueError("An SD3 transformer stores its position embedding buffer")
+    array = np.asarray(position, np.float32)
+    if array.ndim != 3 or array.shape[0] != 1:
+        raise ValueError(f"The position buffer must be [1, tokens, width], got {array.shape}")
+    buffers["pos_embed"] = np.ascontiguousarray(array)
+    layouts += (WeightLayout("transformer/pos_embed.pos_embed", (("buffers", "pos_embed"),),
+                             tuple(position.shape), None),)
+    return parameters, buffers, layouts
+
+
 def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
     """Read published safetensors, including sharded component directories."""
     folder = directory / component
-    weights = "diffusion_pytorch_model" if component in ("unet", "vae") else "model"
+    weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
     index = folder / f"{weights}.safetensors.index.json"
     def arrays(path: Path) -> dict[str, np.ndarray]:
         values = load_params(path)
@@ -354,7 +490,7 @@ def save_source(source, values, destination: Path) -> None:
         component, _, name = layout.name.partition("/")
         grouped.setdefault(component, {})[name] = layout.export(values)
     for component, tensors in grouped.items():
-        weights = "diffusion_pytorch_model" if component in ("unet", "vae") else "model"
+        weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
         _safetensors().save_file(tensors, destination / component / f"{weights}.safetensors", metadata={"format": "pt"})
         declared = index.get(component)
         if isinstance(declared, (list, tuple)) and len(declared) == 2 and isinstance(declared[1], str) and declared[1].startswith("Flax"):
