@@ -505,11 +505,15 @@ def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]
 # trained model writes back into the source's own tensor names beside the
 # config, generation config and tokenizer it came with. A family outside
 # this set saves through the decoder writer, which derives a config
-# instead. The routed-family update/export tests live in test_decoder_export.py.
+# instead. Kimi K2 is here because a derived config cannot know it. It
+# computes what DeepSeek V3 does, so nothing in a built model says which of
+# the two model_types, vocabularies and rope bases the checkpoint came
+# from, and only the source's own config carries that back out.
+# The routed-family update/export tests live in test_decoder_export.py.
 _SOURCE_LAYOUT_FAMILIES = frozenset({
     "gemma4_text", "gemma3n_text", "qwen3_5_text", "qwen3_5_moe_text",
     "mixtral", "qwen3_moe", "glm4_moe", "deepseek_v2", "deepseek_v3",
-    "deepseek_v32", "llama4_text"})
+    "deepseek_v32", "kimi_k2", "llama4_text"})
 
 
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,

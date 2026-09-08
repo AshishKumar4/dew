@@ -2849,9 +2849,15 @@ _FAMILY_ENTRIES = (
                                   and (mixture := _mixture_value(fields)) is not None
                                   and not mixture.bias),
                   'deepseek_v2', 'DeepseekV2ForCausalLM', lambda model: {}),
-    # Kimi K2 is DeepSeek V3's computation under its own model_type and
-    # tokenizer, so no Dew model names it. What it computes exports as
-    # deepseek_v3, which transformers loads with the same modeling code.
+    # Kimi K2 computes what DeepSeek V3 does, under its own model_type,
+    # vocabulary, rope base and routing widths. A built model's fields
+    # therefore name no family of its own, and `matches` returning False
+    # keeps this entry off the model side of the registry so a V3 model is
+    # never written under Kimi's name. A loaded Kimi checkpoint keeps its
+    # provenance instead: its tensors and its own config go back out
+    # through pretrained._SOURCE_LAYOUT_FAMILIES. The export vocabulary
+    # here names the class the release's auto_map points at, which is what
+    # transformers implements for these weights.
     DecoderFamily(('kimi_k2',), _deepseek_config, lambda fields: False,
                   'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}),
     DecoderFamily(('deepseek_v3',), _deepseek_config,
