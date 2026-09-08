@@ -2,7 +2,8 @@
 
 from .solvers import (
     Solver, DDPM, DDIM, Euler, EulerAncestral, Heun, RK4, KDPM2, MultiStepDPM,
-    DPMSolverMultistep, DPMSolverSinglestep, DEIS, UniPC, PNDM, LMS, Consistency, TCD,
+    DPMSolverMultistep, DPMSolverSinglestep, DPMSolverSDE, DEIS, UniPC, PNDM, LMS,
+    Consistency, TCD,
 )
 from .guidance import CFG
 from .sample import sample
@@ -22,6 +23,7 @@ __all__ = [
     "MultiStepDPM",
     "DPMSolverMultistep",
     "DPMSolverSinglestep",
+    "DPMSolverSDE",
     "DEIS",
     "UniPC",
     "PNDM",

@@ -1,0 +1,321 @@
+{
+ "diffusers": "0.34.0",
+ "shape": [
+  2,
+  3,
+  4
+ ],
+ "guidance_scale": 3.0,
+ "label": 0.7,
+ "cases": {
+  "ddim.default": {
+   "scheduler": "DDIMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 1.1975853443145752
+  },
+  "ddim.trailing_zero_snr_v": {
+   "scheduler": "DDIMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.275883436203003
+  },
+  "ddim.threshold": {
+   "scheduler": "DDIMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 1.2413749694824219
+  },
+  "pndm.default": {
+   "scheduler": "PNDMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 13.4100980758667
+  },
+  "pndm.plms_linspace": {
+   "scheduler": "PNDMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 23.425586700439453
+  },
+  "ddpm.default": {
+   "scheduler": "DDPMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.5898351669311523
+  },
+  "ddpm.large_trailing": {
+   "scheduler": "DDPMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 50.16572189331055
+  },
+  "ddpm.threshold_v": {
+   "scheduler": "DDPMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.579453229904175
+  },
+  "ddpm.small_log": {
+   "scheduler": "DDPMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.5898351669311523
+  },
+  "ddpm.large_leading": {
+   "scheduler": "DDPMScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 17.411680221557617
+  },
+  "lms.default": {
+   "scheduler": "LMSDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 41.19659423828125
+  },
+  "lms.karras_leading": {
+   "scheduler": "LMSDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 13.550326347351074
+  },
+  "lms.exponential_v": {
+   "scheduler": "LMSDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 7.006505489349365
+  },
+  "euler.default": {
+   "scheduler": "EulerDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 41.3980827331543
+  },
+  "euler.beta_trailing_min": {
+   "scheduler": "EulerDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 41.86412048339844
+  },
+  "euler.zero_snr_v": {
+   "scheduler": "EulerDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 16.077205657958984
+  },
+  "euler_ancestral.default": {
+   "scheduler": "EulerAncestralDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 49.29022979736328
+  },
+  "euler_ancestral.leading_zero_snr_v": {
+   "scheduler": "EulerAncestralDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 4.809186935424805
+  },
+  "heun.default": {
+   "scheduler": "HeunDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 39.73051071166992
+  },
+  "heun.karras_clip": {
+   "scheduler": "HeunDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 11.621882438659668
+  },
+  "kdpm2.default": {
+   "scheduler": "KDPM2DiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 40.953304290771484
+  },
+  "kdpm2.karras_leading_v": {
+   "scheduler": "KDPM2DiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 4.713423728942871
+  },
+  "kdpm2_ancestral.default": {
+   "scheduler": "KDPM2AncestralDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 45.33261489868164
+  },
+  "kdpm2_ancestral.exponential": {
+   "scheduler": "KDPM2AncestralDiscreteScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 42.447898864746094
+  },
+  "dpm_sde.default": {
+   "scheduler": "DPMSolverSDEScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 52.324703216552734
+  },
+  "dpm_sde.karras_v": {
+   "scheduler": "DPMSolverSDEScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 10.54940128326416
+  },
+  "dpm_multi.default": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 40.821441650390625
+  },
+  "dpm_multi.karras": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 40.216209411621094
+  },
+  "dpm_multi.cosine_clipped": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 468.40728759765625
+  },
+  "dpm_multi.cosine_exponential": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 59502.24609375
+  },
+  "dpm_multi.exponential_trailing": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 41.18785095214844
+  },
+  "dpm_multi.eps_threshold": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.460270643234253
+  },
+  "dpm_multi.beta_leading": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 40.014129638671875
+  },
+  "dpm_single.default": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 40.96718215942383
+  },
+  "dpm_single.karras_order3": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 40.49600601196289
+  },
+  "dpm_single.exponential_zero": {
+   "scheduler": "DPMSolverSinglestepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 41.36562728881836
+  },
+  "deis.default": {
+   "scheduler": "DEISMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 40.91318130493164
+  },
+  "deis.karras_trailing": {
+   "scheduler": "DEISMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 40.81441879272461
+  },
+  "deis.threshold_v": {
+   "scheduler": "DEISMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.1706690788269043
+  },
+  "unipc.default": {
+   "scheduler": "UniPCMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 40.63655090332031
+  },
+  "unipc.beta_eps_bh1": {
+   "scheduler": "UniPCMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 41.468772888183594
+  },
+  "unipc.zero_snr_v_leading": {
+   "scheduler": "UniPCMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 2.370527505874634
+  },
+  "edm.default": {
+   "scheduler": "EDMDPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 40.534881591796875
+  },
+  "edm.exponential_v_threshold": {
+   "scheduler": "EDMDPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": null,
+   "latent_scale": 9.801173210144043
+  },
+  "lcm.default": {
+   "scheduler": "LCMScheduler",
+   "steps": 4,
+   "guidance": null,
+   "latent_scale": 51.62855529785156
+  },
+  "lcm.clip_original_25": {
+   "scheduler": "LCMScheduler",
+   "steps": 4,
+   "guidance": null,
+   "latent_scale": 2.4669995307922363
+  },
+  "tcd.default": {
+   "scheduler": "TCDScheduler",
+   "steps": 4,
+   "guidance": null,
+   "latent_scale": 48.04665756225586
+  },
+  "tcd.original_20_v": {
+   "scheduler": "TCDScheduler",
+   "steps": 4,
+   "guidance": null,
+   "latent_scale": 2.767688274383545
+  },
+  "cfg.epsilon": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": 0.7,
+   "latent_scale": 2.1706702709198
+  },
+  "cfg.velocity": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": 0.5,
+   "latent_scale": 2.1706702709198
+  },
+  "cfg.zero_rescale": {
+   "scheduler": "DPMSolverMultistepScheduler",
+   "steps": 5,
+   "guidance": 0.0,
+   "latent_scale": 71.86064910888672
+  }
+ },
+ "refused": [
+  "cosine_karras"
+ ]
+}
