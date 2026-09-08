@@ -20,6 +20,7 @@ Run in the isolated reference environment on CPU:
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sys
@@ -212,9 +213,14 @@ def main(destination: str) -> None:
     record["flow"] = {"cases": sorted(FLOW_CASES), "steps": list(FLOW_STEPS),
                       "tokens": list(FLOW_TOKENS), "data_std": DATA_STD}
     pipeline = pipeline_record(root)
+    from diffusers import StableDiffusion3Pipeline
+
+    defaults = inspect.signature(StableDiffusion3Pipeline.__call__).parameters
     record["pipeline"] = {"config": PIPELINE, "prompts": PROMPTS, "negatives": NEGATIVES,
                           "t5_tokens": T5_TOKENS, "steps": PIPELINE_STEPS,
-                          "guidance": PIPELINE_GUIDANCE, "size": PIPELINE_SIZE}
+                          "guidance": PIPELINE_GUIDANCE, "size": PIPELINE_SIZE,
+                          "default_steps": defaults["num_inference_steps"].default,
+                          "default_guidance": defaults["guidance_scale"].default}
     np.savez_compressed(root / "sd3_pipeline.npz", allow_pickle=False, **pipeline)
     np.savez_compressed(root / "sd3_flow.npz", allow_pickle=False, **flow)
     np.savez_compressed(root / "sd3_transformer.npz", allow_pickle=False, **arrays)
@@ -376,6 +382,18 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
                           num_inference_steps=PIPELINE_STEPS, guidance_scale=PIPELINE_GUIDANCE,
                           height=PIPELINE_SIZE, width=PIPELINE_SIZE,
                           latents=latents.clone(), output_type="np").images
+        with torch.no_grad():
+            # The same call with its policy omitted: the pipeline's own step
+            # count and guidance scale, which a native task has to take too.
+            omitted = pipe(prompt=[row["text"] for row in PROMPTS],
+                           prompt_2=[row["second"] for row in PROMPTS],
+                           prompt_3=[row["third"] for row in PROMPTS],
+                           negative_prompt=[row["text"] for row in NEGATIVES],
+                           negative_prompt_2=[row["second"] for row in NEGATIVES],
+                           negative_prompt_3=[row["third"] for row in NEGATIVES],
+                           height=PIPELINE_SIZE, width=PIPELINE_SIZE,
+                           latents=latents.clone(), output_type="latent").images
+        arrays[f"{label}.default_latents"] = omitted.permute(0, 2, 3, 1).numpy()
         arrays[f"{label}.x_T"] = latents.permute(0, 2, 3, 1).numpy()
         arrays[f"{label}.latents"] = walked.permute(0, 2, 3, 1).numpy()
         arrays[f"{label}.images"] = images
