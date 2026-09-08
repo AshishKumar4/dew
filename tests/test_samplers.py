@@ -10,6 +10,7 @@ Each solver's order of accuracy is measured against that closed form.
 """
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import jax
@@ -24,8 +25,8 @@ from dew.diffusion import (
     KarrasVENoiseScheduler, LinearNoiseScheduler, Process, broadcast_rates, expand,
 )
 from dew.sampling import (
-    CFG, DDIM, DDPM, DEIS, LMS, PNDM, TCD, Consistency, DPMSolverMultistep, DPMSolverSinglestep,
-    Euler, EulerAncestral, Heun, KDPM2, MultiStepDPM, RK4, UniPC, sample,
+    CFG, DDIM, DDPM, DEIS, LMS, PNDM, TCD, Consistency, DPMSolverMultistep, DPMSolverSDE,
+    DPMSolverSinglestep, Euler, EulerAncestral, Heun, KDPM2, MultiStepDPM, RK4, UniPC, sample,
 )
 
 DATA_STD = 0.3
@@ -801,6 +802,41 @@ class ConditionalSourceOracle(nn.Module):
         return jnp.sin(x) * 0.07 + expand(temb, x) * 0.001 + expand(label, x)
 
 
+@dataclass(frozen=True)
+class RecordedPath(DPMSolverSDE):
+    """`DPMSolverSDE` reading the source's own recorded `torchsde` draws.
+
+    The reference walk runs the actual `BrownianTreeNoiseSampler` and keeps
+    every query it made with the normalized draw it answered. Selecting those
+    by the levels a query asks for couples both sides to one real Brownian
+    path, and leaves the update algebra, the stage placement and the query
+    bounds as what the trajectory compares. A query the reference never made
+    selects nothing, which moves the trajectory well past the bound.
+    """
+
+    intervals: tuple[tuple[float, float], ...] = ()
+    draws: jax.Array | None = None
+
+    def _noise(self, state, first, second, shape):
+        starts = jnp.asarray([pair[0] for pair in self.intervals], jnp.float32)
+        ends = jnp.asarray([pair[1] for pair in self.intervals], jnp.float32)
+        close = lambda asked, recorded: jnp.abs(asked - recorded) <= 1e-4 * jnp.maximum(  # noqa: E731
+            jnp.abs(recorded), 1e-3)
+        weights = (close(first, starts) & close(second, ends)).astype(jnp.float32)
+        return jnp.sum(jnp.reshape(weights, (-1,) + (1,) * len(shape)) * self.draws, axis=0)
+
+
+def source_solver(name: str, schedule):
+    """The case's solver, with the reference's recorded Brownian path where the
+    source drew one."""
+    solver = schedule.solver()
+    if f"{name}.noise" not in SOURCE_ARRAYS:
+        return solver
+    intervals = tuple((float(a), float(b)) for a, b in SOURCE_ARRAYS[f"{name}.intervals"])
+    return RecordedPath(solver.depth, solver.seed, intervals,
+                        jnp.asarray(SOURCE_ARRAYS[f"{name}.noise"], jnp.float32))
+
+
 def source_case(name: str):
     """The reconstructed process, grid and solver of a fixture case, with the
     initial latent the reference walked from."""
@@ -824,10 +860,15 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     `set_timesteps` and walks every call a pipeline makes, so a spacing,
     sigma transformation, terminal sigma, clipping order or stage placement
     that this reconstruction read differently would move the trajectory.
+    A stochastic class integrates the exact draws `sample` folds per step, and
+    `DPMSolverSDEScheduler`'s walk integrates the draws its own `torchsde`
+    tree answered, whose interval the reconstruction is checked to prepare.
     Observed at most 4.0e-5 of a latent's own scale, on the zero-terminal-SNR
     Euler grid whose substituted terminal alpha of 2^-24 puts sigma near 4e3,
-    and 2.5e-6 for the gradients; the model times land within 1.8e-4 of the
-    source's, which shifts this model's output by under 2e-7.
+    and 1.0e-4 for the gradients, on the cosine table's exponential grid whose
+    Jacobian reaches 4e4 and whose own float32 gradient is 8.6e-5 from its
+    float64 one; the model times land within 1.8e-4 of the source's, which
+    shifts this model's output by under 2e-7.
     """
     schedule, process, times, x_T = source_case(name)
     rescale = SOURCE["cases"][name]["guidance"]
@@ -846,7 +887,8 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
         model = SourceOracle()
         params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
         denoise = process.denoiser(model, params, {})
-        run = lambda value: walk(schedule.solver(), process, model, value, times)  # noqa: E731
+        solver = source_solver(name, schedule)
+        run = lambda value: walk(solver, process, model, value, times)  # noqa: E731
         latents = run(x_T)
         assert latents.shape == expected.shape
         assert relative_gap(latents, expected) < 1e-4
@@ -861,12 +903,17 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
         guidance = CFG(SOURCE["guidance_scale"], rescale=rescale)
 
         def final(value):
-            return sample(denoise, value, solver=schedule.solver(), guidance=guidance,
+            return sample(denoise, value, solver=source_solver(name, schedule), guidance=guidance,
                           key=jax.random.PRNGKey(0), times=times, final_denoise=False)
 
         assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
     (gradient,) = jax.vjp(final, x_T)[1](cotangent)
-    assert relative_gap(gradient[None], SOURCE_ARRAYS[f"{name}.grad"][None]) < 1e-4
+    expected_grad = SOURCE_ARRAYS[f"{name}.grad"]
+    # How close a float32 walk can come is what float32 does to this
+    # trajectory, which the reference states from its own side by recording
+    # the same gradient with its sample in float32.
+    floor = relative_gap(SOURCE_ARRAYS[f"{name}.grad_float32"][None], expected_grad[None])
+    assert relative_gap(gradient[None], expected_grad[None]) < max(1e-4, 2 * floor)
 
 
 def source_bridge(depth=None):
@@ -935,6 +982,35 @@ def test_the_native_brownian_increments_have_the_variance_of_the_interval():
     assert abs(float(draws.mean())) < 0.05
     left, right = draws[3].ravel(), draws[11].ravel()
     assert abs(float(np.corrcoef(left, right)[0, 1])) < 0.06
+
+
+def test_a_grid_the_source_scheduler_cannot_walk_is_refused():
+    """A Karras grid over a cosine table recovers the same model index for its
+    largest sigmas, so it repeats its first model time; the source then finds
+    the second match for the step it starts at and walks off the end of its
+    own sigma table. The reference tool records that failure, and the grid is
+    refused rather than walked with an index the source never reaches."""
+    from dew.diffusion.schedules.source import SourceSchedule
+
+    failure = str(SOURCE_ARRAYS["refused.cosine_karras.failure"])
+    times = SOURCE_ARRAYS["refused.cosine_karras.times"]
+    assert failure.startswith("IndexError"), failure
+    assert times[0] == times[1]
+    schedule = SourceSchedule.from_config(
+        json.loads(str(SOURCE_ARRAYS["refused.cosine_karras.config"])))
+    with pytest.raises(ValueError, match="repeat their first value"):
+        schedule.sampling(int(SOURCE_ARRAYS["refused.cosine_karras.steps"]))
+
+
+def test_the_wide_ddpm_posterior_variance_is_refused_where_alpha_is_one():
+    """`DDPM(variance="large")` is the variance-preserving forward step's beta,
+    which is zero on a variance-exploding grid; sampling one there would drop
+    the noise term silently, so the schedule is refused by init."""
+    process, _ = karras_process()
+    times = process.times(4)
+    x = jnp.zeros((1, 4), jnp.float32)
+    with pytest.raises(ValueError, match="variance-preserving"):
+        DDPM("large").init(x, times, process, key=jax.random.PRNGKey(0))
 
 
 def test_a_source_noise_sampler_seed_pins_the_brownian_path():

@@ -575,12 +575,15 @@ class SourceSchedule:
         """The training sigma table sigma/alpha and its logarithm, with the
         near-zero terminal alpha the zero-SNR classes substitute.
 
-        The source accumulates alpha and takes this ratio in float32, and its
-        model times come from a log-linear search of the result, which lands
-        on an integer boundary now and then; a float64 table would truncate to
-        the other side of one.
+        The source accumulates this product in double and keeps the result in
+        float32, which is what `torch.cumprod` of a float32 table does; the
+        ratio and its logarithm are then float32. Both halves matter: a
+        float32 accumulation moves the cosine table's last alpha, about
+        2.4e-9, by a part in a million and its sigma by 8e-3, and a float64
+        ratio moves a model time recovered by log-linear search across the
+        integer boundary it is truncated at.
         """
-        alphas = np.cumprod(1 - self.betas, dtype=np.float32)
+        alphas = np.cumprod(1 - self.betas, dtype=np.float64).astype(np.float32)
         if self.policy.zero_snr_tail:
             alphas[-1] = np.float32(2.0 ** -24)
         base = np.sqrt((1 - alphas) / alphas, dtype=np.float32)
@@ -666,6 +669,24 @@ class SourceSchedule:
         refined_times[1::2] = np.where(stages > 0, _sigma_to_time(stages, log_base), 0.0)
         return refined, refined_times, prior
 
+    @staticmethod
+    def _check_unique_start(times: np.ndarray) -> None:
+        """Refuse a grid whose first model time appears again in it.
+
+        The source finds the step it starts at by matching that time against
+        its own list and takes the second match when the time repeats, which
+        shifts its whole walk by one and runs off the end of its sigma table.
+        A grid that repeats its first model time therefore has no source
+        trajectory to reproduce; the Karras grid of a cosine table at a small
+        step count is the case that reaches it, because the largest sigmas of
+        that table all recover the same index.
+        """
+        if len(times) > 1 and float(np.sum(times == times[0])) > 1:
+            raise ValueError(
+                "The recovered model times repeat their first value "
+                f"({times[0]}), which the source scheduler cannot walk: it "
+                "looks its starting step up by that value and finds the second")
+
     def _edm_grid(self, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
         """EDM's own grid: rho spacing or an exponential one between sigma_min
         and sigma_max, with c_noise = log(sigma) / 4 as the model time and the
@@ -694,14 +715,17 @@ class SourceSchedule:
             schedule: NoiseScheduler = SigmaGrid(sigmas, times, prior)
         elif policy.family == "sigma":
             sigmas, times, prior = self._sigma_grid(steps)
+            self._check_unique_start(times)
             schedule = SigmaGrid(sigmas, np.append(times, times[-1]), prior)
         elif policy.family == "stage":
             sigmas, times, prior = self._stage_grid(steps)
+            self._check_unique_start(times[0::2][:-1])
             schedule = StageSigmaGrid(sigmas, times, prior)
             return (Process(schedule, self.prediction),
                     jnp.arange(len(sigmas) - 1, -1, -2, dtype=jnp.float32))
         else:
             sigmas, times, prior = self._lambda_grid(steps)
+            self._check_unique_start(times)
             schedule = VPGrid(sigmas, np.append(times, times[-1]), prior)
         return (Process(schedule, self.prediction),
                 jnp.arange(len(sigmas) - 1, -1, -1, dtype=jnp.float32))

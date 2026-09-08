@@ -67,14 +67,12 @@ from diffusers.schedulers import (
 from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
 
 from dew.diffusion.schedules.source import SourceSchedule
-from dew.sampling.solvers import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_noise
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "diffusers"
 SHAPE = (2, 3, 4)
 STEPS = 5
 DISTILLED_STEPS = 4
 SEED = 11
-BROWNIAN_DEPTH = MAX_BROWNIAN_DEPTH
 GUIDANCE_SCALE = 3.0
 LABEL = 0.7
 
@@ -148,65 +146,37 @@ def step_noise(count: int) -> list[np.ndarray]:
                        np.float64) for index in range(count)]
 
 
-class FedBrownian:
-    """`BrownianTreeNoiseSampler` replaced by Dew's own bridge, so the source's
-    update algebra runs on the path Dew's solver integrates.
+class RecordedBrownian:
+    """The source's own `BrownianTreeNoiseSampler`, recorded.
 
-    A Brownian path is rough: its slope inside the finest cell is about
-    1 / sqrt(cell width), so a query moved by one float32 step in sigma moves
-    the increment by far more than the trajectory tolerance. The queries are
-    therefore prepared from the native grid's own float32 levels, in the order
-    the source asks for them, and each request is checked against the level it
-    was prepared for; that pins the placement of every query while both sides
-    read one path.
+    The real sampler runs, over the interval the scheduler prepares and from
+    the seed its config pins, and every query it makes is kept with the
+    normalized draw it answered. The native walk then integrates those exact
+    draws, so both sides follow one `torchsde` path and the comparison is of
+    the update algebra, the stage placement and the query bounds. Dew's own
+    bridge is not in this loop; its identities are checked separately.
     """
 
+    real = None
     calls: list[tuple[float, float]] = []
-    expected: list[tuple[float, float]] = []
-    queue: list[np.ndarray] = []
+    draws: list[np.ndarray] = []
     bounds: tuple[float, float] = (0.0, 0.0)
+    transform_is_identity = False
 
     def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda value: value):
-        assert transform(torch.as_tensor(2.0)).item() == 2.0, "the source transform is the identity"
-        assert seed is None, "a seeded source tree is Torch's own stream, not a coupled path"
-        FedBrownian.bounds = (float(sigma_min), float(sigma_max))
-        FedBrownian.calls = []
-        self.shape = tuple(x.shape)
+        RecordedBrownian.transform_is_identity = bool(
+            transform(torch.as_tensor(2.0)).item() == 2.0)
+        RecordedBrownian.bounds = (float(sigma_min), float(sigma_max))
+        RecordedBrownian.calls = []
+        RecordedBrownian.draws = []
+        assert RecordedBrownian.real is not None
+        self.inner = RecordedBrownian.real(x, sigma_min, sigma_max, seed, transform)
 
     def __call__(self, sigma, sigma_next):
-        first, second = float(sigma), float(sigma_next)
-        index = len(FedBrownian.calls)
-        FedBrownian.calls.append((first, second))
-        for asked, prepared in zip((first, second), FedBrownian.expected[index]):
-            assert abs(asked - prepared) <= 1e-5 * max(abs(prepared), 1e-3), (
-                f"query {index} asks for {(first, second)}, prepared {FedBrownian.expected[index]}")
-        return torch.tensor(FedBrownian.queue[index], dtype=torch.float64)
-
-
-def brownian_queue(config: Mapping[str, object], steps: int, key) -> tuple[
-        list[np.ndarray], list[tuple[float, float]], tuple[float, float]]:
-    """The increments Dew's solver draws over a prepared grid, in the order the
-    source's two stages ask for them, with the levels each was drawn over.
-
-    Both the levels and the geometric midpoint are computed the way the solver
-    computes them, in float32 through the same operations, so the path is the
-    solver's own rather than a re-derivation of it."""
-    schedule = SourceSchedule.from_config(config)
-    process, times = schedule.sampling(steps)
-    grid = process.sampler_schedule.sigmas(times)
-    state = _Brownian(key, jnp.asarray(process.sampler_schedule.sigma_min, jnp.float32),
-                      jnp.asarray(process.sampler_schedule.sigma_max, jnp.float32))
-    queue, expected = [], []
-    for index in range(len(grid) - 1):
-        first, second = grid[index], grid[index + 1]
-        if float(second) == 0.0:  # the source's terminal step is deterministic
-            continue
-        middle = jnp.exp(0.5 * (jnp.log(first) + jnp.log(second)))
-        for target in (middle, second):
-            queue.append(np.asarray(_brownian_noise(state, first, target, SHAPE, BROWNIAN_DEPTH),
-                                    np.float64))
-            expected.append((float(first), float(target)))
-    return queue, expected, (float(state.low), float(state.high))
+        value = self.inner(sigma, sigma_next)
+        RecordedBrownian.calls.append((float(sigma), float(sigma_next)))
+        RecordedBrownian.draws.append(value.detach().numpy().astype(np.float64))
+        return value
 
 
 def walk(scheduler, module: ModuleType, case: Case, x: torch.Tensor,
@@ -284,6 +254,9 @@ CASES: Mapping[str, Case] = {
         VP, thresholding=True, prediction_type="v_prediction", timestep_spacing="linspace",
         clip_sample=False)),
     "ddpm.small_log": Case("DDPMScheduler", dict(VP, variance_type="fixed_small_log")),
+    # A leading grid ends at index 0, where the source adds no noise at all.
+    "ddpm.large_leading": Case("DDPMScheduler", dict(
+        VP, variance_type="fixed_large", timestep_spacing="leading", clip_sample=False)),
     # LMS, Euler, Euler ancestral and Heun: paired VE grids, the three sigma
     # transformations over the interpolated subset, and Heun's clipped stages.
     "lms.default": Case("LMSDiscreteScheduler", VP),
@@ -311,21 +284,19 @@ CASES: Mapping[str, Case] = {
     "kdpm2_ancestral.default": Case("KDPM2AncestralDiscreteScheduler", VP),
     "kdpm2_ancestral.exponential": Case("KDPM2AncestralDiscreteScheduler", dict(
         VP, use_exponential_sigmas=True)),
-    "dpm_sde.default": Case("DPMSolverSDEScheduler", VP),
+    # The tree's entropy is the config's, so the recorded path is reproducible.
+    "dpm_sde.default": Case("DPMSolverSDEScheduler", dict(VP, noise_sampler_seed=SEED)),
     "dpm_sde.karras_v": Case("DPMSolverSDEScheduler", dict(
-        VP, use_karras_sigmas=True, prediction_type="v_prediction")),
+        VP, use_karras_sigmas=True, prediction_type="v_prediction",
+        noise_sampler_seed=SEED + 1)),
     # The log-SNR classes: spacing variants, lambda clipping, every sigma
     # transformation, both terminal sigmas and the epsilon-domain algorithms.
     "dpm_multi.default": Case("DPMSolverMultistepScheduler", VP),
     "dpm_multi.karras": Case("DPMSolverMultistepScheduler", dict(VP, use_karras_sigmas=True)),
     "dpm_multi.cosine_clipped": Case("DPMSolverMultistepScheduler", dict(
         VP, beta_schedule="squaredcos_cap_v2", lambda_min_clipped=-5.1)),
-    # The cosine table's terminal alpha is about 2e-9, so its largest sigma is
-    # about 2e4 and a float32 accumulation of that product differs between
-    # Torch and numpy by enough to move a truncated model time. A sigma
-    # transformation over that table is therefore not comparable, and a Karras
-    # one there also repeats its first model time; the clipped case above
-    # covers the cosine table over the range a source actually walks.
+    "dpm_multi.cosine_exponential": Case("DPMSolverMultistepScheduler", dict(
+        VP, beta_schedule="squaredcos_cap_v2", use_exponential_sigmas=True)),
     "dpm_multi.exponential_trailing": Case("DPMSolverMultistepScheduler", dict(
         VP, use_exponential_sigmas=True, timestep_spacing="trailing", solver_order=3)),
     "dpm_multi.eps_threshold": Case("DPMSolverMultistepScheduler", dict(
@@ -380,6 +351,14 @@ CASES: Mapping[str, Case] = {
 }
 
 
+def native_bounds(config: Mapping[str, object], steps: int) -> tuple[float, float]:
+    """The positive sigma domain Dew prepares for this config, which is the
+    interval the source builds its Brownian tree over."""
+    schedule = SourceSchedule.from_config(config)
+    process, _ = schedule.sampling(steps)
+    return float(process.sampler_schedule.sigma_min), float(process.sampler_schedule.sigma_max)
+
+
 def grid_times(scheduler, case: Case) -> np.ndarray:
     """The model times at the grid points the outer walk visits, out of the
     call list the source runs: PNDM keeps its own ascending grid beside the
@@ -393,6 +372,46 @@ def grid_times(scheduler, case: Case) -> np.ndarray:
     if case.scheduler in TWO_STAGE:
         return np.concatenate([times[:1], times[2::2]])
     return times
+
+
+class ReplayBrownian:
+    """The draws `RecordedBrownian` kept, answered again in the same order."""
+
+    def __init__(self, x, sigma_min, sigma_max, seed=None, transform=lambda value: value):
+        self.taken = 0
+
+    def __call__(self, sigma, sigma_next):
+        value = RecordedBrownian.draws[self.taken]
+        self.taken += 1
+        return torch.tensor(value, dtype=torch.float32)
+
+
+def single_precision_gradient(module: ModuleType, case: Case, prior: float,
+                              cotangent: torch.Tensor) -> np.ndarray:
+    """The same trajectory gradient with the sample in float32.
+
+    A reconstruction runs in float32, so how close it can come is bounded by
+    what float32 does to this walk rather than by a fixed number. Recording
+    the reference's own float32 gradient beside its float64 one states that
+    bound from the source's side.
+    """
+    scheduler = getattr(module, case.scheduler)(**case.config)
+    scheduler.set_timesteps(case.steps)
+    generator = torch.Generator().manual_seed(SEED)
+    x = (torch.randn(SHAPE, generator=generator, dtype=torch.float64) * prior).to(torch.float32)
+    x.requires_grad_(True)
+    if case.scheduler == "DPMSolverSDEScheduler":
+        # Replay the draws the float64 walk recorded: querying the real tree
+        # again at float32 levels would answer a different point of a rough
+        # path, and this measures arithmetic, not the query's placement.
+        with patch.object(module, "BrownianTreeNoiseSampler", ReplayBrownian):
+            latents, _ = walk(scheduler, module, case, x, [])
+    else:
+        noises = step_noise(len(scheduler.timesteps))
+        runner = guided_walk if case.guidance is not None else walk
+        latents, _ = runner(scheduler, module, case, x, noises)
+    (gradient,) = torch.autograd.grad((latents[-1] * cotangent.to(torch.float32)).sum(), x)
+    return gradient.numpy().astype(np.float32)
 
 
 def run(name: str, case: Case) -> dict[str, np.ndarray]:
@@ -417,26 +436,31 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
     x_T.requires_grad_(True)
     arrays: dict[str, np.ndarray] = {}
     if case.scheduler == "DPMSolverSDEScheduler":
-        queue, expected, (low, high) = brownian_queue(config, case.steps, jax.random.PRNGKey(0))
-        FedBrownian.queue, FedBrownian.expected = queue, expected
-        with patch.object(module, "BrownianTreeNoiseSampler", FedBrownian):
+        RecordedBrownian.real = module.BrownianTreeNoiseSampler
+        with patch.object(module, "BrownianTreeNoiseSampler", RecordedBrownian):
             latents, inputs = walk(scheduler, module, case, x_T, [])
-        assert len(FedBrownian.calls) == len(queue), (name, len(FedBrownian.calls), len(queue))
-        assert abs(FedBrownian.bounds[0] - low) < 1e-6 and abs(FedBrownian.bounds[1] - high) < 1e-4, (
-            f"{name}: the source tree spans {FedBrownian.bounds}, Dew prepares {(low, high)}")
-        arrays["intervals"] = np.asarray(FedBrownian.calls, np.float64)
-        arrays["bounds"] = np.asarray(FedBrownian.bounds, np.float64)
+        assert RecordedBrownian.transform_is_identity, "the source transform is the identity"
+        low, high = native_bounds(config, case.steps)
+        assert abs(RecordedBrownian.bounds[0] - low) < 1e-5 * low, (
+            f"{name}: the source tree starts at {RecordedBrownian.bounds[0]}, Dew prepares {low}")
+        assert abs(RecordedBrownian.bounds[1] - high) < 1e-5 * high, (
+            f"{name}: the source tree ends at {RecordedBrownian.bounds[1]}, Dew prepares {high}")
+        arrays["intervals"] = np.asarray(RecordedBrownian.calls, np.float64)
+        arrays["noise"] = np.stack(RecordedBrownian.draws)
+        arrays["bounds"] = np.asarray(RecordedBrownian.bounds, np.float64)
     else:
         noises = step_noise(len(scheduler.timesteps))
         runner = guided_walk if case.guidance is not None else walk
         latents, inputs = runner(scheduler, module, case, x_T, noises)
     assert len(latents) == case.steps, (name, len(latents), case.steps)
     (gradient,) = torch.autograd.grad((latents[-1] * cotangent).sum(), x_T)
+    single = single_precision_gradient(module, case, prior, cotangent)
     arrays.update({
         "x_T": x_T.detach().numpy().astype(np.float32),
         "latents": np.stack([latent.detach().numpy() for latent in latents]).astype(np.float32),
         "cotangent": cotangent.numpy().astype(np.float32),
         "grad": gradient.numpy().astype(np.float32),
+        "grad_float32": single,
         "times": scheduler.timesteps.numpy().astype(np.float64),
         "prior": np.asarray(prior, np.float64),
         "inputs": np.stack(inputs),
@@ -498,6 +522,44 @@ def brownian_record() -> dict[str, np.ndarray]:
     }
 
 
+REFUSED: Mapping[str, Case] = {
+    # The largest sigmas of a cosine table all recover the same model index, so
+    # this grid repeats its first model time and the source cannot walk it.
+    "cosine_karras": Case("DPMSolverMultistepScheduler", dict(
+        VP, beta_schedule="squaredcos_cap_v2", use_karras_sigmas=True)),
+}
+
+
+def refused_record() -> dict[str, np.ndarray]:
+    """Configurations Diffusers itself cannot run, with the failure it raises.
+
+    A refusal is only honest against the real behaviour, so each of these is
+    walked here and the exception it produces is recorded beside its config.
+    """
+    arrays: dict[str, np.ndarray] = {}
+    for name, case in REFUSED.items():
+        module = MODULES[case.scheduler]
+        scheduler = getattr(module, case.scheduler)(**case.config)
+        with tempfile.TemporaryDirectory(prefix="dew-source-refused-") as saved:
+            scheduler.save_pretrained(saved)
+            config = json.loads((Path(saved) / "scheduler_config.json").read_text())
+        scheduler.set_timesteps(case.steps)
+        times = scheduler.timesteps.tolist()
+        x = torch.zeros(SHAPE, dtype=torch.float64)
+        try:
+            walk(scheduler, module, case, x, step_noise(len(times)))
+        except Exception as failure:
+            reason = f"{type(failure).__name__}: {failure}"
+        else:
+            raise AssertionError(f"{name} walked to the end; it is not a refused configuration")
+        arrays[f"refused.{name}.config"] = np.asarray(json.dumps(config))
+        arrays[f"refused.{name}.times"] = np.asarray(times, np.float64)
+        arrays[f"refused.{name}.failure"] = np.asarray(reason)
+        arrays[f"refused.{name}.steps"] = np.asarray(case.steps, np.int64)
+        print(f"refused {name}: {reason} at times {times}")
+    return arrays
+
+
 def main() -> None:
     import diffusers
 
@@ -507,7 +569,7 @@ def main() -> None:
     FIXTURES.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, np.ndarray] = {}
     record: dict[str, object] = {"diffusers": diffusers.__version__, "shape": list(SHAPE),
-                                 "brownian_depth": BROWNIAN_DEPTH, "guidance_scale": GUIDANCE_SCALE,
+                                 "guidance_scale": GUIDANCE_SCALE,
                                  "label": LABEL, "cases": {}}
     cases: dict[str, dict[str, object]] = record["cases"]  # type: ignore[assignment]
     for name, case in CASES.items():
@@ -518,6 +580,8 @@ def main() -> None:
                        "guidance": case.guidance,
                        "latent_scale": float(np.abs(result["latents"]).max())}
         print(f"{name}: {case.steps} intervals, |latent| <= {cases[name]['latent_scale']:.4g}")
+    arrays.update(refused_record())
+    record["refused"] = sorted(REFUSED)
     for key, value in brownian_record().items():
         arrays[f"brownian.{key}"] = value
     print(f"brownian: torchsde tree over {arrays['brownian.bounds']}")
