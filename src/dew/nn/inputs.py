@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import hashlib
+import itertools
 import math
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -17,6 +18,7 @@ from typing_extensions import TypeVar
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
+TreeT = TypeVar("TreeT")
 
 BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 """The mesh axes a request's rows split over: every axis but sequence and stage."""
@@ -28,7 +30,11 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
                    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Pad ragged token rows and their scalar token fields on the host.
 
-    Filler IDs carry no content; attention_mask alone marks real slots.
+    Filler IDs carry no content; attention_mask alone marks real slots. Rows
+    that all fill the width take no filler, so no attention_mask comes back.
+    Absent validity is how a host says every slot is real. An all-true mask
+    would say the same thing in a form the model cannot read the contents
+    of, and it would cost it the fused attention kernel.
     Tokenizer state is not involved in this numeric layout operation.
     """
     if padding_side not in ("left", "right"):
@@ -60,6 +66,8 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
         for index, (row, slot) in enumerate(zip(aligned, slots)):
             value[index, slot] = row
         padded[name] = value
+    if padded["attention_mask"].all():
+        del padded["attention_mask"]
     return tokens, padded
 
 
@@ -181,6 +189,100 @@ def generation_signature(inputs: object, controls: object) -> np.ndarray:
     schema = (str(jax.tree.structure(inputs)),
               [(leaf.shape, str(leaf.dtype)) for leaf in jax.tree.leaves(inputs)], controls)
     return np.frombuffer(hashlib.sha256(repr(schema).encode()).digest(), np.uint8)
+
+
+VALIDITY_FIELD = "attention_mask"
+"""The token field that marks real slots. Absent means every slot is real."""
+
+
+def validity_sites(tree: object) -> list[ModelInputs]:
+    """The tree's `ModelInputs` nodes, in flatten order.
+
+    A node is a site whether or not it carries validity, so every process
+    finds the same sites in the same order and a per-site vector has the same
+    length everywhere.
+    """
+    leaves = jax.tree.leaves(tree, is_leaf=lambda node: isinstance(node, ModelInputs))
+    return [leaf for leaf in leaves if isinstance(leaf, ModelInputs)]
+
+
+def _validity_agnostic(tree: TreeT) -> TreeT:
+    """`tree` with every validity field dropped."""
+    return jax.tree.map(
+        lambda node: (replace(node, token_fields={
+            name: value for name, value in node.token_fields.items()
+            if name != VALIDITY_FIELD}) if isinstance(node, ModelInputs) else node),
+        tree, is_leaf=lambda node: isinstance(node, ModelInputs))
+
+
+def assembly_signature(tree: object, controls: object = ()) -> np.ndarray:
+    """`generation_signature` of the tree with validity left out.
+
+    Whether a process's own rows needed padding is rank-local, so a digest
+    that counted validity would refuse a pool that agrees on everything else.
+    This one still carries every other field, shape, dtype and control, so a
+    real schema disagreement is still refused, and it is fixed-width and
+    computed from local structure alone, which is what lets it be the first
+    thing a pool agrees on.
+    """
+    return generation_signature(_validity_agnostic(tree), controls)
+
+
+def filled_validity(tree: TreeT, wanted: bool | Sequence[bool] = True) -> TreeT:
+    """All-true validity at the sites that want it and do not carry it.
+
+    `wanted` is one flag per site of `validity_sites`, or one flag for all of
+    them. Nothing is read from a resident array and no site that carries
+    validity is touched, so this is a schema operation and not a mask.
+    """
+    sites = itertools.count()
+
+    def fill(node):
+        if not isinstance(node, ModelInputs):
+            return node
+        index = next(sites)
+        needed = wanted if isinstance(wanted, bool) else bool(wanted[index])
+        if not needed or VALIDITY_FIELD in node.token_fields:
+            return node
+        shape = np.shape(node.tokens)
+        ones = (np.ones(shape, bool) if isinstance(node.tokens, np.ndarray)
+                else jnp.ones(shape, bool))
+        return replace(node, token_fields={**node.token_fields, VALIDITY_FIELD: ones})
+
+    return jax.tree.map(fill, tree, is_leaf=lambda node: isinstance(node, ModelInputs))
+
+
+def agreed_validity(tree: TreeT, processes: int, *, controls: object = (),
+                    phase: str = "input") -> TreeT:
+    """One validity schema for the whole pool, agreed before arrays are built.
+
+    A host that padded nothing carries no validity, which is what keeps
+    attention on its fused kernel. Padding is a property of a process's own
+    rows, so one process can omit the field while another carries it, and the
+    same step would then receive two different pytrees. Where any process
+    carries validity for a site, every process materializes it; where none
+    does, the omission stays.
+
+    The collectives are fixed-shape and their number does not depend on what
+    this process holds: the validity-agnostic signature is agreed first, and
+    the site count that sizes the presence vector comes from that agreed
+    schema. Both run on the calling thread, so call this where the caller's
+    other collectives are issued, in the same order on every process.
+    """
+    if processes <= 1:
+        return tree
+    from jax.experimental import multihost_utils
+
+    multihost_utils.assert_equal(
+        assembly_signature(tree, controls),
+        f"{phase} schemas, shapes and controls must agree across processes")
+    count = len(validity_sites(tree))
+    if not count:
+        return tree
+    present = np.asarray([VALIDITY_FIELD in site.token_fields
+                          for site in validity_sites(tree)], np.int32)
+    gathered = np.asarray(multihost_utils.process_allgather(present)).reshape(-1, count)
+    return filled_validity(tree, [bool(flag) for flag in gathered.max(axis=0)])
 
 
 def local_rows(leaf) -> np.ndarray:

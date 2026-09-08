@@ -86,8 +86,12 @@ class SampledRollout:
             if (prompt_lengths.shape != (rows,) or not np.issubdtype(prompt_lengths.dtype, np.integer)
                     or np.any(prompt_lengths < 1) or np.any(prompt_lengths > width)):
                 raise ValueError("prompt_length must contain one valid integer length per row")
+            # The lengths are already here on the host, so a batch of whole
+            # prompts states its validity by carrying none.
+            padded = bool(np.any(prompt_lengths < width))
             inputs = ModelInputs(jnp.asarray(prompts), {
-                "attention_mask": jnp.arange(width)[None, :] >= width - jnp.asarray(prompt_lengths)[:, None]})
+                "attention_mask": jnp.arange(width)[None, :] >= width - jnp.asarray(prompt_lengths)[:, None]
+            } if padded else {})
             prepared = prompts, prompt_lengths, sources, truths, infos, inputs
         except BaseException as failure:
             error = failure

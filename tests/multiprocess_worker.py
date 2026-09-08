@@ -1245,9 +1245,136 @@ def mode_inference_pipeline(args) -> dict:
     }
 
 
+MIXED_NEW = 3
+
+
+def mixed_token_lengths() -> np.ndarray:
+    """Real token counts of the token batch: rows 0-4 whole, rows 5-7 shorter.
+
+    Under the trainer's halving process zero pads nothing and process one
+    does, which is the split that makes validity a rank-local property.
+    """
+    width = SEQ_LEN + 1
+    return np.array([width] * 5 + [width - 1, width - 2, width - 3], np.int32)
+
+
+def mixed_validity_inputs(prompts: np.ndarray, lengths: np.ndarray, *, explicit: bool):
+    """What a host producer hands generation for these left-padded rows.
+
+    A producer that padded nothing omits validity, the way `SampledRollout`
+    does from the lengths it already holds. `explicit` spells the field out
+    on every row instead, which is the reference a pool has to reproduce.
+    """
+    import jax.numpy as jnp
+    from dew.nn.inputs import ModelInputs
+
+    mask = np.arange(prompts.shape[1])[None, :] >= prompts.shape[1] - lengths[:, None]
+    if not explicit and mask.all():
+        return ModelInputs(jnp.asarray(prompts))
+    return ModelInputs(jnp.asarray(prompts), {"attention_mask": jnp.asarray(mask)})
+
+
+def mixed_validity_batch(rows: slice, *, explicit: bool) -> dict:
+    """A training batch whose validity is omitted where nothing was padded."""
+    import jax.numpy as jnp
+    from dew.nn.inputs import ModelInputs
+
+    tokens = token_batch()[rows]
+    mask = np.arange(tokens.shape[1])[None, :] < mixed_token_lengths()[rows][:, None]
+    if not explicit and mask.all():
+        return {"text": ModelInputs(jnp.asarray(tokens))}
+    return {"text": ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(mask)})}
+
+
+MIXED_RATE = 0.1
+"""The learning rate of the mixed-validity step. Plain unclipped SGD, so the
+update is the rate times the gradient and comparing updates compares gradient
+magnitudes; Adam's first step would normalize them away."""
+
+
+def mixed_validity_trainer(fsdp: int):
+    """The pipeline model under plain SGD, for the mixed-validity regression."""
+    import jax
+    import optax
+    import dew.nn.backbones.causal_transformer  # registers the model built below
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Layout, MeshSpec, Trainer
+
+    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
+                         num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
+    return Trainer(LMObjective(model, SEQ_LEN), optax.sgd(MIXED_RATE), key=jax.random.key(0),
+                   mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY),
+                   checkpoints=None, tracker=None)
+
+
+def mixed_validity_step(trainer, batch: dict, out: Path | None = None) -> dict:
+    """One step over `batch`, with the update each parameter took.
+
+    The update is the gradient scaled by the rate, so a caller can compare
+    gradients between topologies instead of the state an optimizer with
+    memory would have reached.
+    """
+    from dew.training.distributed import shard_batch
+
+    state, _, _ = trainer.place()
+    placed = shard_batch(trainer.device_mesh, batch)
+    compiled = trainer.compile(state, placed)
+    updated, loss, _, _, _ = compiled(state, placed)
+    before, after = params_dict(state.params), params_dict(updated.params)
+    update = {name: after[name] - before[name] for name in after}
+    if out is not None:
+        np.savez(out.with_suffix(".npz"), **after)
+        np.savez(out.with_suffix(".update.npz"), **update)
+    return {"placed_fields": sorted(placed["text"].token_fields),
+            "loss": float(as_numpy(loss)), "batch_sharding": sharding_facts(placed),
+            "update": update}
+
+
+def mode_mixed_validity(args) -> dict:
+    """Generation and one training step where only some processes padded.
+
+    Process zero's rows fill their width, so its producer omits validity;
+    process one's are padded and carry it. Generation has to agree one schema
+    before it digests the request, and placement has to materialize the field
+    before it assembles the batch, or the two processes hand the same step two
+    different pytrees.
+    """
+    import jax
+    from dew.nn.inputs import agreed_validity
+    from dew.sampling import Sampling, generate
+
+    rank, processes = jax.process_index(), jax.process_count()
+    prompts = rollout_prompts()
+    rows = BATCH // processes
+    mine = slice(rank * rows, (rank + 1) * rows)
+    local = mixed_validity_inputs(prompts["prompt"][mine], prompts["prompt_length"][mine],
+                                  explicit=args.explicit)
+    trainer = mixed_validity_trainer(args.fsdp_size)
+    state, _, _ = trainer.place()
+    agreed = agreed_validity(local, processes, phase="mixed validity request")
+    drawn = generate(trainer.objective.model, state.params, local, MIXED_NEW, seed=3,
+                     sampling=Sampling(temperature=0)).host()
+    trained = mixed_validity_step(
+        trainer, mixed_validity_batch(mine, explicit=args.explicit), args.out)
+    return {
+        "process_index": rank,
+        "local_fields": sorted(local.token_fields),
+        "agreed_fields": sorted(agreed.token_fields),
+        "agreed_all_true": (None if not agreed.token_fields else
+                            bool(np.all(np.asarray(agreed.token_fields["attention_mask"])))),
+        "placed_fields": trained["placed_fields"],
+        "tokens": np.asarray(drawn.tokens).tolist(),
+        "raw_log_probs": np.asarray(drawn.raw_log_probs, np.float64).tolist(),
+        "loss": trained["loss"],
+        "update_scale": max(float(np.max(np.abs(leaf))) for leaf in trained["update"].values()),
+        "batch_sharding": trained["batch_sharding"],
+    }
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "inference_pipeline": mode_inference_pipeline,
-         "rollout": mode_rollout,
+         "rollout": mode_rollout, "mixed_validity": mode_mixed_validity,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
          "training_contract": mode_training_contract,
@@ -1271,6 +1398,8 @@ def parse_args(argv=None):
     parser.add_argument("--lm-dir", help="an LM run directory for the pipeline mode")
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--save", action="store_true")
+    parser.add_argument("--explicit", action="store_true",
+                        help="spell validity out on every row instead of omitting it")
     parser.add_argument("--save-every", type=int)
     parser.add_argument("--local-dir", help="every process's local checkpoint directory")
     parser.add_argument("--local-every", type=int)
