@@ -7,7 +7,7 @@ The classes are exported for direct use in notebooks and tests.
 """
 
 from .unet import Unet
-from .unet_condition import UNet2DCondition, UNetStage, DenoisingCondition
+from .unet_condition import UNet2DCondition, UNetStage
 from .uvit import UViT, SimpleUDiT
 from .dit import SimpleDiT
 from .causal_transformer import CausalTransformer
@@ -19,7 +19,7 @@ from .unet3d import UNet3D
 __all__ = [
     # Image backbones
     "Unet",
-    "UNet2DCondition", "UNetStage", "DenoisingCondition",
+    "UNet2DCondition", "UNetStage",
     "UViT",
     "SimpleUDiT",
     "SimpleDiT",

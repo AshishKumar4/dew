@@ -29,7 +29,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
-from dew.nn.backbones.unet_condition import DenoisingCondition, sinusoidal_time
+from dew.diffusion.process import DenoisingCondition
+from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 

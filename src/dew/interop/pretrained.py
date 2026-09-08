@@ -1212,13 +1212,15 @@ def _t5_tower(directory: Path, compute, component: str):
     """
     from transformers import AutoTokenizer
     from dew.interop import diffusion
-    from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, translate_t5_config
+    from dew.nn.text_encoders import (
+        T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config)
 
     config = _component_config(directory, component)
     tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
+    tensors = diffusion.component_tensors(directory, component)
+    t5_embedding(tensors)
     params, layouts = diffusion.record_layouts(
-        component, diffusion.component_tensors(directory, component), _t5_path,
-        ("encoders", "conditioning", component))
+        component, tensors, _t5_path, ("encoders", "conditioning", component))
     tokenizer = AutoTokenizer.from_pretrained(
         directory / ("tokenizer" + component.removeprefix("text_encoder")))
     return tower, tokenizer, params, layouts, config

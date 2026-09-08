@@ -6,46 +6,13 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn, struct
+from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import FlaxFeedForward, scaled_dot_product_attention
 from dew.nn.blocks import ResidualBlock
 from dew.registry import models
-
-
-@struct.dataclass
-class DenoisingCondition:
-    """Text conditioning as the published families read it: the token states,
-    a pooled vector, the size and crop ids the XL towers add, and the
-    distilled guidance value a guidance-embedded transformer takes as a model
-    input rather than as two guided branches."""
-
-    context: jax.Array
-    pooled: jax.Array | None = None
-    time_ids: jax.Array | None = None
-    guidance: jax.Array | None = None
-
-    def aligned(self, given: "DenoisingCondition") -> "DenoisingCondition":
-        """This conditioning with `given`'s own model inputs.
-
-        A distilled guidance value belongs to the row rather than to its
-        caption: dropping the caption or guiding against an unconditional one
-        changes what the model reads about the text, not the scale the
-        checkpoint was distilled to walk at. The two seams that pair a
-        conditional record with an unconditional one align them here first,
-        so both keep each row's own scalar.
-        """
-        return self.replace(guidance=given.guidance)
-
-
-def aligned_conditions(conditions: dict, unconditional: dict) -> dict:
-    """`unconditional` with each row's own model inputs taken from
-    `conditions`, for the keywords that carry conditioning records."""
-    return {key: (value.aligned(conditions[key])
-                  if isinstance(value, DenoisingCondition)
-                  and isinstance(conditions.get(key), DenoisingCondition) else value)
-            for key, value in unconditional.items()}
 
 
 @dataclass(frozen=True)

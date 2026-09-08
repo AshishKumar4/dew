@@ -956,6 +956,8 @@ def translate_t5_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+# The names a published T5 stores its one tied token embedding under.
+_T5_EMBEDDING = ("shared.weight", "encoder.embed_tokens.weight")
 _T5_PROJECTIONS = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "out_proj"}
 _T5_WIDTHS = {"wi", "wi_0", "wi_1", "wo"}
 
@@ -963,16 +965,19 @@ _T5_WIDTHS = {"wi", "wi_0", "wi_1", "wo"}
 def _t5_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     """One HF T5 tensor name into its path in a `T5EncoderTransformer` tree.
 
-    Only the shared embedding and the encoder blocks map. The decoder, the
-    lm_head and the encoder's tied copy of the embedding are not this tower
-    and come back as None; any other name raises ValueError with the tensor
-    name.
+    The token embedding and the encoder blocks map. A published T5 ties its
+    embedding and stores it as `shared.weight`, as `encoder.embed_tokens.
+    weight`, or as both: all of them are the one native embedding, so both
+    names map to it and both are bound for export, and `t5_embedding` checks
+    that a file carrying two copies carries the same one. The decoder and the
+    lm_head are not this tower and come back as None; any other name raises
+    ValueError with the tensor name.
     """
-    if hf_name == "shared.weight":
+    if hf_name in _T5_EMBEDDING:
         return ("embed_tokens", "embedding")
     if hf_name == "encoder.final_layer_norm.weight":
         return ("final_layer_norm", "scale")
-    if hf_name == "encoder.embed_tokens.weight" or hf_name.startswith(("decoder.", "lm_head.")):
+    if hf_name.startswith(("decoder.", "lm_head.")):
         return None
     parts = hf_name.split(".")
     if len(parts) >= 3 and parts[:2] == ["encoder", "block"] and parts[2].isdigit():
@@ -993,12 +998,31 @@ def _t5_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
+def t5_embedding(hf_tensors: Mapping[str, np.ndarray]) -> None:
+    """Check the token embedding a T5 encoder stores under its two names.
+
+    Both names are the same tied tensor, and a checkpoint may ship either or
+    both. A file whose two copies disagree is refused rather than loaded as
+    whichever the iteration order reached last, and a file with neither is
+    refused rather than initialized.
+    """
+    present = [name for name in _T5_EMBEDDING if name in hf_tensors]
+    if not present:
+        raise ValueError("A T5 encoder stores its token embedding as "
+                         + " or ".join(_T5_EMBEDDING))
+    if len(present) == 2 and not np.array_equal(np.asarray(hf_tensors[present[0]]),
+                                                np.asarray(hf_tensors[present[1]])):
+        raise ValueError(f"{present[0]} and {present[1]} are one tied embedding, and this "
+                         f"checkpoint's two copies differ")
+
+
 def translate_t5_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
     """HF T5 encoder tensors into a `T5EncoderTransformer` params tree, in fp32.
 
     Dense kernels transpose from torch's [out, in] to linen's [in, out]; the
     embedding, the norms and the relative bias table keep their layout.
     """
+    t5_embedding(hf_tensors)
     return _translate(hf_tensors, _t5_path)
 
 

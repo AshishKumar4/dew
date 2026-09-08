@@ -22,7 +22,7 @@ from flax import linen as nn
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, sd3_fields, translate_sd3_weights
 from dew.nn.backbones.sd3 import SD3Transformer
-from dew.nn.backbones.unet_condition import DenoisingCondition
+from dew.diffusion.process import DenoisingCondition
 from dew.sampling import sample
 
 ROOT = Path(__file__).resolve().parents[1]

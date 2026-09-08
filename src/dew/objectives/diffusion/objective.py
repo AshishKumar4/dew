@@ -25,7 +25,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.backbones.unet_condition import aligned_conditions
+from dew.diffusion.process import aligned_conditions
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
 from dew.registry import objectives
 from dew.sampling.guidance import CFG

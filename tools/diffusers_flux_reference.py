@@ -71,10 +71,11 @@ CASES: dict[str, Case] = {
 def native_frequencies(half: int) -> np.ndarray:
     """The frequency table Dew's own `sinusoidal_time` builds, in float32.
 
-    Torch's CPU `exp` is not correctly rounded at six of these entries, so the
-    two libraries' tables differ by an ulp there. Handing this table to the
-    source as well is the controlled comparison: everything but that ulp is
-    then identical on both sides.
+    Neither backend's float32 exponential is correctly rounded everywhere, so
+    the two tables differ by one unit in the last place at some entries.
+    Handing this table to the source as well is the controlled comparison:
+    everything but that one-ulp backend difference is then identical on both
+    sides.
     """
     import jax.numpy as jnp
 
@@ -221,6 +222,125 @@ def reload(directory: str, recorded: str) -> None:
     print("the source reads the native update")
 
 
+def errors(fixture: str, destination: str) -> None:
+    """The per-tensor error table for both records, as a JSON artifact.
+
+    For every case: each parameter gradient's scaled error against the
+    unmodified source and against the controlled same-frequency source, with
+    the source tensor's own scale, so the reference criterion's shortfall is
+    a number in a file rather than a claim.
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    from test_flux_source import flux_walk, packed, parameter_gaps, relative_gap
+
+    root = Path(fixture)
+    record = json.loads((root / "flux_transformer.json").read_text())
+    table: dict[str, object] = {"bound": 1e-4, "cases": {}}
+    with np.load(root / "flux_transformer.npz") as arrays:
+        for name, case in record["cases"].items():
+            grid = tuple(case["grid"])
+            output, gradients, layout = flux_walk(root, arrays, name, grid)
+            plain = parameter_gaps(arrays, gradients, layout, f"{name}.grad_param.")
+            control = parameter_gaps(arrays, gradients, layout, f"{name}.control_grad_param.")
+            scales = {key: float(np.abs(arrays[f"{name}.grad_param.{key}"]).max())
+                      for key in plain}
+            table["cases"][name] = {
+                "output": relative_gap(packed(np.asarray(output)), arrays[f"{name}.output"]),
+                "parameters": {key: {"unmodified": plain[key], "controlled": control[key],
+                                     "scale": scales[key]} for key in sorted(plain)},
+                "worst_unmodified": max(plain.items(), key=lambda item: item[1]),
+                "worst_controlled": max(control.items(), key=lambda item: item[1]),
+                "over_bound": sorted(key for key, gap in plain.items() if gap >= 1e-4)}
+            print(f"{name:8s} worst unmodified {table['cases'][name]['worst_unmodified'][1]:.3g} "
+                  f"controlled {table['cases'][name]['worst_controlled'][1]:.3g} "
+                  f"over bound {table['cases'][name]['over_bound']}")
+    Path(destination).write_text(json.dumps(table, indent=1) + "\n")
+    print(f"{destination}: {len(table['cases'])} cases")
+
+
+def amplify(destination: str) -> None:
+    """How far one unit in the last place of a frequency travels, measured.
+
+    The actual source model, walked under its own frequency table and under
+    four mutations of it, over bounded seeds and input scales. Every row
+    reports the absolute and relative difference of the guidance embedder's
+    first weight gradient - the tensor whose gradient IS the sinusoidal
+    features - beside that gradient's own scale, so the reference criterion's
+    shortfall is attributed rather than fitted. The mutations discriminate:
+    one ulp at a single frequency reproduces the observed difference, while a
+    scaled table or the other frequency-shift convention is orders larger, so
+    the diagnostic separates a rounding difference from an operator error.
+    """
+    from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
+
+    config = {**BASE, "guidance_embeds": True}
+    half = 128
+    theirs = source_frequencies(half)
+    ours = native_frequencies(half)
+    index = int(np.argmax(np.abs(theirs - ours)))
+    single = theirs.copy()
+    single[index] = np.nextafter(single[index], np.float32(np.inf), dtype=np.float32)
+    variants = {
+        "native_table": ours,
+        "one_ulp_at_one_frequency": single,
+        "scaled_by_1e-3": (theirs.astype(np.float64) * (1 + 1e-3)).astype(np.float32),
+        "other_shift_convention": np.exp(
+            -math.log(10000.0) * np.arange(half, dtype=np.float32) / (half - 1)).astype(np.float32),
+    }
+    rows = []
+    for seed in (SEED, SEED + 101, SEED + 202):
+        for scale in (1.0, 4.0):
+            torch.manual_seed(seed)
+            model = FluxTransformer2DModel(**config).eval()
+            generator = torch.Generator().manual_seed(seed + 1)
+            packed_latent = scale * torch.randn((2, 16, config["in_channels"]),
+                                                generator=generator, dtype=torch.float32)
+            context = scale * torch.randn((2, TOKENS, config["joint_attention_dim"]),
+                                          generator=generator, dtype=torch.float32)
+            pooled = scale * torch.randn((2, config["pooled_projection_dim"]),
+                                         generator=generator, dtype=torch.float32)
+            times = torch.tensor([731.0, 42.0], dtype=torch.float32)
+            guidance = torch.full((2,), 3.5, dtype=torch.float32)
+            weight = model.time_text_embed.guidance_embedder.linear_1.weight
+            probe = torch.randn((2, 16, config["in_channels"]), generator=generator,
+                                dtype=torch.float32)
+
+            def gradient():
+                output = model(hidden_states=packed_latent, encoder_hidden_states=context,
+                               pooled_projections=pooled, timestep=times / 1000,
+                               guidance=guidance, txt_ids=torch.zeros(TOKENS, 3),
+                               img_ids=image_ids(4, 4), return_dict=False)[0]
+                return torch.autograd.grad((output * probe).sum(), [weight])[0].numpy()
+
+            reference = gradient()
+            scale_of = float(np.abs(reference).max())
+            spread = scale_of / max(float(np.abs(reference).mean()), 1e-30)
+            for label, table in variants.items():
+                with controlled_frequencies(table):
+                    moved = gradient()
+                absolute = float(np.abs(moved - reference).max())
+                # The largest difference in units of the last place AT the
+                # entry where it occurs, not against the table's widest step.
+                moved_index = int(np.argmax(np.abs(table - theirs)))
+                ulps = float(np.abs(table[moved_index] - theirs[moved_index])
+                             / np.spacing(theirs[moved_index]))
+                rows.append({"seed": seed, "input_scale": scale, "mutation": label,
+                             "table_ulps": ulps, "absolute": absolute,
+                             "relative": absolute / max(scale_of, 1e-30),
+                             "scaled_by_bound_reference": absolute / max(1.0, scale_of),
+                             "reference_scale": scale_of, "reference_spread": spread})
+    for row in rows:
+        print(f"seed {row['seed']} scale {row['input_scale']:.0f} {row['mutation']:24s} "
+              f"ulps {row['table_ulps']:.3g} abs {row['absolute']:.3g} "
+              f"rel {row['relative']:.3g} scaled {row['scaled_by_bound_reference']:.3g} "
+              f"|grad| {row['reference_scale']:.3g}")
+    Path(destination).write_text(json.dumps(
+        {"frequency_index_of_worst_difference": index, "rows": rows}, indent=1) + "\n")
+    print(f"{destination}: {len(rows)} rows")
+
+
 def bundle(directory: str, destination: str) -> None:
     """Pack the saved transformers and the recorded arrays for the suite."""
     import tarfile
@@ -355,5 +475,9 @@ if __name__ == "__main__":
         bundle(sys.argv[2], sys.argv[3])
     elif len(sys.argv) > 2 and sys.argv[1] == "reload":
         reload(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 2 and sys.argv[1] == "errors":
+        errors(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) > 1 and sys.argv[1] == "amplify":
+        amplify(sys.argv[2] if len(sys.argv) > 2 else "/tmp/dew-flux-amplification.json")
     else:
         main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-flux-reference")

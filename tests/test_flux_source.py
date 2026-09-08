@@ -24,7 +24,7 @@ import pytest
 
 from dew.interop.diffusion import component_tensors, flux_fields, translate_flux_weights
 from dew.nn.backbones.flux import FluxTransformer
-from dew.nn.backbones.unet_condition import DenoisingCondition
+from dew.diffusion.process import DenoisingCondition
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("schnell", "dev", "rect", "deep", "mixed")
@@ -78,93 +78,115 @@ def transformer_case(directory: Path, arrays, name: str, grid: tuple[int, int]):
     return forward, params, layouts, latent, context, pooled
 
 
+def flux_walk(source, arrays, name: str, grid: tuple[int, int]):
+    """The native forward and every gradient of one case, once."""
+    forward, params, layouts, latent, context, pooled = transformer_case(
+        source, arrays, name, grid)
+    probe = jnp.asarray(unpacked(arrays[f"{name}.probe"], *grid))
+    output = jax.jit(forward)(params, latent, context, pooled)
+    gradients = jax.jit(jax.grad(
+        lambda p, l, c, q: jnp.sum(forward(p, l, c, q) * probe), argnums=(0, 1, 2, 3)))(
+            params, latent, context, pooled)
+    return output, gradients, {entry.name: entry for entry in layouts}
+
+
+def parameter_gaps(arrays, gradients, layout, prefix: str) -> dict[str, float]:
+    """Every recorded parameter gradient's scaled error against the native one."""
+    gaps = {}
+    for key in arrays.files:
+        if not key.startswith(prefix):
+            continue
+        entry = layout["transformer/" + key[len(prefix):]]
+        node = gradients[0]
+        for step in entry.paths[0][1:]:
+            node = node[step]
+        value = np.asarray(node)
+        if entry.transpose is not None:
+            value = value.transpose(entry.transpose)
+        assert value.shape == tuple(entry.shape), key
+        gaps[key[len(prefix):]] = relative_gap(value, arrays[key])
+    assert gaps, prefix
+    return gaps
+
+
 @pytest.mark.parametrize("name", CASES)
 def test_native_flux_matches_the_source_forward_and_every_gradient(name, source):
-    """One published transformer's own tensors, read through the native model.
+    """The unmodified source, at the suite's fixed 1e-4 scaled-error bound.
 
-    The variants are the ones whose wiring differs: the schnell-style model
-    with no guidance embedder, the distilled one with it, a rectangular packed
-    grid whose row and column rotations differ, a stack with a different split
-    between double and single blocks, and one walked at a different distilled
-    guidance per row.
+    This is the reference reproduction: the actual `FluxTransformer2DModel`
+    walked as its pipeline walks it, with nothing on either side altered. The
+    variants are the ones whose wiring differs - the schnell-style model with
+    no guidance embedder, the distilled one with it, a rectangular packed grid
+    whose row and column rotations differ, a different split between double
+    and single blocks, and one walked at a different distilled guidance per
+    row.
 
-    Two records are compared. The unmodified source gives the forward and the
-    latent, token and pooled gradients within 1e-5. The controlled record is
-    the same source walk with Dew's own frequency table handed to its timestep
-    embedding - a control, not unmodified-source parity - and every parameter
-    gradient is held to 1e-4 there, because torch's CPU `exp` is not correctly
-    rounded at six of those 128 frequencies and an ulp of a frequency is 1e-4
-    of a 3500-radian angle. `test_the_frequency_table_is_the_only_component_
-    that_differs` measures that difference and what it costs unmodified.
+    The criterion is currently UNMET for one tensor on the guidance-embedded
+    cases: `time_text_embed.guidance_embedder.linear_1.weight`. The two
+    backends' float32 exponentials of a bit-identical exponent differ by one
+    unit in the last place at some of the 128 frequencies; an ulp of a
+    frequency is an ulp of a 3500-radian angle, and that gradient is exactly
+    those sines. The bound is not edited and the tensor is not dropped:
+    `test_native_flux_matches_the_controlled_same_frequency_source` attributes
+    the difference, `test_the_two_frequency_tables_differ_by_one_ulp` holds
+    the component itself, and `tools/diffusers_flux_reference.py errors` and
+    `... amplify` write the per-tensor table and the amplification study.
     """
     record = json.loads((source / "flux_transformer.json").read_text())
     grid = tuple(record["cases"][name]["grid"])
     with np.load(source / "flux_transformer.npz") as arrays:
-        forward, params, layouts, latent, context, pooled = transformer_case(
-            source, arrays, name, grid)
-        probe = jnp.asarray(unpacked(arrays[f"{name}.probe"], *grid))
-        output = jax.jit(forward)(params, latent, context, pooled)
+        output, gradients, layout = flux_walk(source, arrays, name, grid)
         assert relative_gap(packed(np.asarray(output)), arrays[f"{name}.output"]) < 1e-5
-        gradients = jax.jit(jax.grad(
-            lambda p, l, c, q: jnp.sum(forward(p, l, c, q) * probe), argnums=(0, 1, 2, 3)))(
-                params, latent, context, pooled)
         assert relative_gap(packed(np.asarray(gradients[1])), arrays[f"{name}.grad_packed"]) < 1e-5
         assert relative_gap(gradients[2], arrays[f"{name}.grad_context"]) < 1e-5
         assert relative_gap(gradients[3], arrays[f"{name}.grad_pooled"]) < 1e-5
-        # The controlled record, where both sides read the same frequencies.
-        assert relative_gap(packed(np.asarray(output)),
-                            arrays[f"{name}.control_output"]) < 1e-5
-        layout = {entry.name: entry for entry in layouts}
-        prefix = f"{name}.control_grad_param."
-        names = [key for key in arrays.files if key.startswith(prefix)]
-        assert names, name
-        for key in names:
-            entry = layout["transformer/" + key[len(prefix):]]
-            node = gradients[0]
-            for step in entry.paths[0][1:]:
-                node = node[step]
-            value = np.asarray(node)
-            if entry.transpose is not None:
-                value = value.transpose(entry.transpose)
-            assert value.shape == tuple(entry.shape), key
-            assert relative_gap(value, arrays[key]) < 1e-4, key
+        gaps = parameter_gaps(arrays, gradients, layout, f"{name}.grad_param.")
+        worst = max(gaps.items(), key=lambda item: item[1])
+        assert worst[1] < 1e-4, worst
 
 
-def test_the_frequency_table_is_the_only_component_that_differs(source):
-    """What the unmodified source's own `exp` costs, measured.
+@pytest.mark.parametrize("name", CASES)
+def test_native_flux_matches_the_controlled_same_frequency_source(name, source):
+    """A CONTROL, not unmodified-source parity.
 
-    Dew's frequency table is the correctly rounded float32 exponential of the
-    same bit-identical exponent; torch's CPU `exp` differs from it at a few
-    entries by one unit in the last place. Nothing else in the embedding
-    differs, so with the source's own table handed back to it the whole model
-    agrees, and the two weights whose gradients ARE those features are the
-    only place the unmodified comparison exceeds 1e-4. That excess is reported
-    here rather than accommodated: the bound above stays 1e-4 over every
-    tensor of the controlled record.
+    The same source walk with Dew's own frequency table handed to its timestep
+    embedding, its own float32 product, `sin`, `cos` and flip otherwise
+    untouched. Every parameter gradient is held to the same 1e-4 here, which
+    isolates the model's arithmetic from the one component the two libraries
+    round differently. It does not stand in for the reference test above.
     """
-    features = ("time_text_embed.timestep_embedder.linear_1.weight",
-                "time_text_embed.guidance_embedder.linear_1.weight")
+    record = json.loads((source / "flux_transformer.json").read_text())
+    grid = tuple(record["cases"][name]["grid"])
+    with np.load(source / "flux_transformer.npz") as arrays:
+        output, gradients, layout = flux_walk(source, arrays, name, grid)
+        assert relative_gap(packed(np.asarray(output)), arrays[f"{name}.control_output"]) < 1e-5
+        assert relative_gap(packed(np.asarray(gradients[1])),
+                            arrays[f"{name}.control_grad_packed"]) < 1e-5
+        gaps = parameter_gaps(arrays, gradients, layout, f"{name}.control_grad_param.")
+        worst = max(gaps.items(), key=lambda item: item[1])
+        assert worst[1] < 1e-4, worst
+
+
+def test_the_two_frequency_tables_differ_by_one_ulp(source):
+    """The one component the two backends round differently.
+
+    `get_timestep_embedding` builds its frequency table as a float32
+    exponential of a float32 exponent. The exponents are bit-identical, and
+    neither backend's exponential is correctly rounded everywhere: they
+    disagree at some entries, by exactly one unit in the last place. That is
+    the whole difference between the two records, and what it costs the
+    unmodified comparison is reported by `tools/diffusers_flux_reference.py
+    errors` and `... amplify` rather than asserted here.
+    """
     with np.load(source / "flux_transformer.npz") as arrays:
         native = arrays["dev.frequencies_native"]
         theirs = arrays["dev.frequencies_source"]
         differing = np.nonzero(native != theirs)[0]
-        # The tables agree to one unit in the last place everywhere, and they
-        # do differ, so the control is not comparing a table with itself.
+        # They do differ, so the controlled record is not the same table
+        # twice, and nowhere do they differ by more than one ulp.
         assert differing.size
         ulps = np.abs(native[differing] - theirs[differing]) / np.spacing(theirs[differing])
         np.testing.assert_array_equal(ulps, np.ones_like(ulps))
-        # An ulp of a frequency times a guidance of 3500 is an ulp of the
-        # angle, and that is what the two feature gradients carry.
-        worst = {}
-        for name in ("dev", "rect"):
-            for key in features:
-                unmodified = arrays[f"{name}.grad_param.{key}"]
-                controlled = arrays[f"{name}.control_grad_param.{key}"]
-                worst[f"{name}.{key}"] = float(
-                    np.abs(unmodified - controlled).max()
-                    / max(1.0, float(np.abs(unmodified).max())))
-        assert max(worst.values()) < 3e-4, worst
-        assert min(worst.values()) > 1e-5, worst
 
 
 def test_every_declared_flux_tensor_is_mapped(source):
@@ -436,3 +458,38 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
         return float(value.total / value.mass)
 
     assert not np.isclose(loss(rows), loss(same), atol=1e-6)
+
+
+def test_the_tied_t5_embedding_maps_under_either_name(source):
+    """A published T5 ties its token embedding and may store either name.
+
+    Both are the one native embedding, so both map to it and both are bound
+    for export; a file carrying two copies that differ is refused, and one
+    carrying neither is refused rather than initialized.
+    """
+    from dew.interop.diffusion import component_tensors, record_layouts
+    from dew.nn.text_encoders import _t5_path, t5_embedding, translate_t5_weights
+
+    tensors = dict(component_tensors(source / "pipeline", "text_encoder_2"))
+    embedding = next(tensors[name] for name in
+                     ("shared.weight", "encoder.embed_tokens.weight") if name in tensors)
+    for stored in (["shared.weight"], ["encoder.embed_tokens.weight"],
+                   ["shared.weight", "encoder.embed_tokens.weight"]):
+        variant = {name: value for name, value in tensors.items()
+                   if name not in ("shared.weight", "encoder.embed_tokens.weight")}
+        variant.update({name: embedding for name in stored})
+        params, layouts = record_layouts("text_encoder_2", variant, _t5_path, ("encoders",))
+        np.testing.assert_array_equal(params["embed_tokens"]["embedding"], embedding)
+        bound = [entry.name for entry in layouts
+                 if entry.paths[0][-2:] == ("embed_tokens", "embedding")]
+        assert sorted(bound) == sorted(f"text_encoder_2/{name}" for name in stored)
+        np.testing.assert_array_equal(
+            translate_t5_weights(variant)["embed_tokens"]["embedding"], embedding)
+    disagreeing = dict(tensors)
+    disagreeing["shared.weight"] = np.asarray(embedding) + 1.0
+    disagreeing["encoder.embed_tokens.weight"] = np.asarray(embedding)
+    with pytest.raises(ValueError, match="two copies differ"):
+        t5_embedding(disagreeing)
+    with pytest.raises(ValueError, match="stores its token embedding"):
+        t5_embedding({name: value for name, value in tensors.items()
+                      if name not in ("shared.weight", "encoder.embed_tokens.weight")})

@@ -57,7 +57,7 @@ import tyro
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
-from dew.nn.backbones.unet_condition import DenoisingCondition
+from dew.diffusion.process import DenoisingCondition
 from dew.objectives.base import Variables
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
