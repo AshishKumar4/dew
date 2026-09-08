@@ -378,3 +378,77 @@ def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_
                             initial=arrays[f"{case}.x_T"], seed=0)
     walked = task(prepared, key=jax.random.PRNGKey(0)).host()
     assert relative_gap(walked.latents, arrays[f"{case}.default_latents"]) < 2e-5
+
+
+def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(source, tmp_path):
+    """A real coupled-loss step over the published source, then a resume and
+    an export.
+
+    The objective's own loss runs the whole source: the VAE encodes the
+    pixels, both CLIP towers and the T5 tower encode the prompt, and the
+    transformer takes the step. The optimizer sees only `params`, so the
+    stored position buffer is state rather than a weight: it survives the
+    step and the resume unchanged, and the export writes it back where the
+    source keeps it, so a reload recomputes the trained model exactly.
+    """
+    import optax
+    from dew.interop.pretrained import load_pretrained
+    from dew.checkpoints import Checkpoints
+    from dew.objectives import Step
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.training import Trainer
+
+    loaded = load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    height, width = loaded.inputs.sample.shape[:2]
+    objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
+                                   autoencoder=loaded.autoencoder, pretrained=loaded.variables,
+                                   unconditional_prob=0.0, ema_decay=None, steps=2)
+    # One row per simulated device, which is what the data mesh divides.
+    rows = jax.device_count()
+    pixels = np.tile(np.arange(height * width * 3, dtype=np.uint8).reshape(1, height, width, 3),
+                     (rows, 1, 1, 1))
+    batch = {"image": pixels,
+             **loaded.inputs.tokenize([{"text": "a red cat", "second": "a blue dog",
+                                        "third": "a green bird"}] * rows)}
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3),
+                      checkpoints=checkpoints)
+    initial = trainer.initial_state()
+    buffer = initial.params["buffers"]["pos_embed"]
+    np.testing.assert_array_equal(buffer, loaded.variables["buffers"]["pos_embed"])
+
+    fixed = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
+
+    def value(params) -> float:
+        loss, _ = objective.loss(params, batch, fixed)
+        return float(loss.total / loss.mass)
+
+    before = value(initial.params)
+    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    assert bool(accepted)
+    assert value(state.params) < before
+    # The step moved weights and left the buffer alone.
+    assert not np.allclose(state.params["params"]["proj_out"]["kernel"],
+                           initial.params["params"]["proj_out"]["kernel"])
+    np.testing.assert_array_equal(state.params["buffers"]["pos_embed"], buffer)
+
+    checkpoints.save(1, state, None, {})
+    checkpoints.wait()
+    restored, _, _ = trainer.place()
+    for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
+        np.testing.assert_array_equal(got, want)
+
+    export = tmp_path / "export"
+    loaded.save(export, variables=state.params)
+    again = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    np.testing.assert_array_equal(again.variables["buffers"]["pos_embed"], buffer)
+    latent = jnp.asarray(np.load(source / "sd3_pipeline.npz")["pipeline.x_T"][:1])
+    condition = DenoisingCondition(jnp.ones((1, 4, 32), jnp.float32),
+                                   jnp.ones((1, 10), jnp.float32))
+    trained = loaded.model.apply({"params": state.params["params"],
+                                  "buffers": state.params["buffers"]},
+                                 latent, jnp.asarray([0.5]), condition)
+    reloaded = again.model.apply({"params": again.variables["params"],
+                                  "buffers": again.variables["buffers"]},
+                                 latent, jnp.asarray([0.5]), condition)
+    np.testing.assert_array_equal(reloaded, trained)
