@@ -21,11 +21,11 @@ git clone https://github.com/AshishKumar4/dew.git
 cd dew
 uv venv --python 3.14
 source .venv/bin/activate
-uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients]'
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients,vision]'
 ```
 
-This development install includes reference-test, optional data, metric, and inference-client packages. CPU PyTorch is installed first for reference comparisons; Dew training still uses JAX. CI runs these same extras on Python 3.12 and 3.14, with static type checking on the 3.12 compatibility floor. Ordinary users can start with the smaller base installation above.
+This development install includes the reference tests, data providers, metrics, inference clients, and vision processors. Install CPU PyTorch and torchvision first; Dew model computation uses JAX. CI installs these extras on Python 3.12 and 3.14 and checks types against the 3.12 compatibility floor. The base installation above remains smaller.
 
 Local reporting works with the base package. Add `[plots]` for Matplotlib charts, or `[wandb]`, `[mlflow]`, `[tensorboard]` for the optional tracker adapters.
 
