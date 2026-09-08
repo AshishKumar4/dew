@@ -769,6 +769,7 @@ class FlaxGEGLU(nn.Module):
     dim: int
     dtype: Optional[Dtype] = jnp.float32
     precision: PrecisionLike = jax.lax.Precision.DEFAULT
+    approximate: bool = True
 
     def setup(self):
         inner_dim = self.dim * 4
@@ -777,7 +778,7 @@ class FlaxGEGLU(nn.Module):
     def __call__(self, hidden_states):
         hidden_states = self.proj(hidden_states)
         hidden_linear, hidden_gelu = jnp.split(hidden_states, 2, axis=-1)
-        return hidden_linear * nn.gelu(hidden_gelu)
+        return hidden_linear * nn.gelu(hidden_gelu, approximate=self.approximate)
 
 
 @logical_axes({("net_0", "proj"): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
@@ -790,9 +791,10 @@ class FlaxFeedForward(nn.Module):
     dtype: Optional[Dtype] = jnp.float32
     precision: PrecisionLike = jax.lax.Precision.DEFAULT
     dropout: float = 0.0
+    approximate_gelu: bool = True
 
     def setup(self):
-        self.net_0 = FlaxGEGLU(self.dim, dtype=self.dtype, precision=self.precision)
+        self.net_0 = FlaxGEGLU(self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu)
         self.net_2 = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision)
         self.dropout_layer = nn.Dropout(self.dropout)
 

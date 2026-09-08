@@ -130,7 +130,7 @@ def bundle(root, destination):
     import tarfile
     from tools.native_diffusion_reference_files import convert
     def native_files(info):
-        return None if info.name.endswith((".msgpack", ".bin")) else info
+        return None if info.name.endswith(".bin") else info
     with tarfile.open(destination, "w:xz") as archive:
         for task in ("sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"):
             directory = (Path(root) / task).resolve()
