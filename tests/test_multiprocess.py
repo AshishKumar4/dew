@@ -935,6 +935,45 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
 
 
 @pytest.mark.distributed
+def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path):
+    """Validity is optional and rank-local, and the pool has to agree on it.
+
+    Process zero's prompts and token rows fill their width, so its host
+    producer omits the field; process one's are padded and carry it. Both
+    assembly seams have to hand every rank the same tree: generation agrees
+    the schema before it digests the request, and placement materializes the
+    field before it assembles the batch. The run then has to be the run with
+    the mask spelled out on every row, token for token and parameter for
+    parameter.
+
+    Without the agreement this fails in generation with "generation input
+    shapes and sampling must agree across processes", which is also how
+    test_a_pool_samples_rollouts_with_different_lengths_and_eos fails, since
+    `SampledRollout` omits validity for a rank whose prompts are whole.
+    """
+    reports = run_pool("mixed_validity", tmp_path / "pool", 2, fsdp_size=2, timeout=180)
+    single = run_worker("mixed_validity", tmp_path / "single.json", fsdp_size=2,
+                        explicit=True)
+
+    # The producers really did disagree, and the seams really did agree.
+    assert reports[0]["local_fields"] == [] and reports[1]["local_fields"] == ["attention_mask"]
+    assert [report["agreed_fields"] for report in reports] == [["attention_mask"]] * 2
+    assert [report["placed_fields"] for report in reports] == [["attention_mask"]] * 2
+    assert reports[0]["agreed_all_true"] is True and reports[1]["agreed_all_true"] is False
+    assert reports[0]["batch_sharding"]["fully_addressable"] == [False]
+
+    # The pool is the explicit-mask reference: the same draws and the same step.
+    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
+    np.testing.assert_allclose(reports[0]["raw_log_probs"] + reports[1]["raw_log_probs"],
+                               single["raw_log_probs"], rtol=1e-5, atol=1e-6)
+    assert reports[0]["loss"] == reports[1]["loss"], "the processes disagreed with each other"
+    assert single["loss"] == pytest.approx(reports[0]["loss"], **{
+        "rel": PARITY["rtol"], "abs": PARITY["atol"]})
+    assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
+                           dumped_params(tmp_path / "single.json"))
+
+
+@pytest.mark.distributed
 def test_the_front_door_answers_the_same_rows_on_a_pool(tmp_path):
     """Identical user code on one device and on a two-process pool: the run's
     weights land on the mesh under the trainer's layout, each rank hands in

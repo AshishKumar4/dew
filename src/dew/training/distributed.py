@@ -16,7 +16,7 @@ from flax import linen as nn
 from flax.linen import spmd
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 from dew.data.dataset import Checkpointable
-from dew.nn.inputs import BATCH_AXES
+from dew.nn.inputs import BATCH_AXES, filled_validity
 from dew.nn.sharding import (
     DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LogicalAxes,
     declared_axes,
@@ -350,7 +350,25 @@ def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Any:
 
 
 def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
-    """Assemble this process's slice of each array into a globally sharded one."""
+    """Assemble this process's slice of each array into a globally sharded one.
+
+    A pool assembles one leaf per process, so every process has to hand this
+    the same tree. Validity is the one optional token field, and whether a
+    process's own rows needed padding is rank-local, so a pool materializes
+    it at every `ModelInputs` of the batch that lacks it before the traversal
+    below reads the leaves. The schema then depends on the process count and
+    the batch's structure and never on which rows this process drew. One
+    process changes nothing and keeps the omission the fused attention kernel
+    wants.
+
+    The rule is deliberately local. Placement runs on
+    `DevicePrefetchIterator`'s worker thread while the step's collectives run
+    on the caller's, and a collective issued from here would have to be
+    ordered against those across every process. Agreeing which sites actually
+    carry validity, the way `agreed_validity` does for a generation request,
+    belongs where the caller's own collectives are issued.
+    """
+    batch = filled_validity(batch) if jax.process_count() > 1 else batch
     return jax.tree.map(
         lambda leaf, sharding: jax.make_array_from_process_local_data(
             sharding, np.asarray(leaf)),
