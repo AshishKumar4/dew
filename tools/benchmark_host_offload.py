@@ -24,9 +24,11 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import zlib
 import json
 import math
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import jax
@@ -35,8 +37,10 @@ import numpy as np
 import tyro
 
 from dew import models  # naming a registry fills it
-from dew.inference.banks import SyntheticBanks, host_banked
+from dew.inference.banks import entry_names, host_banked, named, narrowed, one_layer
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.base import Variables
+from dew.training.distributed import Placement
 from dew.registry import with_precision
 from dew.training import Layout, MeshSpec
 from dew.training.distributed import build_mesh
@@ -67,6 +71,74 @@ class OffloadConfig:
     """Run the resident case as well as compiling it; False only lowers it."""
     fsdp: int = 1
     out: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class SyntheticBanks:
+    """Generated weights of a given shape, one bank at a time.
+
+    Every leaf of every layer is filled independently: the index of the
+    element inside its leaf, offset by a key from the leaf's path and the
+    layer's depth, goes through murmur3's finalizer, and the result is scaled
+    like a fan-in init, with a norm's scale sitting around one so a deep
+    stack still returns finite logits. Nothing is broadcast, tiled or
+    aliased: every element is computed from its own index, and every leaf and
+    every layer has its own key. Values are not all distinct, and this does
+    not claim they are: the finalizer is a bijection on 32-bit words, but the
+    float it is mapped to has 2**24 distinct values, so a leaf with more
+    elements than that repeats some of them. The key comes from a CRC of the
+    path, not from `hash`, so two processes generate the same weights.
+
+    A bank is filled row by row into the array that is then placed, so what
+    this holds while it answers is one bank and one leaf of one layer. It
+    generates weights; it says nothing about how a published checkpoint of
+    the same size would be read.
+    """
+
+    held: Variables
+    seed: int = 0
+
+    def shapes(self) -> Variables:
+        return self.held
+
+    def entry(self, placement: Placement) -> Variables:
+        held = named(self.held, entry_names(self.held))
+        return jax.device_put(
+            jax.tree_util.tree_map_with_path(
+                lambda path, leaf: self._values(path, None, leaf.shape, leaf.dtype), held),
+            narrowed(placement, held))
+
+    def bank(self, layers: Sequence[int], placement: Placement) -> Variables:
+        def rows(path, leaf):
+            if len(layers) == 1:
+                return self._values(path, layers[0], leaf.shape, leaf.dtype)
+            bank = np.empty((len(layers),) + leaf.shape, np.dtype(leaf.dtype))
+            for offset, index in enumerate(layers):
+                bank[offset] = self._values(path, index, leaf.shape, leaf.dtype)
+            return bank
+
+        return jax.device_put(
+            jax.tree_util.tree_map_with_path(rows, one_layer(self.held, layers[0])),
+            placement)
+
+
+    def _values(self, path, layer: int | None, shape: tuple[int, ...], dtype) -> np.ndarray:
+        name = jax.tree_util.keystr(path)
+        key = np.uint32(zlib.crc32(f"{name}/{layer}/{self.seed}".encode()) | 1)
+        count = math.prod(shape) if shape else 1
+        word = np.arange(count, dtype=np.uint32) + key
+        word ^= word >> np.uint32(16)
+        word *= np.uint32(0x85EBCA6B)
+        word ^= word >> np.uint32(13)
+        word *= np.uint32(0xC2B2AE35)
+        word ^= word >> np.uint32(16)
+        unit = (word >> np.uint32(8)).astype(np.float32) * np.float32(2.0 ** -23) - 1.0
+        if name.endswith("['scale']"):
+            values = 1.0 + 0.02 * unit
+        else:
+            fan_in = shape[-2] if len(shape) >= 2 else max(count, 1)
+            values = unit * np.float32(1.0 / math.sqrt(fan_in))
+        return values.reshape(shape).astype(np.dtype(dtype))
 
 
 def status() -> dict[str, int]:
@@ -103,10 +175,16 @@ def entry_spaces(compiled) -> dict[str, int]:
 
 
 def bytes_of(tree, space: str | None = None) -> int:
-    """The bytes of the leaves of `tree`, optionally only those in one memory
-    space, counting each process's own shards."""
+    """This process's own bytes of the leaves of `tree`, optionally only those
+    in one memory space.
+
+    `leaf.nbytes` is the global array's size, which on more than one process
+    is not what this process holds, so the addressable shards are summed
+    instead and the number is local by construction.
+    """
     return sum(
-        leaf.nbytes for leaf in jax.tree.leaves(tree)
+        shard.data.nbytes for leaf in jax.tree.leaves(tree)
+        for shard in leaf.addressable_shards
         if space is None or str(leaf.sharding.memory_kind) == space)
 
 
@@ -170,7 +248,9 @@ def measure(config: OffloadConfig, depth: int, offload: bool) -> dict:
     shapes = shapes_of(model, tokens, config.dtype)
     record["shapes_seconds"] = time.perf_counter() - started
     record["parameters"] = sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(shapes))
-    record["parameter_bytes"] = sum(
+    # The global store, which is what a single-process case also holds; the
+    # placed sizes below are this process's own.
+    record["global_parameter_bytes"] = sum(
         math.prod(leaf.shape) * leaf.dtype.itemsize for leaf in jax.tree.leaves(shapes))
 
     run = offload or config.resident_run
@@ -200,15 +280,15 @@ def measure(config: OffloadConfig, depth: int, offload: bool) -> dict:
     jax.block_until_ready(store)
     record["load_seconds"] = time.perf_counter() - started
     record["rss_loaded"] = status()
-    record["host_bytes"] = bytes_of(store, "pinned_host")
-    record["device_bytes"] = bytes_of(store, "device")
+    record["local_host_bytes"] = bytes_of(store, "pinned_host")
+    record["local_device_bytes"] = bytes_of(store, "device")
     record["banks"] = sorted(store["params"])
 
     started = time.perf_counter()
     cache = model.apply(store, config.batch, method="init_cache", mutable=["cache"])[1]["cache"]
     jax.block_until_ready(cache)
     record["init_cache_seconds"] = time.perf_counter() - started
-    record["cache_bytes"] = bytes_of(cache)
+    record["local_cache_bytes"] = bytes_of(cache)
 
     prefill = prefill_call(model)
     started = time.perf_counter()
@@ -242,10 +322,12 @@ def measure(config: OffloadConfig, depth: int, offload: bool) -> dict:
     record["decode_latencies"] = latencies
     record["decode_median_seconds"] = float(np.median(latencies))
     record["decode_tokens_per_second"] = config.batch / float(np.median(latencies))
-    if record["host_bytes"]:
-        record["host_to_device_bytes_per_token"] = record["host_bytes"]
-        record["effective_bandwidth_bytes_per_second"] = (
-            record["host_bytes"] / float(np.median(latencies)))
+    if record["local_host_bytes"]:
+        # Every layer of the stack crosses the link once per forward pass, so
+        # what this process moves per token is what it holds on the host.
+        record["local_host_to_device_bytes_per_token"] = record["local_host_bytes"]
+        record["local_effective_bandwidth_bytes_per_second"] = (
+            record["local_host_bytes"] / float(np.median(latencies)))
     record["rss_after"] = status()
     record["allocator"] = {
         name: int(value) for name, value in (jax.devices()[0].memory_stats() or {}).items()
