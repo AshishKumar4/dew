@@ -407,6 +407,47 @@ def test_explicit_prompt_coordinates_reach_the_prediction_cache():
     assert largest < 3e-5, f"largest difference {largest:g}"
 
 
+def test_a_draft_after_an_advance_is_proposed_at_the_advanced_coordinate():
+    """The target and the drafts read one next coordinate. Once the target
+    has advanced a token, a draft chained from it sits one coordinate on,
+    which a teacher-forced pass at the same coordinates has to reproduce. A
+    coordinate the advance left behind would draft every later block one
+    place back and nothing in the emitted tokens would show it."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.strategies import _coordinates, reseed
+    from dew.sampling.text import _operations, _prefill
+
+    model = predictor()
+    grown = jnp.asarray([[1, 2, 3, 4, 5]], jnp.int32)
+    coordinates = jnp.asarray([[10, 11, 12, 13, 14]], jnp.int32)
+    params = model.init(jax.random.key(0), grown)
+    ops = _operations(model, params, 0, 1)
+    states = jnp.asarray(model.apply(params, grown, positions=coordinates,
+                                     method=model.hidden_states))
+    reference = model.apply(params, states[:, :-1], grown[:, 1:], depth=0,
+                            positions=coordinates[:, 1:], method=model.mtp_step)[0]
+
+    prompted, _ = _prefill(model, params,
+                           ModelInputs(grown[:, :3], {"positions": coordinates[:, :3]}), ops)
+    advanced = ops.advance(prompted, grown[:, 3], jnp.ones(1, bool))
+    step = StepState(tokens=jnp.pad(grown[:, :3], ((0, 0), (0, 2))),
+                     valid=jnp.asarray([[True, True, True, False, False]]),
+                     step=jnp.zeros(1, jnp.int32), active=jnp.ones(1, bool),
+                     keys=jax.random.split(jax.random.key(0), 1), prompt_width=3)
+    step = step.commit(grown[:, 3], jnp.ones(1, bool))
+    base = _coordinates(advanced, step, jnp.arange(2)[None, :])
+    # The block that emitted token four writes its own entry behind the draft.
+    advanced, _, _ = reseed(ops, advanced, (prompted.hidden,), states[:, 3:4],
+                            jnp.asarray(model.apply(params, grown[:, 3:4],
+                                                    method=model.token_embeddings)),
+                            jnp.ones((1, 1), bool), coordinates[:, 3:4], jnp.zeros(1, jnp.int32),
+                            prior_tokens=jnp.full(1, 3, jnp.int32))
+    assert ops.propose is not None
+    _, proposed, _ = ops.propose(advanced, states[:, 3:4], grown[:, 4:5], None,
+                                 jnp.ones((1, 1), bool), base[:, :1], 0)
+    np.testing.assert_allclose(proposed[:, 0], reference[:, -1], atol=3e-6, rtol=0)
+
+
 def test_beam_search_refuses_a_chain_that_leaves_a_live_beam_undefined():
     """A search reads the same distributions a draw does, so a chain that
     removes every token has to raise there too rather than ranking `-inf`."""
@@ -495,7 +536,7 @@ def test_multi_axis_rotary_coordinates_reach_the_depths():
     largest = float(np.max(np.abs(np.asarray(produced)[:, 0] - np.asarray(reference)[:, -1])))
     assert largest < 3e-5, f"largest difference {largest:g}"
     # The continuation coordinate is the model's own, not the token count.
-    assert int(np.asarray(seeded.coordinate)[0]) == 5
+    assert int(np.asarray(seeded.positions)[0]) == 5
 
 
 def test_a_padded_prompt_seeds_the_depths_at_its_logical_coordinates():

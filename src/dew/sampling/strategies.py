@@ -31,10 +31,12 @@ from dew.sampling.decoding import StepState
 class DecoderState:
     """The model-owned decode carry.
 
-    `logits` scores the next position of every row. `positions` continues
-    explicitly supplied scalar rotary coordinates; the physical cursors live
-    inside the cache. `hidden` holds the final states of the last step for a
-    strategy that drafts from them, and is None otherwise.
+    `logits` scores the next position of every row. `positions` is the
+    logical coordinate the next token of every row sits at, when the prompt
+    supplied its coordinates; None leaves the cache to count real tokens.
+    Target advancement and draft proposals both read it, and `advance` moves
+    it. `hidden` holds the final states of the last step for a strategy that
+    drafts from them, and is None otherwise.
     """
 
     cache: Variables
@@ -42,7 +44,6 @@ class DecoderState:
     positions: jax.Array | None = None
     hidden: jax.Array | None = None
     drafts: tuple[jax.Array, ...] = ()
-    coordinate: jax.Array | None = None
 
 
 @struct.dataclass
@@ -475,12 +476,10 @@ class Speculative:
 def _coordinates(state: DecoderState, step: StepState, slots: jax.Array) -> jax.Array:
     """The logical coordinate of each slot a block may emit.
 
-    A prompt that supplied its own coordinates continues from the model's next
-    one, which is the largest a real token reached on any axis; a drawn token
-    sits at that coordinate on every axis. Without supplied coordinates the
-    count of real tokens is what the cache assigns.
+    Without supplied coordinates the count of real tokens is what the cache
+    assigns; a drawn token sits at the same coordinate on every axis.
     """
-    base = step.total() if state.coordinate is None else state.coordinate
+    base = step.total() if state.positions is None else state.positions
     return base[:, None] + slots
 
 

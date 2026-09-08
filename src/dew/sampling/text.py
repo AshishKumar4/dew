@@ -174,26 +174,23 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
             jnp.max(jnp.where(valid, jnp.arange(width)[None, :], -1), axis=1))
     supplied = inputs.token_fields.get("positions")
     rotary = inputs.token_fields.get("rotary_positions")
-    positions = None if supplied is None else supplied[jnp.arange(batch),
-                                                       jnp.maximum(last, 0)] + 1
     rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
     logical = rotary if rotary is not None else supplied
     # The model's own next coordinate, as its cache records it: the largest
     # coordinate a real token holds on any axis, one on. A drawn token
     # continues from there on every axis.
     real = jnp.ones((batch, width), bool) if valid is None else valid.astype(bool)
-    coordinate = None if logical is None else jnp.max(
+    positions = None if logical is None else jnp.max(
         jnp.where(jnp.reshape(real, real.shape + (1,) * (logical.ndim - 2)), logical, -1),
         axis=tuple(range(1, logical.ndim))) + 1
     state = DecoderState(updated["cache"], logits[rows, slot], positions,
-                         None if states is None else states[rows, slot], coordinate=coordinate)
+                         None if states is None else states[rows, slot])
     prepared = jax.tree.leaves(updated.get("embeddings", {}))
     if ops.depths and states is not None:
         # Every depth needs a predecessor slot in the carry from the start,
         # so a block's loop keeps one structure whatever the prompt held.
         state = dataclasses.replace(state, drafts=(states[rows, slot],) * ops.depths)
     if ops.depths and width > 1 and states is not None and prepared:
-        real = jnp.ones(inputs.tokens.shape, bool) if valid is None else valid.astype(bool)
         order = jnp.argsort(~real, axis=1, stable=True)[..., None]
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
         # Without supplied coordinates a token's position is its rank among
