@@ -22,12 +22,12 @@ cd dew
 uv venv --python 3.14
 source .venv/bin/activate
 uv pip install torch --index-url https://download.pytorch.org/whl/cpu
-uv pip install -e '.[test,av,tfds,metrics,plots]'
+uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients]'
 ```
 
-This development install includes reference-test, optional data, and metric packages. CPU PyTorch is installed first for reference comparisons; Dew training still uses JAX. CI runs these extras on Python 3.12 and 3.14, with static type checking on the 3.12 compatibility floor. Ordinary users can start with the smaller base installation above.
+This development install includes reference-test, optional data, metric, and inference-client packages. CPU PyTorch is installed first for reference comparisons; Dew training still uses JAX. CI runs these same extras on Python 3.12 and 3.14, with static type checking on the 3.12 compatibility floor. Ordinary users can start with the smaller base installation above.
 
-Local reporting works with the base package. Add `[plots]` for Matplotlib charts or `[wandb]` for the optional Weights & Biases adapter.
+Local reporting works with the base package. Add `[plots]` for Matplotlib charts, or `[wandb]`, `[mlflow]`, `[tensorboard]` for the optional tracker adapters.
 
 ## Check the environment
 
