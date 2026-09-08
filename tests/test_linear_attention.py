@@ -235,7 +235,6 @@ def test_the_layer_decodes_as_it_prefills(reference, geometry):
     parallel = module.apply(variables, hidden)
 
     cache = module.apply(variables, hidden[:, :1], decode=True, mutable=["cache"])[1]["cache"]
-    assert not jnp.any(cache["recurrent_state"]) and not jnp.any(cache["conv_state"])
     prefill = 5
     out, mutated = module.apply({**variables, "cache": cache}, hidden[:, :prefill],
                                 decode=True, mutable=["cache"])

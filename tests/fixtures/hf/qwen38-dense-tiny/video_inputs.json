@@ -1,0 +1,28 @@
+{
+  "prompts": [
+    "a <|vision_start|><|image_pad|><|vision_end|> b <|vision_start|><|video_pad|><|vision_end|> c",
+    "d <|vision_start|><|video_pad|><|vision_end|> e <|vision_start|><|image_pad|><|vision_end|> f"
+  ],
+  "metadata": [
+    {
+      "fps": 5.0,
+      "total_num_frames": 5,
+      "frames_indices": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "fps": 3.0,
+      "total_num_frames": 3,
+      "frames_indices": [
+        0,
+        1,
+        2
+      ]
+    }
+  ]
+}

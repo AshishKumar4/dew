@@ -12,7 +12,6 @@ from transformers.generation.logits_process import (
 )
 
 from dew.inference import TextGeneration
-from dew.interop import load_pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling
 from dew.sampling.text import _sample_token
@@ -54,15 +53,16 @@ def test_bind_freezes_mapping_structure_but_preserves_array_leaves(task):
 @pytest.mark.parametrize("padding_side", ["left", "right"])
 def test_padless_tokenizer_batches_match_unpadded_rows_without_changing_exports(task, tmp_path, padding_side):
     from tokenizers import Tokenizer, models, pre_tokenizers
-    from transformers import PreTrainedTokenizerFast
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
     from dew.interop.pretrained import Processor
 
     vocabulary = {"<unk>": 0, "one": 1, "two": 2, "three": 3, "<eos>": 4}
     vocabulary.update({f"t{index}": index for index in range(5, task.model.vocab_size)})
     backend = Tokenizer(models.WordLevel(vocabulary, unk_token="<unk>"))
     backend.pre_tokenizer = pre_tokenizers.Whitespace()
-    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>", eos_token="<eos>",
-                                        padding_side=padding_side)
+    PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>", eos_token="<eos>",
+                            padding_side=padding_side).save_pretrained(tmp_path / "source")
+    tokenizer = AutoTokenizer.from_pretrained(tmp_path / "source", local_files_only=True)
     processor = Processor(tokenizer, {}, {}, task.model.vocab_size)
     processor.save_pretrained(tmp_path / "before")
     policy = replace(task, processor=processor, sampling=Sampling(temperature=0))
@@ -85,8 +85,8 @@ def test_padless_tokenizer_batches_match_unpadded_rows_without_changing_exports(
 
 
 def warped(logits, sampling):
-    scores = torch.tensor(np.asarray(logits).copy())
-    inputs = torch.zeros((scores.shape[0], 1), dtype=torch.long)
+    scores = torch.FloatTensor(np.asarray(logits).copy())
+    inputs = torch.LongTensor(np.zeros((scores.shape[0], 1), dtype=np.int64))
     scores = TemperatureLogitsWarper(sampling.temperature)(inputs, scores)
     if sampling.top_k is not None:
         scores = TopKLogitsWarper(sampling.top_k)(inputs, scores)
@@ -131,10 +131,11 @@ def test_filters_keep_the_best_token_at_the_boundary(sampling):
 
 
 def test_invalid_probability_controls_are_refused():
-    for name in ("top_p", "min_p"):
-        for value in (-0.1, 1.1, float("nan"), True):
-            with pytest.raises(ValueError):
-                Sampling(**{name: value})
+    for value in (-0.1, 1.1, float("nan"), True):
+        with pytest.raises(ValueError):
+            Sampling(top_p=value)
+        with pytest.raises(ValueError):
+            Sampling(min_p=value)
 
 
 def test_source_policy_preserves_supported_filters_and_requires_an_override_for_others(task):
@@ -157,7 +158,6 @@ def test_source_policy_preserves_supported_filters_and_requires_an_override_for_
 def test_neutral_source_controls_are_accepted_and_active_unsupported_controls_raise(task):
     from pathlib import Path
     from dew.interop.pretrained import Pretrained
-
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
     neutral = {"do_sample": True, "repetition_penalty": 1, "no_repeat_ngram_size": 0, "num_beams": 1,
                "length_penalty": 0.8, "guidance_scale": 1.0, "penalty_alpha": 0.0, "stop_strings": None}

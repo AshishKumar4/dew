@@ -549,8 +549,8 @@ def _qwen35_rope(hf_config: Mapping[str, Any]) -> Tuple[float, float]:
     image share the rotated pairs; with one position per token every grid
     has the same angles and the interleave reads the same value from each
     (modeling_qwen3_5.py:129-164), so text-only input is this partial rope
-    exactly (difference 0.0 against the reference's cos/sin) and both keys
-    map to nothing. The image grids themselves are not modelled.
+    exactly (difference 0.0 against the reference cos/sin). Wrapper loading
+    retains the three-axis layout on its attention mixer for visual inputs.
     """
     entry = hf_config.get('rope_parameters') or {}
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
@@ -1343,6 +1343,11 @@ def _qwen35_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
         _refuse("attn_output_gate=False",
                 "Qwen3_5Attention always gates its output")
     used.update(('attn_output_gate', 'full_attention_interval'))
+    # Published checkpoints call the DeltaNet SiLU gate "swish". Full
+    # attention always uses sigmoid; this field never changes that branch.
+    if hf_config.get('output_gate_type', 'swish') != 'swish':
+        _refuse('output_gate_type', 'Qwen3.5 DeltaNet uses the swish gate')
+    used.add('output_gate_type')
     rope_theta, partial = _qwen35_rope(hf_config)
     used.update(('rope_parameters', 'rope_theta', 'partial_rotary_factor'))
     kinds = dict(config['kinds'])
@@ -1365,14 +1370,37 @@ def _qwen35_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, An
         partial_rotary_type='default',
         kinds=kinds,
     )
-    # Read by no forward pass in transformers 5.16.1. mlp_only_layers and
-    # mamba_ssm_dtype are names no qwen3_5 module looks up, and the MTP
-    # fields describe the mtp.* weights the reference drops on load
-    # (modeling_qwen3_5.py:807, _keys_to_ignore_on_load_unexpected).
+    depth = hf_config.get('mtp_num_hidden_layers', 0)
+    if type(depth) is not int or depth not in (0, 1):
+        _refuse('mtp_num_hidden_layers', 'Qwen supports the released single shared prediction layer')
+    if hf_config.get('mtp_use_dedicated_embeddings', False):
+        _refuse('mtp_use_dedicated_embeddings', 'the released prediction layer shares embeddings and head')
+    config['num_nextn_predict_layers'] = depth
     used.update(('mlp_only_layers', 'mamba_ssm_dtype', 'mtp_num_hidden_layers',
                  'mtp_use_dedicated_embeddings'))
 
     return config
+
+
+def _qwen35_moe_config(hf_config: Mapping[str, object], used: set[str]) -> dict[str, object]:
+    """The hybrid Qwen decoder with routed SwiGLU and a sigmoid-gated shared expert.
+
+    Qwen3_5MoeTopKRouter always renormalizes selected softmax probabilities;
+    SparseMoeBlock gates the shared expert independently (Transformers
+    modeling_qwen3_5_moe.py:763-801). The checkpoint has no dense MLP width.
+    """
+    width = _record_int(hf_config, "moe_intermediate_size")
+    config = _qwen35_config({**hf_config, "intermediate_size": width}, used)
+    config["mixture"] = asdict(Mixture(
+        experts=_record_int(hf_config, "num_experts"),
+        top_k=_record_int(hf_config, "num_experts_per_tok"),
+        expert_features=width,
+        shared_features=_record_int(hf_config, "shared_expert_intermediate_size"),
+        shared_gate=True))
+    used.update(("moe_intermediate_size", "num_experts", "num_experts_per_tok",
+                 "shared_expert_intermediate_size", "output_router_logits", "router_aux_loss_coef"))
+    return config
+
 
 
 def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -1596,6 +1624,9 @@ def _gemma4_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
 
 def _qwen35_wrapper(hf_config: Mapping[str, Any], used: set) -> Dict[str, Any]:
     """A Qwen 3.5 wrapper: NaViT-style tower, merger, decoder."""
+    if hf_config.get('language_model_only', False) is not False:
+        _refuse('language_model_only', 'the multimodal wrapper requires its vision component')
+    used.add('language_model_only')
     text = _wrapper_text(hf_config, used)
     tower = vision_nn.translate_qwen35_vision_config(hf_config)
     used.add("vision_config")
@@ -1720,8 +1751,9 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
     and projector halves ride theirs. Gemma 4 keeps its embedder under
     `embed_vision`, and Qwen 3.5 keeps its merger inside the vision model, so
     the projector prefix runs before the tower's. A record with an audio
-    tower routes `audio_tower` and `embed_audio` too. A prefix outside those
-    raises ValueError with the tensor name.
+    tower routes `audio_tower` and `embed_audio` too, and a Qwen 3.5 record
+    routes the `mtp.` prediction layers a wrapper keeps outside its language
+    model. A prefix outside those raises ValueError with the tensor name.
     """
     tower_kind = record["tower"]["kind"]
     projector_kind = record["projector"]["kind"]
@@ -1750,6 +1782,8 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
             audio_projector_tensors[bare[len(_WRAPPER_AUDIO_PROJECTOR_PREFIX):]] = tensor
         elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PREFIX):
             audio_tensors[bare[len(_WRAPPER_AUDIO_PREFIX):]] = tensor
+        elif bare.startswith("mtp.") and record["text_model_type"] == _QWEN35:
+            text_tensors[bare] = tensor
         elif bare == "lm_head.weight":
             text_tensors["lm_head.weight"] = tensor
         else:
@@ -1818,13 +1852,9 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, ..
     The first name is the collection: `params` for a weight, `moe` for
     DeepSeek's balancing bias. That bias is router state a training step
     moves, not a parameter, so it lands where `Router` keeps it. None means
-    the tensor has no place in the tree: the tied lm_head a checkpoint
-    carries as a copy of the embedding or the mtp.* weights of a Qwen3.5
-    checkpoint, which the reference itself drops on load
-    (modeling_qwen3_5.py:807, _keys_to_ignore_on_load_unexpected). No
-    forward pass of the reference reads them. A name the map cannot explain
-    at all raises ValueError with the tensor name, so an unfamiliar
-    checkpoint fails at load.
+    the tensor is the tied lm_head copy. Prediction layers use their own
+    family path rather than being discarded. An unexplained tensor name
+    raises before any checkpoint is accepted.
     """
     parts = hf_name.split('.')
     if (len(parts) == 6 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
@@ -1849,8 +1879,6 @@ def _param_path(parts: List[str], config: Mapping[str, Any]) -> Optional[Tuple[s
         return ('per_layer_projection_norm', 'scale')
     if parts == ['lm_head', 'weight']:
         return None if config['tie_embeddings'] else ('lm_head', 'kernel')
-    if parts[0] == 'mtp' and 'linear_attention' in config.get('layer_types', ()):
-        return None
 
     if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
         layer, module, leaf = f'layers_{parts[2]}', parts[3], parts[-1]
@@ -2677,6 +2705,53 @@ _GEMMA4_MOE: Dict[Tuple[str, ...], Tuple[str, ...]] = {
 }
 
 
+_QWEN_MTP_FIELDS = {
+    "fc.weight": ("eh_proj", "kernel"),
+    "pre_fc_norm_embedding.weight": ("enorm", "scale"),
+    "pre_fc_norm_hidden.weight": ("hnorm", "scale"),
+    "norm.weight": ("final_norm", "scale"),
+}
+
+
+def _qwen_mtp_path(name: str, config: Mapping[str, object],
+                   block_path: Callable[[str, Mapping[str, object]], Optional[Tuple[str, ...]]]) -> Tuple[str, ...]:
+    """vLLM qwen3_5_mtp.py's shared-embedding single prediction layer."""
+    if config.get("num_nextn_predict_layers", 0) != 1:
+        raise ValueError("mtp tensors require one configured Qwen prediction layer")
+    tail = name.removeprefix("mtp.")
+    if tail in _QWEN_MTP_FIELDS:
+        return ("params", "mtp_0", *_QWEN_MTP_FIELDS[tail])
+    if tail.startswith("layers.0."):
+        path = block_path("model." + tail, config)
+        if path is not None:
+            return (path[0], "mtp_0", "block", *path[2:])
+    raise ValueError(f"unknown Qwen MTP tensor {name!r}")
+
+
+def _qwen35_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    if name.startswith("mtp."):
+        return _qwen_mtp_path(name, config, _dew_path)
+    return _dew_path(name, config)
+
+
+
+def _qwen35_moe_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    if name.startswith("mtp."):
+        return _qwen_mtp_path(name, config, _qwen35_moe_path)
+    parts = name.split(".")
+    if len(parts) >= 5 and parts[:2] == ["model", "layers"] and parts[2].isdigit():
+        tail = parts[3:]
+        layer = ("params", f"layers_{parts[2]}", "mlp")
+        if len(tail) == 3 and tail[:2] == ["mlp", "experts"] and tail[2] in _MOE_SHARED:
+            return (*layer, "experts", tail[2], "kernel")
+        if tail == ["mlp", "shared_expert_gate", "weight"]:
+            return (*layer, "shared_expert_gate", "kernel")
+        if len(tail) == 4 and tail[:2] == ["mlp", "shared_expert"] and tail[2] in _MOE_SHARED and tail[3] == "weight":
+            return (*layer, "shared_experts", tail[2], "kernel")
+    return _dew_path(name, config)
+
+
+
 def _gemma4_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
     parts = name.split('.')
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
@@ -2769,10 +2844,14 @@ _FAMILY_ENTRIES = (
     DecoderFamily(('deepseek_v3',), _deepseek_config,
                   lambda fields: isinstance(_mixer_value(fields), MLAMixer),
                   'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}),
+    DecoderFamily(('qwen3_5_moe_text',), _qwen35_moe_config,
+                  lambda fields: bool(fields['output_gate'] and _mixture_value(fields) is not None),
+                  'qwen3_5_moe_text', 'Qwen3_5MoeForCausalLM', lambda model: {},
+                  weight_path=_qwen35_moe_path, prepare_weights=_gemma4_prepare),
     DecoderFamily((_QWEN35,), _qwen35_config,
                   lambda fields: bool(fields['output_gate']
                                       or 'linear_attention' in (fields['layer_types'] or ())),
-                  _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}),
+                  _QWEN35, 'Qwen3_5ForCausalLM', lambda model: {}, weight_path=_qwen35_path),
     DecoderFamily(('olmo3',), _olmo3_config,
                   lambda fields: not fields['pre_norms'],
                   'olmo3', 'Olmo3ForCausalLM', lambda model: {}, sandwich_norms=True),
