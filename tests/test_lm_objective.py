@@ -766,3 +766,62 @@ def test_evaluation_weights_follow_loss_role():
     assert scores.losses.shape == scores.weights.shape == (4, SEQ)
     expected = (np.asarray(batch[ROLES_KEY])[:, 1:] == Role.ASSISTANT).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(scores.weights), expected)
+
+
+# --- z-loss: PaLM's log-partition penalty ---------------------------------
+
+
+def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
+    """`z_loss * log(Z)^2` per counted target, masked and averaged with the
+    cross entropy, as MaxText's `cross_entropy_with_logits` and
+    `train.py` sum it (tools/distillation_reference.py:z_loss_reference);
+    loss within 1e-6 of the float64 oracle (observed 3.1e-7), and zero keeps the loss the
+    plain cross entropy to the bit."""
+    from tools.distillation_reference import z_loss_reference
+
+    pad_id, coefficient = 0, 1e-2
+    batch = token_batch()
+    tokens = np.asarray(batch[TEXT_KEY])
+    plain = make_objective(pad_id=pad_id)
+    params = plain.init(jax.random.key(0))
+    logits = np.asarray(plain.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32)))
+    weights = (tokens[:, 1:] != pad_id).astype(np.float64)
+    expected, z_term, _ = z_loss_reference(logits, tokens[:, 1:], weights, coefficient)
+
+    loss, aux = scalar_loss(make_objective(pad_id=pad_id, z_loss=coefficient), params, batch, step_at())
+    without, plain_aux = scalar_loss(plain, params, batch, step_at())
+
+    assert float(loss) == pytest.approx(expected, abs=1e-6)
+    assert float(aux.metrics["z_loss"]) == pytest.approx(z_term, abs=1e-6)
+    assert float(aux.metrics["ce"]) == pytest.approx(float(plain_aux.metrics["ce"]))
+    assert "z_loss" not in plain_aux.metrics
+    assert float(without) == pytest.approx(reference_cross_entropy(logits, tokens[:, 1:], pad_id))
+    assert abs(float(loss) - float(without)) > 1e-4, "the term made no difference to check"
+
+
+def test_z_loss_gradient_carries_the_reference_factor():
+    """The oracle's logit gradient, `(1 + 2 z log Z) softmax - onehot`, pulled
+    back through the model agrees with the objective's parameter gradient
+    within 1e-4 scaled; observed at most 6.8e-8."""
+    from tools.distillation_reference import z_loss_reference
+
+    coefficient = 1e-2
+    batch = token_batch()
+    tokens = np.asarray(batch[TEXT_KEY])
+    objective = make_objective(z_loss=coefficient)
+    params = objective.init(jax.random.key(0))
+    ids = jnp.asarray(tokens[:, :-1], jnp.int32)
+    logits, pullback = jax.vjp(lambda p: objective.model.apply({"params": p}, ids), params["params"])
+    _, _, cotangent = z_loss_reference(np.asarray(logits), tokens[:, 1:],
+                                       np.ones(tokens[:, 1:].shape), coefficient)
+    expected, = pullback(jnp.asarray(cotangent, jnp.float32))
+    actual = jax.grad(lambda p: scalar_loss(objective, {"params": p}, batch, step_at())[0])(params["params"])
+
+    for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(actual), strict=True):
+        scale = max(float(jnp.abs(want).max()), 1.0)
+        assert float(jnp.abs(have - want).max()) <= 1e-4 * scale
+
+
+def test_a_negative_z_loss_is_refused():
+    with pytest.raises(ValueError, match="nonnegative"):
+        make_objective(z_loss=-1e-4)
