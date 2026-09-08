@@ -59,12 +59,13 @@ def scripted(target, drafts, rows):
                      depths=1)
 
 
-def run(target, drafts, rows, budget, block, seed=0, stopping=()):
+def run(target, drafts, rows, budget, block, seed=0, stopping=(), transforms=()):
     """One speculative run over fixed distributions."""
-    return run_with(Speculative(block=block), target, drafts, rows, budget, seed, stopping)
+    return run_with(Speculative(block=block), target, drafts, rows, budget, seed, stopping,
+                    transforms)
 
 
-def run_with(plan, target, drafts, rows, budget, seed=0, stopping=()):
+def run_with(plan, target, drafts, rows, budget, seed=0, stopping=(), transforms=()):
     """One run of a given speculative plan over fixed distributions."""
     state = DecoderState(cache={}, logits=jnp.broadcast_to(target, (rows, VOCAB)),
                          positions=None, hidden=jnp.zeros((rows, HIDDEN), jnp.float32),
@@ -77,7 +78,7 @@ def run_with(plan, target, drafts, rows, budget, seed=0, stopping=()):
     ops = scripted(target, drafts, rows)
 
     def body(carried, opening):
-        return plan(carried, opening, ops, chain(()), criterion(stopping), budget, 1)
+        return plan(carried, opening, ops, chain(transforms), criterion(stopping), budget, 1)
 
     failure, drawn = checkify.checkify(body, errors=checkify.user_checks)(state, start)
     failure.throw()
@@ -162,6 +163,21 @@ def test_a_criterion_inside_a_block_truncates_it():
     stopped = run(point(5), [point(5)] * 3, 2, 8, 4, stopping=(stop,))
     np.testing.assert_array_equal(np.asarray(stopped.valid).sum(axis=1), 2)
     np.testing.assert_array_equal(np.asarray(stopped.terminated), True)
+
+
+def test_a_stop_on_the_last_candidate_of_a_whole_block_draws_no_bonus():
+    """A block whose every candidate is accepted draws a bonus token from the
+    target unless a criterion ended the row on one of them. The last candidate
+    gets that check like the others: a chain that leaves nothing to draw
+    after the stop is never asked for a bonus, exactly as `Sample` would not
+    ask for a third token."""
+    stop = jax.tree_util.Partial(lambda state, tokens: state.step >= 2)
+    nothing_after = jax.tree_util.Partial(
+        lambda state, logits: jnp.where((state.step < 2)[:, None], logits, -jnp.inf))
+    drawn = run(point(1), [point(1)] * 3, 2, 4, 2, stopping=(stop,), transforms=(nothing_after,))
+    np.testing.assert_array_equal(np.asarray(drawn.valid).sum(axis=1), 2)
+    np.testing.assert_array_equal(np.asarray(drawn.terminated), True)
+    np.testing.assert_array_equal(np.asarray(drawn.tokens)[:, :2], 1)
 
 
 def test_the_budget_bounds_the_last_block():

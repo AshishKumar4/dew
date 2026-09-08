@@ -528,6 +528,9 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
             sure = sure & (jnp.exp(jnp.take_along_axis(
                 jax.nn.log_softmax(scores), token[:, None], -1)[:, 0]) >= plan.confidence)
             states.append(states[depth].commit(token, active))
+        # Every candidate gets the real criterion, the last one included: a
+        # block accepted whole must not draw its bonus behind a stop.
+        ending.append(stopping(states[gamma], candidates[gamma - 1]))
 
         proposed = jnp.stack(candidates, axis=1)
         drafting, verified, _ = verify(
@@ -558,7 +561,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
         residual = jnp.maximum(jax.nn.softmax(target) - jax.nn.softmax(draft), 0.0)
         weight = jnp.sum(residual, axis=-1, keepdims=True)
         rest = jnp.log(residual / jnp.where(weight > 0, weight, 1.0))
-        stopped = jnp.any(jnp.stack(ending + [jnp.zeros(rows, bool)], axis=1)
+        stopped = jnp.any(jnp.stack(ending, axis=1)
                           & (jnp.arange(gamma)[None, :] < matched[:, None]), axis=1)
         replacement = select(keys[:, 2 * gamma], jnp.where(turned_down[:, None], rest, target),
                              active & ~stopped & (step.step + matched < budget))
