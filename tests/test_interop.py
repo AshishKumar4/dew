@@ -57,7 +57,7 @@ def test_round_trip_keeps_bfloat16(params, tmp_path):
     save_params(narrowed, path)
     loaded = load_params(path)
 
-    for saved, restored in zip(jax.tree.leaves(narrowed), jax.tree.leaves(loaded)):
+    for saved, restored in zip(jax.tree.leaves(narrowed), jax.tree.leaves(loaded), strict=True):
         assert restored.dtype == jnp.bfloat16
         assert np.array_equal(np.asarray(saved), restored)
 

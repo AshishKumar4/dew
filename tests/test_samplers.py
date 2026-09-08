@@ -947,7 +947,7 @@ def test_the_native_brownian_bridge_holds_the_reference_identities():
     widths = SOURCE_ARRAYS["brownian.widths"]
     query = source_bridge()
     increments = [np.asarray(query(a, b)) * np.sqrt(width)
-                  for (a, b), width in zip(queries, widths)]
+                  for (a, b), width in zip(queries, widths, strict=True)]
     np.testing.assert_allclose(increments[0] + increments[1], increments[2], atol=1e-5, rtol=1e-5)
     np.testing.assert_allclose(np.asarray(query(queries[0][1], queries[0][0])),
                                -np.asarray(query(*queries[0])), atol=0, rtol=0)
