@@ -392,6 +392,97 @@ def mode_packed(args) -> dict:
     }
 
 
+def token_trainer(name, checkpoint_base, fsdp: int, seq_len: int):
+    """A small decoder over token windows, with checkpoints, as a recipe
+    would build it.
+
+    Plain SGD, because what a resume test compares is which records trained
+    the weights: an update proportional to the gradient carries a difference
+    of one part in ten million as a difference of one part in ten million,
+    where Adam divides a near-zero gradient by its own near-zero second
+    moment and turns the same reassociation into a visible step.
+    """
+    import jax
+    import optax
+    import dew.nn.backbones.causal_transformer  # registers the model built below
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+
+    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32,
+                         num_layers=2, num_heads=4, num_kv_heads=2, mlp_features=64,
+                         max_seq_len=seq_len)
+    return Trainer(
+        LMObjective(model, seq_len), optax.sgd(0.1), key=jax.random.key(0),
+        mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY),
+        checkpoints=Checkpoints(str(checkpoint_dir(checkpoint_base, name)), keep=4))
+
+
+class Recording:
+    """A training stream with the windows it hands over recorded.
+
+    The position is the stream's own, forwarded, so a run over this
+    checkpoints and resumes exactly as it would without it.
+    """
+
+    def __init__(self, source, seen: list):
+        self._source, self._seen = source, seen
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        batch = next(self._source)
+        self._seen.append([[int(value) for value in row]
+                           for row in np.asarray(batch["text"])])
+        return batch
+
+    def get_state(self):
+        return self._source.get_state()
+
+    def set_state(self, state):
+        self._source.set_state(state)
+
+    def close(self):
+        self._source.close()
+
+
+def mode_packed_fit(args) -> dict:
+    """`--steps` steps of a real fit over the packed training stream, with
+    the windows this process read.
+
+    The packing is planned over the whole corpus ahead of the shard, so the
+    windows a step holds are the same windows at any process count and the
+    saved position is one global window count. What the test reads back is
+    the windows themselves, per step, and the parameters they trained.
+    """
+    import dataclasses
+
+    import jax
+    from dew.data import PackedTokens
+
+    trainer = token_trainer(args.name, args.run_dir, args.fsdp_size, args.seq_len)
+    restored_step, restored = restored_state(trainer)
+    data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=0,
+                        loading=Loading(workers=args.workers,
+                                        worker_buffer=1)).load(batch=BATCH)
+    seen: list = []
+    state = trainer.fit(
+        dataclasses.replace(data, train=lambda: Recording(data.train(), seen)),
+        steps=args.steps, log_every=1, checkpoint_every=args.save_every)
+    dump_params(args.out.with_suffix(".npz"), state.params)
+    _, final_position = restored_state(trainer)
+    return {
+        "process_index": jax.process_index(),
+        "step": int(as_numpy(state.step)),
+        "restored_step": restored_step,
+        "restored_dataset_state": restored,
+        "dataset_state": final_position,
+        "windows": seen,
+        "train_len": data.records,
+    }
+
+
 def restored_state(trainer):
     """The step and this process's data position the trainer would resume
     from, restored the way `fit` restores: onto the mesh, which is the one
@@ -1474,6 +1565,7 @@ def mode_mixed_validity(args) -> dict:
 
 
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
+         "packed_fit": mode_packed_fit,
          "inference_pipeline": mode_inference_pipeline,
          "continuations": mode_continuations,
          "rollout": mode_rollout, "mixed_validity": mode_mixed_validity,
