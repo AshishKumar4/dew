@@ -323,6 +323,37 @@ def _pad_rows(x, rows: int):
     return x if rows == 0 else jnp.pad(x, ((0, 0), (0, rows), (0, 0), (0, 0)))
 
 
+def widen_value_heads(query, value):
+    """`value` with its head axis zero-padded to the query's width, which is
+    what the fused kernels take.
+
+    `jax.nn.dot_product_attention` checks the value against the key's whole
+    shape (`_check_shape_and_dtype` in jax/_src/nn/functions.py), so a value
+    narrower than the query is refused before any kernel sees it, and
+    DeepSeek's latent attention is exactly that shape: `v_head_dim` is 128
+    where the queries carry `qk_nope_head_dim + qk_rope_head_dim`, 192, in
+    every released V2/V3 config. The attention's second product is a separate
+    sum per value column, so a zero column produces a zero output column and
+    leaves the real ones untouched; the caller crops them off, and the
+    arithmetic on the kept columns is the fused kernel's own. transformers
+    5.16.1 hands FlashAttention the same padding
+    (integrations/flash_attention.py:63, `pad(value, [0, head_dim -
+    v_head_dim])`, cropped again after the call).
+
+    A value *wider* than the query has no such rewrite: padding the query and
+    the key instead would move the kernel's own 1/sqrt(d) scale off the
+    query's width, so it raises and names the reference path.
+    """
+    width, v_width = query.shape[-1], value.shape[-1]
+    if v_width > width:
+        raise ValueError(
+            "fused attention runs one head width for the keys and the values, "
+            f"and a value head of {v_width} is wider than the query head of "
+            f"{width}: the kernel would scale the logits by the padded width. "
+            "Use the reference implementation (attention_impl 'reference').")
+    return jnp.pad(value, ((0, 0),) * (value.ndim - 1) + ((0, width - v_width),))
+
+
 def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
     """jax's cudnn flash attention over any sequence length.
 
@@ -451,7 +482,12 @@ def cudnn_runs(query, softcap=None) -> bool:
     """Whether cudnn's fused kernel takes this query: a gpu backend, one of its
     two dtypes, a head dimension it tiles, and no logit softcap, which no
     fused kernel applies. 'auto' asks this; an explicit 'cudnn' refuses by
-    name instead."""
+    name instead.
+
+    The query's head width is the one every fused kernel runs at, values
+    included: a narrower value (DeepSeek's latent attention) is padded to it
+    by `widen_value_heads`, so this predicate reads the query alone and holds
+    for the whole call."""
     head_dim = query.shape[-1]
     return (jax.default_backend() == 'gpu' and query.dtype in CUDNN_DTYPES
             and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM
@@ -494,14 +530,19 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
 
     Inputs are [B, S, H, D]. Keys and values may carry fewer heads than the
     query (grouped-query attention); the paths that cannot group heads
-    themselves get them repeated out. The param trees of the callers never
-    change with the implementation, so checkpoints are interchangeable across
-    hardware:
+    themselves get them repeated out. The value's head width may be narrower
+    than the query's, which is DeepSeek's latent attention (`v_head_dim`
+    against `qk_nope_head_dim + qk_rope_head_dim`): the reference path takes
+    it as it is, and a fused path pads the value to the query's width and
+    crops its own columns back out (`widen_value_heads`), so the selection
+    below reads the query's width for either shape. The param trees of the
+    callers never change with the implementation, so checkpoints are
+    interchangeable across hardware:
 
     - None: flax reference attention (einsum + softmax), the portable default
       and the only path that reads dtype, precision and force_fp32_for_softmax.
     - 'auto': 'cudnn' where its kernel runs (a gpu backend, bf16 or fp16
-      inputs, a head dimension that is a multiple of 8 and at most 128, no
+      inputs, a query head width that is a multiple of 8 and at most 128, no
       softcap), 'xla' anywhere else. Resolved per trace, so a config logged
       as 'auto' still runs on the next machine.
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
@@ -510,7 +551,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
       whatever the inputs are. A dtype other than the inputs' own raises a
       ValueError, and so do a HIGH or HIGHEST precision and
       force_fp32_for_softmax=False. cudnn takes any sequence length
-      (`cudnn_attention` pads an odd one), and only bf16 or fp16 inputs.
+      (`cudnn_attention` pads an odd one), and only bf16 or fp16 inputs. A
+      value wider than the query has no fused rewrite and raises.
     - 'tpu': the pallas TPU flash kernel, with the 1/sqrt(d) scale passed
       explicitly (the deleted EfficientAttention passed none, which inflated
       the logits by sqrt(d) and made its checkpoints poisonous).
@@ -620,6 +662,13 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             f"({query.dtype}). Pass dtype=None or leave the inputs in that dtype, or use "
             "the reference implementation (attention_impl 'reference').")
 
+    # Every fused kernel runs one head width for the keys and the values, so a
+    # narrower value rides in padded and its own columns come back out; the
+    # widths a caller passes are static, so this costs no runtime branch.
+    v_head_dim = value.shape[-1]
+    if v_head_dim != query.shape[-1]:
+        value = widen_value_heads(query, value)
+
     if implementation == 'cudnn':
         if query.dtype not in CUDNN_DTYPES:
             raise ValueError(
@@ -632,15 +681,15 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                 f"cudnn attention needs a head dimension that is a multiple of 8 "
                 f"and at most {CUDNN_MAX_HEAD_DIM}, got {head_dim}; use attention_impl "
                 "'xla' for this shape.")
-        return cudnn_attention(query, key, value, bias, mask, causal, sliding_window)
-    if implementation == 'xla':
+        out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window)
+    elif implementation == 'xla':
         # A left window of l means the l+1 most recent keys on both the xla and
         # the cudnn path, which is the window this function counts.
-        return jax.nn.dot_product_attention(
+        out = jax.nn.dot_product_attention(
             query, key, value, bias=bias, mask=mask, is_causal=causal,
             local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
             implementation='xla')
-    if implementation == 'tpu':
+    elif implementation == 'tpu':
         from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
         heads = query.shape[-2]
         key = repeat_kv_heads(key, heads)
@@ -662,10 +711,12 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                 jnp.where(mask, 0, jnp.finfo(q.dtype).min).astype(q.dtype),
                 (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
             combined = seated if combined is None else combined + seated
-        out = flash_attention(q, k, v, ab=combined, causal=causal,
-                              sm_scale=1.0 / math.sqrt(query.shape[-1]))
-        return jnp.moveaxis(out, -3, -2)
-    raise ValueError(f"Unknown attention implementation: {implementation}")
+        out = jnp.moveaxis(
+            flash_attention(q, k, v, ab=combined, causal=causal,
+                            sm_scale=1.0 / math.sqrt(query.shape[-1])), -3, -2)
+    else:
+        raise ValueError(f"Unknown attention implementation: {implementation}")
+    return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
 
 
 @logical_axes({
