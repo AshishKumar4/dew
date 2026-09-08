@@ -1512,6 +1512,13 @@ def mode_decoding_components(args) -> dict:
     task = TextGeneration(model, placed, sampling=Sampling(temperature=0.8, top_k=5, pad_id=12),
                           logits=chain, stopping=(decoding.MaxNewTokens(3),))
     result = task(request, 4, seed=7).host()
+    # An explicit chain replaces these sampling filters. Their rank-local
+    # values are not part of the executed policy or its agreement identity.
+    equivalent = task(request, 4, seed=7, logits=chain,
+                      sampling=Sampling(temperature=0.3 + rank, top_k=2 + rank, pad_id=12)).host()
+    for name in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
+        if not np.array_equal(getattr(result, name), getattr(equivalent, name)):
+            raise AssertionError(f"unused sampling filters changed {name}")
 
     refused = []
     if processes > 1:
