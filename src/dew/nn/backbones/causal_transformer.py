@@ -163,6 +163,32 @@ def group_name(first: int, count: int) -> str:
     """The module name of a scanned run: `layers_3_7` runs layers 3 through 7."""
     return f'layers_{first}_{first + count - 1}'
 
+
+INTERMEDIATES = "intermediates"
+"""The collection flax's `capture_intermediates` fills."""
+
+
+def layer_outputs(module: nn.Module, method: str) -> bool:
+    """The `capture_intermediates` filter that keeps every layer's output.
+
+    It matches the `__call__` of the stack's `layers_N` modules, a scanned
+    run's `layers_3_7` and a pipeline stage's `layers_j` included, and
+    `StackView.unstack` lays what those sow out per layer, as the plain loop
+    does; `layer_output` reads one layer back.
+    """
+    return method == "__call__" and (module.name or "").startswith("layers_")
+
+
+def layer_output(intermediates: Mapping[str, Mapping[str, Sequence[jax.Array]]], index: int) -> jax.Array:
+    """Layer `index`'s output out of the collection `layer_outputs` filled."""
+    kept = intermediates.get(f"layers_{index}")
+    if kept is None:
+        held = sorted(int(name[len("layers_"):]) for name in intermediates
+                      if name.startswith("layers_") and name[len("layers_"):].isdigit())
+        raise ValueError(f"the model kept no layer {index}; it has layers {held}")
+    return kept["__call__"][0]
+
+
 @dataclasses.dataclass(frozen=True)
 class Mixture:
     """The experts some layers route to, and how the router chooses.
