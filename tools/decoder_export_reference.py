@@ -61,6 +61,7 @@ CASES = (
     Case("deepseek_v3", "deepseek-v3-tiny", balance_rate=1e-2),
     Case("deepseek_v32", "deepseek-v32-tiny", balance_rate=1e-2),
     Case("llama4_text", "llama4-tiny"),
+    Case("olmo3", "olmo3-yarn-tiny"),
 )
 
 
@@ -161,8 +162,18 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
 
 
 def moved(trip: RoundTrip) -> dict[str, float]:
-    """How far the trained export moved from the checkpoint, by tensor kind."""
+    """How far the trained export moved from the checkpoint, by tensor kind.
+
+    Only the kinds this checkpoint names appear: a dense family holds no
+    expert and no router, Mixtral routes every layer and holds no dense
+    feed-forward, and a router without a balancing bias keeps none. Llama 4
+    spells its feed-forward `feed_forward` where the others say `mlp`.
+    """
     kinds = {"embedding": lambda name: name == "model.embed_tokens.weight",
+             "attention": lambda name: ".self_attn." in name,
+             "feedforward": lambda name: (
+                 (".mlp." in name or ".feed_forward." in name) and "expert" not in name
+                 and not name.endswith(("mlp.gate.weight", "router.weight"))),
              "expert": lambda name: ".experts." in name,
              "router": lambda name: name.endswith(("mlp.gate.weight", "router.weight",
                                                    "block_sparse_moe.gate.weight")),

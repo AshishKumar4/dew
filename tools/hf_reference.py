@@ -16,8 +16,8 @@ Set up the venv and run it:
 
 What lands in tests/fixtures/hf:
 - <family>-tiny/ for qwen3, gemma, gemma2, gemma3, llama, llama31, mistral,
-  mixtral, qwen2, qwen3-moe, olmo3, deepseek-v3, deepseek-v32, llada and dream: a
-  random-weight checkpoint in the HF layout (config.json +
+  mixtral, qwen2, qwen3-moe, olmo3, olmo3-yarn, deepseek-v3, deepseek-v32,
+  llada and dream: a random-weight checkpoint in the HF layout (config.json +
   model.safetensors), the 2 x 12 token ids it was run on, and the fp32
   logits of the reference model in eval mode with eager attention. Small
   enough to live in git. Each tiny config turns on what its family adds
@@ -27,6 +27,9 @@ What lands in tests/fixtures/hf:
   V3.2, the sparse indexer; their routers' balancing bias is scattered too,
   since a checkpoint carries it and a fixture at its zeros would not tell a
   load that reads it from one that drops it.
+  olmo3-yarn carries the released 7B rope: its rope_scaling record on the
+  full-attention layers alone and plain rope on the sliding ones, so the
+  fixture is the per-kind frequency table rather than one model-wide ramp.
   The llada and dream tinies carry no transformers class (both ship remote
   code), so their logits come from the small torch port beside them, which
   follows the released block line for line and runs at fp32.
@@ -223,6 +226,33 @@ def tiny_olmo3() -> Olmo3ForCausalLM:
         num_key_value_heads=2, intermediate_size=128, vocab_size=256,
         sliding_window=4, max_position_embeddings=64, rope_theta=5e5,
         rms_norm_eps=1e-6))
+    torch.manual_seed(0)
+    return Olmo3ForCausalLM(config)
+
+
+def tiny_olmo3_yarn() -> Olmo3ForCausalLM:
+    """allenai/Olmo-3-1025-7B's rope at toy width: its rope_scaling record
+    field for field (yarn, factor 8 off 8192 pretraining positions, the
+    betas and the explicit attention_factor) and its 3:1 pattern, on
+    head_dim 16 instead of 128.
+
+    Olmo3Config moves a flat rope_scaling onto the full-attention entry
+    (configuration_olmo3.py:110-113) and leaves the sliding layers at
+    rope_theta, so this fixture is the per-kind rotary: the frequency table
+    of the one full layer is YaRN's, the three sliding layers' is plain.
+    At this head dim the correction range truncates to (2, 5), so of the 8
+    rotated pairs two extrapolate, two ride the linear ramp and four
+    interpolate at 1/8 - a ramp that neither plain rope nor a whole-model
+    YaRN reproduces.
+    """
+    config = Olmo3Config.from_dict(dict(
+        hidden_size=64, num_hidden_layers=4, num_attention_heads=4,
+        num_key_value_heads=2, intermediate_size=96, vocab_size=128,
+        sliding_window=4, max_position_embeddings=65536, rope_theta=5e5,
+        rms_norm_eps=1e-6, eos_token_id=127, pad_token_id=1,
+        rope_scaling=dict(rope_type="yarn", factor=8.0, beta_fast=32, beta_slow=1,
+                          original_max_position_embeddings=8192,
+                          attention_factor=1.2079441541679836)))
     torch.manual_seed(0)
     return Olmo3ForCausalLM(config)
 
@@ -1341,6 +1371,7 @@ def main() -> None:
     write_tiny("qwen2-tiny", tiny_qwen2())
     write_tiny("qwen3-moe-tiny", tiny_qwen3_moe())
     write_tiny("olmo3-tiny", tiny_olmo3())
+    write_tiny("olmo3-yarn-tiny", tiny_olmo3_yarn())
     write_released_config("olmo-3-7b", "allenai/Olmo-3-1025-7B")
     write_released_config("qwen3-30b-a3b", "Qwen/Qwen3-30B-A3B")
     write_released_config("qwen2-0.5b", "Qwen/Qwen2-0.5B")
