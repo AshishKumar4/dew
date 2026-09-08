@@ -10,6 +10,14 @@ control group's, and the compile, prefill and decode times. The logits and the
 greedy continuation go in the file too, so two runs are compared exactly
 rather than described.
 
+Two processes only compare exactly if they compile the same way, and XLA's
+GPU autotuner does not: it times candidate kernels and, compile to compile,
+picks a different emitter for the fusion that sums the split-K partials of a
+layer's output projections into the residual, which sums them in a different
+order. The same graph then gives two different bf16 residuals, resident or
+not. So this runs with autotuning off, and every compile of one graph is the
+same compile.
+
     systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 -- \\
         env JAX_PLATFORMS=cuda XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONPATH=src \\
         python tools/qualify_host_banks.py --kind dense --offload --out r.json
@@ -20,22 +28,27 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import jax
-import jax.numpy as jnp
-import numpy as np
-import tyro
+# Before jax is imported: the backend parses XLA_FLAGS once, when it starts.
+os.environ["XLA_FLAGS"] = f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_autotune_level=0"
 
-from dew import models  # naming a registry fills it
-from dew.inference.banks import HeldBanks, host_banked
-from dew.registry import with_precision
-from dew.sampling.text import Sampling, generate
-from dew.training import Layout, MeshSpec
-from dew.training.distributed import build_mesh
-from probe_pinned_charge import preflight
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+import tyro  # noqa: E402
+
+from dew import models  # noqa: E402  naming a registry fills it
+from dew.inference.banks import HeldBanks, host_banked  # noqa: E402
+from dew.registry import with_precision  # noqa: E402
+from dew.sampling.text import Sampling, generate  # noqa: E402
+from dew.training import Layout, MeshSpec  # noqa: E402
+from dew.training.distributed import build_mesh  # noqa: E402
+from benchmark_host_offload import bytes_of, entry_spaces, plan  # noqa: E402
+from probe_pinned_charge import preflight  # noqa: E402
 
 # About 200 MiB of bf16 weights: small enough for a four-gigabyte cap to hold
 # the source and the store at once, deep enough to bank four times.
@@ -119,18 +132,6 @@ def cgroup_stats() -> dict:
     return values
 
 
-def plan(compiled) -> dict:
-    analysis = compiled.memory_analysis()
-    fields = ("argument_size", "output_size", "alias_size", "temp_size",
-              "host_argument_size", "host_output_size", "host_temp_size", "peak_memory")
-    head = compiled.as_text().splitlines()[0]
-    body = head.partition("entry_computation_layout={(")[2].partition(")->")[0]
-    entries = body.split(", ") if body else []
-    return {name: int(getattr(analysis, f"{name}_in_bytes")) for name in fields} | {
-        "entry_host_parameters": sum(1 for entry in entries if "S(5)" in entry),
-        "entry_device_parameters": sum(1 for entry in entries if "S(5)" not in entry)}
-
-
 def digest(value) -> str:
     """A hash of one array's exact bytes, in the dtype it holds.
 
@@ -156,12 +157,6 @@ def leaf_digests(tree) -> dict[str, dict[str, str]]:
             "shape": list(leaf.shape), "dtype": str(leaf.dtype)}
         del leaf
     return values
-
-
-def owned(tree, space: str | None = None) -> int:
-    return sum(shard.data.nbytes for leaf in jax.tree.leaves(tree)
-               for shard in leaf.addressable_shards
-               if space is None or str(leaf.sharding.memory_kind) == space)
 
 
 def main(case: Case) -> None:
@@ -202,7 +197,8 @@ def main(case: Case) -> None:
                     "kind": case.kind, "offload": case.offload, "dtype": case.dtype,
                     "shape": {name: str(value) for name, value in fields.items()},
                     "devices": [str(device) for device in jax.devices()],
-                    "jax": jax.__version__, "cgroup_before": cgroup_stats()}
+                    "jax": jax.__version__, "xla_flags": os.environ["XLA_FLAGS"].strip(),
+                    "cgroup_before": cgroup_stats()}
 
     if selected > BUDGET_BYTES:
         raise SystemExit(
@@ -216,12 +212,18 @@ def main(case: Case) -> None:
             Path(case.out).write_text(json.dumps(record, indent=1, default=float))
         return
 
+    # Provenance before compute: the weights, the inputs and the empty cache
+    # are hashed leaf by leaf, so a difference in what two residencies were
+    # given is told apart from a difference in what they computed.
     started = time.perf_counter()
     source = jax.tree.map(
         lambda leaf: leaf.astype(case.dtype) if jnp.issubdtype(leaf.dtype, jnp.floating)
         else leaf, plain.init(jax.random.key(case.seed), tokens))
     jax.block_until_ready(source)
     record["init_seconds"] = time.perf_counter() - started
+    record["source_digests"] = leaf_digests(source)
+    record["tokens_digest"] = digest(tokens)
+    record["tokens_dtype"] = str(tokens.dtype)
 
     layout = Layout(min_shard=1, tolerance=1.0,
                     host_parameters=("params/layers_*",) if case.offload else ())
@@ -229,12 +231,13 @@ def main(case: Case) -> None:
     store = host_banked(model, HeldBanks(source), layout=layout)
     record["load_seconds"] = time.perf_counter() - started
     record["banks"] = sorted(store["params"])
-    record["owned_host_bytes"] = owned(store, "pinned_host")
-    record["owned_device_bytes"] = owned(store, "device")
+    record["owned_host_bytes"] = bytes_of(store, "pinned_host")
+    record["owned_device_bytes"] = bytes_of(store, "device")
     record["memory_kinds"] = {name: sorted({str(leaf.sharding.memory_kind)
                                             for leaf in jax.tree.leaves(tree)})
                               for name, tree in store["params"].items()}
     del source
+    record["store_digests"] = leaf_digests(store)
     record["cgroup_loaded"] = cgroup_stats()
 
     forward = jax.jit(lambda held, ids: model.apply(held, ids))
@@ -249,8 +252,9 @@ def main(case: Case) -> None:
     cache = jax.block_until_ready(model.apply(
         store, case.batch, method="init_cache", mutable=["cache"])[1]["cache"])
     record["init_cache_seconds"] = time.perf_counter() - started
-    record["owned_cache_bytes"] = owned(cache)
+    record["owned_cache_bytes"] = bytes_of(cache)
     record["cache_paths"] = sorted(cache)
+    record["initial_cache_digests"] = leaf_digests(cache)
 
     prefill = jax.jit(lambda held, cached, ids: model.apply(
         {**held, "cache": cached}, ids, decode=True, mutable=["cache"]))
@@ -258,6 +262,7 @@ def main(case: Case) -> None:
     compiled = prefill.lower(store, cache, tokens).compile()
     record["prefill_compile_seconds"] = time.perf_counter() - started
     record["prefill_plan"] = plan(compiled)
+    record["prefill_spaces"] = entry_spaces(compiled)
     started = time.perf_counter()
     logits, changed = jax.block_until_ready(compiled(store, cache, tokens))
     record["prefill_seconds"] = time.perf_counter() - started
@@ -277,7 +282,8 @@ def main(case: Case) -> None:
     stepped = step.lower(store, changed["cache"], token, position).compile()
     record["decode_compile_seconds"] = time.perf_counter() - started
     record["decode_plan"] = plan(stepped)
-    cache, produced, latencies, scored = changed["cache"], [], [], []
+    record["decode_spaces"] = entry_spaces(stepped)
+    cache, produced, latencies, scored, steps = changed["cache"], [], [], [], []
     for _ in range(case.new_tokens):
         at = time.perf_counter()
         logits, changed = jax.block_until_ready(stepped(store, cache, token, position))
@@ -286,11 +292,16 @@ def main(case: Case) -> None:
         # inside, so the timings are the step's and not the hash's.
         scored.append(logits)
         cache = changed["cache"]
+        # After the latency is recorded, so the timing is the step's: one
+        # step's cache hashed leaf by leaf, which is what tells a first-step
+        # difference from one the whole loop accumulated.
+        steps.append(leaf_digests(cache))
         token = jnp.argmax(logits[:, -1], axis=-1)[:, None].astype(jnp.int32)
         produced.append(int(token[0, 0]))
         position = position + 1
     record["decode_logits_digests"] = [digest(step) for step in scored]
     del scored
+    record["cache_per_step"] = steps
     record["cache_after_decode"] = leaf_digests(cache)
     record["decode_tokens"] = produced
     record["decode_latencies_seconds"] = latencies
