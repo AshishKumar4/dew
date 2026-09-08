@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from jax.sharding import PartitionSpec as P
 from safetensors.numpy import load_file
 
 from dew.interop.hf_decoders import translate_wrapper_config, translate_wrapper_weights
@@ -21,6 +22,8 @@ from dew.nn import vision as V
 from dew.nn.inputs import ModelInputs
 from dew.nn.mobilenet import MobileConvNormAct
 from dew.registry import models, with_precision
+from dew.training import Layout, MeshSpec, build_mesh
+from dew.training.optim import muon_weight_dimension_numbers
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3n-vision-tiny"
@@ -97,6 +100,66 @@ def test_encoder_backward_and_sgd_update_match_reference(bundle):
     updates, _ = optimizer.update(grads, optimizer.init(params), params)
     stepped = jax.jit(tower.apply)({"params": optax.apply_updates(params, updates)}, pixels)
     np.testing.assert_allclose(stepped, np.load(FIXTURE / "stepped_ref.npy"), rtol=0, atol=1e-4)
+
+
+# One kernel per shape the tower builds, with the spec its declaration derives
+# written out by hand: an expansion, a projection back, a depthwise middle, a
+# strided key downsample and the four attention projections. `min_shard` below
+# keeps the fixture's small widths inside the threshold policy, so the spec of
+# a declaration that stopped matching its module shows up here as P().
+TOWER_SPECS = {
+    ("conv_stem", "conv", "kernel"): P(None, None, None, "fsdp"),
+    ("stages_0", "blocks_0", "conv_exp", "kernel"): P(None, None, None, "fsdp"),
+    ("stages_0", "blocks_0", "conv_pwl", "kernel"): P(None, None, None, "fsdp"),
+    ("stages_1", "blocks_1", "dw_start", "conv", "kernel"): P(None, None, None, "fsdp"),
+    ("stages_1", "blocks_0", "dw_mid", "conv", "kernel"): P(None, None, None, "fsdp"),
+    ("stages_2", "blocks_11", "attn", "query", "proj", "kernel"): P(None, None, None, "fsdp"),
+    ("stages_2", "blocks_11", "attn", "key", "proj", "kernel"): P(None, None, None, "fsdp"),
+    ("stages_2", "blocks_11", "attn", "value", "proj", "kernel"): P(None, None, None, "fsdp"),
+    ("stages_2", "blocks_11", "attn", "output", "proj", "kernel"): P(None, None, None, "fsdp"),
+    ("stages_2", "blocks_11", "attn", "key", "down_conv", "kernel"): P(None, None, None, "fsdp"),
+    ("msfa", "ffn", "pw_exp", "conv", "kernel"): P(None, None, None, "fsdp"),
+    ("msfa", "ffn", "pw_proj", "conv", "kernel"): P(None, None, None, "fsdp"),
+}
+
+
+@pytest.mark.mesh
+def test_the_layout_and_muon_read_the_towers_declared_axes():
+    """Placing the wrapper on an fsdp mesh, the call a Trainer refused before.
+
+    `("proj",)` is a router's declaration elsewhere in the tree, and the
+    attention's projection convolutions sat under exactly that name, so the
+    layout hit a two-name declaration on a rank-four kernel and raised for
+    132 of the tower's leaves. Both readers of the table are asserted here
+    because one declaration answers both: the layout splits a kernel on its
+    output channels, and Muon contracts the flattened receptive field into
+    them, which is what the unnamed leading dimensions say.
+    """
+    loaded = load_pretrained(FIXTURE, dtype="float32", attention_impl="reference")
+    mesh = build_mesh(MeshSpec(fsdp=4))
+    layout = Layout(min_shard=64)
+    shardings = layout.shardings(mesh, loaded.variables)
+    layout.check(loaded.variables["params"], shardings["params"], mesh)
+
+    tower, placed = loaded.variables["params"]["tower"], shardings["params"]["tower"]
+    for path, expected in TOWER_SPECS.items():
+        leaf, sharding = tower, placed
+        for name in path:
+            leaf, sharding = leaf[name], sharding[name]
+        assert sharding.spec == expected, f"{'/'.join(path)} {leaf.shape}"
+
+    # Optax's spec is itself a pytree node, so its own fields would flatten
+    # away; None is the AdamW group the norms and the biases belong to.
+    is_spec = lambda leaf: leaf is None or isinstance(
+        leaf, optax.contrib.MuonDimensionNumbers)
+    numbers = muon_weight_dimension_numbers(tower)
+    matrices = [(jax.tree_util.keystr(path), leaf) for path, leaf
+                in jax.tree_util.tree_flatten_with_path(numbers, is_leaf=is_spec)[0]
+                if leaf is not None]
+    assert len(matrices) == sum(1 for leaf in jax.tree.leaves(tower) if leaf.ndim == 4)
+    wrong = [name for name, leaf in matrices
+             if (leaf.reduction_axis, leaf.output_axis) != ((0, 1, 2), (3,))]
+    assert wrong == [], f"{len(wrong)} kernels are not a receptive field mapped to channels"
 
 
 def test_image_only_wrapper_matches_conditional_reference_and_uses_hard_tokens(bundle):
