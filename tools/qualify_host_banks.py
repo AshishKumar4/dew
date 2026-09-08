@@ -17,6 +17,7 @@ rather than described.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import time
@@ -130,6 +131,33 @@ def plan(compiled) -> dict:
         "entry_device_parameters": sum(1 for entry in entries if "S(5)" not in entry)}
 
 
+def digest(value) -> str:
+    """A hash of one array's exact bytes, in the dtype it holds.
+
+    Two placements are compared on the values themselves rather than on a
+    slice of them, and a hash is small enough to write down. Nothing is cast
+    or rounded on the way, so a hash that matches means the bytes matched.
+    """
+    array = np.asarray(jax.block_until_ready(value))
+    return hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest()[:32]
+
+
+def leaf_digests(tree) -> dict[str, dict[str, str]]:
+    """Every leaf of `tree` hashed one at a time, with where it sits.
+
+    One leaf is fetched, hashed and dropped before the next is read, so the
+    host holds one leaf of the cache and not the cache.
+    """
+    leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
+    values = {}
+    for path, leaf in leaves:
+        values[jax.tree_util.keystr(path)] = {
+            "digest": digest(leaf), "kind": str(leaf.sharding.memory_kind),
+            "shape": list(leaf.shape), "dtype": str(leaf.dtype)}
+        del leaf
+    return values
+
+
 def owned(tree, space: str | None = None) -> int:
     return sum(shard.data.nbytes for leaf in jax.tree.leaves(tree)
                for shard in leaf.addressable_shards
@@ -209,6 +237,14 @@ def main(case: Case) -> None:
     del source
     record["cgroup_loaded"] = cgroup_stats()
 
+    forward = jax.jit(lambda held, ids: model.apply(held, ids))
+    started = time.perf_counter()
+    scores = jax.block_until_ready(forward(store, tokens))
+    record["forward_seconds"] = time.perf_counter() - started
+    record["forward_logits_digest"] = digest(scores)
+    record["forward_logits_shape"] = list(scores.shape)
+    del scores
+
     started = time.perf_counter()
     cache = jax.block_until_ready(model.apply(
         store, case.batch, method="init_cache", mutable=["cache"])[1]["cache"])
@@ -225,7 +261,12 @@ def main(case: Case) -> None:
     started = time.perf_counter()
     logits, changed = jax.block_until_ready(compiled(store, cache, tokens))
     record["prefill_seconds"] = time.perf_counter() - started
+    record["prefill_logits_digest"] = digest(logits)
+    record["prefill_logits_shape"] = list(logits.shape)
+    # Kept beside the digest: a reader can see the values, not only that two
+    # hashes agreed.
     record["prefill_last_logits"] = np.asarray(logits[0, -1], np.float32).tolist()
+    record["cache_after_prefill"] = leaf_digests(changed["cache"])
 
     step = jax.jit(lambda held, cached, token, position: model.apply(
         {**held, "cache": cached}, token, decode=True, mutable=["cache"],
@@ -236,15 +277,21 @@ def main(case: Case) -> None:
     stepped = step.lower(store, changed["cache"], token, position).compile()
     record["decode_compile_seconds"] = time.perf_counter() - started
     record["decode_plan"] = plan(stepped)
-    cache, produced, latencies = changed["cache"], [], []
+    cache, produced, latencies, scored = changed["cache"], [], [], []
     for _ in range(case.new_tokens):
         at = time.perf_counter()
         logits, changed = jax.block_until_ready(stepped(store, cache, token, position))
         latencies.append(time.perf_counter() - at)
+        # The hash is taken after the measurement it would otherwise be
+        # inside, so the timings are the step's and not the hash's.
+        scored.append(logits)
         cache = changed["cache"]
         token = jnp.argmax(logits[:, -1], axis=-1)[:, None].astype(jnp.int32)
         produced.append(int(token[0, 0]))
         position = position + 1
+    record["decode_logits_digests"] = [digest(step) for step in scored]
+    del scored
+    record["cache_after_decode"] = leaf_digests(cache)
     record["decode_tokens"] = produced
     record["decode_latencies_seconds"] = latencies
     record["decode_median_seconds"] = float(np.median(latencies))
