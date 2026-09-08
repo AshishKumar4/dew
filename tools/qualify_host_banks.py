@@ -18,6 +18,7 @@ rather than described.
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,77 +32,53 @@ from dew import models  # naming a registry fills it
 from dew.inference.banks import HeldBanks, host_banked
 from dew.registry import with_precision
 from dew.sampling.text import Sampling, generate
-from dew.training import Layout
+from dew.training import Layout, MeshSpec
+from dew.training.distributed import build_mesh
+from probe_pinned_charge import preflight
 
 # About 200 MiB of bf16 weights: small enough for a four-gigabyte cap to hold
 # the source and the store at once, deep enough to bank four times.
-SHAPE = dict(vocab_size=1024, emb_features=512, num_layers=24, num_heads=8,
-             head_dim=64, mlp_features=2048, max_seq_len=64, tie_embeddings=True,
+SHAPE = dict(vocab_size=1024, emb_features=512, num_heads=8, head_dim=64,
+             mlp_features=2048, max_seq_len=64, tie_embeddings=True,
              scan_layers=True, bank_layers=6)
-KINDS = {
-    "dense": {},
-    "gated_delta_net": dict(layer_types=("linear_attention",) * SHAPE["num_layers"],
-                            kinds={"linear_attention": {"mixer": {"kind": "gated_delta_net"}}}),
-    "latent_attention": dict(mixer={"kind": "mla", "kv_lora_rank": 64, "q_lora_rank": 64,
-                                    "qk_rope_head_dim": 16, "qk_nope_head_dim": 16,
-                                    "v_head_dim": 32}),
-}
+
+BUDGET_BYTES = 512 * 1024 ** 2
+"""The most host-resident weight this is allowed to retain. It is checked
+against the abstract store, from the real init shapes and the layout that
+would place them, before a single weight is allocated."""
+
+# One depth per kind, chosen so the abstract store fits BUDGET_BYTES. A
+# gated delta net carries more parameters per layer than a dense block at the
+# same width, which is why its depth is not the dense one; the accounting
+# below is what decides, not this comment.
+DEPTHS = {"dense": 24, "gated_delta_net": 16, "latent_attention": 24}
 
 
-CAP_BYTES = 4 * 1024 ** 3
-HEADROOM_BYTES = 12 * 1024 ** 3
+def shape_of(kind: str, num_layers: int | None) -> dict:
+    depth = DEPTHS[kind] if num_layers is None else num_layers
+    fields = {**SHAPE, "num_layers": depth}
+    if kind == "gated_delta_net":
+        fields |= dict(layer_types=("linear_attention",) * depth,
+                       kinds={"linear_attention": {"mixer": {"kind": "gated_delta_net"}}})
+    elif kind == "latent_attention":
+        fields |= dict(mixer={"kind": "mla", "kv_lora_rank": 64, "q_lora_rank": 64,
+                              "qk_rope_head_dim": 16, "qk_nope_head_dim": 16,
+                              "v_head_dim": 32})
+    return fields
 
 
-def preflight(store_mib: int | None = None, bank_counts=None) -> dict:
-    """Refuse to start unless a live budget already bounds this process tree.
-
-    Read before the backend is opened, because a check that runs after the
-    first allocation is not a check. Reported limits are not taken as a
-    guard: the group has to be an active cgroup v2 memory controller with a
-    finite `memory.max` no larger than the agreed cap and swap turned off, and
-    the machine has to have the agreed headroom left. Anything missing,
-    unlimited or unreadable exits nonzero with the reason, since running
-    without enforcement is what the cap exists to prevent.
-    """
-    line = Path("/proc/self/cgroup").read_text().strip().splitlines()[-1]
-    where = Path("/sys/fs/cgroup") / line.split(":")[-1].lstrip("/")
-    if not (where / "memory.current").is_file():
-        raise SystemExit(
-            f"refusing to run: {where} is not an active cgroup v2 memory controller, "
-            f"so nothing bounds this process tree")
-    for name in ("memory.max", "memory.swap.max"):
-        if not (where / name).is_file():
-            raise SystemExit(f"refusing to run: {where}/{name} is not readable")
-    limit = (where / "memory.max").read_text().strip()
-    if limit == "max":
-        raise SystemExit(
-            f"refusing to run: {where}/memory.max is unlimited; start inside a scope "
-            f"with MemoryMax set, at most {CAP_BYTES} bytes")
-    if int(limit) > CAP_BYTES:
-        raise SystemExit(
-            f"refusing to run: {where}/memory.max is {limit}, over the agreed "
-            f"{CAP_BYTES} byte cap")
-    swap = (where / "memory.swap.max").read_text().strip()
-    if swap != "0":
-        raise SystemExit(
-            f"refusing to run: {where}/memory.swap.max is {swap}, not 0, so the cap "
-            f"can be paid for in swap")
-    available = 0
-    for entry in Path("/proc/meminfo").read_text().splitlines():
-        if entry.startswith("MemAvailable:"):
-            available = int(entry.split()[1]) * 1024
-    if available < HEADROOM_BYTES:
-        raise SystemExit(
-            f"refusing to run: MemAvailable is {available} bytes, under the "
-            f"{HEADROOM_BYTES} byte headroom this is allowed to leave")
-    if store_mib is not None and not 0 < store_mib <= 512:
-        raise SystemExit(
-            f"refusing to run: store_mib is {store_mib}, outside the permitted "
-            f"1 to 512 MiB")
-    if bank_counts is not None and any(count < 1 for count in bank_counts):
-        raise SystemExit(f"refusing to run: bank_counts {list(bank_counts)} is not positive")
-    return {"cgroup": str(where), "memory.max": limit, "memory.swap.max": swap,
-            "MemAvailable": available}
+def stored_bytes(shapes, placement) -> dict[str, int]:
+    """What the store would retain, per memory kind, from the shapes and the
+    shardings alone: each leaf's own shard, times the devices this process
+    addresses. Nothing is allocated to find out."""
+    totals: dict[str, int] = {}
+    leaves = jax.tree.leaves(shapes)
+    for leaf, sharding in zip(leaves, jax.tree.leaves(placement), strict=True):
+        shard = math.prod(sharding.shard_shape(leaf.shape))
+        local = len(sharding.addressable_devices)
+        kind = str(sharding.memory_kind)
+        totals[kind] = totals.get(kind, 0) + shard * leaf.dtype.itemsize * local
+    return totals
 
 
 @dataclass(frozen=True)
@@ -113,6 +90,9 @@ class Case:
     prompt: int = 16
     new_tokens: int = 8
     seed: int = 0
+    num_layers: int | None = None
+    check_only: bool = False
+    """Account for the store from shapes alone and stop, allocating nothing."""
     out: str | None = None
 
 
@@ -158,18 +138,55 @@ def owned(tree, space: str | None = None) -> int:
 
 def main(case: Case) -> None:
     enforced = preflight()
-    fields = {**SHAPE, **KINDS[case.kind]}
+    if min(case.batch, case.prompt, case.new_tokens) < 1:
+        raise SystemExit(
+            f"refusing to run: batch {case.batch}, prompt {case.prompt} and new_tokens "
+            f"{case.new_tokens} all have to be positive")
+    fields = shape_of(case.kind, case.num_layers)
+    if case.prompt + case.new_tokens > fields["max_seq_len"]:
+        raise SystemExit(
+            f"refusing to run: a prompt of {case.prompt} and {case.new_tokens} new "
+            f"tokens need {case.prompt + case.new_tokens} cache slots and the cache "
+            f"holds {fields['max_seq_len']}")
     model = models.build("causal_transformer", **with_precision(
         "causal_transformer", fields, dtype=case.dtype, attention_impl="xla"))
     plain = models.build("causal_transformer", **with_precision(
         "causal_transformer", {**fields, "scan_layers": False}, dtype=case.dtype,
         attention_impl="xla"))
+    # The store is accounted for before any weight exists: the real init
+    # shapes, cast to the dtype the store holds, under the layout that would
+    # offload them, whether or not this case is the offloaded one, so both
+    # halves of a pair refuse a shape that overruns.
+    offloaded = Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",))
+    abstract = jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(
+            leaf.shape, jnp.dtype(case.dtype)
+            if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype),
+        jax.eval_shape(lambda key: plain.init(
+            key, jax.ShapeDtypeStruct((case.batch, case.prompt), jnp.int32)),
+            jax.random.key(case.seed)))
+    accounting = stored_bytes(abstract, offloaded.offloaded(build_mesh(MeshSpec()), abstract))
+    selected = accounting.get("pinned_host", 0)
     tokens = jnp.asarray(np.random.default_rng(case.seed).integers(
         1, SHAPE["vocab_size"], size=(case.batch, case.prompt)), jnp.int32)
-    record: dict = {"enforced": enforced, "kind": case.kind, "offload": case.offload, "dtype": case.dtype,
+    record: dict = {"enforced": enforced, "accounting": accounting,
+                    "selected_host_bytes": selected, "budget_bytes": BUDGET_BYTES,
+                    "kind": case.kind, "offload": case.offload, "dtype": case.dtype,
                     "shape": {name: str(value) for name, value in fields.items()},
                     "devices": [str(device) for device in jax.devices()],
                     "jax": jax.__version__, "cgroup_before": cgroup_stats()}
+
+    if selected > BUDGET_BYTES:
+        raise SystemExit(
+            f"refusing to run: {case.kind} at {fields['num_layers']} layers would "
+            f"retain {selected} bytes of host-resident weight, over the "
+            f"{BUDGET_BYTES} byte budget, by {selected - BUDGET_BYTES} bytes. The "
+            f"whole store is {accounting}. Reduce num_layers or the width")
+    if case.check_only:
+        print(json.dumps(record, default=float))
+        if case.out is not None:
+            Path(case.out).write_text(json.dumps(record, indent=1, default=float))
+        return
 
     started = time.perf_counter()
     source = jax.tree.map(
