@@ -82,8 +82,8 @@ A position is one of two kinds, and the kind decides whether the process count i
 
 | Kind | Written by | Resumes on |
 |---|---|---|
-| Global record count | Every record dataset built on `train_stream`: token windows, images, video, prompts, preference pairs | Any process count that divides the global batch |
-| Shard offset | `PackedTokens` and `ChatMessages`, whose windows are packed out of one process's own documents, and custom iterators reporting their own state | The process count that wrote it |
+| Global record count | Every record dataset built on `train_stream`: token windows, packed documents and conversations (planned over the whole corpus ahead of the shard), weighted mixtures, images, video, prompts, preference pairs | Any process count that divides the global batch |
+| Shard offset | Custom iterators reporting their own state | The process count that wrote it |
 
 A global position is the number of records the whole run has consumed. Every process reports the same number, because the stream owns both the sharding and the batching: step *k* is records `[k * batch, (k + 1) * batch)` of one shuffled order, and process *p* of *n* reads every *n*th record of that step. A checkpoint saved by two processes therefore restores on one or on four, and the steps after the resume are the steps an uninterrupted run would have taken. Restoring is a slice bound, not a replay: the resumed stream reads nothing it has already read.
 

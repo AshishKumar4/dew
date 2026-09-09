@@ -192,13 +192,13 @@ def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np
 class DocumentChunks(pygrain.MapDataset[Batch]):
     """Documents cut into consecutive chunks of at most `chunk_len` tokens.
 
-    Grain's packer refuses an element longer than the bin it packs into, so a
-    document that outgrows the window is cut first; each chunk becomes its own
-    segment in the packed row, which keeps attention inside the chunk and RoPE
-    running from the chunk's own 0.
+    A window holds nothing longer than itself, so a document that outgrows
+    the window is cut first; each chunk becomes its own segment in the packed
+    window, which keeps attention inside the chunk and RoPE running from the
+    chunk's own 0.
 
     The chunk table is built once from the document lengths. A record then
-    costs one memmap slice.
+    costs one read of its document and a slice.
     """
 
     def __init__(self, parent: pygrain.MapDataset, lengths, chunk_len: int):
@@ -255,15 +255,18 @@ class PackedWindows(pygrain.MapDataset[Batch]):
     way it does the records of any other source. Packing behind the shard,
     as this loader did before, made a window a fact about one process's own
     documents and its saved position a shard offset.
+
+    `documents` is any dataset of per-token fields whose lengths are
+    `lengths`, and `described` names it the way a saved position needs
+    (`describe`), since which chunks share a window is part of the order the
+    position counts into.
     """
 
-    def __init__(self, documents: pygrain.RandomAccessDataSource[Batch], lengths,
-                 window: int, bins: int):
-        chunks: pygrain.MapDataset[Batch] = DocumentChunks(
-            pygrain.MapDataset.source(documents), lengths, window)
-        super().__init__(chunks)
+    def __init__(self, documents: pygrain.MapDataset[Batch], lengths, window: int,
+                 bins: int, described: str):
+        super().__init__(DocumentChunks(documents, lengths, window))
         self._window = window
-        self._described = describe(documents)
+        self._described = described
         self._order, self._starts = first_fit(chunk_lengths(lengths, window), window, bins)
 
     def __repr__(self) -> str:
@@ -354,10 +357,12 @@ class PackedTokens(DatasetSpec):
         # One source per split, and one plan over it. Finding the boundaries
         # reads the whole file, so rebuilding either per epoch would read a
         # multi-gigabyte train.bin again for a table the run already has.
-        train_source = TokenDocumentSource(train_bin)
-        val_source = TokenDocumentSource(val_bin)
-        train = PackedWindows(train_source, train_source.lengths, window, self.packing_bins)
-        val = PackedWindows(val_source, val_source.lengths, window, self.packing_bins)
+        def packed(path: str) -> PackedWindows:
+            source = TokenDocumentSource(path)
+            return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
+                                 self.packing_bins, describe(source))
+
+        train, val = packed(train_bin), packed(val_bin)
 
         return Dataset(
             train=train_stream(train, [], batch=rows, seed=self.seed, loading=self.loading),
