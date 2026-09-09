@@ -45,7 +45,6 @@ import numpy as np
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
 from dew.nn.gemma3n import AltUp
 from dew.nn import llama4
-from dew.nn.gpt_oss import unpack_mxfp4
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mla import MLAMixer
@@ -2529,8 +2528,9 @@ class DecoderFamily:
     export_path: Callable[[str, Mapping[str, object]], Optional[str]] = _hf_name
     sandwich_norms: bool = False
     prepare_weights: Callable[[Mapping[str, np.ndarray]], Mapping[str, np.ndarray]] = dict
-    """The checkpoint's tensors as the path map reads them. GPT OSS unpacks
-    its MXFP4 blocks and Llama 4 splits its fused expert kernels."""
+    """The checkpoint's tensors as the path map reads them: Llama 4 and Gemma 4
+    split their fused expert kernels. A quantized format is undone before this,
+    by `load_pretrained`, which records what it undid for the export."""
 
 
 def _gpt_oss_config(hf_config: Mapping[str, object], used: set[str]) -> dict[str, object]:
@@ -2936,7 +2936,7 @@ _FAMILY_ENTRIES = (
                   lambda fields: fields['mlp'] == 'swigluoai',
                   'gpt_oss', 'GptOssForCausalLM', _gpt_oss_export,
                   weight_path=_gpt_oss_path, export_path=_gpt_oss_export_path,
-                  prepare_weights=unpack_mxfp4, preserve_source_layout=False),
+                  preserve_source_layout=False),
     DecoderFamily(('llama4_text',), _llama4_config,
                   lambda fields: any(isinstance(mixer, Llama4Mixer) for mixer in _kind_mixers(fields)),
                   'llama4_text', 'Llama4ForCausalLM', lambda model: {},

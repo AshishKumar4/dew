@@ -1,13 +1,9 @@
 """GPT OSS parity with transformers 5.16.1, from tools/gpt_oss_reference.py.
 
-The MXFP4 encoder is checked the other way round: its bytes go through the
-released reader, transformers' own `convert_moe_packed_tensors`, at test
-time, because a fixture cannot hold the decode of bytes the test just wrote
-and the released encoder (triton_kernels' `downcast_to_mxfp`) needs a GPU.
-What the encoder is meant to emit -- the group's scale and each element's
-code -- is stated here from the format instead, by exact power-of-two search
-and by comparing against the grid's midpoints, so nothing in this file
-repeats dew's own arithmetic.
+The MXFP4 encoder is held to the released encoder transcribed to numpy
+(`released_encode`, since triton_kernels' `downcast_to_mxfp` needs a GPU)
+and its bytes are read back through the released reader, transformers'
+`convert_moe_packed_tensors`.
 """
 
 from pathlib import Path
@@ -49,16 +45,11 @@ def nearest_codes(values: np.ndarray) -> np.ndarray:
 
 
 def released_encode(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """The released encoder written out in numpy, blocks and scales.
-
-    triton_kernels' `downcast_to_mxfp_torch` under ROUND_UP, which is what
-    transformers 5.16.1's `quantize_to_mxfp4` calls: bf16 in, the group's
-    largest magnitude over 6 rounded up to a power of two in the fp32 bits,
-    the reciprocal of that (zero for a zero group) across the group, and the
-    nearest E2M1 value. numpy keeps the subnormals XLA reads and writes as
-    zero, so this is the arithmetic dew has to agree with and not the
-    arithmetic dew can use to get there.
-    """
+    """triton_kernels' `downcast_to_mxfp_torch` under ROUND_UP, as transformers
+    5.16.1's `quantize_to_mxfp4` calls it: bf16 in, the group's largest
+    magnitude over 6 rounded up to a power of two in the fp32 bits, the
+    reciprocal of that (zero for a zero group) across the group, and the
+    nearest E2M1 value."""
     rows = weight.astype(ml_dtypes.bfloat16).astype(np.float32).swapaxes(1, 2)
     groups = np.ascontiguousarray(rows).reshape(*rows.shape[:2], -1, 32)
     rounded = ((np.abs(groups).max(-1, keepdims=True) / np.float32(6)).view(np.uint32)
@@ -76,10 +67,6 @@ def group_codes(blocks: np.ndarray) -> np.ndarray:
     codes = np.empty((*blocks.shape[:-1], 32), np.uint8)
     codes[..., 0::2], codes[..., 1::2] = blocks & 15, blocks >> 4
     return codes
-
-
-def encode(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    return tuple(np.asarray(part) for part in quantize_mxfp4(jnp.asarray(weight)))
 
 
 def bf16_magnitudes() -> np.ndarray:
@@ -112,11 +99,22 @@ def test_biased_interleaved_experts_match_reference():
 
 
 def test_mxfp4_matches_reference_dequantization_exactly():
-    """bf16 output, atol 0; maximum observed absolute difference 0."""
+    """The fixture's bf16 output, atol 0; and every code at the two scale
+    bytes that decode the smallest magnitudes to float32 subnormals, which
+    XLA on CPU flushes to zero and the released reader keeps."""
     with np.load(FIXTURES / "mxfp4.npz") as fixture:
-        actual = dequantize_mxfp4(jnp.asarray(fixture["blocks"]), jnp.asarray(fixture["scales"]))
-        assert actual.dtype == jnp.bfloat16
-        np.testing.assert_array_equal(actual.astype(jnp.float32), fixture["output"])
+        actual = dequantize_mxfp4(fixture["blocks"], fixture["scales"])
+        assert actual.dtype == np.float32
+        np.testing.assert_array_equal(actual, fixture["output"])
+
+    every_code = np.tile(np.arange(16, dtype=np.uint8), 2)
+    blocks = np.tile(every_code[0::2] | (every_code[1::2] << 4), (2, 1, 1, 1))
+    scales = np.array([0, 1], np.uint8).reshape(2, 1, 1)
+    decoded = dequantize_mxfp4(blocks, scales)
+    theirs = released_decode(blocks, scales)
+    assert np.count_nonzero((decoded != 0) & (np.abs(decoded) < np.finfo(np.float32).tiny)) == 16
+    np.testing.assert_array_equal(decoded, theirs)
+    np.testing.assert_array_equal(np.signbit(decoded), np.signbit(theirs))
 
 
 def test_mxfp4_encodes_every_codepoint_and_the_released_reader_agrees():
@@ -124,7 +122,7 @@ def test_mxfp4_encodes_every_codepoint_and_the_released_reader_agrees():
     each value is its own code. atol 0, observed difference 0, both zeros
     kept apart."""
     weight = np.tile(np.concatenate([E2M1, -E2M1]), 2).reshape(1, 32, 1)
-    blocks, scales = encode(weight)
+    blocks, scales = quantize_mxfp4(weight)
 
     assert (blocks.shape, blocks.dtype) == ((1, 1, 1, 16), np.uint8)
     assert (scales.shape, scales.dtype) == ((1, 1, 1), np.uint8)
@@ -154,7 +152,7 @@ def test_mxfp4_encodes_what_the_released_encoder_encodes():
 
     for weight in (random_bf16.reshape(1, -1, 1), mixed.reshape(1, -1, 1).astype(np.float32),
                    (rng.standard_normal((4, 128, 9)) * 0.08).astype(np.float32)):
-        blocks, scales = encode(weight)
+        blocks, scales = quantize_mxfp4(weight)
         want_blocks, want_scales = released_encode(weight)
         np.testing.assert_array_equal(scales, want_scales)
         np.testing.assert_array_equal(blocks, want_blocks)
@@ -167,13 +165,10 @@ def test_mxfp4_encodes_what_the_released_encoder_encodes():
 
 def test_mxfp4_encodes_every_bf16_magnitude_as_the_released_encoder_does():
     """One group per finite bf16 magnitude, subnormals included: both bytes,
-    atol 0. This is where dew's arithmetic has to differ from the
-    reference's -- XLA reads a subnormal as zero and flushes the subnormal
-    quotient of a group under 6 * 2 ** -126, where the reference keeps both
-    and rounds up to the 2 ** -126 scale -- so the domain is checked whole
-    rather than at a few points."""
+    atol 0. The groups under 6 * 2 ** -126 take a subnormal quotient, which
+    XLA on CPU would flush before the round-up reaches the 2 ** -126 scale."""
     weight = np.repeat(bf16_magnitudes(), 32).reshape(1, -1, 1)
-    blocks, scales = encode(weight)
+    blocks, scales = quantize_mxfp4(weight)
     want_blocks, want_scales = released_encode(weight)
     np.testing.assert_array_equal(scales, want_scales)
     np.testing.assert_array_equal(blocks, want_blocks)
@@ -182,14 +177,11 @@ def test_mxfp4_encodes_every_bf16_magnitude_as_the_released_encoder_does():
 def test_mxfp4_keeps_a_group_of_bf16_subnormals():
     """2 ** -127 is a bf16 subnormal, and the released encoder writes it as
     the 0.5 code at the 2 ** -126 scale, so the reader gives it back exactly.
-    XLA reads that weight as zero in every comparison and multiply it takes
-    part in, which would write the group away as zeros; the encoder reads the
-    significand instead. A subnormal beside a normal large enough to set the
-    scale is a code below the grid, and rounds to zero as the reference's own
-    product does."""
+    A subnormal beside a normal large enough to set the scale is a code below
+    the grid, and rounds to zero as the reference's own product does."""
     weight = np.full((1, 32, 1), np.ldexp(1.0, -127), np.float32)
     weight[0, 5, 0] = -weight[0, 5, 0]
-    blocks, scales = encode(weight)
+    blocks, scales = quantize_mxfp4(weight)
     decoded = released_decode(blocks, scales)
 
     assert int(scales[0, 0, 0]) == 1
@@ -199,7 +191,7 @@ def test_mxfp4_keeps_a_group_of_bf16_subnormals():
 
     beside = np.full((1, 32, 1), np.ldexp(1.0, -130), np.float32)
     beside[0, 0, 0] = 1.0
-    blocks, scales = encode(beside)
+    blocks, scales = quantize_mxfp4(beside)
     assert int(scales[0, 0, 0]) == 125
     assert set(group_codes(blocks).reshape(-1).tolist()) == {0, 6}
 
@@ -211,10 +203,10 @@ def test_mxfp4_rounds_an_fp32_weight_through_bf16_first():
     weight can land one code away from where a single rounding would put it."""
     weight = np.full((1, 32, 1), 0.7495, np.float32)
     weight[0, 0, 0] = 6.0
-    blocks, scales = encode(weight)
+    blocks, scales = quantize_mxfp4(weight)
 
     assert int(scales[0, 0, 0]) == 127
-    assert int(nearest_codes(np.float32(0.7495))) == 1
+    assert nearest_codes(np.array([0.7495], np.float32)).tolist() == [1]
     assert int(group_codes(blocks)[0, 0, 0, 1]) == 2
     assert released_decode(blocks, scales)[0, 1, 0] == 1.0
 
@@ -228,14 +220,14 @@ def test_mxfp4_re_encodes_a_checkpoint_group_onto_the_same_values():
     copy the source's."""
     with np.load(FIXTURES / "mxfp4.npz") as fixture:
         blocks, scales, values = (fixture[name] for name in ("blocks", "scales", "output"))
-    again_blocks, again_scales = encode(values)
+    again_blocks, again_scales = quantize_mxfp4(values)
     np.testing.assert_array_equal(released_decode(again_blocks, again_scales), values)
     canonical = np.isin(np.max(group_codes(blocks) & 7, axis=-1), (6, 7))
     np.testing.assert_array_equal(again_blocks[canonical], blocks[canonical])
     np.testing.assert_array_equal(again_scales[canonical], scales[canonical])
 
     threes = np.full((1, 32, 1), 3.0, np.float32)
-    blocks, scales = encode(threes)
+    blocks, scales = quantize_mxfp4(threes)
     assert int(scales[0, 0, 0]) == 126
     assert set(group_codes(blocks).reshape(-1).tolist()) == {7}
     np.testing.assert_array_equal(released_decode(blocks, scales), threes)
@@ -243,14 +235,12 @@ def test_mxfp4_re_encodes_a_checkpoint_group_onto_the_same_values():
 
 def test_mxfp4_zero_and_smallest_groups_take_the_floor_of_the_format():
     """A group with nothing in it takes the 0x00 scale byte and still tells
-    -0.0 from 0.0. A group down at the fp32 normal floor still encodes
-    exactly, at the 2 ** -126 scale the round-up stops on -- the quotient
-    that picks it is subnormal, which is the one place XLA's arithmetic
-    would have written the zero group instead. Below that floor nothing
+    -0.0 from 0.0. A group down at the fp32 normal floor encodes exactly at
+    the 2 ** -126 scale the round-up stops on. Below that floor nothing
     survives: a group of bf16 subnormals decodes to zero."""
     zeros = np.zeros((1, 32, 1), np.float32)
     zeros[0, 3, 0] = -0.0
-    blocks, scales = encode(zeros)
+    blocks, scales = quantize_mxfp4(zeros)
     decoded = released_decode(blocks, scales)
     assert int(scales[0, 0, 0]) == 0
     np.testing.assert_array_equal(decoded, zeros)
@@ -261,13 +251,13 @@ def test_mxfp4_zero_and_smallest_groups_take_the_floor_of_the_format():
     for exponent, code in ((-126, 2), (-125, 4)):
         smallest = np.full((1, 32, 1), np.ldexp(1.0, exponent), np.float32)
         smallest[0, 7, 0] *= 1.5
-        blocks, scales = encode(smallest)
+        blocks, scales = quantize_mxfp4(smallest)
         assert int(scales[0, 0, 0]) == 1
         assert int(group_codes(blocks)[0, 0, 0, 0]) == code
         np.testing.assert_array_equal(released_decode(blocks, scales), smallest)
 
     subnormal = np.full((1, 32, 1), np.ldexp(1.0, -133), np.float32)
-    blocks, scales = encode(subnormal)
+    blocks, scales = quantize_mxfp4(subnormal)
     np.testing.assert_array_equal(released_decode(blocks, scales), np.zeros_like(subnormal))
 
 
@@ -282,7 +272,7 @@ def test_mxfp4_refuses_what_the_format_cannot_hold(weight, message):
     """E2M1 encodes neither an infinity nor a NaN, and a stored group is
     always exactly 32 values, so a half group has nowhere to go."""
     with pytest.raises(ValueError, match=message):
-        quantize_mxfp4(jnp.asarray(weight))
+        quantize_mxfp4(weight)
 
 
 def test_pack_mxfp4_writes_back_the_recorded_stems_and_nothing_else():

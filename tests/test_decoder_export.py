@@ -283,7 +283,7 @@ def test_the_export_carries_the_sources_tokenizer(tmp_path):
 def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_path):
     """The source config describes real FP8 bytes after a training update."""
     import torch
-    from safetensors.torch import save_file
+    from safetensors.torch import load_file, save_file
 
     directory = tmp_path / "fp8"
     source = FIXTURES / "deepseek-v3-tiny"
@@ -309,7 +309,6 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
     state = tool.train(CASES["deepseek_v3"], quantized, ids)
     destination = tmp_path / "exported"
     quantized.save(destination, variables=state.params)
-    from safetensors.torch import load_file
     packed_export = load_file(str(destination / "model.safetensors"))
     assert packed_export[scaled].dtype == torch.float8_e4m3fn
     assert json.loads((destination / "config.json").read_text()) == config
@@ -330,11 +329,14 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
         if layout.name != scaled:
             np.testing.assert_array_equal(float_export[layout.name], layout.export(state.params))
     without_provenance = dataclasses.replace(quantized, quantized_tensors=())
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="recorded no quantized tensors"):
         without_provenance.save(tmp_path / "refused", variables=state.params)
 
 
 def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(tmp_path):
+    """A GPT OSS source shipped MXFP4 writes its trained experts back as
+    blocks and scales the released reader decodes, and every float tensor
+    -- biases, router, sinks, embeddings -- as itself."""
     import torch
     from safetensors.numpy import load_file
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors
@@ -375,9 +377,8 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     np.testing.assert_array_equal(tool.logits(plain, plain.variables, ids),
                                   tool.logits(reloaded, reloaded.variables, ids))
     missing = dataclasses.replace(loaded, quantized_tensors=())
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="recorded no quantized tensors"):
         missing.save(tmp_path / "missing-provenance", variables=state.params)
-
 
 
 def test_an_mtp_copy_that_differs_from_the_trunk_names_the_tensor(tmp_path):
