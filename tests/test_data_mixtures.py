@@ -791,7 +791,7 @@ def test_a_ramp_stage_the_mesh_cannot_hold_is_refused_before_the_run_reads(tmp_p
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0))
 
-    with pytest.raises(ValueError, match="cuts a batch into 8 shards"):
+    with pytest.raises(ValueError, match=r"\[4, 12\].*multiple of 8"):
         trainer.fit(ramped(indexed_data(256, 12), Ramp(start=4, increment=4, samples=16)),
                     steps=2, log_every=100)
 
