@@ -614,6 +614,16 @@ class RampedStream:
     def __iter__(self) -> Iterator[Batch]:
         return self
 
+    @property
+    def stages(self) -> tuple[Stage, ...]:
+        """The batch this stream reads at each stage, and where each begins.
+
+        The trainer reads them off the stream it opened: a compiled step per
+        stage is the whole set of shapes a ramped run runs, and the mesh has
+        to divide every one of them.
+        """
+        return self._stages
+
     def _stage(self) -> Stage:
         """The stage the records read so far leave the run in."""
         return self._stages[bisect.bisect_right(self._starts, self._records) - 1]

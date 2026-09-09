@@ -188,13 +188,14 @@ def test_step_flops_reads_a_jitted_function():
 
 
 def test_throughput_metrics_are_consistent():
-    metrics = make_trainer()._throughput(elapsed=2.0, steps=10, batch=64)
+    metrics = make_trainer()._throughput(elapsed=2.0, steps=10, samples=640, flops=None)
     assert metrics["train/step_time_ms"] == pytest.approx(200.0)
     assert metrics["train/samples_per_sec"] == pytest.approx(320.0)
+    assert "train/mfu" not in metrics, "no measured FLOPs, no utilization"
 
 
 def test_throughput_metrics_ignore_a_zero_interval():
-    assert make_trainer()._throughput(elapsed=0.0, steps=0, batch=64) == {}
+    assert make_trainer()._throughput(elapsed=0.0, steps=0, samples=0, flops=0.0) == {}
 
 
 def test_mfu_is_skipped_on_unknown_hardware():
