@@ -376,7 +376,7 @@ class BlockWiring:
 
     def __post_init__(self):
         if self.layer_scalar not in (None, "frozen", "trainable"):
-            raise ValueError("layer_scalar must be None, frozen or trainable; boolean modes are not supported")
+            raise ValueError("layer_scalar must be None, frozen or trainable")
 
 
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
@@ -1279,7 +1279,7 @@ class CausalTransformer(nn.Module):
 
     def __post_init__(self):
         if self.layer_scalar not in (None, "frozen", "trainable"):
-            raise ValueError("layer_scalar must be None, frozen or trainable; boolean modes are not supported")
+            raise ValueError("layer_scalar must be None, frozen or trainable")
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
         if self.kv_shared_layers is not None:

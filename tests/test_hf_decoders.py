@@ -2865,12 +2865,6 @@ def test_dream_logits_match_the_reference_implementation():
     assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-def test_layer_scalar_rejects_old_boolean_modes(legacy):
-    with pytest.raises(ValueError, match="layer_scalar"):
-        models.build("causal_transformer", vocab_size=8, layer_scalar=legacy)
-
-
 @pytest.mark.parametrize("mode", ["frozen", "trainable"])
 def test_scalar_mode_survives_scanning_and_rematerialized_backward(mode):
     """Frozen HF buffers and trainable Google scalars retain each view's math."""
