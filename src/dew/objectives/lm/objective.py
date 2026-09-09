@@ -43,8 +43,8 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
 from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
                         router_moments, sequence_router_losses)
-from dew.objectives.base import (Aux, EMASpec, Mean, Objective, Step, Variables,
-                                 mean_loss, merge, select)
+from dew.objectives.base import (FROZEN, Aux, EMASpec, Mean, Objective, PathFilter, Step,
+                                 Variables, freeze, mean_loss, merge, thaw)
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import metrics, objectives
 from dew.inference import TextGeneration
@@ -56,20 +56,6 @@ if TYPE_CHECKING:
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
-
-FROZEN = "frozen"
-"""The collection the dense warm-up keeps the main model's weights under.
-The optimizer moves the `params` collection and nothing else, so what the
-warm-up leaves there is the indexer alone; the rest of the tree rides
-beside it as state, and the model sees them merged."""
-
-
-def model_variables(params: Variables) -> Variables:
-    """Merge a pretrained run's frozen split into the model variables."""
-    if FROZEN not in params:
-        return params
-    variables = {name: value for name, value in params.items() if name != FROZEN}
-    return {**variables, "params": merge(params[FROZEN], params["params"])}
 
 
 @dataclass(frozen=True)
@@ -310,6 +296,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         mtp_weight: Optional[float] = None,
         qk_stats: bool = False,
         indexer: Optional[IndexerTraining] = None,
+        trainable: PathFilter | None = None,
     ):
         """`head_chunks` is how many vocabulary slices the loss scores a batch
         in; the `[tokens, vocab]` logits are built one slice at a time. Four costs
@@ -358,7 +345,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         a dense checkpoint does, and the fresh init fills them. The sparse
         phase reads a whole tree, either layout. The warm-up trains nothing
         but the indexer, so the terms of the main loss (`balance_rate`,
-        `aux_loss_alpha`, `mtp_weight`, `loss_role`) are refused there."""
+        `aux_loss_alpha`, `mtp_weight`, `loss_role`) are refused there.
+
+        `trainable` selects the parameter leaves the optimizer moves, by
+        their full path (`dew.objectives.base.PathFilter`); the rest of the
+        tree is kept under `frozen`, the split the warm-up uses for the
+        indexer, so `init` returns it and a checkpoint stores it. An
+        adapter's own filter (`dew.lora.LoRA.trainable`) goes here. None
+        trains every leaf."""
         if getattr(model, "causal", True) is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")
         self.model = model
@@ -388,6 +382,10 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.mtp_weight = mtp_weight
         self.qk_stats = qk_stats
         self.indexer = indexer
+        if indexer is not None and trainable is not None:
+            raise ValueError("the indexer's phase decides what trains, so trainable is not taken with it")
+        self.trainable: PathFilter | None = (
+            _is_indexer if indexer is not None and indexer.phase == "warmup" else trainable)
         if indexer is not None:
             mixers = indexed_mixers(model)
             if not mixers:
@@ -435,11 +433,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def init(self, key, variables: Optional[Variables] = None) -> Variables:
         pretrained = self.pretrained if variables is None else variables
         tree = self._whole_tree(pretrained, key)
-        if not self._warmup:
-            return tree
-        indexer = select(tree, lambda path: path[0] == "params" and _is_indexer(path))
-        frozen = select(tree, lambda path: path[0] == "params" and not _is_indexer(path))
-        return {**tree, "params": indexer["params"], FROZEN: frozen["params"]}
+        return tree if self.trainable is None else freeze(tree, self.trainable)
 
     def _whole_tree(self, pretrained: Optional[Variables], key) -> Variables:
         """The model's variables in one `params` collection: the pretrained
@@ -451,9 +445,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             raise ValueError(
                 "pretrained is the variables dict ({'params': ...}) that "
                 "load_pretrained and model.init return")
-        if FROZEN in pretrained:
-            rest = {name: value for name, value in pretrained.items() if name != FROZEN}
-            pretrained = {**rest, "params": merge(pretrained[FROZEN], pretrained["params"])}
+        pretrained = thaw(pretrained)
         if not self._warmup:
             return pretrained
         # The warm-up may start from a dense checkpoint that has no indexer
@@ -476,13 +468,13 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         from it; the result records the actual and raw-policy likelihoods
         the objective's ratio needs.
         """
-        return TextGeneration(self.model, model_variables(params), sampling=sampling)
+        return TextGeneration(self.model, thaw(params), sampling=sampling)
 
     def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> TextGeneration:
         """The decoder over the state's published weights, sampling and
         budgeted the way this objective's previews are; `processor` decodes."""
         samples = self.samples
-        return TextGeneration(self.model, model_variables(self._pipeline_weights(state, ema)), processor,
+        return TextGeneration(self.model, thaw(self._pipeline_weights(state, ema)), processor,
                               sampling=Sampling() if samples is None else samples.sampling,
                               max_new_tokens=None if samples is None else samples.max_new_tokens)
 
@@ -517,7 +509,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             packing["positions"] = positions[:, :-1]
         if segment_ids is not None:
             packing["segment_ids"] = segment_ids[:, :-1]
-        params = model_variables(params)
+        params = thaw(params)
         collections = ((["router"] if routing else []) + (["qk"] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []))
         hidden, gathered = self._hidden_states(params, inputs, train, rngs, collections, packing)
@@ -676,7 +668,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         segment_ids, positions = _packing(batch)
         collections = [INDEXER_COLLECTION] + (["qk"] if self.qk_stats else [])
         _, gathered = self._hidden_states(
-            model_variables(params), inputs, True, {"dropout": step.key},
+            thaw(params), inputs, True, {"dropout": step.key},
             collections, _packing_of(segment_ids, positions))
         total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], inputs, segment_ids)
         reported = {"indexer_kl": total / jnp.where(mass > 0, mass, 1)}
