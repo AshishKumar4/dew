@@ -6,7 +6,7 @@ import functools
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
@@ -30,7 +30,6 @@ from dew.nn import audio as audio_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs, pad_token_rows
 from dew.nn.multimodal import MultimodalTransformer
-from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
 from dew.registry import models, resolve_dtype, with_precision
@@ -39,7 +38,6 @@ from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition, DiffusionConditioner, T5Segment
 from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
-from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling.guidance import CFG
 from dew.sampling.pipelines import TextToImage
 
