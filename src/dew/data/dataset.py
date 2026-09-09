@@ -426,8 +426,8 @@ def mixture(corpora: Sequence[Corpus], seed: int | None) -> pygrain.MapDataset[o
 
     Grain's own proportional interleave decides which corpus record k comes
     from: the one whose share of the first k + 1 records is short by one, so
-    every prefix of the order -- every batch -- holds each corpus's share to
-    within one record, and nothing is drawn at random
+    every prefix of the order (every global batch) holds each corpus's share
+    to within one record, and nothing is drawn at random
     (`grain/_src/python/dataset/transformations/mix.py:314-347`). Weights
     reach grain as ratios and it scales them to integers against the
     smallest, so a share is exact to a hundredth of the smallest one
@@ -444,10 +444,14 @@ def mixture(corpora: Sequence[Corpus], seed: int | None) -> pygrain.MapDataset[o
 
     Mixing here, ahead of the shard, is what keeps a mixture's position one
     global record count: which corpus record k is from, and where it sits in
-    that corpus, are functions of k. MaxText mixes iterators after the shard
-    and keeps a state per corpus per host, which lets it change the mixture
-    on resume (`grain_data_processing.py:208-212`); dew refuses a changed
-    order instead, as it already does for a changed corpus.
+    that corpus, are functions of k. The shares hold over the global batch.
+    One process's rows of it are every nth record of the interleave, so two
+    corpora at equal weights, which alternate, put only the first on one of
+    two processes and only the second on the other; the step's gradient is
+    the same sum either way. MaxText mixes iterators after the
+    shard and keeps a state per corpus per host, which lets it change the
+    mixture on resume (`grain_data_processing.py:208-212`); dew refuses a
+    changed order instead, as it already does for a changed corpus.
     """
     shares = _shares(corpora)
 
@@ -556,26 +560,11 @@ class GlobalStream:
         self._records += self._batch
         return batch
 
-    def ramping(self, ramp: Ramp) -> "RampedStream":
-        """The same order, cut into the steps `ramp` asks for.
-
-        Opening is what costs something and neither stream has opened yet, so
-        `ramped` builds one of these out of a stream it then drops.
-        """
-        return RampedStream(self._open, self._batch, self._order, ramp)
-
     def get_state(self) -> bytes:
         return position.encode(position.Global(records=self._records, order=self._order))
 
     def set_state(self, state: bytes) -> None:
-        saved = position.decode(state)
-        if saved is None:
-            raise ValueError(
-                "this training stream resumes from a global record count, and the "
-                "saved position is one process's own offset into its shard: either "
-                "a stream that batches its own records or one written before dew "
-                "stored a global count. There is no conversion; resume the run "
-                "that wrote it with the dataset that wrote it")
+        saved = position.read(state)
         if saved.order != self._order:
             raise ValueError(
                 f"the saved data position is {saved.records} records into "
@@ -591,57 +580,64 @@ class GlobalStream:
             reads.close()
 
 
-class RampedStream(GlobalStream):
+@runtime_checkable
+class Resumable(Checkpointable, Protocol):
+    """A stream that is read and can be put back where it stopped, which is
+    what a batch ramp wraps."""
+
+    def __next__(self) -> Batch: ...
+
+
+class RampedStream:
     """A training stream whose step grows over the run's first records.
 
-    The order and the position are the base class's; the ramp only decides
-    how many of its records a step reads. MaxText reads a whole final-size
-    batch and cuts the current one out of a rolling buffer
-    (`common/data_loader.py:122-176`), so the records a step reads are the
-    records the run would have read without the ramp, in the same order, and
-    a stage change neither skips a record nor reads one twice. What is left
-    in the buffer has not been trained on and is not in the position: the
-    count the base class saves is what this stream has handed out, and a
-    resume opens the read there.
+    Wraps a stream whose position is a global record count, a `GlobalStream`
+    or `tokenized` over one, and decides only how many of its records a step
+    reads. MaxText reads a whole final-size batch and cuts the current one
+    out of a rolling buffer (`common/data_loader.py:122-176`), so the records
+    a step reads are the records the run would have read without the ramp,
+    in the same order, and a stage change neither skips a record nor reads
+    one twice. What is left in the buffer has not been trained on and is not
+    in the position, which is the source's with its count replaced by the
+    records handed out; a restore hands the source that count, so it reopens
+    its read there.
     """
 
-    def __init__(self, open: Callable[[int], pygrain.DatasetIterator[Batch]],
-                 batch: int, order: str, ramp: Ramp):
-        super().__init__(open, batch, order)
-        self._stages = ramp.stages(batch)
-        self._starts = tuple(stage.records for stage in self._stages)
-        self._processes = batch // local_batch(batch)
+    def __init__(self, source: Resumable, stages: Sequence[Stage]):
+        self._source = source
+        self._stages = tuple(stages)
+        self._starts = tuple(stage.records for stage in stages)
+        self._processes = jax.process_count()
+        self._records = 0
         self._held: Batch | None = None
 
-    @property
-    def stages(self) -> tuple[Stage, ...]:
-        """The batch this stream reads at each stage, and where each begins.
-
-        The trainer reads them off the stream it opened: a compiled step per
-        stage is the whole set of shapes a ramped run runs, and the mesh has
-        to divide every one of them.
-        """
-        return self._stages
+    def __iter__(self) -> Iterator[Batch]:
+        return self
 
     def _stage(self) -> Stage:
         """The stage the records read so far leave the run in."""
         return self._stages[bisect.bisect_right(self._starts, self._records) - 1]
 
     def __next__(self) -> Batch:
-        rows = self._stage().batch // self._processes
-        if self._reads is None:
-            self._reads = self._open(self._records)
+        stage = self._stage()
+        rows = stage.batch // self._processes
         while self._held is None or rows_of(self._held) < rows:
-            read = next(self._reads)
+            read = next(self._source)
             self._held = read if self._held is None else jax.tree.map(
                 lambda kept, new: np.concatenate([kept, new]), self._held, read)
         step = jax.tree.map(lambda field: field[:rows], self._held)
         self._held = jax.tree.map(lambda field: field[rows:], self._held)
-        self._records += rows * self._processes
+        self._records += stage.batch
         return step
 
+    def get_state(self) -> bytes:
+        place = position.read(self._source.get_state())
+        return position.encode(dataclasses.replace(place, records=self._records))
+
     def set_state(self, state: bytes) -> None:
-        super().set_state(state)
+        self._source.set_state(state)  # Refuses a shard offset and another order.
+        self._held = None
+        self._records = position.read(state).records
         stage = self._stage()
         if (self._records - stage.records) % stage.batch:
             raise ValueError(
@@ -650,9 +646,17 @@ class RampedStream(GlobalStream):
                 f"{stage.records} on, so no step of it ends there: the checkpoint "
                 f"was written by a run that ramped differently")
 
+    def request_stop(self) -> None:
+        """Forward only the source's thread-safe cancellation signal."""
+        request_stop = getattr(self._source, "request_stop", None)
+        if request_stop is not None:
+            request_stop()
+
     def close(self) -> None:
         self._held = None
-        super().close()
+        close = getattr(self._source, "close", None)
+        if close is not None:
+            close()
 
 
 def ramped(data: Dataset, ramp: Ramp) -> Dataset:
@@ -661,17 +665,19 @@ def ramped(data: Dataset, ramp: Ramp) -> Dataset:
     A validation pass keeps the whole batch: a score over a growing number
     of records is a score of a different thing each time.
 
-    Only a stream that cuts its steps out of a global record order can ramp,
-    because the ramp cuts them differently and the count it saves has to be
-    the records it handed over. A stream that batches its own records is
-    refused, by name.
+    Only a stream whose position is a global record count can ramp, because
+    the ramp cuts that order into other steps and the count it saves has to
+    be the records it handed over. A stream that batches its own records
+    reports a shard offset and is refused, by name.
     """
-    ramp.stages(data.batch)  # An impossible schedule fails here, not mid-run.
+    stages = ramp.stages(data.batch)  # An impossible schedule fails here, not mid-run.
 
     def train() -> Iterator[Batch]:
         stream = data.train()
-        if isinstance(stream, GlobalStream):
-            return stream.ramping(ramp)
+        if isinstance(stream, Resumable):
+            state = stream.get_state()
+            if isinstance(state, bytes) and position.translates(state):
+                return RampedStream(stream, stages)
         close = getattr(stream, "close", None)
         if close is not None:
             close()
