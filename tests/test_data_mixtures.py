@@ -547,6 +547,46 @@ def test_a_ramped_stream_resumes_on_the_records_it_had_not_read(monkeypatch):
     assert taken(resumed, 6) == rest
 
 
+def test_a_ramped_stream_put_back_mid_read_forgets_its_buffer(monkeypatch):
+    """A restore into a stream that is already reading, as the prefetch
+    worker restores the stream it opened, hands over the records at the
+    saved count and none it had buffered past it."""
+    as_processes(monkeypatch, 1, 0)
+    schedule = Ramp(start=2, increment=1, samples=6)
+    stream = ramped(indexed_data(64, 4), schedule).train()
+    taken(stream, 1)
+    state = stream.get_state()
+    rest = taken(stream, 6)
+
+    stream.set_state(state)
+
+    assert taken(stream, 6) == rest
+
+
+def test_a_ramped_steps_position_counts_every_process(monkeypatch):
+    """Each process cuts its own share of a stage's batch, and the position
+    is the records all of them handed over: two processes four steps into
+    a ramp of two, then four, have read eight records, and the pool's steps
+    are the single process's steps with the shares interleaved."""
+    schedule = Ramp(start=2, increment=2, samples=8)
+
+    def build():
+        rows = 4 // jax.process_count()
+        data = Dataset(train=train_stream(Indexed(1, 64), [], batch=rows, seed=0, loading=READ),
+                       val=None, records=64, batch=4)
+        return ramped(data, schedule).train()
+
+    whole = pooled(monkeypatch, build, 1, 6)
+    as_processes(monkeypatch, 2, 1)
+    stopped = build()
+    taken(stopped, 4)
+
+    assert [len(step) for step in whole] == [2, 2, 2, 2, 4, 4]
+    assert json.loads(stopped.get_state())["dew_global_position"]["records"] == 8
+    assert pooled(monkeypatch, build, 2, 6) == whole
+    assert pooled(monkeypatch, build, 2, 2, stopped.get_state()) == whole[4:]
+
+
 def test_a_position_no_step_of_this_ramp_ends_on_is_refused(monkeypatch):
     as_processes(monkeypatch, 1, 0)
     stream = ramped(indexed_data(64, 4), Ramp(start=2, increment=1, samples=6)).train()
