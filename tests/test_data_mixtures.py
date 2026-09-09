@@ -28,9 +28,10 @@ from flax import linen as nn
 
 import dew.data
 from dew.data import Corpus, Loading, PackedTokens, Ramp, ramped
-from dew.data.dataset import Dataset, mixed_records, mixed_stream, mixture, train_stream
+from dew.data.dataset import (CAPTION, Dataset, mixed_records, mixed_stream, mixture, tokenized,
+                              train_stream)
 from dew.objectives.base import Aux, Objective
-from dew.training import Checkpoints, Layout, Trainer
+from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
 
@@ -242,6 +243,25 @@ def test_load_reads_a_weighted_mixture_of_two_datasets(two_splits):
         stream.close()
     for step in batches:
         assert sum(value >= 2000 for value in step) == 1, step
+
+
+def test_load_scores_a_mixture_on_the_same_held_out_records_every_pass(two_splits):
+    """A mixed validation pass keeps the weights and stops before the small
+    split comes round: eight small records at a quarter of a step are
+    thirty-two records, eight batches of four, each record once, and the
+    second pass is the first pass again."""
+    big, small = two_splits
+    data = dew.data.load({f"hf/{big}": 0.75, f"hf/{small}": 0.25}, batch=4,
+                         val_split="train", preprocess=just_index, loading=READ)
+
+    assert data.val is not None
+    first, second = ids(data.val()), ids(data.val())
+
+    assert len(first) == 8, "a pass runs until the first split would repeat"
+    scored = [value for step in first for value in step]
+    assert len(set(scored)) == 32, "a record was scored twice"
+    assert all(sum(value >= 2000 for value in step) == 1 for step in first), first
+    assert second == first
 
 
 def test_a_mixture_written_in_either_order_is_the_same_run(two_splits):
@@ -540,16 +560,66 @@ def test_a_position_no_step_of_this_ramp_ends_on_is_refused(monkeypatch):
         other.set_state(state)
 
 
-def test_only_a_stream_that_cuts_a_global_order_can_ramp():
-    class OwnBatches:
-        def __iter__(self):
-            return self
+def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream(monkeypatch):
+    """An image or video dataset opens `tokenized` over its global stream, so
+    the ramp has to cut the batches that stage hands over and save the
+    position it forwards; a ramp that only knew the bare stream refused
+    every captioned dataset by the wrapper's name."""
+    as_processes(monkeypatch, 1, 0)
 
-        def __next__(self):
-            return {"id": np.zeros((4,), np.int32)}
+    class Captioned(Indexed):
+        def __getitem__(self, index: int) -> dict:
+            return {**super().__getitem__(index), CAPTION: f"caption {index}"}
 
-    data = Dataset(train=OwnBatches, val=None, records=64, batch=8)
-    with pytest.raises(TypeError, match="OwnBatches"):
+    def lengths(captions):
+        return {"length": np.asarray([len(caption) for caption in captions], np.int32)}
+
+    def captioned(batch: int) -> Dataset:
+        return Dataset(train=tokenized(train_stream(Captioned(1, 64), [], batch=batch,
+                                                    seed=0, loading=READ), lengths),
+                       val=None, records=64, batch=batch)
+
+    flat = [value for step in taken(captioned(4).train(), 12) for value in step]
+    schedule = Ramp(start=2, increment=1, samples=6)
+    stream = ramped(captioned(4), schedule).train()
+    steps = list(itertools.islice(stream, 6))
+    state = stream.get_state()
+    rest = taken(stream, 3)
+
+    assert [len(step["id"]) for step in steps] == [2, 2, 3, 4, 4, 4]
+    assert [int(value) for step in steps for value in step["id"]] == flat[:19]
+    assert all(len(step["length"]) == len(step["id"]) for step in steps), (
+        "the tokenized field was cut to another step than the ids")
+    resumed = ramped(captioned(4), schedule).train()
+    resumed.set_state(state)
+    assert json.loads(state)["dew_global_position"]["records"] == 19
+    assert taken(resumed, 3) == rest
+
+
+class OwnBatches:
+    """A stream that cut its batches itself, with no position at all."""
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return {"id": np.zeros((4,), np.int32)}
+
+
+class ShardOffset(OwnBatches):
+    """The same, reporting where its own shard stopped, as grain does."""
+
+    def get_state(self):
+        return {"next_index": 3}
+
+    def set_state(self, state):
+        pass
+
+
+@pytest.mark.parametrize("stream", [OwnBatches, ShardOffset])
+def test_only_a_stream_whose_position_is_a_global_count_can_ramp(stream):
+    data = Dataset(train=stream, val=None, records=64, batch=8)
+    with pytest.raises(TypeError, match=stream.__name__):
         ramped(data, Ramp(start=4, increment=4, samples=16)).train()
 
 
@@ -629,11 +699,10 @@ def test_a_ramped_run_lands_where_the_fixed_batch_runs_stitched_together_land(tm
         ramped(indexed_data(records, FINAL, seed), RAMP),
         steps=sum(lengths), log_every=100, checkpoint_every=None)
 
-    stitched = None
-    for stage, length in enumerate(lengths):
-        stitched = regression_trainer(tmp_path / "stitched").fit(
-            indexed_data(records, [8, 16, 24][stage], seed),
-            steps=sum(lengths[:stage + 1]), log_every=100, checkpoint_every=None)
+    stitched = [regression_trainer(tmp_path / "stitched").fit(
+                    indexed_data(records, batch, seed), steps=sum(lengths[:stage + 1]),
+                    log_every=100, checkpoint_every=None)
+                for stage, batch in enumerate([8, 16, 24])][-1]
 
     assert [stage.batch for stage in stages] == [8, 16, 24]
     assert lengths == [4, 2, 3]
@@ -687,6 +756,21 @@ def test_a_ramp_stage_the_mesh_cannot_hold_is_refused_before_the_run_reads(tmp_p
                     steps=2, log_every=100)
 
 
+def test_a_ramp_stage_the_pipeline_cannot_cut_into_microbatches_is_refused():
+    """A pipelined step cuts its batch into microbatches, which the decoder
+    checks when it traces, so a stage a later compile would refuse is
+    refused before the run reads: two stages over four devices and six
+    microbatches hold batches of twelve, and stages of eight and sixteen
+    are not ones."""
+    trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
+                      mesh=MeshSpec(stage=2, microbatches=6),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+
+    with pytest.raises(ValueError, match=r"\[8, 16\].*multiple of 12"):
+        trainer.fit(ramped(indexed_data(256, 24), Ramp(start=8, increment=8, samples=16)),
+                    steps=2, log_every=100)
+
+
 def test_the_log_tick_reports_the_records_a_ramped_interval_read():
     """`samples_per_sec` is the records the interval read over its wall time,
     summed per step, so a ramped interval is not reported as if every step
@@ -698,6 +782,9 @@ def test_the_log_tick_reports_the_records_a_ramped_interval_read():
             logged.append((step, dict(scalars)))
 
         def artifact(self, value, step):
+            pass
+
+        def close(self):
             pass
 
     trainer = Trainer(
