@@ -142,6 +142,38 @@ def merge(tree: Variables, overlay: Variables) -> Variables:
     return merged
 
 
+FROZEN = "frozen"
+"""The collection a partially trained run keeps its held weights under.
+The optimizer moves the `params` collection and nothing else, so what
+`freeze` leaves there is what trains; the rest rides beside it as state,
+and the model sees them merged by `thaw`."""
+
+
+def freeze(variables: Variables, trainable: PathFilter) -> Variables:
+    """`variables` with the `params` leaves `trainable` rejects moved under `FROZEN`.
+
+    Paths are full leaf paths, `("params", ...)`. A filter that keeps every
+    leaf or none names nothing to split and is refused.
+    """
+    leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
+    kept = sum(trainable(("params", *(entry.key for entry in path))) for path, _ in leaves)
+    if kept in (0, len(leaves)):
+        raise ValueError(
+            f"trainable keeps {kept} of {len(leaves)} parameter leaves, which "
+            f"{'freezes' if kept else 'trains'} nothing")
+    moving = select(variables, lambda path: path[0] == "params" and trainable(path))
+    frozen = select(variables, lambda path: path[0] == "params" and not trainable(path))
+    return {**variables, "params": moving["params"], FROZEN: frozen["params"]}
+
+
+def thaw(variables: Variables) -> Variables:
+    """The tree with its frozen split undone, one `params` collection again."""
+    if FROZEN not in variables:
+        return variables
+    rest = {name: value for name, value in variables.items() if name != FROZEN}
+    return {**rest, "params": merge(variables[FROZEN], variables["params"])}
+
+
 @dataclass(frozen=True)
 class EMASpec:
     """Which leaves of the variables the EMA copy tracks, and how fast.

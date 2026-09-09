@@ -63,7 +63,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
     from dew.registry import objectives
     import dew.objectives.lm  # noqa: F401 registers the saved objective kinds
     import dew.objectives.rl  # noqa: F401 registers the saved objective kinds
-    from dew.objectives.lm.objective import model_variables
+    from dew.objectives.base import thaw
 
     record = json.loads((root / RUN_FILE).read_text())
     if not isinstance(record, dict) or not isinstance(record.get("objective"), str):
@@ -105,7 +105,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
     if controls is not None and not isinstance(controls, dict):
         raise ValueError("the run's sampling policy must be a Sampling record")
     sampling = Sampling() if controls is None else Sampling(**controls)
-    return TextGeneration(model, model_variables(variables), RunProcessor(tokenizer), sampling=sampling,
+    return TextGeneration(model, thaw(variables), RunProcessor(tokenizer), sampling=sampling,
                           max_new_tokens=budget if budget else None)
 
 def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
