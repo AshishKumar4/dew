@@ -1010,15 +1010,27 @@ def _qwen3_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any
                         layer_types=_qwen_layer_types(hf_config, used))
 
 
+def _sparse_step_layers(hf_config: Mapping[str, Any], layers: int, used: set[str]) -> Tuple[int, ...]:
+    """The layers a Qwen MoE routes: every decoder_sparse_step-th counting
+    from one, minus mlp_only_layers (modeling_qwen3_moe.py:309-313,
+    modeling_qwen3_next.py:813-818)."""
+    used.update(('decoder_sparse_step', 'mlp_only_layers'))
+    step = int(hf_config.get('decoder_sparse_step', 1))
+    if step < 1:
+        _refuse(f"decoder_sparse_step {step}", "the reference counts layers from one")
+    dense = {int(index) for index in hf_config.get('mlp_only_layers') or ()}
+    return tuple(index for index in range(layers)
+                 if (index + 1) % step == 0 and index not in dense)
+
+
 def _qwen3_moe_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
     """The Qwen3 block with a routed feed-forward on the layers
-    decoder_sparse_step and mlp_only_layers pick (modeling_qwen3_moe.py:
-    309-313). Every decoder_sparse_step-th layer counting from one routes,
-    minus the listed ones, which stay dense at intermediate_size. The routed
-    experts are moe_intermediate_size wide. Its window rule is not Qwen3's.
-    With use_sliding_window every layer is windowed and max_window_layers is
-    never read (configuration_qwen3_moe.py:115, modeling_qwen3_moe.py:149).
-    The expert count is `num_experts`, with `num_local_experts` its alias
+    decoder_sparse_step and mlp_only_layers pick; the others stay dense at
+    intermediate_size. The routed experts are moe_intermediate_size wide.
+    Its window rule is not Qwen3's. With use_sliding_window every layer is
+    windowed and max_window_layers is never read
+    (configuration_qwen3_moe.py:115, modeling_qwen3_moe.py:149). The expert
+    count is `num_experts`, with `num_local_experts` its alias
     (attribute_map), the name transformers 5.16.1 writes it back under."""
     layers = int(hf_config['num_hidden_layers'])
     used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
@@ -1027,17 +1039,11 @@ def _qwen3_moe_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str,
     layer_types = _specified_layer_types(hf_config, used, (
         'sliding_attention' if windowed else 'full_attention',) * layers)
     config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types)
-    used.update(('num_experts', 'num_local_experts', 'decoder_sparse_step',
-                 'mlp_only_layers', 'norm_topk_prob', 'moe_intermediate_size'))
+    used.update(('num_experts', 'num_local_experts', 'norm_topk_prob', 'moe_intermediate_size'))
     experts = hf_config.get('num_experts', hf_config.get('num_local_experts'))
     if experts is None:
         _refuse("num_experts", "a qwen3_moe layer needs its expert count")
-    step = int(hf_config.get('decoder_sparse_step', 1))
-    if step < 1:
-        _refuse(f"decoder_sparse_step {step}", "the reference counts layers from one")
-    dense = {int(index) for index in hf_config.get('mlp_only_layers') or ()}
-    sparse = tuple(index for index in range(layers)
-                   if (index + 1) % step == 0 and index not in dense)
+    sparse = _sparse_step_layers(hf_config, layers, used)
     if not sparse:
         _refuse("mlp_only_layers with decoder_sparse_step",
                 "together they leave no routed layer, which is a dense qwen3 model")
@@ -1498,17 +1504,12 @@ def _qwen3_next_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str
     used.add('rope_scaling')
     if hf_config.get('rope_scaling') is not None:
         _refuse('rope_scaling', 'the Qwen3-Next rotary is plain at rope_theta')
-    layers = int(hf_config['num_hidden_layers'])
-    used.update(('num_experts', 'decoder_sparse_step', 'mlp_only_layers', 'norm_topk_prob',
-                 'moe_intermediate_size', 'shared_expert_intermediate_size'))
+    used.update(('num_experts', 'norm_topk_prob', 'moe_intermediate_size',
+                 'shared_expert_intermediate_size'))
     experts = _record_int(hf_config, 'num_experts')
-    step = _record_int(hf_config, 'decoder_sparse_step')
-    if step < 1:
-        _refuse(f"decoder_sparse_step {step}", "the reference counts layers from one")
-    dense = {int(index) for index in hf_config.get('mlp_only_layers') or ()}
-    sparse = tuple(index for index in range(layers)
-                   if experts > 0 and (index + 1) % step == 0 and index not in dense)
-    if sparse:
+    sparse = _sparse_step_layers(hf_config, int(hf_config['num_hidden_layers']), used)
+    # `num_experts > 0` gates the routed block too (modeling_qwen3_next.py:814).
+    if sparse and experts > 0:
         config['mixture'] = _softmax_mixture(
             hf_config, used, experts, layers=sparse,
             norm_topk_prob=bool(hf_config.get('norm_topk_prob', True)),
