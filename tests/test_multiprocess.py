@@ -304,26 +304,31 @@ def test_processes_read_disjoint_shards_that_cover_the_corpus(tmp_path):
 
 
 @pytest.mark.distributed
-def test_processes_pack_disjoint_documents(tmp_path):
-    """The packed loader shards by slicing documents, which is its own rule.
+def test_processes_read_disjoint_windows_of_one_packing(tmp_path):
+    """The packing is planned over the whole corpus, ahead of the shard, and
+    the windows are what the processes divide.
 
-    It cannot use ShardByJaxProcess, because sharding after the packer would
-    have every process pack the same documents into the same windows, so it
-    strides the document list instead. A process may only see documents from
-    its own stride, and never one of another's.
+    Sharding the documents instead, as this loader once did, made a window a
+    fact about one process's own documents: no two process counts packed the
+    same windows and a saved position belonged to the count that wrote it.
+    With one plan, a process reads every nth window of it, so the union of
+    what the pool reads is the split and the intersection is empty.
     """
     documents, seq_len = 24, 6
+    # Each document is six tokens and an eos, so it fills a seven-id window
+    # by itself and window i holds document i.
     corpus = document_corpus(tmp_path / "corpus", documents, length=seq_len)
     reports = run_pool("packed", tmp_path / "out", 2, tokens=corpus,
                        seq_len=seq_len, workers=2)
 
     packed = [report["documents"] for report in reports]
     for index, seen in enumerate(packed):
-        assert seen, f"process {index} packed nothing"
-        # Document i is value i + 1, and the stride keeps i for process i % 2.
+        assert seen, f"process {index} read nothing"
+        # Window i is document i + 1 here, and process p reads windows
+        # p, p + 2, ... of the one plan.
         assert all((value - 1) % 2 == index for value in seen), seen
-    assert not set(packed[0]) & set(packed[1]), "both processes packed one document"
-    assert set(packed[0] + packed[1]) <= set(range(1, documents + 1))
+    assert not set(packed[0]) & set(packed[1]), "both processes read one window"
+    assert set(packed[0] + packed[1]) == set(range(1, documents + 1))
     for report in reports:
         assert report["local_batch_size"] == worker.BATCH // 2
         assert report["windows"] % (worker.BATCH // 2) == 0, "a partial batch came out"
@@ -333,14 +338,13 @@ def test_processes_pack_disjoint_documents(tmp_path):
 def test_a_validation_split_packed_unevenly_ends_on_every_process(tmp_path):
     """Every process scores the batch count all of them have.
 
-    The packed split strides its documents over the processes and packs each
-    stride on its own. Of these 60 documents, 16 on process 0's stride and
-    20 on process 1's fill a window and the rest are one eos each, so the
-    strides pack into 18 and 22 windows, 4 and 5 batches of 4. Each batch is
-    agreed before it is scored, so both score 4; a process that bounded its
-    own pass with an islice would issue a fifth validation collective after
-    the other had left the pass, and the pool would sit in it until the
-    heartbeat killed both.
+    Of these 60 documents, 36 fill a nine-id window and 24 are one eos each,
+    which the plan packs into 39 windows; process 0 reads 20 of them and
+    process 1 the other 19, so their passes are 5 and 4 batches of 4. Each
+    batch is agreed before it is scored, so both score 4; a process that
+    bounded its own pass with an islice would issue a fifth validation
+    collective after the other had left the pass, and the pool would sit in
+    it until the heartbeat killed both.
     """
     seq_len, val_steps = 8, 5
     lengths = [seq_len if index // 2 < (16, 20)[index % 2] else 0 for index in range(60)]
@@ -349,7 +353,7 @@ def test_a_validation_split_packed_unevenly_ends_on_every_process(tmp_path):
                        fsdp_size=2, steps=2, records=RECORDS, tokens=corpus,
                        seq_len=seq_len, val_steps=val_steps)
 
-    assert [report["val_available"] for report in reports] == [4, 5]
+    assert [report["val_available"] for report in reports] == [5, 4]
     for report in reports:
         assert report["val_batches"] == 4
         assert report["step"] == 2
@@ -591,6 +595,77 @@ def test_a_pool_position_resumes_on_another_process_count(tmp_path, elastic_chec
         assert report["dataset_state"] == whole[index]["dataset_state"]
         assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
                                dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+PACKED_SEQ_LEN = 15
+
+
+@pytest.fixture(scope="module")
+def packed_checkpoint(tmp_path_factory):
+    """A three-step fit on two processes over the packed training stream."""
+    directory = tmp_path_factory.mktemp("packed-checkpoint")
+    corpus = document_corpus(directory / "corpus", 48, length=PACKED_SEQ_LEN)
+    reports = run_pool("packed_fit", directory / "out", 2, name="packed",
+                       run_dir=directory / "run", fsdp_size=1, steps=POOL_STEPS,
+                       tokens=corpus, seq_len=PACKED_SEQ_LEN)
+    positions = {report["dataset_state"] for report in reports}
+    assert len(positions) == 1, "the processes saved different global positions"
+    saved = json.loads(positions.pop())[worker.ENVELOPE]
+    assert saved["records"] == POOL_STEPS * worker.BATCH
+    assert "PackedWindows" in saved["order"], "the order has to name the packing"
+    return {"run_dir": directory / "run", "corpus": corpus, "reports": reports}
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("processes", [1, 4])
+def test_a_packed_pool_position_resumes_on_another_process_count(tmp_path,
+                                                                 packed_checkpoint,
+                                                                 processes):
+    """The packed corpus is the case a resume used to refuse.
+
+    Its windows are planned over the whole corpus ahead of the shard, so
+    global batch k is the same windows at any process count, and the count
+    two processes saved is where one process or four carry on. What is
+    compared is the windows themselves, step by step, against a run of the
+    resumed size that nobody stopped, and the parameters they trained.
+    """
+    directory = tmp_path / "resumed-run"
+    shutil.copytree(packed_checkpoint["run_dir"], directory)
+    flags = {"name": "packed", "fsdp_size": 1, "steps": 2 * POOL_STEPS,
+             "tokens": packed_checkpoint["corpus"], "seq_len": PACKED_SEQ_LEN}
+
+    resumed = run_pool("packed_fit", tmp_path / "resumed", processes,
+                       run_dir=directory, **flags)
+    whole = run_pool("packed_fit", tmp_path / "whole", processes,
+                     run_dir=tmp_path / "whole-run", **flags)
+
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == POOL_STEPS
+        assert json.loads(report["restored_dataset_state"])[worker.ENVELOPE]["records"] == (
+            POOL_STEPS * worker.BATCH)
+        assert report["step"] == 2 * POOL_STEPS
+        assert report["windows"] == whole[index]["windows"][POOL_STEPS:], (
+            "the resumed run read other windows than the run nobody stopped")
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+@pytest.mark.distributed
+def test_a_packed_pool_reads_the_windows_one_process_reads(tmp_path, packed_checkpoint):
+    """The same claim without a checkpoint in it: the union of the windows a
+    pool reads at a step is the step one process reads, row for row."""
+    flags = {"name": "packed", "fsdp_size": 1, "steps": POOL_STEPS,
+             "tokens": packed_checkpoint["corpus"], "seq_len": PACKED_SEQ_LEN}
+    single = run_worker("packed_fit", tmp_path / "single.json", devices=DEVICES,
+                        run_dir=tmp_path / "single-run", **flags)
+    pool = run_pool("packed_fit", tmp_path / "pool", 2,
+                    run_dir=tmp_path / "pool-run", **flags)
+
+    for step in range(POOL_STEPS):
+        rows = [row for held in zip(*(report["windows"][step] for report in pool))
+                for row in held]
+        assert rows == single["windows"][step], f"step {step} read other windows"
 
 
 # --------------------------------------------------------------------------

@@ -3,11 +3,12 @@
 A `ChatMessages` source reads a parquet file of conversations and renders
 each with the tokenizer's chat template. Every token gets the role of the
 message that wrote it, so `LMObjective` with `loss_role=Role.ASSISTANT`
-trains on assistant tokens only. Packing reuses the token pipeline's
-first-fit bins with `text_roles` as one more per-token feature. Grain emits
-segment ids and positions per packed feature, so a bin carries `text`,
-`text_roles`, `text_segment_ids`, `text_positions` and the identical
-`text_roles_segment_ids`, `text_roles_positions`, all aligned.
+trains on assistant tokens only. Packing is the token pipeline's plan over
+the whole corpus (`PackedWindows`) with `text_roles` as one more per-token
+field, so a window carries `text`, `text_roles`, `text_segment_ids`,
+`text_positions` and the identical `text_roles_segment_ids`,
+`text_roles_positions`, all aligned, and the training stream's position is
+a global window count that resumes on any process count.
 
 Conversations are structured. A `Message` carries what the Hugging Face
 chat-template contract reads: a role, content that is a string, a list of
@@ -31,14 +32,14 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 import grain.python as pygrain
-import jax
 import numpy as np
 from jinja2 import TemplateError
 
 from dew.registry import datasets
 
-from .dataset import Batch, Dataset, DatasetSpec, Loading, local_batch
-from .tokens import DocumentChunks, bounded, chunk_counts
+from .dataset import (Batch, Dataset, DatasetSpec, Loading, describe, local_batch,
+                      train_stream, validation_pass)
+from .tokens import PackedWindows, bounded
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -540,10 +541,13 @@ class ChatMessages(DatasetSpec):
     and whose `tools` column, when present, holds each row's tool schemas;
     `tokenizer` is the hub name or local path whose chat template renders
     them. Each conversation (in chunks, when it outgrows the window) is one
-    element the packer adds to the first bin with room, and every emitted
+    element the packing plan adds to the first window with room, and every
     window carries `text_roles` beside the ids, so the loss can count one
-    role's targets. `val_path` is a second parquet file scored as one pass;
-    None trains without validation.
+    role's targets. The plan is over the whole file in row order, ahead of
+    the shard, as `PackedTokens` plans its documents, so `records` is the
+    windows of a pass exactly and a saved position is a global window count.
+    `val_path` is a second parquet file scored as one pass; None trains
+    without validation.
     """
 
     tokenizer: str
@@ -556,52 +560,27 @@ class ChatMessages(DatasetSpec):
     packing_bins: int = 8
 
     def load(self, *, batch: int) -> Dataset:
-        from grain.experimental import FirstFitPackIterDataset
-
         if self.path is None:
             raise ValueError("ChatMessages reads a parquet file: --data.path names it")
-        per_process = local_batch(batch)
-        window = self.seq_len + 1
-        train_source = ConversationSource(self.path)
-        train_lengths = _lengths(train_source, self.tokenizer)
+        rows, window = local_batch(batch), self.seq_len + 1
 
-        def stream(source: ConversationSource, lengths: list[int], shuffle: bool,
-                   epochs: int | None):
+        def packed(path: str) -> PackedWindows:
+            source = ConversationSource(path)
             rendered = pygrain.MapDataset.source(source).map_with_index(
                 RenderConversation(self.tokenizer))
-            chunks: pygrain.MapDataset[Batch] = DocumentChunks(rendered, lengths, window)
-            chunks = chunks[jax.process_index()::jax.process_count()]  # a slice is a dataset
-            if shuffle:
-                chunks = chunks.shuffle(self.seed)
-            reads = chunks.repeat(epochs).to_iter_dataset()
-            if self.loading.workers:
-                # The workers render records, and the packer stays behind them
-                # in this process. Grain runs a whole pipeline per worker, so
-                # packing inside them would fill bins from one worker's slice
-                # of the records and make the windows depend on worker_count.
-                reads = reads.mp_prefetch(pygrain.MultiprocessingOptions(
-                    num_workers=self.loading.workers,
-                    per_worker_buffer_size=self.loading.worker_buffer))
-            packed = FirstFitPackIterDataset(
-                reads,
-                length_struct={"text": window, ROLES_KEY: window},
-                num_packing_bins=self.packing_bins,
-                seed=self.seed,
-                # Bins come out in packing order for val, so a validation pass
-                # is the same batches every time.
-                shuffle_bins=shuffle,
-                padding_struct={"text": 0, ROLES_KEY: 0},
-            )
-            return iter(packed.batch(per_process, drop_remainder=True))
+            return PackedWindows(rendered, _lengths(source, self.tokenizer), window,
+                                 self.packing_bins,
+                                 f"{describe(source)} rendered by {self.tokenizer!r}")
 
+        train = packed(self.path)
         val = None
         if self.val_path is not None:
-            val_source = ConversationSource(self.val_path)
-            val_lengths = _lengths(val_source, self.tokenizer)
-            val = bounded(lambda: stream(val_source, val_lengths, False, 1), self.val_batches)
+            val = bounded(validation_pass(packed(self.val_path), [], batch=rows,
+                                          seed=self.seed, loading=self.loading),
+                          self.val_batches)
         return Dataset(
-            train=lambda: stream(train_source, train_lengths, True, None),
+            train=train_stream(train, [], batch=rows, seed=self.seed, loading=self.loading),
             val=val,
-            records=int(chunk_counts(train_lengths, window).sum()),
+            records=len(train),
             batch=batch,
         )

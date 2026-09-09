@@ -471,7 +471,8 @@ def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
     _document_dir(tmp_path, [[10, 11, 12], [20, 21, 22, 23, 24], [30, 31, 32, 33]])
     data = _packed_tokens(tmp_path, seq_len=seq_len, packing_bins=2).load(batch=2)
 
-    assert data.records == 3 and data.batch == 2
+    # Two windows hold the three documents, and records is that pass exactly.
+    assert data.records == 2 and data.batch == 2 and data.steps_per_epoch == 1
     batch = next(data.val())
 
     for key in ("text", "text_segment_ids", "text_positions"):

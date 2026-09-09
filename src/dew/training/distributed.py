@@ -154,6 +154,20 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: Optional[list] = None) -> M
     )
 
 
+def batch_divisor(mesh: Mesh, spec: MeshSpec) -> int:
+    """The count every global batch a step reads has to be a multiple of.
+
+    A batch's rows are sharded over the batch axes as whole rows, and a
+    pipelined step cuts them into `spec`'s microbatches (one per stage when
+    unset), so a batch neither divides fails where it is placed or traced.
+    A run whose batch never changes hits that on its first step; a batch
+    ramp is checked against this before it reads, since a later stage would
+    fail an hour in.
+    """
+    shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+    return math.lcm(shards, spec.microbatches or spec.stage)
+
+
 def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:
     """Shard the largest evenly-divisible axis over 'fsdp', else replicate.
 

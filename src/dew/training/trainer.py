@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Generic, Protocol
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
@@ -27,13 +28,13 @@ from termcolor import colored
 
 from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
-from dew.data.dataset import Checkpointable
+from dew.data.dataset import Checkpointable, RampedStream, rows_of
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import (Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective,
                                  Step, Variables, merge, select, mean_loss)
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.training.distributed import (
-    DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_shardings, build_mesh,
+    DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_divisor, batch_shardings, build_mesh,
     shard_batch,
 )
 from dew.training.evaluation import Evaluation, evaluate
@@ -55,6 +56,15 @@ CompiledStep = Callable[
     [TrainState, Batch],
     tuple[TrainState, jax.Array, Mapping[str, jax.Array], jax.Array, jax.Array]]
 """A call returns state, scalar loss, metrics, loss_finite, and accepted."""
+
+Shapes = tuple[tuple[int, ...], ...]
+"""A batch's leaf shapes in tree order, the key a compiled step is held
+under. A fixed batch has one; a ramped batch has one per stage of its ramp,
+each compiled on the first step that reads it."""
+
+
+def batch_shapes(batch: Batch) -> Shapes:
+    return tuple(np.shape(leaf) for leaf in jax.tree.leaves(batch))
 
 
 class Rollout(Protocol):
@@ -241,7 +251,8 @@ class Trainer(Generic[Loss, Effects]):
         self.step = step
         self.rollout = rollout
         self.profile = profile
-        # Measured off the compiled step, once per fit.
+        # Measured off the step `compile` last compiled, which for a ramped
+        # run is the stage it was called for; `fit` keeps one per stage.
         self.flops_per_step = None
 
     # ------------------------------------------------------------------
@@ -640,13 +651,17 @@ class Trainer(Generic[Loss, Effects]):
             if current == steps and checkpoints is not None and checkpoints.latest is not None:
                 return state
             local_every = None if checkpoints is None else checkpoints.local_every
-            train_step = None
+            compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
             # Rebound once the step is compiled, so the first tick measures steps,
             # not the compile.
             last_log_time = time.time()
             last_saved = current if checkpoints is not None and checkpoints.latest is not None else None
             interval_steps = 0
             steps_since_log = 0
+            # Summed per step rather than taken off the dataset's batch, so a
+            # ramped interval reports the records it read and their FLOPs.
+            interval_samples = 0
+            interval_flops: float | None = 0.0
             # Seconds spent sampling this interval, logged under
             # train/rollout_seconds when a rollout is set.
             rollout_seconds = 0.0
@@ -668,6 +683,21 @@ class Trainer(Generic[Loss, Effects]):
                         f"written without the data position would replay the data on "
                         f"resume. Train it with checkpoint_every=None "
                         f"(--trainer.checkpoint-every None)")
+                if isinstance(source, RampedStream):
+                    if self.accumulation > 1:
+                        raise ValueError(
+                            f"a batch ramp grows the records a step reads, and an "
+                            f"accumulation window of {self.accumulation} pools "
+                            f"microbatches of one shape into one update; ramp the "
+                            f"batch or accumulate, not both")
+                    divisor = batch_divisor(mesh, self.mesh)
+                    refused = [stage.batch for stage in source.stages if stage.batch % divisor]
+                    if refused:
+                        raise ValueError(
+                            f"the batch ramp reads {refused} records a step at some of "
+                            f"its stages, and {dict(mesh.shape)} with "
+                            f"{self.mesh.microbatches or self.mesh.stage} microbatch(es) "
+                            f"holds a batch that is a multiple of {divisor}")
                 train = DevicePrefetchIterator(source, mesh, source_state=position)
                 source = None  # Lifetime transferred to the prefetch worker.
 
@@ -693,9 +723,12 @@ class Trainer(Generic[Loss, Effects]):
                         jax.random.fold_in(state.key, state.step), 1)
                     batch = shard_batch(mesh, self.rollout(state, batch, key))
                     rollout_seconds += time.perf_counter() - began
-                if train_step is None:
-                    train_step = self.compile(state, batch)
-                    last_log_time = time.time()
+                shapes = batch_shapes(batch)
+                if shapes not in compiled:
+                    compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
+                    if len(compiled) == 1:
+                        last_log_time = time.time()
+                train_step, measured_flops = compiled[shapes]
                 if (profile is not None and not tracing and traced == 0
                         and seen >= profile.warmup):
                     jax.profiler.start_trace(profile.directory)
@@ -707,6 +740,9 @@ class Trainer(Generic[Loss, Effects]):
                 seen += 1
                 steps_since_log += 1
                 interval_steps += 1
+                interval_samples += rows_of(batch)
+                interval_flops = (None if interval_flops is None or measured_flops is None
+                                  else interval_flops + measured_flops)
                 book = bookkeep(book, loss, finite)
                 if first_step is None:
                     loss.block_until_ready()
@@ -732,7 +768,7 @@ class Trainer(Generic[Loss, Effects]):
                             scalars = {"train/loss": float(loss),
                                        **{f"train/{k}": float(v) for k, v in aux.items()},
                                        **self._throughput(now - last_log_time, steps_since_log,
-                                                          data.batch)}
+                                                          interval_samples, interval_flops)}
                             scalars["train/accepted"] = float(accepted)
                             if state.scale is not None:
                                 scalars["train/loss_scale"] = float(state.scale.scale)
@@ -742,6 +778,7 @@ class Trainer(Generic[Loss, Effects]):
                             if self.tracker is not None:
                                 self.tracker.log(scalars, current)
                             last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
+                            interval_samples, interval_flops = 0, 0.0
 
                     except BaseException as failure:
                         error = failure
@@ -937,13 +974,21 @@ class Trainer(Generic[Loss, Effects]):
         if streak:
             print(colored(f"Non-finite loss for {streak} step(s) before {step}", 'red'))
 
-    def _throughput(self, elapsed: float, steps: int, batch: int) -> dict[str, float]:
+    def _throughput(self, elapsed: float, steps: int, samples: int,
+                    flops: float | None) -> dict[str, float]:
+        """The interval's rates from the records it read and the FLOPs the
+        compiler measured for each step's own shape; `flops` is None when a
+        shape's measurement was unavailable. An interval that spans a stage
+        boundary carries that stage's compile in its wall time, where MaxText
+        hides the performance metrics during a ramp
+        (`common/metric_logger.py:166-194`).
+        """
         if elapsed <= 0 or steps <= 0:
             return {}
         step_time = elapsed / steps
         scalars = {"train/step_time_ms": step_time * 1000,
-                   "train/samples_per_sec": batch / step_time}
-        mfu = model_flops_utilization(self.flops_per_step, step_time)
+                   "train/samples_per_sec": samples / elapsed}
+        mfu = None if flops is None else model_flops_utilization(flops / steps, step_time)
         if mfu is not None:
             scalars["train/mfu"] = mfu
         return scalars
