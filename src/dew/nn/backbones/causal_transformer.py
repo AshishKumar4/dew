@@ -41,6 +41,9 @@ from ..inputs import AttentionMetadata
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
+from ..hyper_connections import (
+    HyperConnection, HyperConnections, HyperHead, collapse_streams, expand_streams, mix_streams,
+)
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..mla import INDEXER_COLLECTION, YarnScaling
@@ -324,11 +327,16 @@ class GatedMLP(nn.Module):
 
     activation_sparsity is Gemma 3n's gaussian top-k on the gate before its
     nonlinearity (`dew.nn.gemma3n.gaussian_topk`); 0 leaves the gate alone.
+    swiglu_limit is the clamp GLM-5.3-Flash and DeepSeek V4 apply before the
+    activation (`Glm5NextTextMLP.forward`, modeling_glm5_next.py:98-104): the
+    gate capped at the limit from above and the up projection on both sides.
+    None is the plain gated MLP.
     """
     hidden_features: int
     out_features: int
     activation: str = 'swiglu'
     activation_sparsity: float = 0.0
+    swiglu_limit: Optional[float] = None
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -348,10 +356,13 @@ class GatedMLP(nn.Module):
 
     def __call__(self, x):
         gate = checkpoint_name(self.gate_proj(x), 'gate_proj')
+        up = checkpoint_name(self.up_proj(x), 'up_proj')
+        if self.swiglu_limit is not None:
+            gate = jnp.minimum(gate, self.swiglu_limit)
+            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
         gate = _gated_activation(self.activation, gate)
-        up = checkpoint_name(self.up_proj(x), 'up_proj')
         return checkpoint_name(self.down_proj(gate * up), 'down_proj')
 
 
@@ -510,6 +521,12 @@ class DecoderBlock(nn.Module):
     output (modeling_gemma3n.py, Gemma3nTextDecoderLayer.forward). laurel_rank
     adds the LAuReL block over the attention's normed input, averaged with
     the attention residual over sqrt(2).
+
+    hyper_connections makes the block take and return the mHC stack of
+    residual streams, `[B, S, hc_mult, D]`: each sublayer reads the collapse
+    its site's mapping chooses and writes back into every stream over the
+    Sinkhorn-mixed residual (`dew.nn.hyper_connections`), the plain pre-norm
+    block otherwise (modeling_glm5_next.py:1293-1327).
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module]
@@ -524,6 +541,7 @@ class DecoderBlock(nn.Module):
     called with the residual and that output (Gemma 4's routed experts)."""
     altup: Optional[AltUp] = None  # Gemma 3n's stack of residual copies
     laurel_rank: Optional[int] = None  # Gemma 3n's learned augmented residual
+    hyper_connections: Optional[HyperConnections] = None  # mHC's stack of residual streams
     dropout_rate: float = 0.0
     remat: Optional[RematPolicy] = None
     dtype: Optional[Dtype] = None
@@ -574,6 +592,19 @@ class DecoderBlock(nn.Module):
                 rank=self.laurel_rank, emb_features=self.emb_features,
                 norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
                 name='laurel')
+        if self.hyper_connections is not None:
+            if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
+                    or self.parallel is not None or self.altup is not None
+                    or self.laurel_rank is not None or self.per_layer_input_dim):
+                raise ValueError(
+                    "hyper_connections runs the mHC block, a plain pre-norm block whose "
+                    "residual is the stream stack: no output norms, layer scalar, parallel "
+                    "branch, altup, laurel or per-layer inputs")
+            site = functools.partial(HyperConnection, spec=self.hyper_connections,
+                                     emb_features=self.emb_features, norm_eps=self.norm_eps,
+                                     dtype=self.dtype)
+            self.attn_hc = site(name='attn_hc')
+            self.ffn_hc = site(name='ffn_hc')
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, x, train: bool = False, decode: bool = False,
@@ -606,6 +637,9 @@ class DecoderBlock(nn.Module):
 
     def _forward(self, x, train: bool, decode: bool, positions, segment_ids,
                  kv_store, per_layer_input, attention_metadata):
+        if self.hyper_connections is not None:
+            return self._forward_streams(x, train, decode, positions, segment_ids,
+                                         kv_store, attention_metadata)
         altup = self.altup
         predictions = None if altup is None else self.altup_layer.predict(x, train=train)
         if altup is not None and predictions is not None:
@@ -641,6 +675,19 @@ class DecoderBlock(nn.Module):
         if self.wiring.layer_scalar:
             x = x * self.output_scalar.astype(x.dtype)
         return x
+
+    def _forward_streams(self, streams, train: bool, decode: bool, positions, segment_ids,
+                         kv_store, attention_metadata):
+        """The mHC block over `[B, S, hc_mult, D]` (modeling_glm5_next.py:1293-1327)."""
+        post, comb, collapsed = self.attn_hc(streams)
+        mixed = self.self_attn(self.input_layernorm(collapsed),
+                               decode=decode, positions=positions, segment_ids=segment_ids,
+                               **({} if kv_store is None else {"kv_store": kv_store}),
+                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}))
+        streams = mix_streams(post, comb, self.dropout(mixed, deterministic=not train), streams)
+        post, comb, collapsed = self.ffn_hc(streams)
+        hidden = self.mlp(self.post_attention_layernorm(collapsed))
+        return mix_streams(post, comb, self.dropout(hidden, deterministic=not train), streams)
 
     def _per_layer_residual(self, x, per_layer_input):
         """Gemma 3n/4's per-layer residual (modeling_gemma4.py,
@@ -1273,6 +1320,8 @@ class CausalTransformer(nn.Module):
     num_nextn_predict_layers: int = 0         # MTP depths after the final norm; 0 disables
     altup: Optional[AltUp] = None             # Gemma 3n's stack of residual copies; None disables
     laurel_rank: Optional[int] = None         # Gemma 3n's learned augmented residual; None disables
+    hyper_connections: Optional[HyperConnections] = None  # mHC's stack of residual streams; None disables
+    swiglu_limit: Optional[float] = None      # GLM-5.3-Flash's clamp before every gated MLP's activation
     activation_sparsity_pattern: Optional[Tuple[float, ...]] = None  # Gemma 3n's gaussian top-k, one fraction per layer
     mask_token_id: Optional[int] = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
     scan_layers: bool = False                 # runs of like layers under flax's scan
@@ -1305,6 +1354,8 @@ class CausalTransformer(nn.Module):
                                tuple(float(fraction) for fraction in self.activation_sparsity_pattern))
         if isinstance(self.altup, Mapping):
             object.__setattr__(self, "altup", AltUp(**self.altup))
+        if isinstance(self.hyper_connections, Mapping):
+            object.__setattr__(self, "hyper_connections", HyperConnections(**self.hyper_connections))
         # A value arrives as a record from a config and as itself from code,
         # and `models.build` already reads one; doing it here too means the
         # plain constructor takes the same records, as a test or a notebook
@@ -1571,6 +1622,14 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 "altup carries a stack of residual copies through the layers and "
                 "the prediction depths read one, so a model has one or the other")
+        if self.altup is not None and self.hyper_connections is not None:
+            raise ValueError(
+                "altup and hyper_connections each carry their own stack of residual "
+                "copies through the layers, so a model has one or the other")
+        if self.swiglu_limit is not None and self.swiglu_limit <= 0:
+            raise ValueError(
+                f"swiglu_limit caps the gate and up projections, so it is positive, "
+                f"got {self.swiglu_limit}; None leaves them unclamped")
         mask = self.mask_token_id
         if mask is not None and (isinstance(mask, bool) or not isinstance(mask, int) or mask < 0):
             raise ValueError(
@@ -1599,14 +1658,13 @@ class CausalTransformer(nn.Module):
         # The shared branch is the dense feed-forward at the mixture's shared
         # width, handed to the sparse layer as a factory the way the block
         # takes its own slots.
-        shared = None if mixture is None or not mixture.shared_features else (
-            functools.partial(
-                GatedMLP,
-                hidden_features=mixture.shared_features,
-                out_features=self.emb_features,
-                activation=self.mlp,
-                dtype=self.dtype,
-                precision=self.precision))
+        # Every gated MLP in the model shares the activation and the clamp:
+        # the dense feed-forwards, the shared branch and the routed experts.
+        gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
+                                      activation=self.mlp, swiglu_limit=self.swiglu_limit,
+                                      precision=self.precision)
+        shared = None if mixture is None or not mixture.shared_features else functools.partial(
+            gated_mlp, hidden_features=mixture.shared_features, dtype=self.dtype)
         routed = None if mixture is None else functools.partial(
             SparseMLP,
             num_experts=mixture.experts,
@@ -1626,6 +1684,7 @@ class CausalTransformer(nn.Module):
             group_score=mixture.group_score,
             expert_bias=mixture.bias,
             scale_inputs=mixture.scale_inputs,
+            swiglu_limit=self.swiglu_limit,
             shared=shared,
             shared_gate=mixture.shared_gate,
             dtype=self.dtype,
@@ -1686,13 +1745,8 @@ class CausalTransformer(nn.Module):
                 feedforward=(
                     routed
                     if spec.routed and routed is not None else
-                    functools.partial(
-                        GatedMLP,
-                        hidden_features=spec.width,
-                        out_features=self.emb_features,
-                        activation=self.mlp,
-                        activation_sparsity=spec.sparsity,
-                        precision=self.precision)),
+                    functools.partial(gated_mlp, hidden_features=spec.width,
+                                      activation_sparsity=spec.sparsity)),
                 emb_features=self.emb_features,
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
@@ -1702,6 +1756,7 @@ class CausalTransformer(nn.Module):
                 parallel=parallel if spec.routed else None,
                 altup=self.altup,
                 laurel_rank=self.laurel_rank,
+                hyper_connections=self.hyper_connections,
                 dropout_rate=self.dropout_rate,
                 remat=self.remat,
                 dtype=self.dtype,
@@ -1724,14 +1779,9 @@ class CausalTransformer(nn.Module):
             kinds[mtp_type], mtp_type, False))
         mtp_feedforward = (
             routed if routed is not None and self.num_layers - 1 in sparse else
-            functools.partial(
-                GatedMLP,
-                # The last layer's width: the one width of every model with
-                # depths, since the widths that vary are Gemma 3n's alone.
-                hidden_features=widths[-1],
-                out_features=self.emb_features,
-                activation=self.mlp,
-                precision=self.precision))
+            # The last layer's width: the one width of every model with
+            # depths, since the widths that vary are Gemma 3n's alone.
+            functools.partial(gated_mlp, hidden_features=widths[-1]))
         self.mtp = [
             MTPBlock(
                 mixer=mtp_mixer, feedforward=mtp_feedforward,
@@ -1757,6 +1807,9 @@ class CausalTransformer(nn.Module):
             self.altup_unembed_projections = [
                 projection(name=f'altup_unembed_projections_{index}')
                 for index in range(self.altup.num_inputs - 1)]
+        if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
+            self.hc_head = HyperHead(spec=self.hyper_connections, emb_features=self.emb_features,
+                                     norm_eps=self.norm_eps, name='hc_head')
         self.norm = RMSNorm(
             epsilon=self.norm_eps, scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype, name='norm')
@@ -1961,6 +2014,10 @@ class CausalTransformer(nn.Module):
             # The embeddings and, rescaled to their magnitude, each projected
             # copy: [num_inputs, B, S, D].
             x = jnp.stack([x] + [rescale_to(project(x), x) for project in self.altup_projections])
+        hc = self.hyper_connections
+        if hc is not None:
+            # The embeddings copied into every residual stream: [B, S, hc_mult, D].
+            x = expand_streams(x, hc.hc_mult)
         x = self.stack(x, train=train, decode=decode, positions=positions,
                        segment_ids=segment_ids, per_layer_input=ple, attention_metadata=attention_metadata)
         if self.altup is not None:
@@ -1970,6 +2027,8 @@ class CausalTransformer(nn.Module):
             copies = [x[0]] + [rescale_to(project(copy), x[0])
                                for project, copy in zip(self.altup_unembed_projections, x[1:])]
             x = jnp.mean(jnp.stack(copies), axis=0)
+        if hc is not None:
+            x = collapse_streams(x, self.hc_head if hc.head == 'weighted' else None)
         return self.norm(x)
 
     def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
