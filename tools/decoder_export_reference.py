@@ -70,6 +70,7 @@ CASES = (
     Case("mixtral", "mixtral-tiny"),
     Case("qwen3_moe", "qwen3-moe-tiny"),
     Case("glm4_moe", "glm4-moe-tiny", balance_rate=1e-2, mtp_weight=0.3),
+    Case("glm_moe_dsa", "glm-moe-dsa-tiny", balance_rate=1e-2, mtp_weight=0.3),
     Case("deepseek_v2", "deepseek-v2-tiny"),
     Case("deepseek_v3", "deepseek-v3-tiny", balance_rate=1e-2),
     Case("deepseek_v32", "deepseek-v32-tiny", balance_rate=1e-2),
@@ -180,7 +181,7 @@ def reference_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray
     config = model.config
     prefixes = (tuple(f"model.layers.{config.num_hidden_layers + depth}."
                       for depth in range(config.num_nextn_predict_layers))
-                if config.model_type == "glm4_moe" else ())
+                if config.model_type in ("glm4_moe", "glm_moe_dsa") else ())
     if any(not name.startswith(prefixes) for name in unexpected):
         raise ValueError(f"reference load unexpected tensors: {unexpected}")
     model.eval()
@@ -230,6 +231,63 @@ def moved(trip: RoundTrip) -> dict[str, float]:
         if moves:
             distances[kind] = max(moves)
     return distances
+
+
+def gradient_parity(trip: RoundTrip) -> dict[str, float]:
+    """The two implementations' gradients of the mean next-token cross
+    entropy over the source checkpoint, per source tensor, as
+    `max |ours - theirs| / max(1, |ours|, |theirs|)`.
+
+    Each bound layout writes dew's gradient tree back into the source's
+    own tensor layout the way the export writes the weights, so the same
+    slices, transposes and concatenations that carry a trained weight out
+    carry its gradient to the reference's `.grad`. A per-expert tensor
+    reads its slice of the reference's fused `experts.gate_up_proj` and
+    `experts.down_proj`, the parameters transformers converts them into.
+    Tensors the reference holds no gradient for (an MTP depth, the
+    balancing bias buffer, the indexer it runs under no_grad) are not
+    compared.
+    """
+    import torch
+
+    source = trip.source
+    ids = jnp.asarray(trip.ids, jnp.int32)
+
+    def loss(params):
+        logits = jnp.asarray(source.model.apply({**source.variables, "params": params}, ids),
+                             jnp.float32)
+        return -jnp.mean(jnp.take_along_axis(
+            jax.nn.log_softmax(logits[:, :-1], axis=-1), ids[:, 1:, None], axis=-1))
+
+    grads = {"params": jax.grad(loss)(source.variables["params"])}
+    model, _ = reference_model(trip.case, FIXTURES / trip.case.fixture)
+    model.train(False)
+    model.set_attn_implementation("eager")
+    labels = torch.from_numpy(np.asarray(trip.ids, np.int64))
+    model(input_ids=labels, labels=labels, use_cache=False).loss.backward()
+    theirs = {name: parameter.grad for name, parameter in model.named_parameters()}
+
+    def reference_grad(layout) -> np.ndarray | None:
+        grad = theirs.get(layout.name)
+        if grad is None and layout.expert_index is not None:
+            experts, projection = layout.name.rsplit(".", 3)[0], layout.name.rsplit(".", 2)[1]
+            fused = theirs.get(f"{experts}.{'down_proj' if projection == 'down_proj' else 'gate_up_proj'}")
+            if fused is not None:
+                grad = fused[layout.expert_index]
+                if projection != "down_proj":
+                    width = grad.shape[0] // 2
+                    grad = grad[:width] if projection == "gate_proj" else grad[width:]
+        return None if grad is None else grad.to(torch.float32).numpy()
+
+    errors = {}
+    for layout in source.weight_layouts:
+        reference = reference_grad(layout) if layout.paths[0][0] == "params" else None
+        if reference is None:
+            continue
+        ours = layout.export(grads)
+        errors[layout.name] = float(np.max(
+            np.abs(ours - reference) / np.maximum(1.0, np.maximum(np.abs(ours), np.abs(reference)))))
+    return errors
 
 
 def measure(trip: RoundTrip) -> dict[str, object]:

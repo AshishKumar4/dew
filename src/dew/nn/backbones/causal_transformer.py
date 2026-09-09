@@ -1148,7 +1148,14 @@ class CausalTransformer(nn.Module):
     keys and values of the last earlier layer of their own kind instead of
     projecting their own (Gemma 3n/4 cross-layer KV sharing). 0 is a plain
     decoder and leaves the tree unchanged, and use_double_wide_mlp, which
-    widens the sharing layers' MLP, needs it.
+    widens the sharing layers' MLP, needs it. kv_shared_layers names the
+    sharing layers one by one instead, for a pattern that is not a trailing
+    run: GLM's IndexShare puts a sharing layer after every indexer layer
+    but the first three (modeling_glm_moe_dsa.py:313-318). Either spelling
+    resolves to the same plan: a sharing layer reads what the last earlier
+    non-sharing layer of its own kind stashed, and what a layer stashes is
+    its mixer's own, keys and values for attention and the indexer's
+    selection for MLA.
 
     altup carries Gemma 3n's `altup_num_inputs` copies of the residual stream
     (`dew.nn.gemma3n`): the embeddings and their projections enter the
@@ -1248,6 +1255,7 @@ class CausalTransformer(nn.Module):
     per_layer_input_dim: Optional[int] = None  # Gemma 3n/4 per-layer inputs
     per_layer_input_vocab: Optional[int] = None  # None: vocab_size
     num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
+    kv_shared_layers: Optional[Tuple[int, ...]] = None  # the sharing layers named one by one
     mixer: Optional[MixerBase] = None         # None: today's attention; a kind value or its record
     num_nextn_predict_layers: int = 0         # MTP depths after the final norm; 0 disables
     altup: Optional[AltUp] = None             # Gemma 3n's stack of residual copies; None disables
@@ -1274,6 +1282,9 @@ class CausalTransformer(nn.Module):
             raise ValueError("layer_scalar must be None, frozen or trainable; boolean modes are not supported")
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
+        if self.kv_shared_layers is not None:
+            object.__setattr__(self, "kv_shared_layers",
+                               tuple(int(index) for index in self.kv_shared_layers))
         if isinstance(self.mlp_features, (tuple, list)):
             object.__setattr__(self, "mlp_features", tuple(int(width) for width in self.mlp_features))
         if self.activation_sparsity_pattern is not None:
@@ -1373,25 +1384,46 @@ class CausalTransformer(nn.Module):
         return tuple(range(self.num_layers))
 
     @property
-    def kv_sharing(self) -> dict:
-        """Sharing layer index to the provider it reads, both of one layer type.
-
-        The trailing num_kv_shared_layers layers own no K/V and read the last
-        non-sharing layer of their own type (modeling_gemma4.py,
-        Gemma4TextAttention). Empty unless sharing is on.
-        """
+    def sharing_layers(self) -> Tuple[int, ...]:
+        """The layers that read another layer's stash, in order: the trailing
+        num_kv_shared_layers or the ones kv_shared_layers names."""
+        if self.num_kv_shared_layers and self.kv_shared_layers is not None:
+            raise ValueError(
+                "num_kv_shared_layers and kv_shared_layers both name the sharing "
+                "layers; a model spells them one way")
+        if self.kv_shared_layers is not None:
+            outside = sorted(index for index in self.kv_shared_layers
+                             if not 0 <= index < self.num_layers)
+            if outside:
+                raise ValueError(
+                    f"kv_shared_layers {outside} name no layer of a "
+                    f"{self.num_layers}-layer model")
+            return tuple(sorted(set(self.kv_shared_layers)))
         if not self.num_kv_shared_layers:
-            return {}
+            return ()
         first = self.num_layers - self.num_kv_shared_layers
         if first <= 0:
             raise ValueError(
                 f"num_kv_shared_layers ({self.num_kv_shared_layers}) has to leave "
                 f"a provider: it must be between 1 and num_layers - 1 "
                 f"({self.num_layers - 1})")
+        return tuple(range(first, self.num_layers))
+
+    @property
+    def kv_sharing(self) -> dict:
+        """Sharing layer index to the provider it reads, both of one layer type.
+
+        A sharing layer owns no K/V (no indexer, for MLA) and reads the last
+        earlier non-sharing layer of its own type (modeling_gemma4.py,
+        Gemma4TextAttention; modeling_glm_moe_dsa.py:739-748 carries the
+        last full layer's top-k forward). Empty unless sharing is on.
+        """
+        sharing = set(self.sharing_layers)
         types = self.per_layer_types
         providers = {}
-        for index in range(first, self.num_layers):
-            earlier = [j for j in range(first) if types[j] == types[index]]
+        for index in sorted(sharing):
+            earlier = [j for j in range(index)
+                       if j not in sharing and types[j] == types[index]]
             if not earlier:
                 raise ValueError(
                     f"layer {index} shares K/V but no earlier {types[index]} layer "
@@ -1944,7 +1976,7 @@ class CausalTransformer(nn.Module):
                 self.layers, self.block, self.specs,
                 tuple((index, 1) for index in range(self.num_layers)), x,
                 train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-                kv_store={} if self.num_kv_shared_layers else None,
+                kv_store={} if self.sharing_layers else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         banked = self.banked_collections()
         if stages == 1:
@@ -2035,7 +2067,7 @@ class CausalTransformer(nn.Module):
         output = jax.eval_shape(lambda held: layer.apply(
             held, x, mutable=True, rngs=rngs,
             train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            kv_store={} if self.num_kv_shared_layers else None,
+            kv_store={} if self.sharing_layers else None,
             per_layer_input=None if per_layer_input is None else per_layer_input[:, :, 0, :],
             attention_metadata=attention_metadata)[0], self.first_layer_shapes())
         return jnp.result_type(x.dtype, output.dtype)
@@ -2103,7 +2135,7 @@ class CausalTransformer(nn.Module):
             return run_stack(
                 self.layers, self.block, self.specs, view.groups, x,
                 train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-                kv_store={} if self.num_kv_shared_layers else None,
+                kv_store={} if self.sharing_layers else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
                 banked='params' in view.banked)
         return self._pipeline(view, x, train=train, positions=positions,

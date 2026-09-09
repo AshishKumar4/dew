@@ -2046,6 +2046,175 @@ def test_a_glm4_moe_depth_with_its_own_head_is_refused(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# GLM-5 (glm_moe_dsa): V3.2's sparse MLA with an interleaved indexer,
+# IndexShare layers and the MTP depth
+# --------------------------------------------------------------------------
+
+GLM_MOE_DSA = FIXTURES / "glm-moe-dsa-tiny"
+
+
+def test_glm_moe_dsa_config_translates_field_by_field():
+    """The tiny GLM-5.3: every layer sparse MLA whose indexer rotates
+    interleaved pairs and norms its latents at the hardcoded 1e-6, the
+    IndexShare schedule as sharing layers, three dense layers ahead of the
+    routed ones, and the released head_dim (qk_nope_head_dim) read as
+    the stale field it is."""
+    config = translate_config(fixture_config("glm-moe-dsa-tiny"))
+
+    assert config["layer_types"] == ("deepseek_sparse_attention",) * 8
+    assert config["mixer"] == {
+        "kind": "mla", "q_lora_rank": 12, "kv_lora_rank": 8, "qk_nope_head_dim": 12,
+        "qk_rope_head_dim": 4, "v_head_dim": 16, "rope_interleave": True, "yarn": None,
+        "index_topk": 4, "index_n_heads": 4, "index_head_dim": 8,
+        "index_rope_interleave": True, "latent_norm_eps": 1e-6}
+    assert config["kv_shared_layers"] == (3, 4, 5, 7)
+    assert config["mixture"]["layers"] == (3, 4, 5, 6, 7)
+    assert config["mixture"]["bias"] and config["mixture"]["shared_features"] == 12
+    assert config["rope_theta"] == 8e6 and config["norm_eps"] == 1e-5
+    assert config["head_dim"] == 16 and config["num_nextn_predict_layers"] == 1
+
+
+@pytest.mark.parametrize("name, sharing", [("glm-5", None), ("glm-5.3", tuple(
+    index for index in range(78) if index >= 3 and (index - 2) % 4 != 0))])
+def test_the_released_glm_5_configs_translate(name, sharing):
+    """zai-org/GLM-5 runs its indexer on all 78 layers; GLM-5.3 ships the
+    IndexShare list its schedule (freq 4 off offset 3) produces, so layers
+    6, 10, ... 74 select and the rest of the tail share. Both: 256 experts
+    with 8 per token in one group scaled by 2.5, one shared expert, MLA
+    with the 2048 query LoRA, plain rope, one prediction depth."""
+    config = translate_config(fixture_config(name))
+
+    assert config["num_layers"] == 78 and config["mixture"]["layers"] == tuple(range(3, 78))
+    assert (config["mixture"]["experts"], config["mixture"]["top_k"]) == (256, 8)
+    assert config["mixture"]["scaling"] == 2.5 and config["mixture"]["shared_features"] == 2048
+    mixer = config["mixer"]
+    assert (mixer["q_lora_rank"], mixer["kv_lora_rank"]) == (2048, 512)
+    assert (mixer["qk_nope_head_dim"], mixer["qk_rope_head_dim"], mixer["v_head_dim"]) == (192, 64, 256)
+    assert (mixer["index_topk"], mixer["index_n_heads"], mixer["index_head_dim"]) == (2048, 32, 128)
+    assert mixer["index_rope_interleave"] and mixer["yarn"] is None
+    assert config.get("kv_shared_layers") == sharing
+    assert config["num_nextn_predict_layers"] == 1 and config["vocab_size"] == 154880
+
+
+def test_the_glm_5_3_schedule_derives_from_its_freq_and_offset():
+    """Dropping the list leaves the schedule GlmMoeDsaConfig.__post_init__
+    derives (configuration_glm_moe_dsa.py:144-148), which is the list."""
+    config = fixture_config("glm-5.3")
+    listed = translate_config(config)
+    del config["indexer_types"]
+    assert translate_config(config)["kv_shared_layers"] == listed["kv_shared_layers"]
+    config["index_topk_pattern"] = "F" * 78
+    assert "kv_shared_layers" not in translate_config(config)
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("indexer_rope_interleave", False, "always rotates interleaved"),
+    ("indexer_types", ["shared"] + ["full"] * 7, "starting with 'shared'"),
+    ("indexer_types", ["full"] * 7, "8 layers"),
+    ("indexer_types", ["full"] * 7 + ["skip"], "entries \\['skip'\\]"),
+    ("norm_topk_prob", False, "norm_topk_prob=False"),
+    ("rope_parameters", {"rope_type": "linear", "factor": 4.0, "rope_theta": 8e6}, "plain or YaRN"),
+    ("layer_types", ["full_attention"] * 8, "every layer is deepseek_sparse_attention"),
+])
+def test_a_glm_moe_dsa_field_with_no_counterpart_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("glm-moe-dsa-tiny"), field: value})
+
+
+def test_glm_moe_dsa_logits_match_the_reference_implementation():
+    """fp32 parity of the trunk: tolerance 1e-4, observed max |logit
+    difference| 2.7e-05 with identical argmax, over four selecting layers
+    and four that share the previous full layer's top-k."""
+    model, variables = fp32_decoder(GLM_MOE_DSA)
+    ids = np.load(GLM_MOE_DSA / "input_ids.npy")
+    reference = np.load(GLM_MOE_DSA / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_the_glm_moe_dsa_sharing_layers_carry_no_indexer_and_read_the_last_full_one():
+    """The fixture's sharing layers own no indexer leaves, and the plan
+    reads the last earlier selecting layer: layer 7 attends layer 6's
+    top-k, not layer 2's. Rewiring the tail onto layer 2's selection, or
+    letting the sharing layers select with layer 6's indexer weights,
+    both disagree with the reference by more than the tolerance."""
+    model, variables = fp32_decoder(GLM_MOE_DSA)
+    assert model.kv_sharing == {3: 2, 4: 2, 5: 2, 7: 6}
+    params = variables["params"]
+    for layer in (3, 4, 5, 7):
+        assert "indexer" not in params[f"layers_{layer}"]["self_attn"]
+    for layer in (0, 1, 2, 6):
+        assert params[f"layers_{layer}"]["self_attn"]["indexer"]["wq_b"]["kernel"].shape == (12, 32)
+    assert "indexer" in params["mtp_0"]["block"]["self_attn"]
+
+    ids = jnp.asarray(np.load(GLM_MOE_DSA / "input_ids.npy"), jnp.int32)
+    reference = np.load(GLM_MOE_DSA / "logits.npy")
+    tail_on_layer_2 = model.clone(kv_shared_layers=(3, 4, 5, 6, 7))
+    rewired = {**variables, "params": {**params, "layers_6": {
+        **params["layers_6"], "self_attn": {
+            key: value for key, value in params["layers_6"]["self_attn"].items()
+            if key != "indexer"}}}}
+    difference = float(np.max(np.abs(
+        np.asarray(tail_on_layer_2.apply(rewired, ids)) - reference)))
+    assert difference > 1e-2, f"the tail on layer 2's selection differs by only {difference:.3e}"
+
+    unshared = model.clone(kv_shared_layers=None)
+    own = {**variables, "params": {**params, **{
+        f"layers_{layer}": {**params[f"layers_{layer}"], "self_attn": {
+            **params[f"layers_{layer}"]["self_attn"],
+            "indexer": params["layers_6"]["self_attn"]["indexer"]}}
+        for layer in (3, 4, 5, 7)}}}
+    difference = float(np.max(np.abs(np.asarray(unshared.apply(own, ids)) - reference)))
+    assert difference > 1e-2, f"sharing layers selecting on their own differ by only {difference:.3e}"
+
+
+def test_the_glm_moe_dsa_mtp_depth_matches_the_reference_composition():
+    """The checkpoint's model.layers.8.* depth loads as mtp_0 with its own
+    indexer and the trunk's routing, and computes what the engines running
+    the released weights compute (tools/hf_reference_b.py GlmMTP over a
+    GlmMoeDsaDecoderLayer): tolerance 1e-4, observed max |logit difference|
+    6.7e-06 with identical argmax."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    model, variables = fp32_decoder(GLM_MOE_DSA)
+    ids = jnp.asarray(np.load(GLM_MOE_DSA / "input_ids.npy"), jnp.int32)
+    reference = np.load(GLM_MOE_DSA / "mtp_logits.npy")
+    depth = variables["params"]["mtp_0"]
+    assert set(depth) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
+    assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == (8, 32, 12)
+
+    hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
+    logits = np.asarray(model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0])
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |mtp logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_glm_moe_dsa_decodes_what_it_computes_in_one_pass():
+    """Cached decode over the sparse layers, the sharing ones included:
+    the prompt then one token reaches the one-pass logits of that token,
+    with the sharing layers' cache holding no indexer keys."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    model, variables = fp32_decoder(GLM_MOE_DSA)
+    ids = jnp.asarray(np.load(GLM_MOE_DSA / "input_ids.npy"), jnp.int32)
+    full = np.asarray(model.apply(variables, ids))
+    cache = model.apply(variables, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
+    state = {**variables, "cache": cache}
+    _, updated = model.apply(state, ids[:, :-1], decode=True, mutable=["cache"])
+    step, _ = model.apply({**state, "cache": updated["cache"]}, ids[:, -1:], decode=True,
+                          mutable=["cache"])
+    assert "cached_index" in updated["cache"]["layers_6"]["self_attn"]
+    assert "cached_index" not in updated["cache"]["layers_7"]["self_attn"]
+    difference = float(np.max(np.abs(np.asarray(step)[:, 0] - full[:, -1])))
+    assert difference < 1e-4, f"decode differs from the one-pass logits by {difference:.3e}"
+
+
+# --------------------------------------------------------------------------
 # Llama 4 (text): iRoPE with chunked local layers, input-scaled experts
 # --------------------------------------------------------------------------
 
