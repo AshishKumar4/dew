@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -29,14 +28,13 @@ from termcolor import colored
 
 from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
-from dew.data.dataset import Checkpointable, RampedStream, Stage, rows_of
-from dew.nn.inputs import BATCH_AXES
+from dew.data.dataset import Checkpointable, RampedStream, rows_of
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import (Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective,
                                  Step, Variables, merge, select, mean_loss)
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.training.distributed import (
-    DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_shardings, build_mesh,
+    DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_divisor, batch_shardings, build_mesh,
     shard_batch,
 )
 from dew.training.evaluation import Evaluation, evaluate
@@ -61,17 +59,11 @@ CompiledStep = Callable[
 
 Shapes = tuple[tuple[int, ...], ...]
 """A batch's leaf shapes in tree order, the key a compiled step is held
-under: a step is compiled for the shapes it was traced on and no others."""
+under. A fixed batch has one; a ramped batch has one per stage of its ramp,
+each compiled on the first step that reads it."""
 
 
 def batch_shapes(batch: Batch) -> Shapes:
-    """`batch`'s shapes, in tree order.
-
-    A run whose batch never changes has one of these and compiles once. A run
-    whose dataset ramps the batch has one per stage of the ramp, so the set of
-    compiled steps is that ramp's stages: `Ramp.stages` bounds it and
-    `Trainer.fit` compiles each one on the first step that reads it.
-    """
     return tuple(np.shape(leaf) for leaf in jax.tree.leaves(batch))
 
 
@@ -659,10 +651,6 @@ class Trainer(Generic[Loss, Effects]):
             if current == steps and checkpoints is not None and checkpoints.latest is not None:
                 return state
             local_every = None if checkpoints is None else checkpoints.local_every
-            # One compiled step per batch shape, with the FLOPs measured off
-            # it. A run whose batch is fixed compiles once; a ramped run
-            # compiles once per stage of its ramp, and the shapes are that
-            # ramp's stages and no others.
             compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
             # Rebound once the step is compiled, so the first tick measures steps,
             # not the compile.
@@ -670,10 +658,8 @@ class Trainer(Generic[Loss, Effects]):
             last_saved = current if checkpoints is not None and checkpoints.latest is not None else None
             interval_steps = 0
             steps_since_log = 0
-            # The records this logging interval trained on, and the FLOPs the
-            # compiler measured for the steps that read them. Both are summed
-            # per step rather than taken off the dataset's batch, so a ramped
-            # run reports the samples it read and not the batch it ends at.
+            # Summed per step rather than taken off the dataset's batch, so a
+            # ramped interval reports the records it read and their FLOPs.
             interval_samples = 0
             interval_flops: float | None = 0.0
             # Seconds spent sampling this interval, logged under
@@ -704,10 +690,14 @@ class Trainer(Generic[Loss, Effects]):
                             f"accumulation window of {self.accumulation} pools "
                             f"microbatches of one shape into one update; ramp the "
                             f"batch or accumulate, not both")
-                    # Before the prefetch worker places a batch, which is
-                    # where a stage the mesh cannot hold would otherwise
-                    # surface, for a later stage an hour into the run.
-                    self._check_stages(source.stages, mesh)
+                    divisor = batch_divisor(mesh, self.mesh)
+                    refused = [stage.batch for stage in source.stages if stage.batch % divisor]
+                    if refused:
+                        raise ValueError(
+                            f"the batch ramp reads {refused} records a step at some of "
+                            f"its stages, and {dict(mesh.shape)} with "
+                            f"{self.mesh.microbatches or self.mesh.stage} microbatch(es) "
+                            f"holds a batch that is a multiple of {divisor}")
                 train = DevicePrefetchIterator(source, mesh, source_state=position)
                 source = None  # Lifetime transferred to the prefetch worker.
 
@@ -986,15 +976,11 @@ class Trainer(Generic[Loss, Effects]):
 
     def _throughput(self, elapsed: float, steps: int, samples: int,
                     flops: float | None) -> dict[str, float]:
-        """The interval's rates, from the records it actually read.
-
-        `samples` is summed over the interval's steps rather than taken as
-        `batch * steps`, so a ramped run's throughput is the records it read;
-        `flops` is summed the same way, over what the compiler measured for
-        each step's own shape, and is None when a shape's measurement was
-        unavailable. An interval that spans a stage boundary carries that
-        stage's compile in its wall time, as MaxText's does; it hides the
-        performance metrics during a ramp instead
+        """The interval's rates from the records it read and the FLOPs the
+        compiler measured for each step's own shape; `flops` is None when a
+        shape's measurement was unavailable. An interval that spans a stage
+        boundary carries that stage's compile in its wall time, where MaxText
+        hides the performance metrics during a ramp
         (`common/metric_logger.py:166-194`).
         """
         if elapsed <= 0 or steps <= 0:
@@ -1006,23 +992,3 @@ class Trainer(Generic[Loss, Effects]):
         if mfu is not None:
             scalars["train/mfu"] = mfu
         return scalars
-
-    def _check_stages(self, stages: Sequence[Stage], mesh: Mesh) -> None:
-        """Refuse a batch ramp with a stage this mesh cannot hold, before the
-        run reads anything.
-
-        A stage's rows are sharded over the mesh's batch axes like any other
-        batch's, and a pipelined step cuts them into its microbatches, so a
-        stage neither count divides fails where it is placed or traced,
-        which for a later stage is an hour into the run.
-        """
-        shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
-        microbatches = self.mesh.microbatches or self.mesh.stage
-        divisor = math.lcm(shards, microbatches)
-        refused = [stage.batch for stage in stages if stage.batch % divisor]
-        if refused:
-            raise ValueError(
-                f"the batch ramp reads {refused} records a step at some of its "
-                f"stages, and {dict(mesh.shape)} cuts a batch into {shards} shards "
-                f"of whole rows and {microbatches} microbatch(es), so every stage "
-                f"of a ramp has to be a multiple of {divisor}")
