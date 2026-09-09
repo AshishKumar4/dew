@@ -70,6 +70,20 @@ def decode(position: bytes) -> Global | None:
     return Global(records=int(envelope["records"]), order=str(envelope["order"]))
 
 
+def read(position: bytes) -> Global:
+    """The global position `position` holds, for a stream that resumes from
+    one; a shard offset is refused, since there is no conversion."""
+    place = decode(position)
+    if place is None:
+        raise ValueError(
+            "this training stream resumes from a global record count, and the "
+            "saved position is one process's own offset into its shard: either "
+            "a stream that batches its own records or one written before dew "
+            "stored a global count. There is no conversion; resume the run "
+            "that wrote it with the dataset that wrote it")
+    return place
+
+
 def translates(position: bytes) -> bool:
     """Whether a process count other than the one that wrote `position` can
     read it: true for a global position, false for one shard's own offset."""

@@ -131,6 +131,13 @@ class TokenDocumentSource:
         self._starts = np.concatenate([[0], ends[:-1]])
         self.lengths = self._ends - self._starts
 
+    def __repr__(self) -> str:
+        # A saved data position names the order it counts into by naming its
+        # source, and the packed loader's order is planned over these
+        # documents, so this describes the file rather than an address in the
+        # process that wrote the position.
+        return f"TokenDocumentSource(path={self.path!r}, eos_id={self.eos_id})"
+
     def __len__(self) -> int:
         return len(self._ends)
 

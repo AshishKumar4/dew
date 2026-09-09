@@ -132,7 +132,7 @@ def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
     data = ChatMessages(tokenizer=str(TOKENIZER), path=path, val_path=path,
                         seq_len=window - 1, packing_bins=1,
                         loading=Loading(workers=0)).load(batch=1)
-    assert data.records == chunks, "records counts chunks, which a run turns into steps"
+    assert data.records == chunks, "one bin puts every chunk in a window of its own"
     assert data.val is not None
     batches = list(data.val())
     assert len(batches) == chunks

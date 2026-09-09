@@ -35,7 +35,7 @@ from etils import epath
 import dew.data  # noqa: F401  registers the datasets a config names
 import dew.io
 from dew.checkpoints import RUN_FILE, Checkpoints
-from dew.data import Dataset, DatasetSpec
+from dew.data import Dataset, DatasetSpec, Ramp, ramped
 import dew.nn.backbones  # noqa: F401  registers the models a config names
 from dew import registry
 from dew.objectives.base import Effects, Loss, Metric, Objective
@@ -149,6 +149,12 @@ class TrainerConfig:
     trainer refuses any other answer for one."""
     accumulation: int = 1
     """Micro-batches per optimizer update."""
+    batch_ramp: Optional[Ramp] = None
+    """Grow `batch_size` over the run's first records instead of starting
+    there: the global batch the run starts at, what a stage adds and the
+    records the whole ramp spans. Unset trains at `batch_size` throughout.
+    One optimizer update a step either way, and the compiled step is traced
+    once per stage."""
     dynamic_scale: bool = False
     mesh: MeshSpec = MeshSpec()
     layout: Layout = Layout()
@@ -326,6 +332,9 @@ class RunConfig:
                 else f"{objective_type.__module__}.{objective_type.__qualname__}")
         self = dataclasses.replace(self, objective=kind)
         trainer = self.trainer
+        # Before the run length, since a ramp reads fewer records a step early
+        # and a pass over the data is that many steps longer.
+        data = data if trainer.batch_ramp is None else ramped(data, trainer.batch_ramp)
         steps = trainer.total_steps(data)
         tracker = None
         try:
