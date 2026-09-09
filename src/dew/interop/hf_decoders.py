@@ -2287,12 +2287,12 @@ def save_pretrained_decoder(model, variables, directory, *,
     if not isinstance(model, CausalTransformer):
         raise ValueError(
             f"save_pretrained_decoder takes a CausalTransformer, got {type(model).__name__}")
-    if model.per_layer_input_dim or model.num_kv_shared_layers or model.v_norm:
+    if model.per_layer_input_dim or model.sharing_layers or model.v_norm:
         raise ValueError(
             "per-layer input embeddings, KV sharing and the values norm have "
             "no counterpart in the dense families this "
-            "exports, so a model with per_layer_input_dim, num_kv_shared_layers "
-            "or v_norm set cannot be written back to the HF layout")
+            "exports, so a model with per_layer_input_dim, num_kv_shared_layers, "
+            "kv_shared_layers or v_norm set cannot be written back to the HF layout")
     mixers = [model.mixer] + [kind.mixer for kind in (model.kinds or {}).values()]
     if (model.output_gate or model.partial_rotary_factor is not None
             or any(mixer is not None and not isinstance(mixer, AttentionMixer)
@@ -2671,6 +2671,78 @@ def _glm4_moe_path(name: str, config: Mapping[str, Any]) -> Optional[Tuple[str, 
     return (path[0], depth, 'block', *path[2:])
 
 
+def _glm_indexer_types(hf_config: Mapping[str, Any], layers: int, used: set[str]) -> Tuple[str, ...]:
+    """Which layers run their own indexer ('full') and which reuse the
+    previous full layer's top-k ('shared'), as GlmMoeDsaConfig.__post_init__
+    resolves them (configuration_glm_moe_dsa.py:136-148): an explicit
+    `indexer_types` as it stands, else the `index_topk_pattern` string,
+    else the `index_topk_freq` / `index_skip_topk_offset` schedule. The
+    released configs ship the list beside the schedule that produced it,
+    and the reference reads the list alone when both are present.
+    """
+    used.update(('indexer_types', 'index_topk_pattern', 'index_topk_freq',
+                 'index_skip_topk_offset'))
+    types = hf_config.get('indexer_types')
+    if types is None:
+        pattern = hf_config.get('index_topk_pattern')
+        if pattern is not None:
+            letters = {'F': 'full', 'S': 'shared'}
+            types = ([letters.get(letter, letter) for letter in pattern]
+                     if isinstance(pattern, str) else list(pattern))
+        else:
+            freq = max(int(hf_config.get('index_topk_freq', 1)), 1)
+            offset = int(hf_config.get('index_skip_topk_offset', 2))
+            types = ['full' if max(index - offset + 1, 0) % freq == 0 else 'shared'
+                     for index in range(layers)]
+    if len(types) != layers:
+        _refuse(f"indexer_types of {len(types)} entries",
+                f"the model has {layers} layers, one indexer mode each")
+    unknown = sorted(set(types) - {'full', 'shared'})
+    if unknown:
+        _refuse(f"indexer_types entries {unknown}",
+                "a GLM layer runs its indexer ('full') or reuses the previous "
+                "full layer's top-k ('shared')")
+    if types and types[0] == 'shared':
+        _refuse("indexer_types starting with 'shared'",
+                "the first layer has no earlier indexer to share "
+                "(modeling_glm_moe_dsa.py:444-445)")
+    return tuple(types)
+
+
+def _glm_moe_dsa_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """GLM-5, 5.1, 5.2 and 5.3: DeepSeek V3.2's sparse MLA block under GLM's
+    choices. The indexer rotates interleaved pairs like the main rope head
+    (modeling_glm_moe_dsa.py:231-232), IndexShare layers own no indexer and
+    attend the previous full layer's top-k (:313-318, :739-748), and the
+    MTP depth ships past num_hidden_layers as GLM 4.5's does."""
+    layers = int(hf_config['num_hidden_layers'])
+    # GlmMoeDsaConfig.__post_init__:152 points head_dim at the rope slice
+    # whatever the config says (GLM-5.2 ships 192 over a rope width of 64),
+    # so the field describes nothing the reference computes.
+    config = _deepseek_config({**hf_config, 'head_dim': None}, used, sparse=True)
+    used.add('head_dim')
+    # The indexer's rotation is not a dial: GlmMoeDsaIndexer.forward always
+    # interleaves, and a flag saying otherwise describes no model the
+    # reference builds.
+    if hf_config.get('indexer_rope_interleave', True) is not True:
+        _refuse(f"indexer_rope_interleave {hf_config['indexer_rope_interleave']!r}",
+                "GlmMoeDsaIndexer always rotates interleaved pairs")
+    # GlmMoeDsaTopkRouter casts to float32 itself (:514), whatever
+    # moe_router_dtype says; index_share_for_mtp_iteration tells a
+    # speculative-decoding engine to reuse draft step 0's top-k on the later
+    # draft steps, and transformers builds no MTP depth to read it.
+    used.update(('indexer_rope_interleave', 'moe_router_dtype',
+                 'index_share_for_mtp_iteration'))
+    shared = tuple(index for index, kind in
+                   enumerate(_glm_indexer_types(hf_config, layers, used))
+                   if kind == 'shared')
+    config['mixer'] = {**config['mixer'], 'index_rope_interleave': True, 'latent_norm_eps': 1e-6}
+    if shared:
+        config['kv_shared_layers'] = shared
+    config['num_nextn_predict_layers'] = int(hf_config.get('num_nextn_predict_layers', 0))
+    return config
+
+
 def _llama4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
     """Llama 4's text decoder: chunked rotated local layers around global
     layers with no rope, every interleaved layer routed with a shared
@@ -2946,6 +3018,14 @@ _FAMILY_ENTRIES = (
                                   and (mixture := _mixture_value(fields)) is not None
                                   and mixture.bias),
                   'glm4_moe', 'Glm4MoeForCausalLM', lambda model: {},
+                  weight_path=_glm4_moe_path, preserve_source_layout=True),
+    # GLM's sparse block is V3.2's with the indexer rotating interleaved
+    # pairs, which no DeepSeek release does, so that field names the family.
+    DecoderFamily(('glm_moe_dsa',), _glm_moe_dsa_config,
+                  lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)
+                                  and mixer.index_topk is not None
+                                  and mixer.index_rope_interleave),
+                  'glm_moe_dsa', 'GlmMoeDsaForCausalLM', lambda model: {},
                   weight_path=_glm4_moe_path, preserve_source_layout=True),
     DecoderFamily(('deepseek_v32',), partial(_deepseek_config, sparse=True),
                   lambda fields: (isinstance(mixer := _mixer_value(fields), MLAMixer)

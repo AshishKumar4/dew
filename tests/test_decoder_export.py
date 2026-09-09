@@ -21,6 +21,7 @@ Observed on CPU in fp32, every position's argmax equal and the tolerance
 | mixtral      |             41 |         24 |                  2.9e-06 |
 | qwen3_moe    |             46 |         12 |                  2.0e-06 |
 | glm4_moe     |            103 |         48 |                  2.2e-06 |
+| glm_moe_dsa  |            298 |        144 |                  3.8e-06 |
 | deepseek_v2  |             48 |         24 |                  3.2e-06 |
 | deepseek_v3  |             53 |         24 |                  5.1e-06 |
 | deepseek_v32 |             63 |         24 |                  3.4e-06 |
@@ -30,13 +31,19 @@ Observed on CPU in fp32, every position's argmax equal and the tolerance
 
 Llama 4 ships one fused `experts.gate_up_proj` per routed layer instead of
 one tensor per expert, so its export runs the fused path and holds no
-indexed binding. transformers' Glm4Moe has no MTP depth and ignores those
-tensors of the GLM checkpoint, so the reference agrees on the trunk and the
-depth's own weights are held to account through the dew reload. OLMo 3 is
-the dense case, and the one whose rotary differs between its layer kinds:
-its fixture carries the released 7B YaRN on the full-attention layers
-alone, so the export has to write that per-kind rope back and not one
-table for the model.
+indexed binding. transformers' Glm4Moe and GlmMoeDsa have no MTP depth and
+ignore those tensors of the GLM checkpoints, so the reference agrees on the
+trunk and the depth's own weights are held to account through the dew
+reload. OLMo 3 is the dense case, and the one whose rotary differs between
+its layer kinds: its fixture carries the released 7B YaRN on the
+full-attention layers alone, so the export has to write that per-kind rope
+back and not one table for the model.
+
+glm_moe_dsa is also held to the reference's gradients: dew's gradient of
+the next-token cross entropy, written into the source layout through the
+same bindings the export uses, against the reference's `.grad` on 224
+tensors (the per-expert ones read their slice of the fused parameters),
+observed max scaled error 1.5e-06 at the 1e-4 bound.
 
 transformers 5.16.1 registers no `kimi_k2` config, so the tool names the
 class Kimi's release points its `auto_map` at, `DeepseekV3ForCausalLM`,
@@ -71,12 +78,18 @@ MOVEMENT = 1e-4
 # The families whose checkpoint names one tensor per expert, which the load
 # stacks and the export slices back apart. Llama 4 fuses its experts
 # instead and is covered by every other case here.
-INDEXED = ("mixtral", "qwen3_moe", "glm4_moe", "deepseek_v2", "deepseek_v3",
-           "deepseek_v32", "kimi_k2")
+INDEXED = ("mixtral", "qwen3_moe", "glm4_moe", "glm_moe_dsa", "deepseek_v2",
+           "deepseek_v3", "deepseek_v32", "kimi_k2")
 
 
 CASES = {case.name: case for case in tool.CASES}
 BALANCED = tuple(name for name, case in CASES.items() if case.balance_rate is not None)
+MTP = tuple(name for name, case in CASES.items() if case.mtp_weight is not None)
+# The families whose training claim is held to the reference's gradients
+# too: dew's gradient of the next-token cross entropy, written back into
+# the source's tensor layout, against the reference's `.grad`.
+GRADIENTS = ("glm_moe_dsa",)
+GRADIENT = 1e-4
 
 
 def flat(tree):
@@ -220,11 +233,12 @@ def test_an_expert_index_past_the_stack_is_refused(indexed):
         beyond.export(trip.trained)
 
 
-def test_the_mtp_copies_carry_the_trained_embedding_and_head(trips):
+@pytest.mark.parametrize("name", MTP, ids=MTP)
+def test_the_mtp_copies_carry_the_trained_embedding_and_head(name, trips):
     """GLM's prediction depth ships copies of the trunk's embedding and
     head, which it shares. The export writes the trained weights into both
     names, so a reload still sees a depth that shares them."""
-    trip = trips("glm4_moe")
+    trip = trips(name)
     exported, source = trip.exported_tensors, trip.source_tensors
     depth = f"model.layers.{trip.source.model.num_layers}"
 
@@ -234,6 +248,18 @@ def test_the_mtp_copies_carry_the_trained_embedding_and_head(trips):
         moved = float(np.max(np.abs(exported[copy].astype(np.float32)
                                     - source[copy].astype(np.float32))))
         assert moved > MOVEMENT, f"{copy} still holds the checkpoint's values"
+
+
+@pytest.mark.parametrize("name", GRADIENTS, ids=GRADIENTS)
+def test_the_gradients_match_the_reference_implementation(name, trips):
+    """One training step is what the export carries, so the step's
+    gradient is held to the reference's: every source tensor the reference
+    holds a gradient for, at a scaled error below 1e-4 (glm_moe_dsa:
+    224 tensors, observed 1.5e-06)."""
+    errors = tool.gradient_parity(trips(name))
+    assert len(errors) > 100, f"{name} compared {len(errors)} tensors"
+    worst = max(errors, key=errors.__getitem__)
+    assert errors[worst] < GRADIENT, f"{worst} gradient scaled error {errors[worst]:.3e}"
 
 
 @pytest.mark.parametrize("name", BALANCED, ids=BALANCED)
