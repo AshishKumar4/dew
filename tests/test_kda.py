@@ -97,7 +97,7 @@ def oracle_layer(x, p, lower_bound, eps, rule):
     """`Glm5NextTextLinearAttention.forward` at float64 over `rule`."""
     batch, length, _ = x.shape
     mixed = np.concatenate([x @ p["q_proj"], x @ p["k_proj"], x @ p["v_proj"]], axis=-1)
-    taps = p["conv1d"][:, 0, :]
+    taps = np.concatenate([p[name][:, 0, :] for name in ("q_conv1d", "k_conv1d", "v_conv1d")])
     padded = np.pad(np.swapaxes(mixed, 1, 2), ((0, 0), (0, 0), (K - 1, 0)))
     conv = sum(padded[:, :, k:k + length] * taps[None, :, k, None] for k in range(K))
     conv = conv / (1 + np.exp(-conv))  # silu, the conv activation (hidden_act)
@@ -171,7 +171,7 @@ def layer_and_params(lower_bound):
     dense = lambda rows, cols: rng.randn(rows, cols) / np.sqrt(rows)
     params = {
         "q_proj": dense(E, H * D), "k_proj": dense(E, H * D), "v_proj": dense(E, H * D),
-        "conv1d": rng.randn(3 * H * D, 1, K) * 0.5,
+        **{name: rng.randn(H * D, 1, K) * 0.5 for name in ("q_conv1d", "k_conv1d", "v_conv1d")},
         "f_a_proj": dense(E, D), "f_b_proj": dense(D, H * D) * 3,
         "dt_bias": rng.randn(H * D) * 0.5, "A_log": rng.randn(H) * 0.3,
         "b_proj": dense(E, H), "g_a_proj": dense(E, D), "g_b_proj": dense(D, H * D) * 2,
@@ -181,7 +181,8 @@ def layer_and_params(lower_bound):
         **{name: {"kernel": jnp.asarray(params[name], jnp.float32)}
            for name in ("q_proj", "k_proj", "v_proj", "f_a_proj", "f_b_proj", "b_proj",
                         "g_a_proj", "g_b_proj", "o_proj")},
-        "conv1d": {"weight": jnp.asarray(params["conv1d"], jnp.float32)},
+        **{name: {"weight": jnp.asarray(params[name], jnp.float32)}
+           for name in ("q_conv1d", "k_conv1d", "v_conv1d")},
         "dt_bias": jnp.asarray(params["dt_bias"], jnp.float32),
         "A_log": jnp.asarray(params["A_log"], jnp.float32),
         "o_norm": {"weight": jnp.asarray(params["o_norm"], jnp.float32)},

@@ -14,10 +14,11 @@ recurrence and a different parameterisation around it
   softplus(g)` (`Glm5NextTextForgetGate`, modeling_glm5_next.py:319-335).
 - `beta = sigmoid(b_proj(x))` per head (modeling_glm5_next.py:697).
 - q, k and v have their own projections and their own depthwise convs,
-  which the reference concatenates and runs as one `conv1d` over
-  `3 * H * Dk` channels (modeling_glm5_next.py:607-615, 642-649); the
-  release stores the three convs apart (`q_conv1d`, `k_conv1d`,
-  `v_conv1d`), which the loader concatenates in that order.
+  which the reference concatenates and runs as one conv over `3 * H * Dk`
+  channels (modeling_glm5_next.py:607-615, 642-649); the release stores the
+  three convs apart as `q_conv1d`, `k_conv1d` and `v_conv1d` (transformers'
+  conversion concatenates them on load), and so does this module, whose
+  taps concatenate in the same order at call time.
 - The output gate is `g_b_proj(g_a_proj(x))` through a sigmoid-gated RMSNorm
   with a weight, `o_norm` (modeling_glm5_next.py:339-358, 729-730), then
   `o_proj`.
@@ -156,12 +157,12 @@ def recurrent_kimi_delta_rule(query, key, value, g, beta, state=None):
     ("f_b_proj",): (None, "heads"),
     ("g_a_proj",): ("embed", None),
     ("g_b_proj",): (None, "heads"),
-}, heuristic=(("conv1d",),))
+}, heuristic=(("q_conv1d",), ("k_conv1d",), ("v_conv1d",)))
 class KimiDeltaAttention(nn.Module):
     """The token mixer of a GLM-5.3-Flash `linear_attention` layer.
 
     Parameter names are the checkpoint's under the reference's module:
-    `q_proj`, `k_proj`, `v_proj`, `conv1d/weight` `[3 H Dk, 1, K]`, the
+    `q_proj`, `k_proj`, `v_proj`, `{q,k,v}_conv1d/weight` `[H Dk, 1, K]`, the
     forget gate's `f_a_proj`, `f_b_proj`, `dt_bias` `[H Dk]` and `A_log` `[H]`
     (which the release stores directly under the layer and transformers'
     conversion renames under `forget_gate`; the loader keeps the released
@@ -194,7 +195,9 @@ class KimiDeltaAttention(nn.Module):
         self.q_proj = dense(self.qkv_features, name='q_proj')
         self.k_proj = dense(self.qkv_features, name='k_proj')
         self.v_proj = dense(self.qkv_features, name='v_proj')
-        self.conv1d = DepthwiseConv1d(features=3 * self.qkv_features, kernel=self.conv_kernel, name='conv1d')
+        self.q_conv1d, self.k_conv1d, self.v_conv1d = (
+            DepthwiseConv1d(features=self.qkv_features, kernel=self.conv_kernel, name=f'{name}_conv1d')
+            for name in 'qkv')
         self.f_a_proj = dense(self.head_dim, name='f_a_proj')
         self.f_b_proj = dense(self.qkv_features, name='f_b_proj')
         self.dt_bias = self.param('dt_bias', nn.initializers.zeros, (self.qkv_features,), jnp.float32)
@@ -231,7 +234,8 @@ class KimiDeltaAttention(nn.Module):
             x = jnp.where(valid[:, :, None], x, 0)
         conv_input = jnp.moveaxis(
             jnp.concatenate([self.q_proj(x), self.k_proj(x), self.v_proj(x)], axis=-1).astype(jnp.float32), 2, 1)
-        taps = jnp.asarray(self.conv1d()[:, 0, :], jnp.float32)
+        taps = jnp.concatenate([jnp.asarray(conv()[:, 0, :], jnp.float32)
+                                for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
         recurrent = None
         if decode:
             allocated = self.has_variable('cache', 'recurrent_state')
