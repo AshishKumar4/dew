@@ -29,7 +29,7 @@ from termcolor import colored
 
 from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
-from dew.data.dataset import Checkpointable, Stage, rows_of
+from dew.data.dataset import Checkpointable, RampedStream, Stage, rows_of
 from dew.nn.inputs import BATCH_AXES
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import (Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective,
@@ -689,7 +689,15 @@ class Trainer(Generic[Loss, Effects]):
             first_step = None
 
             if current < steps:
-                if data.ramp is not None:
+                source = data.train()
+                if (checkpoint_every or local_every) and not isinstance(source, Checkpointable):
+                    raise ValueError(
+                        f"checkpoint_every needs a training stream with get_state and "
+                        f"set_state, and {type(source).__name__} lacks one; a checkpoint "
+                        f"written without the data position would replay the data on "
+                        f"resume. Train it with checkpoint_every=None "
+                        f"(--trainer.checkpoint-every None)")
+                if isinstance(source, RampedStream):
                     if self.accumulation > 1:
                         raise ValueError(
                             f"a batch ramp grows the records a step reads, and an "
@@ -699,15 +707,7 @@ class Trainer(Generic[Loss, Effects]):
                     # Before the prefetch worker places a batch, which is
                     # where a stage the mesh cannot hold would otherwise
                     # surface, for a later stage an hour into the run.
-                    self._check_stages(data.ramp.stages(data.batch), mesh)
-                source = data.train()
-                if (checkpoint_every or local_every) and not isinstance(source, Checkpointable):
-                    raise ValueError(
-                        f"checkpoint_every needs a training stream with get_state and "
-                        f"set_state, and {type(source).__name__} lacks one; a checkpoint "
-                        f"written without the data position would replay the data on "
-                        f"resume. Train it with checkpoint_every=None "
-                        f"(--trainer.checkpoint-every None)")
+                    self._check_stages(source.stages, mesh)
                 train = DevicePrefetchIterator(source, mesh, source_state=position)
                 source = None  # Lifetime transferred to the prefetch worker.
 
