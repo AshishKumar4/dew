@@ -31,6 +31,12 @@ What lands in tests/fixtures/hf:
   tensors composed the way the engines that run the released weights do:
   eh_proj over enorm(embeddings) and hnorm(hidden) in that order, one
   Glm4MoeDecoderLayer, shared_head.norm, then the trunk's head.
+- glm-moe-dsa-tiny/: GLM-5.3 at toy width, DeepSeek V3.2's sparse MLA with
+  the indexer rotating interleaved pairs, three dense layers over routed
+  ones with the balancing bias and a shared expert, IndexShare's
+  full/shared schedule (index_topk_freq 4 off index_skip_topk_offset 3)
+  over eight layers, and one MTP depth (model.layers.8.*) with its own
+  indexer, composed as glm4-moe-tiny's is (mtp_logits.npy).
 - llama4-tiny/: Llama 4 at toy width, three chunked local layers with the
   interleaved rope and the L2 q/k norm around one global layer with
   temperature tuning, every other layer routed with the shared expert.
@@ -42,10 +48,10 @@ What lands in tests/fixtures/hf:
   branch beside every layer's dense MLP under Gemma4TextRouter, global
   layers reading their values off the keys with fewer key/value heads and
   a wider head, and the per-layer output scalar.
-- gpt-oss-20b/, deepseek-v2-lite/, kimi-k2/, glm-4.5-air/, llama-4-scout/,
-  gemma4-26b-a4b/: released configs only. Llama-4-Scout and gemma-4-26B-A4B
-  are gated, so their configs come from mirrors and drop the mirror's own
-  marker key.
+- gpt-oss-20b/, deepseek-v2-lite/, kimi-k2/, glm-4.5-air/, glm-5/, glm-5.3/,
+  llama-4-scout/, gemma4-26b-a4b/: released configs only. Llama-4-Scout and
+  gemma-4-26B-A4B are gated, so their configs come from mirrors and drop
+  the mirror's own marker key.
 
 The gemma4-ple, gemma4-kvshare and gemma4-e2b fixtures predate the
 persistent layer_scalar buffer transformers 5.16.1 saves, so
@@ -87,7 +93,7 @@ from safetensors.numpy import load_file, save_file
 from transformers import (
     DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma3nTextConfig, Gemma4TextConfig, Glm4MoeConfig, Glm4MoeForCausalLM,
-    Llama4TextConfig,
+    GlmMoeDsaConfig, GlmMoeDsaForCausalLM, Llama4TextConfig,
 )
 from transformers.masking_utils import create_causal_mask, create_chunked_causal_mask
 from transformers.models.gemma3n.modeling_gemma3n import (
@@ -95,6 +101,9 @@ from transformers.models.gemma3n.modeling_gemma3n import (
 )
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM, Gemma4TextDecoderLayer
 from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeDecoderLayer, Glm4MoeRMSNorm
+from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
+    GlmMoeDsaDecoderLayer, GlmMoeDsaRMSNorm,
+)
 from transformers.models.llama4.modeling_llama4 import (
     Llama4ForCausalLM, Llama4TextAttention, Llama4TextMoe, Llama4TextRotaryEmbedding,
 )
@@ -256,18 +265,19 @@ def tiny_glm4_moe() -> Glm4MoeForCausalLM:
     return Glm4MoeForCausalLM(config)
 
 
-class Glm4MoeMTP(torch.nn.Module):
-    """One GLM MTP depth as vLLM's Glm4MoeMultiTokenPredictorLayer composes it."""
+class GlmMTP(torch.nn.Module):
+    """One GLM MTP depth as vLLM's Glm4MoeMultiTokenPredictorLayer composes
+    it, over the family's own decoder block and norm."""
 
-    def __init__(self, config: Glm4MoeConfig) -> None:
+    def __init__(self, config, norm: type[torch.nn.Module], block: torch.nn.Module) -> None:
         super().__init__()
-        self.enorm = Glm4MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hnorm = Glm4MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.enorm = norm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = norm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = torch.nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
-        self.block = Glm4MoeDecoderLayer(config, layer_idx=config.num_hidden_layers)
-        self.shared_head_norm = Glm4MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.block = block
+        self.shared_head_norm = norm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(self, model: Glm4MoeForCausalLM, hidden: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, model, hidden: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
         fused = self.eh_proj(torch.cat(
             [self.enorm(model.model.embed_tokens(ids)), self.hnorm(hidden)], dim=-1))
         positions = torch.arange(fused.shape[1])[None]
@@ -275,13 +285,38 @@ class Glm4MoeMTP(torch.nn.Module):
                                   past_key_values=None, position_ids=positions)
         out = self.block(fused, attention_mask=mask, position_ids=positions,
                          position_embeddings=model.model.rotary_emb(fused, positions))
+        # GlmMoeDsaDecoderLayer hands its top-k indices up beside the states.
+        if isinstance(out, tuple):
+            out = out[0]
         return model.lm_head(self.shared_head_norm(out))
 
 
-def write_glm4_moe_mtp(name: str, model: Glm4MoeForCausalLM, seed: int = 2026) -> None:
+def glm4_moe_mtp(config: Glm4MoeConfig) -> GlmMTP:
+    return GlmMTP(config, Glm4MoeRMSNorm, Glm4MoeDecoderLayer(config, layer_idx=config.num_hidden_layers))
+
+
+def glm_moe_dsa_mtp(config: GlmMoeDsaConfig) -> GlmMTP:
+    """The depth's block reads its own indexer mode and MLP kind at its
+    index, past the trunk's lists: the released depth ships indexer weights
+    (GLM-5.3's model.layers.78.self_attn.indexer.*) and routes. The strict
+    config holds the lists to num_hidden_layers, so the block is built from
+    a copy one layer deeper."""
+    depth = config.num_hidden_layers
+    # __post_init__ fills the three lists; the strict validator refuses a
+    # short one, so an unset list fails loudly here rather than silently.
+    extended = GlmMoeDsaConfig.from_dict(dict(
+        config.to_dict(), num_hidden_layers=depth + 1,
+        indexer_types=[*(config.indexer_types or ()), "full"],
+        mlp_layer_types=[*(config.mlp_layer_types or ()), "sparse"],
+        layer_types=[*(config.layer_types or ()), "deepseek_sparse_attention"]))
+    extended._attn_implementation = "eager"
+    return GlmMTP(config, GlmMoeDsaRMSNorm, GlmMoeDsaDecoderLayer(extended, layer_idx=depth))
+
+
+def write_glm_mtp(name: str, model, depth: GlmMTP, seed: int = 2026) -> None:
     """The depth's tensors into the fixture checkpoint, and its reference logits."""
     directory = FIXTURES / name
-    depth = Glm4MoeMTP(model.config).eval()
+    depth = depth.eval()
     scatter_weights(depth, seed)
     # The layer's submodules sit behind a class decorator that hides them
     # from a checker, so the routed block's parts are fetched by their paths.
@@ -307,6 +342,89 @@ def write_glm4_moe_mtp(name: str, model: Glm4MoeForCausalLM, seed: int = 2026) -
     np.save(directory / "mtp_logits.npy", logits.to(torch.float32).numpy())
     print(f"{directory}: depth {prefix}* with {len(tensors)} tensors, "
           f"mtp logits {tuple(logits.shape)}")
+
+
+# zai-org/GLM-5.3 at toy width. The release's proportions on a hidden width
+# of 32: intermediate_size twice the width (64), moe_intermediate_size and
+# the query LoRA a third of it (12 each), qk_nope three times qk_rope with
+# the values four times it (12, 4, 16), the indexer head twice the rope
+# width (8). The 1/12 latent would round to 3, too narrow to carry the
+# compressed keys and values, so kv_lora_rank stays at the 8 the other MLA
+# fixtures use. The release's own values: routed_scaling_factor 2.5,
+# rope_theta 8e6 under rope_parameters, one group holding every expert,
+# three dense layers, one shared expert, one prediction depth, and the
+# stale head_dim the release ships at qk_nope_head_dim, which the config
+# points back at the rope slice. 256 experts with 8 per token become 8
+# with 2 per token. IndexShare keeps the release's schedule, index_topk_freq
+# 4 from index_skip_topk_offset 3, which over eight layers reads
+# full, full, full, shared, shared, shared, full, shared: the last layer
+# shares the seventh's top-k and not the third's, so a reader that took
+# the first full layer's selection would disagree. The depth is a full
+# layer, as the release's model.layers.78.self_attn.indexer.* says.
+#
+# The release's indexer has half as many heads as the attention, which
+# would be two here; the relu zeroes a key's score whenever every head's
+# agreement is negative, and at two heads no seed in 400 kept the fourth
+# and fifth scores apart on every row of the five indexer layers (the
+# trunk's four full layers and the depth). Four heads with seed 3850 keep
+# them at least 0.0149 apart everywhere, so the fixture's top-k is one
+# selection and not a tie torch and jax break differently.
+GLM_MOE_DSA_SEED = 3850
+GLM_MOE_DSA_TINY = dict(
+    vocab_size=256, hidden_size=32, intermediate_size=64, moe_intermediate_size=12,
+    num_hidden_layers=8, num_attention_heads=4, num_key_value_heads=4,
+    n_shared_experts=1, n_routed_experts=8, routed_scaling_factor=2.5,
+    kv_lora_rank=8, q_lora_rank=12, qk_rope_head_dim=4, v_head_dim=16,
+    qk_nope_head_dim=12, n_group=1, topk_group=1, num_experts_per_tok=2,
+    norm_topk_prob=True, hidden_act="silu", max_position_embeddings=64,
+    rms_norm_eps=1e-5, tie_word_embeddings=False,
+    rope_parameters={"rope_theta": 8000000.0, "rope_type": "default"},
+    attention_bias=False, attention_dropout=0.0, index_topk=4, index_head_dim=8,
+    index_n_heads=4, head_dim=12, first_k_dense_replace=3,
+    num_nextn_predict_layers=1, indexer_rope_interleave=True, rope_interleave=True,
+    index_topk_freq=4, index_skip_topk_offset=3, index_topk_pattern=None,
+    index_share_for_mtp_iteration=True, moe_router_dtype="float32",
+    scoring_func="sigmoid", topk_method="noaux_tc", moe_layer_freq=1, ep_size=1,
+    pretraining_tp=1, use_cache=True, bos_token_id=0, eos_token_id=1,
+)
+
+
+def tiny_glm_moe_dsa() -> GlmMoeDsaForCausalLM:
+    torch.manual_seed(0)
+    return GlmMoeDsaForCausalLM(GlmMoeDsaConfig.from_dict(dict(GLM_MOE_DSA_TINY)))
+
+
+def write_glm_moe_dsa_head_dim(name: str) -> None:
+    """The release's head_dim back over the saved config, and the proof it
+    changes nothing.
+
+    GLM-5.2 and 5.3 ship head_dim at qk_nope_head_dim (192), which
+    GlmMoeDsaConfig.__post_init__:152 overwrites with the rope width before
+    anything reads it, so `save_pretrained` writes the rope width. The
+    fixture keeps the release's spelling, and fails if the reloaded model
+    reaches other logits than the saved one.
+    """
+    directory = FIXTURES / name
+    saved = json.loads((directory / "config.json").read_text())
+    saved["head_dim"] = GLM_MOE_DSA_TINY["head_dim"]
+    (directory / "config.json").write_text(json.dumps(saved, indent=2) + "\n")
+    loaded = GlmMoeDsaForCausalLM.from_pretrained(
+        str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True)
+    if not isinstance(loaded, tuple):
+        raise SystemExit("output_loading_info returns the model and its report")
+    model, report = loaded
+    unread = {key: sorted(report[key]) for key in
+              ("missing_keys", "mismatched_keys", "error_msgs") if report[key]}
+    depth = f"model.layers.{model.config.num_hidden_layers}."
+    stray = sorted(key for key in report["unexpected_keys"] if not key.startswith(depth))
+    if unread or stray:
+        raise SystemExit(f"{directory}: the config does not read its own weights: {unread} {stray}")
+    ids = np.load(directory / "input_ids.npy")
+    difference = float(np.max(np.abs(reference_logits(model, ids) - np.load(directory / "logits.npy"))))
+    if difference != 0.0:
+        raise SystemExit(f"{directory}: the released head_dim moved the logits by {difference:.3e}")
+    print(f"{directory}: head_dim {saved['head_dim']} over a rope width of "
+          f"{saved['qk_rope_head_dim']} reloads bit for bit")
 
 
 def llama4_tiny_config() -> Llama4TextConfig:
@@ -511,7 +629,11 @@ def main() -> None:
     write_kimi_k2_config("kimi-k2-tiny", "moonshotai/Kimi-K2-Instruct")
     glm = tiny_glm4_moe()
     write_tiny("glm4-moe-tiny", glm)
-    write_glm4_moe_mtp("glm4-moe-tiny", glm)
+    write_glm_mtp("glm4-moe-tiny", glm, glm4_moe_mtp(glm.config))
+    dsa = tiny_glm_moe_dsa()
+    write_tiny("glm-moe-dsa-tiny", dsa, seed=GLM_MOE_DSA_SEED)
+    write_glm_mtp("glm-moe-dsa-tiny", dsa, glm_moe_dsa_mtp(dsa.config))
+    write_glm_moe_dsa_head_dim("glm-moe-dsa-tiny")
     write_tiny("llama4-tiny", tiny_llama4())
     write_llama4_blocks(FIXTURES.parent / "llama4")
     write_mirrored_config("llama-4-scout", "unsloth/Llama-4-Scout-17B-16E")
@@ -527,6 +649,8 @@ def main() -> None:
     write_released_config("deepseek-v2-lite", "deepseek-ai/DeepSeek-V2-Lite")
     write_released_config("kimi-k2", "moonshotai/Kimi-K2-Instruct")
     write_released_config("glm-4.5-air", "zai-org/GLM-4.5-Air")
+    write_released_config("glm-5", "zai-org/GLM-5")
+    write_released_config("glm-5.3", "zai-org/GLM-5.3")
     write_mirrored_config("gemma-3n-e2b", "unsloth/gemma-3n-E2B")
 
 

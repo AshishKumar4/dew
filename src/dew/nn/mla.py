@@ -2,7 +2,10 @@
 
 The reference is transformers 5.16.1
 (models/deepseek_v3/modeling_deepseek_v3.py and
-models/deepseek_v32/modeling_deepseek_v32.py), read as the specification.
+models/deepseek_v32/modeling_deepseek_v32.py), read as the specification;
+models/glm_moe_dsa/modeling_glm_moe_dsa.py is the same block with the
+indexer rotating interleaved pairs and IndexShare layers attending the
+previous full layer's selection.
 MLA compresses keys and values into one low-rank latent per token plus a
 small decoupled rotary head: `kv_a_proj_with_mqa` maps the hidden states to
 `[kv_lora_rank + qk_rope_head_dim]`, the latent is normed, and `kv_b_proj`
@@ -207,7 +210,11 @@ def open_latent_cache(module: nn.Module, latent, rot, index_keys, max_seq_len, *
 
 
 def open_expanded_cache(module: nn.Module, key, value, index_keys, max_seq_len, *, valid=None):
-    """Per-row expanded K/V and sparse-index cache, as DeepSeek V3.2 stores it."""
+    """Per-row expanded K/V and sparse-index cache, as DeepSeek V3.2 stores it.
+
+    `index_keys` is None on a layer that owns no indexer and reads another
+    layer's selection; its cache holds the expanded keys and values alone.
+    """
     if max_seq_len is None:
         raise ValueError("decoding needs max_seq_len for its fixed-capacity sparse cache")
     batch, length = key.shape[:2]
@@ -217,16 +224,20 @@ def open_expanded_cache(module: nn.Module, key, value, index_keys, max_seq_len, 
                                  (batch, max_seq_len) + key.shape[2:], key.dtype)
     cached_value = module.variable("cache", "cached_value", jnp.zeros,
                                    (batch, max_seq_len) + value.shape[2:], value.dtype)
-    cached_index = module.variable("cache", "cached_index", jnp.zeros,
-                                   (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
+    cached_index = None
+    if index_keys is not None:
+        cached_index = module.variable("cache", "cached_index", jnp.zeros,
+                                       (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
     positions, allocated = _cache_positions(module, batch, length, max_seq_len, valid)
 
     def append(new_key, new_value, new_index_keys):
         if allocated:
             cached_key.value = _write_cache(cached_key.value, new_key, positions)
             cached_value.value = _write_cache(cached_value.value, new_value, positions)
-            cached_index.value = _write_cache(cached_index.value, new_index_keys, positions)
-        return cached_key.value, cached_value.value, cached_index.value
+            if cached_index is not None:
+                cached_index.value = _write_cache(cached_index.value, new_index_keys, positions)
+        full_index = None if cached_index is None else cached_index.value
+        return cached_key.value, cached_value.value, full_index
 
     return positions, append
 
@@ -302,9 +313,11 @@ class SparseIndexer(nn.Module):
     the indexer's weights nowhere, and the indexer's own loss (`indexer_kl`)
     reaches the main model nowhere.
 
-    The indexer rotates with the plain rotate-half convention, unlike the
-    main rope head's interleaved pairs; the reference calls the two
-    different functions and so does this.
+    The indexer rotates its rope slice in its family's convention: V3.2's
+    rotates half-split pairs (`modeling_deepseek_v32.py` calls
+    `apply_rotary_pos_emb` in the indexer beside the main head's interleaved
+    rotation) and GLM's rotates interleaved pairs like its main head
+    (modeling_glm_moe_dsa.py:231-232), which `rope_interleave` selects.
     """
 
     q_lora_rank: int
@@ -312,6 +325,7 @@ class SparseIndexer(nn.Module):
     head_dim: int
     rope_head_dim: int
     top_k: Optional[int] = None
+    rope_interleave: bool = False
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
 
@@ -334,6 +348,11 @@ class SparseIndexer(nn.Module):
         """The indexer's keys for these hidden states: `[B, S, head_dim]`."""
         return self.k_norm(self.wk(jax.lax.stop_gradient(hidden)))
 
+    def _rotate(self, part, freqs_cos, freqs_sin):
+        if self.rope_interleave:
+            return apply_rotary_interleave(part, freqs_cos, freqs_sin)
+        return apply_rotary(part, freqs_cos, freqs_sin)
+
     def rotated_keys(self, keys, freqs_cos, freqs_sin):
         """`keys` with their rope slice rotated at their own positions.
 
@@ -342,7 +361,7 @@ class SparseIndexer(nn.Module):
         what the reference's `update_indexer` ordering does.
         """
         k_rot, k_pass = jnp.split(keys, [self.rope_head_dim], axis=-1)
-        k_rot = apply_rotary(k_rot[:, :, None, :], freqs_cos, freqs_sin)
+        k_rot = self._rotate(k_rot[:, :, None, :], freqs_cos, freqs_sin)
         return jnp.concatenate([k_rot[:, :, 0, :], k_pass], axis=-1)
 
     def scores(self, hidden, q_resid, keys, freqs_cos, freqs_sin):
@@ -360,7 +379,7 @@ class SparseIndexer(nn.Module):
             batch, length, self.n_heads, self.head_dim)
         q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
-            [apply_rotary(q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
+            [self._rotate(q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
         scores = jnp.matmul(
             query.astype(jnp.float32),
             jnp.expand_dims(keys.astype(jnp.float32).transpose(0, 2, 1), -3))
@@ -435,6 +454,14 @@ class MultiHeadLatentAttention(nn.Module):
     frozen model. Whenever the indexer is present and the `indexer`
     collection is open, a training pass sows the per-query `indexer_kl`
     under `kl`, over the keys the attention itself used.
+    `index_rope_interleave` is the indexer's own rotation convention.
+
+    `index_shared` is GLM's IndexShare layer (modeling_glm_moe_dsa.py:313-318,
+    432-446): it owns no indexer and attends the keys the last earlier
+    selecting layer chose, which that layer stashes under `kv_store_key` in
+    the `kv_store` the block threads down the stack, as a KV-sharing
+    attention layer reads its provider's keys and values. It caches the
+    expanded keys and values like any sparse layer, without indexer keys.
 
     `attention_impl` reaches the shared kernel path, which pads these
     values to the query's width for a fused kernel and hands back their own
@@ -467,6 +494,9 @@ class MultiHeadLatentAttention(nn.Module):
     index_topk: Optional[int] = None
     index_n_heads: Optional[int] = None
     index_head_dim: Optional[int] = None
+    index_rope_interleave: bool = False
+    index_shared: bool = False
+    kv_store_key: Optional[str] = None
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
     attention_impl: Optional[str] = None
@@ -489,6 +519,15 @@ class MultiHeadLatentAttention(nn.Module):
             raise ValueError(
                 "index_topk selects with the indexer, which index_n_heads "
                 "and index_head_dim have to describe")
+        if self.index_shared and (self.index_n_heads is not None or self.index_topk is not None):
+            raise ValueError(
+                "index_shared reads another layer's selection, so the layer "
+                "carries no indexer of its own: index_n_heads, index_head_dim "
+                "and index_topk have to be None")
+        if self.index_shared and self.kv_store_key is None:
+            raise ValueError(
+                "index_shared reads the selection under kv_store_key, which "
+                "names the layer type that stashes it")
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         dense = functools.partial(
             nn.Dense, use_bias=self.attention_bias, dtype=self.dtype,
@@ -526,6 +565,7 @@ class MultiHeadLatentAttention(nn.Module):
                 q_lora_rank=self.q_lora_rank, n_heads=self.index_n_heads,
                 head_dim=self.index_head_dim,
                 rope_head_dim=self.qk_rope_head_dim, top_k=self.index_topk,
+                rope_interleave=self.index_rope_interleave,
                 dtype=self.dtype, precision=self.precision, name=INDEXER)
 
     @property
@@ -535,8 +575,24 @@ class MultiHeadLatentAttention(nn.Module):
 
     @property
     def sparse(self) -> bool:
-        """Whether the V3.2 indexer selects the keys per query."""
-        return self.index_topk is not None
+        """Whether each query attends a selection of the keys: this layer's
+        indexer's, or the one it shares."""
+        return self.index_topk is not None or self.index_shared
+
+    def _select(self, index_scores, keep, kv_store):
+        """The keys each query attends among `keep`: this layer's top-k,
+        stashed for the layers sharing it, or the stashed selection read."""
+        if self.index_shared:
+            if kv_store is None or self.kv_store_key not in kv_store:
+                raise ValueError(
+                    f"layer shares the index selection under {self.kv_store_key!r} "
+                    "but no earlier selecting layer stashed one; the model has to "
+                    "pass one kv_store dict down its layer stack")
+            return jnp.logical_and(kv_store[self.kv_store_key], keep)
+        selected = self.indexer.select(index_scores, keep)
+        if kv_store is not None and self.kv_store_key is not None:
+            kv_store[self.kv_store_key] = selected
+        return selected
 
     @property
     def query_scale(self) -> float:
@@ -611,11 +667,10 @@ class MultiHeadLatentAttention(nn.Module):
             # and the appended latents at theirs, while the cached ones keep
             # the angles of the slots they were written at.
             if self.sparse:
-                assert q_resid is not None
                 # The cache is shaped by the expansion; its values are
                 # recomputed after rotation below, so only shapes flow here.
                 shape_key, shape_value = self._expand(latent, rot)
-                index_keys = self.indexer.keys(x)
+                index_keys = self.indexer.keys(x) if self.indexed else None
                 positions, append = open_expanded_cache(
                     self, shape_key, shape_value, index_keys,
                     self.max_seq_len, valid=valid)
@@ -625,17 +680,19 @@ class MultiHeadLatentAttention(nn.Module):
                 q_rot = self._rotate(q_rot, freqs_cos, freqs_sin)
                 rot = self._rotate(
                     rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :]
-                index_keys = self.indexer.rotated_keys(
-                    self.indexer.keys(x), freqs_cos, freqs_sin)
+                if index_keys is not None:
+                    index_keys = self.indexer.rotated_keys(index_keys, freqs_cos, freqs_sin)
                 key, value, index_full = append(
                     *self._expand(latent, rot), index_keys)
-                index_scores = self.indexer.scores(
-                    x, q_resid, index_full, freqs_cos, freqs_sin)
-                mask = self.indexer.select(
-                    index_scores,
-                    causal_attention_mask(
-                        positions, key.shape[1],
-                        key_valid=self.get_variable("cache", "cache_valid"))[:, 0])[:, None]
+                index_scores = None
+                if self.indexed:
+                    assert q_resid is not None
+                    index_scores = self.indexer.scores(
+                        x, q_resid, index_full, freqs_cos, freqs_sin)
+                keep = causal_attention_mask(
+                    positions, key.shape[1],
+                    key_valid=self.get_variable("cache", "cache_valid"))[:, 0]
+                mask = self._select(index_scores, keep, kv_store)[:, None]
             else:
                 positions, append = open_latent_cache(
                     self, latent, rot, None, self.max_seq_len, valid=valid)
@@ -672,8 +729,7 @@ class MultiHeadLatentAttention(nn.Module):
                         inside, causal_attention_mask(
                             jnp.arange(length), length))
                 causal = False
-            if self.indexed:
-                assert q_resid is not None
+            if self.indexed or self.index_shared:
                 # The keys a query may attend before selection: the rows'
                 # causal order (packed positions restart per document, so
                 # they order nothing here) and the packed base when there
@@ -685,17 +741,20 @@ class MultiHeadLatentAttention(nn.Module):
                     keep = rows if keep is None else jnp.logical_and(keep, rows)
                 if keep is None:
                     keep = jnp.ones((1, length, length), jnp.bool_)
-                index_keys = self.indexer.rotated_keys(
-                    self.indexer.keys(x), freqs_cos, freqs_sin)
                 if valid is not None:
                     # Selection and its objective range over real keys only.
                     keep = jnp.logical_and(keep, jnp.asarray(valid, bool)[:, None, :])
-                index_scores = self.indexer.scores(
-                    x, q_resid, index_keys, freqs_cos, freqs_sin)
+                index_scores = None
+                if self.indexed:
+                    assert q_resid is not None
+                    index_keys = self.indexer.rotated_keys(
+                        self.indexer.keys(x), freqs_cos, freqs_sin)
+                    index_scores = self.indexer.scores(
+                        x, q_resid, index_keys, freqs_cos, freqs_sin)
                 if self.sparse:
-                    keep = self.indexer.select(index_scores, keep)
+                    keep = self._select(index_scores, keep, kv_store)
                     mask, causal = keep[:, None], False
-                if (not self.is_initializing()
+                if (index_scores is not None and not self.is_initializing()
                         and self.is_mutable_collection(INDEXER_COLLECTION)):
                     objective = (index_scores, keep)
         if valid is not None:
@@ -766,12 +825,18 @@ class MLAMixer(MixerBase):
     than replaced, so scaling is configured once, and the mscale is applied
     in the attention as a query pre-scale.
 
+    `index_rope_interleave` is the indexer's rotation convention: V3.2
+    rotates half-split pairs, GLM interleaved ones.
+
     The context's grouped-query geometry (`num_kv_heads`, `head_dim`) has
     no meaning here and is not read, as the backbone documents; `qk_norm` is
     not read either, since the latent norms are the design's own and always
-    present. The dials a standard attention honours and this cannot (a
-    values norm, KV sharing, a window, an attention scale, a partial rotary)
-    are refused.
+    present. A layer the backbone marks `kv_shared` is GLM's IndexShare
+    layer (modeling_glm_moe_dsa.py:313-318): what an MLA layer shares is
+    its indexer's selection, so the layer builds no indexer and attends the
+    keys its provider chose, which needs the kind to select. The dials a
+    standard attention honours and this cannot (a values norm, a window, an
+    attention scale, a partial rotary) are refused.
     """
 
     q_lora_rank: Optional[int] = None
@@ -784,6 +849,10 @@ class MLAMixer(MixerBase):
     index_topk: Optional[int] = None
     index_n_heads: Optional[int] = None
     index_head_dim: Optional[int] = None
+    index_rope_interleave: bool = False
+    latent_norm_eps: Optional[float] = None
+    """None uses the trunk epsilon; GLM hardcodes 1e-6 on the MLA latents
+    (modeling_glm_moe_dsa.py:349,361), independently of rms_norm_eps."""
 
     @property
     def indexed(self) -> bool:
@@ -799,7 +868,6 @@ class MLAMixer(MixerBase):
         unsupported = {
             "v_norm": ctx.v_norm,
             "k_eq_v": ctx.k_eq_v,
-            "kv_shared": ctx.kv_shared,
             "sliding_window": ctx.sliding_window,
             "attention_scale": ctx.attention_scale,
             "partial_rotary_factor": ctx.partial_rotary_factor,
@@ -816,6 +884,11 @@ class MLAMixer(MixerBase):
                 f"the yarn record's rope_theta ({self.yarn.rope_theta}) and "
                 f"the layer's ({ctx.rope_theta}) disagree; the rope base is "
                 "configured once, on the model")
+        if ctx.kv_shared and not self.sparse:
+            raise ValueError(
+                "a sharing mla layer attends the selection of an earlier "
+                "layer's indexer, so the kind has to select: index_topk, "
+                "index_n_heads and index_head_dim have to be set")
         return functools.partial(
             MultiHeadLatentAttention,
             emb_features=ctx.emb_features,
@@ -830,13 +903,16 @@ class MLAMixer(MixerBase):
             rope_theta=ctx.rope_theta,
             rope_interleave=self.rope_interleave,
             yarn=self.yarn,
-            norm_eps=ctx.norm_eps,
+            norm_eps=ctx.norm_eps if self.latent_norm_eps is None else self.latent_norm_eps,
             scale_offset=ctx.scale_offset,
             scale_after_cast=ctx.scale_after_cast,
             attention_bias=ctx.attention_bias,
-            index_topk=self.index_topk,
-            index_n_heads=self.index_n_heads,
-            index_head_dim=self.index_head_dim,
+            index_topk=None if ctx.kv_shared else self.index_topk,
+            index_n_heads=None if ctx.kv_shared else self.index_n_heads,
+            index_head_dim=None if ctx.kv_shared else self.index_head_dim,
+            index_rope_interleave=self.index_rope_interleave,
+            index_shared=ctx.kv_shared,
+            kv_store_key=ctx.kv_store_key,
             dtype=ctx.dtype,
             precision=ctx.precision,
             attention_impl=ctx.attention_impl,
