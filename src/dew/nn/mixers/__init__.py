@@ -140,6 +140,7 @@ def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
 # The kind modules register where they are defined; this hub imports them,
 # one line per kind module, alphabetical.
 from .attention import AttentionMixer  # noqa: E402,F401  (registers the kind)
+from .. import dsa_kpool  # noqa: E402,F401  (registers the kind)
 from . import gated_delta_net  # noqa: E402,F401  (registers the kind)
 from .. import kda  # noqa: E402,F401  (registers the kind)
 from .. import llama4  # noqa: E402,F401  (registers the kind)
