@@ -82,6 +82,19 @@ def load_params(path) -> Dict[str, Any]:
     return _unflatten(_safetensors().load_file(os.fspath(path)))
 
 
+def read_file(path) -> tuple[Dict[str, np.ndarray], Dict[str, str]]:
+    """A file's flat tensor table, names as stored, and its header metadata."""
+    from safetensors import safe_open
+    with safe_open(os.fspath(path), "np") as handle:
+        metadata = handle.metadata() or {}
+        return {name: handle.get_tensor(name) for name in handle.keys()}, metadata
+
+
+def write_file(tensors: Mapping[str, np.ndarray], path, metadata: Mapping[str, str]) -> None:
+    """Write a flat tensor table under the names given, with header metadata."""
+    _safetensors().save_file(dict(tensors), os.fspath(path), metadata=dict(metadata))
+
+
 def save_hf_layout(params, config: Dict[str, Any], directory) -> None:
     """Write model.safetensors and config.json into `directory`.
 

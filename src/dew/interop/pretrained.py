@@ -492,6 +492,20 @@ class WeightLayout:
                 f"fill the source's {self.shape}")
         return np.ascontiguousarray(value).reshape(self.shape)
 
+    def restore(self, tensor: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+        """The leaf of `shape` whose export is `tensor`.
+
+        The inverse of `export` for a layout that binds one whole leaf; a
+        tensor assembled from several leaves has no single leaf to restore.
+        """
+        if len(self.paths) != 1 or self.concatenate is not None or self.expert_index is not None:
+            raise ValueError(f"{self.name} is assembled from several leaves, so no one leaf restores it")
+        if tensor.shape != self.shape:
+            raise ValueError(f"{self.name} stores {self.shape}, not {tensor.shape}")
+        transpose = self.transpose or tuple(range(len(shape)))
+        stored = tensor.reshape(tuple(shape[axis] for axis in transpose))
+        return np.ascontiguousarray(stored.transpose(sorted(range(len(shape)), key=transpose.__getitem__)))
+
 
 def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
     """A per-expert leaf path as the stacked leaf the loaded tree holds.
@@ -745,24 +759,28 @@ class Pretrained:
             from dew.interop import diffusion
             diffusion.save_source(self, values, destination)
             return
+        family = self.config.get("model_type")
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
+        elif (isinstance(self.model, CausalTransformer) and isinstance(family, str)
+              and not decoders._FAMILIES[family].preserve_source_layout and quantization is None):
+            # A family that derives its export from the model is written by
+            # the decoder export, which writes the whole directory: weights,
+            # the config it derives, this processor's files and this
+            # generation config. One export path, so a decoder saved here and
+            # one saved directly leave the same files behind. A quantized
+            # source is not derived: its packed format goes back over the
+            # source names, so it takes the layout writer below.
+            decoders.save_pretrained_decoder(self.model, values, destination,
+                                             tokenizer=self.processor,
+                                             generation_config=generation_config)
+            return
         elif self.weight_layouts:
             # Source names and geometry first; the packed format goes back over them.
             text = self.model.language_model if isinstance(self.model, MultimodalTransformer) else self.model
             scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
             tensors = {**self.retained_tensors,
                        **{layout.name: layout.export(values, scalar_mode) for layout in self.weight_layouts}}
-        elif isinstance(self.model, CausalTransformer):
-            # A source with no layout to run backwards is written by the
-            # decoder export, which writes the whole directory: weights, the
-            # config it derives, this processor's files and this generation
-            # config. One export path, so a decoder saved here and one saved
-            # directly leave the same files behind.
-            decoders.save_pretrained_decoder(self.model, values, destination,
-                                             tokenizer=self.processor,
-                                             generation_config=generation_config)
-            return
         else:
             raise ValueError("this source has no reversible weight layout")
         if quantization is not None:
@@ -1768,7 +1786,14 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
         model = models.build("causal_transformer", **built)
         variables = decoders.translate_weights(tensors, record)
         decoders._check_tree(variables, model)
-        if decoders._FAMILIES[family].preserve_source_layout or quantized_tensors:
+        # The bindings are what an adapter loader resolves source names
+        # through and what a quantized source is written back through, so a
+        # derived-export family binds too; `save` picks its writer by
+        # preserve_source_layout and quantization, not by whether bindings
+        # exist. A family whose tensors are rewritten before the path map
+        # reads them (Gemma 4's prepare) has no raw-name bindings.
+        entry = decoders._FAMILIES[family]
+        if entry.preserve_source_layout or entry.prepare_weights is dict:
             bindings = []
             for name, tensor in tensors.items():
                 layout = _language_layout(name, name, tensor, record, family)
