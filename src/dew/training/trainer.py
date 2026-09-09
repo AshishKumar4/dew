@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -28,7 +29,8 @@ from termcolor import colored
 
 from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
-from dew.data.dataset import Checkpointable, RampedStream, Stage, rows_of
+from dew.data.dataset import Checkpointable, Stage, rows_of
+from dew.nn.inputs import BATCH_AXES
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import (Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective,
                                  Step, Variables, merge, select, mean_loss)
@@ -662,7 +664,6 @@ class Trainer(Generic[Loss, Effects]):
             # compiles once per stage of its ramp, and the shapes are that
             # ramp's stages and no others.
             compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
-            stages: tuple[Stage, ...] | None = None
             # Rebound once the step is compiled, so the first tick measures steps,
             # not the compile.
             last_log_time = time.time()
@@ -688,16 +689,7 @@ class Trainer(Generic[Loss, Effects]):
             first_step = None
 
             if current < steps:
-                source = data.train()
-                if (checkpoint_every or local_every) and not isinstance(source, Checkpointable):
-                    raise ValueError(
-                        f"checkpoint_every needs a training stream with get_state and "
-                        f"set_state, and {type(source).__name__} lacks one; a checkpoint "
-                        f"written without the data position would replay the data on "
-                        f"resume. Train it with checkpoint_every=None "
-                        f"(--trainer.checkpoint-every None)")
-                stages = source.stages if isinstance(source, RampedStream) else None
-                if stages is not None:
+                if data.ramp is not None:
                     if self.accumulation > 1:
                         raise ValueError(
                             f"a batch ramp grows the records a step reads, and an "
@@ -706,8 +698,16 @@ class Trainer(Generic[Loss, Effects]):
                             f"batch or accumulate, not both")
                     # Before the prefetch worker places a batch, which is
                     # where a stage the mesh cannot hold would otherwise
-                    # surface -- for a later stage, an hour into the run.
-                    self._check_stages(stages, mesh)
+                    # surface, for a later stage an hour into the run.
+                    self._check_stages(data.ramp.stages(data.batch), mesh)
+                source = data.train()
+                if (checkpoint_every or local_every) and not isinstance(source, Checkpointable):
+                    raise ValueError(
+                        f"checkpoint_every needs a training stream with get_state and "
+                        f"set_state, and {type(source).__name__} lacks one; a checkpoint "
+                        f"written without the data position would replay the data on "
+                        f"resume. Train it with checkpoint_every=None "
+                        f"(--trainer.checkpoint-every None)")
                 train = DevicePrefetchIterator(source, mesh, source_state=position)
                 source = None  # Lifetime transferred to the prefetch worker.
 
@@ -1012,18 +1012,17 @@ class Trainer(Generic[Loss, Effects]):
         run reads anything.
 
         A stage's rows are sharded over the mesh's batch axes like any other
-        batch's, so a stage those axes do not divide fails where it is
-        placed, which for a later stage is an hour into the run. How many
-        shards those axes cut a batch into is a fact about the mesh, read
-        here off the placement a row-shaped field would take.
+        batch's, and a pipelined step cuts them into its microbatches, so a
+        stage neither count divides fails where it is placed or traced,
+        which for a later stage is an hour into the run.
         """
-        devices = mesh.devices.size
-        placed = batch_shardings(mesh, {"rows": np.zeros(devices)})["rows"]
-        shards = devices // placed.shard_shape((devices,))[0]
-        refused = [stage.batch for stage in stages if stage.batch % shards]
+        shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+        microbatches = self.mesh.microbatches or self.mesh.stage
+        divisor = math.lcm(shards, microbatches)
+        refused = [stage.batch for stage in stages if stage.batch % divisor]
         if refused:
             raise ValueError(
                 f"the batch ramp reads {refused} records a step at some of its "
-                f"stages, and this mesh cuts a batch into {shards} shards: "
-                f"{dict(mesh.shape)} places whole rows per shard, so every stage "
-                f"of a ramp has to be a multiple of that count")
+                f"stages, and {dict(mesh.shape)} cuts a batch into {shards} shards "
+                f"of whole rows and {microbatches} microbatch(es), so every stage "
+                f"of a ramp has to be a multiple of {divisor}")
