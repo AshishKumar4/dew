@@ -1319,11 +1319,11 @@ def _source_decoding(config: Mapping[str, object], generation_config: Mapping[st
 
 class _Call(NamedTuple):
     """One pinned pipeline's own `__call__` policy, read from Diffusers
-    0.34.0: the denoiser it drives, the steps and guidance scale it defaults
-    to, whether that scale guides two branches or is the value the model
-    embeds, and the text sequence budget it pads its T5 tower to."""
+    0.34.0: the family it belongs to, the steps and guidance scale it
+    defaults to, whether that scale guides two branches or is the value the
+    model embeds, and the text sequence budget it pads its T5 tower to."""
 
-    component: str
+    family: Literal["sd", "sdxl", "sd3", "flux"]
     steps: int
     guidance: float
     guided: bool
@@ -1336,18 +1336,18 @@ class _Call(NamedTuple):
 # Flux's 3.5 is the guidance its transformer embeds while its own true
 # classifier-free guidance is off at the pinned default.
 _PIPELINE_POLICY: Mapping[str, _Call] = MappingProxyType({
-    "StableDiffusionPipeline": _Call("unet", 50, 7.5, True),
-    "StableDiffusionImg2ImgPipeline": _Call("unet", 50, 7.5, True),
-    "StableDiffusionInpaintPipeline": _Call("unet", 50, 7.5, True),
-    "StableDiffusionXLPipeline": _Call("unet", 50, 5.0, True),
-    "StableDiffusionXLImg2ImgPipeline": _Call("unet", 50, 5.0, True),
-    "StableDiffusionXLInpaintPipeline": _Call("unet", 50, 7.5, True),
-    "StableDiffusion3Pipeline": _Call("transformer", 28, 7.0, True, 256),
-    "FluxPipeline": _Call("transformer", 28, 3.5, False, 512),
-    "FlaxStableDiffusionPipeline": _Call("unet", 50, 7.5, True),
-    "FlaxStableDiffusionImg2ImgPipeline": _Call("unet", 50, 7.5, True),
-    "FlaxStableDiffusionInpaintPipeline": _Call("unet", 50, 7.5, True),
-    "FlaxStableDiffusionXLPipeline": _Call("unet", 50, 7.5, True),
+    "StableDiffusionPipeline": _Call("sd", 50, 7.5, True),
+    "StableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, True),
+    "StableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, True),
+    "StableDiffusionXLPipeline": _Call("sdxl", 50, 5.0, True),
+    "StableDiffusionXLImg2ImgPipeline": _Call("sdxl", 50, 5.0, True),
+    "StableDiffusionXLInpaintPipeline": _Call("sdxl", 50, 7.5, True),
+    "StableDiffusion3Pipeline": _Call("sd3", 28, 7.0, True, 256),
+    "FluxPipeline": _Call("flux", 28, 3.5, False, 512),
+    "FlaxStableDiffusionPipeline": _Call("sd", 50, 7.5, True),
+    "FlaxStableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, True),
+    "FlaxStableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, True),
+    "FlaxStableDiffusionXLPipeline": _Call("sdxl", 50, 7.5, True),
 })
 
 
@@ -1357,23 +1357,21 @@ def _call_policy(index: Mapping[str, object], denoiser: _Denoiser) -> _Call:
     A directory that declares no pipeline - a bare component tree - takes its
     family's reference pipeline. A directory that declares one Dew does not
     implement is refused rather than run under another pipeline's defaults,
-    and a declared pipeline that drives a different denoiser than the one the
-    directory holds is refused too: a component this loader reads does not
-    qualify a workflow it does not.
+    and a declared pipeline of another family is refused too: a component
+    this loader reads does not qualify a workflow it does not.
     """
     published = index.get("_class_name")
+    expected = _PIPELINE_POLICY[denoiser.pipeline]
     if published is None:
-        policy = _PIPELINE_POLICY[denoiser.pipeline]
-    else:
-        found = _PIPELINE_POLICY.get(published) if isinstance(published, str) else None
-        if found is None:
-            raise ValueError(f"Native diffusion does not implement the published pipeline "
-                             f"{published!r}")
-        policy = found
-    if policy.component != denoiser.component:
-        raise ValueError(f"The published pipeline {published!r} drives a {policy.component}, and "
-                         f"this directory holds a {denoiser.component}")
-    return policy
+        return expected
+    found = _PIPELINE_POLICY.get(published) if isinstance(published, str) else None
+    if found is None:
+        raise ValueError(f"Native diffusion does not implement the published pipeline "
+                         f"{published!r}")
+    if found.family != expected.family:
+        raise ValueError(f"The declared pipeline {published!r} is a {found.family} pipeline, and "
+                         f"this directory's denoiser belongs to {denoiser.pipeline!r}")
+    return found
 
 
 @dataclass(frozen=True)

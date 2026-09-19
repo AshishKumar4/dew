@@ -14,6 +14,7 @@ written out here, rather than with the functions under test.
 """
 
 import json
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -441,3 +442,18 @@ def test_the_tied_t5_embedding_maps_under_either_name(source):
     with pytest.raises(ValueError, match="stores its token embedding"):
         translate_t5_weights({name: value for name, value in tensors.items()
                               if name not in ("shared.weight", "encoder.embed_tokens.weight")})
+
+
+def test_a_flux_directory_declaring_an_sd3_pipeline_is_refused(source, tmp_path):
+    """A declared class another family's denoiser drives is refused: the
+    shared unet/transformer check cannot tell SD3's transformer from Flux's,
+    so the gate reads the pipeline family."""
+    from dew.interop.pretrained import load_pretrained
+
+    directory = tmp_path / "pipeline"
+    shutil.copytree(source / "pipeline", directory)
+    index = json.loads((directory / "model_index.json").read_text())
+    index["_class_name"] = "StableDiffusion3Pipeline"
+    (directory / "model_index.json").write_text(json.dumps(index))
+    with pytest.raises(ValueError, match="StableDiffusion3Pipeline.*FluxPipeline"):
+        load_pretrained(str(directory), dtype="float32", attention_impl="xla")
