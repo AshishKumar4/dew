@@ -26,6 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from safetensors.numpy import load_file, save_file
 
 from dew import lora
@@ -289,6 +290,69 @@ def test_freeze_refuses_a_filter_that_splits_nothing(decoder):
         freeze(decoder.variables, lambda path: False)
     with pytest.raises(ValueError, match="freezes nothing"):
         freeze(decoder.variables, lambda path: True)
+
+
+class _BranchHost(nn.Module):
+    """A target Dense carried as a submodule, the way models carry one."""
+
+    proj: nn.Module
+    keyword: bool = False
+
+    def __call__(self, x):
+        return self.proj(inputs=x) if self.keyword else self.proj(x)
+
+
+def _adapted(model, tree, *, contracted=1, rank=2, alpha=4.0, seed=0):
+    """A target on `proj`'s kernel with nonzero factors spliced in, and the
+    merged base beside it. A fresh adapter's zero B proves nothing."""
+    adapter = lora.LoRA({("params", "proj"): lora.Target(rank, alpha)})
+    keys = iter(jax.random.split(jax.random.key(seed), 2))
+    shape = tree["params"]["proj"]["kernel"].shape
+    factors = {"lora_A": jnp.asarray(jax.random.normal(next(keys), shape[:contracted] + (rank,))),
+               "lora_B": jnp.asarray(jax.random.normal(next(keys), (rank,) + shape[contracted:]))}
+    adapted_tree = merge(tree, {"params": {"proj": factors}})
+    return adapter, adapter.adapt(model), adapted_tree, adapter.merge(adapted_tree)
+
+
+def test_the_branch_reads_a_keyword_input():
+    """Flax calls Dense's inputs by keyword as well as positionally; the
+    branch has to read `inputs` from kwargs where the call passes it there."""
+    model = _BranchHost(nn.Dense(4), keyword=True)
+    x = jnp.asarray(np.random.RandomState(0).randn(2, 3), jnp.float32)
+    adapter, adapted, adapted_tree, merged = _adapted(model, model.init(jax.random.key(0), x))
+    node = adapted_tree["params"]["proj"]
+    expected = (jnp.einsum("bi,ij->bj", x, node["kernel"]) + node["bias"]
+                + adapter.scale(adapter.targets[("params", "proj")])
+                * jnp.einsum("bi,ij,jk->bk", x, node["lora_A"], node["lora_B"]))
+
+    np.testing.assert_allclose(
+        np.asarray(adapted.apply(adapted_tree, x)), np.asarray(expected), atol=1e-5, rtol=0)
+    np.testing.assert_allclose(
+        np.asarray(model.apply(merged, x)), np.asarray(expected), atol=1e-5, rtol=0)
+
+
+@pytest.mark.parametrize("features", [5, 3], ids=["mismatched-widths", "square"])
+def test_a_multi_axis_target_contracts_the_sorted_axes(features):
+    """DenseGeneral sorts the contracted axes before pairing them with the
+    kernel's leading dims; the branch has to do the same. Widths that differ
+    crash the unsorted pairing outright, and equal widths answer a different
+    contraction, so the oracle is the einsum the kernel means."""
+    model = _BranchHost(nn.DenseGeneral(4, axis=(-1, -2)))
+    x = jnp.asarray(np.random.RandomState(1).randn(2, 3, features), jnp.float32)
+    adapter, adapted, adapted_tree, merged = _adapted(
+        model, model.init(jax.random.key(0), x), contracted=2)
+    node = adapted_tree["params"]["proj"]
+    created = adapted.init(jax.random.key(9), x)["params"]["proj"]
+    assert created["lora_A"].shape == (3, features, 2)
+    assert created["lora_B"].shape == (2, 4)
+    expected = jnp.einsum("bij,ijk->bk", x, node["kernel"]) + node["bias"] + (
+        adapter.scale(adapter.targets[("params", "proj")])
+        * jnp.einsum("bij,ijr,rk->bk", x, node["lora_A"], node["lora_B"]))
+
+    np.testing.assert_allclose(
+        np.asarray(adapted.apply(adapted_tree, x)), np.asarray(expected), atol=1e-5, rtol=0)
+    np.testing.assert_allclose(
+        np.asarray(model.apply(merged, x)), np.asarray(expected), atol=1e-5, rtol=0)
 
 
 # --------------------------------------------------------------------------
