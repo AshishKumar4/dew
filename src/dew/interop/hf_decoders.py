@@ -2736,7 +2736,7 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[st
     shared = tuple(index for index, kind in
                    enumerate(_glm_indexer_types(hf_config, layers, used))
                    if kind == 'shared')
-    config['mixer'] = {**config['mixer'], 'index_rope_interleave': True, 'latent_norm_eps': 1e-6}
+    config['mixer'] = {**config['mixer'], 'index_rope_interleave': True}
     if shared:
         config['kv_shared_layers'] = shared
     config['num_nextn_predict_layers'] = int(hf_config.get('num_nextn_predict_layers', 0))
