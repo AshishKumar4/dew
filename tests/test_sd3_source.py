@@ -10,6 +10,7 @@ it, with the Euler trajectory and its input gradient.
 """
 
 import json
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -378,6 +379,21 @@ def test_omitted_call_policy_takes_the_published_pipelines_own(source, pipeline_
                             initial=arrays[f"{case}.x_T"], seed=0)
     walked = task(prepared, key=jax.random.PRNGKey(0)).host()
     assert relative_gap(walked.latents, arrays[f"{case}.default_latents"]) < 2e-5
+
+
+def test_an_sd3_directory_declaring_a_flux_pipeline_is_refused(source, tmp_path):
+    """A declared class another family's denoiser drives is refused: the
+    shared unet/transformer check cannot tell Flux's transformer from SD3's,
+    so the gate reads the pipeline family."""
+    from dew.interop.pretrained import load_pretrained
+
+    directory = tmp_path / "pipeline"
+    shutil.copytree(source / "pipeline", directory)
+    index = json.loads((directory / "model_index.json").read_text())
+    index["_class_name"] = "FluxPipeline"
+    (directory / "model_index.json").write_text(json.dumps(index))
+    with pytest.raises(ValueError, match="FluxPipeline.*StableDiffusion3Pipeline"):
+        load_pretrained(str(directory), dtype="float32", attention_impl="xla")
 
 
 def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(source, tmp_path):

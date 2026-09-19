@@ -4,8 +4,10 @@ References run Diffusers 0.34.0 / Transformers 4.49.0 in isolation. Tests here
 run Dew-native models, preprocessing, Process and solvers on the current stack.
 Each worker process releases its JAX executable caches after the comparison.
 """
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -64,3 +66,42 @@ def test_multilevel_unet_geometry_and_input_gradient(tmp_path, case):
     with tarfile.open(ROOT / "tests/fixtures/native_unet_geometry.tar.xz") as archive:
         archive.extractall(tmp_path, filter="data")
     run_check(tmp_path / case, "--model")
+
+
+def _declared(saved_pipelines, tmp_path, case: str, class_name: str) -> Path:
+    """A copy of the fixture directory declaring `class_name` instead."""
+    directory = tmp_path / case
+    shutil.copytree(saved_pipelines / case, directory)
+    index = json.loads((directory / "model_index.json").read_text())
+    index["_class_name"] = class_name
+    (directory / "model_index.json").write_text(json.dumps(index))
+    return directory
+
+
+@pytest.mark.parametrize("case, declared, held", [
+    ("sd", "StableDiffusionXLPipeline", "StableDiffusionPipeline"),
+    ("xl", "StableDiffusionPipeline", "StableDiffusionXLPipeline"),
+])
+def test_a_directory_declaring_another_familys_pipeline_is_refused(
+        saved_pipelines, tmp_path, case, declared, held):
+    """SD and XL share the UNet denoiser, so the component check cannot tell
+    them apart; the gate reads the pipeline family and names both classes."""
+    from dew.interop.pretrained import load_pretrained
+
+    directory = _declared(saved_pipelines, tmp_path, case, declared)
+    with pytest.raises(ValueError, match=f"{declared}.*{held}"):
+        load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+
+
+@pytest.mark.parametrize("case, declared, guidance", [
+    ("sd", "StableDiffusionImg2ImgPipeline", 7.5),
+    ("xl", "StableDiffusionXLImg2ImgPipeline", 5.0),
+])
+def test_a_matching_image_task_variant_loads(saved_pipelines, tmp_path, case, declared, guidance):
+    """A pipeline of the denoiser's own family keeps loading with its own
+    defaults: each img2img variant is accepted and guides at its scale."""
+    from dew.interop.pretrained import load_pretrained
+
+    directory = _declared(saved_pipelines, tmp_path, case, declared)
+    loaded = load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+    assert loaded.text_to_image().guidance.scale == guidance
