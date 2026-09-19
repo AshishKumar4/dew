@@ -9,6 +9,43 @@ import pytest
 from dew.checkpoints import Checkpoints
 from dew.objectives import Aux, EMASpec, Mean, Objective, mean_loss
 from dew.training import Trainer
+from dew.nn.blocks import TokenEmbedding
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
+@pytest.mark.parametrize("vocab", [1, 5])
+def test_token_lookup_preserves_linen_forward_and_parameter_layout(dtype, vocab):
+    model = TokenEmbedding(vocab, 3, dtype=dtype)
+    reference = nn.Embed(vocab, 3, dtype=dtype)
+    ids = jnp.asarray([[0, 0, vocab - 1]], jnp.int32)
+    variables = reference.init(jax.random.key(4), ids)
+    native = model.init(jax.random.key(4), ids)
+    assert jax.tree.structure(native) == jax.tree.structure(variables)
+    for actual, expected in zip(jax.tree.leaves(native), jax.tree.leaves(variables), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(model.apply(variables, ids), reference.apply(variables, ids))
+    query = jnp.asarray([[0.3, -0.2, 0.1]], dtype)
+    np.testing.assert_array_equal(model.apply(variables, query, method=model.attend),
+                                  reference.apply(variables, query, method=reference.attend))
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+def test_repeated_token_gradients_accumulate_in_master_precision(dtype):
+    model = TokenEmbedding(3, 2, dtype=dtype)
+    ids = jnp.asarray([0, 0, 0, 0, 1], jnp.int32)
+    small = 2.0 ** (-8 if dtype == jnp.bfloat16 else -11)
+    cotangent = jnp.asarray([[1, -1], [small, -small], [small, -small], [-1, 1], [2, 3]], dtype)
+    variables = model.init(jax.random.key(5), ids)
+
+    def loss(parameters):
+        outputs = model.apply({"params": parameters}, ids)
+        return jnp.sum(outputs.astype(jnp.float32) * cotangent.astype(jnp.float32))
+
+    gradient = jax.jit(jax.grad(loss))(variables["params"])["embedding"]
+    expected = np.zeros((3, 2), np.float32)
+    np.add.at(expected, np.asarray(ids), np.asarray(cotangent, np.float32))
+    assert gradient.dtype == jnp.float32
+    np.testing.assert_array_equal(gradient, expected)
 
 
 @struct.dataclass
