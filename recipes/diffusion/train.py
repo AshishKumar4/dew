@@ -62,7 +62,8 @@ def experiment_name(config: DiffusionRunConfig, summary: dict) -> str:
 
 def main(config: DiffusionRunConfig) -> TrainState:
     prepare_process(config.trainer.wandb, config.trainer.multi_host,
-                    config.trainer.xla_flags, config.trainer.compilation_cache_dir)
+                    config.trainer.xla_flags, config.trainer.compilation_cache_dir,
+                    layout=config.trainer.layout)
     print(f"Local devices: {jax.local_devices()}")
 
     # The objective first: its conditions are what read the dataset's

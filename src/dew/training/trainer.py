@@ -31,7 +31,7 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, RampedStream, rows_of
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import (Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective,
-                                 Step, Variables, merge, select, mean_loss)
+                                 Step, Variables, select)
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.telemetry import profile as telemetry_profile
 from dew.training.distributed import (
@@ -40,6 +40,7 @@ from dew.training.distributed import (
 )
 from dew.training.evaluation import Evaluation, evaluate
 from dew.training.state import Accumulation, TrainState
+from dew.training.transaction import Transaction, compact_qk, with_ema
 from dew.training.tracker import Tracker
 from dew.telemetry.records import FitStarted, FitEnded, CheckpointRequested, ProfileWindow, Record
 if TYPE_CHECKING:
@@ -133,86 +134,6 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
     return numbers
 
 
-def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
-    """The variables tree with the averaged leaves in place of the live ones."""
-    return None if ema is None else merge(params, ema)
-
-
-def _project(tree: Variables, like: Variables) -> Variables:
-    """The leaves of `tree` at the paths `like` holds, in `like`'s nesting."""
-    return {name: _project(tree[name], child) if isinstance(child, Mapping) else tree[name]
-            for name, child in like.items()}
-
-
-def ema_update(ema: Variables, params: Variables,
-               decay: jax.typing.ArrayLike) -> Variables:
-    """Update selected EMA leaves in their initialized storage dtypes.
-
-    Arithmetic uses at least fp32 and preserves explicit fp64. Unit decay
-    selects the original leaf, including nonfinite frozen-reference values.
-    """
-    def step(average, live):
-        dtype = jnp.result_type(average.dtype, live.dtype, decay, jnp.float32)
-        if average.dtype != dtype or live.dtype != dtype:
-            # Widen stored values without bypassing their producer's rounding.
-            average, live = jax.lax.optimization_barrier((average, live))
-        weight = jnp.asarray(decay, dtype)
-        updated = weight * average.astype(dtype) + (1 - weight) * live.astype(dtype)
-        stored = updated.astype(average.dtype)
-        return jnp.where(jnp.asarray(decay) >= 1.0, average, stored)
-
-    return jax.tree.map(step, ema, _project(params, ema))
-
-
-def write_back(params: Variables, variables: Variables | None) -> Variables:
-    """`params` with the collections in `variables` replaced whole."""
-    if variables is None:
-        return params
-    if "params" in variables:
-        raise ValueError("Aux.variables cannot carry the params collection; "
-                         "the optimizer owns it")
-    for name, collection in variables.items():
-        if name not in params:
-            raise ValueError(f"Aux.variables names {name!r}, which is not a collection "
-                             f"of the objective's tree {sorted(params)}")
-        if jax.tree.structure(collection) != jax.tree.structure(params[name]):
-            raise ValueError(f"Aux.variables[{name!r}] does not have the collection's "
-                             f"structure")
-    return {**params, **variables}
-
-
-def _unscale(gradient: jax.Array, factor: jax.typing.ArrayLike) -> jax.Array:
-    """Working gradients use at least fp32, preserving higher caller precision."""
-    dtype = jnp.promote_types(gradient.dtype, jnp.float32)
-    return gradient.astype(dtype) / jnp.asarray(factor, dtype)
-
-
-def _all_finite(tree) -> jax.Array:
-    finite = jnp.asarray(True)
-    for leaf in jax.tree.leaves(tree):
-        finite = finite & jnp.all(jnp.isfinite(leaf))
-    return finite
-
-
-def _compact_qk(tree):
-    def compact(path, leaf):
-        is_maximum = any(getattr(entry, "key", None) == "max_logits" for entry in path)
-        return jnp.max(leaf, axis=-2, keepdims=True) if is_maximum and leaf.ndim > 1 else leaf
-    return jax.tree_util.tree_map_with_path(compact, tree)
-
-
-def _advance_scale(scale: dynamic_scale_lib.DynamicScale, finite: jax.Array):
-    # Flax's growth comparison uses the incoming streak, including at restart.
-    grow = scale.fin_steps == scale.growth_interval
-    increased = jnp.minimum(scale.scale * scale.growth_factor, jnp.finfo(jnp.float32).max)
-    decreased = scale.scale * scale.backoff_factor
-    if scale.minimum_scale is not None:
-        decreased = jnp.maximum(decreased, scale.minimum_scale)
-    return dataclasses.replace(scale, scale=jnp.where(finite, jnp.where(grow, increased, scale.scale), decreased),
-                         fin_steps=jnp.where(grow | ~finite, 0, scale.fin_steps + 1))
-
-
-
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints, logging."""
 
@@ -240,6 +161,8 @@ class Trainer(Generic[Loss, Effects]):
         """
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
+        if step is not None and "params" in layout.host:
+            raise ValueError("Parameter-streamed training requires the trainer objective transaction; custom steps own their execution")
         self.objective = objective
         self.optimizer = optimizer
         self.key = key
@@ -301,14 +224,25 @@ class Trainer(Generic[Loss, Effects]):
         built on first use."""
         return build_mesh(self.mesh)
 
+    @property
+    def host_master(self) -> bool:
+        return "params" in self.layout.host
+
+    @functools.cached_property
+    def state_mesh(self) -> Mesh:
+        if not self.host_master:
+            return self.device_mesh
+        from dew.training.host import companion_mesh
+        return companion_mesh(self.device_mesh)
+
     def shardings(self, state: TrainState) -> Placement:
         """Parameter gradients follow parameters; replay records follow batches;
         the layout's host-resident fields sit in pinned host memory."""
-        mesh = self.device_mesh
+        mesh = self.state_mesh
         placed = self.layout.shardings(mesh, dataclasses.replace(state, accumulation=None))
         placed = dataclasses.replace(placed, **{
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
-            for field in self.layout.host})
+            for field in (() if self.host_master else self.layout.host)})
         accumulation = state.accumulation
         if accumulation is None:
             return placed
@@ -329,6 +263,8 @@ class Trainer(Generic[Loss, Effects]):
     def _fetched(self, state: TrainState, shardings: Placement) -> TrainState:
         """`state` with the layout's host-resident fields brought to the
         device, where a step or an evaluation reads them."""
+        if self.host_master:
+            return state
         return dataclasses.replace(state, **{
             field: jax.device_put(getattr(state, field), jax.tree.map(
                 lambda s: s.with_memory_kind("device"), getattr(shardings, field)))
@@ -341,6 +277,11 @@ class Trainer(Generic[Loss, Effects]):
         # through the same overridable method, and the objective is asked for
         # what it holds exactly once.
         initializer, key = self.objective.initializer, self.key
+        if self.host_master:
+            from dew.training.host import transfer
+            replicated = NamedSharding(self.state_mesh, P())
+            initializer, key = transfer(
+                (initializer, key), jax.tree.map(lambda _: replicated, (initializer, key)))
         abstract = jax.eval_shape(self.initial_state, initializer, key)
         shardings = self.shardings(abstract)
         self.layout.check(abstract.params, shardings.params, self.device_mesh)
@@ -399,7 +340,7 @@ class Trainer(Generic[Loss, Effects]):
                 qk_stats=jax.tree.map(
                     lambda x: jnp.full(x.shape, -jnp.inf, jnp.promote_types(x.dtype, jnp.float32))
                     if jnp.issubdtype(x.dtype, jnp.inexact) else zeros(x),
-                    _compact_qk(jax.tree.map(zeros, aux.qk_stats))),
+                    compact_qk(jax.tree.map(zeros, aux.qk_stats))),
                 batches=None if shared else buffer(records),
                 variables=None if mutable is None else buffer(mutable),
                 attempts=None if shared else jnp.zeros((slots,), jnp.int32))
@@ -413,156 +354,7 @@ class Trainer(Generic[Loss, Effects]):
 
 
     def _default_step(self, shapes):
-        objective, optimizer, size = self.objective, self.optimizer, self.accumulation
-        stats_shape, aux_shape = shapes
-        shared = isinstance(stats_shape, (Mean, jax.ShapeDtypeStruct))
-        stats_tree = jax.tree.structure(stats_shape)
-        effects_tree = jax.tree.structure(aux_shape.effects)
-
-        def step(state: TrainState, batch: Batch):
-            info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
-                        with_ema(state.params, state.ema))
-            scale = state.scale
-            factor = jnp.asarray(1., jnp.float32) if scale is None else scale.scale
-            previous = state.accumulation
-            fill = state.microstep % size
-            due = (fill + 1) == size
-
-            def loss_fn(trainable):
-                return objective.loss({**state.params, "params": trainable}, batch, info)
-
-            stats, pullback, aux = jax.vjp(loss_fn, state.params["params"], has_aux=True)
-            loss, local_cotangent = jax.vjp(lambda s: objective.reduce_loss(s)[0], stats)
-            gradients = jax.tree.map(lambda x: _unscale(x, factor),
-                                     pullback(local_cotangent(jnp.asarray(factor, loss.dtype))[0])[0])
-            local_finite = _all_finite((loss, stats, gradients, aux.variables, aux.effects))
-            local_ok = jnp.asarray(True) if scale is None else local_finite
-            qk = _compact_qk(aux.qk_stats)
-            effects = tuple(jax.tree.leaves(aux.effects))
-            candidate = previous
-            if previous is not None:
-                effects = tuple(a + b for a, b in zip(previous.effects, effects, strict=True))
-                qk = jax.tree.map(jnp.maximum, previous.qk_stats, qk)
-                if shared:
-                    prior_mass, prior_gradient = previous.mass, previous.gradient
-                    if prior_mass is None or prior_gradient is None:
-                        raise ValueError("checkpoint accumulator does not match shared-mean statistics")
-                    if isinstance(stats, Mean):
-                        mass, total = stats.mass, stats.total
-                    elif isinstance(stats, (jax.Array, float, int)):
-                        mass, total = jnp.asarray(1.), jnp.asarray(stats)
-                    else:
-                        raise TypeError("shared accumulation requires Mean or a scalar")
-                    mass = jax.lax.stop_gradient(mass)
-                    total_mass = prior_mass + mass
-                    denominator = jnp.where(total_mass > 0, total_mass, 1)
-                    gradients = jax.tree.map(
-                        lambda old, new: old * jnp.asarray(prior_mass / denominator, old.dtype)
-                        + new * jnp.asarray(mass / denominator, new.dtype), prior_gradient, gradients)
-                    numerator = previous.statistics[0] + total
-                    pooled = Mean(numerator, total_mass)
-                    value, active = mean_loss(pooled)
-                    candidate = dataclasses.replace(previous, gradient=gradients, mass=total_mass,
-                                                 statistics=(numerator,), effects=effects, qk_stats=qk)
-                else:
-                    pooled_leaves = tuple(a + b for a, b in zip(
-                        previous.statistics, jax.tree.leaves(stats), strict=True))
-                    pooled = stats_tree.unflatten(pooled_leaves)
-                    value, active = objective.reduce_loss(pooled)
-                    candidate = dataclasses.replace(previous, statistics=pooled_leaves, effects=effects, qk_stats=qk)
-
-                    def final_gradient(_):
-                        attempts = previous.attempts
-                        assert attempts is not None
-                        _, reduce_pullback = jax.vjp(lambda s: objective.reduce_loss(s)[0], pooled)
-                        cotangent = jax.tree.map(
-                            lambda cot, leaf: cot.astype(leaf.dtype)
-                            if jnp.issubdtype(leaf.dtype, jnp.inexact) else cot,
-                            reduce_pullback(jnp.asarray(factor, value.dtype))[0], stats)
-                        combined = jax.tree.map(lambda x: _unscale(x, factor),
-                                                pullback(cotangent)[0])
-                        # Each replay reads its original sequential-mutable snapshot.
-                        # Returned Aux is discarded; effects and writes happen once.
-                        def replay(index, accumulated):
-                            retained = jax.tree.map(lambda x: x[index], previous.batches)
-                            variables = state.params if previous.variables is None else {
-                                **state.params, **jax.tree.map(lambda x: x[index], previous.variables)}
-                            original = Step(state.microstep - fill + index,
-                                            jax.random.fold_in(state.key, attempts[index]),
-                                            with_ema(variables, state.ema))
-                            def forward(trainable):
-                                replayed, _ = objective.loss({**variables, "params": trainable}, retained, original)
-                                return replayed
-                            _, back = jax.vjp(forward, state.params["params"])
-                            contribution = back(cotangent)[0]
-                            return jax.tree.map(lambda a, b: a + _unscale(b, factor),
-                                                accumulated, contribution)
-                        return jax.lax.fori_loop(0, size - 1, replay, combined)
-                    gradients = jax.lax.cond(due & local_ok, final_gradient, lambda _: gradients, None)
-                loss = jnp.where(due, value, loss)
-            else:
-                _, active = objective.reduce_loss(stats)
-            gradient_finite = local_finite & _all_finite((loss, gradients, effects, qk, aux.variables))
-            accepted = jnp.asarray(True) if scale is None else gradient_finite
-            numerical = dataclasses.replace(state, params=write_back(state.params, aux.variables),
-                                      microstep=state.microstep + 1)
-
-            def commit(current):
-                # Optax initializes its state from parameter dtypes. Accumulation
-                # stays wider; only the completed gradient enters that contract.
-                optimizer_gradients = jax.tree.map(
-                    lambda gradient, parameter: gradient.astype(parameter.dtype),
-                    gradients, current.params["params"])
-                native_finite = _all_finite(optimizer_gradients)
-
-                def apply(current):
-                    if isinstance(optimizer, optax.GradientTransformationExtraArgs):
-                        update, opt_state = optimizer.update(optimizer_gradients, current.opt_state,
-                                                            current.params["params"], qk_stats=qk)
-                    else:
-                        update, opt_state = optimizer.update(optimizer_gradients, current.opt_state,
-                                                            current.params["params"])
-                    params = {**current.params, "params": optax.apply_updates(current.params["params"], update)}
-                    if aux_shape.effects is not None:
-                        params = write_back(params, objective.apply_effects(params, effects_tree.unflatten(effects)))
-                    averaged = current.ema
-                    if objective.ema is not None:
-                        if averaged is None:
-                            raise ValueError("the objective declares EMA but the state carries none")
-                        averaged = ema_update(averaged, params, objective.ema.decay(current.updates))
-                    return dataclasses.replace(current, params=params, opt_state=opt_state, ema=averaged,
-                                               updates=current.updates + 1)
-
-                current = jax.lax.cond(native_finite if scale is not None else jnp.asarray(True),
-                                       apply, lambda x: x, current)
-                return current, native_finite
-
-            numerical, native_finite = jax.lax.cond(
-                due & active & accepted, commit, lambda x: (x, jnp.asarray(True)), numerical)
-            gradient_finite = gradient_finite & native_finite
-            if scale is not None:
-                accepted = gradient_finite & _all_finite((numerical.params, numerical.opt_state, numerical.ema))
-            if previous is not None:
-                assert candidate is not None
-                def retain(acc):
-                    if not shared:
-                        acc = dataclasses.replace(acc, batches=jax.tree.map(lambda held, x: held.at[fill].set(x), acc.batches, batch),
-                        attempts=acc.attempts.at[fill].set(state.step))
-                        if acc.variables is not None:
-                            reads = {name: state.params[name] for name in acc.variables}
-                            acc = dataclasses.replace(acc, variables=jax.tree.map(
-                                lambda held, x: held.at[fill].set(x), acc.variables, reads))
-                    return acc
-                def clear(acc):
-                    return dataclasses.replace(jax.tree.map(jnp.zeros_like, acc), qk_stats=jax.tree.map(
-                        lambda x: jnp.full_like(x, -jnp.inf) if jnp.issubdtype(x.dtype, jnp.inexact)
-                        else jnp.zeros_like(x), acc.qk_stats))
-                numerical = dataclasses.replace(numerical, accumulation=jax.lax.cond(due, clear, retain, candidate))
-            result = jax.lax.cond(accepted, lambda _: numerical, lambda _: state, None)
-            if scale is not None:
-                result = dataclasses.replace(result, scale=_advance_scale(scale, gradient_finite))
-            return result, loss, aux
-        return step
+        return Transaction(self.objective, self.optimizer, self.accumulation, shapes).step()
 
     def compile(self, state: TrainState, batch: Batch) -> CompiledStep:
         """Compile a transaction over state and one already-produced global batch.
@@ -574,6 +366,8 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         if (state.scale is not None) != self.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
+        if self.host_master:
+            return self._compile_host(state, batch)
         mesh = self.device_mesh
         with jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches):
             shapes = None if self.step is not None else self._loss_shape(state, batch)
@@ -601,6 +395,31 @@ class Trainer(Generic[Loss, Effects]):
                     current = self._initialize_accumulation(current, batch, shapes)
                     current = jax.device_put(current, shardings)
                 return jitted(current, batch)
+        return run
+
+    def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
+        from dew.training.execution import HostExecution
+        from dew.training.host import transfer
+        cpu = self.state_mesh
+        execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu)
+        cpu_batch = transfer(batch, batch_shardings(cpu, batch))
+        with jax.set_mesh(cpu), pipeline_microbatches(self.mesh.microbatches):
+            shapes = self._loss_shape(state, cpu_batch)
+            prepared = self._initialize_accumulation(state, cpu_batch, shapes, shape_only=True)
+            placement = self.shardings(prepared)
+            transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes)
+            body = transaction.step(realize=execution.realize, host=True)
+
+        def run(current, batch):
+            batch = transfer(batch, batch_shardings(cpu, batch))
+            with jax.set_mesh(cpu), pipeline_microbatches(self.mesh.microbatches):
+                if current.accumulation is None and self.accumulation > 1:
+                    current = self._initialize_accumulation(current, batch, shapes)
+                result, loss, aux = body(current, batch)
+                result = dataclasses.replace(result, step=current.step + 1)
+                result = jax.device_put(result, placement)
+                return (result, loss, aux.metrics, jnp.isfinite(loss),
+                        result.microstep > current.microstep)
         return run
 
     # ------------------------------------------------------------------
@@ -1008,10 +827,20 @@ class Trainer(Generic[Loss, Effects]):
 
     def _evaluate(self, state: TrainState, shardings: Placement, data: "Dataset",
                   metrics: Sequence[Metric], preview: bool, mesh) -> None:
+        params = state.params
+        averaged = with_ema(state.params, self._fetched(state, shardings).ema)
+        key = state.key
+        if self.host_master:
+            from dew.training.execution import HostExecution
+            execution = HostExecution(self.objective, self.layout, self.device_mesh, self.state_mesh)
+            with jax.set_mesh(self.state_mesh):
+                params, averaged = execution.snapshot(params), execution.snapshot(averaged)
+            key = execution.on_accelerator(key)
+        assert params is not None, "evaluation always has model variables"
         self._report_evaluation(evaluate(
-            self.objective, state.params, data.val, metrics=metrics, key=state.key,
+            self.objective, params, data.val, metrics=metrics, key=key,
             step=state.step, schedule_step=state.microstep,
-            averaged=with_ema(state.params, self._fetched(state, shardings).ema),
+            averaged=averaged,
             preview=preview, mesh=mesh))
 
     def _report_evaluation(self, result: Evaluation) -> None:

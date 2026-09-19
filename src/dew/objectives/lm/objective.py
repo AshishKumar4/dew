@@ -480,6 +480,10 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         """
         return self.pretrained
 
+    @property
+    def layer_groups(self) -> tuple[tuple[int, int], ...]:
+        return self.model.bind({}).groups
+
     def init(self, key, variables: Optional[Variables] = None) -> Variables:
         pretrained = self.pretrained if variables is None else variables
         tree = self._whole_tree(pretrained, key)

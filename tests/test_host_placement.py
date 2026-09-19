@@ -92,8 +92,8 @@ def test_host_resident_state_resumes_from_its_checkpoint(tmp_path):
 
 
 def test_a_layout_places_only_the_state_it_can_fetch():
-    with pytest.raises(ValueError, match="params"):
-        Layout(host=("params",))
+    with pytest.raises(ValueError, match="batches"):
+        Layout(host=("batches",))
 
 
 # --------------------------------------------------------------------------
@@ -297,10 +297,9 @@ def test_host_parameters_that_name_nothing_are_refused():
                                   host_parameters=("params/blocks_*",)))
 
 
-def test_a_train_state_is_refused_under_host_resident_parameters(tmp_path):
-    """A training step reads every weight again in its backward pass, which no
-    forward staging covers, so the trainer refuses the layout instead of
-    placing the weights where nothing brings them back."""
+def test_inference_parameter_patterns_are_not_a_training_layout():
+    """Training selects complete CPU transaction ownership with host=params,
+    not the inference-only path selection."""
     trainer = Trainer(Regression(), optax.adam(0.1), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0,
                                     host_parameters=("params/*",)))
@@ -308,13 +307,25 @@ def test_a_train_state_is_refused_under_host_resident_parameters(tmp_path):
         trainer.place()
 
 
-def test_a_banked_store_refuses_a_training_forward():
-    """The same refusal where the store is read: a fetched run stages one
-    forward pass and nothing for a backward one."""
-    _, scanned, variables, tokens = pair(num_layers=4)
+def test_banked_training_preserves_each_layers_dropout_rng_lineage():
+    """Lifted staging and remat must not split or fold a different RNG stream.
+    Compare every layer's two dropout masks to the original Linen scan, not
+    merely repeated calls with the same root key."""
+    from flax import linen as nn
+    _, scanned, variables, tokens = pair(num_layers=4, dropout_rate=.4)
     _, on_host = stores(scanned, variables)
-    with pytest.raises(ValueError, match="backward pass"):
-        scanned.apply(on_host, tokens, train=True)
+    captures = []
+    for store in (variables, on_host):
+        _, changed = scanned.apply(
+            store, tokens, train=True, rngs={"dropout": jax.random.key(9)},
+            capture_intermediates=lambda module, method: isinstance(module, nn.Dropout),
+            mutable=["intermediates"])
+        captures.append(changed["intermediates"])
+    for index in range(4):
+        assert len(captures[0][f"layers_{index}"]["dropout"]["__call__"]) == 2
+    assert jax.tree.structure(captures[0]) == jax.tree.structure(captures[1])
+    for a, b in zip(jax.tree.leaves(captures[0]), jax.tree.leaves(captures[1]), strict=True):
+        np.testing.assert_array_equal(np.asarray(a) == 0, np.asarray(b) == 0)
 
 
 def test_a_store_holding_both_a_bank_and_its_layers_is_refused():

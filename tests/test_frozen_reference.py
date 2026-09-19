@@ -24,7 +24,7 @@ import pytest
 
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Checkpoints, Layout, Trainer
-from dew.training.trainer import ema_update
+from dew.training import ema_update
 
 FEATURES = 3
 

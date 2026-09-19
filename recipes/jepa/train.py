@@ -101,7 +101,8 @@ def run_summary(config: JepaRunConfig, encoder_fields: dict) -> dict:
 
 def main(config: JepaRunConfig) -> TrainState:
     prepare_process(config.trainer.wandb, config.trainer.multi_host,
-                    config.trainer.xla_flags, config.trainer.compilation_cache_dir)
+                    config.trainer.xla_flags, config.trainer.compilation_cache_dir,
+                    layout=config.trainer.layout)
 
     data = config.data.load(batch=config.trainer.batch_size)
     steps = config.trainer.total_steps(data)

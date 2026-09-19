@@ -219,12 +219,12 @@ def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: M
     return P(*entries)
 
 
-HOST_RESIDENT = ("opt_state", "ema")
+HOST_RESIDENT = ("params", "opt_state", "ema")
 """The train-state fields a layout may keep in pinned host memory between
-steps. The parameters are not among them: a host copy of the weights saves
-device memory only if each layer fetches its own just in time inside the
-stack, which a training step's backward pass would have to fetch a second
-time and does not."""
+steps. Naming params selects a CPU-owned complete transaction state, including
+optimizer, EMA and accumulation. The accelerator scan fetches parameter rows
+and rematerialization refetches them in backward. Naming only opt_state or
+ema retains accelerator execution with pinned-host storage."""
 
 
 def _variable_path(path) -> str:
@@ -263,6 +263,12 @@ class Layout:
     the fields of `HOST_RESIDENT` kept in pinned host memory between steps;
     the step fetches them to the device, updates them as it would have, and
     writes them back, so what they hold is the same and only where changes.
+    Naming params instead selects canonical CPU ownership of the entire
+    TrainState, including optimizer, EMA and accumulation. The full logical
+    optimizer transaction runs on a CPU companion of this mesh; accelerator
+    parameter banks are immutable execution snapshots, never another master.
+    Runtime CPU device count must match the accelerator count on every process
+    before JAX initializes; neither this layout nor the trainer changes it.
 
     `host_parameters` names the variables an inference placement keeps in
     pinned host memory, as globs over their logical paths
@@ -376,9 +382,8 @@ class Layout:
                 f"in pinned host memory, which only a stack that fetches a layer's "
                 f"parameters as it reaches it reads; this placement keeps every "
                 f"parameter on the device. Place the weights for generation with "
-                f"dew.inference.host_banked, or drop host_parameters: a training "
-                f"step reads every weight again in its backward pass, which no "
-                f"forward staging covers")
+                f"dew.inference.host_banked, or use host=('params',) for a "
+                f"CPU-owned training transaction and drop the inference-only patterns")
         if all(mesh.shape[axis] == 1 for axis in PARAMETER_AXES):
             return
 
