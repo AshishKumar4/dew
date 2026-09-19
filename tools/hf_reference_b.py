@@ -23,6 +23,14 @@ What lands in tests/fixtures/hf:
   beta_slow 1.0) and its MLA widths (qk_nope twice qk_rope, values as wide
   as qk_nope), not DeepSeek V3's. Its weights are the released per-expert
   tensor names transformers reads through V3's conversion.
+- kimi-k25-tiny/: Kimi K2.5 at toy width: the release's vision wrapper
+  around a Kimi K2 text decoder, so the checkpoint carries the tower and
+  the projector beside the decoder under the release's own tensor names
+  (language_model.model.*, vision_tower.*, mm_projector.*), which is not
+  what save_pretrained's reverse conversion writes. Its text config keeps
+  the release's kimi_k2 model_type, its rms_norm_eps 1e-5 and its YaRN
+  factor 64 at beta_fast 32; the wrapper keeps the media placeholder
+  offsets, and the logits come from a forward pass on input_ids alone.
 - glm4-moe-tiny/: GLM 4.5 at toy width, biased q/k/v over a bias-free
   o_proj, the q/k norms of GLM 4.6, a half rotary, a dense first layer over
   a routed one with the balancing bias and a shared expert, scaled by 1.5,
@@ -37,6 +45,25 @@ What lands in tests/fixtures/hf:
   full/shared schedule (index_topk_freq 4 off index_skip_topk_offset 3)
   over eight layers, and one MTP depth (model.layers.8.*) with its own
   indexer, composed as glm4-moe-tiny's is (mtp_logits.npy).
+- deepseek-v4-tiny/: DeepSeek V4-Flash at toy width under the release's own
+  legacy spelling: the compressed-attention schedule as compress_ratios
+  with a trailing entry for the prediction depth, the compression rates as
+  compress_rate_csa and compress_rate_hca, the hash count as
+  num_hash_layers, the rope slice as qk_rope_head_dim and YaRN flat under
+  rope_scaling. Six layers cover all three attention kinds (2x heavily
+  compressed, then compressed-sparse and heavily compressed around one
+  sliding layer), three hash-routed MLPs over three top-k routed ones, so
+  the checkpoint carries both a tid2eid table per hash layer and a
+  balancing bias per top-k layer, manifold-constrained hyper-connections
+  over two residual streams, grouped output projections and attention
+  sinks. Its tensor names are the release's index.json spelling, not
+  `save_pretrained`'s, down to the unprefixed keys, the flat hc_head_*
+  scalars and attn.kv_norm; and it carries the one prediction depth the
+  release ships as mtp.0.*, a sliding layer over a top-k routed MLP with
+  its own enorm, hnorm, e_proj, h_proj, norm and mHC head. transformers
+  builds no depth and ignores the prefix, so those 53 tensors have no
+  reference logits: they are payload a reader has to carry through a load
+  and an export unchanged.
 - llama4-tiny/: Llama 4 at toy width, three chunked local layers with the
   interleaved rope and the L2 q/k norm around one global layer with
   temperature tuning, every other layer routed with the shared expert.
@@ -48,10 +75,10 @@ What lands in tests/fixtures/hf:
   branch beside every layer's dense MLP under Gemma4TextRouter, global
   layers reading their values off the keys with fewer key/value heads and
   a wider head, and the per-layer output scalar.
-- gpt-oss-20b/, deepseek-v2-lite/, kimi-k2/, glm-4.5-air/, glm-5/, glm-5.3/,
-  llama-4-scout/, gemma4-26b-a4b/: released configs only. Llama-4-Scout and
-  gemma-4-26B-A4B are gated, so their configs come from mirrors and drop
-  the mirror's own marker key.
+- gpt-oss-20b/, deepseek-v2-lite/, deepseek-v4-flash/, kimi-k2/, kimi-k25/,
+  glm-4.5-air/, glm-5/, glm-5.3/, llama-4-scout/, gemma4-26b-a4b/: released
+  configs only. Llama-4-Scout and gemma-4-26B-A4B are gated, so their
+  configs come from mirrors and drop the mirror's own marker key.
 
 The gemma4-ple, gemma4-kvshare and gemma4-e2b fixtures predate the
 persistent layer_scalar buffer transformers 5.16.1 saves, so
@@ -115,10 +142,13 @@ from transformers.models.llama4.modeling_llama4 import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from deepseek_v4_reference import (  # noqa: E402
+    DEEPSEEK_V4_SEED, tiny_deepseek_v4, write_deepseek_v4_config, write_deepseek_v4_source,
+)
 from gpt_oss_reference import tiny_gpt_oss  # noqa: E402
 from hf_reference import (  # noqa: E402
-    DEEPSEEK_YARN, FIXTURES, reference_logits, scatter_weights, write_released_config,
-    write_tiny,
+    BATCH, DEEPSEEK_YARN, FIXTURES, LENGTH, reference_logits, scatter_weights,
+    write_released_config, write_tiny,
 )
 from moe_reference import expert_tensors  # noqa: E402
 from qwen_mtp_reference import QwenMTP  # noqa: E402
@@ -240,10 +270,15 @@ def write_kimi_k2_config(name: str, repo: str) -> None:
                          "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
     }, indent=1) + "\n")
 
-    register_checkpoint_conversion_mapping(
-        "kimi_k2", get_checkpoint_conversion_mapping("deepseek_v3"), overwrite=True)
-    model, report = DeepseekV3ForCausalLM.from_pretrained(
+    conversion = get_checkpoint_conversion_mapping("deepseek_v3")
+    if conversion is None:
+        raise SystemExit("deepseek_v3 has no checkpoint conversion mapping")
+    register_checkpoint_conversion_mapping("kimi_k2", conversion, overwrite=True)
+    loaded = DeepseekV3ForCausalLM.from_pretrained(
         str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True)
+    if not isinstance(loaded, tuple):
+        raise SystemExit("output_loading_info must return the model and its report")
+    model, report = loaded
     unread = {key: sorted(report[key]) for key in
               ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
               if report[key]}
@@ -256,6 +291,50 @@ def write_kimi_k2_config(name: str, repo: str) -> None:
         raise SystemExit(f"{directory}: the released rope spelling moved the logits by {difference:.3e}")
     print(f"{directory}: model_type {config['model_type']}, {len(config)} fields, "
           f"released spelling reloads bit for bit")
+
+
+# moonshotai/Kimi-K2.5 at revision 4d01dfe0, scaled to a fixture. The repo
+# is a vision wrapper over a Kimi K2 text decoder, so the text half keeps
+# the same proportions kimi-k2-tiny does at a hidden width of 32:
+# intermediate_size 2.571x that width (80), moe_intermediate_size 0.286x
+# (8), the query LoRA 0.214x (8), qk_nope twice qk_rope with the values as
+# wide as qk_nope, and kv_lora_rank at the 8 the other MLA fixtures use
+# because the release's 0.071x would round to 2.
+# What K2.5's text_config changes from K2-Instruct, and this keeps: the
+# YaRN factor is 64 with beta_fast 32 (K2's is 32 at beta_fast 1) and
+# rms_norm_eps is 1e-5. Over an eight-wide rope slice at theta 50000 that
+# correction range is [1, 3) of the four frequencies, so one extrapolates,
+# two ramp and the last interpolates: a fixture whose ramp came out all one
+# way would agree with an implementation that dropped a branch.
+# The rest is the release's own: routed_scaling_factor 2.827, rope_theta
+# 50000, one group holding every expert, one dense layer, one shared
+# expert, no prediction depth, sigmoid scores under noaux_tc with the
+# balancing bias, and an untied head. Its 384 experts and the 48:1 ratio
+# they keep against num_experts_per_tok do not survive a fixture; twelve
+# experts with two per token keep a routed layer whose choice the group
+# limit cannot decide, which is what n_group 1 means.
+
+
+
+
+# The tower at toy width: two layers of 16 over 2x2 patches, the release's
+# 3.736x MLP (60 here), its 2x2 merge kernel and an 8x8x2 position table
+# for the release's 64x64x4. projection_hidden_size is the tower's own
+# width, which is what Kimi_K25MultimodalProjection normalises over
+# (modeling_kimi_k25.py:571), and the release spells 1152 twice for that
+# reason.
+# What `save_pretrained` writes where the release's index.json names
+# something else. transformers reverses its own conversion mapping, and
+# three of those renames are not the release's spelling: the vision
+# tower's `blocks` -> `layers` rename reverses over the language model too
+# (conversion_mapping.py:464), `vision_tower.encoder` -> `model.vision_tower`
+# reverses onto the patch embedding (:460), and the projector's pre_norm is
+# renamed in neither direction (only proj.0 and proj.2 are, :462-463), so
+# it keeps the forward `model.` prefix.
+
+
+
+
 
 
 def tiny_glm4_moe() -> Glm4MoeForCausalLM:
@@ -492,6 +571,11 @@ def write_glm_moe_dsa_head_dim(name: str) -> None:
     saved = json.loads((directory / "config.json").read_text())
     saved["head_dim"] = GLM_MOE_DSA_TINY["head_dim"]
     (directory / "config.json").write_text(json.dumps(saved, indent=2) + "\n")
+    (directory / "source.json").write_text(json.dumps({
+        "released": {"repo": "zai-org/GLM-5.3",
+                     "revision": "aca966e4e02791568aa6a4ced368624b3d897f42"},
+        "transformers": {"version": transformers.__version__}, "seed": GLM_MOE_DSA_SEED,
+    }, indent=1) + "\n")
     loaded = GlmMoeDsaForCausalLM.from_pretrained(
         str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True)
     if not isinstance(loaded, tuple):
@@ -747,7 +831,6 @@ def write_glm5_next_config(name: str, repo: str) -> None:
     print(f"{directory}: model_type {config['model_type']}, {len(config)} fields, "
           f"released spelling reloads bit for bit")
 
-
 def llama4_tiny_config() -> Llama4TextConfig:
     """Every fourth layer global, so the pattern holds one of each kind;
     floor_scale 4 makes the temperature bite inside twelve positions."""
@@ -964,6 +1047,9 @@ def main() -> None:
     write_tiny("glm-moe-dsa-tiny", dsa, seed=GLM_MOE_DSA_SEED)
     write_glm_mtp("glm-moe-dsa-tiny", dsa, glm_moe_dsa_mtp(dsa.config))
     write_glm_moe_dsa_head_dim("glm-moe-dsa-tiny")
+    write_tiny("deepseek-v4-tiny", tiny_deepseek_v4(), seed=DEEPSEEK_V4_SEED)
+    write_deepseek_v4_source("deepseek-v4-tiny")
+    write_deepseek_v4_config("deepseek-v4-tiny", "deepseek-ai/DeepSeek-V4-Flash")
     write_tiny("llama4-tiny", tiny_llama4())
     write_llama4_blocks(FIXTURES.parent / "llama4")
     write_mirrored_config("llama-4-scout", "unsloth/Llama-4-Scout-17B-16E")
@@ -981,6 +1067,7 @@ def main() -> None:
     write_released_config("glm-4.5-air", "zai-org/GLM-4.5-Air")
     write_released_config("glm-5", "zai-org/GLM-5")
     write_released_config("glm-5.3", "zai-org/GLM-5.3")
+    write_released_config("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash")
     write_mirrored_config("gemma-3n-e2b", "unsloth/gemma-3n-E2B")
 
 

@@ -135,6 +135,8 @@ class LayerSpec:
     kind: ResolvedKind
     routed: bool
     """The feed-forward routes to the mixture's experts."""
+    hash_routed: bool
+    """The routed feed-forward selects its experts by the token table."""
     width: int
     """The dense feed-forward width, doubled on a sharing layer when the model asks."""
     sparsity: float
@@ -247,6 +249,12 @@ class Mixture:
     bounded rounds on an expert mesh axis larger than one that divides the
     expert count. The default `'global'` retains global sort/gather. Both
     dispatches share the projection precision and differentiation contract.
+
+    `hash_layers` names the sparse layers that route by DeepSeek V4's fixed
+    token table instead of the scores (`DeepseekV4HashRouter`,
+    modeling_deepseek_v4.py:1045-1073, the `hash_moe` entries of
+    `mlp_layer_types`): their router holds `tid2eid` over the vocabulary in
+    place of the balancing bias, and the block hands it the token ids.
     """
 
     experts: int
@@ -267,10 +275,17 @@ class Mixture:
     shared_gate: bool = False
     implementation: str = 'xla'
     dispatch: str = 'global'
+    hash_layers: Optional[Tuple[int, ...]] = None
 
     def __post_init__(self):
         if self.layers is not None:
             object.__setattr__(self, "layers", tuple(self.layers))
+        if self.hash_layers is not None:
+            object.__setattr__(self, "hash_layers", tuple(int(index) for index in self.hash_layers))
+            if self.groups != 1 or self.parallel:
+                raise ValueError(
+                    "hash routing selects by the token table alone, so it has no "
+                    "expert groups and is not Gemma 4's parallel branch")
         if self.experts < 1:
             raise ValueError(
                 f"a mixture needs experts to route to, got {self.experts}; a "
@@ -499,7 +514,9 @@ class DecoderBlock(nn.Module):
     builds lands in the tree as self_attn and has to accept (x, decode=...,
     positions=..., segment_ids=...), the last two None outside a packed batch.
     What `feedforward` builds lands there as mlp and takes the normalized
-    states alone, which is the one call `GatedMLP` and `moe.SparseMLP` share.
+    states alone, which is the one call `GatedMLP` and `moe.SparseMLP` share;
+    a `hash_routed` block hands it the token ids too, which the metadata
+    carries down the stack for DeepSeek V4's hash router.
 
     `wiring` places the block's norms: the input pair alone is the plain
     pre-norm block, both pairs Gemma's sandwich block, and the output pair
@@ -543,6 +560,7 @@ class DecoderBlock(nn.Module):
     altup: Optional[AltUp] = None  # Gemma 3n's stack of residual copies
     laurel_rank: Optional[int] = None  # Gemma 3n's learned augmented residual
     hyper_connections: Optional[HyperConnections] = None  # mHC's stack of residual streams
+    hash_routed: bool = False  # the feed-forward routes by the token ids the metadata carries
     dropout_rate: float = 0.0
     remat: Optional[RematPolicy] = None
     dtype: Optional[Dtype] = None
@@ -623,7 +641,7 @@ class DecoderBlock(nn.Module):
             store = None if kv_store is None else dict(kv_store)
             out = module._forward(x, train, False, positions, segment_ids,
                                   store, per_layer_input, attention_metadata, prediction_phase)
-            changed = {} if store is None else {
+            changed = {} if kv_store is None or store is None else {
                 name: value for name, value in store.items()
                 if value is not kv_store.get(name)}
             return out, changed
@@ -657,7 +675,8 @@ class DecoderBlock(nn.Module):
         x = x + self.dropout(mixed, deterministic=not train)
         if self.laurel_rank is not None:
             x = (x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), x.dtype)
-        hidden = self.mlp(self.post_attention_layernorm(x) if self.wiring.pre_norms else x)
+        hidden = self.mlp(self.post_attention_layernorm(x) if self.wiring.pre_norms else x,
+                          **self._feedforward_inputs(attention_metadata))
         if self.parallel is not None:
             hidden = self.moe(x, hidden)
         if self.wiring.output_norms:
@@ -690,8 +709,19 @@ class DecoderBlock(nn.Module):
                                **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
         streams = mix_streams(post, comb, self.dropout(mixed, deterministic=not train), streams)
         post, comb, collapsed = self.ffn_hc(streams)
-        hidden = self.mlp(self.post_attention_layernorm(collapsed))
+        hidden = self.mlp(self.post_attention_layernorm(collapsed),
+                          **self._feedforward_inputs(attention_metadata))
         return mix_streams(post, comb, self.dropout(hidden, deterministic=not train), streams)
+
+    def _feedforward_inputs(self, attention_metadata) -> dict:
+        """The token ids for a hash-routed feed-forward, nothing for the rest."""
+        if not self.hash_routed:
+            return {}
+        if attention_metadata is None or attention_metadata.token_ids is None:
+            raise ValueError(
+                "a hash-routed layer selects its experts by the token ids, which the "
+                "model passes down the stack as attention_metadata.token_ids")
+        return {"tokens": attention_metadata.token_ids}
 
     def _per_layer_residual(self, x, per_layer_input):
         """Gemma 3n/4's per-layer residual (modeling_gemma4.py,
@@ -1441,6 +1471,12 @@ class CausalTransformer(nn.Module):
             mixer=kind.mixer)
 
     @property
+    def hash_layers(self) -> set:
+        """The sparse layers routing by the mixture's token table."""
+        mixture = self.mixture
+        return set() if mixture is None or mixture.hash_layers is None else set(mixture.hash_layers)
+
+    @property
     def sparse_layers(self) -> Tuple[int, ...]:
         """The layers whose feed-forward routes to experts."""
         mixture = self.mixture
@@ -1599,6 +1635,11 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"the mixture's layers {outside} are outside the "
                 f"{self.num_layers} layers of this model")
+        hashed = self.hash_layers
+        if hashed - set(sparse):
+            raise ValueError(
+                f"the mixture's hash_layers {sorted(hashed - set(sparse))} are not "
+                "among its sparse layers, which are the ones with experts to route")
         sharing = self.kv_sharing
         if self.use_double_wide_mlp and not sharing:
             raise ValueError(
@@ -1734,6 +1775,7 @@ class CausalTransformer(nn.Module):
                 layer_type=layer_type,
                 kind=kinds[layer_type],
                 routed=index in sparse,
+                hash_routed=index in hashed,
                 width=(2 * widths[index] if self.use_double_wide_mlp and index in sharing
                        else widths[index]),
                 sparsity=0.0 if sparsity is None else sparsity[index],
@@ -1749,10 +1791,13 @@ class CausalTransformer(nn.Module):
                 mixer=(spec.kind.mixer or mixer_spec).build(
                     self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared)),
                 feedforward=(
+                    functools.partial(routed, expert_bias=False, hash_vocab=self.vocab_size)
+                    if spec.hash_routed and routed is not None else
                     routed
                     if spec.routed and routed is not None else
                     functools.partial(gated_mlp, hidden_features=spec.width,
                                       activation_sparsity=spec.sparsity)),
+                hash_routed=spec.hash_routed,
                 emb_features=self.emb_features,
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
@@ -1996,11 +2041,13 @@ class CausalTransformer(nn.Module):
                 raise ValueError("explicit pairwise masks require ordinary attention mixers")
         attention_metadata = (None if attention_mask is None and image_groups is None
                               and rotary_positions is None and attention_pairwise_mask is None
-                              and attention_key_positions is None else AttentionMetadata(
+                              and attention_key_positions is None and not self.hash_layers
+                              else AttentionMetadata(
                                   valid=attention_mask, image_groups=image_groups,
                                   rotary_positions=rotary_positions,
                                   pairwise_mask=attention_pairwise_mask,
-                                  key_positions=attention_key_positions))
+                                  key_positions=attention_key_positions,
+                                  token_ids=tokens if self.hash_layers else None))
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
             # Gemma casts embed_scale to the embedding weight dtype

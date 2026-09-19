@@ -53,14 +53,26 @@ class Case:
     prediction depth, which GLM's checkpoint is the one to ship.
 
     `reference_class` names the transformers class for a released
-    model_type transformers registers no config for. Kimi K2 is the family
-    that ships that way. Its `auto_map` points at its own copy of DeepSeek
-    V3's modeling code, and transformers says the same thing where it does
-    read the name: `Kimi_K25Config.__post_init__` turns a text config of
-    model_type `kimi_k2` into a `deepseek_v3` one
-    (models/kimi_k25/configuration_kimi_k25.py:80-91), so
+    model_type `AutoModelForCausalLM` reads no mapping for. Kimi K2 and
+    Kimi K2.5 are the families that ship that way. K2's `auto_map` points
+    at its own copy of DeepSeek V3's modeling code, and transformers says
+    the same thing where it does read the name:
+    `Kimi_K25Config.__post_init__` turns a text config of model_type
+    `kimi_k2` into a `deepseek_v3` one
+    (models/kimi_k25/configuration_kimi_k25.py:80-92), so
     `DeepseekV3ForCausalLM` is upstream's implementation of these weights.
+    K2.5's class exists but is registered for image-text-to-text, not
+    causal LM, so the case names `Kimi_K25ForConditionalGeneration` and the
+    export runs on input_ids alone, which is its text half.
     `AutoModelForCausalLM` reads every other family here off its model_type.
+
+    `rate` is the step this case trains with, `RATE` unless it says
+    otherwise. DeepSeek V4's lightning indexer keeps two of the compressed
+    entries a query may attend, and its fixture's top-k margin is 0.022, so
+    a step of `RATE` puts five query rows on exactly tied zero scores.
+    Torch and JAX choose different sets on three of those rows even when
+    handed identical scores. This fixture steps at 5e-3, retaining a strict
+    top-k boundary; no parity claim covers tied indexer selections.
     """
 
     name: str
@@ -70,6 +82,7 @@ class Case:
     reference_class: str | None = None
     reference_module: str = 'transformers'
     conversion_type: str | None = None
+    rate: float = RATE
 
 
 CASES = (
@@ -80,6 +93,7 @@ CASES = (
     Case("deepseek_v2", "deepseek-v2-tiny"),
     Case("deepseek_v3", "deepseek-v3-tiny", balance_rate=1e-2),
     Case("deepseek_v32", "deepseek-v32-tiny", balance_rate=1e-2),
+    Case("deepseek_v4", "deepseek-v4-tiny", balance_rate=1e-2, rate=5e-3),
     Case("kimi_k2", "kimi-k2-tiny", balance_rate=1e-2,
          reference_class="DeepseekV3ForCausalLM"),
     Case("llama4_text", "llama4-tiny"),
@@ -138,7 +152,7 @@ def train(case: Case, source: Pretrained, ids: np.ndarray):
     stream = (pygrain.MapDataset.source(entries).repeat().to_iter_dataset()
               .batch(count, drop_remainder=True))
     data = Dataset(train=lambda: iter(stream), val=None, records=count, batch=count)
-    state = Trainer(objective, optax.sgd(RATE), key=jax.random.key(SEED)).fit(
+    state = Trainer(objective, optax.sgd(case.rate), key=jax.random.key(SEED)).fit(
         data, steps=1, log_every=1)
     return state
 
@@ -197,17 +211,23 @@ def reference_tie_contract(model) -> Iterator[None]:
     """Dew's selector tie rule over a reference that specifies none.
 
     `jax.lax.top_k` is stable, so equal selector scores go to the lower
-    token index; torch's `topk` promises no tie order, and the k-pool
+    token index; torch's `topk` promises no tie order, and a sparse
     indexer is the only place that ordering reaches the logits. Scope the
-    stable ordering to that one class, and leave every other family's
-    reference run untouched.
+    stable ordering to that one class per family that has one, and leave
+    every other family's reference run untouched.
     """
-    if model.config.model_type != 'glm5_next_text':
+    selectors = {'glm5_next_text': ('transformers.models.glm5_next.modeling_glm5_next',
+                                    'Glm5NextTextIndexer'),
+                 'deepseek_v4': ('transformers.models.deepseek_v4.modeling_deepseek_v4',
+                                 'DeepseekV4Indexer')}
+    named = selectors.get(model.config.model_type)
+    if named is None:
         yield
         return
-    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextIndexer
+    from importlib import import_module
 
-    with stable_selector_ties(model, Glm5NextTextIndexer):
+    module, class_name = named
+    with stable_selector_ties(model, getattr(import_module(module), class_name)):
         yield
 
 
@@ -255,7 +275,10 @@ def reference_model(case: Case, directory: Path):
     # reads the depths past num_hidden_layers as unexpected and
     # Qwen3NextPreTrainedModel ignores `^mtp.*` on load
     # (modeling_qwen3_next.py:877). Only those may remain unconsumed; an
-    # unrelated tensor is an export bug.
+    # unrelated tensor is an export bug. DeepSeek V4 ships a depth too and
+    # reports nothing for it, so it declares no prefix here: its own class
+    # filters every `mtp.` key out of the report
+    # (`_keys_to_ignore_on_load_unexpected`, modeling_deepseek_v4.py:1212).
     prefixes = _prediction_prefixes(model.config)
     if any(not name.startswith(prefixes) for name in unexpected):
         raise ValueError(f"reference load unexpected tensors: {unexpected}")
@@ -358,23 +381,38 @@ def moved(trip: RoundTrip) -> dict[str, float]:
 
     Only the kinds this checkpoint names appear: a dense family holds no
     expert and no router, Mixtral routes every layer and holds no dense
-    feed-forward, and a router without a balancing bias keeps none. Llama 4
-    spells its feed-forward `feed_forward` where the others say `mlp`.
+    feed-forward, and DeepSeek V4's only unrouted feed-forward is its
+    shared expert. Llama 4 spells its feed-forward `feed_forward` where
+    most say `mlp`, V4 spells the block's halves `attn` and `ffn` and its
+    embedding `embed`, and a wrapper repo nests the decoder's own names
+    under its language model.
+
+    Only bound tensors are measured. A retained one carries its source
+    bytes out by construction, which
+    `test_every_source_tensor_is_bound_or_retained_and_written_back` holds
+    to account, and a training step cannot move it.
     """
-    kinds = {"embedding": lambda name: name == "model.embed_tokens.weight",
-             "attention": lambda name: ".self_attn." in name,
+    bound = {layout.name for layout in trip.source.weight_layouts}
+    kinds = {"embedding": lambda name: name.endswith(("model.embed_tokens.weight",
+                                                      "embed.weight")),
+             "attention": lambda name: ".self_attn." in name or ".attn." in name,
              "feedforward": lambda name: (
-                 (".mlp." in name or ".feed_forward." in name) and "expert" not in name
-                 and not name.endswith(("mlp.gate.weight", "router.weight"))),
+                 (".mlp." in name or ".feed_forward." in name or ".ffn." in name)
+                 and ".experts." not in name
+                 and not name.endswith(("mlp.gate.weight", "router.weight",
+                                        "ffn.gate.weight", "ffn.gate.bias", "ffn.gate.tid2eid"))),
              "expert": lambda name: ".experts." in name,
              "router": lambda name: name.endswith(("mlp.gate.weight", "router.weight",
+                                                   "ffn.gate.weight",
                                                    "block_sparse_moe.gate.weight")),
-             "balancing bias": lambda name: name.endswith("e_score_correction_bias")}
+             "balancing bias": lambda name: name.endswith(("e_score_correction_bias",
+                                                           "ffn.gate.bias"))}
     distances = {}
     for kind, belongs in kinds.items():
         moves = [float(np.max(np.abs(trip.exported_tensors[name].astype(np.float32)
                                      - tensor.astype(np.float32))))
-                 for name, tensor in trip.source_tensors.items() if belongs(name)]
+                 for name, tensor in trip.source_tensors.items()
+                 if name in bound and belongs(name)]
         if moves:
             distances[kind] = max(moves)
     return distances
@@ -394,6 +432,19 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
     Tensors the reference holds no gradient for (an MTP depth, the
     balancing bias buffer, the indexer it runs under no_grad) are not
     compared.
+
+    Every gradient is keyed the way a checkpoint is written back, by the
+    reversal transformers saves through
+    (`core_model_loading.revert_weight_conversion`), so a release whose
+    names are not its module names at all — DeepSeek V4 spells the block's
+    halves `attn` and `ffn` and its experts `w1`/`w2`/`w3` — is named the
+    way the source and every binding name it, per-expert tensors included.
+    What the reversal keeps is the module tree's own nesting prefix, which
+    a release need not carry: V4 holds its stack at `layers.N.*` and Kimi
+    K2.5's `model.language_model.X` is the source's `language_model.model.X`.
+    Only those prefixes move, so both sides are indexed with them stripped,
+    a collision there is raised rather than guessed at, and the two indexes
+    must be a bijection.
     """
     import torch
 
@@ -432,25 +483,53 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
     converted = revert_weight_conversion(model, upstream)
     if sum(value.numel() for value in upstream.values()) != sum(value.numel() for value in converted.values()):
         raise ValueError('reference gradient conversion lost or duplicated scalar entries')
+
+    def bare(name: str) -> str:
+        """`name` without the nesting prefixes the two sides disagree on.
+
+        The reversal keys a gradient the way the module tree is named, which
+        is not always how the release spells the same tensor: DeepSeek V4
+        holds its stack at `layers.N.*` with no `model.`, and Kimi K2.5's
+        `model.language_model.X` is the source's `language_model.model.X`.
+        Only those prefixes move, so both sides are indexed with them
+        stripped and a collision is raised rather than guessed at.
+        """
+        parts = name.split('.')
+        while parts[:1] in (['model'], ['language_model']):
+            parts.pop(0)
+        return '.'.join(parts)
+
+    def indexed(named):
+        held: dict[str, tuple[str, object]] = {}
+        for name, value in named:
+            key = bare(name)
+            if key in held:
+                raise ValueError(f'{name!r} and {held[key][0]!r} share the bare name {key!r}')
+            held[key] = (name, value)
+        return held
+
+    reference = indexed(converted.items())
     # Prediction-owned serialized embedding/head copies alias trunk leaves;
     # exclude their declared source prefix as well as independent MTP paths.
-    layouts = {layout.name: layout for layout in source.weight_layouts
-               if layout.paths[0][0] == 'params' and 'indexer' not in layout.paths[0]
-               and not layout.paths[0][1].startswith('mtp_')
-               and not layout.name.startswith(prediction_prefixes)}
-    if set(converted) != set(layouts):
+    layouts = indexed(
+        (layout.name, layout) for layout in source.weight_layouts
+        if layout.paths[0][0] == 'params' and 'indexer' not in layout.paths[0]
+        and not layout.paths[0][1].startswith('mtp_')
+        and not layout.name.startswith(prediction_prefixes))
+    if set(reference) != set(layouts):
         raise ValueError(f'gradient source/layout bijection differs: '
-                         f'upstream only {sorted(set(converted) - set(layouts))}, '
-                         f'Dew only {sorted(set(layouts) - set(converted))}')
+                         f'upstream only {sorted(reference[key][0] for key in set(reference) - set(layouts))}, '
+                         f'Dew only {sorted(layouts[key][0] for key in set(layouts) - set(reference))}')
     for layout in source.weight_layouts:
         path = layout.paths[0]
         if path[0] == 'params' and ('indexer' in path or path[1].startswith('mtp_')):
             if np.any(layout.export(grads) != 0):
                 raise ValueError(f'{layout.name} has an unexpected trunk-loss gradient')
     errors = {}
-    for name, reference in converted.items():
-        ours = layouts[name].export(grads)
-        theirs = reference.to(torch.float32).numpy()
+    for key, (_, upstream_grad) in reference.items():
+        name, layout = layouts[key]
+        ours = layout.export(grads)
+        theirs = upstream_grad.to(torch.float32).numpy()
         if ours.shape != theirs.shape:
             raise ValueError(f'{name} gradient shapes differ: {ours.shape} versus {theirs.shape}')
         errors[name] = float(np.max(

@@ -64,6 +64,8 @@ Prediction tensors omitted by upstream trunk classes are checked separately,
 not treated as evidence of an executed upstream prediction layer. Gradient
 scope is stated by each gate. Released-scale and tied-selector behavior are
 not established by the tiny untied-cutoff fixtures.
+
+DeepSeek V4 trunk: 361 source tensors, 308 bound (144 indexed), 53 MTP tensors retained unexecuted; trained export max absolute logit error 6.4e-06, 280 gradients at scaled error 1.1e-06. Cached decode is not qualified in this commit.
 """
 
 import dataclasses
@@ -88,7 +90,8 @@ MOVEMENT = 1e-4
 # stacks and the export slices back apart. Llama 4 fuses its experts
 # instead and is covered by every other case here.
 INDEXED = ("mixtral", "qwen3_moe", "glm4_moe", "glm_moe_dsa", "deepseek_v2",
-           "deepseek_v3", "deepseek_v32", "kimi_k2", "qwen3_next", "glm5_next")
+           "deepseek_v3", "deepseek_v32", "deepseek_v4", "kimi_k2", "qwen3_next",
+           "glm5_next")
 
 
 CASES = {case.name: case for case in tool.CASES}
@@ -98,7 +101,7 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # The families whose training claim is held to the reference's gradients
 # too: dew's gradient of the next-token cross entropy, written back into
 # the source's tensor layout, against the reference's `.grad`.
-GRADIENTS = ("glm_moe_dsa", "qwen3_next", "glm5_next")
+GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "qwen3_next", "glm5_next")
 GRADIENT = 1e-4
 
 
@@ -158,6 +161,9 @@ def test_every_source_tensor_is_bound_or_retained_and_written_back(trip):
     assert set(trip.exported_tensors) == set(trip.source_tensors)
     for name, tensor in trip.source_tensors.items():
         assert trip.exported_tensors[name].shape == tensor.shape, name
+        if name in retained or name.endswith('.tid2eid'):
+            np.testing.assert_array_equal(trip.exported_tensors[name], tensor, err_msg=name)
+            assert trip.exported_tensors[name].dtype == tensor.dtype, name
 
 
 def test_the_export_carries_the_trained_weights_not_the_loaded_ones(trip):
@@ -307,7 +313,7 @@ def test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export(name, trip
     rate = CASES[name].balance_rate
     assert rate is not None
     biases = [layout.name for layout in trip.source.weight_layouts
-              if layout.name.endswith("e_score_correction_bias")]
+              if layout.paths[0][-1] == "e_score_correction_bias"]
     assert biases, f"{name} carries no balancing bias"
 
     for bias in biases:
