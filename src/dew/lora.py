@@ -39,12 +39,14 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path as FilePath
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
+from flax.linen.module import Interceptor
 
 from dew.interop.pretrained import Pretrained, WeightLayout
 from dew.interop.safetensors_io import read_file, write_file
@@ -100,16 +102,20 @@ class LoRA:
         tree's `params` for a model applied on it, deeper for a tower
         applied on a subtree.
         """
-        branch = self._branch(root)
         base = type(model)
+        if hasattr(base, "_dew_lora_interceptor"):
+            raise ValueError("The model is already adapted")
+        branch = self._branch(root)
 
         class Adapted(base):
+            _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
+
             def apply(self, *args, **kwargs):
-                with nn.intercept_methods(branch):
+                with nn.intercept_methods(self._dew_lora_interceptor):
                     return super().apply(*args, **kwargs)
 
             def init_with_output(self, *args, **kwargs):
-                with nn.intercept_methods(branch):
+                with nn.intercept_methods(self._dew_lora_interceptor):
                     return super().init_with_output(*args, **kwargs)
 
         Adapted.__name__ = Adapted.__qualname__ = base.__name__

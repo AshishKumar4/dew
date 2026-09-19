@@ -759,7 +759,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
         scores = self.token_scores(
-            params, prepared, train=train, rngs={"dropout": step.key},
+            params, prepared, train=train, rngs={"dropout": step.key} if train else None,
             segment_ids=segment_ids, positions=positions,
             routing=rate is not None or alpha is not None,
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
