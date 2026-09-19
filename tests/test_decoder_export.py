@@ -23,7 +23,6 @@ Observed on CPU in fp32, every position's argmax equal and the tolerance
 | deepseek_v32 |             63 |         24 |                  3.4e-06 |
 | kimi_k2      |             65 |         36 |                  2.6e-06 |
 | kimi_k25     |            100 |         36 |                  2.9e-06 |
-| deepseek_v4  |            361 |        144 |                  6.4e-06 |
 | llama4_text  |             45 |          0 |                  4.2e-06 |
 | olmo3        |             47 |          0 |                  3.6e-06 |
 | qwen3_next   |            195 |         96 |                  1.4e-04 |
@@ -48,9 +47,11 @@ gradient of the next-token cross entropy, written into the source layout
 through the same bindings the export uses, against the reference's `.grad`
 (the per-expert tensors read their slice of the fused parameters).
 Observed max scaled error 1.5e-06 over 224 tensors for glm_moe_dsa and
-4.5e-07 over 64 for kimi_k25, both at the 1e-4 bound. DeepSeek V4's
-trunk compares 280 gradients with max scaled error 1.1e-06. Its 53 MTP
-tensors are retained unchanged, not executed by this qualification.
+4.5e-07 over 64 for kimi_k25, both at the 1e-4 bound. DeepSeek V4 compares
+the actual LMObjective gradients including its executable prediction depth,
+covering every source parameter except independently checked no-gradient
+selector leaves. Its 361 tensors are bound, including 168 expert tensors;
+the reference depth follows the official raw-stream MTPBlock composition.
 
 transformers 5.16.1 registers no `kimi_k2` config, so the tool names the
 class Kimi's release points its `auto_map` at, `DeepseekV3ForCausalLM`,
@@ -300,11 +301,13 @@ def test_glm5_next_trained_prediction_depth_reads_its_export(trips):
 def test_the_gradients_match_the_reference_implementation(name, trips):
     """Compare all trunk next-token CE gradients by source tensor name.
 
-    This gate does not claim prediction-loss gradient parity: the ordinary
-    reference classes do not execute those depths. Selector gradients must
-    be absent in the reference and exactly zero in Dew. The helper starts
-    from every non-None upstream gradient and enforces the source/layout
-    bijection before reporting errors.
+    This gate does not claim prediction-loss gradient parity for the
+    ordinary reference classes, which do not execute those depths; V4 is
+    the exception, whose raw-stream depth runs under the actual
+    LMObjective loss and whose depth gradients are therefore compared too.
+    Selector gradients must be absent in the reference and exactly zero in
+    Dew. The helper starts from every non-None upstream gradient and
+    enforces the source/layout bijection before reporting errors.
     """
     trip = trips(name)
     errors = tool.gradient_parity(trip)
@@ -333,6 +336,39 @@ def test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export(name, trip
         assert float(np.max(moved)) == pytest.approx(rate, rel=1e-5), bias
         assert np.all((moved < rate * 1e-3) | (np.abs(moved - rate) < rate * 1e-5)), (
             f"{bias} moved by {sorted(set(moved.tolist()))}, not by whole rate steps")
+
+
+def test_deepseek_v4_trained_mtp_export_matches_reference(trips):
+    import torch
+    from tools.deepseek_v4_reference import load_mtp_reference
+
+    trip = trips('deepseek_v4')
+    _, streams = trip.source.model.apply(trip.trained, trip.ids,
+                                         method=trip.source.model.hidden_and_mtp_inputs)
+    actual = trip.source.model.apply(trip.trained, streams, trip.ids,
+                                     method=trip.source.model.mtp_logits)[0]
+    reference, _ = tool.reference_model(trip.case, trip.export)
+    reference.eval()
+    reference.set_attn_implementation('eager')
+    captured = []
+
+    def capture(module, args, output):
+        captured.append(output)
+
+    handle = reference.model.layers[-1].register_forward_hook(capture)
+    ids = torch.from_numpy(trip.ids.astype(np.int64))
+    try:
+        with torch.no_grad():
+            reference(input_ids=ids, use_cache=False)
+    finally:
+        handle.remove()
+    depth = load_mtp_reference(trip.export, reference.config)
+    with torch.no_grad():
+        expected = depth(reference, captured[0][:, :-1], ids[:, 1:]).numpy()
+    np.testing.assert_allclose(actual, expected, atol=LOGITS, rtol=0)
+    for projection in ('e_proj', 'h_proj'):
+        name = f'mtp.0.{projection}.weight'
+        assert np.max(np.abs(trip.exported_tensors[name] - trip.source_tensors[name])) > 0
 
 
 def test_the_export_carries_the_sources_tokenizer(tmp_path):

@@ -67,12 +67,9 @@ class Case:
     `AutoModelForCausalLM` reads every other family here off its model_type.
 
     `rate` is the step this case trains with, `RATE` unless it says
-    otherwise. DeepSeek V4's lightning indexer keeps two of the compressed
-    entries a query may attend, and its fixture's top-k margin is 0.022, so
-    a step of `RATE` puts five query rows on exactly tied zero scores.
-    Torch and JAX choose different sets on three of those rows even when
-    handed identical scores. This fixture steps at 5e-3, retaining a strict
-    top-k boundary; no parity claim covers tied indexer selections.
+    otherwise. Torch and JAX can choose different valid indexer sets at
+    equal scores. The V4 MTP-enabled step preserves the observed tied-score
+    failure at 5e-3; a smaller step is not evidence resolving that failure.
     """
 
     name: str
@@ -93,7 +90,7 @@ CASES = (
     Case("deepseek_v2", "deepseek-v2-tiny"),
     Case("deepseek_v3", "deepseek-v3-tiny", balance_rate=1e-2),
     Case("deepseek_v32", "deepseek-v32-tiny", balance_rate=1e-2),
-    Case("deepseek_v4", "deepseek-v4-tiny", balance_rate=1e-2, rate=5e-3),
+    Case("deepseek_v4", "deepseek-v4-tiny", balance_rate=1e-2, mtp_weight=0.3, rate=5e-3),
     Case("kimi_k2", "kimi-k2-tiny", balance_rate=1e-2,
          reference_class="DeepseekV3ForCausalLM"),
     Case("kimi_k25", "kimi-k25-tiny", balance_rate=1e-2,
@@ -448,6 +445,8 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
     a collision there is raised rather than guessed at, and the two indexes
     must be a bijection.
     """
+    if trip.case.name == 'deepseek_v4' and trip.case.mtp_weight is not None:
+        return v4_training_gradient_parity(trip)
     import torch
 
     source = trip.source
@@ -510,6 +509,9 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
             held[key] = (name, value)
         return held
 
+    if model.config.model_type == 'deepseek_v4':
+        from tools.deepseek_v4_reference import deepseek_v4_source_name
+        converted = {deepseek_v4_source_name(name): value for name, value in converted.items()}
     reference = indexed(converted.items())
     # Prediction-owned serialized embedding/head copies alias trunk leaves;
     # exclude their declared source prefix as well as independent MTP paths.
@@ -536,6 +538,94 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
             raise ValueError(f'{name} gradient shapes differ: {ours.shape} versus {theirs.shape}')
         errors[name] = float(np.max(
             np.abs(ours - theirs) / np.maximum(1.0, np.maximum(np.abs(ours), np.abs(theirs)))))
+    return errors
+
+
+def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, float]:
+    """Actual LMObjective gradients, including V4's raw-stream prediction loss.
+
+    The CPU reference composes unchanged Transformers modules according to
+    the released inference/model.py MTPBlock. Name coverage is the full
+    loaded parameter tree, except selector parameters proven to have no
+    gradient through top-k; missing reference gradients are errors.
+    """
+    import torch
+    from transformers.core_model_loading import revert_weight_conversion
+    from dew.objectives.base import Step, scalar_loss
+    from tools.deepseek_v4_reference import deepseek_v4_source_name, load_mtp_reference
+
+    source, case = trip.source, trip.case
+    weight = case.mtp_weight
+    if weight is None:
+        raise ValueError('V4 training gradient comparison requires mtp_weight')
+    objective = LMObjective(source.model, seq_len=trip.ids.shape[1] - 1, ema_decay=None,
+                            pretrained=source.variables, mtp_weight=case.mtp_weight)
+    step = Step(step=jnp.asarray(0), key=jax.random.key(SEED), ema=None)
+    batch = {'text': jnp.asarray(trip.ids, jnp.int32)}
+
+    def loss(params):
+        return scalar_loss(objective, {**source.variables, 'params': params}, batch, step)[0]
+
+    our_loss, gradients = jax.value_and_grad(loss)(source.variables['params'])
+    model, _ = reference_model(case, FIXTURES / case.fixture)
+    model.eval()
+    model.set_attn_implementation('eager')
+    depth = load_mtp_reference(FIXTURES / case.fixture, model.config)
+    tokens = torch.from_numpy(trip.ids.astype(np.int64))
+    streams: list[torch.Tensor] = []
+
+    def capture(module, args, output):
+        if not isinstance(output, torch.Tensor):
+            raise TypeError('V4 decoder layer must return raw residual streams')
+        streams.append(output)
+
+    handle = model.model.layers[-1].register_forward_hook(capture)
+    try:
+        logits = model(input_ids=tokens[:, :-1], use_cache=False).logits
+    finally:
+        handle.remove()
+    predicted = depth(model, streams[0][:, :-1], tokens[:, 1:-1])
+    denominator = tokens[:, 1:].numel()
+    main_loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]), tokens[:, 1:].reshape(-1), reduction='sum')
+    prediction_loss = torch.nn.functional.cross_entropy(
+        predicted.reshape(-1, predicted.shape[-1]), tokens[:, 2:].reshape(-1), reduction='sum')
+    reference_loss = (main_loss + weight * prediction_loss) / denominator
+    reference_loss.backward()
+    if abs(float(our_loss) - float(reference_loss.detach())) > 1e-4:
+        raise ValueError('V4 LMObjective and reference prediction losses differ')
+
+    def converted(reference):
+        grads = {name: parameter.grad for name, parameter in reference.named_parameters()
+                 if parameter.grad is not None}
+        return {deepseek_v4_source_name(name): value
+                for name, value in revert_weight_conversion(reference, grads).items()}
+
+    expected = converted(model)
+    for name, value in converted(depth.reference_model).items():
+        if name.startswith('layers.0.'):
+            expected['mtp.0.' + name.removeprefix('layers.0.')] = value
+        elif name.startswith('hc_head_') or name == 'norm.weight':
+            expected['mtp.0.' + name] = value
+    for name in ('e_proj', 'h_proj', 'enorm', 'hnorm'):
+        for leaf, parameter in getattr(depth, name).named_parameters():
+            if parameter.grad is not None:
+                expected[f'mtp.0.{name}.{leaf}'] = parameter.grad
+    layouts = {layout.name: layout for layout in source.weight_layouts
+               if layout.paths[0][0] == 'params' and 'indexer' not in layout.paths[0]}
+    if set(expected) != set(layouts):
+        raise ValueError(f"V4 gradient coverage mismatch: missing {sorted(set(layouts) - set(expected))}, "
+                         f"unexpected {sorted(set(expected) - set(layouts))}")
+    errors = {}
+    for name, layout in layouts.items():
+        ours = layout.export({'params': gradients})
+        theirs = expected[name].detach().float().numpy()
+        errors[name] = float(np.max(np.abs(ours - theirs) /
+                                   np.maximum(1.0, np.maximum(np.abs(ours), np.abs(theirs)))))
+    for layout in source.weight_layouts:
+        if layout.paths[0][0] == 'params' and 'indexer' in layout.paths[0]:
+            if np.any(layout.export({'params': gradients}) != 0):
+                raise ValueError(f'{layout.name} differentiates through discrete selection')
     return errors
 
 

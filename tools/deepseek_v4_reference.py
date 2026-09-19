@@ -1,18 +1,20 @@
 """Released-shaped DeepSeek V4 fixture generation; no pretrained weights."""
 
 import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
+import safetensors.torch
 import torch
 import transformers
+from safetensors import safe_open
 from safetensors.numpy import load_file, save_file
 from transformers import DeepseekV4Config, DeepseekV4ForCausalLM
+from transformers.masking_utils import create_sliding_window_causal_mask
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
-    DeepseekV4HashRouter, DeepseekV4TopKRouter,
+    DeepseekV4HashRouter, DeepseekV4RMSNorm, DeepseekV4TopKRouter,
 )
-
-from hf_reference import FIXTURES, reference_logits
 
 
 # deepseek-ai/DeepSeek-V4-Flash at toy width. The release's proportions on a
@@ -36,7 +38,7 @@ from hf_reference import FIXTURES, reference_logits
 # the width. And the release ropes an eighth of head_dim (64 of 512):
 # a quarter is roped here (4 of 16) because an eighth would leave the rope
 # slice 2 wide, one frequency, which YaRN's correction range extrapolates
-# whole — the interpolating branch would never run. At a quarter the two
+# whole; the interpolating branch would never run. At a quarter the two
 # frequencies come out fully extrapolated and half interpolated, so both
 # branches of the ramp move a frequency.
 #
@@ -98,7 +100,7 @@ DEEPSEEK_V4_TINY = dict(
 # three kinds and :276 truncates to num_hidden_layers), the fixture's rates
 # beside it as compress_rate_csa and compress_rate_hca (:261-264), the hash
 # count as num_hash_layers (:279-282), the rope slice as qk_rope_head_dim
-# (:254, :286-292) and YaRN flat under rope_scaling (:302-321) — where
+# (:254, :286-292) and YaRN flat under rope_scaling (:302-321), where
 # `save_pretrained` writes layer_types, mlp_layer_types, compress_rates,
 # partial_rotary_factor and the nested rope_parameters it derived from
 # them. The trailing 0 is the depth, which V4-Flash ships without a
@@ -228,16 +230,19 @@ def write_deepseek_v4_source(name: str, seed: int = DEEPSEEK_V4_SEED) -> None:
 
     transformers instantiates no depth (configuration_deepseek_v4.py:173)
     and ignores the whole prefix on load (modeling_deepseek_v4.py:1212), so
-    these tensors have no reference output and none is written: they are
-    here for a reader that must carry them through a load and an export
-    unchanged. The draw follows `scatter_weights`: norms around one,
-    everything else at a fifth, and the depth's balancing bias on the same
-    linspace the trunk's top-k layers carry.
+    the generic reference loader leaves these tensors unused.
+    `load_mtp_reference` composes them into the depth's reference logits
+    (`write_deepseek_v4_mtp_reference` writes mtp_logits.npy). The draw
+    follows `scatter_weights`: norms around one, everything else at a
+    fifth, and the depth's balancing bias on the same linspace the trunk's
+    top-k layers carry.
 
     This runs on the config `save_pretrained` wrote, before
     `write_deepseek_v4_config` folds `layer_types` back into the release's
     `compress_ratios`, and says so if the order is ever swapped.
     """
+    from hf_reference import FIXTURES
+
     directory = FIXTURES / name
     tensors = {deepseek_v4_source_name(key): value
                for key, value in load_file(str(directory / "model.safetensors")).items()}
@@ -283,6 +288,7 @@ def write_deepseek_v4_config(name: str, repo: str) -> None:
     goes unread.
     """
     from huggingface_hub import model_info
+    from hf_reference import FIXTURES, reference_logits
 
     directory = FIXTURES / name
     saved = json.loads((directory / "config.json").read_text())
@@ -308,7 +314,7 @@ def write_deepseek_v4_config(name: str, repo: str) -> None:
               ("missing_keys", "mismatched_keys", "error_msgs") if report[key]}
     # The depth's tensors are `_keys_to_ignore_on_load_unexpected`
     # (modeling_deepseek_v4.py:1212): transformers builds no depth, so they
-    # are the fixture's retained payload and no other key may go unread.
+    # are checked by the separate MTP composition; no other key may go unread.
     stray = sorted(key for key in report["unexpected_keys"] if "mtp." not in key)
     if unread or stray:
         raise SystemExit(f"{directory}: the released config does not read its own weights: "
@@ -369,3 +375,179 @@ def print_deepseek_v4_tensors(directory: Path, model: DeepseekV4ForCausalLM) -> 
     print(f"{directory}: {len(tensors)} tensors over {len(families)} names")
     for key, shapes in sorted(families.items()):
         print(f"  {len(shapes):4d}  {key:52s} {', '.join(sorted(set(shapes)))}")
+
+
+class DeepseekV4MTP(torch.nn.Module):
+    """The V4 prediction depth as the release composes it.
+
+    The official inference model runs it in MTPBlock.forward
+    (deepseek-v4-pro-b5968e9-model.py:756-766): the shifted token's
+    embedding is normalised and projected, added to the normalised and
+    projected raw trunk streams ([B, S, H, D]; the depth never reads the
+    trunk's collapsed, final-normed state), run through one unchanged
+    decoder layer, collapsed by the depth's own mHC head, normed by its
+    own norm and mapped to logits by the trunk's head. ParallelHead
+    scores only the last position for generation; the fixture scores
+    every position, like the trunk's own logits.
+
+    `reference_model` owns the loaded block, norm and collapse head of the
+    one-layer checkpoint constructed from the released depth tensors. Its
+    original module names also drive reference gradient conversion.
+    """
+
+    def __init__(self, config: DeepseekV4Config,
+                 reference_model: DeepseekV4ForCausalLM) -> None:
+        super().__init__()
+        self.config = config
+        self.e_proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.h_proj = torch.nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.enorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = DeepseekV4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.reference_model = reference_model
+
+    def forward(self, model: DeepseekV4ForCausalLM, streams: torch.Tensor,
+                ids: torch.Tensor) -> torch.Tensor:
+        embeddings = model.model.embed_tokens(ids)
+        fused = self.e_proj(self.enorm(embeddings))[:, :, None, :] + self.h_proj(self.hnorm(streams))
+        positions = torch.arange(fused.shape[1], device=fused.device)[None]
+        mask = create_sliding_window_causal_mask(
+            config=self.config, inputs_embeds=embeddings, attention_mask=None,
+            past_key_values=None, position_ids=positions)
+        out = self.reference_model.model.layers[0](
+            fused,
+            position_embeddings={
+                "main": model.model.rotary_emb(embeddings, position_ids=positions,
+                                               layer_type="main"),
+            },
+            position_ids=positions, attention_mask=mask, input_ids=ids)
+        return model.lm_head(self.reference_model.model.norm(self.reference_model.model.hc_head(out)))
+
+
+def load_mtp_reference(directory: Path, config: DeepseekV4Config) -> DeepseekV4MTP:
+    """The fixture's released mtp.0.* tensors as a runnable depth.
+
+    The release ships the depth under its own flat names and transformers
+    builds none, so the block is loaded through the standard
+    `from_pretrained` conversion instead of a name map: the depth's block
+    keys are re-prefixed mtp.0.* -> layers.0.*, its own final norm and mHC
+    head are moved to the checkpoint's top level (norm.weight and
+    hc_head_fn/hc_head_base/hc_head_scale, where the trunk's live), and
+    the trunk's embed.weight and head.weight complete the one-layer
+    source. e_proj, h_proj, enorm and hnorm have no trunk counterpart, so
+    they are bound straight onto the wrapper's four own modules.
+
+    The temporary config is a copy of the trunk's with the schedule
+    overridden rather than translated: explicit `layer_types` and
+    `mlp_layer_types` take precedence over the legacy compress_ratios and
+    num_hash_layers spellings (configuration_deepseek_v4.py:266-282), so
+    the one sliding layer over a top-k routed MLP is spelled directly and
+    the released rope_parameters carry over untouched.
+
+    Reads the depth tensors off the index when the checkpoint is sharded
+    (trained exports are), so it composes the same way without redrawing
+    any weight.
+    """
+    directory = Path(directory)
+    fields = config.to_dict()
+    fields.update(architectures=["DeepseekV4ForCausalLM"], num_hidden_layers=1,
+                  layer_types=["sliding_attention"], mlp_layer_types=["moe"])
+    for legacy in ("compress_ratios", "num_hash_layers"):
+        fields.pop(legacy, None)
+
+    index = directory / "model.safetensors.index.json"
+    if index.exists():
+        weight_map = json.loads(index.read_text())["weight_map"]
+        wanted = [key for key in weight_map
+                  if key.startswith("mtp.0.") or key in ("embed.weight", "head.weight")]
+        tensors = {}
+        for shard in sorted({weight_map[key] for key in wanted}):
+            with safe_open(str(directory / shard), framework="pt") as opened:
+                tensors.update({key: opened.get_tensor(key) for key in wanted
+                                if weight_map[key] == shard})
+    else:
+        tensors = {key: value for key, value in
+                   safetensors.torch.load_file(str(directory / "model.safetensors")).items()
+                   if key.startswith("mtp.0.") or key in ("embed.weight", "head.weight")}
+
+    renamed, direct = {}, {}
+    for key, value in tensors.items():
+        if key.startswith("mtp.0."):
+            leaf = key.removeprefix("mtp.0.")
+            if leaf in ("e_proj.weight", "h_proj.weight", "enorm.weight", "hnorm.weight"):
+                direct[leaf] = value
+            elif leaf.startswith("norm.") or leaf.startswith("hc_head_"):
+                renamed[leaf] = value
+            else:
+                renamed[f"layers.0.{leaf}"] = value
+        else:
+            renamed[key] = value
+
+    with tempfile.TemporaryDirectory() as temporary:
+        Path(temporary, "config.json").write_text(json.dumps(fields))
+        safetensors.torch.save_file(renamed, str(Path(temporary, "model.safetensors")))
+        loaded = DeepseekV4ForCausalLM.from_pretrained(
+            temporary, dtype=torch.float32, local_files_only=True, output_loading_info=True)
+    if not isinstance(loaded, tuple):
+        raise SystemExit("output_loading_info returns the model and its report")
+    model, report = loaded
+    unread = {key: sorted(report[key]) for key in
+              ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
+              if report[key]}
+    if unread:
+        raise SystemExit(f"{directory}: the mtp.0 depth does not load cleanly: {unread}")
+    model.eval()
+    model.set_attn_implementation('eager')
+
+    # Loader-only copies are not part of the MTP computation: forward calls
+    # the trunk's shared embedding and head, as the released MTPBlock does.
+    model.model.embed_tokens.requires_grad_(False)
+    model.lm_head.requires_grad_(False)
+    depth = DeepseekV4MTP(model.config, model)
+    for name in ("e_proj", "h_proj", "enorm", "hnorm"):
+        getattr(depth, name).weight = torch.nn.Parameter(direct[f"{name}.weight"])
+    return depth
+
+
+def write_deepseek_v4_mtp_reference(name: str) -> None:
+    """The depth's reference logits over the fixture's shifted tokens.
+
+    A forward hook on the last decoder layer captures the trunk's raw
+    [B, S, H, D] streams, the tensor the released depth reads before
+    the trunk's hc_head and final norm touch it, and the depth then
+    scores the next token from each position, the same shift the GLM
+    fixtures use. The hook is removed in `finally` and nothing detaches
+    the streams, so `load_mtp_reference`'s forward stays differentiable
+    when it is called outside no_grad.
+    """
+    from hf_reference import FIXTURES
+
+    directory = FIXTURES / name
+    model = DeepseekV4ForCausalLM.from_pretrained(
+        str(directory), dtype=torch.float32, local_files_only=True)
+    model.eval()
+    model.set_attn_implementation("eager")
+    ids = torch.from_numpy(np.load(directory / "input_ids.npy").astype(np.int64))
+    captured = []
+
+    def capture(_module, _inputs, output):
+        captured.append(output)
+
+    hook = model.model.layers[-1].register_forward_hook(capture)
+    try:
+        with torch.no_grad():
+            model(input_ids=ids, use_cache=False)
+    finally:
+        hook.remove()
+    depth = load_mtp_reference(directory, model.config)
+    with torch.no_grad():
+        logits = depth(model, captured[0][:, :-1], ids[:, 1:])
+    np.save(directory / "mtp_logits.npy", logits.to(torch.float32).numpy())
+    source = json.loads((directory / "source.json").read_text())
+    source["mtp_reference"] = {
+        "repo": "deepseek-ai/DeepSeek-V4-Pro",
+        "revision": "b5968e9190ef611bbf34a7229255be88a0e937c1",
+        "path": "inference/model.py",
+        "sha256": "ce962f1face79d4f633d36436576214057a7e11443c9789935e1deb5c6cd1d71",
+    }
+    (directory / "source.json").write_text(json.dumps(source, indent=1) + "\n")
+    print(f"{directory}: depth mtp.0.* composed, mtp logits {tuple(logits.shape)}")

@@ -20,13 +20,10 @@ indexer, :437-578), and a per-query bias says which entries a query may
 attend: HCA every entry whose window closed before the query, CSA the
 indexer's top-k of those.
 
-The compressors emit no entry for a trailing partial window; the reference
-drops the remainder outside a cache (:398, :630) and buffers it inside
-one. The training path here runs the whole sequence at once, so the
-remainder is dropped as the reference's stateless path drops it. Cached
-decode is not implemented for this mixer: the compressors' buffered
-windows and the two-series overlap state (:246-291) have no counterpart in
-the cache helpers yet, and `decode=True` raises naming that.
+The compressors emit no entry for a trailing partial window: the reference
+drops it outside a cache (:398, :630) and buffers it inside one. Cached
+calls keep projected incomplete windows, CSA's preceding Ca window and
+completed rotated entries (:209-291); no old hidden state is reprojected.
 """
 
 from __future__ import annotations
@@ -42,7 +39,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.nn.attention import RMSNorm, rotary_freqs
+from dew.nn.attention import RMSNorm, _cache_positions, _write_cache, causal_attention_mask, rotary_freqs
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, top_k_keys, yarn_inv_freq
@@ -92,7 +89,8 @@ def unweighted_rmsnorm(x, eps: float):
     """`x * rsqrt(mean(x^2) + eps)` with no scale, in fp32
     (`DeepseekV4UnweightedRMSNorm`, modeling_deepseek_v4.py:66-72)."""
     fp32 = x.astype(jnp.float32)
-    return (fp32 * jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)).astype(x.dtype)
+    inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
+    return x * inverse.astype(x.dtype)
 
 
 def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
@@ -136,6 +134,54 @@ def entries_visible(positions, entries: int, rate: int):
     if threshold.ndim == 1:
         threshold = threshold[None]
     return jnp.arange(entries)[None, None, :] < threshold[:, :, None]
+
+
+def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
+    """Pool newly closed windows without reprojecting old tokens.
+
+    The incomplete window survives a call boundary. CSA additionally keeps
+    the preceding window's Ca series (modeling_deepseek_v4.py:209-243,
+    277-291); a first window has no previous Ca contribution. Slots are
+    compact per-row cache positions, with -1 marking an invalid token.
+    """
+    batch, length, _ = kv.shape
+    maximum = (length + rate - 1) // rate
+    pooled = jnp.zeros((batch, maximum, width), kv.dtype)
+    emitted = jnp.full((batch, maximum), -1, jnp.int32)
+    counts = jnp.zeros((batch,), jnp.int32)
+
+    def step(carry, inputs):
+        buffered, prior, values, indices, count = carry
+        key, logits, position = inputs
+        within = jnp.where(position >= 0, position % rate, -1)
+        buffered = (_write_cache(buffered[0], key[:, None], within[:, None]),
+                    _write_cache(buffered[1], logits[:, None], within[:, None]))
+        closed = (position >= 0) & ((position + 1) % rate == 0)
+
+        def emit(state):
+            old, values, indices, count = state
+            window_key, window_gate = buffered
+            if old is not None:
+                window_key = jnp.concatenate([old[0], window_key[..., width:]], axis=1)
+                window_gate = jnp.concatenate([old[1], window_gate[..., width:]], axis=1)
+            weights = jax.nn.softmax(window_gate.astype(jnp.float32), axis=1).astype(window_key.dtype)
+            entry = jnp.sum(window_key * weights, axis=1)
+            at = jnp.where(closed, count, -1)[:, None]
+            values = _write_cache(values, entry[:, None], at)
+            indices = _write_cache(indices[..., None], (position // rate)[:, None, None], at)[..., 0]
+            if old is not None:
+                old = tuple(jnp.where(closed[:, None, None], current[..., :width], before)
+                            for current, before in zip(buffered, old))
+            return old, values, indices, count + closed.astype(jnp.int32)
+
+        prior, values, indices, count = jax.lax.cond(
+            jnp.any(closed), emit, lambda state: state, (prior, values, indices, count))
+        return (buffered, prior, values, indices, count), None
+
+    (buffers, previous, pooled, emitted, _), _ = jax.lax.scan(
+        step, (buffers, previous, pooled, emitted, counts),
+        (jnp.swapaxes(kv, 0, 1), jnp.swapaxes(gate, 0, 1), jnp.swapaxes(slots, 0, 1)))
+    return pooled, emitted, buffers, previous
 
 
 class GroupedLinear(nn.Module):
@@ -188,7 +234,8 @@ class CompressedEntries(nn.Module):
         self.gate_proj = dense(series * self.width, name='gate_proj')
         self.position_bias = self.param(
             'position_bias', nn.initializers.zeros, (self.rate, series * self.width), jnp.float32)
-        self.kv_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='kv_norm')
+        self.kv_norm = RMSNorm(epsilon=self.norm_eps, scale_after_cast=True,
+                               dtype=self.dtype, name='kv_norm')
 
     def entries(self, x):
         """The rotated entries `[B, T, width]`, `T = S // rate`."""
@@ -198,6 +245,36 @@ class CompressedEntries(nn.Module):
         cos, sin = rope_freqs(jnp.arange(pooled.shape[1]) * self.rate, self.rope_dim,
                               self.rope_theta, self.yarn)
         return rotate_trailing(pooled, cos, sin)
+
+    @nn.compact
+    def cached_entries(self, x, slots, capacity: int, write: bool):
+        """Append closed windows to the rotated-entry cache; allocation writes none."""
+        kv, gate = self.kv_proj(x), self.gate_proj(x)
+        gate = gate + self.position_bias[jnp.maximum(slots, 0) % self.rate].astype(gate.dtype)
+        shape = (x.shape[0], self.rate, kv.shape[-1])
+        buffer_kv = self.variable('cache', 'buffer_kv', jnp.zeros, shape, kv.dtype)
+        buffer_gate = self.variable('cache', 'buffer_gate', jnp.zeros, shape, gate.dtype)
+        entries = self.variable('cache', 'compressed', jnp.zeros,
+                                (x.shape[0], capacity // self.rate, self.width), kv.dtype)
+        prior = None
+        overlap_kv = overlap_gate = None
+        if self.overlap:
+            overlap_kv = self.variable('cache', 'overlap_kv', jnp.zeros,
+                                       (x.shape[0], self.rate, self.width), kv.dtype)
+            overlap_gate = self.variable('cache', 'overlap_gate', jnp.full,
+                                         (x.shape[0], self.rate, self.width), -jnp.inf, gate.dtype)
+            prior = (overlap_kv.value, overlap_gate.value)
+        pooled, emitted, buffered, prior = append_windows(
+            kv, gate, slots, (buffer_kv.value, buffer_gate.value), prior, self.rate, self.width)
+        pooled = self.kv_norm(pooled)
+        cos, sin = rope_freqs(emitted * self.rate, self.rope_dim, self.rope_theta, self.yarn)
+        rotated = rotate_trailing(pooled, cos, sin)
+        if write:
+            buffer_kv.value, buffer_gate.value = buffered
+            entries.value = _write_cache(entries.value, rotated, emitted)
+            if overlap_kv is not None and overlap_gate is not None and prior is not None:
+                overlap_kv.value, overlap_gate.value = prior
+        return entries.value
 
 
 class IndexScorer(nn.Module):
@@ -214,10 +291,11 @@ class IndexScorer(nn.Module):
     @nn.compact
     def __call__(self, query, keys, x):
         scores = jnp.maximum(jnp.einsum('bshd,btd->bsht', query.astype(jnp.float32),
-                                        keys.astype(jnp.float32)), 0) * self.head_dim ** -0.5
+                                        keys.astype(jnp.float32), precision=self.precision), 0) * self.head_dim ** -0.5
         weights = nn.Dense(self.n_heads, use_bias=False, dtype=self.dtype,
                            precision=self.precision, name='weights_proj')(x)
-        return jnp.einsum('bsht,bsh->bst', scores, weights.astype(jnp.float32) * self.n_heads ** -0.5)
+        return jnp.einsum('bsht,bsh->bst', scores, weights.astype(jnp.float32) * self.n_heads ** -0.5,
+                          precision=self.precision)
 
 
 class LightningIndexer(CompressedEntries):
@@ -244,7 +322,7 @@ class LightningIndexer(CompressedEntries):
         self.scorer = IndexScorer(n_heads=self.n_heads, head_dim=self.width,
                                   dtype=self.dtype, precision=self.precision, name='scorer')
 
-    def select(self, x, q_resid, positions, cos, sin):
+    def select(self, x, q_resid, positions, cos, sin, cache=None):
         """The entries each query attends: `[B, S, T]`, bool.
 
         The top-k among the entries whose window closed before the query
@@ -255,7 +333,7 @@ class LightningIndexer(CompressedEntries):
         x = jax.lax.stop_gradient(x)
         q_resid = jax.lax.stop_gradient(q_resid)
         batch, length, _ = x.shape
-        keys = self.entries(x)
+        keys = self.entries(x) if cache is None else self.cached_entries(x, *cache)
         query = rotate_trailing(
             self.q_b_proj(q_resid).reshape(batch, length, self.n_heads, self.width), cos, sin)
         scores = self.scorer(query, keys, x)
@@ -281,11 +359,11 @@ class Compressor(CompressedEntries):
                 n_heads=self.index_n_heads, top_k=self.index_topk,
                 dtype=self.dtype, precision=self.precision, name='indexer')
 
-    def __call__(self, x, q_resid, positions, cos, sin):
+    def __call__(self, x, q_resid, positions, cos, sin, cache=None):
         """The entries `[B, T, width]` and which of them each query attends `[B, S, T]`."""
-        entries = self.entries(x)
+        entries = self.entries(x) if cache is None else self.cached_entries(x, *cache)
         if self.index_topk is not None:
-            return entries, self.indexer.select(x, q_resid, positions, cos, sin)
+            return entries, self.indexer.select(x, q_resid, positions, cos, sin, cache)
         visible = entries_visible(positions, entries.shape[1], self.rate)
         return entries, jnp.broadcast_to(visible, (x.shape[0],) + visible.shape[1:])
 
@@ -328,6 +406,7 @@ class DeepseekV4Attention(nn.Module):
     o_lora_rank: int
     rope_dim: int
     sliding_window: int
+    max_seq_len: int = 8192
     rope_theta: float = 10000.0
     yarn: Optional[YarnScaling] = None
     compressor: Optional[str] = None
@@ -359,7 +438,7 @@ class DeepseekV4Attention(nn.Module):
         if self.compressor != 'csa' and any(field is not None for field in index):
             raise ValueError("only a csa layer carries the indexer")
         dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
-        norm = functools.partial(RMSNorm, epsilon=self.norm_eps, dtype=self.dtype)
+        norm = functools.partial(RMSNorm, epsilon=self.norm_eps, scale_after_cast=True, dtype=self.dtype)
         self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
         self.q_a_norm = norm(name='q_a_norm')
         self.q_b_proj = dense(self.num_heads * self.head_dim, name='q_b_proj')
@@ -377,12 +456,9 @@ class DeepseekV4Attention(nn.Module):
                 index_head_dim=self.index_head_dim, index_topk=self.index_topk,
                 dtype=self.dtype, precision=self.precision, name='compressor')
 
+    @nn.compact
     def __call__(self, x, decode: bool = False, positions=None, segment_ids=None,
                  kv_store=None, attention_metadata: AttentionMetadata | None = None):
-        if decode:
-            raise ValueError(
-                "the deepseek_v4 mixer has no cached decode path: its compressors' "
-                "buffered windows are not cached here yet")
         if segment_ids is not None and self.compressor is not None:
             raise ValueError("segment_ids are not supported by deepseek_v4 compressed windows")
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
@@ -390,6 +466,19 @@ class DeepseekV4Attention(nn.Module):
         valid = (None if attention_metadata is None or attention_metadata.valid is None
                  else jnp.asarray(attention_metadata.valid, bool))
         batch, length, _ = x.shape
+        cache = None
+        cached_key = None
+        if decode:
+            if segment_ids is not None:
+                raise ValueError("decode accepts row validity, not packed segment_ids")
+            if valid is None and length > self.max_seq_len:
+                raise ValueError(f"{length} tokens exceed max_seq_len={self.max_seq_len}")
+            slots, allocated = _cache_positions(self, batch, length, self.max_seq_len, valid)
+            cache = (slots, self.max_seq_len, allocated)
+            cached_key = self.variable('cache', 'cached_key', jnp.zeros,
+                                       (batch, self.max_seq_len, self.head_dim), x.dtype)
+            if positions is None:
+                positions = slots
         if positions is None:
             positions = jnp.arange(length) if valid is None else jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0)
         positions = jnp.asarray(positions)
@@ -408,14 +497,23 @@ class DeepseekV4Attention(nn.Module):
         query_pos, key_pos = rows[:, None], rows[None, :]
         allowed = (key_pos <= query_pos) & (key_pos > query_pos - self.sliding_window)
         allowed = jnp.broadcast_to(allowed, (batch, length, length))
+        if cache is not None and cached_key is not None:
+            slots, _, allocated = cache
+            if allocated:
+                cached_key.value = _write_cache(cached_key.value, keys, slots)
+            keys = cached_key.value
+            allowed = causal_attention_mask(
+                slots, keys.shape[1], self.sliding_window,
+                key_valid=self.get_variable('cache', 'cache_valid'))[:, 0]
         if segment_ids is not None:
             segment_ids = jnp.asarray(segment_ids)
             allowed = allowed & (segment_ids[:, :, None] == segment_ids[:, None, :]) & (segment_ids[:, :, None] != 0)
-        if valid is not None:
+        if valid is not None and not decode:
             allowed = allowed & valid[:, None, :]
 
         if self.compressor is not None:
-            entries, selected = self.compress(x, q_resid, positions, cos, sin)
+            selected_positions = positions if cache is None else cache[0]
+            entries, selected = self.compress(x, q_resid, selected_positions, cos, sin, cache)
             if entries.shape[1]:
                 keys = jnp.concatenate([keys, entries], axis=1)
                 allowed = jnp.concatenate([allowed, selected], axis=-1)
@@ -433,7 +531,8 @@ class DeepseekV4Attention(nn.Module):
         # turned back at the query's position (:853-859).
         context = rotate_trailing(checkpoint_name(context, 'context'), cos, -sin)
         mixed = self.o_a_proj(context.reshape(batch, length, self.o_groups, -1))
-        return checkpoint_name(self.o_b_proj(mixed.reshape(batch, length, -1)), 'o_proj')
+        output = checkpoint_name(self.o_b_proj(mixed.reshape(batch, length, -1)), 'o_proj')
+        return output if valid is None else jnp.where(valid[..., None], output, 0)
 
 
 @mixers("deepseek_v4")
@@ -485,6 +584,7 @@ class DeepseekV4Mixer(MixerBase):
             o_lora_rank=self.o_lora_rank,
             rope_dim=self.rope_head_dim,
             sliding_window=ctx.sliding_window,
+            max_seq_len=ctx.max_seq_len,
             rope_theta=ctx.rope_theta,
             yarn=ctx.yarn,
             compressor=self.compressor,

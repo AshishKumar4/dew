@@ -6,5 +6,11 @@
  "transformers": {
   "version": "5.16.1",
   "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"
+ },
+ "mtp_reference": {
+  "repo": "deepseek-ai/DeepSeek-V4-Pro",
+  "revision": "b5968e9190ef611bbf34a7229255be88a0e937c1",
+  "path": "inference/model.py",
+  "sha256": "ce962f1face79d4f633d36436576214057a7e11443c9789935e1deb5c6cd1d71"
  }
 }
