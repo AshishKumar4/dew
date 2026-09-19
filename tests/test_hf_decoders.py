@@ -86,6 +86,7 @@ import dataclasses
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import jax
@@ -108,7 +109,6 @@ TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
         "llama31-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = DEEPSEEK + ("kimi-k2-tiny", "mixtral-tiny", "qwen3-moe-tiny")
-TORCH_VENV = Path("/tmp/hfref/bin/python")
 REAL = FIXTURES / "qwen3-0.6b"
 
 
@@ -940,13 +940,11 @@ np.save(out, logits.to(torch.float32).numpy())
 """
     ids_path, out = tmp_path / "ids.npy", tmp_path / "theirs.npy"
     np.save(ids_path, ids)
-    subprocess.run([str(TORCH_VENV), "-c", script, str(export), str(ids_path), str(out)],
+    subprocess.run([sys.executable, "-c", script, str(export), str(ids_path), str(out)],
                    check=True, capture_output=True)
     return np.load(out)
 
 
-@pytest.mark.skipif(not TORCH_VENV.exists(),
-                    reason="no torch venv at /tmp/hfref to load the export with")
 def test_our_export_loads_in_transformers_with_the_same_logits(tmp_path):
     """The export is a real HF checkpoint: transformers reads it and agrees."""
     model, variables = fp32_decoder(FIXTURES / "qwen3-tiny")
@@ -960,8 +958,6 @@ def test_our_export_loads_in_transformers_with_the_same_logits(tmp_path):
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
 
 
-@pytest.mark.skipif(not TORCH_VENV.exists(),
-                    reason="no torch venv at /tmp/hfref to load the export with")
 def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rng):
     """Qwen3Attention builds q, k, v and o with bias=config.attention_bias
     (modeling_qwen3.py:225-236), so the reference applies the biases where dew
