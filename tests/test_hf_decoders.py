@@ -2146,27 +2146,220 @@ def test_the_kimi_k2_fixture_keeps_the_releases_mla_proportions():
 # Kimi K2.5: a vision wrapper whose decoder is Kimi K2's, text half only
 # --------------------------------------------------------------------------
 
+KIMI_K25 = FIXTURES / "kimi-k25-tiny"
+
+
+def test_kimi_k25_translates_the_wrapper_into_its_text_decoder():
+    """The wrapper's own fields name a vision tower, a projector and the
+    media marks it fills, none of which reach the decoder; what translates
+    is text_config, and the head is the wrapper's.
+
+    The tiny fixture scales the release's widths and keeps its choices, so
+    the two configs agree on the routing, the rope and the MLA record. What
+    K2.5's text config changes from K2-Instruct's, and both of these hold,
+    is rms_norm_eps 1e-5 and the YaRN factor 64 at beta_fast 32.
+    """
+    tiny = translate_config(fixture_config("kimi-k25-tiny"))
+    released = translate_config(fixture_config("kimi-k25"))
+    k2 = translate_config(fixture_config("kimi-k2-tiny"))
+
+    shared = ("score_function", "bias", "groups", "groups_per_token", "scaling")
+    assert ({name: tiny["mixture"][name] for name in shared}
+            == {name: released["mixture"][name] for name in shared}
+            == {"score_function": "sigmoid", "bias": True, "groups": 1,
+                "groups_per_token": 1, "scaling": 2.827})
+    assert tiny["mixer"]["yarn"] == released["mixer"]["yarn"]
+    assert (tiny["mixer"]["yarn"]["factor"], tiny["mixer"]["yarn"]["beta_fast"],
+            tiny["mixer"]["yarn"]["beta_slow"]) == (64.0, 32.0, 1.0)
+    assert tiny["mixer"]["yarn"]["original_max_position_embeddings"] == 4096
+    assert tiny["rope_theta"] == released["rope_theta"] == 50000.0
+    assert tiny["norm_eps"] == released["norm_eps"] == 1e-5
+    assert tiny["mixer"]["kind"] == "mla" and tiny["mixture"]["layers"] == (1,)
+    assert tiny["mixer"]["qk_nope_head_dim"] == 2 * tiny["mixer"]["qk_rope_head_dim"]
+    assert tiny["mixer"]["v_head_dim"] == tiny["mixer"]["qk_nope_head_dim"]
+    # The wrapper's tie_word_embeddings decides the head, not the nested
+    # text config's, which describes a DeepseekV3Model with no head.
+    assert tiny["tie_embeddings"] is False and released["tie_embeddings"] is False
+    assert translate_config({**fixture_config("kimi-k25-tiny"),
+                             "tie_word_embeddings": True})["tie_embeddings"] is True
+
+    # K2.5 is not K2-Instruct: the ramp and the norm epsilon moved.
+    assert k2["mixer"]["yarn"]["factor"] == 32.0 and k2["norm_eps"] == 1e-6
+
+
+def test_the_real_kimi_k25_config_translates():
+    """moonshotai/Kimi-K2.5 releases the remote-code spelling: a wrapper
+    whose text_config is model_type kimi_k2 with every PreTrainedConfig
+    attribute transformers 4.56.2 serialized beside it, and whose media
+    mark is media_placeholder_token_id rather than image_token_id. Its
+    decoder is K2's 61 layers with one dense, 384 sigmoid-scored experts
+    with 8 per token in one group, and MLA with the 1536 query LoRA over a
+    192-wide query head."""
+    config = translate_config(fixture_config("kimi-k25"))
+
+    assert config["vocab_size"] == 163840 and config["num_layers"] == 61
+    assert config["mixture"]["experts"] == 384 and config["mixture"]["top_k"] == 8
+    assert config["mixture"]["shared_features"] == 2048
+    assert config["mixture"]["layers"] == tuple(range(1, 61))
+    assert (config["num_heads"], config["num_kv_heads"]) == (64, 64)
+    assert config["mixer"]["q_lora_rank"] == 1536 and config["mixer"]["kv_lora_rank"] == 512
+    assert config["mixer"]["qk_nope_head_dim"] == 128 and config["mixer"]["qk_rope_head_dim"] == 64
+    assert config["head_dim"] == 192 and config["norm_eps"] == 1e-5
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("text_config", {"model_type": "qwen3_moe"}, "text_config model_type 'qwen3_moe'"),
+    ("text_config", 7, "the wrapper carries its decoder under text_config"),
+    ("tie_word_embeddings", "yes", "tie_word_embeddings 'yes'"),
+    ("audio_config", {"hidden_size": 8}, r"config fields \['audio_config'\]"),
+])
+def test_a_kimi_k25_wrapper_field_with_no_counterpart_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("kimi-k25-tiny"), field: value})
+
+
+@pytest.mark.parametrize("field, value", [
+    ("add_cross_attention", True),
+    ("cross_attention_hidden_size", 128),
+    ("tie_encoder_decoder", True),
+    ("pruned_heads", {"0": [1]}),
+])
+def test_a_kimi_k25_text_config_that_names_an_encoder_is_refused(field, value):
+    """The release's text_config carries transformers 4.x's whole
+    PreTrainedConfig serialization at its defaults. The four fields of it
+    that would name another model are read by value, not accepted by
+    name."""
+    config = fixture_config("kimi-k25")
+    text = {**config["text_config"], field: value}
+    with pytest.raises(ValueError, match=f"text_config {field}"):
+        translate_config({**config, "text_config": text})
+
+
+def test_kimi_k25_refuses_to_load_as_a_multimodal_wrapper():
+    """The tower and the projector have no counterpart here, so the
+    wrapper path names the model_type rather than building half a model."""
+    from dew.interop.hf_decoders import translate_wrapper_config
+
+    with pytest.raises(ValueError, match="model_type 'kimi_k25'"):
+        translate_wrapper_config(fixture_config("kimi-k25-tiny"))
+
+
+def test_kimi_k25_logits_match_the_reference_implementation():
+    """fp32 parity of the text half against Kimi_K25ForConditionalGeneration
+    on input_ids alone: tolerance 1e-4, observed max |logit difference|
+    the bound applies to the complete vocabulary at every input position."""
+    model, variables = fp32_decoder(KIMI_K25)
+    ids = np.load(KIMI_K25 / "input_ids.npy")
+    reference = np.load(KIMI_K25 / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_the_kimi_k25_fixture_carries_the_releases_ramp_and_not_kimi_k2s():
+    """K2.5's text config differs from K2-Instruct's in the YaRN factor
+    (64 against 32), beta_fast (32 against 1) and rms_norm_eps (1e-5
+    against 1e-6). Each of K2's values on the same weights disagrees with
+    the fixture by far more than the tolerance, so the fixture is K2.5's
+    choices and not a relabelled K2."""
+    model, variables = fp32_decoder(KIMI_K25)
+    ids = jnp.asarray(np.load(KIMI_K25 / "input_ids.npy"), jnp.int32)
+    reference = np.load(KIMI_K25 / "logits.npy")
+
+    def moved(swapped):
+        logits = np.asarray(swapped.apply(variables, ids))
+        return float(np.max(np.abs(logits - reference)))
+
+    yarn = model.mixer.yarn
+    assert (yarn.factor, yarn.beta_fast, yarn.beta_slow) == (64.0, 32.0, 1.0)
+    kimi_k2_ramp = {"factor": 32.0, "beta_fast": 1.0}
+    for field, value in kimi_k2_ramp.items():
+        swapped = model.clone(mixer=dataclasses.replace(
+            model.mixer, yarn=dataclasses.replace(yarn, **{field: value})))
+        assert moved(swapped) > 1e-2, f"{field}={value} moved {moved(swapped):.3e}"
+    assert moved(model.clone(norm_eps=1e-6)) > 1e-4
 
 
 
+def test_a_kimi_k25_load_binds_the_decoder_and_retains_the_vision_halves():
+    """The release nests its decoder under `language_model.model.*` beside
+    a `vision_tower.*` and a `mm_projector.*` this has no counterpart for.
+    Every decoder tensor binds to a leaf, every vision tensor is retained
+    by name, and the retained bytes reach the export untouched."""
+    loaded = load_pretrained(str(KIMI_K25), dtype="float32", attention_impl="reference")
+    from dew.interop.hf_decoders import _load_shards
+
+    tensors = _load_shards(KIMI_K25)
+    bound = {layout.name for layout in loaded.weight_layouts}
+    retained = set(loaded.retained_tensors)
+
+    assert bound | retained == set(tensors)
+    assert not bound & retained
+    assert all(name.startswith(("language_model.model.", "language_model.lm_head."))
+               for name in bound)
+    assert all(name.startswith(("vision_tower.", "mm_projector.")) for name in retained)
+    assert len(retained) == 35 and len(bound) == 65
+    for name in retained:
+        np.testing.assert_array_equal(loaded.retained_tensors[name], tensors[name])
 
 
+def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path):
+    """The whole checkpoint comes back out: the decoder from the parameter
+    tree under the release's names, the tower and the projector from the
+    bytes they were retained as, and the source's own config beside them."""
+    loaded = load_pretrained(str(KIMI_K25), dtype="float32", attention_impl="reference")
+    from dew.interop.hf_decoders import _load_shards
+
+    destination = tmp_path / "export"
+    loaded.save(destination)
+    exported = _load_shards(destination)
+    source = _load_shards(KIMI_K25)
+
+    assert set(exported) == set(source)
+    for name, tensor in source.items():
+        np.testing.assert_array_equal(exported[name], tensor, err_msg=name)
+    assert (json.loads((destination / "config.json").read_text())
+            == fixture_config("kimi-k25-tiny"))
+    again = load_pretrained(str(destination), dtype="float32", attention_impl="reference")
+    ids = jnp.asarray(np.load(KIMI_K25 / "input_ids.npy"), jnp.int32)
+    np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)),
+                                  np.asarray(loaded.model.apply(loaded.variables, ids)))
 
 
+def test_a_kimi_k25_tied_head_binds_to_the_nested_embedding(tmp_path):
+    """Kimi_K25ForConditionalGeneration ties `lm_head.weight` to
+    `model.language_model.embed_tokens.weight` (modeling_kimi_k25.py:727),
+    which the checkpoint spells `language_model.lm_head.weight` and
+    `language_model.model.embed_tokens.weight`. Under tying the head is the
+    embedding's leaf, and a copy that is a different matrix is refused
+    under those names rather than the unnested ones."""
+    from shutil import copytree
+    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.safetensors_io import write_file
 
+    source = Path(copytree(KIMI_K25, tmp_path / "tied"))
+    config = fixture_config("kimi-k25-tiny")
+    config["tie_word_embeddings"] = True
+    (source / "config.json").write_text(json.dumps(config))
+    tensors = _load_shards(source)
+    embedding = tensors["language_model.model.embed_tokens.weight"]
+    write_file({**tensors, "language_model.lm_head.weight": embedding},
+               source / "model.safetensors", {"format": "pt"})
 
+    loaded = load_pretrained(str(source), dtype="float32", attention_impl="reference")
+    assert "lm_head" not in loaded.variables["params"]
+    head = next(layout for layout in loaded.weight_layouts
+                if layout.name == "language_model.lm_head.weight")
+    assert head.paths == (("params", "embed_tokens", "embedding"),)
 
-
-
-
-
-
-
-
-
-
-
-
+    write_file({**tensors, "language_model.lm_head.weight": embedding + 1.0},
+               source / "model.safetensors", {"format": "pt"})
+    with pytest.raises(ValueError,
+                       match="language_model.lm_head.weight is not the embedding"):
+        load_pretrained(str(source), dtype="float32", attention_impl="reference")
 
 
 # --------------------------------------------------------------------------
@@ -2283,8 +2476,34 @@ def test_a_glm4_moe_depth_with_its_own_head_is_refused(tmp_path):
 GLM_MOE_DSA = FIXTURES / "glm-moe-dsa-tiny"
 
 
+def test_kimi_k25_text_only_placeholders_match_reference():
+    import torch
+    from tools.decoder_export_reference import Case, reference_model
+
+    directory = FIXTURES / "kimi-k25-tiny"
+    source = load_pretrained(directory, dtype="float32", attention_impl="reference")
+    ids = np.load(directory / "input_ids.npy").copy()
+    config = fixture_config("kimi-k25-tiny")
+    ids[0, 0] = config["image_token_id"]
+    ids[1, 2] = config["video_token_id"]
+    reference, _ = reference_model(
+        Case("kimi_k25", "kimi-k25-tiny", reference_class="Kimi_K25ForConditionalGeneration"),
+        directory)
+    reference.eval()
+    reference.set_attn_implementation("eager")
+    with torch.no_grad():
+        expected = reference(input_ids=torch.from_numpy(ids.astype(np.int64)), use_cache=False).logits.numpy()
+    actual = np.asarray(source.model.apply(source.variables, jnp.asarray(ids)))
+    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
+    np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
 
 
+def test_kimi_k25_nested_quantization_is_refused_before_loading_shards(tmp_path):
+    config = fixture_config("kimi-k25-tiny")
+    config["text_config"]["quantization_config"] = {"quant_method": "compressed-tensors"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError, match=r"text_config\.quantization_config"):
+        load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
 
 
 def test_glm_moe_dsa_config_translates_field_by_field():

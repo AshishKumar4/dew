@@ -1964,6 +1964,11 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     with open(directory / "config.json") as handle:
         config = json.load(handle)
     text_config = config.get("text_config")
+    if (config.get("model_type") == "kimi_k25" and isinstance(text_config, Mapping)
+            and text_config.get("quantization_config") is not None):
+        raise ValueError(
+            "text_config.quantization_config is not supported for the kimi_k25 text-only loader; "
+            "provide dequantized text weights and remove that quantization descriptor")
     tensors = decoders._load_shards(directory)
     family = config.get("model_type")
     quantization = _source_quantization(config, param_dtype=param_dtype)

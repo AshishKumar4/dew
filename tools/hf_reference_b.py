@@ -120,7 +120,8 @@ from safetensors.numpy import load_file, save_file
 from transformers import (
     DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma3nTextConfig, Gemma4TextConfig, Glm4MoeConfig, Glm4MoeForCausalLM,
-    Glm5NextTextConfig, GlmMoeDsaConfig, GlmMoeDsaForCausalLM, Llama4TextConfig,
+    Glm5NextTextConfig, GlmMoeDsaConfig, GlmMoeDsaForCausalLM,
+    Kimi_K25Config, Kimi_K25ForConditionalGeneration, Llama4TextConfig,
     Qwen3NextConfig, Qwen3NextForCausalLM,
 )
 from transformers.masking_utils import create_causal_mask, create_chunked_causal_mask
@@ -313,8 +314,22 @@ def write_kimi_k2_config(name: str, repo: str) -> None:
 # they keep against num_experts_per_tok do not survive a fixture; twelve
 # experts with two per token keep a routed layer whose choice the group
 # limit cannot decide, which is what n_group 1 means.
+KIMI_K25_YARN = {
+    "type": "yarn", "factor": 64.0, "beta_fast": 32.0, "beta_slow": 1.0,
+    "mscale": 1.0, "mscale_all_dim": 1.0,
+    "original_max_position_embeddings": 4096,
+}
 
 
+def kimi_k25_text() -> dict:
+    """The release's text fields, with a fresh rope entry per call.
+
+    Config standardization writes `rope_type` and `rope_theta` into the
+    entry it is handed, and the config written beside the weights is the
+    release's own seven fields.
+    """
+    return dict(KIMI_K2_TINY, rms_norm_eps=1e-5, model_type="kimi_k2",
+                rope_scaling=dict(KIMI_K25_YARN))
 
 
 # The tower at toy width: two layers of 16 over 2x2 patches, the release's
@@ -323,6 +338,12 @@ def write_kimi_k2_config(name: str, repo: str) -> None:
 # width, which is what Kimi_K25MultimodalProjection normalises over
 # (modeling_kimi_k25.py:571), and the release spells 1152 twice for that
 # reason.
+KIMI_K25_VISION = dict(
+    patch_size=2, pos_emb_height=8, pos_emb_width=8, pos_emb_time=2,
+    num_attention_heads=2, num_hidden_layers=2, hidden_size=16,
+    intermediate_size=60, hidden_act="gelu_pytorch_tanh",
+    merge_kernel_size=(2, 2),
+)
 # What `save_pretrained` writes where the release's index.json names
 # something else. transformers reverses its own conversion mapping, and
 # three of those renames are not the release's spelling: the vision
@@ -331,10 +352,113 @@ def write_kimi_k2_config(name: str, repo: str) -> None:
 # reverses onto the patch embedding (:460), and the projector's pre_norm is
 # renamed in neither direction (only proj.0 and proj.2 are, :462-463), so
 # it keeps the forward `model.` prefix.
+KIMI_K25_RELEASED_NAMES = (
+    ("language_model.model.blocks.", "language_model.model.layers."),
+    ("vision_tower.encoder.patch_embed.", "vision_tower.patch_embed."),
+    ("model.mm_projector.pre_norm.", "mm_projector.pre_norm."),
+)
 
 
+def tiny_kimi_k25() -> Kimi_K25ForConditionalGeneration:
+    """Kimi K2.5's shape at toy width, built by transformers' own class.
+
+    The text config keeps the release's `kimi_k2` model_type, which
+    Kimi_K25Config.__post_init__ reads as `deepseek_v3`
+    (configuration_kimi_k25.py:80-92), and the released `rope_scaling`
+    spelling; `write_kimi_k25` puts both back over the saved config, since
+    config standardization rewrites the entry it is handed into
+    `rope_parameters`.
+
+    The release marks media with 163605 of 163840 tokens, three below its
+    vision_start and one below its vision_end, and its video id sits at the
+    top of the vocabulary where no id reaches it. These are the same offsets
+    under a 256-token vocabulary. The ids the fixture runs on stay below
+    them, which `write_kimi_k25` checks: with no pixels the reference embeds
+    an image or video mark as token 0 (modeling_kimi_k25.py:686-690), and a
+    text-only load embeds it as itself.
+    """
+    config = Kimi_K25Config(
+        text_config=kimi_k25_text(), vision_config=dict(KIMI_K25_VISION),
+        projection_hidden_size=16, projection_layer_norm_eps=1e-5,
+        image_token_id=255, video_token_id=256, vision_start_token_id=252,
+        vision_end_token_id=254, tie_word_embeddings=False)
+    torch.manual_seed(0)
+    return Kimi_K25ForConditionalGeneration(config)
 
 
+def write_kimi_k25(name: str, repo: str, model: Kimi_K25ForConditionalGeneration,
+                   seed: int = 1234) -> None:
+    """The wrapper fixture under the release's own tensor names and config.
+
+    The checkpoint holds the vision tower and the projector beside the text
+    decoder, as the release does: a text-only reader has no counterpart for
+    them and writes their bytes back untouched, and a fixture without them
+    would not hold that to account. The logits come from a forward pass on
+    input_ids alone, which is the text half of the wrapper's own class.
+
+    It fails the fixture if the released spelling reads other weights or
+    other logits than the saved one, or if an id the fixture runs on is a
+    media mark.
+    """
+    from huggingface_hub import model_info
+
+    directory = FIXTURES / name
+    directory.mkdir(parents=True, exist_ok=True)
+    scatter_weights(model, seed)
+    model = model.float()
+    model.save_pretrained(directory, safe_serialization=True)
+
+    saved = json.loads((directory / "config.json").read_text())
+    vocab = int(saved["text_config"]["vocab_size"])
+    ids = np.random.RandomState(7).randint(0, vocab, (BATCH, LENGTH)).astype(np.int32)
+    marks = {model.config.image_token_id, model.config.video_token_id}
+    if marks & set(ids.reshape(-1).tolist()):
+        raise SystemExit(f"{directory}: the ids carry a media mark of {sorted(marks)}, "
+                         f"which the reference embeds as token 0 with no pixels")
+    np.save(directory / "input_ids.npy", ids)
+    np.save(directory / "logits.npy", reference_logits(model, ids))
+
+    weights = directory / "model.safetensors"
+    released = {}
+    for tensor_name, tensor in load_file(str(weights)).items():
+        for saved_prefix, release_prefix in KIMI_K25_RELEASED_NAMES:
+            if tensor_name.startswith(saved_prefix):
+                tensor_name = release_prefix + tensor_name[len(saved_prefix):]
+                break
+        released[tensor_name] = tensor
+    save_file(released, str(weights), metadata={"format": "pt"})
+
+    spelling = dict(saved["text_config"])
+    for field in ("head_dim", "qk_head_dim", "rope_parameters", "rope_interleave"):
+        spelling.pop(field, None)
+    config = {"architectures": ["Kimi_K25ForConditionalGeneration"], **saved,
+              "text_config": dict(sorted({**spelling, **kimi_k25_text()}.items())),
+              "transformers_version": transformers.__version__}
+    (directory / "config.json").write_text(
+        json.dumps(dict(sorted(config.items())), indent=1) + "\n")
+    (directory / "source.json").write_text(json.dumps({
+        "released": {"repo": repo, "revision": model_info(repo).sha},
+        "transformers": {"version": transformers.__version__,
+                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
+    }, indent=1) + "\n")
+
+    loaded = Kimi_K25ForConditionalGeneration.from_pretrained(
+        str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True)
+    if not isinstance(loaded, tuple):
+        raise SystemExit("output_loading_info returns the model and its report")
+    reloaded, report = loaded
+    unread = {key: sorted(report[key]) for key in
+              ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")
+              if report[key]}
+    if unread:
+        raise SystemExit(f"{directory}: the released names do not read their own weights: {unread}")
+    difference = float(np.max(np.abs(reference_logits(reloaded, ids)
+                                     - np.load(directory / "logits.npy"))))
+    if difference != 0.0:
+        raise SystemExit(f"{directory}: the released spelling moved the logits by {difference:.3e}")
+    print(f"{directory}: model_type {config['model_type']} over text "
+          f"{config['text_config']['model_type']}, {len(released)} tensors under the "
+          f"release's names, released spelling reloads bit for bit")
 
 
 def tiny_glm4_moe() -> Glm4MoeForCausalLM:
@@ -1031,6 +1155,7 @@ def main() -> None:
     write_tiny("deepseek-v2-tiny", tiny_deepseek_v2())
     write_tiny("kimi-k2-tiny", tiny_kimi_k2())
     write_kimi_k2_config("kimi-k2-tiny", "moonshotai/Kimi-K2-Instruct")
+    write_kimi_k25("kimi-k25-tiny", "moonshotai/Kimi-K2.5", tiny_kimi_k25())
     glm = tiny_glm4_moe()
     write_tiny("glm4-moe-tiny", glm)
     write_glm_mtp("glm4-moe-tiny", glm, glm4_moe_mtp(glm.config))
@@ -1064,6 +1189,7 @@ def main() -> None:
     write_released_config("gpt-oss-20b", "openai/gpt-oss-20b")
     write_released_config("deepseek-v2-lite", "deepseek-ai/DeepSeek-V2-Lite")
     write_released_config("kimi-k2", "moonshotai/Kimi-K2-Instruct")
+    write_released_config("kimi-k25", "moonshotai/Kimi-K2.5")
     write_released_config("glm-4.5-air", "zai-org/GLM-4.5-Air")
     write_released_config("glm-5", "zai-org/GLM-5")
     write_released_config("glm-5.3", "zai-org/GLM-5.3")
