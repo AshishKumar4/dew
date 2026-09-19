@@ -20,6 +20,7 @@ Tolerances and the differences actually observed, fp32 on CPU:
 """
 
 import json
+import re
 from pathlib import Path
 
 import jax
@@ -122,22 +123,34 @@ def test_every_translated_leaf_is_load_bearing(path):
 
 
 def test_the_name_map_takes_the_encoder_and_refuses_the_rest():
-    """The decoder, the lm_head and the encoder's tied copy of the embedding
-    are not this tower and translate to nothing; a name the map cannot
-    explain raises ValueError, so a renamed upstream layout fails whole."""
+    """The encoder's tied embedding is this tower whether a file stores it as
+    shared.weight or encoder.embed_tokens.weight; the decoder and the lm_head
+    translate to nothing. A name the map cannot explain raises ValueError, so
+    a renamed upstream layout fails whole."""
     from dew.nn.text_encoders import translate_t5_weights
 
-    beside_the_encoder = {
-        "encoder.embed_tokens.weight": np.zeros((4, 2), np.float32),
+    input_embedding = np.arange(8, dtype=np.float32).reshape(4, 2)
+    encoded = translate_t5_weights({
+        "encoder.embed_tokens.weight": input_embedding,
         "decoder.block.0.layer.0.SelfAttention.q.weight": np.zeros((2, 2), np.float32),
         "lm_head.weight": np.zeros((4, 2), np.float32),
+    })
+    assert set(encoded) == {"embed_tokens"}
+    np.testing.assert_array_equal(encoded["embed_tokens"]["embedding"], input_embedding)
+
+    beside_the_embedding = {
+        "shared.weight": input_embedding,
+        "decoder.block.0.layer.1.DenseReluDense.wi.weight": np.zeros((2, 2), np.float32),
+        "lm_head.weight": np.zeros((4, 2), np.float32),
     }
-    assert translate_t5_weights(beside_the_encoder) == {}
-    with pytest.raises(ValueError, match="encoder.block.0.layer.0.SelfAttention.qkv"):
-        translate_t5_weights({"encoder.block.0.layer.0.SelfAttention.qkv.weight":
-                              np.zeros((2, 2), np.float32)})
-    with pytest.raises(ValueError, match="encoder.pooler.weight"):
-        translate_t5_weights({"encoder.pooler.weight": np.zeros((2, 2), np.float32)})
+    encoded = translate_t5_weights(beside_the_embedding)
+    assert set(encoded) == {"embed_tokens"}
+    np.testing.assert_array_equal(encoded["embed_tokens"]["embedding"], input_embedding)
+
+    for name in ("encoder.block.0.layer.0.SelfAttention.qkv.weight", "encoder.pooler.weight"):
+        with pytest.raises(ValueError, match=re.escape(name)):
+            translate_t5_weights({"shared.weight": input_embedding,
+                                  name: np.zeros((2, 2), np.float32)})
 
 
 @pytest.mark.network
