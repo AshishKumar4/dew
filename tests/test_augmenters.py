@@ -7,8 +7,8 @@ cv2-decoded uint8 HWC numpy arrays. Augmentation was therefore a silent
 no-op before; it is live now, which is a training data distribution change,
 not parity.
 
-These tests run in the bare venv: torchvision is blocked in sys.modules to
-prove nothing in the module's import or construction path reaches it.
+These tests run in the bare venv: a subprocess test proves nothing in the
+module's import or construction path reaches torchvision.
 """
 
 import dataclasses
@@ -30,12 +30,8 @@ import pytest
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
-# Any import of torchvision from here on raises ImportError; the module under
-# test must import, construct and augment regardless.
-sys.modules["torchvision"] = None
-
-from dew.data import CC12M, Loading, OxfordFlowers, images  # noqa: E402
-from dew.data.images import ImageTransform  # noqa: E402
+from dew.data import CC12M, Loading, OxfordFlowers, images
+from dew.data.images import ImageTransform
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -110,8 +106,7 @@ def _record_rng(key):
 # ---------------------------------------------------------------------------------
 
 def test_module_imports_and_constructs_without_torchvision(tmp_path):
-    """The old create_transform imported torchvision at call time; the whole
-    point of the migration is that a base install (no torchvision) works."""
+    """A base install without torchvision imports, constructs and augments."""
     labels_file = _write_labels(tmp_path)
     script = "\n".join([
         "import sys",
@@ -138,6 +133,27 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
     )
     assert result.stdout.strip().splitlines()[-1:] == ["ok"], result.stderr
     assert "torchvision" not in result.stderr
+
+
+def test_collecting_augmenters_preserves_reference_imports():
+    """Collecting this file in a shared run must not poison the modules the
+    rest of the suite imports. The old sys.modules['torchvision'] = None at
+    module scope survived collection and broke every later import of
+    torchvision or transformers in the same process."""
+    script = "\n".join([
+        "import pytest",
+        "assert pytest.main(['--collect-only', '-q', 'tests/test_augmenters.py']) == 0",
+        "from torchvision.io import decode_image",
+        "from transformers import MixtralForCausalLM",
+        "print('ok')",
+    ])
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), JAX_PLATFORMS="cpu")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, env=env, cwd=REPO_ROOT,
+    )
+    assert result.returncode == 0 and result.stdout.strip().splitlines()[-1:] == ["ok"], (
+        result.stdout + result.stderr)
 
 
 # ---------------------------------------------------------------------------------
