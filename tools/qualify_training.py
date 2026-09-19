@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
 import os
 import signal
@@ -146,10 +147,15 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
             if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
             else leaf
         )
-        arrays[jax.tree_util.keystr(path)] = np.asarray(value)
+        array = np.asarray(value)
+        if not np.isfinite(array).all():
+            raise AssertionError(f"Nonfinite state at {jax.tree_util.keystr(path)}")
+        arrays[jax.tree_util.keystr(path)] = array
     for left, right in zip(
         jax.tree.leaves(state), jax.tree.leaves(restored), strict=True
     ):
+        if left.dtype != right.dtype:
+            raise AssertionError("Checkpoint restoration changed a state dtype")
         if jnp.issubdtype(left.dtype, jax.dtypes.prng_key):
             left, right = jax.random.key_data(left), jax.random.key_data(right)
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
@@ -164,7 +170,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
     )
     actual = reloaded.model.apply(reloaded.variables, ids)
     np.testing.assert_allclose(
-        np.asarray(actual), np.asarray(expected), atol=1e-4, rtol=0
+        np.asarray(actual), np.asarray(expected), atol=1e-4, rtol=0, equal_nan=False
     )
     np.savez(run / "export_logits.npz", ids=np.asarray(ids), logits=np.asarray(actual))
     report = {
@@ -188,6 +194,8 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
         "state_structure": str(jax.tree.structure(state)),
         "state_leaves": len(arrays),
         "jax": jax.__version__,
+        "default_matmul_precision": jax.config.jax_default_matmul_precision,
+        "device_kinds": [device.device_kind for device in jax.devices()],
     }
     (run / "result.json").write_text(json.dumps(report, indent=2) + "\n")
 
@@ -271,6 +279,19 @@ def prepare(
             ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
         ).strip(),
         tool_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        packages={
+            name: importlib.metadata.version(name)
+            for name in (
+                "jax",
+                "jaxlib",
+                "flax",
+                "optax",
+                "grain",
+                "orbax-checkpoint",
+                "torch",
+                "transformers",
+            )
+        },
         xla_flags=os.environ.get("XLA_FLAGS", ""),
     )
     (directory / "configuration.json").write_text(json.dumps(record, indent=2) + "\n")
@@ -335,6 +356,14 @@ def compare(directory: Path) -> None:
         raise AssertionError(
             "Resume did not restore the partial accumulation checkpoint"
         )
+    if not np.isfinite(
+        [
+            run[field]
+            for run in (baseline, resumed)
+            for field in ("initial_loss", "final_loss")
+        ]
+    ).all():
+        raise AssertionError("Qualification produced a nonfinite loss")
     if baseline["final_loss"] >= baseline["initial_loss"]:
         raise AssertionError("Training did not improve the fixed-batch loss")
     with (
@@ -344,6 +373,8 @@ def compare(directory: Path) -> None:
         if set(left.files) != set(right.files):
             raise AssertionError("Recovery changed the state leaves")
         for name in left.files:
+            if left[name].dtype != right[name].dtype:
+                raise AssertionError(f"Recovery changed dtype for {name}")
             np.testing.assert_array_equal(left[name], right[name], err_msg=name)
     reference = AutoModelForCausalLM.from_pretrained(
         directory / "source",
@@ -359,7 +390,7 @@ def compare(directory: Path) -> None:
             logits.reshape(-1, logits.shape[-1]), ids[:, 1:].reshape(-1)
         )
         np.testing.assert_allclose(
-            loss.detach().numpy(), data["loss"], atol=1e-4, rtol=0
+            loss.detach().numpy(), data["loss"], atol=1e-4, rtol=0, equal_nan=False
         )
         loss.backward()
         gradients = {}
@@ -392,7 +423,7 @@ def compare(directory: Path) -> None:
         for name, wanted in gradients.items():
             delta = float(np.max(np.abs(data["gradient/" + name] - wanted)))
             scaled = delta / max(1.0, float(np.max(np.abs(wanted))))
-            if scaled > 1e-4:
+            if not scaled <= 1e-4:
                 raise AssertionError(f"Gradient mismatch for {name}: {scaled}")
             gradient_errors[name] = scaled
     errors = []
@@ -405,7 +436,9 @@ def compare(directory: Path) -> None:
         ).eval()
         with np.load(run / "export_logits.npz") as data, torch.no_grad():
             actual = reference(torch.from_numpy(data["ids"]).long()).logits.numpy()
-            np.testing.assert_allclose(actual, data["logits"], atol=1e-4, rtol=0)
+            np.testing.assert_allclose(
+                actual, data["logits"], atol=1e-4, rtol=0, equal_nan=False
+            )
             errors.append(float(np.max(np.abs(actual - data["logits"]))))
     result = {
         "baseline": baseline,
