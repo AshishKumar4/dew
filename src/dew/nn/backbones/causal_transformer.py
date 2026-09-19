@@ -36,6 +36,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ..attention import RMSNorm, RopeScaling
+from ..blocks import TokenEmbedding
 from ..inputs import AttentionMetadata
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
@@ -1557,14 +1558,14 @@ class CausalTransformer(nn.Module):
                 f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
                 "model trained on plain next-token prediction")
 
-        self.embed_tokens = nn.Embed(
+        self.embed_tokens = TokenEmbedding(
             num_embeddings=self.vocab_size, features=self.emb_features,
             dtype=self.dtype, name='embed_tokens')
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
             # hidden_size_per_layer_input slice per layer.
-            self.embed_tokens_per_layer = nn.Embed(
+            self.embed_tokens_per_layer = TokenEmbedding(
                 num_embeddings=self.per_layer_vocab, features=self.num_layers * ple,
                 dtype=self.dtype, name='embed_tokens_per_layer')
             self.per_layer_model_projection = nn.Dense(
@@ -1915,7 +1916,7 @@ class CausalTransformer(nn.Module):
         x = self.embed_tokens(tokens)
         if self.embedding_scale:
             # Gemma casts embed_scale to the embedding weight dtype
-            # (modeling_gemma3.py:117). Dew's nn.Embed holds that table in
+            # (modeling_gemma3.py:117). The token lookup holds that table in
             # fp32 and returns the compute dtype, so the factor keeps its
             # fp32 value and only the product rounds with the activations.
             # A factor rounded to bf16 would be 34.0 at hidden 1152, where
@@ -1932,10 +1933,10 @@ class CausalTransformer(nn.Module):
         # collection, and init leaves it out so the variables tree a caller
         # keeps holds parameters and nothing else.
         if not self.is_initializing():
-            self.sow("embeddings", "prepared",
-                     self._scatter_inputs(self.embed_tokens(tokens), tokens,
-                                          input_embeddings, embedding_positions),
-                     reduce_fn=lambda _, value: value, init_fn=lambda: None)
+            prepared = self._scatter_inputs(self.embed_tokens(tokens), tokens,
+                                            input_embeddings, embedding_positions)
+            self.sow("embeddings", "prepared", prepared,
+                     reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         ple = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
         if self.altup is not None:
             # The embeddings and, rescaled to their magnitude, each projected

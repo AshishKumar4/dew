@@ -93,6 +93,31 @@ def test_the_unmerged_forward_matches_peft(decoder, loaded, reference):
     assert np.max(np.abs(reference["adapted_logits"] - reference["base_logits"])) > 1
 
 
+def test_eval_prediction_disables_adapter_dropout(decoder, loaded, reference):
+    adapter, variables = loaded
+    ids = jnp.asarray(reference["input_ids"])
+    objective = LMObjective(adapter.adapt(decoder.model), ids.shape[1] - 1, ema_decay=None)
+    predictions = {}
+    for train in (False, True):
+        predictions[train] = [
+            objective.predict(variables, {"text": ids},
+                              Step(step=jnp.int32(0), key=jax.random.key(seed), ema=None),
+                              train=train)[2].logits
+            for seed in (0, 1)
+        ]
+    np.testing.assert_array_equal(*predictions[False])
+    np.testing.assert_allclose(predictions[False][0], reference["adapted_logits"][:, :-1],
+                               atol=1e-4, rtol=0)
+    assert not np.array_equal(*predictions[True])
+
+
+def test_adapting_an_adapted_model_is_refused(decoder, loaded):
+    adapter, _ = loaded
+    adapted = adapter.adapt(decoder.model)
+    with pytest.raises(ValueError, match="already adapted"):
+        adapter.adapt(adapted)
+
+
 def test_the_merge_matches_peft_weights_and_logits(decoder, loaded, reference):
     """W + scale * B A into every kernel, the factors gone, the plain model
     over the merged tree agreeing with merge_and_unload."""
@@ -281,7 +306,7 @@ def test_a_per_expert_source_tensor_takes_no_adapter():
 
 def test_a_target_that_is_not_a_dense_is_refused_when_called(decoder, reference):
     adapter = lora.LoRA({("params", "embed_tokens"): lora.Target(2, 2.0)})
-    with pytest.raises(TypeError, match="embed_tokens is a Embed"):
+    with pytest.raises(TypeError, match="params/embed_tokens.*targets nn.Dense and nn.DenseGeneral kernels"):
         adapter.adapt(decoder.model).apply(decoder.variables, jnp.asarray(reference["input_ids"]))
 
 
