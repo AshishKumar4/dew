@@ -13,9 +13,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
-
 from dew.nn.attention import scaled_dot_product_attention
 from dew.telemetry.devices import apply_xla_flags
 
