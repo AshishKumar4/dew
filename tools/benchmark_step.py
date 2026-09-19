@@ -4,7 +4,7 @@
 tools/benchmark_data.py measures the loader. This measures what a step of the
 Trainer costs for a given architecture, batch size and fsdp width. The step
 is the one the trainer compiles for a real run (same objective, same
-sharding, same donated state), so a number from this tool is a number from
+sharding and state ownership), so a number from this tool is a number from
 training.
 
 FLOPs are read off the compiled executable's optimized HLO
@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any, Iterator, Literal, Mapping, Sequence
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
@@ -60,6 +61,9 @@ from dew.inputs.encoders import ConditionEncoder
 from dew.diffusion.process import DenoisingCondition
 from dew.objectives.base import Variables
 from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.backbones.flux import FluxTransformer
+from dew.nn.backbones.sd3 import SD3Transformer
+from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import ProjectorBase, TowerBase, projector_from_record, tower_from_record
@@ -83,32 +87,38 @@ Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 Row = dict[str, object]
 
 
-class _UNetTextTable(ConditionEncoder[str]):
-    """The benchmark table in the native conditional UNet input format."""
+class _DenoisingTextTable(ConditionEncoder[str]):
+    """Synthetic token and pooled features for native diffusion models."""
 
-    def __init__(self, table: CharTable):
+    def __init__(self, table: CharTable, features: int, pooled_features: int | None,
+                 guidance: float | None):
         self.table = table
         self.params = table.params
+        self.features = features
+        self.pooled_features = pooled_features
+        self.guidance = guidance
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = TEXT_TOKENS,
-                        features: int = TEXT_FEATURES, vocab: int = 130, seed: int = 0, dtype=None):
-        return cls(CharTable.from_pretrained(checkpoint, tokens=tokens, features=features,
-                                            vocab=vocab, seed=seed, dtype=dtype))
+                        features: int = TEXT_FEATURES, pooled_features: int | None = None,
+                        guidance: float | None = None, vocab: int = 130, seed: int = 0, dtype=None):
+        return cls(CharTable.from_pretrained(checkpoint, tokens=tokens,
+                                            features=max(features, pooled_features or 0),
+                                            vocab=vocab, seed=seed, dtype=dtype),
+                   features, pooled_features, guidance)
 
     def tokenize(self, data: Sequence[str]) -> Mapping[str, np.ndarray]:
         return self.table.tokenize(data)
 
     def encode(self, params: Variables, tokens) -> DenoisingCondition:
-        return DenoisingCondition(self.table.encode(params, tokens).hidden)
+        hidden = self.table.encode(params, tokens).hidden
+        pooled = None if self.pooled_features is None else hidden[:, 0, :self.pooled_features]
+        guidance = None if self.guidance is None else jnp.full((hidden.shape[0],), self.guidance)
+        return DenoisingCondition(hidden[..., :self.features], pooled, guidance=guidance)
 
     def to_json(self) -> dict:
-        return self.table.to_json()
-
-
-def text_condition(architecture: str = "") -> Condition:
-    table = _UNetTextTable if architecture == "unet_2d_condition" else CharTable
-    return Condition(table.from_pretrained(tokens=TEXT_TOKENS, features=TEXT_FEATURES))
+        return {**self.table.to_json(), "features": self.features, "pooled_features": self.pooled_features,
+                "guidance": self.guidance}
 
 
 @dataclass(frozen=True)
@@ -304,6 +314,17 @@ def cpu_smoke_cases() -> list[Case]:
         Case("unet_2d_condition", {"stages": [{"features": 32, "heads": 2}, {"features": 64, "heads": 4}],
                                     "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
              batch_size=8, image_size=16, channels=4, fsdp_min_param_size=256),
+        Case("sd3_transformer", {"in_channels": 4, "out_channels": 4, "num_layers": 2,
+                                  "heads": 2, "head_dim": 8, "joint_attention_dim": 16,
+                                  "caption_projection_dim": 16, "pooled_projection_dim": 32,
+                                  "sample_size": 8, "pos_embed_max_size": 4},
+             batch_size=8, image_size=8, channels=4, fsdp_min_param_size=256),
+        Case("flux_transformer", {"in_channels": 16, "out_channels": 16,
+                                   "num_layers": 1, "num_single_layers": 1, "heads": 2,
+                                   "head_dim": 12, "joint_attention_dim": 16,
+                                   "pooled_projection_dim": 8, "axes_dims_rope": (4, 4, 4),
+                                   "guidance_embeds": True},
+             batch_size=8, image_size=8, channels=4, fsdp_min_param_size=256),
         Case("jepa_encoder", {"patch_size": 4, "emb_features": 32, "num_layers": 2,
                               "num_heads": 2, "mlp_ratio": 2},
              predictor={"grid": (4, 4), "emb_features": 32, "predictor_features": 16,
@@ -354,6 +375,14 @@ def small_cases(dtype: str) -> list[Case]:
                                               {"features": 256, "heads": 8, "cross_attention": False}],
                                     "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
              batch_size=4, image_size=32, channels=4),
+        Case("sd3_transformer", {"num_layers": 6, "heads": 6, "head_dim": 64,
+                                  "caption_projection_dim": 384, "sample_size": 32,
+                                  "pos_embed_max_size": 16},
+             batch_size=4, image_size=32, channels=16),
+        Case("flux_transformer", {"num_layers": 3, "num_single_layers": 3, "heads": 6,
+                                   "head_dim": 64, "axes_dims_rope": (16, 24, 24),
+                                   "guidance_embeds": True},
+             batch_size=4, image_size=32, channels=16),
         Case("uvit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
         Case("simple_udit", {**dit, "num_layers": 6}, batch_size=16, image_size=64),
         Case("simple_dit", dit, batch_size=16, image_size=64),
@@ -548,10 +577,22 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
             sample=Field(sample_key, case.sample_shape))
     else:
         model = built(case.architecture, case.config)
-        keyword = "conditioning" if case.architecture == "unet_2d_condition" else "textcontext"
+        process = presets.EDM()()
+        if isinstance(model, (SD3Transformer, FluxTransformer)):
+            keyword = "conditioning"
+            encoder = _DenoisingTextTable.from_pretrained(
+                features=model.joint_attention_dim, pooled_features=model.pooled_projection_dim,
+                guidance=3.5 if isinstance(model, FluxTransformer) and model.guidance_embeds else None)
+            process = presets.Flow()()
+        elif isinstance(model, UNet2DCondition):
+            keyword = "conditioning"
+            encoder = _DenoisingTextTable.from_pretrained()
+        else:
+            keyword = "textcontext"
+            encoder = CharTable.from_pretrained(tokens=TEXT_TOKENS, features=TEXT_FEATURES)
         inputs = InputSpec(Field(sample_key, case.sample_shape),
-                           {keyword: text_condition(case.architecture)})
-        objective = DiffusionObjective(model, presets.EDM()(), inputs)
+                           {keyword: Condition(encoder)})
+        objective = DiffusionObjective(model, process, inputs)
 
     return Trainer(
         objective, optax.adam(1e-4), key=jax.random.key(0),
@@ -622,7 +663,7 @@ def batches(case: Case) -> Iterator[Batch]:
         batch[sample_key] = rng.integers(
             0, 256, size=(case.batch_size, *case.sample_shape)).astype(np.float32)
         if not case.is_jepa:
-            batch["text"] = text_condition(case.architecture).encoder.tokenize(["a flower"] * case.batch_size)
+            batch["text"] = CharTable.from_pretrained(tokens=TEXT_TOKENS).tokenize(["a flower"] * case.batch_size)
     while True:
         yield batch
 

@@ -417,6 +417,28 @@ def test_step_benchmark_small_preset_exempts_only_the_jepa_predictor():
     assert models.name_of(type(predictor)) == "jepa_predictor"
 
 
+@pytest.mark.parametrize("architecture", ["sd3_transformer", "flux_transformer"])
+def test_step_benchmark_native_diffusion_trains_text_and_pooled_conditioning(architecture):
+    tool = load("benchmark_step")
+    case = composite_case(tool, architecture)
+    trainer = tool.build_trainer(case, "reference")
+    encoder = trainer.objective.inputs.conditions["conditioning"].encoder
+    encoded = encoder.encode(encoder.params, next(tool.batches(case))["text"])
+    assert encoded.context.shape == (case.batch_size, tool.TEXT_TOKENS,
+                                     trainer.objective.model.joint_attention_dim)
+    assert encoded.pooled.shape == (case.batch_size, trainer.objective.model.pooled_projection_dim)
+    if architecture == "flux_transformer":
+        np.testing.assert_array_equal(encoded.guidance, np.full(case.batch_size, 3.5))
+    moved, flops = parameter_movement(tool, case)
+    assert flops > 0
+    for projection in ("context_embedder", "text_embedder_linear_1"):
+        changes = [value for path, value in moved.items() if projection in path]
+        assert changes and min(changes) > 0, projection
+    if architecture == "flux_transformer":
+        changes = [value for path, value in moved.items() if "guidance_embedder_linear_1" in path]
+        assert changes and min(changes) > 0
+
+
 def test_step_benchmark_media_rows_mark_one_slot_per_projected_feature():
     """A media row is what a processor hands the model: the image tokens fill
     exactly the slots the projector has features for, each slot naming its
