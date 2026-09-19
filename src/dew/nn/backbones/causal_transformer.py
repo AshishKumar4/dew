@@ -1339,6 +1339,9 @@ class CausalTransformer(nn.Module):
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     final_logit_softcap: Optional[float] = None
     tie_embeddings: bool = True
+    embedding_zero_ids: Tuple[int, ...] = ()
+    """Placeholder ids looked up as token zero, without changing labels
+    (modeling_kimi_k25.py:686-690, the text-only wrapper path)."""
     dropout_rate: float = 0.0
     dtype: Optional[Dtype] = None
     precision: PrecisionLike = None
@@ -1380,6 +1383,7 @@ class CausalTransformer(nn.Module):
             raise ValueError("layer_scalar must be None, frozen or trainable")
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
+        object.__setattr__(self, "embedding_zero_ids", tuple(self.embedding_zero_ids))
         if self.kv_shared_layers is not None:
             object.__setattr__(self, "kv_shared_layers",
                                tuple(int(index) for index in self.kv_shared_layers))
@@ -1933,7 +1937,7 @@ class CausalTransformer(nn.Module):
         """
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
-        embeds = self._scatter_inputs(self.embed_tokens(tokens), tokens,
+        embeds = self._scatter_inputs(self.token_embeddings(tokens), tokens,
                                       input_embeddings, embedding_positions)
         # A depth restricts its keys only where the caller's validity or a
         # document boundary does. With neither, every shifted pair is real,
@@ -1987,7 +1991,7 @@ class CausalTransformer(nn.Module):
             raise ValueError("prediction_phase must be ordinary, extend or draft")
         if depth < 0 or depth >= len(self.mtp):
             raise ValueError("prediction depth is outside the model's configured depths")
-        embeds = self.embed_tokens(tokens) if input_embeddings is None else input_embeddings
+        embeds = self.token_embeddings(tokens) if input_embeddings is None else input_embeddings
         state = self.mtp[depth](hidden, embeds, positions=positions, decode=decode,
                                 prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
                                 attention_metadata=AttentionMetadata(valid=attention_mask,
@@ -2000,7 +2004,10 @@ class CausalTransformer(nn.Module):
         `mtp_hidden_states` reads the unscaled table, so this is that lookup
         and nothing else: a drawn token is text, and media never reaches it.
         """
-        return self.embed_tokens(tokens)
+        lookup = tokens
+        for token_id in self.embedding_zero_ids:
+            lookup = jnp.where(tokens == token_id, 0, lookup)
+        return self.embed_tokens(lookup)
 
     def init_mtp_cache(self, batch_size: int):
         """Allocate only prediction-layer caches; ordinary generation does not pay for them."""
@@ -2048,7 +2055,7 @@ class CausalTransformer(nn.Module):
                                   pairwise_mask=attention_pairwise_mask,
                                   key_positions=attention_key_positions,
                                   token_ids=tokens if self.hash_layers else None))
-        x = self.embed_tokens(tokens)
+        x = self.token_embeddings(tokens)
         if self.embedding_scale:
             # Gemma casts embed_scale to the embedding weight dtype
             # (modeling_gemma3.py:117). The token lookup holds that table in
@@ -2068,7 +2075,7 @@ class CausalTransformer(nn.Module):
         # collection, and init leaves it out so the variables tree a caller
         # keeps holds parameters and nothing else.
         if not self.is_initializing():
-            prepared = self._scatter_inputs(self.embed_tokens(tokens), tokens,
+            prepared = self._scatter_inputs(self.token_embeddings(tokens), tokens,
                                             input_embeddings, embedding_positions)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)

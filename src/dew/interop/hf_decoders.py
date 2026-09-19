@@ -3392,17 +3392,110 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[st
 # a missing one, into `deepseek_v3` (configuration_kimi_k25.py:80-92), so
 # these two spellings name one computation and any other names a decoder
 # this wrapper does not carry.
+_KIMI_K25_TEXT = ('kimi_k2', 'deepseek_v3')
 
 # moonshotai/Kimi-K2.5's text_config was serialized by transformers 4.56.2,
 # which wrote every PreTrainedConfig attribute. 5.16.1's DeepseekV3Config
 # reads none of these off a decoder config: the first group is decoding
 # policy, which no forward pass consults, and the second is metadata.
+_KIMI_K25_TEXT_SERIALIZED = frozenset({
+    'bad_words_ids', 'begin_suppress_tokens', 'decoder_start_token_id',
+    'diversity_penalty', 'do_sample', 'early_stopping',
+    'encoder_no_repeat_ngram_size', 'exponential_decay_length_penalty',
+    'forced_bos_token_id', 'forced_eos_token_id', 'length_penalty',
+    'max_length', 'min_length', 'no_repeat_ngram_size', 'num_beam_groups',
+    'num_beams', 'num_return_sequences', 'output_scores',
+    'remove_invalid_values', 'repetition_penalty', 'return_dict_in_generate',
+    'sep_token_id', 'suppress_tokens', 'temperature', 'top_k', 'top_p',
+    'typical_p',
+    'finetuning_task', 'is_decoder', 'prefix', 'task_specific_params',
+    'tf_legacy_loss', 'tokenizer_class', 'torchscript', 'use_bfloat16',
+})
 # The four the same serialization carries that would name another model if
 # they were set, so they are read by value rather than accepted by name.
+_KIMI_K25_TEXT_ENCODER = ('add_cross_attention', 'cross_attention_hidden_size',
+                          'tie_encoder_decoder', 'pruned_heads')
 
 
+def _kimi_k25_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
+    """moonshotai/Kimi-K2.5: a vision wrapper whose decoder is Kimi K2's.
+
+    Kimi_K25Model is a vision tower, a language model built from
+    text_config and a projector (modeling_kimi_k25.py:590-592), and
+    Kimi_K25ForConditionalGeneration puts the head on top
+    (:727, :734). The text computation is DeepSeek V3's verbatim, so this
+    translates the text half and accounts for the wrapper's own fields by
+    name: the tower, the projector and the media placeholders they fill
+    have no counterpart here, and nothing they name reaches the decoder.
+
+    The head is the wrapper's, not the nested text model's: the text
+    config's own `tie_word_embeddings` describes a DeepseekV3Model with no
+    head at all, while the wrapper's ties `lm_head.weight` to
+    `model.language_model.embed_tokens.weight` (:727).
+
+    Without pixels the reference looks up image/video placeholders as token
+    zero (:686-690). Only the embedding lookup changes; targets retain the
+    original vocabulary ids.
+    """
+    text = hf_config.get('text_config')
+    if not isinstance(text, Mapping):
+        _refuse('text_config',
+                f"the wrapper carries its decoder under text_config, got {text!r}")
+    model_type = text.get('model_type', 'deepseek_v3')
+    if model_type not in _KIMI_K25_TEXT:
+        _refuse(f"text_config model_type {model_type!r}",
+                "a Kimi K2.5 wrapper's decoder is Kimi K2's, which the "
+                f"reference reads as one of {', '.join(map(repr, _KIMI_K25_TEXT))}")
+    for field in _KIMI_K25_TEXT_ENCODER:
+        if text.get(field):
+            _refuse(f"text_config {field}={text[field]!r}",
+                    "the decoder has no cross attention, no encoder to tie "
+                    "against and no pruned heads")
+    tied = hf_config.get('tie_word_embeddings', True)
+    if not isinstance(tied, bool):
+        _refuse(f"tie_word_embeddings {tied!r}", "the wrapper head takes a boolean tying policy")
+    # The release ships the media placeholder under its remote-code name;
+    # transformers' own default for image_token_id is that same 163605, and
+    # its video_token_id default sits at the top of the vocabulary, where no
+    # id can reach it (configuration_kimi_k25.py:74-77).
+    used.update(('text_config', 'tie_word_embeddings', 'vision_config',
+                 'projection_hidden_size', 'projection_layer_norm_eps',
+                 'image_token_id', 'media_placeholder_token_id', 'video_token_id',
+                 'vision_start_token_id', 'vision_end_token_id',
+                 'use_unified_vision_chunk', 'video_placeholder', 'ignore_index'))
+    config = translate_config({**text, 'model_type': model_type,
+                             'tie_word_embeddings': tied},
+                            inert=_KIMI_K25_TEXT_SERIALIZED
+                            | frozenset(_KIMI_K25_TEXT_ENCODER))
+    placeholders = []
+    for field, default in (('image_token_id', 163605), ('video_token_id', 163840)):
+        value = hf_config.get(field, default)
+        if type(value) is not int or value < 0:
+            _refuse(field, 'the text-only wrapper requires a nonnegative token id')
+        placeholders.append(value)
+    config['embedding_zero_ids'] = tuple(placeholders)
+    return config
 
 
+def _kimi_k25_path(name: str, config: Mapping[str, object]) -> Optional[Tuple[str, ...]]:
+    """A Kimi K2.5 checkpoint's tensor names onto the text decoder's leaves.
+
+    The release nests the decoder under `language_model.model.*` with its
+    head at `language_model.lm_head.weight`
+    (model.safetensors.index.json of moonshotai/Kimi-K2.5 at 4d01dfe0);
+    transformers renames those to `model.language_model.*` and
+    `lm_head.weight` on the way in (conversion_mapping.py:432-433). The
+    tower and the projector have no counterpart here, so their tensors map
+    to nothing and the export writes their source bytes back.
+    """
+    decoder = 'language_model.model.'
+    if name.startswith(decoder):
+        return _dew_path('model.' + name[len(decoder):], config)
+    if name == 'language_model.lm_head.weight':
+        return _dew_path('lm_head.weight', config)
+    if name.startswith(('vision_tower.', 'mm_projector.')):
+        return None
+    raise ValueError(f"unknown tensor name {name!r}")
 
 
 def _llama4_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
@@ -4182,6 +4275,11 @@ _FAMILY_ENTRIES = (
                   'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}, preserve_source_layout=True),
     # Kimi K2.5 wraps that same computation in a vision repo, so it is
     # provenance-only too, and its own tensor names are the wrapper's.
+    DecoderFamily(('kimi_k25',), _kimi_k25_config, lambda fields: False,
+                  'kimi_k25', 'Kimi_K25ForConditionalGeneration', lambda model: {},
+                  weight_path=_kimi_k25_path, preserve_source_layout=True,
+                  tied_head_names=('language_model.lm_head.weight',
+                                   'language_model.model.embed_tokens.weight')),
     DecoderFamily(('deepseek_v3',), _deepseek_config,
                   lambda fields: isinstance(_mixer_value(fields), MLAMixer),
                   'deepseek_v3', 'DeepseekV3ForCausalLM', lambda model: {}, preserve_source_layout=True),

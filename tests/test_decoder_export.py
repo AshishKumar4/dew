@@ -22,6 +22,8 @@ Observed on CPU in fp32, every position's argmax equal and the tolerance
 | deepseek_v3  |             53 |         24 |                  5.1e-06 |
 | deepseek_v32 |             63 |         24 |                  3.4e-06 |
 | kimi_k2      |             65 |         36 |                  2.6e-06 |
+| kimi_k25     |            100 |         36 |                  2.9e-06 |
+| deepseek_v4  |            361 |        144 |                  6.4e-06 |
 | llama4_text  |             45 |          0 |                  4.2e-06 |
 | olmo3        |             47 |          0 |                  3.6e-06 |
 | qwen3_next   |            195 |         96 |                  1.4e-04 |
@@ -41,11 +43,14 @@ through the dew reload and the MTP loss term of the training step; its
 larger residue is the delta net layers' fp32 rounding, the same residue
 tests/test_hf_decoders.py records for qwen35-tiny.
 
-glm_moe_dsa is also held to the reference's gradients: dew's gradient of
-the next-token cross entropy, written into the source layout through the
-same bindings the export uses, against the reference's `.grad` on 224
-tensors (the per-expert ones read their slice of the fused parameters),
-observed max scaled error 1.5e-06 at the 1e-4 bound.
+glm_moe_dsa and kimi_k25 are also held to the reference's gradients: dew's
+gradient of the next-token cross entropy, written into the source layout
+through the same bindings the export uses, against the reference's `.grad`
+(the per-expert tensors read their slice of the fused parameters).
+Observed max scaled error 1.5e-06 over 224 tensors for glm_moe_dsa and
+4.5e-07 over 64 for kimi_k25, both at the 1e-4 bound. DeepSeek V4's
+trunk compares 280 gradients with max scaled error 1.1e-06. Its 53 MTP
+tensors are retained unchanged, not executed by this qualification.
 
 transformers 5.16.1 registers no `kimi_k2` config, so the tool names the
 class Kimi's release points its `auto_map` at, `DeepseekV3ForCausalLM`,
@@ -56,6 +61,14 @@ transformers keys the conversion by model_type; without it the release's
 one tensor per expert reaches no converter and the loading report names 2
 missing and 36 unexpected keys.
 
+kimi_k25 is the Kimi K2.5 repo: the same decoder nested under
+`language_model.model.*` inside a vision wrapper, so 35 of its 100 tensors
+are the tower and the projector, which this has no counterpart for. They
+are retained by name at load and written back byte for byte, and the
+reference is `Kimi_K25ForConditionalGeneration` on input_ids alone, which
+is that wrapper's text half. Media placeholder ids follow its token-zero
+embedding rule; no vision or projector computation is claimed.
+
 The tiny checkpoints carry no tokenizer, so the tokenizer half of an export
 is exercised on a copy of one with the committed byte-level BPE beside it.
 
@@ -64,8 +77,6 @@ Prediction tensors omitted by upstream trunk classes are checked separately,
 not treated as evidence of an executed upstream prediction layer. Gradient
 scope is stated by each gate. Released-scale and tied-selector behavior are
 not established by the tiny untied-cutoff fixtures.
-
-DeepSeek V4 trunk: 361 source tensors, 308 bound (144 indexed), 53 MTP tensors retained unexecuted; trained export max absolute logit error 6.4e-06, 280 gradients at scaled error 1.1e-06. Cached decode is not qualified in this commit.
 """
 
 import dataclasses
@@ -90,8 +101,8 @@ MOVEMENT = 1e-4
 # stacks and the export slices back apart. Llama 4 fuses its experts
 # instead and is covered by every other case here.
 INDEXED = ("mixtral", "qwen3_moe", "glm4_moe", "glm_moe_dsa", "deepseek_v2",
-           "deepseek_v3", "deepseek_v32", "deepseek_v4", "kimi_k2", "qwen3_next",
-           "glm5_next")
+           "deepseek_v3", "deepseek_v32", "deepseek_v4", "kimi_k2", "kimi_k25",
+           "qwen3_next", "glm5_next")
 
 
 CASES = {case.name: case for case in tool.CASES}
@@ -101,7 +112,7 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # The families whose training claim is held to the reference's gradients
 # too: dew's gradient of the next-token cross entropy, written back into
 # the source's tensor layout, against the reference's `.grad`.
-GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "qwen3_next", "glm5_next")
+GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next")
 GRADIENT = 1e-4
 
 

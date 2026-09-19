@@ -96,6 +96,8 @@ CASES = (
     Case("deepseek_v4", "deepseek-v4-tiny", balance_rate=1e-2, rate=5e-3),
     Case("kimi_k2", "kimi-k2-tiny", balance_rate=1e-2,
          reference_class="DeepseekV3ForCausalLM"),
+    Case("kimi_k25", "kimi-k25-tiny", balance_rate=1e-2,
+         reference_class="Kimi_K25ForConditionalGeneration"),
     Case("llama4_text", "llama4-tiny"),
     Case("olmo3", "olmo3-yarn-tiny"),
     Case("qwen3_next", "qwen3-next-tiny", mtp_weight=0.3),

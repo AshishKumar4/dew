@@ -1,0 +1,10 @@
+{
+ "released": {
+  "repo": "moonshotai/Kimi-K2.5",
+  "revision": "4d01dfe0332d63057c186e0b262165819efb6611"
+ },
+ "transformers": {
+  "version": "5.16.1",
+  "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"
+ }
+}
