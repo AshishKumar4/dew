@@ -1780,7 +1780,63 @@ def mode_masked_generation(args) -> dict:
             "valid_lengths": valid[mine].sum(axis=1).tolist(), "refused": refused}
 
 
-MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
+def mode_host_training(args) -> dict:
+    """One global clipped update on resident and companion-CPU state."""
+    import functools
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training.distributed import build_mesh, shard_batch
+    from dew.training.host import companion_mesh
+
+    class Coupled(Objective):
+        def init(self, key, variables=None):
+            return {"params": {"small": jnp.ones(8), "large": jnp.ones(16)}}
+
+        def loss(self, params, batch, step):
+            weights = params["params"]
+            x = batch["x"]
+            return (jnp.sum(weights["small"]) * jnp.mean(x)
+                    + jnp.sum(weights["large"]) * jnp.mean(x ** 2)), Aux({})
+
+    reports = {}
+    compute_devices, transaction_devices = [], []
+    for process in range(jax.process_count()):
+        devices = sorted((d for d in jax.devices() if d.process_index == process), key=lambda d: d.id)
+        middle = len(devices) // 2
+        compute_devices.extend(devices[:middle])
+        transaction_devices.extend(devices[middle:])
+
+    class SeparateLanes(Trainer):
+        @functools.cached_property
+        def device_mesh(self):
+            return build_mesh(self.mesh, devices=compute_devices)
+
+        @functools.cached_property
+        def state_mesh(self):
+            return (companion_mesh(self.device_mesh, transaction_devices)
+                    if self.host_master else self.device_mesh)
+
+    rows = np.arange(8, dtype=np.float32)
+    local = np.array_split(rows, jax.process_count())[jax.process_index()]
+    for name, host in (("resident", ()), ("host", ("params",))):
+        trainer = SeparateLanes(Coupled(), optax.chain(optax.clip_by_global_norm(.5), optax.sgd(.1)),
+                          key=jax.random.key(0), mesh=MeshSpec(fsdp=2),
+                          layout=Layout(host=host, min_shard=1, tolerance=1.))
+        state, _, _ = trainer.place()
+        batch = shard_batch(trainer.device_mesh, {"x": local})
+        state, loss, _, _, _ = trainer.compile(state, batch)(state, batch)
+        reports[name] = {"params": jax.tree.map(lambda x: x.tolist(), as_numpy(state.params)),
+                         "loss": float(loss), "step": int(state.step)}
+    reports["compute_devices"] = [d.id for d in compute_devices]
+    reports["transaction_devices"] = [d.id for d in transaction_devices]
+    return reports
+
+
+MODES = {"host_training": mode_host_training,
+         "topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "masked_generation": mode_masked_generation,
          "packed_fit": mode_packed_fit,
          "inference_pipeline": mode_inference_pipeline,

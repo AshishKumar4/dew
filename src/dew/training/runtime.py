@@ -22,12 +22,14 @@ from dew.artifacts import broadcast_from_process_zero
 
 if TYPE_CHECKING:
     from dew.config import Wandb
+    from dew.training.distributed import Layout
 
 
 def prepare_process(wandb: Wandb | None = None,
                     multi_host: bool | None = None,
                     xla_flags: str | None = None,
-                    compilation_cache_dir: str | None = None) -> None:
+                    compilation_cache_dir: str | None = None,
+                    *, layout: Layout | None = None) -> None:
     """Raise the fd/core limits, set the env vars, join the JAX process pool.
 
     `wandb` is the run's `dew.config.Wandb`, or None for a run without a
@@ -45,6 +47,12 @@ def prepare_process(wandb: Wandb | None = None,
     opens a backend, so this call has to come before the first JAX call in the
     process. That makes it a recipe's first line. A library user, who never
     runs a recipe, sets XLA_FLAGS in the environment.
+
+    The same Layout passed to Trainer selects CPU transaction ownership when
+    host includes params. JAX_PLATFORMS must permit CPU beside the accelerator
+    and JAX_NUM_CPU_DEVICES (or the existing XLA flags) must establish one CPU
+    device per local accelerator before this call. Validation never changes
+    backend configuration after initialization.
     """
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
@@ -77,6 +85,10 @@ def prepare_process(wandb: Wandb | None = None,
             # their model builds, and a process that arrives late dies in gloo
             # before the run can report it.
             multihost_utils.sync_global_devices("dew process pool joined")
+    if layout is not None and "params" in layout.host:
+        from dew.training.distributed import build_mesh
+        from dew.training.host import companion_mesh
+        companion_mesh(build_mesh())
     print(f"Number of devices: {jax.device_count()}")
 
 

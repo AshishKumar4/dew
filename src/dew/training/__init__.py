@@ -14,7 +14,8 @@ from .runtime import prepare_process, run_timestamp
 from .state import TrainState
 from .tracker import (Tracker, MLflowTracker, TensorBoardTracker, WandbTracker, LocalTracker,
                       Trackers)
-from .trainer import Profile, Rollout, Trainer, ema_update, write_back
+from .trainer import Profile, Rollout, Trainer
+from .transaction import ema_update, write_back
 
 __all__ = [
     "Aux", "Checkpoints", "DEFAULT_RULES", "EMASpec", "Evaluation", "Layout", "MLflowTracker",

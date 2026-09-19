@@ -15,6 +15,7 @@ takes the vocabulary from the data, not the command line.
 """
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -203,7 +204,7 @@ def build_samples(config: LmRunConfig) -> Optional[Samples]:
         decode=tokenizer.decode)
 
 
-def run_summary(config: LmRunConfig, fields: dict) -> dict:
+def run_summary(config: LmRunConfig, fields: Mapping[str, object]) -> dict:
     """Flat view of the run, for the tracker."""
     return {
         **fields,
@@ -262,7 +263,8 @@ def build_block_objective(config: LmRunConfig, model, pretrained):
 
 def main(config: LmRunConfig) -> TrainState:
     prepare_process(config.trainer.wandb, config.trainer.multi_host,
-                    config.trainer.xla_flags, config.trainer.compilation_cache_dir)
+                    config.trainer.xla_flags, config.trainer.compilation_cache_dir,
+                    layout=config.trainer.layout)
 
     tokens = token_directory(config.data.path)
     # The tokenizer and vocabulary the token files were written with.

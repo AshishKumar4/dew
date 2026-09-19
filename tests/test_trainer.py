@@ -25,7 +25,7 @@ from dew.artifacts import Representations
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training import trainer as trainer_module
-from dew.training.trainer import ema_update, write_back
+from dew.training import ema_update, write_back
 
 BATCH = 8
 FEATURES = 3

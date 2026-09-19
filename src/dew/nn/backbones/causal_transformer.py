@@ -903,26 +903,25 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     Where a bank sits changes nothing here: a leaf in device memory is not
     moved, so a resident bank and a host-resident one are read by the same
     loop and give the same values.
+    Training uses the native Linen scan instead: map_variables stages one
+    row under remat, so backward refetches the original pinned bank rather
+    than retaining a device copy of every layer. There is no saved duplicate
+    weight bank and no training prefetch carry; inference keeps its prefetch.
     """
     runs = [layers[first] if count == 1 else block(first, group_name(first, count))
             for first, count in groups]
     fetching = banked or any(_on_host(run.variables.get('params', {})) for run in runs)
-    if fetching and train:
-        raise ValueError(
-            "a banked or host-resident store is read for a forward pass; a training "
-            "step reads every layer again in its backward pass, which this staging "
-            "does not cover, and dropout under it has no rng of its own")
-    if not fetching:
+    if not fetching or train:
         for run, (first, count) in zip(runs, groups):
             inputs = (None if per_layer_input is None
                       else per_layer_input[:, :, first:first + count, :])
-            if count == 1:
+            if count == 1 and not fetching:
                 x = run(x, train=train, decode=decode, positions=positions,
                         segment_ids=segment_ids, kv_store=kv_store,
                         per_layer_input=None if inputs is None else inputs[:, :, 0, :],
                         attention_metadata=attention_metadata)
                 continue
-            store = kv_store if specs[first].kv_shared else None
+            store = kv_store if count == 1 or specs[first].kv_shared else None
 
             def step(layer, carry, per_layer_input):
                 return layer(carry, train=train, decode=decode, positions=positions,
@@ -930,8 +929,19 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
                              per_layer_input=per_layer_input,
                              attention_metadata=attention_metadata), None
 
-            x, _ = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
-                           in_axes=2, length=count)(run, x, inputs)
+            if fetching:
+                # Scan variables are xs, not closed-over bank slices. Native
+                # transposition stacks host cotangent rows instead of adding
+                # a whole-bank device accumulator. Remat retains the original
+                # host operand and refetches only this layer in backward
+                # (MaxText layers/decoders.py:544-565).
+                step = nn.remat(nn.map_variables(
+                    step, True, trans_in_fn=_fetched, init=False, mutable=True))
+            if count == 1:
+                x, _ = step(run, x, None if inputs is None else inputs[:, :, 0, :])
+            else:
+                x, _ = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
+                               in_axes=2, length=count)(run, x, inputs)
         return x
 
     def read_only(run: DecoderBlock) -> list[str]:

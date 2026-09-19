@@ -24,7 +24,7 @@ class Terms:
     positions: jax.Array
 
 
-class Tiny(Objective):
+class Tiny(Objective[Mean | Terms, None]):
     ema = EMASpec(optax.constant_schedule(.5), select=under("params"))
 
     def __init__(self, composite=False):
@@ -69,7 +69,7 @@ def batches():
                  bad=jnp.array(bad), active=jnp.array(1))
             for mask, bad in [([1., 0.], False), ([1., 1.], True), ([.5, 1.], False), ([1., 1.], False)]]
 
-class ShortScaleTrainer(Trainer):
+class ShortScaleTrainer(Trainer[Mean | Terms, None]):
     def initial_state(self, initializer=None, key=None):
         state = super().initial_state(initializer, key)
         return dataclasses.replace(state, scale=dataclasses.replace(state.scale, growth_interval=1))

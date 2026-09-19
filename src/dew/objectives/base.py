@@ -222,6 +222,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         return None
 
     @property
+    def layer_groups(self) -> tuple[tuple[int, int], ...]:
+        """Scanned layer runs, as (first, count), for an execution snapshot.
+
+        Objectives without a layer stack have only entry variables. The
+        canonical variables and optimizer trees never adopt these banks.
+        """
+        return ()
+
+    @property
     def initializer(self) -> Initializer:
         """`init` as one value a JIT can take, with held arrays as arguments.
 
