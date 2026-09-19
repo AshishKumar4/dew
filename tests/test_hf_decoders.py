@@ -2066,7 +2066,7 @@ def test_glm_moe_dsa_config_translates_field_by_field():
         "kind": "mla", "q_lora_rank": 12, "kv_lora_rank": 8, "qk_nope_head_dim": 12,
         "qk_rope_head_dim": 4, "v_head_dim": 16, "rope_interleave": True, "yarn": None,
         "index_topk": 4, "index_n_heads": 4, "index_head_dim": 8,
-        "index_rope_interleave": True, "latent_norm_eps": 1e-6}
+        "index_rope_interleave": True}
     assert config["kv_shared_layers"] == (3, 4, 5, 7)
     assert config["mixture"]["layers"] == (3, 4, 5, 6, 7)
     assert config["mixture"]["bias"] and config["mixture"]["shared_features"] == 12

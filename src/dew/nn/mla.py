@@ -487,6 +487,9 @@ class MultiHeadLatentAttention(nn.Module):
     rope_theta: float = 10000.0
     rope_interleave: bool = True
     yarn: Optional[YarnScaling] = None
+    # DeepSeek and GLM norm the latents at RMSNorm's 1e-6 default whatever
+    # the trunk's rms_norm_eps says (modeling_deepseek_v3.py:392,404,
+    # modeling_glm_moe_dsa.py:349,361).
     norm_eps: float = 1e-6
     scale_offset: bool = False
     scale_after_cast: bool = False
@@ -850,9 +853,6 @@ class MLAMixer(MixerBase):
     index_n_heads: Optional[int] = None
     index_head_dim: Optional[int] = None
     index_rope_interleave: bool = False
-    latent_norm_eps: Optional[float] = None
-    """None uses the trunk epsilon; GLM hardcodes 1e-6 on the MLA latents
-    (modeling_glm_moe_dsa.py:349,361), independently of rms_norm_eps."""
 
     @property
     def indexed(self) -> bool:
@@ -903,7 +903,6 @@ class MLAMixer(MixerBase):
             rope_theta=ctx.rope_theta,
             rope_interleave=self.rope_interleave,
             yarn=self.yarn,
-            norm_eps=ctx.norm_eps if self.latent_norm_eps is None else self.latent_norm_eps,
             scale_offset=ctx.scale_offset,
             scale_after_cast=ctx.scale_after_cast,
             attention_bias=ctx.attention_bias,

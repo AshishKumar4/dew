@@ -433,3 +433,21 @@ def test_a_shared_copy_cannot_hide_an_undeclared_prediction_depth(tmp_path):
     save_hf_layout(tensors, config, directory)
     with pytest.raises(ValueError, match="undeclared prediction depth"):
         load_pretrained(directory, dtype="float32", attention_impl="reference")
+
+
+@pytest.mark.parametrize("name", ["deepseek_v2", "deepseek_v3", "deepseek_v32"])
+def test_the_latent_norms_keep_the_reference_epsilon(name, tmp_path):
+    """DeepSeek's q_a_layernorm and kv_a_layernorm run RMSNorm's 1e-6
+    whatever rms_norm_eps configures: a checkpoint whose trunk epsilon is
+    1e-3 still parities the reference, so the mixer's epsilon is its own."""
+    source = FIXTURES / CASES[name].fixture
+    config = json.loads((source / "config.json").read_text())
+    config["rms_norm_eps"] = 1e-3
+    directory = tmp_path / name
+    save_hf_layout(tool.source_tensors(source), config, directory)
+    ids = np.load(source / "input_ids.npy")
+
+    loaded = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
+    np.testing.assert_allclose(tool.logits(loaded, loaded.variables, ids),
+                               tool.reference_logits(CASES[name], directory, ids),
+                               atol=LOGITS, rtol=0)
