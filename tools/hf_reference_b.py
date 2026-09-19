@@ -61,9 +61,9 @@ What lands in tests/fixtures/hf:
   scalars and attn.kv_norm; and it carries the one prediction depth the
   release ships as mtp.0.*, a sliding layer over a top-k routed MLP with
   its own enorm, hnorm, e_proj, h_proj, norm and mHC head. transformers
-  builds no depth and ignores the prefix, so those 53 tensors have no
-  reference logits: they are payload a reader has to carry through a load
-  and an export unchanged.
+  builds no depth and ignores the prefix. A separate composition of its
+  unchanged modules, following the pinned official MTPBlock source, writes
+  mtp_logits.npy for those 53 tensors. Dew executes and trains the depth.
 - llama4-tiny/: Llama 4 at toy width, three chunked local layers with the
   interleaved rope and the L2 q/k norm around one global layer with
   temperature tuning, every other layer routed with the shared expert.
@@ -145,6 +145,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from deepseek_v4_reference import (  # noqa: E402
     DEEPSEEK_V4_SEED, tiny_deepseek_v4, write_deepseek_v4_config, write_deepseek_v4_source,
+    write_deepseek_v4_mtp_reference,
 )
 from gpt_oss_reference import tiny_gpt_oss  # noqa: E402
 from hf_reference import (  # noqa: E402
@@ -374,8 +375,8 @@ def tiny_kimi_k25() -> Kimi_K25ForConditionalGeneration:
     top of the vocabulary where no id reaches it. These are the same offsets
     under a 256-token vocabulary. The ids the fixture runs on stay below
     them, which `write_kimi_k25` checks: with no pixels the reference embeds
-    an image or video mark as token 0 (modeling_kimi_k25.py:686-690), and a
-    text-only load embeds it as itself.
+    an image or video mark as token 0 (modeling_kimi_k25.py:686-690). Dew
+    reproduces that rule; a separate regression exercises both placeholders.
     """
     config = Kimi_K25Config(
         text_config=kimi_k25_text(), vision_config=dict(KIMI_K25_VISION),
@@ -1175,6 +1176,7 @@ def main() -> None:
     write_tiny("deepseek-v4-tiny", tiny_deepseek_v4(), seed=DEEPSEEK_V4_SEED)
     write_deepseek_v4_source("deepseek-v4-tiny")
     write_deepseek_v4_config("deepseek-v4-tiny", "deepseek-ai/DeepSeek-V4-Flash")
+    write_deepseek_v4_mtp_reference("deepseek-v4-tiny")
     write_tiny("llama4-tiny", tiny_llama4())
     write_llama4_blocks(FIXTURES.parent / "llama4")
     write_mirrored_config("llama-4-scout", "unsloth/Llama-4-Scout-17B-16E")

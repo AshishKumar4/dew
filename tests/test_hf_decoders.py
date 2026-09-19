@@ -2710,7 +2710,8 @@ def test_deepseek_v4_config_translates_field_by_field():
             "window": 4, "rope_theta": 160000.0, "yarn": V4_YARN,
             "mixer": {**V4_MIXER, "compressor": "csa", "compress_rate": 2,
                       "index_topk": 2, "index_n_heads": 2, "index_head_dim": 8}},
-        "sliding_attention": {"window": 4}}
+        "sliding_attention": {"window": 4},
+        "mtp_attention": {"window": 4, "rope_theta": 10000.0, "mixer": V4_MIXER}}
     assert config["mixture"] == {
         "experts": 8, "top_k": 2, "layers": (0, 1, 2, 3, 4, 5),
         "score_function": "sqrtsoftplus", "bias": True, "scaling": 1.5,
@@ -2720,7 +2721,8 @@ def test_deepseek_v4_config_translates_field_by_field():
                                            "hc_sinkhorn_iters": 20, "head": "weighted"}
     assert config["norm_eps"] == 1e-6 and config["tie_embeddings"] is False
     assert config["max_seq_len"] == 64 and config["vocab_size"] == 256
-    assert config["scale_after_cast"] and "num_nextn_predict_layers" not in config
+    assert config["scale_after_cast"] and config["num_nextn_predict_layers"] == 1
+    assert config["mtp_layer_type"] == 'mtp_attention'
 
 
 def test_the_released_deepseek_v4_flash_config_translates():
@@ -2761,9 +2763,9 @@ def test_the_deepseek_v4_legacy_fields_fold_into_the_modern_spelling():
     """The fixture is the released legacy spelling: `compress_ratios` per
     layer, the two `compress_rate_*` scalars, `num_hash_layers`,
     `qk_rope_head_dim` and one flat `rope_scaling`. Stating the modern
-    fields instead — `layer_types`, `mlp_layer_types`, `compress_rates`,
+    fields instead (`layer_types`, `mlp_layer_types`, `compress_rates`,
     `partial_rotary_factor` and the nested `rope_parameters` transformers
-    writes back — reaches the same record
+    writes back) reaches the same record
     (configuration_deepseek_v4.py:239-321)."""
     legacy = fixture_config("deepseek-v4-tiny")
     modern = {key: value for key, value in legacy.items()
@@ -2857,17 +2859,6 @@ def test_a_deepseek_v4_released_tensor_name_reaches_the_same_leaf(released, save
     assert path is not None and path == _deepseek_v4_path(saved, config)
 
 
-def test_a_deepseek_v4_prediction_depth_is_read_by_no_leaf():
-    """transformers builds no depth and ignores its tensors
-    (modeling_deepseek_v4.py:1212), so the release's `mtp.0.*` reaches no
-    leaf here and the load keeps its bytes for the export."""
-    from dew.interop.hf_decoders import _deepseek_v4_path
-
-    config = translate_config(fixture_config("deepseek-v4-tiny"))
-    assert _deepseek_v4_path("mtp.0.attn.wq_a.weight", config) is None
-    assert _deepseek_v4_path("mtp.0.e_proj.weight", config) is None
-    assert _deepseek_v4_path("mtp.0.hc_head_fn", config) is None
-
 
 def test_the_deepseek_v4_tree_is_exactly_the_models_variables(rng):
     """Same collections, paths and shapes as a freshly initialised model,
@@ -2890,7 +2881,7 @@ def test_the_deepseek_v4_tree_is_exactly_the_models_variables(rng):
     assert sorted(name for name in loaded if name.startswith("moe.")) == [
         f"moe.layers_{index}.mlp.gate."
         + ("tid2eid" if index < 3 else "e_score_correction_bias")
-        for index in range(6)]
+        for index in range(6)] + ['moe.mtp_0.block.mlp.gate.e_score_correction_bias']
 
 
 def test_deepseek_v4_logits_match_the_reference_implementation():
@@ -2917,16 +2908,123 @@ def test_the_deepseek_v4_hash_layers_route_by_their_token_table():
     reference = np.load(DEEPSEEK_V4 / "logits.npy")
     moe = variables["moe"]
     assert [layer for layer in sorted(moe)
-            if "tid2eid" in moe[layer]["mlp"]["gate"]] == ["layers_0", "layers_1", "layers_2"]
+            if layer.startswith('layers_') and "tid2eid" in moe[layer]["mlp"]["gate"]] == ["layers_0", "layers_1", "layers_2"]
 
-    rolled = {layer: {"mlp": {"gate": dict(moe[layer]["mlp"]["gate"])}}
-              for layer in moe}
+    rolled = jax.tree.map(lambda value: value, moe)
     for layer in ("layers_0", "layers_1", "layers_2"):
         table = np.asarray(moe[layer]["mlp"]["gate"]["tid2eid"])
         rolled[layer]["mlp"]["gate"]["tid2eid"] = np.roll(table, 1, axis=0)
     difference = float(np.max(np.abs(
         np.asarray(model.apply({**variables, "moe": rolled}, ids)) - reference)))
     assert difference > 1e-2, f"rolling the table moved the logits {difference:.3e}"
+
+
+@pytest.mark.parametrize('saved_spelling', [False, True], ids=['released', 'hf_saved'])
+def test_deepseek_v4_tied_source_names_roundtrip(tmp_path, saved_spelling):
+    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.safetensors_io import save_hf_layout
+
+    tensors = _load_shards(DEEPSEEK_V4)
+    tensors['head.weight'] = tensors['embed.weight'].copy()
+    if saved_spelling:
+        # HF's reverse converter prefixes the trunk and misses the anchored
+        # embedding/head renames. Keep the released prediction payload too.
+        renamed = {}
+        for name, tensor in tensors.items():
+            if name == 'embed.weight':
+                name = 'model.embed_tokens.weight'
+            elif name == 'norm.weight':
+                name = 'model.norm.weight'
+            elif name.startswith('hc_head_'):
+                name = 'model.hc_head.hc_' + name.removeprefix('hc_head_')
+            elif name.startswith('layers.'):
+                name = 'model.' + name.replace('.attn.kv_norm.', '.attn.norm.')
+            renamed[name] = tensor
+        tensors = renamed
+    config = fixture_config('deepseek-v4-tiny')
+    config['tie_word_embeddings'] = True
+    directory = tmp_path / 'source'
+    save_hf_layout(tensors, config, directory)
+    source = load_pretrained(directory, dtype='float32', attention_impl='reference')
+    export = tmp_path / 'export'
+    source.save(export)
+    emitted = _load_shards(export)
+    assert set(emitted) == set(tensors)
+    for name, tensor in tensors.items():
+        np.testing.assert_array_equal(emitted[name], tensor, err_msg=name)
+    reloaded = load_pretrained(export, dtype='float32', attention_impl='reference')
+    ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
+    np.testing.assert_array_equal(source.model.apply(source.variables, ids),
+                                  reloaded.model.apply(reloaded.variables, ids))
+    save_hf_layout({**tensors, 'head.weight': tensors['head.weight'] + 1}, config, directory)
+    with pytest.raises(ValueError, match=r'head\.weight is not the embedding'):
+        load_pretrained(directory, dtype='float32', attention_impl='reference')
+
+
+@pytest.mark.parametrize('invalid', [2**32, 8])
+def test_deepseek_v4_hash_table_refuses_invalid_expert_indices(tmp_path, invalid):
+    from dew.interop.hf_decoders import _load_shards
+    from dew.interop.safetensors_io import save_hf_layout
+
+    tensors = _load_shards(DEEPSEEK_V4)
+    name = 'layers.0.ffn.gate.tid2eid'
+    tensors[name] = tensors[name].copy()
+    tensors[name][0, 0] = invalid
+    save_hf_layout(tensors, fixture_config('deepseek-v4-tiny'), tmp_path)
+    with pytest.raises(ValueError, match=r'tid2eid.*(int32 range|outside its 8 experts)'):
+        load_pretrained(tmp_path, dtype='float32', attention_impl='reference')
+
+
+def test_deepseek_v4_cached_chunks_match_transformers():
+    import torch
+    from tools.decoder_export_reference import Case, reference_model
+
+    source = load_pretrained(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
+    cache = source.model.apply(source.variables, ids.shape[0], method=source.model.init_cache,
+                               mutable=['cache'])[1]['cache']
+    reference, _ = reference_model(Case('deepseek_v4', 'deepseek-v4-tiny'), DEEPSEEK_V4)
+    reference.eval()
+    reference.set_attn_implementation('eager')
+    past, begin = None, 0
+    # End calls both inside and on compressor boundaries; the third call
+    # closes several windows and must retain the preceding CSA Ca series.
+    for size in (3, 1, 5, 3):
+        tokens = ids[:, begin:begin + size]
+        actual, updated = source.model.apply(
+            {**source.variables, 'cache': cache}, jnp.asarray(tokens),
+            decode=True, mutable=['cache'])
+        cache = updated['cache']
+        with torch.no_grad():
+            output = reference(input_ids=torch.from_numpy(tokens.astype(np.int64)),
+                               past_key_values=past, use_cache=True)
+        past = output.past_key_values
+        np.testing.assert_allclose(actual, output.logits.numpy(), atol=1e-4, rtol=0)
+        begin += size
+
+
+def test_deepseek_v4_mtp_matches_released_raw_stream_composition():
+    source = load_pretrained(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
+    hidden, streams = source.model.apply(source.variables, ids, method=source.model.hidden_and_mtp_inputs)
+    streams = jnp.asarray(streams)
+    actual = source.model.apply(source.variables, streams, ids, method=source.model.mtp_logits)[0]
+    expected = np.load(DEEPSEEK_V4 / 'mtp_logits.npy')
+    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
+    cache = source.model.apply(source.variables, ids.shape[0], method=source.model.init_mtp_cache,
+                               mutable=['cache'])[1]['cache']
+    start = 0
+    for size in (3, 1, 5, 2):
+        (logits, prediction), updated = source.model.apply(
+            {**source.variables, 'cache': cache}, streams[:, start:start + size],
+            ids[:, start + 1:start + size + 1], method=source.model.mtp_step,
+            decode=True, mutable=['cache'])
+        np.testing.assert_allclose(logits, expected[:, start:start + size], atol=1e-4, rtol=0)
+        assert prediction.shape == streams[:, start:start + size].shape
+        cache = updated['cache']
+        start += size
+    with pytest.raises(ValueError, match='uncollapsed residual streams'):
+        source.model.apply(source.variables, hidden, ids, method=source.model.mtp_logits)
 
 
 def test_the_deepseek_v4_swiglu_limit_clamps_the_gated_mlps():

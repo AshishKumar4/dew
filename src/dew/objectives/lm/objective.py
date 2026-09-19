@@ -209,17 +209,6 @@ def _balanced_biases(moe: Variables) -> Variables:
     return kept
 
 
-def _merged(base: Variables, updates: Variables) -> Variables:
-    """`base` with `updates`' leaves replacing the ones at their paths."""
-    merged = dict(base)
-    for key, value in updates.items():
-        current = merged.get(key)
-        merged[key] = (_merged(current, value)
-                       if isinstance(current, Mapping) and isinstance(value, Mapping)
-                       else value)
-    return merged
-
-
 def router_counts(moe: Variables, routing: Variables) -> Variables:
     """Selected-slot counts at each active bias path."""
     def count(path, bias):
@@ -244,7 +233,7 @@ def balance(moe: Variables, routing: Variables, rate: float
     shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
     balanced = jax.tree.map(lambda bias, count: _updated_bias(bias, count, rate),
                             _balanced_biases(moe), counts)
-    return _merged(moe, balanced), {
+    return merge(moe, balanced), {
         "moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
         "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))}
 
@@ -575,7 +564,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         params = thaw(params)
         collections = ((["router"] if routing else []) + (["qk"] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []))
-        hidden, gathered = self._hidden_states(params, inputs, train, rngs, collections,
+        stream_depth = depths and getattr(self.model, 'hyper_connections', None) is not None
+        opened = [*collections, 'prediction_inputs'] if stream_depth else collections
+        hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
                                                packing, layers)
         sown = gathered.get("router", {}) if routing else None
         qk = gathered.get("qk") if qk_stats else None
@@ -607,7 +598,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             # targets are the shifted row's from d on, with the same weight
             # rule between the state's document and the target's.
             states = self.model.apply(
-                params, hidden, inputs, train=train, rngs=rngs,
+                params, gathered['prediction_inputs']['states'] if stream_depth else hidden,
+                inputs, train=train, rngs=rngs,
                 method=type(self.model).mtp_hidden_states,
                 mutable=collections or False, **packing)
             if collections:
@@ -888,7 +880,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         balanced = jax.tree.map(
             lambda bias, count: _updated_bias(bias, count, rate),
             active, effects)
-        return {"moe": _merged(moe, balanced)}
+        return {"moe": merge(moe, balanced)}
 
     def evaluate(self, params, batch, step: Step):
         """Teacher-forced scores over the complete batch, using EMA when present."""

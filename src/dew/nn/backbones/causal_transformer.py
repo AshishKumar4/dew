@@ -741,6 +741,8 @@ class DecoderBlock(nn.Module):
     # The input is two embed-width vectors concatenated, which no single name
     # describes and the rules must not split twice; the output side shards.
     ("eh_proj",): (None, "embed"),
+    ("e_proj",): (None, "embed"),
+    ("h_proj",): (None, "embed"),
 })
 class MTPBlock(nn.Module):
     """One multi-token-prediction depth: the next depth's hidden states.
@@ -757,6 +759,7 @@ class MTPBlock(nn.Module):
     feedforward: Callable[..., nn.Module]
     emb_features: int
     wiring: BlockWiring
+    hyper_connections: Optional[HyperConnections] = None
     norm_eps: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
@@ -771,16 +774,26 @@ class MTPBlock(nn.Module):
             scale_after_cast=self.scale_after_cast, dtype=self.dtype)
         self.enorm = norm(name='enorm')
         self.hnorm = norm(name='hnorm')
-        self.eh_proj = nn.Dense(
-            self.emb_features, use_bias=False,
-            dtype=self.dtype, precision=self.precision, name='eh_proj')
+        dense = functools.partial(nn.Dense, self.emb_features, use_bias=False,
+                                   dtype=self.dtype, precision=self.precision)
+        if self.hyper_connections is None:
+            self.eh_proj = dense(name='eh_proj')
+        else:
+            # Official V4 inference/model.py MTPBlock.forward: project the
+            # embedding once and broadcast over independently projected raw
+            # residual streams; the trunk's collapsed/normed state is not read.
+            self.e_proj = dense(name='e_proj')
+            self.h_proj = dense(name='h_proj')
+            self.hc_head = HyperHead(spec=self.hyper_connections, emb_features=self.emb_features,
+                                     norm_eps=self.norm_eps, name='hc_head')
         self.block = DecoderBlock(
             mixer=self.mixer, feedforward=self.feedforward,
             emb_features=self.emb_features,
             norm_eps=self.norm_eps,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
-                wiring=self.wiring,
+            wiring=self.wiring,
+            hyper_connections=self.hyper_connections,
             dropout_rate=self.dropout_rate,
             remat=self.remat,
             dtype=self.dtype, precision=self.precision, name='block')
@@ -789,11 +802,30 @@ class MTPBlock(nn.Module):
     def __call__(self, hidden, embeds, train: bool = False, positions=None,
                  segment_ids=None, attention_metadata=None, decode: bool = False,
                  prediction_phase: PredictionPhase = "ordinary"):
-        fused = self.eh_proj(jnp.concatenate(
-            [self.enorm(embeds), self.hnorm(hidden)], axis=-1))
-        return self.final_norm(self.block(
+        return self.states(hidden, embeds, train=train, positions=positions, segment_ids=segment_ids,
+                           attention_metadata=attention_metadata, decode=decode,
+                           prediction_phase=prediction_phase)[0]
+
+    def states(self, hidden, embeds, train: bool = False, positions=None,
+               segment_ids=None, attention_metadata=None, decode: bool = False,
+               prediction_phase: PredictionPhase = "ordinary"):
+        """The normalized head input and the state a subsequent prediction reads."""
+        if self.hyper_connections is None:
+            fused = self.eh_proj(jnp.concatenate(
+                [self.enorm(embeds), self.hnorm(hidden)], axis=-1))
+        else:
+            if hidden.ndim != 4 or hidden.shape[-2] != self.hyper_connections.hc_mult:
+                raise ValueError("mHC prediction needs the trunk's uncollapsed residual streams")
+            fused = self.e_proj(self.enorm(embeds))[:, :, None, :] + self.h_proj(self.hnorm(hidden))
+        predicted = self.block(
             fused, train=train, positions=positions, segment_ids=segment_ids,
-            attention_metadata=attention_metadata, decode=decode, prediction_phase=prediction_phase))
+            attention_metadata=attention_metadata, decode=decode,
+            prediction_phase=prediction_phase)
+        streams = predicted
+        if self.hyper_connections is not None:
+            predicted = self.hc_head(predicted)
+        normalized = self.final_norm(predicted)
+        return normalized, normalized if self.hyper_connections is None else streams
 
 
 Block = Callable[[int, str], DecoderBlock]
@@ -1357,6 +1389,8 @@ class CausalTransformer(nn.Module):
     mixer: Optional[MixerBase] = None         # None: today's attention; a kind value or its record
     num_nextn_predict_layers: int = 0         # MTP depths after the final norm; 0 disables
     index_share_for_mtp_iteration: bool = False
+    mtp_layer_type: Optional[str] = None
+    """An explicit prediction-layer kind, which need not occur in the trunk."""
     altup: Optional[AltUp] = None             # Gemma 3n's stack of residual copies; None disables
     laurel_rank: Optional[int] = None         # Gemma 3n's learned augmented residual; None disables
     hyper_connections: Optional[HyperConnections] = None  # mHC's stack of residual streams; None disables
@@ -1602,12 +1636,18 @@ class CausalTransformer(nn.Module):
         if len(types) != self.num_layers:
             raise ValueError(
                 f"layer_types has {len(types)} entries for {self.num_layers} layers")
-        unnamed = sorted(set(self.kinds or {}) - set(types))
+        prediction_kinds = {self.mtp_layer_type} if self.num_nextn_predict_layers and self.mtp_layer_type else set()
+        unnamed = sorted(set(self.kinds or {}) - set(types) - prediction_kinds)
         if unnamed:
             raise ValueError(
                 f"kinds {unnamed} name no layer of this model, whose pattern is "
                 f"{sorted(set(types))}")
-        kinds = {layer_type: self.kind_of(layer_type) for layer_type in set(types)}
+        kinds = {layer_type: self.kind_of(layer_type) for layer_type in set(types) | prediction_kinds}
+        if self.hyper_connections is not None and self.num_nextn_predict_layers > 1:
+            raise ValueError("mHC prediction currently supports the released single prediction depth")
+        if (self.hyper_connections is not None and self.num_nextn_predict_layers
+                and self.hyper_connections.head != 'weighted'):
+            raise ValueError("mHC prediction requires the V4 weighted stream-collapse head")
         for layer_type, kind in sorted(kinds.items()):
             if kind.head_dim % 2:
                 raise ValueError(
@@ -1828,7 +1868,7 @@ class CausalTransformer(nn.Module):
         # one, else from the first layer's kind; the feed-forward routes
         # like the last layer's (GLM 4.5 ships its depth with the trunk's
         # experts) and is dense otherwise.
-        mtp_type = 'full_attention' if 'full_attention' in types else types[0]
+        mtp_type = self.mtp_layer_type or ('full_attention' if 'full_attention' in types else types[0])
         prediction_mixer = kinds[mtp_type].mixer or mixer_spec
         if (self.index_share_for_mtp_iteration and self.num_nextn_predict_layers
                 and not isinstance(prediction_mixer, KPoolSparseAttentionMixer)):
@@ -1844,6 +1884,7 @@ class CausalTransformer(nn.Module):
             MTPBlock(
                 mixer=mtp_mixer, feedforward=mtp_feedforward,
                 emb_features=self.emb_features,
+                hyper_connections=self.hyper_connections,
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
@@ -1881,7 +1922,7 @@ class CausalTransformer(nn.Module):
                  input_embeddings=None, embedding_positions=None,
                  attention_mask=None, image_groups=None, rotary_positions=None,
                  attention_pairwise_mask=None, attention_key_positions=None):
-        x = self.hidden_states(tokens, train=train, decode=decode,
+        x, prediction = self.hidden_and_mtp_inputs(tokens, train=train, decode=decode,
                                positions=positions, segment_ids=segment_ids,
                                input_embeddings=input_embeddings,
                                embedding_positions=embedding_positions, attention_mask=attention_mask,
@@ -1893,20 +1934,21 @@ class CausalTransformer(nn.Module):
             # main forward never enters the prediction depths. Reaching them
             # here, during init only, makes the model's tree the model's
             # business: a plain init holds every depth.
-            self.mtp_hidden_states(x, tokens, train=train, positions=positions,
+            self.mtp_hidden_states(prediction, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, input_embeddings=input_embeddings,
                                    embedding_positions=embedding_positions, attention_mask=attention_mask,
                                    image_groups=image_groups, rotary_positions=rotary_positions)
         return self._logits(x)
 
     def states_and_logits(self, tokens, **kwargs):
-        """The final hidden states and their logits from one forward.
+        """The prediction input states and logits from one forward.
 
         A speculative decoder verifies with both: the logits give the target
-        distribution and the states seed the next block's prediction depths.
+        distribution and the states seed the next block's prediction depths:
+        normalized states normally, uncollapsed residual streams for V4.
         """
-        x = self.hidden_states(tokens, **kwargs)
-        return x, self._logits(x)
+        x, prediction = self.hidden_and_mtp_inputs(tokens, **kwargs)
+        return prediction, self._logits(x)
 
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
@@ -1992,11 +2034,12 @@ class CausalTransformer(nn.Module):
         if depth < 0 or depth >= len(self.mtp):
             raise ValueError("prediction depth is outside the model's configured depths")
         embeds = self.token_embeddings(tokens) if input_embeddings is None else input_embeddings
-        state = self.mtp[depth](hidden, embeds, positions=positions, decode=decode,
-                                prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
-                                attention_metadata=AttentionMetadata(valid=attention_mask,
-                                                                    rotary_positions=rotary_positions))
-        return self._logits(state), state
+        state, prediction = self.mtp[depth].states(
+            hidden, embeds, positions=positions, decode=decode,
+            prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
+            attention_metadata=AttentionMetadata(valid=attention_mask,
+                                                 rotary_positions=rotary_positions))
+        return self._logits(state), prediction
 
     def token_embeddings(self, tokens):
         """The embeddings a prediction depth pairs with `tokens`.
@@ -2011,20 +2054,29 @@ class CausalTransformer(nn.Module):
 
     def init_mtp_cache(self, batch_size: int):
         """Allocate only prediction-layer caches; ordinary generation does not pay for them."""
+        shape = ((batch_size, 1, self.emb_features) if self.hyper_connections is None else
+                 (batch_size, 1, self.hyper_connections.hc_mult, self.emb_features))
         for block in self.mtp:
-            block(jnp.zeros((batch_size, 1, self.emb_features), self.dtype),
+            block(jnp.zeros(shape, self.dtype),
                   jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True,
                   prediction_phase="extend" if self.index_share_for_mtp_iteration else "ordinary")
 
 
 
-    def hidden_states(self, tokens, train: bool = False, decode: bool = False,
+    def hidden_states(self, tokens, **kwargs):
+        """The final normalized states, excluding the vocabulary projection."""
+        return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
+
+    def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None,
                       input_embeddings=None, embedding_positions=None,
                       attention_mask=None, image_groups=None, rotary_positions=None,
                       attention_pairwise_mask=None, attention_key_positions=None):
-        """The final normalised states, `[B, S, D]`: everything the forward
-        pass does before the head projection.
+        """The final normalized states and the prediction depth's input.
+
+        V4's depth reads the raw residual streams before the collapse head
+        and final norm (official inference/model.py MTPBlock.forward at
+        b5968e9); ordinary depths read the final normalized states.
 
         A packed batch passes per-document `positions` and `segment_ids`
         through to the layers, where RoPE and the mask read them.
@@ -2097,9 +2149,15 @@ class CausalTransformer(nn.Module):
             copies = [x[0]] + [rescale_to(project(copy), x[0])
                                for project, copy in zip(self.altup_unembed_projections, x[1:])]
             x = jnp.mean(jnp.stack(copies), axis=0)
+        streams = x
         if hc is not None:
             x = collapse_streams(x, self.hc_head if hc.head == 'weighted' else None)
-        return self.norm(x)
+        hidden = self.norm(x)
+        prediction = hidden if hc is None else streams
+        if not self.is_initializing() and self.is_mutable_collection('prediction_inputs'):
+            self.sow('prediction_inputs', 'states', prediction,
+                     reduce_fn=lambda _, value: value, init_fn=lambda: None)
+        return hidden, prediction
 
     def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
               per_layer_input, attention_metadata=None):
