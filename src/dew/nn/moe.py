@@ -186,6 +186,14 @@ class Router(nn.Module):
 
     `normalize_weights` divides a token's selected weights by their sum,
     the reference's `norm_topk_prob`; V2's released configs set it false.
+
+    `hash_vocab` set makes this DeepSeek V4's hash router
+    (`DeepseekV4HashRouter`, modeling_deepseek_v4.py:1045-1073): a token's
+    experts are the `top_k` entries of a fixed `tid2eid` table at its
+    vocabulary id, `[hash_vocab, top_k]` in the `moe` collection beside the
+    bias (the checkpoint's persistent buffer), and the learned gate still
+    weights them, gathered from the scores the same way. The caller passes
+    the token ids; the table is never written by training.
     """
     num_experts: int
     in_features: int
@@ -197,6 +205,7 @@ class Router(nn.Module):
     groups_per_token: int = 1
     group_score: str = 'top2'
     expert_bias: bool = False
+    hash_vocab: Optional[int] = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -243,13 +252,27 @@ class Router(nn.Module):
             self.bias = self.variable(
                 'moe', 'e_score_correction_bias', jnp.zeros,
                 (self.num_experts,), jnp.float32)
+        if self.hash_vocab is not None:
+            if self.expert_bias or self.expert_groups > 1:
+                raise ValueError(
+                    "hash routing selects by the token table alone, so it has no "
+                    "balancing bias and no expert groups")
+            self.tid2eid = self.variable(
+                'moe', 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
 
-    def __call__(self, x):
+    def __call__(self, x, tokens=None):
         scores = self.scores(x)
-        selection = scores if not self.expert_bias else scores + self.bias.value
-        if self.expert_groups > 1:
-            selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
-        _, indices = jax.lax.top_k(selection, self.top_k)
+        if self.hash_vocab is not None:
+            if tokens is None:
+                raise ValueError("hash routing selects by the token ids, which the caller passes")
+            indices = self.tid2eid.value[jnp.asarray(tokens)]
+        else:
+            if tokens is not None:
+                raise ValueError("only a hash router reads the token ids")
+            selection = scores if not self.expert_bias else scores + self.bias.value
+            if self.expert_groups > 1:
+                selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
+            _, indices = jax.lax.top_k(selection, self.top_k)
         # The load each expert took, for the step that balances the bias:
         # written only when a caller opens the 'router' collection, and never
         # into the tree init returns, where it is not a variable.
@@ -705,6 +728,7 @@ class SparseMLP(nn.Module):
     groups_per_token: int = 1
     group_score: str = 'top2'
     expert_bias: bool = False
+    hash_vocab: Optional[int] = None
     swiglu_limit: Optional[float] = None
     scale_inputs: bool = False
     shared: Optional[Callable[..., nn.Module]] = None
@@ -722,6 +746,7 @@ class SparseMLP(nn.Module):
                            groups_per_token=self.groups_per_token,
                            group_score=self.group_score,
                            expert_bias=self.expert_bias,
+                           hash_vocab=self.hash_vocab,
                            precision=self.precision, name='gate')
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
@@ -739,8 +764,8 @@ class SparseMLP(nn.Module):
                     1, use_bias=False, dtype=self.dtype, precision=self.precision,
                     name='shared_expert_gate')
 
-    def __call__(self, x):
-        weights, indices = self.gate(x)
+    def __call__(self, x, tokens=None):
+        weights, indices = self.gate(x, tokens)
         routed = self.experts(x, weights, indices)
         if self.shared is None:
             return routed

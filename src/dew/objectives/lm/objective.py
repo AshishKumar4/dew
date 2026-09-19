@@ -182,6 +182,44 @@ def _packing(batch):
             None if positions is None else jnp.asarray(positions, jnp.int32))
 
 
+# The `moe` leaf a balanced router keeps. DeepSeek V4's hash router keeps
+# the frozen token-to-expert table it selects by in the same collection
+# (dew.nn.moe.Router), and no load-balance update moves that.
+ROUTER_BIAS = "e_score_correction_bias"
+
+
+def _balanced_biases(moe: Variables) -> Variables:
+    """The balancing biases of a `moe` collection, at their own paths.
+
+    Router state that is not a bias, and any branch left holding none of
+    them, is dropped, so what comes back is one leaf per router the load
+    balancer moves.
+    """
+    if not isinstance(moe, Mapping):
+        return moe
+    kept = {}
+    for key, value in moe.items():
+        if not isinstance(value, Mapping):
+            if key == ROUTER_BIAS:
+                kept[key] = value
+            continue
+        branch = _balanced_biases(value)
+        if branch:
+            kept[key] = branch
+    return kept
+
+
+def _merged(base: Variables, updates: Variables) -> Variables:
+    """`base` with `updates`' leaves replacing the ones at their paths."""
+    merged = dict(base)
+    for key, value in updates.items():
+        current = merged.get(key)
+        merged[key] = (_merged(current, value)
+                       if isinstance(current, Mapping) and isinstance(value, Mapping)
+                       else value)
+    return merged
+
+
 def router_counts(moe: Variables, routing: Variables) -> Variables:
     """Selected-slot counts at each active bias path."""
     def count(path, bias):
@@ -190,7 +228,8 @@ def router_counts(moe: Variables, routing: Variables) -> Variables:
             sown = sown[entry.key]
         (indices,) = sown["indices"]
         return jnp.bincount(indices.ravel(), length=bias.shape[0])
-    return jax.tree_util.tree_map_with_path(count, moe)
+    return jax.tree_util.tree_map_with_path(count, _balanced_biases(moe))
+
 
 def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
     dtype = jnp.result_type(bias.dtype, rate, jnp.float32)
@@ -204,9 +243,10 @@ def balance(moe: Variables, routing: Variables, rate: float
     counts = router_counts(moe, routing)
     shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
     balanced = jax.tree.map(lambda bias, count: _updated_bias(bias, count, rate),
-                            moe, counts)
-    return balanced, {"moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
-                      "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))}
+                            _balanced_biases(moe), counts)
+    return _merged(moe, balanced), {
+        "moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
+        "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))}
 
 
 def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
@@ -812,6 +852,10 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                    if self.mtp_weight is not None or not name.startswith("mtp_")}
             counts = router_counts(ran, routing)
             shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
+            if not shares:
+                raise ValueError(
+                    "balance_rate requires routers that keep a balancing bias, "
+                    "and these select by their hash table alone")
             reported.update({"moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
                              "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))})
             effects = counts
@@ -840,11 +884,11 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         if rate is None:
             raise ValueError("router count effects require balance_rate")
         moe = variables["moe"]
-        active = {name: moe[name] for name in effects}
+        active = _balanced_biases({name: moe[name] for name in effects})
         balanced = jax.tree.map(
             lambda bias, count: _updated_bias(bias, count, rate),
             active, effects)
-        return {"moe": {**moe, **balanced}}
+        return {"moe": _merged(moe, balanced)}
 
     def evaluate(self, params, batch, step: Step):
         """Teacher-forced scores over the complete batch, using EMA when present."""

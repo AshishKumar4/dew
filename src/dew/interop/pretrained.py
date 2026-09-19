@@ -517,6 +517,11 @@ class WeightLayout:
     loader stacks those tensors onto an expert dimension
     (`hf_decoders._stack_experts`), so one stacked leaf answers for every
     expert of a layer and the index says which slice this tensor is.
+
+    `dtype` is the width the source stores this tensor in where that is
+    not its leaf's: DeepSeek V4's token-to-expert table is int64 on disk
+    and int32 in the collection, and the export writes back what the
+    checkpoint held.
     """
 
     name: str
@@ -525,6 +530,7 @@ class WeightLayout:
     transpose: tuple[int, ...] | None = None
     concatenate: int | None = None
     expert_index: int | None = None
+    dtype: np.dtype | None = None
 
     def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
         leaves = []
@@ -559,7 +565,8 @@ class WeightLayout:
             raise ValueError(
                 f"{self.name} assembles {value.shape} from {self.paths}, which does not "
                 f"fill the source's {self.shape}")
-        return np.ascontiguousarray(value).reshape(self.shape)
+        value = np.ascontiguousarray(value).reshape(self.shape)
+        return value if self.dtype is None else value.astype(self.dtype)
 
     def restore(self, tensor: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
         """The leaf of `shape` whose export is `tensor`.
@@ -591,8 +598,30 @@ def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]
     return path, None
 
 
+def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
+                  expert_index: int | None) -> int:
+    """How many axes a bound leaf carries ahead of its stored matrix.
+
+    A kernel stores `[in, out]` where its source stores `[out, in]`, and a
+    grouped projection's leaf keeps one such matrix per group: DeepSeek
+    V4's `[groups, in, rank]` is stored `[groups * rank, in]`, the group
+    axis folded into the rows (modeling_deepseek_v4.py:294-323). The
+    transpose is the same swap of the trailing pair under those axes, so
+    the leaf says how many there are. A per-expert source tensor is one
+    slice of its stacked leaf, which is taken before the transpose.
+    """
+    node: object = variables
+    for part in path:
+        if not isinstance(node, Mapping) or part not in node:
+            raise ValueError(f"the loaded tree holds no {path}, which {part!r} names")
+        node = node[part]
+    rank = getattr(node, "ndim", 0) - (0 if expert_index is None else 1)
+    return max(rank - 2, 0)
+
+
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
-                     config, model_type: str, component: str | None = None) -> WeightLayout | None:
+                     config, model_type: str, variables: Mapping[str, object],
+                     component: str | None = None) -> WeightLayout | None:
     """The text family's existing leaf map plus its inverse storage operations."""
     family = decoders._FAMILIES[model_type]
     # A family whose checkpoint packs its experts as `[E, out, in]`
@@ -606,8 +635,14 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
     transpose = None
     concatenate = None
     expert_index = None
-    if text_name == "lm_head.weight" and config["tie_embeddings"]:
-        paths = (nested(("params", "embed_tokens", "embedding")),)
+    head_name, embedding_name = family.tied_head_names
+    if text_name == head_name and config["tie_embeddings"]:
+        # The tied head has no leaf of its own, so its source name binds to
+        # the embedding it copies, under whatever name that family stores.
+        embedding = family.weight_path(embedding_name, config)
+        if embedding is None:
+            raise ValueError(f"{embedding_name!r} has no parameter path to tie {name!r} to")
+        paths = (nested(embedding),)
     elif text_name.endswith(".experts.gate_up_proj") and (packed or model_type == "llama4_text"):
         names = [text_name.removesuffix("gate_up_proj") + projection for projection in ("gate_proj", "up_proj")]
         paths_list = []
@@ -627,14 +662,19 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
         path, expert_index = _stacked_expert(path)
         paths = (nested(path),)
         if path[-1] == "kernel" and tensor.ndim == 2:
-            transpose = (1, 0)
+            lead = _leading_axes(variables, paths[0], expert_index)
+            transpose = (*range(lead), lead + 1, lead)
         elif text_name.endswith(".experts.down_proj") and packed:
             transpose = (0, 2, 1)
-    return WeightLayout(name, paths, tensor.shape, transpose, concatenate, expert_index)
+    # A weight is fp32 in the tree whatever the checkpoint stored it as, so
+    # only an index table's own width has to be carried back.
+    stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
+    return WeightLayout(name, paths, tensor.shape, transpose, concatenate,
+                        expert_index, stored)
 
 
 
-def _wrapper_layouts(tensors, record):
+def _wrapper_layouts(tensors, record, variables):
     """Retain source names while borrowing the loader's internal leaf paths."""
     from dew.nn import vision
 
@@ -687,7 +727,8 @@ def _wrapper_layouts(tensors, record):
             tail = bare.removeprefix("language_model.")
             text_name = tail if tail.startswith(("model.", "lm_head.", "mtp.")) else "model." + tail
             layout = _language_layout(name, text_name, tensor, record["text"],
-                                      record["text_model_type"], "language_model")
+                                      record["text_model_type"], variables,
+                                      "language_model")
             if layout is None:
                 retained[name] = tensor
             else:
@@ -1922,6 +1963,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
                                           attention_impl=attention_impl, param_dtype=param_dtype)
     with open(directory / "config.json") as handle:
         config = json.load(handle)
+    text_config = config.get("text_config")
     tensors = decoders._load_shards(directory)
     family = config.get("model_type")
     quantization = _source_quantization(config, param_dtype=param_dtype)
@@ -1943,7 +1985,13 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         record = config
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
-    elif "text_config" in config:
+    elif "text_config" in config and family not in decoders._FAMILIES:
+        # A wrapper repo carries its decoder under text_config. Where the
+        # wrapper's own model_type is a registered decoder family, its
+        # towers have no counterpart and its text half is the model, so it
+        # takes the decoder branch below and its translator reads the
+        # nested config; `translate_config` refuses the rest by the same
+        # rule.
         record = decoders.translate_wrapper_config(config)
         text_fields = dict(record["text"])
         if max_seq_len is not None:
@@ -1989,14 +2037,14 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             audio_soft_tokens=record["audio_soft_tokens"],
             attention_impl=None if attention_impl == "reference" else attention_impl)
         variables = _native_variables(decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype))
-        layouts, retained = _wrapper_layouts(tensors, record)
+        layouts, retained = _wrapper_layouts(tensors, record, variables)
     else:
         record = decoders.translate_config(config)
         if max_seq_len is not None:
             record["max_seq_len"] = max_seq_len
         built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
         model = models.build("causal_transformer", **built)
-        variables = decoders.translate_weights(tensors, record, param_dtype=param_dtype)
+        variables = decoders.translate_weights(tensors, record, family, param_dtype=param_dtype)
         decoders._check_tree(variables, model)
         # The bindings are what an adapter loader resolves source names
         # through and what a quantized source is written back through, so a
@@ -2008,7 +2056,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         if entry.preserve_source_layout or entry.prepare_weights is dict:
             bindings = []
             for name, tensor in tensors.items():
-                layout = _language_layout(name, name, tensor, record, family)
+                layout = _language_layout(name, name, tensor, record, family, variables)
                 if layout is None:
                     retained[name] = tensor
                 else:

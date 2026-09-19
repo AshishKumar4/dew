@@ -85,6 +85,12 @@ Tolerances and the differences actually observed, fp32 on CPU:
   copies of the residual stream under AltUp, the LAuReL block, gaussian
   top-k on the first two layers, widths of 48 and 64, per-layer inputs and
   one sharing layer; the blocks' numbers are in tests/test_gemma3n.py.
+- deepseek-v4-tiny: max |logit difference| 9.8e-06, tolerance 1e-4. mHC's
+  two residual streams over all three attention kinds (sliding, compressed
+  sparse with its lightning indexer, heavily compressed), the grouped
+  output projection and per-head sinks, three hash-routed layers over
+  three top-k ones and the gate clamp at 2.0; rolling the hash table moves
+  the logits by more than 1e-2 and dropping the clamp by more than 1.
 """
 
 import dataclasses
@@ -167,7 +173,7 @@ def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path
     ids = np.load(original / "input_ids.npy")
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     expected = np.load(original / "logits.npy")
-    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
+    np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-4, rtol=0)
 
 
 def test_qwen3_config_translates_field_by_field():
@@ -2137,6 +2143,33 @@ def test_the_kimi_k2_fixture_keeps_the_releases_mla_proportions():
 
 
 # --------------------------------------------------------------------------
+# Kimi K2.5: a vision wrapper whose decoder is Kimi K2's, text half only
+# --------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# --------------------------------------------------------------------------
 # GLM 4.5: a half rotary over biased GQA, DeepSeek V3 routing, an MTP depth
 # --------------------------------------------------------------------------
 
@@ -2248,6 +2281,10 @@ def test_a_glm4_moe_depth_with_its_own_head_is_refused(tmp_path):
 # --------------------------------------------------------------------------
 
 GLM_MOE_DSA = FIXTURES / "glm-moe-dsa-tiny"
+
+
+
+
 
 
 def test_glm_moe_dsa_config_translates_field_by_field():
@@ -2409,6 +2446,285 @@ def test_glm_moe_dsa_decodes_what_it_computes_in_one_pass():
     assert "cached_index" not in updated["cache"]["layers_7"]["self_attn"]
     difference = float(np.max(np.abs(np.asarray(step)[:, 0] - full[:, -1])))
     assert difference < 1e-4, f"decode differs from the one-pass logits by {difference:.3e}"
+
+
+# --------------------------------------------------------------------------
+# DeepSeek V4: mHC's residual streams over the sliding, compressed sparse
+# and heavily compressed kinds, with hash-routed first layers
+# --------------------------------------------------------------------------
+
+DEEPSEEK_V4 = FIXTURES / "deepseek-v4-tiny"
+V4_TYPES = ("heavily_compressed_attention", "heavily_compressed_attention",
+            "compressed_sparse_attention", "heavily_compressed_attention",
+            "sliding_attention", "compressed_sparse_attention")
+V4_YARN = {"rope_type": "yarn", "rope_theta": 160000.0, "factor": 16.0,
+           "original_max_position_embeddings": 65536, "beta_fast": 32.0,
+           "beta_slow": 1.0, "mscale": None, "mscale_all_dim": None,
+           "truncate": True, "attention_factor": 1.0}
+V4_MIXER = {"kind": "deepseek_v4", "q_lora_rank": 8, "o_groups": 2, "o_lora_rank": 8,
+            "rope_head_dim": 4, "compressor": None, "compress_rate": None,
+            "index_topk": None, "index_n_heads": None, "index_head_dim": None}
+
+
+def test_deepseek_v4_config_translates_field_by_field():
+    """The tiny V4: the legacy `compress_ratios` read as the attention
+    schedule, one key/value head, the rotated quarter head derived from
+    `qk_rope_head_dim`, every kind naming the window and the compressed
+    ones the compress rope under its YaRN ramp with the reference's forced
+    attention_factor, the mixer carrying the query LoRA and the grouped
+    output projection, every layer routed with the first three by the hash
+    table, the gate clamp and mHC's stack."""
+    config = translate_config(fixture_config("deepseek-v4-tiny"))
+
+    assert config["layer_types"] == V4_TYPES
+    assert config["num_kv_heads"] == 1 and config["head_dim"] == 16
+    assert config["num_heads"] == 4 and config["emb_features"] == 32
+    assert config["mlp"] == "swiglu" and config["mlp_features"] == 16
+    assert config["qk_norm"] is False and config["attention_bias"] is False
+    assert config["rope_theta"] == 10000.0 and config.get("yarn") is None
+    assert config["mixer"] == V4_MIXER
+    assert config["kinds"] == {
+        "heavily_compressed_attention": {
+            "window": 4, "rope_theta": 160000.0, "yarn": V4_YARN,
+            "mixer": {**V4_MIXER, "compressor": "hca", "compress_rate": 4}},
+        "compressed_sparse_attention": {
+            "window": 4, "rope_theta": 160000.0, "yarn": V4_YARN,
+            "mixer": {**V4_MIXER, "compressor": "csa", "compress_rate": 2,
+                      "index_topk": 2, "index_n_heads": 2, "index_head_dim": 8}},
+        "sliding_attention": {"window": 4}}
+    assert config["mixture"] == {
+        "experts": 8, "top_k": 2, "layers": (0, 1, 2, 3, 4, 5),
+        "score_function": "sqrtsoftplus", "bias": True, "scaling": 1.5,
+        "shared_features": 16, "expert_features": 16, "hash_layers": (0, 1, 2)}
+    assert config["swiglu_limit"] == 2.0
+    assert config["hyper_connections"] == {"hc_mult": 2, "hc_eps": 1e-6,
+                                           "hc_sinkhorn_iters": 20, "head": "weighted"}
+    assert config["norm_eps"] == 1e-6 and config["tie_embeddings"] is False
+    assert config["max_seq_len"] == 64 and config["vocab_size"] == 256
+    assert config["scale_after_cast"] and "num_nextn_predict_layers" not in config
+
+
+def test_the_released_deepseek_v4_flash_config_translates():
+    """deepseek-ai/DeepSeek-V4-Flash: 43 layers whose `compress_ratios`
+    name two sliding layers and then the CSA/HCA interleave, with the list
+    carrying one entry more than the stack for its prediction depth; 256
+    experts, 6 per token, one shared expert of the routed width, sinks over
+    64 heads of 512 with the rope on 64 of them, the 128-token window and
+    four residual streams."""
+    config = translate_config(fixture_config("deepseek-v4-flash"))
+
+    assert config["num_layers"] == 43 and len(config["layer_types"]) == 43
+    assert config["layer_types"][:4] == (
+        "sliding_attention", "sliding_attention",
+        "compressed_sparse_attention", "heavily_compressed_attention")
+    assert config["layer_types"][-1] == "compressed_sparse_attention"
+    assert (config["num_heads"], config["head_dim"], config["num_kv_heads"]) == (64, 512, 1)
+    mixer = config["mixer"]
+    assert (mixer["q_lora_rank"], mixer["o_groups"], mixer["o_lora_rank"]) == (1024, 8, 1024)
+    assert mixer["rope_head_dim"] == 64 and mixer["compressor"] is None
+    sparse = config["kinds"]["compressed_sparse_attention"]["mixer"]
+    heavy = config["kinds"]["heavily_compressed_attention"]["mixer"]
+    assert (sparse["compress_rate"], heavy["compress_rate"]) == (4, 128)
+    assert (sparse["index_topk"], sparse["index_n_heads"], sparse["index_head_dim"]) == (512, 64, 128)
+    assert heavy["index_topk"] is None
+    assert config["kinds"]["sliding_attention"] == {"window": 128}
+    assert config["kinds"]["compressed_sparse_attention"]["yarn"] == V4_YARN
+    assert config["mixture"]["experts"] == 256 and config["mixture"]["top_k"] == 6
+    assert config["mixture"]["shared_features"] == 2048
+    assert config["mixture"]["hash_layers"] == (0, 1, 2)
+    assert config["mixture"]["layers"] == tuple(range(43))
+    assert config["swiglu_limit"] == 10.0
+    assert config["hyper_connections"]["hc_mult"] == 4
+    assert config["vocab_size"] == 129280 and config["rope_theta"] == 10000.0
+
+
+def test_the_deepseek_v4_legacy_fields_fold_into_the_modern_spelling():
+    """The fixture is the released legacy spelling: `compress_ratios` per
+    layer, the two `compress_rate_*` scalars, `num_hash_layers`,
+    `qk_rope_head_dim` and one flat `rope_scaling`. Stating the modern
+    fields instead — `layer_types`, `mlp_layer_types`, `compress_rates`,
+    `partial_rotary_factor` and the nested `rope_parameters` transformers
+    writes back — reaches the same record
+    (configuration_deepseek_v4.py:239-321)."""
+    legacy = fixture_config("deepseek-v4-tiny")
+    modern = {key: value for key, value in legacy.items()
+              if key not in ("compress_ratios", "compress_rate_csa", "compress_rate_hca",
+                             "num_hash_layers", "qk_rope_head_dim", "rope_scaling")}
+    modern.update(
+        layer_types=list(V4_TYPES),
+        mlp_layer_types=["hash_moe"] * 3 + ["moe"] * 3,
+        compress_rates={"compressed_sparse_attention": 2,
+                        "heavily_compressed_attention": 4},
+        partial_rotary_factor=0.25,
+        rope_parameters={
+            "main": {"rope_type": "default", "rope_theta": 10000,
+                     "partial_rotary_factor": 0.25},
+            "compress": {"rope_type": "yarn", "rope_theta": 160000, "factor": 16,
+                         "beta_fast": 32, "beta_slow": 1, "attention_factor": 1.0,
+                         "original_max_position_embeddings": 65536,
+                         "partial_rotary_factor": 0.25}})
+
+    assert translate_config(modern) == translate_config(legacy)
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("num_key_value_heads", 4, "num_key_value_heads 4"),
+    ("scoring_func", "relu", "scoring_func 'relu'"),
+    ("norm_topk_prob", False, "norm_topk_prob=False"),
+    ("n_shared_experts", 2, "n_shared_experts 2"),
+    ("topk_method", "greedy", "topk_method 'greedy'"),
+    ("layer_types", ["full_attention"] * 6, r"layer_types entries \['full_attention'\]"),
+    ("layer_types", ["sliding_attention"] * 5, "layer_types of 5 entries"),
+    ("mlp_layer_types", ["dense"] * 6, r"mlp_layer_types entries \['dense'\]"),
+    ("mlp_layer_types", ["moe"] * 5, "mlp_layer_types of 5 entries"),
+    ("compress_ratios", [7] * 6, r"compress_ratios entries \[7\]"),
+    ("compress_rates", {"full_attention": 4}, r"compress_rates keys \['full_attention'\]"),
+    ("compress_rate_hca", 0, "compress_rates\\['heavily_compressed_attention'\\] 0"),
+    ("mlp_bias", True, "mlp_bias=True"),
+    ("attention_bias", True, "attention_bias=True"),
+    ("sliding_window", None, "sliding_window"),
+    ("o_groups", 3, "o_groups 3"),
+
+    ("partial_rotary_factor", 0.1875, "partial_rotary_factor 0.1875"),
+    ("rope_scaling", {"type": "linear", "factor": 4.0}, "plain or YaRN"),
+    ("rope_scaling", {"type": "yarn", "factor": 16,
+                      "original_max_position_embeddings": 65536,
+                      "attention_factor": 1.3}, "attention_factor 1.3"),
+])
+def test_a_deepseek_v4_field_with_no_counterpart_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("deepseek-v4-tiny"), field: value})
+
+
+def test_a_deepseek_v4_yarn_ramp_that_scales_its_table_is_refused():
+    """A nested compress entry naming no `attention_factor` derives one
+    that scales cos and sin (modeling_deepseek_v4.py:151-152), which this
+    rotary does not do, so it refuses naming the field."""
+    config = {key: value for key, value in fixture_config("deepseek-v4-tiny").items()
+              if key != "rope_scaling"}
+    config["rope_parameters"] = {
+        "main": {"rope_type": "default", "rope_theta": 10000,
+                 "partial_rotary_factor": 0.25},
+        "compress": {"rope_type": "yarn", "rope_theta": 160000, "factor": 16,
+                     "original_max_position_embeddings": 65536,
+                     "partial_rotary_factor": 0.25}}
+    with pytest.raises(ValueError, match="attention_factor None"):
+        translate_config(config)
+
+
+@pytest.mark.parametrize("released, saved", [
+    ("embed.weight", "model.embed_tokens.weight"),
+    ("norm.weight", "model.norm.weight"),
+    ("hc_head_fn", "model.hc_head.hc_fn"),
+    ("hc_head_base", "model.hc_head.hc_base"),
+    ("hc_head_scale", "model.hc_head.hc_scale"),
+    ("layers.0.attn.kv_norm.weight", "model.layers.0.attn.norm.weight"),
+    ("layers.0.attn.wq_a.weight", "model.layers.0.attn.wq_a.weight"),
+    ("layers.0.hc_attn_fn", "model.layers.0.hc_attn_fn"),
+    ("layers.2.attn.indexer.wq_b.weight", "model.layers.2.attn.indexer.wq_b.weight"),
+    ("layers.0.ffn.experts.3.w2.weight", "model.layers.0.ffn.experts.3.w2.weight"),
+])
+def test_a_deepseek_v4_released_tensor_name_reaches_the_same_leaf(released, saved):
+    """A released checkpoint holds the stack at `layers.N.*` with no
+    `model.` prefix, a flat `hc_head_*` and the latent norm as `kv_norm`,
+    while a checkpoint transformers wrote back carries the prefix, the
+    nested head and `norm` (conversion_mapping.py:489-508 is ^-anchored on
+    the first three, so the reverse leaves them). Both spellings are the
+    same weights and land on the same leaf."""
+    from dew.interop.hf_decoders import _deepseek_v4_path
+
+    config = translate_config(fixture_config("deepseek-v4-tiny"))
+    path = _deepseek_v4_path(released, config)
+    assert path is not None and path == _deepseek_v4_path(saved, config)
+
+
+def test_a_deepseek_v4_prediction_depth_is_read_by_no_leaf():
+    """transformers builds no depth and ignores its tensors
+    (modeling_deepseek_v4.py:1212), so the release's `mtp.0.*` reaches no
+    leaf here and the load keeps its bytes for the export."""
+    from dew.interop.hf_decoders import _deepseek_v4_path
+
+    config = translate_config(fixture_config("deepseek-v4-tiny"))
+    assert _deepseek_v4_path("mtp.0.attn.wq_a.weight", config) is None
+    assert _deepseek_v4_path("mtp.0.e_proj.weight", config) is None
+    assert _deepseek_v4_path("mtp.0.hc_head_fn", config) is None
+
+
+def test_the_deepseek_v4_tree_is_exactly_the_models_variables(rng):
+    """Same collections, paths and shapes as a freshly initialised model,
+    with the `moe` collection holding the hash layers' int32 table and the
+    top-k layers' fp32 balancing bias."""
+    from dew.interop.hf_decoders import _load_shards
+
+    config = translate_config(fixture_config("deepseek-v4-tiny"))
+    built = with_precision("causal_transformer", dict(config),
+                           dtype="float32", attention_impl="reference")
+    model = models.build("causal_transformer", **built)
+    initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32)))
+    loaded = flat_tree(translate_weights(_load_shards(DEEPSEEK_V4), config))
+
+    assert set(loaded) == set(initialised)
+    for path, leaf in loaded.items():
+        assert leaf.shape == initialised[path].shape, path
+        assert leaf.dtype == (jnp.int32 if path.endswith("tid2eid") else jnp.float32), path
+    assert loaded["params.layers_0.self_attn.o_a_proj.kernel"].shape == (2, 32, 8)
+    assert sorted(name for name in loaded if name.startswith("moe.")) == [
+        f"moe.layers_{index}.mlp.gate."
+        + ("tid2eid" if index < 3 else "e_score_correction_bias")
+        for index in range(6)]
+
+
+def test_deepseek_v4_logits_match_the_reference_implementation():
+    """fp32 parity over all three attention kinds and both routers:
+    tolerance 1e-4 on logits of magnitude 4.4."""
+    model, variables = fp32_decoder(DEEPSEEK_V4)
+    ids = np.load(DEEPSEEK_V4 / "input_ids.npy")
+    reference = np.load(DEEPSEEK_V4 / "logits.npy")
+
+    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_the_deepseek_v4_hash_layers_route_by_their_token_table():
+    """The first three layers select their experts at `tid2eid[input_ids]`
+    rather than on the scores (modeling_deepseek_v4.py:1062-1073): rolling
+    the table along the vocabulary sends every token to another token's
+    experts, and the logits move far past the parity tolerance."""
+    model, variables = fp32_decoder(DEEPSEEK_V4)
+    ids = jnp.asarray(np.load(DEEPSEEK_V4 / "input_ids.npy"), jnp.int32)
+    reference = np.load(DEEPSEEK_V4 / "logits.npy")
+    moe = variables["moe"]
+    assert [layer for layer in sorted(moe)
+            if "tid2eid" in moe[layer]["mlp"]["gate"]] == ["layers_0", "layers_1", "layers_2"]
+
+    rolled = {layer: {"mlp": {"gate": dict(moe[layer]["mlp"]["gate"])}}
+              for layer in moe}
+    for layer in ("layers_0", "layers_1", "layers_2"):
+        table = np.asarray(moe[layer]["mlp"]["gate"]["tid2eid"])
+        rolled[layer]["mlp"]["gate"]["tid2eid"] = np.roll(table, 1, axis=0)
+    difference = float(np.max(np.abs(
+        np.asarray(model.apply({**variables, "moe": rolled}, ids)) - reference)))
+    assert difference > 1e-2, f"rolling the table moved the logits {difference:.3e}"
+
+
+def test_the_deepseek_v4_swiglu_limit_clamps_the_gated_mlps():
+    """`swiglu_limit` caps the gate from above and the up projection on
+    both sides before the activation, in the shared MLP as in the routed
+    experts (modeling_deepseek_v4.py:978-979, :1014-1022). The fixture's
+    pre-activations reach its 2.0, so the same weights unclamped disagree
+    with the reference by more than 1."""
+    model, variables = fp32_decoder(DEEPSEEK_V4)
+    ids = jnp.asarray(np.load(DEEPSEEK_V4 / "input_ids.npy"), jnp.int32)
+    reference = np.load(DEEPSEEK_V4 / "logits.npy")
+    assert model.swiglu_limit == 2.0
+
+    unclamped = np.asarray(model.clone(swiglu_limit=None).apply(variables, ids))
+
+    difference = float(np.max(np.abs(unclamped - reference)))
+    assert difference > 1.0, f"dropping the clamp moved the logits {difference:.3e}"
 
 
 # --------------------------------------------------------------------------

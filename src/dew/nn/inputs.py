@@ -171,13 +171,20 @@ class ModelInputs:
 
 @struct.dataclass
 class AttentionMetadata:
-    """Per-token attention data independent of physical cache-slot addresses."""
+    """Per-token data the layers read beside their inputs, independent of
+    physical cache-slot addresses.
+
+    `token_ids` are the vocabulary ids of the rows, for a layer that routes
+    by them (DeepSeek V4's hash router); the model sets them when it has
+    such a layer.
+    """
 
     valid: jax.Array | None = None
     image_groups: jax.Array | None = None
     rotary_positions: jax.Array | None = None
     pairwise_mask: jax.Array | None = None
     key_positions: jax.Array | None = None
+    token_ids: jax.Array | None = None
 
 def generation_signature(inputs: object, controls: object) -> np.ndarray:
     """Digest execution shapes and stable host controls without reading payloads.
