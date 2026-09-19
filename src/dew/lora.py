@@ -127,7 +127,7 @@ class LoRA:
                 raise TypeError(
                     f"{'/'.join(root + module.path)} is a {type(module).__name__}; an adapter "
                     "targets nn.Dense and nn.DenseGeneral kernels")
-            (x,) = args
+            x = args[0] if args else kwargs["inputs"]
             output = next_fun(*args, **kwargs)
             if isinstance(module, nn.DenseGeneral):
                 if module.batch_dims:
@@ -135,7 +135,7 @@ class LoRA:
                 axes = (module.axis,) if isinstance(module.axis, int) else tuple(module.axis)
             else:
                 axes = (-1,)
-            axes = tuple(axis % x.ndim for axis in axes)
+            axes = tuple(sorted(axis % x.ndim for axis in axes))
             kernel = module.get_variable("params", "kernel")
             a = module.param("lora_A", INIT_A, kernel.shape[:len(axes)] + (target.rank,), module.param_dtype)
             b = module.param("lora_B", INIT_B, (target.rank,) + kernel.shape[len(axes):], module.param_dtype)
