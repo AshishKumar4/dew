@@ -35,6 +35,7 @@ from orbax.checkpoint.checkpoint_manager import MultiprocessingOptions
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import position
+from dew.telemetry.profile import active_profile
 
 STATE_LEAVES = ("step", "microstep", "updates", "params", "opt_state", "ema", "key",
                 "scale", "window_size", "accumulation")
@@ -275,8 +276,17 @@ class Checkpoints:
         A write that fails surfaces from `wait`, which is deliberately
         unguarded: a checkpoint that did not land is data loss.
         """
-        self._open().save(step, args=ocp.args.PyTreeSave(self._item(state, saved)),
-                          metrics=metrics, force=True)
+        annotation = None
+        active = active_profile()
+        if active is not None and active.running:
+            annotation = jax.profiler.TraceAnnotation("checkpoint.submit")
+            annotation.__enter__()
+        try:
+            self._open().save(step, args=ocp.args.PyTreeSave(self._item(state, saved)),
+                              metrics=metrics, force=True)
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
 
     def save_local(self, step: int, state: Any, saved: bytes | None) -> None:
         """Write `state` under `step` to this process's local directory,
@@ -288,9 +298,18 @@ class Checkpoints:
         if saved is not None:
             item['position'] = jax.tree.map(
                 lambda leaf: jax.device_put(leaf, state.step.sharding), item['position'])
-        self._open_local().save(
-            step, args=ocp.args.PyTreeSave(item), force=True,
-            custom_metadata={'processes': jax.process_count(), 'placement': written})
+        annotation = None
+        active = active_profile()
+        if active is not None and active.running:
+            annotation = jax.profiler.TraceAnnotation("checkpoint.submit_local")
+            annotation.__enter__()
+        try:
+            self._open_local().save(
+                step, args=ocp.args.PyTreeSave(item), force=True,
+                custom_metadata={'processes': jax.process_count(), 'placement': written})
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
 
     @staticmethod
     def _item(state: Any, saved: bytes | None) -> dict[str, Any]:
@@ -435,25 +454,34 @@ class Checkpoints:
 
     def _check_placement(self, step: int, item: Mapping[str, Any]) -> None:
         """Refuse a local step written for another placement of the state."""
-        written = self._open_local().metadata(step).custom_metadata or {}
-        wanted = placement(item)
-        moved = [path for path in wanted if written.get('placement', {}).get(path) != wanted[path]]
-        processes = written.get('processes')
-        if processes == jax.process_count() and not moved:
-            return
-        if processes != jax.process_count():
-            difference = (f"written by {_processes(processes or 0)}, and this run has "
-                          f"{_processes(jax.process_count())}")
-        else:
-            difference = (f"written with {moved[0]} placed as "
-                          f"{written.get('placement', {}).get(moved[0])}, and this run "
-                          f"places it as {wanted[moved[0]]}")
-        raise ValueError(
-            f"The local checkpoint at {self.local_path} holds step {step} {difference}; "
-            f"it holds each process's own shards, so it restores onto the mesh, "
-            f"layout and process count it was written with. Resume with those, or "
-            f"delete {self.local_directory} to resume from the persistent checkpoint "
-            f"at step {self._open().latest_step()} in {self.directory}.")
+        annotation = None
+        active = active_profile()
+        if active is not None and active.running:
+            annotation = jax.profiler.TraceAnnotation("checkpoint.validate")
+            annotation.__enter__()
+        try:
+            written = self._open_local().metadata(step).custom_metadata or {}
+            wanted = placement(item)
+            moved = [path for path in wanted if written.get('placement', {}).get(path) != wanted[path]]
+            processes = written.get('processes')
+            if processes == jax.process_count() and not moved:
+                return
+            if processes != jax.process_count():
+                difference = (f"written by {_processes(processes or 0)}, and this run has "
+                              f"{_processes(jax.process_count())}")
+            else:
+                difference = (f"written with {moved[0]} placed as "
+                              f"{written.get('placement', {}).get(moved[0])}, and this run "
+                              f"places it as {wanted[moved[0]]}")
+            raise ValueError(
+                f"The local checkpoint at {self.local_path} holds step {step} {difference}; "
+                f"it holds each process's own shards, so it restores onto the mesh, "
+                f"layout and process count it was written with. Resume with those, or "
+                f"delete {self.local_directory} to resume from the persistent checkpoint "
+                f"at step {self._open().latest_step()} in {self.directory}.")
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
 
     def wait(self) -> None:
         """Block until pending async writes have landed on disk.
@@ -461,15 +489,24 @@ class Checkpoints:
         Saving is async so it stays off the training loop's critical path;
         anything that reads a checkpoint back has to call this first.
         """
-        error = None
-        for manager in (self._manager, self._local_manager):
-            if manager is not None:
-                try:
-                    manager.wait_until_finished()
-                except BaseException as failure:
-                    if error is None:
-                        error = failure
-                    else:
-                        error.add_note(f"Checkpoint wait also failed: {failure!r}")
-        if error is not None:
-            raise error
+        annotation = None
+        active = active_profile()
+        if active is not None and active.running:
+            annotation = jax.profiler.TraceAnnotation("checkpoint.wait")
+            annotation.__enter__()
+        try:
+            error = None
+            for manager in (self._manager, self._local_manager):
+                if manager is not None:
+                    try:
+                        manager.wait_until_finished()
+                    except BaseException as failure:
+                        if error is None:
+                            error = failure
+                        else:
+                            error.add_note(f"Checkpoint wait also failed: {failure!r}")
+            if error is not None:
+                raise error
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)

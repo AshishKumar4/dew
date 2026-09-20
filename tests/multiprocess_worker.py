@@ -601,6 +601,49 @@ def mode_fit(args) -> dict:
     }
 
 
+def mode_profile_failure(args) -> dict:
+    """A scheduled profile window whose directory is a file on rank 0 only.
+
+    Rank 0's start fails while rank 1's capture is already open; the
+    coordination has to fail every rank together, close the started capture
+    on the way out, and leave the pool able to reach the next barrier."""
+    import jax
+    import optax
+    import dew.telemetry.profile as telemetry_profile
+    from dew.artifacts import agree_process_phase
+    from dew.training import Profile, Trainer
+
+    # The optional XProf package is absent in the test environment; stubbing
+    # its converter keeps the start path real while export becomes a no-op.
+    class Converter:
+        def xspace_to_tool_names(self, paths):
+            return ["overview_page"]
+
+        def xspace_to_tool_data(self, paths, tool, params):
+            return b"{}", "application/json"
+
+    telemetry_profile.require_profile_support = lambda: Converter()
+    real_version = telemetry_profile.version
+    telemetry_profile.version = (lambda name: "0.0" if name == "xprof"
+                                 else real_version(name))
+    profile_dir = Path(args.profile_dir)
+    if args.process_id == 0:
+        profile_dir.parent.mkdir(parents=True, exist_ok=True)
+        profile_dir.write_text("occupied")  # a file where the capture must mkdir
+    loader = indexed_loader(args.records, BATCH // args.processes)
+    trainer = Trainer(make_objective(), optax.adam(1e-3), key=jax.random.key(0),
+                      profile=Profile(str(profile_dir), steps=2, warmup=0))
+    error = None
+    try:
+        trainer.fit(Data(lambda: iter(loader)), steps=args.steps, log_every=1)
+    except BaseException as failure:
+        error = failure
+    recovered = agree_process_phase(None, phase="after profiling failure")
+    return {"failed": None if error is None else
+            f"{type(error).__name__}: {error} | {'; '.join(error.__notes__)}",
+            "recovered": recovered}
+
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 PROMPTS = ["a red bird", "two cats on a mat", "a harbour at dawn", "rain on the roof",
            "bread and jam", "birds at dawn", "a short note", "the sun set"]
@@ -1749,7 +1792,8 @@ MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "training_contract": mode_training_contract,
          "evaluation_contract": mode_evaluation_contract,
          "evaluation_replicas": mode_evaluation_replicas,
-         "builtin_preview_failures": mode_builtin_preview_failures}
+         "builtin_preview_failures": mode_builtin_preview_failures,
+         "profile_failure": mode_profile_failure}
 
 
 def parse_args(argv=None):
@@ -1784,8 +1828,8 @@ def parse_args(argv=None):
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through train_stream, whose "
                              "saved position is a global record count")
+    parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
     return parser.parse_args(argv)
-
 
 def main(argv=None) -> None:
     args = parse_args(argv)

@@ -9,7 +9,10 @@ import math
 import queue
 import threading
 from collections.abc import Mapping
-from typing import Any, Iterator, Optional, TypeAlias
+from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeAlias
+
+if TYPE_CHECKING:
+    from dew.telemetry.profile import Profiler
 
 import jax
 import numpy as np
@@ -475,7 +478,8 @@ class DevicePrefetchIterator:
     """
 
     def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = 2,
-                 source_state: Optional[bytes] = None):
+                 source_state: Optional[bytes] = None,
+                 profiler: "Profiler | None" = None):
         if depth <= 0:
             raise ValueError("prefetch depth must be positive")
         self._iterator: Iterator | None = iter(iterator)
@@ -487,6 +491,7 @@ class DevicePrefetchIterator:
         self._start_lock = threading.Lock()
         self._error: BaseException | None = None
         self._cleanup_error: BaseException | None = None
+        self._profiler = profiler
         self.source_state = source_state
         self._thread = threading.Thread(target=self._prefetch, name="dew-prefetch", daemon=True)
         # No source work may start until the caller owns this object. In
@@ -526,20 +531,54 @@ class DevicePrefetchIterator:
                 source.set_state(saved if isinstance(source.get_state(), bytes)
                                  else json.loads(saved))
             while not self._stop.is_set():
-                batch = next(iterator)
+                # Each scope exists only while the tracer owns a capture; the
+                # unprofiled worker runs its reads untouched.
+                annotation = None
+                if self._profiler is not None and self._profiler.running:
+                    annotation = jax.profiler.TraceAnnotation("data.read")
+                    annotation.__enter__()
+                try:
+                    batch = next(iterator)
+                finally:
+                    if annotation is not None:
+                        annotation.__exit__(None, None, None)
                 if self._stop.is_set():
                     break
-                state = source.get_state() if source is not None else None
-                if source is not None and not isinstance(state, bytes):
-                    state = json.dumps(state).encode()
-                placed = shard_batch(mesh, batch)
+                annotation = None
+                if self._profiler is not None and self._profiler.running:
+                    annotation = jax.profiler.TraceAnnotation("data.position")
+                    annotation.__enter__()
+                try:
+                    state = source.get_state() if source is not None else None
+                    if source is not None and not isinstance(state, bytes):
+                        state = json.dumps(state).encode()
+                finally:
+                    if annotation is not None:
+                        annotation.__exit__(None, None, None)
+                annotation = None
+                if self._profiler is not None and self._profiler.running:
+                    annotation = jax.profiler.TraceAnnotation("data.place")
+                    annotation.__enter__()
+                try:
+                    placed = shard_batch(mesh, batch)
+                finally:
+                    if annotation is not None:
+                        annotation.__exit__(None, None, None)
                 batch = None
-                while not self._stop.is_set():
-                    try:
-                        self._queue.put((placed, state), timeout=0.05)
-                        break
-                    except queue.Full:
-                        pass
+                annotation = None
+                if self._profiler is not None and self._profiler.running:
+                    annotation = jax.profiler.TraceAnnotation("data.enqueue")
+                    annotation.__enter__()
+                try:
+                    while not self._stop.is_set():
+                        try:
+                            self._queue.put((placed, state), timeout=0.05)
+                            break
+                        except queue.Full:
+                            pass
+                finally:
+                    if annotation is not None:
+                        annotation.__exit__(None, None, None)
                 placed = state = None
         except StopIteration:
             pass

@@ -32,6 +32,8 @@ from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
 from dew.sampling.text import Criteria, Generation, Sampling, Transforms, generate
+from dew.telemetry.profile import active_profile
+
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
@@ -176,24 +178,41 @@ class TextGeneration:
                  sampling: Sampling | None = None, images: object | None = None,
                  logits: Transforms | None = None, stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation:
-        inputs, budget, random_key = _task_inputs(self.processor, request, images=images,
-                                      collective=mesh_of(self.variables) is not None,
-                                      max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
-                                      max_length=self.max_length, key=key, seed=seed)
-        chain = self.logits if sampling is None else None
-        result = generate(self.model, self.variables, inputs, budget, key=random_key,
-                          sampling=self.sampling if sampling is None else sampling,
-                          n=self.n if n is None else n,
-                          logits=chain if logits is None else logits,
-                          stopping=self.stopping if stopping is None else stopping,
-                          strategy=self.strategy if strategy is None else strategy)
-        decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
-        return replace(result, decoder=decoder)
+        annotation = None
+        if active_profile() is not None:
+            annotation = jax.profiler.TraceAnnotation("inference.text")
+            annotation.__enter__()
+        try:
+            inputs, budget, random_key = _task_inputs(self.processor, request, images=images,
+                                          collective=mesh_of(self.variables) is not None,
+                                          max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
+                                          max_length=self.max_length, key=key, seed=seed)
+            chain = self.logits if sampling is None else None
+            result = generate(self.model, self.variables, inputs, budget, key=random_key,
+                              sampling=self.sampling if sampling is None else sampling,
+                              n=self.n if n is None else n,
+                              logits=chain if logits is None else logits,
+                              stopping=self.stopping if stopping is None else stopping,
+                              strategy=self.strategy if strategy is None else strategy)
+            decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+            return replace(result, decoder=decoder)
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
 
     def decode(self, generation: Generation) -> tuple[str, ...]:
         """Each row's valid continuation as text; empty without a processor."""
-        rows = generation.host()
-        return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+        annotation = None
+        if active_profile() is not None:
+            annotation = jax.profiler.TraceAnnotation("inference.text.decode")
+            annotation.__enter__()
+        try:
+            rows = generation.host()
+            return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
+
 
 
 @dataclass(frozen=True)
@@ -238,22 +257,39 @@ class BlockGeneration:
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
                  process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration:
-        inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
-                                      max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
-                                      max_length=self.max_length, key=key, seed=seed)
-        result = (self.process if process is None else process).generate(
-            self.model, self.variables, inputs, budget, key=random_key,
-            n=self.n if n is None else n,
-            eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
-        decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
-        return replace(result, decoder=decoder)
+        annotation = None
+        if active_profile() is not None:
+            annotation = jax.profiler.TraceAnnotation("inference.block")
+            annotation.__enter__()
+        try:
+            inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
+                                          max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
+                                          max_length=self.max_length, key=key, seed=seed)
+            result = (self.process if process is None else process).generate(
+                self.model, self.variables, inputs, budget, key=random_key,
+                n=self.n if n is None else n,
+                eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+            decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+            return replace(result, decoder=decoder)
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
         """Each row's valid continuation as text; empty without a processor."""
-        if generation.prompt_width is None:
-            raise ValueError("this generation has no prompt width")
-        rows = generation.host()
-        return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+        annotation = None
+        if active_profile() is not None:
+            annotation = jax.profiler.TraceAnnotation("inference.block.decode")
+            annotation.__enter__()
+        try:
+            if generation.prompt_width is None:
+                raise ValueError("this generation has no prompt width")
+            rows = generation.host()
+            return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
+
 
 
 @dataclass(frozen=True)
@@ -297,19 +333,37 @@ class MaskedGeneration:
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
                  steps: int | None = None, images: object | None = None) -> CanvasGeneration:
-        inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
-            max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
-            max_length=self.max_length, key=key, seed=seed)
-        result = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
-            sampler=self.sampler, steps=self.steps if steps is None else steps, n=self.n if n is None else n,
-            eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
-        decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
-        return replace(result, decoder=decoder)
+        annotation = None
+        if active_profile() is not None:
+            annotation = jax.profiler.TraceAnnotation("inference.masked")
+            annotation.__enter__()
+        try:
+            inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
+                max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
+                max_length=self.max_length, key=key, seed=seed)
+            result = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
+                sampler=self.sampler, steps=self.steps if steps is None else steps,
+                n=self.n if n is None else n,
+                eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+            decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+            return replace(result, decoder=decoder)
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
         """Each row's valid response as text; empty without a processor."""
-        if generation.prompt_width is None:
-            raise ValueError("this generation has no prompt width")
-        rows = generation.host()
-        return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+        annotation = None
+        if active_profile() is not None:
+            annotation = jax.profiler.TraceAnnotation("inference.masked.decode")
+            annotation.__enter__()
+        try:
+            if generation.prompt_width is None:
+                raise ValueError("this generation has no prompt width")
+            rows = generation.host()
+            return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
+
 

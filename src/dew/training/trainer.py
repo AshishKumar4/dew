@@ -33,6 +33,7 @@ from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import (Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective,
                                  Step, Variables, merge, select, mean_loss)
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
+from dew.telemetry import profile as telemetry_profile
 from dew.training.distributed import (
     DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_divisor, batch_shardings, build_mesh,
     shard_batch,
@@ -41,9 +42,9 @@ from dew.training.evaluation import Evaluation, evaluate
 from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
 from dew.telemetry.records import FitStarted, FitEnded, CheckpointRequested, ProfileWindow, Record
-
 if TYPE_CHECKING:
     from dew.data import Dataset
+    from dew.telemetry.profile import Profiler
 
 # Consecutive non-finite losses that stop a run.
 BAD_LOSS_STEPS = 5
@@ -632,6 +633,32 @@ class Trainer(Generic[Loss, Effects]):
         current = 0
         first_step = None
         process_zero = jax.process_index() == 0
+        # A configured window must own the capture: refuse before the dataset
+        # or the mesh do any work when another profiler already holds it, so
+        # neither trace is silently dropped or cut short. A configured window
+        # also resolves its optional dependency up front rather than after
+        # warmup steps have run.
+        profiler = None
+        if profile is not None:
+            # Every rank either leaves this block owning a stopped Profiler or
+            # raises together; a rank that proceeds alone would deadlock its
+            # peers at the first collective of training.
+            error = None
+            try:
+                if telemetry_profile.active_profile() is not None:
+                    raise ValueError(
+                        "Trainer.profile cannot schedule a window while an explicit "
+                        "dew.profile capture is active; drop one or stop the outer "
+                        "profiler before fitting")
+                telemetry_profile.require_profile_support()
+                profiler = telemetry_profile.profile(profile.directory)
+            except BaseException as failure:
+                error = failure
+            agree_process_phase(error, phase="profiling window setup")
+        outer = telemetry_profile.active_profile()
+        # One boundary lookup at setup: the prefetch worker and the step
+        # scopes share whichever profiler owns the capture.
+        tracer = profiler if profiler is not None else outer
         try:
             mesh = self.device_mesh
 
@@ -698,7 +725,8 @@ class Trainer(Generic[Loss, Effects]):
                             f"its stages, and {dict(mesh.shape)} with "
                             f"{self.mesh.microbatches or self.mesh.stage} microbatch(es) "
                             f"holds a batch that is a multiple of {divisor}")
-                train = DevicePrefetchIterator(source, mesh, source_state=position)
+                train = DevicePrefetchIterator(source, mesh, source_state=position,
+                                               profiler=tracer)
                 source = None  # Lifetime transferred to the prefetch worker.
 
             error = None
@@ -711,102 +739,175 @@ class Trainer(Generic[Loss, Effects]):
             agree_process_phase(error, phase="training announcement")
             while current < steps:
                 assert train is not None
-                batch = next(train)
-                if self.rollout is not None:
-                    # Host-side and untraceable: sampling, scoring, advantages.
-                    # The key folds the step key once more, keeping the
-                    # rollout's draws off the step's stream; both are
-                    # checkpointed, so a resumed run samples forward. Fixed
-                    # shapes mean the compile below traces once.
-                    began = time.perf_counter()
-                    key = jax.random.fold_in(
-                        jax.random.fold_in(state.key, state.step), 1)
-                    batch = shard_batch(mesh, self.rollout(state, batch, key))
-                    rollout_seconds += time.perf_counter() - began
-                shapes = batch_shapes(batch)
-                if shapes not in compiled:
-                    compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
-                    if len(compiled) == 1:
-                        last_log_time = time.time()
-                train_step, measured_flops = compiled[shapes]
-                if (profile is not None and not tracing and traced == 0
+                # The window's capture opens before this iteration's first
+                # read, so the step row records the read it waits on rather
+                # than a compile that ran before capture began.
+                if (profiler is not None and profile is not None
+                        and not tracing and traced == 0
                         and seen >= profile.warmup):
-                    jax.profiler.start_trace(profile.directory)
-                    tracing = True
+                    error = None
+                    try:
+                        profiler.start()
+                    except BaseException as failure:
+                        error = failure
+                    else:
+                        tracing = True
+                    try:
+                        agree_process_phase(error, phase="profiling window start")
+                    except BaseException as primary:
+                        # A peer failed while this capture did start: closing it
+                        # here keeps a live trace from outliving the aborted run.
+                        if tracing:
+                            tracing = False
+                            try:
+                                profiler.stop()
+                            except BaseException as failure:
+                                primary.add_note(f"Profiler stop failed: {failure!r}")
+                        raise
+                capturing = tracer is not None and tracer.running
+                step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=current)
+                              if capturing else None)
+                if step_scope is not None:
+                    step_scope.__enter__()
+                try:
+                    annotation = None
+                    if capturing:
+                        annotation = jax.profiler.TraceAnnotation("input.wait")
+                        annotation.__enter__()
+                    try:
+                        batch = next(train)
+                    finally:
+                        if annotation is not None:
+                            annotation.__exit__(None, None, None)
+                    if self.rollout is not None:
+                        # Host-side and untraceable: sampling, scoring, advantages.
+                        # The key folds the step key once more, keeping the
+                        # rollout's draws off the step's stream; both are
+                        # checkpointed, so a resumed run samples forward. Fixed
+                        # shapes mean the compile below traces once.
+                        began = time.perf_counter()
+                        key = jax.random.fold_in(
+                            jax.random.fold_in(state.key, state.step), 1)
+                        batch = shard_batch(mesh, self.rollout(state, batch, key))
+                        rollout_seconds += time.perf_counter() - began
+                    shapes = batch_shapes(batch)
+                    if shapes not in compiled:
+                        annotation = None
+                        if capturing:
+                            annotation = jax.profiler.TraceAnnotation("compile")
+                            annotation.__enter__()
+                        try:
+                            compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
+                        finally:
+                            if annotation is not None:
+                                annotation.__exit__(None, None, None)
+                        if len(compiled) == 1:
+                            last_log_time = time.time()
+                    train_step, measured_flops = compiled[shapes]
 
-                state, loss, aux, finite, accepted = train_step(state, batch)
-                position = train.source_state
-                current += 1
-                seen += 1
-                steps_since_log += 1
-                interval_steps += 1
-                interval_samples += rows_of(batch)
-                interval_flops = (None if interval_flops is None or measured_flops is None
-                                  else interval_flops + measured_flops)
-                book = bookkeep(book, loss, finite)
-                if first_step is None:
-                    loss.block_until_ready()
-                    first_step = time.perf_counter() - started
+                    annotation = None
+                    if capturing:
+                        annotation = jax.profiler.TraceAnnotation("train.step")
+                        annotation.__enter__()
+                    try:
+                        state, loss, aux, finite, accepted = train_step(state, batch)
+                    finally:
+                        if annotation is not None:
+                            annotation.__exit__(None, None, None)
+                    position = train.source_state
+                    current += 1
+                    seen += 1
+                    steps_since_log += 1
+                    interval_steps += 1
+                    interval_samples += rows_of(batch)
+                    interval_flops = (None if interval_flops is None or measured_flops is None
+                                      else interval_flops + measured_flops)
+                    book = bookkeep(book, loss, finite)
+                    if first_step is None:
+                        loss.block_until_ready()
+                        first_step = time.perf_counter() - started
 
+                    if current % log_every == 0:
+                        interval_loss, _, worst_bad_run = book
+                        self._check_finite(worst_bad_run, current)
+                        book = (interval_loss, book[1], jnp.zeros((), jnp.int32))
+                        error = None
+                        annotation = None
+                        if capturing:
+                            annotation = jax.profiler.TraceAnnotation("log")
+                            annotation.__enter__()
+                        try:
+                            try:
+                                if process_zero:
+                                    # The interval's numbers need the loss on the host, so
+                                    # this is where the loop waits on the device.
+                                    loss.block_until_ready()
+                                    now = time.time()
+                                    scalars = {"train/loss": float(loss),
+                                               **{f"train/{k}": float(v) for k, v in aux.items()},
+                                               **self._throughput(now - last_log_time, steps_since_log,
+                                                                  interval_samples, interval_flops)}
+                                    scalars["train/accepted"] = float(accepted)
+                                    if state.scale is not None:
+                                        scalars["train/loss_scale"] = float(state.scale.scale)
+                                    if self.rollout is not None:
+                                        scalars["train/rollout_seconds"] = rollout_seconds
+                                    print(f"step {current}: loss {scalars['train/loss']:.4f}")
+                                    if self.tracker is not None:
+                                        self.tracker.log(scalars, current)
+                                    last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
+                                    interval_samples, interval_flops = 0, 0.0
+
+                            except BaseException as failure:
+                                error = failure
+                            agree_process_phase(error, phase="training reporting")
+                        finally:
+                            if annotation is not None:
+                                annotation.__exit__(None, None, None)
+
+                    if eval_every and current % eval_every == 0 and current < steps:
+                        paused = time.perf_counter()
+                        annotation = None
+                        if capturing:
+                            annotation = jax.profiler.TraceAnnotation("evaluate")
+                            annotation.__enter__()
+                        try:
+                            self._evaluate(state, shardings, data, metrics, preview, mesh)
+                        finally:
+                            if annotation is not None:
+                                annotation.__exit__(None, None, None)
+                        other += time.perf_counter() - paused
+
+                    # On its own clock, not the logging one: nested inside the log
+                    # tick, a cadence that did not divide log_every never fired at all.
+                    if (checkpoint_every and checkpoints is not None
+                            and current % checkpoint_every == 0 and current < steps):
+                        paused = time.perf_counter()
+                        checkpoints.save(current, state, position,
+                                         {"loss": float(book[0] / interval_steps)})
+                        self._report(CheckpointRequested(checkpoints.directory), current)
+                        other += time.perf_counter() - paused
+                        last_saved = current
+                        book = (jnp.zeros_like(book[0]), book[1], book[2])
+                        interval_steps = 0
+                    if (local_every and checkpoints is not None
+                            and current % local_every == 0 and current < steps):
+                        paused = time.perf_counter()
+                        checkpoints.save_local(current, state, position)
+                        self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), current)
+                        other += time.perf_counter() - paused
+                finally:
+                    if step_scope is not None:
+                        step_scope.__exit__(None, None, None)
+                # The step row is complete once its scope exits; closing the
+                # window here keeps the last iteration inside the capture.
                 if tracing and profile is not None:
                     traced += 1
                     if traced == profile.steps:
                         tracing = False
-                        self._stop_trace(traced, loss, profile, step=current)
+                        assert profiler is not None
+                        self._stop_trace(traced, loss, profile, profiler, step=current)
 
-                if current % log_every == 0:
-                    interval_loss, _, worst_bad_run = book
-                    self._check_finite(worst_bad_run, current)
-                    book = (interval_loss, book[1], jnp.zeros((), jnp.int32))
-                    error = None
-                    try:
-                        if process_zero:
-                            # The interval's numbers need the loss on the host, so
-                            # this is where the loop waits on the device.
-                            loss.block_until_ready()
-                            now = time.time()
-                            scalars = {"train/loss": float(loss),
-                                       **{f"train/{k}": float(v) for k, v in aux.items()},
-                                       **self._throughput(now - last_log_time, steps_since_log,
-                                                          interval_samples, interval_flops)}
-                            scalars["train/accepted"] = float(accepted)
-                            if state.scale is not None:
-                                scalars["train/loss_scale"] = float(state.scale.scale)
-                            if self.rollout is not None:
-                                scalars["train/rollout_seconds"] = rollout_seconds
-                            print(f"step {current}: loss {scalars['train/loss']:.4f}")
-                            if self.tracker is not None:
-                                self.tracker.log(scalars, current)
-                            last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
-                            interval_samples, interval_flops = 0, 0.0
-
-                    except BaseException as failure:
-                        error = failure
-                    agree_process_phase(error, phase="training reporting")
-
-                if eval_every and current % eval_every == 0 and current < steps:
-                    paused = time.perf_counter()
-                    self._evaluate(state, shardings, data, metrics, preview, mesh)
-                    other += time.perf_counter() - paused
-
-                # On its own clock, not the logging one: nested inside the log
-                # tick, a cadence that did not divide log_every never fired at all.
-                if (checkpoint_every and checkpoints is not None
-                        and current % checkpoint_every == 0 and current < steps):
-                    paused = time.perf_counter()
-                    checkpoints.save(current, state, position,
-                                     {"loss": float(book[0] / interval_steps)})
-                    self._report(CheckpointRequested(checkpoints.directory), current)
-                    other += time.perf_counter() - paused
-                    last_saved = current
-                    book = (jnp.zeros_like(book[0]), book[1], book[2])
-                    interval_steps = 0
-                if (local_every and checkpoints is not None
-                        and current % local_every == 0 and current < steps):
-                    paused = time.perf_counter()
-                    checkpoints.save_local(current, state, position)
-                    self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), current)
-                    other += time.perf_counter() - paused
 
             paused = time.perf_counter()
             if train is not None:
@@ -817,7 +918,8 @@ class Trainer(Generic[Loss, Effects]):
                 tracing = False
                 # The window outlived the run, and a trace left running takes the
                 # next one down with it.
-                self._stop_trace(traced, loss, profile, step=current)
+                assert profiler is not None
+                self._stop_trace(traced, loss, profile, profiler, step=current)
             interval_loss, _, worst_bad_run = book
             self._check_finite(worst_bad_run, current)
             if loss is not None:
@@ -844,7 +946,8 @@ class Trainer(Generic[Loss, Effects]):
             stop_trace = None
             if tracing and profile is not None:
                 tracing = False
-                stop_trace = lambda: self._stop_trace(traced, loss, profile, step=current)
+                assert profiler is not None
+                stop_trace = lambda: self._stop_trace(traced, loss, profile, profiler, step=current)
             for label, cleanup in (
                 ("Training iterator", close),
                 ("Profiler", stop_trace),
@@ -933,8 +1036,13 @@ class Trainer(Generic[Loss, Effects]):
     # Telemetry
     # ------------------------------------------------------------------
 
-    def _stop_trace(self, traced: int, loss, profile: Profile, *, step: int) -> None:
-        """Stop every owned trace before reporting its window on process zero."""
+    def _stop_trace(self, traced: int, loss, profile: Profile,
+                    profiler: "Profiler", *, step: int) -> None:
+        """Stop the window's owned capture before reporting it on process zero.
+
+        The core Profiler drains the backend and exports the native reports on
+        `stop`; the loss's block only orders the primary's failure ahead of
+        the profiler's own drain."""
         error = None
         try:
             try:
@@ -943,7 +1051,7 @@ class Trainer(Generic[Loss, Effects]):
             finally:
                 primary = sys.exception()
                 try:
-                    jax.profiler.stop_trace()
+                    profiler.stop()
                 except BaseException as failure:
                     if primary is None:
                         raise

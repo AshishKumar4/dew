@@ -18,6 +18,7 @@ from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.objectives.base import Aux, EMASpec, Objective
+import dew
 import dew.nn.backbones  # registers the decoder the FLOP formula test builds
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -440,9 +441,35 @@ def test_compilation_cache_directory_is_configured(tmp_path):
     assert jax.config.jax_compilation_cache_dir == path
 
 
+def _fake_converter():
+    """The XProf converter surface, so capture tests run where xprof is absent."""
+    class Converter:
+        def xspace_to_tool_names(self, paths):
+            return ["overview_page"]
+
+        def xspace_to_tool_data(self, paths, tool, params):
+            return b"{}", "application/json"
+
+    return Converter()
+
+
+def _capture_env(monkeypatch):
+    """A working profiler without the optional XProf package: the native
+    trace calls still run, only the report export is stubbed at the seam the
+    missing dependency occupies."""
+    import dew.telemetry.profile as telemetry_profile
+
+    monkeypatch.setattr(telemetry_profile, "require_profile_support",
+                        _fake_converter)
+    real_version = telemetry_profile.version
+    monkeypatch.setattr(telemetry_profile, "version",
+                        lambda name: "0.0" if name == "xprof" else real_version(name))
+
+
 def test_profiler_writes_a_trace_after_the_warmup(tmp_path, monkeypatch):
     """The window has to open after the warmup: a trace that starts at step 0
     is mostly compilation, and reports its occupancy instead of the loop's."""
+    _capture_env(monkeypatch)
     started_at = []
     real_start = jax.profiler.start_trace
     seen = []
@@ -476,9 +503,10 @@ def test_profiler_writes_a_trace_after_the_warmup(tmp_path, monkeypatch):
     assert list((tmp_path / "profile").glob("**/*.xplane.pb")), "no trace to read"
 
 
-def test_an_unfinished_profile_window_is_still_closed(tmp_path):
+def test_an_unfinished_profile_window_is_still_closed(tmp_path, monkeypatch):
     """A window wider than the run has to close anyway: a trace left running
     takes the next one down with it."""
+    _capture_env(monkeypatch)
     make_trainer(profile=Profile(str(tmp_path / "long"), steps=8, warmup=1)).fit(
         Data(batches), steps=3, log_every=1)
     assert list((tmp_path / "long").glob("**/*.xplane.pb")), "no trace to read"
@@ -489,14 +517,115 @@ def test_an_unfinished_profile_window_is_still_closed(tmp_path):
 
 
 def test_the_profiler_runs_once_per_fit(tmp_path, monkeypatch):
-    starts, stops = [], []
-    monkeypatch.setattr(jax.profiler, "start_trace", lambda *a, **k: starts.append(1))
-    monkeypatch.setattr(jax.profiler, "stop_trace", lambda: stops.append(1))
-
+    """One scheduled window means one capture directory holding one trace."""
+    _capture_env(monkeypatch)
     make_trainer(profile=Profile(str(tmp_path), steps=1, warmup=0)).fit(
         Data(batches), steps=6, log_every=1)
 
-    assert len(starts) == 1 and len(stops) == 1
+    captures = [path for path in (tmp_path).glob("capture-*")]
+    assert len(captures) == 1
+    assert list(captures[0].glob("**/*.xplane.pb")), "no trace to read"
+
+
+def test_an_outer_profile_covers_the_whole_fit(tmp_path, monkeypatch):
+    """With no scheduled window an explicit capture sees every step."""
+    _capture_env(monkeypatch)
+    with dew.profile(tmp_path / "outer"):
+        make_trainer().fit(Data(batches), steps=3, log_every=1)
+
+    assert list((tmp_path / "outer").glob("**/*.xplane.pb")), "no trace to read"
+
+
+def test_a_scheduled_window_and_an_outer_profile_conflict(tmp_path, monkeypatch):
+    """Both must refuse before training: neither trace is dropped silently."""
+    _capture_env(monkeypatch)
+    with dew.profile(tmp_path / "outer"):
+        with pytest.raises(ValueError, match="dew.profile capture is active"):
+            make_trainer(profile=Profile(str(tmp_path / "window"), steps=1, warmup=0)).fit(
+                Data(batches), steps=2)
+
+
+def test_a_stopped_outer_profile_releases_the_loop(tmp_path, monkeypatch):
+    """Stopping an explicit capture mid-run has to free the loop completely:
+    the tracer is only leased while it is running, so the steps after the stop
+    allocate no scopes and the fit finishes unharmed."""
+    _capture_env(monkeypatch)
+    outer = dew.profile(tmp_path / "outer")
+    outer.start()
+    try:
+        scopes = []
+        real_step_scope = jax.profiler.StepTraceAnnotation
+
+        class CountingScope:
+            def __init__(self, *args, **kwargs):
+                scopes.append(1)
+                if len(scopes) == 2:
+                    outer.stop()
+                self.scope = real_step_scope(*args, **kwargs)
+
+            def __enter__(self):
+                return self.scope.__enter__()
+
+            def __exit__(self, *args):
+                return self.scope.__exit__(*args)
+
+        monkeypatch.setattr(jax.profiler, "StepTraceAnnotation", CountingScope)
+        make_trainer().fit(Data(batches), steps=4, log_every=2)
+
+        assert scopes == [1, 1], "scopes kept being built after the outer capture stopped"
+        assert not outer.running
+    finally:
+        if outer.running:
+            outer.stop()
+
+
+def test_a_peer_start_failure_keeps_the_cleanup_note(tmp_path, monkeypatch):
+    """When another process fails during the window's start barrier this rank
+    has already opened a capture, so the loop stops it before propagating; a
+    stop that itself fails must land on the error being raised, not on the
+    cleanup failure."""
+    _capture_env(monkeypatch)
+    import dew.training.trainer as trainer_module
+    from dew.telemetry.profile import Profiler
+    import dew.telemetry.profile as telemetry_profile
+
+    def refused(error, phase):
+        if phase == "profiling window start":
+            raise RuntimeError("peer reported a broken window")
+
+    monkeypatch.setattr(trainer_module, "agree_process_phase", refused)
+
+    real_stop = Profiler.stop
+
+    def broken_stop(self):
+        # Real export failures happen after the capture is released, so the
+        # genuine stop runs first and only then the synthetic failure raises.
+        real_stop(self)
+        raise OSError("export refused")
+
+    monkeypatch.setattr(Profiler, "stop", broken_stop)
+
+    try:
+        with pytest.raises(RuntimeError, match="peer reported a broken window") as raised:
+            make_trainer(profile=Profile(str(tmp_path / "window"), steps=2, warmup=0)).fit(
+                Data(batches), steps=4)
+
+        assert any("export refused" in note for note in raised.value.__notes__), (
+            "the profiler-stop failure never reached the propagated error")
+    finally:
+        leaked = telemetry_profile.active_profile()
+        if leaked is not None:
+            leaked.stop()
+
+
+def test_the_next_outer_capture_still_works(tmp_path, monkeypatch):
+    """The two tests above exercise stopped and failed captures; a fresh
+    context capture afterwards proves neither leaked the process-wide owner."""
+    _capture_env(monkeypatch)
+    with dew.profile(tmp_path / "outer"):
+        make_trainer().fit(Data(batches), steps=2, log_every=1)
+
+    assert list((tmp_path / "outer").glob("**/*.xplane.pb")), "no trace to read"
 
 
 def test_the_training_step_is_compiled_once_per_fit(monkeypatch):

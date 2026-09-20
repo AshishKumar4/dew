@@ -28,6 +28,7 @@ from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 
+from dew.telemetry.profile import active_profile
 
 if TYPE_CHECKING:
     from dew.objectives.diffusion import DiffusionObjective
@@ -282,20 +283,28 @@ class TextToImage:
         plan, process, request, tokens, null_tokens, shape, count, selected, data, signature = prepared
         if plan.processes > 1:
             multihost_utils.assert_equal(signature, "image input shapes and sampling must agree across processes")
-        given = _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
-        null = self._unconditional(null_tokens, plan)
-        if data:
-            start = process.times(count)[0] if selected is None else selected[0]
-            initial_state, spatial = _image_start(plan.sharding)(
-                self.autoencoder, process, shape, self.params, plan.place(plan.pad(data)),
-                plan.keys(request), encode_key, start)
-            if spatial:
-                given = {**given, **spatial}
-                null = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (plan.global_rows, *leaf.shape[1:]))
-                                    if leaf.shape[0] == 1 else leaf, null)
-                null = {**null, **spatial}
-        else:
-            initial_state = _noise(plan.sharding)(process, plan.keys(request), shape)
+        annotation = None
+        if active_profile() is not None:
+            annotation = jax.profiler.TraceAnnotation("inference.image.prepare")
+            annotation.__enter__()
+        try:
+            given = _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
+            null = self._unconditional(null_tokens, plan)
+            if data:
+                start = process.times(count)[0] if selected is None else selected[0]
+                initial_state, spatial = _image_start(plan.sharding)(
+                    self.autoencoder, process, shape, self.params, plan.place(plan.pad(data)),
+                    plan.keys(request), encode_key, start)
+                if spatial:
+                    given = {**given, **spatial}
+                    null = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (plan.global_rows, *leaf.shape[1:]))
+                                        if leaf.shape[0] == 1 else leaf, null)
+                    null = {**null, **spatial}
+            else:
+                initial_state = _noise(plan.sharding)(process, plan.keys(request), shape)
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
         owns_grid = self.grid is not None or times is not None
         return DenoisingInputs(initial_state, given, null, rows=plan.rows,
                                grid_steps=count if owns_grid else None,
@@ -379,12 +388,20 @@ class TextToImage:
         if prepared is None:
             assert not isinstance(prompts, DenoisingInputs)
             prepared = self.prepare(prompts, key=request, steps=count)
-        assert prepared.rows is not None
-        plan = RowPlan.over(mesh, prepared.rows)
-        result = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
-                                     solver, chosen, self.final_denoise, times, decode, self.params,
-                                     prepared.conditions, prepared.unconditional,
-                                     prepared.noise, jax.random.fold_in(request, 1))
+        annotation = None
+        if active_profile() is not None:
+            annotation = jax.profiler.TraceAnnotation("inference.image")
+            annotation.__enter__()
+        try:
+            assert prepared.rows is not None
+            plan = RowPlan.over(mesh, prepared.rows)
+            result = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
+                                         solver, chosen, self.final_denoise, times, decode, self.params,
+                                         prepared.conditions, prepared.unconditional,
+                                         prepared.noise, jax.random.fold_in(request, 1))
+        finally:
+            if annotation is not None:
+                annotation.__exit__(None, None, None)
         return replace(result, rows=plan.rows)
 
 
