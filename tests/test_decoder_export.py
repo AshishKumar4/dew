@@ -316,32 +316,49 @@ def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_p
     tensors = tool.source_tensors(source)
     config = json.loads((source / "config.json").read_text())
     scaled = "model.layers.0.self_attn.o_proj.weight"
-    rounded = torch.from_numpy(tensors[scaled]).to(torch.float8_e4m3fn)
+    rounded = torch.from_numpy(np.array(tensors[scaled], copy=True)).to(
+        torch.float8_e4m3fn
+    )
     dense_tensors = {**tensors, scaled: rounded.float().numpy()}
     expected_directory = tmp_path / "dequantized"
     save_hf_layout(dense_tensors, config, expected_directory)
-    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+    config["quantization_config"] = {
+        "quant_method": "fp8",
+        "fmt": "e4m3",
+        "weight_block_size": [128, 128],
+    }
     directory.mkdir()
     (directory / "config.json").write_text(json.dumps(config))
-    packed = {name: torch.from_numpy(value) for name, value in tensors.items()}
+    packed = {
+        name: torch.from_numpy(np.array(value, copy=True))
+        for name, value in tensors.items()
+    }
     packed[scaled] = rounded
     packed[scaled + "_scale_inv"] = torch.ones((1, 1), dtype=torch.float32)
     save_file(packed, str(directory / "model.safetensors"))
     quantized = load_pretrained(directory, dtype="float32", attention_impl="reference")
-    expected = load_pretrained(expected_directory, dtype="float32", attention_impl="reference")
+    expected = load_pretrained(
+        expected_directory, dtype="float32", attention_impl="reference"
+    )
     ids = np.load(source / "input_ids.npy")
-    np.testing.assert_array_equal(tool.logits(quantized, quantized.variables, ids),
-                                  tool.logits(expected, expected.variables, ids))
+    np.testing.assert_array_equal(
+        tool.logits(quantized, quantized.variables, ids),
+        tool.logits(expected, expected.variables, ids),
+    )
     state = tool.train(CASES["deepseek_v3"], quantized, ids)
     destination = tmp_path / "exported"
     quantized.save(destination, variables=state.params)
     packed_export = load_file(str(destination / "model.safetensors"))
     assert packed_export[scaled].dtype == torch.float8_e4m3fn
     assert json.loads((destination / "config.json").read_text()) == config
-    float_export = {name: value.float().numpy() for name, value in packed_export.items()
-                    if name != scaled + "_scale_inv"}
-    float_export[scaled] = (packed_export[scaled].float() *
-                            packed_export[scaled + "_scale_inv"][0, 0]).numpy()
+    float_export = {
+        name: value.float().numpy()
+        for name, value in packed_export.items()
+        if name != scaled + "_scale_inv"
+    }
+    float_export[scaled] = (
+        packed_export[scaled].float() * packed_export[scaled + "_scale_inv"][0, 0]
+    ).numpy()
     original_quantized = dense_tensors[scaled]
     assert not np.array_equal(float_export[scaled], original_quantized)
     plain_config = {name: value for name, value in config.items() if name != "quantization_config"}

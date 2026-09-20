@@ -3,7 +3,8 @@
 translate_config and translate_weights are the map: a decoder config dict into
 CausalTransformer kwargs, and HF-named tensors into a dew params tree. The
 helpers around them fetch a repo (or read a local directory) and read the
-safetensors shards as fp32 without torch, so dew.interop.load_pretrained
+safetensors shards in their stored dtype without torch; the weight map
+widens parameters to fp32, so dew.interop.load_pretrained
 builds a model whose variables a forward pass takes straight away, and
 save_pretrained_decoder writes one back out in the HF layout.
 
@@ -39,9 +40,9 @@ from pathlib import Path
 from typing import (Any, Callable, Dict, List, Mapping, NoReturn, Optional, Protocol,
                     Tuple, Union)
 
-import ml_dtypes
 import numpy as np
 
+from dew.interop.safetensors_io import read_file
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
 from dew.nn.gemma3n import AltUp
 from dew.nn import llama4
@@ -2161,52 +2162,17 @@ def translate_denoiser_weights(hf_tensors: Mapping[str, np.ndarray],
             "self_conditioning": {"params": translate_sc_weights(sc)}}
 
 
-# An fp8 weight widens to fp32 exactly, and its block scales are applied by
-# `dequantize_checkpoint` once every shard is read.
-_DTYPES = {'F32': np.float32, 'F16': np.float16, 'F8_E4M3': ml_dtypes.float8_e4m3fn}
-# MXFP4 payloads stay uint8. They are unpacked into weights by the family
-# that reads them.
-_PACKED = {'U8': np.uint8}
-
-
 def _read_shard(path: Path) -> Dict[str, np.ndarray]:
-    """Every tensor of one safetensors file as fp32, without torch.
-
-    safetensors.numpy cannot read bfloat16 and most decoder checkpoints are
-    bfloat16, so those leaves are widened here the way every bf16 reader does.
-    The 16 payload bits shift into the top half of an fp32 word. The file is
-    opened once and read in header order, which is offset order.
-    """
-    tensors: Dict[str, np.ndarray] = {}
-    with open(path, 'rb') as handle:
-        length = int.from_bytes(handle.read(8), 'little')
-        header = json.loads(handle.read(length))
-        data = 8 + length
-        for name, meta in header.items():
-            if name == '__metadata__':
-                continue
-            dtype, shape = meta['dtype'], tuple(meta['shape'])
-            start, end = meta['data_offsets']
-            handle.seek(data + start)
-            raw = handle.read(end - start)
-            if dtype == 'BF16':
-                widened = np.frombuffer(raw, dtype='<u2').astype(np.uint32) << 16
-                tensors[name] = widened.view(np.float32).reshape(shape)
-            elif dtype in _DTYPES:
-                tensors[name] = np.frombuffer(
-                    raw, dtype=_DTYPES[dtype]).astype(np.float32).reshape(shape)
-            elif dtype in _PACKED:
-                tensors[name] = np.frombuffer(raw, dtype=_PACKED[dtype]).reshape(shape)
-            else:
-                raise ValueError(
-                    f"tensor {name} in {path.name} has dtype {dtype}, which this "
-                    "loader cannot read")
+    """Every tensor of one safetensors file, memory mapped in its stored
+    dtype. Leaves bound to the tree are cast to fp32 by translate_weights;
+    packed payloads such as MXFP4 stay bytes for their dequantizer."""
+    tensors, _ = read_file(path)
     return tensors
 
 
 def _load_shards(directory: Path) -> Dict[str, np.ndarray]:
-    """Every tensor of a checkpoint directory, shard by shard, as fp32."""
-    shards = sorted(directory.glob('*.safetensors'))
+    """Every tensor of a checkpoint directory, mapped in its stored dtype."""
+    shards = sorted(directory.glob("*.safetensors"))
     if not shards:
         raise FileNotFoundError(f"no *.safetensors under {directory}")
     tensors: Dict[str, np.ndarray] = {}
@@ -2220,9 +2186,21 @@ def _snapshot(name_or_dir: str, revision: Optional[str]) -> Path:
     if os.path.isdir(name_or_dir):
         return Path(name_or_dir)
     from huggingface_hub import snapshot_download
-    return Path(snapshot_download(
-        name_or_dir, revision=revision,
-        allow_patterns=["*.safetensors", "*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]))
+
+    return Path(
+        snapshot_download(
+            name_or_dir,
+            revision=revision,
+            allow_patterns=[
+                "*.safetensors",
+                "*.json",
+                "*.txt",
+                "*.model",
+                "*.tiktoken",
+                "*.jinja",
+            ],
+        )
+    )
 
 
 class ExportTokenizer(Protocol):
@@ -2231,8 +2209,12 @@ class ExportTokenizer(Protocol):
     def save_pretrained(self, directory: str, /) -> object: ...
 
 
-def save_export_assets(directory, *, tokenizer: Union[str, ExportTokenizer, None] = None,
-                       generation_config: Optional[Mapping[str, Any]] = None) -> None:
+def save_export_assets(
+    directory,
+    *,
+    tokenizer: Union[str, ExportTokenizer, None] = None,
+    generation_config: Optional[Mapping[str, Any]] = None,
+) -> None:
     """Write the tokenizer files and generation_config.json beside exported weights.
 
     Readers of the HF layout (transformers, llama.cpp and the runtimes on it) locate the
@@ -2240,12 +2222,16 @@ def save_export_assets(directory, *, tokenizer: Union[str, ExportTokenizer, None
     A name is resolved through `tokenizer_for` from local files only and recorded under
     `tokenizer_name`, which is the whole record for the byte vocabulary.
     """
-    values: Dict[str, Any] = ({'do_sample': True, 'use_cache': True}
-                              if generation_config is None else dict(generation_config))
+    values: Dict[str, Any] = (
+        {"do_sample": True, "use_cache": True}
+        if generation_config is None
+        else dict(generation_config)
+    )
     name: Optional[str] = None
     writer: Optional[ExportTokenizer] = None
     if isinstance(tokenizer, str):
         from dew.data.text import ByteTokenizer, tokenizer_for
+
         name = tokenizer
         resolved = tokenizer_for(tokenizer, local_files_only=True)
         # Dew's byte vocabulary is no HF tokenizer and no HF file describes
