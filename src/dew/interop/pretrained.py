@@ -21,7 +21,7 @@ from dew.artifacts import agree_process_phase
 from dew.interop import hf_decoders as decoders
 from dew.interop.quantized import (dequantize_checkpoint, fp8_format, fp8_tensor_names,
                                      pack_fp8, read_fp8_tensor, scaled_names)
-from dew.inference import BlockGeneration, TextGeneration
+from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.gpt_oss import (mxfp4_stems, mxfp4_tensor_names, pack_mxfp4, read_mxfp4_tensor,
                               unpack_mxfp4)
@@ -806,8 +806,11 @@ class Pretrained:
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
     quantized_tensors: tuple[str, ...] = ()
 
-    def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
-        """The source's decoding components, or the caller's explicit policy.
+    def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration | MaskedGeneration:
+        """Native MDLM for masked models, source decoding controls for causal models.
+
+        Masked generation refines a full response with Unmask, not the source
+        family's custom generation recipe. AR sampling overrides are refused.
 
         Without an override the task runs the source's whole chain, its
         criteria and the strategy its config names. An explicit `sampling`
@@ -819,6 +822,18 @@ class Pretrained:
             raise TypeError("a latent diffusion source generates through text_to_image")
         if isinstance(self.model, DiffusionGemma):
             raise TypeError("a DiffusionGemma source generates through block_generation")
+        mask_id = getattr(self.model, "mask_token_id", None)
+        if not getattr(self.model, "causal", True) and mask_id is not None:
+            from dew.diffusion.discrete import MDLM
+            if sampling is not None:
+                raise TypeError("native MDLM accepts denoising steps, not autoregressive sampling controls")
+            _audit_masked(self.config, self.generation_config)
+            return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(), self.processor,
+                eos_token_ids=_eos_ids(self.config, self.generation_config),
+                pad_token_id=_pad_id(self.config, self.generation_config),
+                max_new_tokens=_generation_limit(self.config, self.generation_config, "max_new_tokens"),
+                max_length=_generation_limit(self.config, self.generation_config, "max_length"),
+                n=_return_sequences(self.config, self.generation_config))
         rows = _return_sequences(self.config, self.generation_config)
         policy, logits, stopping, strategy = _source_decoding(
             self.config, self.generation_config, self.model, self.processor, rows,
@@ -973,6 +988,7 @@ class _Control:
     neutral: tuple[object, ...] = ()
     mode: Literal["always", "sampling", "beam"] = "always"
     refusal: str | None = None
+    masked_neutral: tuple[object, ...] | None = None
 
 
 # GenerationConfig is external data. Keep each control's disposition and
@@ -998,7 +1014,7 @@ _CONTROLS = {
     "cache_implementation": _Control(
         "unsupported",
         neutral=('static',),
-        refusal="the native cache is the fixed-capacity static one"),
+        refusal="the native cache is the fixed-capacity static one", masked_neutral=()),
     "compile_config": _Control("unsupported", refusal="the native decoder owns its compilation"),
     "constraints": _Control("unsupported", refusal="constrained beam search is not implemented"),
     "continuous_batching_config": _Control("unsupported", refusal="continuous batching is not implemented"),
@@ -1012,12 +1028,12 @@ _CONTROLS = {
         neutral=(0.0,),
         mode="beam",
         refusal="diverse group beam search is not implemented"),
-    "do_sample": _Control("policy"),
+    "do_sample": _Control("policy", masked_neutral=(True,)),
     "dola_layers": _Control("unsupported", refusal="DoLa is a decoding strategy that is not implemented"),
     "early_stopping": _Control("strategy", neutral=(False,), mode="beam"),
     "encoder_no_repeat_ngram_size": _Control("transform", neutral=(0,)),
     "encoder_repetition_penalty": _Control("transform", neutral=(1.0,)),
-    "eos_token_id": _Control("policy"),
+    "eos_token_id": _Control("task"),
     "epsilon_cutoff": _Control("transform", neutral=(0.0,), mode="sampling"),
     "eta_cutoff": _Control("transform", neutral=(0.0,), mode="sampling"),
     "exponential_decay_length_penalty": _Control("transform"),
@@ -1044,7 +1060,7 @@ _CONTROLS = {
     "max_time": _Control("unsupported", refusal="a host clock cannot stop a coordinated device loop"),
     "min_length": _Control("transform", neutral=(0,)),
     "min_new_tokens": _Control("transform", neutral=(0,)),
-    "min_p": _Control("policy", mode="sampling"),
+    "min_p": _Control("policy", mode="sampling", masked_neutral=(0.0,)),
     "no_repeat_ngram_size": _Control("transform", neutral=(0,)),
     "num_assistant_tokens": _Control("strategy"),
     "num_assistant_tokens_schedule": _Control(
@@ -1074,7 +1090,7 @@ _CONTROLS = {
         "unsupported",
         neutral=(False,),
         refusal="generation does not return per-step distributions"),
-    "pad_token_id": _Control("policy"),
+    "pad_token_id": _Control("task"),
     "penalty_alpha": _Control(
         "unsupported",
         neutral=(0.0,),
@@ -1092,21 +1108,21 @@ _CONTROLS = {
     "target_lookbehind": _Control(
         "unsupported",
         refusal="translating between two tokenizers' token spaces is not implemented"),
-    "temperature": _Control("policy"),
+    "temperature": _Control("policy", masked_neutral=(1.0,)),
     "token_healing": _Control(
         "unsupported",
         neutral=(False,),
         refusal="retokenizing the prompt is prompt construction, not decoding"),
     "tokenizer_name": _Control("metadata"),
     "top_h": _Control("transform", mode="sampling"),
-    "top_k": _Control("policy"),
-    "top_p": _Control("policy", mode="sampling"),
+    "top_k": _Control("policy", masked_neutral=(0,)),
+    "top_p": _Control("policy", mode="sampling", masked_neutral=(1.0,)),
     "transformers_version": _Control("metadata"),
     "typical_p": _Control("transform", neutral=(1.0,), mode="sampling"),
     "use_cache": _Control(
         "unsupported",
         neutral=(True,),
-        refusal="native decoding always runs through its own cache"),
+        refusal="native decoding always runs through its own cache", masked_neutral=(False,)),
     "use_mtp": _Control("strategy", neutral=(False,)),
     "watermarking_config": _Control("transform", refusal="no watermarking transform is implemented"),
 }
@@ -1122,11 +1138,27 @@ def _neutral(value: object, neutral: tuple[object, ...]) -> bool:
 
 
 def _active(config: Mapping[str, object], generation_config: Mapping[str, object],
-            name: str) -> object:
+            name: str, *, masked: bool = False) -> object:
     """The control's value when it is active, None when it changes nothing."""
     value = _generation_value(config, generation_config, name)
     rule = _CONTROLS.get(name)
-    return None if _neutral(value, () if rule is None else rule.neutral) else value
+    neutral = () if rule is None else rule.neutral
+    if masked and rule is not None and rule.masked_neutral is not None:
+        neutral = rule.masked_neutral
+    return None if _neutral(value, neutral) else value
+
+
+def _audit_masked(config: Mapping[str, object], generation_config: Mapping[str, object]) -> None:
+    """Native MDLM has no AR policy chain or KV cache, but shares task controls."""
+    refused = []
+    for name in sorted(_CONTROLS.keys() | generation_config.keys()):
+        rule = _CONTROLS.get(name)
+        if rule is not None and rule.owner in ("task", "metadata", "inapplicable"):
+            continue
+        if _active(config, generation_config, name, masked=True) is not None:
+            refused.append(name)
+    if refused:
+        raise ValueError(f"native MDLM cannot honor active source controls {refused}")
 
 
 def _audit(config: Mapping[str, object], generation_config: Mapping[str, object],

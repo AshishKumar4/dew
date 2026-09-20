@@ -27,7 +27,7 @@ import numpy as np
 import optax
 
 from dew.artifacts import TextSamples, agree_process_phase, collective_host
-from dew.diffusion.discrete import DiscreteProcess, Unmask
+from dew.diffusion.discrete import DiscreteProcess, MDLM_STEPS, Unmask
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -36,6 +36,8 @@ from dew.sampling.sample import sample
 
 if TYPE_CHECKING:
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.inference.tasks import MaskedGeneration, Processor
+    from dew.training.state import TrainState
 
 TEXT_KEY = "text"
 
@@ -55,7 +57,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
         head_chunks: int = 4,
         ema_decay: float | None = 0.999,
         sampler: Unmask = Unmask(),
-        steps: int = 64,
+        steps: int = MDLM_STEPS,
         samples: int = 4,
         decode: Optional[Callable[[Sequence[int]], str]] = None,
         pretrained: Variables | None = None,
@@ -83,6 +85,13 @@ class MaskedDiffusionObjective(Objective[Mean]):
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
         self.ema = None if ema_decay is None else EMASpec(decay=optax.constant_schedule(ema_decay))
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
+
+    def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> MaskedGeneration:
+        """The published weights as a native full-response MDLM task."""
+        from dew.inference.tasks import MaskedGeneration
+
+        return MaskedGeneration(self.model, self._pipeline_weights(state, ema), self.process,
+                                processor, sampler=self.sampler, steps=self.steps)
 
     def held_variables(self) -> Variables | None:
         """The checkpoint this run continues from, or None for a fresh init."""

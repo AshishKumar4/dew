@@ -1,11 +1,9 @@
 """Load the native inference task for a saved run or published checkpoint.
 
-A run directory holds `run.json` and checkpoints; a diffusion run becomes a
-`TextToImage`, a language-model run a `TextGeneration`. A source checkpoint
-(a Hub repository or a directory in its layout) loads through
-`dew.interop.load_pretrained` and becomes a `TextGeneration`, or a
-`BlockGeneration` for a DiffusionGemma. Diffusion sources produce an image
-task. Weights are placed once on a mesh
+A run directory holds run.json and checkpoints; sources load through
+dew.interop.load_pretrained. Causal text uses TextGeneration, native MDLM
+uses MaskedGeneration, DiffusionGemma uses BlockGeneration, and image
+diffusion uses TextToImage. Weights are placed once on a mesh
 under a layout, the way the trainer places a train state. The default mesh
 uses the current pool's devices. A just-trained state needs no reload; its objective's
 `pipeline(state)` binds it in place.
@@ -24,7 +22,7 @@ import numpy as np
 from etils import epath
 
 from dew.checkpoints import RUN_FILE
-from dew.inference.tasks import BlockGeneration, TextGeneration
+from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import ModelInputs, pad_token_rows
 from dew.sampling.pipelines import TextToImage, restore_variables
 from dew.objectives.base import Variables
@@ -38,7 +36,7 @@ if TYPE_CHECKING:
 def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None = None,
              dtype: str | None = None, param_dtype: str | None = None,
              ema: bool = True, step: int | None = None,
-             revision: str | None = None) -> TextToImage | TextGeneration | BlockGeneration:
+             revision: str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     """The inference task for `source`, its weights placed once.
 
     `source` is a run directory, or a source checkpoint directory or Hub
@@ -65,7 +63,7 @@ def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool,
-              step: int | None) -> TextToImage | TextGeneration | BlockGeneration:
+              step: int | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     from dew.config import ModelConfig
     from dew.data import tokenizer_for
     from dew.registry import objectives
@@ -81,8 +79,8 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
     if kind == "diffusion":
         return TextToImage.from_run(directory, ema=ema, step=step, mesh=mesh, layout=layout,
                                     dtype=dtype, param_dtype=param_dtype)
-    if kind not in ("lm", "dpo", "grpo", "ppo", "block_diffusion"):
-        raise TypeError(f"{kind!r} has no saved generation task; supported kinds are diffusion, lm, dpo, grpo, ppo and block_diffusion")
+    if kind not in ("lm", "dpo", "grpo", "ppo", "block_diffusion", "masked_diffusion"):
+        raise TypeError(f"{kind!r} has no saved generation task; supported kinds are diffusion, lm, dpo, grpo, ppo, block_diffusion and masked_diffusion")
     model_config = ModelConfig.from_dict(record["model"])
     compute = dtype_name(resolve_dtype(dtype))
     if compute is not None:
@@ -99,6 +97,20 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
                                       param_dtype=param_dtype)
         return BlockGeneration(model, variables, BlockProcess(model.canvas_length, model.vocab_size),
                                RunProcessor(tokenizer), pad_token_id=int(record.get("pad_token_id", 0)))
+    budget = record.get("sample_tokens")
+    if budget is not None and (type(budget) is not int or budget < 0):
+        raise ValueError("sample_tokens must be a nonnegative integer")
+    if kind == "masked_diffusion":
+        from dew.diffusion.discrete import MDLM
+        model = model_config.build()
+        mask_id = getattr(model, "mask_token_id", None)
+        if getattr(model, "causal", True) or type(mask_id) is not int:
+            raise ValueError("a saved masked run requires causal=False and a mask_token_id")
+        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
+                                      param_dtype=param_dtype)
+        return MaskedGeneration(model, variables, MDLM(mask_id=mask_id)(), RunProcessor(tokenizer),
+                                pad_token_id=int(record.get("pad_token_id", 0)),
+                                max_new_tokens=budget or None)
     objective_type = objectives[kind]
     variables = restore_variables(directory, ema=ema and not objective_type._ema_is_reference,
                                   step=step, mesh=mesh, layout=layout, param_dtype=param_dtype)
@@ -109,9 +121,6 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
     if record.get("quantization") is not None:
         from dew.training.quantization import Quantization, apply_quantization
         model = apply_quantization(model, Quantization(**record["quantization"]))
-    budget = record.get("sample_tokens")
-    if budget is not None and (type(budget) is not int or budget < 0):
-        raise ValueError("sample_tokens must be a nonnegative integer")
     controls = record.get("sampling")
     if controls is None and budget:
         raise ValueError("run.json lacks the sampling policy for its text previews")
@@ -123,7 +132,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
 
 def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
-                 revision: str | None) -> TextToImage | TextGeneration | BlockGeneration:
+                 revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     from dew.interop import load_pretrained
     from dew.nn.diffusion_gemma import DiffusionGemma
 

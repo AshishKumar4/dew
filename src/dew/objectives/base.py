@@ -29,10 +29,10 @@ from dew.artifacts import Artifacts
 if TYPE_CHECKING:
     from dew.inputs import InputSpec
     from dew.training.state import TrainState
-    from dew.inference.tasks import BlockGeneration, TextGeneration
+    from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
     from dew.sampling.pipelines import TextToImage
 
-    Task: TypeAlias = TextGeneration | BlockGeneration | TextToImage
+    Task: TypeAlias = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 
 Variables: TypeAlias = Mapping[str, Any]
 """A flax variables dict: the `params` collection plus any other collection

@@ -128,6 +128,25 @@ The base fixture is not an instruction-tuned chat assistant. Use the checkpoint'
 
 LLaDA and Dream use bidirectional masked-token prediction. They require a mask token ID and a masked-diffusion objective; replacing an autoregressive loss without changing the attention and corruption process is not sufficient.
 
+`load_pretrained(...).text_generation()`, `dew.pipeline(source_or_run)`, and `MaskedDiffusionObjective.pipeline(state)` return `MaskedGeneration` for these models. This is Dew's native MDLM algorithm (`DiscreteProcess` with `Unmask`), **not** a reproduction of LLaDA's or Dream's source-specific remasking and block-generation recipes.
+
+```python
+from dew.interop import load_pretrained
+
+bundle = load_pretrained("tests/fixtures/hf/llada-tiny", dtype="float32", attention_impl="xla")
+task = bundle.text_generation()
+result = task([[1, 2, 3]], 8, seed=7, steps=16, n=2)
+print(result.host().tokens)
+```
+
+The tiny fixtures demonstrate mechanics, not language quality. Released sources with a tokenizer also accept text and provide `result.text`. This path is text-only: media payloads and media token fields are rejected. Numeric requests use `ModelInputs`; attention validity, logical `[B, S]` positions, rotary coordinates and segment IDs travel through the masked model. The prompt stays fixed even when it contains a literal mask ID. All requested response positions refine together under bidirectional attention; mask IDs are excluded from generated categorical draws.
+
+The default is 64 model evaluations, including the final clean prediction. A call can override `steps`. `n` continuations are prompt-major, and continuation zero is unchanged when more continuations are requested. EOS is applied after full-span refinement: lengths include its first occurrence, and the tail is padded. This is not autoregressive early stopping. A zero-token request preserves the prompt and reports zero refinements. `CanvasGeneration` reports lengths, EOS flags and refinement counts without fabricated autoregressive log-probabilities. AR sampling, beam and logits controls are not accepted on this path.
+
+Active source generation controls that native MDLM cannot honor are rejected by name. Neutral values and shared budget, continuation-count, EOS and padding metadata remain accepted. MDLM does not use a KV cache: `use_cache=False` is compatible; requesting a cache is not.
+
+Saved masked recipe runs preserve compute/storage precision and select live or EMA weights through the ordinary `dew.pipeline` options. Their run record reconstructs native MDLM with its default `Unmask` sampler and 64 steps; it does not serialize custom programmatic objective steps or sampler choices. Plain `Checkpoints` stores weights/state, not those task settings: callers must retain and reapply custom task configuration. The existing recipe also saves no EOS policy. Source checkpoints honor their EOS metadata; programmatic objective tasks can be configured with `dataclasses.replace(task, eos_token_ids=(...))`. No additional recipe inference fields are implied.
+
 DiffusionGemma uses uniform-vocabulary corruption, a causal prompt encoder, a bidirectional canvas, and self-conditioning. Load the complete model through the same `load_pretrained` interface as other published models. Its `BlockProcess` generation policy refines full canvases, commits clean tokens to the shared text cache, and returns `CanvasGeneration`: response lengths including EOS, termination flags and per-row refinement counts, without autoregressive likelihood fields.
 
 From a repository checkout, this CPU example loads the complete tiny reference checkpoint, tokenizes, generates, decodes, saves and reloads it. Its 64-token synthetic vocabulary tests the workflow, not language quality. The released model ID is `google/diffusiongemma-26B-A4B-it`; loading that ID downloads large weights and requires sufficient host/device memory.

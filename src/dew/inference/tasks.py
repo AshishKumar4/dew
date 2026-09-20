@@ -24,6 +24,7 @@ from flax.core import freeze
 from jax.typing import ArrayLike
 
 from dew.diffusion.block import BlockProcess, CanvasGeneration
+from dew.diffusion.discrete import DiscreteProcess, MDLM_STEPS, Unmask
 from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs, mesh_of, request_key
@@ -253,3 +254,62 @@ class BlockGeneration:
             raise ValueError("this generation has no prompt width")
         rows = generation.host()
         return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+
+
+@dataclass(frozen=True)
+class MaskedGeneration:
+    """Native MDLM sampling of the whole requested response, with a fixed prompt.
+
+    This is not LLaDA's or Dream's source-specific remasking recipe. EOS trims
+    the finished response, not the bidirectional denoising trajectory. Results
+    carry refinement counts, never autoregressive action likelihoods.
+    """
+
+    model: nn.Module
+    variables: Variables
+    process: DiscreteProcess
+    processor: Processor | None = None
+    sampler: Unmask = Unmask()
+    steps: int = MDLM_STEPS
+    eos_token_ids: tuple[int, ...] = ()
+    pad_token_id: int = 0
+    max_new_tokens: int | None = None
+    max_length: int | None = None
+    n: int = 1
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "variables", freeze(dict(self.variables)))
+
+    def bind(self, variables: Variables) -> MaskedGeneration:
+        """The same native MDLM task over another weight snapshot."""
+        return replace(self, variables=variables)
+
+    @overload
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
+                 n: int | None = None, steps: int | None = None,
+                 images: object | None = None) -> CanvasGeneration: ...
+
+    @overload
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
+                 n: int | None = None, steps: int | None = None,
+                 images: object | None = None) -> CanvasGeneration: ...
+
+    def __call__(self, request: Request, max_new_tokens: int | None = None, *,
+                 key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
+                 steps: int | None = None, images: object | None = None) -> CanvasGeneration:
+        inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
+            max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
+            max_length=self.max_length, key=key, seed=seed)
+        result = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
+            sampler=self.sampler, steps=self.steps if steps is None else steps, n=self.n if n is None else n,
+            eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
+        decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+        return replace(result, decoder=decoder)
+
+    def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
+        """Each row's valid response as text; empty without a processor."""
+        if generation.prompt_width is None:
+            raise ValueError("this generation has no prompt width")
+        rows = generation.host()
+        return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+
