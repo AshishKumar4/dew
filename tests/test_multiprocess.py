@@ -1311,3 +1311,20 @@ def test_masked_task_preserves_pool_rows_and_coordinates_invalid_requests(tmp_pa
     for name in ("tokens", "lengths", "terminated", "decoder_steps"):
         assert reports[0][name] + reports[1][name] == single[name], name
 
+
+
+
+@pytest.mark.distributed
+def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_path):
+    """A capture that cannot start on one rank must not leave its peer's open.
+
+    Rank 0's scheduled directory is a file, so its start fails while rank 1's
+    already began. Both have to report the profiling-start failure and reach
+    the barrier after it rather than hang in a collective."""
+    reports = run_pool("profile_failure", tmp_path / "pool", 2,
+                       devices=2, timeout=120, steps=4,
+                       profile_dir=str(tmp_path / "pool" / "trace"))
+    assert "profiling window start" in reports[0]["failed"]
+    assert "NotADirectoryError" in reports[0]["failed"]
+    assert "profiling window start" in reports[1]["failed"]
+    assert all(report["recovered"] == 2 for report in reports)

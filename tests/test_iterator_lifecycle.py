@@ -307,7 +307,22 @@ def test_fit_attempts_every_cleanup_without_masking_tracker_error(tmp_path, monk
         stopped.set()
         raise OSError("trace stop failed")
 
-    monkeypatch.setattr(jax.profiler, "start_trace", lambda directory: None)
+    import dew.telemetry.profile as telemetry_profile
+
+    real_version = telemetry_profile.version
+    monkeypatch.setattr(telemetry_profile, "version",
+                        lambda name: "0.0" if name == "xprof" else real_version(name))
+
+    class Converter:
+        def xspace_to_tool_names(self, paths):
+            return ["overview_page"]
+
+        def xspace_to_tool_data(self, paths, tool, params):
+            return b"{}", "application/json"
+
+    monkeypatch.setattr(telemetry_profile, "require_profile_support",
+                        lambda: Converter())
+    monkeypatch.setattr(jax.profiler, "start_trace", lambda *a, **k: None)
     monkeypatch.setattr(jax.profiler, "stop_trace", stop_trace)
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=Waiting(str(tmp_path)), tracker=Tracker(),
