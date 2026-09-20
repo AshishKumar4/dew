@@ -7,7 +7,7 @@ the step's key, and a golden fingerprint of five real steps pins the numbers
 of the objective and the trainer together.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import jax
 from dew.objectives.base import scalar_loss
@@ -20,8 +20,8 @@ from flax import linen as nn
 
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
-from dew.diffusion import broadcast_rates, expand, presets
-from dew.inputs import Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.diffusion import Process, broadcast_rates, expand, presets
+from dew.inputs import CharTable, Condition, ConditionEncoder, Field, InputSpec, unit_range
 from dew.nn.dit import TextContext
 from dew.objectives.base import Step, Variables
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
@@ -186,9 +186,8 @@ def test_the_compiled_step_carries_no_encoder_constants():
     assert (VOCAB, FEATURES) not in shapes_of_constants(objective.loss)
 
     class Leaky(DiffusionObjective):
-        def encode(self, encoders, tokens):
-            return {keyword: condition.encoder.encode(condition.encoder.params, tokens[keyword])
-                    for keyword, condition in self.inputs.conditions.items()}
+        def encode(self, encoders, tokens=None):
+            return super().encode(self.encoder_params(), tokens)
 
     leaky = Leaky(objective.model, objective.process, objective.inputs, steps=3)
     assert (VOCAB, FEATURES) in shapes_of_constants(leaky.loss)
@@ -317,3 +316,56 @@ def test_diffusion_objective_reproduces_the_golden_fingerprint(tmp_path):
 # devices of conftest move the third figure after the decimal point by 2e-9).
 GOLDEN = {"params": 15.044008062570356, "ema": 15.049092350082788,
           "opt_state": 2.391809580367163}
+
+
+
+@pytest.fixture(scope="module")
+def conditional_mmdit():
+    encoder = CharTable.from_pretrained(tokens=3, features=6, vocab=16)
+    inputs = InputSpec(Field("image", (4, 4, 1)), {"textcontext": Condition(encoder)})
+    model = models.SimpleMMDiT(output_channels=1, patch_size=2, emb_features=8,
+                               num_layers=1, num_heads=2, mlp_ratio=2, attention_impl="xla")
+    process = presets.EDM(sigma_max=1.0)()
+    objective = DiffusionObjective(model, process, inputs, steps=3, sampler=Euler(), guidance=CFG(2.0))
+    variables = objective.init(jax.random.key(0))
+    # The initialized zero output head otherwise hides conditioning gradients.
+    variables = {**variables, "params": jax.tree.map(lambda leaf: leaf + 0.02, variables["params"])}
+    table = variables["encoders"]["textcontext"]["table"].at[1].add(jnp.linspace(-1, 1, 6))
+    variables = {**variables, "encoders": {"textcontext": {"table": table}}}
+    batch = {"image": np.arange(64, dtype=np.uint8).reshape(4, 4, 4, 1) * 3,
+             **inputs.tokenize(["ab", "cd", "ef", "gh"])}
+    step = Step(jnp.asarray(0), jax.random.key(4), None)
+    return objective, variables, batch, step
+
+
+@pytest.mark.parametrize("probability", [0.5, 1.0])
+def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_mmdit, probability):
+    source, variables, batch, step = conditional_mmdit
+    dropped = DiffusionObjective(source.model, source.process, source.inputs,
+                                 unconditional_prob=probability, steps=3, sampler=Euler())
+    conditional = DiffusionObjective(source.model, source.process, source.inputs,
+                                     unconditional_prob=0.0, steps=3, sampler=Euler())
+    mask = jax.random.bernoulli(jax.random.split(step.key, 5)[1], probability, (4,))
+    explicit = source.inputs.tokenize([""] * 4)
+    explicit = {"image": batch["image"], "text": jax.tree.map(
+        lambda blank, given: jnp.where(mask[:, None], blank, given), explicit["text"], batch["text"])}
+    expected = jax.jit(jax.value_and_grad(
+        lambda values: scalar_loss(conditional, values, explicit, step)[0]))(variables)
+    actual = jax.jit(jax.value_and_grad(
+        lambda values: scalar_loss(dropped, values, batch, step)[0]))(variables)
+    assert float(jnp.linalg.norm(expected[1]["encoders"]["textcontext"]["table"])) > 1e-6
+    for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        np.testing.assert_allclose(left, right, atol=1e-6, rtol=1e-6)
+
+
+def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mmdit):
+    objective, variables, batch, step = conditional_mmdit
+    condition = objective.inputs.conditions["textcontext"]
+    rebound = replace(condition.encoder, params=variables["encoders"]["textcontext"])
+    inputs = replace(objective.inputs, conditions={"textcontext": replace(condition, encoder=rebound)})
+    reconstructed = DiffusionObjective(objective.model, objective.process, inputs,
+                                       steps=3, sampler=Euler(), guidance=CFG(2.0))
+    expected = reconstructed.evaluate(variables, batch, step).images
+    actual = objective.evaluate(variables, batch, step).images
+    np.testing.assert_array_equal(actual, expected)
+
