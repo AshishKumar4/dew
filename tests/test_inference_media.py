@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.inference import BlockGeneration, DenoisingInputs, TextToImage
+from dew.inference import DenoisingInputs, TextToImage
 from dew.interop import load_pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import CFG, Heun
@@ -98,3 +98,44 @@ def test_partial_image_trajectory_and_refiner_handoff_preserve_latents(tmp_path)
     np.testing.assert_array_equal(decoded.images, np.clip(tail.latents, -1, 1))
     with pytest.raises(ValueError, match="already noisy"):
         task.prepare(["flower"], initial=prefix.latents, noise=noise, seed=3)
+
+
+
+@pytest.mark.parametrize("family", ["diffusion-gemma-workflow", "gemma3-native-tiny"])
+def test_host_and_resident_media_generate_equivalent_public_results(family):
+    from dew.training import Layout, MeshSpec
+    from dew.training.distributed import build_mesh
+
+    directory = FIXTURE.parent / family
+    loaded = load_pretrained(directory, dtype="float32", attention_impl="xla", max_seq_len=64)
+    if family == "diffusion-gemma-workflow":
+        with np.load(directory / "reference.npz") as reference:
+            tokens = reference["image_prompt"]
+            inputs = ModelInputs(tokens, {"image_indices": np.where(tokens == 60, 0, -1)},
+                                 {"pixel_values": reference["pixels"]})
+        task = loaded.block_generation()
+    else:
+        images = np.load(directory / "raw_images.npy")
+        prompts = json.loads((directory / "prompts.json").read_text())
+        inputs = loaded.processor(prompts, images=[[images[0]], [images[1], images[2]]])
+        task = loaded.text_generation()
+    host_inputs = jax.tree.map(np.asarray, inputs)
+    resident = replace(host_inputs, conditioning=jax.tree.map(jnp.asarray, host_inputs.conditioning))
+    mesh = build_mesh(MeshSpec())
+    variables = jax.device_put(loaded.variables, Layout().shardings(mesh, loaded.variables))
+    task = task.bind(variables)
+    key = jax.random.key(7)
+    expected = task(host_inputs, 4, key=key).host()
+    jax.block_until_ready(resident.conditioning)
+    if family == "diffusion-gemma-workflow":
+        with jax.transfer_guard_device_to_host("disallow"):
+            generated = task(resident, 4, key=key)
+            jax.block_until_ready(generated.tokens)
+    else:
+        # Autoregressive checkify reports scalar error status on the host;
+        # public result equivalence does not forbid that control-plane transfer.
+        generated = task(resident, 4, key=key)
+    actual = generated.host()
+    for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+        np.testing.assert_array_equal(left, right)
+

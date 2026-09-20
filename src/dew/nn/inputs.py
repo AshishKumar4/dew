@@ -7,7 +7,7 @@ import hashlib
 import itertools
 import math
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -285,13 +285,23 @@ def agreed_validity(tree: TreeT, processes: int, *, controls: object = (),
     return filled_validity(tree, [bool(flag) for flag in gathered.max(axis=0)])
 
 
-def local_rows(leaf) -> np.ndarray:
-    """This process's rows of a batch leaf, in global order.
+@overload
+def local_rows(leaf: jax.typing.ArrayLike, *, host: Literal[True] = True) -> np.ndarray: ...
 
-    A global array hands back the rows this process's devices hold, with a
-    sequence-split second dimension reassembled. Anything a process can read
-    whole is read whole.
+
+@overload
+def local_rows(leaf: jax.typing.ArrayLike, *, host: bool) -> jax.Array | np.ndarray: ...
+
+
+def local_rows(leaf: jax.typing.ArrayLike, *, host: bool = True) -> jax.Array | np.ndarray:
+    """This process's rows in global order, optionally kept on device.
+
+    With ``host=False``, fully addressable JAX arrays retain their placement.
+    Partial global arrays still gather local shards on the host, reassembling
+    a sequence-split second dimension.
     """
+    if isinstance(leaf, jax.Array) and leaf.is_fully_addressable and not host:
+        return leaf
     if not isinstance(leaf, jax.Array) or leaf.is_fully_addressable:
         return np.asarray(leaf)
     if leaf.ndim == 0:
@@ -401,20 +411,21 @@ class RowPlan:
         return np.arange(self.count) >= self.rows
 
     def pad(self, tree):
-        """Rows repeated up to ``count`` on the host; unchanged when none are needed."""
+        """Repeat rows up to ``count`` without moving resident arrays to the host."""
         if self.count == self.rows:
             return tree
         indices = np.arange(self.count) % self.rows
-        return jax.tree.map(lambda leaf: np.asarray(leaf)[indices], tree)
+        return jax.tree.map(lambda leaf: leaf[indices] if isinstance(leaf, jax.Array)
+                            else np.asarray(leaf)[indices], tree)
 
     def place(self, tree):
-        """Padded host rows as device arrays, row-sharded on a mesh."""
+        """Place padded host or device rows, row-sharded on a mesh."""
         sharding = self.sharding
         if sharding is None:
             return jax.tree.map(jnp.asarray, tree)
 
         def put(leaf):
-            rows = np.asarray(leaf)
+            rows = leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)
             if rows.ndim == 0 or rows.shape[0] != self.count:
                 raise ValueError(f"a placed leaf needs {self.count} rows on axis zero, got {rows.shape}")
             return jax.make_array_from_process_local_data(sharding, rows)
@@ -429,7 +440,7 @@ class RowPlan:
         sharding = self.sharding
         if sharding is None:
             return row_keys
-        data = jax.make_array_from_process_local_data(sharding, np.asarray(jax.random.key_data(row_keys)))
+        data = jax.make_array_from_process_local_data(sharding, jax.random.key_data(row_keys))
         return jax.random.wrap_key_data(data, impl=jax.random.key_impl(key))
 
     def host(self, leaf) -> np.ndarray:

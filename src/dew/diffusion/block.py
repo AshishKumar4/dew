@@ -221,7 +221,7 @@ class BlockProcess:
         try:
             request = request_key(key, seed)
             canonical = ModelInputs.from_value(inputs)
-            prepared = jax.tree.map(local_rows, canonical)
+            prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
             _validated(model, self, prepared, max_new_tokens, eos_token_ids, pad_token_id, n)
         except BaseException as failure:
             error = failure

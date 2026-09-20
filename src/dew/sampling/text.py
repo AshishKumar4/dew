@@ -319,7 +319,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
 
 
 def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
-               conditioning: dict[str, np.ndarray], max_new_tokens: int, sampling: Sampling,
+               conditioning: dict[str, jax.Array | np.ndarray], max_new_tokens: int, sampling: Sampling,
                n: int) -> ModelInputs:
     """Host checks shared by every caller; returns device inputs whose validity
     field is present only where a prompt is actually padded."""
@@ -478,7 +478,7 @@ def _request(model: nn.Module, params: Variables,
     canonical = ModelInputs.from_value(inputs)
     ids = local_rows(canonical.tokens)
     fields = {name: local_rows(value) for name, value in canonical.token_fields.items()}
-    conditioning = {name: local_rows(value) for name, value in canonical.conditioning.items()}
+    conditioning = {name: local_rows(value, host=False) for name, value in canonical.conditioning.items()}
     if "params" not in params:
         raise ValueError("generate takes the full variables dict ({'params': ...})")
     prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling, n)
@@ -595,8 +595,7 @@ def generate(model: nn.Module, params: Variables,
         # Repeated rows carry no real token, so they finish at once and emit
         # nothing. Their validity is the field an unpadded request omitted.
         existing = padded.token_fields.get("attention_mask")
-        valid = (np.ones(padded.tokens.shape, bool) if existing is None
-                 else np.asarray(existing))
+        valid = jnp.ones(padded.tokens.shape, bool) if existing is None else existing
         padded = replace(padded, token_fields={**padded.token_fields,
                                                "attention_mask": valid & ~plan.padding[:, None]})
     failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
