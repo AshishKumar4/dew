@@ -213,11 +213,6 @@ class Transaction:
     def add_contribution(accumulated, contribution, factor):
         return jax.tree.map(lambda a, b: a + _unscale(b, factor), accumulated, contribution)
 
-    def replay_one(self, state, fill, index, cotangent, accumulated, factor, realize):
-        variables, batch, info = self.replay_input(state, fill, index)
-        realized = realize(variables, batch, info)
-        return self.add_contribution(accumulated, realized.pullback(cotangent), factor)
-
     def finish_attempt(self, state, batch, aux, pending, gradient):
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
@@ -293,6 +288,7 @@ class Transaction:
         pooled = compile_phase(self.pooled_cotangent)
         finish = compile_phase(self.finish_attempt)
         unscale = compile_phase(self.unscaled)
+        add = compile_phase(self.add_contribution)
 
         def run(state, batch):
             info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
@@ -307,7 +303,9 @@ class Transaction:
                 cot = pooled(pending.pooled, realized.stats, factor)
                 combined = unscale(realized.pullback(cot), factor)
                 def one(index, accumulated):
-                    return self.replay_one(state, pending.fill, index, cot, accumulated, factor, realize)
+                    replayed, records, step_info = self.replay_input(state, pending.fill, index)
+                    realized = realize(replayed, records, step_info)
+                    return add(accumulated, realized.pullback(cot), factor)
                 if host:
                     for index in range(self.size - 1):
                         combined = one(index, combined)
