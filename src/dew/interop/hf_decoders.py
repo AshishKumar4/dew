@@ -3,8 +3,8 @@
 translate_config and translate_weights are the map: a decoder config dict into
 CausalTransformer kwargs, and HF-named tensors into a dew params tree. The
 helpers around them fetch a repo (or read a local directory) and read the
-safetensors shards in their stored dtype without torch; the weight map
-widens parameters to fp32, so dew.interop.load_pretrained
+safetensors shards in their stored dtype without torch. Parameter binding
+defaults to FP32, independently of compute dtype, so dew.interop.load_pretrained
 builds a model whose variables a forward pass takes straight away, and
 save_pretrained_decoder writes one back out in the HF layout.
 
@@ -43,6 +43,7 @@ from typing import (Any, Callable, Dict, List, Mapping, NoReturn, Optional, Prot
 import numpy as np
 
 from dew.interop.safetensors_io import read_file
+from dew.nn.text_encoders import checkpoint_array
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
 from dew.nn.gemma3n import AltUp
 from dew.nn import llama4
@@ -1780,33 +1781,36 @@ def translate_wrapper_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     return record
 
 
-def _wrapper_tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
+def _wrapper_tower_variables(
+    kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+) -> Dict[str, Any]:
     if kind == "siglip":
-        return {"params": vision_nn.translate_siglip_vision_weights(hf_tensors)}
+        return {"params": vision_nn.translate_siglip_vision_weights(hf_tensors, param_dtype=param_dtype)}
     if kind == "llama4":
-        return {"params": vision_nn.translate_llama4_vision_weights(hf_tensors)}
+        return {"params": vision_nn.translate_llama4_vision_weights(hf_tensors, param_dtype=param_dtype)}
     if kind == "gemma4":
-        return vision_nn.translate_gemma4_vision_weights(hf_tensors)
+        return vision_nn.translate_gemma4_vision_weights(hf_tensors, param_dtype=param_dtype)
     if kind == "qwen3_5":
-        return {"params": vision_nn.translate_qwen35_vision_weights(hf_tensors)}
+        return {"params": vision_nn.translate_qwen35_vision_weights(hf_tensors, param_dtype=param_dtype)}
     if kind == "gemma3n":
-        return {"params": vision_nn.translate_gemma3n_vision_weights(hf_tensors)}
+        return {"params": vision_nn.translate_gemma3n_vision_weights(hf_tensors, param_dtype=param_dtype)}
     raise ValueError(f"tower kind {kind!r} has no weight map here")
 
 
-def _wrapper_projector_weights(kind: str,
-                               hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """Projector tensors by projector kind."""
+def _wrapper_projector_weights(
+    kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+) -> Dict[str, Any]:
+    """Projector tensors by projector kind, preserving the requested storage."""
     if kind == "gemma":
-        return vision_nn.translate_gemma_projector_weights(hf_tensors)
+        return vision_nn.translate_gemma_projector_weights(hf_tensors, param_dtype=param_dtype)
     if kind == "llama4":
-        return vision_nn.translate_llama4_projector_weights(hf_tensors)
+        return vision_nn.translate_llama4_projector_weights(hf_tensors, param_dtype=param_dtype)
     if kind == "gemma4":
-        return vision_nn.translate_gemma4_projector_weights(hf_tensors)
+        return vision_nn.translate_gemma4_projector_weights(hf_tensors, param_dtype=param_dtype)
     if kind == "qwen3_5":
-        return vision_nn.translate_qwen35_projector_weights(hf_tensors)
+        return vision_nn.translate_qwen35_projector_weights(hf_tensors, param_dtype=param_dtype)
     if kind == "gemma3n":
-        return vision_nn.translate_gemma3n_projector_weights(hf_tensors)
+        return vision_nn.translate_gemma3n_projector_weights(hf_tensors, param_dtype=param_dtype)
     raise ValueError(f"projector kind {kind!r} has no weight map here")
 
 
@@ -1821,9 +1825,13 @@ _WRAPPER_AUDIO_PREFIX = "audio_tower."
 _WRAPPER_AUDIO_PROJECTOR_PREFIX = "embed_audio."
 
 
-def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
-                              record: Mapping[str, Any]) -> Dict[str, Any]:
-    """Wrapper tensors into language, tower, projector and audio trees, in fp32.
+def translate_wrapper_weights(
+    hf_tensors: Mapping[str, np.ndarray],
+    record: Mapping[str, Any],
+    *,
+    param_dtype: str = "float32",
+) -> Dict[str, Any]:
+    """Wrapper weights into language, tower, projector and audio trees.
 
     One leading `model.` comes off every name first, which is the released
     nesting; what stays routes by prefix. The language half rides the text
@@ -1869,18 +1877,23 @@ def translate_wrapper_weights(hf_tensors: Mapping[str, np.ndarray],
         else:
             raise ValueError(f"unknown tensor name {name!r}")
     variables = {
-        "language_model": translate_weights(text_tensors, record["text"]),
-        "tower": _wrapper_tower_variables(tower_kind, tower_tensors),
-        "projector": {"params": _wrapper_projector_weights(projector_kind,
-                                                            projector_tensors)},
+        "language_model": translate_weights(
+            text_tensors, record["text"], param_dtype=param_dtype
+        ),
+        "tower": _wrapper_tower_variables(tower_kind, tower_tensors, param_dtype),
+        "projector": {
+            "params": _wrapper_projector_weights(
+                projector_kind, projector_tensors, param_dtype
+            )
+        },
     }
     if audio is not None:
         encoder = vision_nn.tower_from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError(f"audio tower kind {audio['kind']!r} has no weight map here")
-        variables["audio_tower"] = audio_nn.audio_weights(audio_tensors, encoder)
+        variables["audio_tower"] = audio_nn.audio_weights(audio_tensors, encoder, param_dtype=param_dtype)
         variables["audio_projector"] = {"params": _wrapper_projector_weights(
-            record["audio_projector"]["kind"], audio_projector_tensors)}
+            record["audio_projector"]["kind"], audio_projector_tensors, param_dtype)}
     return variables
 
 
@@ -2060,9 +2073,13 @@ def _stack_experts(params: Dict[str, Any]) -> None:
         mlp['experts'] = stacked
 
 
-def translate_weights(hf_tensors: Mapping[str, np.ndarray],
-                      config: Mapping[str, Any]) -> Dict[str, Any]:
-    """HF-named tensors into a CausalTransformer variables dict, in fp32.
+def translate_weights(
+    hf_tensors: Mapping[str, np.ndarray],
+    config: Mapping[str, Any],
+    *,
+    param_dtype: str = "float32",
+) -> Dict[str, Any]:
+    """HF tensors into a CausalTransformer tree; parameters default to FP32.
 
     Linear weights arrive as [out, in] and nn.Dense keeps [in, out], so every
     `.kernel` is transposed; norm `.weight` becomes `.scale`; Gemma's
@@ -2077,6 +2094,9 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     an expert dimension here; its dense shared experts, MLA projections
     and indexer map by pattern like everything else, and its routers'
     balancing bias lands in the `moe` collection beside `params`.
+    param_dtype changes floating parameter storage, independently of compute
+    dtype. Router and frozen state remain FP32; integer indices retain their
+    native dtype. Conversion happens per leaf before its layout copy.
     """
     tied_head = hf_tensors.get('lm_head.weight')
     if config['tie_embeddings'] and tied_head is not None:
@@ -2106,7 +2126,7 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
         path = family.weight_path(name, config)
         if path is None:
             continue
-        leaf = np.asarray(tensor, np.float32)
+        leaf = checkpoint_array(tensor, param_dtype if path[0] == "params" else "float32")
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
         if path[-1] == 'kernel' and leaf.ndim == 2:
@@ -2119,8 +2139,12 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray],
     return variables
 
 
-def translate_denoiser_weights(hf_tensors: Mapping[str, np.ndarray],
-                               config: Mapping[str, Any]) -> Dict[str, Any]:
+def translate_denoiser_weights(
+    hf_tensors: Mapping[str, np.ndarray],
+    config: Mapping[str, Any],
+    *,
+    param_dtype: str = "float32",
+) -> Dict[str, Any]:
     """A DiffusionGemma text checkpoint into the shared tree plus self-conditioning.
 
     The encoder (`model.encoder.language_model.*`) and the decoder
@@ -2158,13 +2182,17 @@ def translate_denoiser_weights(hf_tensors: Mapping[str, np.ndarray],
                     raise ValueError(
                         f"{key} differs between the encoder and the decoder, "
                         "which share their text weights")
-    return {"text": translate_weights(text, config),
-            "self_conditioning": {"params": translate_sc_weights(sc)}}
+    return {
+        "text": translate_weights(text, config, param_dtype=param_dtype),
+        "self_conditioning": {
+            "params": translate_sc_weights(sc, param_dtype=param_dtype)
+        },
+    }
 
 
 def _read_shard(path: Path) -> Dict[str, np.ndarray]:
     """Every tensor of one safetensors file, memory mapped in its stored
-    dtype. Leaves bound to the tree are cast to fp32 by translate_weights;
+    dtype. The translator chooses each bound leaf's storage precision;
     packed payloads such as MXFP4 stay bytes for their dequantizer."""
     tensors, _ = read_file(path)
     return tensors

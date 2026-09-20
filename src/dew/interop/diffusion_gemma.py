@@ -76,8 +76,17 @@ def build(config: Mapping[str, object], *, dtype: str = "bfloat16",
                           conditioner=conditioner)
 
 
-def translate_weights(tensors: Mapping[str, np.ndarray], config: Mapping[str, object]) -> Variables:
-    """Map published aliases and media tensors into one native parameter tree."""
+def translate_weights(
+    tensors: Mapping[str, np.ndarray],
+    config: Mapping[str, object],
+    *,
+    param_dtype: str = "float32",
+) -> Variables:
+    """Map shared aliases and media weights with independent parameter storage.
+
+    Each component casts parameters at its binding site; frozen state remains
+    native FP32. No completed FP32 variables tree is narrowed afterward.
+    """
     text: dict[str, np.ndarray] = {}
     vision: dict[str, np.ndarray] = {}
     projection: dict[str, np.ndarray] = {}
@@ -89,7 +98,7 @@ def translate_weights(tensors: Mapping[str, np.ndarray], config: Mapping[str, ob
         else:
             text[name] = tensor
     fields = translate_config(text_config(config))
-    mapped = translate_denoiser_weights(text, fields)
+    mapped = translate_denoiser_weights(text, fields, param_dtype=param_dtype)
     params = {"text": mapped["text"]["params"],
               "self_conditioning": mapped["self_conditioning"]["params"]}
     variables = {"params": params}
@@ -99,10 +108,10 @@ def translate_weights(tensors: Mapping[str, np.ndarray], config: Mapping[str, ob
     if config.get("vision_config") is not None:
         if not vision or not projection:
             raise ValueError("vision_config requires both vision_tower and embed_vision tensors")
-        tower_variables = translate_gemma4_vision_weights(vision)
+        tower_variables = translate_gemma4_vision_weights(vision, param_dtype=param_dtype)
         params["conditioner"] = {
             "tower": tower_variables["params"],
-            "projector": translate_gemma4_projector_weights(projection)}
+            "projector": translate_gemma4_projector_weights(projection, param_dtype=param_dtype)}
         if "constants" in tower_variables:
             variables.setdefault("constants", {})["conditioner"] = {"tower": tower_variables["constants"]}
     elif vision or projection:
