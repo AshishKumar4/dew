@@ -48,3 +48,56 @@ def test_public_generation_override_keeps_canvas_semantics():
     with np.load(FIXTURE / "reference.npz") as reference:
         np.testing.assert_array_equal(result.tokens, reference["stopped"][:, :12])
         np.testing.assert_array_equal(result.decoder_steps, reference["stopped_steps"])
+
+
+def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(tmp_path):
+    import json
+    import jax.numpy as jnp
+    import optax
+    import dew
+    from dew.inference import BlockGeneration
+    from dew.inference.pipeline import place
+    from dew.nn.diffusion_gemma import DiffusionGemma
+    from dew.objectives.base import FROZEN
+    from dew.objectives.diffusion.block import BlockDiffusionObjective
+    from dew.training import Checkpoints, Trainer
+
+    bundle = load_pretrained(str(FIXTURE), dtype="float32", param_dtype="bfloat16")
+    assert isinstance(bundle.model, DiffusionGemma)
+    source = dew.pipeline(str(FIXTURE), dtype="float32", param_dtype="bfloat16")
+    assert isinstance(source, BlockGeneration)
+    for expected, actual in zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(source.variables), strict=True):
+        assert actual.dtype == expected.dtype
+        np.testing.assert_array_equal(actual, expected)
+    wanted = bundle.block_generation()([[1, 5, 7]], 3, seed=4).host()
+    actual = source([[1, 5, 7]], 3, seed=4).host()
+    np.testing.assert_array_equal(actual.tokens, wanted.tokens)
+    np.testing.assert_array_equal(actual.decoder_steps, wanted.decoder_steps)
+
+    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables)
+    state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
+    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints.save(0, state, None)
+    checkpoints.wait()
+    record = {"objective": "block_diffusion",
+              "model": {"architecture": "diffusion_gemma",
+                        "config": {**bundle.config, "max_seq_len": bundle.model.max_seq_len},
+                        "dtype": "float32", "attention_impl": "auto"},
+              "tokenizer": "byte", "pad_token_id": 0}
+    (tmp_path / "run.json").write_text(json.dumps(record))
+    restored = dew.pipeline(str(tmp_path), ema=False, dtype="bfloat16", param_dtype="float32")
+    assert isinstance(restored, BlockGeneration)
+    expected_vars = {name: jax.tree.map(lambda leaf: leaf.astype(jnp.float32), value)
+                     if name in ("params", FROZEN) else value for name, value in state.params.items()}
+    expected_model = objective.model.clone(text=objective.model.text.clone(dtype=jnp.bfloat16))
+    expected_task = BlockGeneration(expected_model, place(expected_vars, None, None),
+                                    BlockProcess(expected_model.canvas_length, expected_model.vocab_size))
+    assert jnp.dtype(restored.model.text.dtype) == jnp.dtype(jnp.bfloat16)
+    for expected, actual in zip(jax.tree.leaves(expected_vars), jax.tree.leaves(restored.variables), strict=True):
+        assert actual.dtype == expected.dtype
+        np.testing.assert_array_equal(actual, expected)
+    result = restored([[1, 5, 7]], 3, seed=8).host()
+    expected = expected_task([[1, 5, 7]], 3, seed=8).host()
+    np.testing.assert_array_equal(result.tokens, expected.tokens)
+    np.testing.assert_array_equal(result.decoder_steps, expected.decoder_steps)
+

@@ -689,7 +689,7 @@ def translate_vae_weights(torch_tensors: Mapping[str, Any]) -> dict:
 FLAX_REVISIONS = ("bf16", "flax")
 
 
-def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
+def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) -> dict:
     """A pretrained AutoencoderKL's config and params, from a local directory
     or the Hub.
 
@@ -698,7 +698,8 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
     `flax`/`bf16` revision. Every 16-channel VAE (SD3.5, Flux) ships torch
     `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
     reads, so the newer latent spaces load through the same seam.
-    Returns a dict with `config` (dict) and `params` (nested param tree).
+    Returns a dict with config and params. Supplied params are authoritative;
+    only configuration and repository file metadata are read, never weight bytes.
 
     `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
     the torch path then reads the repo's default branch. Any other revision is
@@ -711,7 +712,7 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
         directory = Path(modelname)
         with open(directory / "config.json") as handle:
             config = json.load(handle)
-        return {"config": config, "params": _read_vae_weights(directory)}
+        return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
 
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
@@ -727,10 +728,16 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
         try:
             config_path = hf_hub_download(modelname, "config.json",
                                           revision=candidate_revision, subfolder=subfolder)
-            weights_path = hf_hub_download(modelname, "diffusion_flax_model.msgpack",
-                                           revision=candidate_revision, subfolder=subfolder)
             with open(config_path) as f:
                 config = json.load(f)
+            # Candidate eligibility must match a source load even when a
+            # config exists in a revision that carries no matching weights.
+            weights_path = hf_hub_download(modelname, "diffusion_flax_model.msgpack",
+                                           revision=candidate_revision, subfolder=subfolder,
+                                           dry_run=params is not None)
+            if params is not None:
+                return {"config": config, "params": params}
+            assert isinstance(weights_path, str)
             with open(weights_path, "rb") as f:
                 return {"config": config, "params": msgpack_restore(f.read())}
         except (EntryNotFoundError, RevisionNotFoundError) as e:
@@ -744,14 +751,14 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16") -> dict:
             config_path = hf_hub_download(modelname, "config.json",
                                           revision=candidate_revision, subfolder=subfolder)
             hf_hub_download(modelname, "diffusion_pytorch_model.safetensors",
-                            revision=candidate_revision, subfolder=subfolder)
+                            revision=candidate_revision, subfolder=subfolder, dry_run=params is not None)
         except (EntryNotFoundError, RevisionNotFoundError) as e:
             last_error = e
             continue
         directory = Path(config_path).parent
         with open(config_path) as handle:
             config = json.load(handle)
-        return {"config": config, "params": _read_vae_weights(directory)}
+        return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
 
     raise FileNotFoundError(
         f"no VAE weights in {modelname}"

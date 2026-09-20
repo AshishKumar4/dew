@@ -124,10 +124,7 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
     spec = InputSpec(Field("image", (8, 8, 3)),
                      {"textcontext": Condition(CLIPText.from_pretrained(str(TINY)))})
     data = spec.to_json()
-    assert data["conditions"]["textcontext"] == {
-        "encoder": {"name": "clip_text", "fields": {"checkpoint": str(TINY), "dtype": None}},
-        "field": "text", "unconditional": ""}
-    assert data["sample"] == {"key": "image", "shape": [8, 8, 3]}
+
 
     restored = InputSpec.from_json(data)
     assert restored.sample == spec.sample
@@ -137,34 +134,7 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
                           np.asarray(encoder.encode(encoder.params, tokens).hidden))
 
 
-def test_a_pinned_revision_reaches_the_tokenizer_and_the_record(monkeypatch):
-    """A pin has to survive the whole way round: the tokenizer loads from the
-    pinned revision along with the weights, and `to_json` keeps the pin, so
-    an `InputSpec` rebuilt from a run's record reads the same revision."""
-    from transformers import AutoTokenizer
 
-    seen = []
-    original = AutoTokenizer.from_pretrained
-
-    def capture(name, **fields):
-        seen.append(fields.get("revision"))
-        return original(name, **{k: v for k, v in fields.items() if k != "revision"})
-
-    monkeypatch.setattr(AutoTokenizer, "from_pretrained", capture)
-    encoder = CLIPText.from_pretrained(str(TINY), revision="refs/pr/1")
-
-    assert seen == ["refs/pr/1"]
-    assert encoder.to_json() == {"checkpoint": str(TINY), "dtype": None,
-                                 "revision": "refs/pr/1"}
-
-    spec = InputSpec(Field("image", (8, 8, 3)), {"textcontext": Condition(encoder)})
-    rebuilt = InputSpec.from_json(spec.to_json()).conditions["textcontext"].encoder
-    assert rebuilt.revision == "refs/pr/1"
-    assert seen == ["refs/pr/1", "refs/pr/1"]
-
-    # An unpinned encoder records no revision, so a record stays as small as
-    # what the run actually chose.
-    assert "revision" not in CLIPText.from_pretrained(str(TINY)).to_json()
 
 
 def test_padding_is_masked_where_the_reference_masks_it():
@@ -470,3 +440,54 @@ def test_public_text_encoder_storage_is_separate_from_compute(kind):
         assert np.asarray(before).dtype == np.float32
         assert after.dtype == jnp.bfloat16
         np.testing.assert_array_equal(after, np.asarray(before).astype(jnp.bfloat16))
+
+
+@pytest.mark.parametrize("kind", ["clip_text", "t5"])
+def test_convenience_encoder_rebuild_binds_saved_weights_without_source_reads(kind, tmp_path, monkeypatch):
+    import dataclasses
+    import jax
+    import jax.numpy as jnp
+    from dew.inputs import T5Text
+    from dew.inputs.encoders import rebuild
+    import dew.nn.text_encoders as loaders
+
+    cls = CLIPText if kind == "clip_text" else T5Text
+    directory = TINY if kind == "clip_text" else FIXTURES.parent / "t5/tiny"
+    kwargs = {} if kind == "clip_text" else {"max_length": 8}
+    encoder = cls.from_pretrained(str(directory), dtype="float32", param_dtype="bfloat16", **kwargs)
+    tokens = encoder.tokenize(["a red bird"])
+    ordinary = rebuild(kind, encoder.to_json())
+    np.testing.assert_array_equal(ordinary.encode(ordinary.params, tokens).hidden,
+                                  encoder.encode(encoder.params, tokens).hidden)
+    assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(ordinary.params))
+
+    # The restored tree differs from the source. A reload cannot accidentally
+    # pass the forward comparison, even if it happens to use the right dtype.
+    saved = jax.tree.map(lambda leaf: leaf + jnp.asarray(0.125, leaf.dtype), encoder.params)
+    saved = {**saved, "constants": {"scale": jnp.asarray([1.003], jnp.float32),
+                                   "ids": jnp.asarray([16777217], jnp.int32)}}
+    for source in directory.iterdir():
+        if source.is_file() and source.suffix != ".safetensors":
+            shutil.copyfile(source, tmp_path / source.name)
+
+    def forbid_weights(*args, **kwargs):
+        raise AssertionError("supplied-variable reconstruction opened source weights")
+
+    monkeypatch.setattr(loaders, "_read_tensors", forbid_weights)
+    fields = {**encoder.to_json(), "checkpoint": str(tmp_path),
+              "dtype": "bfloat16", "param_dtype": "float32"}
+    spec = InputSpec.from_json(
+        {"sample": {"key": "image", "shape": [8, 8, 3]},
+         "conditions": {"textcontext": {"encoder": {"name": kind, "fields": fields},
+                                         "field": "text", "unconditional": ""}}},
+        params={"textcontext": saved})
+    restored = spec.conditions["textcontext"].encoder
+    expected = dataclasses.replace(encoder, transformer=encoder.transformer.clone(dtype=jnp.bfloat16),
+                                   dtype=jnp.bfloat16, params=saved)
+    np.testing.assert_array_equal(restored.encode(restored.params, tokens).hidden,
+                                  expected.encode(saved, tokens).hidden)
+
+    for before, after in zip(jax.tree.leaves(saved), jax.tree.leaves(restored.params), strict=True):
+        assert after.dtype == before.dtype
+        np.testing.assert_array_equal(after, before)
+

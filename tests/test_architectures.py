@@ -67,9 +67,11 @@ class StubText(ConditionEncoder):
     params: dict
 
     @classmethod
-    def from_pretrained(cls, checkpoint: str, **fields):
-        return cls(params={"table": jnp.asarray(
-            np.random.RandomState(0).normal(size=(TEXT_VOCAB, TEXT_FEATURES)).astype(np.float32))})
+    def from_pretrained(cls, checkpoint: str, *, params=None, **fields):
+        if params is None:
+            params = {"table": jnp.asarray(
+                np.random.RandomState(0).normal(size=(TEXT_VOCAB, TEXT_FEATURES)).astype(np.float32))}
+        return cls(params=params)
 
     def tokenize(self, texts):
         ids = np.zeros((len(texts), TEXT_TOKENS), np.int32)

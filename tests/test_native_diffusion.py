@@ -173,3 +173,76 @@ def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(save
     for layout in latest.weight_layouts:
         expected = original[layout.name] + np.float32(1.) if layout.name == changed.name else original[layout.name]
         np.testing.assert_array_equal(layout.export(latest.variables), expected)
+
+
+@pytest.mark.parametrize("family", ["sd", "xl", "sd3", "flux"])
+def test_conditioner_rebuild_uses_supplied_weights_without_reading_any_source_shard(
+        saved_pipelines, tmp_path, monkeypatch, family):
+    from dataclasses import replace
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from dew.inputs.diffusion import DiffusionConditioner
+    from dew.inputs.encoders import rebuild
+    from dew.interop import diffusion, load_pretrained
+
+    if family in ("sd3", "flux"):
+        with tarfile.open(ROOT / f"tests/fixtures/{family}_source.tar.xz") as archive:
+            archive.extractall(tmp_path, filter="data")
+        directory = tmp_path / "pipeline"
+    else:
+        directory = saved_pipelines / family
+    source = load_pretrained(directory, dtype="float32", attention_impl="xla")
+    assert source.inputs is not None
+    encoder = source.inputs.conditions["conditioning"].encoder
+    assert isinstance(encoder, DiffusionConditioner)
+    tokens = encoder.tokenize(["a red bird"])
+    from fnmatch import fnmatch
+    import huggingface_hub
+
+    cache = tmp_path / "hub" / ("a" * 40)
+    selected = set(encoder.names)
+    if encoder.t5 is not None:
+        selected.add(encoder.t5.name)
+    supplied = False
+
+    def snapshot(repo_id, *, revision=None, allow_patterns):
+        # Model the Hub storage boundary: forbidden weight files cannot be
+        # transferred even if the caller would never open them afterward.
+        for source_file in directory.rglob("*"):
+            if not source_file.is_file():
+                continue
+            relative = source_file.relative_to(directory)
+            if not any(fnmatch(relative.as_posix(), pattern) for pattern in allow_patterns):
+                continue
+            if source_file.suffix == ".safetensors" and (supplied or relative.parts[0] not in selected):
+                raise AssertionError(f"unrequested weight download: {relative}")
+            destination = cache / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source_file, destination)
+        return str(cache)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
+    ordinary = DiffusionConditioner.from_pretrained("fixture/conditioner", dtype="float32", revision="main")
+    for actual, reference in zip(jax.tree.leaves(ordinary.encode(ordinary.params, tokens)),
+                                 jax.tree.leaves(encoder.encode(encoder.params, tokens)), strict=True):
+        np.testing.assert_array_equal(actual, reference)
+
+    saved = jax.tree.map(lambda leaf: (jnp.asarray(leaf) + 0.015625).astype(jnp.bfloat16), encoder.params)
+    expected = replace(encoder, params=saved).encode(saved, tokens)
+
+    def forbid_weights(*args, **kwargs):
+        raise AssertionError("conditioner reconstruction opened source weights")
+
+    monkeypatch.setattr(diffusion, "component_tensors", forbid_weights)
+    supplied = True
+    rebuilt = rebuild("diffusion_text", {**encoder.to_json(), "checkpoint": "fixture/conditioner",
+                                         "revision": "main", "param_dtype": "float32"}, params=saved)
+    actual = rebuilt.encode(rebuilt.params, tokens)
+
+    for reference, value in zip(jax.tree.leaves(expected), jax.tree.leaves(actual), strict=True):
+        np.testing.assert_array_equal(value, reference)
+    for actual, original in zip(jax.tree.leaves(rebuilt.params), jax.tree.leaves(saved), strict=True):
+        assert actual.dtype == original.dtype == jnp.bfloat16
+        np.testing.assert_array_equal(actual, original)
+

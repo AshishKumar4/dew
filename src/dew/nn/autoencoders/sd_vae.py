@@ -13,13 +13,18 @@ class StableDiffusionVAE(AutoEncoder):
     def __init__(self, modelname="CompVis/stable-diffusion-v1-4", revision="bf16",
                  dtype=jnp.bfloat16, latent_shift=None, latent_scale=None, params=None,
                  model: AutoencoderKL | None = None):
+        """Bind supplied params unchanged, reading only missing model metadata.
+
+        Without params, load source weights. Supplying model as well avoids
+        metadata I/O; dtype controls computation and never casts supplied params.
+        """
         self.modelname = modelname
         self.revision = revision
         self.dtype = dtype
         if model is None:
-            pretrained = load_pretrained_vae(modelname, revision=revision)
+            pretrained = load_pretrained_vae(modelname, revision=revision, params=params)
             config = pretrained["config"]
-            params = pretrained["params"] if params is None else params
+            params = pretrained["params"]
             model = AutoencoderKL(
                 channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
                 image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],

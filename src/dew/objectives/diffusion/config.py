@@ -18,7 +18,8 @@ from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.registry import datasets, metrics, models, presets, samplers
+from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, samplers
+from dew.objectives.base import FROZEN, Variables
 from dew.sampling.guidance import CFG
 from .objective import DiffusionObjective
 
@@ -68,8 +69,10 @@ class TextCondition:
 
     encoder: str = "clip_text"
     checkpoint: str = DEFAULT_MODEL
-    dtype: Optional[Literal["float32", "bfloat16"]] = None
+    dtype: Optional[DtypeName] = None
     """The encoder's compute dtype; None keeps the checkpoint's."""
+    param_dtype: DtypeName = "float32"
+    """Storage precision when loading source weights; supplied params retain theirs."""
     field: str = "text"
     """The batch field holding the tokenized text."""
     unconditional: str = ""
@@ -81,12 +84,14 @@ class TextCondition:
     """The checkpoint's git revision. A rerun then conditions on the weights
     the run named, even after the branch has moved on."""
 
-    def build(self) -> Condition:
+    def build(self, *, params: Variables | None = None) -> Condition:
+        """Bind supplied encoder params without a source weight load or storage cast."""
         fields = {name: value for name, value in
                   (("max_length", self.max_length), ("revision", self.revision))
                   if value is not None}
         return Condition(
-            rebuild(self.encoder, {"checkpoint": self.checkpoint, "dtype": self.dtype, **fields}),
+            rebuild(self.encoder, {"checkpoint": self.checkpoint, "dtype": self.dtype,
+                                   "param_dtype": self.param_dtype, **fields}, params=params),
             field=self.field, unconditional=self.unconditional)
 
 
@@ -96,18 +101,20 @@ class StableDiffusionAutoencoder:
 
     modelname: str = "pcuenq/sd-vae-ft-mse-flax"
     revision: str = "bf16"
-    dtype: Literal["float32", "bfloat16"] = "bfloat16"
+    dtype: DtypeName = "bfloat16"
     latent_shift: Optional[float] = None
     latent_scale: Optional[float] = None
     """Per-dataset latent statistics; None keeps the checkpoint's."""
 
-    def build(self) -> AutoEncoder:
+    def build(self, *, params: Variables | None = None) -> AutoEncoder:
+        """Bind supplied VAE params while reconstructing its model metadata."""
         from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
         from dew.registry import resolve_dtype
 
         return StableDiffusionVAE(self.modelname, revision=self.revision,
                                   dtype=resolve_dtype(self.dtype),
-                                  latent_shift=self.latent_shift, latent_scale=self.latent_scale)
+                                  latent_shift=self.latent_shift, latent_scale=self.latent_scale,
+                                  params=params)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -158,17 +165,35 @@ class DiffusionRunConfig(RunConfig):
                                      else autoencoder.latent_channels)
         return fields
 
-    def build(self) -> DiffusionObjective:
-        """The objective this run trains: the model, the process, the inputs
-        and the autoencoder, with validation sampling as configured. The one
-        construction, shared by the recipe and by `TextToImage.from_run`."""
+    @property
+    def parameter_roots(self) -> tuple[tuple[str, ...], ...]:
+        """Parameter ownership in the variables tree this config builds."""
+        roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
+        if self.text is not None:
+            prefix = ("encoders", "textcontext")
+            collections = encoders[self.text.encoder].parameter_collections
+            roots.extend((prefix,) if collections is None else
+                         (prefix + (collection,) for collection in collections))
+        if self.autoencoder is not None:
+            roots.append(("autoencoder",))
+        return tuple(roots)
+
+    def build(self, *, variables: Variables | None = None) -> DiffusionObjective:
+        """Build the configured compute owners around their parameters.
+
+        Supplied variables are the authoritative saved snapshot. Encoders and
+        the VAE read only configuration/tokenizer metadata and bind their
+        respective subtrees without a source weight load or storage cast.
+        """
         if self.text is None and self.model.architecture in TEXT_STREAM_MODELS:
             raise ValueError(
                 f"an unconditional run needs a model that attends without text, and "
                 f"{self.model.architecture!r} runs the text as a second stream through "
                 "every block")
-        autoencoder = None if self.autoencoder is None else self.autoencoder.build()
-        conditions = {} if self.text is None else {"textcontext": self.text.build()}
+        autoencoder = (None if self.autoencoder is None else self.autoencoder.build(
+            params=None if variables is None else variables["autoencoder"]))
+        conditions = {} if self.text is None else {"textcontext": self.text.build(
+            params=None if variables is None else variables["encoders"]["textcontext"])}
         inputs = InputSpec(sample=self.sample_field(), conditions=conditions)
         model = models.build(self.model.architecture, **self.model_fields(autoencoder))
         process = self.preset()
@@ -179,7 +204,7 @@ class DiffusionRunConfig(RunConfig):
                 "Process; a discrete preset trains through MaskedDiffusionObjective")
         return DiffusionObjective(
             model, process, inputs,
-            autoencoder=autoencoder,
+            autoencoder=autoencoder, pretrained=variables,
             unconditional_prob=self.unconditional_prob,
             ema_decay=self.ema_decay,
             sampler=self.sampler,

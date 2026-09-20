@@ -311,3 +311,20 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     restored = dew.pipeline(str(tmp_path))([[1, 2]], seed=3).host()
     np.testing.assert_array_equal(restored.tokens, expected.tokens)
     np.testing.assert_allclose(restored.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)
+
+    from dataclasses import replace
+    import jax.numpy as jnp
+    from dew.inference import TextGeneration
+
+    baseline = dew.pipeline(str(tmp_path))
+    assert isinstance(baseline, TextGeneration)
+    params = {**baseline.variables, "params": jax.tree.map(
+        lambda leaf: leaf.astype(jnp.bfloat16), baseline.variables["params"])}
+    expected_task = replace(baseline, model=baseline.model.clone(dtype=jnp.bfloat16), variables=params)
+    converted = dew.pipeline(str(tmp_path), dtype="bfloat16", param_dtype="bfloat16")
+    assert isinstance(converted, TextGeneration)
+    wanted = expected_task([[1, 2]], 1, seed=3).host()
+    result = converted([[1, 2]], 1, seed=3).host()
+    np.testing.assert_array_equal(result.tokens, wanted.tokens)
+    np.testing.assert_array_equal(result.raw_log_probs, wanted.raw_log_probs)
+

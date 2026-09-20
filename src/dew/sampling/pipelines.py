@@ -22,7 +22,8 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import ArrayT, RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.artifacts import agree_process_phase
 from jax.experimental import multihost_utils
-from dew.objectives.base import Variables
+from dew.objectives.base import FROZEN, Variables
+from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
@@ -116,28 +117,39 @@ class TextToImage:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool = True, step: int | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: str | None = None) -> TextToImage:
+                 dtype: str | None = None, param_dtype: str | None = None) -> TextToImage:
         """The run in `directory`: its `run.json` built the way the recipe
         built it, and the weights of its latest checkpoint (or `step`).
 
         `ema` reads the averaged weights when the run kept them. With `mesh`
         the weights restore straight onto that mesh under `layout`, the way
         the trainer places them; without one the default mesh uses the current pool.
+        dtype overrides computation in the model, encoders and VAE. param_dtype
+        overrides parameter storage; None preserves checkpoint storage exactly.
         """
         from dew.objectives.diffusion import DiffusionRunConfig
 
-        objective = DiffusionRunConfig.load(directory).build()
-        params = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout, dtype=dtype)
-        return cls.from_objective(objective, params)
+        config = DiffusionRunConfig.load(directory)
+        compute = dtype_name(resolve_dtype(dtype))
+        if compute is not None:
+            config = replace(config, model=replace(config.model, dtype=compute),
+                             text=None if config.text is None else replace(config.text, dtype=compute),
+                             autoencoder=None if config.autoencoder is None else
+                             replace(config.autoencoder, dtype=compute))
+        params = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
+                                   param_dtype=param_dtype, parameter_roots=config.parameter_roots)
+        return cls.from_objective(config.build(variables=params), params)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, ema: bool = True, mesh: MeshSpec | None = None,
-                        layout: Layout | None = None, dtype: str | None = None) -> TextToImage:
+                        layout: Layout | None = None, dtype: str | None = None,
+                        param_dtype: str | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
         `dew.interop.hub.push_to_hub` writes it."""
         from dew.interop.hub import pull_from_hub
 
-        return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema, mesh=mesh, layout=layout, dtype=dtype)
+        return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema, mesh=mesh, layout=layout,
+                            dtype=dtype, param_dtype=param_dtype)
 
     def prepared_process(self, steps: int) -> tuple[Process, tuple[float, ...] | None]:
         """The process and explicit time grid a `steps` call walks; the grid
@@ -426,16 +438,19 @@ def _image_start(rows: jax.sharding.NamedSharding | None):
 
 
 def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: MeshSpec | None,
-                      layout: Layout | None, dtype: str | None) -> Variables:
+                      layout: Layout | None, param_dtype: str | None,
+                      parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))) -> Variables:
     """A run's published variables, restored onto the current mesh under a layout.
 
-    The checkpoint is its own template. `ema` merges the averaged copy over
-    the live weights when the run kept one; `dtype` casts the floating leaves.
+    The checkpoint is its own template. Owner-declared parameter roots select
+    floating weights for param_dtype; other leaves keep their stored dtype.
+    EMA uses the live tree's selection, restricted to the leaves it contains.
     """
     from dew.checkpoints import Checkpoints
     from dew.objectives.base import merge
     from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
 
+    target = resolve_dtype(param_dtype)
     checkpoints = Checkpoints(directory)
     stored = checkpoints.stored(step)
     template = {"params": stored["params"]}
@@ -448,23 +463,25 @@ def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: Mesh
     chosen_layout = DefaultLayout() if layout is None else layout
     placement = chosen_layout.shardings(device_mesh, template)
     chosen_layout.check(template["params"], placement["params"], device_mesh)
-    template = jax.tree.map(
-        lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
+    selected = set()
+    if target is not None:
+        roots = tuple(tuple(jax.tree_util.DictKey(name) for name in root) for root in parameter_roots)
+        selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(stored["params"])[0]
+                    if jnp.issubdtype(leaf.dtype, jnp.floating) and
+                    any(path[:len(root)] == root for root in roots)}
+    template = jax.tree_util.tree_map_with_path(
+        lambda path, leaf, sharding: jax.ShapeDtypeStruct(
+            leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),
         template, placement)
     values, _ = checkpoints.restore(template, step=step)
     params = values["params"]
     if averaged:
         params = merge(params, values["ema"])
-    if dtype is not None:
-        params = cast_floating(params, dtype)
+
     return params
 
 
-def cast_floating(tree, dtype: str):
-    """Every floating leaf as `dtype`, keeping each leaf's placement."""
-    target = jnp.dtype(dtype)
-    return jax.tree.map(
-        lambda leaf: leaf.astype(target) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
+
 
 
 @functools.lru_cache(maxsize=None)

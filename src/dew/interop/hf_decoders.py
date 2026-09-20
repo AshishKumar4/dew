@@ -2265,18 +2265,22 @@ def _load_shards(directory: Path) -> Dict[str, np.ndarray]:
     return tensors
 
 
-def _snapshot(name_or_dir: str, revision: Optional[str]) -> Path:
-    """A local directory as given, or a hub snapshot downloaded once."""
+def _snapshot(name_or_dir: str, revision: Optional[str], *,
+              weights: bool | tuple[str, ...] = True) -> Path:
+    """Resolve a snapshot with all, no, or named components' weight shards."""
     if os.path.isdir(name_or_dir):
         return Path(name_or_dir)
     from huggingface_hub import snapshot_download
+
+    weight_patterns = (["*.safetensors"] if weights else []) if isinstance(weights, bool) else [
+        f"{component}/*.safetensors" for component in weights]
 
     return Path(
         snapshot_download(
             name_or_dir,
             revision=revision,
             allow_patterns=[
-                "*.safetensors",
+                *weight_patterns,
                 "*.json",
                 "*.txt",
                 "*.model",
