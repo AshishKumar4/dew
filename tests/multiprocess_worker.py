@@ -1685,7 +1685,60 @@ def mode_decoding_components(args) -> dict:
     }
 
 
+def mode_masked_generation(args) -> dict:
+    """Native MDLM row keys and setup failures over the real CPU pool."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import multihost_utils
+    from dew.inference.pipeline import place
+    from dew.interop import load_pretrained
+    from dew.nn.inputs import ModelInputs
+    from dew.training import Layout, MeshSpec
+
+    rank, processes = jax.process_index(), jax.process_count()
+    source = load_pretrained(Path(__file__).parent / "fixtures/hf/llada-tiny",
+                             dtype="float32", attention_impl="xla")
+    task = source.text_generation().bind(place(source.variables, MeshSpec(fsdp=args.fsdp_size),
+                                              Layout(min_shard=TINY)))
+    prompts = np.asarray([[120, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12],
+                          [0, 0, 120, 5], [0, 6, 7, 8], [0, 0, 0, 9]], np.int32)
+    valid = np.asarray([[1, 1, 1, 1]] * 3 + [[0, 0, 1, 1], [0, 1, 1, 1], [0, 0, 0, 1]], bool)
+    rows = len(prompts) // processes
+    mine = slice(rank * rows, (rank + 1) * rows)
+    fields = {} if valid[mine].all() else {"attention_mask": jnp.asarray(valid[mine])}
+    request = ModelInputs(jnp.asarray(prompts[mine]), fields)
+    result = task(request, 8, steps=5, seed=7, n=2).host()
+    np.testing.assert_array_equal(result.tokens[:, :4], np.repeat(prompts[mine], 2, axis=0))
+    assert np.all(result.tokens[:, 4:] != 120)
+    refused = []
+    if processes > 1:
+        for label in ("conditioning", "steps"):
+            invalid = request
+            steps = 5
+            if rank == 1:
+                if label == "conditioning":
+                    invalid = request.replace(conditioning={"pixel_values": jnp.zeros((rows, 1, 3, 4, 4))})
+                else:
+                    steps = 0
+            try:
+                task(invalid, 8, steps=steps, seed=7, n=2)
+            except (ValueError, RuntimeError) as error:
+                diagnostic = " ".join([str(error), *getattr(error, "__notes__", ())])
+                assert label in diagnostic and "rank 1" in diagnostic, diagnostic
+                refused.append(label)
+            else:
+                raise AssertionError(f"rank one's invalid {label} request was accepted")
+            np.testing.assert_array_equal(multihost_utils.process_allgather(np.asarray(rank, np.int32)),
+                                          np.arange(processes))
+        recovered = task(request, 8, steps=5, seed=7, n=2).host()
+        np.testing.assert_array_equal(recovered.tokens, result.tokens)
+    return {"rows": result.rows, "tokens": result.tokens.tolist(), "lengths": result.lengths.tolist(),
+            "terminated": result.terminated.tolist(), "decoder_steps": result.decoder_steps.tolist(),
+            "valid_lengths": valid[mine].sum(axis=1).tolist(), "refused": refused}
+
+
 MODES = {"topology": mode_topology, "data": mode_data, "packed": mode_packed,
+         "masked_generation": mode_masked_generation,
          "packed_fit": mode_packed_fit,
          "inference_pipeline": mode_inference_pipeline,
          "continuations": mode_continuations,

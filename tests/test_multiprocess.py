@@ -1294,3 +1294,20 @@ def test_a_pool_agrees_on_its_decoding_components_or_refuses_the_request(tmp_pat
         assert reports[0][name] + reports[1][name] == single[name], name
     assert len(set(single["draft_lengths"])) > 1, "the rows did not end raggedly"
     assert len(single["beam_tokens"]) == 2 * len(single["draft_tokens"])
+
+
+@pytest.mark.distributed
+def test_masked_task_preserves_pool_rows_and_coordinates_invalid_requests(tmp_path):
+    deadline = 180
+    reports = run_pool("masked_generation", tmp_path / "pool", 2,
+                       devices=2, fsdp_size=2, timeout=deadline)
+    out = tmp_path / "single.json"
+    single = report_of(spawn("masked_generation", out, devices=1, fsdp_size=1), out, timeout=deadline)
+    assert reports[0]["valid_lengths"] == [4, 4, 4]
+    assert reports[1]["valid_lengths"] == [2, 3, 1]
+    for report in reports:
+        assert report["rows"] == 6
+        assert report["refused"] == ["conditioning", "steps"]
+    for name in ("tokens", "lengths", "terminated", "decoder_steps"):
+        assert reports[0][name] + reports[1][name] == single[name], name
+
