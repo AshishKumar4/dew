@@ -14,11 +14,13 @@ Model training with JAX and Flax
 [Documentation](docs/index.md) · [Installation](#installation) · [Examples](examples/) · [API reference](docs/reference/core-api.md)
 </div>
 
+> An AI assistant maintains this README. It is provided as-is.
+
 Dew is a framework for training language models, image and video diffusion models, and JEPA encoders in JAX. It provides Flax Linen models and training objectives, with a shared trainer for optimization, device sharding, evaluation, and checkpoints.
 
 Use the supplied architectures, load a supported Hugging Face checkpoint, or train your own Flax model. Model variables and training state remain JAX PyTrees; optimizers are Optax transformations, data loading uses Grain, and checkpoints use Orbax.
 
-APIs and checkpoint formats can change before 1.0. [Models](#models) lists the configurations whose whole workflow runs.
+APIs and checkpoint formats can change before 1.0. [Models](#models) lists supported configurations and workflow limits.
 
 ## Contents
 
@@ -212,8 +214,8 @@ The DPO and GRPO objectives run on the same trainer as pretraining. `dew.rl` hol
 
 ## Models
 
-The supported configurations below can be loaded, trained, used for generation,
-and exported through Dew's public APIs.
+The tables below list native architectures and supported checkpoint families.
+Each section describes their training, inference, and export workflows.
 
 ### Text decoders
 
@@ -222,6 +224,11 @@ and exported through Dew's public APIs.
 `dew.sampling.generate` or `Pretrained.text_generation()`, and
 `Pretrained.save` writes `config.json`, `model.safetensors` and
 `generation_config.json` back in the Hugging Face layout.
+
+`dtype` selects computation; `param_dtype` independently selects parameter
+storage. `load_pretrained` keeps FP32 parameters by default. Pass
+`param_dtype="bfloat16"` to reduce weight storage without changing the
+compute dtype. Non-parameter state retains its declared precision.
 
 | Model or family | `model_type` |
 |---|---|
@@ -240,12 +247,10 @@ and exported through Dew's public APIs.
 | Kimi K2 | `kimi_k2` |
 | Llama 4 text | `llama4_text` |
 
-Kimi K2 loads and exports under its own `model_type` rather than DeepSeek
-V3's, so a trained checkpoint keeps the vocabulary, rope base and routing
-widths it came with. `tests/fixtures/hf/kimi-k2-tiny/source.json` pins the
-released revision those were scaled from. The 1T released weights were not
-downloaded, so the load, `Trainer` update, export and reference reload run
-on that tiny fixture on CPU in float32.
+Kimi K2 keeps its own model type, vocabulary, RoPE settings, and routing widths
+when exported. Small fixtures cover loading, a `Trainer` update, export, and
+reference reload. Their [source record](tests/fixtures/hf/kimi-k2-tiny/source.json)
+pins the released configuration.
 
 ### Native multimodal models
 
@@ -258,7 +263,7 @@ carries the processor and tokenizer files beside the weights.
 |---|---|---|
 | Gemma 3 | `gemma3` | Images |
 | Gemma 3n | `gemma3n` | Images through MobileNet-v5; waveforms |
-| Gemma 4 | `gemma4` | Images; waveforms |
+| Gemma 4 | `gemma4` | Images; videos; waveforms |
 | Qwen 3.5 | `qwen3_5` | Images and timestamped videos, with M-RoPE positions |
 | Llama 4 | `llama4` | Tiled images |
 
@@ -287,11 +292,15 @@ claimed, and more than one prediction layer is refused.
 
 | Model | `model_type` | Workflow |
 |---|---|---|
-| Diffusion Gemma | `diffusion_gemma` | Canvas generation and the published Google SFT recipe |
+| Diffusion Gemma | `diffusion_gemma` | Canvas generation; text and image-conditioned SFT |
 
 `BlockDiffusionObjective` trains the canvas loss from the loaded weights and
-`Pretrained.block_generation()` decodes canvases. The objective makes
-`layer_scalar` trainable, so the export goes through the objective's model:
+`Pretrained.block_generation()` decodes canvases. Text SFT follows Google's
+published recipe. Image-conditioned SFT uses the same `ModelInputs`, `Dataset`
+and `Trainer` path. Images condition the clean encoder; their placeholder slots
+are not text targets. `BlockGeneration` takes the matching `images=` when it
+decodes. The objective makes `layer_scalar` trainable, so the export goes
+through the objective's model:
 `replace(loaded, model=objective.model).save(directory, variables=state.params)`.
 
 ### Masked-diffusion decoders
@@ -310,16 +319,17 @@ Transformers ships no class for either release, so the export is qualified
 against the block each of them is, read with an all-visible attention mask:
 `LlamaForCausalLM` for LLaDA and `Qwen2ForCausalLM` for Dream.
 
-### Unsupported configurations
+### Pretrained diffusion and quantized checkpoints
 
-| Model or family | `model_type` | Missing piece |
-|---|---|---|
-| Quantized source-format export | FP8 / MXFP4 | Requantization of trained weights into the original blocks/scales is unsupported |
+`load_pretrained` reads SD, SDXL, SD3, and Flux pipeline directories.
+SD and SDXL include img2img, inpainting, and the SDXL refiner.
 
-Video inputs are qualified on Qwen 3.5 only; the other processors are
-exercised for text, images and waveforms. Native checkpoint loading covers
-SD and SDXL, including img2img, inpainting and the SDXL refiner.
-SD3 and Flux do not yet have loaders.
+For supported FP8 and MXFP4 checkpoints, `Pretrained.save` requantizes trained
+weights into the source format's blocks and scales.
+
+Model-family tests use small source-shaped fixtures. Full-size checkpoint
+execution, accelerator performance, and physical multi-host validation remain
+incomplete. Video inputs are qualified on Gemma 4 and Qwen 3.5.
 
 ### Diffusion and representation models
 
@@ -647,6 +657,55 @@ print(tokenizer.decode(result.tokens[0], skip_special_tokens=True))
 
 Pass `pretrained=pretrained.variables` to `LMObjective` or a post-training objective to continue from those weights, and tokenize the training data with the checkpoint's own tokenizer. [Generating and serving](#generating-and-serving) draws from the result and exports it.
 
+### Composing a native decoder
+
+`CausalTransformer` takes its layer pattern as configuration. This decoder
+uses a local/global attention pattern of three windowed layers to one global
+layer, trains on a Grain stream, then generates from the trained state:
+
+```python
+import grain.python as grain
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+
+from dew import Checkpoints, Dataset, Trainer
+from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
+from dew.objectives.lm import LMObjective
+from dew.sampling import Sampling
+
+model = CausalTransformer(
+    vocab_size=8, emb_features=64, num_layers=4,
+    num_heads=4, num_kv_heads=2, mlp_features=128, max_seq_len=32,
+    layer_types=("sliding_attention",) * 3 + ("full_attention",),
+    kinds={"sliding_attention": LayerKind(window=8)},
+    dtype=jnp.float32,
+)
+row = np.resize(np.array([1, 2, 3, 4], np.int32), 17)
+batch = {"text": np.tile(row, (4, 1))}
+stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
+data = Dataset(train=lambda: iter(stream), val=None, records=4, batch=4)
+objective = LMObjective(model, seq_len=16, ema_decay=None)
+checkpoints = Checkpoints("runs/custom-decoder")
+state = Trainer(objective, optax.adamw(0.003), key=jax.random.key(0),
+                checkpoints=checkpoints).fit(data, steps=40, log_every=20,
+                                             checkpoint_every=40)
+checkpoints.wait()
+task = objective.pipeline(state, ema=False)
+result = task([[1, 2]], 8, key=jax.random.key(1), sampling=Sampling(temperature=0))
+print(np.asarray(result.tokens))
+```
+
+`layer_types` names each layer's kind and `kinds` says what that kind does:
+`sliding_attention` attends 8 keys including its own, and `full_attention`
+attends all of them. A Grain `to_iter_dataset()` iterator carries
+`get_state`/`set_state`, which is what `checkpoint_every` needs to record a
+data position; a plain generator carries neither, and `Trainer` refuses that
+pair. `objective.pipeline` returns the `TextGeneration` task over the state's
+weights.
+
 ### Custom Flax models
 
 An objective can train an ordinary Linen module. This example learns `y = 2x + 1` with a single dense layer.
@@ -695,6 +754,27 @@ Pass `eval_every` and metrics to `fit` to score validation data. Set `preview=Tr
 `Checkpoints` saves numerical state and data position through Orbax. Rebuild the run with the same checkpoint directory to continue it. `fit(steps=1200)` sets a total target: restoring step 1000 runs toward 1200, not 2200. Recipe configuration is separate; `RunConfig.save` writes `run.json`.
 
 See [checkpointing and resume](docs/guides/checkpoints.md) for restore requirements, local checkpoints, and current recovery limitations.
+
+Which call continues a run depends on the artifact you kept:
+
+| What you have | What it continues into | Call |
+|---|---|---|
+| A native checkpoint directory | The same run: optimizer state, the root key, and the data position | `Trainer(..., checkpoints=Checkpoints(directory))`, then `fit` |
+| A `TrainState` in memory | Generation from the weights you just trained | `objective.pipeline(state)` |
+| A saved run: `run.json` beside its checkpoints | Generation, with the model rebuilt from the record | `dew.pipeline(run_directory)` |
+| A source checkpoint directory or Hub repository | Generation, or training from those weights | `dew.pipeline(source)`, or `load_pretrained(source)` for the variables |
+| Trained variables another runtime has to read | The source format, without Dew | `Pretrained.save(directory, variables=state.params)` |
+
+`Pretrained.save` writes the weights, the config it derives, and the
+tokenizer or processor files. It does not include optimizer state or data
+position; retain the native checkpoint to resume the training state.
+
+Reproducing a run bitwise on CUDA needs deterministic GPU reductions, which
+`--xla_gpu_deterministic_ops=true` requests and `TrainerConfig.xla_flags`
+appends to `XLA_FLAGS`. Check that flag against the attention backend you
+run: under JAX 0.11.1, repeated cuDNN backward calls currently fail with it
+set, while the XLA attention path passed the recorded bitwise checks, which
+is the path `tools/qualify_training.py` takes as `--attention-impl xla`.
 
 ### Standalone evaluation and local reports
 
