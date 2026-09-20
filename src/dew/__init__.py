@@ -29,6 +29,7 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.objectives.base import Aux, EMASpec, Step
     from dew.registry import datasets, encoders, metrics, models, presets, samplers
     from dew.sampling import CFG, sample
+    from dew.telemetry.profile import profile
     from dew.training import (
         Checkpoints, Evaluation, Layout, LocalTracker, MeshSpec, MLflowTracker,
         TensorBoardTracker, Tracker, Trackers, Trainer, TrainState, WandbTracker, evaluate,
@@ -59,6 +60,7 @@ _EXPORTS = {
     "InputSpec": "dew.inputs", "Field": "dew.inputs", "Condition": "dew.inputs",
     "sample": "dew.sampling", "CFG": "dew.sampling",
     "pipeline": "dew.inference",
+    "profile": "dew.telemetry.profile",
     "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
     "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
     "TokenScores": "dew.artifacts",
@@ -88,6 +90,6 @@ __all__ = [
     "ImageGrid", "InputSpec", "Layout", "MLflowTracker", "MeshSpec", "Objective", "Process",
     "Representations", "Step", "TensorBoardTracker", "TextSamples", "TokenScores", "Tracker",
     "TrainState", "Trainer", "VideoGrid", "LocalTracker", "Trackers", "WandbTracker",
-    "datasets", "encoders", "evaluate", "metrics", "models", "pipeline", "presets", "sample",
+    "datasets", "encoders", "evaluate", "metrics", "models", "pipeline", "profile", "presets", "sample",
     "samplers",
 ]

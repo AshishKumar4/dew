@@ -36,6 +36,7 @@ license = "MIT"
 dew-tpu = "dew.cli.tpu:main"
 
 [project.optional-dependencies]
+profile = ["xprof>=2.23.2,<3"]
 test = [
     "pytest",
     "pytest-xdist",
