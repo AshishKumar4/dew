@@ -253,3 +253,42 @@ def test_a_padded_prompt_gives_a_history_transform_the_same_row_as_an_unpadded_o
                            sampling=Sampling(temperature=0))
     assert not np.array_equal(np.asarray(together.tokens)[0, 4:],
                               np.asarray(unpenalized.tokens)[0, 4:])
+
+
+@pytest.mark.parametrize("factory,values", [
+    (decoding.Temperature, (0.5, 2.0)),
+    (decoding.TopP, (0.35, 0.95)),
+    (decoding.MinP, (0.1, 0.8)),
+])
+def test_scalar_values_change_outputs_without_retracing_a_fixed_chain(factory, values):
+    from dew.sampling.text import _digest, resolve
+
+    traces = []
+
+    @jax.jit
+    def apply(transforms, state, logits):
+        traces.append(None)
+        return decoding.chain(transforms)(state, logits)
+
+    state = StepState(tokens=jnp.ones((1, 1), jnp.int32), valid=jnp.ones((1, 1), bool),
+                      step=jnp.zeros(1, jnp.int32), active=jnp.ones(1, bool),
+                      keys=jax.random.split(jax.random.key(0), 1), prompt_width=1)
+    logits = jnp.asarray([[-2.0, -1.0, 0.0, 1.0]], jnp.float32)
+    first = resolve(Sampling(), (factory(values[0]),), None, None)
+    second = resolve(Sampling(), (factory(values[1]),), None, None)
+    a = np.asarray(apply(first[0], state, logits))
+    b = np.asarray(apply(second[0], state, logits))
+    assert traces == [None]
+    assert not np.array_equal(a, b)
+    assert _digest(first) != _digest(second), "pooled ranks must detect different effective policies"
+
+
+def test_sampling_defaults_and_explicit_policies_generate_the_same_outputs(model):
+    module, params = model
+    sampling = Sampling(temperature=0.5, top_k=5, top_p=0.95, min_p=0.2)
+    explicit = (decoding.Temperature(0.5), decoding.TopK(5), decoding.TopP(0.95), decoding.MinP(0.2))
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    a = generate(module, params, prompt, 3, key=jax.random.key(0), sampling=sampling)
+    b = generate(module, params, prompt, 3, key=jax.random.key(0), sampling=sampling, logits=explicit)
+    for field in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
+        np.testing.assert_array_equal(np.asarray(getattr(a, field)), np.asarray(getattr(b, field)))

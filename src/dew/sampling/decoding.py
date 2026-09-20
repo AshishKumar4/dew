@@ -206,6 +206,26 @@ class Greedy:
                          point, logits)
 
 
+def _temperature(value: float, state: StepState, logits: jax.Array) -> jax.Array:
+    return logits / value
+
+
+def _top_p(excluded_mass: float, state: StepState, logits: jax.Array) -> jax.Array:
+    order = jnp.argsort(logits, axis=-1, stable=True)
+    ascending = jnp.take_along_axis(logits, order, axis=-1)
+    tail = jnp.cumsum(jax.nn.softmax(ascending), axis=-1) <= excluded_mass
+    tail = tail.at[:, -1].set(False)
+    rows = jnp.arange(logits.shape[0])[:, None]
+    removed = jnp.zeros_like(tail).at[rows, order].set(tail)
+    return jnp.where(removed, FILTER, logits)
+
+
+def _min_p(p: float, state: StepState, logits: jax.Array) -> jax.Array:
+    probabilities = jax.nn.softmax(logits)
+    cutoff = jnp.max(probabilities, axis=-1, keepdims=True) * p
+    return jnp.where(probabilities < cutoff, FILTER, logits)
+
+
 @struct.dataclass
 class Temperature:
     """`logits / value`, as `TemperatureLogitsWarper`."""
@@ -216,7 +236,7 @@ class Temperature:
         _positive("temperature", self.value)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        return logits / self.value
+        return _temperature(self.value, state, logits)
 
 
 @struct.dataclass
@@ -248,13 +268,7 @@ class TopP:
         _unit("top_p", self.p)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        order = jnp.argsort(logits, axis=-1, stable=True)
-        ascending = jnp.take_along_axis(logits, order, axis=-1)
-        tail = jnp.cumsum(jax.nn.softmax(ascending), axis=-1) <= 1.0 - self.p
-        tail = tail.at[:, -1].set(False)
-        rows = jnp.arange(logits.shape[0])[:, None]
-        removed = jnp.zeros_like(tail).at[rows, order].set(tail)
-        return jnp.where(removed, FILTER, logits)
+        return _top_p(1.0 - self.p, state, logits)
 
 
 @struct.dataclass
@@ -267,9 +281,7 @@ class MinP:
         _unit("min_p", self.p)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        probabilities = jax.nn.softmax(logits)
-        cutoff = jnp.max(probabilities, axis=-1, keepdims=True) * self.p
-        return jnp.where(probabilities < cutoff, FILTER, logits)
+        return _min_p(self.p, state, logits)
 
 
 @struct.dataclass
@@ -969,14 +981,20 @@ def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
 def as_pytree(value: LogitsTransform) -> LogitsTransform:
     """`value` in a form `jax.jit` accepts as data.
 
-    A built-in transform or criterion is already a pytree. A plain function is
-    a leaf that `jit` cannot take, so it is wrapped in
-    `jax.tree_util.Partial`, which keeps the function in the tree structure
-    and any array arguments as data. `dew.sampling.strategies` applies the
-    same rule to a strategy.
+    Validated scalar policies lower to partials whose numerical arguments
+    are dynamic leaves. Other built-ins retain their registered pytrees.
+    A plain function is wrapped in a Partial that keeps the function static
+    and its bound arguments as data; strategies use that same callable rule.
     """
     if not callable(value):
         raise TypeError(f"a decoding component must be callable, got {type(value).__name__}")
+    if type(value) is Temperature:
+        return jax.tree_util.Partial(_temperature, value.value)
+    if type(value) is TopP:
+        # Match the public callable's host subtraction before scalar tracing.
+        return jax.tree_util.Partial(_top_p, 1.0 - value.p)
+    if type(value) is MinP:
+        return jax.tree_util.Partial(_min_p, value.p)
     return jax.tree_util.Partial(value) if jax.tree_util.all_leaves([value]) else value
 
 

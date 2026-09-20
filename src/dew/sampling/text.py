@@ -369,7 +369,8 @@ def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | 
     EOS criterion rather than replacing it, so naming a criterion cannot drop
     termination by accident. No strategy means `Sample`.
     """
-    return (sampling.transforms() if logits is None else decoding.components(logits, "logits"),
+    transforms = sampling.transforms() if logits is None else logits
+    return (decoding.components(transforms, "logits"),
             (() if stopping is None else decoding.components(stopping, "stopping"))
             + sampling.criteria(),
             Sample() if strategy is None else strategies.as_pytree(strategy))
