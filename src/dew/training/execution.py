@@ -13,8 +13,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.inference.banks import entry_names, named, one_layer
-from dew.nn.backbones.causal_transformer import StackView
+from dew.inference.banks import entry_tree, one_layer
+from dew.nn.backbones.causal_transformer import DecoderBank, StackView
 from dew.objectives.base import FROZEN, Step
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
@@ -44,7 +44,7 @@ class HostExecution:
         weights = {collection: tree for collection, tree in variables.items()
                    if collection in ("params", FROZEN)}
         entries = {**{collection: tree for collection, tree in variables.items()
-                       if collection not in weights}, **named(weights, entry_names(weights))}
+                       if collection not in weights}, **entry_tree(weights, (DecoderBank((), self.view),))}
         entry_placement = {collection: {name: placement[collection][name] for name in tree}
                            for collection, tree in entries.items()}
         store = transfer(entries, entry_placement)
