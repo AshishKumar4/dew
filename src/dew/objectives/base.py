@@ -29,6 +29,7 @@ from dew.artifacts import Artifacts
 if TYPE_CHECKING:
     from dew.inputs import InputSpec
     from dew.training.state import TrainState
+    from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
     from dew.sampling.pipelines import TextToImage
 
@@ -222,11 +223,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         return None
 
     @property
-    def layer_groups(self) -> tuple[tuple[int, int], ...]:
-        """Scanned layer runs, as (first, count), for an execution snapshot.
+    def bank_sites(self) -> tuple["DecoderBank", ...]:
+        """Physical scanned stacks this objective evaluates, for an execution snapshot.
 
-        Objectives without a layer stack have only entry variables. The
-        canonical variables and optimizer trees never adopt these banks.
+        Each site names a decoder namespace below every variables collection
+        and its StackView, as the model declares them. Objectives without a
+        layer stack have only entry variables. The canonical variables and
+        optimizer trees never adopt these banks.
         """
         return ()
 

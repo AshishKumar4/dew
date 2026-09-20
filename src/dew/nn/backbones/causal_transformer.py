@@ -1641,8 +1641,12 @@ class CausalTransformer(nn.Module):
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
-        if not self.scan_layers:
-            raise ValueError("parameter banks require scan_layers=True on their decoder owner")
+        """This decoder's stored stack: scanned runs, or one layer per bank.
+
+        `groups` already says which is which. A scanned stack declares its
+        runs and a plain loop declares singletons, and `run_stack` fetches a
+        run of one the same way it fetches a longer one.
+        """
         bound = self if self.scope is not None else self.bind({})
         return (DecoderBank((), StackView(bound.groups)),)
 
