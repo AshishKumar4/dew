@@ -1,5 +1,7 @@
 # Working on Dew
 
+An AI assistant maintains this file. It is provided as-is.
+
 Read `CONTRIBUTING.md` for design, reference parity, code, tests, and writing standards. This checklist adds agent workflow rules; it does not duplicate that contract. Follow the user's current scope and approval boundaries.
 
 ## Scope and implementation
@@ -20,9 +22,20 @@ Read `CONTRIBUTING.md` for design, reference parity, code, tests, and writing st
 
 - Run the affected test files with pytest's cache enabled. Let the coordinating agent run integration suites; capture complete output and exit status once instead of rerunning a suite to recover failure names.
 - In a worktree, pytest uses its configured source path; run scripts with `PYTHONPATH=src` so they import that worktree. Use the project's environment and commands documented in `CONTRIBUTING.md`.
-- Use small deterministic cases for logic and representative GPU/TPU cases for device behavior. Confirm the test size exercises the intended failure without constructing a production model by accident.
+- Use CPU tests for fast logic checks. Validate device behavior and performance on real GPUs and TPUs, locally when possible. Keep test cases small enough to isolate the failure.
 - For numerical changes, record reference version, inputs, dtype, backend, command, observed error, and the reason for the tolerance. Investigate a failing bound before changing it.
 - A shell pipeline's last command succeeding does not prove tests passed. Stop integration on a failed check; fix and rerun the affected behavior.
+
+## Performance investigations
+
+- Start with [JAX/XProf](https://docs.jax.dev/en/latest/201/profiling.html) and [Grain's native diagnostics](https://google-grain.readthedocs.io/en/latest/tutorials/dataset_debugging_tutorial.html). Add instrumentation only for a demonstrated visibility gap.
+- Separate compilation, data warm-up, steady execution, and checkpoint/inference costs. Choose capture windows from settled timings and compile events, not a fixed warm-up assumption.
+- Preserve asynchronous execution. Synchronize timing boundaries, not every step; distinguish dispatch time from completed device work.
+- Keep profiling-disabled execution free of timers, trace allocations, retained arrays, extra transfers, and synchronization. Measure active-capture overhead separately.
+- Attribute stalls across input production, placement, dispatch, collectives, and kernels before changing code. Busy-device percentages alone do not establish useful throughput or compute efficiency.
+- Use compile-time JAX naming inside compiled code. Inspect compilation, shapes, static arguments, and executable reuse before blaming missing JIT or replacing kernels.
+- Cache deterministic work before random transformations unless frozen augmentation is intentional. Preserve record order, randomness, restart position, sharding, and buffer memory bounds.
+- Profile the actual execution configuration. Label diagnostic variants; preserve native reports and missing-data warnings rather than presenting unavailable counters as zero.
 
 ## Reporting
 
