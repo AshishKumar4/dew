@@ -58,6 +58,39 @@ def test_row_plan_preserves_resident_rows_padding_and_random_keys():
     np.testing.assert_array_equal(jax.random.key_data(keys), jax.random.key_data(expected_keys))
 
 
+def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from dew.nn.inputs import ModelInputs
+    from dew.training.distributed import build_mesh, shard_batch
+
+    mesh = build_mesh()
+    rows = 2 * jax.device_count()
+    tokens = jnp.arange(rows * 4, dtype=jnp.int32).reshape(rows, 4)
+    pixels = jnp.arange(rows * 12, dtype=jnp.float32).reshape(rows, 2, 2, 3) / 16
+    labels = np.arange(rows, dtype=np.int32)
+    batch = {"text": ModelInputs(tokens, conditioning={"pixel_values": pixels}),
+             "labels": labels, "weight": np.float32(0.5)}
+    jax.block_until_ready(batch)
+    with jax.transfer_guard_device_to_host("disallow"):
+        placed = shard_batch(mesh, batch)
+        jax.block_until_ready(placed)
+    np.testing.assert_array_equal(placed["text"].tokens, np.arange(rows * 4).reshape(rows, 4))
+    np.testing.assert_array_equal(placed["text"].conditioning["pixel_values"],
+                                  np.arange(rows * 12, dtype=np.float32).reshape(rows, 2, 2, 3) / 16)
+    np.testing.assert_array_equal(placed["labels"], labels)
+    np.testing.assert_array_equal(placed["weight"], np.float32(0.5))
+    assert placed["text"].tokens.dtype == jnp.int32
+    assert placed["text"].conditioning["pixel_values"].dtype == jnp.float32
+    assert "attention_mask" not in placed["text"].token_fields
+    row_axes = ("data", "expert", "fsdp", "tensor")
+    assert placed["text"].tokens.sharding == NamedSharding(mesh, P(row_axes, "sequence"))
+    assert placed["text"].conditioning["pixel_values"].sharding == NamedSharding(mesh, P(row_axes))
+    assert placed["labels"].sharding == NamedSharding(mesh, P(row_axes))
+    assert placed["weight"].sharding == NamedSharding(mesh, P())
+
+
 def test_char_table_compute_override_preserves_supplied_storage():
     import jax.numpy as jnp
     from dew.inputs import CharTable

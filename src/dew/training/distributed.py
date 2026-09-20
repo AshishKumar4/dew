@@ -457,7 +457,7 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
     return jax.tree.map(
         lambda leaf, sharding: jax.make_array_from_process_local_data(
-            sharding, np.asarray(leaf)),
+            sharding, leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)),
         batch, batch_shardings(mesh, batch))
 
 
