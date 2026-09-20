@@ -19,6 +19,7 @@ import optax
 
 from dew.inputs import Field, InputSpec
 from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.inputs import ModelInputs
 from dew.objectives.base import (Aux, Batch, EMASpec, Mean, Objective, Step,
                                  Variables, mean_loss)
 from dew.registry import objectives
@@ -40,7 +41,8 @@ def _positions(valid: jax.Array) -> jax.Array:
     return counts - (counts >= 1)
 
 
-def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, canvas_size: int):
+def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, canvas_size: int,
+                    positions: jax.Array | None = None, image_groups: jax.Array | None = None):
     """Represent the reference's circular overlay without mutating encoder K/V.
 
     Google evaluates the whole response, not only the selected canvas. Its
@@ -55,9 +57,14 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
     physical = jnp.arange(total)
     ordered = jnp.argsort(~valid, axis=-1, stable=True)
     packed_valid = jnp.take_along_axis(valid, ordered, axis=-1)
-    positions = _positions(valid)
+    positions = _positions(valid) if positions is None else positions
     packed_positions = jnp.take_along_axis(positions, ordered, axis=-1)
-    encoder_mask = (ordered[:, None, :] <= physical[None, :, None]) & packed_valid[:, None, :]
+    encoder_mask = ordered[:, None, :] <= physical[None, :, None]
+    if image_groups is not None:
+        key_groups = jnp.take_along_axis(image_groups, ordered, axis=-1)
+        encoder_mask |= ((image_groups[:, :, None] == key_groups[:, None, :])
+                         & (image_groups[:, :, None] >= 0))
+    encoder_mask &= packed_valid[:, None, :]
     write_slots = (prompt_length + selected[:, None] * canvas_size
                    + jnp.arange(response)[None, :]) % total
     overwritten = jnp.any(physical[None, :, None] == write_slots[:, None, :], axis=-1)
@@ -82,11 +89,14 @@ def _row_mean(losses: jax.Array, mask: jax.Array) -> Mean:
 class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     """Official post-release SFT over clean ``text`` rows split into prompt and canvases.
 
-    A row has ``prompt_length + canvas_size * num_canvases`` tokens. Optional
-    ``canvas_mask`` and ``encoder_target_mask`` select valid targets; absent
-    masks are derived from the pad ID and adjacent valid encoder positions,
-    matching Google's SequenceTargetShift. Every response token is corrupted,
-    but only a uniformly selected valid canvas contributes diffusion CE.
+    A row has ``prompt_length + canvas_size * num_canvases`` tokens. ``text``
+    accepts token arrays or ModelInputs; media conditions only the clean encoder.
+    Supplied attention validity controls cache occupancy, otherwise the pad ID
+    and canvas mask do. Optional ``canvas_mask`` and ``encoder_target_mask``
+    select text targets; media placeholders are never labels. Default encoder
+    targets require adjacent valid slots, matching Google's SequenceTargetShift.
+    Every response token is corrupted, but only a uniformly selected valid
+    canvas contributes diffusion CE.
     """
 
     def __init__(self, model: DiffusionGemma, *, prompt_length: int,
@@ -191,15 +201,29 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, params: Variables, batch: Batch, step: Step):
-        tokens = jnp.asarray(batch["text"])
+        value = batch["text"]
+        prepared = value if isinstance(value, ModelInputs) else ModelInputs(jnp.asarray(value))
+        tokens = prepared.tokens
         if tokens.ndim != 2 or tokens.shape[1] != self.sequence_length or not jnp.issubdtype(tokens.dtype, jnp.integer):
             raise ValueError(f"block SFT expects integer [B, {self.sequence_length}] token rows")
         tokens = tokens.astype(jnp.int32)
+        fields = prepared.token_fields
         response = tokens[:, self.prompt_length:]
-        canvas_mask = jnp.asarray(batch.get("canvas_mask", response != self.pad_token_id), bool)
+        validity = fields.get("attention_mask")
+        response_valid = response != self.pad_token_id if validity is None else validity[:, self.prompt_length:]
+        canvas_mask = jnp.asarray(batch.get("canvas_mask", response_valid), bool)
         if canvas_mask.shape != response.shape:
             raise ValueError("canvas_mask must align with all response tokens")
-        full_valid = jnp.concatenate([tokens[:, :self.prompt_length] != self.pad_token_id, canvas_mask], axis=-1)
+        full_valid = (jnp.concatenate([tokens[:, :self.prompt_length] != self.pad_token_id, canvas_mask], axis=-1)
+                      if validity is None else jnp.asarray(validity, bool))
+        if full_valid.shape != tokens.shape:
+            raise ValueError("attention_mask must align with the full sequence")
+        canvas_mask &= full_valid[:, self.prompt_length:]
+        image_indices = fields.get("image_indices")
+        text_slots = None if image_indices is None else image_indices < 0
+        if text_slots is not None:
+            # Zero-weight targets still reach embeddings and integer-label CE.
+            response = jnp.where(text_slots[:, self.prompt_length:], response, 0)
         time_key, corruption_key, canvas_key, sc_key = jax.random.split(step.key, 4)
         time = jax.random.uniform(time_key, (tokens.shape[0], 1),
                                   minval=self.safety_epsilon, maxval=1 - self.safety_epsilon)
@@ -210,13 +234,16 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         valid_canvases = canvas_mask[:, ::self.canvas_size].sum(axis=-1)
         selected = jax.random.randint(canvas_key, valid_canvases.shape, 0, jnp.maximum(valid_canvases, 1))
         positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
-            full_valid, selected, self.prompt_length, self.canvas_size)
+            full_valid, selected, self.prompt_length, self.canvas_size,
+            fields.get("positions"), fields.get("image_groups"))
         model = self.training_model
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
+        encoder_kwargs = prepared.kwargs()
+        encoder_kwargs.update(positions=positions, attention_mask=full_valid)
         encoder_logits, mutated = model.apply(
-            {**params, "cache": cache}, tokens, positions=positions, attention_mask=full_valid,
+            {**params, "cache": cache}, tokens, **encoder_kwargs,
             attention_pairwise_mask=encoder_mask, attention_key_positions=encoder_keys,
-            method=model.encode, train=True, mutable=["cache"])
+            method=model.encode, train=True, mutable=["cache"], rngs=None, capture_intermediates=False)
         cache = mutated["cache"]
         if self.stop_gradient_from_denoiser_to_encoder:
             cache = jax.lax.stop_gradient(cache)
@@ -236,12 +263,19 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         logits = denoise(sc_logits)
         chosen = jnp.arange(response.shape[1])[None, :] // self.canvas_size == selected[:, None]
         target_mask = canvas_mask & chosen
+        if text_slots is not None:
+            target_mask &= text_slots[:, self.prompt_length:]
         canvas_losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), response)
         shifted = jnp.concatenate([tokens[:, 1:], jnp.full((tokens.shape[0], 1), self.pad_token_id, jnp.int32)], axis=-1)
         adjacent = full_valid & jnp.concatenate([full_valid[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
         encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), jnp.float32)
         if encoder_target_mask.shape != tokens.shape:
             raise ValueError("encoder_target_mask must align with the full sequence")
+        if validity is not None:
+            encoder_target_mask *= adjacent
+        if text_slots is not None:
+            encoder_target_mask *= jnp.concatenate([text_slots[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
+        shifted = jnp.where(encoder_target_mask != 0, shifted, 0)
         encoder_losses = optax.softmax_cross_entropy_with_integer_labels(encoder_logits.astype(jnp.float32), shifted)
         canvas_stats, encoder_stats = _row_mean(canvas_losses, target_mask), _row_mean(encoder_losses, encoder_target_mask)
         support = self.decoder_loss_weight * target_mask.sum() + self.encoder_loss_weight * encoder_target_mask.sum()
