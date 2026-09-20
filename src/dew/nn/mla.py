@@ -399,16 +399,17 @@ def top_k_keys(scores, keep, top_k: int):
     """The `top_k` highest-scoring keys of each query among those `keep`
     allows: `[B, S, T]`, bool.
 
-    Exactly `top_k` keys where at least that many are allowed, ties to the
-    earlier key as `jax.lax.top_k` breaks them (the reference's exact
-    top-k, MaxText `indexer_mask_exact_topk`), and every allowed key where
-    fewer are, so a sequence the top-k covers attends as the dense mixer
-    does. `keep` is the `[B, S, T]` attention mask (a leading axis of one
-    broadcasts).
+    Exactly `top_k` keys where at least that many are allowed, and every
+    allowed key where fewer are, so a sequence the top-k covers attends as
+    the dense mixer does. Equal scores choose the lower key index, because
+    `jax.lax.top_k` is stable; torch's `topk` promises no tie order, so a
+    selection a tie decides may differ from the reference's. `keep` is the
+    `[B, S, T]` attention mask (a leading axis of one broadcasts), and a key
+    it forbids is never selected whatever the tie rule.
     """
     batch, length, total = scores.shape
     ranked = jnp.where(keep, scores, jnp.finfo(jnp.float32).min)
-    chosen = jax.lax.top_k(ranked, min(top_k, total))[1]
+    chosen = jax.lax.top_k(ranked, min(top_k, total), is_stable=True)[1]
     selected = jnp.zeros((batch, length, total), jnp.bool_).at[
         jnp.arange(batch)[:, None, None],
         jnp.arange(length)[None, :, None], chosen].set(True)
