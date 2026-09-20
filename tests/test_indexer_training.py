@@ -487,3 +487,12 @@ def test_the_warmup_trains_through_the_trainer():
         state.params["params"]["layers_0"]["self_attn"][INDEXER]["wq_b"]["kernel"].sharding.spec)
     abstract = jax.eval_shape(trainer.initial_state)
     trainer.layout.check(abstract.params, trainer.shardings(abstract).params, trainer.device_mesh)
+
+
+def test_the_selection_breaks_a_tie_at_the_lower_key_index():
+    """Equal scores choose the lower key index, and a key the mask forbids
+    stays unselected even when it ties with a chosen one."""
+    scores = jnp.asarray([[[0.0, 0.0, 1.0, 0.0]]], jnp.float32)
+    keep = jnp.asarray([[[False, True, True, True]]])
+    selected = top_k_keys(scores, keep, 2)
+    np.testing.assert_array_equal(selected[0, 0], [False, True, True, False])
