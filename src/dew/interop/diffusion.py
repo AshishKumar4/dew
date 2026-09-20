@@ -13,6 +13,7 @@ from flax.typing import Dtype
 import numpy as np
 
 from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
+from dew.nn.text_encoders import checkpoint_array
 from dew.registry import resolve_dtype
 from dew.interop.safetensors_io import load_params
 if TYPE_CHECKING:
@@ -37,6 +38,15 @@ def _insert(tree: TensorTree, path: tuple[str, ...], value: np.ndarray) -> None:
     if held is not None:
         raise ValueError(f"Two source tensors map to {path}")
     node[path[-1]] = value
+
+
+def _source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...], str],
+                  path: tuple[str, ...], name: str) -> None:
+    """Check tied source values before a requested storage cast can round
+    different values to the same BF16 leaf. Only names are retained here."""
+    previous = owners.setdefault(path, name)
+    if previous != name and not np.array_equal(tensors[previous], tensors[name]):
+        raise ValueError(f"Two different source tensors {previous!r} and {name!r} map to {path}")
 
 
 
@@ -220,14 +230,17 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
     return tuple(path)
 
 
-def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondition) -> tuple[TensorTree, tuple[WeightLayout, ...]]:
-    """Native parameters and reversible source layouts, without random leaves."""
+def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondition, *,
+                           param_dtype: str = "float32") -> tuple[TensorTree, tuple[WeightLayout, ...]]:
+    """Native parameters and reversible layouts, cast before layout conversion."""
     from dew.interop.pretrained import WeightLayout
     parameters: TensorTree = {}
     layouts = []
+    owners: dict[tuple[str, ...], str] = {}
     for name, tensor in tensors.items():
-        tensor = np.asarray(tensor)
         path = _unet_path(name, tensor.ndim)
+        _source_alias(tensors, owners, path, name)
+        tensor = checkpoint_array(tensor, param_dtype)
         value, transpose = tensor, None
         if path[-1] == "kernel":
             value = tensor.transpose(2, 3, 1, 0) if tensor.ndim == 4 else tensor.T
@@ -470,14 +483,14 @@ def _flux_path(name: str) -> tuple[str, ...]:
     raise ValueError(f"unknown tensor name {name!r}")
 
 
-def translate_flux_weights(tensors: Mapping[str, np.ndarray]
+def translate_flux_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
                            ) -> tuple[TensorTree, tuple[WeightLayout, ...]]:
-    """Native parameters and reversible source layouts. Flux builds its
-    rotary table from the ids it is called with, so it stores no buffer."""
-    return record_layouts("transformer", tensors, _flux_path, ("params",))
+    """Native parameters and reversible layouts. Rotary tables are computed
+    from input ids, so Flux stores no positional buffer."""
+    return record_layouts("transformer", tensors, _flux_path, ("params",), param_dtype=param_dtype)
 
 
-def translate_sd3_weights(tensors: Mapping[str, np.ndarray]
+def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
                           ) -> tuple[TensorTree, TensorTree, tuple[WeightLayout, ...]]:
     """Native parameters, frozen buffers and reversible source layouts.
 
@@ -488,7 +501,8 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray]
     """
     from dew.interop.pretrained import WeightLayout
 
-    parameters, layouts = record_layouts("transformer", tensors, _sd3_path, ("params",))
+    parameters, layouts = record_layouts(
+        "transformer", tensors, _sd3_path, ("params",), param_dtype=param_dtype)
     buffers: TensorTree = {}
     position = tensors.get("pos_embed.pos_embed")
     if position is None:
@@ -529,17 +543,23 @@ def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
 
 
 def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
-                   path_of: Callable[[str], tuple[str, ...] | None], prefix: tuple[str, ...]
-                   ) -> tuple[TensorTree, tuple[WeightLayout, ...]]:
-    """Translate component tensors and retain their inverse storage layout."""
+                   path_of: Callable[[str], tuple[str, ...] | None], prefix: tuple[str, ...], *,
+                   param_dtype: str = "float32") -> tuple[TensorTree, tuple[WeightLayout, ...]]:
+    """Bind component parameters in the requested precision before layout copies.
+
+    Frozen encoders and autoencoders still contain parameters. Callers with
+    actual buffers or scoring state keep those on their explicit FP32 path.
+    """
     from dew.interop.pretrained import WeightLayout
     parameters: TensorTree = {}
     layouts = []
+    owners: dict[tuple[str, ...], str] = {}
     for name, tensor in tensors.items():
         path = path_of(name)
         if path is None:
             continue
-        array = np.asarray(tensor, np.float32)
+        _source_alias(tensors, owners, path, name)
+        array = checkpoint_array(tensor, param_dtype)
         transpose = None
         if path[-1] == "kernel":
             transpose = (3, 2, 0, 1) if array.ndim == 4 else (1, 0)
@@ -596,7 +616,7 @@ def write_flax_component(directory: Path, component: str, tensors: Mapping[str, 
 
 def save_source(source, values, destination: Path) -> None:
     """Write a native diffusion bundle back to its published directory layout."""
-    from dew.interop.safetensors_io import _safetensors
+    from dew.interop.safetensors_io import write_file
     destination.mkdir(parents=True, exist_ok=True)
     config = dict(source.config)
     index = dict(config.pop("model_index"))
@@ -616,7 +636,7 @@ def save_source(source, values, destination: Path) -> None:
         grouped.setdefault(component, {})[name] = layout.export(values)
     for component, tensors in grouped.items():
         weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
-        _safetensors().save_file(tensors, destination / component / f"{weights}.safetensors", metadata={"format": "pt"})
+        write_file(tensors, destination / component / f"{weights}.safetensors", metadata={"format": "pt"})
         declared = index.get(component)
         if isinstance(declared, (list, tuple)) and len(declared) == 2 and isinstance(declared[1], str) and declared[1].startswith("Flax"):
             write_flax_component(destination, component, tensors)

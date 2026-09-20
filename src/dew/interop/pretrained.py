@@ -19,10 +19,12 @@ from flax import linen as nn
 
 from dew.artifacts import agree_process_phase
 from dew.interop import hf_decoders as decoders
-from dew.interop.quantized import dequantize_checkpoint, fp8_format, pack_fp8, scaled_names
+from dew.interop.quantized import (dequantize_checkpoint, fp8_format, fp8_tensor_names,
+                                     pack_fp8, read_fp8_tensor, scaled_names)
 from dew.inference import BlockGeneration, TextGeneration
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.gpt_oss import mxfp4_stems, pack_mxfp4, unpack_mxfp4
+from dew.nn.gpt_oss import (mxfp4_stems, mxfp4_tensor_names, pack_mxfp4, read_mxfp4_tensor,
+                              unpack_mxfp4)
 from dew.sampling import decoding
 from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling
@@ -32,7 +34,7 @@ from dew.nn.inputs import ModelInputs, pad_token_rows
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
-from dew.registry import models, resolve_dtype, with_precision
+from dew.registry import dtype_name, models, resolve_dtype, with_precision
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inputs import Condition, Field, InputSpec
@@ -642,16 +644,20 @@ class _SourceQuantization:
     """A source format the loader undoes and `Pretrained.save` restores.
 
     `names` reads which tensors arrived quantized off the raw checkpoint,
-    before `dequantize` replaces them with dense float32 weights;
+    before dequantize replaces them with dense weights in requested storage;
     `requantize` writes those names back in the format.
+    tensor_names and read expose original per-weight values for alias checks;
+    read dequantizes on demand rather than retaining an FP32 model.
     """
 
     names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
     dequantize: Callable[[Mapping[str, np.ndarray]], dict[str, np.ndarray]]
     requantize: Callable[[Mapping[str, np.ndarray], tuple[str, ...]], dict[str, np.ndarray]]
+    tensor_names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
+    read: Callable[[Mapping[str, np.ndarray], str], np.ndarray]
 
 
-def _source_quantization(config: Mapping[str, object]) -> _SourceQuantization | None:
+def _source_quantization(config: Mapping[str, object], *, param_dtype: str = "float32") -> _SourceQuantization | None:
     """The format a config's `quantization_config` declares, or None for a dense source."""
     quantization = config.get("quantization_config")
     if quantization is None:
@@ -661,13 +667,47 @@ def _source_quantization(config: Mapping[str, object]) -> _SourceQuantization | 
     method = quantization.get("quant_method")
     if method == "fp8":
         block, ue8m0 = fp8_format(quantization)
-        return _SourceQuantization(scaled_names, partial(dequantize_checkpoint, block=block),
-                                   partial(pack_fp8, block=block, ue8m0=ue8m0))
+        return _SourceQuantization(
+            scaled_names, partial(dequantize_checkpoint, block=block, param_dtype=param_dtype),
+            partial(pack_fp8, block=block, ue8m0=ue8m0),
+            fp8_tensor_names, partial(read_fp8_tensor, block=block))
     if method == "mxfp4":
-        return _SourceQuantization(mxfp4_stems, unpack_mxfp4, pack_mxfp4)
+        return _SourceQuantization(
+            mxfp4_stems, partial(unpack_mxfp4, param_dtype=param_dtype), pack_mxfp4,
+            mxfp4_tensor_names, read_mxfp4_tensor)
     raise ValueError(
         f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
         f"fp8 blocks and GPT OSS's mxfp4 and nothing else")
+
+
+def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tuple[str, str], ...],
+                             quantized: tuple[str, ...]) -> None:
+    """Share only aliases verified on original values before codec narrowing.
+
+    A component may mix quantized and unquantized copies, or several MTP
+    copies of a tied head. Fold the checked relationships transitively, then
+    reuse the already decoded storage: no second cast or weight copy.
+    """
+    if not aliases:
+        return
+    links: dict[str, set[str]] = {}
+    for left, right in aliases:
+        links.setdefault(left, set()).add(right)
+        links.setdefault(right, set()).add(left)
+    remaining = set(links)
+    while remaining:
+        first = remaining.pop()
+        group, pending = {first}, [first]
+        while pending:
+            fresh = links[pending.pop()] - group
+            group.update(fresh)
+            remaining.difference_update(fresh)
+            pending.extend(fresh)
+        representative = next((name for name in quantized if name in group), None)
+        if representative is not None:
+            value = tensors[representative]
+            for name in group:
+                tensors[name] = value
 
 
 @dataclass(frozen=True)
@@ -1421,7 +1461,7 @@ class _Denoiser:
 
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,
-                           attention_impl: str) -> Pretrained:
+                           attention_impl: str, param_dtype: str = "float32") -> Pretrained:
     """A published latent diffusion directory as native modules and variables.
 
     Two denoiser families ship this layout: a UNet reading one or two CLIP
@@ -1433,19 +1473,19 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     """
     compute = resolve_dtype(dtype)
     denoiser = (_transformer_denoiser if (directory / "transformer" / "config.json").is_file()
-                else _unet_denoiser)(directory, dtype=dtype, attention_impl=attention_impl)
+                else _unet_denoiser)(directory, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype)
     policy = _call_policy(index, denoiser)
-    autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(directory, compute)
+    autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(directory, compute, param_dtype=param_dtype)
     names = tuple(name for name in denoiser.towers if _present(index, name))
     if not names:
         raise ValueError("A latent diffusion source needs at least one text encoder")
-    towers, tokenizers, text_params, text_layouts = _clip_towers(directory, names, compute)
+    towers, tokenizers, text_params, text_layouts = _clip_towers(directory, names, compute, param_dtype=param_dtype)
     components = {denoiser.component: denoiser.config, "vae": vae_config,
                   **{name: _component_config(directory, name) for name in names}}
     t5 = None
     if denoiser.t5_tower is not None and _present(index, denoiser.t5_tower):
         t5, t5_params, t5_layouts, components[denoiser.t5_tower] = _t5_tower(
-            directory, compute, denoiser.t5_tower, policy.sequence)
+            directory, compute, denoiser.t5_tower, policy.sequence, param_dtype=param_dtype)
         text_params[denoiser.t5_tower] = t5_params
         text_layouts += t5_layouts
     size = denoiser.sample_size * autoencoder.downscale_factor
@@ -1468,7 +1508,7 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     finish, safety_layouts = None, ()
     if _present(index, "safety_checker"):
         finish, encoders["safety"], safety_layouts, safety_configs = _image_safety(
-            directory, compute)
+            directory, compute, param_dtype=param_dtype)
         components.update(safety_configs)
     schedule = SourceSchedule.from_config(_component_config(directory, "scheduler"))
     components["scheduler"] = dict(schedule.config)
@@ -1485,7 +1525,8 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
                       schedule=schedule, finish=finish, task=task)
 
 
-def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str) -> _Denoiser:
+def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str,
+                   param_dtype: str = "float32") -> _Denoiser:
     """The published UNet: cross attention over one or two CLIP towers, whose
     pooled text conditioning is the one its added time features ask for."""
     from dew.interop import diffusion
@@ -1496,7 +1537,7 @@ def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str) -> _Deno
     fields = diffusion.unet_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = UNet2DCondition(**fields)
     params, layouts = diffusion.translate_unet_weights(
-        diffusion.component_tensors(directory, "unet"), model)
+        diffusion.component_tensors(directory, "unet"), model, param_dtype=param_dtype)
     pooled = model.additional_time_features > 0
     built = {"name": "unet_2d_condition",
              "fields": {**fields, "dtype": dtype,
@@ -1510,19 +1551,21 @@ def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str) -> _Deno
         pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline")
 
 
-def _transformer_denoiser(directory: Path, *, dtype: str, attention_impl: str) -> _Denoiser:
+def _transformer_denoiser(directory: Path, *, dtype: str, attention_impl: str,
+                          param_dtype: str = "float32") -> _Denoiser:
     """The published transformer this directory holds, by the class it names."""
     config = _component_config(directory, "transformer")
     published = config.get("_class_name")
     if published == "SD3Transformer2DModel":
-        return _sd3_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+        return _sd3_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype)
     if published == "FluxTransformer2DModel":
-        return _flux_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+        return _flux_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype)
     raise ValueError(f"Native diffusion does not implement the published transformer "
                      f"{published!r}")
 
 
-def _sd3_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: str) -> _Denoiser:
+def _sd3_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: str,
+                  param_dtype: str = "float32") -> _Denoiser:
     """SD3's MM-DiT: both CLIP towers and the T5 tower read jointly, with the
     stored position buffer in its own frozen collection."""
     from dew.interop import diffusion
@@ -1532,7 +1575,7 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: 
     fields = diffusion.sd3_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = SD3Transformer(**fields)
     params, buffers, layouts = diffusion.translate_sd3_weights(
-        diffusion.component_tensors(directory, "transformer"))
+        diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
     built = {"name": "sd3_transformer",
              "fields": {**fields, "dtype": dtype,
                         "dual_attention_layers": list(fields["dual_attention_layers"])}}
@@ -1545,7 +1588,8 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: 
         t5_tower="text_encoder_3")
 
 
-def _flux_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: str) -> _Denoiser:
+def _flux_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: str,
+                   param_dtype: str = "float32") -> _Denoiser:
     """Flux's transformer: one CLIP tower for the pooled vector, the T5 tower
     for the sequence, and a latent its pipeline packs in 2x2 patches.
 
@@ -1560,7 +1604,7 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl:
     fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = FluxTransformer(**fields)
     params, layouts = diffusion.translate_flux_weights(
-        diffusion.component_tensors(directory, "transformer"))
+        diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
     built = {"name": "flux_transformer",
              "fields": {**fields, "dtype": dtype,
                         "axes_dims_rope": list(fields["axes_dims_rope"])}}
@@ -1586,8 +1630,8 @@ def _present(index: Mapping[str, object], name: str) -> bool:
     return isinstance(entry, list) and entry[0] is not None
 
 
-def _diffusion_vae(directory: Path, compute) -> tuple[StableDiffusionVAE, Variables,
-                                                      tuple[WeightLayout, ...], dict]:
+def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32"
+                   ) -> tuple[StableDiffusionVAE, Variables, tuple[WeightLayout, ...], dict]:
     """The published autoencoder, its parameters and their source layouts."""
     from dew.interop import diffusion
     from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
@@ -1601,14 +1645,15 @@ def _diffusion_vae(directory: Path, compute) -> tuple[StableDiffusionVAE, Variab
         post_quantize=config.get("use_post_quant_conv", True), dtype=compute)
     tensors = diffusion.component_tensors(directory, "vae")
     params, layouts = diffusion.record_layouts(
-        "vae", tensors, lambda name: _vae_path(name, np.ndim(tensors[name])), ("autoencoder",))
+        "vae", tensors, lambda name: _vae_path(name, np.ndim(tensors[name])), ("autoencoder",),
+        param_dtype=param_dtype)
     autoencoder = StableDiffusionVAE(str(directory), dtype=compute, params=params, model=model,
                                      latent_shift=config.get("shift_factor") or 0.0,
                                      latent_scale=config.get("scaling_factor", 0.18215))
     return autoencoder, params, layouts, config
 
 
-def _clip_towers(directory: Path, names: tuple[str, ...], compute):
+def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtype: str = "float32"):
     """The published CLIP text towers, their tokenizers, their parameters and
     the layouts those parameters came from."""
     from transformers import CLIPTokenizer
@@ -1621,7 +1666,7 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute):
         towers.append(CLIPTextTransformer(**translate_config(config), dtype=compute))
         tower, recorded = diffusion.record_layouts(
             name, diffusion.component_tensors(directory, name), _text_head_path,
-            ("encoders", "conditioning", name))
+            ("encoders", "conditioning", name), param_dtype=param_dtype)
         params[name] = tower
         layouts += recorded
         tokenizers.append(CLIPTokenizer.from_pretrained(
@@ -1629,7 +1674,7 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute):
     return tuple(towers), tuple(tokenizers), params, layouts
 
 
-def _t5_tower(directory: Path, compute, component: str, tokens: int):
+def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dtype: str = "float32"):
     """The published T5 encoder as the conditioner's segment, with its
     parameters, their layouts and its config.
 
@@ -1647,7 +1692,7 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int):
     tensors = diffusion.component_tensors(directory, component)
     t5_embedding(tensors)
     params, layouts = diffusion.record_layouts(
-        component, tensors, _t5_path, ("encoders", "conditioning", component))
+        component, tensors, _t5_path, ("encoders", "conditioning", component), param_dtype=param_dtype)
     tokenizer = AutoTokenizer.from_pretrained(
         directory / ("tokenizer" + component.removeprefix("text_encoder")))
     return T5Segment(tower, tokenizer, component, tokens), params, layouts, config
@@ -1661,7 +1706,7 @@ def _unconditional(composition: str, index: Mapping[str, object]) -> dict:
     return {"text": "", "negative": True, "zero": zero}
 
 
-def _image_safety(directory: Path, compute):
+def _image_safety(directory: Path, compute, *, param_dtype: str = "float32"):
     """The safety head a file declares: the finish, its parameters, their
     layouts and the two configs it ships."""
     from dew.inputs.diffusion import CLIPImageTransform, CLIPSafetyHead, ImageSafety
@@ -1671,9 +1716,18 @@ def _image_safety(directory: Path, compute):
     config = _component_config(directory, "safety_checker")
     with open(directory / "feature_extractor" / "preprocessor_config.json") as handle:
         transform = json.load(handle)
+    tensors = diffusion.component_tensors(directory, "safety_checker")
+    # The root scoring vectors and thresholds are state, not tower/projection
+    # weights. Preserve their FP32 contract without post-casting a whole tree.
+    state = {name: value for name, value in tensors.items()
+             if (path := _safety_path(name)) is not None and len(path) == 1}
+    weights = {name: value for name, value in tensors.items() if name not in state}
     params, layouts = diffusion.record_layouts(
-        "safety_checker", diffusion.component_tensors(directory, "safety_checker"), _safety_path,
-        ("encoders", "safety"))
+        "safety_checker", weights, _safety_path, ("encoders", "safety"), param_dtype=param_dtype)
+    scoring, state_layouts = diffusion.record_layouts(
+        "safety_checker", state, _safety_path, ("encoders", "safety"), param_dtype="float32")
+    params.update(scoring)
+    layouts += state_layouts
     head = CLIPSafetyHead(CLIPVisionTransformer(**translate_vision_config(config), dtype=compute),
                           int(config["projection_dim"]), dtype=compute)
     return (ImageSafety(head, CLIPImageTransform.from_config(transform)), params, layouts,
@@ -1695,7 +1749,7 @@ def _safety_path(name: str):
     return _clip_path(name.removeprefix("vision_model."))
 
 
-def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
+def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                     attention_impl: str = "auto", max_seq_len: int | None = None,
                     revision: str | None = None) -> Pretrained:
     """Load a source into a native Flax model with explicit parameter trees.
@@ -1704,26 +1758,40 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
     decoder/tower/projector maps preserve their established internal paths;
     wrapper variables join under their existing component names. Processor
     artifacts are loaded only when the source contains them.
+    dtype selects computation; param_dtype independently selects floating
+    parameter storage and defaults to FP32 masters. Frozen component weights
+    (text encoders and VAE) follow it too; router, clipping, positional and
+    safety state retain their own FP32/integer contracts.
     """
+    storage = dtype_name(resolve_dtype(param_dtype))
+    if storage is None:
+        raise ValueError("param_dtype must select floating parameter storage")
+    param_dtype = storage
     directory = decoders._snapshot(str(name_or_dir), revision)
     if (directory / "model_index.json").is_file():
         with open(directory / "model_index.json") as handle:
-            return _load_diffusion_source(directory, json.load(handle), dtype=dtype, attention_impl=attention_impl)
+            return _load_diffusion_source(directory, json.load(handle), dtype=dtype,
+                                          attention_impl=attention_impl, param_dtype=param_dtype)
     with open(directory / "config.json") as handle:
         config = json.load(handle)
     tensors = decoders._load_shards(directory)
     family = config.get("model_type")
-    quantization = _source_quantization(config)
+    quantization = _source_quantization(config, param_dtype=param_dtype)
     quantized_tensors = () if quantization is None else quantization.names(tensors)
     if quantization is not None:
+        aliases: tuple[tuple[str, str], ...] = ()
+        if param_dtype != "float32":
+            aliases = decoders.validate_source_aliases(
+                quantization.tensor_names(tensors), partial(quantization.read, tensors), config)
         tensors = quantization.dequantize(tensors)
+        _share_quantized_aliases(tensors, aliases, quantized_tensors)
     layouts: tuple[WeightLayout, ...] = ()
     retained: dict[str, np.ndarray] = {}
     export_adapter = None
     if family == "diffusion_gemma":
         from dew.interop import diffusion_gemma
         model = diffusion_gemma.build(config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len)
-        variables = diffusion_gemma.translate_weights(tensors, config)
+        variables = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype)
         record = config
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
@@ -1772,7 +1840,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
             audio_projection=None if audio_record is None else projector_from_record(record["audio_projector"]),
             audio_soft_tokens=record["audio_soft_tokens"],
             attention_impl=None if attention_impl == "reference" else attention_impl)
-        variables = _native_variables(decoders.translate_wrapper_weights(tensors, record))
+        variables = _native_variables(decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype))
         layouts, retained = _wrapper_layouts(tensors, record)
     else:
         record = decoders.translate_config(config)
@@ -1780,7 +1848,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16",
             record["max_seq_len"] = max_seq_len
         built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
         model = models.build("causal_transformer", **built)
-        variables = decoders.translate_weights(tensors, record)
+        variables = decoders.translate_weights(tensors, record, param_dtype=param_dtype)
         decoders._check_tree(variables, model)
         # The bindings are what an adapter loader resolves source names
         # through and what a quantized source is written back through, so a

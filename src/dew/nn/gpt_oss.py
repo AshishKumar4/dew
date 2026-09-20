@@ -99,12 +99,32 @@ def mxfp4_stems(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
     return tuple(stems)
 
 
-def unpack_mxfp4(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Replace each `<name>_blocks` and `<name>_scales` pair with `<name>` in fp32."""
+def mxfp4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """Decoded names, using the codec's validated pair discovery."""
+    stems = mxfp4_stems(tensors)
+    return tuple(name for name in tensors if not name.endswith(('_blocks', '_scales'))) + tuple(
+        stem for stem in stems if stem not in tensors)
+
+
+def read_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
+    """One original tensor, with a packed weight decoded in FP32 on demand."""
+    if name + '_blocks' in tensors:
+        return dequantize_mxfp4(tensors[name + '_blocks'], tensors[name + '_scales'])
+    return tensors[name]
+
+
+def unpack_mxfp4(tensors: Mapping[str, np.ndarray], *,
+                 param_dtype: str = "float32") -> dict[str, np.ndarray]:
+    """Decode each packed pair in FP32, then retain that weight in param_dtype.
+    Biases and every other unpaired tensor remain untouched.
+    """
+    from dew.nn.text_encoders import checkpoint_array
+
     unpacked = dict(tensors)
     for stem in mxfp4_stems(tensors):
-        unpacked[stem] = dequantize_mxfp4(unpacked.pop(stem + '_blocks'),
-                                          unpacked.pop(stem + '_scales'))
+        unpacked[stem] = checkpoint_array(read_mxfp4_tensor(unpacked, stem), param_dtype)
+        unpacked.pop(stem + '_blocks')
+        unpacked.pop(stem + '_scales')
     return unpacked
 
 

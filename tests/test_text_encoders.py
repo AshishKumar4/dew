@@ -447,3 +447,26 @@ def test_the_real_checkpoint_embeddings_match_the_reference():
     text = largest_difference(text_embeds, expected["text_embeds"])
     assert image < REAL_TOLERANCE, f"max |image embedding difference| {image:.3e}"
     assert text < REAL_TOLERANCE, f"max |text embedding difference| {text:.3e}"
+
+
+@pytest.mark.parametrize("kind", ["clip-text", "clip", "t5"])
+def test_public_text_encoder_storage_is_separate_from_compute(kind):
+    import jax
+    import jax.numpy as jnp
+    from dew.nn.text_encoders import T5EncoderModel
+
+    cls = {"clip-text": CLIPTextModel, "clip": CLIPModel, "t5": T5EncoderModel}[kind]
+    directory = Path(__file__).resolve().parent / "fixtures/t5/tiny" if kind == "t5" else TINY
+    masters = cls.from_pretrained(str(directory), dtype=jnp.bfloat16)
+    native = cls.from_pretrained(str(directory), dtype=jnp.float32, param_dtype="bfloat16")
+    if kind == "clip":
+        assert isinstance(native, CLIPModel)
+        assert native.module.dtype == jnp.float32
+    else:
+        assert isinstance(native, (CLIPTextModel, T5EncoderModel))
+        assert native.transformer.dtype == jnp.float32
+    assert jax.tree.structure(masters.variables) == jax.tree.structure(native.variables)
+    for before, after in zip(jax.tree.leaves(masters.variables), jax.tree.leaves(native.variables), strict=True):
+        assert np.asarray(before).dtype == np.float32
+        assert after.dtype == jnp.bfloat16
+        np.testing.assert_array_equal(after, np.asarray(before).astype(jnp.bfloat16))
