@@ -24,6 +24,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.multimodal import VisionConditioner
+from dew.nn.text_encoders import checkpoint_array
 from dew.registry import models
 
 
@@ -153,8 +154,10 @@ class DiffusionGemma(nn.Module):
                             attention_key_positions=attention_key_positions)
 
 
-def translate_weights(hf_tensors: Mapping[str, np.ndarray]) -> dict[str, dict[str, np.ndarray]]:
-    """Self-conditioning tensors into the module parameter tree in fp32."""
+def translate_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> dict[str, dict[str, np.ndarray]]:
+    """Self-conditioning parameters, cast per weight before the layout copy."""
     paths = {
         "pre_norm.weight": ("pre_norm", "scale"),
         "gate_proj.weight": ("gate_proj", "kernel"),
@@ -169,7 +172,7 @@ def translate_weights(hf_tensors: Mapping[str, np.ndarray]) -> dict[str, dict[st
         module, key = paths[bare]
         if module in params:
             raise ValueError(f"duplicate self-conditioning tensor {name!r}")
-        leaf = np.asarray(tensor, np.float32)
+        leaf = checkpoint_array(tensor, param_dtype)
         params[module] = {key: np.ascontiguousarray(leaf.T) if key == "kernel" else leaf}
     missing = {path[0] for path in paths.values()} - set(params)
     if missing:

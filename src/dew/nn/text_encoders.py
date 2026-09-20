@@ -44,6 +44,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.sharding import logical_axes
+from dew.registry import resolve_dtype
 
 CONFIG_FILE = "config.json"
 WEIGHTS_FILE = "model.safetensors"
@@ -490,21 +491,42 @@ def _clip_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
-def _leaf(path: Tuple[str, ...], tensor) -> np.ndarray:
-    """The tensor as the fp32 leaf at `path`, in linen's layout.
-
-    torch Linear holds [out, in] and `nn.Dense` keeps [in, out]; torch Conv2d
-    holds [out, in, kh, kw] and `nn.Conv` [kh, kw, in, out]. A norm's `weight`
-    becomes `scale` and an embedding's becomes `embedding`, the names linen
-    gives those params.
+def checkpoint_array(tensor, param_dtype: str = "float32") -> np.ndarray:
+    """One stored floating array in the requested precision, without an FP32
+    array intermediate. Integer and boolean payloads retain their native dtype.
+    Callers choose FP32 for frozen state rather than applying parameter
+    precision to an entire variables tree.
     """
-    leaf = np.asarray(tensor, np.float32)
+    dtype = resolve_dtype(param_dtype)
+    if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
+        raise ValueError(
+            f"param_dtype {param_dtype!r} must name floating parameter storage"
+        )
+    leaf = np.asarray(tensor)
+    return (
+        leaf.astype(dtype, copy=False)
+        if jnp.issubdtype(leaf.dtype, jnp.floating)
+        else leaf
+    )
+
+
+def checkpoint_leaf(
+    path: Tuple[str, ...], tensor, param_dtype: str = "float32"
+) -> np.ndarray:
+    """One checkpoint leaf in Linen layout and the requested storage precision.
+
+    Linear holds [out, in] and Dense keeps [in, out]; Conv2d holds
+    [out, in, kh, kw] and Conv keeps [kh, kw, in, out]. Norms and
+    embeddings keep their layout. Conversion precedes the layout copy,
+    avoiding an FP32 intermediate for a BF16 leaf.
+    """
+    leaf = checkpoint_array(tensor, param_dtype)
     if path[-1] == "kernel":
         leaf = np.ascontiguousarray(leaf.T if leaf.ndim == 2 else leaf.transpose(2, 3, 1, 0))
     return leaf
 
 
-def _translate(hf_tensors: Mapping[str, np.ndarray], path_of) -> Dict[str, Any]:
+def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
     for name, tensor in hf_tensors.items():
         path = path_of(name)
@@ -513,18 +535,22 @@ def _translate(hf_tensors: Mapping[str, np.ndarray], path_of) -> Dict[str, Any]:
         node = params
         for key in path[:-1]:
             node = node.setdefault(key, {})
-        node[path[-1]] = _leaf(path, tensor)
+        node[path[-1]] = checkpoint_leaf(path, tensor, param_dtype)
     return params
 
 
-def translate_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """HF text-tower tensors into a `CLIPTextTransformer` params tree, in fp32."""
-    return _translate(hf_tensors, _text_path)
+def translate_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """Text-tower parameters; storage precision is independent of compute dtype."""
+    return _translate(hf_tensors, _text_path, param_dtype)
 
 
-def translate_clip_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """The tensors of a full CLIP checkpoint into a `CLIP` params tree, in fp32."""
-    return _translate(hf_tensors, _clip_path)
+def translate_clip_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """Full CLIP parameters, with FP32 storage unless explicitly requested otherwise."""
+    return _translate(hf_tensors, _clip_path, param_dtype)
 
 
 def _flat(tree) -> Dict[str, Any]:
@@ -1016,14 +1042,16 @@ def t5_embedding(hf_tensors: Mapping[str, np.ndarray]) -> None:
                          f"checkpoint's two copies differ")
 
 
-def translate_t5_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """HF T5 encoder tensors into a `T5EncoderTransformer` params tree, in fp32.
+def translate_t5_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """HF T5 encoder tensors into a parameter tree at the requested precision.
 
-    Dense kernels transpose from torch's [out, in] to linen's [in, out]; the
-    embedding, the norms and the relative bias table keep their layout.
+    Dense kernels transpose from torch to Linen; embeddings, norms and
+    relative bias tables keep their layout.
     """
     t5_embedding(hf_tensors)
-    return _translate(hf_tensors, _t5_path)
+    return _translate(hf_tensors, _t5_path, param_dtype)
 
 
 class T5EncoderModel:

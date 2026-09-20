@@ -39,7 +39,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
-from dew.nn.text_encoders import CLIPAttention, MLP
+from dew.nn.text_encoders import CLIPAttention, MLP, checkpoint_array, checkpoint_leaf
 from dew.registry import from_record, projectors, towers
 from .mobilenet import MobileNetV5Encoder
 
@@ -1270,21 +1270,9 @@ def merge_soft_tokens(token_embeds: jax.typing.ArrayLike, soft_tokens: jax.typin
     return jnp.where(mask[..., None], chosen, token_embeds)
 
 
-def _leaf(path: Tuple[str, ...], tensor: np.ndarray) -> np.ndarray:
-    """The tensor as the fp32 leaf at `path`, in linen's layout.
-
-    torch Linear holds [out, in] and `nn.Dense` keeps [in, out]; torch Conv2d
-    holds [out, in, kh, kw] and `nn.Conv` [kh, kw, in, out]. A norm's `weight`
-    becomes `scale`, an embedding's `weight` becomes `embedding`, and a plain
-    parameter matrix (a projector map, a class token) keeps its layout.
-    """
-    leaf = np.asarray(tensor, np.float32)
-    if path[-1] == "kernel":
-        leaf = np.ascontiguousarray(leaf.T if leaf.ndim == 2 else leaf.transpose(2, 3, 1, 0))
-    return leaf
 
 
-def _translate(hf_tensors: Mapping[str, np.ndarray], path_of) -> Dict[str, Any]:
+def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> Dict[str, Any]:
     params: Dict[str, Any] = {}
     for name, tensor in hf_tensors.items():
         path = path_of(name)
@@ -1293,7 +1281,8 @@ def _translate(hf_tensors: Mapping[str, np.ndarray], path_of) -> Dict[str, Any]:
         node = params
         for key in path[:-1]:
             node = node.setdefault(key, {})
-        node[path[-1]] = _leaf(path, tensor)
+        storage = "float32" if path[0] == "constants" else param_dtype
+        node[path[-1]] = checkpoint_leaf(path, tensor, storage)
     return params
 
 
@@ -1343,9 +1332,11 @@ def siglip_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
-def translate_siglip_vision_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """SigLIP vision tensors into a trunk params tree, in fp32."""
-    return _translate(hf_tensors, siglip_vision_path)
+def translate_siglip_vision_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """SigLIP vision parameters at the requested storage precision."""
+    return _translate(hf_tensors, siglip_vision_path, param_dtype)
 
 
 _LLAMA4_VISION_TENSORS = {
@@ -1396,9 +1387,11 @@ def llama4_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     return path
 
 
-def translate_llama4_vision_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """Llama 4 vision tensors into a trunk params tree, in fp32."""
-    return _translate(hf_tensors, llama4_vision_path)
+def translate_llama4_vision_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """Llama 4 vision parameters at the requested storage precision."""
+    return _translate(hf_tensors, llama4_vision_path, param_dtype)
 
 
 _PROJECTOR_PATHS: dict[str, dict[str, tuple[str, ...]]] = {
@@ -1432,8 +1425,10 @@ def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
 
 
 
-def translate_gemma_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """A Gemma projector's two tensors into its params tree, in fp32.
+def translate_gemma_projector_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """A Gemma projector's two tensors into its parameter tree.
 
     The norm's weight becomes its scale; the projection matrix is a plain
     parameter the reference multiplies as is, so unlike a Linear kernel it
@@ -1443,14 +1438,15 @@ def translate_gemma_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> D
     unknown = sorted(set(hf_tensors) - known)
     if unknown:
         raise ValueError(f"unknown tensor names {unknown}")
-    return {module: {leaf: np.ascontiguousarray(hf_tensors[name], dtype=np.float32)}
+    return {module: {leaf: np.ascontiguousarray(checkpoint_array(hf_tensors[name], param_dtype))}
             for name, (module, leaf) in _PROJECTOR_PATHS["gemma"].items()}
 
 
-def translate_llama4_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """Llama 4's outer projector map into its params tree, in fp32."""
-
-    return _translate(hf_tensors, lambda name: projector_weight_path("llama4", name))
+def translate_llama4_projector_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """Llama 4's outer projector map at the requested storage precision."""
+    return _translate(hf_tensors, lambda name: projector_weight_path("llama4", name), param_dtype)
 
 
 def _image_size(value: object, field: str) -> int:
@@ -1643,20 +1639,24 @@ def gemma4_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     return (collection, *path)
 
 
-def translate_gemma4_vision_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """Gemma 4 weights and frozen buffers as a complete Flax variables tree."""
-    return _translate(hf_tensors, gemma4_vision_path)
+def translate_gemma4_vision_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """Gemma 4 parameters plus native FP32 frozen and clipping buffers."""
+    return _translate(hf_tensors, gemma4_vision_path, param_dtype)
 
 
-def translate_gemma4_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """A Gemma 4 embedder's map into its params tree, in fp32.
+def translate_gemma4_projector_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """A Gemma 4 embedder's map into its parameter tree.
 
     The pre-projection norm carries no scale, so the projection weight is
     the only tensor.
     """
     if set(hf_tensors) != set(_PROJECTOR_PATHS["gemma4"]):
         raise ValueError(f"unknown tensor names {sorted(hf_tensors)}")
-    return _translate(hf_tensors, lambda name: projector_weight_path("gemma4", name))
+    return _translate(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
 
 
 def _gemma4_rope_theta(vision: Mapping[str, Any]) -> float:
@@ -1780,8 +1780,10 @@ def qwen35_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     return path
 
 
-def translate_qwen35_vision_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """Qwen 3.5 vision tensors into a trunk params tree, in fp32.
+def translate_qwen35_vision_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """Qwen 3.5 vision tensors into a trunk parameter tree.
 
     The patch convolution carries [out, in, time, h, w] and lands as one map;
     the trunk's buffer already holds the viewed channel order, so the rows
@@ -1789,20 +1791,20 @@ def translate_qwen35_vision_weights(hf_tensors: Mapping[str, np.ndarray]) -> Dic
     """
     rest = {name: tensor for name, tensor in hf_tensors.items()
             if name != "patch_embed.proj.weight"}
-    params = _translate(rest, qwen35_vision_path)
+    params = _translate(rest, qwen35_vision_path, param_dtype)
     if "patch_embed.proj.weight" not in hf_tensors:
         raise ValueError("patch_embed.proj.weight is missing, the trunk reads it")
-    conv = np.asarray(hf_tensors["patch_embed.proj.weight"], np.float32)
+    conv = checkpoint_array(hf_tensors["patch_embed.proj.weight"], param_dtype)
     params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
         conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
     return params
 
 
 def translate_qwen35_projector_weights(
-        hf_tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    """A Qwen 3.5 merger's tensors into its params tree, in fp32."""
-
-    return _translate(hf_tensors, lambda name: projector_weight_path("qwen3_5", name))
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> Dict[str, Any]:
+    """A Qwen 3.5 merger's tensors at the requested storage precision."""
+    return _translate(hf_tensors, lambda name: projector_weight_path("qwen3_5", name), param_dtype)
 
 
 def _qwen35_patch_field(vision: Mapping[str, Any], field: str) -> int:
@@ -2025,16 +2027,20 @@ def gemma3n_vision_path(hf_name: str) -> Tuple[str, ...]:
     return prefix + parts[:-1] + ("scale" if norm else "kernel",)
 
 
-def translate_gemma3n_vision_weights(hf_tensors: Mapping[str, np.ndarray]) -> dict[str, object]:
-    return _translate(hf_tensors, gemma3n_vision_path)
+def translate_gemma3n_vision_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> dict[str, object]:
+    return _translate(hf_tensors, gemma3n_vision_path, param_dtype)
 
 
-def translate_gemma3n_projector_weights(hf_tensors: Mapping[str, np.ndarray]) -> dict[str, object]:
+def translate_gemma3n_projector_weights(
+    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+) -> dict[str, object]:
     paths = _PROJECTOR_PATHS["gemma3n"]
     if set(hf_tensors) != set(paths):
         raise ValueError(f"vision embedder tensors differ: missing {sorted(set(paths) - set(hf_tensors))}, "
                          f"unknown {sorted(set(hf_tensors) - set(paths))}")
-    return _translate(hf_tensors, paths.__getitem__)
+    return _translate(hf_tensors, paths.__getitem__, param_dtype)
 
 
 def _gemma3n_vision_record(

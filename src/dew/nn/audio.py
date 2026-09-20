@@ -23,6 +23,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.registry import from_record, towers
 from .attention import RMSNorm
 from .sharding import logical_axes
+from .text_encoders import checkpoint_array
 from .vision import TowerBase
 
 
@@ -583,18 +584,24 @@ def audio_weight_path(name: str, config: Gemma3nAudio | Gemma4Audio) -> tuple[st
 
 
 
-def audio_weights(tensors: Mapping[str, np.ndarray], config: Gemma3nAudio | Gemma4Audio) -> dict:
+def audio_weights(
+    tensors: Mapping[str, np.ndarray],
+    config: Gemma3nAudio | Gemma4Audio,
+    *,
+    param_dtype: str = "float32",
+) -> dict:
     """Translate reference weights into params and frozen clipping constants.
 
-    Prefix stripping belongs to the shared wrapper loader. This accepts only
-    the encoder's own tensor names and verifies them against its abstract tree.
+    Prefix stripping belongs to the shared wrapper loader. Parameters use the
+    requested storage precision; clipping state stays FP32. Integer tensors
+    retain their native dtype, and every shape is checked against the encoder.
     """
     expected = _audio_template(config)
     result = {}
     seen = set()
     for name, array in tensors.items():
         path = audio_weight_path(name, config)
-        value = np.asarray(array, np.float32)
+        value = checkpoint_array(array, param_dtype if path[0] == "params" else "float32")
         if path[-1] == "kernel":
             value = np.ascontiguousarray(value.transpose(*range(2, value.ndim), 1, 0))
         if path not in expected or value.shape != expected[path].shape:
