@@ -17,7 +17,7 @@ import dataclasses
 import sys
 import types
 import typing
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypeVar, Union
 
 import jax.numpy as jnp
@@ -190,11 +190,12 @@ def entry_types(annotation: object, count: int) -> list[object]:
 
 
 def wants_tuple(annotation: object) -> bool:
-    """Whether a container annotation declares a tuple, which a record's
-    list becomes; JSON has no tuple, and a frozen value with a list in a
-    tuple field is unhashable and unequal to the one that was written."""
+    """Whether the annotation declares an immutable sequence. A record's
+    list is rebuilt as a tuple so the frozen value stays hashable; `list`
+    and `MutableSequence` keep their list."""
     annotation = _unwrapped(annotation)
-    return annotation is tuple or typing.get_origin(annotation) is tuple
+    return (annotation in (tuple, Sequence)
+            or typing.get_origin(annotation) in (tuple, Sequence))
 
 
 def from_record(annotation: object, value: Any) -> Any:
