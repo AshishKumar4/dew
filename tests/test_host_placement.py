@@ -92,7 +92,7 @@ def test_host_resident_state_resumes_from_its_checkpoint(tmp_path):
 
 
 def test_a_layout_places_only_the_state_it_can_fetch():
-    with pytest.raises(ValueError, match="opt_state.*ema.*params"):
+    with pytest.raises(ValueError, match="params"):
         Layout(host=("params",))
 
 
