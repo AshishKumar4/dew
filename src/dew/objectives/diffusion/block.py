@@ -25,6 +25,7 @@ from dew.objectives.base import (Aux, Batch, EMASpec, Mean, Objective, Step,
 from dew.registry import objectives
 
 if TYPE_CHECKING:
+    from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.training.state import TrainState
     from dew.inference.tasks import BlockGeneration, Processor
 
@@ -153,6 +154,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
         return BlockGeneration(self.model, self._pipeline_weights(state, ema), process, processor,
                                pad_token_id=self.pad_token_id)
+
+    @property
+    def bank_sites(self) -> tuple["DecoderBank", ...]:
+        """The shared text stack, as the training model declares it."""
+        return self.training_model.bank_sites
 
     def held_variables(self) -> Variables | None:
         """The SFT source this objective starts from."""

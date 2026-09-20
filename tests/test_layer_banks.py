@@ -220,6 +220,25 @@ def test_nested_entry_offload_cannot_treat_a_decoder_owner_as_one_fetch():
     with pytest.raises(ValueError, match="stack does not fetch"):
         host_banked(model, HeldBanks(variables), layout=Layout(
             min_shard=1, tolerance=1.0, host_parameters=("params/language_model/*",)))
+
+
+def test_an_unscanned_decoder_banks_one_layer_at_a_time():
+    """A plain loop declares singleton runs, which stream like longer ones."""
+    model, variables, tokens, indices, media = fixture("multimodal")
     unscanned = model.clone(language_model=model.language_model.clone(scan_layers=False))
-    with pytest.raises(ValueError, match="scan_layers=True"):
-        host_banked(unscanned, HeldBanks(variables), layout=DEVICE)
+    (site,) = unscanned.bank_sites
+    assert site.view.groups == tuple((index, 1) for index in range(4))
+    source = SelectedReads(HeldBanks(variables), unscanned.bank_sites)
+    resident = host_banked(unscanned, HeldBanks(variables), layout=DEVICE)
+    hosted = host_banked(unscanned, source, layout=host_layout(site))
+    identical(unpack(hosted, unscanned.bank_sites, source.shapes()), variables)
+    layers = in_namespace(hosted, site.namespace)["params"]
+    device_layers = in_namespace(resident, site.namespace)["params"]
+    for index in range(4):
+        for leaf, row in zip(jax.tree.leaves(layers[f"layers_{index}"]),
+                             jax.tree.leaves(device_layers[f"layers_{index}"]), strict=True):
+            assert leaf.sharding.memory_kind == "pinned_host"
+            assert leaf.shape == row.shape
+    identical(scores(unscanned, hosted, tokens, indices, media),
+              scores(unscanned, resident, tokens, indices, media))
+    assert source.reads == [(site.namespace, (index,)) for index in range(4)]

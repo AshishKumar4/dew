@@ -273,7 +273,14 @@ class BankedModel(Protocol):
     def bank_sites(self) -> tuple[DecoderBank, ...]: ...
 
 
-def _sites(model: BankedModel) -> tuple[DecoderBank, ...]:
+def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
+    """The model's declared stacks, deduplicated by canonical namespace.
+
+    Two readers of one physical scope declare the same site, so a shared
+    decoder is packed once. Conflicting views of a namespace, overlapping
+    layer ownership and staged or already banked views are refused here,
+    before any value is read.
+    """
     owners: dict[tuple[str, ...], DecoderBank] = {}
     for site in model.bank_sites:
         if any(not isinstance(name, str) or not name or "/" in name for name in site.namespace):
@@ -283,7 +290,7 @@ def _sites(model: BankedModel) -> tuple[DecoderBank, ...]:
             raise ValueError(f"conflicting decoder views at namespace {site.namespace}")
         owners[site.namespace] = site
     if not owners:
-        raise ValueError("host_banked requires a declared decoder bank owner")
+        raise ValueError("a banked store requires a declared decoder bank owner")
     paths = []
     for site in owners.values():
         if site.view.stages != 1 or site.view.banked:
@@ -365,7 +372,7 @@ def host_banked(model: BankedModel, source: LayerBanks, *,
     from dew.training.distributed import (
         Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh)
 
-    sites = _sites(model)
+    sites = bank_sites(model)
     shapes = source.shapes()
     for site in sites:
         _check_shapes(shapes, site)

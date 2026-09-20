@@ -46,7 +46,7 @@ from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
 from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
                         router_moments, sequence_router_losses)
 from dew.objectives.base import (FROZEN, Aux, EMASpec, Mean, Objective, PathFilter, Prediction,
-                                 Step, Variables, freeze, mean_loss, merge, select, thaw)
+                                 Step, Variables, freeze, mean_loss, merge, thaw)
 from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
 from dew.registry import metrics, objectives
 from dew.inference import TextGeneration
@@ -54,6 +54,7 @@ from dew.inference.tasks import Processor
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
+    from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.training.state import TrainState
 
 TEXT_KEY = "text"
@@ -481,8 +482,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         return self.pretrained
 
     @property
-    def layer_groups(self) -> tuple[tuple[int, int], ...]:
-        return self.model.bind({}).groups
+    def bank_sites(self) -> tuple["DecoderBank", ...]:
+        return self.model.bank_sites
 
     def init(self, key, variables: Optional[Variables] = None) -> Variables:
         pretrained = self.pretrained if variables is None else variables

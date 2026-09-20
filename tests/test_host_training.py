@@ -8,7 +8,8 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
-from dew.objectives.base import Aux, EMASpec, Mean, Objective
+from dew.nn.inputs import ModelInputs
+from dew.objectives.base import FROZEN, Aux, EMASpec, Mean, Objective
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
@@ -251,3 +252,227 @@ def test_companion_pool_uses_one_global_optimizer_reduction(tmp_path):
         assert set(result["compute_devices"]).isdisjoint(result["transaction_devices"])
         assert result["resident"] == result["host"]
         assert result["host"] == single["host"]
+
+
+# --------------------------------------------------------------------------
+# Declared decoder banks: nested owners, shared owners and partial freezing
+# --------------------------------------------------------------------------
+
+# Banked execution runs a different compiled module from the resident stack,
+# and the preserved test_decoder_scan_training_keeps_the_original_logical_state
+# records a difference between the two whose cause is not established. The
+# bound below qualifies these cases numerically and settles nothing about that
+# failure. Leaves nothing moves are compared exactly.
+STREAMED_BOUND = 1e-6
+
+
+def close(left, right, bound=STREAMED_BOUND):
+    assert jax.tree.structure(left) == jax.tree.structure(right)
+    for (path, a), b in zip(jax.tree_util.tree_leaves_with_path(left), jax.tree.leaves(right), strict=True):
+        if jnp.issubdtype(a.dtype, jax.dtypes.prng_key):
+            a, b = jax.random.key_data(a), jax.random.key_data(b)
+        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=bound, rtol=0,
+                                   err_msg=jax.tree_util.keystr(path))
+
+
+def updated(objective, batch, layout, *, optimizer=None, checkpoints=None, steps=1):
+    """`steps` compiled updates of one objective under one placement."""
+    trainer = Trainer(objective, optax.adam(.01) if optimizer is None else optimizer,
+                      key=jax.random.key(5), layout=layout, checkpoints=checkpoints)
+    state, _, _ = trainer.place()
+    step = trainer.compile(state, batch)
+    for _ in range(steps):
+        state, *_ = step(state, batch)
+    return state
+
+
+def tokens(width=9):
+    return {"text": jnp.tile(jnp.arange(1, width + 1, dtype=jnp.int32)[None], (jax.device_count(), 1))}
+
+
+def decoder(**overrides):
+    fields = dict(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
+                  mlp_features=16, max_seq_len=8, scan_layers=True)
+    return CausalTransformer(**{**fields, **overrides})
+
+
+def frozen_leaves(state):
+    return {jax.tree_util.keystr(path): np.asarray(leaf) for path, leaf
+            in jax.tree_util.tree_leaves_with_path(state.params[FROZEN])}
+
+
+def _moments(opt_state) -> optax.ScaleByAdamState:
+    """Adam's moments out of the optimizer state, narrowed for the checker."""
+    held, _ = jax.tree_util.tree_flatten(
+        opt_state, is_leaf=lambda node: isinstance(node, optax.ScaleByAdamState))
+    for node in held:
+        if isinstance(node, optax.ScaleByAdamState):
+            return node
+    raise AssertionError("the optimizer state carries no Adam moments")
+
+
+def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stack(tmp_path):
+    """Per-layer and per-leaf freezing through one banked decoder.
+
+    Every layer's parameters ride in one bank whatever their ownership, and
+    only the canonical moving leaves come back as gradients: the optimizer
+    holds those and nothing else, the frozen collection is untouched, and the
+    stored names stay `layers_N`.
+    """
+    def trainable(path):
+        return "layers_1" not in path and path[-2:] != ("gate_proj", "kernel")
+
+    def objective():
+        return LMObjective(decoder(), 8, head_chunks=1, trainable=trainable)
+
+    batch = tokens()
+    resident = updated(objective(), batch, DEVICE)
+    host = updated(objective(), batch, HOST)
+    close(host, resident)
+    initial = frozen_leaves(Trainer(objective(), optax.adam(.01), key=jax.random.key(5),
+                                    layout=HOST).place()[0])
+    assert initial and frozen_leaves(host).keys() == initial.keys()
+    for name, value in frozen_leaves(host).items():
+        np.testing.assert_array_equal(value, initial[name], err_msg=name)
+    assert sorted(host.params["params"]) == ["embed_tokens", "layers_0", "norm"]
+    assert "layers_0" in host.params[FROZEN] and "layers_1" in host.params[FROZEN]
+    assert jax.tree.structure(_moments(host.opt_state).mu) == jax.tree.structure(host.params["params"])
+
+    # The EMA tracks the moving collection only, and banked execution reads
+    # that partial tree without extending it.
+    assert host.ema is not None and FROZEN not in host.ema
+    assert jax.tree.structure(host.ema["params"]) == jax.tree.structure(host.params["params"])
+    checkpoints = Checkpoints(str(tmp_path / "mixed"))
+    prefix = updated(objective(), batch, HOST, checkpoints=checkpoints)
+    checkpoints.save(int(prefix.step), prefix, None)
+    checkpoints.wait()
+    restored, _, _ = Trainer(objective(), optax.adam(.01), key=jax.random.key(5),
+                             layout=HOST, checkpoints=Checkpoints(str(tmp_path / "mixed"))).place()
+    equal(prefix, restored)
+    resumed = updated(objective(), batch, HOST, checkpoints=Checkpoints(str(tmp_path / "mixed")))
+    equal(resumed, updated(objective(), batch, HOST, steps=2))
+
+
+def multimodal(**overrides):
+    """A media-conditioned wrapper over one declared decoder."""
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+
+    return MultimodalTransformer(
+        decoder(emb_features=16, max_seq_len=16, **overrides), SiglipVision(
+            hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+            image_size=8, patch_size=4),
+        GemmaProjector(vision_width=16, text_width=16, patches_per_side=2, tokens_per_side=1),
+        family="gemma3", image_token_id=1, dtype=jnp.float32)
+
+
+def media_batch(scale=1.):
+    """Nine-token rows whose third slot reads one image, one row per device."""
+    rows = jax.device_count()
+    ids = jnp.tile(jnp.asarray([[2, 3, 1, 4, 5, 6, 7, 8, 9]], jnp.int32), (rows, 1))
+    indices = jnp.tile(jnp.asarray([[-1, -1, 0, -1, -1, -1, -1, -1, -1]], jnp.int32), (rows, 1))
+    pixels = jnp.tile(jnp.linspace(-.5, .5, 3 * 8 * 8).reshape(1, 1, 3, 8, 8) * scale, (rows, 1, 1, 1, 1))
+    return {"text": ModelInputs(ids, {"image_indices": indices}, {"pixel_values": pixels})}
+
+
+def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
+    """A multimodal wrapper declares its decoder under `language_model`.
+
+    The batch carries real pixels, so the frozen tower and projector run in
+    the loss beside the banked decoder: the images move the loss, the banked
+    update matches the resident one, and the media weights do not move.
+    """
+    model = multimodal()
+    batch, other = media_batch(), media_batch(scale=.25)
+    held = model.init(jax.random.key(0), batch["text"].tokens,
+                      image_indices=batch["text"].token_fields["image_indices"],
+                      conditioning=batch["text"].conditioning)
+
+    def trainable(path):
+        return path[1] == "language_model" and "layers_1" not in path
+
+    def objective():
+        return LMObjective(model, 8, head_chunks=1, pretrained=held, trainable=trainable)
+
+    trainer = Trainer(objective(), optax.adam(.01), key=jax.random.key(5), layout=DEVICE)
+    start, _, _ = trainer.place()
+    step = trainer.compile(start, batch)
+    _, loss, *_ = step(start, batch)
+    _, changed, *_ = step(start, other)
+    assert abs(float(loss) - float(changed)) > 1e-4, "the pixels do not reach the loss"
+
+    resident = updated(objective(), batch, DEVICE)
+    host = updated(objective(), batch, HOST)
+    close(host, resident)
+    assert sorted(host.params["params"]) == ["language_model"]
+    assert sorted(host.params[FROZEN]) == ["language_model", "projector", "tower"]
+    assert sorted(host.params[FROZEN]["language_model"]) == ["layers_1"]
+    media = {name: value for name, value in frozen_leaves(host).items()
+             if "tower" in name or "projector" in name}
+    initial = frozen_leaves(Trainer(objective(), optax.adam(.01), key=jax.random.key(5),
+                                    layout=HOST).place()[0])
+    assert media
+    for name, value in media.items():
+        np.testing.assert_array_equal(value, initial[name], err_msg=name)
+
+
+def test_an_unscanned_decoder_trains_through_singleton_banks():
+    """A plain loop declares one bank per layer and streams them the same way."""
+    model = multimodal(scan_layers=False)
+    (site,) = model.bank_sites
+    assert site.namespace == ("language_model",)
+    assert site.view.groups == ((0, 1), (1, 1))
+    batch = media_batch()
+    held = model.init(jax.random.key(0), batch["text"].tokens,
+                      image_indices=batch["text"].token_fields["image_indices"],
+                      conditioning=batch["text"].conditioning)
+
+    def objective():
+        return LMObjective(model, 8, head_chunks=1, pretrained=held,
+                           trainable=lambda path: path[1] == "language_model")
+
+    resident = updated(objective(), batch, DEVICE)
+    host = updated(objective(), batch, HOST)
+    close(host, resident)
+    assert sorted(host.params["params"]["language_model"]) == ["embed_tokens", "layers_0", "layers_1", "norm"]
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
+    """DiffusionGemma reads one physical stack twice: encoder and denoiser.
+
+    The site is declared once, so the bank is packed once and native reverse
+    mode sums both uses into it. The detached variant keeps the existing
+    encoder-gradient policy.
+    """
+    from pathlib import Path
+
+    from dew.interop import load_pretrained
+    from dew.nn.diffusion_gemma import DiffusionGemma
+    from dew.objectives.diffusion.block import BlockDiffusionObjective
+
+    fixture = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
+    loaded = load_pretrained(fixture, dtype="float32", attention_impl="xla", max_seq_len=32)
+    source = loaded.model
+    assert isinstance(source, DiffusionGemma)
+    scanned = source.clone(text=source.text.clone(scan_layers=True))
+    assert isinstance(scanned, DiffusionGemma)
+    with np.load(fixture / "reference.npz") as arrays:
+        rows = jax.device_count() // arrays["tokens"].shape[0]
+        batch = {name: jnp.tile(jnp.asarray(arrays[name]), (rows, 1)) for name in
+                 ("tokens", "canvas_mask", "encoder_target_mask")}
+    batch["text"] = batch.pop("tokens")
+
+    def objective():
+        return BlockDiffusionObjective(
+            scanned, prompt_length=4, num_canvases=2, pretrained=loaded.variables,
+            stop_gradient_from_denoiser_to_encoder=detached)
+
+    (site,) = objective().bank_sites
+    assert site.namespace == ("text",)
+    resident = updated(objective(), batch, DEVICE, optimizer=optax.sgd(.001))
+    host = updated(objective(), batch, HOST, optimizer=optax.sgd(.001))
+    close(host, resident, 1e-5)
+    assert "layers_0" in host.params["params"]["text"]
+    assert not any(name.startswith("layers_0_") for name in host.params["params"]["text"])
+
