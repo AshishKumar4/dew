@@ -15,24 +15,39 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import pytest
 
 from dew.nn.dit import TextContext
 from dew.interop import (
-    hub, load_params, pull_from_hub, push_to_hub, save_hf_layout, save_params,
+    hub,
+    load_params,
+    pull_from_hub,
+    push_to_hub,
+    save_hf_layout,
+    save_params,
 )
 from dew.nn.backbones.dit import SimpleDiT
 
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
+import safetensors
+
+from dew.interop.safetensors_io import read_file, write_file
 
 
 @pytest.fixture
 def params(rng):
-    model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1)
+    model = SimpleDiT(
+        patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1
+    )
     x = jax.random.normal(rng, (1, 8, 8, 3))
-    return model.init(rng, x, jnp.ones((1,)),
-                      TextContext(jnp.ones((1, 77, 768)), jnp.ones((1, 77), bool)))
+    return model.init(
+        rng,
+        x,
+        jnp.ones((1,)),
+        TextContext(jnp.ones((1, 77, 768)), jnp.ones((1, 77), bool)),
+    )
 
 
 def flat_names(tree):
@@ -57,7 +72,9 @@ def test_round_trip_keeps_bfloat16(params, tmp_path):
     save_params(narrowed, path)
     loaded = load_params(path)
 
-    for saved, restored in zip(jax.tree.leaves(narrowed), jax.tree.leaves(loaded), strict=True):
+    for saved, restored in zip(
+        jax.tree.leaves(narrowed), jax.tree.leaves(loaded), strict=True
+    ):
         assert restored.dtype == jnp.bfloat16
         assert np.array_equal(np.asarray(saved), restored)
 
@@ -92,9 +109,175 @@ def test_missing_safetensors_names_the_extra(params, tmp_path, monkeypatch):
         save_params(params, tmp_path / "model.safetensors")
 
 
+def test_missing_safetensors_reader_names_the_extra(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "safetensors", None)
+    with pytest.raises(ImportError, match=r"dew-ml\[interop\]"):
+        read_file(tmp_path / "model.safetensors")
+
+
+# ---------------------------------------------------------------------------------
+# The memory-mapped reader
+# ---------------------------------------------------------------------------------
+
+
+def test_every_stored_dtype_reads_back_exactly(tmp_path):
+    """Scalar, nonempty and empty tensors keep their own dtype and bytes."""
+    stored = {
+        "bf16": np.asarray(jnp.asarray([1.5, -2.0], jnp.bfloat16)),
+        "f16": np.asarray([0.5, -0.25], np.float16),
+        "f32": np.asarray([0.5, -0.25], np.float32),
+        "f64": np.asarray([[3.0]], np.float64),
+        "i64": np.asarray([7], np.int64),
+        "bytes": np.asarray([0, 127, 128, 255], np.uint8),
+        "empty": np.zeros((0, 4), np.uint8),
+        "flag": np.asarray(True, np.bool_),
+        "scalar": np.asarray(0.25, np.float32),
+    }
+    path = tmp_path / "model.safetensors"
+    safetensors_numpy.save_file(stored, str(path), metadata={"writer": "dew"})
+
+    tensors, metadata = read_file(path)
+
+    assert metadata == {"writer": "dew"}
+    for name, expected in stored.items():
+        tensor = tensors[name]
+        assert tensor.dtype == expected.dtype and tensor.shape == expected.shape
+        np.testing.assert_array_equal(tensor, expected)
+
+
+def test_float8_payloads_are_mapped_without_numpy_dtype_conversion(tmp_path):
+    """FP8 array, scalar and empty payloads use the official format tag.
+    Compare stored bits, including signed zero, rather than widened values."""
+    from dew.interop.quantized import E4M3
+
+    stored = {
+        "weight": np.asarray([0.0, -0.0, 1.5, -2.0, 448.0], dtype=E4M3),
+        "scalar": np.asarray(-1.5, dtype=E4M3),
+        "empty": np.empty((0, 3), dtype=E4M3),
+        "bf16": np.asarray([1.5, -2.0], dtype=ml_dtypes.bfloat16),
+        "packed": np.asarray([0, 128, 255], dtype=np.uint8),
+    }
+    path = tmp_path / "fp8.safetensors"
+    safetensors_numpy.save_file(stored, str(path))
+    tensors, _ = read_file(path)
+    for name, expected in stored.items():
+        actual = tensors[name]
+        assert actual.shape == expected.shape and actual.dtype == expected.dtype
+        assert isinstance(actual.base, np.memmap) and not actual.flags.writeable
+        assert actual.tobytes() == expected.tobytes()
+
+
+def test_the_arrays_are_read_only_views_of_the_file(tmp_path):
+    """The map outlives the reader context, and the arrays refuse writes."""
+    path = tmp_path / "model.safetensors"
+    safetensors_numpy.save_file(
+        {"w": np.asarray([1.0, 2.0, 3.0], np.float32)}, str(path)
+    )
+
+    tensors, _ = read_file(path)
+
+    tensor = tensors["w"]
+    assert isinstance(tensor.base, np.memmap) and not tensor.flags.writeable
+    np.testing.assert_array_equal(tensor, [1.0, 2.0, 3.0])
+    with pytest.raises(ValueError, match="read-only"):
+        tensor[0] = 9.0
+
+
+_PUBLISHERS = [
+    pytest.param(
+        lambda value, path: save_params({"params": {"w": value}}, path),
+        id="save_params",
+    ),
+    pytest.param(
+        lambda value, path: write_file({"params/w": value}, path, {}), id="write_file"
+    ),
+]
+
+
+@pytest.mark.parametrize("publish", _PUBLISHERS)
+def test_overwrite_retains_the_previously_loaded_tree(tmp_path, publish):
+    path = tmp_path / "model.safetensors"
+    save_params({"params": {"w": np.asarray([1.0, 2.0], np.float32)}}, path)
+    original = load_params(path)
+
+    publish(np.asarray([9.0, 8.0], np.float32), path)
+
+    np.testing.assert_array_equal(original["params"]["w"], [1.0, 2.0])
+    np.testing.assert_array_equal(load_params(path)["params"]["w"], [9.0, 8.0])
+    assert set(tmp_path.iterdir()) == {path}
+
+
+@pytest.mark.parametrize("publish", _PUBLISHERS)
+def test_failed_publication_preserves_the_file_and_cleans_the_temporary(
+    tmp_path, monkeypatch, publish
+):
+    path = tmp_path / "model.safetensors"
+    save_params({"params": {"w": np.asarray([1.0, 2.0], np.float32)}}, path)
+    original = load_params(path)
+    before = path.read_bytes()
+
+    def partial_write(tensors, filename, metadata=None):
+        Path(filename).write_bytes(b"incomplete payload")
+        raise OSError("injected write failure")
+
+    monkeypatch.setattr(safetensors_numpy, "save_file", partial_write)
+    with pytest.raises(OSError, match="injected write failure"):
+        publish(np.asarray([9.0, 8.0], np.float32), path)
+
+    assert path.read_bytes() == before
+    np.testing.assert_array_equal(original["params"]["w"], [1.0, 2.0])
+    assert set(tmp_path.iterdir()) == {path}
+
+
+def test_a_truncated_file_fails_in_the_official_parser(tmp_path):
+    path = tmp_path / "model.safetensors"
+    safetensors_numpy.save_file({"w": np.ones((4,), np.float32)}, str(path))
+    raw = path.read_bytes()
+    path.write_bytes(raw[: len(raw) // 2])
+
+    with pytest.raises(safetensors.SafetensorError):
+        read_file(path)
+
+
+def test_a_metadata_only_file_reads_empty(tmp_path):
+    path = tmp_path / "model.safetensors"
+    safetensors_numpy.save_file({}, str(path), metadata={"layout": "dew"})
+
+    tensors, metadata = read_file(path)
+
+    assert tensors == {} and metadata == {"layout": "dew"}
+
+
+def test_a_bf16_checkpoint_still_loads_as_fp32_parameters(tmp_path):
+    """A bfloat16 checkpoint reads in its stored dtype and widens exactly,
+    so the public fp32 default is unchanged."""
+    from dew.interop import load_pretrained
+
+    source = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
+    tensors, _ = read_file(source / "model.safetensors")
+    bf16 = {
+        name: np.asarray(jnp.asarray(tensor, jnp.bfloat16))
+        for name, tensor in tensors.items()
+    }
+    directory = tmp_path / "checkpoint"
+    directory.mkdir()
+    (directory / "config.json").write_text((source / "config.json").read_text())
+    safetensors_numpy.save_file(bf16, str(directory / "model.safetensors"))
+
+    loaded = load_pretrained(str(directory), dtype="float32", attention_impl="xla")
+
+    leaves, _ = jax.tree_util.tree_flatten(loaded.variables)
+    assert all(np.asarray(leaf).dtype == np.float32 for leaf in leaves)
+    np.testing.assert_array_equal(
+        np.asarray(loaded.variables["params"]["embed_tokens"]["embedding"]),
+        np.asarray(bf16["model.embed_tokens.weight"], np.float32),
+    )
+
+
 # ---------------------------------------------------------------------------------
 # Hub push and pull
 # ---------------------------------------------------------------------------------
+
 
 class _RecordingApi:
     """Stands in for HfApi and keeps every call push_to_hub makes."""
@@ -124,17 +307,23 @@ def test_push_creates_the_repo_and_uploads_the_export_directory(params, tmp_path
     push_to_hub(export, "acme/dew-export")
 
     assert api.created == [("acme/dew-export", {"private": False, "exist_ok": True})]
-    assert api.uploaded == [{
-        "repo_id": "acme/dew-export",
-        "folder_path": str(export),
-        "commit_message": "Upload dew export",
-    }]
+    assert api.uploaded == [
+        {
+            "repo_id": "acme/dew-export",
+            "folder_path": str(export),
+            "commit_message": "Upload dew export",
+        }
+    ]
     uploaded = Path(api.uploaded[0]["folder_path"])
     assert {entry.name for entry in uploaded.iterdir()} == {
-        "model.safetensors", "config.json"}
+        "model.safetensors",
+        "config.json",
+    }
 
 
-def test_push_passes_the_private_flag_and_the_commit_message_through(params, tmp_path, api):
+def test_push_passes_the_private_flag_and_the_commit_message_through(
+    params, tmp_path, api
+):
     export = tmp_path / "export"
     save_hf_layout(params, {"architecture": "simple_dit"}, export)
 
