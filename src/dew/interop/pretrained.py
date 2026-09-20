@@ -136,7 +136,7 @@ class Processor:
         """Validate and normalize actual processor outputs before device use."""
         known = {"input_ids", "attention_mask", "pixel_values", "token_type_ids", "mm_token_type_ids",
                  "image_position_ids", "image_grid_thw", "input_features", "input_features_mask",
-                 "pixel_values_videos", "video_grid_thw"}
+                 "pixel_values_videos", "video_grid_thw", "video_position_ids"}
         unknown = set(values) - known
         if unknown:
             raise ValueError(f"processor fields {sorted(unknown)} have no native model input")
@@ -153,10 +153,28 @@ class Processor:
         token_fields = {"positions": jnp.asarray(positions)}
         if not valid.all():
             token_fields["attention_mask"] = jnp.asarray(valid)
+        gemma = self.config.get("model_type") == "gemma4"
+        if gemma:
+            for pixels, coordinates in (("pixel_values", "image_position_ids"),
+                                         ("pixel_values_videos", "video_position_ids")):
+                if (pixels in values) != (coordinates in values):
+                    raise ValueError(f"{pixels} and {coordinates} arrive together")
+            if "mm_token_type_ids" in values:
+                types = np.asarray(values["mm_token_type_ids"])
+                if types.shape != tokens.shape or not np.issubdtype(types.dtype, np.integer):
+                    raise ValueError("mm_token_type_ids must be integer values aligned with input_ids")
+                # Image-to-video adjacency stays one vision run; hard text
+                # breaks it (modeling_gemma4.py:2148-2157).
+                vision = (types == 1) | (types == 2)
+                previous = np.concatenate([np.zeros((tokens.shape[0], 1), bool), vision[:, :-1]], axis=1)
+                groups = np.cumsum(vision & ~previous, axis=1, dtype=np.int32) - 1
+                token_fields["image_groups"] = jnp.asarray(np.where(vision, groups, -1))
+        elif "video_position_ids" in values:
+            raise ValueError("video_position_ids require the Gemma4 visual tower")
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
-            if "pixel_values_videos" in values and self.config.get("model_type") != "qwen3_5":
-                raise ValueError("video patch inputs require the Qwen3.5 visual tower")
+            if "pixel_values_videos" in values and self.config.get("model_type") not in ("qwen3_5", "gemma4"):
+                raise ValueError("video patch inputs require a Qwen3.5 or Gemma4 visual tower")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
             if self.config.get("model_type") == "qwen3_5":
@@ -180,10 +198,13 @@ class Processor:
         if type(image_id) is not int:
             raise ValueError("image_token_id must be an integer")
         qwen = self.config.get("model_type") == "qwen3_5"
-        video_id = self.config.get("video_token_id") if qwen else None
+        gemma = self.config.get("model_type") == "gemma4"
+        video_id = (self.config.get("video_token_id", 258884) if gemma else
+                    self.config.get("video_token_id") if qwen else None)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
         if pixels.ndim not in (2, 3, 4) or not np.issubdtype(pixels.dtype, np.floating):
             raise ValueError("pixel_values must contain floating image tensors or patch vectors")
+        pixel_dtype = pixels.dtype
         runs = []
         for row in tokens:
             locations = np.flatnonzero((row == image_id) | (row == video_id if video_id is not None else False))
@@ -202,30 +223,73 @@ class Processor:
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
             lengths = np.prod(grid, axis=1) // merge ** 2
             capacity = shape[0] // merge ** 2
-        elif "image_position_ids" in values:
+        elif "image_position_ids" in values or "video_position_ids" in values:
             vision = self.config.get("vision_config")
             if not isinstance(vision, Mapping):
-                raise ValueError("image_position_ids require a vision config")
+                raise ValueError("patch position ids require a vision config")
             kernel = vision.get("pooling_kernel_size")
             if type(kernel) is not int or kernel < 1:
                 raise ValueError("pooling_kernel_size must be a positive integer")
-            patch_positions = np.asarray(values["image_position_ids"])
-            if (pixels.ndim != 3 or patch_positions.shape != pixels.shape[:2] + (2,)
-                    or not np.issubdtype(patch_positions.dtype, np.integer)):
-                raise ValueError("patch pixels require aligned integer image_position_ids")
-            valid_patches = (patch_positions >= 0).all(axis=-1)
-            padding = (patch_positions == -1).all(axis=-1)
-            if not np.all(valid_patches | padding):
-                raise ValueError("image_position_ids use nonnegative coordinates or paired (-1, -1) padding")
-            table_size = vision.get("position_embedding_size")
-            if type(table_size) is not int or np.any(patch_positions >= table_size):
-                raise ValueError("image_position_ids exceed position_embedding_size")
-            counts = valid_patches.sum(axis=1)
-            if pixels.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2):
-                raise ValueError("patch counts must divide into complete pooling blocks")
-            lengths = counts // kernel ** 2
-            capacity = pixels.shape[1] // kernel ** 2
-            chunks, shape = list(pixels), pixels.shape[1:]
+            table_size, patch_size = vision.get("position_embedding_size"), vision.get("patch_size")
+            if type(table_size) is not int or table_size < 1 or type(patch_size) is not int or patch_size < 1:
+                raise ValueError("position_embedding_size and patch_size must be positive integers")
+            streams: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+            for pixel_name, position_name, token_id, ndim in (
+                ("pixel_values", "image_position_ids", image_id, 3),
+                ("pixel_values_videos", "video_position_ids", video_id, 4),
+            ):
+                if pixel_name not in values and position_name not in values:
+                    continue
+                if pixel_name not in values or position_name not in values:
+                    raise ValueError(f"{pixel_name} and {position_name} arrive together")
+                if type(token_id) is not int:
+                    raise ValueError(f"{pixel_name} requires an integer placeholder id")
+                if token_id in streams:
+                    raise ValueError("image_token_id and video_token_id must identify separate payload streams")
+                frames, coordinates = np.asarray(values[pixel_name]), np.asarray(values[position_name])
+                if (frames.ndim != ndim or not np.issubdtype(frames.dtype, np.floating)
+                        or min(frames.shape[1:]) < 1):
+                    raise ValueError(f"{pixel_name} must contain floating patch frames of rank {ndim}")
+                if (coordinates.shape != frames.shape[:-1] + (2,)
+                        or not np.issubdtype(coordinates.dtype, np.integer)):
+                    raise ValueError(f"{position_name} must contain aligned integer patch coordinates")
+                if frames.shape[-1] != 3 * patch_size ** 2:
+                    raise ValueError(f"{pixel_name} patch width disagrees with vision_config.patch_size")
+                # The source flattens video then frame axes, not prompt rows
+                # (modeling_gemma4.py:2476-2488). Keep the two modality streams
+                # separate until their placeholder runs establish row order.
+                frames = frames.reshape(-1, *frames.shape[-2:])
+                coordinates = coordinates.reshape(-1, *coordinates.shape[-2:])
+                valid_patches = (coordinates >= 0).all(axis=-1)
+                padding = (coordinates == -1).all(axis=-1)
+                if not np.all(valid_patches | padding):
+                    raise ValueError(f"{position_name} uses nonnegative coordinates or paired (-1, -1) padding")
+                if np.any(coordinates >= table_size):
+                    raise ValueError(f"{position_name} exceeds position_embedding_size")
+                counts = valid_patches.sum(axis=1)
+                if frames.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2):
+                    raise ValueError("patch counts must divide into complete pooling blocks")
+                streams[token_id] = (frames, coordinates, counts // kernel ** 2)
+            offsets = {token_id: 0 for token_id in streams}
+            chunks, patch_positions, lengths = [], [], []
+            for row, blocks in enumerate(runs):
+                for slots in blocks:
+                    token_id = int(tokens[row, slots[0]])
+                    stream = streams.get(token_id)
+                    offset = offsets.get(token_id, 0)
+                    if stream is None or offset >= len(stream[0]):
+                        raise ValueError("pixel_values and image/video placeholder counts disagree")
+                    chunks.append(stream[0][offset])
+                    patch_positions.append(stream[1][offset])
+                    lengths.append(int(stream[2][offset]))
+                    offsets[token_id] += 1
+            if any(offsets[token_id] != len(stream[0]) for token_id, stream in streams.items()):
+                raise ValueError("pixel_values and image/video placeholder counts disagree")
+            if not chunks:
+                raise ValueError("pixels require image or video placeholders")
+            shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
+            pixel_dtype = np.result_type(*(chunk.dtype for chunk in chunks))
+            capacity = shape[0] // kernel ** 2
         else:
             count = self.record.get("tokens_per_image")
             if type(count) is not int or count < 1 or pixels.ndim != 4:
@@ -238,14 +302,14 @@ class Processor:
         width = int(image_counts.max())
         if width < 1:
             raise ValueError("pixels require image placeholders")
-        padded = np.zeros((tokens.shape[0], width, *shape), pixels.dtype)
+        padded = np.zeros((tokens.shape[0], width, *shape), pixel_dtype)
         padded_grid = None if grid is None else np.zeros((tokens.shape[0], width, 3), np.int32)
         if padded_grid is not None:
             padded_grid[..., 1:] = merge
         padded_positions = (None if patch_positions is None else np.full(
-            (tokens.shape[0], width, *patch_positions.shape[1:]), -1, np.int32))
+            (tokens.shape[0], width, shape[0], 2), -1, np.int32))
         indices = np.full(tokens.shape, -1, np.int32)
-        groups = np.full(tokens.shape, -1, np.int32)
+        groups = None if gemma else np.full(tokens.shape, -1, np.int32)
         token_lengths = np.zeros((tokens.shape[0], width), np.int32)
         offset = 0
         for row, blocks in enumerate(runs):
@@ -258,10 +322,12 @@ class Processor:
                 if padded_grid is not None and grid is not None:
                     padded_grid[row, image] = grid[offset]
                 if padded_positions is not None and patch_positions is not None:
-                    padded_positions[row, image] = patch_positions[offset]
+                    positions = patch_positions[offset]
+                    padded_positions[row, image, :positions.shape[0]] = positions
                 token_lengths[row, image] = length
                 indices[row, slots] = image * capacity + np.arange(length)
-                groups[row, slots] = image
+                if groups is not None:
+                    groups[row, slots] = image
                 offset += 1
         conditioning = {"pixel_values": jnp.asarray(padded), "image_lengths": jnp.asarray(image_counts),
                         "image_token_lengths": jnp.asarray(token_lengths)}
@@ -269,7 +335,10 @@ class Processor:
             conditioning["image_position_ids"] = jnp.asarray(padded_positions)
         if padded_grid is not None:
             conditioning["image_grid_thw"] = jnp.asarray(padded_grid)
-        return {"image_indices": jnp.asarray(indices), "image_groups": jnp.asarray(groups)}, conditioning
+        fields = {"image_indices": jnp.asarray(indices)}
+        if groups is not None:
+            fields["image_groups"] = jnp.asarray(groups)
+        return fields, conditioning
 
     def _audio(self, values: Mapping[str, object], tokens: np.ndarray
                ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:

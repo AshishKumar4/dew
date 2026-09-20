@@ -135,6 +135,123 @@ def test_source_processor_rejects_unknown_fields_and_incorrect_image_counts(sour
         loaded.processor.from_hf({**values, "pixel_values": values["pixel_values"][:1]})
 
 
+@pytest.fixture(scope='module')
+def gemma4_video_batch():
+    from transformers.video_utils import VideoMetadata
+
+    loaded = load_pretrained(FIXTURE.parent / 'gemma4-native-tiny', dtype='float32', attention_impl='reference')
+    native = loaded.processor
+    if native is None:
+        raise ValueError('the Gemma4 fixture requires its saved Processor')
+    processor = native.reference
+    vision = native.config.get('vision_config')
+    if not isinstance(vision, dict):
+        raise ValueError('the Gemma4 fixture requires its vision configuration')
+    patch, pool = vision['patch_size'], vision['pooling_kernel_size']
+    side = patch * pool
+    frame = (np.arange(side * side * 3).reshape(side, side, 3) % 256).astype(np.uint8)
+    videos = [np.stack([frame, np.roll(frame, 3, axis=1)]),
+              np.stack([np.flip(frame, axis=0), np.roll(frame, 5, axis=0)])]
+    # Nine image tokens exceed the tiny sliding window of four, exercising
+    # window AND (causal OR vision-group), not an unbounded group override.
+    image = np.tile(frame, (3, 3, 1))
+    images = [[image], [np.roll(image, 3, axis=0)]]
+    video_token, image_token = getattr(processor, 'video_token'), getattr(processor, 'image_token')
+    text = [f'{video_token} {image_token} token4',
+            f'{image_token} {video_token} token5']
+    metadata = [VideoMetadata(total_num_frames=2, fps=2.0, width=side, height=side,
+                              frames_indices=[0, 1]) for _ in videos]
+    # Documented per-call options match the tiny tower; serialized video
+    # defaults describe the released patch16/pool3 geometry.
+    values = dict(processor(
+        text=text, images=images, videos=videos, padding=True, return_tensors='np',
+        images_kwargs={'do_resize': False, 'max_soft_tokens': 70},
+        videos_kwargs={'patch_size': patch, 'pooling_kernel_size': pool,
+                       'do_resize': False, 'do_sample_frames': False,
+                       'max_soft_tokens': 70, 'input_data_format': 'channels_last',
+                       'video_metadata': metadata}))
+    return loaded, values
+
+
+def test_gemma4_processor_interleaves_independent_image_and_video_streams(gemma4_video_batch):
+    import torch
+    from transformers.models.gemma4.modeling_gemma4 import get_block_sequence_ids_for_mask
+
+    loaded, values = gemma4_video_batch
+    inputs = loaded.processor.from_hf(values)
+    frames, images = values['pixel_values_videos'], values['pixel_values']
+    expected = np.stack([frames[0, 0], frames[0, 1], images[0],
+                         images[1], frames[1, 0], frames[1, 1]])
+    actual = np.asarray(inputs.conditioning['pixel_values'])
+    np.testing.assert_array_equal(actual.reshape(expected.shape), expected)
+    np.testing.assert_array_equal(inputs.conditioning['image_lengths'], [3, 3])
+    groups = get_block_sequence_ids_for_mask(
+        torch.from_numpy(values['mm_token_type_ids']), torch.device('cpu')).numpy()
+    np.testing.assert_array_equal(inputs.token_fields['image_groups'], groups)
+
+
+@pytest.mark.parametrize('grouped', [False, True], ids=['causal_without_mmtypes', 'vision_groups'])
+def test_gemma4_mixed_video_forward_matches_unmodified_reference(gemma4_video_batch, grouped):
+    import torch
+    from transformers import Gemma4ForConditionalGeneration
+
+    loaded, original = gemma4_video_batch
+    values = dict(original)
+    if not grouped:
+        del values['mm_token_type_ids']
+    inputs = loaded.processor.from_hf(values)
+    if not grouped:
+        assert 'image_groups' not in inputs.token_fields
+    reference = Gemma4ForConditionalGeneration.from_pretrained(
+        FIXTURE.parent / 'gemma4-native-tiny', dtype=torch.float32).eval()
+    reference.set_attn_implementation('eager')
+    with torch.no_grad():
+        expected = reference(**{name: torch.from_numpy(value) for name, value in values.items()},
+                             use_cache=False).logits.numpy()
+    actual = jax.jit(lambda variables: loaded.model.apply(
+        variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
+    valid = np.asarray(values['attention_mask'], dtype=bool)
+    np.testing.assert_allclose(np.asarray(actual)[valid], expected[valid], atol=1e-4, rtol=0)
+
+
+def test_gemma4_vision_groups_cross_modality_boundaries_not_text(gemma4_video_batch):
+    loaded, _ = gemma4_video_batch
+    image, video = loaded.processor.config['image_token_id'], loaded.processor.config['video_token_id']
+    values = {'input_ids': np.array([[image, image, video, video, 4, video, 5, image]], np.int32),
+              'mm_token_type_ids': np.array([[1, 1, 2, 2, 0, 2, 0, 1]], np.int32)}
+    groups = loaded.processor.from_hf(values).token_fields['image_groups']
+    np.testing.assert_array_equal(groups, [[0, 0, 0, 0, -1, 1, -1, 2]])
+
+
+@pytest.mark.parametrize('invalid', ['missing_positions', 'unaligned_frames', 'unpaired_padding',
+                                      'coordinate_bounds', 'incomplete_pool', 'unused_frames'])
+def test_gemma4_video_payload_must_match_positions_and_placeholders(gemma4_video_batch, invalid):
+    loaded, original = gemma4_video_batch
+    values = dict(original)
+    values['video_position_ids'] = original['video_position_ids'].copy()
+    if invalid == 'missing_positions':
+        del values['video_position_ids']
+        message = 'arrive together'
+    elif invalid == 'unaligned_frames':
+        values['video_position_ids'] = values['video_position_ids'][:, :1]
+        message = 'aligned integer patch coordinates'
+    elif invalid == 'unpaired_padding':
+        values['video_position_ids'][0, 0, 0] = [-1, 0]
+        message = 'paired'
+    elif invalid == 'coordinate_bounds':
+        values['video_position_ids'][0, 0, 0, 0] = loaded.processor.config['vision_config']['position_embedding_size']
+        message = 'position_embedding_size'
+    elif invalid == 'incomplete_pool':
+        values['video_position_ids'][0, 0, 0] = [-1, -1]
+        message = 'complete pooling blocks'
+    else:
+        values['pixel_values_videos'] = np.concatenate([original['pixel_values_videos']] * 2)
+        values['video_position_ids'] = np.concatenate([original['video_position_ids']] * 2)
+        message = 'placeholder counts disagree'
+    with pytest.raises(ValueError, match=message):
+        loaded.processor.from_hf(values)
+
+
 def test_the_processor_emits_validity_only_where_the_batch_is_padded(source):
     """A whole batch states its validity by carrying none, and the positions
     it does carry are the row indices. A mask that only says every slot is
