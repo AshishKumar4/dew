@@ -58,6 +58,29 @@ def test_row_plan_preserves_resident_rows_padding_and_random_keys():
     np.testing.assert_array_equal(jax.random.key_data(keys), jax.random.key_data(expected_keys))
 
 
+def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
+    """A request key placed replicated over the mesh derives its rows without
+    a host round trip: a pool's key arrives this way, and folding the placed
+    key itself is what a multi-process request cannot do."""
+    import jax
+    import jax.numpy as jnp
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from dew.nn.inputs import BATCH_AXES, RowPlan
+    from dew.training import MeshSpec
+    from dew.training.distributed import build_mesh
+
+    mesh = build_mesh(MeshSpec())
+    plan = RowPlan(mesh, 3, 8, 0, 1)
+    key = jax.device_put(jax.random.key(11), NamedSharding(mesh, P()))
+    with jax.transfer_guard_device_to_host("disallow"):
+        keys = plan.keys(key)
+        jax.block_until_ready(keys)
+    expected = jax.vmap(lambda row: jax.random.fold_in(jax.random.key(11), row))(jnp.arange(8))
+    np.testing.assert_array_equal(jax.random.key_data(keys), jax.random.key_data(expected))
+    assert jax.random.key_impl(keys) == jax.random.key_impl(key)
+    assert keys.sharding == NamedSharding(mesh, P(BATCH_AXES))
+
+
 def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     import jax
     import jax.numpy as jnp

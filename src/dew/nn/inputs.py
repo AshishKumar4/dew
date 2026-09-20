@@ -434,9 +434,18 @@ class RowPlan:
 
     def keys(self, key: jax.Array) -> jax.Array:
         """One key per placed row, folded by global row index, so a pool draws
-        what a single process draws for the same rows."""
-        row_keys = jax.vmap(lambda row: jax.random.fold_in(key, row))(
-            jnp.arange(self.count) + self.process * self.rows)
+        what a single process draws for the same rows.
+
+        A request key replicated over a multi-process mesh is not
+        addressable, and folding it would hand
+        `make_array_from_process_local_data` rows this process cannot place.
+        Every replica holds the same key data, so the rows fold from this
+        process's own replica and stay device-resident throughout.
+        """
+        local = key if key.is_fully_addressable else key.addressable_data(0)
+        indices = jnp.arange(self.count, dtype=jnp.uint32,
+                             device=local.sharding) + self.process * self.rows
+        row_keys = jax.vmap(lambda row: jax.random.fold_in(local, row))(indices)
         sharding = self.sharding
         if sharding is None:
             return row_keys

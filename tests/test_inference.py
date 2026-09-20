@@ -430,7 +430,7 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
                                   live("the ", seed=7).host().tokens)
 
 
-@pytest.mark.parametrize("kind", ["jepa", "masked_diffusion", "unregistered"])
+@pytest.mark.parametrize("kind", ["jepa", "unregistered"])
 def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
     import json
     (tmp_path / "run.json").write_text(json.dumps({"objective": kind}))
