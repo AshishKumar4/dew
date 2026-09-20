@@ -91,11 +91,6 @@ class DiffusionObjective(Objective[Mean]):
                     EMASpec(decay=optax.constant_schedule(ema_decay), select=under("params")))
         self.artifact = VideoGrid if len(inputs.sample.shape) == 4 else ImageGrid
         check_solver(process, sampler, steps)
-        # The unconditional datum's value: the encoders are frozen, so one
-        # pass here serves every step and every sample.
-        self.unconditional = self.encode(self.encoder_params(), {
-            keyword: condition.encoder.tokenize([condition.unconditional])
-            for keyword, condition in inputs.conditions.items()})
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def pipeline(self, state: TrainState, *, ema: bool = True) -> TextToImage:
@@ -122,9 +117,12 @@ class DiffusionObjective(Objective[Mean]):
         return {keyword: condition.encoder.params
                 for keyword, condition in self.inputs.conditions.items()}
 
-    def encode(self, encoders, tokens: dict) -> dict:
-        """Every condition's value from its tokens, under the tree's encoder
-        parameters."""
+    def encode(self, encoders, tokens: dict | None = None) -> dict:
+        """Encode conditions under the supplied parameters; omitted tokens
+        select each condition's configured unconditional datum."""
+        if tokens is None:
+            tokens = {keyword: condition.encoder.tokenize([condition.unconditional])
+                      for keyword, condition in self.inputs.conditions.items()}
         return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
                 for keyword, condition in self.inputs.conditions.items()}
 
@@ -148,7 +146,7 @@ class DiffusionObjective(Objective[Mean]):
         held = self.held_variables() if variables is None else variables
         if "params" in held:
             return held
-        conditions = self.unconditional
+        conditions = self.encode(held["encoders"])
         if self.inputs.mask is not None:
             conditions = {**conditions, "mask": jnp.zeros((1, *self.latent_shape[:-1], 1)),
                           "masked_image": jnp.zeros((1, *self.latent_shape))}
@@ -170,19 +168,20 @@ class DiffusionObjective(Objective[Mean]):
         tokens = {keyword: batch[condition.field]
                   for keyword, condition in self.inputs.conditions.items()}
         given = self.encode(params["encoders"], tokens)
+        unconditional = self.encode(params["encoders"])
         if dropout:
             count = batch[self.inputs.sample.key].shape[0]
             dropped = jax.random.bernoulli(key, self.unconditional_prob, (count,))
             given = jax.tree.map(
                 lambda value, blank: jnp.where(
                     expand(dropped, value), jnp.broadcast_to(blank, value.shape), value),
-                given, aligned_conditions(given, self.unconditional))
+                given, aligned_conditions(given, unconditional))
         if self.inputs.mask is not None:
             from dew.inputs.diffusion import latent_image_conditions
             spatial = latent_image_conditions(self.autoencoder, params["autoencoder"],
                 unit_range(batch[self.inputs.sample.key]), batch[self.inputs.mask.key], jax.random.fold_in(key, 1))
-            return {**given, **spatial}, {**self.unconditional, **spatial}
-        return given, self.unconditional
+            return {**given, **spatial}, {**unconditional, **spatial}
+        return given, unconditional
 
     def _sampling_batch(self, batch):
         fields = [condition.field for condition in self.inputs.conditions.values()]
