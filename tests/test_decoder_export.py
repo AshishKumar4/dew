@@ -592,3 +592,73 @@ def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path
     save_hf_layout(tensors, config, directory)
     with pytest.raises(ValueError, match="differs between the encoder and the decoder"):
         load_pretrained(directory, param_dtype="bfloat16")
+
+
+def test_diffusion_gemma_source_export_resolves_omitted_embedding_tie_default(tmp_path):
+    from shutil import copytree
+    from dew.interop.diffusion_gemma import export_weights
+
+    source = copytree(FIXTURES / "diffusion-gemma-workflow", tmp_path / "source")
+    config = json.loads((source / "config.json").read_text())
+    del config["text_config"]["tie_word_embeddings"]
+    (source / "config.json").write_text(json.dumps(config))
+    loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
+    destination = tmp_path / "export"
+    loaded.save(destination)
+    restored = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    for expected, actual in zip(jax.tree.leaves(loaded.variables),
+                                jax.tree.leaves(restored.variables), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    mismatched = {**config, "text_config": {**config["text_config"], "tie_word_embeddings": False}}
+    with pytest.raises(ValueError, match="tie_word_embeddings"):
+        export_weights(loaded.model, loaded.variables, mismatched)
+
+
+@pytest.mark.parametrize("fixture, mode, dense", [
+    ("gemma4-ple", "frozen", True),
+    ("gemma4-ple", "frozen", False),
+    ("gemma4-kvshare", "frozen", False),
+    ("gemma4-e2b", "frozen", False),
+    ("gemma4-moe-tiny", "frozen", False),
+    ("gemma4-moe-tiny", "trainable", False),
+])
+def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tmp_path):
+    """Only model + variables reach the writer; HF receives no source template."""
+    import jax.numpy as jnp
+    import torch
+    from flax.core import unfreeze
+    from transformers import Gemma4ForCausalLM
+    from dew.interop.hf_decoders import save_pretrained_decoder
+
+    loaded = load_pretrained(FIXTURES / fixture, dtype="float32", attention_impl="reference")
+    model = loaded.model.clone(layer_scalar=mode)
+    ids = np.load(FIXTURES / fixture / "input_ids.npy")
+    if dense:
+        model = model.clone(per_layer_input_dim=None, per_layer_input_vocab=None)
+        variables = unfreeze(model.init(jax.random.key(11), jnp.asarray(ids)))
+    else:
+        variables = unfreeze(loaded.variables)
+    for index in range(model.num_layers):
+        layer = f"layers_{index}"
+        scalar = variables["constants"][layer].pop("layer_scalar")
+        collection = "params" if mode == "trainable" else "constants"
+        variables[collection][layer]["layer_scalar"] = jnp.full_like(scalar, 0.75 + index * 0.125)
+    expected = np.asarray(jax.jit(model.apply)(variables, jnp.asarray(ids)))
+    save_pretrained_decoder(model, variables, tmp_path)
+
+    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, jnp.asarray(ids)))
+    np.testing.assert_allclose(actual, expected, atol=LOGITS, rtol=0)
+    reference, report = Gemma4ForCausalLM.from_pretrained(
+        tmp_path, dtype=torch.float32, attn_implementation="eager", output_loading_info=True)
+    assert not report["missing_keys"] and not report["unexpected_keys"]
+    assert not report["mismatched_keys"] and not report["error_msgs"]
+    with torch.no_grad():
+        reference_logits = reference.eval()(torch.from_numpy(ids), use_cache=False).logits.numpy()
+    np.testing.assert_allclose(reference_logits, expected, atol=LOGITS, rtol=0)
+    # HF stores layer scalars as buffers, even when their exported values were trained.
+    for index in range(model.num_layers):
+        layer = f"layers_{index}"
+        collection = "params" if mode == "trainable" else "constants"
+        np.testing.assert_array_equal(restored.variables["constants"][layer]["layer_scalar"],
+                                      variables[collection][layer]["layer_scalar"])
