@@ -13,7 +13,8 @@ evaluation running against the sharded EMA copy, and a checkpoint on disk
 afterwards.
 """
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import jax
@@ -27,10 +28,13 @@ pytestmark = pytest.mark.mesh
 from jax.sharding import PartitionSpec as P
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
+from dew.config import ModelConfig
+from dew.data import OxfordFlowers
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
+from dew.nn.attention import Stage
 from dew.nn.dit import TextContext
-from dew.objectives.diffusion import DiffusionObjective
+from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -515,3 +519,48 @@ def test_a_placed_state_carries_the_layout_the_declarations_derive(case, tmp_pat
 
     for placed, derived in zip(jax.tree.leaves(state), jax.tree.leaves(shardings), strict=True):
         assert placed.sharding == derived
+
+
+# A unet the way a command line and a run.json carry it: every sequence a
+# list, every stage a record. Two stages over 8-pixel images is the smallest
+# unet that still downsamples once and attends on the coarse stage.
+JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
+             "num_res_blocks": 1, "num_middle_res_blocks": 1,
+             "attention_configs": [None, {"heads": 2, "use_projection": True}]}
+
+
+def unet_run(fields):
+    return DiffusionRunConfig(
+        model=ModelConfig("unet", fields, dtype="float32", attention_impl="reference"),
+        data=OxfordFlowers(image_size=8), text=None, guidance=None,
+        sampler=Euler(), sampling_steps=SAMPLER_STEPS)
+
+
+def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():
+    """JSON reconstruction preserves sampling with the same weights and key."""
+    value_unet = {**JSON_UNET, "feature_depths": (8, 16),
+                  "attention_configs": (None, Stage(heads=2, use_projection=True))}
+
+    record = json.loads(json.dumps(unet_run(JSON_UNET).to_dict()))
+    from_json = DiffusionRunConfig.from_dict(record).build()
+    from_values = unet_run(value_unet).build()
+
+    state = Trainer(from_json, optax.adam(1e-3), key=jax.random.key(0)).initial_state()
+    key = jax.random.key(3)
+    prompts = ["a water lily", "a sunflower"]
+    drawn = from_json.pipeline(state, ema=False)(
+        prompts, steps=SAMPLER_STEPS, key=key).host().images
+    np.testing.assert_array_equal(
+        drawn, from_values.pipeline(state, ema=False)(
+            prompts, steps=SAMPLER_STEPS, key=key).host().images)
+
+
+def test_a_declared_list_field_keeps_the_list_its_record_carries():
+    """The build boundary reads the annotation, not the value: `val_metrics`
+    is declared `list`, so a record rebuilds it as the mutable list the
+    dataclass asks for, and a run is the run it wrote down."""
+    config = replace(unet_run(JSON_UNET), val_metrics=["psnr", "ssim"])
+    rebuilt = DiffusionRunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
+    assert type(rebuilt.val_metrics) is list
+    assert rebuilt.val_metrics == ["psnr", "ssim"]
+    assert rebuilt == config
