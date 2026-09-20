@@ -12,8 +12,6 @@ is vLLM's formula in `vllm/model_executor/layers/utils.py`, applied here as
 plain numpy.
 """
 
-import math
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -432,3 +430,50 @@ def test_a_stop_string_split_across_byte_tokens_still_ends_the_row(tmp_path):
         got = bool(checked(state, jnp.asarray([row[-1]], jnp.int32))[0])
         want = bool(oracle(torch.tensor([row], dtype=torch.long), None)[0])
         assert got == want, (row, got, want)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("policy", [
+    decoding.Temperature(0.5), decoding.Temperature(2),
+    decoding.TopP(0.95), decoding.TopP(0), decoding.TopP(1),
+    decoding.MinP(0.2), decoding.MinP(0), decoding.MinP(1),
+])
+def test_lowered_scalar_policies_preserve_direct_values_and_dtype(policy, dtype):
+    state = rows([[1]], [[]])
+    logits = jnp.asarray([[-3.0, -1.0, 0.0, 2.0]], dtype)
+    expected = jax.jit(lambda s, x: policy(s, x))(state, logits)
+    lowered = decoding.components((policy,), "logits")[0]
+    actual = jax.jit(lambda transform, s, x: transform(s, x))(lowered, state, logits)
+    assert actual.dtype == expected.dtype == dtype
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def test_lowered_top_p_preserves_host_subtraction_at_the_probability_boundary():
+    p = 0.95
+    excluded = 1.0 - p
+    # Nineteen tokens let the lowest probability straddle the 0.05 cutoff.
+    # Adjacent input floats exercise the narrow host/device subtraction gap.
+    center = np.float32(np.log(18 * excluded / (1.0 - excluded)))
+    low = center + np.arange(-64, 65, dtype=np.float32) * abs(np.spacing(center))
+    logits = jnp.zeros((low.size, 19), jnp.float32).at[:, 0].set(jnp.asarray(low))
+    state = rows([[1]] * low.size, [[]] * low.size)
+    probability = jax.nn.softmax(logits)[:, 0]
+    device_excluded = jnp.float32(1.0) - jnp.float32(p)
+    assert bool(jnp.any((probability > np.float32(excluded)) & (probability <= device_excluded)))
+    policy = decoding.TopP(p)
+    expected = jax.jit(lambda s, x: policy(s, x))(state, logits)
+    lowered = decoding.components((policy,), "logits")[0]
+    actual = jax.jit(lambda transform, s, x: transform(s, x))(lowered, state, logits)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def test_policy_subclasses_keep_their_own_callable_behavior():
+    class ShiftedTemperature(decoding.Temperature):
+        def __call__(self, state, logits):
+            return logits + 3.0
+
+    state = rows([[1]], [[]])
+    logits = jnp.asarray([[-1.0, 0.0, 2.0]], jnp.float32)
+    lowered = decoding.components((ShiftedTemperature(1.0),), "logits")[0]
+    actual = jax.jit(lambda transform, s, x: transform(s, x))(lowered, state, logits)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(logits + 3.0))
