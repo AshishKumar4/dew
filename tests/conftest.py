@@ -8,6 +8,9 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 os.environ["XLA_FLAGS"] = (
     os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
 ).strip()
+if os.environ["JAX_PLATFORMS"] == "cuda":
+    # Exact state and gradient checks require repeatable CUDA reductions.
+    os.environ["XLA_FLAGS"] += " --xla_gpu_deterministic_ops=true"
 # Parity tests assert fp32 against references computed in fp32. Ampere and
 # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
 # 1e-2 between two correct implementations.
