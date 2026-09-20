@@ -1503,18 +1503,16 @@ class SourceTask:
 class _Denoiser:
     """What one architecture contributes to a diffusion source.
 
-    The native model and the variables its component's tensors translate to,
-    and the reading conventions the rest of the source follows from it: which
-    text towers it takes and how they compose, the width it reads their
-    sequence at, how many latent pixels one of its positions covers, its own
-    input channel count, the pipeline class its family's call policy comes
-    from and where that pipeline's sigmas start.
+    Model construction and conditioning conventions use metadata only.
+    The weight reader is invoked only by a complete source load; a restored
+    conditioner can reuse the same architecture metadata without reading
+    denoiser or autoencoder weights.
+
     """
 
     component: str
     model: nn.Module
-    variables: Variables
-    layouts: tuple[WeightLayout, ...]
+    weights: Callable[[str], tuple[Variables, tuple[WeightLayout, ...]]]
     built: Mapping[str, object]
     config: Mapping[str, object]
     composition: Composition
@@ -1542,38 +1540,21 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     """
     compute = resolve_dtype(dtype)
     denoiser = (_transformer_denoiser if (directory / "transformer" / "config.json").is_file()
-                else _unet_denoiser)(directory, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype)
+                else _unet_denoiser)(directory, dtype=dtype, attention_impl=attention_impl)
+    denoiser_variables, denoiser_layouts = denoiser.weights(param_dtype)
     policy = _call_policy(index, denoiser)
     autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(directory, compute, param_dtype=param_dtype)
-    names = tuple(name for name in denoiser.towers if _present(index, name))
-    if not names:
-        raise ValueError("A latent diffusion source needs at least one text encoder")
-    towers, tokenizers, text_params, text_layouts = _clip_towers(directory, names, compute, param_dtype=param_dtype)
-    components = {denoiser.component: denoiser.config, "vae": vae_config,
-                  **{name: _component_config(directory, name) for name in names}}
-    t5 = None
-    if denoiser.t5_tower is not None and _present(index, denoiser.t5_tower):
-        t5, t5_params, t5_layouts, components[denoiser.t5_tower] = _t5_tower(
-            directory, compute, denoiser.t5_tower, policy.sequence, param_dtype=param_dtype)
-        text_params[denoiser.t5_tower] = t5_params
-        text_layouts += t5_layouts
-    size = denoiser.sample_size * autoencoder.downscale_factor
-    height, width = index.get("dew_height", size), index.get("dew_width", size)
-    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
-        raise ValueError("Image geometry must contain positive integer dimensions")
-    # A guidance-embedded model takes the pipeline's scale as an input; a
-    # model that reads none carries nothing.
-    encoder = DiffusionConditioner(
-        towers, tokenizers, names, text_params, str(directory), height, width,
-        denoiser.context_width, composition=denoiser.composition, t5=t5,
-        guidance=policy.guidance if denoiser.embeds_guidance and not policy.guided else None,
-        aesthetics=bool(index.get("requires_aesthetics_score", False)))
+    encoder, text_layouts, components = _conditioning(
+        directory, index, denoiser, policy, compute,
+        denoiser.sample_size * autoencoder.downscale_factor, param_dtype=param_dtype)
+    components.update({denoiser.component: denoiser.config, "vae": vae_config})
+    height, width = encoder.height, encoder.width
     inpaint = denoiser.latent_input == autoencoder.latent_channels * 2 + 1
     inputs = InputSpec(Field("image", (height, width, 3)),
                        {"conditioning": Condition(encoder, unconditional=_unconditional(
                            denoiser.composition, index))},
                        mask=Field("mask", (height, width, 1)) if inpaint else None)
-    encoders: dict[str, object] = {"conditioning": text_params}
+    encoders: dict[str, object] = {"conditioning": encoder.params}
     finish, safety_layouts = None, ()
     if _present(index, "safety_checker"):
         finish, encoders["safety"], safety_layouts, safety_configs = _image_safety(
@@ -1586,16 +1567,71 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
                       CFG(policy.guidance) if policy.guided and policy.guidance > 1 else None,
                       functools.partial(schedule.sampling, origin=denoiser.origin,
                                         tokens=(height // patch) * (width // patch)))
-    variables = {**denoiser.variables, "encoders": encoders, "autoencoder": vae_params}
+    variables = {**denoiser_variables, "encoders": encoders, "autoencoder": vae_params}
     config = {"model_index": {**index, "dew_height": height, "dew_width": width}, **components}
     return Pretrained(denoiser.model, variables, None, config, directory, denoiser.built,
-                      weight_layouts=denoiser.layouts + vae_layouts + text_layouts + safety_layouts,
+                      weight_layouts=denoiser_layouts + vae_layouts + text_layouts + safety_layouts,
                       process=schedule.training_process(), inputs=inputs, autoencoder=autoencoder,
                       schedule=schedule, finish=finish, task=task)
 
 
-def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str,
-                   param_dtype: str = "float32") -> _Denoiser:
+def _conditioning(directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
+                  policy: _Call, compute, size: int, *, param_dtype: str,
+                  params: Variables | None = None):
+    """Construct the published text composition from metadata and either weight source."""
+    names = tuple(name for name in denoiser.towers if _present(index, name))
+    if not names:
+        raise ValueError("A latent diffusion source needs at least one text encoder")
+    towers, tokenizers, text_params, layouts = _clip_towers(
+        directory, names, compute, param_dtype=param_dtype, params=params)
+    components: dict[str, Mapping[str, object]] = {name: _component_config(directory, name) for name in names}
+    t5 = None
+    if denoiser.t5_tower is not None and _present(index, denoiser.t5_tower):
+        t5, t5_params, t5_layouts, components[denoiser.t5_tower] = _t5_tower(
+            directory, compute, denoiser.t5_tower, policy.sequence, param_dtype=param_dtype,
+            params=None if params is None else params[denoiser.t5_tower])
+        if params is None:
+            text_params = {**text_params, denoiser.t5_tower: t5_params}
+        layouts += t5_layouts
+    height, width = index.get("dew_height", size), index.get("dew_width", size)
+    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
+        raise ValueError("Image geometry must contain positive integer dimensions")
+    encoder = DiffusionConditioner(
+        towers, tokenizers, names, text_params, str(directory), height, width,
+        denoiser.context_width, composition=denoiser.composition, t5=t5,
+        guidance=policy.guidance if denoiser.embeds_guidance and not policy.guided else None,
+        aesthetics=bool(index.get("requires_aesthetics_score", False)), param_dtype=param_dtype)
+    return encoder, layouts, components
+
+
+def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16",
+                               param_dtype: str = "float32", revision: str | None = None,
+                               attention_impl: str = "auto", params: Variables | None = None
+                               ) -> DiffusionConditioner:
+    """Load conditioning weights, or bind supplied parameters using metadata only."""
+    from dew.nn.autoencoders import AutoencoderKL
+
+    compute = resolve_dtype(dtype)
+    resolve_dtype(param_dtype)
+    directory = decoders._snapshot(checkpoint, revision, weights=False)
+    with open(directory / "model_index.json") as handle:
+        index = json.load(handle)
+    denoiser = (_transformer_denoiser if (directory / "transformer" / "config.json").is_file()
+                else _unet_denoiser)(directory, dtype=dtype, attention_impl=attention_impl)
+    if params is None:
+        names = tuple(name for name in (*denoiser.towers, denoiser.t5_tower)
+                      if name is not None and _present(index, name))
+        # snapshot_download returns a commit directory. Keep both fetches on
+        # that commit even when the requested Hub branch moves between them.
+        directory = decoders._snapshot(checkpoint, directory.name, weights=names)
+    vae = AutoencoderKL(channels=tuple(_component_config(directory, "vae")["block_out_channels"]))
+    encoder, _, _ = _conditioning(
+        directory, index, denoiser, _call_policy(index, denoiser), compute,
+        denoiser.sample_size * vae.downscale_factor, param_dtype=param_dtype, params=params)
+    return encoder
+
+
+def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
     """The published UNet: cross attention over one or two CLIP towers, whose
     pooled text conditioning is the one its added time features ask for."""
     from dew.interop import diffusion
@@ -1605,14 +1641,18 @@ def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str,
     config = _component_config(directory, "unet")
     fields = diffusion.unet_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = UNet2DCondition(**fields)
-    params, layouts = diffusion.translate_unet_weights(
-        diffusion.component_tensors(directory, "unet"), model, param_dtype=param_dtype)
+
+    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, layouts = diffusion.translate_unet_weights(
+            diffusion.component_tensors(directory, "unet"), model, param_dtype=param_dtype)
+        return {"params": params}, layouts
+
     pooled = model.additional_time_features > 0
     built = {"name": "unet_2d_condition",
              "fields": {**fields, "dtype": dtype,
                         "stages": [asdict(stage) for stage in model.stages]}}
     return _Denoiser(
-        component="unet", model=model, variables={"params": params}, layouts=layouts,
+        component="unet", model=model, weights=weights,
         built=built, config=config, composition="clip_pooled" if pooled else "clip",
         towers=("text_encoder", "text_encoder_2"), patch=1, latent_input=model.in_channels,
         sample_size=_integer(config["sample_size"], "sample_size"),
@@ -1620,21 +1660,19 @@ def _unet_denoiser(directory: Path, *, dtype: str, attention_impl: str,
         pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline")
 
 
-def _transformer_denoiser(directory: Path, *, dtype: str, attention_impl: str,
-                          param_dtype: str = "float32") -> _Denoiser:
+def _transformer_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
     """The published transformer this directory holds, by the class it names."""
     config = _component_config(directory, "transformer")
     published = config.get("_class_name")
     if published == "SD3Transformer2DModel":
-        return _sd3_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype)
+        return _sd3_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     if published == "FluxTransformer2DModel":
-        return _flux_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype)
+        return _flux_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     raise ValueError(f"Native diffusion does not implement the published transformer "
                      f"{published!r}")
 
 
-def _sd3_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: str,
-                  param_dtype: str = "float32") -> _Denoiser:
+def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
     """SD3's MM-DiT: both CLIP towers and the T5 tower read jointly, with the
     stored position buffer in its own frozen collection."""
     from dew.interop import diffusion
@@ -1643,22 +1681,25 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: 
 
     fields = diffusion.sd3_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = SD3Transformer(**fields)
-    params, buffers, layouts = diffusion.translate_sd3_weights(
-        diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
+
+    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, buffers, layouts = diffusion.translate_sd3_weights(
+            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
+        return {"params": params, "buffers": buffers}, layouts
+
     built = {"name": "sd3_transformer",
              "fields": {**fields, "dtype": dtype,
                         "dual_attention_layers": list(fields["dual_attention_layers"])}}
     return _Denoiser(
-        component="transformer", model=model, variables={"params": params, "buffers": buffers},
-        layouts=layouts, built=built, config=config, composition="sd3",
+        component="transformer", model=model, weights=weights,
+        built=built, config=config, composition="sd3",
         towers=("text_encoder", "text_encoder_2"), patch=fields["patch_size"],
         latent_input=fields["in_channels"], sample_size=_integer(config["sample_size"], "sample_size"),
         context_width=fields["joint_attention_dim"], pipeline="StableDiffusion3Pipeline",
         t5_tower="text_encoder_3")
 
 
-def _flux_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl: str,
-                   param_dtype: str = "float32") -> _Denoiser:
+def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
     """Flux's transformer: one CLIP tower for the pooled vector, the T5 tower
     for the sequence, and a latent its pipeline packs in 2x2 patches.
 
@@ -1672,13 +1713,17 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str, attention_impl:
 
     fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = FluxTransformer(**fields)
-    params, layouts = diffusion.translate_flux_weights(
-        diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
+
+    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, layouts = diffusion.translate_flux_weights(
+            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
+        return {"params": params}, layouts
+
     built = {"name": "flux_transformer",
              "fields": {**fields, "dtype": dtype,
                         "axes_dims_rope": list(fields["axes_dims_rope"])}}
     return _Denoiser(
-        component="transformer", model=model, variables={"params": params}, layouts=layouts,
+        component="transformer", model=model, weights=weights,
         built=built, config=config, composition="flux", towers=("text_encoder",), patch=2,
         latent_input=fields["in_channels"] // 4,
         sample_size=_integer(config.get("sample_size", 128), "sample_size"),
@@ -1722,28 +1767,32 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32"
     return autoencoder, params, layouts, config
 
 
-def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtype: str = "float32"):
+def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtype: str = "float32",
+                 params: Variables | None = None):
     """The published CLIP text towers, their tokenizers, their parameters and
     the layouts those parameters came from."""
     from transformers import CLIPTokenizer
     from dew.interop import diffusion
     from dew.nn.text_encoders import CLIPTextTransformer, translate_config
 
-    towers, tokenizers, params, layouts = [], [], {}, ()
+    towers, tokenizers, layouts = [], [], ()
+    bound = {} if params is None else params
     for name in names:
         config = _component_config(directory, name)
         towers.append(CLIPTextTransformer(**translate_config(config), dtype=compute))
-        tower, recorded = diffusion.record_layouts(
-            name, diffusion.component_tensors(directory, name), _text_head_path,
-            ("encoders", "conditioning", name), param_dtype=param_dtype)
-        params[name] = tower
-        layouts += recorded
+        if params is None:
+            tower, recorded = diffusion.record_layouts(
+                name, diffusion.component_tensors(directory, name), _text_head_path,
+                ("encoders", "conditioning", name), param_dtype=param_dtype)
+            bound = {**bound, name: tower}
+            layouts += recorded
         tokenizers.append(CLIPTokenizer.from_pretrained(
             directory / ("tokenizer" + name.removeprefix("text_encoder"))))
-    return tuple(towers), tuple(tokenizers), params, layouts
+    return tuple(towers), tuple(tokenizers), bound, layouts
 
 
-def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dtype: str = "float32"):
+def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dtype: str = "float32",
+              params: Variables | None = None):
     """The published T5 encoder as the conditioner's segment, with its
     parameters, their layouts and its config.
 
@@ -1758,10 +1807,12 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
 
     config = _component_config(directory, component)
     tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)
-    tensors = diffusion.component_tensors(directory, component)
-    t5_embedding(tensors)
-    params, layouts = diffusion.record_layouts(
-        component, tensors, _t5_path, ("encoders", "conditioning", component), param_dtype=param_dtype)
+    layouts = ()
+    if params is None:
+        tensors = diffusion.component_tensors(directory, component)
+        t5_embedding(tensors)
+        params, layouts = diffusion.record_layouts(
+            component, tensors, _t5_path, ("encoders", "conditioning", component), param_dtype=param_dtype)
     tokenizer = AutoTokenizer.from_pretrained(
         directory / ("tokenizer" + component.removeprefix("text_encoder")))
     return T5Segment(tower, tokenizer, component, tokens), params, layouts, config

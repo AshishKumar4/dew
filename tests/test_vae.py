@@ -37,21 +37,59 @@ def test_latent_normalization_defaults_to_the_identity(rng):
     assert jnp.allclose(autoencoder.decode(autoencoder.params, x), x)
 
 
-def test_the_vae_loader_receives_the_revision(monkeypatch):
-    """`StableDiffusionVAE(revision=...)` hands the revision to the loader as
-    well as keeping it for its record, so a non-default run rebuilds from
-    the same weights."""
-    import dew.nn.autoencoders.sd_vae as sd_vae
-    seen = {}
+@pytest.mark.parametrize("remote", [False, True])
+def test_vae_reconstructs_metadata_without_reloading_supplied_weights(tmp_path, monkeypatch, remote):
+    import json
+    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
+    import dew.nn.autoencoders.vae as loader
 
-    def refuse(modelname, revision="bf16"):
-        seen["revision"] = revision
-        raise RuntimeError("no download in this test")
+    config = dict(block_out_channels=[8, 16], latent_channels=4, in_channels=3,
+                  layers_per_block=1, norm_num_groups=4, use_quant_conv=False,
+                  use_post_quant_conv=False, shift_factor=0.25, scaling_factor=0.5)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    name = str(tmp_path)
+    if remote:
+        import huggingface_hub
+        from huggingface_hub.errors import EntryNotFoundError
+        from huggingface_hub.file_download import DryRunFileInfo
 
-    monkeypatch.setattr(sd_vae, "load_pretrained_vae", refuse)
-    with pytest.raises(RuntimeError, match="no download"):
-        sd_vae.StableDiffusionVAE(revision="flax")
-    assert seen["revision"] == "flax"
+        wrong = tmp_path / "wrong.json"
+        wrong.write_text(json.dumps({**config, "shift_factor": 99.0}))
+
+        def download(repo_id, filename, *, revision=None, subfolder=None, dry_run=False):
+            if filename == "config.json":
+                return str(wrong if revision == "bf16" else tmp_path / "config.json")
+            if not dry_run:
+                raise AssertionError("supplied VAE parameters triggered a weight download")
+            if revision == "bf16":
+                raise EntryNotFoundError("this revision has config but no matching weights")
+            return DryRunFileInfo(commit_hash="a" * 40, file_size=1, filename=filename,
+                                 is_cached=False, local_path=str(tmp_path / filename), will_download=True)
+
+        monkeypatch.setattr(huggingface_hub, "hf_hub_download", download)
+        name = "fixture/vae"
+    model = AutoencoderKL(channels=(8, 16), blocks_per_level=1, norm_groups=4,
+                          quantize=False, post_quantize=False, dtype=jnp.float32)
+    image = jnp.linspace(-0.5, 0.5, 8 * 8 * 3).reshape(1, 8, 8, 3)
+    saved = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16),
+                         model.init(jax.random.key(4), image)["params"])
+
+    def forbid_weights(*args, **kwargs):
+        raise AssertionError("supplied VAE params must not read source weights")
+
+    monkeypatch.setattr(loader, "_read_vae_weights", forbid_weights)
+    restored = StableDiffusionVAE(name, params=saved, dtype=jnp.bfloat16)
+    expected = StableDiffusionVAE(model=model.clone(dtype=jnp.bfloat16), params=saved,
+                                 dtype=jnp.bfloat16, latent_shift=0.25, latent_scale=0.5)
+    actual_latent = restored.encode(restored.params, image)
+    expected_latent = expected.encode(saved, image)
+    np.testing.assert_array_equal(actual_latent, expected_latent)
+    np.testing.assert_array_equal(restored.decode(restored.params, actual_latent),
+                                  expected.decode(saved, expected_latent))
+    for actual, original in zip(jax.tree.leaves(restored.params), jax.tree.leaves(saved), strict=True):
+        assert actual.dtype == original.dtype
+        np.testing.assert_array_equal(actual, original)
+
 
 
 @pytest.mark.parametrize("shape", [(2, 8, 8, 4), (2, 3, 8, 8, 4)])

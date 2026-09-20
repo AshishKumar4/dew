@@ -24,6 +24,11 @@ class AutoencoderKL(nn.Module):
     post_quantize: bool = True
     dtype: Dtype = jnp.float32
 
+    @property
+    def downscale_factor(self) -> int:
+        """Every encoder level except the last halves each spatial axis."""
+        return 2 ** (len(self.channels) - 1)
+
     def setup(self):
         levels = len(self.channels)
         self.encoder = FlaxEncoder(in_channels=self.image_channels, out_channels=self.latent_channels,

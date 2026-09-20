@@ -57,3 +57,23 @@ def test_row_plan_preserves_resident_rows_padding_and_random_keys():
     expected_keys = jax.vmap(lambda row: jax.random.fold_in(key, row))(jnp.arange(8))
     np.testing.assert_array_equal(jax.random.key_data(keys), jax.random.key_data(expected_keys))
 
+
+def test_char_table_compute_override_preserves_supplied_storage():
+    import jax.numpy as jnp
+    from dew.inputs import CharTable
+    from dew.inputs.encoders import rebuild
+
+    source = CharTable.from_pretrained(dtype="bfloat16", param_dtype="float32", tokens=4, features=3)
+    tokens = source.tokenize(["ab"])
+    table = source.params["table"]
+    assert table.dtype == jnp.float32
+    expected = table[tokens["input_ids"]].astype(jnp.bfloat16)
+    np.testing.assert_array_equal(source.encode(source.params, tokens).hidden, expected)
+    saved = {"table": (table + 0.25).astype(jnp.bfloat16)}
+    rebuilt = rebuild("char_table", {**source.to_json(), "dtype": "float32"}, params=saved)
+    actual = rebuilt.encode(rebuilt.params, tokens).hidden
+    assert actual.dtype == jnp.float32
+    assert rebuilt.params["table"].dtype == jnp.bfloat16
+    np.testing.assert_array_equal(rebuilt.params["table"], saved["table"])
+    np.testing.assert_array_equal(actual, saved["table"][tokens["input_ids"]].astype(jnp.float32))
+

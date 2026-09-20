@@ -580,7 +580,7 @@ def _check_tree(params: Mapping[str, Any], module: nn.Module, *inputs) -> None:
             f"unexpected {unexpected}, mismatched {mismatched}")
 
 
-def _checkpoint_dir(name_or_dir: str, revision: Optional[str]) -> Path:
+def _checkpoint_dir(name_or_dir: str, revision: Optional[str], *, weights: bool = True) -> Path:
     """The directory holding config.json and the safetensors weights.
 
     A local directory is taken as it is. A repo id fetches the config and the
@@ -593,7 +593,7 @@ def _checkpoint_dir(name_or_dir: str, revision: Optional[str]) -> Path:
         return Path(name_or_dir)
     from huggingface_hub import snapshot_download
     return Path(snapshot_download(name_or_dir, revision=revision,
-                                  allow_patterns=[CONFIG_FILE, "model*.safetensors"]))
+                                  allow_patterns=[CONFIG_FILE, *(["model*.safetensors"] if weights else [])]))
 
 
 def _read_config(directory: Path) -> Dict[str, Any]:
@@ -638,19 +638,26 @@ class CLIPTextModel:
     @classmethod
     def from_pretrained(cls, name_or_dir: str = DEFAULT_MODEL, *,
                         dtype: Optional[Dtype] = None, param_dtype: str = "float32",
-                        revision: Optional[str] = None) -> "CLIPTextModel":
+                        revision: Optional[str] = None,
+                        variables: Mapping[str, object] | None = None) -> "CLIPTextModel":
         """Load a checkpoint from the Hub or a local directory.
 
         dtype selects computation; param_dtype selects weight storage and
         defaults to FP32 masters independently of the checkpoint dtype.
+        Supplied variables are bound unchanged; only configuration is read.
         """
-        directory = _checkpoint_dir(name_or_dir, revision)
+        directory = _checkpoint_dir(name_or_dir, revision, weights=variables is None)
         config = translate_config(_read_config(directory))
 
-        transformer = CLIPTextTransformer(dtype=dtype, **config)
-        params = translate_weights(_read_tensors(directory), param_dtype=param_dtype)
+        transformer = CLIPTextTransformer(dtype=resolve_dtype(dtype), **config)
+        if variables is None:
+            params = translate_weights(_read_tensors(directory), param_dtype=param_dtype)
+            variables = {"params": jax.tree.map(jnp.asarray, params)}
+        params = variables["params"]
+        if not isinstance(params, Mapping):
+            raise ValueError("CLIP text variables require a params collection")
         _check_tree(params, transformer, jnp.zeros((1, 2), jnp.int32))
-        return cls(transformer, {"params": jax.tree.map(jnp.asarray, params)}, config)
+        return cls(transformer, variables, config)
 
     def __call__(self, input_ids, attention_mask=None) -> CLIPTowerOutput:
         if attention_mask is not None:
@@ -1070,19 +1077,26 @@ class T5EncoderModel:
     @classmethod
     def from_pretrained(cls, name_or_dir: str = DEFAULT_T5_MODEL, *,
                         dtype: Optional[Dtype] = None, param_dtype: str = "float32",
-                        revision: Optional[str] = None) -> "T5EncoderModel":
+                        revision: Optional[str] = None,
+                        variables: Mapping[str, object] | None = None) -> "T5EncoderModel":
         """Load a checkpoint from the Hub or a local directory, encoder
         tensors only.
 
         dtype selects computation; param_dtype selects weight storage and
         defaults to FP32 masters. Sharded checkpoints load as one tower.
+        Supplied variables are bound unchanged; only configuration is read.
         """
-        directory = _checkpoint_dir(name_or_dir, revision)
+        directory = _checkpoint_dir(name_or_dir, revision, weights=variables is None)
         config = translate_t5_config(_read_config(directory))
-        transformer = T5EncoderTransformer(dtype=dtype, **config)
-        params = translate_t5_weights(_read_tensors(directory), param_dtype=param_dtype)
+        transformer = T5EncoderTransformer(dtype=resolve_dtype(dtype), **config)
+        if variables is None:
+            params = translate_t5_weights(_read_tensors(directory), param_dtype=param_dtype)
+            variables = {"params": jax.tree.map(jnp.asarray, params)}
+        params = variables["params"]
+        if not isinstance(params, Mapping):
+            raise ValueError("T5 variables require a params collection")
         _check_tree(params, transformer, jnp.zeros((1, 2), jnp.int32))
-        return cls(transformer, {"params": jax.tree.map(jnp.asarray, params)}, config)
+        return cls(transformer, variables, config)
 
     def __call__(self, input_ids, attention_mask=None) -> jax.Array:
         if attention_mask is not None:

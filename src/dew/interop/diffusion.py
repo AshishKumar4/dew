@@ -10,6 +10,7 @@ from pathlib import Path
 import json
 from typing import TYPE_CHECKING, TypedDict
 from flax.typing import Dtype
+from jax.typing import DTypeLike
 import numpy as np
 
 from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
@@ -87,7 +88,8 @@ def _boolean(value: object, name: str) -> bool:
     return value
 
 
-def unet_fields(config: Mapping[str, object], *, dtype="float32", attention_impl="auto") -> UNetFields:
+def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
+                attention_impl="auto") -> UNetFields:
     """Interpret source geometry and reject operation-changing unsupported controls."""
     raw_widths = config["block_out_channels"]
     if not isinstance(raw_widths, (tuple, list)) or not raw_widths:
@@ -279,7 +281,7 @@ class SD3Fields(TypedDict):
     attention_impl: str | None
 
 
-def sd3_fields(config: Mapping[str, object], *, dtype="float32",
+def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
                attention_impl="auto") -> SD3Fields:
     """A published `SD3Transformer2DModel` config as native model fields.
 
@@ -405,7 +407,7 @@ class FluxFields(TypedDict):
     attention_impl: str | None
 
 
-def flux_fields(config: Mapping[str, object], *, dtype="float32",
+def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
                 attention_impl="auto") -> FluxFields:
     """A published `FluxTransformer2DModel` config as native model fields.
 

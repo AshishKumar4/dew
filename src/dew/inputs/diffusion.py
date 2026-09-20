@@ -119,14 +119,16 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     aesthetics: bool = False
     t5: T5Segment | None = None
     guidance: float | None = None
+    param_dtype: str = "float32"
 
     @classmethod
-    def from_pretrained(cls, checkpoint: str, **kwargs):
-        from dew.interop.pretrained import load_pretrained
-        source = load_pretrained(checkpoint, **kwargs)
-        if source.inputs is None:
-            raise TypeError("This checkpoint has no image conditioning specification")
-        return source.inputs.conditions["conditioning"].encoder
+    def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
+                        param_dtype: str = "float32", revision: str | None = None,
+                        attention_impl: str = "auto", params: Variables | None = None):
+        from dew.interop.pretrained import load_diffusion_conditioner
+
+        return load_diffusion_conditioner(checkpoint, dtype=dtype, param_dtype=param_dtype,
+                                          revision=revision, attention_impl=attention_impl, params=params)
 
     @property
     def stacked(self) -> bool:
@@ -276,7 +278,8 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return tuple(self.tokenizers[0].batch_decode(np.asarray(ids), skip_special_tokens=True))
 
     def to_json(self):
-        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.towers[0].dtype)}
+        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.towers[0].dtype),
+                "param_dtype": self.param_dtype}
 
 
 @lru_cache(maxsize=32)

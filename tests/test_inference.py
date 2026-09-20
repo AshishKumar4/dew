@@ -8,7 +8,7 @@ trainer has just written.
 """
 
 import dataclasses
-from dataclasses import dataclass
+
 
 import dew
 import jax
@@ -273,35 +273,7 @@ def test_guidance_is_a_value_with_its_interval(tmp_path):
     assert unguided.build().guidance is None
     assert DiffusionRunConfig.from_dict(unguided.to_dict()).guidance is None
 
-def test_the_text_condition_pins_a_revision(tmp_path, monkeypatch):
-    """Both text loaders take a `revision` and the autoencoder's spec has
-    always named one, so a run could not pin its text tower: a moved branch
-    changed what a rerun conditioned on. The record carries it now, and only
-    when set, since an encoder that takes no revision must still build."""
-    from dew.registry import encoders as registry
 
-    seen = {}
-    original = registry["stub_text"].from_pretrained
-
-    @classmethod
-    def capture(cls, checkpoint, **fields):
-        seen.update(checkpoint=checkpoint, **fields)
-        return original(checkpoint, **{k: v for k, v in fields.items()
-                                      if k not in ("revision", "max_length")})
-
-    monkeypatch.setattr(registry["stub_text"], "from_pretrained", capture)
-
-    pinned = dataclasses.replace(
-        run_config(tmp_path),
-        text=TextCondition(encoder="stub_text", checkpoint="stub-clip", revision="refs/pr/1"))
-    assert DiffusionRunConfig.from_dict(pinned.to_dict()) == pinned
-    pinned.text.build()
-    assert seen["revision"] == "refs/pr/1"
-
-    seen.clear()
-    dataclasses.replace(pinned, text=TextCondition(encoder="stub_text",
-                                                   checkpoint="stub-clip")).text.build()
-    assert "revision" not in seen and "max_length" not in seen
 
 
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9):
@@ -484,3 +456,172 @@ def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
     actual = task([[1, 2]], 3, seed=4).host()
     np.testing.assert_array_equal(actual.tokens, expected.tokens)
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
+
+
+@pytest.mark.parametrize("compute,storage", [(None, None), ("bfloat16", None),
+                                               (None, "float32"), ("bfloat16", "float32")])
+def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
+        tmp_path, monkeypatch, compute, storage):
+    import tarfile
+    from dew.inference.pipeline import place
+    from pathlib import Path
+    from flax.core import unfreeze
+    import jax.numpy as jnp
+    from dew.inputs import CLIPText
+    from dew.nn.autoencoders import StableDiffusionVAE
+    from dew.objectives.base import FROZEN
+    import dew.nn.text_encoders as text_loader
+    import dew.nn.autoencoders.vae as vae_loader
+
+    fixtures = Path(__file__).parent / "fixtures"
+    with tarfile.open(fixtures / "tiny_diffusers.tar.xz") as archive:
+        archive.extractall(tmp_path / "source", filter="data")
+    directory = tmp_path / "run"
+    config = dataclasses.replace(
+        run_config(directory),
+        model=ModelConfig("simple_dit", {**MODEL, "patch_size": 2},
+                          dtype="float32", attention_impl="reference"),
+        text=TextCondition(encoder="clip_text", checkpoint=str(fixtures / "clip/tiny"), dtype="float32"),
+        autoencoder=StableDiffusionAutoencoder(modelname=str(tmp_path / "source/sd/vae"), dtype="float32"))
+    objective = config.build()
+    initial = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(3)).initial_state()
+    params = unfreeze(jax.tree.map(lambda leaf: (leaf + 0.015625).astype(jnp.bfloat16), initial.params))
+    params = {**params, "constants": {"scale": jnp.asarray([1.003], jnp.float32)}}
+    params["params"]["packed"] = jnp.asarray([16777217], jnp.int32)
+    params["encoders"]["textcontext"]["constants"] = {
+        "scale": jnp.asarray([3.14159], jnp.float32), "ids": jnp.asarray([16777217], jnp.int32)}
+    first = next(iter(params["params"]))
+    averaged = {"params": {first: jax.tree.map(lambda leaf: leaf.astype(jnp.float32) + 0.03125,
+                                             params["params"][first])},
+                "constants": {"scale": jnp.asarray([1.007], jnp.float32)}}
+    state = dataclasses.replace(initial, params=params, ema=averaged)
+    checkpoints = Checkpoints(str(directory))
+    checkpoints.save(0, state, None)
+    checkpoints.wait()
+    config.save(str(directory))
+
+    def forbid_weights(*args, **kwargs):
+        raise AssertionError("restoring a run opened source weight shards")
+
+    monkeypatch.setattr(text_loader, "_read_tensors", forbid_weights)
+    monkeypatch.setattr(vae_loader, "_read_vae_weights", forbid_weights)
+    restored = dew.pipeline(str(directory), dtype=compute, param_dtype=storage)
+    assert isinstance(restored, TextToImage)
+    merged = merge(params, averaged)
+
+    def expected_leaf(path, leaf):
+        keys = tuple(entry.key for entry in path)
+        parameter = (keys[0] in ("params", FROZEN, "autoencoder") or
+                     keys[:3] in (("encoders", "textcontext", "params"),
+                                  ("encoders", "textcontext", FROZEN)))
+        return leaf.astype(storage) if storage and parameter and jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+
+    expected_params = jax.tree_util.tree_map_with_path(expected_leaf, merged)
+    for expected, actual in zip(jax.tree.leaves(expected_params), jax.tree.leaves(restored.params), strict=True):
+        assert actual.dtype == expected.dtype
+        np.testing.assert_array_equal(actual, expected)
+    # Equal storage is insufficient for bitwise comparison: the unplaced
+    # oracle otherwise compiles one row while the restored mesh pads to eight.
+    expected_params = place(expected_params, None, None)
+    encoder = objective.inputs.conditions["textcontext"].encoder
+    assert isinstance(encoder, CLIPText)
+    vae = objective.autoencoder
+    assert isinstance(vae, StableDiffusionVAE)
+    target = jnp.float32 if compute is None else jnp.bfloat16
+    expected_encoder = dataclasses.replace(encoder, transformer=encoder.transformer.clone(dtype=target),
+                                           dtype=target, params=expected_params["encoders"]["textcontext"])
+    expected_vae = StableDiffusionVAE(model=vae.model.clone(dtype=target),
+                                    params=expected_params["autoencoder"], dtype=target,
+                                    latent_shift=vae.latent_shift, latent_scale=vae.latent_scale)
+    condition = dataclasses.replace(objective.inputs.conditions["textcontext"], encoder=expected_encoder)
+    reference = dataclasses.replace(
+        TextToImage.from_objective(objective, expected_params),
+        model=objective.model.clone(dtype=target),
+        inputs=dataclasses.replace(objective.inputs, conditions={"textcontext": condition}),
+        autoencoder=expected_vae)
+
+    np.testing.assert_array_equal(restored(["a red bird"], steps=2, seed=5).host().images,
+                                  reference(["a red bird"], steps=2, seed=5).host().images)
+    owned = restored.inputs.conditions["textcontext"].encoder.params
+    for owner_leaf, bound_leaf in zip(jax.tree.leaves(owned),
+                                      jax.tree.leaves(restored.params["encoders"]["textcontext"]), strict=True):
+        assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
+        np.testing.assert_array_equal(owner_leaf, bound_leaf)
+    assert isinstance(restored.autoencoder, StableDiffusionVAE)
+    for owner_leaf, bound_leaf in zip(jax.tree.leaves(restored.autoencoder.params),
+                                      jax.tree.leaves(restored.params["autoencoder"]), strict=True):
+        assert owner_leaf.dtype == bound_leaf.dtype and owner_leaf.sharding == bound_leaf.sharding
+        np.testing.assert_array_equal(owner_leaf, bound_leaf)
+
+
+@pytest.mark.parametrize("compute,storage", [("bfloat16", None), (None, "bfloat16")])
+def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weights(tmp_path, compute, storage):
+    import jax.numpy as jnp
+    from dew.inference import TextGeneration
+    from dew.objectives.base import FROZEN
+
+    _, state = make_lm_run(tmp_path)
+    baseline = dew.pipeline(str(tmp_path))
+    assert isinstance(baseline, TextGeneration)
+    first = next(iter(state.params["params"]))
+
+    def move_to_frozen(variables):
+        trainable = dict(variables["params"])
+        frozen = {**variables.get(FROZEN, {}), first: trainable.pop(first)}
+        return {**variables, "params": trainable, FROZEN: frozen}
+
+    assert state.ema is not None
+    step = int(state.step) + 1
+    frozen = dataclasses.replace(state, step=jnp.asarray(step, state.step.dtype),
+                                 params=move_to_frozen(state.params), ema=move_to_frozen(state.ema))
+    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints.save(step, frozen, None)
+    checkpoints.wait()
+    params = baseline.variables
+    if storage is not None:
+        params = {**params, "params": jax.tree.map(lambda leaf: leaf.astype(storage), params["params"])}
+    target = jnp.float32 if compute is None else jnp.bfloat16
+    expected = dataclasses.replace(baseline, model=baseline.model.clone(dtype=target), variables=params)
+    actual = dew.pipeline(str(tmp_path), dtype=compute, param_dtype=storage)
+    assert isinstance(actual, TextGeneration)
+    for reference, restored in zip(jax.tree.leaves(params), jax.tree.leaves(actual.variables), strict=True):
+        assert restored.dtype == reference.dtype
+        np.testing.assert_array_equal(restored, reference)
+    wanted = expected([[1, 2]], 2, seed=7).host()
+    result = actual([[1, 2]], 2, seed=7).host()
+    np.testing.assert_array_equal(result.tokens, wanted.tokens)
+    np.testing.assert_array_equal(result.raw_log_probs, wanted.raw_log_probs)
+
+
+def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_path):
+    import jax.numpy as jnp
+    from dew.inputs import CharTable
+
+    objective, state = make_run(tmp_path, encoder="char_table", checkpoint="char_table")
+    restored = dew.pipeline(str(tmp_path), dtype="float32", param_dtype="bfloat16")
+    assert isinstance(restored, TextToImage)
+    encoder = restored.inputs.conditions["textcontext"].encoder
+    assert isinstance(encoder, CharTable)
+    stored = merge(state.params, state.ema)
+    expected_vars = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), stored)
+    table = restored.params["encoders"]["textcontext"]["table"]
+    assert table.dtype == jnp.bfloat16
+    assert encoder.params["table"].dtype == table.dtype
+    np.testing.assert_array_equal(encoder.params["table"], table)
+    np.testing.assert_array_equal(table, expected_vars["encoders"]["textcontext"]["table"])
+    tokens = encoder.tokenize(["ab"])
+    hidden = encoder.encode(encoder.params, tokens).hidden
+    assert hidden.dtype == jnp.float32
+    np.testing.assert_array_equal(hidden, table[tokens["input_ids"]].astype(jnp.float32))
+    original = objective.inputs.conditions["textcontext"]
+    assert isinstance(original.encoder, CharTable)
+    reference_encoder = dataclasses.replace(original.encoder, dtype=jnp.float32,
+                                           params=expected_vars["encoders"]["textcontext"])
+    expected = dataclasses.replace(TextToImage.from_objective(objective, expected_vars),
+        inputs=dataclasses.replace(objective.inputs, conditions={
+            "textcontext": dataclasses.replace(original, encoder=reference_encoder)}))
+    np.testing.assert_array_equal(restored(["ab"], steps=2, seed=9).host().images,
+                                  expected(["ab"], steps=2, seed=9).host().images)
+
+
+

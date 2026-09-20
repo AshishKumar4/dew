@@ -21,6 +21,7 @@ from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypeVar, Union
 
 import jax.numpy as jnp
+from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations
 
 if TYPE_CHECKING:
@@ -236,21 +237,22 @@ def _field_value(member: Any, field: str, value: Any) -> Any:
     return from_record(_declared_type(member, field), value)
 
 
-_DTYPES = {"float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
+DtypeName = Literal["float32", "bfloat16", "float16"]
+_DTYPES: dict[DtypeName, DTypeLike] = {
+    "float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
 
 
 def resolve_dtype(value: Any) -> Any:
     """A dtype as a module field: a jnp dtype, one of its names, or None."""
     if value is None or not isinstance(value, str):
         return value
-    try:
-        return _DTYPES[value]
-    except KeyError:
-        raise ValueError(
-            f"dtype {value!r} is not one of {sorted(_DTYPES)}") from None
+    for name, dtype in _DTYPES.items():
+        if value == name:
+            return dtype
+    raise ValueError(f"dtype {value!r} is not one of {sorted(_DTYPES)}")
 
 
-def dtype_name(value: Any) -> str | None:
+def dtype_name(value: DTypeLike | None) -> DtypeName | None:
     """The name `resolve_dtype` accepts for a dtype, for a logged config."""
     if value is None:
         return None

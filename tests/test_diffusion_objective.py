@@ -17,16 +17,16 @@ import optax
 import pytest
 from flax import linen as nn
 
-import dew.nn.backbones  # registers the models
+
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
-from dew.diffusion import Process, broadcast_rates, expand, presets
+from dew.diffusion import broadcast_rates, expand, presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec, unit_range
 from dew.nn.dit import TextContext
 from dew.objectives.base import Step, Variables
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import encoders, models
-from dew.sampling import CFG, DDIM, Euler
+from dew.sampling import CFG, Euler
 from dew.training import Trainer
 
 RES = 8
@@ -47,9 +47,11 @@ class StubText(ConditionEncoder[str]):
     params: Variables
 
     @classmethod
-    def from_pretrained(cls, checkpoint: str, **fields):
-        return cls(checkpoint=checkpoint, params={"table": jnp.asarray(
-            np.random.RandomState(0).normal(size=(VOCAB, FEATURES)).astype(np.float32))})
+    def from_pretrained(cls, checkpoint: str, *, params=None, **fields):
+        if params is None:
+            params = {"table": jnp.asarray(
+                np.random.RandomState(0).normal(size=(VOCAB, FEATURES)).astype(np.float32))}
+        return cls(checkpoint=checkpoint, params=params)
 
     def tokenize(self, data):
         ids = np.zeros((len(data), TOKENS), np.int32)

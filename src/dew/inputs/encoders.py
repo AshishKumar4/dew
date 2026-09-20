@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic, Mapping, Optional, Self, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Mapping, Optional, Self, Sequence, TypeVar
 
 import jax.numpy as jnp
 import numpy as np
@@ -26,7 +26,7 @@ from dew.nn.text_encoders import (
     DEFAULT_MODEL, DEFAULT_T5_MODEL, CLIPTextModel, CLIPTextTransformer,
     T5EncoderModel, T5EncoderTransformer,
 )
-from dew.objectives.base import Variables
+from dew.objectives.base import FROZEN, Variables
 from dew.registry import dtype_name, encoders, resolve_dtype
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -39,14 +39,19 @@ class ConditionEncoder(ABC, Generic[Raw]):
     """A modality's path from raw data to a conditioning value."""
 
     params: Variables
+    parameter_collections: ClassVar[tuple[str, ...] | None] = None
+    """None declares a bare parameter tree; otherwise these collections own
+    learned weights, including frozen ones. Other collections retain their dtype."""
 
     @classmethod
     @abstractmethod
-    def from_pretrained(cls, checkpoint: str) -> Self:
+    def from_pretrained(cls, checkpoint: str, *, params: Variables | None = None) -> Self:
         """Load the tower named `checkpoint`; the one call that opens files.
 
         Whatever else a checkpoint needs is a keyword field with a default,
         the fields `to_json` records and the registry rebuilds from.
+        Supplied params are authoritative: read metadata, never source weights,
+        and retain their values, dtypes and placement unchanged.
         """
 
     @abstractmethod
@@ -67,14 +72,15 @@ class ConditionEncoder(ABC, Generic[Raw]):
         """The keyword fields `from_pretrained` rebuilds this encoder from."""
 
 
-def rebuild(name: str, fields: Mapping[str, Any]) -> ConditionEncoder[Any]:
+def rebuild(name: str, fields: Mapping[str, Any], *,
+            params: Variables | None = None) -> ConditionEncoder[Any]:
     """The named encoder rebuilt from its JSON fields.
 
     A run's record stores the registry name with the keyword fields `to_json`
     wrote. Those fields are unpacked here, so each encoder's
     `from_pretrained` keeps its own concrete signature.
     """
-    return encoders[name].from_pretrained(**fields)
+    return encoders[name].from_pretrained(**fields, params=params)
 
 
 @encoders("clip_text")
@@ -90,24 +96,29 @@ class CLIPText(ConditionEncoder[str]):
     """
 
     checkpoint: str
+    parameter_collections: ClassVar[tuple[str, ...] | None] = ("params", FROZEN)
     transformer: CLIPTextTransformer
     params: Variables
     tokenizer: PreTrainedTokenizerBase
     dtype: Optional[Dtype] = None
+
     revision: Optional[str] = None
     """The checkpoint's git revision, recorded so a rebuild reads the same
     weights and the same tokenizer."""
+    param_dtype: str = "float32"
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = DEFAULT_MODEL, *, dtype=None,
-                        revision: Optional[str] = None) -> "CLIPText":
+                        revision: Optional[str] = None, param_dtype: str = "float32",
+                        params: Variables | None = None) -> "CLIPText":
         from transformers import AutoTokenizer
 
         dtype = resolve_dtype(dtype)
-        model = CLIPTextModel.from_pretrained(checkpoint, dtype=dtype, revision=revision)
+        model = CLIPTextModel.from_pretrained(
+            checkpoint, dtype=dtype, revision=revision, param_dtype=param_dtype, variables=params)
         return cls(checkpoint=checkpoint, transformer=model.transformer, params=model.variables,
                    tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
-                   dtype=dtype, revision=revision)
+                   dtype=dtype, param_dtype=param_dtype, revision=revision)
 
     def tokenize(self, data: Sequence[str]) -> dict[str, np.ndarray]:
         tokens = self.tokenizer(list(data), padding="max_length",
@@ -130,6 +141,7 @@ class CLIPText(ConditionEncoder[str]):
 
     def to_json(self) -> dict:
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.dtype),
+                "param_dtype": self.param_dtype,
                 **({} if self.revision is None else {"revision": self.revision})}
 
 
@@ -146,26 +158,31 @@ class T5Text(ConditionEncoder[str]):
     """
 
     checkpoint: str
+    parameter_collections: ClassVar[tuple[str, ...] | None] = ("params", FROZEN)
     transformer: T5EncoderTransformer
     params: Variables
     tokenizer: PreTrainedTokenizerBase
     max_length: int = 256
     dtype: Optional[Dtype] = None
+
     revision: Optional[str] = None
     """The checkpoint's git revision, recorded so a rebuild reads the same
     weights and the same tokenizer."""
+    param_dtype: str = "float32"
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = DEFAULT_T5_MODEL, *, dtype=None,
                         revision: Optional[str] = None,
-                        max_length: int = 256) -> "T5Text":
+                        max_length: int = 256, param_dtype: str = "float32",
+                        params: Variables | None = None) -> "T5Text":
         from transformers import AutoTokenizer
 
         dtype = resolve_dtype(dtype)
-        model = T5EncoderModel.from_pretrained(checkpoint, dtype=dtype, revision=revision)
+        model = T5EncoderModel.from_pretrained(
+            checkpoint, dtype=dtype, revision=revision, param_dtype=param_dtype, variables=params)
         return cls(checkpoint=checkpoint, transformer=model.transformer, params=model.variables,
                    tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
-                   max_length=max_length, dtype=dtype, revision=revision)
+                   max_length=max_length, dtype=dtype, param_dtype=param_dtype, revision=revision)
 
     def tokenize(self, data: Sequence[str]) -> dict[str, np.ndarray]:
         tokens = self.tokenizer(list(data), padding="max_length", max_length=self.max_length,
@@ -185,6 +202,7 @@ class T5Text(ConditionEncoder[str]):
 
     def to_json(self) -> dict:
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.dtype),
+                "param_dtype": self.param_dtype,
                 "max_length": self.max_length,
                 **({} if self.revision is None else {"revision": self.revision})}
 
@@ -204,14 +222,21 @@ class CharTable(ConditionEncoder[str]):
     features: int = 16
     vocab: int = 130
     seed: int = 0
+    dtype: Optional[Dtype] = None
+    param_dtype: str = "float32"
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = "char_table", *, dtype=None,
                         tokens: int = 8, features: int = 16, vocab: int = 130,
-                        seed: int = 0):
-        table = np.random.RandomState(seed).normal(size=(vocab, features))
-        return cls(params={"table": jnp.asarray(table, resolve_dtype(dtype) or jnp.float32)},
-                   tokens=tokens, features=features, vocab=vocab, seed=seed)
+                        seed: int = 0, param_dtype: str = "float32",
+                        params: Variables | None = None):
+        compute = resolve_dtype(dtype)
+        storage = resolve_dtype(param_dtype)
+        if params is None:
+            table = np.random.RandomState(seed).normal(size=(vocab, features))
+            params = {"table": jnp.asarray(table, storage)}
+        return cls(params=params, tokens=tokens, features=features, vocab=vocab, seed=seed,
+                   dtype=compute, param_dtype=param_dtype)
 
     def tokenize(self, data: Sequence[str]) -> dict[str, np.ndarray]:
         # id 0 is padding, 1 is the start token, characters follow.
@@ -224,8 +249,10 @@ class CharTable(ConditionEncoder[str]):
         return {"input_ids": ids, "attention_mask": mask}
 
     def encode(self, params, tokens) -> TextContext:
-        return TextContext(hidden=params["table"][jnp.asarray(tokens["input_ids"])],
-                           mask=jnp.asarray(tokens["attention_mask"]))
+        hidden = params["table"][jnp.asarray(tokens["input_ids"])]
+        if self.dtype is not None:
+            hidden = hidden.astype(self.dtype)
+        return TextContext(hidden=hidden, mask=jnp.asarray(tokens["attention_mask"]))
 
     def captions(self, tokens) -> tuple[str, ...]:
         return tuple("".join(chr(97 + (int(i) - 2) % 26) for i in row[row > 1])
@@ -234,7 +261,7 @@ class CharTable(ConditionEncoder[str]):
     def to_json(self) -> dict:
         return {"checkpoint": "char_table", "tokens": self.tokens,
                 "features": self.features, "vocab": self.vocab, "seed": self.seed,
-                "dtype": dtype_name(self.params["table"].dtype)}
+                "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype}
 
 
 __all__ = ["ConditionEncoder", "CLIPText", "T5Text", "CharTable", "rebuild"]

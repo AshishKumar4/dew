@@ -23,6 +23,7 @@ import numpy as np
 
 from dew import registry
 from .encoders import CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
+from dew.objectives.base import Variables
 from dew.nn.vision import PIXEL_VALUES_KEY
 
 
@@ -65,9 +66,9 @@ class Condition:
                 "unconditional": self.unconditional}
 
     @classmethod
-    def from_json(cls, data: Mapping) -> "Condition":
+    def from_json(cls, data: Mapping, *, params: Variables | None = None) -> "Condition":
         encoder = data["encoder"]
-        return cls(encoder=rebuild(encoder["name"], encoder["fields"]),
+        return cls(encoder=rebuild(encoder["name"], encoder["fields"], params=params),
                    field=data["field"], unconditional=data["unconditional"])
 
 
@@ -112,12 +113,12 @@ class InputSpec:
                 **({"mask": {"key": self.mask.key, "shape": list(self.mask.shape)}} if self.mask is not None else {})}
 
     @classmethod
-    def from_json(cls, data: Mapping) -> "InputSpec":
-        """Rebuild the spec, loading each encoder's weights. The spec's
-        other methods open no files."""
+    def from_json(cls, data: Mapping, *, params: Mapping[str, Variables] | None = None) -> "InputSpec":
+        """Rebuild metadata around supplied condition parameters, or load source weights."""
         sample = data["sample"]
         return cls(sample=Field(sample["key"], tuple(sample["shape"])),
-                   conditions={keyword: Condition.from_json(condition)
+                   conditions={keyword: Condition.from_json(
+                       condition, params=None if params is None else params[keyword])
                                for keyword, condition in data["conditions"].items()},
                    mask=Field(data["mask"]["key"], tuple(data["mask"]["shape"])) if "mask" in data else None)
 

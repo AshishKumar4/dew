@@ -76,8 +76,8 @@ class ModelConfig:
 
     architecture: str = "simple_dit"
     config: JsonDict = dataclasses.field(default_factory=dict)
-    dtype: Literal["float32", "bfloat16"] = "bfloat16"
-    """Compute dtype; params stay float32."""
+    dtype: registry.DtypeName = "bfloat16"
+    """Compute dtype; parameter storage is independent."""
     attention_impl: Literal["auto", "reference", "xla", "cudnn", "tpu"] = "auto"
     """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
     supports and xla for the rest, xla on any other backend."""
