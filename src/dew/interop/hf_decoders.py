@@ -2373,6 +2373,12 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
 
     The family owns collection packing and any fused tensor geometry. A
     wrapper adds only its naming envelope after this shared inverse.
+
+    A config that carries `tie_word_embeddings` is read exactly as
+    `_base_config` reads it, an explicit null included; only an absent key
+    asks the family for its own default. A derived config therefore reaches
+    its weight encoder without translating geometry that encoder may not
+    support.
     """
     if not isinstance(model, CausalTransformer):
         raise TypeError('decoder weight export requires a CausalTransformer')
@@ -2380,7 +2386,8 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
     if not isinstance(model_type, str) or model_type not in _FAMILIES:
         raise ValueError(f'no decoder tensor encoder for model_type {model_type!r}')
     family = _FAMILIES[model_type]
-    tied = family.translate_config(config, set())['tie_embeddings']
+    tied = (bool(config['tie_word_embeddings']) if 'tie_word_embeddings' in config
+            else family.translate_config(config, set())['tie_embeddings'])
     if tied != model.tie_embeddings:
         raise ValueError('tie_word_embeddings disagrees with the native model')
     return family.export_weights(model, variables, {**config, 'tie_word_embeddings': tied})

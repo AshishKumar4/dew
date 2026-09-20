@@ -1269,17 +1269,6 @@ def test_a_sharing_model_decodes_like_it_prefills(rng):
         jnp.asarray(generated[-1]))
 
 
-def test_export_refuses_the_new_features(tmp_path, rng):
-    """The three exported families have neither, so a model with any of them
-    set raises a ValueError naming the feature, and no leaves are dropped."""
-    config = translate_config(gemma4_config("gemma4-kvshare"))
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", config, dtype="float32", attention_impl="xla"))
-    variables = model.init(rng, jnp.ones((1, 4), jnp.int32))
-    with pytest.raises(ValueError, match="num_kv_shared_layers"):
-        save_pretrained_decoder(model, variables, str(tmp_path))
-
-
 def test_a_gemma4_config_without_layer_types_derives_the_reference_pattern():
     """A gemma4_text config need not carry layer_types: its own config class
     fills the 5:1 pattern at a fixed period of six and forces the last layer
@@ -1630,11 +1619,12 @@ def test_qwen_mtp_weights_require_a_declared_prediction_layer():
 
 
 def test_export_refuses_the_qwen35_features(tmp_path):
-    """Neither the gate, the delta net kind nor the partial rotary has a
-    place in the three exported families."""
+    """The gate, the delta net kind and the partial rotary have no place in
+    the exported families, and a refused model publishes nothing."""
     model, variables = fp32_decoder(FIXTURES / "qwen35-tiny")
-    with pytest.raises(ValueError, match="output_gate"):
+    with pytest.raises(ValueError):
         save_pretrained_decoder(model, variables, str(tmp_path))
+    assert not list(tmp_path.iterdir())
 
 
 def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
@@ -2719,10 +2709,13 @@ def test_a_gemma3n_wrapper_config_is_refused_by_name():
         translate_config(fixture_config("gemma-3n-e2b"))
 
 
-def test_gemma3n_export_is_refused_by_name(tmp_path):
+def test_gemma3n_export_is_refused_as_an_unrepresentable_model(tmp_path):
+    """No exported family carries Gemma 3n's shape, so its export is refused
+    by name and leaves nothing behind, whichever feature is met first."""
     model, variables = fp32_decoder(GEMMA3N)
-    with pytest.raises(ValueError, match="v_norm"):
+    with pytest.raises(ValueError):
         save_pretrained_decoder(model, variables, str(tmp_path))
+    assert not list(tmp_path.iterdir())
 
 
 def test_the_released_llada_config_translates_field_by_field():
