@@ -35,13 +35,14 @@ import numpy as np
 import optax
 import pytest
 
+from dew.data import Dataset
 from dew.inference.banks import CheckpointBanks, HeldBanks, host_banked
 from dew.nn.backbones.causal_transformer import StackView
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from test_trainer import Data, RecordingTracker, Regression, val_batches
+from test_trainer import BATCH, Counting, Regression, val_batches
 
 DEVICE = Layout(min_shard=1, tolerance=1.0)
 HOST = Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema"))
@@ -51,9 +52,9 @@ BANKS = Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",))
 def fit(layout, directory, steps):
     checkpoints = Checkpoints(str(directory), keep=3)
     trainer = Trainer(Regression(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
-                      checkpoints=checkpoints, tracker=RecordingTracker())
-    state = trainer.fit(Data(val=val_batches()), steps=steps, log_every=1, eval_every=2,
-                        checkpoint_every=2)
+                      checkpoints=checkpoints)
+    data = Dataset(train=Counting, val=val_batches(), records=None, batch=BATCH)
+    state = trainer.fit(data, steps=steps, log_every=1, eval_every=2, checkpoint_every=2)
     checkpoints.wait()
     return state
 
@@ -490,3 +491,25 @@ def test_a_pool_reads_its_own_shards_of_a_host_resident_bank(tmp_path):
         # parameter axes.
         assert all(value["spec"].startswith("P(None") for value in banks.values())
         assert any(value["shard"] != value["shape"] for value in banks.values())
+
+
+@pytest.mark.parametrize("kind", ["root", "multimodal"])
+def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
+    from tools.benchmark_host_offload import SyntheticBanks
+    from test_layer_banks import SelectedReads, fixture, host_layout, identical, scores, unpack
+    from dew.nn.multimodal import MultimodalTransformer
+
+    model, variables, tokens, indices, media = fixture(kind)
+    sites = model.bank_sites
+    source = SyntheticBanks(HeldBanks(variables).shapes(), seed=17)
+    resident = host_banked(model, source, layout=DEVICE)
+    selected = SelectedReads(source, sites)
+    hosted = host_banked(model, selected, layout=host_layout(sites[0]))
+    identical(scores(model, hosted, tokens, indices, media),
+              scores(model, resident, tokens, indices, media))
+    one = (model.clone(language_model=model.language_model.clone(bank_layers=1))
+           if isinstance(model, MultimodalTransformer) else model.clone(bank_layers=1))
+    separate = host_banked(one, source, layout=DEVICE)
+    identical(unpack(separate, one.bank_sites, source.shapes()),
+              unpack(resident, sites, source.shapes()))
+

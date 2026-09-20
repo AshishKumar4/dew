@@ -22,7 +22,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
-from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.text_encoders import checkpoint_array
 from dew.registry import models
@@ -94,6 +94,12 @@ class DiffusionGemma(nn.Module):
     @property
     def vocab_size(self) -> int:
         return self.text.vocab_size
+
+    @property
+    def bank_sites(self) -> tuple[DecoderBank, ...]:
+        # decoder shares text's scope; it is another reader, not another bank.
+        return tuple(DecoderBank(("text",) + site.namespace, site.view)
+                     for site in self.text.bank_sites)
 
     @property
     def max_seq_len(self) -> int:

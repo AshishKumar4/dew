@@ -1075,6 +1075,18 @@ class StackView:
         return real.reshape((-1,) + real.shape[2:])
 
 
+@dataclasses.dataclass(frozen=True)
+class DecoderBank:
+    """One decoder's stored layer namespace below every variables collection.
+
+    A container prefixes the namespace and leaves the view untouched: layer
+    groups, module names and RNG streams remain the decoder's. Shared scopes
+    declare one site even when several methods read the same parameters.
+    """
+    namespace: tuple[str, ...]
+    view: StackView
+
+
 def _on_stage_axis(leaf):
     """`leaf`, its leading dimension placed on the stage axis of the mesh in context."""
     return jax.lax.with_sharding_constraint(leaf, _stage_sharding(leaf.ndim))
@@ -1480,6 +1492,13 @@ class CausalTransformer(nn.Module):
             partial_rotary_factor=(None if kind.window is not None
                                    else self.partial_rotary_factor),
             partial_rotary_type=self.partial_rotary_type)
+
+    @property
+    def bank_sites(self) -> tuple[DecoderBank, ...]:
+        if not self.scan_layers:
+            raise ValueError("parameter banks require scan_layers=True on their decoder owner")
+        bound = self if self.scope is not None else self.bind({})
+        return (DecoderBank((), StackView(bound.groups)),)
 
     def setup(self):
         types = self.per_layer_types

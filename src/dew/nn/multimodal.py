@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
 from dew.nn.vision import Gemma3nProjectorModule, ProjectorBase, TowerBase
 from dew.registry import models
 
@@ -189,6 +189,11 @@ class MultimodalTransformer(nn.Module):
     @property
     def vocab_size(self) -> int:
         return self.language_model.vocab_size
+
+    @property
+    def bank_sites(self) -> tuple[DecoderBank, ...]:
+        return tuple(DecoderBank(("language_model",) + site.namespace, site.view)
+                     for site in self.language_model.bank_sites)
 
     @property
     def max_seq_len(self) -> int:
