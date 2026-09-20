@@ -2552,12 +2552,17 @@ def test_a_gemma4_wrapper_around_the_routed_text_config_is_refused_by_name():
         translate_config(fixture_config("gemma4-26b-a4b"))
 
 
-def test_gemma4_moe_export_is_refused_by_name(tmp_path):
-    """The values norm every Gemma 4 carries is refused before the routed
-    branch is reached, and by the field's name."""
+@pytest.mark.parametrize("changes, field", [
+    ({"partial_rotary_type": "default"}, "partial_rotary_type"),
+    ({"layer_types": ("sliding_attention",) * 3}, "layer_types"),
+    ({"kv_shared_layers": (1,)}, "kv_shared_layers"),
+    ({"attention_scale": 0.25}, "attention_scale"),
+])
+def test_standalone_gemma4_refuses_unrepresentable_native_computation(changes, field, tmp_path):
     model, variables = fp32_decoder(GEMMA4_MOE)
-    with pytest.raises(ValueError, match="v_norm"):
-        save_pretrained_decoder(model, variables, str(tmp_path))
+    with pytest.raises(ValueError, match=field):
+        save_pretrained_decoder(model.clone(**changes), variables, str(tmp_path))
+    assert not (tmp_path / "config.json").exists()
 
 
 # ---------------------------------------------------------------------------

@@ -143,57 +143,20 @@ def generation_process(config: Mapping[str, object], generation: Mapping[str, ob
 
 def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, object]) -> dict[str, np.ndarray]:
     """Write canonical decoder tensors under the native model's explicit scalar policy."""
-    from dew.interop.hf_decoders import _GEMMA4_MOE, _flatten, _hf_name
+    from dew.interop.hf_decoders import _flatten, export_decoder_weights
     from dew.nn.vision import _GEMMA4_VISION_TENSORS
 
     if not isinstance(model, DiffusionGemma):
         raise TypeError("DiffusionGemma export requires its native model value")
-    mode = model.text.layer_scalar
-    if mode not in ("frozen", "trainable"):
-        raise ValueError("DiffusionGemma export requires an explicit layer_scalar mode")
     params = variables["params"]
-    flat = _flatten(params["text"])
-    scalar_collection = "params" if mode == "trainable" else "constants"
-    other_collection = "constants" if mode == "trainable" else "params"
-    for index in range(model.text.num_layers):
-        layer = f"layers_{index}"
-        wrong = variables.get(other_collection, {}).get("text", {}).get(layer, {})
-        if "layer_scalar" in wrong:
-            raise ValueError(f"layer_scalar in {other_collection} disagrees with model mode {mode}")
-        value = variables[scalar_collection]["text"][layer]["layer_scalar"]
-        flat[f"{layer}.layer_scalar"] = value
-    inverse_moe = {value: key for key, value in _GEMMA4_MOE.items()}
-    hf_text = text_config(config)
+    text_variables = {collection: tree["text"] for collection, tree in variables.items()
+                      if "text" in tree}
     result: dict[str, np.ndarray] = {}
-    for name, raw in flat.items():
-        leaf = np.asarray(raw)
-        parts = name.split(".")
-        if parts[0].startswith("layers_") and tuple(parts[1:]) in inverse_moe:
-            index = parts[0].removeprefix("layers_")
-            tail = ".".join(inverse_moe[tuple(parts[1:])])
-            target = f"model.decoder.layers.{index}.{tail}"
-        elif len(parts) == 5 and parts[1:3] == ["moe", "experts"]:
-            index = parts[0].removeprefix("layers_")
-            stem = f"model.decoder.layers.{index}.experts."
-            if parts[3] == "up_proj":
-                continue
-            if parts[3] == "gate_proj":
-                up = np.asarray(flat[name.replace("gate_proj", "up_proj")])
-                result[stem + "gate_up_proj"] = np.ascontiguousarray(
-                    np.swapaxes(np.concatenate([leaf, up], axis=-1), -1, -2))
-            elif parts[3] == "down_proj":
-                result[stem + "down_proj"] = np.ascontiguousarray(np.swapaxes(leaf, -1, -2))
-            else:
-                raise ValueError(f"unknown expert parameter {name!r}")
-            continue
-        else:
-            mapped = _hf_name(name, hf_text)
-            if mapped is None:
-                continue
-            target = "model.decoder." + mapped.removeprefix("model.") if mapped.startswith("model.") else mapped
-        result[target] = np.ascontiguousarray(leaf.T if parts[-1] == "kernel" else leaf)
-        if parts[-1] == "layer_scalar":
-            result[target.replace("model.decoder.", "model.encoder.language_model.")] = result[target]
+    for name, tensor in export_decoder_weights(model.text, text_variables, text_config(config)).items():
+        target = "model.decoder." + name.removeprefix("model.") if name.startswith("model.") else name
+        result[target] = tensor
+        if name.endswith(".layer_scalar"):
+            result[target.replace("model.decoder.", "model.encoder.language_model.")] = tensor
     for name, leaf in _flatten(params["self_conditioning"]).items():
         module, kind = name.split(".")
         result[f"model.decoder.self_conditioning.{module}.weight"] = np.ascontiguousarray(

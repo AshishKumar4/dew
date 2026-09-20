@@ -993,7 +993,7 @@ def _dream_export(model: CausalTransformer) -> dict[str, object]:
 
 
 def _diffusion_gemma_export(model: CausalTransformer) -> dict[str, object]:
-    return {'use_bidirectional_attention': 'all'}
+    raise ValueError('diffusion_gemma_text is a cache-reading view; export the complete native DiffusionGemma wrapper')
 
 
 def _qwen2_config(hf_config: Mapping[str, Any], used: set[str]) -> Dict[str, Any]:
@@ -2339,12 +2339,11 @@ def save_pretrained_decoder(model, variables, directory, *,
                             generation_config: Optional[Mapping[str, Any]] = None) -> None:
     """Write a decoder back out in the HF layout: config.json, model.safetensors.
 
-    The inverse of load_pretrained, the same field map run backwards.
-    A round-trip through dew hands transformers a checkpoint it accepts and
-    a load hands back bitwise-equal parameters. The family entry whose
-    predicate matches the model names the model_type: a model with the
-    sandwich norms writes gemma3_text, one with q/k norms qwen3, one with
-    biased q/k/v over a bias-free o_proj qwen2, and a plain stack llama.
+    Derive the config from native computation and encode all variable
+    collections through the matching family. Source-bound exports instead
+    retain their source layout in Pretrained.save. Gemma4 writes frozen or
+    trainable layer-scalar values into HF buffers; reloading that layout
+    preserves computation, not the native scalar training policy.
 
     `tokenizer` is the vocabulary the weights were trained against, by object
     or by name; `save_export_assets` writes its files beside them, so one call
@@ -2357,43 +2356,61 @@ def save_pretrained_decoder(model, variables, directory, *,
     if not isinstance(model, CausalTransformer):
         raise ValueError(
             f"save_pretrained_decoder takes a CausalTransformer, got {type(model).__name__}")
-    if model.per_layer_input_dim or model.sharing_layers or model.v_norm:
-        raise ValueError(
-            "per-layer input embeddings, KV sharing and the values norm have "
-            "no counterpart in the dense families this "
-            "exports, so a model with per_layer_input_dim, num_kv_shared_layers, "
-            "kv_shared_layers or v_norm set cannot be written back to the HF layout")
-    mixers = [model.mixer] + [kind.mixer for kind in (model.kinds or {}).values()]
-    if (model.output_gate or model.partial_rotary_factor is not None
-            or any(mixer is not None and not isinstance(mixer, AttentionMixer)
-                   for mixer in mixers)):
-        raise ValueError(
-            "the attention output gate, a partial rotary and a mixer other than "
-            "attention have no counterpart in the dense "
-            "families this exports, so a model with output_gate, "
-            "partial_rotary_factor or a linear-attention kind set cannot be "
-            "written back to the HF layout")
-    if model.mixture is not None and _family_for_model(model).export_path is _hf_name:
-        raise ValueError(
-            "routed experts have no writer here yet: the config half "
-            "round-trips through _export_config, but the router and the "
-            "per-expert tensors have no _hf_name, so a model with a mixture "
-            "set cannot be written back to the HF layout")
-    params = variables.get('params', variables)
     config = _export_config(model)
-
-    family = _FAMILIES[config['model_type']]
-    hf_tensors: Dict[str, np.ndarray] = {}
-    for name, leaf in _flatten(params).items():
-        hf_name = family.export_path(name, config)
-        if hf_name is None:
-            continue
-        leaf = np.asarray(leaf)
-        hf_tensors[hf_name] = np.ascontiguousarray(
-            leaf.T if name.endswith('.kernel') else leaf)
+    hf_tensors = export_decoder_weights(model, variables, config)
 
     save_hf_layout(hf_tensors, config, directory)
     save_export_assets(directory, tokenizer=tokenizer, generation_config=generation_config)
+
+
+def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
+                           config: Mapping[str, object]) -> dict[str, np.ndarray]:
+    """Encode whole native variables as canonical model.* / lm_head.* tensors.
+
+    The family owns collection packing and any fused tensor geometry. A
+    wrapper adds only its naming envelope after this shared inverse.
+    """
+    if not isinstance(model, CausalTransformer):
+        raise TypeError('decoder weight export requires a CausalTransformer')
+    model_type = config.get('model_type')
+    if not isinstance(model_type, str) or model_type not in _FAMILIES:
+        raise ValueError(f'no decoder tensor encoder for model_type {model_type!r}')
+    family = _FAMILIES[model_type]
+    tied = family.translate_config(config, set())['tie_embeddings']
+    if tied != model.tie_embeddings:
+        raise ValueError('tie_word_embeddings disagrees with the native model')
+    return family.export_weights(model, variables, {**config, 'tie_word_embeddings': tied})
+
+
+def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
+                           config: Mapping[str, object]) -> dict[str, np.ndarray]:
+    if model.per_layer_input_dim or model.sharing_layers or model.v_norm:
+        raise ValueError(
+            'per-layer input embeddings, KV sharing and the values norm have '
+            'no counterpart in this dense tensor encoder: per_layer_input_dim, '
+            'num_kv_shared_layers, kv_shared_layers or v_norm is set')
+    mixers = [model.mixer] + [kind.mixer for kind in (model.kinds or {}).values()]
+    if (model.output_gate or model.partial_rotary_factor is not None
+            or any(mixer is not None and not isinstance(mixer, AttentionMixer) for mixer in mixers)):
+        raise ValueError(
+            'the attention output gate, a partial rotary and a mixer other than attention '
+            'have no counterpart in this dense tensor encoder')
+    model_type = config['model_type']
+    if not isinstance(model_type, str):
+        raise ValueError('model_type must name a decoder family')
+    family = _FAMILIES[model_type]
+    if model.mixture is not None and family.export_path is _hf_name:
+        raise ValueError('a model with a mixture has no routed tensor writer in this family')
+    params = variables.get('params', variables)
+    if not isinstance(params, Mapping):
+        raise ValueError('params must contain the decoder parameter tree')
+    tensors: dict[str, np.ndarray] = {}
+    for name, value in _flatten(params).items():
+        target = family.export_path(name, config)
+        if target is not None:
+            leaf = np.asarray(value)
+            tensors[target] = np.ascontiguousarray(leaf.T if name.endswith('.kernel') else leaf)
+    return tensors
 
 
 def _flatten(tree: Mapping[str, Any], prefix: str = '') -> Dict[str, Any]:
@@ -2551,6 +2568,152 @@ def _gemma3_export(model: CausalTransformer) -> dict[str, object]:
     }
 
 
+def _gemma4_export(model: CausalTransformer) -> dict[str, object]:
+    """Canonical Gemma4TextConfig from the native computation, never a source template."""
+    fixed = {'qk_norm': True, 'v_norm': True, 'sandwich_norms': True, 'pre_norms': True,
+             'embedding_scale': True, 'attention_scale': 1.0, 'scale_offset': False,
+             'scale_after_cast': False, 'qk_norm_scope': 'head', 'causal': True}
+    for name, expected in fixed.items():
+        if getattr(model, name) != expected:
+            _refuse(name, f'Gemma4 computes {expected!r} for this field')
+    for name in ('output_gate', 'attention_sinks', 'attn_logit_softcap', 'altup',
+                 'laurel_rank', 'activation_sparsity_pattern', 'num_nextn_predict_layers', 'dropout_rate'):
+        if getattr(model, name):
+            _refuse(name, 'the standalone Gemma4 reference has no such computation')
+    if model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias:
+        _refuse('o_proj_bias', 'Gemma4 uses one attention_bias setting for every projection')
+    if model.partial_rotary_factor is not None and model.partial_rotary_type != 'proportional':
+        _refuse('partial_rotary_type', 'Gemma4 full layers use proportional rotary')
+    if model.layer_scalar not in ('frozen', 'trainable'):
+        _refuse('layer_scalar', 'Gemma4 exports an explicit frozen or trainable scalar value')
+    types = model.per_layer_types
+    if not types or set(types) - {'sliding_attention', 'full_attention'}:
+        _refuse('layer_types', 'Gemma4 has only sliding and full attention')
+    if types[-1] != 'full_attention':
+        _refuse('layer_types', 'Gemma4TextConfig forces the final layer to full attention')
+    for name in set(types):
+        kind = model.kind_of(name)
+        mixer = kind.mixer or model.mixer
+        if mixer is not None and not isinstance(mixer, AttentionMixer):
+            _refuse(f'kinds.{name}.mixer', 'Gemma4 uses ordinary attention')
+        if isinstance(mixer, AttentionMixer) and (mixer.bidirectional_images or mixer.mrope_section is not None):
+            _refuse(f'kinds.{name}.mixer', 'multimodal attention metadata needs its source wrapper')
+        if kind.rope_scaling is not None or kind.yarn is not None:
+            _refuse(f'kinds.{name}.rope', 'Gemma4 uses plain local and proportional global rotary')
+    full = model.kind_of('full_attention')
+    local = model.kind_of('sliding_attention') if 'sliding_attention' in types else full
+    if full.window is not None:
+        _refuse('kinds.full_attention.window', 'full attention is unwindowed')
+    if 'sliding_attention' in types and (local.window is None or local.window < 1):
+        _refuse('kinds.sliding_attention.window', 'sliding attention needs a positive window')
+    sharing = model.sharing_layers
+    if sharing != tuple(range(model.num_layers - len(sharing), model.num_layers)):
+        _refuse('kv_shared_layers', 'Gemma4 can express only a trailing run of shared-KV layers')
+    mixture = model.mixture
+    fields: dict[str, object] = {
+        'hidden_act': None, 'hidden_activation': _HF_ACTIVATIONS[model.mlp],
+        'layer_types': list(types), 'intermediate_size': model.hidden_features,
+        'head_dim': local.head_dim, 'num_key_value_heads': local.num_kv_heads,
+        'global_head_dim': full.head_dim, 'num_global_key_value_heads': full.num_kv_heads,
+        # Explicit overrides avoid configuration_gemma4.py:210-223 replacing
+        # full geometry with global defaults or gating KV heads on K=V.
+        'per_layer_config': {str(index): {'head_dim': full.head_dim, 'num_key_value_heads': full.num_kv_heads}
+                             for index, name in enumerate(types) if name == 'full_attention'},
+        'rope_theta': None, 'rope_scaling': None,
+        'rope_parameters': {
+            'sliding_attention': {'rope_type': 'default', 'rope_theta': local.rope_theta},
+            'full_attention': {'rope_type': 'proportional', 'rope_theta': full.rope_theta,
+                               'partial_rotary_factor': model.partial_rotary_factor or 1.0}},
+        'sliding_window': local.window if 'sliding_attention' in types else 512,
+        'attention_k_eq_v': model.attention_k_eq_v, 'num_kv_shared_layers': len(sharing),
+        'use_double_wide_mlp': model.use_double_wide_mlp,
+        'hidden_size_per_layer_input': model.per_layer_input_dim or 0,
+        'vocab_size_per_layer_input': model.per_layer_input_vocab or model.vocab_size,
+        'final_logit_softcapping': model.final_logit_softcap, 'use_bidirectional_attention': None,
+        'enable_moe_block': mixture is not None,
+    }
+    if mixture is not None:
+        if not mixture.parallel or tuple(model.sparse_layers) != tuple(range(model.num_layers)):
+            _refuse('mixture', 'Gemma4 routes a parallel expert branch on every layer')
+        defaults = Mixture(experts=mixture.experts, top_k=mixture.top_k,
+                           expert_features=mixture.expert_features, parallel=True)
+        represented = {'experts', 'top_k', 'expert_features', 'parallel', 'layers', 'every',
+                       'implementation', 'dispatch'}
+        for entry in dataclasses.fields(mixture):
+            if entry.name not in represented and getattr(mixture, entry.name) != getattr(defaults, entry.name):
+                _refuse(f'mixture.{entry.name}', 'Gemma4 has its fixed parallel router and expert computation')
+        fields.update(num_experts=mixture.experts, top_k_experts=mixture.top_k,
+                      moe_intermediate_size=mixture.expert_features or model.hidden_features)
+    return fields
+
+
+def _gemma4_export_weights(model: CausalTransformer, variables: Mapping[str, object],
+                           config: Mapping[str, object]) -> dict[str, np.ndarray]:
+    """One canonical text inverse shared by standalone Gemma4 and DiffGemma."""
+    mode = model.layer_scalar
+    if mode not in ('frozen', 'trainable'):
+        raise ValueError('Gemma4 tensor export requires an explicit layer_scalar mode')
+    params = variables.get('params', variables)
+    constants = variables.get('constants', {})
+    if not isinstance(params, Mapping) or not isinstance(constants, Mapping):
+        raise ValueError('params and constants must contain native variable trees')
+    flat, fixed = _flatten(params), _flatten(constants)
+    scalar_names = {f'layers_{index}.layer_scalar' for index in range(model.num_layers)}
+    if set(fixed) - scalar_names:
+        raise ValueError(f'unrepresented Gemma4 constants: {sorted(set(fixed) - scalar_names)}')
+    for name in scalar_names:
+        if mode == 'frozen':
+            if name in flat or name not in fixed:
+                raise ValueError(f'{name} requires constants only under layer_scalar=frozen')
+            flat[name] = fixed[name]
+        elif name in fixed or name not in flat:
+            raise ValueError(f'{name} requires params only under layer_scalar=trainable')
+    inverse = {value: key for key, value in _GEMMA4_MOE.items()}
+    per_model = {'embed_tokens_per_layer.embedding': 'model.embed_tokens_per_layer.weight',
+                 'per_layer_model_projection.kernel': 'model.per_layer_model_projection.weight',
+                 'per_layer_projection_norm.scale': 'model.per_layer_projection_norm.weight'}
+    tensors: dict[str, np.ndarray] = {}
+    for name, raw in flat.items():
+        parts, leaf = name.split('.'), np.asarray(raw)
+        if parts[0].startswith('layers_') and tuple(parts[1:]) in inverse:
+            layer = parts[0].removeprefix('layers_')
+            target = f"model.layers.{layer}." + '.'.join(inverse[tuple(parts[1:])])
+        elif len(parts) == 5 and parts[1:3] == ['moe', 'experts']:
+            layer = parts[0].removeprefix('layers_')
+            stem = f'model.layers.{layer}.experts.'
+            if parts[-1] != 'kernel':
+                raise ValueError(f'unknown expert parameter {name!r}')
+            if parts[3] == 'up_proj':
+                if name.replace('.up_proj.', '.gate_proj.') not in flat:
+                    raise ValueError(f'{name} has no matching gate projection')
+                continue
+            if parts[3] == 'gate_proj':
+                up = np.asarray(flat[name.replace('.gate_proj.', '.up_proj.')])
+                tensors[stem + 'gate_up_proj'] = np.ascontiguousarray(
+                    np.swapaxes(np.concatenate([leaf, up], axis=-1), -1, -2))
+            elif parts[3] == 'down_proj':
+                tensors[stem + 'down_proj'] = np.ascontiguousarray(np.swapaxes(leaf, -1, -2))
+            else:
+                raise ValueError(f'unknown expert parameter {name!r}')
+            continue
+        elif name in per_model:
+            target = per_model[name]
+        elif (len(parts) == 3 and parts[0].startswith('layers_')
+              and parts[1] in ('per_layer_input_gate', 'per_layer_projection', 'post_per_layer_input_norm')):
+            ending = 'scale' if parts[1] == 'post_per_layer_input_norm' else 'kernel'
+            if parts[2] != ending:
+                raise ValueError(f'unknown per-layer input parameter {name!r}')
+            target = f"model.layers.{parts[0].removeprefix('layers_')}.{parts[1]}.weight"
+        else:
+            target = _hf_name(name, config)
+            if target is None:
+                continue
+        if target in tensors:
+            raise ValueError(f'duplicate canonical tensor {target!r}')
+        tensors[target] = np.ascontiguousarray(leaf.T if parts[-1] == 'kernel' else leaf)
+    return tensors
+
+
 def _gemma2_export(model: CausalTransformer) -> dict[str, object]:
     return {**_gemma3_export(model), 'attn_logit_softcapping': model.attn_logit_softcap}
 
@@ -2596,6 +2759,9 @@ class DecoderFamily:
     """Bind source tensor names/config for export instead of deriving them from the model."""
     weight_path: Callable[[str, Mapping[str, object]], Optional[Tuple[str, ...]]] = _dew_path
     export_path: Callable[[str, Mapping[str, object]], Optional[str]] = _hf_name
+    export_weights: Callable[[CausalTransformer, Mapping[str, object], Mapping[str, object]],
+                             dict[str, np.ndarray]] = _dense_decoder_weights
+    """Whole-variable encoder; dense families retain their export_path loop."""
     sandwich_norms: bool = False
     prepare_weights: Callable[[Mapping[str, np.ndarray]], Mapping[str, np.ndarray]] = dict
     """The checkpoint's tensors as the path map reads them: Llama 4 and Gemma 4
@@ -3057,7 +3223,8 @@ _FAMILY_ENTRIES = (
                                            or fields.get('num_kv_shared_layers'))),
                   'diffusion_gemma_text', 'DiffusionGemmaForBlockDiffusion',
                   _diffusion_gemma_export, sandwich_norms=True,
-                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare, preserve_source_layout=False),
+                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare,
+                  export_weights=_gemma4_export_weights, preserve_source_layout=False),
     DecoderFamily(('dream', 'Dream'), _dream_config,
                   lambda fields: bool(fields.get('causal') is False
                                       and fields.get('attention_bias')
@@ -3131,8 +3298,9 @@ _FAMILY_ENTRIES = (
     DecoderFamily(('gemma4_text',), _gemma4_config,
                   lambda fields: bool(fields['v_norm'] or fields['per_layer_input_dim']
                                       or fields['num_kv_shared_layers']),
-                  'gemma4_text', 'Gemma4ForCausalLM', _gemma3_export, sandwich_norms=True,
-                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare, preserve_source_layout=True),
+                  'gemma4_text', 'Gemma4ForCausalLM', _gemma4_export, sandwich_norms=True,
+                  weight_path=_gemma4_path, prepare_weights=_gemma4_prepare,
+                  export_weights=_gemma4_export_weights, preserve_source_layout=True),
     DecoderFamily((_GEMMA,), _gemma3_config,
                   lambda fields: bool(fields['sandwich_norms'] and fields['qk_norm']),
                   _GEMMA, 'Gemma3ForCausalLM', _gemma3_export, sandwich_norms=True, preserve_source_layout=False),
