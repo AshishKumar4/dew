@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol
 
 import jax
@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, StackView
+from dew.nn.backbones.causal_transformer import DecoderBank
 from dew.objectives.base import Variables, merge
 
 if TYPE_CHECKING:
@@ -43,8 +43,8 @@ if TYPE_CHECKING:
 class LayerBanks(Protocol):
     """Where a banked store's values come from, read one bank at a time.
 
-    The paths are the stored ones, `params/layers_N/...`: a source knows
-    nothing about how the runs are grouped, which is the model's business,
+    Paths are canonical below each collection. A namespace selects a decoder
+    inside a wrapper; the source knows nothing about how runs are grouped
     and answers for the layers it is asked for. `bank` stacks them on a new
     leading axis in the order given and places the result, so how much
     memory holding one bank costs is the source's own business, and is what
@@ -56,13 +56,14 @@ class LayerBanks(Protocol):
         ...
 
     def entry(self, placement: "Placement") -> Variables:
-        """The variables outside the layer stack, on those shardings."""
+        """Read exactly the canonical leaves selected by placement."""
         ...
 
-    def bank(self, layers: Sequence[int], placement: "Placement") -> Variables:
+    def bank(self, layers: Sequence[int], placement: "Placement", *,
+             namespace: tuple[str, ...] = ()) -> Variables:
         """One run's bank, on those shardings: those layers stacked on a new
         leading axis in the order given, or, for a run of one layer, that
-        layer's own subtree, which is what a run of one is stored as."""
+        layer's own subtree. Returned collections are local to namespace."""
         ...
 
 
@@ -74,38 +75,50 @@ def layer_index(name: str) -> int | None:
     return int(rest) if rest.isdigit() else None
 
 
-def stack_depth(shapes: Variables) -> int:
-    """How many layers the stack in `shapes` has."""
-    return sum(1 for name in shapes.get("params", {}) if layer_index(name) is not None)
 
 
-def entry_names(shapes: Variables) -> tuple[str, ...]:
-    """Everything in the store that is not one layer of the stack, in order."""
-    names: list[str] = []
-    for tree in shapes.values():
-        names.extend(name for name in tree if layer_index(name) is None)
-    return tuple(dict.fromkeys(names))
 
 
-def named(variables: Variables, names: Sequence[str]) -> Variables:
-    """The collections of `variables` narrowed to `names`, empty ones dropped."""
-    narrowed = {}
-    for collection, tree in variables.items():
-        held = {name: tree[name] for name in names if name in tree}
-        if held:
-            narrowed[collection] = held
-    return narrowed
-
-
-def one_layer(variables: Variables, index: int) -> Variables:
-    """One layer's subtree per collection, under the collection alone."""
+def one_layer(variables: Variables, index: int, *, namespace: tuple[str, ...] = ()) -> Variables:
+    """One layer's subtree per collection, local to its decoder namespace."""
     name = f"layers_{index}"
-    return {collection: tree[name] for collection, tree in variables.items() if name in tree}
+    local = in_namespace(variables, namespace) if namespace else variables
+    return {collection: tree[name] for collection, tree in local.items() if name in tree}
 
 
-def at_layer(subtrees: Variables, index: int) -> Variables:
-    """The inverse of `one_layer`: those subtrees under that layer's name."""
-    return {collection: {f"layers_{index}": tree} for collection, tree in subtrees.items()}
+def at_layer(subtrees: Variables, index: int, *, namespace: tuple[str, ...] = ()) -> Variables:
+    """The inverse of one_layer, preserving the canonical module namespace."""
+    return at_namespace({collection: {f"layers_{index}": tree}
+                         for collection, tree in subtrees.items()}, namespace)
+
+
+def in_namespace(variables: Variables, namespace: tuple[str, ...]) -> Variables:
+    """Read the same module namespace below each variables collection."""
+    selected = {}
+    for collection, tree in variables.items():
+        for name in namespace:
+            if not isinstance(tree, Mapping):
+                raise ValueError(f"{collection}/{namespace} crosses a variable leaf")
+            if name not in tree:
+                break
+            tree = tree[name]
+        else:
+            if not isinstance(tree, Mapping):
+                raise ValueError(f"{collection}/{namespace} is not a module subtree")
+            if tree:
+                selected[collection] = tree
+    return selected
+
+
+def at_namespace(subtrees: Variables, namespace: tuple[str, ...]) -> Variables:
+    """Place collection-local subtrees back under their canonical namespace."""
+    result = {}
+    for collection, tree in subtrees.items():
+        for name in reversed(namespace):
+            tree = {name: tree}
+        result[collection] = tree
+    return result
+
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,11 +143,11 @@ class HeldBanks:
             self.variables)
 
     def entry(self, placement: "Placement") -> Variables:
-        held = named(self.variables, entry_names(self.variables))
-        return jax.device_put(held, narrowed(placement, held))
+        return jax.device_put(narrowed(self.variables, placement), placement)
 
-    def bank(self, layers: Sequence[int], placement: "Placement") -> Variables:
-        rows = [one_layer(self.variables, index) for index in layers]
+    def bank(self, layers: Sequence[int], placement: "Placement", *,
+             namespace: tuple[str, ...] = ()) -> Variables:
+        rows = [one_layer(self.variables, index, namespace=namespace) for index in layers]
         bank = rows[0] if len(rows) == 1 else jax.tree.map(
             lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *rows)
         return jax.device_put(bank, placement)
@@ -170,20 +183,22 @@ class CheckpointBanks:
             object.__setattr__(self, "step", latest)
 
     def shapes(self) -> Variables:
+        assert self.step is not None
         stored = _stored(self.directory, self.step)
         if self.ema and stored.get("ema") is None:
             raise ValueError("the run keeps no EMA; read the live weights with ema=False")
         return stored["params"]
 
     def entry(self, placement: "Placement") -> Variables:
-        return self._restored(
-            narrowed(placement, named(self.shapes(), entry_names(self.shapes()))))
+        return self._restored(placement)
 
-    def bank(self, layers: Sequence[int], placement: "Placement") -> Variables:
+    def bank(self, layers: Sequence[int], placement: "Placement", *,
+             namespace: tuple[str, ...] = ()) -> Variables:
         if len(layers) == 1:
-            return one_layer(self._restored(at_layer(placement, layers[0])), layers[0])
-        rows = [one_layer(self._restored(at_layer(_row_placement(placement), index)), index)
-                for index in layers]
+            return one_layer(self._restored(at_layer(placement, layers[0], namespace=namespace)),
+                             layers[0], namespace=namespace)
+        rows = [one_layer(self._restored(at_layer(_row_placement(placement), index, namespace=namespace)),
+                          index, namespace=namespace) for index in layers]
         stacked = jax.jit(lambda *held: jax.tree.map(lambda *leaves: jnp.stack(leaves), *held),
                           out_shardings=placement)
         return stacked(*rows)
@@ -192,14 +207,15 @@ class CheckpointBanks:
         """The variables `placement` names, restored onto its shardings."""
         from dew.checkpoints import Checkpoints
 
-        names = [name for tree in placement.values() for name in tree]
-        shapes = named(self.shapes(), names)
+        shapes = narrowed(self.shapes(), placement)
         template = {"params": _typed(shapes, narrowed(placement, shapes))}
         if self.ema:
-            averaged = named(_stored(self.directory, self.step)["ema"], names)
-            template["ema"] = _typed(averaged, narrowed(placement, averaged))
+            assert self.step is not None
+            averaged = narrowed(_stored(self.directory, self.step)["ema"], placement)
+            if averaged:
+                template["ema"] = _typed(averaged, narrowed(placement, averaged))
         values, _ = Checkpoints(self.directory).restore(template, step=self.step)
-        return merge(values["params"], values["ema"]) if self.ema else values["params"]
+        return merge(values["params"], values["ema"]) if "ema" in template else values["params"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -208,10 +224,23 @@ def _stored(directory: str, step: int) -> Variables:
     return Checkpoints(directory).stored(step)
 
 
-def narrowed(placement: "Placement", shapes: Variables) -> "Placement":
-    """`placement` cut down to the paths `shapes` holds."""
-    return {collection: {name: placement[collection][name] for name in tree}
-            for collection, tree in shapes.items()}
+def narrowed(tree: Mapping, selection: Mapping) -> dict:
+    """The leaf-level intersection of tree and selection, retaining canonical paths."""
+    result = {}
+    for name, selected in selection.items():
+        if name not in tree:
+            continue
+        value = tree[name]
+        if isinstance(selected, Mapping):
+            if not isinstance(value, Mapping):
+                raise ValueError(f"selection descends through leaf {name!r}")
+            value = narrowed(value, selected)
+            if not value:
+                continue
+        elif isinstance(value, Mapping):
+            raise ValueError(f"selection treats subtree {name!r} as a leaf")
+        result[name] = value
+    return result
 
 
 def _typed(shapes: Variables, placement: "Placement") -> Variables:
@@ -238,15 +267,88 @@ def _bank_placement(placement: "Placement", stacked: bool) -> "Placement":
                                        memory_kind=sharding.memory_kind), placement)
 
 
-def host_banked(model: CausalTransformer, source: LayerBanks, *,
+
+class BankedModel(Protocol):
+    @property
+    def bank_sites(self) -> tuple[DecoderBank, ...]: ...
+
+
+def _sites(model: BankedModel) -> tuple[DecoderBank, ...]:
+    owners: dict[tuple[str, ...], DecoderBank] = {}
+    for site in model.bank_sites:
+        if any(not isinstance(name, str) or not name or "/" in name for name in site.namespace):
+            raise ValueError("decoder namespaces must contain nonempty module names")
+        previous = owners.get(site.namespace)
+        if previous is not None and previous.view != site.view:
+            raise ValueError(f"conflicting decoder views at namespace {site.namespace}")
+        owners[site.namespace] = site
+    if not owners:
+        raise ValueError("host_banked requires a declared decoder bank owner")
+    paths = []
+    for site in owners.values():
+        if site.view.stages != 1 or site.view.banked:
+            raise ValueError("bank sources require a logical, unstaged StackView")
+        for first, count in site.view.groups:
+            if first < 0 or count < 1:
+                raise ValueError("decoder bank groups require nonnegative starts and positive lengths")
+            paths.extend(site.namespace + (f"layers_{index}",) for index in range(first, first + count))
+    ordered = sorted(paths)
+    if any(right[:len(left)] == left for left, right in zip(ordered, ordered[1:])):
+        raise ValueError("declared decoder banks overlap in their canonical layer ownership")
+    return tuple(owners.values())
+
+
+def entry_tree(variables: Variables, sites: Sequence[DecoderBank]) -> Variables:
+    """The leaf complement of declared decoder layers, including nested media."""
+    layers = {site.namespace + (f"layers_{index}",) for site in sites
+              for first, count in site.view.groups for index in range(first, first + count)}
+
+    def outside(tree: Mapping, path: tuple[str, ...]) -> dict:
+        result = {}
+        for name, value in tree.items():
+            current = (*path, name)
+            if current in layers:
+                continue
+            if isinstance(value, Mapping):
+                value = outside(value, current)
+                if not value:
+                    continue
+            result[name] = value
+        return result
+
+    return {collection: held for collection, tree in variables.items()
+            if (held := outside(tree, ()))}
+
+
+def _check_shapes(shapes: Variables, site: DecoderBank) -> None:
+    local = in_namespace(shapes, site.namespace)
+    expected = {index for first, count in site.view.groups for index in range(first, first + count)}
+    observed = {index for tree in local.values() for name in tree
+                if (index := layer_index(name)) is not None}
+    if observed != expected:
+        raise ValueError(f"namespace {site.namespace} holds layers {sorted(observed)}; "
+                         f"the decoder declares {sorted(expected)}")
+
+    def signature(row):
+        return {jax.tree_util.keystr(path): (leaf.shape, str(leaf.dtype))
+                for path, leaf in jax.tree_util.tree_flatten_with_path(row)[0]}
+
+    for first, count in site.view.groups:
+        reference = signature(one_layer(local, first))
+        for index in range(first + 1, first + count):
+            if signature(one_layer(local, index)) != reference:
+                raise ValueError(f"namespace {site.namespace} layers {first} and {index} "
+                                 "must have identical leaf paths, shapes and dtypes within one bank")
+
+def host_banked(model: BankedModel, source: LayerBanks, *,
                 mesh: "MeshSpec | None" = None, layout: "Layout | None" = None) -> Variables:
     """`source`'s weights as the banked store `model`'s runs read.
 
     Each run's bank is read, stacked and placed on its own, and the copies of
     one bank are waited for before the next bank is read, so the transfers a
     load has in flight are one bank's and not the store's.
-    `model.bank_layers` caps how long a run is, which is what makes that
-    bound a choice. What the *source* holds while it answers is the source's
+    Each declared StackView bounds the run length. What the source holds
+    while it answers is the source's
     contract, not this one: `HeldBanks` holds the whole tree it borrowed,
     `CheckpointBanks` stages one bank's rows, and a load of either costs the
     store plus whatever its source holds. Nothing here donates or deletes a
@@ -263,34 +365,37 @@ def host_banked(model: CausalTransformer, source: LayerBanks, *,
     from dew.training.distributed import (
         Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh)
 
-    if not model.scan_layers:
-        raise ValueError(
-            "a banked store holds one array per scanned run, which only scan_layers "
-            "groups; build the model with scan_layers=True")
-    groups = model.bind({}).groups
+    sites = _sites(model)
     shapes = source.shapes()
-    depth = sum(count for _, count in groups)
-    if stack_depth(shapes) != depth:
-        raise ValueError(
-            f"the source holds {stack_depth(shapes)} layers and this model's runs "
-            f"hold {depth}; a store is banked for the model that reads it")
+    for site in sites:
+        _check_shapes(shapes, site)
     device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
     chosen = DefaultLayout() if layout is None else layout
     placement = chosen.offloaded(device_mesh, shapes)
     chosen.check(shapes["params"], placement["params"], device_mesh)
-    _check_consumers(placement, groups)
+    entries = entry_tree(placement, sites)
+    outside = [jax.tree_util.keystr(path) for path, sharding in
+               jax.tree_util.tree_flatten_with_path(entries)[0] if sharding.memory_kind == "pinned_host"]
+    if outside:
+        raise ValueError(f"host_parameters selected {outside}, which the layer stack does not fetch; "
+                         "select declared decoder layers and keep embeddings, heads and media resident")
+    for site in sites:
+        _check_consumers(in_namespace(placement, site.namespace), site.view.groups)
 
-    store: dict[str, dict] = {collection: {} for collection in shapes}
-    entry = jax.block_until_ready(source.entry(placement))
-    for collection, tree in entry.items():
-        store[collection].update(tree)
-    for (first, count), name in zip(groups, StackView(groups).bank_names()):
-        bank = jax.block_until_ready(source.bank(
-            range(first, first + count),
-            _bank_placement(one_layer(placement, first), stacked=count > 1)))
-        for collection, tree in bank.items():
-            store[collection][name] = tree
-    return {collection: tree for collection, tree in store.items() if tree}
+    entry_values = jax.block_until_ready(source.entry(entries)) if entries else {}
+    bank_store: dict[str, dict] = {}
+    for site in sites:
+        for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
+            bank = jax.block_until_ready(source.bank(
+                range(first, first + count),
+                _bank_placement(one_layer(placement, first, namespace=site.namespace), stacked=count > 1),
+                namespace=site.namespace))
+            for collection, tree in bank.items():
+                branch = bank_store.setdefault(collection, {})
+                for component in site.namespace:
+                    branch = branch.setdefault(component, {})
+                branch[name] = tree
+    return merge(entry_values, bank_store)
 
 
 def _places(subtree) -> dict[str, tuple[str, str]]:
@@ -302,8 +407,7 @@ def _places(subtree) -> dict[str, tuple[str, str]]:
 
 
 def _check_consumers(placement: "Placement", groups: Sequence[tuple[int, int]]) -> None:
-    """Refuse host-resident variables nothing fetches, and a run whose layers
-    do not agree leaf for leaf about where they go.
+    """Require corresponding layers of one bank to agree on placement.
 
     The comparison is per path inside a layer, not over the set of memory
     kinds a layer uses: two layers can use the same two spaces for different
@@ -311,19 +415,7 @@ def _check_consumers(placement: "Placement", groups: Sequence[tuple[int, int]]) 
     correspondence that has to hold. The spec is compared beside the memory
     kind, because a bank is one array and one sharding for the run.
     """
-    for collection, tree in placement.items():
-        outside = sorted(
-            name for name, subtree in tree.items()
-            if layer_index(name) is None
-            and any(sharding.memory_kind == "pinned_host"
-                    for sharding in jax.tree.leaves(subtree)))
-        if outside:
-            raise ValueError(
-                f"host_parameters selected {collection}/{outside}, which the layer "
-                f"stack does not fetch: only a run of layers is read one layer at a "
-                f"time, and an embedding table, a head or a prediction depth would "
-                f"come over whole and cost the device memory the offload saves. "
-                f"Select layers_* paths and keep a tied head resident")
+
     for collection, tree in placement.items():
         for first, count in groups:
             held = [index for index in range(first, first + count)

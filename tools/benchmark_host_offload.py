@@ -37,7 +37,7 @@ import numpy as np
 import tyro
 
 from dew import models  # naming a registry fills it
-from dew.inference.banks import entry_names, host_banked, named, narrowed, one_layer
+from dew.inference.banks import at_namespace, host_banked, in_namespace, narrowed, one_layer
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables
 from dew.training.distributed import Placement
@@ -102,13 +102,14 @@ class SyntheticBanks:
         return self.held
 
     def entry(self, placement: Placement) -> Variables:
-        held = named(self.held, entry_names(self.held))
+        held = narrowed(self.held, placement)
         return jax.device_put(
             jax.tree_util.tree_map_with_path(
                 lambda path, leaf: self._values(path, None, leaf.shape, leaf.dtype), held),
             narrowed(placement, held))
 
-    def bank(self, layers: Sequence[int], placement: Placement) -> Variables:
+    def bank(self, layers: Sequence[int], placement: Placement, *,
+             namespace: tuple[str, ...] = ()) -> Variables:
         def rows(path, leaf):
             if len(layers) == 1:
                 return self._values(path, layers[0], leaf.shape, leaf.dtype)
@@ -117,9 +118,9 @@ class SyntheticBanks:
                 bank[offset] = self._values(path, index, leaf.shape, leaf.dtype)
             return bank
 
-        return jax.device_put(
-            jax.tree_util.tree_map_with_path(rows, one_layer(self.held, layers[0])),
-            placement)
+        local = one_layer(self.held, layers[0], namespace=namespace)
+        values = jax.tree_util.tree_map_with_path(rows, at_namespace(local, namespace))
+        return jax.device_put(in_namespace(values, namespace), placement)
 
 
     def _values(self, path, layer: int | None, shape: tuple[int, ...], dtype) -> np.ndarray:
