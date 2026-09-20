@@ -63,6 +63,7 @@ import json
 from pathlib import Path
 
 import jax
+import ml_dtypes
 import numpy as np
 import pytest
 
@@ -468,3 +469,126 @@ def test_the_latent_norms_keep_the_reference_epsilon(name, tmp_path):
     np.testing.assert_allclose(tool.logits(loaded, loaded.variables, ids),
                                tool.reference_logits(CASES[name], directory, ids),
                                atol=LOGITS, rtol=0)
+
+
+@pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
+def test_codec_parameter_storage_follows_fp32_dequantization(kind):
+    from dew.interop.quantized import dequantize_checkpoint, pack_fp8
+    from dew.nn.gpt_oss import pack_mxfp4, unpack_mxfp4
+
+    weight = (np.arange(15, dtype=np.float32).reshape(3, 5) - 7) / 11 if kind == "fp8" else (
+        np.arange(2 * 64 * 48, dtype=np.float32).reshape(2, 64, 48) % 13 - 6) / 7
+    source = {"weight": weight, "state": np.asarray([.1234567], np.float32),
+              "indices": np.asarray([0, 255], np.uint8)}
+    if kind == "fp8":
+        packed = pack_fp8(source, ("weight",), block=2, ue8m0=False)
+        masters = dequantize_checkpoint(packed, block=2)
+        native = dequantize_checkpoint(packed, block=2, param_dtype="bfloat16")
+    else:
+        packed = pack_mxfp4(source, ("weight",))
+        masters = unpack_mxfp4(packed)
+        native = unpack_mxfp4(packed, param_dtype="bfloat16")
+    assert masters["weight"].dtype == np.float32
+    assert native["weight"].dtype == ml_dtypes.bfloat16
+    np.testing.assert_array_equal(native["weight"], masters["weight"].astype(ml_dtypes.bfloat16))
+    for name in ("state", "indices"):
+        assert native[name].dtype == source[name].dtype
+        np.testing.assert_array_equal(native[name], source[name])
+
+
+@pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
+def test_codec_rejects_integer_parameter_storage(kind):
+    from dew.interop.quantized import dequantize_checkpoint
+    from dew.nn.gpt_oss import pack_mxfp4, unpack_mxfp4
+
+    if kind == "fp8":
+        packed = {"weight": np.ones((1, 1), np.float32),
+                  "weight_scale_inv": np.full((1, 1), 1.25, np.float32)}
+        with pytest.raises(ValueError, match="int32"):
+            dequantize_checkpoint(packed, 1, param_dtype="int32")
+    else:
+        packed = pack_mxfp4({"weight": np.full((1, 32, 2), 1.5, np.float32)}, ("weight",))
+        with pytest.raises(ValueError, match="int32"):
+            unpack_mxfp4(packed, param_dtype="int32")
+
+
+@pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
+def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
+    from dew.interop.quantized import pack_fp8
+    from dew.nn.gpt_oss import pack_mxfp4
+    from test_interop import assert_parameter_storage
+
+    fixture = FIXTURES / ("deepseek-v3-tiny" if kind == "fp8" else "gpt-oss-tiny")
+    tensors = tool.source_tensors(fixture)
+    config = json.loads((fixture / "config.json").read_text())
+    if kind == "fp8":
+        packed = pack_fp8(tensors, ("model.layers.0.self_attn.o_proj.weight",), block=128, ue8m0=False)
+        config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
+                                         "weight_block_size": [128, 128]}
+    else:
+        stems = tuple(name for name in tensors if name.endswith(
+            (".experts.gate_up_proj", ".experts.down_proj")))
+        packed = pack_mxfp4(tensors, stems)
+        config["quantization_config"] = {"quant_method": "mxfp4"}
+    directory = tmp_path / "quantized"
+    save_hf_layout(packed, config, directory)
+    masters = load_pretrained(directory, dtype="bfloat16", attention_impl="xla")
+    native = load_pretrained(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    assert masters.quantized_tensors == native.quantized_tensors
+    assert_parameter_storage(masters.variables, native.variables, lambda path: path[0] == "params")
+
+
+@pytest.mark.parametrize("same_values", [True, False], ids=["equal-before-rounding", "different-before-rounding"])
+def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_values):
+    from dew.interop.quantized import E4M3
+
+    fixture = FIXTURES / "deepseek-v3-tiny"
+    tensors = tool.source_tensors(fixture)
+    config = json.loads((fixture / "config.json").read_text())
+    config["tie_word_embeddings"] = True
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
+                                     "weight_block_size": [128, 128]}
+    shape = tensors["model.embed_tokens.weight"].shape
+    decoded = np.float32(1. + 1. / 1024)
+    unquantized = decoded if same_values else np.float32(1. + 2. / 1024)
+    tensors["model.embed_tokens.weight"] = np.full(shape, unquantized, np.float32)
+    tensors["lm_head.weight"] = np.ones(shape, dtype=E4M3)
+    tensors["lm_head.weight_scale_inv"] = np.full(
+        ((shape[0] + 127) // 128, (shape[1] + 127) // 128), decoded, np.float32)
+    for name in tensors:
+        if name.startswith("model.layers.") and name.endswith(".embed_tokens.weight"):
+            tensors[name] = np.full_like(tensors[name], unquantized, dtype=np.float32)
+        elif name.startswith("model.layers.") and name.endswith(".shared_head.head.weight"):
+            tensors[name] = np.full_like(tensors[name], decoded, dtype=np.float32)
+    directory = tmp_path / "mixed-aliases"
+    save_hf_layout(tensors, config, directory)
+    if not same_values:
+        with pytest.raises(ValueError, match="tie_word_embeddings"):
+            load_pretrained(directory, param_dtype="bfloat16")
+    else:
+        loaded = load_pretrained(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+        values = loaded.variables["params"]["embed_tokens"]["embedding"]
+        assert np.asarray(values).dtype == ml_dtypes.bfloat16
+        np.testing.assert_array_equal(values, np.full(shape, decoded).astype(ml_dtypes.bfloat16))
+
+
+def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path):
+    from dew.interop.quantized import E4M3
+
+    fixture = FIXTURES / "diffusion-gemma-workflow"
+    tensors = tool.source_tensors(fixture)
+    config = json.loads((fixture / "config.json").read_text())
+    decoder = next(name for name in tensors if name.startswith("model.decoder.layers.")
+                   and name.endswith(".self_attn.q_proj.weight"))
+    encoder = decoder.replace("model.decoder.", "model.encoder.language_model.")
+    shape = tensors[decoder].shape
+    tensors[decoder] = np.ones(shape, dtype=E4M3)
+    tensors[decoder + "_scale_inv"] = np.ones(
+        ((shape[0] + 127) // 128, (shape[1] + 127) // 128), np.float32)
+    tensors[encoder] = np.full(shape, 1. + 1. / 1024, np.float32)
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
+                                     "weight_block_size": [128, 128]}
+    directory = tmp_path / "shared-decoder"
+    save_hf_layout(tensors, config, directory)
+    with pytest.raises(ValueError, match="differs between the encoder and the decoder"):
+        load_pretrained(directory, param_dtype="bfloat16")

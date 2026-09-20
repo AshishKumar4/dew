@@ -100,12 +100,29 @@ def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
     return out
 
 
-def dequantize_checkpoint(tensors: Mapping[str, np.ndarray],
-                          block: int) -> dict[str, np.ndarray]:
-    """`tensors` with every `<name>_scale_inv` applied to `<name>` and dropped.
+def fp8_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """Names after decoding; scale metadata is not a model tensor."""
+    return tuple(name for name in tensors if not name.endswith(SCALE_SUFFIX))
 
-    A scale with no weight to scale is refused: the checkpoint has lost a tensor.
+
+def read_fp8_tensor(tensors: Mapping[str, np.ndarray], name: str, *, block: int) -> np.ndarray:
+    """One original tensor for alias validation, decoding paired weights in
+    FP32 on demand. Unscaled values keep their original precision and dtype.
     """
+    value = tensors[name]
+    scale = tensors.get(name + SCALE_SUFFIX)
+    return value if scale is None else dequantize_fp8_blocks(value, scale, block)
+
+
+def dequantize_checkpoint(tensors: Mapping[str, np.ndarray], block: int, *,
+                          param_dtype: str = "float32") -> dict[str, np.ndarray]:
+    """Apply and drop each scale partner, retaining each completed weight in
+    param_dtype. Block multiplication remains FP32; conversion happens before
+    the result enters the output dictionary, never on a whole decoded model.
+    A scale without its weight is refused. Unscaled tensors are unchanged.
+    """
+    from dew.nn.text_encoders import checkpoint_array
+
     out = dict(tensors)
     for name in tuple(out):
         if not name.endswith(SCALE_SUFFIX):
@@ -114,7 +131,8 @@ def dequantize_checkpoint(tensors: Mapping[str, np.ndarray],
         if scaled not in out:
             raise ValueError(
                 f"{name} scales {scaled}, which the checkpoint does not hold")
-        out[scaled] = dequantize_fp8_blocks(out[scaled], out.pop(name), block)
+        out[scaled] = checkpoint_array(read_fp8_tensor(out, scaled, block=block), param_dtype)
+        out.pop(name)
     return out
 
 

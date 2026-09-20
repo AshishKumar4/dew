@@ -105,3 +105,71 @@ def test_a_matching_image_task_variant_loads(saved_pipelines, tmp_path, case, de
     directory = _declared(saved_pipelines, tmp_path, case, declared)
     loaded = load_pretrained(str(directory), dtype="float32", attention_impl="xla")
     assert loaded.text_to_image().guidance.scale == guidance
+
+
+@pytest.mark.parametrize("family", ["sd", "xl", "safety", "sd3", "flux"])
+def test_public_source_precision_covers_denoiser_and_frozen_component_weights(saved_pipelines, tmp_path, family):
+    import jax.numpy as jnp
+    from dew.interop import load_pretrained
+    from test_interop import assert_parameter_storage
+
+    if family in ("sd3", "flux"):
+        with tarfile.open(ROOT / f"tests/fixtures/{family}_source.tar.xz") as archive:
+            archive.extractall(tmp_path, filter="data")
+        directory = tmp_path / "pipeline"
+    else:
+        directory = saved_pipelines / family
+    masters = load_pretrained(directory, dtype="bfloat16", attention_impl="xla")
+    native = load_pretrained(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    assert masters.model.dtype == jnp.bfloat16
+    assert native.model.dtype == jnp.float32
+
+    def parameter(path):
+        return (path[0] in ("params", "autoencoder")
+                or path[:2] == ("encoders", "conditioning")
+                or path[:3] in (("encoders", "safety", "vision_model"),
+                               ("encoders", "safety", "visual_projection")))
+
+    assert_parameter_storage(masters.variables, native.variables, parameter)
+
+
+def test_component_binding_preserves_large_integer_indices():
+    import numpy as np
+    from dew.interop.diffusion import record_layouts
+
+    indices = np.asarray([1, 16777217], np.int64)
+    values, _ = record_layouts("component", {"indices": indices}, lambda name: (name,),
+                               ("buffers",), param_dtype="bfloat16")
+    value = values["indices"]
+    assert isinstance(value, np.ndarray) and value.dtype == np.int64
+    np.testing.assert_array_equal(value, indices)
+
+
+def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(saved_pipelines, tmp_path):
+    import numpy as np
+    from dew.interop import load_pretrained
+
+    source = load_pretrained(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
+    original = {layout.name: layout.export(source.variables) for layout in source.weight_layouts}
+    destination = tmp_path / "export"
+    source.save(destination)
+    mapped = load_pretrained(destination, dtype="float32", attention_impl="xla")
+    assert {layout.name for layout in mapped.weight_layouts} == set(original)
+    for layout in mapped.weight_layouts:
+        np.testing.assert_array_equal(layout.export(mapped.variables), original[layout.name])
+
+    changed = next(layout for layout in mapped.weight_layouts if layout.name == "unet/conv_in.bias")
+
+    def replace_leaf(tree, path):
+        name, *tail = path
+        value = replace_leaf(tree[name], tail) if tail else np.asarray(tree[name]) + np.float32(1.)
+        return {**tree, name: value}
+
+    updated = replace_leaf(mapped.variables, changed.paths[0])
+    mapped.save(destination, variables=updated)
+    for layout in mapped.weight_layouts:
+        np.testing.assert_array_equal(layout.export(mapped.variables), original[layout.name])
+    latest = load_pretrained(destination, dtype="float32", attention_impl="xla")
+    for layout in latest.weight_layouts:
+        expected = original[layout.name] + np.float32(1.) if layout.name == changed.name else original[layout.name]
+        np.testing.assert_array_equal(layout.export(latest.variables), expected)

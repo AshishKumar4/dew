@@ -37,7 +37,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import (Any, Callable, Dict, List, Mapping, NoReturn, Optional, Protocol,
+from typing import (Any, Callable, Collection, Dict, List, Mapping, NoReturn, Optional, Protocol,
                     Tuple, Union)
 
 import numpy as np
@@ -50,7 +50,7 @@ from dew.nn import llama4
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mla import MLAMixer
-from dew.registry import from_record, models
+from dew.registry import from_record
 from dew.nn import audio as audio_nn
 from dew.nn import vision as vision_nn
 
@@ -1825,6 +1825,123 @@ _WRAPPER_AUDIO_PREFIX = "audio_tower."
 _WRAPPER_AUDIO_PROJECTOR_PREFIX = "embed_audio."
 
 
+def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], record):
+    """Route source names once, checking any names that claim one local leaf.
+    The table retains names, not decoded arrays, so read can be a codec accessor.
+    """
+    tower_prefix = _WRAPPER_TOWER_PREFIX[record["tower"]["kind"]]
+    projector_prefix = _WRAPPER_PROJECTOR_PREFIX[record["projector"]["kind"]]
+    audio = record.get("audio")
+    sources: dict[str, dict[str, str]] = {name: {} for name in (
+        "language_model", "tower", "projector", "audio_tower", "audio_projector")}
+    aliases: list[tuple[str, str]] = []
+    for name in names:
+        bare = name.removeprefix("model.")
+        if bare.startswith("language_model."):
+            tail = bare[len("language_model."):]
+            local = tail if tail.startswith(("model.", "lm_head.weight", "mtp.")) else f"model.{tail}"
+            group = "language_model"
+        elif bare.startswith(projector_prefix):
+            group, local = "projector", bare[len(projector_prefix):]
+        elif bare.startswith(tower_prefix):
+            group, local = "tower", bare[len(tower_prefix):]
+        elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PROJECTOR_PREFIX):
+            group, local = "audio_projector", bare[len(_WRAPPER_AUDIO_PROJECTOR_PREFIX):]
+        elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PREFIX):
+            group, local = "audio_tower", bare[len(_WRAPPER_AUDIO_PREFIX):]
+        elif bare.startswith("mtp.") and record["text_model_type"] == _QWEN35:
+            group, local = "language_model", bare
+        elif bare == "lm_head.weight":
+            group, local = "language_model", bare
+        else:
+            raise ValueError(f"unknown tensor name {name!r}")
+        previous = sources[group].get(local)
+        if previous is not None:
+            if not np.array_equal(read(previous), read(name)):
+                raise ValueError(f"{name} differs from {previous}, which names the same {group}/{local}")
+            aliases.append((previous, name))
+        sources[group][local] = name
+    return sources, tuple(aliases)
+
+
+def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], config) -> tuple[tuple[str, str], ...]:
+    """Check tied-head/MTP values and return the verified source relationships."""
+    aliases: list[tuple[str, str]] = []
+    if config["tie_embeddings"] and "lm_head.weight" in names:
+        if ("model.embed_tokens.weight" not in names
+                or not np.array_equal(read("lm_head.weight"), read("model.embed_tokens.weight"))):
+            raise ValueError("tie_word_embeddings is set but lm_head.weight is not the "
+                             "embedding it claims to copy")
+        aliases.append(("lm_head.weight", "model.embed_tokens.weight"))
+    for name in names:
+        parts = name.split(".")
+        if (len(parts) >= 4 and parts[:2] == ["model", "layers"]
+                and parts[3:] in (["embed_tokens", "weight"], ["shared_head", "head", "weight"])):
+            shared = "model.embed_tokens.weight" if parts[3] == "embed_tokens" else "lm_head.weight"
+            reference = shared if shared in names else "lm_head.weight"
+            if reference not in names or not np.array_equal(read(name), read(reference)):
+                raise ValueError(f"{name} differs from {shared}, which the depth shares")
+            aliases.append((name, reference))
+    return tuple(aliases)
+
+
+def _denoiser_sources(names: Collection[str], read: Callable[[str], np.ndarray], *,
+                      text_only: bool):
+    """Shared text names, preferring the encoder exactly as the weight map does.
+    Alias-only inspection of a complete source leaves media validation to its
+    own mapper; the text-only translator still refuses every unknown prefix.
+    """
+    text, conditioning, decoder = {}, {}, []
+    aliases: list[tuple[str, str]] = []
+    for name in names:
+        if name.startswith("model.encoder.language_model."):
+            text["model." + name[len("model.encoder.language_model."):]] = name
+        elif name.startswith("model.decoder."):
+            rest = name[len("model.decoder."):]
+            if rest.startswith("self_conditioning."):
+                conditioning[rest] = name
+            else:
+                local = "model." + rest
+                text.setdefault(local, name)
+                decoder.append((local, name))
+        elif name == "lm_head.weight":
+            text[name] = name
+        elif text_only:
+            raise ValueError(f"unknown tensor name {name!r}")
+    for local, name in decoder:
+        reference = read(text[local])
+        value = reference if text[local] == name else read(name)
+        if not np.array_equal(reference, value):
+            raise ValueError(f"{local} differs between the encoder and the decoder, "
+                             "which share their text weights")
+        if text[local] != name:
+            aliases.append((text[local], name))
+        del reference, value
+    return text, conditioning, tuple(aliases)
+
+
+def validate_source_aliases(names: Collection[str], read: Callable[[str], np.ndarray],
+                            config: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
+    """Check original values before a codec retains narrowed weights. read
+    decodes only the requested tensor in FP32; no FP32 mapping is built.
+    Verified relationships let a narrowed quantized weight and an unquantized
+    copy share storage rather than subsequently disagree due to rounding.
+    """
+    if config.get("model_type") == "diffusion_gemma":
+        from dew.interop.diffusion_gemma import text_config
+        text, _, aliases = _denoiser_sources(names, read, text_only=False)
+        tied = _text_aliases(text, lambda name: read(text[name]), translate_config(text_config(config)))
+        return aliases + tuple((text[a], text[b]) for a, b in tied)
+    if "text_config" in config:
+        record = translate_wrapper_config(config)
+        sources, aliases = _wrapper_sources(names, read, record)
+        text = sources["language_model"]
+        tied = _text_aliases(text, lambda name: read(text[name]), record["text"])
+        return aliases + tuple((text[a], text[b]) for a, b in tied)
+    return _text_aliases(names, read, translate_config(config))
+
+
+
 def translate_wrapper_weights(
     hf_tensors: Mapping[str, np.ndarray],
     record: Mapping[str, Any],
@@ -1845,37 +1962,15 @@ def translate_wrapper_weights(
     """
     tower_kind = record["tower"]["kind"]
     projector_kind = record["projector"]["kind"]
-    tower_prefix = _WRAPPER_TOWER_PREFIX[tower_kind]
-    projector_prefix = _WRAPPER_PROJECTOR_PREFIX[projector_kind]
     audio = record.get("audio")
-    text_tensors: Dict[str, np.ndarray] = {}
-    tower_tensors: Dict[str, np.ndarray] = {}
-    projector_tensors: Dict[str, np.ndarray] = {}
-    audio_tensors: Dict[str, np.ndarray] = {}
-    audio_projector_tensors: Dict[str, np.ndarray] = {}
-    for name, tensor in hf_tensors.items():
-        bare = name[6:] if name.startswith("model.") else name
-        if bare.startswith("language_model."):
-            tail = bare[15:]
-            # A text model holds its tensors directly while a causal LM nests
-            # them under a second model. The family map reads model.* and
-            # lm_head.weight, so a bare tail regains its prefix.
-            text_tensors[tail if tail.startswith(("model.", "lm_head.weight", "mtp."))
-                         else f"model.{tail}"] = tensor
-        elif bare.startswith(projector_prefix):
-            projector_tensors[bare[len(projector_prefix):]] = tensor
-        elif bare.startswith(tower_prefix):
-            tower_tensors[bare[len(tower_prefix):]] = tensor
-        elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PROJECTOR_PREFIX):
-            audio_projector_tensors[bare[len(_WRAPPER_AUDIO_PROJECTOR_PREFIX):]] = tensor
-        elif audio is not None and bare.startswith(_WRAPPER_AUDIO_PREFIX):
-            audio_tensors[bare[len(_WRAPPER_AUDIO_PREFIX):]] = tensor
-        elif bare.startswith("mtp.") and record["text_model_type"] == _QWEN35:
-            text_tensors[bare] = tensor
-        elif bare == "lm_head.weight":
-            text_tensors["lm_head.weight"] = tensor
-        else:
-            raise ValueError(f"unknown tensor name {name!r}")
+    sources, _ = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record)
+    tables = {group: {local: hf_tensors[name] for local, name in held.items()}
+              for group, held in sources.items()}
+    text_tensors = tables["language_model"]
+    tower_tensors = tables["tower"]
+    projector_tensors = tables["projector"]
+    audio_tensors = tables["audio_tower"]
+    audio_projector_tensors = tables["audio_projector"]
     variables = {
         "language_model": translate_weights(
             text_tensors, record["text"], param_dtype=param_dtype
@@ -2098,25 +2193,7 @@ def translate_weights(
     dtype. Router and frozen state remain FP32; integer indices retain their
     native dtype. Conversion happens per leaf before its layout copy.
     """
-    tied_head = hf_tensors.get('lm_head.weight')
-    if config['tie_embeddings'] and tied_head is not None:
-        embedding = hf_tensors.get('model.embed_tokens.weight')
-        if embedding is None or not np.array_equal(tied_head, embedding):
-            raise ValueError(
-                "tie_word_embeddings is set but lm_head.weight is not the "
-                "embedding it claims to copy")
-    # An MTP depth shares the trunk's embedding and head (arXiv 2412.19437,
-    # section 2.2); a checkpoint that ships copies of them beside the depth
-    # is checked so a depth trained apart cannot load as a shared one.
-    for name, tensor in hf_tensors.items():
-        parts = name.split('.')
-        if (len(parts) >= 4 and parts[:2] == ['model', 'layers']
-                and parts[3:] in (['embed_tokens', 'weight'], ['shared_head', 'head', 'weight'])):
-            shared = 'model.embed_tokens.weight' if parts[3] == 'embed_tokens' else 'lm_head.weight'
-            reference = hf_tensors.get(shared, tied_head)
-            if reference is None or not np.array_equal(tensor, reference):
-                raise ValueError(
-                    f"{name} differs from {shared}, which the depth shares")
+    _text_aliases(hf_tensors, hf_tensors.__getitem__, config)
 
     # params is always a collection, mapped tensors or not. A checkpoint
     # whose every tensor maps to nothing is an empty tree.
@@ -2158,30 +2235,9 @@ def translate_denoiser_weights(
     """
     from dew.nn.diffusion_gemma import translate_weights as translate_sc_weights
 
-    text: Dict[str, np.ndarray] = {}
-    sc: Dict[str, np.ndarray] = {}
-    for name, tensor in hf_tensors.items():
-        if name.startswith("model.encoder.language_model."):
-            text["model." + name[len("model.encoder.language_model."):]] = tensor
-        elif name.startswith("model.decoder."):
-            rest = name[len("model.decoder."):]
-            if rest.startswith("self_conditioning."):
-                sc[rest] = tensor
-            else:
-                text.setdefault("model." + rest, tensor)
-        elif name == "lm_head.weight":
-            text[name] = tensor
-        else:
-            raise ValueError(f"unknown tensor name {name!r}")
-    for name, tensor in hf_tensors.items():
-        if name.startswith("model.decoder."):
-            rest = name[len("model.decoder."):]
-            if not rest.startswith("self_conditioning."):
-                key = "model." + rest
-                if not np.array_equal(np.asarray(text[key]), np.asarray(tensor)):
-                    raise ValueError(
-                        f"{key} differs between the encoder and the decoder, "
-                        "which share their text weights")
+    text_names, sc_names, _ = _denoiser_sources(hf_tensors, hf_tensors.__getitem__, text_only=True)
+    text = {local: hf_tensors[name] for local, name in text_names.items()}
+    sc = {local: hf_tensors[name] for local, name in sc_names.items()}
     return {
         "text": translate_weights(text, config, param_dtype=param_dtype),
         "self_conditioning": {

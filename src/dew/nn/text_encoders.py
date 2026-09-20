@@ -637,18 +637,18 @@ class CLIPTextModel:
 
     @classmethod
     def from_pretrained(cls, name_or_dir: str = DEFAULT_MODEL, *,
-                        dtype: Optional[Dtype] = None,
+                        dtype: Optional[Dtype] = None, param_dtype: str = "float32",
                         revision: Optional[str] = None) -> "CLIPTextModel":
         """Load a checkpoint from the Hub or a local directory.
 
-        `dtype` is the compute dtype, as on every other dew module. The
-        weights stay fp32, the dtype the checkpoint stores them in.
+        dtype selects computation; param_dtype selects weight storage and
+        defaults to FP32 masters independently of the checkpoint dtype.
         """
         directory = _checkpoint_dir(name_or_dir, revision)
         config = translate_config(_read_config(directory))
 
         transformer = CLIPTextTransformer(dtype=dtype, **config)
-        params = translate_weights(_read_tensors(directory))
+        params = translate_weights(_read_tensors(directory), param_dtype=param_dtype)
         _check_tree(params, transformer, jnp.zeros((1, 2), jnp.int32))
         return cls(transformer, {"params": jax.tree.map(jnp.asarray, params)}, config)
 
@@ -679,10 +679,9 @@ class CLIPModel:
 
     @classmethod
     def from_pretrained(cls, name_or_dir: str = DEFAULT_MODEL, *,
-                        dtype: Optional[Dtype] = None,
+                        dtype: Optional[Dtype] = None, param_dtype: str = "float32",
                         revision: Optional[str] = None) -> "CLIPModel":
-        """Load a full checkpoint from the Hub or a local directory; `dtype`
-        as on `CLIPTextModel.from_pretrained`."""
+        """Load full CLIP with independent compute and parameter precision."""
         directory = _checkpoint_dir(name_or_dir, revision)
         config = translate_clip_config(_read_config(directory))
 
@@ -690,7 +689,7 @@ class CLIPModel:
             text_model=CLIPTextTransformer(dtype=dtype, **config["text"]),
             vision_model=CLIPVisionTransformer(dtype=dtype, **config["vision"]),
             projection_dim=config["projection_dim"], dtype=dtype)
-        params = translate_clip_weights(_read_tensors(directory))
+        params = translate_clip_weights(_read_tensors(directory), param_dtype=param_dtype)
         vision = config["vision"]
         _check_tree(
             params, module,
@@ -1070,19 +1069,18 @@ class T5EncoderModel:
 
     @classmethod
     def from_pretrained(cls, name_or_dir: str = DEFAULT_T5_MODEL, *,
-                        dtype: Optional[Dtype] = None,
+                        dtype: Optional[Dtype] = None, param_dtype: str = "float32",
                         revision: Optional[str] = None) -> "T5EncoderModel":
         """Load a checkpoint from the Hub or a local directory, encoder
         tensors only.
 
-        `dtype` is the compute dtype, as on every other dew module. The
-        weights stay fp32, the dtype the checkpoint stores them in. Sharded
-        checkpoints (model-00001-of-00002.safetensors) load as one tower.
+        dtype selects computation; param_dtype selects weight storage and
+        defaults to FP32 masters. Sharded checkpoints load as one tower.
         """
         directory = _checkpoint_dir(name_or_dir, revision)
         config = translate_t5_config(_read_config(directory))
         transformer = T5EncoderTransformer(dtype=dtype, **config)
-        params = translate_t5_weights(_read_tensors(directory))
+        params = translate_t5_weights(_read_tensors(directory), param_dtype=param_dtype)
         _check_tree(params, transformer, jnp.zeros((1, 2), jnp.int32))
         return cls(transformer, {"params": jax.tree.map(jnp.asarray, params)}, config)
 

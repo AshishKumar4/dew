@@ -274,6 +274,61 @@ def test_a_bf16_checkpoint_still_loads_as_fp32_parameters(tmp_path):
     )
 
 
+def assert_parameter_storage(reference, actual, is_parameter):
+    """The public storage contract on full variable paths, not implementation calls."""
+    assert jax.tree.structure(reference) == jax.tree.structure(actual)
+    for (path, before), after in zip(jax.tree_util.tree_leaves_with_path(reference),
+                                    jax.tree.leaves(actual), strict=True):
+        names = tuple(entry.key for entry in path)
+        before, after = np.asarray(before), np.asarray(after)
+        floating = jnp.issubdtype(before.dtype, jnp.floating)
+        if floating:
+            assert before.dtype == np.float32, names
+        dtype = np.dtype(ml_dtypes.bfloat16) if floating and is_parameter(names) else before.dtype
+        assert after.dtype == dtype, names
+        np.testing.assert_array_equal(after, before.astype(dtype), err_msg=str(names))
+
+
+@pytest.mark.parametrize("family", [
+    "llama-tiny", "gemma4-tiny-mm", "gemma-4-audio-tiny", "diffusion-gemma-workflow",
+])
+def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_path, family):
+    from dew.interop import load_pretrained
+    from dew.nn.diffusion_gemma import DiffusionGemma
+
+    directory = Path(__file__).resolve().parent / "fixtures" / "hf" / family
+    masters = load_pretrained(directory, dtype="bfloat16", attention_impl="xla")
+    native = load_pretrained(directory, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    master_model = masters.model.text if isinstance(masters.model, DiffusionGemma) else masters.model
+    native_model = native.model.text if isinstance(native.model, DiffusionGemma) else native.model
+    assert jnp.dtype(master_model.dtype) == jnp.dtype(jnp.bfloat16)
+    assert jnp.dtype(native_model.dtype) == jnp.dtype(jnp.float32)
+    assert_parameter_storage(masters.variables, native.variables, lambda path: path[0] == "params")
+    destination = tmp_path / "export"
+    native.save(destination)
+    restored = load_pretrained(destination, dtype="float32", param_dtype="bfloat16", attention_impl="xla")
+    assert jax.tree.structure(native.variables) == jax.tree.structure(restored.variables)
+    for before, after in zip(jax.tree.leaves(native.variables), jax.tree.leaves(restored.variables), strict=True):
+        assert np.asarray(before).dtype == np.asarray(after).dtype
+        np.testing.assert_array_equal(before, after)
+
+
+def test_public_loader_rejects_aliases_hidden_by_bfloat16_rounding(tmp_path):
+    from dew.interop import load_pretrained
+
+    source = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
+    tensors, _ = read_file(source / "model.safetensors")
+    config = json.loads((source / "config.json").read_text())
+    config["tie_word_embeddings"] = True
+    shape = tensors["model.embed_tokens.weight"].shape
+    tensors["model.embed_tokens.weight"] = np.full(shape, 1., np.float32)
+    tensors["lm_head.weight"] = np.full(shape, 1. + 1. / 1024, np.float32)
+    directory = tmp_path / "different-aliases"
+    save_hf_layout(tensors, config, directory)
+    with pytest.raises(ValueError, match="tie_word_embeddings"):
+        load_pretrained(directory, param_dtype="bfloat16")
+
+
 # ---------------------------------------------------------------------------------
 # Hub push and pull
 # ---------------------------------------------------------------------------------
