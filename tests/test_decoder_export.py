@@ -609,9 +609,13 @@ def test_diffusion_gemma_source_export_resolves_omitted_embedding_tie_default(tm
     for expected, actual in zip(jax.tree.leaves(loaded.variables),
                                 jax.tree.leaves(restored.variables), strict=True):
         np.testing.assert_array_equal(actual, expected)
-    mismatched = {**config, "text_config": {**config["text_config"], "tie_word_embeddings": False}}
-    with pytest.raises(ValueError, match="tie_word_embeddings"):
-        export_weights(loaded.model, loaded.variables, mismatched)
+    for stated in (False, None):
+        # An explicit null is the reference's own False, not the family's
+        # tied default (configuration_utils.py reads the key it is given).
+        disagreeing = {**config, "text_config": {**config["text_config"],
+                                                 "tie_word_embeddings": stated}}
+        with pytest.raises(ValueError, match="tie_word_embeddings"):
+            export_weights(loaded.model, loaded.variables, disagreeing)
 
 
 @pytest.mark.parametrize("fixture, mode, dense", [
