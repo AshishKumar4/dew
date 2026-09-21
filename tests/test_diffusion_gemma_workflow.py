@@ -120,3 +120,15 @@ def test_a_published_checkpoint_with_a_sampler_index_loads_as_the_decoder(tmp_pa
     bundle = load_pretrained(str(tmp_path / "published"), dtype="float32", attention_impl="xla", max_seq_len=32)
     assert type(bundle.model) is type(reference.model)
     assert jax.tree.structure(bundle.variables) == jax.tree.structure(reference.variables)
+
+
+def test_a_text_decoder_takes_its_tokenizer_whatever_processor_files_ship(tmp_path):
+    """The published 26B repo carries a Gemma 4 processor config (image and
+    audio feature extractors) beside a text-only model; the loader reads the
+    tokenizer, not a processor that needs towers the model does not have."""
+    shutil.copytree(FIXTURE, tmp_path / "published")
+    (tmp_path / "published" / "processor_config.json").write_text(json.dumps(
+        {"processor_class": "Gemma4Processor", "image_processor": {"image_processor_type": "Gemma4ImageProcessor"}}))
+    bundle = load_pretrained(str(tmp_path / "published"), dtype="float32", attention_impl="xla", max_seq_len=32)
+    reference = load_pretrained(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
+    assert type(bundle.processor.reference) is type(reference.processor.reference)
