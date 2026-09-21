@@ -1,0 +1,10 @@
+{
+ "released": {
+  "repo": "zai-org/GLM-5.3-Flash",
+  "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a"
+ },
+ "transformers": {
+  "version": "5.16.1",
+  "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"
+ }
+}

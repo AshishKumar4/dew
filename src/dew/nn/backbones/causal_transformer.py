@@ -37,13 +37,14 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from ..attention import RMSNorm, RopeScaling
 from ..blocks import TokenEmbedding
-from ..inputs import AttentionMetadata
+from ..inputs import AttentionMetadata, PredictionPhase
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
 from ..hyper_connections import (
     HyperConnection, HyperConnections, HyperHead, collapse_streams, expand_streams, mix_streams,
 )
+from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..mla import INDEXER_COLLECTION, YarnScaling
@@ -609,10 +610,11 @@ class DecoderBlock(nn.Module):
 
     def __call__(self, x, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
-                 per_layer_input=None, attention_metadata=None):
+                 per_layer_input=None, attention_metadata=None,
+                 prediction_phase: PredictionPhase = "ordinary"):
         if self.remat is None or self.is_initializing() or decode:
             return self._forward(x, train, decode, positions, segment_ids,
-                                 kv_store, per_layer_input, attention_metadata)
+                                 kv_store, per_layer_input, attention_metadata, prediction_phase)
 
         def run(module, x, positions, segment_ids, kv_store, per_layer_input, attention_metadata):
             # Providers write K/V into a dict; scanned consumers only read it.
@@ -620,7 +622,7 @@ class DecoderBlock(nn.Module):
             # scan result so its tracers cannot replace the outer store.
             store = None if kv_store is None else dict(kv_store)
             out = module._forward(x, train, False, positions, segment_ids,
-                                  store, per_layer_input, attention_metadata)
+                                  store, per_layer_input, attention_metadata, prediction_phase)
             changed = {} if store is None else {
                 name: value for name, value in store.items()
                 if value is not kv_store.get(name)}
@@ -636,10 +638,10 @@ class DecoderBlock(nn.Module):
         return out
 
     def _forward(self, x, train: bool, decode: bool, positions, segment_ids,
-                 kv_store, per_layer_input, attention_metadata):
+                 kv_store, per_layer_input, attention_metadata, prediction_phase="ordinary"):
         if self.hyper_connections is not None:
             return self._forward_streams(x, train, decode, positions, segment_ids,
-                                         kv_store, attention_metadata)
+                                         kv_store, attention_metadata, prediction_phase)
         altup = self.altup
         predictions = None if altup is None else self.altup_layer.predict(x, train=train)
         if altup is not None and predictions is not None:
@@ -648,7 +650,8 @@ class DecoderBlock(nn.Module):
         mixed = self.self_attn(normed,
                                decode=decode, positions=positions, segment_ids=segment_ids,
                                **({} if kv_store is None else {"kv_store": kv_store}),
-                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}))
+                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
+                               **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         x = x + self.dropout(mixed, deterministic=not train)
@@ -677,13 +680,14 @@ class DecoderBlock(nn.Module):
         return x
 
     def _forward_streams(self, streams, train: bool, decode: bool, positions, segment_ids,
-                         kv_store, attention_metadata):
+                         kv_store, attention_metadata, prediction_phase="ordinary"):
         """The mHC block over `[B, S, hc_mult, D]` (modeling_glm5_next.py:1293-1327)."""
         post, comb, collapsed = self.attn_hc(streams)
         mixed = self.self_attn(self.input_layernorm(collapsed),
                                decode=decode, positions=positions, segment_ids=segment_ids,
                                **({} if kv_store is None else {"kv_store": kv_store}),
-                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}))
+                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
+                               **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
         streams = mix_streams(post, comb, self.dropout(mixed, deterministic=not train), streams)
         post, comb, collapsed = self.ffn_hc(streams)
         hidden = self.mlp(self.post_attention_layernorm(collapsed))
@@ -753,12 +757,13 @@ class MTPBlock(nn.Module):
         self.final_norm = norm(name='final_norm')
 
     def __call__(self, hidden, embeds, train: bool = False, positions=None,
-                 segment_ids=None, attention_metadata=None, decode: bool = False):
+                 segment_ids=None, attention_metadata=None, decode: bool = False,
+                 prediction_phase: PredictionPhase = "ordinary"):
         fused = self.eh_proj(jnp.concatenate(
             [self.enorm(embeds), self.hnorm(hidden)], axis=-1))
         return self.final_norm(self.block(
             fused, train=train, positions=positions, segment_ids=segment_ids,
-            attention_metadata=attention_metadata, decode=decode))
+            attention_metadata=attention_metadata, decode=decode, prediction_phase=prediction_phase))
 
 
 Block = Callable[[int, str], DecoderBlock]
@@ -1318,6 +1323,7 @@ class CausalTransformer(nn.Module):
     kv_shared_layers: Optional[Tuple[int, ...]] = None  # the sharing layers named one by one
     mixer: Optional[MixerBase] = None         # None: today's attention; a kind value or its record
     num_nextn_predict_layers: int = 0         # MTP depths after the final norm; 0 disables
+    index_share_for_mtp_iteration: bool = False
     altup: Optional[AltUp] = None             # Gemma 3n's stack of residual copies; None disables
     laurel_rank: Optional[int] = None         # Gemma 3n's learned augmented residual; None disables
     hyper_connections: Optional[HyperConnections] = None  # mHC's stack of residual streams; None disables
@@ -1775,6 +1781,9 @@ class CausalTransformer(nn.Module):
         # experts) and is dense otherwise.
         mtp_type = 'full_attention' if 'full_attention' in types else types[0]
         prediction_mixer = kinds[mtp_type].mixer or mixer_spec
+        if (self.index_share_for_mtp_iteration and self.num_nextn_predict_layers
+                and not isinstance(prediction_mixer, KPoolSparseAttentionMixer)):
+            raise ValueError("index_share_for_mtp_iteration requires a k-pool prediction mixer")
         mtp_mixer = prediction_mixer.build(self.mixer_context(
             kinds[mtp_type], mtp_type, False))
         mtp_feedforward = (
@@ -1917,19 +1926,25 @@ class CausalTransformer(nn.Module):
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
-                 decode: bool = False):
+                 decode: bool = False, prediction_phase: PredictionPhase = "ordinary"):
         """One unshifted prediction step, optionally appending its own KV cache.
 
         Call init_mtp_cache before cached steps. The hidden input is the
         target model's preceding state; tokens or input_embeddings supply
         the candidate next token, as in vLLM's Qwen3_5MultiTokenPredictor.
         Returns the step's logits and its own hidden state, which the next
-        step of a chained draft consumes in place of the target's.
+        step of a chained draft consumes in place of the target's. With
+        index_share_for_mtp_iteration, cached extend publishes index selections
+        and draft reuses them; ordinary always recomputes. Uncached training
+        never carries a selection between queries.
         """
+        if prediction_phase not in ("ordinary", "extend", "draft"):
+            raise ValueError("prediction_phase must be ordinary, extend or draft")
         if depth < 0 or depth >= len(self.mtp):
             raise ValueError("prediction depth is outside the model's configured depths")
         embeds = self.embed_tokens(tokens) if input_embeddings is None else input_embeddings
         state = self.mtp[depth](hidden, embeds, positions=positions, decode=decode,
+                                prediction_phase=prediction_phase if self.index_share_for_mtp_iteration else "ordinary",
                                 attention_metadata=AttentionMetadata(valid=attention_mask,
                                                                     rotary_positions=rotary_positions))
         return self._logits(state), state
@@ -1946,7 +1961,8 @@ class CausalTransformer(nn.Module):
         """Allocate only prediction-layer caches; ordinary generation does not pay for them."""
         for block in self.mtp:
             block(jnp.zeros((batch_size, 1, self.emb_features), self.dtype),
-                  jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True)
+                  jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True,
+                  prediction_phase="extend" if self.index_share_for_mtp_iteration else "ordinary")
 
 
 

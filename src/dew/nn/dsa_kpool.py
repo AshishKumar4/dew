@@ -24,6 +24,11 @@ Decode caches the expanded keys and values and the indexer's packed state
 `[k | gate_scores | valid]` per slot, as the reference's indexed cache layers
 do, in the fixed-capacity cache MLA's sparse variant uses; unused slots carry
 a zero valid channel, which is what keeps their pools out of the candidates.
+
+Opted-in prediction caches also retain the complete selected token list and
+its physical origin. Extend publishes the last valid query; draft reuses it
+until replay publishes another. Ordinary steps recompute and invalidate it.
+An origin of -1 means no seed, distinct from a valid empty selection.
 """
 
 from __future__ import annotations
@@ -40,7 +45,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from .attention import RMSNorm, causal_attention_mask, max_attention_logits, scaled_dot_product_attention
-from .inputs import AttentionMetadata
+from .inputs import AttentionMetadata, PredictionPhase
 from .mixers import MixerBase, MixerContext, mixers
 from .mla import INDEXER, open_expanded_cache
 from .sharding import logical_axes
@@ -75,7 +80,7 @@ class KPoolIndexer(nn.Module):
     (`Glm5NextTextIndexer`, modeling_glm5_next.py:736-1024).
 
     `packed` is the per-token state the attention caches on decode,
-    `[k | gate_scores | valid]`, and `select` scores every pool of it for
+    `[k | gate_scores | valid]`, and `select_indices` scores every pool of it for
     every query: the pooled keys against `wq_b` of the query residual, relu,
     the heads weighted by `weights_proj`, top `index_topk // index_kpool`
     pools among those whose last token the query sees, the tail appended.
@@ -162,13 +167,17 @@ class KPoolIndexer(nn.Module):
         tail_visible = jnp.take_along_axis(visible, jnp.clip(tail, 0, total - 1), axis=-1)
         return jnp.where(jnp.logical_and(allowed, tail_visible), tail, -1)
 
-    def select(self, x, q_resid, packed, visible):
-        """The keys each query attends: `[B, S, T]`, bool.
+    def select_indices(self, x, q_resid, packed, visible):
+        """Complete selected token indices `[B, S, N]`, -1 for an empty slot.
 
         `packed` is the state of every candidate (the cache on decode),
         `visible` `[B, S, T]` which of them the query may see (causality and
         validity). Scores run in fp32 as the reference's do, everything
-        detached (modeling_glm5_next.py:773-877).
+        detached (modeling_glm5_next.py:773-877). Pools that score equally
+        choose the lower token index, because `jax.lax.top_k` is stable;
+        torch's `topk` promises no tie order, so a selection a tie decides
+        may differ from the reference's. A pool the query cannot see is
+        never chosen, whatever the tie rule.
         """
         x, q_resid, packed = (jax.lax.stop_gradient(part) for part in (x, q_resid, packed))
         batch, length, _ = x.shape
@@ -192,13 +201,13 @@ class KPoolIndexer(nn.Module):
         # minimum; a dropped pool is never a candidate, and a selected
         # non-candidate contributes no indices, so the selection is the same.
         select_k = min(self.top_k // self.kpool, index_scores.shape[-1])
-        chosen = jax.lax.top_k(index_scores, select_k)[1]
+        chosen = jax.lax.top_k(index_scores, select_k, is_stable=True)[1]
         chosen_valid = jnp.take_along_axis(candidates, chosen, axis=-1)
         chosen_indices = pool_indices[jnp.arange(batch)[:, None, None], chosen]
         tokens = jnp.where(chosen_valid[..., None], chosen_indices, -1).reshape(batch, length, -1)
         if self.always_select_tail and self.kpool > 1:
             tokens = jnp.concatenate([tokens, self._tail(visible, valid)], axis=-1)
-        return selection_mask(tokens, total)
+        return tokens
 
 
 # The latent projections and norms carry MLA's declarations under the same names.
@@ -285,7 +294,8 @@ class KPoolSparseAttention(nn.Module):
 
     @nn.compact
     def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
+                 attention_metadata: AttentionMetadata | None = None,
+                 prediction_phase: PredictionPhase = "ordinary"):
         # No rope: the slot positions order the keys and nothing rotates.
         del positions, kv_store
         if segment_ids is not None:
@@ -311,6 +321,8 @@ class KPoolSparseAttention(nn.Module):
         packed = self.indexer.packed(x, row_valid)
         implementation = self.attention_impl
         if decode:
+            allocated = self.has_variable("cache", "cache_index")
+            committed = self.get_variable("cache", "cache_index")
             slots, append = open_expanded_cache(self, key, value, packed, self.max_seq_len, valid=valid)
             key, value, packed = append(key, value, packed)
             # The reference's static cache: keys at every slot, causality
@@ -318,6 +330,37 @@ class KPoolSparseAttention(nn.Module):
             # (`get_visible_tokens`, modeling_glm5_next.py:879-897).
             visible = causal_attention_mask(
                 slots, key.shape[1], key_valid=self.get_variable("cache", "cache_valid"))[:, 0]
+            # SGLang 97c6978 index_topk_share.py:22-28,48-64 carries the complete
+            # token list; draft hits must not append the new query's tail.
+            if prediction_phase != "ordinary" or self.has_variable("cache", "selection_position"):
+                if prediction_phase == "draft" and length != 1:
+                    raise ValueError("draft index reuse accepts one candidate per row")
+                count = min(self.index_topk // self.index_kpool, -(-self.max_seq_len // self.index_kpool))
+                width = count * self.index_kpool + (self.index_kpool - 1 if self.index_kpool_always_select_tail else 0)
+                saved = self.variable("cache", "selection_indices", jnp.full, (batch, width), -1, jnp.int32)
+                origin = self.variable("cache", "selection_position", jnp.full, (batch,), -1, jnp.int32)
+                active = jnp.any(row_valid, axis=1)
+                if committed is not None:
+                    origin.value = jnp.where(active & (origin.value >= committed), -1, origin.value)
+                hit = (origin.value >= 0) & active if prediction_phase == "draft" else jnp.zeros((batch,), bool)
+                frozen = jnp.broadcast_to(saved.value[:, None], (batch, length, width))
+                if allocated and prediction_phase == "draft":
+                    indices = nn.cond(
+                        jnp.all(hit | ~active), lambda module: frozen,
+                        lambda module: module.indexer.select_indices(x, q_resid, packed, visible), self)
+                    indices = jnp.where(hit[:, None, None], frozen, indices)
+                else:
+                    indices = self.indexer.select_indices(x, q_resid, packed, visible)
+                if allocated:
+                    if prediction_phase == "ordinary":
+                        origin.value = jnp.where(active, -1, origin.value)
+                    else:
+                        last = jnp.max(jnp.where(row_valid, jnp.arange(length), 0), axis=1)
+                        publish = active & ~hit
+                        saved.value = jnp.where(publish[:, None], indices[jnp.arange(batch), last], saved.value)
+                        origin.value = jnp.where(publish, slots[jnp.arange(batch), last], origin.value)
+            else:
+                indices = self.indexer.select_indices(x, q_resid, packed, visible)
         else:
             visible = causal_attention_mask(jnp.arange(length), length, key_valid=row_valid)[:, 0]
             if implementation in ('auto', 'cudnn'):
@@ -325,7 +368,8 @@ class KPoolSparseAttention(nn.Module):
                 # at an odd length while training (dew.nn.mla says why); the
                 # selection is always a mask, so training runs xla.
                 implementation = 'xla'
-        selected = self.indexer.select(x, q_resid, packed, visible)
+            indices = self.indexer.select_indices(x, q_resid, packed, visible)
+        selected = selection_mask(indices, key.shape[1])
         # An invalid query selects nothing (modeling_glm5_next.py:875).
         mask = jnp.logical_and(selected, row_valid[:, :, None])[:, None]
         # The per-head maxima the QK-Clip reads, over the selected keys,

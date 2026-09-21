@@ -21,7 +21,7 @@ from jax.typing import ArrayLike
 
 from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.inputs import (
-    ArrayT, ModelInputs, RowPlan, agreed_validity, generation_signature,
+    ArrayT, ModelInputs, PredictionPhase, RowPlan, agreed_validity, generation_signature,
     local_rows, mesh_of, request_key,
 )
 from dew.objectives.base import Variables
@@ -265,7 +265,7 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
 
     def propose(state: DecoderState, hidden: jax.Array, tokens: jax.Array | None,
                 embeds: jax.Array | None, valid: jax.Array, positions: jax.Array,
-                depth: int) -> tuple[DecoderState, jax.Array, jax.Array]:
+                depth: int, prediction_phase: PredictionPhase) -> tuple[DecoderState, jax.Array, jax.Array]:
         ids = jnp.zeros(valid.shape, jnp.int32) if tokens is None else jnp.where(valid, tokens, pad_id)
         # Multi-axis rotary metadata is not a scalar position, and a depth
         # takes it under its own name.
@@ -274,6 +274,7 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
         (logits, states), updated = model.apply(
             {**params, "cache": state.cache}, hidden, ids, depth=depth, attention_mask=valid,
             input_embeddings=embeds, decode=True, mutable=["cache"], rngs=None,
+            prediction_phase=prediction_phase,
             method="mtp_step", capture_intermediates=False, **placed)
         return dataclasses.replace(state, cache=updated["cache"]), logits, states
 
