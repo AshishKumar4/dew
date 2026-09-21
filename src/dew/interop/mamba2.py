@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dew import records
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.text_encoders import checkpoint_array
 from dew.objectives.base import Variables
@@ -35,16 +36,6 @@ MODEL_TYPE = "mamba2"
 
 _MIXER_LEAVES = ("A_log", "dt_bias", "D")
 _MIXER_LINEARS = ("in_proj", "out_proj")
-
-
-def _float(value: object) -> float:
-    """A config float, including the `{"__float__": "Infinity"}` transformers
-    writes for a non-finite one (`time_step_limit`'s upper bound)."""
-    if isinstance(value, Mapping):
-        return float(str(value["__float__"]))
-    if isinstance(value, (int, float)):
-        return float(value)
-    raise ValueError(f"expected a number, got {value!r}")
 
 
 def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None) -> DecoderFields:
@@ -61,17 +52,11 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
 
     def integer(key: str, default: int) -> int:
         read.add(key)
-        value = hf_config.get(key, default)
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"{key}={value!r}: an integer was expected")
-        return value
+        return records.integer(hf_config.get(key, default), key)
 
     def flag(key: str, *, default: bool) -> bool:
         read.add(key)
-        value = hf_config.get(key, default)
-        if not isinstance(value, bool):
-            raise ValueError(f"{key}={value!r}: a boolean was expected")
-        return value
+        return records.boolean(hf_config.get(key, default), key)
 
     hidden, expand = integer("hidden_size", 4096), integer("expand", 2)
     heads, head_dim = integer("num_heads", 128), integer("head_dim", 64)
@@ -87,10 +72,15 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
     # forward reads at fp32.
     read.update(("time_step_rank", "time_step_min", "time_step_max", "time_step_floor",
                  "residual_in_fp32", "rescale_prenorm_residual", "time_step_limit", "layer_norm_epsilon"))
-    limit = hf_config.get("time_step_limit", (0.0, float("inf")))
-    if not isinstance(limit, (list, tuple)) or len(limit) != 2:
-        raise ValueError(f"time_step_limit is a (lower, upper) pair, got {limit!r}")
-    lower, upper = (_float(bound) for bound in limit)
+    # The reference leaves the upper bound open by default, and a file that
+    # states one writes it as the {"__float__": "Infinity"} record `records`
+    # reads; the default is this module's own value and is not read from one.
+    lower, upper = 0.0, float("inf")
+    if "time_step_limit" in hf_config:
+        limit = hf_config["time_step_limit"]
+        if not isinstance(limit, (list, tuple)) or len(limit) != 2:
+            raise ValueError(f"time_step_limit is a (lower, upper) pair, got {limit!r}")
+        lower, upper = (records.number(bound, "time_step_limit") for bound in limit)
     mixer = Mamba2Mixer(
         num_heads=heads, head_dim=head_dim,
         state_size=integer("state_size", 128),
@@ -109,7 +99,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
         "head_dim": hidden,
         "mlp_features": 0,
         "qk_norm": False,
-        "norm_eps": _float(hf_config.get("layer_norm_epsilon", 1e-5)),
+        "norm_eps": records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
         "tie_embeddings": flag("tie_word_embeddings", default=False),
         "mixer": mixer,
     }

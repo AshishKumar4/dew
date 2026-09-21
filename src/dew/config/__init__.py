@@ -39,9 +39,10 @@ from dew.checkpoints import RUN_FILE, Checkpoints
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
+from dew.records import JSON
 from dew.registry import REGISTRIES, _declared_type, datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
-from dew.telemetry.records import JSON, RunRecord, json_value, packages_installed
+from dew.telemetry.records import RunRecord, json_value, packages_installed
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import build_optimizer
 from dew.training.quantization import Quantization, quantize

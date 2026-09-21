@@ -1,4 +1,9 @@
-"""Host-only run records carried by Tracker.artifact, not training pytrees."""
+"""Host-only run records carried by Tracker.artifact, not training pytrees.
+
+`json_value` here runs the opposite direction from `dew.records`: that module
+narrows a config field a published file handed over, this one encodes a
+finished record on its way out to a tracker.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +16,7 @@ import typing
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
-type JSON = None | bool | int | float | str | list['JSON'] | dict[str, 'JSON']
+from dew.records import JSON
 
 
 def json_value(value: object) -> JSON:

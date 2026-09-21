@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew import records
 from dew.artifacts import agree_process_phase
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
@@ -42,13 +43,13 @@ from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.text_encoders import ParamTree
 from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
+from dew.records import JSON
 from dew.registry import dtype_name, models, resolve_dtype, with_precision
 from dew.sampling import decoding
 from dew.sampling.guidance import CFG
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling
-from dew.telemetry.records import JSON
 
 # One keyword a host processor takes: the text it tokenizes, the flags and
 # tensor format that shape what it hands back, the media a caller loaded, and
@@ -982,35 +983,12 @@ def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str,
     return collections
 
 
-def _json(value: object, name: str) -> JSON:
-    """One source config field, narrowed to the JSON its file carries.
-
-    config.json and generation_config.json are read with `json.loads`, so a
-    field is a scalar, a list or a record of them; anything else reached this
-    mapping from somewhere other than the source.
-    """
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, (list, tuple)):
-        return [_json(entry, name) for entry in value]
-    if isinstance(value, Mapping):
-        return {_json_key(key, name): _json(entry, name) for key, entry in value.items()}
-    raise ValueError(f"{name}={value!r} is not a value a JSON config carries")
-
-
-def _json_key(key: object, name: str) -> str:
-    """One record field name, which JSON always spells as a string."""
-    if not isinstance(key, str):
-        raise ValueError(f"{name} record key {key!r} is not a string")
-    return key
-
-
 def _generation_value(config: Mapping[str, object], generation_config: Mapping[str, object],
                       name: str, default: JSON = None) -> JSON:
     text = config.get("text_config", config)
     if not isinstance(text, Mapping):
         raise ValueError("text_config must be a mapping")
-    return _json(generation_config.get(name, config.get(name, text.get(name, default))), name)
+    return records.json_value(generation_config.get(name, config.get(name, text.get(name, default))), name)
 
 
 def _eos_ids(config: Mapping[str, object], generation_config: Mapping[str, object]) -> tuple[int, ...]:
@@ -1755,7 +1733,6 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
     """The published UNet: cross attention over one or two CLIP towers, whose
     pooled text conditioning is the one its added time features ask for."""
     from dew.interop import diffusion
-    from dew.interop.diffusion import _integer
     from dew.nn.backbones.unet_condition import UNet2DCondition
 
     config = _component_config(directory, "unet")
@@ -1775,8 +1752,8 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
         component="unet", model=model, weights=weights,
         built=built, config=config, composition="clip_pooled" if pooled else "clip",
         towers=("text_encoder", "text_encoder_2"), patch=1, latent_input=model.in_channels,
-        sample_size=_integer(config["sample_size"], "sample_size"),
-        context_width=_integer(config.get("cross_attention_dim", 1280), "cross_attention_dim"),
+        sample_size=records.integer(config["sample_size"], "sample_size"),
+        context_width=records.integer(config.get("cross_attention_dim", 1280), "cross_attention_dim"),
         pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline")
 
 
@@ -1796,7 +1773,6 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
     """SD3's MM-DiT: both CLIP towers and the T5 tower read jointly, with the
     stored position buffer in its own frozen collection."""
     from dew.interop import diffusion
-    from dew.interop.diffusion import _integer
     from dew.nn.backbones.sd3 import SD3Transformer
 
     fields = diffusion.sd3_fields(config, dtype=dtype, attention_impl=attention_impl)
@@ -1814,7 +1790,7 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
         component="transformer", model=model, weights=weights,
         built=built, config=config, composition="sd3",
         towers=("text_encoder", "text_encoder_2"), patch=fields["patch_size"],
-        latent_input=fields["in_channels"], sample_size=_integer(config["sample_size"], "sample_size"),
+        latent_input=fields["in_channels"], sample_size=records.integer(config["sample_size"], "sample_size"),
         context_width=fields["joint_attention_dim"], pipeline="StableDiffusion3Pipeline",
         t5_tower="text_encoder_3")
 
@@ -1828,7 +1804,6 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attentio
     geometry. It starts from the sigmas its pipeline hands the scheduler.
     """
     from dew.interop import diffusion
-    from dew.interop.diffusion import _integer
     from dew.nn.backbones.flux import FluxTransformer
 
     fields = diffusion.flux_fields(config, dtype=dtype, attention_impl=attention_impl)
@@ -1846,7 +1821,7 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attentio
         component="transformer", model=model, weights=weights,
         built=built, config=config, composition="flux", towers=("text_encoder",), patch=2,
         latent_input=fields["in_channels"] // 4,
-        sample_size=_integer(config.get("sample_size", 128), "sample_size"),
+        sample_size=records.integer(config.get("sample_size", 128), "sample_size"),
         context_width=fields["joint_attention_dim"], pipeline="FluxPipeline",
         origin="linspace", embeds_guidance=fields["guidance_embeds"], t5_tower="text_encoder_2")
 
