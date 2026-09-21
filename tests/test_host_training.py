@@ -477,3 +477,51 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
     assert "layers_0" in host.params["params"]["text"]
     assert not any(name.startswith("layers_0_") for name in host.params["params"]["text"])
 
+
+
+# --------------------------------------------------------------------------
+# Frozen residency: placed once, aliased by every snapshot, streamed into place
+# --------------------------------------------------------------------------
+
+
+def _pointers(tree):
+    return {path: tuple(shard.data.unsafe_buffer_pointer() for shard in leaf.addressable_shards)
+            for path, leaf in _named_leaves(tree)}
+
+
+def _named_leaves(tree):
+    return [(jax.tree_util.keystr(path), leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(tree)]
+
+
+@pytest.mark.parametrize("scan", [False, True], ids=["per-layer", "scanned"])
+def test_frozen_leaves_stay_resident_and_snapshots_alias_them(scan):
+    """A frozen leaf is placed once, beside the accelerator, and is the same
+    buffer after every step; the snapshot of a per-layer bank is the leaf
+    itself and a scanned run's frozen bank is built once and kept."""
+    from dew.training.execution import BANK_MEMORY, HostExecution
+
+    def trainable(path):
+        return path[-2:] == ("q_proj", "kernel")
+
+    objective = LMObjective(decoder(scan_layers=scan), 8, head_chunks=1, trainable=trainable)
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
+    state, placement, _ = trainer.place()
+    frozen = state.params[FROZEN]
+    for path, leaf in _named_leaves(frozen):
+        assert leaf.sharding.mesh == trainer.device_mesh, path
+        assert leaf.sharding.memory_kind == (BANK_MEMORY if "layers_" in path else "device"), path
+    execution = HostExecution(objective, HOST, trainer.device_mesh, trainer.state_mesh)
+    with jax.set_mesh(trainer.state_mesh):
+        first, second = execution.snapshot(state.params), execution.snapshot(state.params)
+    if not scan:
+        assert first["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"] is frozen["layers_1"]["mlp"]["gate_proj"]["kernel"]
+    else:
+        bank = next(name for name in first["params"] if name.startswith("layers_0_"))
+        assert first["params"][bank]["mlp"]["gate_proj"]["kernel"] is second["params"][bank]["mlp"]["gate_proj"]["kernel"]
+        assert first["params"][bank]["self_attn"]["q_proj"]["kernel"] is not second["params"][bank]["self_attn"]["q_proj"]["kernel"]
+    before = _pointers(frozen)
+    step = trainer.compile(state, tokens())
+    for _ in range(2):
+        state, *_ = step(state, tokens())
+    assert _pointers(state.params[FROZEN]) == before
+    assert _pointers(state.params["params"]) != _pointers(frozen) and set(state.params["params"]) == {"layers_0", "layers_1"}
