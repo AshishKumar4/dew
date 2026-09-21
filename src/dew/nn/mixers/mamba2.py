@@ -23,6 +23,13 @@ fp32 as the reference casts. The decode step is `mamba2_selective_state_update`
 (192-251). Both live here beside their gated-delta-rule counterparts'
 shapes so tests/test_mamba2.py can hold them to the reference's numbers.
 
+The scan over the chunks is `xla_chunk_scan` here, and on a GPU or a TPU
+whose tiling covers the geometry it is `dew.nn.kernels.ssd`'s Pallas kernel,
+chosen at trace time from the backend the way attention's 'auto' chooses
+cudnn. The two compute the same scan: the XLA form is the oracle the kernel's
+tests hold it to and the path every other backend and shape takes. Decoding
+stays on the recurrent form either way.
+
 Around the scan: `in_proj` yields `[z, x, B, C, dt]` in that order
 (`projected_states.split([intermediate, conv_dim, num_heads])`, 484-486,
 with `conv_dim = intermediate + 2 G N`), the depthwise causal conv with its
@@ -48,6 +55,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.inputs import AttentionMetadata
+from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import _masked_conv1d, causal_conv1d
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.sharding import logical_axes
@@ -76,6 +84,35 @@ def _expand_groups(x, num_heads: int):
     return jnp.repeat(x, num_heads // x.shape[2], axis=2)
 
 
+def xla_chunk_scan(x_c, B_c, C_c, a_c, carried):
+    """The scan over chunks in plain XLA, the oracle and the fallback for
+    `dew.nn.kernels.ssd`. `x_c` `[NC, B, C, H, P]` already scaled by `dt`,
+    `B_c` and `C_c` `[NC, B, C, H, N]` with the groups expanded, `a_c`
+    `[NC, B, H, C]` the per-step `A dt`, `carried` `[B, H, P, N]` the state
+    entering the sequence; returns the output in `x_c`'s layout and the state
+    leaving it."""
+    a_cumsum = jnp.cumsum(a_c, axis=-1)
+    # 1. The intra-chunk output: L[i, j] = exp(segsum) masks C_i . B_j.
+    L = jnp.exp(segment_sum(a_c))                           # [NC, B, H, C, C]
+    G = jnp.einsum('nbihs,nbjhs->nbhij', C_c, B_c)
+    y_diag = jnp.einsum('nbhij,nbjhp->nbihp', G * L, x_c)
+    # 2. Each chunk's own write into the state, decayed to the chunk's end.
+    decay_states = jnp.exp(a_cumsum[..., -1:] - a_cumsum)   # [NC, B, H, C]
+    states = jnp.einsum('nbjhs,nbhj,nbjhp->nbhps', B_c, decay_states, x_c)
+
+    # 3. The state crossing the chunks: the reference's `decay_chunk @ states`
+    # over the padded [NC+1, NC+1] segment sums is this product carried
+    # chunk by chunk.
+    def one_chunk(previous, step):
+        step_states, chunk_decay = step
+        return jnp.exp(chunk_decay)[..., None, None] * previous + step_states, previous
+
+    final, previous = jax.lax.scan(one_chunk, carried, (states, a_cumsum[..., -1]))
+    # 4. The state each chunk reads, decayed to every position of it.
+    y_off = jnp.einsum('nbihs,nbhps,nbhi->nbihp', C_c, previous, jnp.exp(a_cumsum))
+    return y_diag + y_off, final
+
+
 def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE):
     """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357).
 
@@ -83,6 +120,10 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE):
     limit, `A` `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns
     `(output [B, S, H, P], state [B, H, P, N])`, fp32 throughout as the
     reference, cast back to the input's dtype.
+
+    The scan over chunks runs on the Pallas kernel where `ssd_kernel_platform`
+    takes the backend and the geometry, and on `xla_chunk_scan` everywhere
+    else. The two agree to fp32 tolerance (tests/test_ssd_kernel.py).
     """
     dtype = x.dtype
     x, dt, A, B, C, D = (jnp.asarray(t, jnp.float32) for t in (x, dt, A, B, C, D))
@@ -103,29 +144,12 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE):
 
     x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
     a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]
-    a_cumsum = jnp.cumsum(a_c, axis=-1)
-    # 1. The intra-chunk output: L[i, j] = exp(segsum) masks C_i . B_j.
-    L = jnp.exp(segment_sum(a_c))                           # [NC, B, H, C, C]
-    G = jnp.einsum('nbihs,nbjhs->nbhij', C_c, B_c)
-    y_diag = jnp.einsum('nbhij,nbjhp->nbihp', G * L, x_c)
-    # 2. Each chunk's own write into the state, decayed to the chunk's end.
-    decay_states = jnp.exp(a_cumsum[..., -1:] - a_cumsum)   # [NC, B, H, C]
-    states = jnp.einsum('nbjhs,nbhj,nbjhp->nbhps', B_c, decay_states, x_c)
-    # 3. The state crossing the chunks: the reference's `decay_chunk @ states`
-    # over the padded [NC+1, NC+1] segment sums is this product carried
-    # chunk by chunk.
     carried = (jnp.zeros((batch, heads, head_dim, state_size), jnp.float32) if state is None
                else jnp.asarray(state, jnp.float32))
-
-    def one_chunk(previous, step):
-        step_states, chunk_decay = step
-        return jnp.exp(chunk_decay)[..., None, None] * previous + step_states, previous
-
-    final, previous = jax.lax.scan(one_chunk, carried, (states, a_cumsum[..., -1]))
-    # 4. The state each chunk reads, decayed to every position of it.
-    y_off = jnp.einsum('nbihs,nbhps,nbhi->nbihp', C_c, previous, jnp.exp(a_cumsum))
-    output = jnp.moveaxis(y_diag + y_off, 0, 1).reshape(batch, total, heads, head_dim)
-    output = output + skip
+    platform = ssd_kernel_platform(chunk_size, head_dim, state_size)
+    scanned, final = (xla_chunk_scan(x_c, B_c, C_c, a_c, carried) if platform is None else
+                      ssd_chunk_scan(x_c, B_c, C_c, a_c, carried, platform))
+    output = jnp.moveaxis(scanned, 0, 1).reshape(batch, total, heads, head_dim) + skip
     return output[:, :length].astype(dtype), final.astype(dtype)
 
 
