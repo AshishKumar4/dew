@@ -387,16 +387,11 @@ class RunConfig:
             except BaseException as failure:
                 error = failure
             agree_process_phase(error, phase="run metadata")
-            state = Trainer(
-                objective, build_optimizer(self.optim, steps),
+            state = Trainer.from_config(
+                trainer, objective, build_optimizer(self.optim, steps),
                 key=jax.random.key(trainer.seed),
-                mesh=trainer.mesh,
-                layout=trainer.layout,
-                accumulation=trainer.accumulation,
-                dynamic_scale=trainer.dynamic_scale,
                 checkpoints=checkpoints,
                 tracker=tracker,
-                profile=trainer.profile,
             ).fit(
                 dataset, steps=steps,
                 log_every=trainer.log_every,
