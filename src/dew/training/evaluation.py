@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -153,9 +154,10 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
                 error = None
                 batch = None
                 try:
-                    batch = next(iterator)
-                except StopIteration:
-                    pass
+                    # A drained iterator is the end of the split, which the
+                    # phase below agrees on; anything else is a failure.
+                    with contextlib.suppress(StopIteration):
+                        batch = next(iterator)
                 except BaseException as failure:
                     error = failure
                 available = agree_process_phase(

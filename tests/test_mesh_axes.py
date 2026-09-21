@@ -18,12 +18,12 @@ import pytest
 pytestmark = pytest.mark.mesh
 from jax.sharding import PartitionSpec as P
 
-import dew.nn.backbones.causal_transformer  # registers the model built below
 from dew.data import Dataset
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import batch_shardings, shard_batch
+
 VOCAB = 64
 # Training batches carry seq_len + 1 columns for the one-token shift, so the
 # 17 columns of a 16-token model never split over a sequence axis of two: the

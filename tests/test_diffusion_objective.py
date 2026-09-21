@@ -10,20 +10,18 @@ of the objective and the trainer together.
 from dataclasses import dataclass, replace
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 from flax import linen as nn
 
-
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
-from dew.diffusion import Process, broadcast_rates, expand, presets
+from dew.diffusion import broadcast_rates, expand, presets
 from dew.inputs import CharTable, Condition, ConditionEncoder, Field, InputSpec, unit_range
 from dew.nn.dit import TextContext
-from dew.objectives.base import Step, Variables
+from dew.objectives.base import Step, Variables, scalar_loss
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import encoders, models
 from dew.sampling import CFG, Euler

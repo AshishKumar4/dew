@@ -1,15 +1,15 @@
 """Training and checkpoint precision against native Linen/Optax updates."""
-from flax import linen as nn, struct
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn, struct
 
 from dew.checkpoints import Checkpoints
+from dew.nn.blocks import TokenEmbedding
 from dew.objectives import Aux, EMASpec, Mean, Objective, mean_loss
 from dew.training import Trainer
-from dew.nn.blocks import TokenEmbedding
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])

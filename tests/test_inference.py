@@ -9,13 +9,13 @@ trainer has just written.
 
 import dataclasses
 
-
-import dew
 import jax
 import numpy as np
 import optax
 import pytest
+from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
 
+import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, TrainerConfig
@@ -26,7 +26,6 @@ from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, StableDiffusionAutoencoder, TextCondition
 from dew.registry import presets, samplers
-from test_diffusion_objective import StubText  # noqa: F401  registers "stub_text"
 from dew.sampling import CFG, Heun, TextToImage
 from dew.training import Checkpoints, Trainer
 
@@ -440,6 +439,7 @@ def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
 
 def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
     import json
+
     from dew.sampling import Sampling
 
     objective, state = make_lm_run(tmp_path)
@@ -463,15 +463,17 @@ def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
 def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
         tmp_path, monkeypatch, compute, storage):
     import tarfile
-    from dew.inference.pipeline import place
     from pathlib import Path
-    from flax.core import unfreeze
+
     import jax.numpy as jnp
+    from flax.core import unfreeze
+
+    import dew.nn.autoencoders.vae as vae_loader
+    import dew.nn.text_encoders as text_loader
+    from dew.inference.pipeline import place
     from dew.inputs import CLIPText
     from dew.nn.autoencoders import StableDiffusionVAE
     from dew.objectives.base import FROZEN
-    import dew.nn.text_encoders as text_loader
-    import dew.nn.autoencoders.vae as vae_loader
 
     fixtures = Path(__file__).parent / "fixtures"
     with tarfile.open(fixtures / "tiny_diffusers.tar.xz") as archive:
@@ -557,6 +559,7 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
 @pytest.mark.parametrize("compute,storage", [("bfloat16", None), (None, "bfloat16")])
 def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weights(tmp_path, compute, storage):
     import jax.numpy as jnp
+
     from dew.inference import TextGeneration
     from dew.objectives.base import FROZEN
 
@@ -595,6 +598,7 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
 
 def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_path):
     import jax.numpy as jnp
+
     from dew.inputs import CharTable
 
     objective, state = make_run(tmp_path, encoder="char_table", checkpoint="char_table")

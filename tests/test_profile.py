@@ -1,13 +1,13 @@
 """Public native profiling lifecycle and retained capture artifacts."""
 
-from concurrent.futures import ThreadPoolExecutor
 import gzip
 import importlib
 import json
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from threading import Event
 
 import jax

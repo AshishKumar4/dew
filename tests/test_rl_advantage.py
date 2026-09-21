@@ -31,9 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.rl.advantage import (
-    gae, group_advantage, masked_mean, masked_whiten, rloo_advantage,
-)
+from dew.rl.advantage import gae, group_advantage, masked_mean, masked_whiten, rloo_advantage
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "advantage.npz"
 GENERATOR = Path(__file__).resolve().parents[1] / "tools" / "parity_rl.py"

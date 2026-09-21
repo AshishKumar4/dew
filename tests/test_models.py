@@ -11,12 +11,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.backbones.unet import Unet
+from dew.nn.attention import Stage
 from dew.nn.backbones.dit import SimpleDiT
-from dew.nn.dit import ModulatedBlock, TextContext
 from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
-from dew.nn.attention import Stage
+from dew.nn.backbones.unet import Unet
+from dew.nn.dit import ModulatedBlock, TextContext
 from dew.nn.scan_orders import hilbert_indices, zigzag_indices
 from dew.registry import models
 

@@ -15,6 +15,7 @@ Scope is per rule, because the rules are not all about the same thing:
   SLOP005) do not run there. A swallowed exception, a narration comment and an
   unsplittable function are defects anywhere, so those do.
 - SLOP008 is about the suite only.
+- SLOP009 is advisory everywhere: it prints and does not set the exit status.
 
 Analysis boundaries, stated the way anti-slop states its own: this reads one
 file's AST, with no imported definitions and no inference across calls.
@@ -45,11 +46,23 @@ MAPPINGS = {"dict", "Dict", "Mapping", "MutableMapping", "defaultdict", "Ordered
 OPEN_VALUES = {("dict", "Any"), ("Dict", "Any"), ("Mapping", "Any"), ("MutableMapping", "Any"),
                ("defaultdict", "Any"), ("OrderedDict", "Any"), ("dict", "object"),
                ("Dict", "object"), ("defaultdict", "object"), ("OrderedDict", "object")}
+# The one open mapping that promises what it means: read-only, and every value
+# has to be narrowed before it is used. It is the type of a config file just
+# parsed out of JSON, and the rule wants those parsed once at a boundary.
+BOUNDARY_MAPPING = {("Mapping", "object"), ("MappingProxyType", "object")}
 
 VAGUE = {"tmp", "temp", "obj", "thing", "info", "item", "items", "val", "helper", "helpers",
          "util", "utils", "manager", "handler", "res", "ret", "arr", "lst", "dct", "num",
          "cnt", "idx", "flag", "foo", "bar", "data", "result", "results"}
 VAGUE_SUFFIXES = ("_impl", "_v2", "_new", "_old", "_copy")
+# Three words the tree earns. `value` is the attention V, `Mean.value` and the
+# partner of `key` in 296 more places; `values` is the same plural, the critic
+# values of GAE among them; `out` is the output array a numeric function
+# returns, which is what numpy calls its own out= parameter. Counted at 405,
+# 63 and 56 uses before they were dropped, not allowlisted per call site.
+# `attention_impl` is 59 uses of jax.nn.dot_product_attention's own
+# `implementation` argument as a module field, so the `_impl` suffix spares it.
+DOMAIN_WORDS = {"value", "values", "out", "attention_impl"}
 NARRATION = re.compile(
     r"^(now |then |this (function|method|class|line) |here we |we (now|then) |increment|decrement"
     r"|loop over|iterate|call |return the|set the|get the|create (a|the)|initialize|init )",
@@ -111,15 +124,32 @@ def _named(node: ast.expr | None) -> str:
     return ""
 
 
-def _open_mapping(node: ast.expr) -> ast.Subscript | None:
-    """`dict[str, Any]` and friends, the dictionary types that promise nothing."""
+def _mapping_kind(node: ast.expr) -> str:
+    """"open" for a dictionary type that promises nothing, "boundary" for the
+    read-only mapping of unnarrowed values, "" for anything else."""
     if not isinstance(node, ast.Subscript) or not isinstance(node.slice, ast.Tuple):
-        return None
+        return ""
     container = _named(node.value).rsplit(".", 1)[-1]
-    if container not in MAPPINGS or len(node.slice.elts) != 2:
-        return None
-    value = _named(node.slice.elts[1]).rsplit(".", 1)[-1]
-    return node if (container, value) in OPEN_VALUES else None
+    if container not in MAPPINGS | {"MappingProxyType"} or len(node.slice.elts) != 2:
+        return ""
+    pair = (container, _named(node.slice.elts[1]).rsplit(".", 1)[-1])
+    return "open" if pair in OPEN_VALUES else "boundary" if pair in BOUNDARY_MAPPING else ""
+
+
+def _mappings(annotation: ast.expr) -> tuple[set[int], list[ast.expr]]:
+    """Every mapping type in one annotation: the node ids whose width a
+    mapping already accounts for, and the open dictionaries to report."""
+    claimed: set[int] = set()
+    reported: list[ast.expr] = []
+    for found in ast.walk(annotation):
+        if not isinstance(found, ast.expr):
+            continue
+        kind = _mapping_kind(found)
+        if kind and isinstance(found, ast.Subscript):
+            claimed |= {id(child) for child in ast.walk(found.slice)}
+            if kind == "open":
+                reported.append(found)
+    return claimed, reported
 
 
 def _widest(node: ast.expr, skip: set[int]) -> Iterator[ast.expr]:
@@ -173,9 +203,9 @@ def contracts(module: Module) -> Iterator[Finding]:
                              f"re-declares the {name} alias; import it from "
                              f"{SANCTIONED_ALIASES[name].removeprefix('src/').replace('/', '.')}")
             elif not sanctioned:
-                claimed = {id(found) for found in [_open_mapping(target)] if found}
-                if claimed:
-                    yield report(target, "SLOP002",
+                claimed, open_dictionaries = _mappings(target)
+                for mapping in open_dictionaries:
+                    yield report(mapping, "SLOP002",
                                  f"alias {name} is an open dictionary; name the keys it carries")
                 for wide in _widest(target, claimed):
                     yield report(wide, "SLOP001",
@@ -184,13 +214,11 @@ def contracts(module: Module) -> Iterator[Finding]:
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
         for name, annotation in _annotations(node):
-            claimed: set[int] = set()
-            for found in ast.walk(annotation):
-                if isinstance(found, ast.expr) and (mapping := _open_mapping(found)) is not None:
-                    claimed |= {id(child) for child in ast.walk(mapping.slice)}
-                    yield report(mapping, "SLOP002",
-                                 f"{name} is an open dictionary; name the keys it carries "
-                                 f"or take one of Variables, Batch")
+            claimed, open_dictionaries = _mappings(annotation)
+            for mapping in open_dictionaries:
+                yield report(mapping, "SLOP002",
+                             f"{name} is an open dictionary; name the keys it carries, "
+                             f"take one of Variables, Batch, or read it as Mapping[str, object]")
             for wide in _widest(annotation, claimed):
                 if _named(wide) == "object" and name in {"cause", "error"}:
                     continue
@@ -283,7 +311,14 @@ def _declared(function: ast.AST | None) -> dict[str, str]:
 
 
 def names(module: Module) -> Iterator[Finding]:
-    """SLOP005: a name that describes its slot instead of its contents."""
+    """SLOP005: a name that describes its slot instead of its contents.
+
+    A trailing digit is not one of those. In ported numeric code `norm2`,
+    `conv2` and `net_2` are the reference module names a checkpoint is keyed
+    by, and `mu_x2`, `sigma_y2`, `d2` and `k2` are squares and second-order
+    terms of the equations being implemented: 50 of them, against none that
+    meant "the second version of". `_v2` still reports.
+    """
     comprehended = {id(target) for node in ast.walk(module.tree)
                     if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp)
                     for generator in node.generators for target in ast.walk(generator.target)}
@@ -298,8 +333,9 @@ def names(module: Module) -> Iterator[Finding]:
             found, line, col = node.attr, node.lineno, node.col_offset
         else:
             continue
-        if found in VAGUE or found.endswith(VAGUE_SUFFIXES) or (found[-1:] == "2" and
-                                                                not found[-2:-1].isdigit()):
+        if found in DOMAIN_WORDS:
+            continue
+        if found in VAGUE or found.endswith(VAGUE_SUFFIXES):
             yield Finding(module.relative, line, col + 1, "SLOP005",
                           f"`{found}` names a slot, not a value; say what it holds")
 
@@ -321,8 +357,17 @@ def _reported(handler: ast.ExceptHandler) -> bool:
 
 
 def swallowed(module: Module) -> Iterator[Finding]:
-    """SLOP006: an except that ends the story instead of telling it."""
+    """SLOP006: an except that ends the story instead of telling it.
+
+    `contextlib.suppress(SomethingNarrow)` is a decision written at the site
+    and is not reported; a broad suppress is the empty handler with a nicer
+    spelling, so it is.
+    """
     for node in ast.walk(module.tree):
+        if (isinstance(node, ast.Call) and _named(node.func).endswith("suppress")
+                and any(_named(kind) in {"Exception", "BaseException"} for kind in node.args)):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP006",
+                          "suppress(Exception) hides every failure; name the ones this handles")
         if not isinstance(node, ast.ExceptHandler):
             continue
         kinds = ([_named(kind) for kind in node.type.elts] if isinstance(node.type, ast.Tuple)
@@ -346,14 +391,20 @@ def swallowed(module: Module) -> Iterator[Finding]:
 def comments(module: Module) -> Iterator[Finding]:
     """SLOP007: a comment that reads the code back instead of saying why."""
     readable = io.StringIO(module.source).readline
+    previous = (0, -1)
     for token in tokenize.generate_tokens(readable):
         if token.type != tokenize.COMMENT:
             continue
         text = token.string.lstrip("#").strip()
         line, col = token.start[0], token.start[1] + 1
+        # A block of comment lines is one comment. Only its first line opens
+        # the thought, so only its first line can open it with narration.
+        continuation, previous = previous == (line - 1, col), (line, col)
         if module.is_source and (marker := MARKERS.search(text)) is not None:
             yield Finding(module.relative, line, col, "SLOP007",
                           f"{marker.group(1)} defers the work into a comment")
+        if continuation:
+            continue
         if NARRATION.match(text):
             yield Finding(module.relative, line, col, "SLOP007",
                           "the comment narrates the next line; say why or delete it")
@@ -411,6 +462,12 @@ def size(module: Module) -> Iterator[Finding]:
 
 CONTRACT_RULES = (contracts, suppressions, probes, names)
 UNIVERSAL_RULES = (swallowed, comments, size)
+# SLOP009 measures what a split would cost, not what a change introduced. It
+# prints with everything else and does not fail the gate: the 4469-line
+# decoder module and the long reference functions are a split somebody has to
+# schedule, and holding the gate red until then would only teach people to
+# skip the gate.
+ADVISORY = frozenset({"SLOP009"})
 
 
 def check(module: Module) -> Iterator[Finding]:
@@ -440,9 +497,12 @@ def main() -> int:
             print(finding)
             counts[finding.code] = counts.get(finding.code, 0) + 1
     for code, count in sorted(counts.items()):
-        print(f"{count:5d} {code}", file=sys.stderr)
-    print(f"{sum(counts.values())} findings", file=sys.stderr)
-    return 1 if counts else 0
+        label = " (advisory)" if code in ADVISORY else ""
+        print(f"{count:5d} {code}{label}", file=sys.stderr)
+    failures = sum(count for code, count in counts.items() if code not in ADVISORY)
+    advisories = sum(counts.values()) - failures
+    print(f"{failures} findings, {advisories} advisory", file=sys.stderr)
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

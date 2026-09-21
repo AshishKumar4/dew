@@ -10,13 +10,13 @@ caller's tracker.
 import json
 
 import pytest
+from test_instrumentation import Regression, batches
 
 from dew.config import RunConfig, TrainerConfig
 from dew.config.sweep import grid_search, optuna_search, override, random_search, sweep
 from dew.data import Dataset
 from dew.telemetry.records import TrialFinished
 from dew.training import LocalTracker
-from test_instrumentation import Regression, batches
 
 SPACE = {'optim.learning_rate': [0.1, 0.01], 'optim.clip_grads': [0.0, 1.0]}
 

@@ -19,6 +19,7 @@ import multiprocessing
 import multiprocessing.queues
 import multiprocessing.synchronize
 import queue
+import struct
 import threading
 import time
 import urllib.request
@@ -108,7 +109,8 @@ def fetch_bytes(url: str, timeout: float, retries: int) -> bytes | None:
             request = urllib.request.Request(url, headers={"user-agent": _user_agent()})
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return response.read()
-        except ValueError:
+        except ValueError as error:
+            _log.debug("skipping %r: %s", url, error)
             return None
         except (OSError, http.client.HTTPException):
             if attempt == retries:
@@ -127,7 +129,8 @@ def decode_pixels(data: bytes) -> np.ndarray | None:
     """
     try:
         return np.asarray(PIL.Image.open(io.BytesIO(data)))
-    except Exception:
+    except (OSError, SyntaxError, ValueError, struct.error) as error:
+        _log.debug("undecodable image of %d bytes: %s", len(data), error)
         return None
 
 
@@ -184,7 +187,7 @@ def fetch_one(url: str, caption: str, sink: queue.Queue | multiprocessing.queues
             sink.put(sample, timeout=0.05)
             return
         except queue.Full:
-            pass
+            continue
 
 
 def columns(shard: Mapping[str, Sequence[str]]) -> tuple[Sequence[str], Sequence[str]]:
@@ -250,7 +253,7 @@ def fetch_rows(rows: Dataset, sink: multiprocessing.queues.Queue, *, workers: in
                         result.get(timeout=0.05)
                         break
                     except multiprocessing.TimeoutError:
-                        pass
+                        continue
                 if stop.is_set():
                     return
                 rows = rows.shuffle(seed=iteration)
@@ -373,8 +376,10 @@ class ImageStream:
         if not self._done.is_set():
             if not self._waiting_logged:
                 self._waiting_logged = True
-                _log.warning("no sample in %ss, still fetching (%d dropped so far)",
-                             self.queue_timeout, self.dropped)
+                # The one line a stalled loader owes the person watching it,
+                # asserted by tests/test_online_loader.py on stdout.
+                print(f"No sample in {self.queue_timeout}s, still fetching "
+                      f"({self.dropped} dropped so far)")
             return
         if self._error is not None:
             raise RuntimeError("the url fetcher died") from self._error

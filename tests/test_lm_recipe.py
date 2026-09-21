@@ -1,22 +1,22 @@
 """recipes/lm/train.py: what it refuses, and a run over real token files."""
 
-import importlib.util
 import dataclasses
+import importlib.util
 import json
 import sys
 from pathlib import Path
 
-import dew
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import tyro
 
+import dew
 from dew.data import PackedTokens, TokenWindows
 from dew.inference import TextGeneration
-from dew.sampling import Sampling
 from dew.objectives.lm import LMObjective, Samples
+from dew.sampling import Sampling
 
 pytestmark = pytest.mark.mesh
 

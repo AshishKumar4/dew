@@ -9,14 +9,18 @@ Nothing here imports torch, so the oracle holds the module to the math and
 not to another implementation's rounding.
 """
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import jax
-import jax.numpy as jnp
-
 from dew.nn.hyper_connections import (
-    HyperConnection, HyperConnections, HyperHead, collapse_streams, expand_streams, mix_streams,
+    HyperConnection,
+    HyperConnections,
+    HyperHead,
+    collapse_streams,
+    expand_streams,
+    mix_streams,
 )
 
 BOUND = 1e-4

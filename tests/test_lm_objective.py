@@ -14,11 +14,12 @@ sampler runs in test_lm_recipe.
 from typing import Optional
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+
+from dew.objectives.base import scalar_loss
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -27,7 +28,7 @@ from flax import linen as nn
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
 from dew.objectives.base import Step
-from dew.objectives.lm import LMObjective, Samples, TEXT_KEY
+from dew.objectives.lm import TEXT_KEY, LMObjective, Samples
 from dew.registry import metrics
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer

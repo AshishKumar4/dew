@@ -12,19 +12,18 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from dew.telemetry.records import RECORD_TYPES
-import pytest
 import optax
-from dew.training import Trainer
-
+import pytest
 from flax import linen as nn
 
 from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
-from dew.sampling import CFG, sample
-from dew.sampling.flow import FlowSDE, flow_transition, sample_trajectory
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
+from dew.sampling import CFG, sample
+from dew.sampling.flow import FlowSDE, flow_transition, sample_trajectory
+from dew.telemetry.records import RECORD_TYPES
+from dew.training import Trainer
 
 
 def test_transition_density_and_velocity_gradient_match_gaussian_algebra():
@@ -316,7 +315,15 @@ def test_transition_matches_released_sampler_and_torch_distribution():
 def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
     import subprocess
     import sys
-    from test_multiprocess import free_port, report_of, terminate, worker_env, dumped_params, assert_same_parameters
+
+    from test_multiprocess import (
+        assert_same_parameters,
+        dumped_params,
+        free_port,
+        report_of,
+        terminate,
+        worker_env,
+    )
 
     worker = Path(__file__).with_name("flow_grpo_worker.py")
     coordinator = f"127.0.0.1:{free_port()}"
@@ -427,6 +434,7 @@ def test_group_normalization_preserves_small_differences_on_large_reward_offset(
 
 def test_float64_callback_distinctions_reach_a_real_policy_update():
     import itertools
+
     from dew.data import Dataset
     from dew.nn.backbones.dit import SimpleDiT
 
@@ -460,6 +468,7 @@ def test_float64_callback_distinctions_reach_a_real_policy_update():
 
 def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     import itertools
+
     from dew.artifacts import ImageGrid
     from dew.data import Dataset
     from dew.inputs import CharTable, Condition

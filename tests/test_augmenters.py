@@ -20,10 +20,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from absl import flags
 import cv2
 import numpy as np
 import pytest
+from absl import flags
 
 # grain's worker processes read absl flags; a test that never ran absl.app
 # would trip UnparsedFlagAccessError at any worker_count > 0.

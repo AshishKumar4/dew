@@ -20,13 +20,40 @@ import pytest
 from flax import linen as nn
 
 from dew.diffusion import (
-    ConsistencyBoundary, CosineNoiseScheduler, DirectPredictionTransform, EDMNoiseScheduler,
-    EpsilonPredictionTransform, FlowMatchingScheduler, FlowMatchPredictionTransform, KarrasPredictionTransform,
-    KarrasVENoiseScheduler, LinearNoiseScheduler, Process, broadcast_rates, expand,
+    ConsistencyBoundary,
+    CosineNoiseScheduler,
+    DirectPredictionTransform,
+    EDMNoiseScheduler,
+    EpsilonPredictionTransform,
+    FlowMatchingScheduler,
+    FlowMatchPredictionTransform,
+    KarrasPredictionTransform,
+    KarrasVENoiseScheduler,
+    LinearNoiseScheduler,
+    Process,
+    broadcast_rates,
+    expand,
 )
 from dew.sampling import (
-    CFG, DDIM, DDPM, DEIS, LMS, PNDM, TCD, Consistency, DPMSolverMultistep, DPMSolverSDE,
-    DPMSolverSinglestep, Euler, EulerAncestral, Heun, KDPM2, MultiStepDPM, RK4, UniPC, sample,
+    CFG,
+    DDIM,
+    DDPM,
+    DEIS,
+    KDPM2,
+    LMS,
+    PNDM,
+    RK4,
+    TCD,
+    Consistency,
+    DPMSolverMultistep,
+    DPMSolverSDE,
+    DPMSolverSinglestep,
+    Euler,
+    EulerAncestral,
+    Heun,
+    MultiStepDPM,
+    UniPC,
+    sample,
 )
 
 DATA_STD = 0.3

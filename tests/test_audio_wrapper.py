@@ -11,9 +11,9 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import checkify
 import numpy as np
 import pytest
+from jax.experimental import checkify
 from safetensors.numpy import load_file
 
 from dew.data.audio import AudioProcessor
@@ -21,7 +21,6 @@ from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn import vision as V
 from dew.nn.audio import Gemma3nAudio, audio_config, audio_weights
 from dew.registry import models, with_precision
-
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 HIGHEST = jax.lax.Precision.HIGHEST

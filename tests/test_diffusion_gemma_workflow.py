@@ -52,8 +52,10 @@ def test_public_generation_override_keeps_canvas_semantics():
 
 def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(tmp_path):
     import json
+
     import jax.numpy as jnp
     import optax
+
     import dew
     from dew.inference import BlockGeneration
     from dew.inference.pipeline import place

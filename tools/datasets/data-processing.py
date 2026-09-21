@@ -134,7 +134,6 @@ def get_clip_metric(
     
     @jax.jit
     def calc(pixel_values, input_ids, attention_mask):
-        # Get the logits
         generated_out = model(
             pixel_values=pixel_values,
             input_ids=input_ids,
@@ -152,7 +151,6 @@ def get_clip_metric(
         # Using einsum for batch dot product: batch (b), embedding_dim (d) -> bd,bd->b
         # Calculate cosine similarity
 
-            # Compute cosine similarity
         similarity = jnp.sum(gen_img_emb * txt_emb, axis=-1)
         return similarity
         
@@ -345,16 +343,13 @@ def process_dataset(dataloader, output_folder, num_samples_per_shard=10000, oom_
     print(f"Target samples per shard: {num_samples_per_shard}")
 
     try:
-        # Get the iterator for the filtered data
         filtered_data_iterator = clean_dataset(dataloader)
 
-        # Iterate through the filtered batches yielded by clean_dataset
         for batch_num, filtered_batch in enumerate(filtered_data_iterator):
             # filtered_batch contains lists: 'text', 'image_jpg'
             filtered_jpgs = filtered_batch['image_jpg']
             filtered_texts = filtered_batch['text']
 
-            # Iterate through individual samples within the filtered batch
             for img_jpg_bytes, text_caption in tqdm.tqdm(zip(filtered_jpgs, filtered_texts)):
 
                 # Check if a new shard writer is needed (start of processing or shard full)
@@ -363,10 +358,9 @@ def process_dataset(dataloader, output_folder, num_samples_per_shard=10000, oom_
                         # Close the previous writer (handles cleanup/upload)
                         print(f"Target samples reached for shard {shard_id}. Closing writer.")
                         writer.close()
-                        shard_id += 1 # Increment shard ID for the next file
-                        samples_in_current_shard = 0 # Reset counter for the new shard
+                        shard_id += 1
+                        samples_in_current_shard = 0
 
-                    # Create and open a new writer for the current shard
                     print(f"Creating writer for shard {shard_id}...")
                     writer = ArrayRecordSampleWriter(
                         shard_id=shard_id,

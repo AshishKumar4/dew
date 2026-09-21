@@ -40,10 +40,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dew.inputs import CLIPText, Condition, InputSpec, Field
+from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.nn.text_encoders import (
-    CLIPModel, CLIPTextModel, CLIPTextTransformer, translate_clip_config,
-    translate_clip_weights, translate_config, translate_vision_config, translate_weights,
+    CLIPModel,
+    CLIPTextModel,
+    CLIPTextTransformer,
+    translate_clip_config,
+    translate_clip_weights,
+    translate_config,
+    translate_vision_config,
+    translate_weights,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "clip"
@@ -423,6 +429,7 @@ def test_the_real_checkpoint_embeddings_match_the_reference():
 def test_public_text_encoder_storage_is_separate_from_compute(kind):
     import jax
     import jax.numpy as jnp
+
     from dew.nn.text_encoders import T5EncoderModel
 
     cls = {"clip-text": CLIPTextModel, "clip": CLIPModel, "t5": T5EncoderModel}[kind]
@@ -445,11 +452,13 @@ def test_public_text_encoder_storage_is_separate_from_compute(kind):
 @pytest.mark.parametrize("kind", ["clip_text", "t5"])
 def test_convenience_encoder_rebuild_binds_saved_weights_without_source_reads(kind, tmp_path, monkeypatch):
     import dataclasses
+
     import jax
     import jax.numpy as jnp
+
+    import dew.nn.text_encoders as loaders
     from dew.inputs import T5Text
     from dew.inputs.encoders import rebuild
-    import dew.nn.text_encoders as loaders
 
     cls = CLIPText if kind == "clip_text" else T5Text
     directory = TINY if kind == "clip_text" else FIXTURES.parent / "t5/tiny"

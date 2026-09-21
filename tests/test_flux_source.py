@@ -23,9 +23,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux_fields, translate_flux_weights
 from dew.nn.backbones.flux import FluxTransformer
-from dew.diffusion.process import DenoisingCondition
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("schnell", "dev", "rect", "deep", "mixed")
@@ -271,6 +271,7 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     leaves survives the step, and the export reloads to the same forward.
     """
     import optax
+
     from dew.checkpoints import Checkpoints
     from dew.interop.pretrained import load_pretrained
     from dew.objectives import Step
@@ -338,7 +339,6 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
     a caption changes what the model reads about the text and not the scale
     the checkpoint was distilled to walk at.
     """
-    import optax
     from dew.interop.pretrained import load_pretrained
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective

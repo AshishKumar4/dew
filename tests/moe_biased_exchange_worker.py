@@ -2,8 +2,8 @@
 
 import itertools
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp

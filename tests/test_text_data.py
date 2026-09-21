@@ -14,7 +14,6 @@ from collections import Counter
 from pathlib import Path
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -24,6 +23,7 @@ from dew.data import ByteTokenizer, Loading, PackedTokens, TokenWindows
 from dew.data.sources.text import TokenDocumentSource, TokenFileSource
 from dew.nn.backbones import causal_transformer as backbone
 from dew.nn.mixers import attention as attention_kind
+from dew.objectives.base import scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.position import ENVELOPE
 from dew.training import Step

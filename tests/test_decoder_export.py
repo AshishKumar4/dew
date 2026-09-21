@@ -340,6 +340,7 @@ def test_the_balancing_bias_moves_by_its_rate_and_lands_in_the_export(name, trip
 
 def test_deepseek_v4_trained_mtp_export_matches_reference(trips):
     import torch
+
     from tools.deepseek_v4_reference import load_mtp_reference
 
     trip = trips('deepseek_v4')
@@ -477,6 +478,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     import torch
     from safetensors.numpy import load_file
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors
+
     from dew.nn.gpt_oss import pack_mxfp4
 
     source = FIXTURES / "gpt-oss-tiny"
@@ -607,9 +609,10 @@ def test_codec_rejects_integer_parameter_storage(kind):
 
 @pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
 def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
+    from test_interop import assert_parameter_storage
+
     from dew.interop.quantized import pack_fp8
     from dew.nn.gpt_oss import pack_mxfp4
-    from test_interop import assert_parameter_storage
 
     fixture = FIXTURES / ("deepseek-v3-tiny" if kind == "fp8" else "gpt-oss-tiny")
     tensors = tool.source_tensors(fixture)
@@ -689,6 +692,7 @@ def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path
 
 def test_diffusion_gemma_source_export_resolves_omitted_embedding_tie_default(tmp_path):
     from shutil import copytree
+
     from dew.interop.diffusion_gemma import export_weights
 
     source = copytree(FIXTURES / "diffusion-gemma-workflow", tmp_path / "source")
@@ -725,6 +729,7 @@ def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tm
     import torch
     from flax.core import unfreeze
     from transformers import Gemma4ForCausalLM
+
     from dew.interop.hf_decoders import save_pretrained_decoder
 
     loaded = load_pretrained(FIXTURES / fixture, dtype="float32", attention_impl="reference")
@@ -764,6 +769,7 @@ def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tm
 def glm5_native_export_case(variant):
     import jax.numpy as jnp
     from flax.core import unfreeze
+
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
     from dew.nn.kda import KimiDeltaAttentionMixer
@@ -816,6 +822,7 @@ def glm5_native_export_case(variant):
 @pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])
 def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
     import jax.numpy as jnp
+
     from dew.interop.hf_decoders import save_pretrained_decoder
     from dew.sampling import Sampling, Speculative, generate
 

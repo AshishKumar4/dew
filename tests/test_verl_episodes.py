@@ -1,15 +1,15 @@
 """Lossless episode interchange through pinned verl's real rollout models."""
 
+import json
 from copy import deepcopy
 from dataclasses import replace
-import json
 from pathlib import Path
 
 import numpy as np
 import pytest
+from test_tool_episodes import build, collect
 
 from dew.objectives.rl.verl import from_verl, to_verl
-from test_tool_episodes import build, collect
 
 FIXTURE = Path(__file__).parent / "fixtures/rl/verl_episodes.json"
 

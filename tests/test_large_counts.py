@@ -57,6 +57,7 @@ def test_router_loss_is_invariant_to_large_window_replication(sequence):
 
 def test_diffusion_support_accepts_large_abstract_image_batches():
     from flax import linen as nn
+
     from dew.diffusion import presets
     from dew.inputs import Field, InputSpec
     from dew.objectives import Step

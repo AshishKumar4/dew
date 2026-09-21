@@ -18,9 +18,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
-from dew.telemetry.records import RECORD_TYPES
+
 from dew.data import Loading
-from dew.position import ENVELOPE
+from dew.telemetry.records import RECORD_TYPES
 from dew.training.evaluation import evaluate
 
 RES = 8
@@ -59,6 +59,7 @@ def make_objective():
     """
     import jax.numpy as jnp
     import optax
+
     from dew.artifacts import Representations
     from dew.inputs import unit_range
     from dew.nn.backbones.dit import SimpleDiT
@@ -93,6 +94,7 @@ def build_trainer(name, checkpoint_base, fsdp=1, tracker=None, local_dir=None,
     """The trainer a recipe would build, at the smallest size that still shards."""
     import jax
     import optax
+
     from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
     return Trainer(
@@ -213,8 +215,7 @@ def elastic_loader(records: int, workers: int):
     takes, so what a pool reading it exercises is a position every process
     reports alike and a pool of another size reads back.
     """
-    from dew.data.dataset import Loading as ReadLoading
-    from dew.data.dataset import local_batch, train_stream
+    from dew.data.dataset import Loading as ReadLoading, local_batch, train_stream
 
     class Indexed:
         """Records that say which they are, in the field the objective reads."""
@@ -317,6 +318,7 @@ class YearAhead(datetime):
 
 def mode_topology(args) -> dict:
     import jax
+
     from dew.training import runtime
     from dew.training.distributed import MeshSpec, build_mesh, shard_batch
 
@@ -348,6 +350,7 @@ def mode_topology(args) -> dict:
 def mode_data(args) -> dict:
     """One pass over the held-out split, which ends by itself."""
     import jax
+
     from dew.data import TokenWindows, local_batch
 
     data = TokenWindows(path=args.tokens, seq_len=args.seq_len, val_batches=None,
@@ -371,6 +374,7 @@ def mode_data(args) -> dict:
 
 def mode_packed(args) -> dict:
     import jax
+
     from dew.data import PackedTokens, local_batch
 
     data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=None,
@@ -404,7 +408,7 @@ def token_trainer(name, checkpoint_base, fsdp: int, seq_len: int):
     """
     import jax
     import optax
-    import dew.nn.backbones.causal_transformer  # registers the model built below
+
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -459,6 +463,7 @@ def mode_packed_fit(args) -> dict:
     import dataclasses
 
     import jax
+
     from dew.data import PackedTokens
 
     trainer = token_trainer(args.name, args.run_dir, args.fsdp_size, args.seq_len)
@@ -609,6 +614,7 @@ def mode_profile_failure(args) -> dict:
     on the way out, and leave the pool able to reach the next barrier."""
     import jax
     import optax
+
     import dew.telemetry.profile as telemetry_profile
     from dew.artifacts import agree_process_phase
     from dew.training import Profile, Trainer
@@ -684,6 +690,7 @@ def mode_validate(args) -> dict:
     """
     import jax
     import optax
+
     from dew.data import Dataset
     from dew.diffusion import presets
     from dew.eval import clip
@@ -731,6 +738,7 @@ def mode_tracked(args) -> dict:
     """
     import jax
     import optax
+
     from dew.data import Dataset
     from dew.training import Layout, MeshSpec, Trainer
     from dew.training.tracker import render
@@ -779,7 +787,7 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
     every topology."""
     import jax
     import optax
-    import dew.nn.backbones.causal_transformer  # registers the model built below
+
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import Layout, MeshSpec, Trainer
@@ -829,6 +837,7 @@ def mode_evaluation_contract(args) -> dict:
     import jax
     import jax.numpy as jnp
     import optax
+
     from dew.artifacts import Representations, host
     from dew.data import Dataset
     from dew.objectives.base import Aux, Objective
@@ -965,6 +974,7 @@ def mode_evaluation_replicas(args) -> dict:
     import jax
     import jax.numpy as jnp
     import optax
+
     from dew.artifacts import Representations, host
     from dew.data import Dataset
     from dew.objectives.base import Aux, Objective
@@ -1014,19 +1024,19 @@ def mode_builtin_preview_failures(args) -> dict:
     """Exercise nested builtin preview failures while both ranks remain alive."""
     import jax
     import optax
+
     import dew.sampling.text as text_sampling
-    from dew.inference import TextGeneration
     from dew.data import Dataset
     from dew.diffusion import presets
-    from dew.sampling import text as text_sampling
     from dew.diffusion.discrete import MDLM
+    from dew.inference import TextGeneration
     from dew.inputs import Field, InputSpec
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.dit import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
     from dew.objectives.lm import LMObjective, Samples
-    from dew.sampling import Euler
+    from dew.sampling import Euler, text as text_sampling
     from dew.training import Trainer
 
     rank = jax.process_index()
@@ -1129,10 +1139,11 @@ def mode_training_contract(args) -> dict:
     """A rejected shard and a partial composite checkpoint in a real pool."""
     import jax
     import jax.numpy as jnp
+    import optax
+    from test_training_transactions import ShortScaleTrainer, Tiny
+
     from dew.checkpoints import Checkpoints
     from dew.training.distributed import shard_batch
-    from test_training_transactions import Tiny, ShortScaleTrainer
-    import optax
 
     class Rows(Tiny):
         def loss(self, variables, batch, step):
@@ -1209,6 +1220,7 @@ def mode_rollout(args) -> dict:
     import jax.numpy as jnp
     import optax
     from jax.experimental import multihost_utils
+
     from dew.data import Dataset
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import GRPOObjective, SampledRollout
@@ -1331,6 +1343,7 @@ def mode_rollout(args) -> dict:
 def mode_inference_pipeline(args) -> dict:
     """Load diffusion and LM runs on the mesh with process-local prompts and results."""
     import jax
+
     import dew
     from dew.sampling import Sampling
     from dew.training import Layout, MeshSpec
@@ -1352,6 +1365,7 @@ def mode_inference_pipeline(args) -> dict:
     rejected = []
     if args.processes > 1:
         from dataclasses import replace
+
         from jax.experimental import multihost_utils
 
         prepared = images.prepare(prompts, steps=3, seed=5)
@@ -1414,6 +1428,7 @@ def mode_continuations(args) -> dict:
     import jax
     import jax.numpy as jnp
     from jax.experimental import multihost_utils
+
     from dew.inference import TextGeneration
     from dew.inference.pipeline import place
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -1512,6 +1527,7 @@ def mixed_validity_inputs(prompts: np.ndarray, lengths: np.ndarray, *, explicit:
     on every row instead, which is the reference a pool has to reproduce.
     """
     import jax.numpy as jnp
+
     from dew.nn.inputs import ModelInputs
 
     mask = np.arange(prompts.shape[1])[None, :] >= prompts.shape[1] - lengths[:, None]
@@ -1523,6 +1539,7 @@ def mixed_validity_inputs(prompts: np.ndarray, lengths: np.ndarray, *, explicit:
 def mixed_validity_batch(rows: slice, *, explicit: bool) -> dict:
     """A training batch whose validity is omitted where nothing was padded."""
     import jax.numpy as jnp
+
     from dew.nn.inputs import ModelInputs
 
     tokens = token_batch()[rows]
@@ -1542,7 +1559,7 @@ def mixed_validity_trainer(fsdp: int):
     """The pipeline model under plain SGD, for the mixed-validity regression."""
     import jax
     import optax
-    import dew.nn.backbones.causal_transformer  # registers the model built below
+
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import Layout, MeshSpec, Trainer
@@ -1587,6 +1604,7 @@ def mode_mixed_validity(args) -> dict:
     different pytrees.
     """
     import jax
+
     from dew.nn.inputs import agreed_validity
     from dew.sampling import Sampling, generate
 
@@ -1629,6 +1647,7 @@ def mode_decoding_components(args) -> dict:
     import jax
     import jax.numpy as jnp
     from jax.experimental import multihost_utils
+
     from dew.inference import TextGeneration
     from dew.inference.pipeline import place
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -1733,6 +1752,7 @@ def mode_masked_generation(args) -> dict:
     import jax
     import jax.numpy as jnp
     from jax.experimental import multihost_utils
+
     from dew.inference.pipeline import place
     from dew.interop import load_pretrained
     from dew.nn.inputs import ModelInputs
@@ -1783,9 +1803,11 @@ def mode_masked_generation(args) -> dict:
 def mode_host_training(args) -> dict:
     """One global clipped update on resident and companion-CPU state."""
     import functools
+
     import jax
     import jax.numpy as jnp
     import optax
+
     from dew.objectives.base import Aux, Objective
     from dew.training import Layout, MeshSpec, Trainer
     from dew.training.distributed import build_mesh, shard_batch

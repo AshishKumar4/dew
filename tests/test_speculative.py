@@ -13,13 +13,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental import checkify
+from test_text_rollout_contract import decoder
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.sampling import Sampling, Speculative, generate
-from dew.sampling import decoding
+from dew.sampling import Sampling, Speculative, decoding, generate
 from dew.sampling.decoding import StepState, chain, criterion
 from dew.sampling.strategies import DecodeOps, DecoderState
-from test_text_rollout_contract import decoder
 
 VOCAB = 13
 HIDDEN = 2
@@ -678,6 +677,7 @@ def test_prediction_depths_resume_from_real_history_not_rotary_coordinates(prefi
 
 def test_prediction_index_reuse_reseeds_each_rows_accepted_history():
     from dataclasses import replace
+
     from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
     from dew.nn.inputs import ModelInputs
     from dew.sampling.strategies import reseed

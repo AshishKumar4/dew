@@ -18,14 +18,29 @@ import numpy as np
 import pytest
 import torch
 from transformers.generation.logits_process import (
-    EncoderNoRepeatNGramLogitsProcessor, EncoderRepetitionPenaltyLogitsProcessor,
-    EpsilonLogitsWarper, EtaLogitsWarper, ExponentialDecayLengthPenalty,
-    ForcedBOSTokenLogitsProcessor, ForcedEOSTokenLogitsProcessor, InfNanRemoveLogitsProcessor,
-    LogitNormalization, MinLengthLogitsProcessor, MinNewTokensLengthLogitsProcessor,
-    MinPLogitsWarper, NoBadWordsLogitsProcessor, NoRepeatNGramLogitsProcessor,
-    RepetitionPenaltyLogitsProcessor, SequenceBiasLogitsProcessor,
-    SuppressTokensAtBeginLogitsProcessor, SuppressTokensLogitsProcessor, TemperatureLogitsWarper,
-    TopHLogitsWarper, TopKLogitsWarper, TopPLogitsWarper, TypicalLogitsWarper,
+    EncoderNoRepeatNGramLogitsProcessor,
+    EncoderRepetitionPenaltyLogitsProcessor,
+    EpsilonLogitsWarper,
+    EtaLogitsWarper,
+    ExponentialDecayLengthPenalty,
+    ForcedBOSTokenLogitsProcessor,
+    ForcedEOSTokenLogitsProcessor,
+    InfNanRemoveLogitsProcessor,
+    LogitNormalization,
+    MinLengthLogitsProcessor,
+    MinNewTokensLengthLogitsProcessor,
+    MinPLogitsWarper,
+    NoBadWordsLogitsProcessor,
+    NoRepeatNGramLogitsProcessor,
+    RepetitionPenaltyLogitsProcessor,
+    SequenceBiasLogitsProcessor,
+    SuppressTokensAtBeginLogitsProcessor,
+    SuppressTokensLogitsProcessor,
+    TemperatureLogitsWarper,
+    TopHLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
+    TypicalLogitsWarper,
 )
 
 from dew.sampling import decoding

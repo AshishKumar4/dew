@@ -9,7 +9,6 @@ group or RLOO family from `dew.rl`, with old log-probabilities rescored
 through the objective's own head.
 """
 
-import dataclasses
 import json
 
 import jax
@@ -21,9 +20,9 @@ from flax import linen as nn
 
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
-from dew.sampling import Sampling
 from dew.objectives.rl import SampledRollout
 from dew.rl import group_advantage, rloo_advantage
+from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, Trainer
 
 FEATURES = 3

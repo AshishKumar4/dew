@@ -1,25 +1,29 @@
 """Real sampled tool actions, verifier rewards and action-only GRPO updates."""
 
 import asyncio
+import json
 from collections import Counter
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from dataclasses import replace
-import json
 
-from flax import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 
 from dew.data import Dataset
 from dew.inference import TextGeneration
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.episodes import (
-    EpisodeCancelled, EpisodeFailure, EpisodeRollout, EpisodeStatus, Observation,
+    EpisodeCancelled,
+    EpisodeFailure,
+    EpisodeRollout,
+    EpisodeStatus,
+    Observation,
 )
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Trainer

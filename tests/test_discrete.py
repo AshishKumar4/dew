@@ -4,19 +4,17 @@ data path, through the general trainer.
 """
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 from flax import linen as nn
 
-import dew.nn.backbones  # registers the models
 from dew.data import Dataset
 from dew.diffusion import EpsilonPredictionTransform, Process
 from dew.diffusion.discrete import MDLM, DiscreteProcess, LogLinear, Unmask
 from dew.diffusion.schedules import CosineNoiseScheduler
-from dew.objectives.base import Step
+from dew.objectives.base import Step, scalar_loss
 from dew.objectives.diffusion import MaskedDiffusionObjective
 from dew.registry import models, presets, samplers
 from dew.sampling import sample

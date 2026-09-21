@@ -15,8 +15,7 @@ import numpy as np
 import pytest
 
 from dew.data import Loading, Prompts
-from dew.data.prompts import (INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY,
-                              TRUTH_KEY, PromptSource)
+from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptSource
 
 TOKENIZER = "tests/fixtures/tokenizers/tiny-chat"
 WINDOW = 8

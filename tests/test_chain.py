@@ -19,7 +19,6 @@ from flax import linen as nn
 
 from dew.data import ChatMessages, Loading, PreferencePairs, Prompts
 from dew.training import Layout
-
 from recipes.chain import Recipe, Stage
 
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"

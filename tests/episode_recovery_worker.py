@@ -2,16 +2,16 @@
 
 import itertools
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import jax
 import numpy as np
+from test_tool_episodes import build
 
 from dew.data import Dataset
 from dew.objectives.rl import EpisodeJournal, SandboxLimits, SubprocessEnvironment
 from dew.objectives.rl.records import episode_record
-from test_tool_episodes import build
 
 
 def main() -> None:

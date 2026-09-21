@@ -2,22 +2,19 @@
 
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-import jax
 import numpy as np
 import pytest
+from test_tool_episodes import CALL_THREE, EOS, GROUPS, NINE, PROMPT, SAMPLING, START, build, collect, verify
 
 from dew.objectives.rl import EpisodeStatus, SandboxLimits, SubprocessEnvironment
 from dew.objectives.rl.episodes import Action, EpisodeId
 from dew.objectives.rl.sandbox import _ProcessEnvironment
-from test_tool_episodes import (
-    CALL_THREE, EOS, GROUPS, NINE, PROMPT, SAMPLING, START, build, collect, verify,
-)
 
 WORKER = Path(__file__).with_name("sandbox_square_worker.py")
 IDENTITY = EpisodeId(task=3, attempt=0, sample=0, seed=(1, 2))

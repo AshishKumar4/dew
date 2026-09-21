@@ -15,6 +15,7 @@ leaves, so the production join and the rendezvous right after it are what
 every pool test runs.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -86,10 +87,8 @@ def spawn(mode, out, processes=1, process_id=0, coordinator=None, devices=None, 
 
 def terminate(process) -> None:
     """SIGKILL the worker and every process in its session."""
-    try:
+    with contextlib.suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
     process.wait(timeout=60)
 
 
@@ -1087,6 +1086,7 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     # A step that ignored validity is a different gradient, so the comparison
     # above is sensitive to the term the field controls.
     import jax.numpy as jnp
+
     from dew.nn.inputs import ModelInputs
 
     unmasked = worker.mixed_validity_step(

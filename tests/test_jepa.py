@@ -2,23 +2,30 @@
 the objective through the general trainer."""
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+
+from dew.objectives.base import scalar_loss
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
 
 from dew.artifacts import Representations
 from dew.inputs import Field
+from dew.nn.backbones.jepa import JepaPredictor
 from dew.objectives.base import Step
 from dew.objectives.jepa import (
-    JepaEncoder, JepaVideoEncoder, JepaObjective, multi_block_mask,
-    representation_health, normalize_targets, linear_probe_accuracy, knn_probe_accuracy,
+    JepaEncoder,
+    JepaObjective,
+    JepaVideoEncoder,
+    knn_probe_accuracy,
+    linear_probe_accuracy,
+    multi_block_mask,
+    normalize_targets,
+    representation_health,
 )
-from dew.nn.backbones.jepa import JepaPredictor
 from dew.registry import metrics
 from dew.training import Layout, MeshSpec, Trainer
 

@@ -7,8 +7,8 @@ from dew.artifacts import ImageGrid, TokenScores, VideoGrid
 from dew.eval import psnr, ssim
 from dew.eval.fid import FIDStats, GaussianStats, fid, frechet_distance
 from dew.objectives.lm.objective import perplexity
-from dew.objectives.rl.preference import DPOObjective
 from dew.objectives.rl.grpo import GRPOObjective
+from dew.objectives.rl.preference import DPOObjective
 
 
 def test_fid_pools_unequal_batches_and_singletons():
@@ -66,6 +66,7 @@ def test_perplexity_streams_weighted_targets_and_empty_contributions():
 def test_policy_preview_uses_policy_weights_instead_of_frozen_reference(objective_type):
     import jax
     import jax.numpy as jnp
+
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.base import Step
     from dew.objectives.lm import Samples

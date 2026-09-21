@@ -17,7 +17,7 @@ import pytest
 from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
 from dew.nn.moe import Router, deepseek_v2_aux_loss
 from dew.objectives.base import Step, scalar_loss
-from dew.objectives.lm import LMObjective, TEXT_KEY
+from dew.objectives.lm import TEXT_KEY, LMObjective
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "moe"
 CONFIG = json.loads((FIXTURES / "config.json").read_text())["deepseek_v2"]

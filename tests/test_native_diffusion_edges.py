@@ -1,10 +1,10 @@
 """Numerical regressions for nondefault published diffusion controls."""
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tarfile
+from pathlib import Path
 
 import numpy as np
 import pytest

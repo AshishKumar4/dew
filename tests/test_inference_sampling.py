@@ -7,8 +7,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from test_text_rollout_contract import decoder
 from transformers.generation.logits_process import (
-    MinPLogitsWarper, TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper,
+    MinPLogitsWarper,
+    TemperatureLogitsWarper,
+    TopKLogitsWarper,
+    TopPLogitsWarper,
 )
 
 from dew.inference import TextGeneration
@@ -16,7 +20,6 @@ from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling
 from dew.sampling.decoding import StepState, chain
 from dew.sampling.strategies import draw
-from test_text_rollout_contract import decoder
 
 
 @pytest.fixture
@@ -55,6 +58,7 @@ def test_bind_freezes_mapping_structure_but_preserves_array_leaves(task):
 def test_padless_tokenizer_batches_match_unpadded_rows_without_changing_exports(task, tmp_path, padding_side):
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
+
     from dew.interop.pretrained import Processor
 
     vocabulary = {"<unk>": 0, "one": 1, "two": 2, "three": 3, "<eos>": 4}
@@ -170,8 +174,9 @@ def test_a_source_binds_its_whole_chain_and_an_override_clears_it(task):
     its basic policy visible as a `Sampling` value. An explicit policy
     replaces that policy and clears the chain it was built around, while the
     row count stays the source's."""
-    from dew.interop.pretrained import Pretrained
     from pathlib import Path
+
+    from dew.interop.pretrained import Pretrained
 
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
                         generation_config={"do_sample": True, "temperature": 0.7, "top_p": 0.4,
@@ -189,6 +194,7 @@ def test_a_source_binds_its_whole_chain_and_an_override_clears_it(task):
 def test_unsupported_source_controls_report_their_reason(task):
     """An unsupported active source control names itself and the missing behavior."""
     from pathlib import Path
+
     from dew.interop.pretrained import Pretrained
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {}, generation_config={})
     refusals = {
@@ -229,6 +235,7 @@ def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(ta
     strategy runs. An explicit call count overrides it in either direction and
     an explicit sampling policy leaves it alone."""
     from pathlib import Path
+
     from dew.interop.pretrained import Pretrained
 
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
@@ -252,6 +259,7 @@ def test_a_source_asking_for_several_sequences_binds_them_as_the_task_default(ta
 
 def test_source_total_length_and_explicit_continuation_budget_have_defined_precedence(task):
     from pathlib import Path
+
     from dew.interop.pretrained import Pretrained
 
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
@@ -270,6 +278,7 @@ def test_a_source_forced_eos_follows_the_budget_the_call_asks_for(task):
     end of the request, so a call that changes the budget moves it. Pinning
     the position to the source's own length would force at the wrong step."""
     from pathlib import Path
+
     from dew.interop.pretrained import Pretrained
 
     source = Pretrained(task.model, task.variables, None, {}, Path("."), {},
@@ -299,6 +308,7 @@ def test_an_explicit_policy_replaces_the_chain_the_source_could_not_build(task):
     still judged, and an unknown name still refuses because nothing says who
     would own it."""
     from pathlib import Path
+
     from dew.interop.pretrained import Pretrained
 
     blocked = {"watermarking_config": {"greenlist_ratio": 0.5}, "guidance_scale": 2.0,
@@ -328,6 +338,7 @@ def test_an_explicit_policy_replaces_the_chain_the_source_could_not_build(task):
 def test_neutral_beam_controls_preserve_the_search(task):
     """Serialized beam defaults remain inert while beam search is active."""
     from pathlib import Path
+
     from dew.interop.pretrained import Pretrained
 
     config = {"num_beams": 2, "num_return_sequences": 2, "eos_token_id": 5}

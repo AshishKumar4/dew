@@ -25,7 +25,6 @@ from dew.registry import models, with_precision
 from dew.training import Layout, MeshSpec, build_mesh
 from dew.training.optim import muon_weight_dimension_numbers
 
-
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3n-vision-tiny"
 
 

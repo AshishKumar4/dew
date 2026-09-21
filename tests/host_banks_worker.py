@@ -77,6 +77,7 @@ def banked(args) -> dict:
     import jax
     import jax.numpy as jnp
     import numpy as np
+
     from dew.inference.banks import HeldBanks, host_banked
     from dew.registry import models
     from dew.sampling.text import Sampling, generate
@@ -126,6 +127,7 @@ def _checkpointed(args, scanned, plain, tokens, mesh, resident_layout, host_layo
     import jax
     import numpy as np
     import optax
+
     from dew.checkpoints import Checkpoints
     from dew.inference.banks import CheckpointBanks, host_banked
     from dew.objectives.lm import LMObjective

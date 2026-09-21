@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import itertools
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import jax
 import numpy as np
+
 from dew.telemetry.records import RECORD_TYPES
 
 
@@ -19,6 +20,7 @@ def main() -> None:
         jax.distributed.initialize(coordinator_address=coordinator, num_processes=processes,
                                    process_id=rank, local_device_ids=[0], initialization_timeout=30)
     import optax
+
     from dew.artifacts import ImageGrid, collective_host
     from dew.data import Dataset
     from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process

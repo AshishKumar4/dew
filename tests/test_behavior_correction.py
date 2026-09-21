@@ -6,12 +6,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_tool_episodes import PROMPT, RESPONSE, build, collect
 
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.rl import GRPOObjective
 from dew.rl import behavior_importance_weights, token_log_ratio, token_mean
 from dew.rl.surrogate import clipped_surrogate_terms
-from test_tool_episodes import build, collect, PROMPT, RESPONSE
 
 FIXTURE = Path(__file__).parent / "fixtures/rl/behavior.npz"
 
@@ -66,7 +66,9 @@ def test_correction_is_explicit_and_uses_actual_recorded_behavior():
 
 def test_corrected_objective_changes_a_real_trainer_update():
     import itertools
+
     import optax
+
     from dew.data import Dataset
     from dew.training import Trainer
 

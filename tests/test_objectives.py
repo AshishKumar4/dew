@@ -7,9 +7,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.objectives.base import (
-    Aux, EMASpec, Objective, Step, everything, merge, scalar_loss, select, under,
-)
+from dew.objectives.base import Aux, EMASpec, Objective, Step, everything, merge, scalar_loss, select, under
 
 
 def tree():

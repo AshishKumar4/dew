@@ -20,10 +20,10 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
+from dew.diffusion.process import DenoisingCondition
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.interop.diffusion import component_tensors, sd3_fields, translate_sd3_weights
 from dew.nn.backbones.sd3 import SD3Transformer
-from dew.diffusion.process import DenoisingCondition
 from dew.sampling import sample
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -408,8 +408,9 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     source keeps it, so a reload recomputes the trained model exactly.
     """
     import optax
-    from dew.interop.pretrained import load_pretrained
+
     from dew.checkpoints import Checkpoints
+    from dew.interop.pretrained import load_pretrained
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer

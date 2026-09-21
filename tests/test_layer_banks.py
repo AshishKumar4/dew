@@ -8,8 +8,14 @@ import numpy as np
 import pytest
 
 from dew.inference.banks import (
-    CheckpointBanks, HeldBanks, LayerBanks, at_namespace, entry_tree, host_banked,
-    in_namespace, narrowed,
+    CheckpointBanks,
+    HeldBanks,
+    LayerBanks,
+    at_namespace,
+    entry_tree,
+    host_banked,
+    in_namespace,
+    narrowed,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank, StackView
 from dew.nn.diffusion_gemma import DiffusionGemma

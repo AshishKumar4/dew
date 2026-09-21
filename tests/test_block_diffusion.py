@@ -6,8 +6,8 @@ Transformers generate trajectory uses matched random inputs, not an assumed
 identity between Torch and JAX seeds (tools/diffusion_gemma_reference.py).
 """
 
-from dataclasses import replace
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -130,7 +130,7 @@ def test_canvas_continuations_refine_the_shared_prefill_without_moving_the_first
 
 @pytest.mark.parametrize("budget", [0, 3, 7])
 def test_canvas_generation_can_resume_at_committed_boundaries(system, budget):
-    from dew.diffusion.block import CanvasPlan, _begin, _advance, _materialize
+    from dew.diffusion.block import CanvasPlan, _advance, _begin, _materialize
 
     model, variables, process, reference, _ = system
     inputs = ModelInputs(jnp.asarray(reference["prompt"]))

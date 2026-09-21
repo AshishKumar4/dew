@@ -16,14 +16,16 @@ central differences of the oracle; the bound is 1e-4 on each. A per-head
 scalar decay in place of the per-dimension one moves the layer by 1.06.
 """
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import jax
-import jax.numpy as jnp
-
 from dew.nn.kda import (
-    KimiDeltaAttention, KimiDeltaAttentionMixer, chunk_kimi_delta_rule, recurrent_kimi_delta_rule,
+    KimiDeltaAttention,
+    KimiDeltaAttentionMixer,
+    chunk_kimi_delta_rule,
+    recurrent_kimi_delta_rule,
 )
 from dew.nn.mixers import mixer_from_record
 

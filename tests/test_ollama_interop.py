@@ -51,6 +51,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_lm_recipe import load_recipe
 
 from dew.data import HFTokenizer
 from dew.inference import Completion, OllamaCompletion
@@ -59,7 +60,6 @@ from dew.interop.hf_decoders import save_pretrained_decoder
 from dew.nn.inputs import ModelInputs
 from dew.registry import models, with_precision
 from dew.sampling.text import Sampling, generate
-from test_lm_recipe import load_recipe
 
 pytestmark = pytest.mark.network
 

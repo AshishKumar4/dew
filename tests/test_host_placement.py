@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from test_trainer import BATCH, Counting, Regression, val_batches
 
 from dew.data import Dataset
 from dew.inference.banks import CheckpointBanks, HeldBanks, host_banked
@@ -42,7 +43,6 @@ from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from test_trainer import BATCH, Counting, Regression, val_batches
 
 DEVICE = Layout(min_shard=1, tolerance=1.0)
 HOST = Layout(min_shard=1, tolerance=1.0, host=("opt_state", "ema"))
@@ -506,9 +506,10 @@ def test_a_pool_reads_its_own_shards_of_a_host_resident_bank(tmp_path):
 
 @pytest.mark.parametrize("kind", ["root", "multimodal"])
 def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
-    from tools.benchmark_host_offload import SyntheticBanks
     from test_layer_banks import SelectedReads, fixture, host_layout, identical, scores, unpack
+
     from dew.nn.multimodal import MultimodalTransformer
+    from tools.benchmark_host_offload import SyntheticBanks
 
     model, variables, tokens, indices, media = fixture(kind)
     sites = model.bank_sites

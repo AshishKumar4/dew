@@ -8,12 +8,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_inference import make_run
 
 from dew.inference import DenoisingInputs, TextToImage
 from dew.interop import load_pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import CFG, Heun
-from test_inference import make_run
 
 FIXTURE = Path(__file__).parent / "fixtures/hf/diffusion-gemma-workflow"
 
