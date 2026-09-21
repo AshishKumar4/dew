@@ -19,12 +19,25 @@ HOST = Layout(host=("params",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)
 
 
-def equal(left, right):
+STREAMED_BOUND = 1e-6
+
+
+def _leaves(left, right):
     assert jax.tree.structure(left) == jax.tree.structure(right)
     for (path, a), b in zip(jax.tree_util.tree_leaves_with_path(left), jax.tree.leaves(right), strict=True):
         if jnp.issubdtype(a.dtype, jax.dtypes.prng_key):
             a, b = jax.random.key_data(a), jax.random.key_data(b)
-        np.testing.assert_array_equal(np.asarray(a), np.asarray(b), err_msg=jax.tree_util.keystr(path))
+        yield jax.tree_util.keystr(path), np.asarray(a), np.asarray(b)
+
+
+def equal(left, right):
+    for path, a, b in _leaves(left, right):
+        np.testing.assert_array_equal(a, b, err_msg=path)
+
+
+def close(left, right, bound=STREAMED_BOUND):
+    for path, a, b in _leaves(left, right):
+        np.testing.assert_allclose(a, b, atol=bound, rtol=0, err_msg=path)
 
 
 class Coupled(Objective):
@@ -119,7 +132,7 @@ def test_decoder_scan_training_keeps_the_original_logical_state():
         assert "layers_0" in state.params["params"] and "layers_1" in state.params["params"]
         assert "layers_0_1" not in state.params["params"]
         states.append(state)
-    equal(*states)
+    close(*states)
 
 
 def test_dropout_composite_replay_restarts_with_effects_and_ema_intact(tmp_path):
@@ -263,18 +276,6 @@ def test_companion_pool_uses_one_global_optimizer_reduction(tmp_path):
 # records a difference between the two whose cause is not established. The
 # bound below qualifies these cases numerically and settles nothing about that
 # failure. Leaves nothing moves are compared exactly.
-STREAMED_BOUND = 1e-6
-
-
-def close(left, right, bound=STREAMED_BOUND):
-    assert jax.tree.structure(left) == jax.tree.structure(right)
-    for (path, a), b in zip(jax.tree_util.tree_leaves_with_path(left), jax.tree.leaves(right), strict=True):
-        if jnp.issubdtype(a.dtype, jax.dtypes.prng_key):
-            a, b = jax.random.key_data(a), jax.random.key_data(b)
-        np.testing.assert_allclose(np.asarray(a), np.asarray(b), atol=bound, rtol=0,
-                                   err_msg=jax.tree_util.keystr(path))
-
-
 def updated(objective, batch, layout, *, optimizer=None, checkpoints=None, steps=1):
     """`steps` compiled updates of one objective under one placement."""
     trainer = Trainer(objective, optax.adam(.01) if optimizer is None else optimizer,
