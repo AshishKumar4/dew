@@ -15,7 +15,7 @@ import functools
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Generic, Protocol
+from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -62,6 +62,7 @@ from dew.training.tracker import Tracker
 from dew.training.transaction import Transaction, compact_qk, with_ema
 
 if TYPE_CHECKING:
+    from dew.config import TrainerConfig
     from dew.data import Dataset
     from dew.telemetry.profile import Profiler
 
@@ -76,6 +77,13 @@ CompiledStep = Callable[
     [TrainState, Batch],
     tuple[TrainState, jax.Array, Mapping[str, jax.Array], jax.Array, jax.Array]]
 """A call returns state, scalar loss, metrics, loss_finite, and accepted."""
+
+ObjectiveLoss = TypeVar("ObjectiveLoss")
+ObjectiveEffects = TypeVar("ObjectiveEffects")
+"""The two parameters of the objective `Trainer.from_config` is handed. A
+classmethod cannot solve the class's own `Loss` and `Effects` from an
+argument, since an unparameterized `Trainer.from_config` binds them to their
+defaults, so the factory carries its own pair and names the class it builds."""
 
 Shapes = tuple[tuple[int, ...], ...]
 """A batch's leaf shapes in tree order, the key a compiled step is held
@@ -196,6 +204,48 @@ class Trainer(Generic[Loss, Effects]):
         # Measured off the step `compile` last compiled, which for a ramped
         # run is the stage it was called for; `fit` keeps one per stage.
         self.flops_per_step = None
+
+    @classmethod
+    def from_config(
+        cls, config: TrainerConfig, objective: Objective[ObjectiveLoss, ObjectiveEffects],
+        optimizer: optax.GradientTransformation, *, key: jax.Array,
+        checkpoints: Checkpoints | None = None, tracker: Tracker | None = None,
+        step: Callable[[Objective[ObjectiveLoss, ObjectiveEffects],
+                        optax.GradientTransformation], StepFn] | None = None,
+        rollout: Rollout | None = None,
+    ) -> Trainer[ObjectiveLoss, ObjectiveEffects]:
+        """The trainer a `TrainerConfig` describes, so the mapping from the
+        config's field names to this constructor's is written once.
+
+        `mesh`, `layout`, `accumulation`, `dynamic_scale` and `profile` are
+        the config fields a trainer holds; `key` is the run key, which
+        `RunConfig.train` draws from `config.seed`. The rest of the config
+        belongs to the capabilities and to the loop, and reaches them from
+        their own owners: `checkpoint_dir` and `keep` build the `Checkpoints`
+        passed in here, `wandb` the tracker, `xla_flags`, `multi_host` and
+        `compilation_cache_dir` are read by `prepare_process` before JAX opens
+        a backend, `batch_ramp` wraps the dataset with `dew.data.ramped`, and
+        `steps`, `epochs`, `log_every`, `eval_every` and `checkpoint_every`
+        are arguments of `fit`. `step` and `rollout` are not configurable:
+        they are code a caller hands over.
+
+        It builds a `Trainer`, whatever it is called on: the objective's two
+        parameters are the factory's own, so a subclass that wants one of
+        itself constructs it.
+        """
+        return Trainer(
+            objective, optimizer,
+            key=key,
+            mesh=config.mesh,
+            layout=config.layout,
+            accumulation=config.accumulation,
+            dynamic_scale=config.dynamic_scale,
+            checkpoints=checkpoints,
+            tracker=tracker,
+            step=step,
+            rollout=rollout,
+            profile=config.profile,
+        )
 
     # ------------------------------------------------------------------
     # The state
