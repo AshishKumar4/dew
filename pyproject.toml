@@ -22,7 +22,6 @@ dependencies = [
     "tqdm",
     "grain",
     "termcolor",
-    "albumentations",
     "tyro",
     "typing_extensions>=4.14",
     "transformers>=5.16.1",
