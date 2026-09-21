@@ -16,22 +16,26 @@ import pytest
 pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
 from dew.data import Loading, OxfordFlowers
+from dew.data.images import decode_image
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 
 
-def test_prepared_records_decode_pixels_labels_and_caption_names():
+def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
+    """The source hands out the bytes on disk; `record` decodes them, so a
+    worker pays one decode at the resolution it needs and no more."""
     spec = OxfordFlowers(path=str(FIXTURE))
     source = spec.source()
     assert len(source) == 20
     for index in range(len(source)):
         record = source[index]
-        np.testing.assert_array_equal(record["image"], np.full((8, 8, 3), index + 10, np.uint8))
+        assert isinstance(record["image"], bytes)
+        np.testing.assert_array_equal(decode_image(record["image"]), np.full((8, 8, 3), index + 10, np.uint8))
         assert record["label"] == index % 2
         _, caption, label = spec.record(record, np.random.default_rng(0))
         assert ("red" if label == 0 else "blue") in caption.split()
     test_split = OxfordFlowers(path=str(FIXTURE), split="test").source()
-    assert [int(test_split[i]["image"][0, 0, 0]) for i in range(len(test_split))] == [26, 27, 28, 29]
+    assert [int(decode_image(test_split[i]["image"])[0, 0, 0]) for i in range(len(test_split))] == [26, 27, 28, 29]
 
 
 def test_a_prepared_source_describes_the_directory_and_split_it_reads():
@@ -101,6 +105,6 @@ def test_missing_records_request_preparation_only_for_the_selected_split(tmp_pat
     shutil.copytree(FIXTURE, directory)
     (directory / "dew_images-train.array_record-00000-of-00001").unlink()
     available = OxfordFlowers(path=str(directory), split="test").source()
-    assert int(available[0]["image"][0, 0, 0]) == 26
+    assert int(decode_image(available[0]["image"])[0, 0, 0]) == 26
     with pytest.raises(FileNotFoundError, match="Missing prepared ArrayRecord shard"):
         OxfordFlowers(path=str(directory), split="train").source()
