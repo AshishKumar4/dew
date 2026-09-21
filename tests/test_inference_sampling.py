@@ -411,6 +411,14 @@ def test_a_request_the_ceiling_refuses_keeps_refusing_at_its_own_shapes(roomy):
         roomy(ramp(1000), 100, seed=0)
 
 
+def test_a_one_token_request_scans_one_trip(roomy):
+    """The budget ladder starts at one: a scoring probe that wants a single
+    token pays for a single decode step, not the smallest serving bucket."""
+    shaped, trips, capacity = tasks._bucketed(ModelInputs.from_value(ramp(40)), 1,
+                                              roomy.model.max_seq_len)
+    assert (shaped.tokens.shape[1], trips, capacity) == (64, 1, 128)
+
+
 def test_a_budget_inside_a_bucket_returns_the_budget_and_what_the_budget_draws(roomy):
     """A 100-token budget scans the 128-trip bucket and hands back 100 tokens
     per row: the same tokens, lengths and likelihoods the 100-trip scan over

@@ -39,15 +39,16 @@ from dew.telemetry.profile import active_profile
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
 
-SHAPE_BUCKETS = tuple(1 << exponent for exponent in range(5, 21))
-"""The shapes a text request is rounded up to: powers of two from 32.
+SHAPE_BUCKETS = tuple(1 << exponent for exponent in range(21))
+"""The shapes a text request is rounded up to: powers of two.
 
 Every distinct prompt width, batch, budget and continuation count is its
 own several-second XLA compile, and served requests are rarely the same
 length twice. So a prompt pads left to the smallest bucket of 64 or more,
 where the attention mask hides the filler as it already hides the padding
-a ragged batch needs; a budget rounds up to the smallest bucket of 32 or
-more, and the trips past the request come off the result; the cache for
+a ragged batch needs; a budget rounds up to the next power of two, so a
+one-token request scans one trip and a scoring probe pays no decode it did
+not ask for, and the trips past the request come off the result; the cache for
 the call is the two together, rounded up again, in place of the model's
 whole `max_seq_len`. Rows are the caller's and are not bucketed. A request
 whose buckets would need more capacity than the model's `max_seq_len`
@@ -171,7 +172,7 @@ def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
     if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
         return inputs, budget, None
     width = _bucket(inputs.tokens.shape[1], 64)
-    trips = _bucket(budget, 32)
+    trips = _bucket(budget, 1)
     capacity = _bucket(width + trips, 64)
     if capacity > ceiling:
         return inputs, budget, None
