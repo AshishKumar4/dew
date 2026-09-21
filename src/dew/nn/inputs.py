@@ -7,7 +7,7 @@ import itertools
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -17,8 +17,16 @@ from typing_extensions import TypeVar
 
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 
+if TYPE_CHECKING:
+    from PIL.Image import Image
+
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 TreeT = TypeVar("TreeT")
+
+# What a caller hands a host processor as one media argument: pixels or audio
+# samples in an array, a PIL image, or one entry per row of either. The source's
+# own processor is the only code that reads it; dew moves it.
+type Media = np.ndarray | Image | Sequence[Media]
 
 PredictionPhase = Literal["ordinary", "extend", "draft"]
 BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
