@@ -807,7 +807,8 @@ class T5SelfAttention(nn.Module):
             if self.has_relative_attention_bias:
                 relative = (jnp.arange(length)[None, :] - jnp.arange(length)[:, None])
                 buckets = _t5_relative_position_bucket(
-                    relative, True, self.num_buckets, self.max_distance)
+                    relative, bidirectional=True, num_buckets=self.num_buckets,
+                    max_distance=self.max_distance)
                 position_bias = jnp.transpose(
                     self.rel_bias(buckets), (2, 0, 1))[None]
             else:

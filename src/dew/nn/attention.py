@@ -381,7 +381,7 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
         def pad_tail(x, fill):
             return jnp.pad(x, ((0, 0),) * (x.ndim - 2) + ((0, q_pad), (0, kv_pad)),
                            constant_values=fill)
-        mask = None if mask is None else pad_tail(mask, False)
+        mask = None if mask is None else pad_tail(mask, fill=False)
         bias = None if bias is None else pad_tail(bias, 0)
     kv_lengths = None if kv_pad == 0 else jnp.full(key.shape[:1], kv_len, jnp.int32)
     # A left window of l means the l+1 most recent keys on both the xla and

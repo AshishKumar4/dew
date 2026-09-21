@@ -220,14 +220,15 @@ class SD3Block(nn.Module):
         context_input = _modulate(_layer_norm(self.dtype)(context), context_shift, context_scale)
 
         attention = _JointAttention(
-            self.heads, self.head_dim, self.qk_norm, not self.context_pre_only, dtype=self.dtype,
+            self.heads, self.head_dim, self.qk_norm, context_out=not self.context_pre_only,
+            dtype=self.dtype,
             precision=self.precision, attention_impl=self.attention_impl, name="attn")
         image_attended, context_attended = attention(image_input, context_input)
         image = image + gate[:, None] * image_attended
         if self.dual_attention:
             shift2, scale2, gate2 = modulation[6:]
             second = _JointAttention(
-                self.heads, self.head_dim, self.qk_norm, False, dtype=self.dtype,
+                self.heads, self.head_dim, self.qk_norm, context_out=False, dtype=self.dtype,
                 precision=self.precision, attention_impl=self.attention_impl, name="attn2")
             attended2, _ = second(_modulate(normalized, shift2, scale2))
             image = image + gate2[:, None] * attended2

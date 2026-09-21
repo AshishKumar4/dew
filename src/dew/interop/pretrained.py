@@ -1519,18 +1519,18 @@ class _Call(NamedTuple):
 # Flux's 3.5 is the guidance its transformer embeds while its own true
 # classifier-free guidance is off at the pinned default.
 _PIPELINE_POLICY: Mapping[str, _Call] = MappingProxyType({
-    "StableDiffusionPipeline": _Call("sd", 50, 7.5, True),
-    "StableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, True),
-    "StableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, True),
-    "StableDiffusionXLPipeline": _Call("sdxl", 50, 5.0, True),
-    "StableDiffusionXLImg2ImgPipeline": _Call("sdxl", 50, 5.0, True),
-    "StableDiffusionXLInpaintPipeline": _Call("sdxl", 50, 7.5, True),
-    "StableDiffusion3Pipeline": _Call("sd3", 28, 7.0, True, 256),
-    "FluxPipeline": _Call("flux", 28, 3.5, False, 512),
-    "FlaxStableDiffusionPipeline": _Call("sd", 50, 7.5, True),
-    "FlaxStableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, True),
-    "FlaxStableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, True),
-    "FlaxStableDiffusionXLPipeline": _Call("sdxl", 50, 7.5, True),
+    "StableDiffusionPipeline": _Call("sd", 50, 7.5, guided=True),
+    "StableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, guided=True),
+    "StableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, guided=True),
+    "StableDiffusionXLPipeline": _Call("sdxl", 50, 5.0, guided=True),
+    "StableDiffusionXLImg2ImgPipeline": _Call("sdxl", 50, 5.0, guided=True),
+    "StableDiffusionXLInpaintPipeline": _Call("sdxl", 50, 7.5, guided=True),
+    "StableDiffusion3Pipeline": _Call("sd3", 28, 7.0, guided=True, sequence=256),
+    "FluxPipeline": _Call("flux", 28, 3.5, guided=False, sequence=512),
+    "FlaxStableDiffusionPipeline": _Call("sd", 50, 7.5, guided=True),
+    "FlaxStableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, guided=True),
+    "FlaxStableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, guided=True),
+    "FlaxStableDiffusionXLPipeline": _Call("sdxl", 50, 7.5, guided=True),
 })
 
 

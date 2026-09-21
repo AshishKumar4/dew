@@ -645,8 +645,10 @@ class DecoderBlock(nn.Module):
             # Return writes explicitly, keeping consumer values out of the
             # scan result so its tracers cannot replace the outer store.
             store = None if kv_store is None else dict(kv_store)
-            out = module._forward(x, train, False, positions, segment_ids,
-                                  store, per_layer_input, attention_metadata, prediction_phase)
+            out = module._forward(
+                x, train, decode=False, positions=positions, segment_ids=segment_ids,
+                kv_store=store, per_layer_input=per_layer_input,
+                attention_metadata=attention_metadata, prediction_phase=prediction_phase)
             changed = {} if kv_store is None or store is None else {
                 name: value for name, value in store.items()
                 if value is not kv_store.get(name)}
@@ -1902,7 +1904,7 @@ class CausalTransformer(nn.Module):
                 and not isinstance(prediction_mixer, KPoolSparseAttentionMixer)):
             raise ValueError("index_share_for_mtp_iteration requires a k-pool prediction mixer")
         mtp_mixer = prediction_mixer.build(self.mixer_context(
-            kinds[mtp_type], mtp_type, False))
+            kinds[mtp_type], mtp_type, kv_shared=False))
         mtp_feedforward = (
             routed if routed is not None and self.num_layers - 1 in sparse else
             # The last layer's width: the one width of every model with

@@ -755,8 +755,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         segment_ids, positions = _packing(batch)
         collections = [INDEXER_COLLECTION] + (["qk"] if self.qk_stats else [])
         _, gathered = self._hidden_states(
-            thaw(params), inputs, True, {"dropout": step.key},
-            collections, _packing_of(segment_ids, positions))
+            thaw(params), inputs, train=True, rngs={"dropout": step.key},
+            collections=collections, packing=_packing_of(segment_ids, positions))
         total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], inputs, segment_ids)
         reported = {"indexer_kl": total / jnp.where(mass > 0, mass, 1)}
         qk = gathered.get("qk") if self.qk_stats else None
