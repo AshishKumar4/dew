@@ -8,6 +8,7 @@ trainer has just written.
 """
 
 import dataclasses
+import json
 
 import jax
 import jax.numpy as jnp
@@ -19,7 +20,7 @@ from test_diffusion_objective import StubText  # noqa: F401  registers "stub_tex
 import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
-from dew.config import ModelConfig, TrainerConfig
+from dew.config import ModelConfig, RunConfig, TrainerConfig
 from dew.data import Dataset, OxfordFlowers, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -407,6 +408,71 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         task("the ", seed=2, key=jax.random.key(2))
     with pytest.raises(ValueError, match="max_new_tokens is required"):
         dataclasses.replace(task, max_new_tokens=None)("the ", seed=2)
+
+
+def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
+    """The quantization knob is the trainer's, so `RunConfig.train` writes it
+    under `trainer` in run.json and `dew.pipeline` reads it back there: the
+    rebuilt model answers the quantized forward on the run's own weights,
+    which the fp32 rebuild does not. Observed on CPU: 3e-02 on logits of
+    order 1."""
+    pytest.importorskip("qwix")
+    from dew.objectives.lm import LMObjective
+    from dew.training.quantization import Quantization
+
+    batch, seq = 8, 8
+    fields = dict(vocab_size=256, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                  mlp_features=32, max_seq_len=16)
+
+    @dataclasses.dataclass(frozen=True)
+    class LmRun(RunConfig):
+        """The two fields the LM entry of `dew.pipeline` reads beside the model."""
+        tokenizer: str = "byte"
+
+    class Stream:
+        def __init__(self):
+            self.position = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.position += 1
+            return {"text": np.random.RandomState(0).randint(1, 250, (batch, seq + 1)).astype(np.int32)}
+
+        def get_state(self):
+            return str(self.position).encode()
+
+        def set_state(self, state):
+            self.position = int(state.decode())
+
+    config = LmRun(
+        model=ModelConfig("causal_transformer", fields, dtype="float32",
+                          attention_impl="reference"),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=batch, steps=1,
+                              eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
+                              quantization=Quantization()))
+    state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),
+                         Dataset(Stream, None, None, batch), name="run")
+    Checkpoints(str(tmp_path / "run")).wait()
+
+    record = json.loads((tmp_path / "run" / "run.json").read_text())
+    assert record["trainer"]["quantization"]["dtype"] == "int8"
+    task = dew.pipeline(str(tmp_path / "run"))
+
+    ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
+    plain = config.model.build()
+    quantized = task.model.apply(task.variables, ids)
+    assert float(jnp.max(jnp.abs(quantized - plain.apply(task.variables, ids)))) > 0.0
+    assert int(state.step) == 1
+
+    # A run.json from before the knob moved keeps the spec at the top level,
+    # where the LM recipe's own flag wrote it, and still re-wraps.
+    before = {**record, "quantization": record["trainer"]["quantization"],
+              "trainer": {**record["trainer"], "quantization": None}}
+    (tmp_path / "run" / "run.json").write_text(json.dumps(before))
+    older = dew.pipeline(str(tmp_path / "run"))
+    np.testing.assert_array_equal(older.model.apply(older.variables, ids), quantized)
 
 
 @pytest.mark.mesh

@@ -230,3 +230,84 @@ def test_stochastic_rounding_draws_from_its_own_stream():
     assert max(float(jnp.max(jnp.abs(first - second)))
                for first, second in zip(jax.tree.leaves(gradients),
                                         jax.tree.leaves(other), strict=True)) > 0.0
+
+
+# --------------------------------------------------------------------------
+# The trainer's knob
+# --------------------------------------------------------------------------
+
+RES = 8
+RUN_BATCH = 8
+"""A whole-run batch: one record per simulated device, so the default mesh
+splits it evenly."""
+
+
+def image_batches(batch):
+    def stream():
+        rng = np.random.RandomState(0)
+        while True:
+            yield {"image": rng.randint(0, 256, (batch, RES, RES, 3), np.uint8)}
+    return stream
+
+
+def diffusion_run(directory, batch=RUN_BATCH, **trainer):
+    """The smallest unconditional diffusion run: a tiny DiT over 8-pixel
+    images, one step, nothing written but the record."""
+    from dew.config import ModelConfig, TrainerConfig
+    from dew.data import OxfordFlowers
+    from dew.objectives.diffusion import DiffusionRunConfig
+
+    return DiffusionRunConfig(
+        model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
+                                         "num_layers": 1, "num_heads": 2}, dtype="float32"),
+        data=OxfordFlowers(image_size=RES), text=None, guidance=None,
+        sampling_steps=2, val_metrics=(),
+        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), batch_size=batch,
+                              steps=1, eval_every=None, checkpoint_every=None,
+                              compilation_cache_dir=None, **trainer))
+
+
+def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
+    """`--trainer.quantization` is the one place a run names quantization:
+    `RunConfig.train` wraps the module the objective trains before anything
+    initialises it, and the run steps on the quantized forward. The distance
+    from the fp32 forward on the trained weights is the assertion that the
+    rules reached the matmuls. Observed on CPU: 2.7e-05 on activations of
+    order 1e-2, against 0.0 for a run trained without the knob."""
+    pytest.importorskip("qwix")
+    from dew.data import Dataset
+
+    batch = RUN_BATCH
+    config = diffusion_run(tmp_path, batch, quantization=Quantization())
+    objective = config.build()
+    plain = config.build()
+
+    state = config.train(objective, Dataset(image_batches(batch), None, None, batch),
+                         name="quantized")
+
+    assert int(state.step) == 1
+    image = jnp.ones((1, RES, RES, 3), jnp.float32)
+    noise_level = jnp.ones((1,), jnp.float32)
+    quantized_out = objective.model.apply(state.params, image, noise_level)
+    plain_out = plain.model.apply(state.params, image, noise_level)
+    assert float(jnp.max(jnp.abs(quantized_out - plain_out))) > 0.0
+
+
+def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
+    """The wrap needs a module to wrap; an objective that keeps none is
+    refused by name, before the run writes anything."""
+    from dew.data import Dataset
+    from dew.objectives.base import Aux, Objective
+
+    class Modelless(Objective):
+        def init(self, key, variables=None):
+            return {"params": {}}
+
+        def loss(self, params, batch, step):
+            return jnp.zeros(()), Aux({})
+
+    config = diffusion_run(tmp_path, quantization=Quantization())
+    with pytest.raises(ValueError, match="Modelless keeps no `model`"):
+        config.train(Modelless(), Dataset(image_batches(RUN_BATCH), None, None, RUN_BATCH),
+                     name="quantized")
+    assert not (tmp_path / "quantized").exists()

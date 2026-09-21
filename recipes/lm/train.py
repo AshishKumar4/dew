@@ -28,7 +28,6 @@ from dew.objectives.lm import IndexerTraining, LMObjective, Samples
 from dew.sampling import Sampling
 from dew.registry import datasets, metrics, models
 from dew.training import TrainState, prepare_process, run_timestamp
-from dew.training.quantization import Quantization, apply_quantization
 
 if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the registered specs, and
@@ -84,9 +83,6 @@ class LmRunConfig(RunConfig):
     """Clean prompt prefix in a block-diffusion token row."""
     block_canvas_size: int | None = None
     """Training canvas width; None uses the checkpoint canvas length."""
-    quantization: Optional[Quantization] = None
-    """Quantized-training spec, wrapped around the built model before the
-    objective sees it; unset trains in the compute dtype."""
 
     def __post_init__(self):
         if not isinstance(self.data, (TokenWindows, PackedTokens)):
@@ -101,7 +97,8 @@ class LmRunConfig(RunConfig):
                 raise ValueError("block_diffusion requires data:token-windows, not packed documents")
             if self.pretrained is None:
                 raise ValueError("block_diffusion fine-tuning requires --pretrained")
-            if self.balance_rate is not None or self.mtp_weight is not None or self.quantization is not None:
+            if (self.balance_rate is not None or self.mtp_weight is not None
+                    or self.trainer.quantization is not None):
                 raise ValueError("block_diffusion has no balancing, MTP or quantized-training term")
 
 
@@ -294,8 +291,6 @@ def main(config: LmRunConfig) -> TrainState:
     else:
         model, pretrained, fields = load_pretrained(
             config.pretrained, config.model, vocab_size, context, meta)
-    if config.quantization is not None:
-        model = apply_quantization(model, config.quantization)
     # run.json records the resolved model as
     # built, vocabulary and context included, so `dew.pipeline` rebuilds it.
     resolved = {name: value for name, value in fields.items() if name not in ("dtype", "attention_impl")}
