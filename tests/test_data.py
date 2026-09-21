@@ -788,6 +788,51 @@ def test_a_validation_record_does_not_depend_on_the_process_count(
 
 
 # ---------------------------------------------------------------------------------
+# Preparing a dataset at training resolution
+# ---------------------------------------------------------------------------------
+
+def test_a_prepared_set_is_the_deterministic_half_of_the_transform(tmp_path):
+    """prepare_images.py writes exactly what ImageTransform with
+    augmentation='none' produces: the same decode and resize, keyed captions
+    and labels, so a prepared record read back through ArrayRecordImages is
+    indistinguishable from the live transform's output."""
+    from tools.prepare_images import prepare
+
+    spec = Augmenting(length=16, image_size=8, augmentation="none",
+                      val_batches=None, **WORKERS)
+    manifest = prepare(spec, str(tmp_path), shards=2,
+                       source={"dataset": "augmenting"})
+    assert manifest["records"] == 16 and manifest["image_size"] == 8
+    assert len(manifest["shard_sizes"]) == 2
+
+    data = images.ArrayRecordImages(path=str(tmp_path), image_size=8,
+                                    augmentation="none", val_batches=None,
+                                    **WORKERS).load(batch=4, tokenize=keep_captions)
+    seen = {}
+    for batch in itertools.islice(data.train(), data.steps_per_epoch):
+        for index, pixels, caption in _rows(batch):
+            seen[index] = (pixels, caption)
+    assert sorted(seen) == list(range(16))
+
+    live = _Images(16)
+    for index in range(16):
+        image, caption, _ = spec.record(live[index], np.random.default_rng(index))
+        expected = images.resize_image(np.ascontiguousarray(image), 8)
+        pixels, stored_caption = seen[index]
+        assert pixels == expected.tobytes(), f"record {index}'s pixels differ"
+        assert np.asarray(image).shape == (12, 12, 3)
+        assert stored_caption == caption, f"record {index}'s caption differed"
+        assert np.frombuffer(pixels, np.uint8).shape == (8 * 8 * 3,)
+
+
+def test_resize_image_returns_an_image_already_at_size():
+    """A prepared record arrives at training size already; resizing it must
+    not spend a cv2.copy on every record of every batch."""
+    image = np.zeros((8, 8, 3), np.uint8)
+    assert images.resize_image(image, 8) is image
+
+
+# ---------------------------------------------------------------------------------
 # Failure paths: a record that cannot be read stops the run
 # ---------------------------------------------------------------------------------
 

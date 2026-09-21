@@ -49,6 +49,18 @@ def unpack_dict_of_byte_arrays(packed_data):
         unpacked_dict[key] = byte_array
     return unpacked_dict
 
+def pack_dict_of_byte_arrays(unpacked: dict) -> bytes:
+    """The inverse of unpack_dict_of_byte_arrays: `str -> bytes` entries,
+    length-prefixed, in dict order."""
+    packed = bytearray()
+    for key, byte_array in unpacked.items():
+        encoded = key.encode('utf-8')
+        packed += st.pack('I', len(encoded))
+        packed += encoded
+        packed += st.pack('I', len(byte_array))
+        packed += byte_array
+    return bytes(packed)
+
 
 def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
     """An encoded image as RGB uint8.
@@ -91,6 +103,8 @@ def _encoded_size(encoded: bytes) -> tuple[int, int]:
 def resize_image(image: np.ndarray, size: int) -> np.ndarray:
     """`image` at `size` square; area interpolation down, cubic up."""
     import cv2
+    if image.shape[:2] == (size, size):
+        return image
     interpolation = cv2.INTER_AREA if max(image.shape[:2]) > size else cv2.INTER_CUBIC
     return cv2.resize(image, (size, size), interpolation=interpolation)
 
@@ -307,8 +321,12 @@ class HFImages(ImageDataset):
 @dataclasses.dataclass(frozen=True)
 class ArrayRecordImages(ImageDataset):
     """Image and caption pairs in arrayrecord shards under `path/<shard>/`,
-    each record a packed dict with a 'jpg' and a 'txt' entry. `path` is the
-    bucket mount or directory the shards live under."""
+    each record a packed dict. Two layouts: 'jpg'/'txt' entries (encoded,
+    decoded on read) and the `prepare_images.py` layout 'image'/'shape'/
+    'caption' (uint8 HxWx3 already at training size, shape two little-endian
+    int32s, 'label' optional). `path` is the bucket mount or directory the
+    shards live under; an empty `shards` reads every arrayrecord file in
+    `path` itself, which is the layout prepare_images.py writes."""
 
     path: str | None = None
     shards: tuple[str, ...] = ()
@@ -318,8 +336,9 @@ class ArrayRecordImages(ImageDataset):
             raise ValueError(
                 f"{type(self).__name__} needs path= set: its records live under "
                 "<path>/<shard>/ for each of its shards")
+        roots = self.shards or ("",)
         files = []
-        for shard in self.shards:
+        for shard in roots:
             root = os.path.join(self.path, shard)
             files += [os.path.join(root, f) for f in sorted(os.listdir(root))
                       if 'array_record' in f]
@@ -327,6 +346,13 @@ class ArrayRecordImages(ImageDataset):
 
     def record(self, element, rng):
         element = unpack_dict_of_byte_arrays(element)
+        if 'image' in element:
+            height, width = np.frombuffer(element['shape'], dtype=np.int32)
+            image = np.frombuffer(element['image'], dtype=np.uint8).reshape(
+                int(height), int(width), 3)
+            label = element.get('label')
+            return (image, element['caption'].decode('utf-8'),
+                    None if label is None else int(np.frombuffer(label, np.int32)[0]))
         return element['jpg'], element['txt'].decode('utf-8'), None
 
 
