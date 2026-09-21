@@ -12,22 +12,21 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
-from flax import struct
 import jax
 import jax.numpy as jnp
 import optax
+from flax import struct
 
 from dew.inputs import Field, InputSpec
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import (Aux, Batch, EMASpec, Mean, Objective, Step,
-                                 Variables, mean_loss)
+from dew.objectives.base import Aux, Batch, EMASpec, Mean, Objective, Step, Variables, mean_loss
 from dew.registry import objectives
 
 if TYPE_CHECKING:
+    from dew.inference.tasks import BlockGeneration, Processor
     from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.training.state import TrainState
-    from dew.inference.tasks import BlockGeneration, Processor
 
 
 @struct.dataclass
@@ -156,7 +155,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                                pad_token_id=self.pad_token_id)
 
     @property
-    def bank_sites(self) -> tuple["DecoderBank", ...]:
+    def bank_sites(self) -> tuple[DecoderBank, ...]:
         """The shared text stack, as the training model declares it."""
         return self.training_model.bank_sites
 

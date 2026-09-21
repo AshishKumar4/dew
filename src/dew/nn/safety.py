@@ -1,5 +1,4 @@
 """CLIP vision projection and published concept-threshold image classification."""
-import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype

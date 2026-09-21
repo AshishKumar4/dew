@@ -16,10 +16,9 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from .dataset import (Batch, Dataset, DatasetSpec, Loading, local_batch, train_stream,
-                      validation_pass)
 from dew.registry import datasets
 
+from .dataset import Batch, Dataset, DatasetSpec, Loading, local_batch, train_stream, validation_pass
 from .tokens import bounded
 
 IDS_KEY = "input_ids"

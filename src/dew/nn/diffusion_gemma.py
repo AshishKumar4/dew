@@ -10,10 +10,9 @@ branch; those are uniform soft embeddings, not a zero signal.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import functools
 import math
-from typing import Optional
+from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
@@ -34,7 +33,7 @@ class SelfConditioning(nn.Module):
     hidden_size: int
     intermediate_size: int
     norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):

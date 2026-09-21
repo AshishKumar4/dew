@@ -1,12 +1,18 @@
+from typing import Literal
+
 from flax import linen as nn
-from typing import Optional, Literal
 from flax.typing import Dtype, PrecisionLike
 
-from ..dit import (
-    PatchSequenceEmbed, ConditioningEmbed, PatchSequenceOutput,
-    ModulatedBlock, remat_block, rope_for_scan,
-)
 from dew.registry import models
+
+from ..dit import (
+    ConditioningEmbed,
+    ModulatedBlock,
+    PatchSequenceEmbed,
+    PatchSequenceOutput,
+    remat_block,
+    rope_for_scan,
+)
 
 
 @models("simple_dit")
@@ -19,12 +25,12 @@ class SimpleDiT(nn.Module):
     num_heads: int = 12
     mlp_ratio: int = 4
     dropout_rate: float = 0.0  # Typically 0 for diffusion
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     remat: bool = False
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 

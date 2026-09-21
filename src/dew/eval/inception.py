@@ -1,14 +1,15 @@
 # Mostly derived from
 # https://github.com/matthias-wright/jax-fid
 
+from typing import Any, Callable, Sequence
+
+import flax.linen as nn
 import jax
+import jax.numpy as jnp
+from flax.linen.module import merge_param
 from jax import lax
 from jax.nn import initializers
-import jax.numpy as jnp
-import flax
-from flax.linen.module import merge_param
-import flax.linen as nn
-from typing import Callable, Optional, Sequence, Tuple, Union, Any
+
 from . import utils
 
 # The FID feature extractor's weights, the jax-fid pickle mirrored on the Hub
@@ -21,7 +22,7 @@ FID_WEIGHTS_DIGEST = '4e030efa5bccac3222d975f658d1884f9e00fab24f2812082884539220
 
 PRNGKey = Any
 Array = Any
-Shape = Tuple[int]
+Shape = tuple[int]
 Dtype = Any
 
 
@@ -156,7 +157,7 @@ class Dense(nn.Module):
     features: int
     kernel_init: nn.initializers.Initializer=nn.initializers.lecun_normal()
     bias_init: nn.initializers.Initializer=nn.initializers.zeros
-    params_dict: Optional[dict]=None
+    params_dict: dict | None=None
     dtype: str='float32'
 
     @nn.compact
@@ -170,13 +171,13 @@ class Dense(nn.Module):
 
 class BasicConv2d(nn.Module):
     out_channels: int
-    kernel_size: Union[int, Sequence[int]]=(3, 3)
-    strides: Optional[Sequence[int]]=(1, 1)
-    padding: Union[str, Sequence[Tuple[int, int]]]='valid'
+    kernel_size: int | Sequence[int]=(3, 3)
+    strides: Sequence[int] | None=(1, 1)
+    padding: str | Sequence[tuple[int, int]]='valid'
     use_bias: bool=False
     kernel_init: nn.initializers.Initializer=nn.initializers.lecun_normal()
     bias_init: nn.initializers.Initializer=nn.initializers.zeros
-    params_dict: Optional[dict]=None
+    params_dict: dict | None=None
     dtype: str='float32'
 
     @nn.compact
@@ -210,7 +211,7 @@ class BasicConv2d(nn.Module):
 
 class InceptionA(nn.Module):
     pool_features: int
-    params_dict: Optional[dict]=None
+    params_dict: dict | None=None
     dtype: str='float32'
 
     @nn.compact
@@ -249,13 +250,13 @@ class InceptionA(nn.Module):
                                   kernel_size=(1, 1),
                                   params_dict=utils.get(self.params_dict, 'branch_pool'),
                                   dtype=self.dtype)(branch_pool, train)
-        
+
         output = jnp.concatenate((branch1x1, branch5x5, branch3x3dbl, branch_pool), axis=-1)
         return output
 
 
 class InceptionB(nn.Module):
-    params_dict: Optional[dict]=None
+    params_dict: dict | None=None
     dtype: str='float32'
 
     @nn.compact
@@ -289,7 +290,7 @@ class InceptionB(nn.Module):
 
 class InceptionC(nn.Module):
     channels_7x7: int
-    params_dict: Optional[dict]=None
+    params_dict: dict | None=None
     dtype: str='float32'
 
     @nn.compact
@@ -298,7 +299,7 @@ class InceptionC(nn.Module):
                                 kernel_size=(1, 1),
                                 params_dict=utils.get(self.params_dict, 'branch1x1'),
                                 dtype=self.dtype)(x, train)
-            
+
         branch7x7 = BasicConv2d(out_channels=self.channels_7x7,
                                 kernel_size=(1, 1),
                                 params_dict=utils.get(self.params_dict, 'branch7x7_1'),
@@ -344,13 +345,13 @@ class InceptionC(nn.Module):
                                   kernel_size=(1, 1),
                                   params_dict=utils.get(self.params_dict, 'branch_pool'),
                                   dtype=self.dtype)(branch_pool, train)
-        
+
         output = jnp.concatenate((branch1x1, branch7x7, branch7x7dbl, branch_pool), axis=-1)
         return output
 
 
 class InceptionD(nn.Module):
-    params_dict: Optional[dict]=None
+    params_dict: dict | None=None
     dtype: str='float32'
 
     @nn.compact
@@ -364,7 +365,7 @@ class InceptionD(nn.Module):
                                 strides=(2, 2),
                                 params_dict=utils.get(self.params_dict, 'branch3x3_2'),
                                 dtype=self.dtype)(branch3x3, train)
-            
+
         branch7x7x3 = BasicConv2d(out_channels=192,
                                   kernel_size=(1, 1),
                                   params_dict=utils.get(self.params_dict, 'branch7x7x3_1'),
@@ -386,14 +387,14 @@ class InceptionD(nn.Module):
                                   dtype=self.dtype)(branch7x7x3, train)
 
         branch_pool = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2))
-        
+
         output = jnp.concatenate((branch3x3, branch7x7x3, branch_pool), axis=-1)
         return output
 
 
 class InceptionE(nn.Module):
     pooling: Callable
-    params_dict: Optional[dict]=None
+    params_dict: dict | None=None
     dtype: str='float32'
 
     @nn.compact
@@ -402,7 +403,7 @@ class InceptionE(nn.Module):
                                 kernel_size=(1, 1),
                                 params_dict=utils.get(self.params_dict, 'branch1x1'),
                                 dtype=self.dtype)(x, train)
-          
+
         branch3x3 = BasicConv2d(out_channels=384,
                                 kernel_size=(1, 1),
                                 params_dict=utils.get(self.params_dict, 'branch3x3_1'),
@@ -445,7 +446,7 @@ class InceptionE(nn.Module):
                                   kernel_size=(1, 1),
                                   params_dict=utils.get(self.params_dict, 'branch_pool'),
                                   dtype=self.dtype)(branch_pool, train)
-        
+
         output = jnp.concatenate((branch1x1, branch3x3, branch3x3dbl, branch_pool), axis=-1)
         return output
 
@@ -454,7 +455,7 @@ class InceptionAux(nn.Module):
     num_classes: int
     kernel_init: nn.initializers.Initializer=nn.initializers.lecun_normal()
     bias_init: nn.initializers.Initializer=nn.initializers.zeros
-    params_dict: Optional[dict]=None
+    params_dict: dict | None=None
     dtype: str='float32'
 
     @nn.compact
@@ -474,7 +475,7 @@ class InceptionAux(nn.Module):
                   params_dict=utils.get(self.params_dict, 'fc'),
                   dtype=self.dtype)(x)
         return x
-    
+
 def _absolute_dims(rank, dims):
     return tuple([rank + dim if dim < 0 else dim for dim in dims])
 
@@ -503,7 +504,7 @@ class BatchNorm(nn.Module):
                        the examples on the first two and last two devices. See `jax.lax.psum`
                        for more details.
     """
-    use_running_average: Optional[bool] = None
+    use_running_average: bool | None = None
     axis: int = -1
     momentum: float = 0.99
     epsilon: float = 1e-5
@@ -514,11 +515,11 @@ class BatchNorm(nn.Module):
     scale_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.ones
     mean_init: Callable[[Shape], Array] = lambda s: jnp.zeros(s, jnp.float32)
     var_init: Callable[[Shape], Array] = lambda s: jnp.ones(s, jnp.float32)
-    axis_name: Optional[str] = None
+    axis_name: str | None = None
     axis_index_groups: Any = None
 
     @nn.compact
-    def __call__(self, x, use_running_average: Optional[bool] = None):
+    def __call__(self, x, use_running_average: bool | None = None):
         """Normalizes the input using batch statistics.
         
         NOTE:
@@ -637,7 +638,7 @@ def pool(inputs, init, reduce_fn, window_shape, strides, padding):
     return y
 
 
-def avg_pool(inputs, window_shape, strides=None, padding: Union[str, Sequence[Tuple[int, int]]]='VALID'):
+def avg_pool(inputs, window_shape, strides=None, padding: str | Sequence[tuple[int, int]]='VALID'):
     """
     Pools the input by taking the average over a window.
 
@@ -666,5 +667,5 @@ def avg_pool(inputs, window_shape, strides=None, padding: Union[str, Sequence[Tu
                                           padding=((1, 1), (1, 1)),
                                           dimension_numbers=nn.linear._conv_dimension_numbers(ones.shape),
                                           feature_group_count=1)
-    y = y / counts 
+    y = y / counts
     return y

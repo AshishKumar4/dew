@@ -18,9 +18,7 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
-    from dew.artifacts import (
-        ImageGrid, Representations, TextSamples, TokenScores, VideoGrid,
-    )
+    from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
     from dew.data import Dataset
     from dew.diffusion import Process
     from dew.inference import pipeline
@@ -31,8 +29,19 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.sampling import CFG, sample
     from dew.telemetry.profile import profile
     from dew.training import (
-        Checkpoints, Evaluation, Layout, LocalTracker, MeshSpec, MLflowTracker,
-        TensorBoardTracker, Tracker, Trackers, Trainer, TrainState, WandbTracker, evaluate,
+        Checkpoints,
+        Evaluation,
+        Layout,
+        LocalTracker,
+        MeshSpec,
+        MLflowTracker,
+        TensorBoardTracker,
+        Tracker,
+        Trackers,
+        Trainer,
+        TrainState,
+        WandbTracker,
+        evaluate,
     )
 
 __version__ = "0.1.0"
@@ -47,7 +56,7 @@ _REGISTERS = (
 _REGISTRIES = ("models", "presets", "samplers", "datasets", "encoders", "metrics")
 
 _EXPORTS = {
-    **{name: "dew.registry" for name in _REGISTRIES},
+    **dict.fromkeys(_REGISTRIES, "dew.registry"),
     "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.training",
     "Aux": "dew.training", "EMASpec": "dew.training", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
@@ -85,11 +94,42 @@ def __dir__() -> list[str]:
 # `from dew import *` can all read the public surface without running the
 # lazy lookup above. tests/test_api_surface.py holds the two in agreement.
 __all__ = [
+    "CFG",
+    "Aux",
+    "Checkpoints",
+    "Condition",
+    "Dataset",
+    "EMASpec",
+    "Evaluation",
+    "Field",
+    "ImageGrid",
+    "InputSpec",
+    "Layout",
+    "LocalTracker",
+    "MLflowTracker",
+    "MeshSpec",
+    "Objective",
+    "Process",
+    "Representations",
+    "Step",
+    "TensorBoardTracker",
+    "TextSamples",
+    "TokenScores",
+    "Tracker",
+    "Trackers",
+    "TrainState",
+    "Trainer",
+    "VideoGrid",
+    "WandbTracker",
     "__version__",
-    "Aux", "CFG", "Checkpoints", "Condition", "Dataset", "EMASpec", "Evaluation", "Field",
-    "ImageGrid", "InputSpec", "Layout", "MLflowTracker", "MeshSpec", "Objective", "Process",
-    "Representations", "Step", "TensorBoardTracker", "TextSamples", "TokenScores", "Tracker",
-    "TrainState", "Trainer", "VideoGrid", "LocalTracker", "Trackers", "WandbTracker",
-    "datasets", "encoders", "evaluate", "metrics", "models", "pipeline", "profile", "presets", "sample",
+    "datasets",
+    "encoders",
+    "evaluate",
+    "metrics",
+    "models",
+    "pipeline",
+    "presets",
+    "profile",
+    "sample",
     "samplers",
 ]

@@ -31,7 +31,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -48,7 +47,7 @@ from dew.nn.sharding import logical_axes
 COMPRESSORS = ('csa', 'hca')
 
 
-def rope_freqs(positions, rope_dim: int, theta: float, yarn: Optional[YarnScaling]):
+def rope_freqs(positions, rope_dim: int, theta: float, yarn: YarnScaling | None):
     """cos/sin per pair over the rope width, `[..., rope_dim // 2]`.
 
     V4's rotary scales neither table: its YaRN entry forces
@@ -192,7 +191,7 @@ class GroupedLinear(nn.Module):
 
     groups: int
     features: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -222,9 +221,9 @@ class CompressedEntries(nn.Module):
     overlap: bool
     rope_dim: int
     rope_theta: float
-    yarn: Optional[YarnScaling]
+    yarn: YarnScaling | None
     norm_eps: float
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -285,7 +284,7 @@ class IndexScorer(nn.Module):
 
     n_heads: int
     head_dim: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -345,9 +344,9 @@ class Compressor(CompressedEntries):
     indexer that selects among them (modeling_deepseek_v4.py:580-693); an HCA
     layer attends every entry whose window closed (:353-435)."""
 
-    index_n_heads: Optional[int] = None
-    index_head_dim: Optional[int] = None
-    index_topk: Optional[int] = None
+    index_n_heads: int | None = None
+    index_head_dim: int | None = None
+    index_topk: int | None = None
 
     def setup(self):
         super().setup()
@@ -408,14 +407,14 @@ class DeepseekV4Attention(nn.Module):
     sliding_window: int
     max_seq_len: int = 8192
     rope_theta: float = 10000.0
-    yarn: Optional[YarnScaling] = None
-    compressor: Optional[str] = None
-    compress_rate: Optional[int] = None
-    index_topk: Optional[int] = None
-    index_n_heads: Optional[int] = None
-    index_head_dim: Optional[int] = None
+    yarn: YarnScaling | None = None
+    compressor: str | None = None
+    compress_rate: int | None = None
+    index_topk: int | None = None
+    index_n_heads: int | None = None
+    index_head_dim: int | None = None
     norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -557,11 +556,11 @@ class DeepseekV4Mixer(MixerBase):
     o_groups: int = 8
     o_lora_rank: int = 1024
     rope_head_dim: int = 64
-    compressor: Optional[str] = None
-    compress_rate: Optional[int] = None
-    index_topk: Optional[int] = None
-    index_n_heads: Optional[int] = None
-    index_head_dim: Optional[int] = None
+    compressor: str | None = None
+    compress_rate: int | None = None
+    index_topk: int | None = None
+    index_n_heads: int | None = None
+    index_head_dim: int | None = None
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         if not ctx.causal:

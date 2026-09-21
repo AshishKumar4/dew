@@ -8,16 +8,17 @@ frame, so a pretrained image checkpoint (inflate_unet_params) is the starting
 point and training only has to learn motion.
 """
 
+
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from typing import Optional
+
+from dew.registry import models
 
 from ..attention import NormalAttention, rotary_freqs
 from ..dit import ROPE_THETA
-from .unet import Unet, unet_body
-from dew.registry import models
 from ..sharding import logical_axes
+from .unet import Unet, unet_body
 
 
 @logical_axes({}, heuristic=(("temporal_out",),))
@@ -29,7 +30,7 @@ class TemporalBlock(nn.Module):
     """
     heads: int = 8
     norm_epsilon: float = 1e-5
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact

@@ -7,34 +7,39 @@ likelihoods; observations are inputs to later calls and never loss targets.
 
 from __future__ import annotations
 
+import hashlib
+import math
 from asyncio import CancelledError as AsyncCancelledError
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import CancelledError
 from contextlib import AbstractContextManager, ExitStack
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import IntEnum
-import hashlib
-import math
 from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, runtime_checkable
 from uuid import uuid4
 
 import jax
 import jax.numpy as jnp
-from jax.experimental import multihost_utils
 import numpy as np
+from jax.experimental import multihost_utils
 
 from dew.artifacts import agree_process_phase
-from dew.nn.inputs import ModelInputs
 from dew.data.prompts import LENGTH_KEY
-from dew.rl import group_advantage
+from dew.nn.inputs import ModelInputs, local_rows
 from dew.objectives.base import Variables
+from dew.rl import group_advantage
 from dew.sampling.text import Generation, Sampling
-from dew.nn.inputs import local_rows
 from dew.training.state import TrainState
 
 from .rollout import (
-    ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, IDS_KEY, OLD_LOG_PROBS_KEY,
-    RESPONSE_LENGTH_KEY, RESPONSE_MASK_KEY, REWARDS_KEY, TERMINATED_KEY,
+    ADVANTAGES_KEY,
+    BEHAVIOR_LOG_PROBS_KEY,
+    IDS_KEY,
+    OLD_LOG_PROBS_KEY,
+    RESPONSE_LENGTH_KEY,
+    RESPONSE_MASK_KEY,
+    REWARDS_KEY,
+    TERMINATED_KEY,
 )
 
 if TYPE_CHECKING:

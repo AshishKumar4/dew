@@ -13,17 +13,16 @@ position is carried entirely by the 2D sincos embedding that travels with
 each token.
 """
 
+from typing import Literal, Sequence
+
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Optional, Sequence, Tuple, Literal
 from flax.typing import Dtype, PrecisionLike
 
-from ..attention import rotary_freqs
-from ..dit import (
-    ROPE_THETA, PatchSequenceEmbed, ModulatedBlock, build_block_pattern,
-    scan_ordered_pos_embed,
-)
 from dew.registry import models
+
+from ..attention import rotary_freqs
+from ..dit import ROPE_THETA, ModulatedBlock, PatchSequenceEmbed, build_block_pattern, scan_ordered_pos_embed
 from ..sharding import logical_axes
 
 
@@ -39,16 +38,16 @@ class TokenStack(nn.Module):
     num_heads: int
     mlp_ratio: int = 4
     ssm_attention_ratio: str = "all-attn"
-    block_pattern: Optional[Sequence[str]] = None
+    block_pattern: Sequence[str] | None = None
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
 
     def setup(self):
         pattern = build_block_pattern(
@@ -90,16 +89,16 @@ class FactorizedTokenStack(nn.Module):
     num_heads: int
     mlp_ratio: int = 4
     ssm_attention_ratio: str = "all-attn"
-    block_pattern: Optional[Sequence[str]] = None
+    block_pattern: Sequence[str] | None = None
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
 
     def setup(self):
         def stack(name, num_layers, ratio):
@@ -145,12 +144,12 @@ class JepaEncoder(nn.Module):
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
 
@@ -197,12 +196,12 @@ class JepaVideoEncoder(nn.Module):
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
 
@@ -243,7 +242,7 @@ class JepaPredictor(nn.Module):
     Context tokens are projected down, mask tokens stand in for the targets,
     and both carry the sincos signal for the grid position they belong to.
     """
-    grid: Tuple[int, int] = (14, 14)
+    grid: tuple[int, int] = (14, 14)
     emb_features: int = 384      # encoder width, in and out
     predictor_features: int = 192
     num_layers: int = 6
@@ -253,12 +252,12 @@ class JepaPredictor(nn.Module):
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     scan_order: str = 'raster'
     factorized: bool = False     # space-time blocks, for video
 

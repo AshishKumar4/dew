@@ -1,10 +1,11 @@
 """JSON-compatible episode records for interchange and turn-boundary recovery."""
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
-import math
 
 from dew.sampling.text import Sampling
+
 from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Transition
 
 

@@ -50,7 +50,7 @@ class MixerContext:
     causal: bool = True
     rope_theta: float = 10000.0
     """The kind-resolved rotary base; a kind's yarn record transforms it."""
-    rope_scaling: Optional[RopeScaling] = None
+    rope_scaling: RopeScaling | None = None
     """The kind-resolved llama3 ramp over the base frequencies, or None for plain rope."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'
@@ -64,21 +64,21 @@ class MixerContext:
     scale_offset: bool = False
     scale_after_cast: bool = False
     kv_shared: bool = False
-    kv_store_key: Optional[str] = None
-    sliding_window: Optional[int] = None
+    kv_store_key: str | None = None
+    sliding_window: int | None = None
     attention_bias: bool = False
-    o_proj_bias: Optional[bool] = None
-    attention_scale: Optional[float] = None
+    o_proj_bias: bool | None = None
+    attention_scale: float | None = None
     attention_sinks: bool = False
-    yarn: Optional[mla.YarnScaling] = None
-    attn_logit_softcap: Optional[float] = None
-    partial_rotary_factor: Optional[float] = None
+    yarn: mla.YarnScaling | None = None
+    attn_logit_softcap: float | None = None
+    partial_rotary_factor: float | None = None
     partial_rotary_type: str = 'proportional'
     """Which convention the partial rotary follows, 'proportional' (Gemma 4)
     or 'default' (Qwen3.5); `dew.nn.attention.rotary_freqs` cites both."""
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     force_fp32_for_softmax: bool = True
     output_gate: bool = False
     """The attention's output gate (Qwen3.5's attn_output_gate), where the
@@ -138,11 +138,13 @@ def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
 
 
 # The kind modules register where they are defined; this hub imports them,
-# one line per kind module, alphabetical.
-from .attention import AttentionMixer  # noqa: E402,F401  (registers the kind)
-from .. import deepseek_v4  # noqa: E402,F401  (registers the kind)
-from .. import dsa_kpool  # noqa: E402,F401  (registers the kind)
+# one name per kind module, alphabetical.
+from .. import (
+    deepseek_v4,  # noqa: F401  (registers the kind)
+    dsa_kpool,  # noqa: F401  (registers the kind)
+    kda,  # noqa: F401  (registers the kind)
+    llama4,  # noqa: F401  (registers the kind)
+    mla,  # registers the kind, and names the YarnScaling above
+)
 from . import gated_delta_net  # noqa: E402,F401  (registers the kind)
-from .. import kda  # noqa: E402,F401  (registers the kind)
-from .. import llama4  # noqa: E402,F401  (registers the kind)
-from .. import mla  # noqa: E402,F401  (registers the kind)
+from .attention import AttentionMixer  # noqa: E402,F401  (registers the kind)

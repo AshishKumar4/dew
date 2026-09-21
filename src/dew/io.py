@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from etils import epath
 import jax
+from etils import epath
 
 from dew.checkpoints import RUN_FILE, is_uri
 from dew.training.tracker import WandbTracker

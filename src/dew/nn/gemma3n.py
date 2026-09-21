@@ -23,7 +23,6 @@ zeros about 95% of them before the activation.
 import dataclasses
 import functools
 import math
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -44,7 +43,7 @@ class AltUp:
     its blocks run on, under the reference's names (configuration_gemma3n.py)."""
     num_inputs: int = 4
     active_idx: int = 0
-    coef_clip: Optional[float] = 120.0
+    coef_clip: float | None = 120.0
     correct_scale: bool = True
 
     def __post_init__(self):
@@ -105,7 +104,7 @@ class LaurelBlock(nn.Module):
     rank: int
     emb_features: int
     norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -125,8 +124,8 @@ class _Coefficients(nn.Module):
     the kernel as stored. Same leaf as a Dense, so a checkpoint's Linear
     lands on it unchanged."""
     features: int
-    clip: Optional[float]
-    dtype: Optional[Dtype] = None
+    clip: float | None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -162,7 +161,7 @@ class AltUpLayer(nn.Module):
     spec: AltUp
     emb_features: int
     norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -206,5 +205,11 @@ class AltUpLayer(nn.Module):
         return (corrected.astype(jnp.float32) * self.correct_output_scale).astype(corrected.dtype)
 
 
-__all__ = ['AltUp', 'AltUpLayer', 'LaurelBlock', 'MAGNITUDE_EPSILON',
-           'gaussian_topk', 'rescale_to']
+__all__ = [
+    'MAGNITUDE_EPSILON',
+    'AltUp',
+    'AltUpLayer',
+    'LaurelBlock',
+    'gaussian_topk',
+    'rescale_to',
+]

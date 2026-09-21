@@ -203,9 +203,11 @@ def suppressions(module: Module) -> Iterator[Finding]:
     for number, text in enumerate(module.lines, start=1):
         code, _, comment = text.partition("#")
         # One sanctioned inline suppression: an import kept for the registry
-        # entry it makes, which is a side effect ruff has no way to see.
-        registration = (code.lstrip().startswith(("import ", "from "))
-                        and "F401" in comment and "registers" in comment)
+        # entry it makes, which is a side effect ruff has no way to see. The
+        # name may stand on an import line or inside a parenthesized block.
+        imported = (code.lstrip().startswith(("import ", "from "))
+                    or re.fullmatch(r"\s*[\w.]+ *,? *", code) is not None)
+        registration = imported and "F401" in comment and "registers" in comment
         for match in SUPPRESSIONS.finditer(text):
             hit = match.group("hit")
             if registration and hit.lstrip().startswith("#"):

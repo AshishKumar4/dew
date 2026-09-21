@@ -37,7 +37,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -178,10 +177,10 @@ class KimiDeltaAttention(nn.Module):
     num_heads: int
     head_dim: int
     conv_kernel: int = 4
-    lower_bound: Optional[float] = -5.0
+    lower_bound: float | None = -5.0
     chunk_size: int = CHUNK_SIZE
     norm_eps: float = 1e-5
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @property
@@ -288,7 +287,7 @@ class KimiDeltaAttentionMixer(MixerBase):
     linear_num_heads: int = 64
     linear_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
-    linear_lower_bound: Optional[float] = -5.0
+    linear_lower_bound: float | None = -5.0
 
     def build(self, ctx: MixerContext):
         if not ctx.causal:

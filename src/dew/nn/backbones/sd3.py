@@ -20,16 +20,14 @@ values are what the model reads and what export writes back.
 
 from __future__ import annotations
 
-import math
 from typing import Sequence
 
-import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.diffusion.process import DenoisingCondition
+from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.sharding import logical_axes
 from dew.registry import models
@@ -352,4 +350,4 @@ class SD3Transformer(nn.Module):
         return image.reshape(image.shape[0], rows * patch, columns * patch, self.out_channels)
 
 
-__all__ = ["SD3Transformer", "SD3Block", "sincos_position"]
+__all__ = ["SD3Block", "SD3Transformer", "sincos_position"]

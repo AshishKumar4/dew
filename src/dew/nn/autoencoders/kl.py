@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype
 
-from .vae import FlaxEncoder, FlaxDecoder
+from .vae import FlaxDecoder, FlaxEncoder
 
 
 class AutoencoderKL(nn.Module):

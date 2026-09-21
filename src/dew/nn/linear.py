@@ -45,7 +45,6 @@ and splits them the way the reference does.
 
 import functools
 import math
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -323,12 +322,12 @@ class GatedDeltaNet(nn.Module):
     head_k_dim: int
     head_v_dim: int
     conv_kernel: int = 4
-    max_seq_len: Optional[int] = None
+    max_seq_len: int | None = None
     chunk_size: int = CHUNK_SIZE
     norm_eps: float = 1e-6
     gate_activation: str = 'silu'  # the norm's gate: 'silu' | 'sigmoid', qwen4_exp's output_gate_type
     fused_in_proj: bool = False
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @property
@@ -529,7 +528,7 @@ class RMSNormGated(nn.Module):
 
     epsilon: float = 1e-6
     activation: str = 'silu'
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
 
     @nn.compact
     def __call__(self, x, gate):

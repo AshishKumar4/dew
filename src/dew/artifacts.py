@@ -10,10 +10,10 @@ from __future__ import annotations
 import json
 from typing import TypeVar
 
-from flax import struct
 import jax
-from jax.experimental import multihost_utils
 import numpy as np
+from flax import struct
+from jax.experimental import multihost_utils
 
 T = TypeVar("T")
 

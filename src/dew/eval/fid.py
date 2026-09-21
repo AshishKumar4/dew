@@ -2,19 +2,19 @@ import functools
 import warnings
 from dataclasses import dataclass
 
-from numpy.typing import NDArray
-
 import jax
 import jax.numpy as jnp
 import numpy as np
+from numpy.typing import NDArray
 
 from dew.artifacts import ImageGrid
 from dew.inputs import unit_range
 from dew.registry import metrics
+
 from .common import metric_device
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_inception():
     """The pool3 feature extractor and its parameters, loaded once per
     process. The FID InceptionV3 is about 90 MB of weights, and every metric
@@ -111,7 +111,7 @@ class FIDStats:
     real: GaussianStats
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_activations():
     """The jitted pool3 feature extractor, built on first use.
 

@@ -9,7 +9,7 @@ import math
 import queue
 import threading
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Iterator, Optional, TypeAlias
+from typing import TYPE_CHECKING, Any, Iterator, TypeAlias
 
 if TYPE_CHECKING:
     from dew.telemetry.profile import Profiler
@@ -19,10 +19,17 @@ import numpy as np
 from flax import linen as nn
 from flax.linen import spmd
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
+
 from dew.data.dataset import Checkpointable
 from dew.nn.inputs import BATCH_AXES, filled_validity
 from dew.nn.sharding import (
-    DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LogicalAxes,
+    DATA_AXIS,
+    EXPERT_AXIS,
+    FSDP_AXIS,
+    SEQUENCE_AXIS,
+    STAGE_AXIS,
+    TENSOR_AXIS,
+    LogicalAxes,
     declared_axes,
 )
 from dew.objectives.base import Batch, Variables
@@ -88,7 +95,7 @@ class MeshSpec:
     stage: int = 1
     """Pipeline stages the layer stack is split into, each on its own devices; 1
     runs the stack whole on every device."""
-    microbatches: Optional[int] = None
+    microbatches: int | None = None
     """Microbatches a step feeds through the stages, a multiple of `stage`; None
     is one per stage, the smallest schedule. A stage runs one microbatch while
     the next runs the one before it, so more microbatches shrink the idle
@@ -126,7 +133,7 @@ def _rule_table(rules: LogicalAxisRules | Mapping[str, MeshAxes]) -> LogicalAxis
 
 
 
-def build_mesh(spec: MeshSpec = MeshSpec(), devices: Optional[list] = None) -> Mesh:
+def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh:
     """Six-axis device mesh: parameters shard over 'fsdp', 'expert' and
     'tensor', batches over the first four with their sequence dimension on
     'sequence', and the layer stack over 'stage'.
@@ -483,8 +490,8 @@ class DevicePrefetchIterator:
     """
 
     def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = 2,
-                 source_state: Optional[bytes] = None,
-                 profiler: "Profiler | None" = None):
+                 source_state: bytes | None = None,
+                 profiler: Profiler | None = None):
         if depth <= 0:
             raise ValueError("prefetch depth must be positive")
         self._iterator: Iterator | None = iter(iterator)

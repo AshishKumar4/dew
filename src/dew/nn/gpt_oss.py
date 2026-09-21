@@ -14,10 +14,10 @@ import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
-from numpy.typing import ArrayLike
 from flax import linen as nn
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
+from numpy.typing import ArrayLike
 
 from dew.nn.moe import expert_dispatch, expert_projection, gather_expert_bias
 from dew.nn.sharding import logical_axes

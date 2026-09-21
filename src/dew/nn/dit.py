@@ -11,23 +11,27 @@ sandwich; the model files arrange blocks.
 
 import inspect
 import math
+from typing import Sequence
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
-from flax import struct
-from typing import Optional, Sequence
+from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from .attention import NormalAttention, rotary_freqs
 from .blocks import FourierEmbedding, TimeProjection
-from .sharding import logical_axes
-from .ssm import S5Layer, BidirectionalS5Layer, SpatialFusionConv
 from .scan_orders import (
-    hilbert_indices, inverse_permutation, hilbert_patchify, hilbert_unpatchify,
-    zigzag_indices, zigzag_patchify, unpatchify,
     build_2d_sincos_pos_embed,
+    hilbert_indices,
+    hilbert_patchify,
+    hilbert_unpatchify,
+    inverse_permutation,
+    unpatchify,
+    zigzag_indices,
+    zigzag_patchify,
 )
+from .sharding import logical_axes
+from .ssm import BidirectionalS5Layer, S5Layer, SpatialFusionConv
 
 SCAN_ORDERS = ('raster', 'hilbert', 'zigzag')
 
@@ -71,7 +75,7 @@ def scan_ordered_pos_embed(emb_dim: int, H_P: int, W_P: int, scan_order: str):
 
 
 def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",
-                        block_pattern: Optional[Sequence[str]] = None):
+                        block_pattern: Sequence[str] | None = None):
     """Per-layer mixer choice from a ratio string like '3:1', 'all-ssm', 'all-attn'."""
     if block_pattern is not None:
         if len(block_pattern) != num_layers:
@@ -92,7 +96,7 @@ class PatchEmbedding(nn.Module):
     row-major token sequence `[B, H_P * W_P, embedding_dim]`."""
     patch_size: int
     embedding_dim: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -118,7 +122,7 @@ class AdaLNParams(nn.Module):
     shared vector, and the zero init makes every block the identity at start.
     """
     features: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -145,7 +149,7 @@ class PatchSequenceEmbed(nn.Module):
     patch_size: int
     emb_features: int
     scan_order: str = 'raster'
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -198,7 +202,7 @@ class ConditioningEmbed(nn.Module):
     consumes."""
     emb_features: int
     mlp_ratio: int = 4
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -211,7 +215,7 @@ class ConditioningEmbed(nn.Module):
             features=self.emb_features, dtype=self.dtype,
             precision=self.precision, name="text_context_proj")
 
-    def __call__(self, temb, textcontext: Optional[TextContext] = None):
+    def __call__(self, temb, textcontext: TextContext | None = None):
         cond_emb = self.time_embed(temb)
         if textcontext is not None:
             text_emb = self.text_proj(textcontext.hidden)
@@ -228,7 +232,7 @@ class PatchSequenceOutput(nn.Module):
     output_channels: int
     modulated: bool = False  # adaLN shift/scale on the final norm (DiT FinalLayer)
     norm_epsilon: float = 1e-5
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -292,7 +296,7 @@ def saved_through_remat(prim, *args, **params) -> bool:
             or _DOTS_AND_ATTENTION_OUTPUT(prim, *args, **params))
 
 
-def remat_block(block_cls, enabled: bool, policy: Optional[str] = 'dots'):
+def remat_block(block_cls, enabled: bool, policy: str | None = 'dots'):
     """Optionally rematerialize a block class.
 
     Recomputing a block during the backward pass trades extra compute for a
@@ -335,13 +339,13 @@ class ModulatedBlock(nn.Module):
     modulated: bool = True
     mlp_ratio: int = 4
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     use_gating: bool = True
     qk_norm: bool = False
-    attention_impl: Optional[str] = None  # None (reference) | 'xla' | 'cudnn' | 'tpu'
+    attention_impl: str | None = None  # None (reference) | 'xla' | 'cudnn' | 'tpu'
     # ssm mixer options
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True

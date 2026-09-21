@@ -11,9 +11,9 @@ The names on disk are the module names in the tree.
 
 import json
 import os
-from pathlib import Path
 import tempfile
-from typing import Any, Callable, Dict, Mapping
+from pathlib import Path
+from typing import Any, Callable, Mapping
 
 import jax
 import ml_dtypes
@@ -61,7 +61,7 @@ def _safetensors():
 
 
 def _publish(
-    tensors: Callable[[], Dict[str, np.ndarray]],
+    tensors: Callable[[], dict[str, np.ndarray]],
     path,
     metadata: Mapping[str, str] | None = None,
 ) -> None:
@@ -109,13 +109,13 @@ def _host_array(leaf) -> np.ndarray:
     return array if array.flags.c_contiguous else np.ascontiguousarray(array)
 
 
-def _flatten(params) -> Dict[str, np.ndarray]:
+def _flatten(params) -> dict[str, np.ndarray]:
     leaves, _ = jax.tree_util.tree_flatten_with_path(params)
     return {_leaf_name(path): _host_array(leaf) for path, leaf in leaves}
 
 
-def _unflatten(tensors: Mapping[str, np.ndarray]) -> Dict[str, Any]:
-    tree: Dict[str, Any] = {}
+def _unflatten(tensors: Mapping[str, np.ndarray]) -> dict[str, Any]:
+    tree: dict[str, Any] = {}
     for name, tensor in tensors.items():
         *branches, leaf = name.split(SEPARATOR)
         node = tree
@@ -130,7 +130,7 @@ def save_params(params, path) -> None:
     _publish(lambda: _flatten(params), path)
 
 
-def load_params(path) -> Dict[str, Any]:
+def load_params(path) -> dict[str, Any]:
     """Read a safetensors file back into a nested parameter dict.
 
     Leaves are read-only views of the file in their stored dtype, so nothing
@@ -140,7 +140,7 @@ def load_params(path) -> Dict[str, Any]:
     return _unflatten(tensors)
 
 
-def _tensor_offsets(path: str, header: object) -> Dict[str, int]:
+def _tensor_offsets(path: str, header: object) -> dict[str, int]:
     """Each tensor's byte offset from the start of the data region.
 
     safe_open already validated the container, so a malformed entry here is a
@@ -149,7 +149,7 @@ def _tensor_offsets(path: str, header: object) -> Dict[str, int]:
     """
     if not isinstance(header, dict):
         raise ValueError(f"{path} is not a safetensors file: its header is not a table")
-    offsets: Dict[str, int] = {}
+    offsets: dict[str, int] = {}
     for key, entry in header.items():
         if key == "__metadata__":
             continue
@@ -175,7 +175,7 @@ def _tensor_offsets(path: str, header: object) -> Dict[str, int]:
     return offsets
 
 
-def read_file(path) -> tuple[Dict[str, np.ndarray], Dict[str, str]]:
+def read_file(path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
     """A file's flat tensor table, names as stored, and its header metadata.
 
     One read-only memory map backs every array, so the tensors stay file
@@ -183,7 +183,7 @@ def read_file(path) -> tuple[Dict[str, np.ndarray], Dict[str, str]]:
     bfloat16 included. Anything that wants float32 asks for it.
     """
     filename = os.fspath(path)
-    tensors: Dict[str, np.ndarray] = {}
+    tensors: dict[str, np.ndarray] = {}
     package, _ = _safetensors()
     with package.safe_open(filename, "np") as reader:
         with open(filename, "rb") as stream:
@@ -218,7 +218,7 @@ def write_file(
     _publish(lambda: dict(tensors), path, metadata)
 
 
-def save_hf_layout(params, config: Dict[str, Any], directory) -> None:
+def save_hf_layout(params, config: dict[str, Any], directory) -> None:
     """Write model.safetensors and config.json into `directory`.
 
     That pair is what a Hugging Face style loader looks for. The config is

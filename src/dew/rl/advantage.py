@@ -33,7 +33,6 @@ Everything here is array math. A function takes arrays and returns arrays, so
 nothing in this file knows what a model, an objective or a trainer is.
 """
 
-from typing import Tuple
 
 import jax
 import jax.numpy as jnp
@@ -131,7 +130,7 @@ def rloo_advantage(rewards: jax.Array, group: int) -> jax.Array:
 
 
 def gae(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
-        gamma: float, lam: float) -> Tuple[jax.Array, jax.Array]:
+        gamma: float, lam: float) -> tuple[jax.Array, jax.Array]:
     """Generalized advantage estimation over `[B, T]` rewards and values.
 
     `delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)` and

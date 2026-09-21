@@ -17,15 +17,15 @@ import io
 import json
 import tempfile
 import time
-from pathlib import Path
 from collections.abc import Mapping
-from typing import Protocol, TextIO, TypeAlias, TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
 
 import jax
 import numpy as np
 
-from dew.artifacts import ImageGrid, Representations, TextSamples, VideoGrid, TokenScores
-from dew.telemetry.records import RECORD_TYPES, RunRecord, FitEnded, json_value
+from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
+from dew.telemetry.records import RECORD_TYPES, FitEnded, RunRecord, json_value
 
 if TYPE_CHECKING:
     from mlflow.tracking import MlflowClient
@@ -263,8 +263,8 @@ class LocalTracker(_OwnedTracker):
     def plot(self) -> list[Path]:
         """Render journal metrics with matplotlib Agg; never changes the journal."""
         self._check()
-        from matplotlib.figure import Figure
         from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
         history: dict[str, list[tuple[int, float]]] = {}
         journal = self.directory / 'scalars.jsonl'
         if not journal.exists():
@@ -489,7 +489,7 @@ class TensorBoardTracker(_OwnedTracker):
 
 def _text(tag: str, payload: str) -> Summary.Value:
     """A text-plugin summary value: the string tensor a text tab reads."""
-    from tensorboard.compat.proto import (summary_pb2, tensor_pb2, tensor_shape_pb2, types_pb2)
+    from tensorboard.compat.proto import summary_pb2, tensor_pb2, tensor_shape_pb2, types_pb2
 
     return summary_pb2.Summary.Value(
         tag=tag,

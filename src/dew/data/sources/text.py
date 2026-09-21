@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Optional
 
 import numpy as np
 
@@ -66,7 +65,7 @@ class TokenFileSource:
     def __len__(self) -> int:
         return (len(self._tokens) - 1) // self.seq_len
 
-    def __getitem__(self, index: int) -> Dict[str, np.ndarray]:
+    def __getitem__(self, index: int) -> dict[str, np.ndarray]:
         # A memmap slice past its end yields an empty array instead of an error,
         # so the bounds are checked here.
         if not 0 <= index < len(self):
@@ -104,7 +103,7 @@ class TokenDocumentSource:
     span it is asked for.
     """
 
-    def __init__(self, path: str, eos_id: Optional[int] = None):
+    def __init__(self, path: str, eos_id: int | None = None):
         self.path = str(path)
         self.dtype = _DEFAULT_DTYPE
         self.vocab_size = None
@@ -141,7 +140,7 @@ class TokenDocumentSource:
     def __len__(self) -> int:
         return len(self._ends)
 
-    def __getitem__(self, index: int) -> Dict[str, np.ndarray]:
+    def __getitem__(self, index: int) -> dict[str, np.ndarray]:
         if not 0 <= index < len(self):
             raise IndexError(index)
         window = self._tokens[self._starts[index]:self._ends[index]]

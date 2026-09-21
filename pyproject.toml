@@ -130,6 +130,12 @@ extend-allowed-calls = ["jax.numpy.asarray", "flax.linen.map_variables"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["dew"]
+# `from x import A as B, C` is one line in this tree; splitting it per alias
+# turns three-name imports into three lines and hides the shared origin.
+combine-as-imports = true
+# A trailing comma in a wrapped import is this tree's punctuation, not a
+# request for one name per line; a wrapped import that fits joins back up.
+split-on-trailing-comma = false
 
 [tool.ruff.lint.per-file-ignores]
 # The suite prints its own diagnostics and calls library predicates positionally.

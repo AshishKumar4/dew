@@ -19,7 +19,7 @@ compilation rather than a constant embedded in the executable.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -27,7 +27,7 @@ import numpy as np
 import optax
 
 from dew.artifacts import TextSamples, agree_process_phase, collective_host
-from dew.diffusion.discrete import DiscreteProcess, MDLM_STEPS, Unmask
+from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables
 from dew.objectives.lm.chunked import chunked_cross_entropy
@@ -35,8 +35,8 @@ from dew.registry import objectives
 from dew.sampling.sample import sample
 
 if TYPE_CHECKING:
-    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.inference.tasks import MaskedGeneration, Processor
+    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.training.state import TrainState
 
 TEXT_KEY = "text"
@@ -59,7 +59,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
         sampler: Unmask = Unmask(),
         steps: int = MDLM_STEPS,
         samples: int = 4,
-        decode: Optional[Callable[[Sequence[int]], str]] = None,
+        decode: Callable[[Sequence[int]], str] | None = None,
         pretrained: Variables | None = None,
     ):
         """`seq_len` is the width of a batch row; `sampler`, `steps` and

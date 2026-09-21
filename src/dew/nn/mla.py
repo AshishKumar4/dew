@@ -28,7 +28,6 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -38,8 +37,14 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.scipy.special import xlogy
 
 from dew.nn.attention import (
-    RMSNorm, _cache_positions, _write_cache, apply_rotary, causal_attention_mask,
-    max_attention_logits, rotary_freqs, scaled_dot_product_attention,
+    RMSNorm,
+    _cache_positions,
+    _write_cache,
+    apply_rotary,
+    causal_attention_mask,
+    max_attention_logits,
+    rotary_freqs,
+    scaled_dot_product_attention,
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.sharding import logical_axes
@@ -62,12 +67,12 @@ class YarnScaling:
     original_max_position_embeddings: int = 4096
     beta_fast: float = 32.0
     beta_slow: float = 1.0
-    mscale: Optional[float] = None
-    mscale_all_dim: Optional[float] = None
+    mscale: float | None = None
+    mscale_all_dim: float | None = None
     truncate: bool = True
     # An explicit cos/sin amplitude, which the reference applies instead of
     # deriving one; None derives it from factor and the mscales above.
-    attention_factor: Optional[float] = None
+    attention_factor: float | None = None
 
 
 def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> jax.Array:
@@ -136,7 +141,7 @@ def yarn_query_scale(yarn: YarnScaling) -> float:
 
 
 def mla_rope_freqs(positions, head_dim: int, theta: float,
-                   yarn: Optional[YarnScaling]):
+                   yarn: YarnScaling | None):
     """cos/sin over the rope width, plain or YaRN-scaled: `[P, head_dim // 2]`.
 
     Plain rope is `rotary_freqs`, the one layout every mixer shares. YaRN
@@ -324,9 +329,9 @@ class SparseIndexer(nn.Module):
     n_heads: int
     head_dim: int
     rope_head_dim: int
-    top_k: Optional[int] = None
+    top_k: int | None = None
     rope_interleave: bool = False
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -479,7 +484,7 @@ class MultiHeadLatentAttention(nn.Module):
     emb_features: int
     num_heads: int
     max_seq_len: int
-    q_lora_rank: Optional[int]
+    q_lora_rank: int | None
     kv_lora_rank: int
     qk_nope_head_dim: int
     qk_rope_head_dim: int
@@ -487,7 +492,7 @@ class MultiHeadLatentAttention(nn.Module):
     causal: bool = True
     rope_theta: float = 10000.0
     rope_interleave: bool = True
-    yarn: Optional[YarnScaling] = None
+    yarn: YarnScaling | None = None
     # DeepSeek and GLM norm the latents at RMSNorm's 1e-6 default whatever
     # the trunk's rms_norm_eps says (modeling_deepseek_v3.py:392,404,
     # modeling_glm_moe_dsa.py:349,361).
@@ -495,15 +500,15 @@ class MultiHeadLatentAttention(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     attention_bias: bool = False
-    index_topk: Optional[int] = None
-    index_n_heads: Optional[int] = None
-    index_head_dim: Optional[int] = None
+    index_topk: int | None = None
+    index_n_heads: int | None = None
+    index_head_dim: int | None = None
     index_rope_interleave: bool = False
     index_shared: bool = False
-    kv_store_key: Optional[str] = None
-    dtype: Optional[Dtype] = None
+    kv_store_key: str | None = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     force_fp32_for_softmax: bool = True
 
     def setup(self):
@@ -810,9 +815,6 @@ class MultiHeadLatentAttention(nn.Module):
 from dew.nn.mixers import MixerBase, MixerContext, mixers  # noqa: E402
 
 
-from dew.nn.mixers import MixerBase, MixerContext, mixers
-
-
 @mixers("mla")
 @dataclasses.dataclass(frozen=True)
 class MLAMixer(MixerBase):
@@ -843,16 +845,16 @@ class MLAMixer(MixerBase):
     attention scale, a partial rotary) are refused.
     """
 
-    q_lora_rank: Optional[int] = None
+    q_lora_rank: int | None = None
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
     rope_interleave: bool = True
-    yarn: Optional[YarnScaling] = None
-    index_topk: Optional[int] = None
-    index_n_heads: Optional[int] = None
-    index_head_dim: Optional[int] = None
+    yarn: YarnScaling | None = None
+    index_topk: int | None = None
+    index_n_heads: int | None = None
+    index_head_dim: int | None = None
     index_rope_interleave: bool = False
 
     @property

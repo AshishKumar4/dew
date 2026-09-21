@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Iterator, Mapping
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import grain.python as pygrain
 
@@ -74,7 +74,7 @@ NO_ROWS = (
     "streaming=True.")
 
 
-def shared(rows: "IterableDataset", *, rank: int, world_size: int) -> "IterableDataset":
+def shared(rows: IterableDataset, *, rank: int, world_size: int) -> IterableDataset:
     """`rows` reduced to the share process `rank` of `world_size` reads."""
     if world_size <= 1:
         return rows
@@ -83,7 +83,7 @@ def shared(rows: "IterableDataset", *, rank: int, world_size: int) -> "IterableD
     return split_dataset_by_node(rows, rank=rank, world_size=world_size)
 
 
-def refusal(rows: "IterableDataset", *, shuffled: bool, given: bool) -> Optional[str]:
+def refusal(rows: IterableDataset, *, shuffled: bool, given: bool) -> str | None:
     """Why this stream cannot be put back where it stopped, or None if it can.
 
     Three questions, in the order they can be answered without reading a row:
@@ -117,8 +117,8 @@ class _Rows(pygrain.DatasetIterator):
     closing the pipeline is not waiting on a `next` that never returns.
     """
 
-    def __init__(self, open_pass: Callable[[int], "IterableDataset"], *,
-                 epochs: Optional[int], refused: Optional[str], what: str, rank: int,
+    def __init__(self, open_pass: Callable[[int], IterableDataset], *,
+                 epochs: int | None, refused: str | None, what: str, rank: int,
                  world_size: int):
         super().__init__()
         self._open_pass = open_pass
@@ -129,9 +129,9 @@ class _Rows(pygrain.DatasetIterator):
         self._world_size = world_size
         self._epoch = 0
         self._read = 0
-        self._restore: Optional[Mapping[str, object]] = None
-        self._split: Optional["IterableDataset"] = None
-        self._rows: Optional[Iterator[Row]] = None
+        self._restore: Mapping[str, object] | None = None
+        self._split: IterableDataset | None = None
+        self._rows: Iterator[Row] | None = None
 
     def _open(self) -> Iterator[Row]:
         split = self._split = self._open_pass(self._epoch)
@@ -203,9 +203,9 @@ class HFRows(pygrain.IterDataset):
     share is a different order and no pass is held in memory.
     """
 
-    def __init__(self, open_split: Callable[[], "IterableDataset"], *, what: str,
+    def __init__(self, open_split: Callable[[], IterableDataset], *, what: str,
                  seed: int, rank: int, world_size: int, shuffle_buffer: int,
-                 epochs: Optional[int], given: bool):
+                 epochs: int | None, given: bool):
         super().__init__()
         if world_size < 1 or not 0 <= rank < world_size:
             raise ValueError(f"rank {rank} is not one of {world_size} processes")
@@ -222,7 +222,7 @@ class HFRows(pygrain.IterDataset):
         self.shuffle_buffer = shuffle_buffer
         self.epochs = epochs
         self._asked = threading.Lock()
-        self._answer: Optional[tuple[Optional[str]]] = None
+        self._answer: tuple[str | None] | None = None
 
     def __repr__(self) -> str:
         return (f"HFRows({self.what}, seed={self.seed}, "
@@ -230,14 +230,14 @@ class HFRows(pygrain.IterDataset):
                 f"shuffle_buffer={self.shuffle_buffer}, epochs={self.epochs}, "
                 f"given={self.given})")
 
-    def _pass(self, epoch: int) -> "IterableDataset":
+    def _pass(self, epoch: int) -> IterableDataset:
         rows = self._open_split()
         if self.shuffle_buffer:
             rows = rows.shuffle(seed=self.seed + epoch, buffer_size=self.shuffle_buffer)
         return shared(rows, rank=self.rank, world_size=self.world_size)
 
     @property
-    def refused(self) -> Optional[str]:
+    def refused(self) -> str | None:
         """Why a position over these rows would not restore them, or None.
 
         Answered once: the question opens the split, which for a hub dataset

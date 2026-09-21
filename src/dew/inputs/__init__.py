@@ -22,9 +22,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import registry
-from .encoders import CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
-from dew.objectives.base import Variables
 from dew.nn.vision import PIXEL_VALUES_KEY
+from dew.objectives.base import Variables
+
+from .encoders import CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
 
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
@@ -66,7 +67,7 @@ class Condition:
                 "unconditional": self.unconditional}
 
     @classmethod
-    def from_json(cls, data: Mapping, *, params: Variables | None = None) -> "Condition":
+    def from_json(cls, data: Mapping, *, params: Variables | None = None) -> Condition:
         encoder = data["encoder"]
         return cls(encoder=rebuild(encoder["name"], encoder["fields"], params=params),
                    field=data["field"], unconditional=data["unconditional"])
@@ -113,7 +114,7 @@ class InputSpec:
                 **({"mask": {"key": self.mask.key, "shape": list(self.mask.shape)}} if self.mask is not None else {})}
 
     @classmethod
-    def from_json(cls, data: Mapping, *, params: Mapping[str, Variables] | None = None) -> "InputSpec":
+    def from_json(cls, data: Mapping, *, params: Mapping[str, Variables] | None = None) -> InputSpec:
         """Rebuild metadata around supplied condition parameters, or load source weights."""
         sample = data["sample"]
         return cls(sample=Field(sample["key"], tuple(sample["shape"])),
@@ -125,5 +126,16 @@ class InputSpec:
 
 from .diffusion import DiffusionConditioner
 
-__all__ = ["Field", "Condition", "InputSpec", "ConditionEncoder", "CLIPText", "T5Text",
-           "CharTable", "DiffusionConditioner", "rebuild", "unit_range", "pixel_field"]
+__all__ = [
+    "CLIPText",
+    "CharTable",
+    "Condition",
+    "ConditionEncoder",
+    "DiffusionConditioner",
+    "Field",
+    "InputSpec",
+    "T5Text",
+    "pixel_field",
+    "rebuild",
+    "unit_range",
+]

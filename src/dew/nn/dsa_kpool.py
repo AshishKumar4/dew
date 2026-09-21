@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -95,7 +94,7 @@ class KPoolIndexer(nn.Module):
     top_k: int
     kpool: int
     always_select_tail: bool = True
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -254,9 +253,9 @@ class KPoolSparseAttention(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     attention_bias: bool = False
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     force_fp32_for_softmax: bool = True
 
     def setup(self):

@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from flax import struct
-from flax.training.dynamic_scale import DynamicScale
 import jax
 import optax
+from flax import struct
+from flax.training.dynamic_scale import DynamicScale
 
 from dew.objectives.base import Aux, Batch, Step, Variables, merge
 

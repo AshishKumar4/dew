@@ -10,7 +10,6 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -19,8 +18,13 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.attention import (
-    RMSNorm, RopeScaling, apply_rotary, causal_attention_mask,
-    max_attention_logits, open_kv_cache, rotary_freqs,
+    RMSNorm,
+    RopeScaling,
+    apply_rotary,
+    causal_attention_mask,
+    max_attention_logits,
+    open_kv_cache,
+    rotary_freqs,
     scaled_dot_product_attention,
 )
 from dew.nn.inputs import AttentionMetadata
@@ -61,7 +65,7 @@ class CausalSelfAttention(nn.Module):
     max_seq_len: int
     causal: bool = True
     rope_theta: float = 10000.0
-    rope_scaling: Optional[RopeScaling] = None  # Llama 3.1's ramp over the base frequencies
+    rope_scaling: RopeScaling | None = None  # Llama 3.1's ramp over the base frequencies
     qk_norm: bool = True
     qk_norm_scope: str = 'head'  # 'head': one RMSNorm per head; 'projection': over the whole q/k
     v_norm: bool = False
@@ -69,21 +73,21 @@ class CausalSelfAttention(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     kv_shared: bool = False
-    kv_store_key: Optional[str] = None
-    sliding_window: Optional[int] = None
+    kv_store_key: str | None = None
+    sliding_window: int | None = None
     attention_bias: bool = False  # q/k/v biases, as config.attention_bias in HF
-    o_proj_bias: Optional[bool] = None  # None follows attention_bias; Qwen2 biases q/k/v only
-    attention_scale: Optional[float] = None  # None: the kernel's own 1/sqrt(head_dim)
+    o_proj_bias: bool | None = None  # None follows attention_bias; Qwen2 biases q/k/v only
+    attention_scale: float | None = None  # None: the kernel's own 1/sqrt(head_dim)
     attention_sinks: bool = False
-    yarn: Optional[YarnScaling] = None
-    attn_logit_softcap: Optional[float] = None  # Gemma 2's tanh on the logits, attn_logit_softcapping
+    yarn: YarnScaling | None = None
+    attn_logit_softcap: float | None = None  # Gemma 2's tanh on the logits, attn_logit_softcapping
     k_eq_v: bool = False  # Gemma 4's global layers project no values: the raw keys, values-normed
     output_gate: bool = False  # Qwen3.5 doubles q_proj and gates the branch with a sigmoid
-    partial_rotary_factor: Optional[float] = None  # None: every head dim rotates
+    partial_rotary_factor: float | None = None  # None: every head dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     force_fp32_for_softmax: bool = True
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None

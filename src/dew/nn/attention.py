@@ -2,20 +2,22 @@
 use, the latter ported from diffusers' attention_flax.py."""
 
 import dataclasses
+import functools
+import math
 
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from flax import linen as nn
-from typing import Optional
+from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.sharding import PartitionSpec as P
-from flax.linen.dtypes import promote_dtype
-import functools
-import math
-from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
-from .attention_sinks import attention_with_sinks
+
 from dew.telemetry.devices import deterministic_ops_requested
+
+from .attention_sinks import attention_with_sinks
+from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
+
 
 def repeat_kv_heads(x, num_heads: int):
     """Repeat grouped key/value heads out to the query heads: [B, S, K, D] -> [B, S, N, D].
@@ -55,8 +57,8 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
 
 
 def combined_attention_mask(query_length: int, key_length: int, causal: bool,
-                            sliding_window: Optional[int],
-                            mask: Optional[jax.Array]) -> Optional[jax.Array]:
+                            sliding_window: int | None,
+                            mask: jax.Array | None) -> jax.Array | None:
     """`mask` with the structural positions folded in: a causal flag keeps
     keys at or before each query's row, a window narrows that to the most
     recent keys, both read off the row index the way the fused kernels take
@@ -70,9 +72,9 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
 
 
 def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = False,
-                         sliding_window: Optional[int] = None,
-                         mask: Optional[jax.Array] = None,
-                         bias: Optional[jax.Array] = None) -> jax.Array:
+                         sliding_window: int | None = None,
+                         mask: jax.Array | None = None,
+                         bias: jax.Array | None = None) -> jax.Array:
     """Per query head, the largest pre-softmax logit: `[batch, heads]`, fp32.
 
     The logits are the scaled dot products the kernels softmax, masked
@@ -113,7 +115,7 @@ class RMSNorm(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     with_scale: bool = True
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
 
     @nn.compact
     def __call__(self, x):
@@ -186,7 +188,7 @@ class RopeScaling:
 
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
                  partial_rotary_type: str = 'proportional',
-                 rope_scaling: Optional[RopeScaling] = None):
+                 rope_scaling: RopeScaling | None = None):
     """cos/sin of the rotary angles at absolute `positions`: [P, pairs].
 
     `positions` may be [P] (one sequence) or [B, P] (a packed batch whose
@@ -235,7 +237,7 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
     return jnp.cos(angles), jnp.sin(angles)
 
 
-def apply_rotary(x, freqs_cos, freqs_sin, scale: Optional[float] = None):
+def apply_rotary(x, freqs_cos, freqs_sin, scale: float | None = None):
     """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders.
 
     The freqs are [S, pairs] for one sequence, or [B, S, pairs] when a packed
@@ -764,14 +766,14 @@ class NormalAttention(nn.Module):
     query_dim: int
     heads: int = 4
     dim_head: int = 64
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_bias: bool = True
     force_fp32_for_softmax: bool = True
     qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
-    attention_impl: Optional[str] = None  # None (reference) | 'auto' | 'xla' | 'cudnn' | 'tpu'
+    attention_impl: str | None = None  # None (reference) | 'auto' | 'xla' | 'cudnn' | 'tpu'
     causal: bool = False
-    max_seq_len: Optional[int] = None  # KV cache length, required to decode
+    max_seq_len: int | None = None  # KV cache length, required to decode
 
     def setup(self):
         dense = functools.partial(
@@ -843,7 +845,7 @@ class FlaxGEGLU(nn.Module):
     half through GELU. The hidden width is four times `dim`."""
 
     dim: int
-    dtype: Optional[Dtype] = jnp.float32
+    dtype: Dtype | None = jnp.float32
     precision: PrecisionLike = jax.lax.Precision.DEFAULT
     approximate: bool = True
 
@@ -864,7 +866,7 @@ class FlaxFeedForward(nn.Module):
     Sequential gives the two layers."""
 
     dim: int
-    dtype: Optional[Dtype] = jnp.float32
+    dtype: Dtype | None = jnp.float32
     precision: PrecisionLike = jax.lax.Precision.DEFAULT
     dropout: float = 0.0
     approximate_gelu: bool = True
@@ -890,14 +892,14 @@ class BasicTransformerBlock(nn.Module):
     query_dim: int
     heads: int = 4
     dim_head: int = 64
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_bias: bool = True
     use_cross_only:bool = False
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-4
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
 
     def setup(self):
         attention = functools.partial(
@@ -956,11 +958,11 @@ class Stage:
     norm_inputs: bool = True
     explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-4
-    dtype: Optional[Dtype] = jnp.float32
+    dtype: Dtype | None = jnp.float32
     precision: PrecisionLike = None
 
 
-def stage_attention(stage: Stage, channels: int, attention_impl: Optional[str],
+def stage_attention(stage: Stage, channels: int, attention_impl: str | None,
                     precision: PrecisionLike, name: str) -> "TransformerBlock":
     """The block a UNet stage's `Stage` describes, at the stage's channel
     count; a stage that names no precision takes the model's."""
@@ -983,13 +985,13 @@ class TransformerBlock(nn.Module):
     heads: int = 4
     dim_head: int = 32
     use_linear_attention: bool = True
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_projection: bool = False
     use_self_and_cross:bool = True
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     norm_inputs: bool = True
     explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-4

@@ -144,4 +144,4 @@ class VPGrid(_PairedGrid, NoiseScheduler):
         return jnp.ones_like(jnp.asarray(t, jnp.float32))
 
 
-__all__ = ["TabulatedVP", "SigmaGrid", "StageSigmaGrid", "VPGrid", "FlowGrid"]
+__all__ = ["FlowGrid", "SigmaGrid", "StageSigmaGrid", "TabulatedVP", "VPGrid"]

@@ -6,16 +6,16 @@ not a distributed barrier. Normal execution installs no instrumentation hooks.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 import importlib
-from importlib.metadata import version
 import json
 import logging
 import os
-from pathlib import Path
 import shlex
 import tempfile
 import threading
+from collections.abc import Mapping, Sequence
+from importlib.metadata import version
+from pathlib import Path
 from types import TracebackType
 from typing import Literal, Protocol, Self, runtime_checkable
 

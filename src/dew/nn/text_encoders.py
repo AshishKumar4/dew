@@ -34,7 +34,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Dict, Mapping, NamedTuple, Optional, Tuple
+from typing import Any, Mapping, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -78,7 +78,7 @@ class CLIPAttention(nn.Module):
     hidden_size: int
     num_heads: int
     causal: bool
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -110,7 +110,7 @@ class MLP(nn.Module):
     hidden_size: int
     intermediate_size: int
     activation: str = "quick_gelu"
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -140,7 +140,7 @@ class CLIPEncoderLayer(nn.Module):
     intermediate_size: int
     causal: bool
     layer_norm_eps: float = 1e-5
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     activation: str = "quick_gelu"
 
@@ -178,7 +178,7 @@ class CLIPTextTransformer(nn.Module):
     max_position_embeddings: int = 77
     layer_norm_eps: float = 1e-5
     eos_token_id: int = 49407
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     activation: str = "quick_gelu"
 
@@ -244,7 +244,7 @@ class CLIPVisionTransformer(nn.Module):
     patch_size: int = 32
     num_channels: int = 3
     layer_norm_eps: float = 1e-5
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -304,7 +304,7 @@ class CLIP(nn.Module):
     text_model: CLIPTextTransformer
     vision_model: CLIPVisionTransformer
     projection_dim: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -332,7 +332,7 @@ def _quick_gelu_only(config: Mapping[str, Any]) -> None:
             "quick-GELU")
 
 
-def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
+def translate_config(hf_config: Mapping[str, Any]) -> dict[str, Any]:
     """A CLIP config into `CLIPTextTransformer` fields.
 
     Reads a full CLIP config, which nests the tower's fields under
@@ -366,7 +366,7 @@ def translate_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def translate_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
+def translate_vision_config(hf_config: Mapping[str, Any]) -> dict[str, Any]:
     """A CLIP config into `CLIPVisionTransformer` fields, read the way
     `translate_config` reads the text ones: from `vision_config` of a full
     config or from a `CLIPVisionConfig` on its own."""
@@ -385,7 +385,7 @@ def translate_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
-def translate_clip_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
+def translate_clip_config(hf_config: Mapping[str, Any]) -> dict[str, Any]:
     """A full CLIP config into the two towers' fields and the width both
     projection heads share."""
     return {
@@ -428,7 +428,7 @@ _BESIDE_THE_TEXT_TOWER = ("vision_model.", "visual_projection.", "text_projectio
                           "logit_scale")
 
 
-def _layer_path(parts) -> Optional[Tuple[str, ...]]:
+def _layer_path(parts) -> tuple[str, ...] | None:
     """`encoder.layers.N...` into the layer's path, the same in both towers."""
     if len(parts) < 5 or parts[:2] != ["encoder", "layers"] or not parts[2].isdigit():
         return None
@@ -444,7 +444,7 @@ def _layer_path(parts) -> Optional[Tuple[str, ...]]:
 
 
 def _tower_path(hf_name: str, prefix: str,
-                tensors: Mapping[str, Tuple[str, ...]]) -> Optional[Tuple[str, ...]]:
+                tensors: Mapping[str, tuple[str, ...]]) -> tuple[str, ...] | None:
     """`hf_name`, a tensor of the tower nested under `prefix`, into its path in
     that tower's tree.
 
@@ -461,7 +461,7 @@ def _tower_path(hf_name: str, prefix: str,
     return path
 
 
-def _text_path(hf_name: str) -> Optional[Tuple[str, ...]]:
+def _text_path(hf_name: str) -> tuple[str, ...] | None:
     """One HF tensor name into its path in a `CLIPTextTransformer` tree.
 
     A full CLIP checkpoint nests the tower under text_model and carries the
@@ -474,7 +474,7 @@ def _text_path(hf_name: str) -> Optional[Tuple[str, ...]]:
     return _tower_path(hf_name, "text_model.", _TEXT_TENSORS)
 
 
-def _clip_path(hf_name: str) -> Optional[Tuple[str, ...]]:
+def _clip_path(hf_name: str) -> tuple[str, ...] | None:
     """One HF tensor name of a full checkpoint into its path in a `CLIP` tree.
 
     The logit scale is the contrastive temperature, which no forward pass here
@@ -511,7 +511,7 @@ def checkpoint_array(tensor, param_dtype: str = "float32") -> np.ndarray:
 
 
 def checkpoint_leaf(
-    path: Tuple[str, ...], tensor, param_dtype: str = "float32"
+    path: tuple[str, ...], tensor, param_dtype: str = "float32"
 ) -> np.ndarray:
     """One checkpoint leaf in Linen layout and the requested storage precision.
 
@@ -526,8 +526,8 @@ def checkpoint_leaf(
     return leaf
 
 
-def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> Dict[str, Any]:
-    params: Dict[str, Any] = {}
+def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> dict[str, Any]:
+    params: dict[str, Any] = {}
     for name, tensor in hf_tensors.items():
         path = path_of(name)
         if path is None:
@@ -541,19 +541,19 @@ def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) 
 
 def translate_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Text-tower parameters; storage precision is independent of compute dtype."""
     return _translate(hf_tensors, _text_path, param_dtype)
 
 
 def translate_clip_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Full CLIP parameters, with FP32 storage unless explicitly requested otherwise."""
     return _translate(hf_tensors, _clip_path, param_dtype)
 
 
-def _flat(tree) -> Dict[str, Any]:
+def _flat(tree) -> dict[str, Any]:
     leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
     return {".".join(entry.key for entry in path): leaf for path, leaf in leaves}
 
@@ -580,7 +580,7 @@ def _check_tree(params: Mapping[str, Any], module: nn.Module, *inputs) -> None:
             f"unexpected {unexpected}, mismatched {mismatched}")
 
 
-def _checkpoint_dir(name_or_dir: str, revision: Optional[str], *, weights: bool = True) -> Path:
+def _checkpoint_dir(name_or_dir: str, revision: str | None, *, weights: bool = True) -> Path:
     """The directory holding config.json and the safetensors weights.
 
     A local directory is taken as it is. A repo id fetches the config and the
@@ -596,12 +596,12 @@ def _checkpoint_dir(name_or_dir: str, revision: Optional[str], *, weights: bool 
                                   allow_patterns=[CONFIG_FILE, *(["model*.safetensors"] if weights else [])]))
 
 
-def _read_config(directory: Path) -> Dict[str, Any]:
+def _read_config(directory: Path) -> dict[str, Any]:
     with open(directory / CONFIG_FILE) as handle:
         return json.load(handle)
 
 
-def _read_tensors(directory: Path) -> Dict[str, np.ndarray]:
+def _read_tensors(directory: Path) -> dict[str, np.ndarray]:
     """Every tensor of the checkpoint in `directory` by its Hugging Face
     name, from the one weights file or from every shard. A name has no '/',
     so `load_params` hands the flat table back as it is."""
@@ -612,7 +612,7 @@ def _read_tensors(directory: Path) -> Dict[str, np.ndarray]:
         raise FileNotFoundError(
             f"no {WEIGHTS_FILE} in {directory}: a Hub repo holds {WEIGHTS_FILE} or "
             "sharded model-0000N-of-0000M.safetensors")
-    tensors: Dict[str, np.ndarray] = {}
+    tensors: dict[str, np.ndarray] = {}
     for shard in shards:
         for name, tensor in load_params(shard).items():
             if name in tensors:
@@ -637,8 +637,8 @@ class CLIPTextModel:
 
     @classmethod
     def from_pretrained(cls, name_or_dir: str = DEFAULT_MODEL, *,
-                        dtype: Optional[Dtype] = None, param_dtype: str = "float32",
-                        revision: Optional[str] = None,
+                        dtype: Dtype | None = None, param_dtype: str = "float32",
+                        revision: str | None = None,
                         variables: Mapping[str, object] | None = None) -> "CLIPTextModel":
         """Load a checkpoint from the Hub or a local directory.
 
@@ -686,8 +686,8 @@ class CLIPModel:
 
     @classmethod
     def from_pretrained(cls, name_or_dir: str = DEFAULT_MODEL, *,
-                        dtype: Optional[Dtype] = None, param_dtype: str = "float32",
-                        revision: Optional[str] = None) -> "CLIPModel":
+                        dtype: Dtype | None = None, param_dtype: str = "float32",
+                        revision: str | None = None) -> "CLIPModel":
         """Load full CLIP with independent compute and parameter precision."""
         directory = _checkpoint_dir(name_or_dir, revision)
         config = translate_clip_config(_read_config(directory))
@@ -748,7 +748,7 @@ class T5LayerNorm(nn.Module):
     """T5's norm: RMS over the width, a weight, no mean subtraction and no
     bias, modeling_t5.py `T5LayerNorm`."""
     epsilon: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
 
     @nn.compact
     def __call__(self, hidden_states):
@@ -781,7 +781,7 @@ class T5SelfAttention(nn.Module):
     num_buckets: int = 32
     max_distance: int = 128
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -828,7 +828,7 @@ class T5DenseReluDense(nn.Module):
     d_ff: int
     d_model: int
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -861,7 +861,7 @@ class T5DenseGatedGeluDense(nn.Module):
     d_ff: int
     d_model: int
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -891,7 +891,7 @@ class T5Block(nn.Module):
     feed_forward_proj: str = "relu"
     dropout_rate: float = 0.0
     layer_norm_epsilon: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -943,7 +943,7 @@ class T5EncoderTransformer(nn.Module):
     feed_forward_proj: str = "relu"
     dropout_rate: float = 0.0
     layer_norm_epsilon: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -971,7 +971,7 @@ class T5EncoderTransformer(nn.Module):
         return self.dropout(hidden_states, deterministic=not train)
 
 
-def translate_t5_config(hf_config: Mapping[str, Any]) -> Dict[str, Any]:
+def translate_t5_config(hf_config: Mapping[str, Any]) -> dict[str, Any]:
     """A T5 config into `T5EncoderTransformer` fields."""
     return {
         "vocab_size": hf_config["vocab_size"],
@@ -994,7 +994,7 @@ _T5_PROJECTIONS = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "out_proj"}
 _T5_WIDTHS = {"wi", "wi_0", "wi_1", "wo"}
 
 
-def _t5_path(hf_name: str) -> Optional[Tuple[str, ...]]:
+def _t5_path(hf_name: str) -> tuple[str, ...] | None:
     """One HF T5 tensor name into its path in a `T5EncoderTransformer` tree.
 
     The token embedding and the encoder blocks map. A published T5 ties its
@@ -1050,7 +1050,7 @@ def t5_embedding(hf_tensors: Mapping[str, np.ndarray]) -> None:
 
 def translate_t5_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """HF T5 encoder tensors into a parameter tree at the requested precision.
 
     Dense kernels transpose from torch to Linen; embeddings, norms and
@@ -1076,8 +1076,8 @@ class T5EncoderModel:
 
     @classmethod
     def from_pretrained(cls, name_or_dir: str = DEFAULT_T5_MODEL, *,
-                        dtype: Optional[Dtype] = None, param_dtype: str = "float32",
-                        revision: Optional[str] = None,
+                        dtype: Dtype | None = None, param_dtype: str = "float32",
+                        revision: str | None = None,
                         variables: Mapping[str, object] | None = None) -> "T5EncoderModel":
         """Load a checkpoint from the Hub or a local directory, encoder
         tensors only.

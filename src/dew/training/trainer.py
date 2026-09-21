@@ -30,19 +30,25 @@ from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, RampedStream, rows_of
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives.base import (Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective,
-                                 Step, Variables, select)
-from dew.telemetry.instrumentation import model_flops_utilization, step_flops
+from dew.objectives.base import Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective, Step, select
 from dew.telemetry import profile as telemetry_profile
+from dew.telemetry.instrumentation import model_flops_utilization, step_flops
+from dew.telemetry.records import CheckpointRequested, FitEnded, FitStarted, ProfileWindow, Record
 from dew.training.distributed import (
-    DevicePrefetchIterator, Layout, MeshSpec, Placement, batch_divisor, batch_shardings, build_mesh,
+    DevicePrefetchIterator,
+    Layout,
+    MeshSpec,
+    Placement,
+    batch_divisor,
+    batch_shardings,
+    build_mesh,
     shard_batch,
 )
 from dew.training.evaluation import Evaluation, evaluate
 from dew.training.state import Accumulation, TrainState
-from dew.training.transaction import Transaction, compact_qk, with_ema
 from dew.training.tracker import Tracker
-from dew.telemetry.records import FitStarted, FitEnded, CheckpointRequested, ProfileWindow, Record
+from dew.training.transaction import Transaction, compact_qk, with_ema
+
 if TYPE_CHECKING:
     from dew.data import Dataset
     from dew.telemetry.profile import Profiler
@@ -426,7 +432,7 @@ class Trainer(Generic[Loss, Effects]):
     # The loop
     # ------------------------------------------------------------------
 
-    def fit(self, data: "Dataset", *, steps: int, log_every: int = 100,
+    def fit(self, data: Dataset, *, steps: int, log_every: int = 100,
             eval_every: int | None = None, checkpoint_every: int | None = None,
             metrics: Sequence[Metric] = (), preview: bool = False) -> TrainState:
         """Train to `steps` total steps, resuming from the checkpoints' latest
@@ -825,7 +831,7 @@ class Trainer(Generic[Loss, Effects]):
     # Validation
     # ------------------------------------------------------------------
 
-    def _evaluate(self, state: TrainState, shardings: Placement, data: "Dataset",
+    def _evaluate(self, state: TrainState, shardings: Placement, data: Dataset,
                   metrics: Sequence[Metric], preview: bool, mesh) -> None:
         params = state.params
         averaged = with_ema(state.params, self._fetched(state, shardings).ema)
@@ -866,7 +872,7 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _stop_trace(self, traced: int, loss, profile: Profile,
-                    profiler: "Profiler", *, step: int) -> None:
+                    profiler: Profiler, *, step: int) -> None:
         """Stop the window's owned capture before reporting it on process zero.
 
         The core Profiler drains the backend and exports the native reports on

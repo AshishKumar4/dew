@@ -1,9 +1,9 @@
 """Native CLIP conditioning and image preprocessing for latent diffusion."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from collections.abc import Mapping
 from typing import Literal, NamedTuple, Sequence
 
 import jax
@@ -11,12 +11,13 @@ import jax.numpy as jnp
 import numpy as np
 from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
-from dew.inputs.encoders import ConditionEncoder
 from dew.diffusion.process import DenoisingCondition
-from dew.nn.text_encoders import CLIPTextTransformer, T5EncoderTransformer
+from dew.inputs.encoders import ConditionEncoder
 from dew.nn.safety import CLIPSafetyHead
+from dew.nn.text_encoders import CLIPTextTransformer, T5EncoderTransformer
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, encoders
+
 
 def _prompt(record: Mapping[str, object], key: str, default: str) -> str:
     """One text slot of a conditioning record."""

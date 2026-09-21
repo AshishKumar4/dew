@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Mapping, Optional, Self, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Mapping, Self, Sequence, TypeVar
 
 import jax.numpy as jnp
 import numpy as np
@@ -22,12 +22,17 @@ from flax.typing import Dtype
 
 from dew.nn.dit import TextContext
 from dew.nn.text_encoders import (
+    DEFAULT_MODEL,
+    DEFAULT_T5_MODEL,
+    CLIPTextModel,
+    CLIPTextTransformer,
     CLIPTowerOutput,
-    DEFAULT_MODEL, DEFAULT_T5_MODEL, CLIPTextModel, CLIPTextTransformer,
-    T5EncoderModel, T5EncoderTransformer,
+    T5EncoderModel,
+    T5EncoderTransformer,
 )
 from dew.objectives.base import FROZEN, Variables
 from dew.registry import dtype_name, encoders, resolve_dtype
+
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
@@ -100,17 +105,17 @@ class CLIPText(ConditionEncoder[str]):
     transformer: CLIPTextTransformer
     params: Variables
     tokenizer: PreTrainedTokenizerBase
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
 
-    revision: Optional[str] = None
+    revision: str | None = None
     """The checkpoint's git revision, recorded so a rebuild reads the same
     weights and the same tokenizer."""
     param_dtype: str = "float32"
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = DEFAULT_MODEL, *, dtype=None,
-                        revision: Optional[str] = None, param_dtype: str = "float32",
-                        params: Variables | None = None) -> "CLIPText":
+                        revision: str | None = None, param_dtype: str = "float32",
+                        params: Variables | None = None) -> CLIPText:
         from transformers import AutoTokenizer
 
         dtype = resolve_dtype(dtype)
@@ -163,18 +168,18 @@ class T5Text(ConditionEncoder[str]):
     params: Variables
     tokenizer: PreTrainedTokenizerBase
     max_length: int = 256
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
 
-    revision: Optional[str] = None
+    revision: str | None = None
     """The checkpoint's git revision, recorded so a rebuild reads the same
     weights and the same tokenizer."""
     param_dtype: str = "float32"
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = DEFAULT_T5_MODEL, *, dtype=None,
-                        revision: Optional[str] = None,
+                        revision: str | None = None,
                         max_length: int = 256, param_dtype: str = "float32",
-                        params: Variables | None = None) -> "T5Text":
+                        params: Variables | None = None) -> T5Text:
         from transformers import AutoTokenizer
 
         dtype = resolve_dtype(dtype)
@@ -222,7 +227,7 @@ class CharTable(ConditionEncoder[str]):
     features: int = 16
     vocab: int = 130
     seed: int = 0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     param_dtype: str = "float32"
 
     @classmethod
@@ -264,4 +269,4 @@ class CharTable(ConditionEncoder[str]):
                 "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype}
 
 
-__all__ = ["ConditionEncoder", "CLIPText", "T5Text", "CharTable", "rebuild"]
+__all__ = ["CLIPText", "CharTable", "ConditionEncoder", "T5Text", "rebuild"]

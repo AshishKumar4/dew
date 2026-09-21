@@ -21,15 +21,29 @@ from jax.typing import ArrayLike
 
 from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.inputs import (
-    ArrayT, ModelInputs, PredictionPhase, RowPlan, agreed_validity, generation_signature,
-    local_rows, mesh_of, request_key,
+    ArrayT,
+    ModelInputs,
+    PredictionPhase,
+    RowPlan,
+    agreed_validity,
+    generation_signature,
+    local_rows,
+    mesh_of,
+    request_key,
 )
 from dew.objectives.base import Variables
-from dew.sampling import decoding
+from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
-    EndOfSequence, Greedy, LogitsTransform, MinP, StepState, Stopping, Temperature, TopK, TopP,
+    EndOfSequence,
+    Greedy,
+    LogitsTransform,
+    MinP,
+    StepState,
+    Stopping,
+    Temperature,
+    TopK,
+    TopP,
 )
-from dew.sampling import strategies
 from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Strategy
 
 Transforms = LogitsTransform | Sequence[LogitsTransform]
@@ -509,7 +523,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
         params, inputs, keys, transforms, stopping, strategy)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None):
     return jax.jit(_checked, static_argnames=("model", "max_new_tokens", "pad_id", "n"),
                    in_shardings=(None, rows, rows, None, None, None),

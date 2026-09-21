@@ -10,12 +10,13 @@ import math
 import os
 from functools import partial
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence, Tuple
+from typing import Any, Mapping, Sequence
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+
 
 class FlaxUpsample2D(nn.Module):
     """
@@ -101,10 +102,10 @@ class FlaxResnetBlock2D(nn.Module):
     """
 
     in_channels: int
-    out_channels: Optional[int] = None
+    out_channels: int | None = None
     dropout: float = 0.0
     groups: int = 32
-    use_nin_shortcut: Optional[bool] = None
+    use_nin_shortcut: bool | None = None
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
@@ -175,7 +176,7 @@ class FlaxAttentionBlock(nn.Module):
     """
 
     channels: int
-    num_head_channels: Optional[int] = None
+    num_head_channels: int | None = None
     num_groups: int = 32
     dtype: jnp.dtype = jnp.float32
 
@@ -368,7 +369,7 @@ class FlaxUNetMidBlock2D(nn.Module):
     dropout: float = 0.0
     num_layers: int = 1
     resnet_groups: int = 32
-    num_attention_heads: Optional[int] = 1
+    num_attention_heads: int | None = 1
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
@@ -626,7 +627,7 @@ class FlaxDecoder(nn.Module):
 _VAE_ATTENTION = {"to_q": "query", "to_k": "key", "to_v": "value"}
 
 
-def _vae_path(torch_name: str, rank: int) -> Tuple[str, ...]:
+def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
     """One diffusers AutoencoderKL tensor name into its path in the vendored
     tree, `{"encoder": ..., "decoder": ..., "quant_conv": ...}`.
 

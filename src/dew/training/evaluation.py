@@ -12,8 +12,15 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-from dew.artifacts import Artifact, Artifacts, agree_process_phase, broadcast_from_process_zero, collective_host
+from dew.artifacts import (
+    Artifact,
+    Artifacts,
+    agree_process_phase,
+    broadcast_from_process_zero,
+    collective_host,
+)
 from dew.objectives.base import Batch, Effects, Loss, Metric, Objective, Step, Variables
+
 from .distributed import build_mesh, shard_batch
 
 

@@ -21,8 +21,7 @@ import dataclasses
 import math
 import sys
 from abc import ABC, abstractmethod
-from typing import (Any, Callable, Iterator, Mapping, Protocol, Sequence, overload,
-                    runtime_checkable)
+from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, overload, runtime_checkable
 
 import grain.python as pygrain
 import jax

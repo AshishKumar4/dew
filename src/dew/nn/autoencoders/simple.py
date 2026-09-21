@@ -1,9 +1,9 @@
-from typing import Callable, Optional, Sequence
+from typing import Callable, Sequence
 
-import jax
 import flax.linen as nn
-from jax import numpy as jnp
+import jax
 from flax.typing import Dtype, PrecisionLike
+from jax import numpy as jnp
 
 from .api import AutoEncoder
 
@@ -23,7 +23,7 @@ class SimpleEncoder(nn.Module):
     feature_depths: Sequence[int]
     activation: Callable = jax.nn.silu
     norm_groups: int = 8
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -59,7 +59,7 @@ class SimpleDecoder(nn.Module):
     feature_depths: Sequence[int]
     activation: Callable = jax.nn.silu
     norm_groups: int = 8
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -115,12 +115,12 @@ class SimpleAutoEncoder(AutoEncoder):
         out_channels: int = 3,
         activation: Callable = jax.nn.silu,
         norm_groups: int = 8,
-        dtype: Optional[Dtype] = jnp.float32,
+        dtype: Dtype | None = jnp.float32,
         precision: PrecisionLike = None,
         latent_shift: float = 0.0,
         latent_scale: float = 1.0,
         params=None,
-        key: Optional[jax.Array] = None,
+        key: jax.Array | None = None,
     ):
         self.latent_shift = latent_shift
         self.latent_scale = latent_scale

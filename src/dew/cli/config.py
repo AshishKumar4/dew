@@ -10,8 +10,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-import tomllib
 import tempfile
+import tomllib
 from pathlib import Path
 
 from filelock import FileLock

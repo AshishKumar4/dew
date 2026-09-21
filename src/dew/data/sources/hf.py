@@ -14,11 +14,17 @@ import dataclasses
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # the imports themselves happen on the first record
-    from datasets import (Dataset as ArrowDataset, DownloadConfig, DownloadMode, Features,
-                          VerificationMode, Version)
+    from datasets import (
+        Dataset as ArrowDataset,
+        DownloadConfig,
+        DownloadMode,
+        Features,
+        VerificationMode,
+        Version,
+    )
 
 import numpy as np
 
@@ -52,20 +58,20 @@ class HFOptions:
     is.
     """
 
-    config: Optional[str] = None
-    data_dir: Optional[str] = None
-    data_files: Optional[str | Sequence[str] | Mapping[str, str | Sequence[str]]] = None
-    cache_dir: Optional[str] = None
-    features: Optional["Features"] = None
-    download_config: Optional["DownloadConfig"] = None
-    download_mode: Optional["DownloadMode | str"] = None
-    verification_mode: Optional["VerificationMode | str"] = None
-    keep_in_memory: Optional[bool] = None
+    config: str | None = None
+    data_dir: str | None = None
+    data_files: str | Sequence[str] | Mapping[str, str | Sequence[str]] | None = None
+    cache_dir: str | None = None
+    features: Features | None = None
+    download_config: DownloadConfig | None = None
+    download_mode: DownloadMode | str | None = None
+    verification_mode: VerificationMode | str | None = None
+    keep_in_memory: bool | None = None
     save_infos: bool = False
-    revision: Optional["str | Version"] = None
-    token: Optional[str | bool] = None
-    num_proc: Optional[int] = None
-    storage_options: Optional[Mapping[str, Any]] = None
+    revision: str | Version | None = None
+    token: str | bool | None = None
+    num_proc: int | None = None
+    storage_options: Mapping[str, Any] | None = None
     """`datasets` passes this to fsspec, whose backends declare their own
     options; the mapping is theirs to read."""
 
@@ -109,8 +115,8 @@ class HFDatasetSource:
     once and reopened from there, the way TokenFileSource reopens its memmap.
     """
 
-    def __init__(self, name: Optional[str] = None, split: str = "train", dataset=None,
-                 options: Optional[HFOptions] = None):
+    def __init__(self, name: str | None = None, split: str = "train", dataset=None,
+                 options: HFOptions | None = None):
         if name is None and dataset is None:
             raise ValueError(
                 "HFDatasetSource needs a hub dataset name or a loaded dataset")
@@ -124,7 +130,7 @@ class HFDatasetSource:
         self._dataset = dataset
         # Set when a dataset that arrived in memory is written out for the
         # workers; from then on it is what reloads the table.
-        self._cache_path: Optional[str] = None
+        self._cache_path: str | None = None
         self._lock = threading.Lock()
 
     def __repr__(self) -> str:
@@ -134,7 +140,7 @@ class HFDatasetSource:
         return (f"HFDatasetSource(name={self.name!r}, split={self.split!r}, "
                 f"options={self.options!r}, cache={self._cache_path!r})")
 
-    def _table(self) -> "ArrowDataset":
+    def _table(self) -> ArrowDataset:
         """The one Arrow-backed split, loaded once on first access.
 
         Grain reads a source from several threads at a time, and two threads
@@ -153,7 +159,7 @@ class HFDatasetSource:
                     held = self._dataset = self._loaded()
         return held
 
-    def _loaded(self) -> "ArrowDataset":
+    def _loaded(self) -> ArrowDataset:
         """One table, from the cache path or from the dataset's name."""
         datasets = _hf_datasets()
         if self._cache_path is not None:
@@ -177,12 +183,12 @@ class HFDatasetSource:
     def __len__(self) -> int:
         return len(self._table())
 
-    def __getitem__(self, index: int) -> Dict[str, Any]:
+    def __getitem__(self, index: int) -> dict[str, Any]:
         row: Mapping[str, Any] = self._table()[index]
         return {key: _plain_value(value) for key, value in row.items()}
 
 
-    def __getstate__(self) -> Dict[str, Any]:
+    def __getstate__(self) -> dict[str, Any]:
         # grain pickles the source into every worker process, so the table
         # must not be part of it. That would be a copy per worker of a dataset
         # that is already on disk. A named dataset reloads from the hub cache
@@ -197,6 +203,6 @@ class HFDatasetSource:
         state["_lock"] = None  # a lock does not pickle; the worker gets its own
         return state
 
-    def __setstate__(self, state: Dict[str, Any]) -> None:
+    def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state)
         self._lock = threading.Lock()

@@ -38,8 +38,18 @@ import optax
 from flax import linen as nn
 
 from dew.artifacts import Artifacts
-from dew.objectives.base import (Aux, Batch, EMASpec, Effects, Loss, Mean, Objective, Prediction,
-                                 Step, Variables)
+from dew.objectives.base import (
+    Aux,
+    Batch,
+    Effects,
+    EMASpec,
+    Loss,
+    Mean,
+    Objective,
+    Prediction,
+    Step,
+    Variables,
+)
 from dew.registry import objectives
 
 if TYPE_CHECKING:

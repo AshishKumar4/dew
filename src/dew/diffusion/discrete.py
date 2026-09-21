@@ -18,9 +18,9 @@ from, in the slots a Gaussian denoiser puts x_0 and epsilon.
 
 from __future__ import annotations
 
+import functools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
-import functools
 from typing import Any
 
 import jax
@@ -29,8 +29,16 @@ from flax import linen as nn
 
 from dew.artifacts import agree_process_phase
 from dew.diffusion.block import CanvasGeneration
-from dew.nn.inputs import (ModelInputs, RowPlan, agreed_validity, continuation_keys,
-                           generation_signature, local_rows, mesh_of, request_key)
+from dew.nn.inputs import (
+    ModelInputs,
+    RowPlan,
+    agreed_validity,
+    continuation_keys,
+    generation_signature,
+    local_rows,
+    mesh_of,
+    request_key,
+)
 from dew.objectives.base import Variables
 from dew.registry import presets, samplers
 
@@ -223,7 +231,7 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
     for name, value, minimum in (("max_new_tokens", budget, 0), ("steps", steps, 1), ("n", n, 1)):
         if type(value) is not int or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
-    vocab = getattr(model, "vocab_size")
+    vocab = model.vocab_size
     if type(process.mask_id) is not int or not 0 <= process.mask_id < vocab:
         raise ValueError("mask_id is outside the vocabulary")
     if type(pad_id) is not int or not 0 <= pad_id < vocab:
@@ -232,7 +240,7 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
         raise ValueError("eos_token_ids contain an id outside the vocabulary")
     if min(inputs.tokens.shape) < 1:
         raise ValueError("masked generation needs nonempty token rows")
-    if inputs.tokens.shape[1] + budget > getattr(model, "max_seq_len"):
+    if inputs.tokens.shape[1] + budget > model.max_seq_len:
         raise ValueError("prompt plus max_new_tokens exceeds max_seq_len")
     if inputs.conditioning:
         raise ValueError("native MDLM is text-only; conditioning payloads are not supported")
@@ -305,7 +313,7 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
     return jax.tree.map(lambda leaf: leaf.reshape((batch * n, *leaf.shape[2:])), result)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None):
     return jax.jit(_generate, static_argnames=("model", "process", "sampler", "budget", "steps", "n", "eos_ids", "pad_id"),
                    in_shardings=(None, rows, rows), out_shardings=rows)

@@ -1,18 +1,19 @@
 """The convolutional UNet, and the body it shares with the video UNet."""
 
 import dataclasses
-from typing import Callable, Optional, Sequence
+from functools import partial
+from typing import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from functools import partial
 
-from ..blocks import Downsample, Upsample, FourierEmbedding, TimeProjection, ResidualBlock
-from ..attention import Stage, stage_attention
-from ..sharding import logical_axes
 from dew.registry import models
+
+from ..attention import Stage, stage_attention
+from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
+from ..sharding import logical_axes
 
 
 def unet_body(model: "Unet", x, temb, text, temporal=None):
@@ -106,7 +107,7 @@ class Unet(nn.Module):
     output_channels:int=3
     emb_features:int=64*4
     feature_depths: Sequence[int] = (64, 128, 256, 512)
-    attention_configs: Sequence[Optional[Stage]] = (
+    attention_configs: Sequence[Stage | None] = (
         Stage(heads=8), Stage(heads=8), Stage(heads=8), Stage(heads=8))
     """Attention per resolution stage, one entry per feature depth; None is a
     stage with no attention."""
@@ -114,9 +115,9 @@ class Unet(nn.Module):
     num_middle_res_blocks:int=1
     activation:Callable = jax.nn.swish
     norm_groups:int=8
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
 
     def setup(self):
         if self.norm_groups > 0:
