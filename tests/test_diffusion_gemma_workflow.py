@@ -84,7 +84,8 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     record = {"objective": "block_diffusion",
               "model": {"architecture": "diffusion_gemma",
                         "config": {**bundle.config, "max_seq_len": bundle.model.max_seq_len},
-                        "dtype": "float32", "attention_impl": "auto"},
+                        "dtype": "float32", "param_dtype": None, "matmul_precision": None,
+                        "attention_impl": "auto"},
               "tokenizer": "byte", "pad_token_id": 0}
     (tmp_path / "run.json").write_text(json.dumps(record))
     restored = dew.pipeline(str(tmp_path), ema=False, dtype="bfloat16", param_dtype="float32")
