@@ -155,9 +155,14 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
             f"--model.config carries {overridden}, which the checkpoint at "
             f"{pretrained} decides. Only max_seq_len is still a choice.")
 
+    context = model_config.config.get("max_seq_len", max_seq_len)
+    if context is not None and not isinstance(context, int):
+        raise ValueError(
+            f"--model.config max_seq_len is {context!r}; the context a checkpoint "
+            f"is reloaded at is a number of tokens")
     loaded = load_checkpoint(
         pretrained, dtype=model_config.dtype, attention_impl=model_config.attention_impl,
-        max_seq_len=model_config.config.get("max_seq_len", max_seq_len))
+        max_seq_len=context)
     model, variables, fields = loaded.model, loaded.variables, loaded.model_config
     expected = checkpoint_tokenizer(pretrained)
     if meta["tokenizer"] != expected:

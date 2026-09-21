@@ -9,7 +9,7 @@ The encoder is --model, the predictor takes the encoder's width and heads plus
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Mapping, Optional
 
 import tyro
 
@@ -72,7 +72,7 @@ def build_encoder(config: JepaRunConfig):
     return models.build(config.model.architecture, **fields), fields
 
 
-def build_predictor(config: JepaRunConfig, encoder_fields: dict, encoder, grid,
+def build_predictor(config: JepaRunConfig, encoder_fields: Mapping[str, object], encoder, grid,
                     is_video: bool):
     """The predictor that reads the encoder's embeddings, and its fields."""
     fields = {
@@ -87,7 +87,7 @@ def build_predictor(config: JepaRunConfig, encoder_fields: dict, encoder, grid,
     return models.build('jepa_predictor', **fields), fields
 
 
-def run_summary(config: JepaRunConfig, encoder_fields: dict) -> dict:
+def run_summary(config: JepaRunConfig, encoder_fields: Mapping[str, object]) -> dict:
     """Flat view of the run, for the tracker."""
     return {
         **encoder_fields,

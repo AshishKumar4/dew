@@ -109,9 +109,14 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
     if kind == "block_diffusion":
         from dew.diffusion.block import BlockProcess
         from dew.interop import diffusion_gemma
+        canvas = model_config.config["max_seq_len"]
+        if not isinstance(canvas, int):
+            raise ValueError(
+                f"run.json records max_seq_len as {canvas!r}; the canvas a "
+                f"block-diffusion run decodes is a number of tokens")
         model = diffusion_gemma.build(model_config.config, dtype=model_config.dtype,
                                       attention_impl=model_config.attention_impl,
-                                      max_seq_len=model_config.config["max_seq_len"])
+                                      max_seq_len=canvas)
         model = model.clone(text=model.text.clone(layer_scalar="trainable"))
         variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
                                       param_dtype=param_dtype)
