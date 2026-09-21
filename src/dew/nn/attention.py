@@ -5,6 +5,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+from jax.ad_checkpoint import checkpoint_name
 from flax import linen as nn
 from typing import Optional
 from flax.typing import Dtype, PrecisionLike
@@ -591,6 +592,11 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     implementation, honouring dtype, precision and force_fp32_for_softmax the
     way the reference path does; 'auto' resolves it to xla, and cudnn or tpu
     raise a ValueError that names the implementation.
+
+    Whichever path ran, the result leaves here as the checkpoint name
+    'attention_output', which is what lets a remat policy save it instead of
+    replaying the kernel in the backward pass (`remat_block` in dit.py). The
+    name is inert outside jax.checkpoint.
     """
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
@@ -598,11 +604,13 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         sinks=sinks, softcap=softcap)
     shards = sequence_shards()
     if shards > 1:
-        return sequence_parallel_attention(
+        out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
             sliding_window=sliding_window, mask=mask, bias=bias)
-    return kernel(query, key, value, causal=causal, sliding_window=sliding_window,
-                  mask=mask, bias=bias)
+    else:
+        out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
+                     mask=mask, bias=bias)
+    return checkpoint_name(out, 'attention_output')
 
 
 def attention_kernel(query, key, value, dtype=None, precision=None,
