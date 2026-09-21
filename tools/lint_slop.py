@@ -48,11 +48,12 @@ ROOT = Path(__file__).resolve().parent.parent
 # is counted, printed per rule with the file count, and left out of the exit
 # status. Adopting is not suppressing: every finding prints, and a rule never
 # moves back. There are no per-finding suppressions in either set.
-ENFORCED = frozenset({"SLOP003", "SLOP005", "SLOP006", "SLOP007", "SLOP008"})
-# SLOP001, SLOP002 and SLOP004 wait on the typing sweep. SLOP009 measures what
-# a split would cost rather than what a change introduced, so it waits on the
-# decoder split and is the one rule that may stay here.
-ADOPTING = frozenset({"SLOP001", "SLOP002", "SLOP004", "SLOP009"})
+ENFORCED = frozenset({"SLOP001", "SLOP002", "SLOP003", "SLOP005", "SLOP006",
+                      "SLOP007", "SLOP008"})
+# SLOP004 waits on the rest of the probe sweep. SLOP009 measures what a split
+# would cost rather than what a change introduced, so it waits on the decoder
+# split and is the one rule that may stay here.
+ADOPTING = frozenset({"SLOP004", "SLOP009"})
 
 # The two sanctioned open-mapping aliases: one variables tree, one batch, both
 # declared in dew.objectives.base, which is the layer both the trainer and the
