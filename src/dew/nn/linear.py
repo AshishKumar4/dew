@@ -70,13 +70,15 @@ def l2norm(x, eps: float = 1e-6):
     return x * inv
 
 
-def causal_conv1d(x, kernel, activation: bool = True):
+def causal_conv1d(x, kernel, activation: bool = True, bias=None):
     """Depthwise causal conv over [B, D, S] with the [D, K] taps.
 
     The reference pads `K - 1` zeros to the left
     (`F.conv1d(padding=kernel_size - 1)`, modeling_qwen3_next.py:345-365)
     so position s convolves s-K+1..s, then applies silu. `kernel` is
-    `conv1d.weight[:, 0, :]`, the checkpoint's [D, K] depthwise taps.
+    `conv1d.weight[:, 0, :]`, the checkpoint's [D, K] depthwise taps, and
+    `bias` the `[D]` per-channel bias a conv with one adds before the
+    activation (Mamba-2's `use_conv_bias`).
 
     Depthwise in lax terms: the input's channel axis is the feature axis of
     a grouped conv with one channel per group, so the taps land as
@@ -91,12 +93,14 @@ def causal_conv1d(x, kernel, activation: bool = True):
         window_strides=(1,), padding='VALID',
         dimension_numbers=('NCH', 'OIH', 'NCH'),
         feature_group_count=D)
+    if bias is not None:
+        windows = windows + bias.astype(windows.dtype)[None, :, None]
     if activation:
         windows = nn.silu(windows)
     return windows
 
 
-def _masked_conv1d(x, kernel, valid, state=None):
+def _masked_conv1d(x, kernel, valid, state=None, bias=None):
     """Convolve real tokens without advancing a paused row's history.
 
     A row's real tokens keep their order and their history: the j-th of them
@@ -132,7 +136,7 @@ def _masked_conv1d(x, kernel, valid, state=None):
     # The history in front carries the K-1 taps the first real token reads, so
     # column width + j of the convolution is the output of real token j, and
     # the K-1 columns from the row's token count on are the history it leaves.
-    convolved = causal_conv1d(stream, kernel)
+    convolved = causal_conv1d(stream, kernel, bias=bias)
     output = jnp.take_along_axis(convolved, (rank + width)[:, None, :], axis=2)
     history = jnp.take_along_axis(
         stream, (rank[:, -1] + 1)[:, None, None] + jnp.arange(width)[None, None, :], axis=2)

@@ -522,7 +522,10 @@ class DecoderBlock(nn.Module):
     What `feedforward` builds lands there as mlp and takes the normalized
     states alone, which is the one call `GatedMLP` and `moe.SparseMLP` share;
     a `hash_routed` block hands it the token ids too, which the metadata
-    carries down the stack for DeepSeek V4's hash router.
+    carries down the stack for DeepSeek V4's hash router. A `feedforward` of
+    None is a block of the mixer alone, norm, mixer, residual, which is
+    Mamba-2's (`Mamba2Block`, modeling_mamba2.py:608-632): no
+    post_attention_layernorm, no mlp, no output norm for either.
 
     `wiring` places the block's norms: the input pair alone is the plain
     pre-norm block, both pairs Gemma's sandwich block, and the output pair
@@ -553,7 +556,7 @@ class DecoderBlock(nn.Module):
     block otherwise (modeling_glm5_next.py:1293-1327).
     """
     mixer: Callable[..., nn.Module]
-    feedforward: Callable[..., nn.Module]
+    feedforward: Callable[..., nn.Module] | None
     emb_features: int
     wiring: BlockWiring
     norm_eps: float = 1e-5
@@ -579,12 +582,18 @@ class DecoderBlock(nn.Module):
         if self.wiring.pre_norms:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
-        if self.wiring.pre_norms:
+        if self.wiring.pre_norms and self.feedforward is not None:
             self.post_attention_layernorm = norm(name='post_attention_layernorm')
         if self.wiring.output_norms:
             self.attention_output_norm = norm(name='attention_output_norm')
-            self.mlp_output_norm = norm(name='mlp_output_norm')
-        self.mlp = self.feedforward(name='mlp')
+            if self.feedforward is not None:
+                self.mlp_output_norm = norm(name='mlp_output_norm')
+        if self.feedforward is not None:
+            self.mlp = self.feedforward(name='mlp')
+        elif self.parallel is not None or self.laurel_rank is not None:
+            raise ValueError(
+                "a block without a feed-forward has no branch for a parallel "
+                "routed one to sum with and no LAuReL residual to average")
         if self.parallel is not None:
             self.moe = self.parallel(name='moe')
         if self.wiring.layer_scalar == "frozen":
@@ -683,13 +692,14 @@ class DecoderBlock(nn.Module):
         x = x + self.dropout(mixed, deterministic=not train)
         if self.laurel_rank is not None:
             x = (x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), x.dtype)
-        hidden = self.mlp(self.post_attention_layernorm(x) if self.wiring.pre_norms else x,
-                          **self._feedforward_inputs(attention_metadata))
-        if self.parallel is not None:
-            hidden = self.moe(x, hidden)
-        if self.wiring.output_norms:
-            hidden = self.mlp_output_norm(hidden)
-        x = x + self.dropout(hidden, deterministic=not train)
+        if self.feedforward is not None:
+            hidden = self.mlp(self.post_attention_layernorm(x) if self.wiring.pre_norms else x,
+                              **self._feedforward_inputs(attention_metadata))
+            if self.parallel is not None:
+                hidden = self.moe(x, hidden)
+            if self.wiring.output_norms:
+                hidden = self.mlp_output_norm(hidden)
+            x = x + self.dropout(hidden, deterministic=not train)
         if altup is not None and predictions is not None:
             corrected = self.altup_layer.correct(predictions, x, train=train)
             if self.per_layer_input_dim and per_layer_input is not None:
@@ -716,6 +726,8 @@ class DecoderBlock(nn.Module):
                                **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
                                **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
         streams = mix_streams(post, comb, self.dropout(mixed, deterministic=not train), streams)
+        if self.feedforward is None:
+            return streams
         post, comb, collapsed = self.ffn_hc(streams)
         hidden = self.mlp(self.post_attention_layernorm(collapsed),
                           **self._feedforward_inputs(attention_metadata))
@@ -743,7 +755,8 @@ class DecoderBlock(nn.Module):
 
     @property
     def _gate_activation(self) -> str:
-        return getattr(self.mlp, 'activation', 'swiglu')
+        return getattr(self.mlp, 'activation', 'swiglu') if self.feedforward is not None else 'swiglu'
+
 
 @logical_axes({
     # The input is two embed-width vectors concatenated, which no single name
@@ -764,7 +777,7 @@ class MTPBlock(nn.Module):
     prediction steps may use an independently allocated KV cache.
     """
     mixer: Callable[..., nn.Module]
-    feedforward: Callable[..., nn.Module]
+    feedforward: Callable[..., nn.Module] | None
     emb_features: int
     wiring: BlockWiring
     hyper_connections: HyperConnections | None = None
@@ -1309,7 +1322,8 @@ class CausalTransformer(nn.Module):
     projections to a mean the final norm reads. laurel_rank adds the LAuReL
     block to every layer, activation_sparsity_pattern the gaussian top-k on
     each layer's gate, and a tuple mlp_features gives each layer its own
-    feed-forward width. None and an int are a plain decoder.
+    feed-forward width. None and an int are a plain decoder. A width of 0
+    is a layer without a feed-forward, Mamba-2's block of the mixer alone.
 
     partial_rotary_factor rotates that fraction of an unwindowed kind's head
     dims and passes the rest through; a windowed kind rotates whole.
@@ -1361,7 +1375,7 @@ class CausalTransformer(nn.Module):
     num_kv_heads: int | None = None       # None: as many as the query heads
     head_dim: int | None = None           # None: emb_features // num_heads
     mlp: str = 'swiglu'                      # 'swiglu' | 'geglu' | 'geglu_exact'
-    mlp_features: int | tuple[int, ...] | None = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n)
+    mlp_features: int | tuple[int, ...] | None = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n); 0: no feed-forward (Mamba-2)
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
     rope_scaling: RopeScaling | None = None  # Llama 3.1's ramp, unless a kind states its own
@@ -1729,10 +1743,10 @@ class CausalTransformer(nn.Module):
                 f"num_nextn_predict_layers counts prediction depths, got "
                 f"{self.num_nextn_predict_layers}; 0 is a model without them")
         widths = self.mlp_widths
-        if len(widths) != self.num_layers or min(widths) < 1:
+        if len(widths) != self.num_layers or min(widths) < 0:
             raise ValueError(
-                f"mlp_features names one positive width per layer of "
-                f"{self.num_layers}, got {self.mlp_features}")
+                f"mlp_features names one width per layer of {self.num_layers}, "
+                f"0 for a layer without a feed-forward, got {self.mlp_features}")
         sparsity = self.activation_sparsity_pattern
         if sparsity is not None and (len(sparsity) != self.num_layers
                                      or not all(0 <= fraction < 1 for fraction in sparsity)):
@@ -1869,6 +1883,8 @@ class CausalTransformer(nn.Module):
                     if spec.hash_routed and routed is not None else
                     routed
                     if spec.routed and routed is not None else
+                    None
+                    if spec.width == 0 else
                     functools.partial(gated_mlp, hidden_features=spec.width,
                                       activation_sparsity=spec.sparsity)),
                 hash_routed=spec.hash_routed,
@@ -1907,6 +1923,7 @@ class CausalTransformer(nn.Module):
             kinds[mtp_type], mtp_type, kv_shared=False))
         mtp_feedforward = (
             routed if routed is not None and self.num_layers - 1 in sparse else
+            None if widths[-1] == 0 else
             # The last layer's width: the one width of every model with
             # depths, since the widths that vary are Gemma 3n's alone.
             functools.partial(gated_mlp, hidden_features=widths[-1]))

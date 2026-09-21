@@ -1,0 +1,10 @@
+{
+  "hidden_size": 12,
+  "num_heads": 4,
+  "head_dim": 6,
+  "state_size": 5,
+  "n_groups": 2,
+  "conv_kernel": 4,
+  "chunk_size": 32,
+  "layer_norm_epsilon": 1e-05
+}

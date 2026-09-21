@@ -145,5 +145,8 @@ from .. import (
     llama4,  # noqa: F401  (registers the kind)
     mla,  # registers the kind, and names the YarnScaling above
 )
-from . import gated_delta_net  # noqa: F401  (registers the kind)
+from . import (
+    gated_delta_net,  # noqa: F401  (registers the kind)
+    mamba2,  # noqa: F401  (registers the kind)
+)
 from .attention import AttentionMixer  # noqa: F401  (registers the kind)
