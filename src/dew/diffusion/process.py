@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Mapping
 
 import jax
 import jax.numpy as jnp
@@ -39,8 +39,13 @@ class DenoisingCondition:
         return replace(self, guidance=given.guidance)
 
 
-def aligned_conditions(conditions: Mapping[str, Any],
-                       unconditional: Mapping[str, Any]) -> dict[str, Any]:
+# One conditioning keyword's value: the record a text encoder produced, or the
+# array a spatial condition adds beside it.
+type Conditioning = DenoisingCondition | jax.Array
+
+
+def aligned_conditions(conditions: Mapping[str, Conditioning],
+                       unconditional: Mapping[str, Conditioning]) -> dict[str, Conditioning]:
     """`unconditional` with each row's own model inputs taken from `conditions`.
 
     A keyword names a conditioning record on both sides or on neither: the
@@ -48,7 +53,7 @@ def aligned_conditions(conditions: Mapping[str, Any],
     keyword that is a record on one side only is a caller pairing two
     different conditionings, and raises rather than aligning nothing.
     """
-    aligned: dict[str, Any] = {}
+    aligned: dict[str, Conditioning] = {}
     for key, null in unconditional.items():
         given = conditions.get(key)
         if isinstance(null, DenoisingCondition) and isinstance(given, DenoisingCondition):
@@ -98,8 +103,8 @@ class Process:
         """
         return jax.random.normal(key, shape) * self.sampler_schedule.prior_scale()
 
-    def denoiser(self, model, params, conditions: Mapping[str, Any],
-                 unconditional: Mapping[str, Any] | None = None) -> Denoiser:
+    def denoiser(self, model, params, conditions: Mapping[str, Conditioning],
+                 unconditional: Mapping[str, Conditioning] | None = None) -> Denoiser:
         """`(x_t, t) -> (x_0, epsilon)` for `model` under `params` with the
         given conditions, on the sampling schedule.
 
@@ -127,8 +132,8 @@ class Denoiser:
     process: Process
     model: nn.Module
     params: Variables
-    conditions: dict[str, Any]
-    unconditional: dict[str, Any] | None = None
+    conditions: dict[str, Conditioning]
+    unconditional: dict[str, Conditioning] | None = None
 
     def _raw(self, x_t, t, conditions) -> jax.Array:
         """The model's own output at `(x_t, t)`, on the input scale and model
