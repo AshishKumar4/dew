@@ -563,6 +563,11 @@ class DecoderBlock(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     per_layer_input_dim: int = 0
+    gate_activation: str = 'swiglu'
+    """The nonlinearity on the per-layer residual's gate, which Gemma 3n/4
+    share with the feed-forward's own gate (modeling_gemma4.py,
+    Gemma4TextDecoderLayer). `_gated_activation`'s three names; a block whose
+    feed-forward gates by another rule has no name to share and keeps silu."""
     parallel: Callable[..., nn.Module] | None = None
     """A branch summed with the feed-forward's output before its output norm,
     called with the residual and that output (Gemma 4's routed experts)."""
@@ -749,13 +754,9 @@ class DecoderBlock(nn.Module):
         its feed-forward, multiplied by the layer's input signal, projected
         back and normed."""
         gated = self.per_layer_input_gate(x)
-        gated = _gated_activation(self._gate_activation, gated)
+        gated = _gated_activation(self.gate_activation, gated)
         projected = self.per_layer_projection(gated * per_layer_input)
         return self.post_per_layer_input_norm(projected)
-
-    @property
-    def _gate_activation(self) -> str:
-        return getattr(self.mlp, 'activation', 'swiglu') if self.feedforward is not None else 'swiglu'
 
 
 @logical_axes({
@@ -1894,6 +1895,10 @@ class CausalTransformer(nn.Module):
                 scale_after_cast=self.scale_after_cast,
                 wiring=wiring,
                 per_layer_input_dim=ple or 0,
+                # The per-layer residual gates the way this model's gated
+                # feed-forward does; gpt-oss's clamped swiglu is not one of
+                # the three names that gate shares, so it keeps silu.
+                gate_activation='swiglu' if self.mlp == 'swigluoai' else self.mlp,
                 parallel=parallel if spec.routed else None,
                 altup=self.altup,
                 laurel_rank=self.laurel_rank,
