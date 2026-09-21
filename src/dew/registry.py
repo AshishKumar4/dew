@@ -55,7 +55,7 @@ class Registry(Mapping[str, T], Generic[T]):
 
     def __call__(self, name: str, /) -> Callable[[M], M]:
         """`@models("simple_dit")` on the class it names."""
-        if not isinstance(name, str) or not name:
+        if type(name) is not str or not name:
             raise TypeError(f"a {self.kind} name is a non-empty string, not {name!r}")
 
         def register(member: M) -> M:

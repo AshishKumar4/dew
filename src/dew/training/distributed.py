@@ -22,7 +22,7 @@ from flax import linen as nn
 from flax.linen import spmd
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
-from dew.data.dataset import Checkpointable
+from dew.data.dataset import Budgeted, Checkpointable, Closeable, Stoppable
 from dew.nn.inputs import BATCH_AXES, filled_validity
 from dew.nn.sharding import (
     DATA_AXIS,
@@ -527,9 +527,8 @@ class DevicePrefetchIterator:
                         # Thread creation failed before any source operation.
                         self._stop.set()
                         try:
-                            request_stop = getattr(self._iterator, "request_stop", None)
-                            if request_stop is not None:
-                                request_stop()
+                            if isinstance(self._iterator, Stoppable):
+                                self._iterator.request_stop()
                         except BaseException as failure:
                             error.add_note(f"Source cancellation failed: {failure!r}")
                         self._prefetch()
@@ -606,7 +605,7 @@ class DevicePrefetchIterator:
         finally:
             batch = placed = state = None
             try:
-                close = getattr(iterator, "close", None)
+                close = iterator.close if isinstance(iterator, Closeable) else None
                 if close is not None:
                     close()
             except BaseException as error:
@@ -636,7 +635,7 @@ class DevicePrefetchIterator:
         if threading.current_thread() is self._thread:
             raise RuntimeError("a prefetch worker cannot close itself")
         if timeout is None:
-            seconds = getattr(self._iterator, "stop_seconds", None)
+            seconds = self._iterator.stop_seconds if isinstance(self._iterator, Budgeted) else None
             timeout = 5.0 if seconds is None else float(seconds)
         if timeout < 0:
             raise ValueError("close timeout must be nonnegative")
@@ -644,9 +643,8 @@ class DevicePrefetchIterator:
         self._stop.set()
         error = None
         try:
-            request_stop = getattr(self._iterator, "request_stop", None)
-            if first_stop and request_stop is not None:
-                request_stop()
+            if first_stop and isinstance(self._iterator, Stoppable):
+                self._iterator.request_stop()
         except BaseException as failure:
             error = failure
         self._discard()

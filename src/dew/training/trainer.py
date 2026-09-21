@@ -28,7 +28,7 @@ from termcolor import colored
 
 from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
-from dew.data.dataset import Checkpointable, RampedStream, rows_of
+from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective, Step, select
 from dew.telemetry import profile as telemetry_profile
@@ -769,7 +769,8 @@ class Trainer(Generic[Loss, Effects]):
             paused = time.perf_counter()
             primary = sys.exception()
             error = primary
-            close = train.close if train is not None else getattr(source, "close", None)
+            close = (train.close if train is not None else
+                     source.close if isinstance(source, Closeable) else None)
             stop_trace: Callable[[], None] | None = None
             if tracing and profile is not None:
                 tracing = False

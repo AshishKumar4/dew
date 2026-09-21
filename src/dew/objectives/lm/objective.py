@@ -207,8 +207,11 @@ def _packing(batch):
 ROUTER_BIAS = "e_score_correction_bias"
 
 
-def _balanced_biases(moe: Variables) -> Variables:
+def _balanced_biases(moe: Variables | jax.Array) -> Variables | jax.Array:
     """The balancing biases of a `moe` collection, at their own paths.
+
+    The recursion hands itself the branches it walks, so the argument is a
+    collection or one of its leaves.
 
     Router state that is not a bias, and any branch left holding none of
     them, is dropped, so what comes back is one leaf per router the load

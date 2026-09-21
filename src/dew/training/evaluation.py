@@ -20,6 +20,7 @@ from dew.artifacts import (
     broadcast_from_process_zero,
     collective_host,
 )
+from dew.data.dataset import Closeable
 from dew.objectives.base import Batch, Effects, Loss, Metric, Objective, Step, Variables
 
 from .distributed import build_mesh, shard_batch
@@ -231,9 +232,9 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
             primary = sys.exception()
             error = None
             try:
-                close = getattr(iterator if iterator is not None else source, "close", None)
-                if close is not None:
-                    close()
+                held = iterator if iterator is not None else source
+                if isinstance(held, Closeable):
+                    held.close()
             except BaseException as failure:
                 if primary is not None:
                     primary.add_note(f"Validation iterator cleanup failed: {failure!r}")
