@@ -5,6 +5,11 @@ same reductions and commit on CPU and crosses an eager transport boundary to
 realize a batch on the accelerator. Only that orchestration differs: pooling,
 replay snapshots, optimizer admission, effects, EMA and the three clocks have
 one implementation. A pullback belongs to the current attempt, not TrainState.
+
+The host-master commit is compiled over what it moves. The frozen collection
+never changes and, resident beside the accelerator, is not the CPU's to copy:
+it is held out of the compiled commit and put back on the state it returns,
+the same arrays step after step.
 """
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ import optax
 from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 
-from dew.objectives.base import Aux, Batch, Effects, Loss, Mean, Step, Variables, mean_loss, merge
+from dew.objectives.base import FROZEN, Aux, Batch, Effects, Loss, Mean, Step, Variables, mean_loss, merge
 from dew.training.state import Accumulation
 
 
@@ -319,5 +324,11 @@ class Transaction:
                     gradient = jax.lax.cond(pending.replay_required, replay, lambda _: pending.gradient, None)
             else:
                 gradient = pending.gradient
-            return finish(state, batch, realized.aux, pending, gradient)
+            if not host or FROZEN not in state.params:
+                return finish(state, batch, realized.aux, pending, gradient)
+            held = state.params[FROZEN]
+            moving = {name: tree for name, tree in state.params.items() if name != FROZEN}
+            advanced, loss, aux = finish(dataclasses.replace(state, params=moving), batch,
+                                         realized.aux, pending, gradient)
+            return dataclasses.replace(advanced, params={**advanced.params, FROZEN: held}), loss, aux
         return run
