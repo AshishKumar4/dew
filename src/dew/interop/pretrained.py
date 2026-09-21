@@ -2099,7 +2099,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             audio_projection=(None if audio_projector is None
                               else projector_from_record(audio_projector)),
             audio_soft_tokens=record["audio_soft_tokens"],
-            attention_impl=None if attention_impl == "reference" else attention_impl)
+            attention_impl=attention_impl)
         variables = _native_variables(decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype))
         layouts, retained = _wrapper_layouts(tensors, record, variables)
     else:
