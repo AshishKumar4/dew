@@ -1,5 +1,7 @@
 """The general pretrained interface loads, generates, decodes and saves DiffusionGemma."""
 
+import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -104,3 +106,17 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     np.testing.assert_array_equal(result.tokens, expected.tokens)
     np.testing.assert_array_equal(result.decoder_steps, expected.decoder_steps)
 
+
+
+def test_a_published_checkpoint_with_a_sampler_index_loads_as_the_decoder(tmp_path):
+    """google/diffusiongemma-26B-A4B-it ships a diffusers `model_index.json`
+    naming only its scheduler beside the decoder's `config.json`; the loader
+    reads the decoder the config names instead of a latent pipeline."""
+    shutil.copytree(FIXTURE, tmp_path / "published")
+    (tmp_path / "published" / "model_index.json").write_text(json.dumps(
+        {"_class_name": "DiffusionGemmaPipeline", "_diffusers_version": "0.39.0.dev0",
+         "scheduler": ["diffusers", "BlockRefinementScheduler"]}))
+    reference = load_pretrained(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
+    bundle = load_pretrained(str(tmp_path / "published"), dtype="float32", attention_impl="xla", max_seq_len=32)
+    assert type(bundle.model) is type(reference.model)
+    assert jax.tree.structure(bundle.variables) == jax.tree.structure(reference.variables)
