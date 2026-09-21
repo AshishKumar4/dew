@@ -58,12 +58,12 @@ def reference():
 
 @pytest.fixture(scope="module")
 def loaded(decoder):
-    return lora.load(decoder, ADAPTER)
+    return lora.load(decoder.model, decoder.variables, decoder.layouts, ADAPTER)
 
 
 def _factors(source, adapter, tree, directory) -> dict[str, np.ndarray]:
     """The adapter's leaves in `tree`, in PEFT's layout under PEFT's names."""
-    lora.save(source, adapter, tree, directory)
+    lora.save(source.model, tree, source.layouts, adapter, directory)
     return {key.removeprefix(lora.PEFT_PREFIX): value for key, value in load_file(directory / lora.PEFT_WEIGHTS).items()}
 
 
@@ -201,7 +201,7 @@ def test_export_writes_the_peft_file_back(decoder, loaded, tmp_path):
     """The factors land bitwise where PEFT wrote them, under its names, and
     the config resolves every module to the same rank and alpha on reload."""
     adapter, variables = loaded
-    lora.save(decoder, adapter, variables, tmp_path)
+    lora.save(decoder.model, variables, decoder.layouts, adapter, tmp_path)
     ours = load_file(tmp_path / lora.PEFT_WEIGHTS)
     theirs = load_file(ADAPTER / lora.PEFT_WEIGHTS)
     assert ours.keys() == theirs.keys()
@@ -211,7 +211,7 @@ def test_export_writes_the_peft_file_back(decoder, loaded, tmp_path):
     assert (config["r"], config["lora_alpha"], config["use_rslora"], config["lora_dropout"]) == (4, 8, False, 0.1)
     assert config["rank_pattern"] == {"model.layers.1.self_attn.v_proj": 2}
     assert config["alpha_pattern"] == {"model.layers.0.mlp.down_proj": 3, "model.layers.1.mlp.down_proj": 3}
-    again, variables_again = lora.load(decoder, tmp_path)
+    again, variables_again = lora.load(decoder.model, decoder.variables, decoder.layouts, tmp_path)
     assert again == adapter
     for ours_leaf, theirs_leaf in zip(jax.tree.leaves(variables_again), jax.tree.leaves(variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ours_leaf), np.asarray(theirs_leaf))
@@ -221,8 +221,8 @@ def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, referenc
     """PEFT's target_modules: a suffix names every projection under it; B
     starts at zero so the adapted forward is the base forward; A is drawn
     on +-1/sqrt(fan_in)."""
-    adapter, variables = lora.fresh(decoder, rank=3, alpha=6.0, modules=("q_proj", "layers.1.mlp.up_proj"),
-                                    key=jax.random.key(0))
+    adapter, variables = lora.fresh(decoder.model, decoder.variables, decoder.layouts, rank=3, alpha=6.0,
+                                    modules=("q_proj", "layers.1.mlp.up_proj"), key=jax.random.key(0))
     assert set(adapter.targets) == {("params", "layers_0", "self_attn", "q_proj"),
                                     ("params", "layers_1", "self_attn", "q_proj"),
                                     ("params", "layers_1", "mlp", "up_proj")}
@@ -233,7 +233,8 @@ def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, referenc
     assert a.shape == (64, 3) and 0 < float(jnp.abs(a).max()) <= 1 / 8
     assert not bool(jnp.any(variables["params"]["layers_1"]["mlp"]["up_proj"]["lora_B"]))
     with pytest.raises(ValueError, match="w_proj"):
-        lora.fresh(decoder, rank=2, alpha=2.0, modules=("q_proj", "w_proj"), key=jax.random.key(0))
+        lora.fresh(decoder.model, decoder.variables, decoder.layouts, rank=2, alpha=2.0,
+                   modules=("q_proj", "w_proj"), key=jax.random.key(0))
 
 
 def test_the_branch_drops_out_only_under_a_dropout_stream(decoder, loaded, reference):
@@ -274,25 +275,25 @@ def test_refusals_name_the_reason(decoder, tmp_path):
     a, b = fixture[prefix + ".lora_A.weight"], fixture[prefix + ".lora_B.weight"]
 
     with pytest.raises(ValueError, match="layers.5.self_attn.q_proj, which this source does not bind"):
-        lora.load(decoder, _write_peft(tmp_path / "unbound", {
+        lora.load(decoder.model, decoder.variables, decoder.layouts, _write_peft(tmp_path / "unbound", {
             lora.PEFT_PREFIX + "model.layers.5.self_attn.q_proj.lora_A.weight": a,
             lora.PEFT_PREFIX + "model.layers.5.self_attn.q_proj.lora_B.weight": b}))
     with pytest.raises(ValueError, match="stores rank 2 but its config declares 4"):
-        lora.load(decoder, _write_peft(tmp_path / "rank", {
+        lora.load(decoder.model, decoder.variables, decoder.layouts, _write_peft(tmp_path / "rank", {
             prefix + ".lora_A.weight": a[:2], prefix + ".lora_B.weight": b[:, :2]}))
     with pytest.raises(ValueError, match=r"delta of \(64, 32\) on a weight the source stores as \(64, 64\)"):
-        lora.load(decoder, _write_peft(tmp_path / "shape", {
+        lora.load(decoder.model, decoder.variables, decoder.layouts, _write_peft(tmp_path / "shape", {
             prefix + ".lora_A.weight": a[:, :32], prefix + ".lora_B.weight": b}))
     with pytest.raises(ValueError, match="not a projection weight"):
-        lora.load(decoder, _write_peft(tmp_path / "norm", {
+        lora.load(decoder.model, decoder.variables, decoder.layouts, _write_peft(tmp_path / "norm", {
             lora.PEFT_PREFIX + "model.norm.lora_A.weight": a, lora.PEFT_PREFIX + "model.norm.lora_B.weight": b}))
     with pytest.raises(ValueError, match="use_dora"):
-        lora.load(decoder, _write_peft(tmp_path / "dora", {
+        lora.load(decoder.model, decoder.variables, decoder.layouts, _write_peft(tmp_path / "dora", {
             prefix + ".lora_A.weight": a, prefix + ".lora_B.weight": b}, {"use_dora": True}))
     with pytest.raises(ValueError, match="kohya"):
-        lora.load(decoder, _write_peft(tmp_path / "kohya", {"lora_unet_down_blocks_0.alpha": np.full((), 4, np.float32)}))
+        lora.load(decoder.model, decoder.variables, decoder.layouts, _write_peft(tmp_path / "kohya", {"lora_unet_down_blocks_0.alpha": np.full((), 4, np.float32)}))
     with pytest.raises(ValueError, match="lora_A without its partner"):
-        lora.load(decoder, _write_peft(tmp_path / "half", {prefix + ".lora_A.weight": a}))
+        lora.load(decoder.model, decoder.variables, decoder.layouts, _write_peft(tmp_path / "half", {prefix + ".lora_A.weight": a}))
 
 
 def test_a_per_expert_source_tensor_takes_no_adapter():
@@ -301,7 +302,8 @@ def test_a_per_expert_source_tensor_takes_no_adapter():
     mixtral = load_pretrained(ROOT / "tests" / "fixtures" / "hf" / "mixtral-tiny", dtype="float32",
                               attention_impl="reference")
     with pytest.raises(ValueError, match="experts.0.w1 is assembled from several leaves"):
-        lora.fresh(mixtral, rank=2, alpha=2.0, modules=("w1",), key=jax.random.key(0))
+        lora.fresh(mixtral.model, mixtral.variables, mixtral.layouts, rank=2, alpha=2.0,
+                   modules=("w1",), key=jax.random.key(0))
 
 
 def test_a_target_that_is_not_a_dense_is_refused_when_called(decoder, reference):
@@ -412,7 +414,7 @@ def _subtree(tree, path):
 
 
 def test_the_text_encoder_component_adapts_the_conditioning_tower(pipeline, sd_reference):
-    adapter, variables = lora.load(pipeline, SD)
+    adapter, variables = lora.load(pipeline.model, pipeline.variables, pipeline.layouts, SD)
     tower = pipeline.inputs.conditions["conditioning"].encoder.towers[0]
     ids = jnp.asarray(sd_reference["prompt_ids"])
     features = adapter.adapt(tower, root=TEXT_ROOT).apply({"params": _subtree(variables, TEXT_ROOT)}, ids,
@@ -426,7 +428,7 @@ def test_the_unet_component_matches_the_pipeline_adapted_and_fused(pipeline, sd_
     """to_q's [in, heads, depth] and to_out.0's [heads, depth, features]
     DenseGeneral kernels take their factors in kernel layout and merge back
     to the fused torch weights."""
-    adapter, variables = lora.load(pipeline, SD)
+    adapter, variables = lora.load(pipeline.model, pipeline.variables, pipeline.layouts, SD)
     condition = DenoisingCondition(jnp.asarray(sd_reference["context"]), None, None)
     latent, time = jnp.asarray(sd_reference["latent"]), jnp.asarray(sd_reference["time"])
     predicted = adapter.adapt(pipeline.model).apply({"params": variables["params"]}, latent, time, conditioning=condition)
@@ -443,8 +445,8 @@ def test_the_unet_component_matches_the_pipeline_adapted_and_fused(pipeline, sd_
 
 
 def test_export_writes_the_diffusers_file_back(pipeline, tmp_path):
-    adapter, variables = lora.load(pipeline, SD)
-    lora.save(pipeline, adapter, variables, tmp_path)
+    adapter, variables = lora.load(pipeline.model, pipeline.variables, pipeline.layouts, SD)
+    lora.save(pipeline.model, variables, pipeline.layouts, adapter, tmp_path)
     ours, metadata = read_file(tmp_path / lora.DIFFUSERS_WEIGHTS)
     theirs, _ = read_file(SD / lora.DIFFUSERS_WEIGHTS)
     assert ours.keys() == theirs.keys()
@@ -452,13 +454,129 @@ def test_export_writes_the_diffusers_file_back(pipeline, tmp_path):
         np.testing.assert_array_equal(ours[key], theirs[key])
     header = json.loads(metadata[lora.DIFFUSERS_METADATA])
     assert (header["unet.r"], header["unet.lora_alpha"], header["text_encoder.r"], header["text_encoder.lora_alpha"]) == (4, 6, 2, 5)
-    assert lora.load(pipeline, tmp_path)[0] == adapter
+    assert lora.load(pipeline.model, pipeline.variables, pipeline.layouts, tmp_path)[0] == adapter
 
 
 def test_a_file_without_a_header_scales_by_one_as_diffusers_does(pipeline, tmp_path):
     tensors, _ = read_file(SD / lora.DIFFUSERS_WEIGHTS)
     write_file(tensors, tmp_path / lora.DIFFUSERS_WEIGHTS, {"format": "pt"})
-    adapter, _ = lora.load(pipeline, tmp_path)
+    adapter, _ = lora.load(pipeline.model, pipeline.variables, pipeline.layouts, tmp_path)
     assert all(target.alpha == target.rank for target in adapter.targets.values())
     assert {target.rank for path, target in adapter.targets.items() if path[0] == "params"} == {4}
     assert {target.rank for path, target in adapter.targets.items() if path[0] == "encoders"} == {2}
+
+
+# --------------------------------------------------------------------------
+# An adapter on a model the registry built, from a run config
+# --------------------------------------------------------------------------
+
+
+REGISTRY_FIELDS = {"vocab_size": 256, "emb_features": 16, "num_layers": 2, "num_heads": 2,
+                   "head_dim": 8, "mlp_features": 32, "max_seq_len": 16}
+
+
+def _flat(tree):
+    """Every leaf by its dotted path, for comparing two trees leaf by leaf."""
+    return {".".join(str(entry.key) for entry in path): leaf
+            for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
+
+
+def _registry_decoder():
+    """A tiny causal transformer and its variables, built from the registry:
+    no published checkpoint, so no weight layouts to resolve names through."""
+    from dew.config import ModelConfig
+
+    config = ModelConfig("causal_transformer", dict(REGISTRY_FIELDS), dtype="float32",
+                         attention_impl="reference")
+    model = config.build()
+    return config, model, model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+
+
+def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_path):
+    """No loader in sight: the module paths under `params` are the names
+    `target_modules` matches, the fresh adapter is the identity, and the
+    factors write and read back in PEFT's layout under those names."""
+    _, model, variables = _registry_decoder()
+    adapter, adapted = lora.fresh(model, variables, {}, rank=2, alpha=4.0,
+                                  modules=("q_proj", "layers_1.mlp.up_proj"), key=jax.random.key(1))
+    assert set(adapter.targets) == {("params", "layers_0", "self_attn", "q_proj"),
+                                    ("params", "layers_1", "self_attn", "q_proj"),
+                                    ("params", "layers_1", "mlp", "up_proj")}
+    tokens = jnp.asarray([[3, 4, 5, 6, 7, 8]])
+    np.testing.assert_array_equal(np.asarray(adapter.adapt(model).apply(adapted, tokens)),
+                                  np.asarray(model.apply(variables, tokens)))
+
+    lora.save(model, adapted, {}, adapter, tmp_path)
+    written = load_file(tmp_path / lora.PEFT_WEIGHTS)
+    assert set(written) == {f"{lora.PEFT_PREFIX}{name}.lora_{factor}.weight"
+                            for name in ("layers_0.self_attn.q_proj", "layers_1.self_attn.q_proj",
+                                         "layers_1.mlp.up_proj") for factor in "AB"}
+    assert written[f"{lora.PEFT_PREFIX}layers_1.mlp.up_proj.lora_A.weight"].shape == (2, 16)
+    again, restored = lora.load(model, variables, {}, tmp_path)
+    assert again == adapter
+    for ours, theirs in zip(jax.tree.leaves(restored), jax.tree.leaves(adapted), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+    with pytest.raises(ValueError, match="to_q match no projection"):
+        lora.fresh(model, variables, {}, rank=2, alpha=2.0, modules=("to_q",), key=jax.random.key(0))
+
+
+def test_a_run_config_adapter_trains_its_factors_and_nothing_else(tmp_path):
+    """`--lora` on a run: `RunConfig.train` adapts the module the objective
+    trains, freezes every other leaf through the adapter's own filter, and
+    two steps move the factors and leave the base weights bitwise."""
+    from dew.config import RunConfig, TrainerConfig
+
+    config_model, model, variables = _registry_decoder()
+    adapter, _ = lora.fresh(model, variables, {}, rank=2, alpha=4.0, modules=("q_proj", "v_proj"),
+                            key=jax.random.key(1))
+    rows = 2 * jax.device_count()
+    batch = {"text": np.random.RandomState(0).randint(1, 250, (rows, 9)).astype(np.int32)}
+    data = Dataset(train=lambda: iter([batch, batch]), val=None, records=rows, batch=rows)
+    config = RunConfig(model=config_model, lora=dataclasses.replace(adapter, dropout=0.0),
+                       trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=rows, steps=2,
+                                             eval_every=None, checkpoint_every=None,
+                                             compilation_cache_dir=None))
+    objective = LMObjective(config_model.build(), 8, ema_decay=None)
+
+    state = config.train(objective, data, name="run")
+
+    selects = objective.trainable
+    assert selects is not None
+    assert selects(("params", "layers_0", "self_attn", "q_proj", "lora_A"))
+    assert not selects(("params", "layers_0", "self_attn", "q_proj", "kernel"))
+    initial = Trainer(objective, optax.sgd(0.0), key=jax.random.key(config.trainer.seed)).initial_state()
+    moved = _flat(state.params["params"])
+    assert set(moved) == {f"{'.'.join(target[1:])}.{factor}"
+                          for target in config.lora.targets for factor in lora.FACTORS}
+    for name, leaf in moved.items():
+        assert bool(jnp.any(leaf != _flat(initial.params["params"])[name])), f"{name} did not move"
+    for before, after in zip(jax.tree.leaves(initial.params[FROZEN]),
+                             jax.tree.leaves(state.params[FROZEN]), strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    record = json.loads((tmp_path / "run" / "run.json").read_text())
+    assert record["lora"]["targets"]["params/layers_0/self_attn/q_proj"] == {"rank": 2, "alpha": 4.0}
+    assert RunConfig.from_dict(record).lora == config.lora
+
+
+def test_an_objective_that_selects_its_own_leaves_refuses_a_config_adapter():
+    """One filter decides what trains: an objective that already has one, or
+    one that keeps no model to adapt, is refused by name."""
+    from dew.config import RunConfig, TrainerConfig
+
+    _, model, variables = _registry_decoder()
+    adapter, _ = lora.fresh(model, variables, {}, rank=2, alpha=4.0, modules=("q_proj",),
+                            key=jax.random.key(1))
+    rows = jax.device_count()
+    data = Dataset(train=lambda: iter([]), val=None, records=rows, batch=rows)
+    config = RunConfig(lora=adapter, trainer=TrainerConfig(batch_size=rows, steps=1))
+
+    held = LMObjective(model, 8, ema_decay=None, trainable=lambda path: True)
+    with pytest.raises(ValueError, match="LMObjective already selects what trains"):
+        config.train(held, data, name="run")
+
+    class Modelless:
+        """Something that trains other than one module: there is nothing to adapt."""
+
+    with pytest.raises(ValueError, match="Modelless keeps no `model`"):
+        config.train(Modelless(), data, name="run")

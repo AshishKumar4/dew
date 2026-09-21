@@ -874,6 +874,17 @@ class Pretrained:
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
     quantized_tensors: tuple[str, ...] = ()
 
+    @property
+    def layouts(self) -> Mapping[str, WeightLayout]:
+        """Source module name to the layout of its weight: `model.<module>`
+        for a decoder, `unet.<module>` for a pipeline component.
+
+        These are the names a published adapter file writes, so this is what
+        `dew.lora` binds a low-rank delta through.
+        """
+        return {layout.name.removesuffix(".weight").replace("/", "."): layout
+                for layout in self.weight_layouts if layout.name.endswith(".weight")}
+
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration | MaskedGeneration:
         """Native MDLM for masked models, source decoding controls for causal models.
 

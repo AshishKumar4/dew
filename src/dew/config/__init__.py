@@ -23,7 +23,7 @@ import re
 import sys
 import types
 import typing
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping as MappingABC, MutableMapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Literal, Mapping, Self
 
 import jax
@@ -37,6 +37,7 @@ from dew import registry
 from dew.artifacts import agree_process_phase
 from dew.checkpoints import RUN_FILE, Checkpoints
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
+from dew.lora import LoRA, attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON
@@ -270,7 +271,7 @@ def _to_json(value, annotation) -> JSON:
                 for entry_value, entry in zip(value, entries, strict=True)]
     if isinstance(value, Mapping):
         entries = registry.entry_types(annotation, len(value))
-        return {str(key): _to_json(entry_value, entry)
+        return {_key(key): _to_json(entry_value, entry)
                 for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -278,6 +279,29 @@ def _to_json(value, annotation) -> JSON:
         f"{type(value).__name__} is not something a run record can carry; a "
         f"config field holds JSON scalars, sequences, mappings, and the "
         f"registered values this writes as their name and fields")
+
+
+def _key(key: object) -> str:
+    """One mapping key as JSON names it, since JSON has only string keys.
+
+    A tree path is its parts joined the way every message in this tree joins
+    them, `params/layers_0/self_attn/q_proj`, which is the spelling
+    `_rebuild` splits back into the tuple the field declares. A key that is
+    neither a name nor a path of them has no spelling a record reads back,
+    so it is refused here rather than written as its repr.
+    """
+    if isinstance(key, tuple):
+        return "/".join(_key(part) for part in key)
+    if not isinstance(key, (str, int, float)):
+        raise TypeError(
+            f"{key!r} is not a key a run record can carry; a config mapping is keyed "
+            f"by a name, a number, or a tree path of names")
+    return str(key)
+
+
+def _rebuild_key(annotation: registry.Annotation, key: str) -> str | tuple[str, ...]:
+    """One record key as the field declares it: a name, or the path `_key` joined."""
+    return tuple(key.split("/")) if registry.wants_tuple(annotation) else key
 
 
 def _instantiate(member: Callable, fields: Mapping[str, registry.Configured]) -> registry.Configured:
@@ -312,6 +336,9 @@ def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:
     return rebuilt
 
 
+_MAPPINGS = (dict, MappingABC, MutableMapping)
+
+
 def _rebuild(annotation: registry.Annotation, value: registry.Configured) -> registry.Configured:
     """The value `annotation` asks for, built out of a record.
 
@@ -340,6 +367,13 @@ def _rebuild(annotation: registry.Annotation, value: registry.Configured) -> reg
         if value is None or len(inner) != 1:
             return value
         return _rebuild(inner[0], value)
+    if typing.get_origin(annotation) in _MAPPINGS and isinstance(value, Mapping):
+        # A mapping's own annotation names its keys and its values, and the
+        # record carries neither: JSON keys are strings and JSON values are
+        # the scalars and lists below. Both go back through this walk.
+        keys, values = typing.get_args(annotation)
+        return {_rebuild_key(keys, str(name)): _rebuild(values, registry.configured(entry))
+                for name, entry in value.items()}
     if isinstance(value, list):
         # JSON writes every sequence as a list; the field says which are tuples.
         entries = registry.entry_types(annotation, len(value))
@@ -359,6 +393,10 @@ class RunConfig:
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: str | None = None
+    lora: LoRA | None = None
+    """The low-rank adapter the run trains instead of the whole model. The
+    targets are the module paths under `params` a delta sits on; `train`
+    adapts the objective's module and freezes every other leaf."""
 
     def to_dict(self) -> dict[str, JSON]:
         """JSON-safe record of the run; a registered member is written as its
@@ -412,7 +450,8 @@ class RunConfig:
 
         A `trainer.quantization` wraps the module `objective` trains before
         anything initialises it, so the quantized forward is what the run
-        learns through.
+        learns through, and a `lora` adapts the same module the same way,
+        so the run traces the adapted forward and moves only its factors.
         """
         if dataset.batch != self.trainer.batch_size:
             raise ValueError(
@@ -421,6 +460,8 @@ class RunConfig:
                 f"load(batch={self.trainer.batch_size})")
         if self.trainer.quantization is not None:
             quantize(objective, self.trainer.quantization)
+        if self.lora is not None:
+            attach(objective, self.lora)
         objective_type = type(objective)
         kind = (registry.objectives.name_of(objective_type) if objective_type in registry.objectives.values()
                 else f"{objective_type.__module__}.{objective_type.__qualname__}")
