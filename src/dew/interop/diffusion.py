@@ -73,7 +73,7 @@ class UNetFields(TypedDict):
 
 
 def _integer(value: object, name: str) -> int:
-    if type(value) is not int:
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
     return value
 
@@ -85,7 +85,7 @@ def _number(value: object, name: str) -> float:
 
 
 def _boolean(value: object, name: str) -> bool:
-    if type(value) is not bool:
+    if not isinstance(value, bool):
         raise ValueError(f"{name} must be boolean")
     return value
 

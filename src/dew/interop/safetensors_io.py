@@ -13,11 +13,13 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Callable, Mapping
 
 import jax
 import ml_dtypes
 import numpy as np
+
+from dew.nn.text_encoders import ParamTree
 
 SEPARATOR = "/"
 WEIGHTS_FILE = "model.safetensors"
@@ -114,13 +116,16 @@ def _flatten(params) -> dict[str, np.ndarray]:
     return {_leaf_name(path): _host_array(leaf) for path, leaf in leaves}
 
 
-def _unflatten(tensors: Mapping[str, np.ndarray]) -> dict[str, Any]:
-    tree: dict[str, Any] = {}
+def _unflatten(tensors: Mapping[str, np.ndarray]) -> ParamTree:
+    tree: ParamTree = {}
     for name, tensor in tensors.items():
         *branches, leaf = name.split(SEPARATOR)
         node = tree
         for branch in branches:
-            node = node.setdefault(branch, {})
+            child = node.setdefault(branch, {})
+            if not isinstance(child, dict):
+                raise ValueError(f"{name} crosses the tensor already at {branch!r}")
+            node = child
         node[leaf] = tensor
     return tree
 
@@ -130,7 +135,7 @@ def save_params(params, path) -> None:
     _publish(lambda: _flatten(params), path)
 
 
-def load_params(path) -> dict[str, Any]:
+def load_params(path) -> ParamTree:
     """Read a safetensors file back into a nested parameter dict.
 
     Leaves are read-only views of the file in their stored dtype, so nothing
