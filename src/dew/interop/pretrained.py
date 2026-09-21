@@ -2003,7 +2003,10 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         raise ValueError("param_dtype must select floating parameter storage")
     param_dtype = storage
     directory = decoders._snapshot(str(name_or_dir), revision)
-    if (directory / "model_index.json").is_file():
+    if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
+        # A latent diffusion pipeline is a directory of components with no
+        # model of its own; a decoder that also ships a pipeline index for its
+        # sampler (DiffusionGemma) is loaded as the decoder its config names.
         with open(directory / "model_index.json") as handle:
             return _load_diffusion_source(directory, json.load(handle), dtype=dtype,
                                           attention_impl=attention_impl, param_dtype=param_dtype)
