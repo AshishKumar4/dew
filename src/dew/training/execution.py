@@ -4,6 +4,14 @@ Only objective evaluation and its pullback cross this boundary. The optimizer,
 accumulation and checkpoint trees retain their original logical leaf identities.
 Each snapshot bank is assembled and transferred before the next is built; no
 whole parameter tree is ever materialized on the accelerator.
+
+The CPU owns what moves. A leaf the objective's trainable filter froze never
+changes, so the state holds it where a realization reads it (`resident`):
+a layer's leaf in the pinned host memory its bank streams from, anything
+outside the stack in the accelerator's own memory. Its snapshot is itself,
+one array for the whole run, and the per-step copy is of the moving leaves
+alone. A scanned run stacks its frozen rows once, the first step that reads
+them, and keeps that bank for as long as the rows it was built from stay.
 """
 from __future__ import annotations
 
@@ -14,13 +22,41 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.inference.banks import bank_sites, entry_tree, in_namespace, narrowed, one_layer
-from dew.objectives.base import Step, thaw
+from dew.inference.banks import bank_sites, entry_tree, in_namespace, layer_index, narrowed, one_layer
+from dew.objectives.base import FROZEN, Step, thaw
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
 from dew.training.transaction import Realization
 
-_stack = jax.jit(lambda *rows: jax.tree.map(lambda *leaves: jnp.stack(leaves), *rows))
+BANK_MEMORY = "pinned_host"
+"""Where a layer's bank sits beside the accelerator: the stack fetches one
+layer of it at a time as it reaches it (`run_stack`). The CPU backend has
+the space too, so a CPU-only run exercises the same fetching loop."""
+
+
+def _in_stack(path: tuple[str, ...], sites) -> bool:
+    """Whether a `params`-relative leaf path is one of a declared stack's layers."""
+    return any(path[:len(site.namespace)] == site.namespace
+               and len(path) > len(site.namespace)
+               and layer_index(path[len(site.namespace)]) is not None
+               for site in sites)
+
+
+def resident(placement, sites, accelerator):
+    """The frozen collection's placement beside the accelerator, from the
+    specs the layout gave it: a stack's layers in bank memory, the rest in
+    device memory, each leaf the shard the layout named."""
+    def leaf(path, sharding):
+        keys = tuple(entry.key for entry in path)
+        kind = BANK_MEMORY if _in_stack(keys, sites) else None
+        return NamedSharding(accelerator, sharding.spec, memory_kind=kind)
+    return jax.tree_util.tree_map_with_path(leaf, placement)
+
+
+def _bank_shardings(placed, accelerator, count):
+    return jax.tree.map(
+        lambda s: NamedSharding(accelerator, P(None, *s.spec) if count > 1 else s.spec,
+                                memory_kind=BANK_MEMORY), placed)
 
 
 def _replaced(tree, namespace, subtrees):
@@ -81,6 +117,15 @@ class HostExecution:
         self.sites = bank_sites(objective) if objective.bank_sites else ()
         self.loss = jax.jit(objective.loss)
         self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
+        # A scanned run's frozen rows, stacked and placed once: keyed by the
+        # identity of the rows they were built from, so a state whose frozen
+        # leaves are the same arrays step after step reads the same bank,
+        # and one restored from elsewhere builds its own.
+        self._stacked: dict[tuple, jax.Array] = {}
+
+    def resident(self, placement):
+        """Where the frozen collection lives for the run, given its layout specs."""
+        return resident(placement, self.sites, self.accelerator)
 
     def snapshot(self, variables):
         """The declared stacks as banks, everything else as it is stored.
@@ -89,13 +134,18 @@ class HostExecution:
         a layer's parameter leaves and a partially frozen run does not stack
         two sparse trees of different shape. The canonical state keeps its
         own `params` and `frozen` collections; this merged view exists only
-        for the duration of one realization.
+        for the duration of one realization. A frozen leaf already sits
+        where the snapshot puts it, so `transfer` hands it back as it is:
+        the copy is of the moving leaves, and a run of one layer's bank is
+        the state's own arrays.
         """
         if variables is None:
             return None
         placement = self.layout.shardings(self.accelerator, variables)
         if not self.sites:
             return transfer(variables, placement)
+        frozen = {tuple(entry.key for entry in path) for path, _ in
+                  jax.tree_util.tree_leaves_with_path(variables.get(FROZEN, {}))}
         whole, placement = thaw(variables), thaw(placement)
         weights = {"params": whole["params"]}
         places = {"params": placement["params"]}
@@ -105,25 +155,46 @@ class HostExecution:
         entries = {**{collection: tree for collection, tree in whole.items()
                       if collection != "params"}, **entry_tree(weights, self.sites)}
         store = transfer(entries, narrowed(placement, entries))
+        stacked: dict[tuple, jax.Array] = {}
         for site in self.sites:
             for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
                 rows = [one_layer(weights, index, namespace=site.namespace)
                         for index in range(first, first + count)]
                 if not rows[0]:
                     continue
-                placed = one_layer(places, first, namespace=site.namespace)
-                bank = rows[0] if count == 1 else _stack(*rows)
-                spread = jax.tree.map(
-                    lambda s: NamedSharding(
-                        self.accelerator, P(None, *s.spec) if count > 1 else s.spec,
-                        memory_kind="pinned_host"), placed)
-                bank = jax.block_until_ready(transfer(bank, spread))
+                spread = _bank_shardings(one_layer(places, first, namespace=site.namespace),
+                                         self.accelerator, count)
+                if count == 1:
+                    bank = transfer(rows[0], spread)
+                else:
+                    bank = self._run_bank(rows, spread, frozen, site.namespace, first, stacked)
+                bank = jax.block_until_ready(bank)
                 for collection, values in bank.items():
                     branch = store.setdefault(collection, {})
                     for component in site.namespace:
                         branch = branch.setdefault(component, {})
                     branch[name] = values
+        self._stacked = stacked
         return store
+
+    def _run_bank(self, rows, spread, frozen, namespace, first, stacked):
+        """A scanned run's bank, leaf by leaf: a leaf whose every row is
+        frozen is stacked once and kept, any other is stacked now."""
+        def leaf(path, sharding, *leaves):
+            keys = tuple(entry.key for entry in path)[1:]
+            held = all((*namespace, f"layers_{first + offset}", *keys) in frozen
+                       for offset in range(len(leaves)))
+            if not held:
+                # A moving row is the CPU's; a frozen row beside it is
+                # brought over so the run stacks on one backend.
+                return transfer(jnp.stack(self.on_cpu(leaves)), sharding)
+            key = (namespace, first, keys, *(id(row) for row in leaves))
+            bank = self._stacked.get(key)
+            if bank is None:
+                bank = jax.block_until_ready(transfer(jnp.stack(leaves), sharding))
+            stacked[key] = bank
+            return bank
+        return jax.tree_util.tree_map_with_path(leaf, spread, *rows)
 
     def on_cpu(self, tree):
         def placement(leaf):

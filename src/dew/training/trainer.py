@@ -30,7 +30,19 @@ from dew.artifacts import agree_process_phase
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives.base import Aux, Batch, Effects, Initializer, Loss, Mean, Metric, Objective, Step, select
+from dew.objectives.base import (
+    FROZEN,
+    Aux,
+    Batch,
+    Effects,
+    Initializer,
+    Loss,
+    Mean,
+    Metric,
+    Objective,
+    Step,
+    select,
+)
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
 from dew.telemetry.records import CheckpointRequested, FitEnded, FitStarted, ProfileWindow, Record
@@ -243,12 +255,20 @@ class Trainer(Generic[Loss, Effects]):
 
     def shardings(self, state: TrainState) -> Placement:
         """Parameter gradients follow parameters; replay records follow batches;
-        the layout's host-resident fields sit in pinned host memory."""
+        the layout's host-resident fields sit in pinned host memory. Under a
+        CPU-owned state the frozen collection is the exception: it sits where
+        the realization reads it (`execution.resident`) for the whole run."""
         mesh = self.state_mesh
         placed = self.layout.shardings(mesh, dataclasses.replace(state, accumulation=None))
         placed = dataclasses.replace(placed, **{
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
+        if self.host_master and FROZEN in placed.params:
+            from dew.inference.banks import bank_sites
+            from dew.training.execution import resident
+            sites = bank_sites(self.objective) if self.objective.bank_sites else ()
+            placed = dataclasses.replace(placed, params={
+                **placed.params, FROZEN: resident(placed.params[FROZEN], sites, self.device_mesh)})
         accumulation = state.accumulation
         if accumulation is None:
             return placed
@@ -294,6 +314,8 @@ class Trainer(Generic[Loss, Effects]):
         checkpoints = self.checkpoints
         resume = None if checkpoints is None else checkpoints.latest
         if checkpoints is None or resume is None:
+            if self.host_master:
+                return self._placed_host(initializer, key, shardings), shardings, None
             state = jax.jit(self.initial_state, out_shardings=shardings)(initializer, key)
             return state, shardings, None
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
@@ -307,14 +329,33 @@ class Trainer(Generic[Loss, Effects]):
         print(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
 
+    def _placed_host(self, initializer, key, shardings: Placement) -> TrainState:
+        """A fresh CPU-owned state: built on the companion, its frozen leaves
+        then moved to where they stay resident (`execution.resident`).
+        One JIT cannot return to two device sets, so the move follows it."""
+        from dew.training.host import transfer
+        held = shardings.params.get(FROZEN)
+        companion = shardings if held is None else dataclasses.replace(shardings, params={
+            **shardings.params,
+            FROZEN: jax.tree.map(lambda s: NamedSharding(self.state_mesh, s.spec), held)})
+        state = jax.jit(self.initial_state, out_shardings=companion)(initializer, key)
+        if held is None:
+            return state
+        return dataclasses.replace(state, params={
+            **state.params, FROZEN: transfer(state.params[FROZEN], held)})
+
     # ------------------------------------------------------------------
     # The step
     # ------------------------------------------------------------------
 
     def _loss_shape(self, state: TrainState, batch: Batch):
+        # Shapes and dtypes only: a resident frozen leaf sits in another
+        # memory space than the moving ones, and the loss the realization
+        # runs reads a snapshot in one space.
+        params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.params)
         step_info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
-                    with_ema(state.params, state.ema))
-        return jax.eval_shape(self.objective.loss, state.params, batch, step_info)
+                    with_ema(params, state.ema))
+        return jax.eval_shape(self.objective.loss, params, batch, step_info)
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, shape_only=False):
         if self.accumulation == 1 or self.step is not None or state.accumulation is not None:
@@ -425,7 +466,9 @@ class Trainer(Generic[Loss, Effects]):
                     current = self._initialize_accumulation(current, batch, shapes)
                 advanced, loss, aux = body(current, batch)
                 advanced = dataclasses.replace(advanced, step=current.step + 1)
-                advanced = jax.device_put(advanced, placement)
+                # A leaf already where its placement says stays the array it
+                # is: the resident frozen collection crosses no boundary.
+                advanced = transfer(advanced, placement)
                 return (advanced, loss, aux.metrics, jnp.isfinite(loss),
                         advanced.microstep > current.microstep)
         return run
