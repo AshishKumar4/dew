@@ -2124,7 +2124,14 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
                     bindings.append(layout)
             layouts = tuple(bindings)
     processor = None
-    if any((directory / name).exists() for name in ("processor_config.json", "preprocessor_config.json")):
+    processor_files = any((directory / name).exists()
+                          for name in ("processor_config.json", "preprocessor_config.json"))
+    if isinstance(model, MultimodalTransformer) and processor_files:
+        # Only a model with towers reads images or audio, and only through
+        # the processor its repo ships; a text decoder takes its tokenizer
+        # whatever processor files sit beside it (DiffusionGemma publishes a
+        # Gemma 4 processor config beside a text-only model), and a tiny
+        # multimodal fixture without processor files tokenizes text only.
         from transformers import AutoProcessor
         options = {"backend": "pil"} if family == "gemma3" else {}
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
