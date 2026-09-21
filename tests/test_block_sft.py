@@ -22,7 +22,7 @@ from dew.checkpoints import Checkpoints
 from dew.interop import load_pretrained
 from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Step, scalar_loss
+from dew.objectives.base import FROZEN, Step, scalar_loss
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
@@ -281,3 +281,47 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     np.testing.assert_array_equal(generated.tokens, published.tokens)
     np.testing.assert_array_equal(generated.decoder_steps, published.decoder_steps)
     assert np.all(np.asarray(generated.decoder_steps) > 0)
+
+
+def test_trainable_filter_freezes_the_rest_and_moves_only_what_it_keeps(source):
+    """`trainable` splits the tree the way LMObjective's does: the frozen
+    collection holds what the filter rejects, the loss is the loss of the
+    whole tree, only the kept leaves take a gradient, and the published
+    weights are one `params` collection again."""
+    loaded, batch, step, reference = source
+
+    def attention(path):
+        return "self_attn" in path
+
+    obj = objective(loaded, trainable=attention)
+    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    assert set(variables) >= {"params", FROZEN}
+    kept = [path for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])]
+    assert kept and all("self_attn" in jax.tree_util.keystr(path) for path in kept)
+    assert not any("self_attn" in jax.tree_util.keystr(path)
+                   for path, _ in jax.tree_util.tree_leaves_with_path(variables[FROZEN]))
+    (loss, _), gradient = jax.value_and_grad(
+        lambda moving: scalar_loss(obj, {**variables, "params": moving}, batch, step), has_aux=True)(
+            variables["params"])
+    np.testing.assert_allclose(loss, reference["loss"], atol=1e-5, rtol=0)
+    whole = reference_variables(loaded, "gradient.safetensors")
+    assert_tree_close(gradient, _select(whole["params"], attention), 1e-4)
+    trainer = Trainer(obj, optax.sgd(0.001), key=jax.random.key(int(reference["run_seed"])))
+    state = trainer.fit(dataset(jax.tree.map(
+        lambda value: np.concatenate([value] * (math.lcm(2, jax.device_count()) // 2), axis=0), batch)),
+        steps=1, log_every=1)
+    assert sorted(state.params) == sorted(variables)
+    assert "frozen" not in obj.pipeline(state, ema=False).variables
+
+
+def _select(tree, keep, path=("params",)):
+    selected = {}
+    for name, value in tree.items():
+        current = (*path, name)
+        if isinstance(value, dict):
+            child = _select(value, keep, current)
+            if child:
+                selected[name] = child
+        elif keep(current):
+            selected[name] = value
+    return selected

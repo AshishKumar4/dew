@@ -20,7 +20,19 @@ from flax import struct
 from dew.inputs import Field, InputSpec
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Aux, Batch, EMASpec, Mean, Objective, Step, Variables, mean_loss
+from dew.objectives.base import (
+    Aux,
+    Batch,
+    EMASpec,
+    Mean,
+    Objective,
+    PathFilter,
+    Step,
+    Variables,
+    freeze,
+    mean_loss,
+    thaw,
+)
 from dew.registry import objectives
 
 if TYPE_CHECKING:
@@ -97,6 +109,12 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     targets require adjacent valid slots, matching Google's SequenceTargetShift.
     Every response token is corrupted, but only a uniformly selected valid
     canvas contributes diffusion CE.
+
+    `trainable` selects the parameter leaves the optimizer moves, by their
+    full path (`dew.objectives.base.PathFilter`), the way `LMObjective`
+    takes it; the rest of the tree is kept under `frozen`, which `init`
+    returns and a checkpoint stores. An adapter's own filter
+    (`dew.lora.LoRA.trainable`) goes here. None trains every leaf.
     """
 
     def __init__(self, model: DiffusionGemma, *, prompt_length: int,
@@ -105,7 +123,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  self_cond_prob: float = 0.5, safety_epsilon: float = 1e-4,
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
-                 ema_decay: float | None = None):
+                 ema_decay: float | None = None, trainable: PathFilter | None = None):
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
                             ("canvas_size", canvas_size)):
@@ -142,6 +160,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.decoder_loss_weight = decoder_loss_weight
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
         self.ema = None if ema_decay is None else EMASpec(optax.constant_schedule(ema_decay))
+        self.trainable = trainable
 
     def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> BlockGeneration:
         """The DiffusionGemma over the state's published weights as a
@@ -151,7 +170,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         from dew.inference.tasks import BlockGeneration
 
         process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
-        return BlockGeneration(self.model, self._pipeline_weights(state, ema), process, processor,
+        return BlockGeneration(self.model, thaw(self._pipeline_weights(state, ema)), process, processor,
                                pad_token_id=self.pad_token_id)
 
     @property
@@ -164,10 +183,17 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return self.pretrained
 
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
+        tree = self._whole_tree(key, variables)
+        return tree if self.trainable is None else freeze(tree, self.trainable)
+
+    def _whole_tree(self, key: jax.Array, variables: Variables | None) -> Variables:
+        """The model's variables in one `params` collection: the source with
+        its frozen split undone and the layer scalars moved, or a fresh init."""
         pretrained = self.pretrained if variables is None else variables
         if pretrained is not None:
             if "params" not in pretrained:
                 raise ValueError("pretrained must contain the params collection")
+            pretrained = thaw(pretrained)
             if self._initial_scalar_mode == "trainable":
                 return pretrained
             # Google makes skip_scale a parameter; Transformers declares the
@@ -206,6 +232,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, params: Variables, batch: Batch, step: Step):
+        params = thaw(params)
         value = batch["text"]
         prepared = value if isinstance(value, ModelInputs) else ModelInputs(jnp.asarray(value))
         tokens = prepared.tokens
