@@ -10,7 +10,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.diffusion.process import DenoisingCondition
-from dew.nn.attention import FlaxFeedForward, scaled_dot_product_attention
+from dew.nn.attention import FlaxFeedForward, LayerNorm, scaled_dot_product_attention
 from dew.nn.blocks import ResidualBlock
 from dew.registry import models
 
@@ -85,7 +85,7 @@ class _Transformer(nn.Module):
     @nn.compact
     def __call__(self, x, context, *, train=False):
         def norm(name):
-            return nn.LayerNorm(epsilon=1e-5, dtype=self.dtype, name=name)
+            return LayerNorm(epsilon=1e-5, dtype=self.dtype, name=name)
         def attention(name):
             return _Attention(self.stage.features, self.stage.heads, self.dropout, self.dtype,
                               self.precision, self.attention_impl, name=name)

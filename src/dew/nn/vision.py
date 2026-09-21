@@ -39,7 +39,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.nn.attention import RMSNorm, scaled_dot_product_attention
+from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.text_encoders import MLP, CLIPAttention, ParamTree, checkpoint_array, checkpoint_leaf
 from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
@@ -232,7 +232,7 @@ class SiglipVisionTransformer(nn.Module):
                 self.hidden_act, layer_norm_eps=self.layer_norm_eps,
                 dtype=self.dtype, precision=self.precision, name=f"layers_{index}")
             for index in range(self.num_layers)]
-        self.post_layernorm = nn.LayerNorm(
+        self.post_layernorm = LayerNorm(
             epsilon=self.layer_norm_eps, dtype=self.dtype, name="post_layernorm")
 
     def __call__(self, pixel_values) -> jax.Array:
@@ -1254,7 +1254,7 @@ class Qwen35ProjectorModule(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        self.norm = nn.LayerNorm(epsilon=1e-6, dtype=self.dtype, name="norm")
+        self.norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name="norm")
         grown = self.hidden_size * self.spatial_merge_size ** 2
         self.fc1 = nn.Dense(grown, use_bias=True, dtype=self.dtype,
                             precision=self.precision, name="fc1")
