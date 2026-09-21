@@ -7,10 +7,10 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax.ad_checkpoint import checkpoint_name
 from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew.telemetry.devices import deterministic_ops_requested

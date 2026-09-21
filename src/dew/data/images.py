@@ -97,7 +97,9 @@ def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
 def _encoded_size(encoded: bytes) -> tuple[int, int]:
     """(height, width) from the header alone; PIL reads no pixels for this."""
     import io
+
     from PIL import Image
+
     try:
         with Image.open(io.BytesIO(encoded)) as header:
             width, height = header.size
@@ -312,6 +314,7 @@ class OxfordFlowers(ImageDataset):
                 "download_and_prepare(file_format='array_record'), then pass "
                 "the builder.data_dir version directory to training.")
         import tensorflow_datasets as tfds
+
         from .sources.tfds import prepared_source
 
         return prepared_source(self.path, self.split, decoders={"image": tfds.decode.SkipDecoding()})
