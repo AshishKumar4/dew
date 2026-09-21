@@ -178,7 +178,9 @@ def _prediction_prefixes(config) -> tuple[str, ...]:
     return ('mtp.',) if config.model_type == 'qwen3_next' else ()
 
 
-class StableSelectorTopK(TorchFunctionMode):
+class _StableTopK(TorchFunctionMode):
+    """torch.topk with ties broken toward the lower index, like jax.lax.top_k."""
+
     def __torch_function__(self, func: Callable[..., object], types: Sequence[type],
                            args: tuple[object, ...] = (), kwargs: dict[str, object] | None = None) -> object:
         keywords = {} if kwargs is None else kwargs
@@ -189,59 +191,50 @@ class StableSelectorTopK(TorchFunctionMode):
         axis = args[2] if len(args) > 2 else keywords.get('dim', -1)
         largest = args[3] if len(args) > 3 else keywords.get('largest', True)
         if not isinstance(operand, torch.Tensor) or type(count) is not int or type(axis) is not int:
-            raise TypeError('Selector top-k requires a tensor and integer count/axis')
+            raise TypeError('top-k needs a tensor and integer k/dim')
         if largest is not True or keywords.get('out') is not None:
-            raise ValueError('Selector qualification requires descending top-k without out buffers')
+            raise ValueError('only descending top-k without an out buffer is supported here')
         indices = torch.argsort(operand, dim=axis, descending=True, stable=True).narrow(axis, 0, count)
-        values = torch.gather(operand, axis, indices)
-        return torch.return_types.topk((values, indices))
+        return torch.return_types.topk((torch.gather(operand, axis, indices), indices))
 
 
-def _stable_forward(original: Callable[..., object]) -> Callable[..., object]:
-    def forward(*args: object, **kwargs: object) -> object:
-        with StableSelectorTopK():
-            return original(*args, **kwargs)
-    return forward
-
-
-@contextmanager
-def stable_selector_ties(model: torch.nn.Module, selector_type: type[torch.nn.Module]) -> Iterator[int]:
-    """Temporarily scope stable top-k to one concrete reference indexer class."""
-    held = [(module, module.forward) for module in model.modules() if isinstance(module, selector_type)]
-    if not held:
-        raise ValueError('No matching indexers; refusing to label an unmodified run as qualified')
-    try:
-        for module, original in held:
-            module.forward = _stable_forward(original)
-        yield len(held)
-    finally:
-        for module, original in held:
-            module.forward = original
+# The one module per family whose top-k reaches the logits: the sparse
+# attention indexer. Everything else in the reference runs as shipped.
+_INDEXERS = {
+    'glm5_next_text': ('transformers.models.glm5_next.modeling_glm5_next', 'Glm5NextTextIndexer'),
+    'deepseek_v4': ('transformers.models.deepseek_v4.modeling_deepseek_v4', 'DeepseekV4Indexer'),
+}
 
 
 @contextmanager
-def reference_tie_contract(model) -> Iterator[None]:
-    """Dew's selector tie rule over a reference that specifies none.
-
-    `jax.lax.top_k` is stable, so equal selector scores go to the lower
-    token index; torch's `topk` promises no tie order, and a sparse
-    indexer is the only place that ordering reaches the logits. Scope the
-    stable ordering to that one class per family that has one, and leave
-    every other family's reference run untouched.
-    """
-    selectors = {'glm5_next_text': ('transformers.models.glm5_next.modeling_glm5_next',
-                                    'Glm5NextTextIndexer'),
-                 'deepseek_v4': ('transformers.models.deepseek_v4.modeling_deepseek_v4',
-                                 'DeepseekV4Indexer')}
-    named = selectors.get(model.config.model_type)
+def lower_index_ties(model, block: torch.nn.Module | None = None) -> Iterator[None]:
+    """Run `model` (or `block`, a bare layer of its family) with its sparse
+    indexer breaking equal scores toward the lower token index, which is what
+    jax.lax.top_k does and torch leaves unspecified. Families without an
+    indexer run unchanged."""
+    named = _INDEXERS.get(model.config.model_type)
     if named is None:
         yield
         return
     from importlib import import_module
+    indexer = getattr(import_module(named[0]), named[1])
+    target = model if block is None else block
+    held = [(m, m.forward) for m in target.modules() if isinstance(m, indexer)]
+    if not held:
+        raise ValueError(f'{model.config.model_type} reference has no {named[1]}')
 
-    module, class_name = named
-    with stable_selector_ties(model, getattr(import_module(module), class_name)):
+    def stable(original):
+        def forward(*args, **kwargs):
+            with _StableTopK():
+                return original(*args, **kwargs)
+        return forward
+    try:
+        for module, original in held:
+            module.forward = stable(original)
         yield
+    finally:
+        for module, original in held:
+            module.forward = original
 
 
 def reference_model(case: Case, directory: Path):
@@ -305,7 +298,7 @@ def reference_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray
     model, _ = reference_model(case, directory)
     model.eval()
     model.set_attn_implementation("eager")
-    with torch.no_grad(), reference_tie_contract(model):
+    with torch.no_grad(), lower_index_ties(model):
         out = model(input_ids=torch.from_numpy(np.asarray(ids, np.int64)), use_cache=False)
     return out.logits.to(torch.float32).numpy()
 
@@ -324,7 +317,6 @@ def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.n
     import torch
     from transformers.conversion_mapping import get_checkpoint_conversion_mapping
     from transformers.core_model_loading import WeightConverter, dot_natural_key
-    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextIndexer
     from tools.hf_reference_b import glm5_next_mtp
 
     model, _ = reference_model(case, directory)
@@ -365,10 +357,7 @@ def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.n
         prepared.update(converter.convert(target, config=model.config))
     depth.load_state_dict(prepared, strict=True)
     tokens = torch.from_numpy(np.asarray(ids, np.int64))
-    # The depth is its own sparse block with its own indexer, so it needs the
-    # tie contract the trunk runs under, not just the trunk's.
-    with torch.no_grad(), reference_tie_contract(model), \
-            stable_selector_ties(depth, Glm5NextTextIndexer):
+    with torch.no_grad(), lower_index_ties(model), lower_index_ties(model, depth):
         hidden = model.model(input_ids=tokens, use_cache=False).last_hidden_state
         logits = depth(model, hidden[:, :-1], tokens[:, 1:])
     return logits.float().numpy()
