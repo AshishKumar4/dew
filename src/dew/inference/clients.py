@@ -16,6 +16,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from dew.sampling.text import Sampling
+from dew.telemetry.records import JSON
 
 if TYPE_CHECKING:
     from ollama import (
@@ -23,23 +24,35 @@ if TYPE_CHECKING:
         ChatResponse as OllamaChat,
         Client as OllamaClient,
         GenerateResponse as OllamaResponse,
+        Message as OllamaMessage,
+        Options as OllamaOptions,
     )
     from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
     from openai.types import Completion as OpenAIResponse
     from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
+# One SDK request field as the adapters forward it: JSON the way the wire
+# carries it, the bytes of an image, an ollama Options value, or the Sampling
+# policy whose backend options the adapter derives. The SDK owns the schema,
+# so a field is checked where it is read and passed on where it is not.
+type RequestField = JSON | bytes | Sequence[bytes] | Sampling | OllamaOptions
+# One chat message: the JSON object a request carries, or the SDK's own value.
+type ChatMessage = Mapping[str, object] | OllamaMessage
+
 
 class _HTTPResponse(Protocol):
-    def json(self) -> object: ...
+    def json(self) -> JSON: ...
 
 
-class _RawResponse(Protocol):
-    """What the SDK's public `with_raw_response` returns: the parsed model and its HTTP response."""
+class _RawResponse[T](Protocol):
+    """What the SDK's public `with_raw_response` returns: the parsed model and
+    its HTTP response. `T` is the parsed model the caller relies on; a caller
+    that narrows the body itself takes it as `object`."""
 
     @property
     def http_response(self) -> _HTTPResponse: ...
 
-    def parse(self) -> object: ...
+    def parse(self) -> T: ...
 
 
 @dataclass(frozen=True)
@@ -75,7 +88,7 @@ async def _ainvoke[T](call: Callable[..., Awaitable[T]], fields: Mapping[str, ob
     return await call(**fields)
 
 
-def _object(value: object, name: str) -> dict[str, object]:
+def _object(value: object, name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise ValueError(f"{name} must be an object")
     return {key: entry for key, entry in value.items() if isinstance(key, str)}
@@ -84,7 +97,7 @@ def _object(value: object, name: str) -> dict[str, object]:
 def _count(value: object, name: str) -> int | None:
     if value is None:
         return None
-    if type(value) is not int or value < 0:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{name} must be a nonnegative integer or absent")
     return value
 
@@ -106,7 +119,7 @@ def _prompts(prompts: str | Sequence[str], budget: int, seed: int | None) -> lis
     return rows
 
 
-def _bound(options: Mapping[str, object], fixed: Mapping[str, object]) -> dict[str, object]:
+def _bound(options: Mapping[str, object], fixed: Mapping[str, object]) -> Mapping[str, object]:
     overlap = options.keys() & fixed.keys()
     if options.get("extra_body") is not None:
         extensions = _object(options["extra_body"], "extra_body")
@@ -123,7 +136,8 @@ def _ollama_request_names(kind: Literal["generate", "chat"]) -> frozenset[str]:
     return frozenset(inspect.signature(getattr(Client, kind)).parameters) - {"self"}
 
 
-def _ollama_budget(options: object, budget: int, seed: int | None, sampling: object = None) -> dict[str, object]:
+def _ollama_budget(options: object, budget: int, seed: int | None,
+                   sampling: object = None) -> Mapping[str, object]:
     from ollama import Options
 
     supplied = options.model_dump(exclude_none=True) if isinstance(options, Options) else options
@@ -152,7 +166,8 @@ def _ollama_budget(options: object, budget: int, seed: int | None, sampling: obj
     return _bound(fields, fixed)
 
 
-def _ollama_body(model: str, kind: Literal["generate", "chat"], fields: dict[str, object]) -> dict[str, object]:
+def _ollama_body(model: str, kind: Literal["generate", "chat"],
+                 fields: Mapping[str, object]) -> Mapping[str, object]:
     """Keyword arguments for the SDK method; it owns image, message and tool serialization."""
     body = _bound(fields, {"model": model})
     unknown = body.keys() - _ollama_request_names(kind)
@@ -202,14 +217,16 @@ class OllamaCompletion:
             raise TypeError("async methods require ollama.AsyncClient")
         return self.client
 
-    def _request(self, kind: Literal["generate", "chat"], fields: dict[str, object],
-                 fixed: dict[str, object], seed: int | None, max_new_tokens: int) -> dict[str, object]:
-        fields = dict(fields)
-        fields["options"] = _ollama_budget(fields.get("options"), max_new_tokens, seed, fields.pop("sampling", None))
+    def _request(self, kind: Literal["generate", "chat"], supplied: Mapping[str, object],
+                 fixed: Mapping[str, object], seed: int | None,
+                 max_new_tokens: int) -> Mapping[str, object]:
+        fields = dict(supplied)
+        fields["options"] = _ollama_budget(fields.get("options"), max_new_tokens, seed,
+                                           fields.pop("sampling", None))
         return _ollama_body(self.model, kind, _bound(fields, fixed))
 
     def __call__(self, prompts: str | Sequence[str], max_new_tokens: int, *,
-                 seed: int | None = None, **parameters: object) -> Completion:
+                 seed: int | None = None, **parameters: RequestField) -> Completion:
         rows = _prompts(prompts, max_new_tokens, seed)
         client = self._sync()
         responses = []
@@ -220,19 +237,19 @@ class OllamaCompletion:
         return _ollama_result(responses)
 
     def stream(self, prompt: str, max_new_tokens: int, *, seed: int | None = None,
-               **parameters: object) -> Iterator[OllamaResponse]:
+               **parameters: RequestField) -> Iterator[OllamaResponse]:
         _prompts(prompt, max_new_tokens, seed)
         body = self._request("generate", parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
         return _invoke(self._sync().generate, body)
 
-    def chat(self, messages: Sequence[object], max_new_tokens: int, *, seed: int | None = None,
-             stream: bool = False, **parameters: object) -> OllamaChat | Iterator[OllamaChat]:
+    def chat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
+             stream: bool = False, **parameters: RequestField) -> OllamaChat | Iterator[OllamaChat]:
         _prompts("", max_new_tokens, seed)
         body = self._request("chat", parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
         return _invoke(self._sync().chat, body)
 
     async def acall(self, prompts: str | Sequence[str], max_new_tokens: int, *,
-                    seed: int | None = None, **parameters: object) -> Completion:
+                    seed: int | None = None, **parameters: RequestField) -> Completion:
         rows = _prompts(prompts, max_new_tokens, seed)
         client = self._async()
         responses = []
@@ -243,19 +260,19 @@ class OllamaCompletion:
         return _ollama_result(responses)
 
     async def astream(self, prompt: str, max_new_tokens: int, *, seed: int | None = None,
-                      **parameters: object) -> AsyncIterator[OllamaResponse]:
+                      **parameters: RequestField) -> AsyncIterator[OllamaResponse]:
         _prompts(prompt, max_new_tokens, seed)
         body = self._request("generate", parameters, {"prompt": prompt, "stream": True}, seed, max_new_tokens)
         return await _ainvoke(self._async().generate, body)
 
-    async def achat(self, messages: Sequence[object], max_new_tokens: int, *, seed: int | None = None,
-                    stream: bool = False, **parameters: object) -> OllamaChat | AsyncIterator[OllamaChat]:
+    async def achat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
+                    stream: bool = False, **parameters: RequestField) -> OllamaChat | AsyncIterator[OllamaChat]:
         _prompts("", max_new_tokens, seed)
         body = self._request("chat", parameters, {"messages": messages, "stream": stream}, seed, max_new_tokens)
         return await _ainvoke(self._async().chat, body)
 
 
-def _openai_result(raw: object, response: object, expected: int) -> Completion:
+def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
     from openai.types import Completion as SDKCompletion
     if not isinstance(response, SDKCompletion):
         raise ValueError("a non-streaming completion request returned an incompatible response")
@@ -283,13 +300,14 @@ def _openai_result(raw: object, response: object, expected: int) -> Completion:
 
 
 def _openai_fields(model: str, prompts: str | Sequence[str], budget: int, seed: int | None,
-                   parameters: Mapping[str, object]) -> tuple[dict[str, object], int]:
+                   parameters: Mapping[str, object], *,
+                   stream: bool = False) -> tuple[Mapping[str, object], int]:
     rows = _prompts(prompts, budget, seed)
     n = parameters.get("n", 1)
-    if type(n) is not int or n < 1:
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
         raise ValueError("n must be a positive integer")
     fixed: dict[str, object] = {"model": model, "prompt": prompts if isinstance(prompts, str) else rows,
-                                "max_tokens": budget, "stream": False}
+                                "max_tokens": budget, "stream": stream}
     if seed is not None:
         fixed["seed"] = seed
     return _bound(parameters, fixed), len(rows) * n
@@ -313,7 +331,7 @@ class OpenAICompletion:
         if self.provider not in ("openai", "vllm"):
             raise ValueError("provider must be openai or vllm")
 
-    def _parameters(self, supplied: Mapping[str, object]) -> dict[str, object]:
+    def _parameters(self, supplied: Mapping[str, object]) -> Mapping[str, object]:
         fields = dict(supplied)
         sampling = fields.pop("sampling", None)
         if sampling is None:
@@ -359,21 +377,21 @@ class OpenAICompletion:
         return self.client
 
     def __call__(self, prompts: str | Sequence[str], max_new_tokens: int, *,
-                 seed: int | None = None, **parameters: object) -> Completion:
+                 seed: int | None = None, **parameters: RequestField) -> Completion:
         fields, expected = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
-        create: Callable[..., _RawResponse] = self._sync().completions.with_raw_response.create
+        create: Callable[..., _RawResponse[object]] = self._sync().completions.with_raw_response.create
         raw = _invoke(create, fields)
         return _openai_result(raw.http_response.json(), raw.parse(), expected)
 
     def stream(self, prompts: str | Sequence[str], max_new_tokens: int, *, seed: int | None = None,
-               **parameters: object) -> Stream[OpenAIResponse]:
-        fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
-        fields["stream"] = True
+               **parameters: RequestField) -> Stream[OpenAIResponse]:
+        fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
+                                   self._parameters(parameters), stream=True)
         create: Callable[..., Stream[OpenAIResponse]] = self._sync().completions.create
         return _invoke(create, fields)
 
-    def chat(self, messages: Sequence[object], max_new_tokens: int, *, seed: int | None = None,
-             stream: bool = False, **parameters: object) -> ChatCompletion | Stream[ChatCompletionChunk]:
+    def chat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
+             stream: bool = False, **parameters: RequestField) -> ChatCompletion | Stream[ChatCompletionChunk]:
         _prompts("", max_new_tokens, seed)
         fields = _bound(self._parameters(parameters), {"model": self.model, "messages": messages, "max_completion_tokens": max_new_tokens, "stream": stream})
         if seed is not None:
@@ -382,19 +400,19 @@ class OpenAICompletion:
         return _invoke(create, fields)
 
     async def acall(self, prompts: str | Sequence[str], max_new_tokens: int, *,
-                    seed: int | None = None, **parameters: object) -> Completion:
+                    seed: int | None = None, **parameters: RequestField) -> Completion:
         fields, expected = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
         raw = await _ainvoke(self._async().completions.with_raw_response.create, fields)
         return _openai_result(raw.http_response.json(), raw.parse(), expected)
 
     async def astream(self, prompts: str | Sequence[str], max_new_tokens: int, *, seed: int | None = None,
-                      **parameters: object) -> AsyncStream[OpenAIResponse]:
-        fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
-        fields["stream"] = True
+                      **parameters: RequestField) -> AsyncStream[OpenAIResponse]:
+        fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
+                                   self._parameters(parameters), stream=True)
         return await _ainvoke(self._async().completions.create, fields)
 
-    async def achat(self, messages: Sequence[object], max_new_tokens: int, *, seed: int | None = None,
-                    stream: bool = False, **parameters: object) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
+    async def achat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
+                    stream: bool = False, **parameters: RequestField) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
         _prompts("", max_new_tokens, seed)
         fields = _bound(self._parameters(parameters), {"model": self.model, "messages": messages, "max_completion_tokens": max_new_tokens, "stream": stream})
         if seed is not None:
