@@ -50,17 +50,42 @@ def unpack_dict_of_byte_arrays(packed_data):
     return unpacked_dict
 
 
-def decode_image(encoded: bytes) -> np.ndarray:
-    """An encoded image as RGB uint8 at its native size.
+def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
+    """An encoded image as RGB uint8.
 
-    cv2 decodes to BGR(A) and hands back None for a half-written file. The
-    colour conversion turns that None into an error.
+    With `at_least`, a JPEG is decoded at the largest 1/2, 1/4 or 1/8 DCT
+    reduction that keeps both sides >= `at_least`, so the resize after it
+    still only shrinks and most of the decode is skipped. cv2 hands back None
+    for a half-written file; that becomes an error here.
     """
     import cv2
-    image = cv2.imdecode(np.asarray(bytearray(encoded), dtype="uint8"), cv2.IMREAD_UNCHANGED)
+    buffer = np.frombuffer(encoded, dtype=np.uint8)
+    flags = cv2.IMREAD_UNCHANGED
+    if at_least is not None:
+        shortest = min(_encoded_size(encoded))
+        for factor, reduced in ((8, cv2.IMREAD_REDUCED_COLOR_8), (4, cv2.IMREAD_REDUCED_COLOR_4),
+                                (2, cv2.IMREAD_REDUCED_COLOR_2)):
+            if shortest // factor >= at_least:
+                flags = reduced
+                break
+    image = cv2.imdecode(buffer, flags)
     if image is None:
         raise ValueError(f"cv2 could not decode {len(encoded)} bytes of image")
-    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    if image.ndim == 2:
+        return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    return cv2.cvtColor(image, cv2.COLOR_BGRA2RGB if image.shape[-1] == 4 else cv2.COLOR_BGR2RGB)
+
+
+def _encoded_size(encoded: bytes) -> tuple[int, int]:
+    """(height, width) from the header alone; PIL reads no pixels for this."""
+    import io
+    from PIL import Image
+    try:
+        with Image.open(io.BytesIO(encoded)) as header:
+            width, height = header.size
+    except Exception as error:
+        raise ValueError(f"could not read the size of {len(encoded)} bytes of image") from error
+    return height, width
 
 
 def resize_image(image: np.ndarray, size: int) -> np.ndarray:
@@ -151,6 +176,8 @@ class ImageTransform(pygrain.RandomMapTransform):
 
     def random_map(self, element: Any, rng: np.random.Generator) -> dict[str, Any]:
         image, caption, label = self.spec.record(element, rng)
+        if isinstance(image, bytes):
+            image = decode_image(image, at_least=self.spec.image_size)
         image = augment_image(self.augments, resize_image(image, self.spec.image_size), rng)
         record = {"image": image, CAPTION: caption}
         if label is not None:
@@ -182,8 +209,10 @@ class ImageDataset(DatasetSpec):
         `count` says how many there are)."""
         raise NotImplementedError
 
-    def record(self, element, rng: np.random.Generator) -> tuple[np.ndarray, str, int | None]:
-        """One record as `(rgb uint8 image, caption, class index or None)`."""
+    def record(self, element, rng: np.random.Generator) -> tuple[np.ndarray | bytes, str, int | None]:
+        """One record as `(image, caption, class index or None)`; the image is
+        RGB uint8, or the encoded bytes for the transform to decode at the size
+        it needs."""
         raise NotImplementedError
 
     def records(self, source) -> int:
@@ -236,9 +265,10 @@ class OxfordFlowers(ImageDataset):
                 "TFDS ArrayRecords. Prepare oxford_flowers102 separately with "
                 "download_and_prepare(file_format='array_record'), then pass "
                 "the builder.data_dir version directory to training.")
+        import tensorflow_datasets as tfds
         from .sources.tfds import prepared_source
 
-        return prepared_source(self.path, self.split)
+        return prepared_source(self.path, self.split, decoders={"image": tfds.decode.SkipDecoding()})
 
     def record(self, element, rng):
         label = int(element["label"])
@@ -297,7 +327,7 @@ class ArrayRecordImages(ImageDataset):
 
     def record(self, element, rng):
         element = unpack_dict_of_byte_arrays(element)
-        return decode_image(element['jpg']), element['txt'].decode('utf-8'), None
+        return element['jpg'], element['txt'].decode('utf-8'), None
 
 
 # The msml612 shards live in gs://msml612-diffusion-data, read through a gcs
