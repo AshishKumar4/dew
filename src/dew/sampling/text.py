@@ -164,6 +164,12 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
              ) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
+    A decoder that scores one position per row runs its head on the slot the
+    first draw reads and nothing else: the head over a whole prompt is the
+    largest array a prefill allocates, [rows, width, vocab], and the loop
+    keeps one row of it. A decoder without that method scores every position
+    and pays for the ones it discards.
+
     A model with prediction depths also gets their independent cache, seeded
     over the prompt: each depth reads the target's hidden state at one
     position with the token at the next, at that token's own position, which
@@ -176,20 +182,24 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
         drafting = model.apply(params, batch, method="init_mtp_cache", mutable=["cache"])[1]["cache"]
         cache = unflatten_dict({**flatten_dict(dict(cache)), **flatten_dict(dict(drafting))})
     exposed = _exposes_states(model)
-    answer, updated = model.apply(
-        {**params, "cache": cache}, inputs.tokens, decode=True,
-        mutable=["cache", "embeddings"], rngs=None,
-        method="states_and_logits" if exposed else None, capture_intermediates=False,
-        **inputs.kwargs())
-    states, logits = answer if exposed else (None, answer)
+    selective = _scores_one_slot(model)
     # An unpadded prompt carries no validity field, and its last real token is
     # the last slot.
     valid = inputs.token_fields.get("attention_mask")
     last = (jnp.full((batch,), width - 1, jnp.int32) if valid is None else
             jnp.max(jnp.where(valid, jnp.arange(width)[None, :], -1), axis=1))
+    rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
+    scored = (inputs.tokens, slot) if selective else (inputs.tokens,)
+    answer, updated = model.apply(
+        {**params, "cache": cache}, *scored, decode=True,
+        mutable=["cache", "embeddings"], rngs=None,
+        method=("states_and_logits_at" if selective else
+                "states_and_logits" if exposed else None), capture_intermediates=False,
+        **inputs.kwargs())
+    states, logits = answer if exposed or selective else (None, answer)
+    drawn = logits if selective else logits[rows, slot]
     supplied = inputs.token_fields.get("positions")
     rotary = inputs.token_fields.get("rotary_positions")
-    rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
     logical = rotary if rotary is not None else supplied
     # The model's own next coordinate, as its cache records it: the largest
     # coordinate a real token holds on any axis, one on. A drawn token
@@ -198,7 +208,7 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     positions = None if logical is None else jnp.max(
         jnp.where(jnp.reshape(real, real.shape + (1,) * (logical.ndim - 2)), logical, -1),
         axis=tuple(range(1, logical.ndim))) + 1
-    state = DecoderState(updated["cache"], logits[rows, slot], positions,
+    state = DecoderState(updated["cache"], drawn, positions,
                          None if states is None else states[rows, slot])
     prepared = jax.tree.leaves(updated.get("embeddings", {}))
     if ops.depths > 1 and states is not None:
@@ -235,6 +245,17 @@ def _exposes_states(model: nn.Module) -> bool:
     not still decodes; it only cannot draft.
     """
     return hasattr(type(model), "states_and_logits")
+
+
+def _scores_one_slot(model: nn.Module) -> bool:
+    """Whether the model can score one position per row instead of them all.
+
+    A decoder is a boundary the sampler calls across: `nn.Module` declares
+    no forward, so what a model offers is what it defines. One that defines
+    no `states_and_logits_at` still prefills, with the head over every
+    prompt position, which is the work this spares.
+    """
+    return hasattr(type(model), "states_and_logits_at")
 
 
 def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -> DecodeOps:

@@ -366,6 +366,16 @@ class MultimodalTransformer(nn.Module):
         hidden = self.hidden_states(tokens, **kwargs)
         return hidden, self.language_model._logits(hidden)
 
+    def states_and_logits_at(self, tokens, slots, **kwargs):
+        """The final hidden states, and the logits of one slot per row.
+
+        A prefill scores the position the first draw reads and no other; the
+        head over every prompt position is what a long request allocates
+        most of its transient memory for.
+        """
+        hidden = self.hidden_states(tokens, **kwargs)
+        return hidden, self.language_model._logits(hidden[jnp.arange(hidden.shape[0]), slots])
+
     def head_weight(self, params):
         """The decoder's shared fp32 head matrix for chunked objective scoring."""
         return self.language_model.head_weight(params["language_model"])
