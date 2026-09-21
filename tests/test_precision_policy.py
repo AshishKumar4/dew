@@ -69,9 +69,11 @@ def test_cudnn_rejects_a_head_dimension_it_cannot_honor():
         scaled_dot_product_attention(*narrow, implementation="cudnn")
 
 
-@pytest.mark.parametrize("key,value", [("dtype", "bfloat16"), ("attention_impl", "xla")])
-def test_policy_rejects_a_second_path_for_the_same_knob(key, value):
-    with pytest.raises(ValueError, match="--model.dtype"):
+@pytest.mark.parametrize("key,value,flag", [("dtype", "bfloat16", "--model.dtype"),
+                                           ("attention_impl", "xla", "--model.attention-impl")])
+def test_policy_rejects_a_second_path_for_the_same_knob(key, value, flag):
+    """The refusal names the flag that owns the knob the config carried."""
+    with pytest.raises(ValueError, match=flag):
         with_precision('simple_dit', {key: value}, dtype="bfloat16",
                        attention_impl="auto")
 

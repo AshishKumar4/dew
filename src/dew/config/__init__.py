@@ -78,6 +78,15 @@ class ModelConfig:
     config: JsonDict = dataclasses.field(default_factory=dict)
     dtype: registry.DtypeName = "bfloat16"
     """Compute dtype; parameter storage is independent."""
+    param_dtype: registry.DtypeName | None = None
+    """Parameter storage, where the model declares the field. Unset stores
+    float32, which is what a model's own default is and what the optimizer
+    and the checkpoint have always held."""
+    matmul_precision: Literal["default", "high", "highest"] | None = None
+    """What every matmul of the model asks XLA for, where the model declares
+    a `precision` field: `default` is the backend's fastest algorithm,
+    `high` and `highest` trade throughput for mantissa bits (on Ampere and
+    later, tf32 and fp32 against bf16x3). Unset leaves the model's own."""
     attention_impl: AttentionImpl = "auto"
     """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
     supports and xla for the rest, xla on any other backend."""
@@ -85,7 +94,16 @@ class ModelConfig:
     def fields(self) -> dict[str, Any]:
         """The model's fields with the run's precision settings in them."""
         return with_precision(self.architecture, self.config,
-                              dtype=self.dtype, attention_impl=self.attention_impl)
+                              dtype=self.dtype, attention_impl=self.attention_impl,
+                              param_dtype=self.param_dtype,
+                              matmul_precision=self.matmul_precision)
+
+    def precision_settings(self) -> frozenset[str]:
+        """The names `fields()` writes that `config` did not carry: the run's
+        precision settings, as this architecture takes them. A resolved
+        record leaves them out, since this value writes them again every
+        time it builds."""
+        return frozenset(self.fields()) - frozenset(self.config)
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> Self:
