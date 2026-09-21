@@ -29,7 +29,7 @@ from dew.telemetry.instrumentation import (
     model_flops_utilization,
     step_flops,
 )
-from dew.training import Profile, Trainer
+from dew.training import ProfileWindow, Trainer
 from dew.training.distributed import shard_batch
 
 BATCH = 8
@@ -483,7 +483,7 @@ def test_profiler_writes_a_trace_after_the_warmup(tmp_path, monkeypatch):
             return super().loss(params, batch, step)
 
     trainer = Trainer(Counting(), optax.adam(1e-3), key=jax.random.key(0),
-                      profile=Profile(str(tmp_path / "profile"), steps=2, warmup=2))
+                      profile=ProfileWindow(str(tmp_path / "profile"), steps=2, warmup=2))
     compile_step = trainer.compile
 
     def counting_compile(*args):
@@ -510,11 +510,11 @@ def test_an_unfinished_profile_window_is_still_closed(tmp_path, monkeypatch):
     """A window wider than the run has to close anyway: a trace left running
     takes the next one down with it."""
     _capture_env(monkeypatch)
-    make_trainer(profile=Profile(str(tmp_path / "long"), steps=8, warmup=1)).fit(
+    make_trainer(profile=ProfileWindow(str(tmp_path / "long"), steps=8, warmup=1)).fit(
         Data(batches), steps=3, log_every=1)
     assert list((tmp_path / "long").glob("**/*.xplane.pb")), "no trace to read"
 
-    make_trainer(profile=Profile(str(tmp_path / "short"), steps=1, warmup=0)).fit(
+    make_trainer(profile=ProfileWindow(str(tmp_path / "short"), steps=1, warmup=0)).fit(
         Data(batches), steps=2, log_every=1)
     assert list((tmp_path / "short").glob("**/*.xplane.pb")), "no trace to read"
 
@@ -522,7 +522,7 @@ def test_an_unfinished_profile_window_is_still_closed(tmp_path, monkeypatch):
 def test_the_profiler_runs_once_per_fit(tmp_path, monkeypatch):
     """One scheduled window means one capture directory holding one trace."""
     _capture_env(monkeypatch)
-    make_trainer(profile=Profile(str(tmp_path), steps=1, warmup=0)).fit(
+    make_trainer(profile=ProfileWindow(str(tmp_path), steps=1, warmup=0)).fit(
         Data(batches), steps=6, log_every=1)
 
     captures = [path for path in (tmp_path).glob("capture-*")]
@@ -544,7 +544,7 @@ def test_a_scheduled_window_and_an_outer_profile_conflict(tmp_path, monkeypatch)
     _capture_env(monkeypatch)
     with dew.profile(tmp_path / "outer"):
         with pytest.raises(ValueError, match="dew.profile capture is active"):
-            make_trainer(profile=Profile(str(tmp_path / "window"), steps=1, warmup=0)).fit(
+            make_trainer(profile=ProfileWindow(str(tmp_path / "window"), steps=1, warmup=0)).fit(
                 Data(batches), steps=2)
 
 
@@ -610,7 +610,7 @@ def test_a_peer_start_failure_keeps_the_cleanup_note(tmp_path, monkeypatch):
 
     try:
         with pytest.raises(RuntimeError, match="peer reported a broken window") as raised:
-            make_trainer(profile=Profile(str(tmp_path / "window"), steps=2, warmup=0)).fit(
+            make_trainer(profile=ProfileWindow(str(tmp_path / "window"), steps=2, warmup=0)).fit(
                 Data(batches), steps=4)
 
         assert any("export refused" in note for note in raised.value.__notes__), (

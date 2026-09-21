@@ -18,7 +18,7 @@ from dew.artifacts import Representations
 from dew.data import Dataset
 from dew.data.dataset import tokenized
 from dew.data.tokens import bounded
-from dew.training import Checkpoints, Profile, Trainer, build_mesh
+from dew.training import Checkpoints, ProfileWindow, Trainer, build_mesh
 from dew.training.distributed import DevicePrefetchIterator
 
 
@@ -326,7 +326,7 @@ def test_fit_attempts_every_cleanup_without_masking_tracker_error(tmp_path, monk
     monkeypatch.setattr(jax.profiler, "stop_trace", stop_trace)
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=Waiting(str(tmp_path)), tracker=Tracker(),
-                      profile=Profile(str(tmp_path / "trace"), steps=5, warmup=0))
+                      profile=ProfileWindow(str(tmp_path / "trace"), steps=5, warmup=0))
     with pytest.raises(LookupError) as raised:
         trainer.fit(Dataset(lambda: source, None, None, 8), steps=2, log_every=1)
     assert raised.value is primary

@@ -445,7 +445,7 @@ What stays flat, and this is most of it: every independent dial. `qk_norm`, `v_n
 |`Loading`: workers, threads, read_buffer, worker_buffer|The same four grain knobs are declared on three unrelated dataset bases.|
 |`Wandb`: project, entity, offline|`wandb_entity` and `wandb_offline` mean nothing with no project, and an unset project is today's sentinel for running without a tracker.|
 
-Deleted rather than grouped: `mlp_ratio` beside `mlp_features`, because the intermediate size is the primitive and the ratio restates it; `profile_steps`, which restates one field of the `Profile` value the trainer already takes, so the config carries the value; `per_layer_input_dim: int = 0`, whose zero becomes None; and `use_double_wide_mlp`, which today does nothing at all unless layers share their keys and values, so it is refused by name in that combination.
+Deleted rather than grouped: `mlp_ratio` beside `mlp_features`, because the intermediate size is the primitive and the ratio restates it; `profile_steps`, which restates one field of the `ProfileWindow` value the trainer already takes, so the config carries the value; `per_layer_input_dim: int = 0`, whose zero becomes None; and `use_double_wide_mlp`, which today does nothing at all unless layers share their keys and values, so it is refused by name in that combination.
 
 Not condensed, on the second reading: `norm_eps` with the three norm-placement switches, and the attention dials with the head geometry. Each is an independent dial, so each stays a field.
 
