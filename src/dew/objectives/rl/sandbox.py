@@ -21,6 +21,8 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from dew.records import JSON
+
 from .episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
 
 
@@ -81,7 +83,7 @@ class _ProcessEnvironment:
         for stream in (self.stdin, self.stdout, self.stderr):
             os.set_blocking(stream.fileno(), False)
 
-    def _request(self, operation: str, payload: Mapping[str, object]) -> object:
+    def _request(self, operation: str, payload: Mapping[str, object]) -> JSON:
         request = json.dumps({"operation": operation, **payload}, allow_nan=False).encode() + b"\n"
         if len(request) > self.limits.message_bytes:
             raise ValueError("sandbox request exceeds message_bytes")
@@ -137,9 +139,10 @@ class _ProcessEnvironment:
 
     def get_state(self) -> bytes:
         reply = self._request("get_state", {})
-        if not isinstance(reply, Mapping) or not isinstance(reply.get("state"), str):
+        state = reply.get("state") if isinstance(reply, Mapping) else None
+        if not isinstance(state, str):
             raise ValueError("sandbox get_state must return a base64 state string")
-        return base64.b64decode(reply["state"], validate=True)
+        return base64.b64decode(state, validate=True)
 
     def set_state(self, state: bytes) -> None:
         reply = self._request("set_state", {"state": base64.b64encode(state).decode("ascii")})

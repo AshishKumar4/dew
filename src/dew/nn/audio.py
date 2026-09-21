@@ -25,7 +25,7 @@ from dew.registry import from_record, towers
 from .attention import RMSNorm
 from .sharding import logical_axes
 from .text_encoders import checkpoint_array
-from .vision import TowerBase
+from .vision import TowerBase, TowerGeometry
 
 
 @struct.dataclass
@@ -60,6 +60,9 @@ class Gemma3nAudio(TowerBase):
     def build(self) -> nn.Module:
         return Gemma3nAudioEncoder(self)
 
+    def geometry(self) -> TowerGeometry:
+        return TowerGeometry(mel_features=self.input_feat_size)
+
 
 @towers("gemma4_audio")
 @dataclasses.dataclass(frozen=True)
@@ -84,6 +87,9 @@ class Gemma4Audio(TowerBase):
 
     def build(self) -> nn.Module:
         return Gemma4AudioEncoder(self)
+
+    def geometry(self) -> TowerGeometry:
+        return TowerGeometry(mel_features=self.subsampling_conv_channels[0])
 
 
 def _check_geometry(width: int, heads: int, layers: int, chunk: int, left: int,

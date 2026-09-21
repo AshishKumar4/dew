@@ -10,14 +10,36 @@ No torch or verl dependency is imported by Dew.
 
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
+from typing import TypedDict
+
+from dew.records import JSON
 
 from .episodes import Episode
 from .records import episode_from_record, episode_record, integer, object_record, real, sequence
 
 
-def to_verl(episodes: Sequence[Episode]) -> list[dict[str, object]]:
+class VerlRow(TypedDict):
+    """One AgentLoopOutput row, under verl's own field names.
+
+    `extra_fields.dew` is this exporter's own: verl's fields carry neither
+    raw-policy likelihoods nor turn boundaries, so an import that had only
+    the standard fields would have to estimate them, and `from_verl` refuses
+    to. Every value is JSON, because a row is written to a file.
+    """
+
+    prompt_ids: list[int]
+    response_ids: list[int]
+    response_mask: list[int]
+    response_logprobs: list[float] | None
+    reward_score: float | None
+    num_turns: int
+    metrics: Mapping[str, JSON]
+    extra_fields: Mapping[str, Mapping[str, object]]
+
+
+def to_verl(episodes: Sequence[Episode]) -> list[VerlRow]:
     """Export JSON-compatible AgentLoopOutput rows, with lossless Dew metadata."""
-    rows: list[dict[str, object]] = []
+    rows: list[VerlRow] = []
     for episode in episodes:
         header = episode_record(episode)
         header.pop("transitions")
@@ -28,7 +50,7 @@ def to_verl(episodes: Sequence[Episode]) -> list[dict[str, object]]:
             if action is not None:
                 for key in ("context", "tokens", "behavior_log_probs"):
                     action.pop(key)
-            rows.append({
+            row: VerlRow = {
                 "prompt_ids": list(turn.action.context) if turn else list(episode.initial.context if episode.initial else ()),
                 "response_ids": list(turn.action.tokens) if turn else [],
                 "response_mask": [1] * len(turn.action.tokens) if turn else [],
@@ -37,7 +59,8 @@ def to_verl(episodes: Sequence[Episode]) -> list[dict[str, object]]:
                 "num_turns": 1 if turn else 0, "metrics": {},
                 "extra_fields": {"dew": {"episode": header, "turn": index, "turns": len(turns),
                     "action": action, "observation": asdict(turn.observation) if turn else None}},
-            })
+            }
+            rows.append(row)
     return rows
 
 

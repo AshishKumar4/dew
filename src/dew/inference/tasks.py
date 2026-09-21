@@ -29,7 +29,7 @@ from dew.artifacts import agree_process_phase
 from dew.diffusion.block import BlockProcess, CanvasGeneration
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs, mesh_of, request_key
+from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
 from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
@@ -59,12 +59,12 @@ keeps its own shapes, so the ceiling refuses what it refuses today.
 class Processor(Protocol):
     """Host preprocessing and decoding, as a loaded source's processor does."""
 
-    def __call__(self, text: str | Sequence[str], *, images: object | None = None) -> ModelInputs: ...
+    def __call__(self, text: str | Sequence[str], *, images: Media | None = None) -> ModelInputs: ...
 
     def decode(self, tokens: ArrayLike) -> list[str]: ...
 
 
-def _prepared(processor: Processor | None, request: Request, *, images: object | None) -> ModelInputs:
+def _prepared(processor: Processor | None, request: Request, *, images: Media | None) -> ModelInputs:
     """Classify raw text without changing numeric token identities or row order."""
     if isinstance(request, str):
         text = [request]
@@ -95,7 +95,7 @@ def _prepared(processor: Processor | None, request: Request, *, images: object |
     return ModelInputs.from_value(request)
 
 
-def _task_inputs(processor: Processor | None, request: Request, *, images: object | None,
+def _task_inputs(processor: Processor | None, request: Request, *, images: Media | None,
                  collective: bool, max_new_tokens: int | None, default_tokens: int | None,
                  max_length: int | None, key: jax.Array | None, seed: int | None) -> tuple[ModelInputs, int, jax.Array]:
     inputs = None
@@ -276,20 +276,20 @@ class TextGeneration:
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
                  n: int | None = None, sampling: Sampling | None = None,
-                 images: object | None = None, logits: Transforms | None = None,
+                 images: Media | None = None, logits: Transforms | None = None,
                  stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation: ...
 
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
                  n: int | None = None, sampling: Sampling | None = None,
-                 images: object | None = None, logits: Transforms | None = None,
+                 images: Media | None = None, logits: Transforms | None = None,
                  stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
-                 sampling: Sampling | None = None, images: object | None = None,
+                 sampling: Sampling | None = None, images: Media | None = None,
                  logits: Transforms | None = None, stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation:
         annotation = None
@@ -363,16 +363,16 @@ class BlockGeneration:
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
                  n: int | None = None, process: BlockProcess | None = None,
-                 images: object | None = None) -> CanvasGeneration: ...
+                 images: Media | None = None) -> CanvasGeneration: ...
 
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
                  n: int | None = None, process: BlockProcess | None = None,
-                 images: object | None = None) -> CanvasGeneration: ...
+                 images: Media | None = None) -> CanvasGeneration: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
-                 process: BlockProcess | None = None, images: object | None = None) -> CanvasGeneration:
+                 process: BlockProcess | None = None, images: Media | None = None) -> CanvasGeneration:
         annotation = None
         if active_profile() is not None:
             annotation = jax.profiler.TraceAnnotation("inference.block")
@@ -439,16 +439,16 @@ class MaskedGeneration:
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
                  n: int | None = None, steps: int | None = None,
-                 images: object | None = None) -> CanvasGeneration: ...
+                 images: Media | None = None) -> CanvasGeneration: ...
 
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, seed: int,
                  n: int | None = None, steps: int | None = None,
-                 images: object | None = None) -> CanvasGeneration: ...
+                 images: Media | None = None) -> CanvasGeneration: ...
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
-                 steps: int | None = None, images: object | None = None) -> CanvasGeneration:
+                 steps: int | None = None, images: Media | None = None) -> CanvasGeneration:
         annotation = None
         if active_profile() is not None:
             annotation = jax.profiler.TraceAnnotation("inference.masked")

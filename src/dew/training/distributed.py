@@ -11,7 +11,7 @@ import math
 import queue
 import threading
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Iterator
 
 if TYPE_CHECKING:
     from dew.telemetry.profile import Profiler
@@ -50,10 +50,15 @@ PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 BATCH_SPEC = P(BATCH_AXES, SEQUENCE_AXIS)
 
 type MeshAxes = str | tuple[str, ...] | None
-type Placement = Any
-"""A pytree shaped like what it places, with a `NamedSharding` at every leaf.
-Python has no way to say "this tree's structure with those leaves", so the
-name carries what the annotation cannot."""
+type Placement[TreeT] = TreeT
+"""`TreeT`'s own structure, with a `NamedSharding` at every leaf.
+
+A placement is built by mapping over the tree it places, so it is that tree's
+type: the same dataclass with the same fields, the same records under the same
+keys. Only the leaves differ, and Python has no way to say "this structure
+with those leaves", so the parameter carries the structure and this name
+carries the leaves. Every caller reads the leaves as shardings, through
+`jax.jit`, `device_put` or `Layout.check`."""
 
 type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 
@@ -340,7 +345,7 @@ class Layout:
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "host_parameters", tuple(self.host_parameters))
 
-    def shardings(self, mesh: Mesh, tree: Any) -> Placement:
+    def shardings[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """A NamedSharding per leaf of `tree`, from the declared parameter axes.
 
         A leaf whose path no module declares takes the largest-divisible-axis
@@ -365,7 +370,7 @@ class Layout:
 
         return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
 
-    def offloaded(self, mesh: Mesh, tree: Any) -> Placement:
+    def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """`shardings`, with the memory kind each leaf's path asks for.
 
         The spec is the one the rules give a leaf either way, so a selected
@@ -393,7 +398,7 @@ class Layout:
                 if host_selected(self.host_parameters, _variable_path(path)) else sharding),
             placed)
 
-    def check(self, params: Variables, shardings: Placement, mesh: Mesh) -> None:
+    def check(self, params: Variables, shardings: Placement[Variables], mesh: Mesh) -> None:
         """Reject a layout that left too much of the model replicated, or that
         asked for host-resident parameters where nothing fetches them.
 
@@ -449,7 +454,7 @@ class Layout:
             f"Largest replicated parameters:\n{details}")
 
 
-def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Any:
+def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]:
     """A sharding per leaf of `batch`, from the batch spec and the leaf's shape.
 
     Rows split over the data, expert, fsdp, and tensor axes. A leaf of rank 2 or 3 is a

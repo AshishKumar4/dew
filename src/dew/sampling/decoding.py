@@ -34,6 +34,8 @@ import numpy as np
 from flax import struct
 from jax import lax
 
+from dew.records import JSON
+
 FILTER = -jnp.inf
 """The score a removed token keeps, as `logits_process.py`'s filter value."""
 
@@ -822,7 +824,7 @@ def byte_alphabet() -> dict[str, int]:
     return {chr(code): byte for byte, code in zip(used, mapped, strict=True)}
 
 
-def _decoder_has(config: object, name: str) -> bool:
+def _decoder_has(config: JSON, name: str) -> bool:
     if isinstance(config, dict):
         return config.get("type") == name or any(_decoder_has(entry, name) for entry in config.values())
     if isinstance(config, list):
@@ -830,7 +832,7 @@ def _decoder_has(config: object, name: str) -> bool:
     return False
 
 
-def matching_mode(tokenizer: object) -> str | None:
+def matching_mode(tokenizer: Vocabulary) -> str | None:
     """Whether a tokenizer's pieces are bytes, and in which spelling.
 
     `StopStringCriteria._get_stop_string_matching_mode`: a byte-level decoder
@@ -918,8 +920,10 @@ def stop_strings(tokenizer: object, strings: str | Sequence[str],
     wanted = (strings,) if isinstance(strings, str) else tuple(strings)
     if not wanted or any(not isinstance(value, str) or not value for value in wanted):
         raise ValueError("stop_strings needs non-empty strings")
-    source = getattr(tokenizer, "reference", tokenizer)
-    source = getattr(source, "tokenizer", source)
+    # A tokenizer is read as it stands; dew's own processor holds the source
+    # processor as `reference`, and that processor holds the tokenizer.
+    source = tokenizer if isinstance(tokenizer, Vocabulary) else getattr(tokenizer, "reference", tokenizer)
+    source = source if isinstance(source, Vocabulary) else getattr(source, "tokenizer", source)
     if not isinstance(source, Vocabulary):
         raise TypeError("stop_strings needs a tokenizer that can list its vocabulary")
     mode = matching_mode(source)

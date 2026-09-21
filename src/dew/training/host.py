@@ -122,8 +122,11 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
     return tree
 
 
-def transfer(tree, placement: Placement):
+def transfer[TreeT](tree: TreeT, placement: Placement[TreeT] | NamedSharding) -> TreeT:
     """Move only concrete local shards, retaining the global shape and indices.
+
+    `placement` is the tree's own placement, or the single sharding that is
+    one array's whole placement.
 
     Host snapshots and CPU gradients are real copies unless the runtime proves
     otherwise; no donation or aliasing assumption can invalidate retained states

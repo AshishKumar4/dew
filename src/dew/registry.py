@@ -20,14 +20,19 @@ import sys
 import types
 import typing
 from collections.abc import Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypeVar, Union
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypedDict, TypeVar, Union
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations
 
+from dew.records import JSON
+
 if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
     from flax import linen as nn
 
     from dew.data.dataset import DatasetSpec
@@ -49,6 +54,21 @@ the callable and `build` hands back what it returned."""
 # generic, a PEP 695 alias, or the None a field with no resolvable annotation
 # leaves behind. Every reader below takes one of these and asks it what it is.
 type Annotation = type | types.UnionType | types.GenericAlias | typing.TypeAliasType | None
+
+# One field of a member, as a caller writes it or a config file carries it:
+# the JSON a file holds, a dtype, an enum member such as a matmul precision,
+# an array a schedule was tabulated into, a callable a field takes as a hook,
+# a value class already built (every value class here is a dataclass, a Flax
+# module included), and the records and sequences of any of those. This is
+# the width of what may arrive; `build` narrows each one again against the
+# type its member declared before the member ever sees it.
+type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic
+                   | types.FunctionType | types.BuiltinFunctionType
+                   | DataclassInstance | Mapping[str, object] | Sequence[Configured])
+
+# `build` called with no record at all, which is every caller that writes its
+# fields as keywords. Shared because it is read and never written.
+NO_RECORD: Mapping[str, object] = types.MappingProxyType({})
 
 
 class Registry(Mapping[str, T], Generic[T, Built]):
@@ -115,17 +135,23 @@ class Registry(Mapping[str, T], Generic[T, Built]):
                 return name
         raise KeyError(f"{_describe(member)} is not a registered {self.kind}")
 
-    def build(self, name: str, /, **fields: Any) -> Built:
-        """Construct the member called `name` from keyword fields.
+    def build(self, name: str, record: Mapping[str, object] = NO_RECORD, /,
+              **fields: Configured) -> Built:
+        """Construct the member called `name` from a record, keyword fields, or both.
 
         A field the member does not declare is an error. Fields arrive from
         JSON as often as from code, so a field whose declared type is a value
         builds from a record here, where a logged config becomes an object:
         `models.build("m", attention={"heads": 8})` and
         `models.build("m", attention=Attention(heads=8))` agree.
+
+        A whole parsed config is the positional `record`: its values are
+        unnarrowed, and narrowing them against the member's declared types is
+        this method's job, so the splat happens here rather than at a caller
+        that would have to know the member's fields to write it.
         """
         member = self[name]
-        return member(**self._declared_fields(name, member, fields))
+        return member(**self._declared_fields(name, member, {**record, **fields}))
 
     def _declared_fields(self, name: str, member: Callable[..., Built],
                          fields: Mapping[str, object]) -> Mapping[str, object]:
@@ -139,7 +165,9 @@ class Registry(Mapping[str, T], Generic[T, Built]):
             raise ValueError(
                 f"{self.kind} {name!r} ({_describe(member)}) has no field for "
                 f"{unknown}; its fields are {sorted(declared)}")
-        return {key: _field_value(member, key, value) for key, value in fields.items()}
+        return {key: resolve_dtype(value) if key == "dtype"
+                else _rebuilt(_declared_type(member, key), value)
+                for key, value in fields.items()}
 
     @property
     def union(self) -> type[Built] | types.UnionType:
@@ -221,7 +249,23 @@ def wants_tuple(annotation: Annotation) -> bool:
             or typing.get_origin(annotation) in (tuple, Sequence))
 
 
-def from_record(annotation: Annotation, value: Any) -> Any:
+def from_record[ValueT](annotation: type[ValueT], value: Configured) -> ValueT:
+    """`value` as the class `annotation` names, built from a record or already one.
+
+    The class is the witness: what comes back is an instance of it or a
+    `ValueError` naming what the record built instead, so a caller reads a
+    value of the type it asked for rather than one it has to narrow again.
+    `_rebuilt` is the same walk over an annotation that is not a class -- a
+    union, a generic, an alias -- which only this module's own recursion has.
+    """
+    built = _rebuilt(annotation, value)
+    if not isinstance(built, annotation):
+        raise ValueError(f"{value!r} builds {_describe(type(built))}, "
+                         f"not the {_describe(annotation)} the field declares")
+    return built
+
+
+def _rebuilt(annotation: Annotation, value: object) -> Configured:
     """`value` as its annotation asks for it: a record becomes the value it
     describes, and anything already built is left alone.
 
@@ -231,7 +275,7 @@ def from_record(annotation: Annotation, value: Any) -> Any:
     """
     annotation = resolve_alias(annotation)
     if typing.get_origin(annotation) in (Union, types.UnionType) and _unwrapped(annotation) is None:
-        return value
+        return configured(value)
     if isinstance(value, Mapping):
         held = _value_type(annotation)
         if held is None:
@@ -239,28 +283,38 @@ def from_record(annotation: Annotation, value: Any) -> Any:
             # per-stage attention settings: entries are walked and a "dtype"
             # entry resolves the same way as a dtype field.
             entries = entry_types(annotation, len(value))
-            return {key: resolve_dtype(record) if key == "dtype" else from_record(entry, record)
+            return {key: resolve_dtype(record) if key == "dtype" else _rebuilt(entry, record)
                     for entry, (key, record) in zip(entries, value.items(), strict=True)}
         declared = sorted(f.name for f in dataclasses.fields(held) if f.init)
         unknown = sorted(set(value) - set(declared))
         if unknown:
             raise ValueError(f"{_describe(held)} has no field for {unknown}; its "
                              f"fields are {declared}")
-        return held(**{key: _field_value(held, key, record)
+        return held(**{key: resolve_dtype(record) if key == "dtype"
+                       else _rebuilt(_declared_type(held, key), record)
                        for key, record in value.items()})
     if isinstance(value, (list, tuple)):
         entries = entry_types(annotation, len(value))
-        rebuilt = [from_record(entry, record)
+        rebuilt = [_rebuilt(entry, record)
                    for entry, record in zip(entries, value, strict=True)]
         return tuple(rebuilt) if wants_tuple(annotation) else type(value)(rebuilt)
-    return value
+    return configured(value)
 
 
-def _field_value(member: type, field: str, value: Any) -> Any:
-    """One field on its way into `member`: a dtype from its name, a value from a record."""
-    if field == "dtype":
-        return resolve_dtype(value)
-    return from_record(_declared_type(member, field), value)
+def configured(value: object) -> Configured:
+    """One value a record carried, handed back as a field holds it.
+
+    Nothing is converted here: this is the one place that says what a field
+    can carry at all, so a value no member could take is refused where the
+    record was read instead of inside the module that would have used it.
+    """
+    if value is None or isinstance(value, (bool, int, float, str, bytes, type, Enum, np.dtype)):
+        return value
+    if isinstance(value, (np.ndarray, np.generic, jax.Array)):
+        return value
+    if dataclasses.is_dataclass(value) or isinstance(value, (Mapping, Sequence)) or callable(value):
+        return value
+    raise ValueError(f"{value!r} is not a value a member field carries")
 
 
 DtypeName = Literal["float32", "bfloat16", "float16"]
@@ -305,10 +359,30 @@ _PRECISION_FLAGS = {"dtype": "--model.dtype", "attention_impl": "--model.attenti
                     "precision": "--model.matmul-precision"}
 
 
-def with_precision(name: str, config: Mapping[str, object], *,
-                   dtype: str, attention_impl: str, param_dtype: str | None = None,
-                   matmul_precision: str | None = None) -> dict[str, Any]:
-    """A model config with the run's compute dtype and attention kernel in it.
+class PrecisionFields(TypedDict, total=False):
+    """What a run's precision settings write into a model config.
+
+    Only the keys the named member declares are written, so the bag is
+    partial by construction; `attention_configs` is the UNets' per-stage
+    settings, which carry the dtype into each stage a config named. Its
+    entries are a stage record, a built `Stage` or None, which is what a
+    model config carries and what `build` narrows against the field.
+    """
+
+    dtype: str
+    attention_impl: str
+    param_dtype: str
+    precision: str
+    attention_configs: list[object]
+
+
+def precision_fields(name: str, config: Mapping[str, object], *,
+                     dtype: str, attention_impl: str, param_dtype: str | None = None,
+                     matmul_precision: str | None = None) -> PrecisionFields:
+    """The run's compute dtype and attention kernel as the fields a model takes.
+
+    `with_precision` is the same settings merged into the config they belong
+    to; this is them on their own, for a caller holding a typed field bag.
 
     `attention_impl` is an `AttentionImpl` and travels as it is written: the
     kernel reads 'reference' as the reference path, so nothing here rewrites
@@ -333,7 +407,7 @@ def with_precision(name: str, config: Mapping[str, object], *,
     """
     member = models[name]
     declared = {f.name for f in dataclasses.fields(member) if f.init}
-    written = {"dtype": dtype, "attention_impl": attention_impl}
+    written: PrecisionFields = {"dtype": dtype, "attention_impl": attention_impl}
     if param_dtype is not None and "param_dtype" in declared:
         written["param_dtype"] = param_dtype
     if matmul_precision is not None and "precision" in declared:
@@ -343,7 +417,7 @@ def with_precision(name: str, config: Mapping[str, object], *,
         raise ValueError(
             f"the model config carries {duplicate}, which the run's precision "
             f"settings own; set {', '.join(_PRECISION_FLAGS[held] for held in duplicate)} instead")
-    fields = {**config, **written}
+    fields: PrecisionFields = {**written}
     stages = {f.name: f for f in dataclasses.fields(member)}.get("attention_configs")
     if stages is not None:
         carried = config.get("attention_configs", stages.default)
@@ -367,6 +441,15 @@ def with_precision(name: str, config: Mapping[str, object], *,
                     f"a Stage")
         fields["attention_configs"] = resolved
     return fields
+
+
+def with_precision(name: str, config: Mapping[str, object], *,
+                   dtype: str, attention_impl: str, param_dtype: str | None = None,
+                   matmul_precision: str | None = None) -> Mapping[str, object]:
+    """A model config with the run's compute dtype and attention kernel in it."""
+    return {**config, **precision_fields(
+        name, config, dtype=dtype, attention_impl=attention_impl,
+        param_dtype=param_dtype, matmul_precision=matmul_precision)}
 
 
 models: Registry[type[nn.Module], nn.Module] = Registry("model")

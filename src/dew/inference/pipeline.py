@@ -23,7 +23,7 @@ from etils import epath
 
 from dew.checkpoints import RUN_FILE
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
-from dew.nn.inputs import ModelInputs, pad_token_rows
+from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.pipelines import TextToImage, restore_variables
@@ -205,8 +205,8 @@ class RunProcessor:
 
     tokenizer: RunTokenizer
 
-    def __call__(self, text: str | Sequence[str], *, images: object | None = None,
-                 audio: object | None = None) -> ModelInputs:
+    def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
+                 audio: Media | None = None) -> ModelInputs:
         if images is not None or audio is not None:
             raise ValueError("a text run takes no images or audio")
         rows = [text] if isinstance(text, str) else list(text)

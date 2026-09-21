@@ -72,7 +72,7 @@ class DiffusionObjective(Objective[Mean]):
         autoencoder: AutoEncoder | None = None,
         unconditional_prob: float = 0.12,
         ema_decay: float | None = 0.999,
-        sampler: Solver[Any] = DDIM(),
+        sampler: Solver = DDIM(),
         guidance: CFG | None = CFG(3.0),
         steps: int = 200,
         pretrained: Variables | None = None,

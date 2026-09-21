@@ -321,18 +321,18 @@ class TextToImage:
     @overload
     def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
                  steps: int | None = None, guidance: CFG | float | None | _Default = _Default.GUIDANCE,
-                 sampler: Solver[object] | None = None, key: jax.Array,
+                 sampler: Solver | None = None, key: jax.Array,
                  seed: None = None, decode: bool = True) -> Images: ...
 
     @overload
     def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
                  steps: int | None = None, guidance: CFG | float | None | _Default = _Default.GUIDANCE,
-                 sampler: Solver[object] | None = None, key: None = None,
+                 sampler: Solver | None = None, key: None = None,
                  seed: int, decode: bool = True) -> Images: ...
 
     def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
                  steps: int | None = None, guidance: CFG | float | None | _Default = _Default.GUIDANCE,
-                 sampler: Solver[object] | None = None, key: jax.Array | None = None,
+                 sampler: Solver | None = None, key: jax.Array | None = None,
                  seed: int | None = None, decode: bool = True) -> Images:
         """Images in [-1, 1], `[rows, H, W, C]`. `guidance` is a classifier-free
         guidance scale, or a `CFG` with its interval, or None for the plain

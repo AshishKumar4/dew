@@ -16,6 +16,8 @@ from pathlib import Path
 
 from filelock import FileLock
 
+from dew.records import JSON
+
 DEFAULT_ZONES = ("us-central2-b", "europe-west4-a", "us-east1-d")
 
 #: Runtime version per accelerator generation, from the Cloud TPU software
@@ -96,7 +98,7 @@ def save(cfg: TpuConfig, path: Path | None = None) -> Path:
     return path
 
 
-def _toml(value: object) -> str:
+def _toml(value: JSON | tuple[JSON, ...]) -> str:
     if isinstance(value, tuple):
         return "[" + ", ".join(_toml(element) for element in value) + "]"
     # TOML basic strings escape exactly like JSON strings.

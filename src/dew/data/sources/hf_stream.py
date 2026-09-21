@@ -35,11 +35,24 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Iterator, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 
 import grain.python as pygrain
 
 from ..dataset import Batch
+
+
+class StreamState(TypedDict):
+    """Where a streamed pass stands, as grain records and restores it.
+
+    `rows` is the streaming library's own place inside the pass, which only
+    that library reads; a source that cannot hand one over reports None here
+    and `set_state` is where the resume refuses.
+    """
+
+    epoch: int
+    read: int
+    rows: Mapping[str, object] | None
 
 if TYPE_CHECKING:  # `datasets` is imported on the first row, not at import
     from datasets import IterableDataset
@@ -163,7 +176,7 @@ class _Rows(pygrain.DatasetIterator):
             self._read = 0
             self._epoch += 1
 
-    def get_state(self) -> dict[str, object]:
+    def get_state(self) -> StreamState:
         """The pass, the rows read in it, and the library's own place in them.
 
         grain's iterator protocol declares the pair and grain's thread
