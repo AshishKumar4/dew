@@ -35,6 +35,7 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
+from .sources.hf import HFOptions, HubOptions
 
 Augmentation = Literal["none", "flip_only", "flip_jitter"]
 
@@ -335,16 +336,23 @@ class OxfordFlowers(ImageDataset):
 @dataclasses.dataclass(frozen=True)
 class HFImages(ImageDataset):
     """A Hugging Face hub dataset of images with a 'caption' or 'text' column,
-    read through grain's random access. `name` is the repo id."""
+    read through grain's random access.
+
+    `name` is the repo id and `split` the split to read; `options` is
+    everything else `datasets.load_dataset` takes, the same value the `hf`
+    provider holds, so a dataset behind a config name, a revision, its own
+    `data_files` or a token is read here too.
+    """
 
     name: str = ""
     split: str = "train"
+    options: HubOptions = HFOptions()
 
     def source(self):
         from .sources.hf import HFDatasetSource
         if not self.name:
             raise ValueError("HFImages needs name= set to a hub dataset repo id")
-        return HFDatasetSource(name=self.name, split=self.split)
+        return HFDatasetSource(name=self.name, split=self.split, options=self.options)
 
     def record(self, element, rng):
         label = element.get("label")
