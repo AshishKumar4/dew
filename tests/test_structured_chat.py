@@ -536,3 +536,16 @@ def test_a_malformed_tool_call_is_refused(tools_tokenizer):
         render(tools_tokenizer, [{"role": "user", "content": [{"text": "hi"}]}])
     with pytest.raises(ValueError, match="tools is not JSON"):
         render(tools_tokenizer, CONVERSATION, "{oops")
+
+
+def test_a_column_that_holds_neither_a_list_nor_json_text_is_refused(tools_tokenizer):
+    """A parquet column carries the messages as a list or as the JSON text of
+    one. Anything else used to fail on whatever the reader did with it next."""
+    from dew.data.chat import Conversation
+
+    with pytest.raises(ValueError, match="messages are a list of turns"):
+        Conversation.parse(7, None, "row 0")
+    with pytest.raises(ValueError, match="tools are a list of schemas"):
+        Conversation.parse(CONVERSATION, 7, "row 0")
+    with pytest.raises(ValueError, match="an entry of messages is an object"):
+        Conversation.parse(["hello"], None, "row 0")

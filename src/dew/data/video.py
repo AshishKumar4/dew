@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import Any
 
 import grain.python as pygrain
 import numpy as np
@@ -23,6 +22,7 @@ from dew.registry import datasets
 
 from .dataset import (
     CAPTION,
+    Batch,
     Dataset,
     DatasetSpec,
     Tokenize,
@@ -53,7 +53,7 @@ class AudioVideoTransform(pygrain.RandomMapTransform):
         self.spec = spec
         self.audio = AutoAudioProcessor(tensor_type="np", modelname=spec.audio_model)
 
-    def random_map(self, element: Any, rng: np.random.Generator) -> dict[str, Any]:
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         # moviepy is imported on the first record, so importing this module needs no `av` extra.
         from .sources.av_utils import read_av_random_clip
         frames, audio = read_av_random_clip(

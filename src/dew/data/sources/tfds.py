@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated
 
 from etils import epath
 
-from ..dataset import Records, json_argument
+from ..dataset import Batch, Records, json_argument
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
     from tensorflow_datasets import DecoderTree
@@ -183,12 +184,49 @@ def prepared_source(path: str, split: str, *, builder: str | None = None,
     feature it wants as the bytes on disk. A record is whatever the prepared
     features and those decoders make it, which for a features dict is a
     mapping and for a single feature a bare array, which is what `Records`
-    says and the run's own `preprocess` is where it becomes batch fields.
+    admits and the run's own `preprocess` is where it becomes batch fields.
     """
     directory = prepared(path, builder=builder, config=config, version=version)
     reader = read_only_builder(directory, builder=builder, config=config, version=version)
     shards(reader, split, directory)
-    return reader.as_data_source(split, decoders=decoders)
+    return Prepared(reader.as_data_source(split, decoders=decoders),
+                    str(directory), split)
+
+
+class Prepared:
+    """One prepared split, read by index.
+
+    What a record is, TFDS's features and the caller's decoders decide: a
+    mapping of features, or the bytes of a single feature a decoder skipped.
+    One is narrowed here, on the way out, so a record that is neither is
+    named where the split is known rather than inside a grain worker.
+
+    The description is the directory and the split, which is what a saved
+    position counts into; the builder's own source describes itself by its
+    address in this process, and two addresses refuse every resume.
+    """
+
+    def __init__(self, records: Sequence[object], directory: str, split: str):
+        self.directory = directory
+        self.split = split
+        self._records = records
+
+    def __repr__(self) -> str:
+        return f"Prepared(directory={self.directory!r}, split={self.split!r})"
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, index: int) -> Batch | bytes | None:
+        held = self._records[index]
+        if isinstance(held, bytes):
+            return held
+        if isinstance(held, Mapping):
+            return dict(held)
+        raise TypeError(
+            f"record {index} of {self.directory} split {self.split!r} is "
+            f"{type(held).__name__}; a prepared record is its features or the "
+            f"bytes of the one feature a decoder skipped")
 
 
 @dataclasses.dataclass(frozen=True)
