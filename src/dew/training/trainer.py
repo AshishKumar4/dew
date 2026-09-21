@@ -305,9 +305,7 @@ class Trainer(Generic[Loss, Effects]):
         initializer, key = self.objective.initializer, self.key
         if self.host_master:
             from dew.training.host import transfer
-            replicated = NamedSharding(self.state_mesh, P())
-            initializer, key = transfer(
-                (initializer, key), jax.tree.map(lambda _: replicated, (initializer, key)))
+            key = transfer(key, NamedSharding(self.state_mesh, P()))
         abstract = jax.eval_shape(self.initial_state, initializer, key)
         shardings = self.shardings(abstract)
         self.layout.check(abstract.params, shardings.params, self.device_mesh)
@@ -330,19 +328,25 @@ class Trainer(Generic[Loss, Effects]):
         return state, shardings, position
 
     def _placed_host(self, initializer, key, shardings: Placement) -> TrainState:
-        """A fresh CPU-owned state: built on the companion, its frozen leaves
-        then moved to where they stay resident (`execution.resident`).
-        One JIT cannot return to two device sets, so the move follows it."""
-        from dew.training.host import transfer
-        held = shardings.params.get(FROZEN)
-        companion = shardings if held is None else dataclasses.replace(shardings, params={
-            **shardings.params,
-            FROZEN: jax.tree.map(lambda s: NamedSharding(self.state_mesh, s.spec), held)})
-        state = jax.jit(self.initial_state, out_shardings=companion)(initializer, key)
-        if held is None:
-            return state
-        return dataclasses.replace(state, params={
-            **state.params, FROZEN: transfer(state.params[FROZEN], held)})
+        """A fresh CPU-owned state, its leaves streamed into place one at a time.
+
+        The tree is built eagerly on the CPU, where the held leaves the
+        objective hands over are read by reference and nothing of size is
+        computed, then each leaf is moved to its placement and the source
+        let go as it lands (`host.stream`): a moving leaf to the companion,
+        a frozen one to where it stays resident (`execution.resident`). The
+        transient is one leaf, not the tree, and one JIT could not have
+        returned to the two device sets anyway.
+        """
+        from dew.training.host import stream, transfer
+        held = self.objective.held_variables()
+        with jax.default_device(self.state_mesh.local_devices[0]):
+            state = self.initial_state(initializer, key)
+        params = stream(state.params, shardings.params, held)
+        ema = None if state.ema is None else stream(state.ema, shardings.ema)
+        rest = dataclasses.replace(state, params=None, ema=None)
+        placed = transfer(rest, dataclasses.replace(shardings, params=None, ema=None))
+        return dataclasses.replace(placed, params=params, ema=ema)
 
     # ------------------------------------------------------------------
     # The step
