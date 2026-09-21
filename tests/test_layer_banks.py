@@ -32,7 +32,7 @@ def fixture(kind):
     text = CausalTransformer(vocab_size=32, emb_features=16, num_layers=4,
                              num_heads=2, num_kv_heads=2, head_dim=8, mlp_features=32,
                              max_seq_len=16, scan_layers=True, bank_layers=2,
-                             dtype=jnp.float32, attention_impl=None)
+                             dtype=jnp.float32, attention_impl="reference")
     tokens = jnp.asarray([[2, 1, 3, 4]], jnp.int32)
     indices = jnp.asarray([[-1, 0, -1, -1]], jnp.int32)
     media = {"pixel_values": jnp.linspace(-0.5, 0.5, 3 * 8 * 8).reshape(1, 1, 3, 8, 8)}

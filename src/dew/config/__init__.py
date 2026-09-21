@@ -37,6 +37,7 @@ from dew import registry
 from dew.artifacts import agree_process_phase
 from dew.checkpoints import RUN_FILE, Checkpoints
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
+from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.registry import REGISTRIES, _declared_type, datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
@@ -76,7 +77,7 @@ class ModelConfig:
     config: JsonDict = dataclasses.field(default_factory=dict)
     dtype: registry.DtypeName = "bfloat16"
     """Compute dtype; parameter storage is independent."""
-    attention_impl: Literal["auto", "reference", "xla", "cudnn", "tpu"] = "auto"
+    attention_impl: AttentionImpl = "auto"
     """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
     supports and xla for the rest, xla on any other backend."""
 

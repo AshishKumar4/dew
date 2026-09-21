@@ -4,6 +4,7 @@ use, the latter ported from diffusers' attention_flax.py."""
 import dataclasses
 import functools
 import math
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +18,19 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
+
+AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
+"""Which kernel an attention call runs, named once for every layer that
+carries the choice: a `ModelConfig`, the modules' `attention_impl` field and
+`scaled_dot_product_attention`'s `implementation`.
+
+'reference' is the portable einsum and softmax, the only path that reads
+dtype, precision and force_fp32_for_softmax; 'xla' and 'cudnn' are
+`jax.nn.dot_product_attention`'s own two; 'tpu' is the pallas flash kernel;
+'auto' is cudnn where its kernel runs and xla anywhere else, resolved per
+trace. A module field spells 'reference' as None as well, which is what a
+module built in code without the field set runs.
+"""
 
 
 def repeat_kv_heads(x, num_heads: int):
@@ -548,8 +562,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     callers never change with the implementation, so checkpoints are
     interchangeable across hardware:
 
-    - None: flax reference attention (einsum + softmax), the portable default
-      and the only path that reads dtype, precision and force_fp32_for_softmax.
+    - 'reference', which a module field also spells None: flax reference
+      attention (einsum + softmax), the portable default and the only path
+      that reads dtype, precision and force_fp32_for_softmax.
     - 'auto': 'cudnn' where its kernel runs (a gpu backend, bf16 or fp16
       inputs, a query head width that is a multiple of 8 and at most 128, no
       softcap, and no `--xla_gpu_deterministic_ops` on the run), 'xla'
@@ -623,7 +638,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
     if sinks is not None:
-        if implementation not in (None, 'auto', 'xla'):
+        if implementation not in (None, 'reference', 'auto', 'xla'):
             raise ValueError(f"attention implementation '{implementation}' cannot honor sinks")
         if softcap is not None:
             raise ValueError(
@@ -652,7 +667,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             "at execution time (openxla/xla#46500). Use attention_impl 'xla', "
             "which is deterministic, or drop the flag.")
 
-    if implementation is None or softcap is not None:
+    if implementation in (None, 'reference') or softcap is not None:
         heads = query.shape[-2]
         key = repeat_kv_heads(key, heads)
         value = repeat_kv_heads(value, heads)
@@ -771,7 +786,7 @@ class NormalAttention(nn.Module):
     use_bias: bool = True
     force_fp32_for_softmax: bool = True
     qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
-    attention_impl: str | None = None  # None (reference) | 'auto' | 'xla' | 'cudnn' | 'tpu'
+    attention_impl: str | None = None  # an AttentionImpl, or None for 'reference'
     causal: bool = False
     max_seq_len: int | None = None  # KV cache length, required to decode
 
