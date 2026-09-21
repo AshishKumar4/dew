@@ -47,7 +47,14 @@ from .processors import AutoAudioProcessor, AutoTextTokenizer
 from .prompts import Prompts
 from .providers import HubDataset, PreparedTFDS, load
 from .sources.hf import HFDatasetSource, HFOptions
-from .sources.text import TokenDocumentSource, TokenFileSource
+from .sources.text import (
+    TokenBytes,
+    TokenColumn,
+    TokenDocumentSource,
+    TokenRecords,
+    TokenSource,
+    TokenWindowSource,
+)
 from .sources.tfds import TFDSOptions
 from .streaming import CombinedOnline, OnlineImages
 from .text import ByteTokenizer, HFTokenizer, tokenizer_for
@@ -61,6 +68,7 @@ __all__ = ["CC3M", "CC12M", "IDS_KEY", "MASK_KEY", "AestheticCoyo", "AutoAudioPr
            "Laion2bAesthetic", "Laion12mCoco",
            "LaionaCoco", "LaionaCocoCoyo", "Loading", "LocalVideos", "OnlineImages", "OxfordFlowers",
            "PackedTokens", "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Role", "Stage",
-           "TFDSOptions", "TokenDocumentSource",
-           "TokenFileSource", "TokenWindows", "VideoDataset", "VoxCeleb2", "load", "local_batch", "mixture",
+           "TFDSOptions", "TokenBytes", "TokenColumn",
+           "TokenDocumentSource", "TokenRecords", "TokenSource", "TokenWindowSource",
+           "TokenWindows", "VideoDataset", "VoxCeleb2", "load", "local_batch", "mixture",
            "ramped", "tokenizer_for"]

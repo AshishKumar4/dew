@@ -1,5 +1,6 @@
-"""Token datasets over a directory that `tools/tokenize_text.py` wrote:
-`train.bin`, `val.bin` and `meta.json`.
+"""Token datasets over a tokenized corpus directory: the `train.bin`,
+`val.bin` and `meta.json` that `tools/tokenize_text.py` writes, or the same
+splits as ArrayRecord shards or parquet (`dew.data.sources.text`).
 
 `TokenWindows` reads fixed `seq_len + 1` windows off the token stream;
 `PackedTokens` packs whole documents into windows of that size and carries
@@ -20,7 +21,6 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from pathlib import Path
 from typing import Callable, Iterator, overload
 
 import grain.python as pygrain
@@ -39,25 +39,6 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
-
-
-def token_files(path: str | None, name: str) -> tuple[str, str]:
-    """`(train.bin, val.bin)` of a tokenized directory, both required.
-
-    Reading train.bin in val.bin's place would score the validation pass on
-    the windows the model trains on.
-    """
-    if not path:
-        raise ValueError(f"{name} needs path= set to the directory tools/tokenize_text.py wrote")
-    root = Path(path)
-    train_bin, val_bin = root / "train.bin", root / "val.bin"
-    if not train_bin.is_file():
-        raise ValueError(f"{path} has no train.bin; tools/tokenize_text.py writes one")
-    if not val_bin.is_file():
-        raise ValueError(
-            f"{path} has a train.bin but no val.bin; tools/tokenize_text.py "
-            "--val-fraction writes the held-out split")
-    return str(train_bin), str(val_bin)
 
 
 class _BoundedIterator(Forwarding):
@@ -96,22 +77,24 @@ class TokenWindows(DatasetSpec):
     """Fixed windows of `seq_len + 1` ids, each starting `seq_len` after the
     last, so record i's last token is record i + 1's first and the model sees
     every transition once. A batch is `{"text": int32 [batch, seq_len + 1]}`.
-    `val_batches` bounds a validation pass; None scores all of val.bin. The
+    `val_batches` bounds a validation pass; None scores the whole split. The
     training stream's saved position is a global window count, so a run
     resumes on any process count the global batch divides over."""
 
     path: str | None = None
     seq_len: int = 256
     val_batches: int | None = 4
+    field: str | None = None
+    """Which arrayrecord field or parquet column the ids are in, for a corpus
+    held in one of those; a `.bin` corpus is the stream itself."""
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        from .sources.text import TokenFileSource
+        from .sources.text import TokenWindowSource, token_corpus
 
         self.uncaptioned(tokenize)
-
-        train_bin, val_bin = token_files(self.path, "TokenWindows")
-        train = TokenFileSource(train_bin, self.seq_len)
-        validation = TokenFileSource(val_bin, self.seq_len)
+        corpus, held_out = token_corpus(self.path, "TokenWindows", field=self.field)
+        train = TokenWindowSource(corpus, self.seq_len)
+        validation = TokenWindowSource(held_out, self.seq_len)
         return Dataset(
             train=train_stream(train, [], batch=local_batch(batch),
                                seed=self.seed, loading=self.loading),
@@ -338,32 +321,35 @@ class PackedTokens(DatasetSpec):
 
     `records` counts the windows a pass over the split holds, exactly, so
     `steps_per_epoch` is that pass. `val_batches` bounds a validation pass;
-    None scores all of val.bin.
+    None scores the whole split.
     """
 
     path: str | None = None
     seq_len: int = 256
     val_batches: int | None = 4
+    field: str | None = None
+    """Which arrayrecord field or parquet column the ids are in, for a
+    corpus held in one of those; a `.bin` corpus is the stream itself."""
     packing_bins: int = 8
     """Windows the plan keeps open at once. More of them leave less padding
     in a window and let documents further apart in the file share one."""
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        from .sources.text import TokenDocumentSource
+        from .sources.text import TokenDocumentSource, token_corpus
 
         self.uncaptioned(tokenize)
-        train_bin, val_bin = token_files(self.path, "PackedTokens")
+        corpus, held_out = token_corpus(self.path, "PackedTokens", field=self.field)
         rows, window = local_batch(batch), self.seq_len + 1
 
         # One source per split, and one plan over it. Finding the boundaries
         # reads the whole file, so rebuilding either per epoch would read a
         # multi-gigabyte train.bin again for a table the run already has.
-        def packed(path: str) -> PackedWindows:
-            source = TokenDocumentSource(path)
+        def packed(tokens) -> PackedWindows:
+            source = TokenDocumentSource(tokens)
             return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
                                  self.packing_bins, describe(source))
 
-        train, validation = packed(train_bin), packed(val_bin)
+        train, validation = packed(corpus), packed(held_out)
 
         return Dataset(
             train=train_stream(train, [], batch=rows, seed=self.seed, loading=self.loading),
