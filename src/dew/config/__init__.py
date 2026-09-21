@@ -341,7 +341,18 @@ class RunConfig:
         the checkpoint the run ends on is published to the registry under the
         name with slashes and spaces replaced, since an artifact name allows
         neither. Local tracking journals live in a separate tracking directory.
+
+        `dataset` is the one a recipe loaded at `trainer.batch_size`, and a
+        dataset at any other batch is refused here: the record, the ramp and
+        the run's reported throughput all name the configured number, while
+        every step reads the dataset's, so the two disagreeing is a run that
+        trains at a batch it does not report.
         """
+        if dataset.batch != self.trainer.batch_size:
+            raise ValueError(
+                f"--trainer.batch-size is {self.trainer.batch_size} and this dataset "
+                f"reads {dataset.batch} records a step; load it with "
+                f"load(batch={self.trainer.batch_size})")
         objective_type = type(objective)
         kind = (registry.objectives.name_of(objective_type) if objective_type in registry.objectives.values()
                 else f"{objective_type.__module__}.{objective_type.__qualname__}")
