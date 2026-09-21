@@ -5,7 +5,7 @@ import pytest
 
 from dew.artifacts import ImageGrid, TokenScores, VideoGrid
 from dew.eval import psnr, ssim
-from dew.eval.fid import FIDStats, GaussianStats, fid, frechet_distance
+from dew.eval.fid import FID, FIDStats, GaussianStats, frechet_distance
 from dew.objectives.lm.objective import perplexity
 from dew.objectives.rl.grpo import GRPOObjective
 from dew.objectives.rl.preference import DPOObjective
@@ -15,7 +15,7 @@ def test_fid_pools_unequal_batches_and_singletons():
     rng = np.random.default_rng(93)
     generated = rng.normal(size=(19, 7)) + np.arange(19)[:, None] / 5
     real = rng.normal(size=(23, 7)) @ np.diag(np.arange(1, 8))
-    metric = fid()
+    metric = FID()
     accumulated = None
     for gen, ref in zip(np.split(generated, [1, 5, 12]), np.split(real, [0, 8, 22])):
         contribution = FIDStats(GaussianStats.from_features(gen, population="generated"),
@@ -33,7 +33,7 @@ def test_fid_refuses_insufficient_or_nonfinite_populations():
     one = GaussianStats.from_features(np.ones((1, 3)), population="generated")
     real = GaussianStats.from_features(np.eye(3), population="real")
     with pytest.raises(ValueError, match="generated.*at least two"):
-        fid().finalize(FIDStats(one, real))
+        FID().finalize(FIDStats(one, real))
     with pytest.raises(ValueError, match="real.*finite"):
         GaussianStats.from_features([[1, np.nan]], population="real")
 

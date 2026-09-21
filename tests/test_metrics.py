@@ -19,8 +19,10 @@ import pytest
 
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.eval import (
+    FID,
     clip,
     clip_score,
+    clip_score_metric,
     fid,
     peak_signal_noise_ratio as psnr,
     psnr as psnr_metric,
@@ -60,7 +62,7 @@ def test_frechet_distance_of_a_scaled_covariance_matches_the_closed_form():
 
 @pytest.mark.network
 def test_fid_metric_scores_real_images_better_than_noise(rng):
-    metric = fid()
+    metric = FID()
     assert metric.name == 'fid' and metric.reads is ImageGrid
 
     key_real, key_noise = jax.random.split(rng)
@@ -73,6 +75,79 @@ def test_fid_metric_scores_real_images_better_than_noise(rng):
     unrelated = metric.finalize(metric(ImageGrid(jax.random.normal(key_noise, (8, 64, 64, 3))), batch))
     assert np.isfinite(matching) and np.isfinite(unrelated)
     assert matching < unrelated
+
+
+def fid_sets():
+    """Sixteen uint8 images of 32x32, and the same pixels brightened by 40."""
+    images = np.random.default_rng(93).integers(0, 256, (16, 32, 32, 3), dtype=np.uint8)
+    return images, np.clip(images.astype(np.int32) + 40, 0, 255).astype(np.uint8)
+
+
+def test_fid_refuses_an_image_set_it_cannot_score():
+    """Both sides of `fid` are uint8 [N, H, W, 3]. The refusal comes out of the
+    batch parser before the extractor is asked for, so a call that cannot be
+    scored never pays for the 90 MB of Inception weights, which is why this
+    test needs no network."""
+    images = np.zeros((4, 8, 8, 3), np.uint8)
+    with pytest.raises(ValueError, match="generated: expected uint8"):
+        fid(images.astype(np.float32), images)
+    with pytest.raises(ValueError, match="real: expected uint8"):
+        fid(images, images[0])
+    with pytest.raises(ValueError, match="generated: no images"):
+        fid([], images)
+    with pytest.raises(ValueError, match="at least one image"):
+        fid(images, images, batch_size=0)
+
+
+@pytest.mark.network
+def test_fid_of_a_set_against_itself_is_zero_and_a_shifted_set_scores_above_it():
+    """`fid` scores two image sets with no objective, no dataset and no batch.
+
+    One set twice has identical pooled statistics, so the distance is zero up
+    to the rounding in the matrix square root. Observed -2.0e-05 with the
+    released weights on 16 images of 32x32 on CPU, against a bound of 1e-3.
+    Adding 40 counts to every pixel moves the population, observed 10.6."""
+    images, brighter = fid_sets()
+
+    assert abs(fid(images, images)) < 1e-3
+    assert fid(brighter, images) > 0
+
+
+@pytest.mark.network
+def test_the_fid_metric_and_the_function_report_the_same_distance():
+    """The registered metric is that same path with a trainer's artifact and
+    batch in front of it, so a validation pass lands on the number `fid` gives
+    for the same pixels.
+
+    One pass over one batch splits nothing, so the features and the statistics
+    are the same arrays: the two distances were equal to the last bit on CPU,
+    and the bound is 1e-6 relative for a backend that reassociates."""
+    from dew.inputs import unit_range
+
+    images, brighter = fid_sets()
+    metric = FID()
+
+    pooled = metric.finalize(metric(ImageGrid(unit_range(brighter)), {"image": images}))
+
+    assert pooled == pytest.approx(fid(brighter, images), rel=1e-6)
+
+
+@pytest.mark.network
+def test_fid_pools_a_streamed_set_into_the_distance_of_the_whole_set():
+    """A set can arrive as an iterable of arrays, and `batch_size` splits
+    whatever arrives, so a directory of samples never has to be held at once.
+
+    Pooling makes the split invisible. Dropping a block or losing a merge
+    moves the number; six blocks of at most three rows came within 3.8e-09
+    relative of the whole set on CPU, which is what the extractor's
+    batch-shape rounding costs. The bound is 1e-5 to leave a backend that
+    rounds differently the same headroom."""
+    images, brighter = fid_sets()
+
+    whole = fid(brighter, images)
+    streamed = fid([brighter[:7], brighter[7:]], images, batch_size=3)
+
+    assert streamed == pytest.approx(whole, rel=1e-5)
 
 
 ############################################################################################################
@@ -347,7 +422,7 @@ def test_clip_score_metric_clamps_the_reference_cosine():
     cosine (-0.072) among three positive ones, so the clamp does work here.
     Observed 6.1e-06 off the reference on CPU and 1.0e-05 on an RTX 4080,
     against a tolerance of 1e-3 on a score of order 15."""
-    metric = clip_score(modelname=str(CLIP_TINY))
+    metric = clip_score_metric(modelname=str(CLIP_TINY))
     assert metric.name == 'clip_score'
     generated, batch, cosine = clip_fixture()
     assert (cosine < 0).any() and (cosine > 0).any()
@@ -359,11 +434,46 @@ def test_clip_score_metric_clamps_the_reference_cosine():
     assert score != pytest.approx(np.mean(100.0 * cosine), abs=1e-3)
 
 
+def test_clip_score_over_images_and_prompts_is_the_metric_number():
+    """`clip_score` takes uint8 images and prompt strings, with no artifact
+    and no tokenized batch, and tokenizes them the way a run's loader does. It
+    lands on the metric's value for the same fixture, and both land on the
+    reference's own cosines: a different padding or truncation would move the
+    score off them, since one of the four cosines is negative and the clamp
+    reads it."""
+    prompts = json.loads((CLIP_TINY / "prompts.json").read_text())["prompts"]
+    images = np.load(CLIP_TINY / "reference.npz")["images"]
+    generated, batch, cosine = clip_fixture()
+    metric = clip_score_metric(modelname=str(CLIP_TINY))
+
+    score = clip_score(images, prompts, modelname=str(CLIP_TINY))
+
+    pooled = metric.finalize(metric(ImageGrid(generated), batch))
+    assert score == pytest.approx(pooled, abs=1e-9), f"{score} against {pooled}"
+    expected = np.mean(100.0 * np.maximum(cosine, 0.0))
+    assert abs(score - expected) < CLIP_SCORE_TOLERANCE, f"{score} against {expected}"
+
+
+def test_clip_score_batches_a_set_into_the_score_of_the_whole_set():
+    """`batch_size` splits the images and their prompts together. The score is
+    a mean over images, so the split cannot move it: a misaligned slice would
+    pair the wrong prompt with the wrong image and change the number."""
+    prompts = json.loads((CLIP_TINY / "prompts.json").read_text())["prompts"]
+    images = np.load(CLIP_TINY / "reference.npz")["images"]
+
+    whole = clip_score(images, prompts, modelname=str(CLIP_TINY))
+    batched = clip_score(images, prompts, modelname=str(CLIP_TINY), batch_size=3)
+
+    assert batched == pytest.approx(whole, rel=1e-6)
+    with pytest.raises(ValueError, match="equal counts"):
+        clip_score(images, prompts[:2], modelname=str(CLIP_TINY))
+
+
 def test_a_sample_outside_the_pixel_range_is_clipped_not_wrapped():
     """A sampler does not promise [-1, 1]. Casting 1.2 straight to uint8 wraps
     it to a dark pixel, which the old metric did; the score of an overshooting
     white image has to be the score of a white one."""
-    metric = clip_score(modelname=str(CLIP_TINY))
+    metric = clip_score_metric(modelname=str(CLIP_TINY))
     _, batch, _ = clip_fixture()
     white = jnp.ones((4, 16, 12, 3), jnp.float32)
 
@@ -396,9 +506,9 @@ def test_constructing_a_metric_opens_no_weights(monkeypatch):
     monkeypatch.setattr(fid_module, "_get_inception", refused)
     monkeypatch.setattr(images_module, "_get_clip", refused)
 
-    fid()
+    FID()
     clip(modelname="never/downloaded")
-    clip_score(modelname="never/downloaded")
+    clip_score_metric(modelname="never/downloaded")
 
 
 ############################################################################################################
@@ -485,7 +595,7 @@ def test_fid_is_far_smaller_between_halves_of_real_data_than_against_noise():
         np.asarray(jax.image.resize(jnp.asarray(source[index]["image"], jnp.float32),
                                     (64, 64, 3), method="bilinear"))
         for index in range(128)]).astype(np.uint8)
-    metric = fid()
+    metric = FID()
     first, second = photos[:64], photos[64:]
     noise = jax.random.normal(jax.random.PRNGKey(1), (64, 64, 64, 3)).clip(-1.0, 1.0)
 

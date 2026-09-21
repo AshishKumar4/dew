@@ -150,7 +150,7 @@ trainer = Trainer(
     tracker=WandbTracker(project="dew", name="flowers"),   # or None
 )
 state = trainer.fit(data, steps=100_000, log_every=100, eval_every=2_000,
-                    checkpoint_every=5_000, metrics=(metrics.fid(), metrics.clip_score()))
+                    checkpoint_every=5_000, metrics=(metrics["fid"](), metrics["clip_score"]()))
 ```
 
 The trainer keeps what `CONTRIBUTING.md:9` gives it: mesh, compiled step, EMA, checkpoints, logging. The compiled step is `objective_trainer.py:237-299` with `Step` in place of positional `ema_params` and `rng`, plus the `Aux.variables` write-back. `fit` is step-based; `steps = epochs * data.steps_per_epoch` is a recipe's line. Publishing becomes `dew.io.publish(checkpoints.latest(), ...)`, called by a recipe after `fit`. Validation exceptions propagate (fixed in `6b747dc`).
