@@ -41,6 +41,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew import records
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.common import NoiseScheduler
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
@@ -57,6 +58,7 @@ from dew.diffusion.transforms import (
     SourceLimitedPrediction,
     VPredictionTransform,
 )
+from dew.records import JSON
 from dew.sampling.solvers import (
     DDIM,
     DDPM,
@@ -76,7 +78,6 @@ from dew.sampling.solvers import (
     Solver,
     UniPC,
 )
-from dew.telemetry.records import JSON
 
 Kind = Literal[
     "DDIM", "PNDM", "DDPM", "LMSDiscrete", "EulerDiscrete", "EulerAncestralDiscrete",
@@ -112,38 +113,6 @@ class Control(Protocol):
     def __call__(self, key: str, absent: JSON = None) -> JSON: ...
 
 
-def _json(value: object, name: str) -> JSON:
-    """One control as the scheduler file carries it.
-
-    A `scheduler_config.json` is read with `json.loads`, so a control is a
-    scalar or a list of them; `interop.pretrained` narrows a generation config
-    the same way.
-    """
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, (list, tuple)):
-        return [_json(entry, name) for entry in value]
-    raise ValueError(f"{name}={value!r} is not a value a scheduler file carries")
-
-
-def _number(value: object, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
-        raise ValueError(f"{name} must be a finite number")
-    return float(value)
-
-
-def _integer(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an integer")
-    return value
-
-
-def _boolean(value: object, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"{name} must be boolean")
-    return value
-
-
 def _choice[ChoiceT: str](value: object, name: str, allowed: tuple[ChoiceT, ...]) -> ChoiceT:
     if not isinstance(value, str):
         raise ValueError(f"{name} must name one of {', '.join(allowed)}, not {value!r}")
@@ -166,7 +135,7 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
     them accept the three common ones, DDPM adds GeoDiff's sigmoid and Heun
     the exponential alpha-bar.
     """
-    length = _integer(count, "num_train_timesteps")
+    length = records.integer(count, "num_train_timesteps")
     if length < 1:
         raise ValueError("num_train_timesteps must be positive")
     if trained is not None:
@@ -174,8 +143,8 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
             raise ValueError("trained_betas must be a numeric sequence")
         betas = np.asarray(trained, np.float32)
     else:
-        first = _number(start, "beta_start")
-        final = _number(end, "beta_end")
+        first = records.number(start, "beta_start")
+        final = records.number(end, "beta_end")
         kind = _choice(schedule, "beta_schedule", schedules)
         if kind == "linear":
             betas = np.linspace(first, final, length, dtype=np.float32)
@@ -492,7 +461,7 @@ class SourceSchedule:
             this class declares no such control."""
             if key not in declared:
                 return absent
-            return _json(config[key], key) if key in config else declared[key]
+            return records.json_value(config[key], key) if key in config else declared[key]
 
         for key, inactive in _UNIMPLEMENTED.items():
             if key in declared and value(key) != inactive:
@@ -510,7 +479,7 @@ class SourceSchedule:
             count=value("num_train_timesteps"), start=value("beta_start"),
             end=value("beta_end"), schedule=value("beta_schedule"),
             trained=value("trained_betas"),
-            zero_snr=_boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr"),
+            zero_snr=records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr"),
             schedules=source.schedules))
         betas.setflags(write=False)
         policy, sampler = _resolve(kind, source, value, betas)
@@ -821,20 +790,20 @@ def _x0_limit(kind: str, declared: Mapping[str, JSON], value: Control,
     """The clamp or the dynamic thresholding the class's `step` applies to
     x_0, whichever it tests first. A class whose step reads neither is refused
     an active one rather than quietly limited."""
-    thresholding = "thresholding" in declared and _boolean(value("thresholding"), "thresholding")
-    clipping = "clip_sample" in declared and _boolean(value("clip_sample"), "clip_sample")
+    thresholding = "thresholding" in declared and records.boolean(value("thresholding"), "thresholding")
+    clipping = "clip_sample" in declared and records.boolean(value("clip_sample"), "clip_sample")
     if (thresholding or clipping) and kind == "TCD":
         raise ValueError("The published TCD step reads neither thresholding nor clipping")
     if thresholding:
-        if kind == "UniPCMultistep" and not _boolean(value("predict_x0"), "predict_x0"):
+        if kind == "UniPCMultistep" and not records.boolean(value("predict_x0"), "predict_x0"):
             raise ValueError("The published epsilon-prediction UniPC step ignores thresholding")
-        ratio = _number(value("dynamic_thresholding_ratio"), "dynamic_thresholding_ratio")
-        maximum = _number(value("sample_max_value"), "sample_max_value")
+        ratio = records.number(value("dynamic_thresholding_ratio"), "dynamic_thresholding_ratio")
+        maximum = records.number(value("sample_max_value"), "sample_max_value")
         if not 0 < ratio <= 1 or maximum < 1:
             raise ValueError("Dynamic thresholding needs a ratio in (0, 1] and a maximum above 1")
         return None, (ratio, maximum)
     if clipping:
-        clip = _number(value("clip_sample_range"), "clip_sample_range")
+        clip = records.number(value("clip_sample_range"), "clip_sample_range")
         if clip < 0:
             raise ValueError("clip_sample_range must be nonnegative")
         return clip, None
@@ -845,13 +814,13 @@ def _flow_controls(value: Control) -> _Flow:
     """A flow file's shift controls, checked and turned into numbers."""
     terminal = value("shift_terminal")
     return _Flow(
-        shift=_number(value("shift", 1.0), "shift"),
-        dynamic=_boolean(value("use_dynamic_shifting", absent=False), "use_dynamic_shifting"),
-        base_shift=_number(value("base_shift", 0.5), "base_shift"),
-        max_shift=_number(value("max_shift", 1.15), "max_shift"),
-        base_tokens=_integer(value("base_image_seq_len", 256), "base_image_seq_len"),
-        max_tokens=_integer(value("max_image_seq_len", 4096), "max_image_seq_len"),
-        terminal=None if terminal is None else _number(terminal, "shift_terminal"),
+        shift=records.number(value("shift", 1.0), "shift"),
+        dynamic=records.boolean(value("use_dynamic_shifting", absent=False), "use_dynamic_shifting"),
+        base_shift=records.number(value("base_shift", 0.5), "base_shift"),
+        max_shift=records.number(value("max_shift", 1.15), "max_shift"),
+        base_tokens=records.integer(value("base_image_seq_len", 256), "base_image_seq_len"),
+        max_tokens=records.integer(value("max_image_seq_len", 4096), "max_image_seq_len"),
+        terminal=None if terminal is None else records.number(terminal, "shift_terminal"),
         kind=_choice(value("time_shift_type", "exponential"), "time_shift_type",
                      ("exponential", "linear")))
 
@@ -860,9 +829,9 @@ def _resolve(kind: str, source: _Class, value: Control,
              betas: np.ndarray) -> tuple[_Policy, Solver]:
     """Every control the class declares, checked and turned into a number."""
     declared, family = source.fields, source.family
-    train_steps = _integer(value("num_train_timesteps"), "num_train_timesteps")
+    train_steps = records.integer(value("num_train_timesteps"), "num_train_timesteps")
     active: list[Transform] = [name for name, key in _TRANSFORM_CONTROLS
-              if key in declared and _boolean(value(key), key)]
+              if key in declared and records.boolean(value(key), key)]
     if len(active) > 1:
         raise ValueError("Only one of the Karras, exponential and beta sigma grids can be used")
     transform: Transform = active[0] if active else "none"
@@ -885,7 +854,7 @@ def _resolve(kind: str, source: _Class, value: Control,
     elif value("variance_type") in ("learned", "learned_range"):
         raise ValueError("Native source scheduling does not implement learned variance")
     clip, threshold = _x0_limit(kind, declared, value)
-    zero_snr = _boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr")
+    zero_snr = records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr")
     zero_snr_tail = zero_snr and kind in ("DPMSolverMultistep", "UniPCMultistep",
                                           "EulerDiscrete", "EulerAncestralDiscrete")
     lambda_clipped = 0
@@ -896,22 +865,22 @@ def _resolve(kind: str, source: _Class, value: Control,
             alphas[-1] = 2.0 ** -24
         lambdas = 0.5 * (np.log(alphas) - np.log(1 - alphas))
         lambda_clipped = int(np.searchsorted(np.flip(lambdas),
-                                             _number(limit, "lambda_min_clipped")))
-    original_steps = _integer(value("original_inference_steps", train_steps),
+                                             records.number(limit, "lambda_min_clipped")))
+    original_steps = records.integer(value("original_inference_steps", train_steps),
                               "original_inference_steps")
     if not 0 < original_steps <= train_steps:
         raise ValueError("original_inference_steps must be positive and fit the training table")
     corrector = value("disable_corrector", [])
     if not isinstance(corrector, (list, tuple)):
         raise ValueError("disable_corrector must be a sequence of step indices")
-    disabled = tuple(_integer(index, "disable_corrector") for index in corrector)
+    disabled = tuple(records.integer(index, "disable_corrector") for index in corrector)
     sigma_min, sigma_max = value("sigma_min"), value("sigma_max")
-    order = _integer(value("solver_order", 2), "solver_order")
+    order = records.integer(value("solver_order", 2), "solver_order")
     flow = _flow_controls(value) if family == "flow" else None
     policy = _Policy(
         kind=kind, family=family, train_steps=train_steps,
         spacing=spacing,
-        offset=_integer(value("steps_offset", 0), "steps_offset"),
+        offset=records.integer(value("steps_offset", 0), "steps_offset"),
         transform=transform,
         karras_round=(kind in _KARRAS_ROUNDS
                       or (kind == "DPMSolverMultistep"
@@ -919,19 +888,19 @@ def _resolve(kind: str, source: _Class, value: Control,
         terminal=terminal,
         grid_terminal=kind in ("DEISMultistep", "UniPCMultistep"),
         zero_snr_tail=zero_snr_tail, lambda_clipped=lambda_clipped,
-        sigma_min=None if sigma_min is None else _number(sigma_min, "sigma_min"),
-        sigma_max=None if sigma_max is None else _number(sigma_max, "sigma_max"),
-        sigma_data=_number(value("sigma_data", 0.5), "sigma_data"),
-        rho=_number(value("rho", 7.0), "rho"),
+        sigma_min=None if sigma_min is None else records.number(sigma_min, "sigma_min"),
+        sigma_max=None if sigma_max is None else records.number(sigma_max, "sigma_max"),
+        sigma_data=records.number(value("sigma_data", 0.5), "sigma_data"),
+        rho=records.number(value("rho", 7.0), "rho"),
         stride=kind in ("DDIM", "PNDM"),
         clean_terminal=(kind == "DDPM"
-                        or _boolean(value("set_alpha_to_one", absent=True), "set_alpha_to_one")),
+                        or records.boolean(value("set_alpha_to_one", absent=True), "set_alpha_to_one")),
         clip=clip, threshold=threshold,
         recompute_epsilon=(kind in ("DDPM", "DEISMultistep")
                            or (family == "lambda" and algorithm in ("dpmsolver", "sde-dpmsolver"))),
         distilled=kind in ("LCM", "TCD"),
         original_steps=original_steps,
-        timestep_scaling=_number(value("timestep_scaling", 10.0), "timestep_scaling"),
+        timestep_scaling=records.number(value("timestep_scaling", 10.0), "timestep_scaling"),
         flow=flow)
     return policy, _build_solver(kind, value, order, algorithm, terminal,
                                  variance, disabled)
@@ -949,7 +918,7 @@ def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
     if kind == "DDIM":
         return DDIM()
     if kind == "PNDM":
-        return PNDM(skip_prk_steps=_boolean(value("skip_prk_steps"), "skip_prk_steps"))
+        return PNDM(skip_prk_steps=records.boolean(value("skip_prk_steps"), "skip_prk_steps"))
     if kind == "DDPM":
         return DDPM(variance)
     if kind == "LMSDiscrete":
@@ -965,22 +934,22 @@ def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
     if kind == "DPMSolverSDE":
         seed = value("noise_sampler_seed")
         return DPMSolverSDE(seed=None if seed is None
-                            else _integer(seed, "noise_sampler_seed"))
+                            else records.integer(seed, "noise_sampler_seed"))
     if kind == "DEISMultistep":
         # The class rewrites the two DPM names to its own and refuses the
         # rest; its native integrator carries neither control.
         _solver_type(kind, value, ("logrho",))
-        return DEIS(order, _boolean(value("lower_order_final"), "lower_order_final"))
+        return DEIS(order, records.boolean(value("lower_order_final"), "lower_order_final"))
     if kind == "LCM":
         return Consistency()
     if kind == "TCD":
         # The source takes eta as a step argument, not a checkpoint field, so
         # this is the step signature's own default.
         return TCD()
-    lower_order_final = _boolean(value("lower_order_final"), "lower_order_final")
+    lower_order_final = records.boolean(value("lower_order_final"), "lower_order_final")
     if kind == "UniPCMultistep":
         return UniPC(order, _solver_type(kind, value, ("bh1", "bh2")),
-                     _boolean(value("predict_x0"), "predict_x0"), lower_order_final, corrector)
+                     records.boolean(value("predict_x0"), "predict_x0"), lower_order_final, corrector)
     if kind == "DPMSolverSinglestep":
         # `set_timesteps` rewrites this control for a zero terminal, so the
         # reconstruction reads the value the source would walk with.
@@ -993,7 +962,7 @@ def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
     return DPMSolverMultistep(order, algorithm,
                               _solver_type(kind, value, ("midpoint", "heun")),
                               lower_order_final,
-                              _boolean(value("euler_at_final"), "euler_at_final"))
+                              records.boolean(value("euler_at_final"), "euler_at_final"))
 
 
 def _prediction_transform(policy: _Policy, prediction: str) -> PredictionTransform:

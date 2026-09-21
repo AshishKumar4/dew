@@ -15,8 +15,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Literal, Protocol
 
+from dew.records import JSON
 from dew.sampling.text import Sampling
-from dew.telemetry.records import JSON
 
 if TYPE_CHECKING:
     from ollama import (

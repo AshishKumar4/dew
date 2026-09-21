@@ -21,7 +21,7 @@ from typing import Literal, Protocol, Self, runtime_checkable
 
 import jax
 
-from dew.telemetry.records import JSON
+from dew.records import JSON
 
 
 @runtime_checkable

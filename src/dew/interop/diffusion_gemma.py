@@ -12,6 +12,7 @@ from collections.abc import Mapping
 import numpy as np
 from flax import linen as nn
 
+from dew import records
 from dew.diffusion.block import BlockProcess
 from dew.interop.hf_decoders import translate_config, translate_denoiser_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -29,25 +30,18 @@ from dew.objectives.base import Variables
 from dew.registry import with_precision
 
 
+# The wrapper config states these three with a default this assembly supplies
+# when the file omits them, so each reads `config.get` and narrows the answer.
 def _section(config: Mapping[str, object], name: str) -> Mapping[str, object]:
-    value = config[name]
-    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
-        raise ValueError(f"{name} must be a string-keyed configuration record")
-    return value
+    return records.record(config[name], name)
 
 
 def _integer(config: Mapping[str, object], name: str, default: int | None = None) -> int:
-    value = config.get(name, default)
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise ValueError(f"{name} must be an integer")
-    return value
+    return records.integer(config.get(name, default), name)
 
 
 def _number(config: Mapping[str, object], name: str, default: float) -> float:
-    value = config.get(name, default)
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValueError(f"{name} must be a number")
-    return float(value)
+    return records.number(config.get(name, default), name)
 
 
 def text_config(config: Mapping[str, object]) -> Mapping[str, object]:

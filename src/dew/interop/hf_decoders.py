@@ -44,6 +44,7 @@ from typing import Callable, Collection, Literal, Mapping, NoReturn, Protocol, T
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
 
+from dew import records
 from dew.interop import mamba2
 from dew.interop.safetensors_io import read_file
 from dew.nn import audio as audio_nn, llama4, vision as vision_nn
@@ -113,61 +114,9 @@ def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
 
 
-# A released config is JSON, so every field arrives as an unnarrowed value and
-# is read here or refused with the expectation named. `interop/diffusion.py`
-# reads its own source configs through the same four.
-def _int(value: object, key: str) -> int:
-    """One integer field. `True` is an int to Python and a flag to a config."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        _refuse(f"{key}={value!r}", "this field is an integer")
-    return value
-
-
-def _float(value: object, key: str) -> float:
-    """One real field; an integer is one, and a bool is not."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
-        _refuse(f"{key}={value!r}", "this field is a finite number")
-    return float(value)
-
-
-def _bool(value: object, key: str) -> bool:
-    """One flag field, as JSON's true and false."""
-    if not isinstance(value, bool):
-        _refuse(f"{key}={value!r}", "this field is a boolean")
-    return value
-
-
-def _str(value: object, key: str) -> str:
-    """One named field: a dtype, an activation, an architecture."""
-    if not isinstance(value, str):
-        _refuse(f"{key}={value!r}", "this field is a string")
-    return value
-
-
-def _record(value: object, key: str) -> Mapping[str, object]:
-    """One nested section, whose own fields read through the four above."""
-    if not isinstance(value, Mapping) or any(type(name) is not str for name in value):
-        _refuse(f"{key}={value!r}", "this field is a record of named fields")
-    return value
-
-
-def _strings(value: object, key: str) -> tuple[str, ...]:
-    """One list of names: a layer pattern, an architecture list."""
-    if isinstance(value, str) or not isinstance(value, (list, tuple)):
-        _refuse(f"{key}={value!r}", "this field is a list of strings")
-    return tuple(_str(entry, key) for entry in value)
-
-
-def _integers(value: object, key: str) -> tuple[int, ...]:
-    """One list of integers: layer indices, token ids, per-layer widths."""
-    if not isinstance(value, (list, tuple)):
-        _refuse(f"{key}={value!r}", "this field is a list of integers")
-    return tuple(_int(entry, key) for entry in value)
-
-
 def _kind_name(record: Mapping[str, object], section: str) -> str:
     """The registry name of one nested value record."""
-    return _str(_record(record[section], section)['kind'], f"{section} kind")
+    return records.text(records.record(record[section], section)['kind'], f"{section} kind")
 
 
 class Llama3Ramp(TypedDict):
@@ -409,7 +358,7 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
         return _Rope()
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
     theta = entry.get('rope_theta')
-    theta = None if theta is None else _float(theta, 'rope_theta')
+    theta = None if theta is None else records.number(theta, 'rope_theta')
     if rope_type == 'llama3':
         missing = sorted(set(_LLAMA3_FIELDS) - set(entry))
         extra = sorted(set(entry) - set(_LLAMA3_FIELDS) - {'rope_type', 'type', 'rope_theta'})
@@ -419,10 +368,10 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
                     f"missing {missing}, unexpected {extra}")
         return _Rope(theta, {
             'rope_type': 'llama3',
-            'factor': _float(entry['factor'], 'factor'),
-            'low_freq_factor': _float(entry['low_freq_factor'], 'low_freq_factor'),
-            'high_freq_factor': _float(entry['high_freq_factor'], 'high_freq_factor'),
-            'original_max_position_embeddings': _int(entry['original_max_position_embeddings'], 'original_max_position_embeddings'),
+            'factor': records.number(entry['factor'], 'factor'),
+            'low_freq_factor': records.number(entry['low_freq_factor'], 'low_freq_factor'),
+            'high_freq_factor': records.number(entry['high_freq_factor'], 'high_freq_factor'),
+            'original_max_position_embeddings': records.integer(entry['original_max_position_embeddings'], 'original_max_position_embeddings'),
         })
     if rope_type == 'yarn' and yarn_max_pos is not None:
         # The base an entry names, or the shared default until `_at_base`
@@ -518,10 +467,10 @@ def _rope(hf_config: Mapping[str, object], used: set,
             theta = rope.theta or theta
             scaling = rope.scaling or scaling
     if theta is None:
-        theta = _float(hf_config.get('rope_theta', 10000.0), 'rope_theta')
+        theta = records.number(hf_config.get('rope_theta', 10000.0), 'rope_theta')
     local = hf_config.get('rope_local_base_freq')
     return _Ropes(theta, _at_base(scaling, theta),
-                  None if local is None else _float(local, 'rope_local_base_freq'))
+                  None if local is None else records.number(local, 'rope_local_base_freq'))
 
 
 def _specified_layer_types(hf_config: Mapping[str, object], used: set[str],
@@ -529,17 +478,17 @@ def _specified_layer_types(hf_config: Mapping[str, object], used: set[str],
     layers = hf_config.get('layer_types')
     if layers is not None:
         used.add('layer_types')
-        return _strings(layers, 'layer_types')
-    return default if default is not None else ('full_attention',) * _int(hf_config['num_hidden_layers'], 'num_hidden_layers')
+        return records.strings(layers, 'layer_types')
+    return default if default is not None else ('full_attention',) * records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
 
 
 def _qwen_layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
-    layers = _int(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     if hf_config.get('layer_types') is not None:
         return _specified_layer_types(hf_config, used)
     used.update(('use_sliding_window', 'sliding_window'))
     enabled = hf_config.get('use_sliding_window', False) and hf_config.get('sliding_window') is not None
-    first = _int(hf_config.get('max_window_layers', layers), 'max_window_layers')
+    first = records.integer(hf_config.get('max_window_layers', layers), 'max_window_layers')
     return tuple('sliding_attention' if enabled and index >= first else 'full_attention'
                  for index in range(layers))
 
@@ -549,11 +498,11 @@ def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
     if hf_config.get('layer_types') is not None:
         types = _specified_layer_types(hf_config, used)
     else:
-        pattern = 6 if last_full else _int(hf_config.get('sliding_window_pattern', 6), 'sliding_window_pattern')
+        pattern = 6 if last_full else records.integer(hf_config.get('sliding_window_pattern', 6), 'sliding_window_pattern')
         if not last_full:
             used.add('sliding_window_pattern')
         types = tuple('sliding_attention' if (index + 1) % pattern else 'full_attention'
-                      for index in range(_int(hf_config['num_hidden_layers'], 'num_hidden_layers')))
+                      for index in range(records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')))
     # Gemma4TextConfig rewrites the final layer before building the model.
     return (*types[:-1], 'full_attention') if last_full and types else types
 
@@ -592,8 +541,8 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     partial rotary); the sliding layers rotate all of theirs. Anything but
     those two shapes refuses with the entry named.
     """
-    full = _record(entries.get('full_attention') or {}, 'rope_parameters.full_attention')
-    sliding = _record(entries.get('sliding_attention') or {}, 'rope_parameters.sliding_attention')
+    full = records.record(entries.get('full_attention') or {}, 'rope_parameters.full_attention')
+    sliding = records.record(entries.get('sliding_attention') or {}, 'rope_parameters.sliding_attention')
     for kind, entry in (('sliding_attention', sliding),):
         factor = entry.get('partial_rotary_factor')
         if factor not in (None, 1, 1.0):
@@ -614,8 +563,8 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
         if extra or entry.get('factor', 1.0) not in (1, 1.0):
             _refuse("rope_parameters.full_attention scaling",
                     "the backbone applies plain rotary positions at rope_theta")
-        partial = _float(factor, 'rope_parameters.full_attention partial_rotary_factor')
-        theta = _float(entry.get('rope_theta', 1000000.0), 'rope_parameters.full_attention rope_theta')
+        partial = records.number(factor, 'rope_parameters.full_attention partial_rotary_factor')
+        theta = records.number(entry.get('rope_theta', 1000000.0), 'rope_parameters.full_attention rope_theta')
     elif rope_type in ('default', 'none'):
         if factor not in (None, 1, 1.0):
             _refuse("rope_parameters.full_attention partial_rotary_factor",
@@ -625,7 +574,7 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     else:
         _refuse(f"rope_parameters.full_attention (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta")
-    local = _float(local, 'rope_parameters.sliding_attention rope_theta')
+    local = records.number(local, 'rope_parameters.sliding_attention rope_theta')
 
     return theta, (None if local == theta else local), partial
 
@@ -658,21 +607,21 @@ def _yarn_record(entry: Mapping[str, object], field: str, theta: float,
     factor = entry.get('factor')
     if factor is None:
         factor = (float(max_pos)
-                  / _float(entry['original_max_position_embeddings'], 'original_max_position_embeddings'))
+                  / records.number(entry['original_max_position_embeddings'], 'original_max_position_embeddings'))
     return {
         'rope_type': 'yarn',
         'rope_theta': theta,
-        'factor': _float(factor, f'{field} factor'),
-        'original_max_position_embeddings': _int(entry['original_max_position_embeddings'], 'original_max_position_embeddings'),
-        'beta_fast': _float(entry.get('beta_fast') or 32, 'beta_fast'),
-        'beta_slow': _float(entry.get('beta_slow') or 1, 'beta_slow'),
+        'factor': records.number(factor, f'{field} factor'),
+        'original_max_position_embeddings': records.integer(entry['original_max_position_embeddings'], 'original_max_position_embeddings'),
+        'beta_fast': records.number(entry.get('beta_fast') or 32, 'beta_fast'),
+        'beta_slow': records.number(entry.get('beta_slow') or 1, 'beta_slow'),
         'mscale': (None if entry.get('mscale') is None
-                   else _float(entry['mscale'], 'mscale')),
+                   else records.number(entry['mscale'], 'mscale')),
         'mscale_all_dim': (None if entry.get('mscale_all_dim') is None
-                           else _float(entry['mscale_all_dim'], 'mscale_all_dim')),
+                           else records.number(entry['mscale_all_dim'], 'mscale_all_dim')),
         'truncate': bool(entry.get('truncate', True)),
         'attention_factor': (None if entry.get('attention_factor') is None
-                             else _float(entry['attention_factor'], 'attention_factor')),
+                             else records.number(entry['attention_factor'], 'attention_factor')),
     }
 
 
@@ -691,8 +640,8 @@ def _deepseek_rope(hf_config: Mapping[str, object], used: set
     parameters = hf_config.get('rope_parameters')
     entry = (scaling if isinstance(scaling, Mapping)
              else parameters if isinstance(parameters, Mapping) else None)
-    theta = _float(hf_config.get('rope_theta', 10000.0), 'rope_theta')
-    max_pos = _int(hf_config.get('max_position_embeddings',
+    theta = records.number(hf_config.get('rope_theta', 10000.0), 'rope_theta')
+    max_pos = records.integer(hf_config.get('max_position_embeddings',
                                 DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings')
     if entry is None:
         return theta, None
@@ -737,8 +686,8 @@ def _deepseek_mixture(hf_config: Mapping[str, object], layers: int,
     return {
         **_deepseek_layout(hf_config, layers, used),
         'score_function': 'sigmoid',
-        'groups': _int(hf_config.get('n_group') or 1, 'n_group'),
-        'groups_per_token': _int(hf_config.get('topk_group') or 1, 'topk_group'),
+        'groups': records.integer(hf_config.get('n_group') or 1, 'n_group'),
+        'groups_per_token': records.integer(hf_config.get('topk_group') or 1, 'topk_group'),
         'bias': True,
     }
 
@@ -763,8 +712,8 @@ def _deepseek_v2_mixture(hf_config: Mapping[str, object], layers: int,
     if method not in ('greedy', 'group_limited_greedy'):
         _refuse(f"topk_method {method!r}",
                 "DeepseekV2TopkRouter selects greedy or group_limited_greedy")
-    groups = _int(hf_config.get('n_group') or 1, 'n_group')
-    per_token = _int(hf_config.get('topk_group') or 1, 'topk_group')
+    groups = records.integer(hf_config.get('n_group') or 1, 'n_group')
+    per_token = records.integer(hf_config.get('topk_group') or 1, 'topk_group')
     if method == 'greedy' and (groups, per_token) != (1, 1):
         _refuse(f"n_group {groups} with topk_method 'greedy'",
                 "the greedy selection ignores the groups")
@@ -808,7 +757,7 @@ def _deepseek_layout(hf_config: Mapping[str, object], layers: int,
             _refuse(f"moe_layer_freq {freq!r}",
                     "transformers builds every layer past the dense ones as MoE, "
                     "whatever this field says")
-        first_k = _int(hf_config.get('first_k_dense_replace', 0) or 0, 'first_k_dense_replace')
+        first_k = records.integer(hf_config.get('first_k_dense_replace', 0) or 0, 'first_k_dense_replace')
         if not 0 <= first_k <= layers:
             _refuse(f"first_k_dense_replace {first_k!r}",
                     f"it names dense layers of a {layers}-layer model")
@@ -817,25 +766,25 @@ def _deepseek_layout(hf_config: Mapping[str, object], layers: int,
         if pattern is not None:
             expected = (['dense'] * first_k
                         + ['sparse'] * (layers - first_k))
-            if list(_strings(pattern, 'mlp_layer_types')) != expected:
-                _refuse(f"mlp_layer_types {list(_strings(pattern, 'mlp_layer_types'))!r}",
+            if list(records.strings(pattern, 'mlp_layer_types')) != expected:
+                _refuse(f"mlp_layer_types {list(records.strings(pattern, 'mlp_layer_types'))!r}",
                         "it disagrees with first_k_dense_replace, which is what "
                         "the reference builds")
-    shared = _int(hf_config.get('n_shared_experts', 0) or 0, 'n_shared_experts')
+    shared = records.integer(hf_config.get('n_shared_experts', 0) or 0, 'n_shared_experts')
     shared_features = 0
     if shared:
         width = hf_config.get('moe_intermediate_size')
         if width is None:
             _refuse("moe_intermediate_size",
                     "the shared experts need their width")
-        shared_features = shared * _int(width, 'moe_intermediate_size')
+        shared_features = shared * records.integer(width, 'moe_intermediate_size')
     return {
-        'experts': _int(experts, 'n_routed_experts'),
-        'top_k': _int(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
+        'experts': records.integer(experts, 'n_routed_experts'),
+        'top_k': records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
         'layers': sparse,
-        'scaling': _float(hf_config.get('routed_scaling_factor', 1.0), 'routed_scaling_factor'),
+        'scaling': records.number(hf_config.get('routed_scaling_factor', 1.0), 'routed_scaling_factor'),
         'shared_features': shared_features,
-        'expert_features': _int(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
+        'expert_features': records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
     }
 
 
@@ -858,7 +807,7 @@ def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
     exactly (difference 0.0 against the reference cos/sin). Wrapper loading
     retains the three-axis layout on its attention mixer for visual inputs.
     """
-    entry = _record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
+    entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
     if rope_type not in ('default', 'none'):
         _refuse(f"rope_parameters (rope_type {rope_type!r})",
@@ -868,9 +817,9 @@ def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
     if scaling:
         _refuse(f"rope_parameters scaling fields {scaling}",
                 "the backbone applies plain rotary positions at rope_theta")
-    theta = _float(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
+    theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
                    'rope_parameters rope_theta')
-    factor = _float(entry.get('partial_rotary_factor',
+    factor = records.number(entry.get('partial_rotary_factor',
                               hf_config.get('partial_rotary_factor', 0.25)),
                     'rope_parameters partial_rotary_factor')
     return theta, factor
@@ -883,9 +832,9 @@ def _mlp_features(hf_config: Mapping[str, object]) -> int | tuple[int, ...]:
     of one value is that value."""
     stated = hf_config['intermediate_size']
     if isinstance(stated, (list, tuple)):
-        widths = _integers(stated, 'intermediate_size')
+        widths = records.integers(stated, 'intermediate_size')
         return widths[0] if len(set(widths)) == 1 else widths
-    return _int(stated, 'intermediate_size')
+    return records.integer(stated, 'intermediate_size')
 
 
 def _base_config(hf_config: Mapping[str, object], used: set[str], *,
@@ -899,13 +848,13 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
     carry (OLMo 3's spelling) lands on the full kind, because a kind's None
     rides the model's value and cannot turn a ramp off.
     """
-    hidden = _int(hf_config['hidden_size'], 'hidden_size')
-    heads = _int(hf_config['num_attention_heads'], 'num_attention_heads')
+    hidden = records.integer(hf_config['hidden_size'], 'hidden_size')
+    heads = records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
     kv_heads = hf_config.get('num_key_value_heads')
-    head_dim = _int(hf_config.get('head_dim') or hidden // heads, 'head_dim')
+    head_dim = records.integer(hf_config.get('head_dim') or hidden // heads, 'head_dim')
     used.update(('hidden_size', 'num_attention_heads', 'num_key_value_heads', 'head_dim'))
 
-    activation = _str(hf_config.get('hidden_act', hf_config.get('hidden_activation', 'silu')),
+    activation = records.text(hf_config.get('hidden_act', hf_config.get('hidden_activation', 'silu')),
                       'hidden_act/hidden_activation')
     used.update(('hidden_act', 'hidden_activation'))
     mapped = _ACTIVATIONS.get(activation)
@@ -921,26 +870,26 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
     if 'sliding_attention' in layer_types and stated_window is None:
         _refuse("layer_types with sliding attention",
                 "sliding_window is not set, so the window has no size")
-    sliding_window = (_int(stated_window, 'sliding_window')
+    sliding_window = (records.integer(stated_window, 'sliding_window')
                       if 'sliding_attention' in layer_types else None)
 
     kinds = _kinds(layer_types, sliding_window, rope_local_theta, None, None)
     config: DecoderFields = {
-        'vocab_size': _int(hf_config['vocab_size'], 'vocab_size'),
+        'vocab_size': records.integer(hf_config['vocab_size'], 'vocab_size'),
         'emb_features': hidden,
-        'num_layers': _int(hf_config['num_hidden_layers'], 'num_hidden_layers'),
+        'num_layers': records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'),
         'num_heads': heads,
-        'num_kv_heads': heads if kv_heads is None else _int(kv_heads, 'num_key_value_heads'),
+        'num_kv_heads': heads if kv_heads is None else records.integer(kv_heads, 'num_key_value_heads'),
         'head_dim': head_dim,
         'mlp': mapped,
         'mlp_features': _mlp_features(hf_config),
-        'max_seq_len': min(_int(hf_config.get('max_position_embeddings',
+        'max_seq_len': min(records.integer(hf_config.get('max_position_embeddings',
                                              DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
                            DEFAULT_MAX_SEQ_LEN),
         'rope_theta': rope_theta,
         'layer_types': layer_types,
         'kinds': kinds,
-        'norm_eps': _float(hf_config.get('rms_norm_eps', 1e-6), 'rms_norm_eps'),
+        'norm_eps': records.number(hf_config.get('rms_norm_eps', 1e-6), 'rms_norm_eps'),
         # LlamaRMSNorm, Qwen3RMSNorm and DeepseekV3RMSNorm multiply the scale
         # into the activations after casting them (modeling_qwen3.py:61-64,
         # modeling_deepseek_v3.py:47-52); Gemma3's, Gemma4's and Qwen3.5's
@@ -989,7 +938,7 @@ def _softmax_mixture(hf_config: Mapping[str, object], used: set[str],
     logit output are training-time knobs the forward pass never reads."""
     used.update(('num_experts_per_tok', 'output_router_logits',
                  'router_aux_loss_coef'))
-    return {'top_k': _int(hf_config['num_experts_per_tok'], 'num_experts_per_tok'), **fields}
+    return {'top_k': records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'), **fields}
 
 
 def _mixtral_config(hf_config, used):
@@ -998,7 +947,7 @@ def _mixtral_config(hf_config, used):
     if hf_config.get('router_jitter_noise', 0.0):
         _refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
     config['mixture'] = _softmax_mixture(
-        hf_config, used, experts=_int(hf_config['num_local_experts'], 'num_local_experts'))
+        hf_config, used, experts=records.integer(hf_config['num_local_experts'], 'num_local_experts'))
     return config
 
 
@@ -1039,20 +988,20 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
                 'mlp_hidden_size/intermediate_size and embedding_size/vocab_size are required')
     kv_heads = heads if kv_heads is None else kv_heads
     head_dim = hf_config.get('head_dim')
-    head_dim = _int(head_dim, 'head_dim') if head_dim is not None else _int(hidden, 'hidden_size/d_model') // _int(heads, 'num_attention_heads/n_heads')
+    head_dim = records.integer(head_dim, 'head_dim') if head_dim is not None else records.integer(hidden, 'hidden_size/d_model') // records.integer(heads, 'num_attention_heads/n_heads')
     max_pos = hf_config.get('max_position_embeddings',
                             hf_config.get('max_sequence_length', DEFAULT_MAX_SEQ_LEN))
     std: dict[str, object] = {
-        'hidden_size': _int(hidden, 'hidden_size/d_model'),
-        'num_attention_heads': _int(heads, 'num_attention_heads/n_heads'),
-        'num_key_value_heads': _int(kv_heads, 'num_key_value_heads/n_kv_heads'),
+        'hidden_size': records.integer(hidden, 'hidden_size/d_model'),
+        'num_attention_heads': records.integer(heads, 'num_attention_heads/n_heads'),
+        'num_key_value_heads': records.integer(kv_heads, 'num_key_value_heads/n_kv_heads'),
         'head_dim': head_dim,
-        'intermediate_size': _int(intermediate, 'intermediate_size/mlp_hidden_size'),
-        'vocab_size': _int(vocab, 'vocab_size/embedding_size'),
-        'num_hidden_layers': _int(layers, 'num_hidden_layers/n_layers'),
-        'max_position_embeddings': min(_int(max_pos, 'max_position_embeddings/max_sequence_length'), DEFAULT_MAX_SEQ_LEN),
-        'rms_norm_eps': _float(hf_config.get('rms_norm_eps', hf_config.get('norm_eps', 1e-6)), 'rms_norm_eps'),
-        'rope_theta': _float(hf_config.get('rope_theta', 500000.0), 'rope_theta'),
+        'intermediate_size': records.integer(intermediate, 'intermediate_size/mlp_hidden_size'),
+        'vocab_size': records.integer(vocab, 'vocab_size/embedding_size'),
+        'num_hidden_layers': records.integer(layers, 'num_hidden_layers/n_layers'),
+        'max_position_embeddings': min(records.integer(max_pos, 'max_position_embeddings/max_sequence_length'), DEFAULT_MAX_SEQ_LEN),
+        'rms_norm_eps': records.number(hf_config.get('rms_norm_eps', hf_config.get('norm_eps', 1e-6)), 'rms_norm_eps'),
+        'rope_theta': records.number(hf_config.get('rope_theta', 500000.0), 'rope_theta'),
         'attention_bias': bool(hf_config.get('attention_bias', hf_config.get('include_bias',
                               hf_config.get('include_qkv_bias', False)))),
         'tie_word_embeddings': bool(hf_config.get('tie_word_embeddings',
@@ -1061,8 +1010,8 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
                       hf_config.get('activation_type', 'silu'))),
     }
     inner: set[str] = set()
-    config = _base_config(std, inner, layer_types=('full_attention',) * _int(layers, 'num_hidden_layers/n_layers'),
-                          rope=_Ropes(_float(std['rope_theta'], 'rope_theta')))
+    config = _base_config(std, inner, layer_types=('full_attention',) * records.integer(layers, 'num_hidden_layers/n_layers'),
+                          rope=_Ropes(records.number(std['rope_theta'], 'rope_theta')))
     for key in ('hidden_size', 'd_model', 'num_hidden_layers', 'n_layers', 'num_layers',
                 'num_attention_heads', 'n_heads', 'num_key_value_heads', 'n_kv_heads',
                 'head_dim', 'intermediate_size', 'mlp_hidden_size', 'vocab_size',
@@ -1088,9 +1037,9 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
         _refuse('rope_parameters/rope_scaling', 'LLaDA-8B carries plain rope at rope_theta')
     used.update(('rope_parameters', 'rope_scaling', 'rope_local_base_freq'))
     stated = hf_config.get('layer_types')
-    if (stated is not None and _strings(stated, 'layer_types')
-            != ('full_attention',) * _int(layers, 'num_hidden_layers/n_layers')):
-        _refuse(f'layer_types {list(_strings(stated, "layer_types"))!r}',
+    if (stated is not None and records.strings(stated, 'layer_types')
+            != ('full_attention',) * records.integer(layers, 'num_hidden_layers/n_layers')):
+        _refuse(f'layer_types {list(records.strings(stated, "layer_types"))!r}',
                 'LLaDA-8B attends every layer fully')
     if stated is not None:
         used.add('layer_types')
@@ -1115,7 +1064,7 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     if hf_config.get('block_type', 'llama') != 'llama':
         _refuse(f"block_type {hf_config.get('block_type')!r}", 'this entry is the llama block')
     used.add('block_type')
-    if _int(hf_config.get('block_group_size', 1), 'block_group_size') != 1:
+    if records.integer(hf_config.get('block_group_size', 1), 'block_group_size') != 1:
         _refuse('block_group_size', 'the released stack groups no blocks')
     used.add('block_group_size')
     if hf_config.get('alibi'):
@@ -1134,9 +1083,9 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
                  'init_device', 'init_fn', 'init_std', 'init_cutoff_factor', 'mlp_ratio',
                  'eos_token_id', 'pad_token_id'))
     embedding = hf_config.get('embedding_size')
-    if embedding is not None and _int(embedding, 'embedding_size') != _int(vocab, 'vocab_size'):
+    if embedding is not None and records.integer(embedding, 'embedding_size') != records.integer(vocab, 'vocab_size'):
         _refuse('embedding_size', f'it names {embedding} rows for a {vocab} vocabulary')
-    config.update(causal=False, mask_token_id=_int(mask, 'mask_token_id'))
+    config.update(causal=False, mask_token_id=records.integer(mask, 'mask_token_id'))
     return config
 
 
@@ -1159,7 +1108,7 @@ def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     if mask is None:
         _refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
     used.update(('mask_token_id', 'mask_id'))
-    config.update(causal=False, mask_token_id=_int(mask, 'mask_token_id/mask_id'))
+    config.update(causal=False, mask_token_id=records.integer(mask, 'mask_token_id/mask_id'))
     return config
 
 
@@ -1194,9 +1143,9 @@ def _diffusion_gemma_text_config(hf_config: Mapping[str, object], used: set[str]
         # three routed widths routes every layer beside its dense MLP, which
         # is what its encoder and decoder layers both build.
         config["mixture"] = {
-            "experts": _int(hf_config["num_experts"], 'num_experts'),
-            "top_k": _int(hf_config["top_k_experts"], 'top_k_experts'),
-            "expert_features": _int(hf_config["moe_intermediate_size"], 'moe_intermediate_size'),
+            "experts": records.integer(hf_config["num_experts"], 'num_experts'),
+            "top_k": records.integer(hf_config["top_k_experts"], 'top_k_experts'),
+            "expert_features": records.integer(hf_config["moe_intermediate_size"], 'moe_intermediate_size'),
             "parallel": True,
         }
     # final_logit_softcapping is a class attribute of the reference text
@@ -1297,10 +1246,10 @@ def _sparse_step_layers(hf_config: Mapping[str, object], layers: int, used: set[
     from one, minus mlp_only_layers (modeling_qwen3_moe.py:309-313,
     modeling_qwen3_next.py:813-818)."""
     used.update(('decoder_sparse_step', 'mlp_only_layers'))
-    step = _int(hf_config.get('decoder_sparse_step', 1), 'decoder_sparse_step')
+    step = records.integer(hf_config.get('decoder_sparse_step', 1), 'decoder_sparse_step')
     if step < 1:
         _refuse(f"decoder_sparse_step {step}", "the reference counts layers from one")
-    dense = set(_integers(hf_config.get('mlp_only_layers') or (), 'mlp_only_layers'))
+    dense = set(records.integers(hf_config.get('mlp_only_layers') or (), 'mlp_only_layers'))
     return tuple(index for index in range(layers)
                  if (index + 1) % step == 0 and index not in dense)
 
@@ -1314,7 +1263,7 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     (configuration_qwen3_moe.py:115, modeling_qwen3_moe.py:149). The expert
     count is `num_experts`, with `num_local_experts` its alias
     (attribute_map), the name transformers 5.16.1 writes it back under."""
-    layers = _int(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
     windowed = (hf_config.get('use_sliding_window', False)
                 and hf_config.get('sliding_window') is not None)
@@ -1330,9 +1279,9 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
         _refuse("mlp_only_layers with decoder_sparse_step",
                 "together they leave no routed layer, which is a dense qwen3 model")
     config['mixture'] = _softmax_mixture(
-        hf_config, used, experts=_int(experts, 'num_experts/num_local_experts'), layers=sparse,
+        hf_config, used, experts=records.integer(experts, 'num_experts/num_local_experts'), layers=sparse,
         norm_topk_prob=bool(hf_config.get('norm_topk_prob', False)),
-        expert_features=_int(hf_config['moe_intermediate_size'], 'moe_intermediate_size'))
+        expert_features=records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'))
     return config
 
 
@@ -1351,11 +1300,11 @@ def _olmo3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     the released 7B checkpoints put a YaRN there and the sliding layers
     keep rotating plainly at rope_theta.
     """
-    layers = _int(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     layer_types = _specified_layer_types(hf_config, used, tuple(
         'sliding_attention' if (index + 1) % 4 else 'full_attention'
         for index in range(layers)))
-    ropes = _rope(hf_config, used, _int(hf_config.get(
+    ropes = _rope(hf_config, used, records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
     if ropes.scaling is not None and not isinstance(hf_config.get('rope_parameters'), Mapping):
         ropes = dataclasses.replace(ropes, full_only=True)
@@ -1387,17 +1336,17 @@ def _gemma_softcaps(hf_config: Mapping[str, object], used: set[str],
                  'attn_logit_softcapping'))
     scalar = hf_config.get('query_pre_attn_scalar')
     if scalar is not None:
-        config['attention_scale'] = _float(scalar, 'query_pre_attn_scalar') ** -0.5
+        config['attention_scale'] = records.number(scalar, 'query_pre_attn_scalar') ** -0.5
     softcap = hf_config.get('final_logit_softcapping')
     if softcap is not None:
-        config['final_logit_softcap'] = _float(softcap, 'final_logit_softcapping')
+        config['final_logit_softcap'] = records.number(softcap, 'final_logit_softcapping')
 
 
 def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Gemma 2: Gemma 3's block without the q/k norms, alternating sliding
     and full layers at one rope base, and the tanh softcap on the attention
     logits (configuration_gemma2.py:95-98, modeling_gemma2.py:203-206)."""
-    layers = _int(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     layer_types = _specified_layer_types(hf_config, used, tuple(
         'sliding_attention' if (index + 1) % 2 else 'full_attention'
         for index in range(layers)))
@@ -1406,7 +1355,7 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     _gemma_softcaps(hf_config, used, config)
     softcap = hf_config.get('attn_logit_softcapping')
     if softcap is not None:
-        config['attn_logit_softcap'] = _float(softcap, 'attn_logit_softcapping')
+        config['attn_logit_softcap'] = records.number(softcap, 'attn_logit_softcapping')
     return config
 
 
@@ -1426,7 +1375,7 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     else:
         # Gemma3nTextConfig fills every fifth layer full.
         layer_types = tuple('full_attention' if (index + 1) % 5 == 0 else 'sliding_attention'
-                            for index in range(_int(hf_config['num_hidden_layers'], 'num_hidden_layers')))
+                            for index in range(records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')))
     # Gemma3nTextConfig folds a flat rope_scaling into the full layers'
     # entry (convert_rope_params_to_dict) and defaults the bases to 1e6 for
     # the full layers and 1e4 for the sliding ones, spelled rope_theta and
@@ -1447,7 +1396,7 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
         ropes = dataclasses.replace(ropes, local_theta=None if ropes.theta == 10000.0 else 10000.0)
     config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types, rope=ropes)
-    layers = _int(config.get('num_layers'), 'num_layers')
+    layers = records.integer(config.get('num_layers'), 'num_layers')
     sparsity = hf_config.get('activation_sparsity_pattern')
     if sparsity is None:
         # The reference default is the first ten layers at 0.95 when there
@@ -1466,19 +1415,19 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     clip = hf_config.get('altup_coef_clip', 120.0)
     # AltUp's own checks name the reference's fields, so a config out of
     # their range is refused here.
-    altup = AltUp(num_inputs=_int(hf_config.get('altup_num_inputs', 4), 'altup_num_inputs'),
-                  active_idx=_int(hf_config.get('altup_active_idx', 0), 'altup_active_idx'),
-                  coef_clip=None if clip is None else _float(clip, 'altup_coef_clip'),
+    altup = AltUp(num_inputs=records.integer(hf_config.get('altup_num_inputs', 4), 'altup_num_inputs'),
+                  active_idx=records.integer(hf_config.get('altup_active_idx', 0), 'altup_active_idx'),
+                  coef_clip=None if clip is None else records.number(clip, 'altup_coef_clip'),
                   correct_scale=bool(hf_config.get('altup_correct_scale', True)))
     config.update(
         sandwich_norms=True, embedding_scale=True, attention_scale=1.0, v_norm=True,
         activation_sparsity_pattern=tuple(float(fraction) for fraction in sparsity),
-        laurel_rank=_int(hf_config.get('laurel_rank', 64), 'laurel_rank'),
+        laurel_rank=records.integer(hf_config.get('laurel_rank', 64), 'laurel_rank'),
         altup=AltUpFields(**dataclasses.asdict(altup)),
-        per_layer_input_dim=_int(hf_config.get('hidden_size_per_layer_input', 256), 'hidden_size_per_layer_input'),
-        per_layer_input_vocab=_int(hf_config.get('vocab_size_per_layer_input', 262144), 'vocab_size_per_layer_input'),
-        num_kv_shared_layers=_int(hf_config.get('num_kv_shared_layers', 15), 'num_kv_shared_layers'),
-        final_logit_softcap=_float(hf_config.get('final_logit_softcapping', 30.0), 'final_logit_softcapping'),
+        per_layer_input_dim=records.integer(hf_config.get('hidden_size_per_layer_input', 256), 'hidden_size_per_layer_input'),
+        per_layer_input_vocab=records.integer(hf_config.get('vocab_size_per_layer_input', 262144), 'vocab_size_per_layer_input'),
+        num_kv_shared_layers=records.integer(hf_config.get('num_kv_shared_layers', 15), 'num_kv_shared_layers'),
+        final_logit_softcap=records.number(hf_config.get('final_logit_softcapping', 30.0), 'final_logit_softcapping'),
     )
     return config
 
@@ -1517,8 +1466,8 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
                           tie_embeddings=True, layer_types=layer_types, rope=_Ropes(10000.0))
     # The reference's final-layer rewrite takes precedence over an explicit pattern.
     config['layer_types'] = layer_types
-    sliding_dim = _int(config.get('head_dim'), 'head_dim')
-    kv_heads = _int(config.get('num_kv_heads'), 'num_key_value_heads')
+    sliding_dim = records.integer(config.get('head_dim'), 'head_dim')
+    kv_heads = records.integer(config.get('num_kv_heads'), 'num_key_value_heads')
     k_eq_v = k_eq_v or bool(hf_config.get('attention_k_eq_v', False))
     used.update(('attention_k_eq_v', 'enable_moe_block', 'per_layer_config',
                  'global_head_dim', 'num_global_key_value_heads'))
@@ -1542,25 +1491,25 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
             if not isinstance(entry, Mapping):
                 continue
             if entry.get('head_dim') is not None:
-                full_dim = _int(entry['head_dim'], 'per_layer_config head_dim')
+                full_dim = records.integer(entry['head_dim'], 'per_layer_config head_dim')
             if entry.get('num_key_value_heads') is not None:
-                stated = _int(entry['num_key_value_heads'],
+                stated = records.integer(entry['num_key_value_heads'],
                               'per_layer_config num_key_value_heads')
                 if full_kv != kv_heads and stated != full_kv:
                     _refuse("per_layer_config num_key_value_heads",
                             f"the full layers name both {full_kv} and {stated}")
                 full_kv = stated
     else:
-        full_dim = _int(hf_config.get('global_head_dim', 512), 'global_head_dim')
+        full_dim = records.integer(hf_config.get('global_head_dim', 512), 'global_head_dim')
         global_kv = hf_config.get('num_global_key_value_heads')
         if global_kv is not None and k_eq_v:
-            full_kv = _int(global_kv, 'num_global_key_value_heads')
+            full_kv = records.integer(global_kv, 'num_global_key_value_heads')
     # Proportional rope rotates a fraction of the full layers' head dims
     # and passes the rest through; sliding layers rotate all of theirs.
-    entries = _record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
+    entries = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
     rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
     used.update(('rope_parameters', 'rope_theta'))
-    per_layer = _int(hf_config.get('hidden_size_per_layer_input', 0), 'hidden_size_per_layer_input')
+    per_layer = records.integer(hf_config.get('hidden_size_per_layer_input', 0), 'hidden_size_per_layer_input')
     config.update(
         sandwich_norms=True, embedding_scale=True, attention_scale=1.0,
         v_norm=True,
@@ -1571,11 +1520,11 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
             None if full_dim == sliding_dim else full_dim),
         partial_rotary_factor=partial,
         use_double_wide_mlp=bool(hf_config.get('use_double_wide_mlp', False)),
-        num_kv_shared_layers=_int(hf_config.get('num_kv_shared_layers', 0), 'num_kv_shared_layers'),
+        num_kv_shared_layers=records.integer(hf_config.get('num_kv_shared_layers', 0), 'num_kv_shared_layers'),
         per_layer_input_dim=per_layer or None,
-        per_layer_input_vocab=_int(hf_config.get(
+        per_layer_input_vocab=records.integer(hf_config.get(
             'vocab_size_per_layer_input',
-            _int(hf_config['vocab_size'], 'vocab_size')), 'vocab_size_per_layer_input'),
+            records.integer(hf_config['vocab_size'], 'vocab_size')), 'vocab_size_per_layer_input'),
     )
     used.update(('use_double_wide_mlp', 'num_kv_shared_layers',
                  'hidden_size_per_layer_input', 'vocab_size_per_layer_input',
@@ -1587,7 +1536,7 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
     used.add('attention_logit_cap')
     softcap = hf_config.get('final_logit_softcapping')
     if softcap is not None:
-        config['final_logit_softcap'] = _float(softcap, 'final_logit_softcapping')
+        config['final_logit_softcap'] = records.number(softcap, 'final_logit_softcapping')
     if full_kv != kv_heads:
         _kinds_of(config).setdefault('full_attention', {})['num_kv_heads'] = full_kv
     # Every released Gemma 4 checkpoint carries the layer_scalar buffer the
@@ -1601,9 +1550,9 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
             if hf_config.get(field) is None:
                 _refuse("enable_moe_block=True", f"the routed branch needs {field}")
         config['mixture'] = {
-            'experts': _int(hf_config['num_experts'], 'num_experts'),
-            'top_k': _int(hf_config['top_k_experts'], 'top_k_experts'),
-            'expert_features': _int(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
+            'experts': records.integer(hf_config['num_experts'], 'num_experts'),
+            'top_k': records.integer(hf_config['top_k_experts'], 'top_k_experts'),
+            'expert_features': records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
             'parallel': True,
         }
 
@@ -1616,9 +1565,9 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
                      = _deepseek_mixture) -> DecoderFields:
     rope_theta, yarn = _deepseek_rope(hf_config, used)
     config = _base_config(hf_config, used, rope=_Ropes(rope_theta))
-    layer_types = _strings(config.get('layer_types'), 'layer_types')
+    layer_types = records.strings(config.get('layer_types'), 'layer_types')
     model_type = hf_config['model_type']
-    layers = _int(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     sparse_name = ('deepseek_sparse_attention'
                    if sparse else 'full_attention')
     if hf_config.get('layer_types') is None:
@@ -1631,15 +1580,15 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
             _refuse(f"layer_types entry {entry!r}",
                     f"a {model_type} model mixes no attention kinds: "
                     f"every layer is {sparse_name}")
-    nope = _int(hf_config['qk_nope_head_dim'], 'qk_nope_head_dim')
-    rope = _int(hf_config['qk_rope_head_dim'], 'qk_rope_head_dim')
+    nope = records.integer(hf_config['qk_nope_head_dim'], 'qk_nope_head_dim')
+    rope = records.integer(hf_config['qk_rope_head_dim'], 'qk_rope_head_dim')
     head_dim = hf_config.get('head_dim')
-    if head_dim is not None and _int(head_dim, 'head_dim') != rope:
+    if head_dim is not None and records.integer(head_dim, 'head_dim') != rope:
         _refuse(f"head_dim {head_dim!r}",
                 "DeepSeek points head_dim at the rope slice, "
                 f"which is {rope} wide here")
     derived = hf_config.get('qk_head_dim')
-    if derived is not None and _int(derived, 'qk_head_dim') != nope + rope:
+    if derived is not None and records.integer(derived, 'qk_head_dim') != nope + rope:
         _refuse(f"qk_head_dim {derived!r}",
                 f"it derives as qk_nope_head_dim + qk_rope_head_dim, "
                 f"which is {nope + rope} here")
@@ -1661,9 +1610,9 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     index: dict[str, int] | None = None
     if sparse:
         index = {
-            'index_topk': _int(hf_config['index_topk'], 'index_topk'),
-            'index_n_heads': _int(hf_config['index_n_heads'], 'index_n_heads'),
-            'index_head_dim': _int(hf_config['index_head_dim'], 'index_head_dim'),
+            'index_topk': records.integer(hf_config['index_topk'], 'index_topk'),
+            'index_n_heads': records.integer(hf_config['index_n_heads'], 'index_n_heads'),
+            'index_head_dim': records.integer(hf_config['index_head_dim'], 'index_head_dim'),
         }
         used.update(('index_topk', 'index_n_heads', 'index_head_dim'))
     # The released checkpoints ship no mtp.* weights (91991 tensors on
@@ -1685,11 +1634,11 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
         mixer={
             'kind': 'mla',
             'q_lora_rank': (None if hf_config.get('q_lora_rank') is None
-                            else _int(hf_config['q_lora_rank'], 'q_lora_rank')),
-            'kv_lora_rank': _int(kv_rank, 'kv_lora_rank'),
+                            else records.integer(hf_config['q_lora_rank'], 'q_lora_rank')),
+            'kv_lora_rank': records.integer(kv_rank, 'kv_lora_rank'),
             'qk_nope_head_dim': nope,
             'qk_rope_head_dim': rope,
-            'v_head_dim': _int(v_dim, 'v_head_dim'),
+            'v_head_dim': records.integer(v_dim, 'v_head_dim'),
             'rope_interleave': bool(interleave),
             'yarn': yarn,
             'index_topk': None if index is None else index['index_topk'],
@@ -1709,10 +1658,10 @@ def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
     'default'-convention partial rope, and (1 + w) norms. `mixer` is the
     family's own fields of the delta net record beside the config's geometry.
     """
-    interval = _int(hf_config.get('full_attention_interval', 4), 'full_attention_interval')
+    interval = records.integer(hf_config.get('full_attention_interval', 4), 'full_attention_interval')
     layer_types = _specified_layer_types(hf_config, used, tuple(
         'full_attention' if (index + 1) % interval == 0 else 'linear_attention'
-        for index in range(_int(hf_config['num_hidden_layers'], 'num_hidden_layers'))))
+        for index in range(records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'))))
     config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
                           layer_types=layer_types, rope=_Ropes(10000.0))
     used.add('full_attention_interval')
@@ -1722,7 +1671,7 @@ def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
     if 'linear_attention' in layer_types:
         kinds['linear_attention'] = {'mixer': {
             'kind': 'gated_delta_net',
-            **{field: _int(hf_config[field], field) for field in _LINEAR_FIELDS},
+            **{field: records.integer(hf_config[field], field) for field in _LINEAR_FIELDS},
             **mixer}}
     unknown_kinds = sorted(set(layer_types) - {'linear_attention', 'full_attention'})
     if unknown_kinds:
@@ -1795,7 +1744,7 @@ def _qwen3_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
                  'shared_expert_intermediate_size', 'num_experts_per_tok',
                  'output_router_logits', 'router_aux_loss_coef'))
     experts = _record_int(hf_config, 'num_experts')
-    sparse = _sparse_step_layers(hf_config, _int(hf_config['num_hidden_layers'], 'num_hidden_layers'), used)
+    sparse = _sparse_step_layers(hf_config, records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'), used)
     # `num_experts > 0` gates the routed block too (modeling_qwen3_next.py:814).
     if sparse and experts > 0:
         config['mixture'] = _softmax_mixture(
@@ -1958,7 +1907,7 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     if model_type not in _FAMILIES:
         _refuse(f"model_type {model_type!r}",
                 f"expected one of {', '.join(repr(name) for name in _FAMILIES)}")
-    family = _FAMILIES[_str(model_type, 'model_type')]
+    family = _FAMILIES[records.text(model_type, 'model_type')]
 
     # Gemma 4 spells the flag 'vision' for its image tokens alone, and the
     # text decoder is causal (configuration_gemma4.py, only 'all' clears
@@ -2014,7 +1963,7 @@ def _wrapper_image_id(hf_config: Mapping[str, object], used: set, *names: str) -
     for name in names:
         if hf_config.get(name) is not None:
             used.add(name)
-            return _int(hf_config[name], name)
+            return records.integer(hf_config[name], name)
     _refuse("image_token_id",
             f"the image positions are marked by {list(names)}, none is set")
 
@@ -2035,12 +1984,12 @@ def _wrapper_tokens(hf_config: Mapping[str, object], used: set) -> None:
 
 def _record_int(record: Mapping[str, object], field: str, default: int | None = None) -> int:
     """An int field out of a record by name; a None default makes it required."""
-    return _int(record[field] if default is None else record.get(field, default), field)
+    return records.integer(record[field] if default is None else record.get(field, default), field)
 
 
 def _record_float(record: Mapping[str, object], field: str, default: float | None = None) -> float:
     """A real field out of a record by name; a None default makes it required."""
-    return _float(record[field] if default is None else record.get(field, default), field)
+    return records.number(record[field] if default is None else record.get(field, default), field)
 
 
 def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
@@ -2053,7 +2002,7 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     mm = hf_config.get("mm_tokens_per_image")
     used.add("mm_tokens_per_image")
     projector = vision_nn.translate_gemma_projector_config(
-        tower, _int(text.get("emb_features"), "emb_features"), mm)
+        tower, records.integer(text.get("emb_features"), "emb_features"), mm)
     image = _wrapper_image_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(hf_config, used)
     return {
@@ -2074,7 +2023,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = vision_nn.translate_llama4_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_llama4_projector_config(
-        tower, _int(text.get("emb_features"), "emb_features"))
+        tower, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_image_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(hf_config, used)
     grid = _record_int(tower, "image_size") // _record_int(tower, "patch_size")
@@ -2108,7 +2057,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
     used.update(("audio_config", "audio_token_id", "audio_soft_tokens_per_image"))
     if stated is None:
         return _NO_AUDIO.copy()
-    audio = _record(stated, "audio_config")
+    audio = records.record(stated, "audio_config")
     encoder = audio_nn.audio_config(audio)
     slots = None
     projector: Mapping[str, object]
@@ -2116,14 +2065,14 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
         projector = vision_nn.translate_gemma4_projector_config(
             {"hidden_size": encoder.output_proj_dims, "rms_norm_eps": encoder.rms_norm_eps}, text_width)
     else:
-        slots = _int(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
+        slots = records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
         if slots < 1:
             _refuse("audio_soft_tokens_per_image", "Gemma 3n audio needs its fixed slot count per clip")
         projector = {"kind": "gemma3n", **asdict(from_record(vision_nn.Gemma3nProjector, {
             "vision_width": encoder.hidden_size, "text_width": text_width,
             "vocab_size": audio.get("vocab_size", 128), "vocab_offset": audio.get("vocab_offset", 262272),
             "norm_eps": encoder.rms_norm_eps}))}
-    return {"audio": {"kind": _str(audio["model_type"], "audio_config model_type"),
+    return {"audio": {"kind": records.text(audio["model_type"], "audio_config model_type"),
                       **asdict(encoder)},
             "audio_token_id": _wrapper_image_id(hf_config, used, "audio_token_id"),
             "audio_soft_tokens": slots, "audio_projector": projector}
@@ -2135,7 +2084,7 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = vision_nn.translate_gemma4_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_gemma4_projector_config(
-        tower, _int(text.get("emb_features"), "emb_features"))
+        tower, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_image_id(hf_config, used, "image_token_id", "image_token_index")
     _wrapper_tokens(hf_config, used)
     # The soft-token count follows the image resolution, so the record leaves
@@ -2164,7 +2113,7 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = vision_nn.translate_qwen35_vision_config(hf_config)
     used.add("vision_config")
     projector = vision_nn.translate_qwen35_projector_config(
-        tower, _int(text.get("emb_features"), "emb_features"))
+        tower, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_image_id(hf_config, used, "image_token_id")
     _wrapper_tokens(hf_config, used)
     # One resolution per call, so the soft-token count varies with the image
@@ -2637,7 +2586,7 @@ def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ..
             # config counts.
             return (layer, 'mlp', 'shared_experts', parts[5], 'kernel')
         if (module == 'linear_attn'
-                and _strings(config['layer_types'], 'layer_types')[int(parts[2])]
+                and records.strings(config['layer_types'], 'layer_types')[int(parts[2])]
                 == 'linear_attention'):
             tail = tuple(parts[4:])
             if len(tail) == 2 and tail[0] in _LINEAR_PROJECTIONS and leaf == 'weight':
@@ -2955,7 +2904,7 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
         raise ValueError(f'no decoder tensor encoder for model_type {model_type!r}')
     family = _FAMILIES[model_type]
     tied = (bool(config['tie_word_embeddings']) if 'tie_word_embeddings' in config
-            else _bool(family.translate_config(config, set()).get('tie_embeddings'),
+            else records.boolean(family.translate_config(config, set()).get('tie_embeddings'),
                        'tie_embeddings'))
     if tied != model.tie_embeddings:
         raise ValueError('tie_word_embeddings disagrees with the native model')
@@ -3131,7 +3080,7 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
             if module == 'self_attn' and parts[2] in _HEAD_NORMS and leaf == 'scale':
                 return f'model.layers.{index}.self_attn.{parts[2]}.weight'
         theirs = {ours: hf for hf, ours in
-                  _norm_names(_FAMILIES[_str(config['model_type'],
+                  _norm_names(_FAMILIES[records.text(config['model_type'],
                                              'model_type')].sandwich_norms).items()}
         if len(parts) == 3 and module in theirs and leaf == 'scale':
             return f'model.layers.{index}.{theirs[module]}.weight'
@@ -3552,7 +3501,7 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
     # The released configs spell the rotary flat (rope_theta beside
     # partial_rotary_factor); a config transformers wrote nests both under
     # rope_parameters, the spelling Glm4MoeRotaryEmbedding reads.
-    entry = _record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
+    entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
     if rope_type not in ('default', 'none') or hf_config.get('rope_scaling') is not None:
         _refuse(f"rope_parameters (rope_type {rope_type!r})",
@@ -3561,22 +3510,22 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
     if scaling:
         _refuse(f"rope_parameters scaling fields {scaling}",
                 "Glm4MoeRotaryEmbedding is the plain rotary")
-    theta = _float(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
+    theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
                    'rope_parameters rope_theta')
-    factor = _float(entry.get('partial_rotary_factor',
+    factor = records.number(entry.get('partial_rotary_factor',
                               hf_config.get('partial_rotary_factor', 1.0)),
                     'rope_parameters partial_rotary_factor')
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling', 'use_qk_norm',
                  'partial_rotary_factor', 'num_nextn_predict_layers'))
     config = _base_config(hf_config, used, rope=_Ropes(theta),
                           qk_norm=bool(hf_config.get('use_qk_norm', False)))
-    layers = _int(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     config.update(
         o_proj_bias=False,
         partial_rotary_factor=None if factor == 1.0 else factor,
         partial_rotary_type='default',
         mixture=_deepseek_mixture(hf_config, layers, used),
-        num_nextn_predict_layers=_int(hf_config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers'),
+        num_nextn_predict_layers=records.integer(hf_config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers'),
     )
     return config
 
@@ -3594,11 +3543,11 @@ def _glm4_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] |
     """
     parts = name.split('.')
     if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
-            and int(parts[2]) >= _int(config['num_layers'], 'num_layers')):
+            and int(parts[2]) >= records.integer(config['num_layers'], 'num_layers')):
         return _dew_path(name, config)
-    if int(parts[2]) >= _int(config["num_layers"], 'num_layers') + _int(config.get("num_nextn_predict_layers", 0), 'num_nextn_predict_layers'):
+    if int(parts[2]) >= records.integer(config["num_layers"], 'num_layers') + records.integer(config.get("num_nextn_predict_layers", 0), 'num_nextn_predict_layers'):
         raise ValueError(f"{name} names an undeclared prediction depth")
-    depth = f"mtp_{int(parts[2]) - _int(config['num_layers'], 'num_layers')}"
+    depth = f"mtp_{int(parts[2]) - records.integer(config['num_layers'], 'num_layers')}"
     tail = parts[3:]
     if tail == ['embed_tokens', 'weight']:
         return ('params', 'embed_tokens', 'embedding')
@@ -3632,17 +3581,17 @@ def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[s
     used.update(('indexer_types', 'index_topk_pattern', 'index_topk_freq',
                  'index_skip_topk_offset'))
     stated_types = hf_config.get('indexer_types')
-    types = None if stated_types is None else list(_strings(stated_types, 'indexer_types'))
+    types = None if stated_types is None else list(records.strings(stated_types, 'indexer_types'))
     if types is None:
         pattern = hf_config.get('index_topk_pattern')
         if pattern is not None:
             letters = {'F': 'full', 'S': 'shared'}
             types = ([letters.get(letter, letter) for letter in pattern]
                      if isinstance(pattern, str)
-                     else list(_strings(pattern, 'index_topk_pattern')))
+                     else list(records.strings(pattern, 'index_topk_pattern')))
         else:
-            freq = max(_int(hf_config.get('index_topk_freq', 1), 'index_topk_freq'), 1)
-            offset = _int(hf_config.get('index_skip_topk_offset', 2), 'index_skip_topk_offset')
+            freq = max(records.integer(hf_config.get('index_topk_freq', 1), 'index_topk_freq'), 1)
+            offset = records.integer(hf_config.get('index_skip_topk_offset', 2), 'index_skip_topk_offset')
             types = ['full' if max(index - offset + 1, 0) % freq == 0 else 'shared'
                      for index in range(layers)]
     if len(types) != layers:
@@ -3666,7 +3615,7 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     (modeling_glm_moe_dsa.py:231-232), IndexShare layers own no indexer and
     attend the previous full layer's top-k (:313-318, :739-748), and the
     MTP depth ships past num_hidden_layers as GLM 4.5's does."""
-    layers = _int(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     # GlmMoeDsaConfig.__post_init__:152 points head_dim at the rope slice
     # whatever the config says (GLM-5.2 ships 192 over a rope width of 64),
     # so the field describes nothing the reference computes.
@@ -3687,11 +3636,11 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     shared = tuple(index for index, kind in
                    enumerate(_glm_indexer_types(hf_config, layers, used))
                    if kind == 'shared')
-    config['mixer'] = {**_record(config.get('mixer'), 'mixer'),
+    config['mixer'] = {**records.record(config.get('mixer'), 'mixer'),
                        'index_rope_interleave': True}
     if shared:
         config['kv_shared_layers'] = shared
-    config['num_nextn_predict_layers'] = _int(hf_config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
+    config['num_nextn_predict_layers'] = records.integer(hf_config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
     return config
 
 
@@ -3809,18 +3758,18 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     """Llama 4's text decoder: chunked rotated local layers around global
     layers with no rope, every interleaved layer routed with a shared
     expert, and the wider dense MLP of the other layers."""
-    layers = _int(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     no_rope = hf_config.get('no_rope_layers') or None
     if no_rope is None:
         no_rope = llama4.default_no_rope_layers(
-            layers, _int(hf_config.get('no_rope_layer_interval', 4), 'no_rope_layer_interval'))
-    no_rope = _integers(no_rope, 'no_rope_layers')
+            layers, records.integer(hf_config.get('no_rope_layer_interval', 4), 'no_rope_layer_interval'))
+    no_rope = records.integers(no_rope, 'no_rope_layers')
     if len(no_rope) != layers or set(no_rope) - {0, 1}:
         _refuse(f"no_rope_layers {list(no_rope)!r}", f"it names a flag per layer of {layers}")
     layer_types = llama4.rope_layer_types(no_rope)
     stated = hf_config.get('layer_types')
-    if stated is not None and _strings(stated, 'layer_types') != layer_types:
-        _refuse(f"layer_types {list(_strings(stated, 'layer_types'))!r}",
+    if stated is not None and records.strings(stated, 'layer_types') != layer_types:
+        _refuse(f"layer_types {list(records.strings(stated, 'layer_types'))!r}",
                 "it disagrees with no_rope_layers, which is what the reference reads")
     # The released Scout spells its llama3 ramp flat (rope_theta beside
     # rope_scaling); a config transformers wrote nests both. Either way the
@@ -3840,34 +3789,34 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         'kind': 'llama4',
         'use_qk_norm': bool(hf_config.get('use_qk_norm', True)),
         'attn_temperature_tuning': bool(hf_config.get('attn_temperature_tuning', True)),
-        'floor_scale': _float(hf_config.get('floor_scale', 8192), 'floor_scale'),
-        'attn_scale': _float(hf_config.get('attn_scale', 0.1), 'attn_scale'),
+        'floor_scale': records.number(hf_config.get('floor_scale', 8192), 'floor_scale'),
+        'attn_scale': records.number(hf_config.get('attn_scale', 0.1), 'attn_scale'),
     }
     chunk = hf_config.get('attention_chunk_size')
     kinds: dict[str, KindFields] = {
         'full_attention': {'mixer': {**rule, 'use_rope': False}},
         'chunked_attention': {'mixer': {**rule, 'use_rope': True,
-                                        'attention_chunk_size': None if chunk is None else _int(chunk, 'attention_chunk_size')}},
+                                        'attention_chunk_size': None if chunk is None else records.integer(chunk, 'attention_chunk_size')}},
     }
     moe_layers = hf_config.get('moe_layers')
-    step = _int(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
+    step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
     mixture: MixtureFields = {
-        'experts': _int(hf_config['num_local_experts'], 'num_local_experts'),
-        'top_k': _int(hf_config.get('num_experts_per_tok', 1), 'num_experts_per_tok'),
+        'experts': records.integer(hf_config['num_local_experts'], 'num_local_experts'),
+        'top_k': records.integer(hf_config.get('num_experts_per_tok', 1), 'num_experts_per_tok'),
         'score_function': 'sigmoid',
         'norm_topk_prob': False,
         'scale_inputs': True,
-        'expert_features': _int(hf_config['intermediate_size'], 'intermediate_size'),
-        'shared_features': _int(hf_config['intermediate_size'], 'intermediate_size'),
+        'expert_features': records.integer(hf_config['intermediate_size'], 'intermediate_size'),
+        'shared_features': records.integer(hf_config['intermediate_size'], 'intermediate_size'),
     }
     if moe_layers is not None:
-        mixture['layers'] = _integers(moe_layers, 'moe_layers')
+        mixture['layers'] = records.integers(moe_layers, 'moe_layers')
     else:
         mixture['every'] = step
     config.update(
         # The dense layers take intermediate_size_mlp; the experts and the
         # shared expert take intermediate_size.
-        mlp_features=_int(hf_config['intermediate_size_mlp'], 'intermediate_size_mlp'),
+        mlp_features=records.integer(hf_config['intermediate_size_mlp'], 'intermediate_size_mlp'),
         qk_norm=False,
         kinds={name: kinds[name] for name in kinds if name in layer_types},
         mixture=mixture,

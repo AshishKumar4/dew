@@ -42,6 +42,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew import records
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
@@ -324,37 +325,6 @@ class CLIP(nn.Module):
                 self.get_text_features(input_ids, attention_mask))
 
 
-# A published config is JSON, so each field arrives unnarrowed and is read
-# here or refused with the expectation named. `nn.vision` and
-# `interop.hf_decoders` read their own source configs through the same three.
-def _int(value: object, field: str) -> int:
-    """One integer field of a source config; a bool is a flag, not a width."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{field} is {value!r}, this field is an integer")
-    return value
-
-
-def _float(value: object, field: str) -> float:
-    """One real field of a source config: an epsilon, a rate, a dropout."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{field} is {value!r}, this field is a number")
-    return float(value)
-
-
-def _str(value: object, field: str) -> str:
-    """One named field of a source config: an activation, a projection."""
-    if not isinstance(value, str):
-        raise ValueError(f"{field} is {value!r}, this field is a name")
-    return value
-
-
-def _record(value: object, field: str) -> Mapping[str, object]:
-    """One nested section of a source config, read field by field."""
-    if not isinstance(value, Mapping) or any(not isinstance(name, str) for name in value):
-        raise ValueError(f"{field} is {value!r}, not a config")
-    return value
-
-
 class TextFields(TypedDict):
     """Every field of `CLIPTextTransformer` a config states, all of them read.
 
@@ -415,9 +385,9 @@ def translate_config(hf_config: Mapping[str, object]) -> TextFields:
     4.16 dump of it; the loaded tree is checked against the module afterwards,
     so a config that disagrees with its weights fails there.
     """
-    text = _record(hf_config.get("text_config", hf_config), "text_config")
+    text = records.record(hf_config.get("text_config", hf_config), "text_config")
 
-    activation = _str(text.get("hidden_act", "quick_gelu"), "hidden_act")
+    activation = records.text(text.get("hidden_act", "quick_gelu"), "hidden_act")
     if activation not in ("quick_gelu", "gelu", "gelu_pytorch_tanh"):
         raise ValueError(f"Unsupported CLIP text activation: {activation}")
     eos_token_id = text.get("eos_token_id", 49407)
@@ -427,13 +397,13 @@ def translate_config(hf_config: Mapping[str, object]) -> TextFields:
             "pooled row has no position")
 
     return {
-        "vocab_size": _int(text["vocab_size"], "vocab_size"),
-        "hidden_size": _int(text["hidden_size"], "hidden_size"),
-        "intermediate_size": _int(text["intermediate_size"], "intermediate_size"),
-        "num_layers": _int(text["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": _int(text["num_attention_heads"], "num_attention_heads"),
-        "max_position_embeddings": _int(text["max_position_embeddings"], "max_position_embeddings"),
-        "layer_norm_eps": _float(text.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
+        "vocab_size": records.integer(text["vocab_size"], "vocab_size"),
+        "hidden_size": records.integer(text["hidden_size"], "hidden_size"),
+        "intermediate_size": records.integer(text["intermediate_size"], "intermediate_size"),
+        "num_layers": records.integer(text["num_hidden_layers"], "num_hidden_layers"),
+        "num_heads": records.integer(text["num_attention_heads"], "num_attention_heads"),
+        "max_position_embeddings": records.integer(text["max_position_embeddings"], "max_position_embeddings"),
+        "layer_norm_eps": records.number(text.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
         "eos_token_id": eos_token_id,
         "activation": activation,
     }
@@ -443,18 +413,18 @@ def translate_vision_config(hf_config: Mapping[str, object]) -> VisionFields:
     """A CLIP config into `CLIPVisionTransformer` fields, read the way
     `translate_config` reads the text ones: from `vision_config` of a full
     config or from a `CLIPVisionConfig` on its own."""
-    vision = _record(hf_config.get("vision_config", hf_config), "vision_config")
+    vision = records.record(hf_config.get("vision_config", hf_config), "vision_config")
 
     _quick_gelu_only(vision)
     return {
-        "hidden_size": _int(vision["hidden_size"], "hidden_size"),
-        "intermediate_size": _int(vision["intermediate_size"], "intermediate_size"),
-        "num_layers": _int(vision["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": _int(vision["num_attention_heads"], "num_attention_heads"),
-        "image_size": _int(vision["image_size"], "image_size"),
-        "patch_size": _int(vision["patch_size"], "patch_size"),
-        "num_channels": _int(vision.get("num_channels", 3), "num_channels"),
-        "layer_norm_eps": _float(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
+        "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
+        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
+        "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
+        "num_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
+        "image_size": records.integer(vision["image_size"], "image_size"),
+        "patch_size": records.integer(vision["patch_size"], "patch_size"),
+        "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
+        "layer_norm_eps": records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
     }
 
 
@@ -464,7 +434,7 @@ def translate_clip_config(hf_config: Mapping[str, object]) -> CLIPFields:
     return {
         "text": translate_config(hf_config),
         "vision": translate_vision_config(hf_config),
-        "projection_dim": _int(hf_config["projection_dim"], "projection_dim"),
+        "projection_dim": records.integer(hf_config["projection_dim"], "projection_dim"),
     }
 
 
@@ -684,7 +654,7 @@ def _checkpoint_dir(name_or_dir: str, revision: str | None, *, weights: bool = T
 
 def _read_config(directory: Path) -> Mapping[str, object]:
     with open(directory / CONFIG_FILE) as handle:
-        return _record(json.load(handle), CONFIG_FILE)
+        return records.record(json.load(handle), CONFIG_FILE)
 
 
 def _read_tensors(directory: Path) -> dict[str, np.ndarray]:
@@ -1079,19 +1049,19 @@ class T5Fields(TypedDict):
 def translate_t5_config(hf_config: Mapping[str, object]) -> T5Fields:
     """A T5 config into `T5EncoderTransformer` fields."""
     return {
-        "vocab_size": _int(hf_config["vocab_size"], "vocab_size"),
-        "d_model": _int(hf_config["d_model"], "d_model"),
-        "d_ff": _int(hf_config["d_ff"], "d_ff"),
-        "num_layers": _int(hf_config["num_layers"], "num_layers"),
-        "num_heads": _int(hf_config["num_heads"], "num_heads"),
-        "head_dim": _int(hf_config["d_kv"], "d_kv"),
-        "num_buckets": _int(hf_config.get("relative_attention_num_buckets", 32),
+        "vocab_size": records.integer(hf_config["vocab_size"], "vocab_size"),
+        "d_model": records.integer(hf_config["d_model"], "d_model"),
+        "d_ff": records.integer(hf_config["d_ff"], "d_ff"),
+        "num_layers": records.integer(hf_config["num_layers"], "num_layers"),
+        "num_heads": records.integer(hf_config["num_heads"], "num_heads"),
+        "head_dim": records.integer(hf_config["d_kv"], "d_kv"),
+        "num_buckets": records.integer(hf_config.get("relative_attention_num_buckets", 32),
                             "relative_attention_num_buckets"),
-        "max_distance": _int(hf_config.get("relative_attention_max_distance", 128),
+        "max_distance": records.integer(hf_config.get("relative_attention_max_distance", 128),
                              "relative_attention_max_distance"),
-        "feed_forward_proj": _str(hf_config.get("feed_forward_proj", "relu"), "feed_forward_proj"),
-        "dropout_rate": _float(hf_config.get("dropout_rate", 0.0), "dropout_rate"),
-        "layer_norm_epsilon": _float(hf_config.get("layer_norm_epsilon", 1e-6), "layer_norm_epsilon"),
+        "feed_forward_proj": records.text(hf_config.get("feed_forward_proj", "relu"), "feed_forward_proj"),
+        "dropout_rate": records.number(hf_config.get("dropout_rate", 0.0), "dropout_rate"),
+        "layer_norm_epsilon": records.number(hf_config.get("layer_norm_epsilon", 1e-6), "layer_norm_epsilon"),
     }
 
 

@@ -5,8 +5,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from typing import TypedDict
 
+from dew.records import JSON
 from dew.sampling.text import Sampling
-from dew.telemetry.records import JSON
 
 from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Transition
 

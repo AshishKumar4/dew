@@ -14,6 +14,7 @@ import numpy as np
 from flax.typing import Dtype
 from jax.typing import DTypeLike
 
+from dew import records
 from dew.interop.safetensors_io import load_params
 from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
 from dew.nn.text_encoders import checkpoint_array
@@ -72,41 +73,23 @@ class UNetFields(TypedDict):
     attention_impl: str | None
 
 
-def _integer(value: object, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an integer")
-    return value
-
-
-def _number(value: object, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
-        raise ValueError(f"{name} must be a finite number")
-    return float(value)
-
-
-def _boolean(value: object, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise ValueError(f"{name} must be boolean")
-    return value
-
-
 def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
                 attention_impl="auto") -> UNetFields:
     """Interpret source geometry and reject operation-changing unsupported controls."""
     raw_widths = config["block_out_channels"]
     if not isinstance(raw_widths, (tuple, list)) or not raw_widths:
         raise ValueError("block_out_channels must be a nonempty sequence")
-    widths = tuple(_integer(value, "block_out_channels") for value in raw_widths)
+    widths = tuple(records.integer(value, "block_out_channels") for value in raw_widths)
     count = len(widths)
     def per_stage(value, name):
         values = tuple(value) if isinstance(value, (list, tuple)) else (value,) * count
         if len(values) != count:
             raise ValueError(f"{name} must have one entry per UNet stage")
         return values
-    heads = tuple(_integer(value, "attention heads") for value in per_stage(
+    heads = tuple(records.integer(value, "attention heads") for value in per_stage(
         config.get("num_attention_heads") or config.get("attention_head_dim", 8), "attention heads"))
-    depths = tuple(_integer(value, "transformer depth") for value in per_stage(config.get("transformer_layers_per_block", 1), "transformer depth"))
-    only_cross = tuple(_boolean(value, "only_cross_attention") for value in per_stage(config.get("only_cross_attention", False), "only_cross_attention"))
+    depths = tuple(records.integer(value, "transformer depth") for value in per_stage(config.get("transformer_layers_per_block", 1), "transformer depth"))
+    only_cross = tuple(records.boolean(value, "only_cross_attention") for value in per_stage(config.get("only_cross_attention", False), "only_cross_attention"))
     down, up = config["down_block_types"], config["up_block_types"]
     if not isinstance(down, (list, tuple)) or not isinstance(up, (list, tuple)) or len(down) != count or len(up) != count:
         raise ValueError("UNet down/up blocks must have one entry per stage")
@@ -140,8 +123,8 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
             raise ValueError(f"Native UNet cannot honor active {name}={config[name]!r}")
     if config.get("time_embedding_dim") not in (None, widths[0] * 4):
         raise ValueError("Native UNet requires a time embedding four times its first width")
-    groups = _integer(config.get("norm_num_groups", 32), "norm_num_groups")
-    epsilon = _number(config.get("norm_eps", 1e-5), "norm_eps")
+    groups = records.integer(config.get("norm_num_groups", 32), "norm_num_groups")
+    epsilon = records.number(config.get("norm_eps", 1e-5), "norm_eps")
     if groups < 1 or epsilon <= 0 or any(width < 1 or width % groups for width in widths):
         raise ValueError("UNet normalization requires positive epsilon and widths divisible by its group count")
     if any(head < 1 or width % head or depth < 1 for width, head, depth in zip(widths, heads, depths, strict=True)):
@@ -155,13 +138,13 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
     return UNetFields(
         stages=tuple(UNetStage(width, head, depth, attended, cross_only)
                      for width, head, depth, attended, cross_only in zip(widths, heads, depths, cross, only_cross, strict=True)),
-        in_channels=_integer(config["in_channels"], "in_channels"), out_channels=_integer(config["out_channels"], "out_channels"),
-        blocks_per_level=_integer(config.get("layers_per_block", 2), "layers_per_block"),
-        linear_projection=_boolean(config.get("use_linear_projection", False), "use_linear_projection"),
-        additional_time_features=_integer(config["addition_time_embed_dim"], "addition_time_embed_dim") if addition else 0,
-        middle_attention=middle is not None, frequency_shift=_number(config.get("freq_shift", 0), "freq_shift"),
-        cosine_first=_boolean(config.get("flip_sin_to_cos", True), "flip_sin_to_cos"),
-        dropout=_number(config.get("dropout", 0), "dropout"), norm_groups=groups, norm_epsilon=epsilon,
+        in_channels=records.integer(config["in_channels"], "in_channels"), out_channels=records.integer(config["out_channels"], "out_channels"),
+        blocks_per_level=records.integer(config.get("layers_per_block", 2), "layers_per_block"),
+        linear_projection=records.boolean(config.get("use_linear_projection", False), "use_linear_projection"),
+        additional_time_features=records.integer(config["addition_time_embed_dim"], "addition_time_embed_dim") if addition else 0,
+        middle_attention=middle is not None, frequency_shift=records.number(config.get("freq_shift", 0), "freq_shift"),
+        cosine_first=records.boolean(config.get("flip_sin_to_cos", True), "flip_sin_to_cos"),
+        dropout=records.number(config.get("dropout", 0), "dropout"), norm_groups=groups, norm_epsilon=epsilon,
         attention_norm_epsilon=1e-5 if flax_semantics else 1e-6, approximate_gelu=flax_semantics,
         dtype=resolve_dtype(dtype), attention_impl=attention_impl)
 
@@ -293,9 +276,9 @@ def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float
     """
     from dew.interop.pretrained import resolve_dtype
 
-    heads = _integer(config["num_attention_heads"], "num_attention_heads")
-    head_dim = _integer(config["attention_head_dim"], "attention_head_dim")
-    channels = _integer(config["in_channels"], "in_channels")
+    heads = records.integer(config["num_attention_heads"], "num_attention_heads")
+    head_dim = records.integer(config["attention_head_dim"], "attention_head_dim")
+    channels = records.integer(config["in_channels"], "in_channels")
     out_channels = config.get("out_channels")
     dual = config.get("dual_attention_layers") or ()
     if not isinstance(dual, (list, tuple)) or any(type(index) is not int for index in dual):
@@ -304,14 +287,14 @@ def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float
     if qk_norm not in (None, "rms_norm"):
         raise ValueError(f"Native SD3 implements qk_norm 'rms_norm', not {qk_norm!r}")
     return SD3Fields(
-        patch_size=_integer(config["patch_size"], "patch_size"), in_channels=channels,
-        out_channels=channels if out_channels is None else _integer(out_channels, "out_channels"),
-        num_layers=_integer(config["num_layers"], "num_layers"), heads=heads, head_dim=head_dim,
-        joint_attention_dim=_integer(config["joint_attention_dim"], "joint_attention_dim"),
-        caption_projection_dim=_integer(config["caption_projection_dim"], "caption_projection_dim"),
-        pooled_projection_dim=_integer(config["pooled_projection_dim"], "pooled_projection_dim"),
-        sample_size=_integer(config["sample_size"], "sample_size"),
-        pos_embed_max_size=_integer(config["pos_embed_max_size"], "pos_embed_max_size"),
+        patch_size=records.integer(config["patch_size"], "patch_size"), in_channels=channels,
+        out_channels=channels if out_channels is None else records.integer(out_channels, "out_channels"),
+        num_layers=records.integer(config["num_layers"], "num_layers"), heads=heads, head_dim=head_dim,
+        joint_attention_dim=records.integer(config["joint_attention_dim"], "joint_attention_dim"),
+        caption_projection_dim=records.integer(config["caption_projection_dim"], "caption_projection_dim"),
+        pooled_projection_dim=records.integer(config["pooled_projection_dim"], "pooled_projection_dim"),
+        sample_size=records.integer(config["sample_size"], "sample_size"),
+        pos_embed_max_size=records.integer(config["pos_embed_max_size"], "pos_embed_max_size"),
         dual_attention_layers=tuple(dual), qk_norm=qk_norm, dtype=resolve_dtype(dtype),
         attention_impl=attention_impl)
 
@@ -419,26 +402,26 @@ def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
     """
     from dew.interop.pretrained import resolve_dtype
 
-    channels = _integer(config["in_channels"], "in_channels")
+    channels = records.integer(config["in_channels"], "in_channels")
     out_channels = config.get("out_channels")
     axes = config.get("axes_dims_rope", (16, 56, 56))
     if not isinstance(axes, (list, tuple)) or any(type(size) is not int for size in axes):
         raise ValueError("axes_dims_rope must be a sequence of channel counts")
-    heads = _integer(config["num_attention_heads"], "num_attention_heads")
-    head_dim = _integer(config["attention_head_dim"], "attention_head_dim")
+    heads = records.integer(config["num_attention_heads"], "num_attention_heads")
+    head_dim = records.integer(config["attention_head_dim"], "attention_head_dim")
     if sum(axes) != head_dim:
         raise ValueError(f"axes_dims_rope {tuple(axes)} must cover the {head_dim} head channels")
     if any(size % 2 for size in axes):
         raise ValueError(f"axes_dims_rope {tuple(axes)} rotates channel pairs, so each is even")
     return FluxFields(
-        patch_size=_integer(config.get("patch_size", 1), "patch_size"), in_channels=channels,
-        out_channels=channels if out_channels is None else _integer(out_channels, "out_channels"),
-        num_layers=_integer(config["num_layers"], "num_layers"),
-        num_single_layers=_integer(config["num_single_layers"], "num_single_layers"),
+        patch_size=records.integer(config.get("patch_size", 1), "patch_size"), in_channels=channels,
+        out_channels=channels if out_channels is None else records.integer(out_channels, "out_channels"),
+        num_layers=records.integer(config["num_layers"], "num_layers"),
+        num_single_layers=records.integer(config["num_single_layers"], "num_single_layers"),
         heads=heads, head_dim=head_dim,
-        joint_attention_dim=_integer(config["joint_attention_dim"], "joint_attention_dim"),
-        pooled_projection_dim=_integer(config["pooled_projection_dim"], "pooled_projection_dim"),
-        guidance_embeds=_boolean(config.get("guidance_embeds", False), "guidance_embeds"),
+        joint_attention_dim=records.integer(config["joint_attention_dim"], "joint_attention_dim"),
+        pooled_projection_dim=records.integer(config["pooled_projection_dim"], "pooled_projection_dim"),
+        guidance_embeds=records.boolean(config.get("guidance_embeds", False), "guidance_embeds"),
         axes_dims_rope=tuple(axes), dtype=resolve_dtype(dtype),
         attention_impl=attention_impl)
 
