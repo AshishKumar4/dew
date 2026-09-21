@@ -203,7 +203,7 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
                        jnp.broadcast_to(jnp.arange(width)[None, :], (batch, width))
                        if logical is None
                        else jnp.take_along_axis(logical.astype(jnp.int32), order[..., 0], axis=1))
-        compact = jnp.take_along_axis(states, order, axis=1)
+        compact = states[jnp.arange(batch)[:, None], order[..., 0]]
         state, _, carried = strategies.reseed(
             ops, state, (compact[:, 0],) + (None,) * (ops.depths - 1), compact[:, 1:],
             jnp.take_along_axis(prepared[0], order, axis=1)[:, 1:],

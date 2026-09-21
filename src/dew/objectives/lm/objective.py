@@ -564,7 +564,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         params = thaw(params)
         collections = ((["router"] if routing else []) + (["qk"] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []))
-        stream_depth = depths and getattr(self.model, 'hyper_connections', None) is not None
+        stream_depth = depths and getattr(self.model, 'mtp_hyper_connections', None) is not None
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
         hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
                                                packing, layers)

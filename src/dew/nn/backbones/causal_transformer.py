@@ -1387,10 +1387,13 @@ class CausalTransformer(nn.Module):
     num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
     kv_shared_layers: Optional[Tuple[int, ...]] = None  # the sharing layers named one by one
     mixer: Optional[MixerBase] = None         # None: today's attention; a kind value or its record
-    num_nextn_predict_layers: int = 0         # MTP depths after the final norm; 0 disables
+    num_nextn_predict_layers: int = 0         # MTP depths; their input/residual policy is independent below
     index_share_for_mtp_iteration: bool = False
     mtp_layer_type: Optional[str] = None
     """An explicit prediction-layer kind, which need not occur in the trunk."""
+    mtp_hyper_connections: Optional[HyperConnections] = None
+    """None gives prediction depths plain residuals and normalized trunk inputs.
+    A stream depth explicitly opts in, independently of the trunk's residuals."""
     altup: Optional[AltUp] = None             # Gemma 3n's stack of residual copies; None disables
     laurel_rank: Optional[int] = None         # Gemma 3n's learned augmented residual; None disables
     hyper_connections: Optional[HyperConnections] = None  # mHC's stack of residual streams; None disables
@@ -1430,6 +1433,8 @@ class CausalTransformer(nn.Module):
             object.__setattr__(self, "altup", AltUp(**self.altup))
         if isinstance(self.hyper_connections, Mapping):
             object.__setattr__(self, "hyper_connections", HyperConnections(**self.hyper_connections))
+        if isinstance(self.mtp_hyper_connections, Mapping):
+            object.__setattr__(self, "mtp_hyper_connections", HyperConnections(**self.mtp_hyper_connections))
         # A value arrives as a record from a config and as itself from code,
         # and `models.build` already reads one; doing it here too means the
         # plain constructor takes the same records, as a test or a notebook
@@ -1643,11 +1648,14 @@ class CausalTransformer(nn.Module):
                 f"kinds {unnamed} name no layer of this model, whose pattern is "
                 f"{sorted(set(types))}")
         kinds = {layer_type: self.kind_of(layer_type) for layer_type in set(types) | prediction_kinds}
-        if self.hyper_connections is not None and self.num_nextn_predict_layers > 1:
-            raise ValueError("mHC prediction currently supports the released single prediction depth")
-        if (self.hyper_connections is not None and self.num_nextn_predict_layers
-                and self.hyper_connections.head != 'weighted'):
-            raise ValueError("mHC prediction requires the V4 weighted stream-collapse head")
+        mtp_hc = self.mtp_hyper_connections
+        if mtp_hc is not None:
+            if self.num_nextn_predict_layers != 1:
+                raise ValueError("mtp_hyper_connections requires a single prediction depth")
+            if mtp_hc.head != 'weighted':
+                raise ValueError("mtp_hyper_connections requires the V4 weighted stream-collapse head")
+            if self.hyper_connections is None or mtp_hc.hc_mult != self.hyper_connections.hc_mult:
+                raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
         for layer_type, kind in sorted(kinds.items()):
             if kind.head_dim % 2:
                 raise ValueError(
@@ -1884,7 +1892,7 @@ class CausalTransformer(nn.Module):
             MTPBlock(
                 mixer=mtp_mixer, feedforward=mtp_feedforward,
                 emb_features=self.emb_features,
-                hyper_connections=self.hyper_connections,
+                hyper_connections=self.mtp_hyper_connections,
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast,
@@ -2053,9 +2061,9 @@ class CausalTransformer(nn.Module):
         return self.embed_tokens(lookup)
 
     def init_mtp_cache(self, batch_size: int):
-        """Allocate only prediction-layer caches; ordinary generation does not pay for them."""
-        shape = ((batch_size, 1, self.emb_features) if self.hyper_connections is None else
-                 (batch_size, 1, self.hyper_connections.hc_mult, self.emb_features))
+        """Allocate prediction-layer caches independently of the trunk cache."""
+        shape = ((batch_size, 1, self.emb_features) if self.mtp_hyper_connections is None else
+                 (batch_size, 1, self.mtp_hyper_connections.hc_mult, self.emb_features))
         for block in self.mtp:
             block(jnp.zeros(shape, self.dtype),
                   jnp.zeros((batch_size, 1, self.emb_features), self.dtype), decode=True,
@@ -2153,8 +2161,9 @@ class CausalTransformer(nn.Module):
         if hc is not None:
             x = collapse_streams(x, self.hc_head if hc.head == 'weighted' else None)
         hidden = self.norm(x)
-        prediction = hidden if hc is None else streams
-        if not self.is_initializing() and self.is_mutable_collection('prediction_inputs'):
+        prediction = hidden if self.mtp_hyper_connections is None else streams
+        if (self.mtp_hyper_connections is not None and not self.is_initializing()
+                and self.is_mutable_collection('prediction_inputs')):
             self.sow('prediction_inputs', 'states', prediction,
                      reduce_fn=lambda _, value: value, init_fn=lambda: None)
         return hidden, prediction

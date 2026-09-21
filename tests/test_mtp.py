@@ -51,6 +51,31 @@ def test_depths_land_in_the_tree_with_the_fused_projection():
         assert "q_proj" in params[depth]["block"]["self_attn"]
 
 
+def test_mean_stream_trunk_exposes_normalized_states_to_plain_prediction():
+    model = tiny(num_nextn_predict_layers=1, dtype=jnp.float32,
+                 hyper_connections={'hc_mult': 4, 'hc_eps': 1e-6,
+                                    'hc_sinkhorn_iters': 20, 'head': 'mean'})
+    ids = token_batch(batch=2)[TEXT_KEY]
+    variables = model.init(jax.random.key(0), ids)
+    hidden = jnp.asarray(model.apply(variables, ids, method=CausalTransformer.hidden_states))
+    state, _ = model.apply(variables, ids, method=CausalTransformer.states_and_logits)
+    state = jnp.asarray(state)
+    assert state.shape == ids.shape + (model.emb_features,)
+    np.testing.assert_array_equal(state, hidden)
+    doubled = {**variables, 'params': {**variables['params'], 'norm': {
+        **variables['params']['norm'], 'scale': variables['params']['norm']['scale'] * 2}}}
+    louder, _ = model.apply(doubled, ids, method=CausalTransformer.states_and_logits)
+    np.testing.assert_allclose(jnp.asarray(louder), 2 * state, atol=1e-4, rtol=0)
+    expected = model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0]
+    cache = model.apply(variables, ids.shape[0], method=CausalTransformer.init_mtp_cache,
+                        mutable=['cache'])[1]['cache']
+    (logits, carried), _ = model.apply(
+        {**variables, 'cache': cache}, state[:, :1], ids[:, 1:2],
+        method=CausalTransformer.mtp_step, decode=True, mutable=['cache'])
+    np.testing.assert_allclose(jnp.asarray(logits), jnp.asarray(expected)[:, :1], atol=1e-4, rtol=0)
+    assert jnp.asarray(carried).shape == (ids.shape[0], 1, model.emb_features)
+
+
 def test_a_negative_depth_count_is_refused():
     with pytest.raises(ValueError, match="num_nextn_predict_layers"):
         tiny(num_nextn_predict_layers=-1).init(
@@ -198,12 +223,15 @@ def test_the_term_is_off_by_default():
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(grads["params"]["mtp_0"]))
 
 
-def test_the_term_adds_the_weighted_mean_depth_cross_entropy():
+@pytest.mark.parametrize('hyper_connections', [
+    None, {'hc_mult': 4, 'hc_eps': 1e-6, 'hc_sinkhorn_iters': 20, 'head': 'mean'},
+], ids=['plain_trunk', 'mean_stream_trunk'])
+def test_the_term_adds_the_weighted_mean_depth_cross_entropy(hyper_connections):
     """With mtp_weight the loss is ce + lambda times the mean over the depths
     of each depth's cross entropy, each computed here by hand from the
     depth's logits against the targets d + 1 positions out, and the depths
     receive gradient."""
-    model = tiny(num_nextn_predict_layers=2)
+    model = tiny(num_nextn_predict_layers=2, hyper_connections=hyper_connections)
     objective = LMObjective(model, SEQ, mtp_weight=0.3)
     params = objective.init(jax.random.key(0))
     batch = token_batch()

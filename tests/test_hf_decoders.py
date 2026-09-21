@@ -2719,6 +2719,7 @@ def test_deepseek_v4_config_translates_field_by_field():
     assert config["swiglu_limit"] == 2.0
     assert config["hyper_connections"] == {"hc_mult": 2, "hc_eps": 1e-6,
                                            "hc_sinkhorn_iters": 20, "head": "weighted"}
+    assert config['mtp_hyper_connections'] == config['hyper_connections']
     assert config["norm_eps"] == 1e-6 and config["tie_embeddings"] is False
     assert config["max_seq_len"] == 64 and config["vocab_size"] == 256
     assert config["scale_after_cast"] and config["num_nextn_predict_layers"] == 1
@@ -2975,6 +2976,25 @@ def test_deepseek_v4_hash_table_refuses_invalid_expert_indices(tmp_path, invalid
         load_pretrained(tmp_path, dtype='float32', attention_impl='reference')
 
 
+def test_deepseek_v4_public_speculation_preserves_padded_rows():
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling import Sampling, Speculative
+
+    source = load_pretrained(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    tokens = np.load(DEEPSEEK_V4 / 'input_ids.npy')[[0, 1, 0], :5].copy()
+    valid = np.arange(5)[None, :] >= np.asarray([0, 2, 4])[:, None]
+    tokens[~valid] = 0
+    inputs = ModelInputs(jnp.asarray(tokens), {'attention_mask': jnp.asarray(valid)})
+    task = source.text_generation(sampling=Sampling(temperature=0))
+    ordinary = task(inputs, max_new_tokens=7, seed=0).host()
+    speculative = task(inputs, max_new_tokens=7, seed=0, strategy=Speculative(block=3)).host()
+    # Three rows differ from the two residual streams: a row mask must not
+    # accidentally broadcast along the stream axis during predictor reseeding.
+    np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
+    np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
+    np.testing.assert_array_equal(speculative.terminated, ordinary.terminated)
+
+
 def test_deepseek_v4_cached_chunks_match_transformers():
     import torch
     from tools.decoder_export_reference import Case, reference_model
@@ -3001,6 +3021,23 @@ def test_deepseek_v4_cached_chunks_match_transformers():
         past = output.past_key_values
         np.testing.assert_allclose(actual, output.logits.numpy(), atol=1e-4, rtol=0)
         begin += size
+
+
+def test_deepseek_v4_public_prediction_states_preserve_raw_streams():
+    source = load_pretrained(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    ids = np.load(DEEPSEEK_V4 / 'input_ids.npy')
+    model, variables = source.model, source.variables
+    states, logits = model.apply(variables, ids, method=model.states_and_logits)
+    states = jnp.asarray(states)
+    assert states.shape == (*ids.shape, 2, model.emb_features)
+    normalized, expected = model.apply(variables, ids, method=model.hidden_and_mtp_inputs)
+    np.testing.assert_array_equal(states, expected)
+    assert jnp.asarray(normalized).shape == ids.shape + (model.emb_features,)
+    doubled = {**variables, 'params': {**variables['params'], 'norm': {
+        **variables['params']['norm'], 'scale': variables['params']['norm']['scale'] * 2}}}
+    raw, louder = model.apply(doubled, ids, method=model.states_and_logits)
+    np.testing.assert_array_equal(raw, states)
+    np.testing.assert_allclose(jnp.asarray(louder), 2 * jnp.asarray(logits), atol=1e-4, rtol=0)
 
 
 def test_deepseek_v4_mtp_matches_released_raw_stream_composition():
