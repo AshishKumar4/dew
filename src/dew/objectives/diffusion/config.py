@@ -70,7 +70,7 @@ class TextCondition:
     encoder: str = "clip_text"
     checkpoint: str = DEFAULT_MODEL
     dtype: DtypeName | None = None
-    """The encoder's compute dtype; None keeps the checkpoint's."""
+    """The encoder's compute dtype; None follows the model's compute dtype."""
     param_dtype: DtypeName = "float32"
     """Storage precision when loading source weights; supplied params retain theirs."""
     field: str = "text"
@@ -84,13 +84,20 @@ class TextCondition:
     """The checkpoint's git revision. A rerun then conditions on the weights
     the run named, even after the branch has moved on."""
 
-    def build(self, *, params: Variables | None = None) -> Condition:
-        """Bind supplied encoder params without a source weight load or storage cast."""
+    def build(self, *, params: Variables | None = None,
+              dtype: DtypeName | None = None) -> Condition:
+        """Bind supplied encoder params without a source weight load or storage cast.
+
+        `dtype` is the run's own compute dtype, which an unset `self.dtype`
+        follows: the tower runs beside the model it conditions, in every
+        step, and a checkpoint stored in float32 is no reason to run it there.
+        """
         fields = {name: value for name, value in
                   (("max_length", self.max_length), ("revision", self.revision))
                   if value is not None}
         return Condition(
-            rebuild(self.encoder, {"checkpoint": self.checkpoint, "dtype": self.dtype,
+            rebuild(self.encoder, {"checkpoint": self.checkpoint,
+                                   "dtype": dtype if self.dtype is None else self.dtype,
                                    "param_dtype": self.param_dtype, **fields}, params=params),
             field=self.field, unconditional=self.unconditional)
 
@@ -193,7 +200,8 @@ class DiffusionRunConfig(RunConfig):
         autoencoder = (None if self.autoencoder is None else self.autoencoder.build(
             params=None if variables is None else variables["autoencoder"]))
         conditions = {} if self.text is None else {"textcontext": self.text.build(
-            params=None if variables is None else variables["encoders"]["textcontext"])}
+            params=None if variables is None else variables["encoders"]["textcontext"],
+            dtype=self.model.dtype)}
         inputs = InputSpec(sample=self.sample_field(), conditions=conditions)
         model = models.build(self.model.architecture, **self.model_fields(autoencoder))
         process = self.preset()

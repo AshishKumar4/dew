@@ -191,6 +191,117 @@ def test_the_compiled_step_carries_no_encoder_constants():
     assert (VOCAB, FEATURES) in shapes_of_constants(leaky.loss)
 
 
+def encode_calls(monkeypatch, encoder) -> list:
+    """The token batches `encoder`'s class encodes, recorded as they happen."""
+    calls: list = []
+    original = type(encoder).encode
+
+    def counted(self, params, tokens):
+        calls.append(tokens)
+        return original(self, params, tokens)
+
+    monkeypatch.setattr(type(encoder), "encode", counted)
+    return calls
+
+
+def test_the_text_tower_runs_once_a_step(monkeypatch):
+    """The unconditional branch is a pure function of the frozen tower and a
+    fixed prompt, so the objective encodes it when it is built and the
+    compiled step encodes the batch and nothing else. Encoding it in the step
+    instead ran the tower twice a step, the second time over one row of
+    padding."""
+    objective = make_objective()
+    params = objective.init(jax.random.PRNGKey(0))
+    batch = make_batch()
+    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
+    calls = encode_calls(monkeypatch, objective.inputs.conditions["textcontext"].encoder)
+
+    jax.make_jaxpr(objective.loss)(params, batch, step)
+
+    assert len(calls) == 1
+    assert np.shape(calls[0]["input_ids"])[0] == batch["image"].shape[0]
+
+
+def test_the_unconditional_branch_is_encoded_when_the_objective_is_built():
+    """What the objective holds is what encoding the tower again produces, to
+    the bit, and it is host arrays rather than a leaf of the state: the state
+    an objective initializes has the collections it always had."""
+    objective = make_objective()
+    for held, encoded in zip(jax.tree.leaves(objective.unconditional_conditions),
+                             jax.tree.leaves(objective.encode(objective.encoder_params())),
+                             strict=True):
+        np.testing.assert_array_equal(held, encoded)
+
+    params = objective.init(jax.random.PRNGKey(0))
+    assert set(params["encoders"]) == set(objective.inputs.conditions)
+
+
+def test_a_checkpoint_of_this_state_resumes_in_place(tmp_path):
+    """The state carries no derived leaf, so a run resumes from its own
+    checkpoint directory through the trainer, restoring into the template
+    `init` describes and taking the next step."""
+    from dew.training import Checkpoints
+
+    objective = make_objective()
+    batch = make_batch()
+
+    class Stream:
+        def __init__(self):
+            self.position = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.position += 1
+            return batch
+
+        def get_state(self):
+            return str(self.position).encode()
+
+        def set_state(self, state):
+            self.position = int(state.decode())
+
+    def trainer():
+        return Trainer(make_objective(), optax.adam(1e-3), key=jax.random.PRNGKey(0),
+                       checkpoints=Checkpoints(str(tmp_path), keep=1))
+
+    data = Dataset(train=Stream, val=None, records=None, batch=8)
+    first = trainer()
+    first.fit(data, steps=1, log_every=100, checkpoint_every=1)
+    assert first.checkpoints is not None
+    first.checkpoints.wait()
+
+    resumed = trainer().fit(data, steps=2, log_every=100)
+
+    assert int(resumed.step) == 2
+    assert set(resumed.params["encoders"]) == set(objective.inputs.conditions)
+    leaves = jax.tree.leaves(resumed.params["params"])
+    assert leaves and all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
+
+
+def test_a_sampling_call_does_not_encode_the_tasks_own_unconditional_prompt(monkeypatch):
+    """The pipeline's own unconditional prompt is the one the task was built
+    with, so preparing a call traces the tower over the prompts alone.
+    Negatives a caller passes are their own text, and are encoded."""
+    from dew.sampling import TextToImage
+
+    objective = make_objective()
+    params = objective.init(jax.random.PRNGKey(0))
+    pipe = TextToImage.from_objective(objective, params)
+    calls = encode_calls(monkeypatch, objective.inputs.conditions["textcontext"].encoder)
+
+    prepared = pipe.prepare(["a bird", "a cat"], steps=3, seed=0)
+    assert len(calls) == 1
+    for used, held in zip(jax.tree.leaves(prepared.unconditional),
+                          jax.tree.leaves(objective.unconditional_conditions), strict=True):
+        np.testing.assert_array_equal(used, held)
+
+    pipe.prepare(["a bird", "a cat"], steps=3, seed=0, unconditional="a blurry photo")
+    assert len(calls) == 2
+    assert np.shape(calls[1]["input_ids"]) == (1, TOKENS)
+
+
 def test_the_compiled_step_carries_no_autoencoder_constants():
     """T19, the VAE half: the autoencoder weights arrive through
     `params["autoencoder"]`, so the loss's jaxpr has no constant of the
@@ -330,6 +441,10 @@ def conditional_mmdit():
     variables = {**variables, "params": jax.tree.map(lambda leaf: leaf + 0.02, variables["params"])}
     table = variables["encoders"]["textcontext"]["table"].at[1].add(jnp.linspace(-1, 1, 6))
     variables = {**variables, "encoders": {"textcontext": {"table": table}}}
+    # The objective encodes the unconditional branch from the weights it is
+    # built over, so it is rebuilt over the ones these tests sample under.
+    objective = DiffusionObjective(model, process, inputs, steps=3, sampler=Euler(),
+                                   guidance=CFG(2.0), pretrained=variables)
     batch = {"image": np.arange(64, dtype=np.uint8).reshape(4, 4, 4, 1) * 3,
              **inputs.tokenize(["ab", "cd", "ef", "gh"])}
     step = Step(jnp.asarray(0), jax.random.key(4), None)
@@ -340,9 +455,11 @@ def conditional_mmdit():
 def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_mmdit, probability):
     source, variables, batch, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
-                                 unconditional_prob=probability, steps=3, sampler=Euler())
+                                 unconditional_prob=probability, steps=3, sampler=Euler(),
+                                 pretrained=variables)
     conditional = DiffusionObjective(source.model, source.process, source.inputs,
-                                     unconditional_prob=0.0, steps=3, sampler=Euler())
+                                     unconditional_prob=0.0, steps=3, sampler=Euler(),
+                                     pretrained=variables)
     mask = jax.random.bernoulli(jax.random.split(step.key, 5)[1], probability, (4,))
     explicit = source.inputs.tokenize([""] * 4)
     explicit = {"image": batch["image"], "text": jax.tree.map(
@@ -352,8 +469,30 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     actual = jax.jit(jax.value_and_grad(
         lambda values: scalar_loss(dropped, values, batch, step)[0]))(variables)
     assert float(jnp.linalg.norm(expected[1]["encoders"]["textcontext"]["table"])) > 1e-6
-    for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+    # The trained weights, on the loss the two routes agree on. The dropped
+    # rows read a blank the objective encoded once, so the frozen tower is a
+    # constant on that route and takes no gradient through it; it is frozen,
+    # and nothing applies the gradient the explicit route happens to produce.
+    np.testing.assert_allclose(actual[0], expected[0], atol=1e-6, rtol=1e-6)
+    for left, right in zip(jax.tree.leaves(actual[1]["params"]),
+                           jax.tree.leaves(expected[1]["params"]), strict=True):
         np.testing.assert_allclose(left, right, atol=1e-6, rtol=1e-6)
+
+
+def test_a_dropped_row_is_conditioned_on_what_the_objective_holds(conditional_mmdit):
+    """The step takes the unconditional branch from the objective: move what
+    it holds and a fully dropped batch's loss moves with it. A step that
+    encoded the prompt again would not notice."""
+    source, variables, batch, step = conditional_mmdit
+    dropped = DiffusionObjective(source.model, source.process, source.inputs,
+                                 unconditional_prob=1.0, steps=3, sampler=Euler(),
+                                 pretrained=variables)
+    held = dropped.unconditional_conditions
+    before = float(scalar_loss(dropped, variables, batch, step)[0])
+    dropped.unconditional_conditions = jax.tree.map(
+        lambda leaf: leaf + 1.0 if np.issubdtype(leaf.dtype, np.floating) else leaf, held)
+
+    assert float(scalar_loss(dropped, variables, batch, step)[0]) != pytest.approx(before)
 
 
 def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mmdit):

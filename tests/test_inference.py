@@ -10,6 +10,7 @@ trainer has just written.
 import dataclasses
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
@@ -179,6 +180,24 @@ def test_an_unconditional_run_builds_without_an_encoder(tmp_path):
     objective = DiffusionRunConfig.from_dict(config.to_dict()).build()
     assert objective.inputs.conditions == {}
     assert set(objective.init(jax.random.PRNGKey(0))["encoders"]) == set()
+
+
+def test_the_text_encoder_follows_the_models_compute_dtype(tmp_path):
+    """An unset text dtype is the run's own. The tower runs inside every
+    step beside the model it conditions, so the precision the run trains in
+    is the precision it runs in; the float32 a checkpoint is stored in is
+    storage, and `param_dtype` still governs that. A set dtype is kept."""
+    config = dataclasses.replace(
+        run_config(tmp_path),
+        model=ModelConfig("simple_dit", dict(MODEL), dtype="bfloat16", attention_impl="reference"),
+        text=TextCondition(encoder="char_table", checkpoint="char_table"))
+    encoder = config.build().inputs.conditions["textcontext"].encoder
+    assert encoder.dtype == jnp.bfloat16
+    assert encoder.param_dtype == "float32"
+    assert encoder.params["table"].dtype == jnp.float32
+
+    pinned = dataclasses.replace(config, text=dataclasses.replace(config.text, dtype="float32"))
+    assert pinned.build().inputs.conditions["textcontext"].encoder.dtype == jnp.float32
 
 
 def test_an_unconditional_unet_takes_a_step():
@@ -536,11 +555,19 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
                                     params=expected_params["autoencoder"], dtype=target,
                                     latent_shift=vae.latent_shift, latent_scale=vae.latent_scale)
     condition = dataclasses.replace(objective.inputs.conditions["textcontext"], encoder=expected_encoder)
+    inputs = dataclasses.replace(objective.inputs, conditions={"textcontext": condition})
     reference = dataclasses.replace(
         TextToImage.from_objective(objective, expected_params),
         model=objective.model.clone(dtype=target),
-        inputs=dataclasses.replace(objective.inputs, conditions={"textcontext": condition}),
-        autoencoder=expected_vae)
+        inputs=inputs,
+        autoencoder=expected_vae,
+        # The unconditional branch is encoded from the weights the task is
+        # built over, so the oracle encodes it from the restored ones too.
+        blank=lambda given: jax.tree.map(
+            lambda held, value: jnp.asarray(held, value.dtype),
+            {"textcontext": expected_encoder.encode(
+                expected_params["encoders"]["textcontext"],
+                expected_encoder.tokenize([condition.unconditional]))}, given))
 
     np.testing.assert_array_equal(restored(["a red bird"], steps=2, seed=5).host().images,
                                   reference(["a red bird"], steps=2, seed=5).host().images)

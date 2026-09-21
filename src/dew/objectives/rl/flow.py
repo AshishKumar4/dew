@@ -119,7 +119,7 @@ class FlowGRPOObjective(DiffusionObjective):
         given = self.encode(params["encoders"], tokens)
         denoise = self.process.denoiser(
             self.model, self.trainable(params), given,
-            None if self.guidance is None else self.encode(params["encoders"]))
+            None if self.guidance is None else self.blank_conditions(given))
         return denoise if self.guidance is None else self.guidance(denoise)
 
     def _transition(self, predict: Predictor, x: jax.Array,
@@ -313,7 +313,7 @@ class FlowRollout:
         given = objective.encode(params["encoders"], tokens)
         denoise = objective.process.denoiser(
             objective.model, objective.trainable(params), given,
-            None if objective.guidance is None else objective.encode(params["encoders"]))
+            None if objective.guidance is None else objective.blank_conditions(given))
         noise_key, sample_key = jax.random.split(key)
         count = _source(objective.inputs, batch).shape[0]
         initial = objective.process.noise(noise_key, (count, *objective.latent_shape))
