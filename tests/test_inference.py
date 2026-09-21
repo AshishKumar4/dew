@@ -259,12 +259,12 @@ def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     ValueError naming it in `build_eval_metrics`, before the trainer."""
     video = dataclasses.replace(run_config(tmp_path),
                                 data=VideoDataset(frame_size=8, frames=2),
-                                val_metrics=["psnr"])
+                                val_metrics=("psnr",))
     (metric,) = video.build_eval_metrics()
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)
     assert np.isinf(metric.finalize(metric(VideoGrid(unit_range(images)), {"video": images})))
     with pytest.raises(ValueError, match="clip"):
-        dataclasses.replace(video, val_metrics=["clip"]).build_eval_metrics()
+        dataclasses.replace(video, val_metrics=("clip",)).build_eval_metrics()
 
 
 def test_the_autoencoder_record_carries_its_revision(tmp_path):
