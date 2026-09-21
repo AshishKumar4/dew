@@ -361,7 +361,7 @@ def test_deepseek_v4_trained_mtp_export_matches_reference(trips):
     # top-k and jax's break differently; the reference runs under Dew's
     # tie rule so the comparison is of the composition, not of the split.
     try:
-        with torch.no_grad(), tool.reference_tie_contract(reference):
+        with torch.no_grad(), tool.lower_index_ties(reference):
             reference(input_ids=ids, use_cache=False)
     finally:
         handle.remove()
