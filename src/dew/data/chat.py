@@ -41,7 +41,7 @@ from .dataset import (
     Batch,
     Dataset,
     DatasetSpec,
-    Loading,
+    Tokenize,
     describe,
     local_batch,
     train_stream,
@@ -563,11 +563,10 @@ class ChatMessages(DatasetSpec):
     val_path: str | None = None
     seq_len: int = 256
     val_batches: int | None = 4
-    seed: int = 0
-    loading: Loading = Loading()
     packing_bins: int = 8
 
-    def load(self, *, batch: int) -> Dataset:
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
+        self.uncaptioned(tokenize)
         if self.path is None:
             raise ValueError("ChatMessages reads a parquet file: --data.path names it")
         rows, window = local_batch(batch), self.seq_len + 1

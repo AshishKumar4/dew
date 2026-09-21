@@ -25,7 +25,7 @@ from .dataset import (
     CAPTION,
     Dataset,
     DatasetSpec,
-    Loading,
+    Tokenize,
     hold_out,
     local_batch,
     tokenized,
@@ -94,14 +94,12 @@ class VideoDataset(DatasetSpec):
     """HF audio model whose feature extractor prepares the audio inputs."""
     val_batches: int | None = 4
     count: int | None = None
-    seed: int = 0
-    loading: Loading = Loading()
 
     def source(self) -> list[dict[str, str]]:
         """One `{"video_path", "caption"}` record per clip, in a fixed order."""
         raise NotImplementedError
 
-    def load(self, *, batch: int, tokenize=None) -> Dataset:
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         source = self.source()
         name = type(self).__name__
         records = len(source) if self.count is None else self.count

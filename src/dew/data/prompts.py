@@ -24,7 +24,7 @@ import numpy as np
 from dew.registry import datasets
 
 from .chat import Conversation, load_tokenizer, render_prompt
-from .dataset import Batch, Dataset, DatasetSpec, Loading, local_batch, train_stream, validation_pass
+from .dataset import Batch, Dataset, DatasetSpec, Tokenize, local_batch, train_stream, validation_pass
 from .tokens import bounded
 
 PROMPT_KEY = "prompt"
@@ -226,10 +226,9 @@ class Prompts(DatasetSpec):
     max_prompt_len: int = 128
     pad_id: int = 0
     val_batches: int | None = 4
-    seed: int = 0
-    loading: Loading = Loading()
 
-    def load(self, *, batch: int) -> Dataset:
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
+        self.uncaptioned(tokenize)
         if (self.path is None) == (not self.records):
             raise ValueError(
                 "Prompts reads one source: --data.path names a parquet file, "

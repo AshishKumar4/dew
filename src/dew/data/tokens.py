@@ -33,7 +33,7 @@ from .dataset import (
     Dataset,
     DatasetSpec,
     Forwarding,
-    Loading,
+    Tokenize,
     describe,
     local_batch,
     train_stream,
@@ -103,11 +103,11 @@ class TokenWindows(DatasetSpec):
     path: str | None = None
     seq_len: int = 256
     val_batches: int | None = 4
-    seed: int = 0
-    loading: Loading = Loading()
 
-    def load(self, *, batch: int) -> Dataset:
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         from .sources.text import TokenFileSource
+
+        self.uncaptioned(tokenize)
 
         train_bin, val_bin = token_files(self.path, "TokenWindows")
         train = TokenFileSource(train_bin, self.seq_len)
@@ -344,15 +344,14 @@ class PackedTokens(DatasetSpec):
     path: str | None = None
     seq_len: int = 256
     val_batches: int | None = 4
-    seed: int = 0
-    loading: Loading = Loading()
     packing_bins: int = 8
     """Windows the plan keeps open at once. More of them leave less padding
     in a window and let documents further apart in the file share one."""
 
-    def load(self, *, batch: int) -> Dataset:
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         from .sources.text import TokenDocumentSource
 
+        self.uncaptioned(tokenize)
         train_bin, val_bin = token_files(self.path, "PackedTokens")
         rows, window = local_batch(batch), self.seq_len + 1
 

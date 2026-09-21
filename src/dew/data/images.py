@@ -28,7 +28,7 @@ from .dataset import (
     CAPTION,
     Dataset,
     DatasetSpec,
-    Loading,
+    Tokenize,
     hold_out,
     local_batch,
     tokenized,
@@ -249,8 +249,6 @@ class ImageDataset(DatasetSpec):
     augmentation: Augmentation = "flip_jitter"
     val_batches: int | None = 4
     count: int | None = None
-    seed: int = 0
-    loading: Loading = Loading()
 
     def source(self) -> Any:
         """Random access over the records (`__getitem__`, and `__len__` unless
@@ -277,7 +275,7 @@ class ImageDataset(DatasetSpec):
                 f"count {self.count} is more than the {len(source)} records of {name}")
         return self.count
 
-    def load(self, *, batch: int, tokenize=None) -> Dataset:
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         source = self.source()
         train, validation = hold_out(source, self.records(source),
                               (self.val_batches or 0) * batch, type(self).__name__)
