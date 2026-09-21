@@ -136,6 +136,8 @@ Grain lifecycle limits: the installed `DataLoaderIterator` exposes no public clo
 
 Every dataset specification declares `seed` and `loading` as keyword-only fields of `DatasetSpec`, and `spec.load(batch=, tokenize=None)` is the call on all of them; a specification that writes no captions raises `TypeError` for a `tokenize` reader it cannot use.
 
+An image specification takes validation from `val_split`, a split of the dataset's own bounded by `val_batches` batches, or, with `val_split` unset, from `val_batches * batch` records held out of the head of the training source.
+
 
 ## Checkpoints
 

@@ -263,6 +263,78 @@ def test_a_validation_split_cannot_swallow_every_record():
         Indexed(length=1, val_batches=1).load(batch=1)
 
 
+# ---------------------------------------------------------------------------------
+# Validation from a split of the dataset's own
+# ---------------------------------------------------------------------------------
+
+def _labels(iterator, batches=1):
+    return [int(label) for batch in itertools.islice(iterator, batches)
+            for label in batch["label"]]
+
+
+def test_a_named_validation_split_is_its_own_records_and_costs_training_none():
+    """Held out of the head, validation was training records the run then
+    never saw. A dataset that has a validation split of its own should be
+    scored on it and trained on everything."""
+    spec = Augmenting(length=16, splits={"test": 8}, image_size=8, augmentation="none",
+                      val_split="test", val_batches=1, **WORKERS)
+
+    data = spec.load(batch=4, tokenize=keep_captions)
+
+    assert data.records == 16, "a named split holds nothing out of training"
+    assert data.val is not None
+    val = _labels(data.val())
+    train = _labels(data.train(), batches=4)
+    assert val == [1000, 1001, 1002, 1003]
+    assert set(val).isdisjoint(train)
+    assert sorted(train) == list(range(16)), "training reads every record"
+
+
+def test_val_batches_bounds_a_named_split_and_none_scores_all_of_it():
+    """The two readings of val_batches: a bound on a split of its own, a
+    hold-out count without one."""
+    fields = dict(length=16, splits={"test": 8}, image_size=8, augmentation="none",
+                  val_split="test", **WORKERS)
+
+    bounded_pass = Augmenting(val_batches=1, **fields).load(batch=4)
+    whole_pass = Augmenting(val_batches=None, **fields).load(batch=4)
+
+    assert bounded_pass.val is not None and whole_pass.val is not None
+    assert len(_labels(bounded_pass.val(), batches=8)) == 4
+    assert _labels(whole_pass.val(), batches=8) == list(range(1000, 1008))
+
+
+def test_without_a_named_split_the_head_hold_out_is_unchanged():
+    """The default path has to stay exactly what it was: the same records,
+    the same pixels, the same training count."""
+    spec = Augmenting(length=16, image_size=8, augmentation="none", val_batches=1,
+                      **WORKERS)
+
+    data = spec.load(batch=4, tokenize=keep_captions)
+
+    assert data.records == 12 and data.steps_per_epoch == 3
+    held = next(data.val())
+    assert _labels(iter([held])) == [0, 1, 2, 3]
+    assert set(_labels(data.train(), batches=3)).isdisjoint(range(4))
+    expected = ImageTransform(spec).random_map(_Images(16)[0], np.random.default_rng(0))
+    assert held["image"][0].tobytes() == expected["image"].tobytes()
+
+
+def test_a_dataset_of_one_pile_refuses_a_split_it_cannot_name(tmp_path):
+    """An arrayrecord spec reads its shards as one pile; scoring a split it
+    cannot name would read the training records again and call it validation."""
+    from tools.prepare_images import prepare
+
+    prepare(Augmenting(length=8, image_size=8, augmentation="none", val_batches=None,
+                       **WORKERS), str(tmp_path), shards=1, source={"dataset": "a"})
+    spec = images.ArrayRecordImages(path=str(tmp_path), image_size=8, val_batches=1,
+                                    **WORKERS)
+
+    assert spec.load(batch=2).records == 6, "the head hold-out still works"
+    with pytest.raises(ValueError, match="val_split='test' names nothing"):
+        dataclasses.replace(spec, val_split="test").load(batch=2)
+
+
 class _Endless:
     def __getitem__(self, index):
         return {"index": index, "image": np.zeros((4, 4, 3), np.uint8)}
@@ -270,7 +342,7 @@ class _Endless:
 
 @dataclasses.dataclass(frozen=True)
 class Unsized(ImageDataset):
-    def source(self):
+    def source(self, split=None):
         return _Endless()
 
     def record(self, element, rng):
@@ -706,9 +778,12 @@ class Augmenting(ImageDataset):
     through a worker process."""
 
     length: int = 16
+    splits: dict[str, int] = dataclasses.field(default_factory=dict)
+    """Records each named split holds, for a spec that has more than one."""
 
-    def source(self):
-        return _Images(self.length)
+    def source(self, split=None):
+        return _Images(self.length if split is None else self.splits[split],
+                       first=0 if split is None else 1000)
 
     def record(self, element, rng):
         template = images.PROMPT_TEMPLATES[int(rng.integers(len(images.PROMPT_TEMPLATES)))]
@@ -717,13 +792,18 @@ class Augmenting(ImageDataset):
 
 
 class _Images:
-    def __init__(self, length):
+    """`length` images, each one its index's own; `first` shifts the indices
+    so two of these hold no record in common."""
+
+    def __init__(self, length, first=0):
         self.length = length
+        self.first = first
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, index):
+        index += self.first
         rng = np.random.RandomState(index)
         return {"index": index, "image": rng.randint(0, 256, (12, 12, 3), np.uint8)}
 
