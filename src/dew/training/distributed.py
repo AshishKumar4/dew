@@ -37,7 +37,7 @@ from dew.nn.sharding import (
 from dew.objectives.base import Batch, Variables
 
 # The axes a parameter can be split over. A dimension named 'exp' takes the
-# expert axis, a width the rules redirect takes tensor, everything else
+# expert axis, the widths of Megatron's split take tensor, everything else
 # takes fsdp. The data and sequence axes split the batch, and the stage axis
 # holds the pipeline's stages of the layer stack; none of the three ever
 # places a parameter, which `Layout` refuses a rule for.
@@ -57,12 +57,28 @@ name carries what the annotation cannot."""
 
 type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 
-# Rule order is precedence when two logical dimensions target the one fsdp axis.
-# It reproduces the largest-axis choice for the declared model shapes while
-# giving a config one place to redirect a width onto the tensor axis.
+# Rule order is precedence when two logical dimensions target the one mesh
+# axis, and a name written twice is an ordered pair of choices, the form flax
+# documents for `logical_to_mesh_axes`: the second pair places a width the
+# first could not, because another dimension of the same array took that axis.
+#
+# The tensor axis carries Megatron's split: the mlp's hidden width ('mlp'),
+# the attention's query heads ('heads') and its grouped key and value heads
+# ('kv'), and the vocabulary of the embedding table and the output head
+# ('vocab'). Each of those is the output side of one matmul and the input
+# side of the next, so splitting it splits both and leaves the block one
+# reduction. 'embed', the residual width, is the side those matmuls share
+# with every norm, residual add, rotary rotation and the loss, so it stays
+# whole on the tensor axis and keeps fsdp: sharding it would put a collective
+# between every pair of sublayers, which is the cost tensor parallelism is
+# arranged to avoid. A width that holds fsdp composes the two axes and splits
+# fsdp times tensor ways; a width the residual took fsdp from first takes
+# tensor alone, through the pairs at the end. The tensor axis at size 1 drops
+# out of every spec it appears in, so the table places what the fsdp-only
+# table placed, with the largest-axis choice for the declared model shapes.
 DEFAULT_RULES: LogicalAxisRules = (
-    ("vocab", FSDP_AXIS),
-    ("mlp", FSDP_AXIS),
+    ("vocab", (FSDP_AXIS, TENSOR_AXIS)),
+    ("mlp", (FSDP_AXIS, TENSOR_AXIS)),
     ("modulation", FSDP_AXIS),
     ("attention", FSDP_AXIS),
     # The gated delta net's projected width (keys, values and their gate),
@@ -70,17 +86,20 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("linear", FSDP_AXIS),
     ("embed", FSDP_AXIS),
     ("head_dim", FSDP_AXIS),
-    ("heads", FSDP_AXIS),
-    ("kv", FSDP_AXIS),
+    ("heads", (FSDP_AXIS, TENSOR_AXIS)),
+    ("kv", (FSDP_AXIS, TENSOR_AXIS)),
     # The latent widths multi-head latent attention compresses through and
     # the sparse indexer's head dim: model-width-like, so they ride fsdp.
-    # There is no tensor axis today; when one lands, these keep fsdp until
-    # a rule moves them.
     ("index", FSDP_AXIS),
     ("kvlora", FSDP_AXIS),
     ("qlora", FSDP_AXIS),
     ("output", FSDP_AXIS),
     ("exp", EXPERT_AXIS),
+    # A projection from the residual width to the heads, q_proj's shape: the
+    # rule above gave 'embed' fsdp, so the heads take the tensor axis by
+    # itself rather than fall back to replication.
+    ("heads", TENSOR_AXIS),
+    ("kv", TENSOR_AXIS),
 )
 
 
@@ -94,7 +113,8 @@ class MeshSpec:
     expert: int = 1
     """Devices the expert dimension of an MoE layer is split over."""
     tensor: int = 1
-    """Devices a redirected width is split over; 1 keeps every width on fsdp."""
+    """Devices the mlp, head and vocabulary widths are split over, beside the
+    fsdp axis they also take; 1 keeps every width on fsdp alone."""
     sequence: int = 1
     """Devices the batch's sequence dimension is split over; 1 keeps whole sequences."""
     stage: int = 1
@@ -145,12 +165,13 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
 
     An MoE layer's expert dimension is the one dimension no dense model has,
     and splitting it is what expert parallelism is, so it gets its own axis
-    and leaves 'fsdp' to the model's widths. The tensor axis is where a run's
-    rules redirect a width when one card cannot hold it; the sequence axis is
-    where long sequences split; the stage axis is where a decoder's layers
-    split into pipeline stages, each stage on its own devices. Sizes of 1
-    degenerate to plain data parallelism, so the same code path serves every
-    topology without a flag. Axes are Auto so GSPMD infers the collectives.
+    and leaves 'fsdp' to the model's widths. The tensor axis is where the mlp,
+    head and vocabulary widths split beside fsdp, as `DEFAULT_RULES` places
+    them; the sequence axis is where long sequences split; the stage axis is
+    where a decoder's layers split into pipeline stages, each stage on its own
+    devices. Sizes of 1 degenerate to plain data parallelism, so the same code
+    path serves every topology without a flag. Axes are Auto so GSPMD infers
+    the collectives.
     """
     devices = list(devices) if devices is not None else jax.devices()
     sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence * spec.stage

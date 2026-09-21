@@ -19,6 +19,8 @@ pytestmark = pytest.mark.mesh
 from jax.sharding import PartitionSpec as P
 
 from dew.data import Dataset
+from dew.nn.backbones.dit import SimpleDiT
+from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
@@ -70,6 +72,31 @@ def test_the_default_mesh_places_like_the_three_axis_one():
     Layout(min_shard=TINY_SHARD).check(
         variables()["params"],
         Layout(min_shard=TINY_SHARD).shardings(mesh, variables())["params"], mesh)
+
+
+def test_the_default_rules_split_the_megatron_widths_on_the_tensor_axis():
+    """Four tensor shards beside two fsdp: the mlp's hidden width, the query
+    and grouped key-value heads and the vocabulary take the tensor axis, and
+    the residual width the blocks pass between themselves does not."""
+    mesh = build_mesh(MeshSpec(fsdp=2, tensor=4))
+    layout = Layout(min_shard=TINY_SHARD)
+    specs = jax.tree.map(
+        lambda sharding: sharding.spec, layout.shardings(mesh, variables()))["params"]
+    attention = specs["layers_0"]["self_attn"]
+
+    assert attention["q_proj"]["kernel"] == P("fsdp", "tensor")
+    assert attention["k_proj"]["kernel"] == P("fsdp", "tensor")
+    assert attention["v_proj"]["kernel"] == P("fsdp", "tensor")
+    assert specs["layers_0"]["mlp"]["gate_proj"]["kernel"] == P(None, ("fsdp", "tensor"))
+    assert specs["layers_0"]["mlp"]["down_proj"]["kernel"] == P(("fsdp", "tensor"))
+    assert specs["embed_tokens"]["embedding"] == P(("fsdp", "tensor"))
+    # o_proj reads the attention width and writes the residual stream, and the
+    # width is the dimension 'embed' already took fsdp for, so neither side of
+    # this kernel names the tensor axis. The final norm is embed alone.
+    assert attention["o_proj"]["kernel"] == P("fsdp")
+    assert specs["norm"]["scale"] == P()
+    layout.check(variables()["params"],
+                 layout.shardings(mesh, variables())["params"], mesh)
 
 
 def test_redirected_widths_take_the_tensor_axis():
@@ -196,3 +223,77 @@ def test_topologies_agree_with_data_parallel():
     # rounding over 30 steps on losses of order 4 is about 1e-6; a placement
     # that changed a value would show at 1e-2 or worse.
     assert difference < 4e-6, difference
+
+
+def one_step(spec):
+    """One step's loss and gradients under `spec`: the parameters one seed
+    initialises, placed by the default rules, and one batch of the fixture.
+
+    The step is the trainer's inner call without the optimizer: what the
+    default rules place is the only thing `spec` changes between two runs of
+    it, so a gradient that moved means the collectives GSPMD derived from the
+    tensor axis are not the ones the rules meant.
+    """
+    mesh = build_mesh(spec)
+    objective = LMObjective(tiny(), SEQ_LEN)
+    initial = objective.init(jax.random.key(0))
+    placed = jax.device_put(initial, Layout(min_shard=TINY_SHARD).shardings(mesh, initial))
+    batch = shard_batch(mesh, next(token_batches()))
+
+    @jax.jit
+    def step(trainable):
+        def loss_fn(inner):
+            return scalar_loss(objective, {**placed, "params": inner}, batch,
+                               Step(step=jnp.zeros((), jnp.int32),
+                                    key=jax.random.key(1), ema=None))
+
+        return jax.value_and_grad(loss_fn, has_aux=True)(trainable)
+
+    with jax.set_mesh(mesh):
+        (loss, _), grads = step(placed["params"])
+    return float(loss), grads
+
+
+def test_the_tensor_axis_changes_no_value():
+    """Four tensor shards against none, from one seed and one batch: the same
+    loss and the same gradient in every leaf."""
+    whole_loss, whole_grads = one_step(MeshSpec(fsdp=2))
+    split_loss, split_grads = one_step(MeshSpec(fsdp=2, tensor=4))
+
+    assert abs(split_loss - whole_loss) < 1e-5, (whole_loss, split_loss)
+    differences = jax.tree.map(
+        lambda whole, split: float(np.max(np.abs(np.asarray(whole) - np.asarray(split)))),
+        whole_grads, split_grads)
+    # The two losses agree to the bit on CPU, and the gradients to 1.0e-07 at
+    # most against magnitudes of 1.2e-01: the tensor axis reassociates one
+    # reduction, nothing more. A spec that split a dimension the model reads
+    # whole would show at 1e-2 or worse.
+    assert max(jax.tree.leaves(differences)) < 1e-5, differences
+
+
+def test_a_dit_steps_under_a_tensor_axis():
+    """The DiT names 'mlp' and 'heads' on modulated blocks rather than a
+    decoder's gated ones, and carries an adaLN projection and a patch
+    embedding besides: two tensor shards initialise it in place and
+    differentiate one forward pass over it."""
+    mesh = build_mesh(MeshSpec(fsdp=2, tensor=2))
+    model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=4, mlp_ratio=2)
+    images = jax.random.normal(jax.random.key(1), (BATCH, 8, 8, 3), jnp.float32)
+    times = jnp.full((BATCH,), 0.5, jnp.float32)
+    layout = Layout(min_shard=TINY_SHARD)
+    shardings = layout.shardings(
+        mesh, jax.eval_shape(model.init, jax.random.key(0), images, times))
+
+    with jax.set_mesh(mesh):
+        placed = jax.jit(model.init, out_shardings=shardings)(
+            jax.random.key(0), images, times)
+        loss, grads = jax.jit(jax.value_and_grad(
+            lambda trainable: jnp.mean(
+                (model.apply({**placed, "params": trainable}, images, times) - images) ** 2)))(
+            placed["params"])
+
+    assert np.isfinite(float(loss)) and float(loss) > 0
+    assert all(np.all(np.isfinite(leaf)) for leaf in jax.tree.leaves(grads))
+    assert jax.tree.all(jax.tree.map(
+        lambda leaf, sharding: leaf.sharding == sharding, placed, shardings))
+    layout.check(placed["params"], shardings["params"], mesh)
