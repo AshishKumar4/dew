@@ -762,6 +762,7 @@ Which call continues a run depends on the artifact you kept:
 | A saved run: `run.json` beside its checkpoints | Generation, with the model rebuilt from the record | `dew.pipeline(run_directory)` |
 | A source checkpoint directory or Hub repository | Generation, or training from those weights | `dew.pipeline(source)`, or `load_pretrained(source)` for the variables |
 | Trained variables another runtime has to read | The source format, without Dew | `Pretrained.save(directory, variables=state.params)` |
+| A saved run another runtime has to read | The same layout, from the run alone | `dew.interop.export_run(run_directory, destination)`, or `dew export <run> <dest>` |
 
 `Pretrained.save` writes the weights, the config it derives, and the
 tokenizer or processor files. It does not include optimizer state or data

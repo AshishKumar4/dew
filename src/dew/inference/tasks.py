@@ -242,7 +242,7 @@ def _pulled(repo_id: str) -> str:
     return os.fspath(pull_from_hub(repo_id))
 
 
-def _run_record(directory: str) -> Mapping[str, object]:
+def run_record(directory: str) -> Mapping[str, object]:
     """The `run.json` a run directory publishes beside its checkpoints."""
     import json
 
@@ -377,7 +377,7 @@ class TextGeneration:
         from dew.registry import objectives
         from dew.sampling.pipelines import restore_variables
 
-        record = _run_record(directory)
+        record = run_record(directory)
         kind = named(record["objective"], "objective")
         model_config = _saved_model(record, dtype)
         processor = _saved_processor(record)
@@ -401,7 +401,7 @@ class TextGeneration:
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
         """A run directory published to the Hugging Face Hub, as
-        `dew.interop.hub.push_to_hub` writes it."""
+        `dew.interop.hub.push_to_hub(..., raw=True)` writes it."""
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
@@ -507,7 +507,7 @@ class BlockGeneration:
         from dew.interop import diffusion_gemma
         from dew.sampling.pipelines import restore_variables
 
-        record = _run_record(directory)
+        record = run_record(directory)
         model_config = _saved_model(record, dtype)
         processor = _saved_processor(record)
         canvas = model_config.config["max_seq_len"]
@@ -529,7 +529,7 @@ class BlockGeneration:
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
         """A run directory published to the Hugging Face Hub, as
-        `dew.interop.hub.push_to_hub` writes it."""
+        `dew.interop.hub.push_to_hub(..., raw=True)` writes it."""
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 
@@ -623,7 +623,7 @@ class MaskedGeneration:
         from dew.diffusion.discrete import MDLM
         from dew.sampling.pipelines import restore_variables
 
-        record = _run_record(directory)
+        record = run_record(directory)
         model_config = _saved_model(record, dtype)
         processor = _saved_processor(record)
         budget = _saved_budget(record)
@@ -642,7 +642,7 @@ class MaskedGeneration:
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
         """A run directory published to the Hugging Face Hub, as
-        `dew.interop.hub.push_to_hub` writes it."""
+        `dew.interop.hub.push_to_hub(..., raw=True)` writes it."""
         return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
                             dtype=dtype, param_dtype=param_dtype)
 

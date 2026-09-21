@@ -1,3 +1,4 @@
+from .export import export_run
 from .hf_decoders import save_pretrained_decoder, translate_config, translate_weights
 from .hub import pull_from_hub, push_to_hub
 from .pretrained import Pretrained, Processor, load_pretrained
@@ -9,6 +10,7 @@ __all__ = [
     "Processor",
     "dequantize_checkpoint",
     "dequantize_fp8_blocks",
+    "export_run",
     "fp8_format",
     "load_params",
     "load_pretrained",
