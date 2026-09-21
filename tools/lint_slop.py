@@ -65,7 +65,8 @@ OPEN_VALUES = {("dict", "Any"), ("Dict", "Any"), ("Mapping", "Any"), ("MutableMa
 # The one open mapping that promises what it means: read-only, and every value
 # has to be narrowed before it is used. It is the type of a config file just
 # parsed out of JSON, and the rule wants those parsed once at a boundary.
-BOUNDARY_MAPPING = {("Mapping", "object"), ("MappingProxyType", "object")}
+BOUNDARY_MAPPING = {("Mapping", "object"), ("MappingProxyType", "object"),
+                    ("Sequence", "object"), ("tuple", "object")}
 
 VAGUE = {"tmp", "temp", "obj", "thing", "info", "item", "items", "val", "helper", "helpers",
          "util", "utils", "manager", "handler", "res", "ret", "arr", "lst", "dct", "num",
@@ -146,9 +147,11 @@ def _mapping_kind(node: ast.expr) -> str:
     if not isinstance(node, ast.Subscript) or not isinstance(node.slice, ast.Tuple):
         return ""
     container = _named(node.value).rsplit(".", 1)[-1]
-    if container not in MAPPINGS | {"MappingProxyType"} or len(node.slice.elts) != 2:
+    if container not in MAPPINGS | {"MappingProxyType", "Sequence", "tuple"}:
         return ""
-    pair = (container, _named(node.slice.elts[1]).rsplit(".", 1)[-1])
+    if len(node.slice.elts) != 2:
+        return ""
+    pair = (container, _named(node.slice.elts[-1]).rsplit(".", 1)[-1])
     return "open" if pair in OPEN_VALUES else "boundary" if pair in BOUNDARY_MAPPING else ""
 
 
@@ -175,6 +178,25 @@ def _widest(node: ast.expr, skip: set[int]) -> Iterator[ast.expr]:
             continue
         if _named(child).rsplit(".", 1)[-1] in {"Any", "object"}:
             yield child
+
+
+def _parses(function: ast.FunctionDef | ast.AsyncFunctionDef, parameter: str) -> bool:
+    """Does this function narrow `parameter` and refuse what it cannot read?
+
+    A boundary parser is the one place `object` is the true type of an input:
+    the value arrived from JSON or from a library, the function tests what it
+    actually is, and anything else raises with the expectation named. Passing
+    an `object` along without narrowing it is still SLOP001.
+    """
+    if function.returns is None or _named(function.returns).rsplit(".", 1)[-1] in {"object", "Any"}:
+        return False
+    tested = any(isinstance(node, ast.Call) and _named(node.func) in {"isinstance", "issubclass"}
+                 and node.args and _named(node.args[0]) == parameter
+                 for node in ast.walk(function))
+    refuses = any(isinstance(node, ast.Raise)
+                  or (isinstance(node, ast.Call) and _named(node.func).endswith("refuse"))
+                  for node in ast.walk(function))
+    return tested and refuses
 
 
 def _annotations(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Iterator[tuple[str, ast.expr]]:
@@ -236,7 +258,8 @@ def contracts(module: Module) -> Iterator[Finding]:
                              f"{name} is an open dictionary; name the keys it carries, "
                              f"take one of Variables, Batch, or read it as Mapping[str, object]")
             for wide in _widest(annotation, claimed):
-                if _named(wide) == "object" and name in {"cause", "error"}:
+                if _named(wide) == "object" and (name in {"cause", "error"}
+                                                 or _parses(node, name)):
                     continue
                 yield report(wide, "SLOP001", f"{name} is annotated {_named(wide)}; "
                                               f"declare the type the code relies on")
