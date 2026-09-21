@@ -14,6 +14,8 @@ imports none of them.
 from __future__ import annotations
 
 import dataclasses
+import functools
+import operator
 import sys
 import types
 import typing
@@ -134,7 +136,7 @@ class Registry(Mapping[str, T], Generic[T]):
         members = list(self._members.values())
         if not members:
             raise ValueError(f"the {self.kind} registry is empty")
-        return Union[tuple(members)] if len(members) > 1 else members[0]
+        return functools.reduce(operator.or_, members)
 
 
 def _describe(member: object) -> str:
@@ -313,20 +315,5 @@ projectors: Registry[type[ProjectorBase]] = Registry("projector", record="kind")
 REGISTRIES = (models, presets, samplers, datasets, encoders, metrics, objectives,
               mixers, towers, projectors)
 
-__all__ = [
-    "REGISTRIES",
-    "Registry",
-    "datasets",
-    "dtype_name",
-    "encoders",
-    "metrics",
-    "mixers",
-    "models",
-    "objectives",
-    "presets",
-    "projectors",
-    "resolve_dtype",
-    "samplers",
-    "towers",
-    "with_precision",
-]
+__all__ = ["REGISTRIES", "Registry", "datasets", "dtype_name", "encoders", "metrics", "mixers", "models",
+           "objectives", "presets", "projectors", "resolve_dtype", "samplers", "towers", "with_precision"]

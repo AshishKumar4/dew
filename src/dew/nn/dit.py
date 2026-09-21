@@ -101,7 +101,7 @@ class PatchEmbedding(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        batch, height, width, channels = x.shape
+        batch, height, width, _ = x.shape
         assert height % self.patch_size == 0 and width % self.patch_size == 0, "Image dimensions must be divisible by patch size"
 
         x = nn.Conv(features=self.embedding_dim,
@@ -173,7 +173,7 @@ class PatchSequenceEmbed(nn.Module):
             )
 
     def __call__(self, x):
-        B, H, W, C = x.shape
+        _, H, W, _ = x.shape
         assert H % self.patch_size == 0 and W % self.patch_size == 0, \
             "Image dimensions must be divisible by patch size"
         H_P, W_P = H // self.patch_size, W // self.patch_size

@@ -101,7 +101,7 @@ def inverse_permutation(idx: np.ndarray) -> np.ndarray:
 
 def patchify(x: jnp.ndarray, patch_size: int) -> jnp.ndarray:
     """`[B, H, W, C]` to row-major patches `[B, (H/p) * (W/p), p * p * C]`."""
-    B, H, W, C = x.shape
+    _, H, W, _ = x.shape
     if H % patch_size != 0 or W % patch_size != 0:
         raise ValueError(f"Image dimensions ({H}, {W}) must be divisible by patch_size ({patch_size})")
     return einops.rearrange(
@@ -124,13 +124,13 @@ def _ordered_patchify(x: jnp.ndarray, patch_size: int, idx: np.ndarray):
 def hilbert_patchify(x: jnp.ndarray, patch_size: int) -> tuple[jnp.ndarray, np.ndarray]:
     """`(patches in hilbert order, inv_idx)`; `hilbert_unpatchify` takes the
     pair back to the image."""
-    B, H, W, C = x.shape
+    _, H, W, _ = x.shape
     return _ordered_patchify(x, patch_size, hilbert_indices(H // patch_size, W // patch_size))
 
 
 def zigzag_patchify(x: jnp.ndarray, patch_size: int) -> tuple[jnp.ndarray, np.ndarray]:
     """`(patches in zigzag order, inv_idx)`, the contract of `hilbert_patchify`."""
-    B, H, W, C = x.shape
+    _, H, W, _ = x.shape
     return _ordered_patchify(x, patch_size, zigzag_indices(H // patch_size, W // patch_size))
 
 

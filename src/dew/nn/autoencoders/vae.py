@@ -48,8 +48,7 @@ class FlaxUpsample2D(nn.Module):
             shape=(batch, height * 2, width * 2, channels),
             method="nearest",
         )
-        hidden_states = self.conv(hidden_states)
-        return hidden_states
+        return self.conv(hidden_states)
 
 
 class FlaxDownsample2D(nn.Module):
@@ -78,8 +77,7 @@ class FlaxDownsample2D(nn.Module):
     def __call__(self, hidden_states):
         pad = ((0, 0), (0, 1), (0, 1), (0, 0))  # pad height and width dim
         hidden_states = jnp.pad(hidden_states, pad_width=pad)
-        hidden_states = self.conv(hidden_states)
-        return hidden_states
+        return self.conv(hidden_states)
 
 
 class FlaxResnetBlock2D(nn.Module):
@@ -194,8 +192,7 @@ class FlaxAttentionBlock(nn.Module):
         # move heads to 2nd position (B, T, H * D) -> (B, T, H, D)
         new_projection = projection.reshape(new_projection_shape)
         # (B, T, H, D) -> (B, H, T, D)
-        new_projection = jnp.transpose(new_projection, (0, 2, 1, 3))
-        return new_projection
+        return jnp.transpose(new_projection, (0, 2, 1, 3))
 
     def __call__(self, hidden_states):
         residual = hidden_states
@@ -228,8 +225,7 @@ class FlaxAttentionBlock(nn.Module):
 
         hidden_states = self.proj_attn(hidden_states)
         hidden_states = hidden_states.reshape((batch, height, width, channels))
-        hidden_states = hidden_states + residual
-        return hidden_states
+        return hidden_states + residual
 
 
 class FlaxDownEncoderBlock2D(nn.Module):
@@ -516,9 +512,7 @@ class FlaxEncoder(nn.Module):
         # end
         sample = self.conv_norm_out(sample)
         sample = nn.swish(sample)
-        sample = self.conv_out(sample)
-
-        return sample
+        return self.conv_out(sample)
 
 
 class FlaxDecoder(nn.Module):
@@ -618,9 +612,7 @@ class FlaxDecoder(nn.Module):
 
         sample = self.conv_norm_out(sample)
         sample = nn.swish(sample)
-        sample = self.conv_out(sample)
-
-        return sample
+        return self.conv_out(sample)
 
 
 

@@ -6,6 +6,7 @@ boundary. Dew never selects or executes this environment by default.
 """
 
 import base64
+import contextlib
 import json
 import math
 import os
@@ -146,10 +147,9 @@ class _ProcessEnvironment:
             raise ValueError("sandbox set_state must acknowledge restored state")
 
     def close(self) -> None:
-        try:
+        # The group is already gone when the sandbox exited on its own.
+        with contextlib.suppress(ProcessLookupError):
             os.killpg(self.process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
         try:
             self.process.wait(timeout=5)
         finally:

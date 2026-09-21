@@ -981,7 +981,9 @@ def _unipc_weights(rks, hh, B_h, order: int, predictor: bool):
         return [0.5]
     shape = hh.shape
     batch = shape[0]
-    flat = lambda value: jnp.reshape(value, (batch,))
+    def flat(coefficient: jax.Array) -> jax.Array:
+        return jnp.reshape(coefficient, (batch,))
+
     rks = [flat(rk) for rk in rks[:-1]] + [jnp.ones((batch,), hh.dtype)]
     hh, B_h = flat(hh), flat(B_h)
     columns = order - 1 if predictor else order
@@ -1291,7 +1293,7 @@ class TCD:
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        _, (alpha_s, sigma_s) = _rates(process, t, t_next, x)
+        _, (alpha_s, _) = _rates(process, t, t_next, x)
         alpha_mid, sigma_mid = broadcast_rates(process.sampler_schedule, (1 - self.eta) * t_next, x)
         noised = alpha_mid * denoised + sigma_mid * eps
         if self.eta == 0:
@@ -1301,23 +1303,6 @@ class TCD:
         return ratio * noised + jnp.sqrt(1 - ratio ** 2) * noise, state
 
 
-__all__ = [
-    "DDIM",
-    "DDPM",
-    "DEIS",
-    "KDPM2",
-    "LMS",
-    "PNDM",
-    "RK4",
-    "TCD",
-    "Consistency",
-    "DPMSolverMultistep",
-    "DPMSolverSDE",
-    "DPMSolverSinglestep",
-    "Euler",
-    "EulerAncestral",
-    "Heun",
-    "MultiStepDPM",
-    "Solver",
-    "UniPC",
-]
+__all__ = ["DDIM", "DDPM", "DEIS", "KDPM2", "LMS", "PNDM", "RK4", "TCD", "Consistency", "DPMSolverMultistep",
+           "DPMSolverSDE", "DPMSolverSinglestep", "Euler", "EulerAncestral", "Heun", "MultiStepDPM", "Solver",
+           "UniPC"]

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import itertools
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol
 
@@ -300,7 +301,7 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
                 raise ValueError("decoder bank groups require nonnegative starts and positive lengths")
             paths.extend(site.namespace + (f"layers_{index}",) for index in range(first, first + count))
     ordered = sorted(paths)
-    if any(right[:len(left)] == left for left, right in zip(ordered, ordered[1:])):
+    if any(right[:len(left)] == left for left, right in itertools.pairwise(ordered)):
         raise ValueError("declared decoder banks overlap in their canonical layer ownership")
     return tuple(owners.values())
 

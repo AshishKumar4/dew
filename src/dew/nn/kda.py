@@ -78,7 +78,7 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
         blocked = moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
         return jnp.moveaxis(blocked, 2, 0)
 
-    q_c, k_c, v_c, g_c = chunks(query), chunks(key), chunks(value), chunks(g)
+    q_c, k_c, g_c = chunks(query), chunks(key), chunks(g)
     kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
     # Per key dimension: g [NC, B, H, C, Dk] cumulated within the chunk
     # (modeling_glm5_next.py:530), the decay between positions s >= t of
@@ -96,7 +96,7 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     attn = jnp.where(strict, -jnp.einsum('...sd,...td,...std->...st', kb_c, k_c, decay), 0.0)
     inv = jnp.broadcast_to(jnp.eye(chunk_size, dtype=attn.dtype), attn.shape)
     power = attn
-    for _ in range(max(1, int(math.ceil(math.log2(chunk_size))))):
+    for _ in range(max(1, math.ceil(math.log2(chunk_size)))):
         inv = inv + power @ inv
         power = power @ power
     out_vals = inv @ vb_c

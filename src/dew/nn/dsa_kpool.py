@@ -156,7 +156,7 @@ class KPoolIndexer(nn.Module):
         -1 where there is none (`append_visible_tail`,
         modeling_glm5_next.py:974-1024): the `visible_count % kpool` tokens
         after the last complete pool the query sees."""
-        batch, _, total = visible.shape
+        _, _, total = visible.shape
         first = _first_valid(valid, total)
         visible_count = jnp.sum(visible, axis=-1, dtype=jnp.int32)
         tail_count = visible_count % self.kpool

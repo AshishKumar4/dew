@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import itertools
 import math
 import sys
 from abc import ABC, abstractmethod
@@ -165,7 +166,7 @@ class Ramp:
         """
         stages = self.stages(final)
         steps = 0
-        for stage, next_stage in zip(stages, stages[1:]):
+        for stage, next_stage in itertools.pairwise(stages):
             if records < next_stage.records:
                 return steps + (records - stage.records) // stage.batch
             steps += (next_stage.records - stage.records) // stage.batch

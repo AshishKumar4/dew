@@ -40,7 +40,7 @@ class S5Layer(nn.Module):
 
     @nn.compact
     def __call__(self, u):
-        # u: [B, S, F]
+        # The input u has shape [B, S, F].
         B, S, F = u.shape
         assert self.features == F, f"S5Layer built for {self.features} features, got {F}"
 
@@ -125,9 +125,9 @@ class S5Layer(nn.Module):
             (A_bar_expanded, Bu),
             axis=1
         )
-        # x_states: [B, S, state_dim] (complex)
+        # The complex state sequence has shape [B, S, state_dim].
 
-        # y_k = Re(C @ x_k) + D * u_k
+        # The k-th output is Re(C x_k) plus the skip D u_k.
         y_complex = jnp.einsum('fn,bsn->bsf', C_complex, x_states)  # [B, S, F]
         y = y_complex.real
 
@@ -155,7 +155,7 @@ class BidirectionalS5Layer(nn.Module):
 
     @nn.compact
     def __call__(self, u):
-        # u: [B, S, F]
+        # The input u has shape [B, S, F].
         y_fwd = S5Layer(
             features=self.features,
             state_dim=self.state_dim,
@@ -180,14 +180,12 @@ class BidirectionalS5Layer(nn.Module):
 
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
 
-        y = nn.Dense(
+        return nn.Dense(
             features=self.features,
             dtype=self.dtype,
             precision=self.precision,
             name="out_proj"
         )(y_cat)
-
-        return y
 
 
 class SpatialFusionConv(nn.Module):

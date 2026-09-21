@@ -75,7 +75,7 @@ class SimpleDiT(nn.Module):
 
     @nn.compact
     def __call__(self, x, temb, textcontext=None, train: bool = False):
-        B, H, W, C = x.shape
+        _, H, W, _ = x.shape
         x_seq, inv_idx = self.embed(x)
         cond_emb = self.conditioning(temb, textcontext)
         freqs_cis = rope_for_scan(x_seq.shape[1], self.emb_features // self.num_heads,
