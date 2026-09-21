@@ -6,18 +6,25 @@ qkv/mlp/modulation weights and mix through a single joint attention over the
 concatenated sequence.
 """
 
+from typing import Literal, Sequence
+
+import einops
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Optional, Sequence, Literal
-import einops
 from flax.typing import Dtype, PrecisionLike
 
-from ..dit import (
-    ROPE_THETA, AdaLNParams, PatchSequenceEmbed, ConditioningEmbed, PatchSequenceOutput,
-    rope_for_scan, remat_block,
-)
-from ..attention import apply_rotary, rotary_freqs, scaled_dot_product_attention
 from dew.registry import models
+
+from ..attention import apply_rotary, rotary_freqs, scaled_dot_product_attention
+from ..dit import (
+    ROPE_THETA,
+    AdaLNParams,
+    ConditioningEmbed,
+    PatchSequenceEmbed,
+    PatchSequenceOutput,
+    remat_block,
+    rope_for_scan,
+)
 from ..sharding import logical_axes
 
 
@@ -42,12 +49,12 @@ class MMDiTBlock(nn.Module):
     num_heads: int
     mlp_ratio: int = 4
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
 
     def setup(self):
         hidden_features = int(self.features * self.mlp_ratio)
@@ -148,12 +155,12 @@ class SimpleMMDiT(nn.Module):
     num_heads: int = 12
     mlp_ratio: int = 4
     dropout_rate: float = 0.0  # Typically 0 for diffusion
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     remat: bool = False
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
@@ -224,15 +231,15 @@ class PatchMerging(nn.Module):
     concatenated group, then a projection."""
     out_features: int
     merge_size: int = 2
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-5
 
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
         B, L, C = x.shape
-        assert L == H_patches * \
-            W_patches, f"Input length {L} doesn't match {H_patches}*{W_patches}"
+        assert H_patches * \
+            W_patches == L, f"Input length {L} doesn't match {H_patches}*{W_patches}"
         assert H_patches % self.merge_size == 0 and W_patches % self.merge_size == 0, f"Patch dimensions ({H_patches}, {W_patches}) not divisible by merge size {self.merge_size}"
 
         x = x.reshape(B, H_patches, W_patches, C)
@@ -262,14 +269,14 @@ class PatchExpanding(nn.Module):
     then the rearrangement."""
     out_features: int
     expand_size: int = 2
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-5
 
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
         B, L, C = x.shape
-        assert L == H_patches * W_patches, f"Input length {L} doesn't match {H_patches}*{W_patches}"
+        assert H_patches * W_patches == L, f"Input length {L} doesn't match {H_patches}*{W_patches}"
 
         expanded_features = self.expand_size * self.expand_size * self.out_features
         x = nn.Dense(
@@ -310,12 +317,12 @@ class HierarchicalMMDiT(nn.Module):
     num_heads: Sequence[int] = (8, 12, 16)  # Heads per stage, fine to coarse
     mlp_ratio: int = 4
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     remat: bool = False
 
     def setup(self):

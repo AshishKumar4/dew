@@ -1,18 +1,19 @@
 """Durable episode boundaries and pending actions in a per-rank SQLite WAL."""
 
-from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
 import fcntl
 import hashlib
 import json
-from pathlib import Path
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import jax
 import numpy as np
 
 from dew.objectives.base import Variables
+
 from .episodes import Action, Episode, EpisodeId
 from .records import action_record, episode_from_record, episode_record
 

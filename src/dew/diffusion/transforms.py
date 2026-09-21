@@ -18,7 +18,6 @@ from typing import Protocol
 
 import jax
 import jax.numpy as jnp
-
 from jax.typing import ArrayLike
 
 from dew.diffusion.schedules import NoiseScheduler, expand

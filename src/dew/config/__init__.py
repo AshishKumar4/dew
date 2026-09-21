@@ -24,29 +24,27 @@ import sys
 import types
 import typing
 from collections.abc import Sequence
-from typing import (TYPE_CHECKING, Annotated, Any, Literal, Mapping, Optional, Self,
-                    TypeAlias, Union)
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Mapping, Optional, Self, TypeAlias, Union
 
 import jax
 import tyro
-
 from etils import epath
 
-import dew.data  # noqa: F401  registers the datasets a config names
+import dew.data  # registers the datasets a config names
 import dew.io
+import dew.nn.backbones  # registers the models a config names
+from dew import registry
+from dew.artifacts import agree_process_phase
 from dew.checkpoints import RUN_FILE, Checkpoints
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
-import dew.nn.backbones  # noqa: F401  registers the models a config names
-from dew import registry
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.registry import REGISTRIES, _declared_type, datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
+from dew.telemetry.records import RunRecord, json_value, packages_installed
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import build_optimizer
 from dew.training.state import TrainState
-from dew.training.tracker import WandbTracker, LocalTracker, Trackers
-from dew.telemetry.records import RunRecord, packages_installed, json_value
-from dew.artifacts import agree_process_phase
+from dew.training.tracker import LocalTracker, Trackers, WandbTracker
 from dew.training.trainer import Profile, Trainer
 
 JsonDict = Annotated[
@@ -103,13 +101,13 @@ class OptimConfig:
     optimizer: Literal["adam", "adamw", "lamb", "muon", "muonclip"] = "adamw"
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
     learning_rate: float = 2.7e-4
-    learning_rate_schedule: Optional[Literal["cosine"]] = None
+    learning_rate_schedule: Literal["cosine"] | None = None
     learning_rate_peak: float = 3e-4
     learning_rate_end: float = 2e-4
     learning_rate_warmup_steps: int = 10000
-    learning_rate_decay_steps: Optional[int] = None
+    learning_rate_decay_steps: int | None = None
     """Optimizer updates the cosine decays over; unset uses the training step target."""
-    weight_decay: Optional[float] = None
+    weight_decay: float | None = None
     clip_grads: float = 0.0
 
 
@@ -119,7 +117,7 @@ class Wandb:
     the offline switch mean nothing without a project."""
 
     project: str
-    entity: Optional[str] = None
+    entity: str | None = None
     offline: bool = False
 
 
@@ -127,7 +125,7 @@ class Wandb:
 class TrainerConfig:
     """Run length, checkpointing, sharding and run tracking."""
 
-    name: Optional[str] = None
+    name: str | None = None
     checkpoint_dir: str = "./checkpoints"
     keep: int = 2
     """Latest checkpoints kept, besides the best one."""
@@ -135,21 +133,21 @@ class TrainerConfig:
     """Global batch, over every process."""
     seed: int = 0
     """Seed of the run key: parameter init and every per-step draw."""
-    steps: Optional[int] = None
-    epochs: Optional[int] = None
+    steps: int | None = None
+    epochs: int | None = None
     """Run length as passes over the data; `steps` names it directly instead."""
     log_every: int = 100
-    eval_every: Union[int, Literal["epoch"], None] = "epoch"
+    eval_every: int | Literal["epoch"] | None = "epoch"
     """Steps between validation passes: a number of steps, "epoch" for one
     pass over the data, None to never validate. "epoch" over a stream that
     reports no record count raises a ValueError, since it has no pass."""
-    checkpoint_every: Union[int, Literal["epoch"], None] = "epoch"
+    checkpoint_every: int | Literal["epoch"] | None = "epoch"
     """Steps between checkpoints, the same three answers. None is what a
     stream whose iterator cannot report a read position trains with; the
     trainer refuses any other answer for one."""
     accumulation: int = 1
     """Micro-batches per optimizer update."""
-    batch_ramp: Optional[Ramp] = None
+    batch_ramp: Ramp | None = None
     """Grow `batch_size` over the run's first records instead of starting
     there: the global batch the run starts at, what a stage adds and the
     records the whole ramp spans. Unset trains at `batch_size` throughout.
@@ -158,18 +156,18 @@ class TrainerConfig:
     dynamic_scale: bool = False
     mesh: MeshSpec = MeshSpec()
     layout: Layout = Layout()
-    profile: Optional[Profile] = None
+    profile: Profile | None = None
     """One profiler window: the steps to trace, the warmup before it and the
     directory it is written to. Unset traces nothing."""
-    compilation_cache_dir: Optional[str] = dataclasses.field(
+    compilation_cache_dir: str | None = dataclasses.field(
         default_factory=default_compilation_cache_dir)
     """Persisted XLA cache, so a restart skips recompiling the step. None
     compiles from scratch every run."""
-    wandb: Optional[Wandb] = None
+    wandb: Wandb | None = None
     """Optional W&B sink in addition to the local tracking journal."""
-    multi_host: Optional[bool] = None
+    multi_host: bool | None = None
     """Join the JAX process pool. None asks and continues alone only when no cluster is configured; True requires the pool; False never asks."""
-    xla_flags: Optional[str] = None
+    xla_flags: str | None = None
     """Extra XLA_FLAGS for this run, appended to the environment by
     `prepare_process` before JAX opens a backend. Library users set XLA_FLAGS
     themselves; see docs/performance.md for what was measured."""
@@ -190,16 +188,16 @@ class TrainerConfig:
                 "one, so give the run length as --trainer.steps")
         return self.epochs * data.steps_per_epoch
 
-    def eval_interval(self, data: Dataset) -> Optional[int]:
+    def eval_interval(self, data: Dataset) -> int | None:
         """Steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, data, "eval-every")
 
-    def checkpoint_interval(self, data: Dataset) -> Optional[int]:
+    def checkpoint_interval(self, data: Dataset) -> int | None:
         """Steps between checkpoints over `data`, or None for never."""
         return self._interval(self.checkpoint_every, data, "checkpoint-every")
 
     @staticmethod
-    def _interval(value, data: Dataset, flag: str) -> Optional[int]:
+    def _interval(value, data: Dataset, flag: str) -> int | None:
         if value is None or isinstance(value, int):
             return value
         if data.steps_per_epoch is None:

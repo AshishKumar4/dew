@@ -5,18 +5,20 @@ implementation is imported by this module.
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from pathlib import Path
-import json
 from typing import TYPE_CHECKING, TypedDict
+
+import numpy as np
 from flax.typing import Dtype
 from jax.typing import DTypeLike
-import numpy as np
 
+from dew.interop.safetensors_io import load_params
 from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
 from dew.nn.text_encoders import checkpoint_array
 from dew.registry import resolve_dtype
-from dew.interop.safetensors_io import load_params
+
 if TYPE_CHECKING:
     from dew.interop.pretrained import WeightLayout
 

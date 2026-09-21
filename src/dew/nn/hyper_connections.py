@@ -40,7 +40,6 @@ under `hc_head`.
 from __future__ import annotations
 
 import dataclasses
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -115,7 +114,7 @@ class HyperConnection(nn.Module):
     spec: HyperConnections
     emb_features: int
     norm_eps: float = 1e-5
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
 
     @nn.compact
     def __call__(self, streams):
@@ -157,7 +156,7 @@ class HyperHead(nn.Module):
         return jnp.sum(pre[..., None] * streams.astype(jnp.float32), axis=2).astype(streams.dtype)
 
 
-def collapse_streams(streams, head: Optional[HyperHead]):
+def collapse_streams(streams, head: HyperHead | None):
     """The streams as the one vector the final norm reads: their mean without
     a head (modeling_glm5_next.py:301-302) or the weighted head's collapse."""
     if head is None:

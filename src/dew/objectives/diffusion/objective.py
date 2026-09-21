@@ -12,7 +12,7 @@ the averaged weights, through the same `sample` inference uses.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -20,12 +20,11 @@ import optax
 from flax import linen as nn
 
 from dew.artifacts import ImageGrid, VideoGrid, agree_process_phase, collective_host
-from dew.diffusion.process import Process
+from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.diffusion.process import aligned_conditions
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
 from dew.registry import objectives
 from dew.sampling.guidance import CFG
@@ -33,8 +32,8 @@ from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
     from dew.sampling.pipelines import TextToImage
+    from dew.training.state import TrainState
 
 # Samples a validation batch draws, conditioned or not.
 VALIDATION_SAMPLES = 4
@@ -66,11 +65,11 @@ class DiffusionObjective(Objective[Mean]):
         process: Process,
         inputs: InputSpec,
         *,
-        autoencoder: Optional[AutoEncoder] = None,
+        autoencoder: AutoEncoder | None = None,
         unconditional_prob: float = 0.12,
         ema_decay: float | None = 0.999,
         sampler: Solver[Any] = DDIM(),
-        guidance: Optional[CFG] = CFG(3.0),
+        guidance: CFG | None = CFG(3.0),
         steps: int = 200,
         pretrained: Variables | None = None,
     ):

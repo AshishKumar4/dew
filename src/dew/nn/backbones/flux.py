@@ -15,7 +15,7 @@ the layer norm the MM-DiT family uses; what differs is here.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -23,13 +23,13 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.diffusion.process import DenoisingCondition
+from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
-from .sd3 import _FeedForward, _Modulation, _layer_norm, _modulate
+from .sd3 import _FeedForward, _layer_norm, _modulate, _Modulation
 
 
 def rotary_table(positions: np.ndarray, axes: Sequence[int], *, theta: float = 10000.0,
@@ -320,5 +320,13 @@ class FluxTransformer(nn.Module):
         return unpack(packed, rows, columns)
 
 
-__all__ = ["FluxTransformer", "FluxBlock", "FluxSingleBlock", "rotary_table", "flux_positions",
-           "apply_rotary", "pack", "unpack"]
+__all__ = [
+    "FluxBlock",
+    "FluxSingleBlock",
+    "FluxTransformer",
+    "apply_rotary",
+    "flux_positions",
+    "pack",
+    "rotary_table",
+    "unpack",
+]

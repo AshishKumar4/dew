@@ -28,15 +28,13 @@ shards.
 import functools
 import importlib
 from collections.abc import Callable
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
-from jax.ad_checkpoint import checkpoint_name
 from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import Dtype, PrecisionLike
-
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from .sharding import EXPERT_AXIS, logical_axes
@@ -205,7 +203,7 @@ class Router(nn.Module):
     groups_per_token: int = 1
     group_score: str = 'top2'
     expert_bias: bool = False
-    hash_vocab: Optional[int] = None
+    hash_vocab: int | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -319,7 +317,7 @@ class Router(nn.Module):
 
 def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
                    implementation: str, precision: PrecisionLike = None,
-                   preferred_element_type: Optional[Dtype] = None) -> jax.Array:
+                   preferred_element_type: Dtype | None = None) -> jax.Array:
     """Each row of `tokens`, `[rows, in]`, through the matrix of its expert in
     `kernel`, `[exp, in, out]`, for rows already sorted by expert.
 
@@ -380,7 +378,7 @@ def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> 
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
 def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
-                      dtype: Optional[Dtype], implementation: str,
+                      dtype: Dtype | None, implementation: str,
                       precision: PrecisionLike) -> jax.Array:
     """`grouped_matmul` under one precision contract for both dispatches.
 
@@ -408,7 +406,7 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
 
 
 @expert_projection.defjvp
-def _expert_projection_jvp(dtype: Optional[Dtype], implementation: str,
+def _expert_projection_jvp(dtype: Dtype | None, implementation: str,
                            precision: PrecisionLike,
                            primals: tuple[jax.Array, jax.Array, jax.Array],
                            tangents: tuple[jax.Array, jax.Array, jax.Array]
@@ -462,7 +460,7 @@ class ExpertLinear(nn.Module):
     in_features: int
     features: int
     implementation: str = 'xla'
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -623,9 +621,9 @@ class ExpertMLP(nn.Module):
     activation: str = 'swiglu'
     implementation: str = 'xla'
     dispatch: str = 'global'
-    swiglu_limit: Optional[float] = None
+    swiglu_limit: float | None = None
     scale_inputs: bool = False
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -728,12 +726,12 @@ class SparseMLP(nn.Module):
     groups_per_token: int = 1
     group_score: str = 'top2'
     expert_bias: bool = False
-    hash_vocab: Optional[int] = None
-    swiglu_limit: Optional[float] = None
+    hash_vocab: int | None = None
+    swiglu_limit: float | None = None
     scale_inputs: bool = False
-    shared: Optional[Callable[..., nn.Module]] = None
+    shared: Callable[..., nn.Module] | None = None
     shared_gate: bool = False
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):

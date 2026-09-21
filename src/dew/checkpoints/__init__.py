@@ -28,8 +28,8 @@ from typing import Any
 
 import jax
 import numpy as np
-from etils import epath
 import orbax.checkpoint as ocp
+from etils import epath
 from jax.experimental import multihost_utils
 from orbax.checkpoint.checkpoint_manager import MultiprocessingOptions
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation

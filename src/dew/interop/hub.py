@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
 
 from huggingface_hub import HfApi, snapshot_download
 
@@ -32,7 +31,7 @@ def push_to_hub(directory, repo_id: str, *, private: bool = False,
     )
 
 
-def pull_from_hub(repo_id: str, revision: Optional[str] = None) -> Path:
+def pull_from_hub(repo_id: str, revision: str | None = None) -> Path:
     """Download a snapshot of `repo_id` and return the directory holding it.
 
     `revision` is a branch, tag or commit; None takes the default branch. The

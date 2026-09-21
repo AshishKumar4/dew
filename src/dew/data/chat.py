@@ -37,8 +37,16 @@ from jinja2 import TemplateError
 
 from dew.registry import datasets
 
-from .dataset import (Batch, Dataset, DatasetSpec, Loading, describe, local_batch,
-                      train_stream, validation_pass)
+from .dataset import (
+    Batch,
+    Dataset,
+    DatasetSpec,
+    Loading,
+    describe,
+    local_batch,
+    train_stream,
+    validation_pass,
+)
 from .tokens import PackedWindows, bounded
 
 if TYPE_CHECKING:
@@ -438,7 +446,7 @@ def render_conversation(tokenizer: PreTrainedTokenizerBase, conversation: Conver
 _tokenizer_lock = threading.Lock()
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def load_tokenizer(path: str) -> PreTrainedTokenizerBase:
     """The chat template's tokenizer, loaded once per process.
 

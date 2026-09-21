@@ -18,30 +18,35 @@ import numpy as np
 from flax import linen as nn
 
 from dew.artifacts import agree_process_phase
-from dew.interop import hf_decoders as decoders
-from dew.interop.quantized import (dequantize_checkpoint, fp8_format, fp8_tensor_names,
-                                     pack_fp8, read_fp8_tensor, scaled_names)
+from dew.diffusion.process import Process
+from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
-from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.gpt_oss import (mxfp4_stems, mxfp4_tensor_names, pack_mxfp4, read_mxfp4_tensor,
-                              unpack_mxfp4)
-from dew.sampling import decoding
-from dew.sampling.strategies import Beam, Speculative, Strategy
-from dew.sampling.text import Sampling
+from dew.inputs import Condition, Field, InputSpec
+from dew.inputs.diffusion import Composition, DiffusionConditioner, T5Segment
+from dew.interop import hf_decoders as decoders
+from dew.interop.quantized import (
+    dequantize_checkpoint,
+    fp8_format,
+    fp8_tensor_names,
+    pack_fp8,
+    read_fp8_tensor,
+    scaled_names,
+)
 from dew.nn import audio as audio_nn
+from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.gpt_oss import mxfp4_stems, mxfp4_tensor_names, pack_mxfp4, read_mxfp4_tensor, unpack_mxfp4
 from dew.nn.inputs import ModelInputs, pad_token_rows
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, models, resolve_dtype, with_precision
-from dew.diffusion.process import Process
-from dew.diffusion.schedules.source import Origin, SourceSchedule
-from dew.inputs import Condition, Field, InputSpec
-from dew.inputs.diffusion import Composition, DiffusionConditioner, T5Segment
-from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
+from dew.sampling import decoding
 from dew.sampling.guidance import CFG
 from dew.sampling.pipelines import TextToImage
+from dew.sampling.strategies import Beam, Speculative, Strategy
+from dew.sampling.text import Sampling
 
 
 class HostProcessor(Protocol):
@@ -270,7 +275,7 @@ class Processor:
                 if frames.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2):
                     raise ValueError("patch counts must divide into complete pooling blocks")
                 streams[token_id] = (frames, coordinates, counts // kernel ** 2)
-            offsets = {token_id: 0 for token_id in streams}
+            offsets = dict.fromkeys(streams, 0)
             chunks, patch_positions, lengths = [], [], []
             for row, blocks in enumerate(runs):
                 for slots in blocks:
@@ -1170,7 +1175,7 @@ def _neutral(value: object, neutral: tuple[object, ...]) -> bool:
     if value is None:
         return True
     numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
-    return any(value == item and (numeric and not isinstance(item, bool) or type(value) is type(item))
+    return any(value == item and ((numeric and not isinstance(item, bool)) or type(value) is type(item))
                for item in neutral)
 
 
@@ -1841,6 +1846,7 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
     """The published CLIP text towers, their tokenizers, their parameters and
     the layouts those parameters came from."""
     from transformers import CLIPTokenizer
+
     from dew.interop import diffusion
     from dew.nn.text_encoders import CLIPTextTransformer, translate_config
 
@@ -1870,9 +1876,9 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
     the pipeline pads to.
     """
     from transformers import AutoTokenizer
+
     from dew.interop import diffusion
-    from dew.nn.text_encoders import (
-        T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config)
+    from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
 
     config = _component_config(directory, component)
     tower = T5EncoderTransformer(**translate_t5_config(config), dtype=compute)

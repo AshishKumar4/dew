@@ -8,8 +8,6 @@ tokenizer on first use, so a host without the hub cache still imports
 
 from __future__ import annotations
 
-from typing import List
-
 
 class ByteTokenizer:
     """Vocabulary 256, one id per utf-8 byte of the text.
@@ -24,7 +22,7 @@ class ByteTokenizer:
         self.vocab_size = 256
         self.eos_id = 255
 
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str) -> list[int]:
         return list(text.encode("utf-8"))
 
     def decode(self, ids) -> str:
@@ -67,7 +65,7 @@ class HFTokenizer:
     def eos_id(self) -> int:
         return self.tokenizer.eos_token_id
 
-    def encode(self, text: str) -> List[int]:
+    def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
 
     def decode(self, ids) -> str:

@@ -23,9 +23,9 @@ from flax import linen as nn
 from flax.core import freeze
 from jax.typing import ArrayLike
 
-from dew.diffusion.block import BlockProcess, CanvasGeneration
-from dew.diffusion.discrete import DiscreteProcess, MDLM_STEPS, Unmask
 from dew.artifacts import agree_process_phase
+from dew.diffusion.block import BlockProcess, CanvasGeneration
+from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs, mesh_of, request_key
 from dew.objectives.base import Variables
@@ -33,7 +33,6 @@ from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
 from dew.sampling.text import Criteria, Generation, Sampling, Transforms, generate
 from dew.telemetry.profile import active_profile
-
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows

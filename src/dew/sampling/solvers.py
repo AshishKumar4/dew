@@ -1301,6 +1301,23 @@ class TCD:
         return ratio * noised + jnp.sqrt(1 - ratio ** 2) * noise, state
 
 
-__all__ = ["Solver", "DDPM", "DDIM", "Euler", "EulerAncestral", "Heun", "RK4", "KDPM2",
-           "MultiStepDPM", "DPMSolverMultistep", "DPMSolverSinglestep", "DPMSolverSDE",
-           "DEIS", "UniPC", "PNDM", "LMS", "Consistency", "TCD"]
+__all__ = [
+    "DDIM",
+    "DDPM",
+    "DEIS",
+    "KDPM2",
+    "LMS",
+    "PNDM",
+    "RK4",
+    "TCD",
+    "Consistency",
+    "DPMSolverMultistep",
+    "DPMSolverSDE",
+    "DPMSolverSinglestep",
+    "Euler",
+    "EulerAncestral",
+    "Heun",
+    "MultiStepDPM",
+    "Solver",
+    "UniPC",
+]

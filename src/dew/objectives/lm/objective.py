@@ -29,28 +29,46 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, NamedTuple, Optional
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from flax import struct
 import numpy as np
 import optax
+from flax import struct
 
 from dew.artifacts import TextSamples, TokenScores, agree_process_phase, collective_host
 from dew.data.chat import ROLES_KEY, Role
-from dew.inputs import Field, InputSpec
-from dew.nn.inputs import ModelInputs
-from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
-from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
-from dew.nn.moe import (RouterMoments, global_router_loss, load_balance_update,
-                        router_moments, sequence_router_losses)
-from dew.objectives.base import (FROZEN, Aux, EMASpec, Mean, Objective, PathFilter, Prediction,
-                                 Step, Variables, freeze, mean_loss, merge, thaw)
-from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
-from dew.registry import metrics, objectives
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor
+from dew.inputs import Field, InputSpec
+from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
+from dew.nn.inputs import ModelInputs
+from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
+from dew.nn.moe import (
+    RouterMoments,
+    global_router_loss,
+    load_balance_update,
+    router_moments,
+    sequence_router_losses,
+)
+from dew.objectives.base import (
+    FROZEN,
+    Aux,
+    EMASpec,
+    Mean,
+    Objective,
+    PathFilter,
+    Prediction,
+    Step,
+    Variables,
+    freeze,
+    mean_loss,
+    merge,
+    thaw,
+)
+from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
+from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -297,10 +315,10 @@ class Scores(NamedTuple):
     correct: jax.Array
     hidden: jax.Array
     layers: tuple[jax.Array, ...]
-    routing: Optional[dict]
+    routing: dict | None
     depths: list
-    qk: Optional[dict]
-    indexer: Optional[dict]
+    qk: dict | None
+    indexer: dict | None
 
 
 @struct.dataclass
@@ -323,18 +341,18 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         seq_len: int,
         *,
         ema_decay: float | None = 0.999,
-        pad_id: Optional[int] = None,
+        pad_id: int | None = None,
         head_chunks: int = 4,
-        samples: Optional[Samples] = None,
-        pretrained: Optional[Variables] = None,
-        balance_rate: Optional[float] = None,
-        aux_loss_alpha: Optional[float] = None,
+        samples: Samples | None = None,
+        pretrained: Variables | None = None,
+        balance_rate: float | None = None,
+        aux_loss_alpha: float | None = None,
         seq_aux: bool = True,
         loss_role: Role | None = None,
-        mtp_weight: Optional[float] = None,
+        mtp_weight: float | None = None,
         z_loss: float = 0.0,
         qk_stats: bool = False,
-        indexer: Optional[IndexerTraining] = None,
+        indexer: IndexerTraining | None = None,
         trainable: PathFilter | None = None,
     ):
         """`head_chunks` is how many vocabulary slices the loss scores a batch
@@ -472,7 +490,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def _warmup(self) -> bool:
         return self.indexer is not None and self.indexer.phase == "warmup"
 
-    def held_variables(self) -> Optional[Variables]:
+    def held_variables(self) -> Variables | None:
         """The checkpoint a continued-pretraining run starts from.
 
         Bound as the initializer's argument this reaches the trainer's state
@@ -482,15 +500,15 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         return self.pretrained
 
     @property
-    def bank_sites(self) -> tuple["DecoderBank", ...]:
+    def bank_sites(self) -> tuple[DecoderBank, ...]:
         return self.model.bank_sites
 
-    def init(self, key, variables: Optional[Variables] = None) -> Variables:
+    def init(self, key, variables: Variables | None = None) -> Variables:
         pretrained = self.pretrained if variables is None else variables
         tree = self._whole_tree(pretrained, key)
         return tree if self.trainable is None else freeze(tree, self.trainable)
 
-    def _whole_tree(self, pretrained: Optional[Variables], key) -> Variables:
+    def _whole_tree(self, pretrained: Variables | None, key) -> Variables:
         """The model's variables in one `params` collection: the pretrained
         tree with its frozen split undone, or a fresh init."""
         fresh = lambda: self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))

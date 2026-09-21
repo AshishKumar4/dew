@@ -3,10 +3,10 @@
 each a factory returning a `Metric` the trainer scores an `ImageGrid` with."""
 
 from .common import ImageMetric, frames
-from .images import clip, clip_score
 from .fid import fid, frechet_distance
+from .images import clip, clip_score
 from .psnr import peak_signal_noise_ratio, psnr
-from .ssim import structural_similarity, ssim
+from .ssim import ssim, structural_similarity
 
 __all__ = [
     "ImageMetric",

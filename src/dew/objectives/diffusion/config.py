@@ -10,21 +10,21 @@ same file.
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Literal
 
+import dew.eval  # registers the image metrics
+import dew.nn.backbones  # noqa: F401  registers the models
 from dew.config import ModelConfig, RunConfig
 from dew.data import ImageDataset, OnlineImages, OxfordFlowers, VideoDataset
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, samplers
 from dew.objectives.base import FROZEN, Variables
+from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, samplers
 from dew.sampling.guidance import CFG
-from .objective import DiffusionObjective
 
-import dew.eval  # noqa: F401  registers the image metrics
-import dew.nn.backbones  # noqa: F401  registers the models
+from .objective import DiffusionObjective
 
 if TYPE_CHECKING:
     from dew.diffusion.presets import Preset
@@ -69,7 +69,7 @@ class TextCondition:
 
     encoder: str = "clip_text"
     checkpoint: str = DEFAULT_MODEL
-    dtype: Optional[DtypeName] = None
+    dtype: DtypeName | None = None
     """The encoder's compute dtype; None keeps the checkpoint's."""
     param_dtype: DtypeName = "float32"
     """Storage precision when loading source weights; supplied params retain theirs."""
@@ -77,10 +77,10 @@ class TextCondition:
     """The batch field holding the tokenized text."""
     unconditional: str = ""
     """The prompt the unconditional branch is encoded from."""
-    max_length: Optional[int] = None
+    max_length: int | None = None
     """Tokens every prompt is padded to; None keeps the encoder's own
     default, which for CLIP is the checkpoint's context length."""
-    revision: Optional[str] = None
+    revision: str | None = None
     """The checkpoint's git revision. A rerun then conditions on the weights
     the run named, even after the branch has moved on."""
 
@@ -102,8 +102,8 @@ class StableDiffusionAutoencoder:
     modelname: str = "pcuenq/sd-vae-ft-mse-flax"
     revision: str = "bf16"
     dtype: DtypeName = "bfloat16"
-    latent_shift: Optional[float] = None
-    latent_scale: Optional[float] = None
+    latent_shift: float | None = None
+    latent_scale: float | None = None
     """Per-dataset latent statistics; None keeps the checkpoint's."""
 
     def build(self, *, params: Variables | None = None) -> AutoEncoder:
@@ -129,7 +129,7 @@ class DiffusionRunConfig(RunConfig):
     """The convention the model is trained and sampled with."""
     sampler: SamplerSpec = dataclasses.field(default_factory=samplers.EulerAncestral)
     """The solver validation samples with."""
-    guidance: Optional[CFG] = dataclasses.field(default_factory=lambda: CFG(3.0))
+    guidance: CFG | None = dataclasses.field(default_factory=lambda: CFG(3.0))
     """How validation samples are guided, scale and interval; None samples
     the conditional prediction alone."""
     sampling_steps: int = 200
@@ -137,10 +137,10 @@ class DiffusionRunConfig(RunConfig):
     """Fraction of training examples whose condition is dropped."""
     ema_decay: float | None = 0.999
     """None disables EMA; 1.0 retains a frozen copy."""
-    text: Optional[TextCondition] = dataclasses.field(default_factory=TextCondition)
+    text: TextCondition | None = dataclasses.field(default_factory=TextCondition)
     """The text condition, under the models' `textcontext` keyword; None
     trains unconditionally."""
-    autoencoder: Optional[StableDiffusionAutoencoder] = None
+    autoencoder: StableDiffusionAutoencoder | None = None
     """Set for latent diffusion; None trains in pixel space."""
     val_metrics: list[Literal["clip", "clip_score", "fid", "psnr", "ssim"]] = dataclasses.field(
         default_factory=lambda: ["clip"])
@@ -156,7 +156,7 @@ class DiffusionRunConfig(RunConfig):
             f"the diffusion recipe trains on image or video datasets, not "
             f"{datasets.name_of(type(spec))}")
 
-    def model_fields(self, autoencoder: Optional[AutoEncoder]) -> dict:
+    def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
         """The fields the registry builds the model from: the run's precision
         settings and the channels the model denoises, over `model.config`."""
         fields = self.model.fields()

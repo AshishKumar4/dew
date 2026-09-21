@@ -4,30 +4,29 @@ from __future__ import annotations
 
 import functools
 import os
-from dataclasses import dataclass, replace
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Generic, overload
+from dataclasses import dataclass, replace
 from enum import Enum
+from typing import TYPE_CHECKING, Generic, overload
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 from flax.core import freeze
+from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
+from dew.artifacts import agree_process_phase
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import ArrayT, RowPlan, generation_signature, local_rows, mesh_of, request_key
-from dew.artifacts import agree_process_phase
-from jax.experimental import multihost_utils
 from dew.objectives.base import FROZEN, Variables
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
-
 from dew.telemetry.profile import active_profile
 
 if TYPE_CHECKING:
@@ -252,7 +251,7 @@ class TextToImage:
                 raise ValueError("pass image or image_latents, not both")
             if mask is not None and self.autoencoder is None:
                 raise ValueError("masked-image conditioning requires an autoencoder")
-            if noise is not None and (image is None and image_latents is None or initial is not None):
+            if noise is not None and ((image is None and image_latents is None) or initial is not None):
                 raise ValueError("noise is for noising a clean image; initial is already noisy")
             if mask is not None and image is None:
                 raise ValueError("a mask requires its image pixels")
@@ -427,7 +426,7 @@ def _image_rows(value, rows: int, shape: tuple[int, ...], name: str) -> np.ndarr
     return np.broadcast_to(array, (rows, *shape))
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _image_start(rows: jax.sharding.NamedSharding | None):
     def prepare(autoencoder, process, shape, params, data, keys, encode_key, start):
         spatial = {}
@@ -501,7 +500,7 @@ def restore_variables(directory: str, *, ema: bool, step: int | None, mesh: Mesh
 
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _encode(rows: jax.sharding.NamedSharding | None):
     def encode(conditions, params, tokens):
         return {keyword: encoder.encode(params["encoders"][keyword], tokens[keyword])
@@ -509,14 +508,14 @@ def _encode(rows: jax.sharding.NamedSharding | None):
     return jax.jit(encode, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _noise(rows: jax.sharding.NamedSharding | None):
     def noise(process, keys, shape):
         return jax.vmap(lambda key: process.noise(key, shape))(keys)
     return jax.jit(noise, static_argnums=(0, 2), in_shardings=(rows,), out_shardings=rows)
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _run(rows: jax.sharding.NamedSharding | None):
     # Rebinding weights must not change the static compilation identity.
     def run(model, process, autoencoder, finish, steps, sampler, guidance, final_denoise, times, decode,

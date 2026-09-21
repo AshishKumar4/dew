@@ -5,20 +5,20 @@ It has no filesystem or network isolation, so hostile code needs an outer
 boundary. Dew never selects or executes this environment by default.
 """
 
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
-from dataclasses import asdict, dataclass
 import base64
 import json
 import math
 import os
-from pathlib import Path
 import selectors
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from .episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
 

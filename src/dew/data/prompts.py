@@ -24,8 +24,7 @@ import numpy as np
 from dew.registry import datasets
 
 from .chat import Conversation, load_tokenizer, render_prompt
-from .dataset import (Batch, Dataset, DatasetSpec, Loading, local_batch,
-                      train_stream, validation_pass)
+from .dataset import Batch, Dataset, DatasetSpec, Loading, local_batch, train_stream, validation_pass
 from .tokens import bounded
 
 PROMPT_KEY = "prompt"

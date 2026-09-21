@@ -13,12 +13,20 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import (
-    CosineNoiseScheduler, EDMNoiseScheduler, FlowMatchingScheduler, KarrasVENoiseScheduler,
+    CosineNoiseScheduler,
+    EDMNoiseScheduler,
+    FlowMatchingScheduler,
+    KarrasVENoiseScheduler,
     SqrtContinuousNoiseScheduler,
 )
 from dew.diffusion.transforms import (
-    DirectPredictionTransform, FlowMatchPredictionTransform, KarrasPredictionTransform,
-    MinSNR, ScheduleWeighting, VPredictionTransform, Weighting,
+    DirectPredictionTransform,
+    FlowMatchPredictionTransform,
+    KarrasPredictionTransform,
+    MinSNR,
+    ScheduleWeighting,
+    VPredictionTransform,
+    Weighting,
 )
 from dew.registry import presets
 

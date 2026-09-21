@@ -15,7 +15,6 @@ from .episodes import Episode
 from .records import episode_from_record, episode_record, integer, object_record, sequence
 
 
-
 def to_verl(episodes: Sequence[Episode]) -> list[dict[str, object]]:
     """Export JSON-compatible AgentLoopOutput rows, with lossless Dew metadata."""
     rows: list[dict[str, object]] = []

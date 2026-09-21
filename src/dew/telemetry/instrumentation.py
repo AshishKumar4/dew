@@ -15,7 +15,6 @@ import os
 import re
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
 
 import jax
 
@@ -53,7 +52,7 @@ PEAK_FLOPS_PER_DEVICE = {
 }
 
 
-def peak_flops(device_kind: str) -> Optional[float]:
+def peak_flops(device_kind: str) -> float | None:
     """The dense bf16 peak of one device of `device_kind`, by the longest
     table key it starts with, or None for hardware the table does not name."""
     keys = [key for key in PEAK_FLOPS_PER_DEVICE if device_kind.startswith(key)]
@@ -87,8 +86,8 @@ class _Instruction:
     """The parts of one HLO instruction the FLOP count reads."""
 
     op: str
-    dims: Tuple[int, ...]
-    operands: Tuple[str, ...]
+    dims: tuple[int, ...]
+    operands: tuple[str, ...]
     attributes: str
 
 
@@ -96,11 +95,11 @@ class _Instruction:
 class _Computation:
     """One HLO computation: its instructions and their result shapes."""
 
-    instructions: List[_Instruction]
-    shapes: Dict[str, Tuple[int, ...]]
+    instructions: list[_Instruction]
+    shapes: dict[str, tuple[int, ...]]
 
 
-def _dims(text: str) -> Tuple[int, ...]:
+def _dims(text: str) -> tuple[int, ...]:
     """Dimensions of the first shape in `text`, which for a tuple is its head."""
     match = _DIMS.search(text)
     if match is None:
@@ -109,7 +108,7 @@ def _dims(text: str) -> Tuple[int, ...]:
     return tuple(int(d) for d in body.split(',')) if body else ()
 
 
-def _split_operands(rest: str) -> Tuple[Tuple[str, ...], str]:
+def _split_operands(rest: str) -> tuple[tuple[str, ...], str]:
     """The operand names of an instruction, and the attribute text after them."""
     depth, end = 1, len(rest)
     for index, character in enumerate(rest):
@@ -122,9 +121,9 @@ def _split_operands(rest: str) -> Tuple[Tuple[str, ...], str]:
     return operands, rest[end + 1:]
 
 
-def _parse(text: str) -> Tuple[Dict[str, _Computation], Optional[str]]:
+def _parse(text: str) -> tuple[dict[str, _Computation], str | None]:
     """The module's computations, and the name of its entry computation."""
-    computations: Dict[str, _Computation] = {}
+    computations: dict[str, _Computation] = {}
     entry, current = None, None
     for line in text.splitlines():
         stripped = line.strip()
@@ -150,7 +149,7 @@ def _parse(text: str) -> Tuple[Dict[str, _Computation], Optional[str]]:
     return computations, entry
 
 
-def _window(attributes: str) -> Dict[str, List[int]]:
+def _window(attributes: str) -> dict[str, list[int]]:
     """A convolution's window: its size and its dilations, per spatial axis."""
     window = {'size': [1], 'lhs_dilate': [1]}
     match = _WINDOW.search(attributes)
@@ -163,8 +162,8 @@ def _window(attributes: str) -> Dict[str, List[int]]:
     return window
 
 
-def _dot_flops(instruction: _Instruction, shapes: Dict[str, Tuple[int, ...]],
-               contracting: Tuple[int, ...]) -> float:
+def _dot_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]],
+               contracting: tuple[int, ...]) -> float:
     """Every output element costs one multiply-add per contracted element."""
     lhs = shapes.get(instruction.operands[0]) if instruction.operands else None
     if lhs is None:
@@ -174,7 +173,7 @@ def _dot_flops(instruction: _Instruction, shapes: Dict[str, Tuple[int, ...]],
 
 
 def _convolution_flops(instruction: _Instruction,
-                       shapes: Dict[str, Tuple[int, ...]]) -> float:
+                       shapes: dict[str, tuple[int, ...]]) -> float:
     """Output elements times the kernel window times the input features.
 
     Dividing by the input dilation counts a strided convolution's gradient at
@@ -195,7 +194,7 @@ def _convolution_flops(instruction: _Instruction,
 
 
 def _cudnn_convolution_flops(target: str, instruction: _Instruction,
-                             shapes: Dict[str, Tuple[int, ...]]) -> float:
+                             shapes: dict[str, tuple[int, ...]]) -> float:
     """A cuDNN convolution call, at the multiply-adds of its forward shape.
 
     XLA keeps the forward convolution's window and dim_labels on all three
@@ -224,7 +223,7 @@ def _cudnn_convolution_flops(target: str, instruction: _Instruction,
 
 
 def _fused_attention_flops(target: str, instruction: _Instruction,
-                           shapes: Dict[str, Tuple[int, ...]]) -> float:
+                           shapes: dict[str, tuple[int, ...]]) -> float:
     """A cuDNN fused-attention call, from the query and key it is given.
 
     The kernel keeps the scores off memory, so nothing in the module states
@@ -247,7 +246,7 @@ def _fused_attention_flops(target: str, instruction: _Instruction,
 
 
 def _instruction_flops(instruction: _Instruction,
-                       shapes: Dict[str, Tuple[int, ...]]) -> float:
+                       shapes: dict[str, tuple[int, ...]]) -> float:
     """The multiply-add work of one instruction, and zero for anything else.
 
     Only the matmuls and convolutions count. Everything the compiler leaves
@@ -280,7 +279,7 @@ def _instruction_flops(instruction: _Instruction,
     return 0.0
 
 
-def _call_counts(instruction: _Instruction) -> Dict[str, float]:
+def _call_counts(instruction: _Instruction) -> dict[str, float]:
     """The computations this instruction runs, and how often it runs each.
 
     A loop body runs once per iteration, which XLA states as
@@ -289,10 +288,10 @@ def _call_counts(instruction: _Instruction) -> Dict[str, float]:
     then reports no count. A conditional runs one of its branches, so
     counting every branch bounds it.
     """
-    counts = {name: 1.0 for name in _CALLS.findall(instruction.attributes)}
+    counts = dict.fromkeys(_CALLS.findall(instruction.attributes), 1.0)
     branches = _BRANCHES.search(instruction.attributes)
     if branches is not None:
-        counts.update({name: 1.0 for name in _NAME.findall(branches.group(1))})
+        counts.update(dict.fromkeys(_NAME.findall(branches.group(1)), 1.0))
     if instruction.op == 'while':
         body = re.search(r'body=%([\w.\-]+)', instruction.attributes)
         trip = _TRIP_COUNT.search(instruction.attributes)
@@ -301,7 +300,7 @@ def _call_counts(instruction: _Instruction) -> Dict[str, float]:
     return counts
 
 
-def _weights(computations: Dict[str, _Computation], entry: str) -> Dict[str, float]:
+def _weights(computations: dict[str, _Computation], entry: str) -> dict[str, float]:
     """How many times each computation runs per call of the entry computation.
 
     HLO computations cannot recurse, so the call graph is a DAG and one pass in
@@ -311,12 +310,12 @@ def _weights(computations: Dict[str, _Computation], entry: str) -> Dict[str, flo
     calls = {
         name: _merged_call_counts(computation)
         for name, computation in computations.items()}
-    callers = {name: 0 for name in computations}
+    callers = dict.fromkeys(computations, 0)
     for callees in calls.values():
         for callee in callees:
             if callee in callers:
                 callers[callee] += 1
-    weights = {name: 0.0 for name in computations}
+    weights = dict.fromkeys(computations, 0.0)
     weights[entry] = 1.0
     ready = [name for name, count in callers.items() if count == 0]
     while ready:
@@ -331,16 +330,16 @@ def _weights(computations: Dict[str, _Computation], entry: str) -> Dict[str, flo
     return weights
 
 
-def _merged_call_counts(computation: _Computation) -> Dict[str, float]:
+def _merged_call_counts(computation: _Computation) -> dict[str, float]:
     """Per call of this computation, how often each computation it names runs."""
-    merged: Dict[str, float] = {}
+    merged: dict[str, float] = {}
     for instruction in computation.instructions:
         for name, times in _call_counts(instruction).items():
             merged[name] = merged.get(name, 0.0) + times
     return merged
 
 
-def compiled_flops(compiled: jax.stages.Compiled) -> Optional[float]:
+def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
     """FLOPs for one call of an executable that is already compiled.
 
     Reading the count off the executable the loop runs costs nothing, where
@@ -358,7 +357,7 @@ def compiled_flops(compiled: jax.stages.Compiled) -> Optional[float]:
     return None if text is None else hlo_flops(text)
 
 
-def hlo_flops(text: str) -> Optional[float]:
+def hlo_flops(text: str) -> float | None:
     """Matmul and convolution FLOPs of one call of an optimized HLO module."""
     computations, entry = _parse(text)
     if entry is None:
@@ -374,7 +373,7 @@ def hlo_flops(text: str) -> Optional[float]:
     return total if math.isfinite(total) else None
 
 
-def step_flops(jitted: jax.stages.Wrapped, *args: object, **kwargs: object) -> Optional[float]:
+def step_flops(jitted: jax.stages.Wrapped, *args: object, **kwargs: object) -> float | None:
     """FLOPs for one call of a jitted function, straight from the compiler.
 
     Measured, so architectures, remat and gradient accumulation are counted
@@ -387,8 +386,8 @@ def step_flops(jitted: jax.stages.Wrapped, *args: object, **kwargs: object) -> O
 
 
 def model_flops_utilization(
-    flops_per_step: Optional[float], step_time: float
-) -> Optional[float]:
+    flops_per_step: float | None, step_time: float
+) -> float | None:
     """Fraction of one device's dense peak achieved by its executable.
 
     The optimized module is the program one device runs under SPMD, so its

@@ -4,7 +4,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn

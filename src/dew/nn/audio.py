@@ -21,6 +21,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import from_record, towers
+
 from .attention import RMSNorm
 from .sharding import logical_axes
 from .text_encoders import checkpoint_array

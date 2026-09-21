@@ -9,17 +9,21 @@ relabeled as a native raw-policy or behavior-policy likelihood.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-import inspect
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
-    from ollama import AsyncClient as AsyncOllamaClient, Client as OllamaClient
-    from ollama import ChatResponse as OllamaChat, GenerateResponse as OllamaResponse
+    from ollama import (
+        AsyncClient as AsyncOllamaClient,
+        ChatResponse as OllamaChat,
+        Client as OllamaClient,
+        GenerateResponse as OllamaResponse,
+    )
     from openai import AsyncOpenAI, AsyncStream, OpenAI, Stream
     from openai.types import Completion as OpenAIResponse
     from openai.types.chat import ChatCompletion, ChatCompletionChunk

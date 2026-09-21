@@ -10,9 +10,7 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 
 from dew.diffusion.schedules import NoiseScheduler
-from dew.diffusion.transforms import (
-    PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates,
-)
+from dew.diffusion.transforms import PredictionTransform, ScheduleWeighting, Weighting, broadcast_rates
 from dew.objectives.base import Variables
 
 
@@ -170,4 +168,4 @@ class Denoiser:
         return output[:batch], output[batch:]
 
 
-__all__ = ["DenoisingCondition", "aligned_conditions", "Process", "Denoiser"]
+__all__ = ["Denoiser", "DenoisingCondition", "Process", "aligned_conditions"]

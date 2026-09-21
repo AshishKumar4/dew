@@ -23,16 +23,13 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-
 from dew.artifacts import agree_process_phase, broadcast_from_process_zero, collective_host
-
 from dew.diffusion.process import Process
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Batch, Mean, Step, Variables
-from dew.objectives.diffusion.objective import DiffusionObjective, VALIDATION_SAMPLES
+from dew.objectives.diffusion.objective import VALIDATION_SAMPLES, DiffusionObjective
 from dew.registry import objectives
-
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition, sample_trajectory
 from dew.sampling.guidance import CFG
 from dew.sampling.solvers import Euler, Solver

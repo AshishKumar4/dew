@@ -871,7 +871,7 @@ def vocabulary_pieces(tokenizer: Vocabulary, mode: str | None,
     is tokenized once and its text is cut off the front of every piece.
     """
     alphabet = byte_alphabet() if mode == "byte_level" else None
-    base = [tokenizer._convert_id_to_token(token)  # noqa: SLF001 the tokenizer's own piece names
+    base = [tokenizer._convert_id_to_token(token)
             for token in tokenizer(prefix, add_special_tokens=False)["input_ids"]]
     pieces: list[str | bytes] = []
     ids: list[int] = []

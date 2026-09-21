@@ -55,11 +55,11 @@ class LayerBanks(Protocol):
         """The whole store as `jax.ShapeDtypeStruct` leaves, one per layer."""
         ...
 
-    def entry(self, placement: "Placement") -> Variables:
+    def entry(self, placement: Placement) -> Variables:
         """Read exactly the canonical leaves selected by placement."""
         ...
 
-    def bank(self, layers: Sequence[int], placement: "Placement", *,
+    def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
         """One run's bank, on those shardings: those layers stacked on a new
         leading axis in the order given, or, for a run of one layer, that
@@ -142,10 +142,10 @@ class HeldBanks:
             lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)),
             self.variables)
 
-    def entry(self, placement: "Placement") -> Variables:
+    def entry(self, placement: Placement) -> Variables:
         return jax.device_put(narrowed(self.variables, placement), placement)
 
-    def bank(self, layers: Sequence[int], placement: "Placement", *,
+    def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
         rows = [one_layer(self.variables, index, namespace=namespace) for index in layers]
         bank = rows[0] if len(rows) == 1 else jax.tree.map(
@@ -189,10 +189,10 @@ class CheckpointBanks:
             raise ValueError("the run keeps no EMA; read the live weights with ema=False")
         return stored["params"]
 
-    def entry(self, placement: "Placement") -> Variables:
+    def entry(self, placement: Placement) -> Variables:
         return self._restored(placement)
 
-    def bank(self, layers: Sequence[int], placement: "Placement", *,
+    def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
         if len(layers) == 1:
             return one_layer(self._restored(at_layer(placement, layers[0], namespace=namespace)),
@@ -203,7 +203,7 @@ class CheckpointBanks:
                           out_shardings=placement)
         return stacked(*rows)
 
-    def _restored(self, placement: "Placement") -> Variables:
+    def _restored(self, placement: Placement) -> Variables:
         """The variables `placement` names, restored onto its shardings."""
         from dew.checkpoints import Checkpoints
 
@@ -218,7 +218,7 @@ class CheckpointBanks:
         return merge(values["params"], values["ema"]) if "ema" in template else values["params"]
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _stored(directory: str, step: int) -> Variables:
     from dew.checkpoints import Checkpoints
     return Checkpoints(directory).stored(step)
@@ -243,13 +243,13 @@ def narrowed(tree: Mapping, selection: Mapping) -> dict:
     return result
 
 
-def _typed(shapes: Variables, placement: "Placement") -> Variables:
+def _typed(shapes: Variables, placement: Placement) -> Variables:
     return jax.tree.map(
         lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
         shapes, placement)
 
 
-def _row_placement(placement: "Placement") -> "Placement":
+def _row_placement(placement: Placement) -> Placement:
     """One layer's shardings out of a bank's: the layer axis dropped, in device
     memory, which is where the rows a bank is stacked out of are read."""
     return jax.tree.map(
@@ -257,7 +257,7 @@ def _row_placement(placement: "Placement") -> "Placement":
                                        memory_kind="device"), placement)
 
 
-def _bank_placement(placement: "Placement", stacked: bool) -> "Placement":
+def _bank_placement(placement: Placement, stacked: bool) -> Placement:
     """A run's shardings: the layer axis whole in front of each leaf's own
     spec, in the memory space the layout chose for that leaf."""
     if not stacked:
@@ -348,7 +348,7 @@ def _check_shapes(shapes: Variables, site: DecoderBank) -> None:
                                  "must have identical leaf paths, shapes and dtypes within one bank")
 
 def host_banked(model: BankedModel, source: LayerBanks, *,
-                mesh: "MeshSpec | None" = None, layout: "Layout | None" = None) -> Variables:
+                mesh: MeshSpec | None = None, layout: Layout | None = None) -> Variables:
     """`source`'s weights as the banked store `model`'s runs read.
 
     Each run's bank is read, stacked and placed on its own, and the copies of
@@ -369,8 +369,7 @@ def host_banked(model: BankedModel, source: LayerBanks, *,
     the patterns place differently, leaf for leaf, is refused for the same
     reason: a bank is one array with one sharding.
     """
-    from dew.training.distributed import (
-        Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh)
+    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
 
     sites = bank_sites(model)
     shapes = source.shapes()
@@ -413,7 +412,7 @@ def _places(subtree) -> dict[str, tuple[str, str]]:
             for path, sharding in leaves}
 
 
-def _check_consumers(placement: "Placement", groups: Sequence[tuple[int, int]]) -> None:
+def _check_consumers(placement: Placement, groups: Sequence[tuple[int, int]]) -> None:
     """Require corresponding layers of one bank to agree on placement.
 
     The comparison is per path inside a layer, not over the set of memory

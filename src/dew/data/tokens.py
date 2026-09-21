@@ -28,8 +28,17 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .dataset import (Batch, Dataset, DatasetSpec, Forwarding, Loading, describe, local_batch,
-                      train_stream, validation_pass)
+from .dataset import (
+    Batch,
+    Dataset,
+    DatasetSpec,
+    Forwarding,
+    Loading,
+    describe,
+    local_batch,
+    train_stream,
+    validation_pass,
+)
 
 
 def token_files(path: str | None, name: str) -> tuple[str, str]:

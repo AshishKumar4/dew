@@ -14,11 +14,10 @@ from __future__ import annotations
 import dataclasses
 
 import jax.numpy as jnp
-from dew.objectives.base import Variables
 
 from dew.artifacts import TokenScores
 from dew.data.preferences import IDS_KEY, MASK_KEY
-from dew.objectives.base import Aux, Mean
+from dew.objectives.base import Aux, Mean, Variables
 from dew.registry import objectives
 from dew.rl.surrogate import preference_logsigmoid_terms
 

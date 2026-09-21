@@ -13,15 +13,17 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.registry import metrics
+
 from .common import ImageMetric
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_clip(modelname: str):
     """The vendored CLIP towers and the checkpoint's image processor, loaded
     once per model name. CLIP-L/14 is about 600 MB in HBM, and every metric
     built from this module shares the copy."""
     from transformers import CLIPImageProcessorPil
+
     from dew.nn.text_encoders import CLIPModel
     print(f"[metrics] Loading CLIP model '{modelname}' (cached for reuse)...")
     return CLIPModel.from_pretrained(modelname), CLIPImageProcessorPil.from_pretrained(modelname)

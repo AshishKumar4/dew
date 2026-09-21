@@ -4,16 +4,22 @@ blocks in a configurable ratio. The S5 layers live in ssm.py; the block and
 the patchify/conditioning/output machinery live in dit.py.
 """
 
+from typing import Literal, Sequence
+
 from flax import linen as nn
-from typing import Optional, Sequence, Literal
 from flax.typing import Dtype, PrecisionLike
 
-from ..dit import (
-    PatchSequenceEmbed, ConditioningEmbed, PatchSequenceOutput,
-    ModulatedBlock, remat_block, rope_for_scan, build_block_pattern,
-)
 from dew.registry import models
 
+from ..dit import (
+    ConditioningEmbed,
+    ModulatedBlock,
+    PatchSequenceEmbed,
+    PatchSequenceOutput,
+    build_block_pattern,
+    remat_block,
+    rope_for_scan,
+)
 
 DEFAULT_SSM_RATIO = "3:1"
 
@@ -35,15 +41,15 @@ class HybridSSMAttentionDiT(nn.Module):
     mlp_ratio: int = 4
     ssm_state_dim: int = 64
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     remat: bool = False
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
-    block_pattern: Optional[Sequence[str]] = None  # e.g., ['ssm','ssm','ssm','attn']
+    block_pattern: Sequence[str] | None = None  # e.g., ['ssm','ssm','ssm','attn']
     ssm_attention_ratio: str = DEFAULT_SSM_RATIO  # "3:1", "1:1", "all-ssm", "all-attn"
     bidirectional_ssm: bool = True
     use_2d_fusion: bool = False  # 2D state fusion in SSM blocks (see SpatialFusionConv)

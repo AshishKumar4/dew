@@ -20,14 +20,14 @@ tile runs the head forward and backward in 250 ms holding 1.07 GiB of
 temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
 """
 
-from typing import Callable, Optional, Tuple
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
 
 
-def vocabulary_chunks(vocab_size: int, chunks: int) -> Tuple[Tuple[int, int], ...]:
+def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ...]:
     """`chunks` half-open column ranges covering `range(vocab_size)`.
 
     The last chunk is the short one when the count does not divide the
@@ -51,7 +51,7 @@ def vocabulary_chunks(vocab_size: int, chunks: int) -> Tuple[Tuple[int, int], ..
     return bounds
 
 
-def head_logits(hidden, head_weight, *, softcap: Optional[float],
+def head_logits(hidden, head_weight, *, softcap: float | None,
                 precision: PrecisionLike) -> jax.Array:
     """`hidden @ head_weight` as the model's forward scores it: fp32 states
     against the `[features, vocab]` head, accumulated in fp32, softcapped
@@ -65,7 +65,7 @@ def head_logits(hidden, head_weight, *, softcap: Optional[float],
 
 
 def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
-                 softcap: Optional[float], precision: PrecisionLike):
+                 softcap: float | None, precision: PrecisionLike):
     """One tile's logsumexp, target logit, best logit and its column."""
     logits = head_logits(hidden, head_chunk, softcap=softcap, precision=precision)
 
@@ -127,7 +127,7 @@ def _forward(hidden, table, targets, chunks: int, token_tile: int,
     return tuple(value.reshape(targets.shape) for value in outputs)
 
 
-def _bounded_head_impl(hidden, table, targets, chunks: int, tile: Tuple[int, int],
+def _bounded_head_impl(hidden, table, targets, chunks: int, tile: tuple[int, int],
                        softcap, precision: PrecisionLike):
     """`_forward` behind a backward that recomputes its logits."""
     return _forward(hidden, table, targets, chunks, tile[0], softcap, precision)
@@ -209,9 +209,9 @@ _bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
 
 
 def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
-                          softcap: Optional[float] = None,
+                          softcap: float | None = None,
                           precision: PrecisionLike = None,
-                          tile: Tuple[int, int] = (1024, 8192)):
+                          tile: tuple[int, int] = (1024, 8192)):
     """Per-token cross entropy of `hidden @ head_weight`, its top-1 column
     and its log partition.
 

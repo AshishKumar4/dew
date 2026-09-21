@@ -24,7 +24,6 @@ that collapse shows in the training curves, before a probe run.
 from __future__ import annotations
 
 import functools
-from typing import Dict, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -35,6 +34,7 @@ from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, under
 from dew.registry import objectives
+
 from .masking import MultiBlockMask
 
 CONTEXT_ENCODER = "context_encoder"
@@ -42,7 +42,7 @@ PREDICTOR = "predictor"
 LABEL_KEY = "label"
 
 
-def representation_health(z) -> Dict[str, jax.Array]:
+def representation_health(z) -> dict[str, jax.Array]:
     """Collapse telemetry for pooled embeddings [B, D].
 
     repr_std is the per-dimension standard deviation across the batch. It goes
@@ -92,7 +92,7 @@ class JepaObjective(Objective[Mean]):
         predictor: nn.Module,
         mask: MultiBlockMask,
         sample: Field,
-        momentum: Tuple[float, float] = (0.996, 1.0),
+        momentum: tuple[float, float] = (0.996, 1.0),
         momentum_steps: int = 100_000,
         label_key: str = LABEL_KEY,
     ):

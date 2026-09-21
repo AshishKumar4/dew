@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 import hashlib
 import itertools
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal, overload
 

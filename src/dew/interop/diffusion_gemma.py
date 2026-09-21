@@ -18,8 +18,11 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.vision import (
-    projector_from_record, tower_from_record, translate_gemma4_projector_config,
-    translate_gemma4_projector_weights, translate_gemma4_vision_config,
+    projector_from_record,
+    tower_from_record,
+    translate_gemma4_projector_config,
+    translate_gemma4_projector_weights,
+    translate_gemma4_vision_config,
     translate_gemma4_vision_weights,
 )
 from dew.objectives.base import Variables

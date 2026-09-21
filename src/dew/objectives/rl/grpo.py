@@ -17,11 +17,10 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
-from dew.objectives.base import Variables
 
 from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
-from dew.objectives.base import Aux, Mean, mean_loss
+from dew.objectives.base import Aux, Mean, Variables, mean_loss
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
 from dew.rl import behavior_importance_weights, k3_kl, token_log_ratio

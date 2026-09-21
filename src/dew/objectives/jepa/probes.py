@@ -20,8 +20,8 @@ import jax.numpy as jnp
 import optax
 
 from dew.artifacts import Representations
-from dew.registry import metrics
 from dew.eval.common import metric_device
+from dew.registry import metrics
 
 ProbeParams: TypeAlias = dict[str, jax.Array]
 """The linear probe's weight matrix under "w" and its bias under "b"."""

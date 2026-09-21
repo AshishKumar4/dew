@@ -24,7 +24,7 @@ where a linear-attention mixer goes.
 import dataclasses
 import functools
 import math
-from typing import Callable, Literal, Mapping, Optional, Sequence, Tuple, Union
+from typing import Callable, Literal, Mapping, Sequence
 
 import flax.core
 import jax
@@ -35,21 +35,27 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from dew.registry import models
+
 from ..attention import RMSNorm, RopeScaling
 from ..blocks import TokenEmbedding
-from ..inputs import AttentionMetadata, PredictionPhase
-from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
-from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
-from ..hyper_connections import (
-    HyperConnection, HyperConnections, HyperHead, collapse_streams, expand_streams, mix_streams,
-)
 from ..dsa_kpool import KPoolSparseAttentionMixer
+from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
+from ..hyper_connections import (
+    HyperConnection,
+    HyperConnections,
+    HyperHead,
+    collapse_streams,
+    expand_streams,
+    mix_streams,
+)
+from ..inputs import AttentionMetadata, PredictionPhase
+from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..mla import INDEXER_COLLECTION, YarnScaling
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
-from dew.registry import models
 
 
 @dataclasses.dataclass(frozen=True)
@@ -68,20 +74,20 @@ class LayerKind:
     here, keyed by the names already in the pattern.
     """
 
-    window: Optional[int] = None
+    window: int | None = None
     """Keys a layer of this kind attends, its own included; None attends all."""
-    num_kv_heads: Optional[int] = None
+    num_kv_heads: int | None = None
     """This kind's key/value head count; None takes the model's. Gemma 4's
     global layers keep fewer than its sliding ones (num_global_key_value_heads)."""
-    rope_theta: Optional[float] = None  # set: this kind takes this base over the model's
-    rope_scaling: Optional[RopeScaling] = None
+    rope_theta: float | None = None  # set: this kind takes this base over the model's
+    rope_scaling: RopeScaling | None = None
     """This kind's llama3 ramp or its record; None rides the model's."""
-    yarn: Optional[YarnScaling] = None
+    yarn: YarnScaling | None = None
     """This kind's YaRN ramp or its record; None rides the model's. OLMo 3
     scales its full-attention layers alone (configuration_olmo3.py:110-113),
     so a YaRN ramp is a kind's as much as the model's."""
-    head_dim: Optional[int] = None
-    mixer: Optional[MixerBase] = None
+    head_dim: int | None = None
+    mixer: MixerBase | None = None
     """This kind's mixer value or its record; None is the model's mixer."""
 
     def __post_init__(self):
@@ -110,13 +116,13 @@ class ResolvedKind:
     through: it needs no resolution, only the model's default when unset.
     """
 
-    window: Optional[int]
+    window: int | None
     num_kv_heads: int
     rope_theta: float
-    rope_scaling: Optional[RopeScaling]
-    yarn: Optional[YarnScaling]
+    rope_scaling: RopeScaling | None
+    yarn: YarnScaling | None
     head_dim: int
-    mixer: Optional[MixerBase]
+    mixer: MixerBase | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,13 +149,13 @@ class LayerSpec:
     """The gaussian top-k fraction on the feed-forward gate, 0 for none."""
     kv_shared: bool
     """The layer reads its keys and values from an earlier layer's."""
-    provider: Optional[int]
+    provider: int | None
     """The layer's own index when a later layer reads its keys and values; such
     a layer runs unrolled, since what it stashes leaves the stack's loop."""
 
 
 def scan_groups(specs: Sequence[LayerSpec],
-                bank_layers: Optional[int] = None) -> Tuple[Tuple[int, int], ...]:
+                bank_layers: int | None = None) -> tuple[tuple[int, int], ...]:
     """The stack as runs of layers, `(first, count)` each, in order.
 
     Consecutive layers with equal specs form one run, which a scan runs as
@@ -164,7 +170,7 @@ def scan_groups(specs: Sequence[LayerSpec],
     """
     if bank_layers is not None and bank_layers < 1:
         raise ValueError(f"bank_layers counts the layers one run holds, got {bank_layers}")
-    groups: list[Tuple[int, int]] = []
+    groups: list[tuple[int, int]] = []
     for index, spec in enumerate(specs):
         if groups and specs[groups[-1][0]] == spec and groups[-1][1] != bank_layers:
             first, count = groups[-1]
@@ -259,8 +265,8 @@ class Mixture:
 
     experts: int
     top_k: int = 2
-    layers: Optional[Tuple[int, ...]] = None
-    every: Optional[int] = None
+    layers: tuple[int, ...] | None = None
+    every: int | None = None
     score_function: str = 'softmax'
     norm_topk_prob: bool = True
     scaling: float = 1.0
@@ -270,12 +276,12 @@ class Mixture:
     bias: bool = False
     scale_inputs: bool = False
     parallel: bool = False
-    expert_features: Optional[int] = None
+    expert_features: int | None = None
     shared_features: int = 0
     shared_gate: bool = False
     implementation: str = 'xla'
     dispatch: str = 'global'
-    hash_layers: Optional[Tuple[int, ...]] = None
+    hash_layers: tuple[int, ...] | None = None
 
     def __post_init__(self):
         if self.layers is not None:
@@ -352,8 +358,8 @@ class GatedMLP(nn.Module):
     out_features: int
     activation: str = 'swiglu'
     activation_sparsity: float = 0.0
-    swiglu_limit: Optional[float] = None
-    dtype: Optional[Dtype] = None
+    swiglu_limit: float | None = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -435,8 +441,8 @@ class RematPolicy:
     `quantization` names AQT intermediates Qwix does not produce. A config
     gives a policy by name or as a record of the two lists.
     """
-    save: Tuple[str, ...] = ()
-    offload: Tuple[str, ...] = ()
+    save: tuple[str, ...] = ()
+    offload: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, 'save', tuple(self.save))
@@ -479,7 +485,7 @@ largest first. `full` keeps nothing but the block's inputs."""
 
 
 def remat_policy(
-        value: Union[RematPolicy, str, Mapping[str, Sequence[str]], None]) -> Optional[RematPolicy]:
+        value: RematPolicy | str | Mapping[str, Sequence[str]] | None) -> RematPolicy | None:
     """`value` as the policy it names: a `RematPolicy`, a name in
     `REMAT_POLICIES`, a record of `save`/`offload` names, or None for no
     recomputation at all. A config's record arrives here untyped, so a
@@ -554,16 +560,16 @@ class DecoderBlock(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     per_layer_input_dim: int = 0
-    parallel: Optional[Callable[..., nn.Module]] = None
+    parallel: Callable[..., nn.Module] | None = None
     """A branch summed with the feed-forward's output before its output norm,
     called with the residual and that output (Gemma 4's routed experts)."""
-    altup: Optional[AltUp] = None  # Gemma 3n's stack of residual copies
-    laurel_rank: Optional[int] = None  # Gemma 3n's learned augmented residual
-    hyper_connections: Optional[HyperConnections] = None  # mHC's stack of residual streams
+    altup: AltUp | None = None  # Gemma 3n's stack of residual copies
+    laurel_rank: int | None = None  # Gemma 3n's learned augmented residual
+    hyper_connections: HyperConnections | None = None  # mHC's stack of residual streams
     hash_routed: bool = False  # the feed-forward routes by the token ids the metadata carries
     dropout_rate: float = 0.0
-    remat: Optional[RematPolicy] = None
-    dtype: Optional[Dtype] = None
+    remat: RematPolicy | None = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -759,13 +765,13 @@ class MTPBlock(nn.Module):
     feedforward: Callable[..., nn.Module]
     emb_features: int
     wiring: BlockWiring
-    hyper_connections: Optional[HyperConnections] = None
+    hyper_connections: HyperConnections | None = None
     norm_eps: float = 1e-5
     scale_offset: bool = False
     scale_after_cast: bool = False
     dropout_rate: float = 0.0
-    remat: Optional[RematPolicy] = None
-    dtype: Optional[Dtype] = None
+    remat: RematPolicy | None = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -870,7 +876,7 @@ the loop has to carry back out to the scope that asked for them."""
 
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
-              groups: Sequence[Tuple[int, int]], x, *, train: bool, decode: bool,
+              groups: Sequence[tuple[int, int]], x, *, train: bool, decode: bool,
               positions, segment_ids, kv_store, per_layer_input, attention_metadata=None,
               banked: bool = False):
     """The layers over `x`, one run at a time as `groups` says.
@@ -1051,8 +1057,8 @@ class PipelineStage(nn.Module):
     stage repeats.
     """
     block: Block
-    specs: Tuple[LayerSpec, ...]
-    groups: Tuple[Tuple[int, int], ...]
+    specs: tuple[LayerSpec, ...]
+    groups: tuple[tuple[int, int], ...]
 
     def setup(self):
         self.layers = [self.block(index, f'layers_{index}') for index in range(len(self.specs))]
@@ -1097,17 +1103,17 @@ class StackView:
     `[iteration, stage, microbatch, ...]` leaves, of which the real
     iterations of each stage are its microbatches in order.
     """
-    groups: Tuple[Tuple[int, int], ...]
+    groups: tuple[tuple[int, int], ...]
     stages: int = 1
     microbatches: int = 1
-    broadcast: Tuple[str, ...] = ()
-    banked: Tuple[str, ...] = ()
+    broadcast: tuple[str, ...] = ()
+    banked: tuple[str, ...] = ()
 
     @property
     def per_stage(self) -> int:
         return sum(count for _, count in self.groups)
 
-    def _inside_name(self, first: int, count: int) -> Optional[str]:
+    def _inside_name(self, first: int, count: int) -> str | None:
         """A run's name inside, None for a layer the view leaves as it is."""
         if count > 1:
             return group_name(first, count)
@@ -1178,7 +1184,7 @@ class StackView:
             outside[collection] = tree
         return outside
 
-    def _leaf(self, stage: int, offset: Optional[int], broadcast: bool, leaf):
+    def _leaf(self, stage: int, offset: int | None, broadcast: bool, leaf):
         """One layer's leaf out of a run's stacked one.
 
         The row is taken with `index_in_dim`, a slice of a known position, so
@@ -1350,17 +1356,17 @@ class CausalTransformer(nn.Module):
     emb_features: int = 512
     num_layers: int = 8
     num_heads: int = 8
-    num_kv_heads: Optional[int] = None       # None: as many as the query heads
-    head_dim: Optional[int] = None           # None: emb_features // num_heads
+    num_kv_heads: int | None = None       # None: as many as the query heads
+    head_dim: int | None = None           # None: emb_features // num_heads
     mlp: str = 'swiglu'                      # 'swiglu' | 'geglu' | 'geglu_exact'
-    mlp_features: Union[int, Tuple[int, ...], None] = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n)
+    mlp_features: int | tuple[int, ...] | None = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n)
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
-    rope_scaling: Optional[RopeScaling] = None  # Llama 3.1's ramp, unless a kind states its own
-    partial_rotary_factor: Optional[float] = None  # None: every dim rotates
+    rope_scaling: RopeScaling | None = None  # Llama 3.1's ramp, unless a kind states its own
+    partial_rotary_factor: float | None = None  # None: every dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
-    layer_types: Optional[Tuple[str, ...]] = None  # the pattern, one kind per layer
-    kinds: Optional[Mapping[str, LayerKind]] = None  # what each named kind does
+    layer_types: tuple[str, ...] | None = None  # the pattern, one kind per layer
+    kinds: Mapping[str, LayerKind] | None = None  # what each named kind does
     norm_eps: float = 1e-5
     scale_offset: bool = False               # Gemma's (1 + w) RMSNorm scale
     scale_after_cast: bool = False           # Llama and Qwen3 scale the cast activations
@@ -1372,53 +1378,53 @@ class CausalTransformer(nn.Module):
     attention_k_eq_v: bool = False           # Gemma 4's global layers read their values off the keys
     layer_scalar: Literal["frozen", "trainable"] | None = None
     attention_bias: bool = False             # q/k/v biases, and o_proj unless o_proj_bias says
-    o_proj_bias: Optional[bool] = None       # Qwen2 biases q/k/v while o_proj stays bias-free
-    attention_scale: Optional[float] = None  # None: head_dim ** -0.5
+    o_proj_bias: bool | None = None       # Qwen2 biases q/k/v while o_proj stays bias-free
+    attention_scale: float | None = None  # None: head_dim ** -0.5
     attention_sinks: bool = False
-    yarn: Optional[YarnScaling] = None
-    attn_logit_softcap: Optional[float] = None  # Gemma 2's attn_logit_softcapping
+    yarn: YarnScaling | None = None
+    attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
-    final_logit_softcap: Optional[float] = None
+    final_logit_softcap: float | None = None
     tie_embeddings: bool = True
-    embedding_zero_ids: Tuple[int, ...] = ()
+    embedding_zero_ids: tuple[int, ...] = ()
     """Placeholder ids looked up as token zero, without changing labels
     (modeling_kimi_k25.py:686-690, the text-only wrapper path)."""
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
-    attention_impl: Optional[str] = None
-    mixture: Optional[Mixture] = None        # None: every layer is dense
+    attention_impl: str | None = None
+    mixture: Mixture | None = None        # None: every layer is dense
     use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width
     causal: bool = True                      # False: full attention, no cache
-    per_layer_input_dim: Optional[int] = None  # Gemma 3n/4 per-layer inputs
-    per_layer_input_vocab: Optional[int] = None  # None: vocab_size
+    per_layer_input_dim: int | None = None  # Gemma 3n/4 per-layer inputs
+    per_layer_input_vocab: int | None = None  # None: vocab_size
     num_kv_shared_layers: int = 0            # trailing layers reusing a provider's K/V; 0 disables
-    kv_shared_layers: Optional[Tuple[int, ...]] = None  # the sharing layers named one by one
-    mixer: Optional[MixerBase] = None         # None: today's attention; a kind value or its record
+    kv_shared_layers: tuple[int, ...] | None = None  # the sharing layers named one by one
+    mixer: MixerBase | None = None         # None: today's attention; a kind value or its record
     num_nextn_predict_layers: int = 0         # MTP depths; their input/residual policy is independent below
     index_share_for_mtp_iteration: bool = False
-    mtp_layer_type: Optional[str] = None
+    mtp_layer_type: str | None = None
     """An explicit prediction-layer kind, which need not occur in the trunk."""
-    mtp_hyper_connections: Optional[HyperConnections] = None
+    mtp_hyper_connections: HyperConnections | None = None
     """None gives prediction depths plain residuals and normalized trunk inputs.
     A stream depth explicitly opts in, independently of the trunk's residuals."""
-    altup: Optional[AltUp] = None             # Gemma 3n's stack of residual copies; None disables
-    laurel_rank: Optional[int] = None         # Gemma 3n's learned augmented residual; None disables
-    hyper_connections: Optional[HyperConnections] = None  # mHC's stack of residual streams; None disables
-    swiglu_limit: Optional[float] = None      # GLM-5.3-Flash's clamp before every gated MLP's activation
-    activation_sparsity_pattern: Optional[Tuple[float, ...]] = None  # Gemma 3n's gaussian top-k, one fraction per layer
-    mask_token_id: Optional[int] = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
+    altup: AltUp | None = None             # Gemma 3n's stack of residual copies; None disables
+    laurel_rank: int | None = None         # Gemma 3n's learned augmented residual; None disables
+    hyper_connections: HyperConnections | None = None  # mHC's stack of residual streams; None disables
+    swiglu_limit: float | None = None      # GLM-5.3-Flash's clamp before every gated MLP's activation
+    activation_sparsity_pattern: tuple[float, ...] | None = None  # Gemma 3n's gaussian top-k, one fraction per layer
+    mask_token_id: int | None = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
     scan_layers: bool = False                 # runs of like layers under flax's scan
-    bank_layers: Optional[int] = None
+    bank_layers: int | None = None
     """The most layers one scanned run holds, which is how many its parameter
     bank stacks. A longer run of like layers splits into consecutive runs of
     at most this many, each its own bank under its own name; None puts a
     whole run in one bank. Only `scan_layers` reads it, and the split is
     what bounds the memory that building a host-resident bank and reading it
     back cost, so a deep stack offloaded to the host sets it."""
-    remat: Optional[RematPolicy] = None
+    remat: RematPolicy | None = None
     """Recompute each block in the backward pass, keeping its inputs, any K/V
     supplied to later layers and the residuals the policy names. A name from
     `REMAT_POLICIES` or a record of save/offload residual names arrives from
@@ -1484,7 +1490,7 @@ class CausalTransformer(nn.Module):
                 if self.head_dim is None else self.head_dim)
 
     @property
-    def mlp_widths(self) -> Tuple[int, ...]:
+    def mlp_widths(self) -> tuple[int, ...]:
         """Each layer's dense feed-forward width."""
         if self.mlp_features is None:
             return (4 * self.emb_features,) * self.num_layers
@@ -1506,7 +1512,7 @@ class CausalTransformer(nn.Module):
         return widths.pop()
 
     @property
-    def per_layer_types(self) -> Tuple[str, ...]:
+    def per_layer_types(self) -> tuple[str, ...]:
         if self.layer_types is None:
             return ('full_attention',) * self.num_layers
         return tuple(self.layer_types)
@@ -1530,7 +1536,7 @@ class CausalTransformer(nn.Module):
         return set() if mixture is None or mixture.hash_layers is None else set(mixture.hash_layers)
 
     @property
-    def sparse_layers(self) -> Tuple[int, ...]:
+    def sparse_layers(self) -> tuple[int, ...]:
         """The layers whose feed-forward routes to experts."""
         mixture = self.mixture
         if mixture is None:
@@ -1543,7 +1549,7 @@ class CausalTransformer(nn.Module):
         return tuple(range(self.num_layers))
 
     @property
-    def sharing_layers(self) -> Tuple[int, ...]:
+    def sharing_layers(self) -> tuple[int, ...]:
         """The layers that read another layer's stash, in order: the trailing
         num_kv_shared_layers or the ones kv_shared_layers names."""
         if self.num_kv_shared_layers and self.kv_shared_layers is not None:
@@ -2244,7 +2250,7 @@ class CausalTransformer(nn.Module):
                                trans_out_fn=view.unstack, init=False, mutable=True)
         return run(self, view, x, train, decode, positions, segment_ids, per_layer_input, attention_metadata)
 
-    def banked_collections(self) -> Tuple[str, ...]:
+    def banked_collections(self) -> tuple[str, ...]:
         """The collections whose layer subtrees the store holds as banks.
 
         A store built per layer holds `layers_0`; one built bank by bank

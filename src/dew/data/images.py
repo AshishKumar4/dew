@@ -24,8 +24,17 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .dataset import (CAPTION, Dataset, DatasetSpec, Loading, hold_out, local_batch, tokenized,
-                      train_stream, validation_pass)
+from .dataset import (
+    CAPTION,
+    Dataset,
+    DatasetSpec,
+    Loading,
+    hold_out,
+    local_batch,
+    tokenized,
+    train_stream,
+    validation_pass,
+)
 
 Augmentation = Literal["none", "flip_only", "flip_jitter"]
 
@@ -184,7 +193,7 @@ PROMPT_TEMPLATES = (
 )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def class_names(path: str) -> tuple[str, ...]:
     """The class names of a labels file, one per line, read once per process."""
     with open(os.path.expanduser(path)) as handle:
@@ -207,7 +216,7 @@ def record_caption(element) -> str:
 class ImageTransform(pygrain.RandomMapTransform):
     """Resize, augment and caption one record, seeded by the record's own rng."""
 
-    def __init__(self, spec: "ImageDataset"):
+    def __init__(self, spec: ImageDataset):
         self.spec = spec
         self.augments = image_augmentations(spec.augmentation)
 

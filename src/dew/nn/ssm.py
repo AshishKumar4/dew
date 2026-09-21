@@ -3,13 +3,14 @@ S5 state-space layers (diagonal SSM with associative_scan, HiPPO init) and the
 Spatial-Mamba style 2D state fusion conv, the SSM mixer of `ModulatedBlock`.
 """
 
+
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Optional, Tuple
 from flax.typing import Dtype, PrecisionLike
 
 from .sharding import logical_axes
+
 
 def hippo_log_a_real_init(key, shape, dtype=jnp.float32):
     """HiPPO-diag init: A_real_n = -(n + 0.5), stored as log of the negative."""
@@ -34,14 +35,14 @@ class S5Layer(nn.Module):
     state_dim: int = 64
     dt_min: float = 0.001
     dt_max: float = 0.1
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, u):
         # u: [B, S, F]
         B, S, F = u.shape
-        assert F == self.features, f"S5Layer built for {self.features} features, got {F}"
+        assert self.features == F, f"S5Layer built for {self.features} features, got {F}"
 
         # A: diagonal complex state matrix, HiPPO init, parameterized as
         # log of the negative real part for stability
@@ -149,7 +150,7 @@ class BidirectionalS5Layer(nn.Module):
     state_dim: int = 64
     dt_min: float = 0.001
     dt_max: float = 0.1
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -195,9 +196,9 @@ class SpatialFusionConv(nn.Module):
     receptive field. Kernels are zero-init so the fusion starts as a pass-through.
     """
     features: int
-    dilations: Tuple[int, ...] = (1, 2, 3)
+    dilations: tuple[int, ...] = (1, 2, 3)
     kernel_size: int = 3
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact

@@ -16,22 +16,22 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeAlias
-from typing_extensions import TypeVar
 
-from flax import struct
 import jax
-from jax.tree_util import Partial
 import jax.numpy as jnp
 import optax
+from flax import struct
+from jax.tree_util import Partial
+from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
 
 if TYPE_CHECKING:
-    from dew.inputs import InputSpec
-    from dew.training.state import TrainState
-    from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
+    from dew.inputs import InputSpec
+    from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.sampling.pipelines import TextToImage
+    from dew.training.state import TrainState
 
     Task: TypeAlias = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 
@@ -223,7 +223,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         return None
 
     @property
-    def bank_sites(self) -> tuple["DecoderBank", ...]:
+    def bank_sites(self) -> tuple[DecoderBank, ...]:
         """Physical scanned stacks this objective evaluates, for an execution snapshot.
 
         Each site names a decoder namespace below every variables collection

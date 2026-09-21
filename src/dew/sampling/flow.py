@@ -209,5 +209,5 @@ def sample_trajectory(denoise: Denoiser, x_T: jax.Array, steps: int, *,
     return FlowTrajectory(states, times, log_probs.T, stochastic.T)
 
 
-__all__ = ["GaussianTransition", "FlowSDE", "FlowTrajectory", "flow_transition", "sample_trajectory"]
+__all__ = ["FlowSDE", "FlowTrajectory", "GaussianTransition", "flow_transition", "sample_trajectory"]
 

@@ -11,7 +11,6 @@ each choice by `per_expert_scale`. The experts are the plain gated MLPs of
 `dew.nn.moe.ExpertMLP`, weighted on their outputs.
 """
 
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -30,7 +29,7 @@ class Gemma4TextRouter(nn.Module):
     num_experts: int
     top_k: int
     norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -73,7 +72,7 @@ class Gemma4Experts(nn.Module):
     norm_eps: float = 1e-6
     scale_offset: bool = False
     scale_after_cast: bool = False
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact

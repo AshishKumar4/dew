@@ -1,29 +1,29 @@
 """PPO with a separate trainable critic, clipped value loss and episode GAE."""
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import cached_property
-import math
 from typing import Protocol
 
-from flax import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 from jax.experimental import multihost_utils
 
 from dew.data.prompts import LENGTH_KEY
-from dew.nn.inputs import ModelInputs
 from dew.inference.tasks import Processor, TextGeneration
+from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
 from dew.objectives.lm.objective import _shift_rows
 from dew.registry import objectives
 from dew.rl import gae
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
-from dew.nn.inputs import local_rows, mesh_of
 from dew.training.distributed import shard_batch
 from dew.training.state import TrainState
+
 from .episodes import EpisodeInference, EpisodeRollout, _phase
 from .grpo import GRPOObjective
 from .rollout import ADVANTAGES_KEY, IDS_KEY, RESPONSE_MASK_KEY, REWARDS_KEY

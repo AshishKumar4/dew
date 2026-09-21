@@ -1,5 +1,4 @@
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -29,7 +28,7 @@ class AutoEncoder(ABC):
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray,
-                     key: Optional[jax.Array] = None) -> jnp.ndarray:
+                     key: jax.Array | None = None) -> jnp.ndarray:
         """Frames `[B, H, W, C]` to raw latents `[B, h, w, c]`; `key` draws a
         stochastic encoder's sample, and None takes its mean."""
 
@@ -48,7 +47,7 @@ class AutoEncoder(ABC):
         """c, the channels of a latent."""
 
     def encode(self, params, x: jnp.ndarray,
-               key: Optional[jax.Array] = None) -> jnp.ndarray:
+               key: jax.Array | None = None) -> jnp.ndarray:
         """Images `[B, H, W, C]` or video `[B, T, H, W, C]` to normalized
         latents with the same leading axes."""
         if x.ndim == 5:
@@ -70,6 +69,6 @@ class AutoEncoder(ABC):
         return self.decode_batch(params, z)
 
     def __call__(self, params, x: jnp.ndarray,
-                 key: Optional[jax.Array] = None) -> jnp.ndarray:
+                 key: jax.Array | None = None) -> jnp.ndarray:
         """Encode then decode."""
         return self.decode(params, self.encode(params, x, key=key))

@@ -1,21 +1,27 @@
 """The two U-shaped token transformers: UViT, whose blocks take the time and
 the text as tokens, and the U-DiT, whose blocks are adaLN-Zero modulated."""
 
+from functools import partial
+from typing import Callable, Literal
+
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from typing import Callable, Optional, Literal
 from flax.typing import Dtype, PrecisionLike
-from functools import partial
+
+from dew.registry import models
 
 from ..attention import TransformerBlock, rotary_freqs
 from ..blocks import FourierEmbedding, TimeProjection
-from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
 from ..dit import (
-    ROPE_THETA, ConditioningEmbed, PatchEmbedding, PatchSequenceOutput, ModulatedBlock,
+    ROPE_THETA,
+    ConditioningEmbed,
+    ModulatedBlock,
+    PatchEmbedding,
+    PatchSequenceOutput,
     remat_block,
 )
-from dew.registry import models
+from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
 from ..sharding import logical_axes
 
 
@@ -39,9 +45,9 @@ class UViT(nn.Module):
     use_projection: bool = False
     use_self_and_cross: bool = False
     force_fp32_for_softmax: bool = True
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     activation: Callable = jax.nn.swish
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     add_residualblock_output: bool = False
     norm_inputs: bool = False
@@ -207,10 +213,10 @@ class SimpleUDiT(nn.Module):
     num_heads: int = 12
     mlp_ratio: int = 4
     dropout_rate: float = 0.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     remat: bool = False
     norm_epsilon: float = 1e-5
     scan_order: Literal["raster", "hilbert"] = "raster"

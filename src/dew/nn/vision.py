@@ -30,7 +30,7 @@ vision embedder defined here.
 
 import dataclasses
 import functools
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -39,8 +39,9 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
-from dew.nn.text_encoders import CLIPAttention, MLP, checkpoint_array, checkpoint_leaf
+from dew.nn.text_encoders import MLP, CLIPAttention, checkpoint_array, checkpoint_leaf
 from dew.registry import from_record, projectors, towers
+
 from .mobilenet import MobileNetV5Encoder
 
 PIXEL_VALUES_KEY = "pixel_values"
@@ -135,7 +136,7 @@ class SiglipEncoderLayer(nn.Module):
     intermediate_size: int
     hidden_act: str = "gelu_pytorch_tanh"
     layer_norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -177,7 +178,7 @@ class SiglipVisionTransformer(nn.Module):
     num_channels: int = 3
     hidden_act: str = "gelu_pytorch_tanh"
     layer_norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -267,7 +268,7 @@ class GemmaProjectorModule(nn.Module):
     patches_per_side: int
     tokens_per_side: int
     norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -314,7 +315,7 @@ class GemmaProjector(ProjectorBase):
             tokens_per_side=self.tokens_per_side, norm_eps=self.norm_eps)
 
 
-def _llama4_vision_tables(grid: int, head_dim: int, theta: float) -> Tuple[jax.Array, jax.Array]:
+def _llama4_vision_tables(grid: int, head_dim: int, theta: float) -> tuple[jax.Array, jax.Array]:
     """The complex rotary tables of the Llama 4 vision attention, as cos/sin.
 
     Positions are the patch grid in row-major order with the class token last
@@ -344,7 +345,7 @@ class Llama4VisionAttention(nn.Module):
     num_heads: int
     grid: int
     rope_theta: float = 10000.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -379,7 +380,7 @@ class Llama4VisionEncoderLayer(nn.Module):
     grid: int
     rope_theta: float = 10000.0
     layer_norm_eps: float = 1e-5
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -430,7 +431,7 @@ class Llama4VisionAdapterMLP(nn.Module):
 
     input_dim: int
     output_dim: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -468,7 +469,7 @@ class Llama4VisionTransformer(nn.Module):
     pixel_shuffle_ratio: float = 0.5
     projector_input_dim: int = 4096
     projector_output_dim: int = 4096
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -537,7 +538,7 @@ class Llama4VisionAdapter(nn.Module):
     intermediate_size: int
     input_dim: int
     output_dim: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -582,7 +583,7 @@ class Llama4ProjectorModule(nn.Module):
     """Tower output to text width: one bias-free map."""
 
     text_width: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -606,7 +607,7 @@ class Llama4Projector(ProjectorBase):
         return Llama4ProjectorModule(text_width=self.text_width)
 
 def _gemma4_rope_tables(positions: jax.Array, head_dim: int,
-                        theta: float) -> Tuple[jax.Array, jax.Array]:
+                        theta: float) -> tuple[jax.Array, jax.Array]:
     """The 2D rotary tables of the Gemma 4 vision attention, as cos/sin.
 
     Each spatial dim carries its own frequencies over half the head
@@ -680,7 +681,7 @@ class Gemma4VisionAttention(nn.Module):
     num_key_value_heads: int
     rope_theta: float = 100.0
     rms_norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_clipped_linears: bool = False
 
@@ -730,7 +731,7 @@ class Gemma4VisionMLP(nn.Module):
     hidden_size: int
     intermediate_size: int
     hidden_act: str = "gelu_pytorch_tanh"
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_clipped_linears: bool = False
 
@@ -769,7 +770,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
     hidden_act: str = "gelu_pytorch_tanh"
     rms_norm_eps: float = 1e-6
     rope_theta: float = 100.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     use_clipped_linears: bool = False
 
@@ -818,7 +819,7 @@ class Gemma4VisionTransformer(nn.Module):
     hidden_act: str = "gelu_pytorch_tanh"
     rms_norm_eps: float = 1e-6
     rope_theta: float = 100.0
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     standardize: bool = False
     use_clipped_linears: bool = False
@@ -942,7 +943,7 @@ class Gemma4ProjectorModule(nn.Module):
 
     text_width: int
     norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -968,7 +969,7 @@ class Gemma4Projector(ProjectorBase):
     def build(self) -> nn.Module:
         return Gemma4ProjectorModule(text_width=self.text_width, norm_eps=self.norm_eps)
 
-def _qwen35_interp_taps(index: jax.Array, size: int | jax.Array, side: int) -> Tuple[jax.Array, jax.Array]:
+def _qwen35_interp_taps(index: jax.Array, size: int | jax.Array, side: int) -> tuple[jax.Array, jax.Array]:
     """Bilinear taps into a `side`-long table for positions along one axis.
 
     The closed form of the align-corners linspace the reference resamples
@@ -999,7 +1000,7 @@ def _qwen35_pos_embeds(table: jax.Array, rows: jax.Array, cols: jax.Array,
     return (table[indices] * weights[..., None]).sum(axis=-2)
 
 
-def _qwen35_rope_tables(positions: jax.Array, head_dim: int) -> Tuple[jax.Array, jax.Array]:
+def _qwen35_rope_tables(positions: jax.Array, head_dim: int) -> tuple[jax.Array, jax.Array]:
     """The 2D rotary tables of the Qwen 3.5 vision attention, as cos/sin.
 
     Heights then widths share one frequency table over half the head
@@ -1032,7 +1033,7 @@ class Qwen35VisionAttention(nn.Module):
 
     hidden_size: int
     num_heads: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -1060,7 +1061,7 @@ class Qwen35VisionBlock(nn.Module):
     intermediate_size: int
     num_heads: int
     hidden_act: str = "gelu_pytorch_tanh"
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -1100,7 +1101,7 @@ class Qwen35VisionTransformer(nn.Module):
     temporal_patch_size: int = 2
     out_hidden_size: int = 3584
     num_position_embeddings: int = 2304
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -1204,7 +1205,7 @@ class Qwen35ProjectorModule(nn.Module):
     hidden_size: int
     spatial_merge_size: int
     out_hidden_size: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -1272,8 +1273,8 @@ def merge_soft_tokens(token_embeds: jax.typing.ArrayLike, soft_tokens: jax.typin
 
 
 
-def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> Dict[str, Any]:
-    params: Dict[str, Any] = {}
+def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> dict[str, Any]:
+    params: dict[str, Any] = {}
     for name, tensor in hf_tensors.items():
         path = path_of(name)
         if path is None:
@@ -1297,7 +1298,7 @@ _SIGLIP_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "out_proj")
 _SIGLIP_NORMS = ("layer_norm1", "layer_norm2")
 
 
-def _siglip_layer_path(parts) -> Optional[Tuple[str, ...]]:
+def _siglip_layer_path(parts) -> tuple[str, ...] | None:
     """`encoder.layers.N...` into the layer's path."""
     if len(parts) < 5 or parts[:2] != ["encoder", "layers"] or not parts[2].isdigit():
         return None
@@ -1313,7 +1314,7 @@ def _siglip_layer_path(parts) -> Optional[Tuple[str, ...]]:
     return None
 
 
-def siglip_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
+def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """One SigLIP vision tensor name into its path in a trunk tree.
 
     position_ids is an arange buffer, not a parameter. The attention pooling
@@ -1334,7 +1335,7 @@ def siglip_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
 
 def translate_siglip_vision_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """SigLIP vision parameters at the requested storage precision."""
     return _translate(hf_tensors, siglip_vision_path, param_dtype)
 
@@ -1356,7 +1357,7 @@ _LLAMA4_VISION_LAYERS = {
 }
 
 
-def _llama4_vision_layer_path(parts) -> Optional[Tuple[str, ...]]:
+def _llama4_vision_layer_path(parts) -> tuple[str, ...] | None:
     """`model.layers.N...` into the layer's path."""
     if len(parts) < 5 or parts[:2] != ["model", "layers"] or not parts[2].isdigit():
         return None
@@ -1378,7 +1379,7 @@ def _llama4_vision_layer_path(parts) -> Optional[Tuple[str, ...]]:
     return None
 
 
-def llama4_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
+def llama4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """One Llama 4 vision tensor name into its path in a trunk tree."""
     path = _LLAMA4_VISION_TENSORS.get(hf_name) or _llama4_vision_layer_path(
         hf_name.split("."))
@@ -1389,7 +1390,7 @@ def llama4_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
 
 def translate_llama4_vision_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Llama 4 vision parameters at the requested storage precision."""
     return _translate(hf_tensors, llama4_vision_path, param_dtype)
 
@@ -1427,7 +1428,7 @@ def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
 
 def translate_gemma_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """A Gemma projector's two tensors into its parameter tree.
 
     The norm's weight becomes its scale; the projection matrix is a plain
@@ -1444,7 +1445,7 @@ def translate_gemma_projector_weights(
 
 def translate_llama4_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Llama 4's outer projector map at the requested storage precision."""
     return _translate(hf_tensors, lambda name: projector_weight_path("llama4", name), param_dtype)
 
@@ -1461,7 +1462,7 @@ def _image_size(value: object, field: str) -> int:
     return value
 
 
-def translate_siglip_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, object]:
+def translate_siglip_vision_config(hf_config: Mapping[str, Any]) -> dict[str, object]:
     """A SiglipVisionConfig into a SiglipVision value's fields.
 
     Reads the vision_config of a multimodal wrapper or a bare vision config.
@@ -1503,7 +1504,7 @@ def translate_siglip_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, ob
     }
 
 
-def translate_llama4_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, object]:
+def translate_llama4_vision_config(hf_config: Mapping[str, Any]) -> dict[str, object]:
     """A Llama4VisionConfig into a Llama4Vision value's fields.
 
     Reads the vision_config of a wrapper or a bare vision config. The feature
@@ -1556,7 +1557,7 @@ def translate_llama4_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, ob
 
 
 def translate_gemma_projector_config(vision: Mapping[str, Any], text_width: int,
-                                     mm_tokens_per_image: object) -> Dict[str, object]:
+                                     mm_tokens_per_image: object) -> dict[str, object]:
     """A Gemma wrapper's projector fields: trunk width, decoder width, grids."""
     if isinstance(mm_tokens_per_image, bool) or not isinstance(mm_tokens_per_image, int):
         raise ValueError(
@@ -1582,7 +1583,7 @@ def translate_gemma_projector_config(vision: Mapping[str, Any], text_width: int,
 
 
 def translate_llama4_projector_config(vision: Mapping[str, Any],
-                                      text_width: int) -> Dict[str, object]:
+                                      text_width: int) -> dict[str, object]:
     """A Llama 4 wrapper's projector fields: tower output width, text width."""
     return {
         "kind": "llama4",
@@ -1602,7 +1603,7 @@ _GEMMA4_VISION_NORMS = ("input_layernorm", "post_attention_layernorm",
                         "pre_feedforward_layernorm", "post_feedforward_layernorm")
 
 
-def _gemma4_vision_layer_path(parts) -> Optional[Tuple[str, ...]]:
+def _gemma4_vision_layer_path(parts) -> tuple[str, ...] | None:
     """`encoder.layers.N...` into the layer's path."""
     if len(parts) < 5 or parts[:2] != ["encoder", "layers"] or not parts[2].isdigit():
         return None
@@ -1625,7 +1626,7 @@ def _gemma4_vision_layer_path(parts) -> Optional[Tuple[str, ...]]:
             return (layer, "self_attn", parts[4], "scale")
     return None
 
-def gemma4_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
+def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """One Gemma 4 vision tensor name into its collection and trunk path.
 
     The rotary tables are buffers the checkpoint leaves out, recomputed from
@@ -1641,14 +1642,14 @@ def gemma4_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
 
 def translate_gemma4_vision_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Gemma 4 parameters plus native FP32 frozen and clipping buffers."""
     return _translate(hf_tensors, gemma4_vision_path, param_dtype)
 
 
 def translate_gemma4_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """A Gemma 4 embedder's map into its parameter tree.
 
     The pre-projection norm carries no scale, so the projection weight is
@@ -1674,7 +1675,7 @@ def _gemma4_rope_theta(vision: Mapping[str, Any]) -> float:
     return float(theta)
 
 
-def translate_gemma4_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, object]:
+def translate_gemma4_vision_config(hf_config: Mapping[str, Any]) -> dict[str, object]:
     """A Gemma4VisionConfig into a Gemma4Vision value's fields.
 
     Reads the vision_config of a wrapper or a bare vision config. The head
@@ -1725,7 +1726,7 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, ob
 
 
 def translate_gemma4_projector_config(vision: Mapping[str, Any],
-                                      text_width: int) -> Dict[str, object]:
+                                      text_width: int) -> dict[str, object]:
     """A Gemma 4 wrapper's projector fields: tower width, decoder width."""
     return {
         "kind": "gemma4",
@@ -1742,7 +1743,7 @@ _QWEN35_VISION_BLOCK_NORMS = ("norm1", "norm2")
 _QWEN35_VISION_MLP = ("linear_fc1", "linear_fc2")
 
 
-def _qwen35_vision_block_path(parts) -> Optional[Tuple[str, ...]]:
+def _qwen35_vision_block_path(parts) -> tuple[str, ...] | None:
     """`blocks.N...` into the block's path."""
     if len(parts) < 4 or parts[0] != "blocks" or not parts[1].isdigit():
         return None
@@ -1760,7 +1761,7 @@ def _qwen35_vision_block_path(parts) -> Optional[Tuple[str, ...]]:
     return None
 
 
-def qwen35_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
+def qwen35_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """One Qwen 3.5 vision tensor name into its path in a trunk tree.
 
     The merger lives under its own prefix and maps with the projector; the
@@ -1782,7 +1783,7 @@ def qwen35_vision_path(hf_name: str) -> Optional[Tuple[str, ...]]:
 
 def translate_qwen35_vision_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Qwen 3.5 vision tensors into a trunk parameter tree.
 
     The patch convolution carries [out, in, time, h, w] and lands as one map;
@@ -1802,7 +1803,7 @@ def translate_qwen35_vision_weights(
 
 def translate_qwen35_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """A Qwen 3.5 merger's tensors at the requested storage precision."""
     return _translate(hf_tensors, lambda name: projector_weight_path("qwen3_5", name), param_dtype)
 
@@ -1816,7 +1817,7 @@ def _qwen35_patch_field(vision: Mapping[str, Any], field: str) -> int:
     return value
 
 
-def translate_qwen35_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, object]:
+def translate_qwen35_vision_config(hf_config: Mapping[str, Any]) -> dict[str, object]:
     """A Qwen3_5VisionConfig into a Qwen35Vision value's fields.
 
     Reads the vision_config of a wrapper or a bare vision config. The
@@ -1857,7 +1858,7 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, Any]) -> Dict[str, ob
 
 
 def translate_qwen35_projector_config(vision: Mapping[str, Any],
-                                      text_width: int) -> Dict[str, object]:
+                                      text_width: int) -> dict[str, object]:
     """A Qwen 3.5 wrapper's projector fields: trunk width, merge, output.
 
     The merged features enter the text embeddings directly, so a merger width
@@ -1908,7 +1909,7 @@ class Gemma3nProjectorModule(nn.Module):
     vocab_size: int = 128
     vocab_offset: int = 262144
     norm_eps: float = 1e-6
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
@@ -1978,7 +1979,7 @@ class Gemma3nProjector(ProjectorBase):
         return Gemma3nProjectorModule(**dataclasses.asdict(self))
 
 
-def gemma3n_vision_path(hf_name: str) -> Tuple[str, ...]:
+def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
     """A timm MobileNet-v5 weight into the corresponding Linen module."""
     from .mobilenet import _ARCHITECTURE
 

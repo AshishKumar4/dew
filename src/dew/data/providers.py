@@ -31,20 +31,37 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Optional, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
 
 import grain.python as pygrain
 import jax
 import numpy as np
 
-from .dataset import (Batch, Corpus, Dataset, Loading, local_batch, mixed_records,
-                      mixed_stream, mixture, train_stream, validation_pass)
+from .dataset import (
+    Batch,
+    Corpus,
+    Dataset,
+    Loading,
+    local_batch,
+    mixed_records,
+    mixed_stream,
+    mixture,
+    train_stream,
+    validation_pass,
+)
 from .sources.hf import HFOptions
 from .tokens import bounded
 
 if TYPE_CHECKING:
-    from datasets import (Dataset as ArrowDataset, DownloadConfig, DownloadMode, Features,
-                          IterableDataset, VerificationMode, Version)
+    from datasets import (
+        Dataset as ArrowDataset,
+        DownloadConfig,
+        DownloadMode,
+        Features,
+        IterableDataset,
+        VerificationMode,
+        Version,
+    )
     from tensorflow_datasets import DecoderTree
 
 PROVIDERS = ("tfds", "hf")
@@ -88,7 +105,7 @@ def provider_of(source: str) -> tuple[str, str]:
     return provider, name
 
 
-def counted(source: object, given: Optional[int], name: str) -> int:
+def counted(source: object, given: int | None, name: str) -> int:
     """The records the run reports over `source`.
 
     `records` is for a source that cannot count itself. One that can is not
@@ -120,28 +137,28 @@ def _unwanted(provider: str, given: Mapping[str, object]) -> None:
 
 
 def load(source: str | Mapping[str, float], *, batch: int, split: str = "train",
-         val_split: Optional[str] = None,
-         val_batches: Optional[int] = None, records: Optional[int] = None,
-         preprocess: Optional[Preprocess] = None, seed: int = 0,
+         val_split: str | None = None,
+         val_batches: int | None = None, records: int | None = None,
+         preprocess: Preprocess | None = None, seed: int = 0,
          shuffle_buffer: int = 0, loading: Loading = Loading(),
          # which configuration of the dataset, for either provider
-         config: Optional[str] = None,
+         config: str | None = None,
          # what the tfds provider reads
-         path: Optional[str] = None, version: Optional[str] = None,
-         decoders: Optional["DecoderTree"] = None,
+         path: str | None = None, version: str | None = None,
+         decoders: DecoderTree | None = None,
          # what the hf provider reads
          streaming: bool = False,
-         dataset: Optional["ArrowDataset | IterableDataset"] = None,
-         data_dir: Optional[str] = None,
-         data_files: Optional[str | Sequence[str] | Mapping[str, str | Sequence[str]]] = None,
-         cache_dir: Optional[str] = None, features: Optional["Features"] = None,
-         download_config: Optional["DownloadConfig"] = None,
-         download_mode: Optional["DownloadMode | str"] = None,
-         verification_mode: Optional["VerificationMode | str"] = None,
-         keep_in_memory: Optional[bool] = None, save_infos: bool = False,
-         revision: Optional["str | Version"] = None,
-         token: Optional[str | bool] = None, num_proc: Optional[int] = None,
-         storage_options: Optional[Mapping[str, object]] = None) -> Dataset:
+         dataset: ArrowDataset | IterableDataset | None = None,
+         data_dir: str | None = None,
+         data_files: str | Sequence[str] | Mapping[str, str | Sequence[str]] | None = None,
+         cache_dir: str | None = None, features: Features | None = None,
+         download_config: DownloadConfig | None = None,
+         download_mode: DownloadMode | str | None = None,
+         verification_mode: VerificationMode | str | None = None,
+         keep_in_memory: bool | None = None, save_infos: bool = False,
+         revision: str | Version | None = None,
+         token: str | bool | None = None, num_proc: int | None = None,
+         storage_options: Mapping[str, object] | None = None) -> Dataset:
     """The `Dataset` behind `source`, read where the provider already holds it.
 
     `source` is `"tfds/<builder>"` or `"hf/<name>"`, or several of them with
@@ -268,8 +285,8 @@ are bound, the name and the split are not, because a mixture reads several
 names through the same options."""
 
 
-def _tfds(*, path: Optional[str], config: Optional[str],
-          version: Optional[str], decoders: Optional["DecoderTree"]) -> Reader:
+def _tfds(*, path: str | None, config: str | None,
+          version: str | None, decoders: DecoderTree | None) -> Reader:
     """A reader of prepared splits."""
     from .sources.tfds import prepared_source
 
@@ -283,7 +300,7 @@ def _tfds(*, path: Optional[str], config: Optional[str],
 
 
 def _arrow(*, options: HFOptions,
-           dataset: Optional["ArrowDataset | IterableDataset"]) -> Reader:
+           dataset: ArrowDataset | IterableDataset | None) -> Reader:
     """A reader of Arrow-backed splits, through grain's random access."""
     from .sources.hf import HFDatasetSource
 
@@ -292,10 +309,10 @@ def _arrow(*, options: HFOptions,
     return lambda name, split: HFDatasetSource(split=split, dataset=dataset)
 
 
-def _streamed(name: str, split: str, val_split: Optional[str], *, options: HFOptions,
-              dataset: Optional["ArrowDataset | IterableDataset"], batch: int, rows: int,
-              seed: int, shuffle_buffer: int, loading: Loading, records: Optional[int],
-              val_batches: Optional[int], preprocess: Optional[Preprocess]) -> Dataset:
+def _streamed(name: str, split: str, val_split: str | None, *, options: HFOptions,
+              dataset: ArrowDataset | IterableDataset | None, batch: int, rows: int,
+              seed: int, shuffle_buffer: int, loading: Loading, records: int | None,
+              val_batches: int | None, preprocess: Preprocess | None) -> Dataset:
     """The streamed split's `Dataset`: endless training, one ordered pass for val."""
     if records is not None and records < 1:
         raise ValueError("records over a stream is a positive count or None")
@@ -315,9 +332,9 @@ def _streamed(name: str, split: str, val_split: Optional[str], *, options: HFOpt
 
 
 def _stream(name: str, split: str, *, options: HFOptions,
-            dataset: Optional["ArrowDataset | IterableDataset"], batch: int, seed: int,
-            shuffle_buffer: int, loading: Loading, epochs: Optional[int],
-            preprocess: Optional[Preprocess]) -> Callable[[], Iterator[Batch]]:
+            dataset: ArrowDataset | IterableDataset | None, batch: int, seed: int,
+            shuffle_buffer: int, loading: Loading, epochs: int | None,
+            preprocess: Preprocess | None) -> Callable[[], Iterator[Batch]]:
     """A factory over one process's share of a streamed split.
 
     The rows are grain's from the first stage on: the per-record transform is
@@ -338,7 +355,7 @@ def _stream(name: str, split: str, *, options: HFOptions,
     own = None if dataset is None else copy.deepcopy(
         _iterable(dataset, "the dataset load() was given"))
 
-    def open_split() -> "IterableDataset":
+    def open_split() -> IterableDataset:
         if own is None:
             return _iterable(options.load(name, split, streaming=True), f"{name}/{split}")
         return own
@@ -362,7 +379,7 @@ def _stream(name: str, split: str, *, options: HFOptions,
     return stream
 
 
-def _iterable(rows: object, what: str) -> "IterableDataset":
+def _iterable(rows: object, what: str) -> IterableDataset:
     """`rows` as a streamed split, or the refusal that it is not one."""
     import datasets
 

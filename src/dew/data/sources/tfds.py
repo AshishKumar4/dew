@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from etils import epath
 
@@ -48,8 +48,8 @@ def _newest(directory: epath.Path, what: str) -> epath.Path:
     return versions[-1][1]
 
 
-def prepared(path: str, *, builder: Optional[str] = None, config: Optional[str] = None,
-             version: Optional[str] = None) -> epath.Path:
+def prepared(path: str, *, builder: str | None = None, config: str | None = None,
+             version: str | None = None) -> epath.Path:
     """The version directory holding `builder`'s prepared shards.
 
     `path` is either that directory, when it holds the metadata, or the
@@ -99,8 +99,8 @@ def prepared(path: str, *, builder: Optional[str] = None, config: Optional[str] 
     return directory
 
 
-def read_only_builder(directory: epath.Path, *, builder: Optional[str],
-                      config: Optional[str], version: Optional[str]):
+def read_only_builder(directory: epath.Path, *, builder: str | None,
+                      config: str | None, version: str | None):
     """The read-only builder over `directory`, checked against what was asked for.
 
     The import is here rather than at module level so `import dew.data` costs
@@ -165,9 +165,9 @@ def shards(builder, split: str, directory: epath.Path) -> None:
                     f"Copy the complete prepared dataset or prepare it again.")
 
 
-def prepared_source(path: str, split: str, *, builder: Optional[str] = None,
-                    config: Optional[str] = None, version: Optional[str] = None,
-                    decoders: Optional["DecoderTree"] = None) -> Sequence[object]:
+def prepared_source(path: str, split: str, *, builder: str | None = None,
+                    config: str | None = None, version: str | None = None,
+                    decoders: DecoderTree | None = None) -> Sequence[object]:
     """Random access over one split of a prepared TFDS dataset.
 
     The builder's own `as_data_source` is already grain's protocol, so what

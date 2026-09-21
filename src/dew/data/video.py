@@ -21,8 +21,17 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .dataset import (CAPTION, Dataset, DatasetSpec, Loading, hold_out, local_batch, tokenized,
-                      train_stream, validation_pass)
+from .dataset import (
+    CAPTION,
+    Dataset,
+    DatasetSpec,
+    Loading,
+    hold_out,
+    local_batch,
+    tokenized,
+    train_stream,
+    validation_pass,
+)
 from .processors import AutoAudioProcessor
 
 
@@ -40,7 +49,7 @@ def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
 class AudioVideoTransform(pygrain.RandomMapTransform):
     """One clip per record, with its frames, their audio, and the record's caption."""
 
-    def __init__(self, spec: "VideoDataset"):
+    def __init__(self, spec: VideoDataset):
         self.spec = spec
         self.audio = AutoAudioProcessor(tensor_type="np", modelname=spec.audio_model)
 

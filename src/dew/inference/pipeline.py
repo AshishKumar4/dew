@@ -24,10 +24,10 @@ from etils import epath
 from dew.checkpoints import RUN_FILE
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import ModelInputs, pad_token_rows
-from dew.sampling.pipelines import TextToImage, restore_variables
 from dew.objectives.base import Variables
-from dew.sampling.text import Sampling
 from dew.registry import dtype_name, resolve_dtype
+from dew.sampling.pipelines import TextToImage, restore_variables
+from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
     from dew.training.distributed import Layout, MeshSpec
@@ -64,12 +64,12 @@ def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool,
               step: int | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+    import dew.objectives.lm  # registers the saved objective kinds
+    import dew.objectives.rl  # noqa: F401 registers the saved objective kinds
     from dew.config import ModelConfig
     from dew.data import tokenizer_for
-    from dew.registry import objectives
-    import dew.objectives.lm  # noqa: F401 registers the saved objective kinds
-    import dew.objectives.rl  # noqa: F401 registers the saved objective kinds
     from dew.objectives.base import thaw
+    from dew.registry import objectives
 
     record = json.loads((root / RUN_FILE).read_text())
     if not isinstance(record, dict) or not isinstance(record.get("objective"), str):

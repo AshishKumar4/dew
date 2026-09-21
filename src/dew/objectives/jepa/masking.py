@@ -21,13 +21,12 @@ them in a meaningful order.
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
 
 import jax
 import jax.numpy as jnp
 
 
-def _factorizations(area: int, grid: Tuple[int, int], aspect: Tuple[float, float]):
+def _factorizations(area: int, grid: tuple[int, int], aspect: tuple[float, float]):
     """(h, w) pairs of the given area that fit the grid and the aspect range."""
     H_P, W_P = grid
     pairs = []
@@ -43,9 +42,9 @@ def _factorizations(area: int, grid: Tuple[int, int], aspect: Tuple[float, float
 @dataclass(frozen=True)
 class MultiBlockMask:
     """Static mask geometry for one patch grid, plus the sampler over it."""
-    grid: Tuple[int, int]
+    grid: tuple[int, int]
     num_targets: int
-    block_shapes: Tuple[Tuple[int, int], ...]
+    block_shapes: tuple[tuple[int, int], ...]
     num_context: int
 
     @property
@@ -86,10 +85,10 @@ class MultiBlockMask:
 
 
 def multi_block_mask(
-    grid: Tuple[int, int],
+    grid: tuple[int, int],
     num_targets: int = 4,
-    scale: Tuple[float, float] = (0.15, 0.2),
-    aspect: Tuple[float, float] = (0.75, 1.5),
+    scale: tuple[float, float] = (0.15, 0.2),
+    aspect: tuple[float, float] = (0.75, 1.5),
 ) -> MultiBlockMask:
     """Resolve the I-JEPA mask geometry for a patch grid."""
     S = grid[0] * grid[1]

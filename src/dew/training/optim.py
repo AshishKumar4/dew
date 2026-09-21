@@ -296,7 +296,7 @@ OPTIMIZER_MAP = {
 }
 
 
-def build_optimizer(config: "OptimConfig", steps: int) -> optax.GradientTransformation:
+def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransformation:
     """The solver, with its schedule and clipping; `steps` is the run's length,
     which a cosine schedule decays over unless the config names its own."""
     learning_rate = config.learning_rate

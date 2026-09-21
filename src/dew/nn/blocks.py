@@ -1,7 +1,7 @@
 """The convolutional and embedding pieces the UNets and the DiT sandwich share."""
 
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -63,7 +63,7 @@ class Upsample(nn.Module):
     """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`."""
     features: int
     scale: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -77,7 +77,7 @@ class Upsample(nn.Module):
 class Downsample(nn.Module):
     """A stride-2 3x3 convolution to `features`."""
     features: int
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
@@ -96,7 +96,7 @@ class ResidualBlock(nn.Module):
     kernel_size: tuple = (3, 3)
     activation: Callable = jax.nn.swish
     norm_groups: int = 8
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-4
     dropout: float = 0.0

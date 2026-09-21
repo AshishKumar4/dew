@@ -13,7 +13,6 @@ weight, which `dew.nn.moe.ExpertMLP` does under `scale_inputs`.
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +20,10 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import (
-    RopeScaling, causal_attention_mask, open_kv_cache, rotary_freqs,
+    RopeScaling,
+    causal_attention_mask,
+    open_kv_cache,
+    rotary_freqs,
     scaled_dot_product_attention,
 )
 from dew.nn.inputs import AttentionMetadata
@@ -83,18 +85,18 @@ class Llama4Attention(nn.Module):
     max_seq_len: int
     causal: bool = True
     rope_theta: float = 500000.0
-    rope_scaling: Optional[RopeScaling] = None
+    rope_scaling: RopeScaling | None = None
     use_rope: bool = True
     use_qk_norm: bool = True
-    attention_chunk_size: Optional[int] = None
+    attention_chunk_size: int | None = None
     attn_temperature_tuning: bool = True
     floor_scale: float = 8192.0
     attn_scale: float = 0.1
     norm_eps: float = 1e-5
     attention_bias: bool = False
-    dtype: Optional[Dtype] = None
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: Optional[str] = None
+    attention_impl: str | None = None
     force_fp32_for_softmax: bool = True
 
     def setup(self):
@@ -201,7 +203,7 @@ class Llama4Mixer(MixerBase):
 
     use_rope: bool = True
     use_qk_norm: bool = True
-    attention_chunk_size: Optional[int] = None
+    attention_chunk_size: int | None = None
     attn_temperature_tuning: bool = True
     floor_scale: float = 8192.0
     attn_scale: float = 0.1

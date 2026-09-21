@@ -10,22 +10,30 @@ from __future__ import annotations
 
 import functools
 import math
-from dataclasses import dataclass, replace
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import Generic, overload
 
-from flax import struct
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import struct
 from jax.experimental import multihost_utils
 
 from dew.artifacts import agree_process_phase
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import (
-    ArrayT, ModelInputs, RowPlan, agreed_validity, continuation_keys, generation_signature,
-    local_rows, mesh_of, prompt_major, request_key,
+    ArrayT,
+    ModelInputs,
+    RowPlan,
+    agreed_validity,
+    continuation_keys,
+    generation_signature,
+    local_rows,
+    mesh_of,
+    prompt_major,
+    request_key,
 )
 from dew.objectives.base import Variables
 
@@ -373,7 +381,7 @@ def _generate(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
     return prompt_major(jax.lax.map(continued, continuation_keys(key, n)))
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None):
     return jax.jit(_generate, static_argnames=("model", "plan", "n"),
                    in_shardings=(None, rows, None), out_shardings=rows)

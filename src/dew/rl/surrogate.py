@@ -33,7 +33,6 @@ Everything here is array math on `[B, T]` arrays. A policy forward, a
 reference forward and a reward all happen outside.
 """
 
-from typing import Dict, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -108,7 +107,7 @@ def sequence_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array,
 
 def clipped_surrogate_terms(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Array,
                             epsilon_low: float = 0.2, epsilon_high: float = 0.2,
-                            dual_clip: float = 3.0) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+                            dual_clip: float = 3.0) -> tuple[jax.Array, dict[str, jax.Array]]:
     """PPO policy terms before normalization, with the dual clip.
 
     `max(-A r, -A clip(r, 1 - eps_low, 1 + eps_high))` per token, and for a
@@ -154,7 +153,7 @@ def clipped_surrogate_terms(log_ratio: jax.Array, advantages: jax.Array, mask: j
 
 def clipped_surrogate(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Array,
                       epsilon_low: float = 0.2, epsilon_high: float = 0.2,
-                      dual_clip: float = 3.0) -> Tuple[jax.Array, Dict[str, jax.Array]]:
+                      dual_clip: float = 3.0) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Token-mean reduction of the dual-clipped policy terms."""
     terms, aux = clipped_surrogate_terms(
         log_ratio, advantages, mask, epsilon_low, epsilon_high, dual_clip)

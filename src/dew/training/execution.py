@@ -14,8 +14,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.inference.banks import (bank_sites, entry_tree, in_namespace, narrowed,
-                                 one_layer)
+from dew.inference.banks import bank_sites, entry_tree, in_namespace, narrowed, one_layer
 from dew.objectives.base import Step, thaw
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
