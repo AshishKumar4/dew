@@ -1997,6 +1997,18 @@ class CausalTransformer(nn.Module):
         x, prediction = self.hidden_and_mtp_inputs(tokens, **kwargs)
         return prediction, self._logits(x)
 
+    def states_and_logits_at(self, tokens, slots, **kwargs):
+        """The prediction input states, and the logits of one slot per row.
+
+        A prefill scores the position the first draw reads, `slots`, and no
+        other: the head over every prompt position is the largest array the
+        forward allocates, [rows, width, vocab], and a decoder keeps one row
+        of it. Gathering the state before the head leaves the head [rows,
+        features] of work.
+        """
+        x, prediction = self.hidden_and_mtp_inputs(tokens, **kwargs)
+        return prediction, self._logits(x[jnp.arange(x.shape[0]), slots])
+
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
         # fp32 head, as in the DiT output projection: the loss is computed in fp32

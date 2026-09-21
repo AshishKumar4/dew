@@ -446,3 +446,24 @@ def test_a_criterion_the_budget_never_reaches_leaves_the_row_unterminated(roomy)
     drawn = roomy(ramp(40), 100, seed=3, stopping=stop_at_110)
     np.testing.assert_array_equal(drawn.lengths, [100])
     np.testing.assert_array_equal(drawn.terminated, [False])
+
+
+def test_prefill_scores_the_sampled_position_and_no_other(roomy, monkeypatch):
+    """The head runs on the gathered state, not on every prompt position, and
+    the two give the same numbers: the row of the full head the decoder would
+    have kept, bit for bit, the prediction states untouched, and the same
+    greedy continuation as the path that scores every position."""
+    prompt = np.concatenate([ramp(6), ramp(6) + 1], axis=0)
+    slots = jnp.asarray([3, 5], jnp.int32)
+    states, picked = roomy.model.apply(roomy.variables, jnp.asarray(prompt), slots,
+                                       method="states_and_logits_at")
+    whole_states, every = roomy.model.apply(roomy.variables, jnp.asarray(prompt),
+                                            method="states_and_logits")
+    assert picked.shape == (2, roomy.model.vocab_size) and every.shape[:2] == prompt.shape
+    np.testing.assert_array_equal(picked, every[jnp.arange(2), slots])
+    np.testing.assert_array_equal(states, whole_states)
+    gathered = roomy(prompt, 8, seed=0)
+    monkeypatch.setattr(text, "_scores_one_slot", lambda model: False)
+    scored_everywhere = roomy(prompt, 8, seed=0)
+    np.testing.assert_array_equal(gathered.tokens, scored_everywhere.tokens)
+    np.testing.assert_array_equal(gathered.raw_log_probs, scored_everywhere.raw_log_probs)
