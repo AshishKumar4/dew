@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Callable, Literal, Mapping
+from typing import Literal, Mapping, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -76,6 +76,7 @@ from dew.sampling.solvers import (
     Solver,
     UniPC,
 )
+from dew.telemetry.records import JSON
 
 Kind = Literal[
     "DDIM", "PNDM", "DDPM", "LMSDiscrete", "EulerDiscrete", "EulerAncestralDiscrete",
@@ -103,6 +104,28 @@ _TRANSFORM_CONTROLS: tuple[tuple[Transform, str], ...] = (
     ("beta", "use_beta_sigmas"))
 
 
+class Control(Protocol):
+    """One class's reading of a control by name: the value the file states,
+    the class's own declared default when the file omits it, and `absent` when
+    this class declares no such control at all."""
+
+    def __call__(self, key: str, absent: JSON = None) -> JSON: ...
+
+
+def _json(value: object, name: str) -> JSON:
+    """One control as the scheduler file carries it.
+
+    A `scheduler_config.json` is read with `json.loads`, so a control is a
+    scalar or a list of them; `interop.pretrained` narrows a generation config
+    the same way.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json(entry, name) for entry in value]
+    raise ValueError(f"{name}={value!r} is not a value a scheduler file carries")
+
+
 def _number(value: object, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
         raise ValueError(f"{name} must be a finite number")
@@ -110,18 +133,20 @@ def _number(value: object, name: str) -> float:
 
 
 def _integer(value: object, name: str) -> int:
-    if type(value) is not int:
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
     return value
 
 
 def _boolean(value: object, name: str) -> bool:
-    if type(value) is not bool:
+    if not isinstance(value, bool):
         raise ValueError(f"{name} must be boolean")
     return value
 
 
 def _choice[ChoiceT: str](value: object, name: str, allowed: tuple[ChoiceT, ...]) -> ChoiceT:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must name one of {', '.join(allowed)}, not {value!r}")
     for choice in allowed:
         if value == choice:
             return choice
@@ -129,8 +154,9 @@ def _choice[ChoiceT: str](value: object, name: str, allowed: tuple[ChoiceT, ...]
                      f"this class supports {', '.join(allowed)}")
 
 
-def published_betas(*, count: object, start: object, end: object, schedule: object,
-                    trained: object, zero_snr: bool, schedules: tuple[str, ...]) -> np.ndarray:
+def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
+                    trained: JSON | np.ndarray, zero_snr: bool,
+                    schedules: tuple[str, ...]) -> np.ndarray:
     """The class's beta table, rescaled for zero terminal SNR when it asks.
 
     Every control arrives already resolved against the class's own declared
@@ -177,15 +203,15 @@ def published_betas(*, count: object, start: object, end: object, schedule: obje
     return np.asarray(betas, np.float32)
 
 
-def _fields(*groups: Mapping[str, object], **extra: object) -> Mapping[str, object]:
-    merged: dict[str, object] = {}
+def _fields(*groups: Mapping[str, JSON], **extra: JSON) -> Mapping[str, JSON]:
+    merged: dict[str, JSON] = {}
     for group in groups:
         merged.update(group)
     merged.update(extra)
     return MappingProxyType(merged)
 
 
-def _betas(start: float, end: float, schedule: str = "linear") -> Mapping[str, object]:
+def _betas(start: float, end: float, schedule: str = "linear") -> Mapping[str, JSON]:
     return {"num_train_timesteps": 1000, "beta_start": start, "beta_end": end,
             "beta_schedule": schedule, "trained_betas": None, "prediction_type": "epsilon"}
 
@@ -218,7 +244,7 @@ class _Class:
     accepts and the `prediction_type` values its own `step` converts."""
 
     family: Family
-    fields: Mapping[str, object]
+    fields: Mapping[str, JSON]
     schedules: tuple[str, ...] = ("linear", "scaled_linear", "squaredcos_cap_v2")
     predictions: tuple[str, ...] = _ALL_PREDICTIONS
 
@@ -262,7 +288,7 @@ _SOURCES: Mapping[str, _Class] = MappingProxyType({
                                               solver_type="logrho", lower_order_final=True)),
     "UniPCMultistep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _SPACED, _TRANSFORMS, _FLOW,
                                                solver_order=2, predict_x0=True, solver_type="bh2",
-                                               lower_order_final=True, disable_corrector=(),
+                                               lower_order_final=True, disable_corrector=[],
                                                solver_p=None, final_sigmas_type="zero",
                                                rescale_betas_zero_snr=False)),
     "EDMDPMSolverMultistep": _Class("edm", _fields(
@@ -461,10 +487,12 @@ class SourceSchedule:
             raise ValueError(f"Unsupported scheduler: {name}")
         declared = source.fields
 
-        def value(key: str, absent: object = None) -> object:
+        def value(key: str, absent: JSON = None) -> JSON:
             """The class's value for a control it declares, or `absent` when
             this class declares no such control."""
-            return config.get(key, declared[key]) if key in declared else absent
+            if key not in declared:
+                return absent
+            return _json(config[key], key) if key in config else declared[key]
 
         for key, inactive in _UNIMPLEMENTED.items():
             if key in declared and value(key) != inactive:
@@ -752,8 +780,8 @@ class SourceSchedule:
                 jnp.asarray(np.append(times, terminal), jnp.float32))
 
 
-def _algorithm(kind: str, family: str, declared: Mapping[str, object],
-               value: Callable[..., object]) -> Algorithm:
+def _algorithm(kind: str, family: str, declared: Mapping[str, JSON],
+               value: Control) -> Algorithm:
     """The algorithm this class integrates with, after its own coercions: each
     pinned class rewrites a few foreign names to its own before refusing the
     rest, and the EDM class refuses the two non-++ ones outright."""
@@ -773,7 +801,7 @@ def _algorithm(kind: str, family: str, declared: Mapping[str, object],
     return _choice(algorithm, "algorithm_type", allowed)
 
 
-def _solver_type[SolverT: str](kind: str, value: Callable[..., object],
+def _solver_type[SolverT: str](kind: str, value: Control,
                                allowed: tuple[SolverT, ...]) -> SolverT:
     """The class's `solver_type` after its own coercions, in the names the
     class this is being built for takes."""
@@ -788,7 +816,7 @@ def _solver_type[SolverT: str](kind: str, value: Callable[..., object],
                    "solver_type", allowed)
 
 
-def _x0_limit(kind: str, declared: Mapping[str, object], value: Callable[..., object],
+def _x0_limit(kind: str, declared: Mapping[str, JSON], value: Control,
               ) -> tuple[float | None, tuple[float, float] | None]:
     """The clamp or the dynamic thresholding the class's `step` applies to
     x_0, whichever it tests first. A class whose step reads neither is refused
@@ -813,7 +841,7 @@ def _x0_limit(kind: str, declared: Mapping[str, object], value: Callable[..., ob
     return None, None
 
 
-def _flow_controls(value: Callable[..., object]) -> _Flow:
+def _flow_controls(value: Control) -> _Flow:
     """A flow file's shift controls, checked and turned into numbers."""
     terminal = value("shift_terminal")
     return _Flow(
@@ -828,7 +856,7 @@ def _flow_controls(value: Callable[..., object]) -> _Flow:
                      ("exponential", "linear")))
 
 
-def _resolve(kind: str, source: _Class, value: Callable[..., object],
+def _resolve(kind: str, source: _Class, value: Control,
              betas: np.ndarray) -> tuple[_Policy, Solver]:
     """Every control the class declares, checked and turned into a number."""
     declared, family = source.fields, source.family
@@ -873,9 +901,10 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
                               "original_inference_steps")
     if not 0 < original_steps <= train_steps:
         raise ValueError("original_inference_steps must be positive and fit the training table")
-    corrector = value("disable_corrector", ())
-    if not isinstance(corrector, (list, tuple)) or any(type(index) is not int for index in corrector):
+    corrector = value("disable_corrector", [])
+    if not isinstance(corrector, (list, tuple)):
         raise ValueError("disable_corrector must be a sequence of step indices")
+    disabled = tuple(_integer(index, "disable_corrector") for index in corrector)
     sigma_min, sigma_max = value("sigma_min"), value("sigma_max")
     order = _integer(value("solver_order", 2), "solver_order")
     flow = _flow_controls(value) if family == "flow" else None
@@ -905,10 +934,10 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
         timestep_scaling=_number(value("timestep_scaling", 10.0), "timestep_scaling"),
         flow=flow)
     return policy, _build_solver(kind, value, order, algorithm, terminal,
-                                 variance, tuple(corrector))
+                                 variance, disabled)
 
 
-def _build_solver(kind: str, value: Callable[..., object], order: int, algorithm: Algorithm,
+def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
                   terminal: Terminal, variance: Variance,
                   corrector: tuple[int, ...]) -> Solver:
     """The native solver this class and its controls name, built once.

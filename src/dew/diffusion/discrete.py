@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import functools
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -29,6 +29,7 @@ from flax import linen as nn
 
 from dew.artifacts import agree_process_phase
 from dew.diffusion.block import CanvasGeneration
+from dew.diffusion.process import Conditioning
 from dew.nn.inputs import (
     ModelInputs,
     RowPlan,
@@ -108,8 +109,8 @@ class DiscreteProcess:
         return jnp.full(shape, self.mask_id, jnp.int32)
 
     def denoiser(self, model: nn.Module, params: Variables,
-                 conditions: dict[str, Any] | None = None,
-                 unconditional: dict[str, Any] | None = None, *,
+                 conditions: Mapping[str, Conditioning] | None = None,
+                 unconditional: Mapping[str, Conditioning] | None = None, *,
                  inputs: ModelInputs | None = None, mutable_mask: jax.Array | None = None) -> DiscreteDenoiser:
         if conditions or unconditional is not None:
             raise ValueError("the masked diffusion LM takes no conditions")
