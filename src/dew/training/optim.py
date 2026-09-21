@@ -170,7 +170,7 @@ def _rescaled_update(update: jax.Array, param: jax.Array, gamma: jax.Array,
     """The update whose application rescales the stepped weights by `gamma`:
     `(gamma - 1) * param + gamma * update`, over `split` heads."""
     width = param.shape[-1] // split
-    shape = param.shape[:-1] + (split, width)
+    shape = (*param.shape[:-1], split, width)
     gamma = jnp.asarray(gamma, update.dtype)
     out = (gamma - 1) * param.reshape(shape) + gamma * update.reshape(shape)
     return out.reshape(param.shape)

@@ -615,7 +615,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
         # last emitted slot, the target's own state first; a row that emitted
         # nothing keeps what it had.
         following, _, carried = reseed(
-            ops, following, (state.hidden,) + state.drafts, seen, ops.embed(emitted),
+            ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted),
             keep, base, last, prior_tokens=step.total())
         following = dataclasses.replace(
             following,

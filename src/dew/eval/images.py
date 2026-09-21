@@ -8,6 +8,7 @@ what the reference computes for the same pixels and tokens;
 """
 
 import functools
+import logging
 
 import jax.numpy as jnp
 import numpy as np
@@ -15,6 +16,8 @@ import numpy as np
 from dew.registry import metrics
 
 from .common import ImageMetric
+
+_log = logging.getLogger(__name__)
 
 
 @functools.cache
@@ -25,7 +28,7 @@ def _get_clip(modelname: str):
     from transformers import CLIPImageProcessorPil
 
     from dew.nn.text_encoders import CLIPModel
-    print(f"[metrics] Loading CLIP model '{modelname}' (cached for reuse)...")
+    _log.info("loading CLIP model %r (cached for reuse)", modelname)
     return CLIPModel.from_pretrained(modelname), CLIPImageProcessorPil.from_pretrained(modelname)
 
 

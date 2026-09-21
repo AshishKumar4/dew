@@ -72,7 +72,7 @@ def _addressable(leaf: jax.Array | np.ndarray) -> np.ndarray:
     return np.asarray(leaf)
 
 
-def host(value: T) -> T:
+def host[T](value: T) -> T:
     """An artifact whose arrays are host-local numpy.
 
     Scoring and drawing happen on the host: a metric reads the arrays with
@@ -86,7 +86,7 @@ def host(value: T) -> T:
     return jax.tree.map(_addressable, value)
 
 
-def collective_host(value: T, *, phase: str) -> T:
+def collective_host[T](value: T, *, phase: str) -> T:
     """Materialize an evaluation tree on every rank with transfer consensus.
 
     All ranks must call this, even for entirely local trees. Local leaves and

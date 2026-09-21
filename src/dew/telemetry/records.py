@@ -9,9 +9,9 @@ import platform
 import traceback
 import typing
 from collections.abc import Mapping, Sequence
-from typing import Literal, TypeAlias
+from typing import Literal
 
-JSON: TypeAlias = None | bool | int | float | str | list['JSON'] | dict[str, 'JSON']
+type JSON = None | bool | int | float | str | list['JSON'] | dict[str, 'JSON']
 
 
 def json_value(value: object) -> JSON:
@@ -109,6 +109,8 @@ class TrialFinished:
     value: float
 
 
-Record: TypeAlias = (RunRecord | FitStarted | CheckpointRequested | ProfileWindow | FitEnded
-                     | TrialFinished)
-RECORD_TYPES = typing.get_args(Record)
+type Record = (RunRecord | FitStarted | CheckpointRequested | ProfileWindow | FitEnded
+               | TrialFinished)
+# A PEP 695 alias holds its union in `__value__`; `get_args` of the alias
+# itself is empty, and these are the classes `isinstance` is given.
+RECORD_TYPES = typing.get_args(Record.__value__)

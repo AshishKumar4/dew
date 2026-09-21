@@ -212,7 +212,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
 
     def _clip(self, params, ids) -> list[_TextFeatures]:
         outputs = []
-        for index, (name, tower) in enumerate(zip(self.names, self.towers)):
+        for index, (name, tower) in enumerate(zip(self.names, self.towers, strict=True)):
             output = tower.apply({"params": params[name]["text_model"]},
                                  ids[:, index] if self.stacked else ids, method=_text_features)
             assert isinstance(output, _TextFeatures)
@@ -271,7 +271,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
             [padded, self._t5_states(params, tokens, rows, clip.dtype)], axis=1)
         pooled = jnp.concatenate(
             [self._projected(params, name, value.pooled)
-             for name, value in zip(self.names, outputs)], axis=-1)
+             for name, value in zip(self.names, outputs, strict=True)], axis=-1)
         return DenoisingCondition(self._zeroed(hidden, zero), self._zeroed(pooled, zero))
 
     def captions(self, tokens):

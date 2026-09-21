@@ -19,7 +19,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
+from typing import TYPE_CHECKING, Protocol, TextIO
 
 import jax
 import numpy as np
@@ -80,7 +80,7 @@ def _gif(clip: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
-Payload: TypeAlias = dict[str, object]
+type Payload = dict[str, object]
 
 
 @functools.singledispatch
@@ -94,7 +94,7 @@ def _(value: ImageGrid) -> Payload:
 
     captions = list(value.captions) + [None] * (len(value.images) - len(value.captions))
     return {"val/samples": [wandb.Image(image, caption=caption)
-                            for image, caption in zip(_uint8(value.images), captions)]}
+                            for image, caption in zip(_uint8(value.images), captions, strict=True)]}
 
 
 @render.register
@@ -279,7 +279,7 @@ class LocalTracker(_OwnedTracker):
             figure = Figure(figsize=(7, 4))
             FigureCanvasAgg(figure)
             axes = figure.subplots()
-            x, y = zip(*points)
+            x, y = zip(*points, strict=True)
             values = np.asarray(y)
             axes.plot(x, np.where(np.isfinite(values), values, np.nan), marker=".")
             axes.set(title=key, xlabel='step')

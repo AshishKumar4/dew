@@ -572,7 +572,7 @@ class Multistep(NamedTuple):
 
 def _multistep(x, times, depth: int) -> Multistep:
     rates = jnp.ones((depth, x.shape[0]) + (1,) * (x.ndim - 1), jnp.float32)
-    return Multistep(jnp.zeros((depth,) + x.shape, x.dtype), rates, rates,
+    return Multistep(jnp.zeros((depth, *x.shape), x.dtype), rates, rates,
                      jnp.zeros((), jnp.int32), jnp.asarray(times.shape[0] - 1, jnp.int32))
 
 
@@ -998,7 +998,7 @@ def _unipc_weights(rks, hh, B_h, order: int, predictor: bool):
     factorial = 1
     for i in range(1, columns + 1):
         rows.append(jnp.stack([rk ** (i - 1) * inv ** (columns - i)
-                               for rk, inv in zip(normalized, inverse)], axis=-1))
+                               for rk, inv in zip(normalized, inverse, strict=True)], axis=-1))
         b.append(h_phi_k * factorial / B_h)
         factorial *= i + 1
         h_phi_k = h_phi_k / hh - 1 / factorial
@@ -1074,7 +1074,7 @@ class UniPC:
             else:
                 base = alpha_here / alpha_s0 * state.last_x - sigma_here * jnp.expm1(hh) * m0
                 scale = sigma_here
-            residual = sum((rho * d1 for rho, d1 in zip(rhos[:-1], d1s)), rhos[-1] * (m_here - m0))
+            residual = sum((rho * d1 for rho, d1 in zip(rhos[:-1], d1s, strict=True)), rhos[-1] * (m_here - m0))
             return base - scale * B_h * residual
 
         disabled = reduce(jnp.logical_or, [taken - 1 == index for index in self.disable_corrector],
@@ -1104,7 +1104,7 @@ class UniPC:
             rks = [(lambdas[-(i + 1)] - lambdas[-1]) / h for i in range(1, p)] + [1.0]
             d1s = [(outputs[-(i + 1)] - m_here) / rks[i - 1] for i in range(1, p)]
             rhos = _unipc_weights(rks, hh, B_h, p, predictor=True)
-            return base - scale * B_h * sum(rho * d1 for rho, d1 in zip(rhos, d1s))
+            return base - scale * B_h * sum(rho * d1 for rho, d1 in zip(rhos, d1s, strict=True))
 
         this_order = jnp.minimum(self.order, steps - taken) if self.lower_order_final else self.order
         this_order = jnp.minimum(this_order, taken + 1)
@@ -1146,7 +1146,7 @@ class PNDM:
     def init(self, x, times, process, *, key):
         _check_endpoint_domain(process, times, source=True,
                                reason="PNDM stage differences are divided by the source alpha")
-        return jnp.zeros((4,) + x.shape, x.dtype), jnp.zeros((), jnp.int32)
+        return jnp.zeros((4, *x.shape), x.dtype), jnp.zeros((), jnp.int32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         schedule = process.sampler_schedule
@@ -1201,7 +1201,7 @@ def _lagrange_integral(nodes: list, j: int, a, b):
     for m, node in enumerate(nodes):
         if m == j:
             continue
-        polynomial = [0.0] + polynomial
+        polynomial = [0.0, *polynomial]
         polynomial = [polynomial[i] - node * (polynomial[i + 1] if i + 1 < len(polynomial) else 0.0)
                       for i in range(len(polynomial))]
         scale = scale * (nodes[j] - node)
@@ -1229,7 +1229,7 @@ class LMS:
 
     def init(self, x, times, process, *, key):
         sigmas = jnp.ones((self.order, x.shape[0]) + (1,) * (x.ndim - 1), jnp.float32)
-        return jnp.zeros((self.order,) + x.shape, x.dtype), sigmas, jnp.zeros((), jnp.int32)
+        return jnp.zeros((self.order, *x.shape), x.dtype), sigmas, jnp.zeros((), jnp.int32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
         _sigma_integrator("LMS", process)

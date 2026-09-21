@@ -639,7 +639,7 @@ def _gemma4_rope(values: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array
     turns = jnp.split(sin, 2, axis=-1)
     rotated = [half * angle + jnp.concatenate(
         [-half[..., half.shape[-1] // 2:], half[..., :half.shape[-1] // 2]],
-        axis=-1) * turn for half, angle, turn in zip(halves, angles, turns)]
+        axis=-1) * turn for half, angle, turn in zip(halves, angles, turns, strict=True)]
     return jnp.concatenate(rotated, axis=-1)
 
 
@@ -872,7 +872,7 @@ class Gemma4VisionTransformer(nn.Module):
             pixel_position_ids = jnp.broadcast_to(jnp.stack([x, y], axis=-1), (batch, rows * columns, 2))
         if pixels.ndim != 3 or pixels.shape[-1] != 3 * self.patch_size ** 2:
             raise ValueError("Gemma4 patch pixels must be [B, patches, 3 * patch_size**2]")
-        if pixel_position_ids is None or pixel_position_ids.shape != pixels.shape[:2] + (2,):
+        if pixel_position_ids is None or pixel_position_ids.shape != (*pixels.shape[:2], 2):
             raise ValueError("Gemma4 patch pixels require aligned [B, patches, 2] position IDs")
         if not jnp.issubdtype(pixel_position_ids.dtype, jnp.integer):
             raise ValueError("pixel_position_ids must be integers")

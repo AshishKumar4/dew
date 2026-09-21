@@ -120,6 +120,8 @@ ignore = [
     "B023",    # every flagged closure is consumed inside its own iteration (nn.scan,
                # jax.lax.*, an immediate call); ruff cannot see the consumption site
     "RUF009",  # dataclass defaults are frozen dataclasses, so the shared instance is safe
+    "UP046",   # the generic classes' parameters carry PEP 696 defaults (Loss, Effects, ArrayT),
+               # which PEP 695 class syntax can only spell from 3.13; the floor is 3.12
 ]
 
 [tool.ruff.lint.flake8-boolean-trap]
@@ -149,6 +151,14 @@ split-on-trailing-comma = false
 "src/dew/training/runtime.py" = ["T201"]
 # `dew config show` prints the resolved configuration for a person to read.
 "src/dew/config/__init__.py" = ["T201"]
+# Three modules import at the bottom on purpose. The mixer hub imports each
+# kind module after the base class those modules subclass; `mla` imports the
+# hub back after the YarnScaling ramp the hub reads, so either import order
+# resolves; and `dew.inputs` imports its diffusion conditioner after the
+# Condition it registers against. Each says so where the import stands.
+"src/dew/nn/mixers/__init__.py" = ["E402"]
+"src/dew/nn/mla.py" = ["E402"]
+"src/dew/inputs/__init__.py" = ["E402"]
 
 [tool.pyright]
 # The declared boundary: dew's own source, checked against the project venv.

@@ -371,7 +371,7 @@ def render_prompt(tokenizer: PreTrainedTokenizerBase, conversation: Conversation
 def _agreement(rendered: Sequence[int], full: Sequence[int]) -> int:
     """How many leading ids `rendered` shares with `full`."""
     count = 0
-    for mine, theirs in zip(rendered, full):
+    for mine, theirs in zip(rendered, full, strict=False):
         if mine != theirs:
             break
         count += 1

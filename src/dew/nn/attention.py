@@ -416,7 +416,7 @@ def stripe(x, shards: int, axis: int = 1):
             f"sequence to balance the causal work, which needs the sequence "
             f"length to be a multiple of {2 * shards}, got {length}")
     chunk = length // (2 * shards)
-    chunks = x.reshape(x.shape[:axis] + (2 * shards, chunk) + x.shape[axis + 1:])
+    chunks = x.reshape((*x.shape[:axis], 2 * shards, chunk, *x.shape[axis + 1:]))
     first = jax.lax.slice_in_dim(chunks, 0, shards, axis=axis)
     second = jnp.flip(jax.lax.slice_in_dim(chunks, shards, 2 * shards, axis=axis), axis=axis)
     return jnp.stack([first, second], axis=axis + 1).reshape(x.shape)
@@ -426,7 +426,7 @@ def unstripe(x, shards: int, axis: int = 1):
     """The inverse of `stripe`: `axis` back in sequence order."""
     axis %= x.ndim
     chunk = x.shape[axis] // (2 * shards)
-    pairs = x.reshape(x.shape[:axis] + (shards, 2, chunk) + x.shape[axis + 1:])
+    pairs = x.reshape((*x.shape[:axis], shards, 2, chunk, *x.shape[axis + 1:]))
     first = jax.lax.index_in_dim(pairs, 0, axis=axis + 1, keepdims=False)
     second = jnp.flip(jax.lax.index_in_dim(pairs, 1, axis=axis + 1, keepdims=False), axis=axis)
     return jnp.concatenate([first, second], axis=axis).reshape(x.shape)

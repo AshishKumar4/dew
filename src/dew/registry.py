@@ -167,9 +167,19 @@ def _value_type(annotation: object) -> type | None:
             else None)
 
 
+def resolve_alias(annotation: object) -> object:
+    """A PEP 695 alias looked through to the type it declares. `get_origin`
+    and `get_args` see nothing through one, so every reader goes through here
+    before asking an annotation what it is."""
+    while isinstance(annotation, typing.TypeAliasType):
+        annotation = annotation.__value__
+    return annotation
+
+
 def _unwrapped(annotation: object) -> object:
     """`annotation` with an Optional looked through; a union of several
     members says nothing about its entries and answers None."""
+    annotation = resolve_alias(annotation)
     if typing.get_origin(annotation) not in (Union, types.UnionType):
         return annotation
     members = [a for a in typing.get_args(annotation) if a is not type(None)]
@@ -208,6 +218,7 @@ def from_record(annotation: object, value: Any) -> Any:
     build their values too, and a model config is a dict from the command
     line all the way to the module.
     """
+    annotation = resolve_alias(annotation)
     if typing.get_origin(annotation) in (Union, types.UnionType) and _unwrapped(annotation) is None:
         return value
     if isinstance(value, Mapping):
@@ -218,7 +229,7 @@ def from_record(annotation: object, value: Any) -> Any:
             # entry resolves the same way as a dtype field.
             entries = entry_types(annotation, len(value))
             return {key: resolve_dtype(item) if key == "dtype" else from_record(entry, item)
-                    for entry, (key, item) in zip(entries, value.items())}
+                    for entry, (key, item) in zip(entries, value.items(), strict=True)}
         declared = sorted(f.name for f in dataclasses.fields(held) if f.init)
         unknown = sorted(set(value) - set(declared))
         if unknown:
@@ -228,7 +239,7 @@ def from_record(annotation: object, value: Any) -> Any:
                        for key, item in value.items()})
     if isinstance(value, (list, tuple)):
         entries = entry_types(annotation, len(value))
-        items = [from_record(entry, item) for entry, item in zip(entries, value)]
+        items = [from_record(entry, item) for entry, item in zip(entries, value, strict=True)]
         return tuple(items) if wants_tuple(annotation) else type(value)(items)
     return value
 

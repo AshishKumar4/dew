@@ -141,7 +141,7 @@ def _table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> None:
     columns = [headers, *rows]
     widths = [max(len(str(row[index])) for row in columns) for index in range(len(headers))]
     for row in columns:
-        emit("  ".join(str(cell).ljust(width) for cell, width in zip(row, widths)).rstrip())
+        emit("  ".join(str(cell).ljust(width) for cell, width in zip(row, widths, strict=False)).rstrip())
 
 
 def _worker_table(node: Node | None) -> None:

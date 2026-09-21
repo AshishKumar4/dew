@@ -15,7 +15,7 @@ import itertools
 import json
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Protocol, TypeAlias, TypeVar
+from typing import Protocol, TypeVar
 
 import numpy as np
 
@@ -23,13 +23,13 @@ from dew.config import RunConfig
 from dew.telemetry.records import TrialFinished, json_value
 from dew.training.tracker import Tracker
 
-Choice: TypeAlias = None | bool | int | float | str
+type Choice = None | bool | int | float | str
 """One candidate value for a swept field: what JSON and Optuna both hold."""
 
-Space: TypeAlias = Mapping[str, Sequence[Choice]]
+type Space = Mapping[str, Sequence[Choice]]
 """Dotted paths into a run record, each with the values a trial draws from."""
 
-Point: TypeAlias = dict[str, Choice]
+type Point = dict[str, Choice]
 
 C = TypeVar('C', bound=RunConfig)
 
@@ -38,7 +38,7 @@ class Search(Protocol):
     def __call__(self, space: Space, finished: Sequence[TrialFinished], seed: int) -> Point: ...
 
 
-def override(config: C, point: Point) -> C:
+def override[C: RunConfig](config: C, point: Point) -> C:
     """`config` with each dotted path in `point` replaced, through its record.
 
     `RunConfig.from_dict` refuses a leaf the class does not declare, so a
@@ -69,7 +69,7 @@ def grid_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> P
     if len(finished) >= len(points):
         raise ValueError(f'the grid holds {len(points)} points and trial '
                          f'{len(finished)} was asked for; lower the budget')
-    return dict(zip(space, points[len(finished)]))
+    return dict(zip(space, points[len(finished)], strict=True))
 
 
 def optuna_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:

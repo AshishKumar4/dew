@@ -49,7 +49,7 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
                 f"set JAX_NUM_CPU_DEVICES={len(held)} or "
                 f"--xla_force_host_platform_device_count={len(held)} in the existing xla_flags "
                 "before any JAX initialization, and restart; no backend configuration was changed")
-        partners.update(zip(sorted(held, key=lambda d: d.id), sorted(local, key=lambda d: d.id)))
+        partners.update(zip(sorted(held, key=lambda d: d.id), sorted(local, key=lambda d: d.id), strict=True))
     devices = np.asarray([partners[d] for d in accelerator.devices.flat], dtype=object)
     mesh = Mesh(devices.reshape(accelerator.devices.shape), accelerator.axis_names,
                 axis_types=accelerator.axis_types)
@@ -103,7 +103,7 @@ def transfer(tree, placement: Placement):
         target_indices = target.devices_indices_map(value.shape)
         if not isinstance(source.mesh, Mesh):
             raise ValueError("transport requires a concrete source device mesh")
-        partners = dict(zip(source.mesh.devices.flat, target.mesh.devices.flat))
+        partners = dict(zip(source.mesh.devices.flat, target.mesh.devices.flat, strict=True))
         arrays = {}
         for shard in value.addressable_shards:
             device = partners[shard.device]

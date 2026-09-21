@@ -15,7 +15,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -33,19 +33,19 @@ if TYPE_CHECKING:
     from dew.sampling.pipelines import TextToImage
     from dew.training.state import TrainState
 
-    Task: TypeAlias = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
+    type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 
-Variables: TypeAlias = Mapping[str, Any]
+type Variables = Mapping[str, Any]
 """A flax variables dict: the `params` collection plus any other collection
 the modules keep (`moe`, `batch_stats`, an objective's frozen encoders)."""
 
-Batch: TypeAlias = Mapping[str, Any]
-Path: TypeAlias = tuple[str, ...]
-PathFilter: TypeAlias = Callable[[Path], bool]
+type Batch = Mapping[str, Any]
+type Path = tuple[str, ...]
+type PathFilter = Callable[[Path], bool]
 """Selects leaves of a variables tree by the tuple of dict keys above them.
 One filter type serves the EMA selection, `optax.multi_transform` labels and
 frozen subtrees."""
-Initializer: TypeAlias = Partial
+type Initializer = Partial
 """An objective's `init` as one value a JIT can take: a
 `jax.tree_util.Partial`, whose bound arguments are pytree children rather
 than closure cells, so a JIT that builds the initial state receives the held
@@ -137,7 +137,7 @@ def select(tree: Variables, keep: PathFilter) -> Variables:
     """
     def prune(node, path):
         if isinstance(node, Mapping):
-            kept = {name: prune(child, path + (name,)) for name, child in node.items()}
+            kept = {name: prune(child, (*path, name)) for name, child in node.items()}
             return {name: child for name, child in kept.items() if child is not None} or None
         return node if keep(path) else None
 

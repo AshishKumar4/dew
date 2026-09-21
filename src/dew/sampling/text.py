@@ -428,14 +428,14 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> object:
         return ("mapping", tuple(sorted((repr(name), _stable(item, seen))
                                         for name, item in value.items())))
     if hasattr(value, "shape") and hasattr(value, "dtype"):
-        return ("array",) + _hashed(value)
+        return ("array", *_hashed(value))
     if isinstance(value, functools.partial):
         return ("partial", _stable(value.func, seen), _stable(value.args, seen),
                 _stable(dict(value.keywords), seen))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return (_named(value),) + tuple(
+        return (_named(value), *tuple(
             (field.name, _stable(getattr(value, field.name), seen))
-            for field in dataclasses.fields(value))
+            for field in dataclasses.fields(value)))
     if isinstance(value, types.FunctionType):
         cells = []
         for cell in value.__closure__ or ():

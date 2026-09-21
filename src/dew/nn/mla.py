@@ -226,9 +226,9 @@ def open_expanded_cache(module: nn.Module, key, value, index_keys, max_seq_len, 
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a sparse cache of {max_seq_len}.")
     cached_key = module.variable("cache", "cached_key", jnp.zeros,
-                                 (batch, max_seq_len) + key.shape[2:], key.dtype)
+                                 (batch, max_seq_len, *key.shape[2:]), key.dtype)
     cached_value = module.variable("cache", "cached_value", jnp.zeros,
-                                   (batch, max_seq_len) + value.shape[2:], value.dtype)
+                                   (batch, max_seq_len, *value.shape[2:]), value.dtype)
     cached_index = None
     if index_keys is not None:
         cached_index = module.variable("cache", "cached_index", jnp.zeros,
@@ -812,7 +812,7 @@ class MultiHeadLatentAttention(nn.Module):
 # The standard attention mixer reads the YaRN ramp above, so the registry
 # hub imports this module while it imports the hub; the registry side of
 # this module comes after the ramp so either import order resolves.
-from dew.nn.mixers import MixerBase, MixerContext, mixers  # noqa: E402
+from dew.nn.mixers import MixerBase, MixerContext, mixers
 
 
 @mixers("mla")

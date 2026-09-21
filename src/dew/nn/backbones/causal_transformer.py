@@ -414,9 +414,9 @@ class BlockWiring:
 
 
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
-ATTENTION_RESIDUALS = QKV_RESIDUALS + ('o_proj',)
+ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
 MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
-RESIDUALS = ATTENTION_RESIDUALS + ('context',) + MLP_RESIDUALS
+RESIDUALS = (*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)
 """The values a block names as it runs, each after the projection that
 produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
 the attention kernel's output before `o_proj`, and the MLP names cover the
@@ -471,10 +471,10 @@ class RematPolicy:
 REMAT_POLICIES: Mapping[str, RematPolicy] = {
     'full': RematPolicy(),
     'minimal': RematPolicy(save=ATTENTION_RESIDUALS + MLP_RESIDUALS),
-    'minimal_with_context': RematPolicy(save=ATTENTION_RESIDUALS + ('context',) + MLP_RESIDUALS),
+    'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)),
     'save_dot_except_mlp': RematPolicy(save=ATTENTION_RESIDUALS),
-    'save_dot_with_context_except_mlp': RematPolicy(save=ATTENTION_RESIDUALS + ('context',)),
-    'save_dot_except_mlpwi': RematPolicy(save=ATTENTION_RESIDUALS + ('down_proj',)),
+    'save_dot_with_context_except_mlp': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context')),
+    'save_dot_except_mlpwi': RematPolicy(save=(*ATTENTION_RESIDUALS, 'down_proj')),
     'save_qkv_proj': RematPolicy(save=QKV_RESIDUALS),
     'save_out_proj': RematPolicy(save=('o_proj',)),
     'minimal_offloaded': RematPolicy(offload=ATTENTION_RESIDUALS + MLP_RESIDUALS),
@@ -918,7 +918,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
             for first, count in groups]
     fetching = banked or any(_on_host(run.variables.get('params', {})) for run in runs)
     if not fetching or train:
-        for run, (first, count) in zip(runs, groups):
+        for run, (first, count) in zip(runs, groups, strict=True):
             inputs = (None if per_layer_input is None
                       else per_layer_input[:, :, first:first + count, :])
             if count == 1 and not fetching:
@@ -966,7 +966,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         return _fetched(held if groups[index][1] == 1 else _layer_slice(held, 0))
 
     staged = first_of(0)
-    for index, (run, (first, count)) in enumerate(zip(runs, groups)):
+    for index, (run, (first, count)) in enumerate(zip(runs, groups, strict=True)):
         inputs = (None if per_layer_input is None
                   else per_layer_input[:, :, first:first + count, :])
         store = kv_store if count == 1 or specs[first].kv_shared else None
@@ -1202,7 +1202,7 @@ class StackView:
         real = leaf[stage:stage + self.microbatches, stage]
         if offset is not None:
             real = real[:, offset]
-        return real.reshape((-1,) + real.shape[2:])
+        return real.reshape((-1, *real.shape[2:]))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1233,7 +1233,7 @@ def _microbatched(value, axis: int, count: int):
     """`[.., rows, ..]` as `[count, .., rows / count, ..]`: the batch axis cut
     into `count` microbatches of consecutive rows, in order."""
     shape = value.shape
-    split = value.reshape(shape[:axis] + (count, shape[axis] // count) + shape[axis + 1:])
+    split = value.reshape((*shape[:axis], count, shape[axis] // count, *shape[axis + 1:]))
     return jnp.moveaxis(split, axis, 0)
 
 
@@ -1241,7 +1241,7 @@ def _whole(value, axis: int):
     """The batch `_microbatched` cut, back in one piece."""
     moved = jnp.moveaxis(value, 0, axis)
     shape = moved.shape
-    return moved.reshape(shape[:axis] + (shape[axis] * shape[axis + 1],) + shape[axis + 2:])
+    return moved.reshape((*shape[:axis], shape[axis] * shape[axis + 1], *shape[axis + 2:]))
 
 
 @models("causal_transformer")
@@ -2175,7 +2175,7 @@ class CausalTransformer(nn.Module):
             # projections, rescaled to the first's magnitude, and the mean of
             # all of them is what the final norm reads.
             copies = [x[0]] + [rescale_to(project(copy), x[0])
-                               for project, copy in zip(self.altup_unembed_projections, x[1:])]
+                               for project, copy in zip(self.altup_unembed_projections, x[1:], strict=True)]
             x = jnp.mean(jnp.stack(copies), axis=0)
         streams = x
         if hc is not None:
@@ -2409,8 +2409,8 @@ class CausalTransformer(nn.Module):
         inputs = None if per_layer_input is None else micro(per_layer_input, 0)
         metadata = jax.tree.map(lambda value: micro(value, 0), attention_metadata)
         slots = count // stages
-        state_io = _on_stage_axis(x.reshape((stages, slots) + x.shape[1:]))
-        shift = _on_stage_axis(jnp.zeros((stages,) + x.shape[1:], x.dtype))
+        state_io = _on_stage_axis(x.reshape((stages, slots, *x.shape[1:])))
+        shift = _on_stage_axis(jnp.zeros((stages, *x.shape[1:]), x.dtype))
         mesh = jax.sharding.get_abstract_mesh()
         stage_ids = jnp.arange(stages)
 
@@ -2467,7 +2467,7 @@ class CausalTransformer(nn.Module):
         # Microbatch 0 finished stages - 1 iterations in, so it sits that
         # many slots along; the rest follow it in order.
         order = (np.arange(slots) + (stages - 1) % slots) % slots
-        finished = state_io[:, order].reshape((count,) + x.shape[1:])
+        finished = state_io[:, order].reshape((count, *x.shape[1:]))
         return _whole(finished, batch_axis)
 
     def per_layer_inputs(self, tokens, inputs_embeds):

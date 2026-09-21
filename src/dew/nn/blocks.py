@@ -20,7 +20,7 @@ class TokenEmbedding(nn.Embed):
             raise ValueError("Input type must be an integer or unsigned integer.")
         # Casting the table before gathering makes its transpose scatter-add
         # in the compute dtype, losing repeated-token contributions in bf16.
-        values = (jnp.broadcast_to(self.embedding, inputs.shape + (self.features,))
+        values = (jnp.broadcast_to(self.embedding, (*inputs.shape, self.features))
                   if self.num_embeddings == 1 else jnp.take(self.embedding, inputs, axis=0))
         promoted, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
         if promoted is None:

@@ -299,7 +299,7 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
         for first, count in site.view.groups:
             if first < 0 or count < 1:
                 raise ValueError("decoder bank groups require nonnegative starts and positive lengths")
-            paths.extend(site.namespace + (f"layers_{index}",) for index in range(first, first + count))
+            paths.extend((*site.namespace, f"layers_{index}") for index in range(first, first + count))
     ordered = sorted(paths)
     if any(right[:len(left)] == left for left, right in itertools.pairwise(ordered)):
         raise ValueError("declared decoder banks overlap in their canonical layer ownership")
@@ -308,7 +308,7 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
 
 def entry_tree(variables: Variables, sites: Sequence[DecoderBank]) -> Variables:
     """The leaf complement of declared decoder layers, including nested media."""
-    layers = {site.namespace + (f"layers_{index}",) for site in sites
+    layers = {(*site.namespace, f"layers_{index}") for site in sites
               for first, count in site.view.groups for index in range(first, first + count)}
 
     def outside(tree: Mapping, path: tuple[str, ...]) -> dict:

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TypeAlias
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +22,7 @@ from dew.artifacts import Representations
 from dew.eval.common import metric_device
 from dew.registry import metrics
 
-ProbeParams: TypeAlias = dict[str, jax.Array]
+type ProbeParams = dict[str, jax.Array]
 """The linear probe's weight matrix under "w" and its bias under "b"."""
 
 

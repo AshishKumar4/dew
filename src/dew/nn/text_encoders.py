@@ -1017,16 +1017,16 @@ def _t5_path(hf_name: str) -> tuple[str, ...] | None:
         rest = parts[3:]
         if rest[:2] == ["layer", "0"] and rest[2] == "SelfAttention":
             if len(rest) == 5 and rest[3] in _T5_PROJECTIONS:
-                return tuple(layer + ["self_attn", _T5_PROJECTIONS[rest[3]], "kernel"])
+                return (*layer, "self_attn", _T5_PROJECTIONS[rest[3]], "kernel")
             if rest[3:] == ["relative_attention_bias", "weight"]:
-                return tuple(layer + ["self_attn", "rel_bias", "embedding"])
+                return (*layer, "self_attn", "rel_bias", "embedding")
         elif rest[:2] == ["layer", "0"] and rest[2] == "layer_norm" and len(rest) == 4:
-            return tuple(layer + ["attn_norm", "scale"])
+            return (*layer, "attn_norm", "scale")
         elif rest[:2] == ["layer", "1"] and rest[2] in ("DenseReluDense", "DenseGatedGeluDense"):
             if len(rest) == 5 and rest[3] in _T5_WIDTHS:
-                return tuple(layer + ["mlp", rest[3], "kernel"])
+                return (*layer, "mlp", rest[3], "kernel")
         elif rest[:2] == ["layer", "1"] and rest[2] == "layer_norm" and len(rest) == 4:
-            return tuple(layer + ["mlp_norm", "scale"])
+            return (*layer, "mlp_norm", "scale")
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 

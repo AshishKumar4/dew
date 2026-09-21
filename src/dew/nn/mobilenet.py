@@ -116,8 +116,7 @@ class _Block:
 _ARCHITECTURE = (
     (_Block("edge", 128, stride=2, expansion=4, middle_kernel=3),)
     + (_Block("edge", 128, expansion=4, middle_kernel=3),) * 2,
-    (_Block("inverted", 256, stride=2, expansion=6, start_kernel=3, middle_kernel=5),)
-    + tuple(_Block("inverted", 256, expansion=4, start_kernel=k) for k in (5, 3, 5, 3)),
+    (_Block("inverted", 256, stride=2, expansion=6, start_kernel=3, middle_kernel=5), *tuple(_Block("inverted", 256, expansion=4, start_kernel=k) for k in (5, 3, 5, 3))),
     (_Block("inverted", 640, stride=2, expansion=6, start_kernel=5, middle_kernel=5),)
     + (_Block("inverted", 640, expansion=4, start_kernel=5),) * 7
     + (_Block("inverted", 640),)

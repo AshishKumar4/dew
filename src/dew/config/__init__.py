@@ -24,7 +24,7 @@ import sys
 import types
 import typing
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Mapping, Self, TypeAlias
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Mapping, Self
 
 import jax
 import tyro
@@ -63,7 +63,7 @@ if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the registered specs, and a
     # type checker cannot read a variable in a type expression. Both get what
     # they need: the base class statically, the union at runtime.
-    DataSpec: TypeAlias = DatasetSpec
+    type DataSpec = DatasetSpec
 else:
     DataSpec = datasets.union
 
@@ -261,6 +261,7 @@ def _fields(cls, values):
 def _rebuild(annotation, value) -> Any:
     """The value `annotation` asks for, built out of a record. It returns
     whatever type the field declares, so the annotation is Any."""
+    annotation = registry.resolve_alias(annotation)
     held = _registry_for(annotation)
     if held is not None:
         if held.record == "kind":
@@ -279,7 +280,7 @@ def _rebuild(annotation, value) -> Any:
     if isinstance(value, list):
         # JSON writes every sequence as a list; the field says which are tuples.
         entries = registry.entry_types(annotation, len(value))
-        items = [_rebuild(entry, item) for entry, item in zip(entries, value)]
+        items = [_rebuild(entry, item) for entry, item in zip(entries, value, strict=True)]
         return tuple(items) if registry.wants_tuple(annotation) else items
     return value
 
