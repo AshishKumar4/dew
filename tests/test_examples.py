@@ -26,18 +26,20 @@ from dew.interop import load_params
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def smoke(name, out, *arguments):
+def smoke(name, out, *arguments, offline=True):
     """One example's `--smoke` run, in its own process, on one CPU device.
 
     The environment is the one the docstrings tell a reader to use, minus
     the suite's eight simulated devices: a smoke run is a single-device run,
-    and `HF_HUB_OFFLINE` keeps a fixture path from becoming a download.
+    and `HF_HUB_OFFLINE` keeps a fixture path from becoming a download. A
+    harness suite reads its documents from the Hub, so that one run asks for
+    the network and carries the marker.
     """
     environment = {**os.environ,
                    "PYTHONPATH": str(REPO_ROOT / "src"),
                    "JAX_PLATFORMS": "cpu",
                    "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
-                   "HF_HUB_OFFLINE": "1",
+                   "HF_HUB_OFFLINE": "1" if offline else "0",
                    "TOKENIZERS_PARALLELISM": "false"}
     finished = subprocess.run(
         [sys.executable, str(REPO_ROOT / "examples" / f"{name}.py"), "--smoke",
@@ -176,3 +178,44 @@ def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
     run = tmp_path / "checkpoints" / tmp_path.name
     assert json.loads((run / "run.json").read_text())["objective"] == "lm"
     assert json.loads((export / "generation_config.json").read_text())["tokenizer_name"]
+
+
+def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):
+    """The evaluation report of a run the script trains first: the perplexity
+    `evaluate` scores over the held-out split, a greedy continuation, and the
+    clean skip both client extras get when their SDK is not installed."""
+    smoke("evaluate_and_serve", tmp_path,
+          "--openai-base-url", "http://127.0.0.1:1/v1", "--ollama-host", "http://127.0.0.1:1")
+
+    report = json.loads((tmp_path / "report.json").read_text())
+    assert report["perplexity"]["val/perplexity"] > 0
+    assert len(report["greedy"]) == 8
+    assert set(report["served"]) == {"openai", "ollama"}
+    assert all(answer.startswith("skipped: pip install") for answer in report["served"].values())
+
+
+def test_evaluate_and_serve_smoke_scores_a_diffusion_run_it_is_pointed_at(tmp_path):
+    """The image half, over the run the diffusion example trains. FID stays
+    out: its Inception weights are a Hub download, and CLIPScore reads the
+    tiny CLIP fixture instead of the checkpoint the default names."""
+    images = tmp_path / "images"
+    smoke("train_flowers_tpu", images)
+
+    smoke("evaluate_and_serve", tmp_path / "report",
+          "--image-run", str(images / "checkpoints" / "smoke"),
+          "--clip-model", str(REPO_ROOT / "tests/fixtures/clip/tiny"))
+
+    report = json.loads((tmp_path / "report" / "report.json").read_text())
+    assert "clip_score" in report["images"] and "fid" not in report["images"]
+
+
+@pytest.mark.network
+def test_evaluate_and_serve_smoke_runs_an_lm_eval_harness_task(tmp_path):
+    """`DewLM` behind the harness's own `simple_evaluate`, on two documents
+    of a real suite; the task's data comes from the Hub."""
+    smoke("evaluate_and_serve", tmp_path, "--tasks", "hellaswag",
+          "--harness-limit", "2", offline=False)
+
+    harness = json.loads((tmp_path / "report.json").read_text())["harness"]
+    assert {name.split("/")[0] for name in harness} == {"hellaswag"}
+    assert all(0.0 <= value <= 1.0 for name, value in harness.items() if name.endswith("acc,none"))
