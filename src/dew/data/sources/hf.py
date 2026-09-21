@@ -14,7 +14,7 @@ import dataclasses
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 if TYPE_CHECKING:  # the imports themselves happen on the first record
     from datasets import (
@@ -27,6 +27,8 @@ if TYPE_CHECKING:  # the imports themselves happen on the first record
     )
 
 import numpy as np
+
+from ..dataset import json_argument
 
 _STREAMING_HINT = (
     "reading Hugging Face datasets needs the streaming extra: "
@@ -93,6 +95,13 @@ class HFOptions:
             revision=self.revision, token=self.token, num_proc=self.num_proc,
             storage_options=None if self.storage_options is None
             else dict(self.storage_options))
+
+
+HubOptions = Annotated[HFOptions, json_argument(HFOptions)]
+"""`HFOptions` as a dataset spec declares it. The value is the same; the
+annotation says how the command line writes it, which for a value carrying
+`Features` and a `DownloadConfig` is one JSON object rather than a flag per
+field."""
 
 
 def _plain_value(value: Any) -> Any:
