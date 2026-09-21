@@ -163,3 +163,16 @@ def test_sft_diffusion_gemma_smoke_writes_an_adapter_and_generates_from_it(tmp_p
     config = json.loads((adapter / "adapter_config.json").read_text())
     assert config["peft_type"] == "LORA" and config["target_modules"]
     assert len((tmp_path / "samples.txt").read_text().splitlines()) == 2
+
+
+def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
+    """Full-weight SFT over packed conversations: the run record `dew.pipeline`
+    reads, and the Hugging Face directory `export_run` writes beside it."""
+    smoke("sft_gemma4", tmp_path)
+
+    export = tmp_path / "export"
+    assert {entry.name for entry in export.iterdir()} >= {
+        "config.json", "generation_config.json", "model.safetensors"}
+    run = tmp_path / "checkpoints" / tmp_path.name
+    assert json.loads((run / "run.json").read_text())["objective"] == "lm"
+    assert json.loads((export / "generation_config.json").read_text())["tokenizer_name"]
