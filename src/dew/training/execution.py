@@ -12,6 +12,14 @@ outside the stack in the accelerator's own memory. Its snapshot is itself,
 one array for the whole run, and the per-step copy is of the moving leaves
 alone. A scanned run stacks its frozen rows once, the first step that reads
 them, and keeps that bank for as long as the rows it was built from stay.
+
+The pullback is over the moving leaves alone. A resident leaf, or a bank
+stacked from resident rows only, enters the objective as a value the vjp
+does not differentiate, the way the resident transaction passes `frozen`:
+the forward keeps nothing for a cotangent no optimizer reads, and the
+cotangent of a frozen row is never traced rather than dropped after the
+fact. What the backward needs of a resident bank is the bank itself, read
+from where it sits.
 """
 from __future__ import annotations
 
@@ -96,16 +104,21 @@ def _selected(tree, paths):
     return selected
 
 
-@functools.partial(jax.jit, static_argnames=("sites", "paths"))
-def _trainable_cotangent(back, cotangent, *, sites, paths):
+@functools.partial(jax.jit, static_argnames=("sites", "paths", "layout"))
+def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
     """One accelerator computation: the pullback, the unstack and the selection.
 
     `back` crosses this boundary as its own pytree, so the residuals are
-    arguments rather than captured constants, and the cotangents of frozen
-    rows are dead values the compiler can drop instead of arrays a caller
-    receives and throws away.
+    arguments rather than captured constants. It returns one cotangent per
+    moving store leaf; `layout` (the store's treedef and which of its leaves
+    are held) puts them back in the store's shape, a held leaf's place
+    empty, so a mixed bank's frozen rows are the dead values the compiler
+    drops and its moving rows are selected under their logical paths.
     """
-    gradient = _logical({"params": back(cotangent)[0]}, sites)["params"]
+    treedef, held = layout
+    cotangents = iter(back(cotangent)[0])
+    placed = treedef.unflatten([None if known else next(cotangents) for known in held])
+    gradient = _logical({"params": placed}, sites)["params"]
     return _selected(gradient, paths)
 
 
@@ -213,18 +226,29 @@ class HostExecution:
     def realize(self, variables, batch, step):
         with jax.set_mesh(self.cpu):
             store = self.snapshot(variables)
+            # A frozen leaf is the state's own array and a frozen bank the
+            # one kept across steps: those the vjp reads as values.
+            resident = {id(leaf) for leaf in jax.tree.leaves(variables.get(FROZEN, {}))}
+            resident.update(id(bank) for bank in self._stacked.values())
             ema = self.snapshot(step.ema)
         assert store is not None, "a realization always receives model variables"
         moving = tuple(tuple(entry.key for entry in path) for path, _ in
                        jax.tree_util.tree_leaves_with_path(variables["params"]))
+        leaves, treedef = jax.tree.flatten(store["params"])
+        held = tuple(id(leaf) in resident for leaf in leaves)
+        primal = [leaf for leaf, known in zip(leaves, held, strict=True) if not known]
+        layout = (treedef, held)
         with jax.set_mesh(self.accelerator):
             batch = transfer(batch, batch_shardings(self.accelerator, batch))
             clock, key = self.on_accelerator((step.step, step.key))
             execution_info = Step(clock, key, ema)
 
             def loss(trainable):
-                return self.loss({**store, "params": trainable}, batch, execution_info)
-            stats, back, aux = jax.vjp(loss, store["params"], has_aux=True)
+                moved = iter(trainable)
+                merged = treedef.unflatten([leaf if known else next(moved)
+                                            for leaf, known in zip(leaves, held, strict=True)])
+                return self.loss({**store, "params": merged}, batch, execution_info)
+            stats, back, aux = jax.vjp(loss, primal, has_aux=True)
         stats, aux = self.on_cpu((stats, aux))
         if aux.variables is not None:
             with jax.set_mesh(self.cpu):
@@ -234,9 +258,8 @@ class HostExecution:
             # A shared owner is one bank input, so native reverse mode already
             # sums every use's contribution into it.
             with jax.set_mesh(self.accelerator):
-                if not self.sites:
-                    return self.on_cpu(back(self.on_accelerator(cotangent))[0])
                 gradient = _trainable_cotangent(
-                    back, self.on_accelerator(cotangent), sites=self.sites, paths=moving)
+                    back, self.on_accelerator(cotangent), sites=self.sites, paths=moving,
+                    layout=layout)
             return self.on_cpu(gradient)
         return Realization(stats, aux, pullback)
