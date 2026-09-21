@@ -24,8 +24,8 @@ from typing import TYPE_CHECKING, Protocol, TextIO
 import jax
 import numpy as np
 
-from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
-from dew.telemetry.records import RECORD_TYPES, FitEnded, RunRecord, json_value
+from dew.artifacts import Artifact, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
+from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value
 
 if TYPE_CHECKING:
     from mlflow.tracking import MlflowClient
@@ -33,10 +33,16 @@ if TYPE_CHECKING:
     from tensorboard.summary.writer.event_file_writer import EventFileWriter
 
 
+type Reported = Record | Artifact
+"""What a tracker is handed: one of the run's own records, or one of the
+artifact types an objective's evaluation produces. A renderer is registered
+per type, and a new artifact type joins `dew.artifacts.Artifact`."""
+
+
 class Tracker(Protocol):
     def log(self, scalars: Mapping[str, float], step: int) -> None: ...
 
-    def artifact(self, value: object, step: int) -> None: ...
+    def artifact(self, value: Reported, step: int) -> None: ...
 
     def close(self) -> None: ...
 
@@ -80,11 +86,14 @@ def _gif(clip: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
-type Payload = dict[str, object]
+type Payload = Mapping[str, object]
+"""One W&B log call: the metric names a renderer writes under and the wandb
+values it built for them. wandb is an optional import, so the values are
+read by wandb alone and named nowhere here."""
 
 
 @functools.singledispatch
-def render(value: object) -> Payload:
+def render(value: Reported) -> Payload:
     """The W&B payload for an explicitly reported artifact."""
     raise TypeError(f"WandbTracker has no renderer for {type(value).__name__}")
 
@@ -181,7 +190,7 @@ class WandbTracker(_OwnedTracker):
     def log(self, scalars: Mapping[str, float], step: int) -> None:
         self.run.log({**{name: float(value) for name, value in scalars.items()}, "train/step": step})
 
-    def artifact(self, value: object, step: int) -> None:
+    def artifact(self, value: Reported, step: int) -> None:
         if self._closed:
             raise RuntimeError("WandbTracker is closed")
         if isinstance(value, RunRecord):
@@ -235,19 +244,19 @@ class LocalTracker(_OwnedTracker):
         if self._closed:
             raise RuntimeError('LocalTracker is closed')
 
-    def _write(self, name: str, value: object) -> None:
+    def _write(self, name: str, payload: Mapping[str, object]) -> None:
         self._check()
-        payload = json.dumps(json_value(value), allow_nan=False)
+        line = json.dumps(json_value(payload), allow_nan=False)
         if name not in self._files:
             self.directory.mkdir(parents=True, exist_ok=True)
             self._files[name] = (self.directory / name).open('a', buffering=1)
-        self._files[name].write(payload + '\n')
+        self._files[name].write(line + '\n')
 
     def log(self, scalars: Mapping[str, float], step: int) -> None:
         self._write('scalars.jsonl', {'step': step, 'time': time.time(),
                                     'scalars': {name: float(value) for name, value in scalars.items()}})
 
-    def artifact(self, value: object, step: int) -> None:
+    def artifact(self, value: Reported, step: int) -> None:
         self._check()
         if isinstance(value, RECORD_TYPES):
             self._write('records.jsonl', {'type': type(value).__name__, 'step': step,
@@ -316,7 +325,7 @@ class LocalTracker(_OwnedTracker):
 
 
 @functools.singledispatch
-def _write_preview(value: object, prefix: Path) -> list[Path]:
+def _write_preview(value: Reported, prefix: Path) -> list[Path]:
     raise TypeError(f'LocalTracker has no renderer for {type(value).__name__}')
 
 
@@ -406,7 +415,7 @@ class MLflowTracker(_OwnedTracker):
         client.log_batch(run, metrics=[Metric(name, float(value), moment, step)
                                        for name, value in scalars.items()])
 
-    def artifact(self, value: object, step: int) -> None:
+    def artifact(self, value: Reported, step: int) -> None:
         client, run = self.run
         if isinstance(value, RECORD_TYPES):
             client.log_dict(run, {'step': step, 'value': json_value(value)},
@@ -469,7 +478,7 @@ class TensorBoardTracker(_OwnedTracker):
         self._add(Summary(value=[Summary.Value(tag=name, simple_value=float(value))
                                  for name, value in scalars.items()]), step)
 
-    def artifact(self, value: object, step: int) -> None:
+    def artifact(self, value: Reported, step: int) -> None:
         if isinstance(value, RECORD_TYPES):
             from tensorboard.compat.proto.summary_pb2 import Summary
 
@@ -511,7 +520,7 @@ def _picture(tag: str, encoded: bytes, frame: np.ndarray) -> Summary.Value:
 
 
 @functools.singledispatch
-def _summarize(value: object) -> Summary:
+def _summarize(value: Reported) -> Summary:
     """The TensorBoard summary for an explicitly reported artifact."""
     raise TypeError(f'TensorBoardTracker has no renderer for {type(value).__name__}')
 
@@ -587,7 +596,7 @@ class Trackers(_OwnedTracker):
     def log(self, scalars: Mapping[str, float], step: int) -> None:
         self._each(lambda tracker: tracker.log(scalars, step))
 
-    def artifact(self, value: object, step: int) -> None:
+    def artifact(self, value: Reported, step: int) -> None:
         self._each(lambda tracker: tracker.artifact(value, step))
 
     def close(self) -> None:

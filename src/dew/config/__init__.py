@@ -41,7 +41,7 @@ from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.registry import REGISTRIES, _declared_type, datasets, models, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
-from dew.telemetry.records import RunRecord, json_value, packages_installed
+from dew.telemetry.records import JSON, RunRecord, json_value, packages_installed
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import build_optimizer
 from dew.training.quantization import Quantization, quantize
@@ -50,7 +50,7 @@ from dew.training.tracker import LocalTracker, Trackers, WandbTracker
 from dew.training.trainer import ProfileWindow, Trainer
 
 JsonDict = Annotated[
-    dict[str, Any],
+    Mapping[str, object],
     tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
         metavar="JSON",
@@ -59,7 +59,9 @@ JsonDict = Annotated[
         str_from_instance=lambda value: [json.dumps(value)],
     ),
 ]
-"""A dict, written as a single JSON string on the command line."""
+"""The fields a model is built from, written as a single JSON string on the
+command line. The registry knows which architecture takes which field and
+narrows each one where it builds it, so the values are read there."""
 
 if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the registered specs, and a
@@ -91,7 +93,7 @@ class ModelConfig:
     """Attention kernel; 'auto' is cudnn on a GPU for the shapes cudnn
     supports and xla for the rest, xla on any other backend."""
 
-    def fields(self) -> dict[str, Any]:
+    def fields(self) -> Mapping[str, object]:
         """The model's fields with the run's precision settings in them."""
         return with_precision(self.architecture, self.config,
                               dtype=self.dtype, attention_impl=self.attention_impl,
@@ -106,7 +108,7 @@ class ModelConfig:
         return frozenset(self.fields()) - frozenset(self.config)
 
     @classmethod
-    def from_dict(cls, values: Mapping[str, Any]) -> Self:
+    def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Inverse of the record `RunConfig.to_dict` writes for this field."""
         return _rebuild(cls, values)
 
@@ -240,7 +242,7 @@ def _registry_for(annotation):
     return None
 
 
-def _to_json(value, annotation) -> Any:
+def _to_json(value, annotation) -> JSON:
     """`value` as JSON: a dict, a list, or a scalar json.dump can write.
     `annotation` is the declared field type, so the write side names the same
     registry and member types the read side rebuilds from."""
@@ -267,9 +269,14 @@ def _to_json(value, annotation) -> Any:
                 for entry_value, entry in zip(value, entries, strict=True)]
     if isinstance(value, Mapping):
         entries = registry.entry_types(annotation, len(value))
-        return {key: _to_json(entry_value, entry)
+        return {str(key): _to_json(entry_value, entry)
                 for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
-    return value
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(
+        f"{type(value).__name__} is not something a run record can carry; a "
+        f"config field holds JSON scalars, sequences, mappings, and the "
+        f"registered values this writes as their name and fields")
 
 
 def _fields(cls, values):
@@ -322,7 +329,7 @@ class RunConfig:
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: str | None = None
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, JSON]:
         """JSON-safe record of the run; a registered member is written as its
         name and fields."""
         return {field.name: _to_json(getattr(self, field.name),
@@ -330,7 +337,7 @@ class RunConfig:
                 for field in dataclasses.fields(self)}
 
     @classmethod
-    def from_dict(cls, values: Mapping[str, Any]) -> Self:
+    def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Inverse of `to_dict`, for subclasses too; an unknown or a missing
         field raises."""
         return _rebuild(cls, values)

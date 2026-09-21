@@ -23,6 +23,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypeVar, Union
 
 import jax.numpy as jnp
+import numpy as np
 from jax.typing import DTypeLike
 from typing_extensions import Format, get_annotations
 
@@ -39,9 +40,18 @@ if TYPE_CHECKING:
 
 T = TypeVar("T", bound=Callable[..., Any])
 M = TypeVar("M", bound=Callable[..., Any])
+Built = TypeVar("Built")
+"""What calling a member builds: the module a model name builds, the spec a
+dataset name builds. A registry is generic over both, since the table holds
+the callable and `build` hands back what it returned."""
+
+# A type annotation as a value: a class, a union of them, a subscripted
+# generic, a PEP 695 alias, or the None a field with no resolvable annotation
+# leaves behind. Every reader below takes one of these and asks it what it is.
+type Annotation = type | types.UnionType | types.GenericAlias | typing.TypeAliasType | None
 
 
-class Registry(Mapping[str, T], Generic[T]):
+class Registry(Mapping[str, T], Generic[T, Built]):
     """Names for one kind of thing: a decorator, a mapping and an attribute view."""
 
     def __init__(self, kind: str, *, record: Literal["name", "kind"] = "name"):
@@ -97,14 +107,15 @@ class Registry(Mapping[str, T], Generic[T]):
     def __repr__(self) -> str:
         return f"Registry({self.kind!r}, {sorted(self._members)})"
 
-    def name_of(self, member: object) -> str:
-        """The name a member was registered under."""
+    def name_of[Made](self, member: Callable[..., Made]) -> str:
+        """The name a member was registered under. The table is scanned by
+        identity, so this takes a member of any registry, whatever it makes."""
         for name, held in self._members.items():
             if held is member:
                 return name
         raise KeyError(f"{_describe(member)} is not a registered {self.kind}")
 
-    def build(self, name: str, /, **fields: Any) -> Any:
+    def build(self, name: str, /, **fields: Any) -> Built:
         """Construct the member called `name` from keyword fields.
 
         A field the member does not declare is an error. Fields arrive from
@@ -116,11 +127,11 @@ class Registry(Mapping[str, T], Generic[T]):
         member = self[name]
         return member(**self._declared_fields(name, member, fields))
 
-    def _declared_fields(self, name: str, member: Any,
-                         fields: dict[str, Any]) -> dict[str, Any]:
+    def _declared_fields(self, name: str, member: Callable[..., Built],
+                         fields: Mapping[str, object]) -> Mapping[str, object]:
         """`fields` as the member declares them, or an error naming what it
         has no field for. A member that is not a dataclass takes them as given."""
-        if not dataclasses.is_dataclass(member):
+        if not (isinstance(member, type) and dataclasses.is_dataclass(member)):
             return fields
         declared = {f.name for f in dataclasses.fields(member) if f.init}
         unknown = sorted(set(fields) - declared)
@@ -131,7 +142,7 @@ class Registry(Mapping[str, T], Generic[T]):
         return {key: _field_value(member, key, value) for key, value in fields.items()}
 
     @property
-    def union(self) -> Any:
+    def union(self) -> type[Built] | types.UnionType:
         """`Union[...]` of the members, for a tyro subcommand over the table."""
         members = list(self._members.values())
         if not members:
@@ -139,11 +150,11 @@ class Registry(Mapping[str, T], Generic[T]):
         return functools.reduce(operator.or_, members)
 
 
-def _describe(member: object) -> str:
+def _describe[Made](member: Callable[..., Made]) -> str:
     return getattr(member, "__name__", repr(member))
 
 
-def _declared_type(member: type, field: str) -> object:
+def _declared_type(member: type, field: str) -> Annotation:
     """Resolve one field without evaluating unrelated dependency annotations."""
     for owner in member.__mro__:
         annotations = get_annotations(owner, format=Format.FORWARDREF)
@@ -160,14 +171,14 @@ def _declared_type(member: type, field: str) -> object:
     return None
 
 
-def _value_type(annotation: object) -> type | None:
+def _value_type(annotation: Annotation) -> type | None:
     """A dataclass type behind an Optional, but not a multi-member union."""
     annotation = _unwrapped(annotation)
     return (annotation if isinstance(annotation, type) and dataclasses.is_dataclass(annotation)
             else None)
 
 
-def resolve_alias(annotation: object) -> object:
+def resolve_alias(annotation: Annotation) -> Annotation:
     """A PEP 695 alias looked through to the type it declares. `get_origin`
     and `get_args` see nothing through one, so every reader goes through here
     before asking an annotation what it is."""
@@ -176,7 +187,7 @@ def resolve_alias(annotation: object) -> object:
     return annotation
 
 
-def _unwrapped(annotation: object) -> object:
+def _unwrapped(annotation: Annotation) -> Annotation:
     """`annotation` with an Optional looked through; a union of several
     members says nothing about its entries and answers None."""
     annotation = resolve_alias(annotation)
@@ -186,7 +197,7 @@ def _unwrapped(annotation: object) -> object:
     return members[0] if len(members) == 1 else None
 
 
-def entry_types(annotation: object, count: int) -> list[object]:
+def entry_types(annotation: Annotation, count: int) -> list[Annotation]:
     """The annotation of each of the `count` entries of an annotated
     container: a fixed tuple's per-position types, otherwise its one element
     type repeated (a mapping's value type, a sequence's element). None is an
@@ -201,7 +212,7 @@ def entry_types(annotation: object, count: int) -> list[object]:
     return [element] * count
 
 
-def wants_tuple(annotation: object) -> bool:
+def wants_tuple(annotation: Annotation) -> bool:
     """Whether the annotation declares an immutable sequence. A record's
     list is rebuilt as a tuple so the frozen value stays hashable; `list`
     and `MutableSequence` keep their list."""
@@ -210,7 +221,7 @@ def wants_tuple(annotation: object) -> bool:
             or typing.get_origin(annotation) in (tuple, Sequence))
 
 
-def from_record(annotation: object, value: Any) -> Any:
+def from_record(annotation: Annotation, value: Any) -> Any:
     """`value` as its annotation asks for it: a record becomes the value it
     describes, and anything already built is left alone.
 
@@ -245,7 +256,7 @@ def from_record(annotation: object, value: Any) -> Any:
     return value
 
 
-def _field_value(member: Any, field: str, value: Any) -> Any:
+def _field_value(member: type, field: str, value: Any) -> Any:
     """One field on its way into `member`: a dtype from its name, a value from a record."""
     if field == "dtype":
         return resolve_dtype(value)
@@ -257,14 +268,24 @@ _DTYPES: dict[DtypeName, DTypeLike] = {
     "float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
 
 
-def resolve_dtype(value: Any) -> Any:
-    """A dtype as a module field: a jnp dtype, one of its names, or None."""
-    if value is None or not isinstance(value, str):
+def resolve_dtype(value: object) -> DTypeLike | None:
+    """A dtype as a module field: a jnp dtype, one of its names, or None.
+
+    Every field named `dtype` is read here, wherever it arrives from, so a
+    dtype passes through and a name becomes the dtype it names. Anything
+    else is refused here rather than inside a module's first cast.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        for name, dtype in _DTYPES.items():
+            if value == name:
+                return dtype
+        raise ValueError(f"dtype {value!r} is not one of {sorted(_DTYPES)}")
+    if isinstance(value, (type, np.dtype)):
         return value
-    for name, dtype in _DTYPES.items():
-        if value == name:
-            return dtype
-    raise ValueError(f"dtype {value!r} is not one of {sorted(_DTYPES)}")
+    raise ValueError(
+        f"dtype {value!r} is not a dtype, nor one of {sorted(_DTYPES)}")
 
 
 def dtype_name(value: DTypeLike | None) -> DtypeName | None:
@@ -284,7 +305,7 @@ _PRECISION_FLAGS = {"dtype": "--model.dtype", "attention_impl": "--model.attenti
                     "precision": "--model.matmul-precision"}
 
 
-def with_precision(name: str, config: Mapping[str, Any], *,
+def with_precision(name: str, config: Mapping[str, object], *,
                    dtype: str, attention_impl: str, param_dtype: str | None = None,
                    matmul_precision: str | None = None) -> dict[str, Any]:
     """A model config with the run's compute dtype and attention kernel in it.
@@ -325,26 +346,39 @@ def with_precision(name: str, config: Mapping[str, Any], *,
     fields = {**config, **written}
     stages = {f.name: f for f in dataclasses.fields(member)}.get("attention_configs")
     if stages is not None:
-        fields["attention_configs"] = [
-            None if stage is None
-            else {**stage, "dtype": dtype, "force_fp32_for_softmax": True}
-            if isinstance(stage, Mapping)
-            else dataclasses.replace(stage, dtype=resolve_dtype(dtype),
-                                     force_fp32_for_softmax=True)
-            for stage in config.get("attention_configs", stages.default)]
+        carried = config.get("attention_configs", stages.default)
+        if not isinstance(carried, (list, tuple)):
+            raise ValueError(
+                f"attention_configs is {carried!r}; a unet takes one entry per "
+                f"resolution stage, each a record, a Stage, or None for a stage "
+                f"that does not attend")
+        resolved: list[object] = []
+        for stage in carried:
+            if stage is None:
+                resolved.append(None)
+            elif isinstance(stage, Mapping):
+                resolved.append({**stage, "dtype": dtype, "force_fp32_for_softmax": True})
+            elif dataclasses.is_dataclass(stage) and not isinstance(stage, type):
+                resolved.append(dataclasses.replace(
+                    stage, dtype=resolve_dtype(dtype), force_fp32_for_softmax=True))
+            else:
+                raise ValueError(
+                    f"attention_configs carries {stage!r}; a stage is a record or "
+                    f"a Stage")
+        fields["attention_configs"] = resolved
     return fields
 
 
-models: Registry[type[nn.Module]] = Registry("model")
-presets: Registry[type[Preset]] = Registry("preset")
-samplers: Registry[type[Solver[Any]]] = Registry("sampler")
-datasets: Registry[type[DatasetSpec]] = Registry("dataset")
-encoders: Registry[type[ConditionEncoder[Any]]] = Registry("encoder")
-metrics: Registry[Callable[..., Metric]] = Registry("metric")
-objectives: Registry[type[Objective]] = Registry("objective")
-mixers: Registry[type[MixerBase]] = Registry("mixer", record="kind")
-towers: Registry[type[TowerBase]] = Registry("tower", record="kind")
-projectors: Registry[type[ProjectorBase]] = Registry("projector", record="kind")
+models: Registry[type[nn.Module], nn.Module] = Registry("model")
+presets: Registry[type[Preset], Preset] = Registry("preset")
+samplers: Registry[type[Solver[Any]], Solver[Any]] = Registry("sampler")
+datasets: Registry[type[DatasetSpec], DatasetSpec] = Registry("dataset")
+encoders: Registry[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Registry("encoder")
+metrics: Registry[Callable[..., Metric], Metric] = Registry("metric")
+objectives: Registry[type[Objective], Objective] = Registry("objective")
+mixers: Registry[type[MixerBase], MixerBase] = Registry("mixer", record="kind")
+towers: Registry[type[TowerBase], TowerBase] = Registry("tower", record="kind")
+projectors: Registry[type[ProjectorBase], ProjectorBase] = Registry("projector", record="kind")
 
 # Core records nest their fields under a name; model component records inline
 # their fields beside a kind discriminator read by the component's constructor.

@@ -179,7 +179,7 @@ class DiffusionRunConfig(RunConfig):
     def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
         """The fields the registry builds the model from: the run's precision
         settings and the channels the model denoises, over `model.config`."""
-        fields = self.model.fields()
+        fields = dict(self.model.fields())
         sample = self.sample_field()
         fields["output_channels"] = (sample.shape[-1] if autoencoder is None
                                      else autoencoder.latent_channels)
