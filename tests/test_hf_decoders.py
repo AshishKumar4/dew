@@ -106,8 +106,12 @@ import numpy as np
 import pytest
 
 from dew.interop import load_pretrained
+from dew.interop import hf_decoders
 from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
+from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
+from dew.nn.gemma3n import AltUp
 from dew.nn.gpt_oss import dequantize_mxfp4, quantize_mxfp4
+from dew.nn.hyper_connections import HyperConnections
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -123,6 +127,24 @@ REAL = FIXTURES / "qwen3-0.6b"
 
 def fixture_config(name):
     return json.loads((FIXTURES / name / "config.json").read_text())
+
+
+# The records a translated config carries, against the values they build. Each
+# pair is one TypedDict and the dataclass whose init fields it names, so a
+# field added, renamed or dropped there fails here instead of becoming a key
+# the backbone never reads.
+@pytest.mark.parametrize("record, value", [
+    (hf_decoders.DecoderFields, CausalTransformer),
+    (hf_decoders.KindFields, LayerKind),
+    (hf_decoders.MixtureFields, Mixture),
+    (hf_decoders.AltUpFields, AltUp),
+    (hf_decoders.HyperConnectionsFields, HyperConnections),
+])
+def test_a_config_record_names_every_field_of_the_value_it_builds(record, value):
+    # `parent` and `name` are flax's binding, not fields a config states.
+    declared = {field.name for field in dataclasses.fields(value)
+                if field.init} - {"parent", "name"}
+    assert set(record.__optional_keys__) | set(record.__required_keys__) == declared
 
 
 def test_registered_family_alias_preserves_its_source_when_exported(tmp_path, monkeypatch):

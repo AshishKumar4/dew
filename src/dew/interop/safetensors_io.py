@@ -219,7 +219,7 @@ def write_file(
     _publish(lambda: dict(tensors), path, metadata)
 
 
-def save_hf_layout(params, config: dict[str, Any], directory) -> None:
+def save_hf_layout(params, config: Mapping[str, object], directory) -> None:
     """Write model.safetensors and config.json into `directory`.
 
     That pair is what a Hugging Face style loader looks for. The config is

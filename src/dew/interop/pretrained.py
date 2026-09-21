@@ -2005,7 +2005,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         # nested config; `translate_config` refuses the rest by the same
         # rule.
         record = decoders.translate_wrapper_config(config)
-        text_fields = dict(record["text"])
+        text_fields: decoders.DecoderFields = {**record["text"]}
         if max_seq_len is not None:
             text_fields["max_seq_len"] = max_seq_len
         if family == "gemma3":
@@ -2014,9 +2014,10 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             text_fields["final_logit_softcap"] = None
             text_fields["mixer"] = {"kind": "attention", "bidirectional_images": True}
         if family == "gemma4" and config["text_config"].get("use_bidirectional_attention") == "vision":
-            kinds = dict(text_fields["kinds"])
-            sliding = dict(kinds.get("sliding_attention", {}))
-            sliding["mixer"] = {"kind": "attention", "bidirectional_images": True}
+            kinds = dict(text_fields.get("kinds") or {})
+            sliding: decoders.KindFields = {
+                **kinds.get("sliding_attention", {}),
+                "mixer": {"kind": "attention", "bidirectional_images": True}}
             kinds["sliding_attention"] = sliding
             text_fields["kinds"] = kinds
         if family == "qwen3_5":
@@ -2025,18 +2026,23 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             if (not isinstance(sections, (list, tuple)) or len(sections) != 3
                     or any(type(value) is not int or value < 0 for value in sections)):
                 raise ValueError("mrope_section must contain three nonnegative integer widths")
-            kinds = dict(text_fields["kinds"])
-            full = dict(kinds.get("full_attention", {}))
-            full["mixer"] = {"kind": "attention", "mrope_section": [sections[0], sections[1], sections[2]]}
+            kinds = dict(text_fields.get("kinds") or {})
+            full: decoders.KindFields = {
+                **kinds.get("full_attention", {}),
+                "mixer": {"kind": "attention",
+                          "mrope_section": [sections[0], sections[1], sections[2]]}}
             kinds["full_attention"] = full
             text_fields["kinds"] = kinds
 
-        built = {**record, "text": with_precision(
-            "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
-        language_model = models.build("causal_transformer", **built["text"])
+        text = decoders.DecoderFields(**with_precision(
+            "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl))
+        wrapper: decoders.WrapperFields = {**record, "text": text}
+        built = wrapper
+        language_model = models.build("causal_transformer", **wrapper["text"])
         if not isinstance(language_model, CausalTransformer):
             raise TypeError("causal_transformer registry entry must build CausalTransformer")
         audio_record = record["audio"]
+        audio_projector = record["audio_projector"]
         model = MultimodalTransformer(
             language_model, tower_from_record(record["tower"]),
             projector_from_record(record["projector"]), family,
@@ -2045,7 +2051,8 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             extra_placeholder_ids=(tuple(config.get(name, default) for name, default in
                 (("video_token_id", 258884), ("audio_token_id", 258881))) if family == "gemma4" else ()),
             audio=None if audio_record is None else tower_from_record(audio_record),
-            audio_projection=None if audio_record is None else projector_from_record(record["audio_projector"]),
+            audio_projection=(None if audio_projector is None
+                              else projector_from_record(audio_projector)),
             audio_soft_tokens=record["audio_soft_tokens"],
             attention_impl=None if attention_impl == "reference" else attention_impl)
         variables = _native_variables(decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype))
