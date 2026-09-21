@@ -1,6 +1,6 @@
 """Text data for language models: tokenizers, the token-file source, the loader.
 
-ByteTokenizer and TokenFileSource are pure numpy; the HF tokenizer tests only
+ByteTokenizer and the token sources are pure numpy; the HF tokenizer tests only
 run when a cached copy of the hub is reachable, matching the repo's policy
 that no test needs the network.
 """
@@ -19,8 +19,18 @@ import numpy as np
 import optax
 import pytest
 
+import grain.python as pygrain
+
 from dew.data import ByteTokenizer, Loading, PackedTokens, TokenWindows
-from dew.data.sources.text import TokenDocumentSource, TokenFileSource
+from dew.data.dataset import describe
+from dew.data.tokens import PackedWindows
+from dew.data.sources.text import (
+    TokenBytes,
+    TokenColumn,
+    TokenDocumentSource,
+    TokenRecords,
+    TokenWindowSource,
+)
 from dew.nn.backbones import causal_transformer as backbone
 from dew.nn.mixers import attention as attention_kind
 from dew.objectives.base import scalar_loss
@@ -131,15 +141,15 @@ def test_hf_tokenizer_imports_lazily():
 
 
 # ---------------------------------------------------------------------------------
-# TokenFileSource
+# TokenWindowSource
 # ---------------------------------------------------------------------------------
 
-def test_token_file_source_length_and_window_contract(tmp_path):
+def test_token_window_source_length_and_window_contract(tmp_path):
     seq_len = 8
     n = 37  # tokens; (37 - 1) // 8 == 4 windows
     body = np.arange(1, n + 1, dtype=np.int64)
     _token_dir(tmp_path, train_tokens=0, body=body, dtype=np.uint32)
-    source = TokenFileSource(str(tmp_path / "train.bin"), seq_len)
+    source = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len)
 
     assert len(source) == (n - 1) // seq_len
     for i in range(len(source)):
@@ -153,7 +163,7 @@ def test_token_file_source_length_and_window_contract(tmp_path):
         source[len(source)]
 
 
-def test_token_file_source_reads_the_dtype_from_meta(tmp_path):
+def test_token_window_source_reads_the_dtype_from_meta(tmp_path):
     seq_len = 4
     tokens = np.arange(1, 3 * seq_len + 1, dtype=np.uint32)
     (tmp_path / "train.bin").write_bytes(tokens.astype("<u4").tobytes())
@@ -161,27 +171,27 @@ def test_token_file_source_reads_the_dtype_from_meta(tmp_path):
         {"dtype": "uint32", "vocab_size": 100000, "tokenizer": "gpt2"}))
     (tmp_path / "val.bin").write_bytes(tokens.astype("<u4").tobytes())
 
-    source = TokenFileSource(str(tmp_path / "train.bin"), seq_len)
-    assert source.dtype == np.dtype("uint32")
+    source = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len)
+    assert source.tokens.dtype == np.dtype("uint32")
     np.testing.assert_array_equal(source[0]["text"], tokens[:seq_len + 1])
-    assert source.vocab_size == 100000
+    assert source.tokens.vocab_size == 100000
 
     # Without meta.json the nanoGPT default applies.
     bare = tmp_path / "bare"
     bare.mkdir()
     (bare / "train.bin").write_bytes(tokens.astype("<u2").tobytes())
-    default_source = TokenFileSource(str(bare / "train.bin"), seq_len)
-    assert default_source.dtype == np.dtype("uint16")
+    default_source = TokenWindowSource(TokenBytes(str(bare / "train.bin")), seq_len)
+    assert default_source.tokens.dtype == np.dtype("uint16")
     np.testing.assert_array_equal(
         default_source[0]["text"], tokens[:seq_len + 1].astype("<u2").astype(np.int32))
 
 
-def test_token_file_source_rejects_files_too_short(tmp_path):
+def test_token_window_source_rejects_files_too_short(tmp_path):
     (tmp_path / "train.bin").write_bytes(np.zeros(seq_len := 4, np.uint16).tobytes())
     with pytest.raises(ValueError, match="too few for even one window"):
-        TokenFileSource(str(tmp_path / "train.bin"), seq_len)
+        TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len)
     with pytest.raises(ValueError, match="seq_len"):
-        TokenFileSource(str(tmp_path / "train.bin"), 0)
+        TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), 0)
 
 
 # ---------------------------------------------------------------------------------
@@ -336,7 +346,7 @@ def test_a_token_spec_refuses_a_directory_without_a_val_split(tmp_path, spec):
 @pytest.mark.parametrize("spec", [TokenWindows, PackedTokens])
 def test_a_token_spec_needs_a_directory_with_a_train_split(tmp_path, spec):
     (tmp_path / "not_a_dataset.txt").write_text("hello")
-    with pytest.raises(ValueError, match="no train.bin"):
+    with pytest.raises(ValueError, match="holds no train corpus"):
         spec(path=str(tmp_path), loading=Loading(workers=0)).load(batch=4)
     with pytest.raises(ValueError, match="path="):
         spec(loading=Loading(workers=0)).load(batch=4)
@@ -373,9 +383,9 @@ def test_tokenize_tool_round_trips_through_the_source(tmp_path):
         (corpus * 8).encode("utf-8"))
 
     seq_len = 32
-    train = TokenFileSource(str(out / "train.bin"), seq_len)
-    val = TokenFileSource(str(out / "val.bin"), seq_len)
-    assert train.dtype == np.dtype("uint8")
+    train = TokenWindowSource(TokenBytes(str(out / "train.bin")), seq_len)
+    val = TokenWindowSource(TokenBytes(str(out / "val.bin")), seq_len)
+    assert train.tokens.dtype == np.dtype("uint8")
     assert len(train) == (meta["train_tokens"] - 1) // seq_len
     assert len(val) == (meta["val_tokens"] - 1) // seq_len
 
@@ -428,7 +438,7 @@ def test_tokenize_tool_writes_the_smallest_dtype_that_fits():
 def test_document_source_reads_one_document_per_record(tmp_path):
     documents = [[10, 11, 12], [20, 21], [30, 31, 32, 33]]
     _document_dir(tmp_path, documents, eos_id=0)
-    source = TokenDocumentSource(str(tmp_path / "train.bin"))
+    source = TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
 
     assert len(source) == 3
     for index, document in enumerate(documents):
@@ -443,7 +453,7 @@ def test_document_source_keeps_the_tail_past_the_last_boundary(tmp_path):
     eos would lose those tokens with nothing said about it."""
     stream = np.asarray([10, 11, 0, 20, 21], np.int64)
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=0)
-    source = TokenDocumentSource(str(tmp_path / "train.bin"))
+    source = TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
 
     assert len(source) == 2
     np.testing.assert_array_equal(source[1]["text"], np.asarray([20, 21], np.int32))
@@ -452,12 +462,12 @@ def test_document_source_keeps_the_tail_past_the_last_boundary(tmp_path):
 def test_document_source_needs_an_eos_id(tmp_path):
     _token_dir(tmp_path, train_tokens=32)  # meta.json without eos_id
     with pytest.raises(ValueError, match="no eos_id"):
-        TokenDocumentSource(str(tmp_path / "train.bin"))
+        TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
 
 
 def test_document_source_reads_a_split_without_a_boundary_as_one_document(tmp_path):
     _token_dir(tmp_path, train_tokens=32, body=[1, 2, 3, 4], eos_id=9)
-    source = TokenDocumentSource(str(tmp_path / "train.bin"))
+    source = TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
 
     assert len(source) == 1
     np.testing.assert_array_equal(source[0]["text"],
@@ -1004,3 +1014,104 @@ def test_an_interrupted_packed_epoch_resumes_through_mp_prefetch(tmp_path):
     assert unseen and ended and ended_again
     assert resumed == unseen
     assert len(set(seen + resumed)) == len(seen) + len(unseen), "a window came twice"
+
+
+# ---------------------------------------------------------------------------------
+# One corpus, three stores
+# ---------------------------------------------------------------------------------
+
+def _chunks(tokens, sizes):
+    """`tokens` cut into consecutive pieces of `sizes`, the last taking the rest."""
+    edges = np.cumsum([0, *sizes])
+    pieces = [tokens[start:stop] for start, stop in zip(edges, edges[1:])]
+    return [*pieces, tokens[edges[-1]:]]
+
+
+def _as_records(directory, split, tokens, sizes, field=None):
+    """`tokens` as arrayrecord shards, cut into records of `sizes`."""
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data.images import pack_dict_of_byte_arrays
+
+    paths = []
+    for shard, piece in enumerate(_chunks(tokens, sizes)):
+        path = str(directory / f"{split}-{shard:02d}.array_record")
+        writer = ArrayRecordWriter(path, "group_size:1")
+        raw = piece.astype(np.uint16).tobytes()
+        writer.write(raw if field is None else pack_dict_of_byte_arrays({field: raw}))
+        writer.close()
+        paths.append(path)
+    return paths
+
+
+def _as_parquet(directory, split, tokens, sizes, column="input_ids"):
+    """`tokens` as one parquet file whose rows are pieces of `sizes`."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = directory / f"{split}.parquet"
+    rows = [piece.astype(np.int64).tolist() for piece in _chunks(tokens, sizes)]
+    pq.write_table(pa.table({column: rows}), path)
+    return [str(path)]
+
+
+CORPUS = np.concatenate([np.asarray([*document, PACK_EOS], np.int64) for document in
+                         ([10, 11, 12], [20, 21], [30, 31, 32, 33, 34], [40], [50, 51])])
+
+
+@pytest.fixture
+def stores(tmp_path):
+    """The same corpus in all three stores, cut differently in each.
+
+    The pieces are deliberately unequal, so a window that crosses a record
+    boundary has to be joined out of two of them; identical windows then say
+    the stream view is the stream, not the chunking.
+    """
+    (tmp_path / "train.bin").write_bytes(CORPUS.astype(np.uint16).tobytes())
+    return {
+        "bin": TokenBytes(str(tmp_path / "train.bin"), eos_id=PACK_EOS),
+        "records": TokenRecords(_as_records(tmp_path, "train", CORPUS, [4, 3]),
+                                eos_id=PACK_EOS),
+        "packed_records": TokenRecords(
+            _as_records(tmp_path, "packed", CORPUS, [2, 9], field="ids"),
+            field="ids", eos_id=PACK_EOS),
+        "parquet": TokenColumn(_as_parquet(tmp_path, "train", CORPUS, [5, 1, 6]),
+                               eos_id=PACK_EOS),
+    }
+
+
+def test_a_corpus_reads_the_same_span_out_of_every_store(stores):
+    for name, source in stores.items():
+        assert len(source) == len(CORPUS), name
+        np.testing.assert_array_equal(source[0:len(CORPUS)], CORPUS, err_msg=name)
+        # A span inside one piece, and one that crosses two of them.
+        np.testing.assert_array_equal(source[1:3], CORPUS[1:3], err_msg=name)
+        np.testing.assert_array_equal(source[3:9], CORPUS[3:9], err_msg=name)
+
+
+def test_the_same_corpus_gives_the_same_windows_in_every_store(stores):
+    windows = {name: [TokenWindowSource(source, 4)[i]["text"]
+                      for i in range(len(TokenWindowSource(source, 4)))]
+               for name, source in stores.items()}
+
+    assert len(windows["bin"]) == (len(CORPUS) - 1) // 4
+    for name, held in windows.items():
+        assert len(held) == len(windows["bin"]), name
+        for expected, got in zip(windows["bin"], held, strict=True):
+            np.testing.assert_array_equal(got, expected, err_msg=name)
+            assert got.dtype == np.int32
+
+
+def test_the_same_corpus_gives_the_same_packing_plan_in_every_store(stores):
+    def plan(source):
+        documents = TokenDocumentSource(source)
+        windows = PackedWindows(pygrain.MapDataset.source(documents), documents.lengths,
+                                6, 2, describe(documents))
+        return [documents.lengths.tolist(),
+                [{key: value.tolist() for key, value in windows[i].items()}
+                 for i in range(len(windows))]]
+
+    expected = plan(stores["bin"])
+    assert expected[0] == [4, 3, 6, 2, 3], "the documents are the eos spans"
+    for name, source in stores.items():
+        assert plan(source) == expected, name
