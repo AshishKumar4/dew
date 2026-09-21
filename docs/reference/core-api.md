@@ -138,6 +138,8 @@ Every dataset specification declares `seed` and `loading` as keyword-only fields
 
 An image specification takes validation from `val_split`, a split of the dataset's own bounded by `val_batches` batches, or, with `val_split` unset, from `val_batches * batch` records held out of the head of the training source.
 
+`Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())` builds a run over Grain datasets a caller assembled: a `MapDataset` is repeated, batched per process and saved as one global record count, and an `IterDataset` is batched where it is and reports Grain's own iterator state.
+
 
 ## Checkpoints
 
