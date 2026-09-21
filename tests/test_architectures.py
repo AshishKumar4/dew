@@ -37,7 +37,7 @@ from dew.nn.dit import TextContext
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
-from dew.registry import models
+from dew.registry import metrics, models
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, build_mesh
 
@@ -555,12 +555,24 @@ def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():
             prompts, steps=SAMPLER_STEPS, key=key).host().images)
 
 
-def test_a_declared_list_field_keeps_the_list_its_record_carries():
-    """The build boundary reads the annotation, not the value: `val_metrics`
-    is declared `list`, so a record rebuilds it as the mutable list the
-    dataclass asks for, and a run is the run it wrote down."""
-    config = replace(unet_run(JSON_UNET), val_metrics=["psnr", "ssim"])
+def test_a_record_rebuilds_each_field_as_its_annotation_asks():
+    """The build boundary reads the annotation, not the value. JSON writes
+    every sequence as a list: `val_metrics` is declared a tuple and comes
+    back one, while the model config is an opaque JSON dict whose lists are
+    its own, and a run is the run it wrote down."""
+    config = replace(unet_run(JSON_UNET), val_metrics=("psnr", "ssim"))
     rebuilt = DiffusionRunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
-    assert type(rebuilt.val_metrics) is list
-    assert rebuilt.val_metrics == ["psnr", "ssim"]
+    assert rebuilt.val_metrics == ("psnr", "ssim")
+    assert type(rebuilt.model.config["feature_depths"]) is list
+    assert rebuilt.model.config["feature_depths"] == [8, 16]
     assert rebuilt == config
+
+
+def test_a_val_metric_no_registry_knows_is_refused():
+    """`val_metrics` names the metrics registry, so an unknown name is
+    refused where it is written, with the registered names in the message."""
+    with pytest.raises(ValueError, match=r"\['fid_score'\].*'clip', 'clip_score', 'fid'"):
+        replace(unet_run(JSON_UNET), val_metrics=("fid_score",))
+
+    for name in sorted(metrics):
+        assert replace(unet_run(JSON_UNET), val_metrics=(name,)).val_metrics == (name,)

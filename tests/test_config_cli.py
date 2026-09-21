@@ -146,7 +146,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
         "--trainer.log-every", "1", "--model.architecture", "simple_dit", "--model.dtype", "float32",
         "--model.config", '{"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2}',
         "--sampling-steps", "2"])
-    config = dataclasses.replace(config, val_metrics=[])
+    config = dataclasses.replace(config, val_metrics=())
 
     state = recipe.main(config)
 

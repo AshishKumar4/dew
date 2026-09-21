@@ -10,7 +10,7 @@ same file.
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 import dew.eval  # registers the image metrics
 import dew.nn.backbones  # noqa: F401  registers the models
@@ -149,8 +149,21 @@ class DiffusionRunConfig(RunConfig):
     trains unconditionally."""
     autoencoder: StableDiffusionAutoencoder | None = None
     """Set for latent diffusion; None trains in pixel space."""
-    val_metrics: list[Literal["clip", "clip_score", "fid", "psnr", "ssim"]] = dataclasses.field(
-        default_factory=lambda: ["clip"])
+    val_metrics: tuple[str, ...] = ("clip",)
+    """Names in the metrics registry, scored on every validation pass. The
+    registry is the list of what a run can name, so a metric registered
+    elsewhere is spelled here without this class knowing it; `__post_init__`
+    refuses a name nothing is registered under."""
+
+    def __post_init__(self) -> None:
+        # A record carries every sequence as a JSON list and a command line
+        # writes one too; the field is a tuple, so the value is one.
+        object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
+        unknown = [name for name in self.val_metrics if name not in metrics]
+        if unknown:
+            raise ValueError(
+                f"val_metrics names {unknown}, which no metric is registered under; "
+                f"the registered metrics are {sorted(metrics)}")
 
     def sample_field(self) -> Field:
         """The batch field the model generates, at the resolution the data comes in."""

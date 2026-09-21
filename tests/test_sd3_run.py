@@ -69,7 +69,7 @@ def run_config(directory):
         preset=presets.Flow(), sampler=samplers.Euler(), sampling_steps=3, guidance=None,
         text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=StableDiffusionAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
-        val_metrics=[])
+        val_metrics=())
 
 
 def batches(objective):
