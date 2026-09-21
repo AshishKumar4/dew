@@ -44,6 +44,7 @@ from dew.telemetry.instrumentation import default_compilation_cache_dir
 from dew.telemetry.records import RunRecord, json_value, packages_installed
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import build_optimizer
+from dew.training.quantization import Quantization, quantize
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
 from dew.training.trainer import ProfileWindow, Trainer
@@ -172,6 +173,10 @@ class TrainerConfig:
     """Extra XLA_FLAGS for this run, appended to the environment by
     `prepare_process` before JAX opens a backend. Library users set XLA_FLAGS
     themselves; see docs/performance.md for what was measured."""
+    quantization: Quantization | None = None
+    """Quantized-training spec, wrapped around the module the objective
+    trains before the run initialises it; unset trains in the compute dtype.
+    `dew.training.quantization` says what the wrap does and what it keeps."""
 
     def __post_init__(self):
         if self.steps is not None and self.epochs is not None:
@@ -348,12 +353,18 @@ class RunConfig:
         the run's reported throughput all name the configured number, while
         every step reads the dataset's, so the two disagreeing is a run that
         trains at a batch it does not report.
+
+        A `trainer.quantization` wraps the module `objective` trains before
+        anything initialises it, so the quantized forward is what the run
+        learns through.
         """
         if dataset.batch != self.trainer.batch_size:
             raise ValueError(
                 f"--trainer.batch-size is {self.trainer.batch_size} and this dataset "
                 f"reads {dataset.batch} records a step; load it with "
                 f"load(batch={self.trainer.batch_size})")
+        if self.trainer.quantization is not None:
+            quantize(objective, self.trainer.quantization)
         objective_type = type(objective)
         kind = (registry.objectives.name_of(objective_type) if objective_type in registry.objectives.values()
                 else f"{objective_type.__module__}.{objective_type.__qualname__}")

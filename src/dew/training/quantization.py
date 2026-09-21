@@ -1,10 +1,12 @@
-"""Quantized training through Qwix, applied to the model at build time.
+"""Quantized training through Qwix, applied to the model before it trains.
 
 Qwix (google/qwix, Apache 2.0) expresses quantization as rules over module
 paths and applies them without editing the model: one call wraps the module
 and the matmuls in the wrapped methods' extent run quantized. Dew's version
-of that call is `apply_quantization`: a recipe builds its model from the registry as
-always, then wraps it before the objective ever sees it.
+of that call is `apply_quantization`: a caller builds its model from the registry as
+always, then wraps it before the objective ever sees it. A run names the
+value as `--trainer.quantization`, and `RunConfig.train` wraps through
+`quantize` the objective it was handed, before anything initialises it.
 
 What trains is fake-quantized. The parameter tree keeps fp32 master weights
 with the same structure, so the checkpoint layout, the sharding derivation,
@@ -30,7 +32,7 @@ package the call raises naming it, the way the tokamax branch of
 import dataclasses
 import importlib
 import re
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -155,3 +157,34 @@ def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
     ]
     methods = tuple(method for method in METHODS if hasattr(model, method))
     return qwix.quantize_model(model, qwix.QtProvider(rules), methods=methods)
+
+
+@runtime_checkable
+class ModelObjective(Protocol):
+    """An objective that trains one module, which is the shape `quantize`
+    can wrap: the module is its `model`, and every trace it runs reads it
+    there."""
+
+    model: nn.Module
+
+
+def quantize(objective: object, spec: Quantization) -> None:
+    """Quantize the trunk matmuls of the module `objective` trains.
+
+    `apply_quantization` wraps a module before an objective is built, which
+    is what a recipe that builds its own model does. A run that names
+    `--trainer.quantization` has handed `RunConfig.train` the objective
+    already, so the wrap lands on the objective's own model instead, before
+    anything has initialised or traced it; the wrapped module is a copy of
+    the same class, so what the objective read off the model at construction
+    still holds.
+
+    An objective that trains something other than one module has nothing to
+    wrap and is refused by name.
+    """
+    if not isinstance(objective, ModelObjective):
+        raise ValueError(
+            f"--trainer.quantization quantizes the module an objective trains, and "
+            f"{type(objective).__name__} keeps no `model`; train an objective that "
+            f"holds one, or leave the quantization unset")
+    objective.model = apply_quantization(objective.model, spec)

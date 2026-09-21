@@ -157,15 +157,18 @@ def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
 
 
 def test_the_recipe_trains_a_quantized_trunk(tmp_path):
-    """`quantization:quantization --quantization.dtype int8` through
-    `recipe.main`: the run completes to finite weights and the record
+    """`trainer.quantization:quantization --trainer.quantization.dtype int8`
+    through `recipe.main`: the knob is the trainer's, the recipe carries none
+    of its own, the run completes to finite weights and the record
     round-trips the value. Observed on CPU: 4 steps, all leaves finite."""
     pytest.importorskip("qwix")
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     config = run_config(recipe, tokens, "--trainer.name", "quant",
-                        "--trainer.epochs", "1", "quantization:quantization",
-                        "--quantization.dtype", "int8")
+                        "--trainer.epochs", "1", "trainer.quantization:quantization",
+                        "--trainer.quantization.dtype", "int8")
+    assert not any(field.name == "quantization"
+                   for field in dataclasses.fields(recipe.LmRunConfig))
     state = recipe.main(config)
     assert int(state.step) > 0
     assert all(bool(jnp.all(jnp.isfinite(leaf)))

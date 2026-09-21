@@ -138,9 +138,12 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
         from dew.objectives.rl.ppo import _part
         variables = _part(variables, "policy")
     model = model_config.build()
-    if record.get("quantization") is not None:
+    # The knob is the trainer's; a run.json written before it moved there
+    # carries it at the top level, where the LM recipe kept its own flag.
+    quantization = record.get("trainer", {}).get("quantization") or record.get("quantization")
+    if quantization is not None:
         from dew.training.quantization import Quantization, apply_quantization
-        model = apply_quantization(model, Quantization(**record["quantization"]))
+        model = apply_quantization(model, Quantization(**quantization))
     controls = record.get("sampling")
     if controls is None and budget:
         raise ValueError("run.json lacks the sampling policy for its text previews")
