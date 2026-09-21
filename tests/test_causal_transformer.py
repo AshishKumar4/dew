@@ -157,7 +157,7 @@ def test_registry_builds_the_backbone_and_takes_the_precision_policy():
         dtype='bfloat16', attention_impl='reference')
     model = models.build('causal_transformer', **config)
     assert model.dtype is jnp.bfloat16
-    assert model.attention_impl is None
+    assert model.attention_impl == 'reference'
 
     ids = jnp.zeros((1, 4), jnp.int32)
     params = model.init(jax.random.PRNGKey(0), ids)
