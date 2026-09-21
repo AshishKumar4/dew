@@ -2575,9 +2575,23 @@ class CausalTransformer(nn.Module):
         place here. A vocabulary-sized fp32 copy is what a loss over this
         head would hold for its backward, so none is made here.
         """
+        table, vocab_major = self.head_table(params)
+        return table.T if vocab_major else table
+
+    def head_table(self, params):
+        """The head matrix as the tree stores it, and whether its rows are
+        the vocabulary: the `[vocab, D]` embedding table and True for a tied
+        head, `lm_head`'s `[D, vocab]` kernel and False otherwise.
+
+        No operation sits between the parameter and this value, so a loss
+        that keeps the head for its backward (`chunked_cross_entropy` with
+        `vocab_major`) keeps the parameter itself rather than a transposed
+        copy of it, which for a tied head is a vocabulary-sized array.
+        `head_weight` is this value as `[D, vocab]`.
+        """
         if self.tie_embeddings:
-            return params['embed_tokens']['embedding'].T
-        return params['lm_head']['kernel']
+            return params['embed_tokens']['embedding'], True
+        return params['lm_head']['kernel'], False
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.

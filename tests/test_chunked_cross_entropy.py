@@ -161,12 +161,14 @@ def test_dropping_one_chunk_fails_the_parity_check(monkeypatch, dropped):
     skipped = vocabulary_chunks(head.shape[1], 4)[dropped]
 
     def skip(terms, start, stop):
-        if (start, stop) != skipped:
-            return terms
-        # What the loop starts from: a tile that contributes no column.
+        # The full-width chunks are one loop's iterations, so `start` is
+        # traced and the tile is dropped by a select: what the loop starts
+        # from, a tile that contributes no column.
+        dropped_tile = jnp.asarray(start) == skipped[0]
         chunk_lse, picked, chunk_best, chunk_column = terms
-        return (jnp.full_like(chunk_lse, -jnp.inf), jnp.zeros_like(picked),
-                jnp.full_like(chunk_best, -jnp.inf), chunk_column)
+        return (jnp.where(dropped_tile, -jnp.inf, chunk_lse),
+                jnp.where(dropped_tile, 0.0, picked),
+                jnp.where(dropped_tile, -jnp.inf, chunk_best), chunk_column)
 
     mutating_chunk_terms(monkeypatch, skip)
 
