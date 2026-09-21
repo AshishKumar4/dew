@@ -39,6 +39,27 @@ if not flags.FLAGS.is_parsed():
 Batch = dict[str, Any]
 
 
+class Forwarding:
+    """A stream wrapper whose stop signal, stop budget and close are its
+    source's. Subclasses keep the source at `_source` and override `close`
+    for their own cleanup around `super().close()`."""
+
+    def request_stop(self) -> None:
+        request_stop = getattr(getattr(self, "_source", None), "request_stop", None)
+        if request_stop is not None:
+            request_stop()
+
+    @property
+    def stop_seconds(self) -> float | None:
+        seconds = getattr(getattr(self, "_source", None), "stop_seconds", None)
+        return None if seconds is None else float(seconds)
+
+    def close(self) -> None:
+        close = getattr(getattr(self, "_source", None), "close", None)
+        if close is not None:
+            close()
+
+
 @dataclasses.dataclass(frozen=True)
 class Loading:
     """How fast records are read: grain's worker processes, the threads each
@@ -60,6 +81,12 @@ class Loading:
     threads: int = 64
     read_buffer: int = 128
     worker_buffer: int = 2
+
+    @property
+    def stop_seconds(self) -> float:
+        """Grain joins its worker processes one at a time, ~0.5 s each idle
+        and up to a batch's work each busy."""
+        return 2.0 + 1.0 * self.workers
 
 
 @dataclasses.dataclass(frozen=True)
@@ -251,38 +278,30 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
     takes numbers. Pass None for an unconditional run, or a reader that hands
     the words back to keep them.
     """
-    class Tokenizing:
+    class Tokenizing(Forwarding):
         """The stream's iterator with each batch's captions tokenized."""
 
         def __init__(self, source: Iterator[Batch]):
-            self.source: Iterator[Batch] | None = source
+            self._source: Iterator[Batch] | None = source
 
         def __iter__(self):
             return self
 
         def __next__(self) -> Batch:
-            if self.source is None:
+            if self._source is None:
                 raise StopIteration
-            batch = dict(next(self.source))
+            batch = dict(next(self._source))
             captions = [str(caption) for caption in batch.pop(CAPTION)]
             if tokenize is not None:
                 batch.update(tokenize(captions))
             return batch
 
-        def request_stop(self) -> None:
-            """Forward only the source's thread-safe cancellation signal."""
-            request_stop = getattr(self.source, "request_stop", None)
-            if request_stop is not None:
-                request_stop()
-
         def close(self) -> None:
-            close = getattr(self.source, "close", None)
             try:
-                if close is not None:
-                    close()
+                super().close()
             finally:
                 # request_stop must still reach a source waiting inside close.
-                self.source = None
+                self._source = None
 
     class CheckpointableTokenizing(Tokenizing):
         """The same stage over a stream that can report and restore its
@@ -291,13 +310,13 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
         would only satisfy `hasattr`."""
 
         def get_state(self) -> Any:
-            source = self.source
+            source = self._source
             if not isinstance(source, Checkpointable):
                 raise RuntimeError("the tokenized iterator is closed")
             return source.get_state()
 
         def set_state(self, state: Any) -> None:
-            source = self.source
+            source = self._source
             if not isinstance(source, Checkpointable):
                 raise RuntimeError("the tokenized iterator is closed")
             source.set_state(state)
@@ -583,12 +602,13 @@ class GlobalStream:
     """
 
     def __init__(self, open: Callable[[int], pygrain.DatasetIterator[Batch]],
-                 batch: int, order: str):
+                 batch: int, order: str, stop_seconds: float):
         self._open = open
         self._batch = batch
         self._order = order
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
+        self.stop_seconds = stop_seconds
 
     def __iter__(self) -> Iterator[Batch]:
         return self
@@ -630,7 +650,7 @@ class Resumable(Checkpointable, Protocol):
     def __next__(self) -> Batch: ...
 
 
-class RampedStream:
+class RampedStream(Forwarding):
     """A training stream whose step grows over the run's first records.
 
     Wraps a stream whose position is a global record count, a `GlobalStream`
@@ -698,17 +718,9 @@ class RampedStream:
                 f"{stage.records} on, so no step of it ends there: the checkpoint "
                 f"was written by a run that ramped differently")
 
-    def request_stop(self) -> None:
-        """Forward only the source's thread-safe cancellation signal."""
-        request_stop = getattr(self._source, "request_stop", None)
-        if request_stop is not None:
-            request_stop()
-
     def close(self) -> None:
         self._held = None
-        close = getattr(self._source, "close", None)
-        if close is not None:
-            close()
+        super().close()
 
 
 def ramped(data: Dataset, ramp: Ramp) -> Dataset:
@@ -765,7 +777,7 @@ def train_stream(source: pygrain.RandomAccessDataSource[object], operations: Seq
         return _batches(records, batch=batch, loading=loading, offset=offset)
 
     def stream() -> GlobalStream:
-        return GlobalStream(open, batch * jax.process_count(), order)
+        return GlobalStream(open, batch * jax.process_count(), order, loading.stop_seconds)
 
     return stream
 
@@ -793,7 +805,7 @@ def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transfo
         return _batches(records, batch=batch, loading=loading, offset=offset)
 
     def stream() -> GlobalStream:
-        return GlobalStream(open, batch * jax.process_count(), order)
+        return GlobalStream(open, batch * jax.process_count(), order, loading.stop_seconds)
 
     return stream
 
