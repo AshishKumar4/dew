@@ -848,7 +848,29 @@ tracker = Trackers(
 )
 ```
 
-Use this tracker in the same `with` block and `Trainer` call above. `WandbTracker(project="dew-experiments", offline=True)` and `MLflowTracker("dew-experiments", uri="sqlite:///runs/mlflow.db")` take the same place. A custom backend implements `log`, `artifact`, and `close`. Run configuration, progress, checkpoint requests, profiler windows, sweep trials, and failures use typed reporting records. `Profile` enables detailed device traces.
+Use this tracker in the same `with` block and `Trainer` call above. `WandbTracker(project="dew-experiments", offline=True)` and `MLflowTracker("dew-experiments", uri="sqlite:///runs/mlflow.db")` take the same place. A custom backend implements `log`, `artifact`, and `close`. Run configuration, progress, checkpoint requests, profiler windows, sweep trials, and failures use typed reporting records.
+
+### Profiling training and inference
+
+Install `dew-ml[profile]`, or use `uv pip install -e '.[profile]'` from this checkout. Both forms run the same JAX/XProf capture:
+
+```python
+import dew
+
+with dew.profile("profiles/run"):
+    state = trainer.fit(data, steps=1000)
+```
+
+```python
+prof = dew.profile("profiles/run")
+prof.start()
+try:
+    state = trainer.fit(data, steps=1000)
+finally:
+    prof.stop()
+```
+
+Each capture gets a new directory, so restarting a profiler preserves earlier results. Without a path, the first start creates a persistent temporary directory available as `prof.directory`. Captures retain native XPlane traces, available HLO files, and XProf's overview, input, kernel, memory, and other supported reports, and the manifest records the backend, package versions, capture options, and report availability; missing counters are not zero measurements. The `profile` extra installs XProf's own viewer, and every manifest records the command for its own capture under `view_command`: `xprof --logdir=profiles/run/capture-<id>`. For a targeted training window, `Trainer` takes a `Profile` with the trace `directory`, the `steps` to trace, and the `warmup` to run first; the loop starts tracing once the warm-up has run, stops after it has traced the steps you asked for, and reports that window to the tracker as a `ProfileWindow`. Use either this schedule or an outer `dew.profile`, not both.
 
 ### Sweeping a hyperparameter
 
