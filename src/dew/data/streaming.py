@@ -29,7 +29,7 @@ class OnlineImages(DatasetSpec):
     sources: tuple[str, ...] = ()
     image_size: int = 256
     min_image_size: int = 128
-    loading: Loading = Loading(workers=16, threads=512)
+    loading: Loading = Loading(workers=16, threads=512, worker_buffer=20)
     """The fetch pool has no grain reader, so `read_buffer` does not reach
     this path; `worker_buffer` is how many batches the fetchers run ahead."""
     timeout: int = 15

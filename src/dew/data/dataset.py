@@ -19,8 +19,10 @@ from __future__ import annotations
 import bisect
 import dataclasses
 import math
+import sys
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, runtime_checkable
+from typing import (Any, Callable, Iterator, Mapping, Protocol, Sequence, overload,
+                    runtime_checkable)
 
 import grain.python as pygrain
 import jax
@@ -47,14 +49,17 @@ class Loading:
     seed is not one of them; it decides the order records arrive in and keys
     the per-record rng that augments and captions them.
 
-    All four count records: a worker reads records and hands records back,
-    and the batch is stacked behind it, in the process that trains.
+    Each counts something of its own: `workers` is processes, `threads` is
+    the record reads one worker keeps in flight, `read_buffer` is the records
+    one worker reads ahead, and `worker_buffer` is the batches one worker
+    holds ready for the process that trains. Only the last counts batches,
+    because a worker stacks the records it read and hands whole batches back.
     """
 
     workers: int = 32
     threads: int = 64
     read_buffer: int = 128
-    worker_buffer: int = 20
+    worker_buffer: int = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -476,6 +481,41 @@ def mixed_records(corpora: Sequence[Corpus]) -> int:
                for corpus, share in zip(corpora, _shares(corpora)))
 
 
+class _WorkerBatches(pygrain.MapDataset[object]):
+    """`parent` re-indexed so that grain's per-worker stride slice (index i
+    goes to worker i % W) hands each worker whole, contiguous batches:
+    index `q*W*B + p*W + w` is record `p` of batch `b = q*W + w`. Worker w
+    then batches inside its own process and the round-robin interleave in the
+    training process restores batch order 0, 1, 2, ... The length is padded
+    to whole rounds of one batch per worker; an index past the parent's last
+    whole batch is None, which grain's reader skips.
+    """
+
+    _MUTATES_ELEMENT_SPEC = False
+
+    def __init__(self, parent: pygrain.MapDataset[object], batch: int, workers: int):
+        super().__init__(parent)
+        self._batch, self._workers = batch, workers
+        self._whole = len(parent) // batch
+        self._length = min(math.ceil(self._whole / workers) * workers * batch, sys.maxsize)
+
+    def __len__(self) -> int:
+        return self._length
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset[object]: ...
+    @overload
+    def __getitem__(self, index: int) -> object | None: ...
+
+    def __getitem__(self, index: int | slice) -> object | None:
+        if isinstance(index, slice):
+            return self.slice(index)
+        worker, within = index % self._workers, index // self._workers
+        round_, row = divmod(within, self._batch)
+        which = round_ * self._workers + worker
+        return None if which >= self._whole else self._parent[which * self._batch + row]
+
+
 def _batches(records: pygrain.MapDataset[object], *, batch: int, loading: Loading,
              offset: int = 0) -> pygrain.DatasetIterator[Batch]:
     """This process's share of `records`, in batches of `batch` records.
@@ -484,22 +524,24 @@ def _batches(records: pygrain.MapDataset[object], *, batch: int, loading: Loadin
     is the same records at every process count, and an offset is a slice
     bound rather than a replay.
 
-    Reads are records, not batches: the threads behind `to_iter_dataset` each
-    fetch one record, the workers hand records back in order, and the batch
-    is stacked here, behind them, so it depends on neither the worker count
-    nor the process count. Grain's `ElasticIterator` would own the slice and
-    the batch together in twenty fewer lines, but it batches ahead of its
-    read, so every read is one whole batch fetched serially: on a
-    2 ms/record source at batch 256 that took 2.18 s where this takes
-    0.15 s, and 7.28 s against 2.14 s at 20 ms a record over 32 workers.
+    Reads are records: the threads behind `to_iter_dataset` each fetch one,
+    so no read waits on a whole batch (grain's `ElasticIterator` batches
+    ahead of its read and is an order of magnitude slower on a slow source).
+    The batch is stacked inside the worker so each transfer to this process
+    is a whole batch; `_WorkerBatches` permutes the slice so a worker's share
+    is whole batches, and the permutation depends only on the batch and the
+    worker count, so neither count changes which records a batch holds.
     """
     mine = records[offset + jax.process_index()::jax.process_count()]
+    if loading.workers:
+        mine = _WorkerBatches(mine, batch, loading.workers)
     stream = mine.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
+    stream = stream.batch(batch, drop_remainder=True)
     if loading.workers:
         stream = stream.mp_prefetch(pygrain.MultiprocessingOptions(
             num_workers=loading.workers,
             per_worker_buffer_size=loading.worker_buffer))
-    return iter(stream.batch(batch, drop_remainder=True))
+    return iter(stream)
 
 
 def rows_of(batch: Mapping[str, Any]) -> int:
@@ -759,12 +801,12 @@ def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transfo
 def validation_pass(source: pygrain.RandomAccessDataSource[object], transformations: Sequence[pygrain.Transformation], *,
                     batch: int, seed: int,
                     loading: Loading) -> Callable[[], Iterator[Batch]]:
-    """One pass over `source` in record order, batched in this process.
+    """One pass over `source` in record order, in batches of `batch`.
 
-    Grain's DataLoader applies its operations inside the worker processes,
-    where each worker fills a whole batch out of its own slice of the split.
-    This pass batches after workers read and transform records, so batch
-    boundaries do not depend on worker_count.
+    Grain's DataLoader gives each worker its own slice of the split and lets
+    it fill a whole batch out of that, so which records a batch holds moves
+    with worker_count. `_batches` hands a worker the records of one batch
+    instead, so the split is cut into the same batches at every count.
 
     Sharding is grain's slice convention, so process p of n reads records
     p, p + n, ... of the split. The transforms are applied before that slice.

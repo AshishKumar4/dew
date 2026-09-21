@@ -13,6 +13,7 @@ import os
 import sys
 
 import cv2
+import grain.python as pygrain
 import jax
 import numpy as np
 import pytest
@@ -21,7 +22,7 @@ import dew.data
 from dew.data import (Checkpointable, Dataset, DatasetSpec, HFDatasetSource, ImageDataset,
                       LocalVideos, VoxCeleb2, local_batch)
 from dew.data import Loading, images, video
-from dew.data.dataset import hold_out, train_stream, validation_pass
+from dew.data.dataset import _batches, hold_out, train_stream, validation_pass
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
 from dew.data.sources.av_utils import choose_clip_start
@@ -265,6 +266,90 @@ def test_the_training_iterator_carries_its_position():
     resumed.set_state(state)
     assert _indices(resumed, 2) == rest
     assert sorted(i for batch in seen + rest for i in batch) == list(range(32))
+
+
+# ---------------------------------------------------------------------------------
+# The batch is stacked in the worker that read the records
+# ---------------------------------------------------------------------------------
+
+def _order(source, seed=None):
+    """The order `_batches` slices: the corpus, or it reshuffled endlessly."""
+    records = pygrain.MapDataset.source(source).seed(0 if seed is None else seed)
+    return records if seed is None else records.shuffle(seed).repeat(None)
+
+
+def _by_hand(order, *, batch, count, offset=0):
+    """`count` batches stacked the way the training process stacked them
+    before the workers did: this process's slice of `order`, read record by
+    record in order, `batch` records to a batch.
+
+    Read off the `MapDataset` and not off `_batches`, so it is a reference
+    for what `_batches` returns rather than a restatement of it.
+    """
+    mine = order[offset::1]
+    rows = [mine[index] for index in range(count * batch)]
+    return [{field: [row[field] for row in rows[start:start + batch]]
+             for field in rows[start]}
+            for start in range(0, count * batch, batch)]
+
+
+def _fields(iterator, count):
+    """`count` batches as plain lists, so a comparison covers every field of
+    every record rather than one of them."""
+    return [{field: np.asarray(rows).tolist() for field, rows in batch.items()}
+            for batch in itertools.islice(iterator, count)]
+
+
+@pytest.mark.parametrize("workers", [0, pytest.param(1, marks=pytest.mark.slow),
+                                     pytest.param(2, marks=pytest.mark.slow),
+                                     pytest.param(3, marks=pytest.mark.slow)])
+def test_which_records_a_batch_holds_does_not_depend_on_who_stacked_it(workers):
+    """A worker stacks the batch it read, so the records it is handed have to
+    be a whole batch. Grain gives worker w of W every Wth element of the
+    order, which is a batch's worth of every Wth record until the order is
+    permuted; unpermuted, three workers at a batch of four would have stacked
+    records 0, 3, 6, 9 into batch 0."""
+    source = _Indexed(30)
+    stream = _batches(_order(source, seed=5), batch=4, loading=Loading(
+        workers=workers, threads=2, read_buffer=4, worker_buffer=2))
+
+    read = _fields(stream, 12)
+    stream.close()
+
+    assert read == _by_hand(_order(source, seed=5), batch=4, count=12)
+    assert len({tuple(batch["index"]) for batch in read}) == 12, (
+        "twelve batches of four is more than one pass over thirty records, "
+        "so a reshuffled epoch is inside this comparison")
+
+
+@pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
+def test_a_pass_over_a_split_the_workers_do_not_divide_is_still_whole_batches(workers):
+    """Thirty records at a batch of four is seven whole batches and two
+    records over. Two workers take a batch each in turn, so the seventh batch
+    is one worker's alone and the last round is half empty: it still arrives,
+    in its place, and what is dropped is the two records over."""
+    passes = validation_pass(_Indexed(30), [], batch=4, seed=0, loading=Loading(
+        workers=workers, threads=2, read_buffer=4, worker_buffer=2))
+
+    batches, ended = _bounded(passes(), 12)
+
+    assert [[int(index) for index in batch["index"]] for batch in batches] == [
+        list(range(start, start + 4)) for start in range(0, 28, 4)]
+    assert ended
+
+
+@pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
+def test_an_offset_stays_a_bound_on_the_slice_this_process_reads(workers):
+    """A resume opens the stream `offset` records in, and the permutation the
+    workers read through sits behind that slice, so the first batch is still
+    the first four records the interrupted run had not reached."""
+    stream = _batches(_order(_Indexed(30)), batch=4, offset=8, loading=Loading(
+        workers=workers, threads=2, read_buffer=4, worker_buffer=2))
+
+    first = _fields(stream, 1)
+    stream.close()
+
+    assert first == [{"index": [8, 9, 10, 11]}]
 
 
 # ---------------------------------------------------------------------------------
