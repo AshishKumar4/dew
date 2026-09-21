@@ -22,7 +22,7 @@ from flax import struct
 from jax import lax
 from jax.experimental import checkify
 
-from dew.nn.inputs import continuation_keys, prompt_major
+from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.objectives.base import Variables
 from dew.sampling.decoding import StepState
 
@@ -71,7 +71,7 @@ Reindex = Callable[[DecoderState, jax.Array], DecoderState]
 Verify = Callable[[DecoderState, jax.Array, jax.Array],
                   tuple[DecoderState, jax.Array, jax.Array | None]]
 Propose = Callable[[DecoderState, jax.Array, jax.Array | None, jax.Array | None, jax.Array,
-                    jax.Array, int], tuple[DecoderState, jax.Array, jax.Array]]
+                    jax.Array, int, PredictionPhase], tuple[DecoderState, jax.Array, jax.Array]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -85,7 +85,9 @@ class DecodeOps:
     validity mask and returns every position's logits and hidden states.
     `propose` runs one prediction depth over a candidate token at an explicit
     target position, returning its logits and its own hidden state; both are
-    None on a model without prediction depths, and `depths` counts them.
+    None on a model without prediction depths, and `depths` counts them. Its
+    prediction_phase distinguishes ordinary recomputation, accepted-history
+    extend, and single-chain draft operations; the model owns any reuse policy.
     """
 
     advance: Advance
@@ -140,7 +142,7 @@ def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None
             [(jnp.zeros_like(upstream[:, 0]) if head is None else head)[:, None],
              upstream[:, :-1]], axis=1)
         ready = valid & (ordinal > depth)
-        state, _, out = propose(state, before, None, embeds, ready, positions, depth)
+        state, _, out = propose(state, before, None, embeds, ready, positions, depth, "extend")
         produced.append(out)
         held = jnp.zeros_like(upstream[:, 0]) if head is None else head
         predecessor_ready = jnp.any(valid & (ordinal >= depth), axis=1)
@@ -521,7 +523,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
             states[depth] = dataclasses.replace(states[depth], active=live)
             drafting, logits, produced = propose(
                 drafting, hidden[:, None], candidates[depth - 1][:, None], None, live[:, None],
-                base[:, depth - 1][:, None], (depth - 1) % ops.depths)
+                base[:, depth - 1][:, None], (depth - 1) % ops.depths, "draft")
             hidden = produced[:, 0]
             scores = transform(states[depth], logits[:, 0].astype(jnp.float32))
             token = select(keys[:, depth], scores, live)

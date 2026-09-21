@@ -20,6 +20,7 @@ from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 TreeT = TypeVar("TreeT")
 
+PredictionPhase = Literal["ordinary", "extend", "draft"]
 BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 """The mesh axes a request's rows split over: every axis but sequence and stage."""
 

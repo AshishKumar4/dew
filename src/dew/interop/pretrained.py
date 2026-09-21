@@ -591,11 +591,6 @@ def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]
     return path, None
 
 
-_SPLIT_GATE_UP = ("llama4_text", "gemma4_text", "qwen3_5_moe_text")
-"""Families whose fused `experts.gate_up_proj` loads as two stacked kernels;
-GPT OSS keeps the reference's fused leaf and maps the name itself."""
-
-
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
                      config, model_type: str, component: str | None = None) -> WeightLayout | None:
     """The text family's existing leaf map plus its inverse storage operations."""
@@ -613,7 +608,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
     expert_index = None
     if text_name == "lm_head.weight" and config["tie_embeddings"]:
         paths = (nested(("params", "embed_tokens", "embedding")),)
-    elif text_name.endswith(".experts.gate_up_proj") and model_type in _SPLIT_GATE_UP:
+    elif text_name.endswith(".experts.gate_up_proj") and (packed or model_type == "llama4_text"):
         names = [text_name.removesuffix("gate_up_proj") + projection for projection in ("gate_proj", "up_proj")]
         paths_list = []
         for key in names:
