@@ -107,7 +107,9 @@ def flow_transition(x: ArrayLike, velocity: ArrayLike, t: ArrayLike,
     denominator = jnp.where(dt == 0, 1, 1 - jnp.where(t == 1, t_next, t))
     # sigma(t)^2 / (2t) has this finite limit at t=0.
     correction = noise_level**2 / (2 * denominator)
-    expand = lambda value: value.reshape((x.shape[0],) + (1,) * (x.ndim - 1))
+    def expand(rate: jax.Array) -> jax.Array:
+        return rate.reshape((x.shape[0],) + (1,) * (x.ndim - 1))
+
     mean = x * expand(1 + correction * dt) + velocity * expand(
         (1 + correction * (1 - t)) * dt)
     variance = noise_level**2 * t / denominator * -dt

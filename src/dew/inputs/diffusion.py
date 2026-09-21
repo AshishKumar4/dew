@@ -333,7 +333,7 @@ class CLIPImageTransform:
 
     def __call__(self, pixels):
         pixels = jnp.asarray(pixels, jnp.float32)
-        batch, height, width, _ = pixels.shape
+        _, height, width, _ = pixels.shape
         if self.resize:
             if isinstance(self.size, int):
                 scale = self.size / min(height, width)

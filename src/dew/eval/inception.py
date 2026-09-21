@@ -35,7 +35,7 @@ class InceptionV3(nn.Module):
     Attributes:
         include_head (bool): If True, include classifier head.
         num_classes (int): Number of classes.
-        pretrained (bool): If True, use pretrained weights. 
+        pretrained (bool): If True, use pretrained weights.
         transform_input (bool): If True, preprocesses the input according to the method with which it
                                 was trained on ImageNet.
         aux_logits (bool): If True, add an auxiliary branch that can improve training.
@@ -163,10 +163,9 @@ class Dense(nn.Module):
     @nn.compact
     def __call__(self, x):
         params = self.params_dict
-        x = nn.Dense(features=self.features,
+        return nn.Dense(features=self.features,
                      kernel_init=self.kernel_init if params is None else lambda *_ : jnp.array(params['kernel']),
                      bias_init=self.bias_init if params is None else lambda *_ : jnp.array(params['bias']))(x)
-        return x
 
 
 class BasicConv2d(nn.Module):
@@ -205,8 +204,7 @@ class BasicConv2d(nn.Module):
                           var_init=lambda *_ : jnp.array(params['bn']['var']),
                           use_running_average=not train,
                           dtype=self.dtype)(x)
-        x = jax.nn.relu(x)
-        return x
+        return jax.nn.relu(x)
 
 
 class InceptionA(nn.Module):
@@ -251,8 +249,7 @@ class InceptionA(nn.Module):
                                   params_dict=utils.get(self.params_dict, 'branch_pool'),
                                   dtype=self.dtype)(branch_pool, train)
 
-        output = jnp.concatenate((branch1x1, branch5x5, branch3x3dbl, branch_pool), axis=-1)
-        return output
+        return jnp.concatenate((branch1x1, branch5x5, branch3x3dbl, branch_pool), axis=-1)
 
 
 class InceptionB(nn.Module):
@@ -284,8 +281,7 @@ class InceptionB(nn.Module):
 
         branch_pool = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2))
 
-        output = jnp.concatenate((branch3x3, branch3x3dbl, branch_pool), axis=-1)
-        return output
+        return jnp.concatenate((branch3x3, branch3x3dbl, branch_pool), axis=-1)
 
 
 class InceptionC(nn.Module):
@@ -346,8 +342,7 @@ class InceptionC(nn.Module):
                                   params_dict=utils.get(self.params_dict, 'branch_pool'),
                                   dtype=self.dtype)(branch_pool, train)
 
-        output = jnp.concatenate((branch1x1, branch7x7, branch7x7dbl, branch_pool), axis=-1)
-        return output
+        return jnp.concatenate((branch1x1, branch7x7, branch7x7dbl, branch_pool), axis=-1)
 
 
 class InceptionD(nn.Module):
@@ -388,8 +383,7 @@ class InceptionD(nn.Module):
 
         branch_pool = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2))
 
-        output = jnp.concatenate((branch3x3, branch7x7x3, branch_pool), axis=-1)
-        return output
+        return jnp.concatenate((branch3x3, branch7x7x3, branch_pool), axis=-1)
 
 
 class InceptionE(nn.Module):
@@ -447,8 +441,7 @@ class InceptionE(nn.Module):
                                   params_dict=utils.get(self.params_dict, 'branch_pool'),
                                   dtype=self.dtype)(branch_pool, train)
 
-        output = jnp.concatenate((branch1x1, branch3x3, branch3x3dbl, branch_pool), axis=-1)
-        return output
+        return jnp.concatenate((branch1x1, branch3x3, branch3x3dbl, branch_pool), axis=-1)
 
 
 class InceptionAux(nn.Module):
@@ -471,10 +464,9 @@ class InceptionAux(nn.Module):
                         dtype=self.dtype)(x, train)
         x = jnp.mean(x, axis=(1, 2))
         x = jnp.reshape(x, (x.shape[0], -1))
-        x = Dense(features=self.num_classes,
+        return Dense(features=self.num_classes,
                   params_dict=utils.get(self.params_dict, 'fc'),
                   dtype=self.dtype)(x)
-        return x
 
 def _absolute_dims(rank, dims):
     return tuple([rank + dim if dim < 0 else dim for dim in dims])
@@ -521,7 +513,7 @@ class BatchNorm(nn.Module):
     @nn.compact
     def __call__(self, x, use_running_average: bool | None = None):
         """Normalizes the input using batch statistics.
-        
+
         NOTE:
         During initialization (when parameters are mutable) the running average
         of the batch statistics will not be updated. Therefore, the inputs
@@ -629,7 +621,7 @@ def pool(inputs, init, reduce_fn, window_shape, strides, padding):
       assert(len(padding) == len(window_shape)), (
         f"padding {padding} must specify pads for same number of dims as "
         f"window_shape {window_shape}")
-      assert(all([len(x) == 2 for x in padding])), (
+      assert all(len(x) == 2 for x in padding), (
         f"each entry in padding {padding} must be length 2")
       padding = ((0,0),) + padding + ((0,0),)
     y = jax.lax.reduce_window(inputs, init, reduce_fn, dims, strides, padding)
@@ -667,5 +659,4 @@ def avg_pool(inputs, window_shape, strides=None, padding: str | Sequence[tuple[i
                                           padding=((1, 1), (1, 1)),
                                           dimension_numbers=nn.linear._conv_dimension_numbers(ones.shape),
                                           feature_group_count=1)
-    y = y / counts
-    return y
+    return y / counts

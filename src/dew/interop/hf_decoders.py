@@ -253,8 +253,8 @@ def _rope(hf_config: Mapping[str, Any], used: set,
     # transformers prefers rope_scaling when both are present
     # (convert_rope_params_to_dict), so it is read last.
     theta, scaling = None, None
-    for field in ('rope_parameters', 'rope_scaling'):
-        entry = hf_config.get(field)
+    for key in ('rope_parameters', 'rope_scaling'):
+        entry = hf_config.get(key)
         if isinstance(entry, Mapping):
             rope = _rope_entry(entry, field, yarn_max_pos)
             theta = rope.theta or theta
@@ -1594,9 +1594,9 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> dict[s
     if (not isinstance(schedule, (list, tuple)) or len(schedule) != layers
             or any(kind not in ('dense', 'sparse') for kind in schedule)):
         _refuse('mlp_layer_types', 'one dense or sparse entry per layer is required')
-    for field, expected in (('scoring_func', 'sigmoid'), ('topk_method', 'noaux_tc')):
-        if hf_config.get(field, expected) != expected:
-            _refuse(field, f'GLM5 uses {expected}')
+    for key, expected in (('scoring_func', 'sigmoid'), ('topk_method', 'noaux_tc')):
+        if hf_config.get(key, expected) != expected:
+            _refuse(key, f'GLM5 uses {expected}')
     norm_topk = hf_config.get('norm_topk_prob', True)
     if not isinstance(norm_topk, bool):
         _refuse('norm_topk_prob', 'expected a boolean')
@@ -1682,9 +1682,9 @@ def translate_config(hf_config: Mapping[str, Any]) -> dict[str, Any]:
     # decoder), so their own translators own the direction and this check
     # leaves them alone.
     bidirectional = hf_config.get('use_bidirectional_attention', False)
-    if model_type not in ('llada', 'dream', 'Dream', 'diffusion_gemma_text'):
-        if bidirectional and bidirectional != 'vision':
-            _refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
+    if (model_type not in ('llada', 'dream', 'Dream', 'diffusion_gemma_text')
+            and bidirectional and bidirectional != 'vision'):
+        _refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
     if hf_config.get('mlp_bias'):
         _refuse("mlp_bias=True", "the gated MLP is bias-free")
 
@@ -2745,9 +2745,9 @@ def _export_config(model) -> dict[str, Any]:
     # biased q/k/v); Gemma 2 alone applies the attention softcap (Gemma 3
     # reads the field without passing it on). A checkpoint written under a
     # family that would drop the dial is refused naming it.
-    if model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias:
-        if family.export_model_type not in ('qwen2', 'dream'):
-            raise ValueError(
+    if (model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias
+            and family.export_model_type not in ('qwen2', 'dream')):
+        raise ValueError(
                 "o_proj_bias differs from attention_bias, which only the qwen2 "
                 "and dream references build, so the model cannot be written as "
                 f"{family.export_model_type}")
@@ -3456,9 +3456,9 @@ def _kimi_k25_config(hf_config: Mapping[str, object], used: set[str]) -> dict[st
         _refuse(f"text_config model_type {model_type!r}",
                 "a Kimi K2.5 wrapper's decoder is Kimi K2's, which the "
                 f"reference reads as one of {', '.join(map(repr, _KIMI_K25_TEXT))}")
-    for field in _KIMI_K25_TEXT_ENCODER:
-        if text.get(field):
-            _refuse(f"text_config {field}={text[field]!r}",
+    for key in _KIMI_K25_TEXT_ENCODER:
+        if text.get(key):
+            _refuse(f"text_config {key}={text[key]!r}",
                     "the decoder has no cross attention, no encoder to tie "
                     "against and no pruned heads")
     tied = hf_config.get('tie_word_embeddings', True)
@@ -3477,10 +3477,10 @@ def _kimi_k25_config(hf_config: Mapping[str, object], used: set[str]) -> dict[st
               if key not in _KIMI_K25_TEXT_SERIALIZED and key not in _KIMI_K25_TEXT_ENCODER}
     config = translate_config({**nested, 'model_type': model_type, 'tie_word_embeddings': tied})
     placeholders = []
-    for field, default in (('image_token_id', 163605), ('video_token_id', 163840)):
-        value = hf_config.get(field, default)
+    for key, default in (('image_token_id', 163605), ('video_token_id', 163840)):
+        value = hf_config.get(key, default)
         if type(value) is not int or value < 0:
-            _refuse(field, 'the text-only wrapper requires a nonnegative token id')
+            _refuse(key, 'the text-only wrapper requires a nonnegative token id')
         placeholders.append(value)
     config['embedding_zero_ids'] = tuple(placeholders)
     return config
@@ -3965,9 +3965,9 @@ def _v4_mixture(hf_config: Mapping[str, object], layers: int,
     used.update(('n_routed_experts', 'num_experts_per_tok', 'moe_intermediate_size',
                  'n_shared_experts', 'scoring_func', 'norm_topk_prob',
                  'topk_method', 'routed_scaling_factor'))
-    for field in ('n_routed_experts', 'num_experts_per_tok', 'moe_intermediate_size'):
-        if hf_config.get(field) is None:
-            _refuse(field, "every deepseek_v4 layer routes, so the expert "
+    for key in ('n_routed_experts', 'num_experts_per_tok', 'moe_intermediate_size'):
+        if hf_config.get(key) is None:
+            _refuse(key, "every deepseek_v4 layer routes, so the expert "
                            "count, the top-k and the routed width are the "
                            "checkpoint's to state")
     scoring = hf_config.get('scoring_func', 'sqrtsoftplus')

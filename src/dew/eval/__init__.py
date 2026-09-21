@@ -8,18 +8,5 @@ from .images import clip, clip_score
 from .psnr import peak_signal_noise_ratio, psnr
 from .ssim import ssim, structural_similarity
 
-__all__ = [
-    "ImageMetric",
-    "frames",
-    # CLIP-based
-    "clip",
-    "clip_score",
-    # FID
-    "fid",
-    "frechet_distance",
-    # Pixel-level
-    "peak_signal_noise_ratio",
-    "psnr",
-    "structural_similarity",
-    "ssim",
-]
+__all__ = ["ImageMetric", "clip", "clip_score", "fid", "frames", "frechet_distance",
+           "peak_signal_noise_ratio", "psnr", "ssim", "structural_similarity"]

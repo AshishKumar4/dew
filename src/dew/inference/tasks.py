@@ -68,10 +68,10 @@ def _prepared(processor: Processor | None, request: Request, *, images: object |
                 raise ValueError("a request cannot mix text prompts and numeric token rows")
             if isinstance(row, np.ndarray) and not np.issubdtype(row.dtype, np.integer):
                 raise ValueError("token rows must contain integers")
-            if isinstance(row, Sequence):
-                if any(isinstance(token, (bool, np.bool_)) or not isinstance(token, (int, np.integer))
-                       for token in row):
-                    raise ValueError("token rows must contain integers, not coerced token IDs")
+            if isinstance(row, Sequence) and any(
+                    isinstance(token, (bool, np.bool_)) or not isinstance(token, (int, np.integer))
+                    for token in row):
+                raise ValueError("token rows must contain integers, not coerced token IDs")
         return ModelInputs.from_value(np.asarray(request))
     # A resident array stays where it is; a global one cannot be fetched.
     return ModelInputs.from_value(request)

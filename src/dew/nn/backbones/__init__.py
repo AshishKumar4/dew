@@ -16,19 +16,5 @@ from .unet_condition import UNet2DCondition, UNetStage
 from .uvit import SimpleUDiT, UViT
 from .video_dit import VideoDiT
 
-__all__ = [
-    # Image backbones
-    "Unet",
-    "UNet2DCondition", "UNetStage",
-    "UViT",
-    "SimpleUDiT",
-    "SimpleDiT",
-    "SimpleMMDiT",
-    "HierarchicalMMDiT",
-    "HybridSSMAttentionDiT",
-    # Language backbones
-    "CausalTransformer",
-    # Video backbones
-    "VideoDiT",
-    "UNet3D",
-]
+__all__ = ["CausalTransformer", "HierarchicalMMDiT", "HybridSSMAttentionDiT", "SimpleDiT", "SimpleMMDiT",
+           "SimpleUDiT", "UNet2DCondition", "UNet3D", "UNetStage", "UViT", "Unet", "VideoDiT"]

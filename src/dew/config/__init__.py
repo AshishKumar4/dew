@@ -24,7 +24,7 @@ import sys
 import types
 import typing
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Mapping, Optional, Self, TypeAlias, Union
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Mapping, Self, TypeAlias
 
 import jax
 import tyro

@@ -446,9 +446,9 @@ class Checkpoints:
         if template is not None and not isinstance(template, Mapping):
             if int(restored["step"]) != step:
                 raise ValueError("checkpoint directory and serialized attempted step disagree")
-            if not isinstance(template.window_size, jax.ShapeDtypeStruct):
-                if int(restored["window_size"]) != int(template.window_size):
-                    raise ValueError("checkpoint accumulation window_size differs from this run")
+            if (not isinstance(template.window_size, jax.ShapeDtypeStruct)
+                    and int(restored["window_size"]) != int(template.window_size)):
+                raise ValueError("checkpoint accumulation window_size differs from this run")
             restored = template.replace(**restored)
         return restored, saved
 

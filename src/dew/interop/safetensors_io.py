@@ -192,7 +192,8 @@ def read_file(path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
         mapping = np.memmap(filename, mode="r", dtype=np.uint8)
         metadata = reader.metadata() or {}
         offsets = _tensor_offsets(filename, header)
-        for name in reader.keys():
+        names = reader.keys()
+        for name in names:
             view = reader.get_slice(name)
             shape = tuple(view.get_shape())
             tag = view.get_dtype()

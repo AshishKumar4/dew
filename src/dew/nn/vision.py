@@ -411,16 +411,16 @@ def pixel_shuffle(patches: jax.Array, ratio: float) -> jax.Array:
     pixel_shuffle): tokens shrink by ratio squared and channels grow by it.
     """
     batch, count, channels = patches.shape
-    side = int(round(count ** 0.5))
+    side = round(count ** 0.5)
     if side * side != count:
         raise ValueError(
             f"{count} patches are not a square grid, so no shuffle ratio tiles them")
-    grown = int(round(channels / ratio ** 2))
+    grown = round(channels / ratio ** 2)
     if abs(grown * ratio ** 2 - channels) > 1e-6:
         raise ValueError(
             f"{channels} channels do not split over a shuffle ratio of {ratio}")
     grid = patches.reshape(batch, side, side, channels)
-    block = int(round(1 / ratio))
+    block = round(1 / ratio)
     shuffled = grid.reshape(batch, side // block, block, side // block, block, channels)
     shuffled = shuffled.transpose(0, 1, 3, 2, 4, 5)
     return shuffled.reshape(batch, (side // block) ** 2, grown)
@@ -992,7 +992,7 @@ def _qwen35_pos_embeds(table: jax.Array, rows: jax.Array, cols: jax.Array,
     product of the taps (vision_utils.py,
     get_vision_interpolation_indices_and_weights).
     """
-    side = int(round(len(table) ** 0.5))
+    side = round(len(table) ** 0.5)
     row_taps, row_weights = _qwen35_interp_taps(rows, grid_height, side)
     col_taps, col_weights = _qwen35_interp_taps(cols, grid_width, side)
     indices = (row_taps[..., :, None] * side + col_taps[..., None, :]).reshape(*rows.shape, 4)
@@ -1615,15 +1615,15 @@ def _gemma4_vision_layer_path(parts) -> tuple[str, ...] | None:
             return (layer, "self_attn", parts[4], "kernel")
         if parts[3] == "mlp" and parts[4] in _GEMMA4_VISION_MLP:
             return (layer, "mlp", parts[4], "kernel")
-    if len(parts) == 6 and parts[5] in ("input_min", "input_max", "output_min", "output_max"):
-        if ((parts[3] == "self_attn" and parts[4] in _GEMMA4_VISION_PROJECTIONS)
-                or (parts[3] == "mlp" and parts[4] in _GEMMA4_VISION_MLP)):
-            return (layer, parts[3], parts[4], parts[5])
-    if len(parts) == 6 and parts[3] == "self_attn" and parts[5] == "weight":
-        if parts[4] in ("q_norm", "k_norm"):
-            # The value norm carries no scale (modeling_gemma4.py,
-            # Gemma4VisionAttention), so a weight under its name is unknown.
-            return (layer, "self_attn", parts[4], "scale")
+    if (len(parts) == 6 and parts[5] in ("input_min", "input_max", "output_min", "output_max")
+            and ((parts[3] == "self_attn" and parts[4] in _GEMMA4_VISION_PROJECTIONS)
+                 or (parts[3] == "mlp" and parts[4] in _GEMMA4_VISION_MLP))):
+        return (layer, parts[3], parts[4], parts[5])
+    if (len(parts) == 6 and parts[3] == "self_attn" and parts[5] == "weight"
+            and parts[4] in ("q_norm", "k_norm")):
+        # The value norm carries no scale (modeling_gemma4.py,
+        # Gemma4VisionAttention), so a weight under its name is unknown.
+        return (layer, "self_attn", parts[4], "scale")
     return None
 
 def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:

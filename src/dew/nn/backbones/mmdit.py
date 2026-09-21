@@ -59,20 +59,27 @@ class MMDiTBlock(nn.Module):
     def setup(self):
         hidden_features = int(self.features * self.mlp_ratio)
         dim_head = self.features // self.num_heads
-        qkv = lambda name: nn.DenseGeneral(
-            features=[self.num_heads, dim_head], axis=-1,
-            dtype=self.dtype, precision=self.precision, use_bias=True, name=name)
-        out_proj = lambda name: nn.DenseGeneral(
-            self.features, axis=(-2, -1),
-            dtype=self.dtype, precision=self.precision, name=name)
-        mlp = lambda name: nn.Sequential([
-            nn.Dense(features=hidden_features, dtype=self.dtype, precision=self.precision),
-            nn.gelu,
-            nn.Dense(features=self.features, dtype=self.dtype, precision=self.precision),
-        ], name=name)
-        norm = lambda name: nn.LayerNorm(
-            epsilon=self.norm_epsilon, use_scale=False, use_bias=False,
-            dtype=self.dtype, name=name)
+        def qkv(name):
+            return nn.DenseGeneral(
+                features=[self.num_heads, dim_head], axis=-1,
+                dtype=self.dtype, precision=self.precision, use_bias=True, name=name)
+
+        def out_proj(name):
+            return nn.DenseGeneral(
+                self.features, axis=(-2, -1),
+                dtype=self.dtype, precision=self.precision, name=name)
+
+        def mlp(name):
+            return nn.Sequential([
+                nn.Dense(features=hidden_features, dtype=self.dtype, precision=self.precision),
+                nn.gelu,
+                nn.Dense(features=self.features, dtype=self.dtype, precision=self.precision),
+            ], name=name)
+
+        def norm(name):
+            return nn.LayerNorm(
+                epsilon=self.norm_epsilon, use_scale=False, use_bias=False,
+                dtype=self.dtype, name=name)
 
         # image stream
         self.img_ada = AdaLNParams(self.features, dtype=self.dtype, precision=self.precision)
@@ -210,7 +217,7 @@ class SimpleMMDiT(nn.Module):
     @nn.compact
     def __call__(self, x, temb, textcontext, train: bool = False):  # textcontext is required
         assert textcontext is not None, "textcontext must be provided for SimpleMMDiT"
-        B, H, W, C = x.shape
+        _, H, W, _ = x.shape
 
         img, inv_idx = self.embed(x)
         txt = self.txt_embed(textcontext.hidden)
@@ -275,7 +282,7 @@ class PatchExpanding(nn.Module):
 
     @nn.compact
     def __call__(self, x, H_patches, W_patches):
-        B, L, C = x.shape
+        B, L, _ = x.shape
         assert H_patches * W_patches == L, f"Input length {L} doesn't match {H_patches}*{W_patches}"
 
         expanded_features = self.expand_size * self.expand_size * self.out_features
@@ -417,7 +424,7 @@ class HierarchicalMMDiT(nn.Module):
     @nn.compact
     def __call__(self, x, temb, textcontext, train: bool = False):
         assert textcontext is not None, "textcontext must be provided"
-        B, H, W, C = x.shape
+        _, H, W, _ = x.shape
         num_stages = len(self.emb_features)
         assert H % (self.base_patch_size * (2**(num_stages - 1))) == 0 and \
                W % (self.base_patch_size * (2**(num_stages - 1))) == 0, \

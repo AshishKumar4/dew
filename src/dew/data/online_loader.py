@@ -240,7 +240,7 @@ def fetch_rows(rows: Dataset, sink: multiprocessing.queues.Queue, *, workers: in
                 if stop.is_set():
                     return
                 result = pool.map_async(partial(_fetch_shard, fetch=fetch, threads=threads),
-                                        [rows[start:end] for start, end in zip(bounds, bounds[1:])])
+                                        [rows[start:end] for start, end in itertools.pairwise(bounds)])
                 while not stop.is_set():
                     try:
                         result.get(timeout=0.05)

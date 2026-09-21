@@ -33,8 +33,7 @@ The five families are the shapes those `set_timesteps` take:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Callable, Literal, Mapping
 
@@ -445,6 +444,11 @@ class SourceSchedule:
     prediction: PredictionTransform
     policy: _Policy
     sampler: Solver
+    # The grids one schedule has already built, keyed by the call that built
+    # them. Held here rather than in an lru_cache over the method, whose keys
+    # are the schedules themselves: those outlive every pipeline that asks.
+    _grids: dict[tuple[int, int | None, Origin], tuple[Process, jax.Array]] = field(
+        default_factory=dict, repr=False, compare=False)
 
     @classmethod
     def from_config(cls, config: Mapping[str, object]) -> SourceSchedule:
@@ -678,7 +682,6 @@ class SourceSchedule:
         return (np.append(sigmas, terminal), np.append(times, times[-1]),
                 float(np.sqrt(high ** 2 + 1)))
 
-    @lru_cache(maxsize=32)
     def sampling(self, steps: int, *, tokens: int | None = None,
                  origin: Origin = "scheduler") -> tuple[Process, jax.Array]:
         """The process and the explicit descending grid a `steps` walk takes.
@@ -687,6 +690,13 @@ class SourceSchedule:
         reads, and `origin` where a flow file's sigmas start; both are the
         calling pipeline's, bound through the task's grid callable.
         """
+        held = self._grids.get((steps, tokens, origin))
+        if held is None:
+            held = self._grids[(steps, tokens, origin)] = self._sampling(steps, tokens, origin)
+        return held
+
+    def _sampling(self, steps: int, tokens: int | None,
+                  origin: Origin) -> tuple[Process, jax.Array]:
         policy = self.policy
         if type(steps) is not int or steps < 1:
             raise ValueError("The sampling count must be a positive integer")

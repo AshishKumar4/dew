@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Mapping
-from typing import Optional
 
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike

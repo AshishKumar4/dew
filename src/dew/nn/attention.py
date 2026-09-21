@@ -836,8 +836,7 @@ class NormalAttention(nn.Module):
             implementation=self.attention_impl, causal=causal, mask=mask,
         )
         proj = self.proj_attn(hidden_states)
-        proj = proj.reshape(orig_x_shape)
-        return proj
+        return proj.reshape(orig_x_shape)
 
 class FlaxGEGLU(nn.Module):
     """A linear layer into the gated linear unit of Shazeer 2020
@@ -880,8 +879,7 @@ class FlaxFeedForward(nn.Module):
         hidden_states = self.net_0(hidden_states)
         if self.dropout:
             hidden_states = self.dropout_layer(hidden_states, deterministic=not train)
-        hidden_states = self.net_2(hidden_states)
-        return hidden_states
+        return self.net_2(hidden_states)
 
 
 class BasicTransformerBlock(nn.Module):
@@ -929,8 +927,7 @@ class BasicTransformerBlock(nn.Module):
         if not self.use_cross_only:
             hidden_states = hidden_states + self.attention1(self.norm1(hidden_states))
         hidden_states = hidden_states + self.attention2(self.norm2(hidden_states), context)
-        hidden_states = hidden_states + self.ff(self.norm3(hidden_states))
-        return hidden_states
+        return hidden_states + self.ff(self.norm3(hidden_states))
 
 
 @dataclasses.dataclass(frozen=True)

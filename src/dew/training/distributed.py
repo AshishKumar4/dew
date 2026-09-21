@@ -697,10 +697,10 @@ class DevicePrefetchIterator:
                     if error is not None:
                         if cleanup is not None:
                             error.add_note(f"Source cleanup failed: {cleanup!r}")
-                        raise error
+                        raise error from None
                     if cleanup is not None:
-                        raise cleanup
-                    raise StopIteration
+                        raise cleanup from None
+                    raise StopIteration from None
             if self._stop.is_set():
                 break
             self.source_state = position

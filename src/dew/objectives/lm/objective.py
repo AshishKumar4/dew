@@ -511,7 +511,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def _whole_tree(self, pretrained: Variables | None, key) -> Variables:
         """The model's variables in one `params` collection: the pretrained
         tree with its frozen split undone, or a fresh init."""
-        fresh = lambda: self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
+        def fresh() -> Variables:
+            return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
+
         if pretrained is None:
             return fresh()
         if "params" not in pretrained:

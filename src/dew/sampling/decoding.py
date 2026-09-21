@@ -895,9 +895,10 @@ def _piece_bytes(token: str, mode: str | None, alphabet: dict[str, int] | None) 
         if all(char in alphabet for char in token):
             return bytes(alphabet[char] for char in token)
         return None
-    if mode == "byte_fallback" and len(token) == 6 and token.startswith("<0x") and token.endswith(">"):
-        if all(char in "0123456789abcdefABCDEF" for char in token[3:5]):
-            return bytes([int(token[3:5], 16)])
+    if (mode == "byte_fallback" and len(token) == 6 and token.startswith("<0x")
+            and token.endswith(">")
+            and all(char in "0123456789abcdefABCDEF" for char in token[3:5])):
+        return bytes([int(token[3:5], 16)])
     return None
 
 

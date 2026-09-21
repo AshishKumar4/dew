@@ -175,7 +175,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
 
     v_beta = value * beta[..., None]
     k_beta = key * beta[..., None]
-    q_c, k_c, v_c = chunks(query), chunks(key), chunks(value)
+    q_c, k_c = chunks(query), chunks(key)
     kb_c, vb_c, g_c = chunks(k_beta), chunks(v_beta), chunks(g)
 
     # Cumulative log decay within each chunk, the reference's
@@ -201,7 +201,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
     attn = jnp.where(strict, -(kb_c @ jnp.swapaxes(k_c, -1, -2)) * decay, 0.0)
     inv = jnp.broadcast_to(jnp.eye(chunk_size, dtype=attn.dtype), attn.shape)
     power = attn
-    for _ in range(max(1, int(math.ceil(math.log2(chunk_size))))):
+    for _ in range(max(1, math.ceil(math.log2(chunk_size)))):
         inv = inv + power @ inv
         power = power @ power
     # inv is (I + A)^-1 where A = attn, the reference's `attn + I` operator

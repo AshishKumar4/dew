@@ -323,7 +323,9 @@ class Trainer(Generic[Loss, Effects]):
         shared = isinstance(stats, (Mean, jax.ShapeDtypeStruct))
         mean_dtype = jnp.result_type(jnp.float32, *(x.dtype for x in jax.tree.leaves(stats)))
         slots = self.accumulation - 1
-        shape = lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+        def shape(leaf: jax.Array) -> jax.ShapeDtypeStruct:
+            return jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+
         trainable = jax.tree.map(shape, state.params["params"])
         records = jax.tree.map(shape, batch)
         mutable = (None if shared or aux.variables is None else
@@ -772,7 +774,9 @@ class Trainer(Generic[Loss, Effects]):
             if tracing and profile is not None:
                 tracing = False
                 assert profiler is not None
-                stop_trace = lambda: self._stop_trace(traced, loss, profile, profiler, step=current)
+                def stop_trace() -> None:
+                    self._stop_trace(traced, loss, profile, profiler, step=current)
+
             for label, cleanup in (
                 ("Training iterator", close),
                 ("Profiler", stop_trace),
