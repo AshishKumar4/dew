@@ -281,6 +281,10 @@ def with_precision(name: str, config: Mapping[str, Any], *,
                    dtype: str, attention_impl: str) -> dict[str, Any]:
     """A model config with the run's compute dtype and attention kernel in it.
 
+    `attention_impl` is an `AttentionImpl` and travels as it is written: the
+    kernel reads 'reference' as the reference path, so nothing here rewrites
+    the name a run recorded into the None a module field also accepts.
+
     Params stay float32 whatever `dtype` says; it is the compute dtype. The
     UNets keep per-stage attention settings in `attention_configs`, which do
     not inherit the model dtype and default `force_fp32_for_softmax` off,
@@ -297,8 +301,7 @@ def with_precision(name: str, config: Mapping[str, Any], *,
             f"the model config carries {duplicate}, which the run's precision "
             "settings own; set --model.dtype and --model.attention-impl instead")
     member = models[name]
-    fields = {**config, "dtype": dtype,
-              "attention_impl": None if attention_impl == "reference" else attention_impl}
+    fields = {**config, "dtype": dtype, "attention_impl": attention_impl}
     stages = {f.name: f for f in dataclasses.fields(member)}.get("attention_configs")
     if stages is not None:
         fields["attention_configs"] = [

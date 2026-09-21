@@ -198,7 +198,7 @@ def test_fused_attention_rejects_a_dtype_it_cannot_honor(rng):
     assert scaled_dot_product_attention(query, key, value, dtype=jnp.bfloat16,
                                         implementation="xla").dtype == jnp.bfloat16
     assert scaled_dot_product_attention(query, key, value, dtype=jnp.float32,
-                                        implementation=None).dtype == jnp.float32
+                                        implementation="reference").dtype == jnp.float32
 
 
 def open_the_gates(params, key, scale=0.5):
