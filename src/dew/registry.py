@@ -64,7 +64,8 @@ type Annotation = type | types.UnionType | types.GenericAlias | typing.TypeAlias
 # type its member declared before the member ever sees it.
 type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic
                    | types.FunctionType | types.BuiltinFunctionType
-                   | DataclassInstance | Mapping[str, object] | Sequence[Configured])
+                   | DataclassInstance | Mapping[str, object]
+                   | Mapping[str | tuple[str, ...], object] | Sequence[Configured])
 
 # `build` called with no record at all, which is every caller that writes its
 # fields as keywords. Shared because it is read and never written.

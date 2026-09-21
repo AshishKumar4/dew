@@ -25,9 +25,14 @@ Diffusers file (`pytorch_lora_weights.safetensors`, keys
 `<component>.<module>.lora_A.weight`, the PEFT config per component in the
 header's `lora_adapter_metadata`) is what a pipeline's `load_lora_weights`
 reads. Kohya/sgm keys (`lora_unet_...`, `.alpha` tensors) are not accepted.
-Source module names resolve to tree paths through the source's own
-`weight_layouts`, the bindings its export runs backwards, so an adapter is
-placed exactly where the base tensor it modifies went.
+Source module names resolve to tree paths through `Pretrained.layouts`, the
+bindings a source's export runs backwards, so an adapter is placed exactly
+where the base tensor it modifies went. An adapter attaches to a model and
+its variables, not to a loader: a model built from the registry passes no
+layouts and `bound_layouts` reads the names and shapes off its own kernels,
+so a run that never touched a published checkpoint adapts the same way.
+`RunConfig.lora` is that path from a config: the run adapts the module its
+objective trains and freezes everything but the factors.
 """
 
 from __future__ import annotations
@@ -36,10 +41,10 @@ import dataclasses
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path as FilePath
-from typing import ClassVar, TypedDict
+from typing import ClassVar, Protocol, TypedDict, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -48,9 +53,9 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 
-from dew.interop.pretrained import Pretrained, WeightLayout
+from dew.interop.pretrained import WeightLayout
 from dew.interop.safetensors_io import read_file, write_file
-from dew.objectives.base import Path, Variables, merge as overlay, select
+from dew.objectives.base import Path, PathFilter, Variables, merge as overlay, select
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -248,21 +253,68 @@ def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -
                      (*(1 + axis - contracted for axis in transpose[:split]), 0)))
 
 
-def _layouts(source: Pretrained) -> dict[str, WeightLayout]:
-    """Source module name to the layout of its weight: `model.<module>` for
-    a decoder, `unet.<module>` for a pipeline component."""
-    return {layout.name.removesuffix(".weight").replace("/", "."): layout
-            for layout in source.weight_layouts if layout.name.endswith(".weight")}
+def bound_layouts(model: nn.Module, variables: Variables,
+                  layouts: Mapping[str, WeightLayout]) -> Mapping[str, WeightLayout]:
+    """The projections an adapter can bind on `model`, by the name a file uses.
+
+    A loaded source publishes `Pretrained.layouts`, the bindings its export
+    runs backwards, and those names are the ones PEFT and Diffusers write.
+    A model built from the registry has no published file, so its own module
+    path under `params` is the name and its kernel in `variables` is the
+    shape; that is the mapping this derives when none is given.
+
+    A derived layout covers a two-axis kernel, which stores `[in, out]` and
+    exports as PEFT's `[out, in]`. A kernel of more axes splits into
+    contracted and feature axes that the module decides and the tree does
+    not record, so it carries no derived name and a target that asks for it
+    is refused as unbound.
+    """
+    if layouts:
+        return layouts
+    derived = {".".join(module): _kernel_layout(module, kernel)
+               for module, kernel in _kernels(variables.get("params", {}), ())
+               if kernel.ndim == 2}
+    if not derived:
+        raise ValueError(
+            f"this {type(model).__name__}'s variables hold no two-axis kernel to adapt; "
+            f"pass the layouts of a loaded source, or train a model with Dense projections")
+    return derived
 
 
-def _component(source: Pretrained, module: str) -> tuple[str, str]:
-    """A pipeline source's `(component, name relative to it)`; a decoder is
-    one component, `""`, with names relative to its root, which is what the
-    reference injects into and matches its patterns against."""
-    if source.process is None:
-        return "", module
+def _kernels(node: Mapping, path: Path) -> Iterator[tuple[Path, np.ndarray | jax.Array]]:
+    """Every `kernel` leaf under `node`, with the module path that holds it."""
+    for name, child in node.items():
+        if not isinstance(child, Mapping):
+            continue
+        kernel = child.get("kernel")
+        if isinstance(kernel, (np.ndarray, jax.Array)):
+            yield (*path, name), kernel
+        yield from _kernels(child, (*path, name))
+
+
+def _kernel_layout(module: Path, kernel: np.ndarray | jax.Array) -> WeightLayout:
+    """One `[in, out]` kernel as the `[out, in]` weight a PEFT file names."""
+    inner, out = kernel.shape
+    return WeightLayout(f"{'.'.join(module)}.weight", (("params", *module, "kernel"),),
+                        (out, inner), (1, 0))
+
+
+def _components(layouts: Mapping[str, WeightLayout]) -> frozenset[str]:
+    """The named components these layouts bind.
+
+    A pipeline source names each weight under the component that holds it,
+    `unet/down_blocks...`; a decoder and a registry-built model name theirs
+    under the model's own root, which is the one unnamed component the
+    reference injects into and matches its patterns against.
+    """
+    return frozenset(layout.name.partition("/")[0]
+                     for layout in layouts.values() if "/" in layout.name)
+
+
+def _component(components: frozenset[str], module: str) -> tuple[str, str]:
+    """`(component, the name relative to it)` for one module of a file."""
     component, _, relative = module.partition(".")
-    return component, relative
+    return (component, relative) if component in components else ("", module)
 
 
 # --------------------------------------------------------------------------
@@ -375,7 +427,7 @@ class _Entry:
     config: _Config
 
 
-def _entries(source: Pretrained, tensors: Mapping[str, np.ndarray],
+def _entries(components: frozenset[str], tensors: Mapping[str, np.ndarray],
              configs: Mapping[str, _Config], prefix: str) -> list[_Entry]:
     """Every module's factor pair; `configs` is keyed by component."""
     factors: dict[str, dict[str, np.ndarray]] = {}
@@ -390,16 +442,17 @@ def _entries(source: Pretrained, tensors: Mapping[str, np.ndarray],
     for module, pair in factors.items():
         if pair.keys() != {"A", "B"}:
             raise ValueError(f"{module} has lora_{next(iter(pair))} without its partner")
-        component = _component(source, module)[0]
+        component = _component(components, module)[0]
         if component not in configs:
             raise ValueError(f"the file carries no config for {module}'s component {component!r}")
         entries.append(_Entry(module, pair["A"], pair["B"], configs[component]))
     return entries
 
 
-def _place(source: Pretrained, entries: Sequence[_Entry]) -> tuple[LoRA, Variables]:
-    """The adapter the entries describe, with its factors restored into the source's tree."""
-    layouts = _layouts(source)
+def _place(layouts: Mapping[str, WeightLayout], variables: Variables,
+           entries: Sequence[_Entry]) -> tuple[LoRA, Variables]:
+    """The adapter the entries describe, with its factors restored into the model's tree."""
+    components = _components(layouts)
     settings = {(entry.config.rslora, entry.config.dropout) for entry in entries}
     if len(settings) != 1:
         raise ValueError("the components disagree on use_rslora or lora_dropout, which one adapter carries once")
@@ -415,11 +468,11 @@ def _place(source: Pretrained, entries: Sequence[_Entry]) -> tuple[LoRA, Variabl
                 f"{entry.module} carries lora_A {entry.a.shape} and lora_B {entry.b.shape}, "
                 "not [r, in] and [out, r] of one rank")
         rank = entry.a.shape[0]
-        relative = _component(source, entry.module)[1]
+        relative = _component(components, entry.module)[1]
         declared = entry.config.rank_of(relative)
         if declared != rank:
             raise ValueError(f"{entry.module} stores rank {rank} but its config declares {declared}")
-        factors = _factors(entry.module, layout, source.variables, rank)
+        factors = _factors(entry.module, layout, variables, rank)
         if (entry.b.shape[0], entry.a.shape[1]) != layout.shape:
             raise ValueError(
                 f"{entry.module} carries a delta of {(entry.b.shape[0], entry.a.shape[1])} "
@@ -428,29 +481,35 @@ def _place(source: Pretrained, entries: Sequence[_Entry]) -> tuple[LoRA, Variabl
         targets[factors.module] = Target(rank, entry.config.alpha_of(relative))
         _insert(leaves, (*factors.module, "lora_A"), factors.a.restore(entry.a, shape_a))
         _insert(leaves, (*factors.module, "lora_B"), factors.b.restore(entry.b, shape_b))
-    return LoRA(targets, rslora, dropout), overlay(source.variables, leaves)
+    return LoRA(targets, rslora, dropout), overlay(variables, leaves)
 
 
-def load(source: Pretrained, path: str | FilePath) -> tuple[LoRA, Variables]:
-    """An adapter for `source` and the source's variables with the factors in place.
+def load(model: nn.Module, variables: Variables, layouts: Mapping[str, WeightLayout],
+         path: str | FilePath) -> tuple[LoRA, Variables]:
+    """An adapter for `model` and `variables` with the factors in place.
+
+    `layouts` are the bindings a file's module names resolve through:
+    `Pretrained.layouts` for a loaded source, an empty mapping for a model
+    built from the registry, whose own module paths are its names.
 
     `path` is a PEFT adapter directory or a Diffusers file (or the directory
-    holding one). Targets the source does not bind, tensors whose shapes do
+    holding one). Targets the model does not bind, tensors whose shapes do
     not fit the bound weight, ranks that disagree with the config, and PEFT
     features this loader does not carry are refused by name.
     """
+    bound = bound_layouts(model, variables, layouts)
     path = FilePath(path)
     if (path / PEFT_WEIGHTS).is_file():
         where = str(path / PEFT_CONFIG)
         config = _Config.read(json.loads(FilePath(where).read_text()), where)
         tensors, _ = read_file(path / PEFT_WEIGHTS)
-        return _place(source, _entries(source, tensors, {"": config}, PEFT_PREFIX))
+        return _place(bound, variables, _entries(_components(bound), tensors, {"": config}, PEFT_PREFIX))
     file = path if path.is_file() else path / DIFFUSERS_WEIGHTS
     if not file.is_file():
         raise FileNotFoundError(f"{path} holds neither {PEFT_WEIGHTS} nor {DIFFUSERS_WEIGHTS}")
     tensors, metadata = read_file(file)
     configs = _diffusers_configs(tensors, metadata.get(DIFFUSERS_METADATA), str(file))
-    return _place(source, _entries(source, tensors, configs, ""))
+    return _place(bound, variables, _entries(_components(bound), tensors, configs, ""))
 
 
 def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
@@ -476,13 +535,14 @@ def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
             for component, found in ranks.items()}
 
 
-def _named(source: Pretrained, wanted: Sequence[str]) -> dict[str, WeightLayout]:
+def _named(layouts: Mapping[str, WeightLayout], wanted: Sequence[str]) -> dict[str, WeightLayout]:
     """The projections PEFT's `target_modules` selects: a name relative to
     the model that is an entry, or ends in `.` and an entry."""
+    components = _components(layouts)
     matched: dict[str, WeightLayout] = {}
     hit = set()
-    for name, layout in _layouts(source).items():
-        relative = _component(source, name)[1]
+    for name, layout in layouts.items():
+        relative = _component(components, name)[1]
         entries = {entry for entry in wanted if relative == entry or relative.endswith("." + entry)}
         if entries and layout.paths[0][-1] == "kernel":
             matched[name] = layout
@@ -493,9 +553,10 @@ def _named(source: Pretrained, wanted: Sequence[str]) -> dict[str, WeightLayout]
     return matched
 
 
-def fresh(source: Pretrained, *, rank: int, alpha: float, modules: Sequence[str], key: jax.Array,
+def fresh(model: nn.Module, variables: Variables, layouts: Mapping[str, WeightLayout], *,
+          rank: int, alpha: float, modules: Sequence[str], key: jax.Array,
           rslora: bool = False, dropout: float = 0.0) -> tuple[LoRA, Variables]:
-    """A new adapter on the projections `modules` name, and the source's variables with its factors.
+    """A new adapter on the projections `modules` name, and `variables` with its factors.
 
     `modules` are PEFT's `target_modules`: a projection matches when its
     name relative to the model (`model.layers.0.self_attn.q_proj`, or `to_q`
@@ -503,25 +564,29 @@ def fresh(source: Pretrained, *, rank: int, alpha: float, modules: Sequence[str]
     An entry that matches no projection is refused. A is drawn from `key`
     the way PEFT draws it and B is zero, so the fresh adapter is the identity.
     """
-    matched = _named(source, modules)
+    matched = _named(bound_layouts(model, variables, layouts), modules)
     targets: dict[Path, Target] = {}
     leaves: dict = {}
     for name, factor_key in zip(sorted(matched), jax.random.split(key, len(matched)), strict=True):
-        factors = _factors(name, matched[name], source.variables, rank)
+        factors = _factors(name, matched[name], variables, rank)
         shape_a, shape_b = factors.shapes(rank)
         targets[factors.module] = Target(rank, alpha)
         _insert(leaves, (*factors.module, "lora_A"), INIT_A(factor_key, shape_a, jnp.float32))
         _insert(leaves, (*factors.module, "lora_B"), INIT_B(factor_key, shape_b, jnp.float32))
-    return LoRA(targets, rslora, dropout), overlay(source.variables, leaves)
+    return LoRA(targets, rslora, dropout), overlay(variables, leaves)
 
 
-def save(source: Pretrained, lora: LoRA, variables: Variables, path: str | FilePath) -> None:
-    """Write the adapter's factors from `variables` under the source's module names.
+def save(model: nn.Module, variables: Variables, layouts: Mapping[str, WeightLayout],
+         lora: LoRA, path: str | FilePath) -> None:
+    """Write the adapter's factors from `variables` under the model's module names.
 
-    A decoder source writes PEFT's directory; a pipeline source writes the
-    Diffusers file with each component's PEFT config in its header.
+    One unnamed component writes PEFT's directory, which is a decoder source
+    and a registry-built model; a pipeline source, whose weights are named
+    under several components, writes the Diffusers file with each
+    component's PEFT config in its header.
     """
-    layouts = _layouts(source)
+    layouts = bound_layouts(model, variables, layouts)
+    components = _components(layouts)
     names = {layout.paths[0][:-1]: name for name, layout in layouts.items() if layout.paths[0][-1] == "kernel"}
     tensors: dict[str, np.ndarray] = {}
     named: dict[str, dict[str, Target]] = {}
@@ -529,14 +594,14 @@ def save(source: Pretrained, lora: LoRA, variables: Variables, path: str | FileP
         name = names.get(module)
         if name is None:
             raise ValueError(f"{'/'.join(module)} is not a projection this source binds")
-        component, relative = _component(source, name)
+        component, relative = _component(components, name)
         factors = _factors(name, layouts[name], variables, target.rank)
         for factor in (factors.a, factors.b):
             tensors[factor.name] = factor.export(variables)
         named.setdefault(component, {})[relative] = target
     path = FilePath(path)
     path.mkdir(parents=True, exist_ok=True)
-    if source.process is None:
+    if not components:
         (path / PEFT_CONFIG).write_text(json.dumps(_config(lora, named[""]), indent=2) + "\n")
         write_file({PEFT_PREFIX + name: tensor for name, tensor in tensors.items()},
                    path / PEFT_WEIGHTS, {"format": "pt"})
@@ -546,3 +611,40 @@ def save(source: Pretrained, lora: LoRA, variables: Variables, path: str | FileP
                 for field, value in _config(lora, targets).items()}
     write_file(tensors, path / DIFFUSERS_WEIGHTS,
                {"format": "pt", DIFFUSERS_METADATA: json.dumps(metadata, indent=2, sort_keys=True)})
+
+
+@runtime_checkable
+class Adaptable(Protocol):
+    """An objective an adapter attaches to.
+
+    It trains one module, which is its `model`, and it takes the filter that
+    says which of that module's leaves the optimizer moves. `LMObjective`
+    and `BlockDiffusionObjective` are the two; an objective that keeps no
+    model or selects what trains some other way is refused by name.
+    """
+
+    model: nn.Module
+    trainable: PathFilter | None
+
+
+def attach(objective: object, adapter: LoRA) -> None:
+    """Adapt the module `objective` trains and freeze all but the factors.
+
+    `RunConfig.train` calls this once, after a recipe has built the
+    objective and before anything initialises it, so the adapted module is
+    what the run traces and the adapter's own leaves are the only ones the
+    optimizer moves. The adapted module is a subclass of the same class with
+    the same fields, so what the objective read off the model at
+    construction still holds.
+    """
+    if not isinstance(objective, Adaptable):
+        raise ValueError(
+            f"--lora adapts the module an objective trains and freezes the rest, and "
+            f"{type(objective).__name__} keeps no `model` it can select leaves of; train "
+            f"an LMObjective or a BlockDiffusionObjective, or leave the adapter unset")
+    if objective.trainable is not None:
+        raise ValueError(
+            f"{type(objective).__name__} already selects what trains, and an adapter "
+            f"freezes everything but its own factors; pass one filter, not both")
+    objective.model = adapter.adapt(objective.model)
+    objective.trainable = adapter.trainable
