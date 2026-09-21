@@ -423,10 +423,10 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> object:
         return "cycle"
     seen = seen | {id(value)}
     if isinstance(value, (tuple, list)):
-        return ("sequence", tuple(_stable(item, seen) for item in value))
+        return ("sequence", tuple(_stable(entry, seen) for entry in value))
     if isinstance(value, Mapping):
-        return ("mapping", tuple(sorted((repr(name), _stable(item, seen))
-                                        for name, item in value.items())))
+        return ("mapping", tuple(sorted((repr(name), _stable(entry, seen))
+                                        for name, entry in value.items())))
     if hasattr(value, "shape") and hasattr(value, "dtype"):
         return ("array", *_hashed(value))
     if isinstance(value, functools.partial):

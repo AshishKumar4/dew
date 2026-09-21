@@ -70,8 +70,8 @@ def scan_ordered_pos_embed(emb_dim: int, H_P: int, W_P: int, scan_order: str):
     """2D sincos position embedding permuted into the scan order, so token i of
     the sequence carries the signal for the 2D position it came from."""
     pos_embed = build_2d_sincos_pos_embed(emb_dim, H_P, W_P)
-    idx = scan_indices(scan_order, H_P, W_P)
-    return pos_embed if idx is None else pos_embed[idx]
+    order = scan_indices(scan_order, H_P, W_P)
+    return pos_embed if order is None else pos_embed[order]
 
 
 def build_block_pattern(num_layers: int, ssm_attention_ratio: str = "3:1",

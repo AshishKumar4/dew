@@ -209,11 +209,11 @@ class _StatusStop(RuntimeError):
     """An environment returned an explicit error or cancellation outcome."""
 
 
-def _phase[T](operation: Callable[[], _T], name: str) -> _T:
-    result: tuple[_T] | None = None
+def _phase[T](operation: Callable[[], T], name: str) -> T:
+    held: tuple[T] | None = None
     error = None
     try:
-        result = (operation(),)
+        held = (operation(),)
     except BaseException as failure:
         error = failure
     try:
@@ -222,8 +222,8 @@ def _phase[T](operation: Callable[[], _T], name: str) -> _T:
         if error is None:
             raise _PeerFailure(str(failure)) from failure
         raise
-    assert result is not None
-    return result[0]
+    assert held is not None
+    return held[0]
 
 
 @dataclass
@@ -354,11 +354,11 @@ class EpisodeRollout:
         fields = {} if valid.all() else {"attention_mask": jnp.asarray(valid)}
         return ModelInputs(jnp.asarray(tokens), fields)
 
-    def _advance(self, slots: list[_Session], result: Generation, policy_step: int,
+    def _advance(self, slots: list[_Session], generation: Generation, policy_step: int,
                  binding_id: str, turn: int, run: JournalRun | None) -> None:
-        if not isinstance(result, Generation):
+        if not isinstance(generation, Generation):
             raise TypeError("tool episodes require an autoregressive Generation")
-        rows = result.host()
+        rows = generation.host()
         if rows.tokens.shape[0] != len(slots):
             raise TypeError("tool episodes require one autoregressive Generation row per slot")
         # Record every actual draw before invoking any tool. A tool failure
@@ -429,12 +429,12 @@ class EpisodeRollout:
             raise failure from None
         raise failure from error
 
-    def _action(self, result: Generation[np.ndarray], row: int, context: tuple[int, ...], policy_step: int,
+    def _action(self, generation: Generation[np.ndarray], row: int, context: tuple[int, ...], policy_step: int,
                 binding_id: str) -> Action:
         """Validate a cohort row's provenance before an environment acts."""
-        tokens = np.asarray(result.tokens)[row]
-        lengths, ended = np.asarray(result.lengths), np.asarray(result.terminated)
-        raw, behavior = np.asarray(result.raw_log_probs)[row], np.asarray(result.behavior_log_probs)[row]
+        tokens = np.asarray(generation.tokens)[row]
+        lengths, ended = np.asarray(generation.lengths), np.asarray(generation.terminated)
+        raw, behavior = np.asarray(generation.raw_log_probs)[row], np.asarray(generation.behavior_log_probs)[row]
         width = self.max_prompt_tokens
         expected = np.full(width, self.sampling.pad_id, np.int32)
         expected[-len(context):] = context
@@ -510,9 +510,9 @@ class EpisodeRollout:
                         active = any(slot.status == EpisodeStatus.RUNNING for slot in slots)
                         if not agree_process_phase(None, phase="episode availability", available=active):
                             break
-                        result = _phase(lambda: policy(inputs, self.max_new_tokens,
+                        generation = _phase(lambda: policy(inputs, self.max_new_tokens,
                             key=jax.random.fold_in(key, turn), sampling=self.sampling), "episode generation")
-                        _phase(lambda: self._advance(slots, result, policy_step, binding_id, turn, run), "episode tool step")
+                        _phase(lambda: self._advance(slots, generation, policy_step, binding_id, turn, run), "episode tool step")
                     _phase(lambda: self._verify(slots, policy_step, binding_id, run), "episode verification")
         except BaseException as failure:
             error = failure

@@ -119,7 +119,7 @@ def fetch_bytes(url: str, timeout: float, retries: int) -> bytes | None:
             time.sleep(0.1 * attempt)
 
 
-def decode_pixels(data: bytes) -> np.ndarray | None:
+def decode_pixels(blob: bytes) -> np.ndarray | None:
     """`data` as the array PIL decodes it to, or None when it is no image.
 
     The bytes are whatever the open internet returned. PIL reports a bad
@@ -128,9 +128,9 @@ def decode_pixels(data: bytes) -> np.ndarray | None:
     covers all of them.
     """
     try:
-        return np.asarray(PIL.Image.open(io.BytesIO(data)))
+        return np.asarray(PIL.Image.open(io.BytesIO(blob)))
     except (OSError, SyntaxError, ValueError, struct.error) as error:
-        _log.debug("undecodable image of %d bytes: %s", len(data), error)
+        _log.debug("undecodable image of %d bytes: %s", len(blob), error)
         return None
 
 
@@ -178,8 +178,8 @@ def fetch_one(url: str, caption: str, sink: queue.Queue | multiprocessing.queues
     """Queue the sample for `url`, or the url itself when it yields nothing."""
     if stop is not None and stop.is_set():
         return
-    data = fetch_bytes(url, fetch.timeout, fetch.retries)
-    pixels = None if data is None else decode_pixels(data)
+    blob = fetch_bytes(url, fetch.timeout, fetch.retries)
+    pixels = None if blob is None else decode_pixels(blob)
     image = None if pixels is None else prepare_image(pixels, fetch.size, fetch.min_size)
     sample = url if image is None else (image, caption)
     while stop is None or not stop.is_set():
@@ -246,11 +246,11 @@ def fetch_rows(rows: Dataset, sink: multiprocessing.queues.Queue, *, workers: in
             for iteration in itertools.count(1):
                 if stop.is_set():
                     return
-                result = pool.map_async(partial(_fetch_shard, fetch=fetch, threads=threads),
+                pending = pool.map_async(partial(_fetch_shard, fetch=fetch, threads=threads),
                                         [rows[start:end] for start, end in itertools.pairwise(bounds)])
                 while not stop.is_set():
                     try:
-                        result.get(timeout=0.05)
+                        pending.get(timeout=0.05)
                         break
                     except multiprocessing.TimeoutError:
                         continue
@@ -327,16 +327,16 @@ class ImageStream:
             if self._stop.is_set():
                 raise StopIteration
             try:
-                item = samples.get(timeout=min(0.05, self.queue_timeout))
+                sample = samples.get(timeout=min(0.05, self.queue_timeout))
             except queue.Empty:
                 if (self._done.is_set()
                         or time.monotonic() - waiting_since >= self.queue_timeout):
                     self._check_fetcher()
                 continue
-            if isinstance(item, str):
+            if isinstance(sample, str):
                 self.dropped += 1
                 continue
-            pixels, caption = item
+            pixels, caption = sample
             images.append(pixels)
             captions.append(caption)
         if self._stop.is_set():

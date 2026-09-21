@@ -78,7 +78,7 @@ async def _ainvoke[T](call: Callable[..., Awaitable[T]], fields: Mapping[str, ob
 def _object(value: object, name: str) -> dict[str, object]:
     if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise ValueError(f"{name} must be an object")
-    return {key: item for key, item in value.items() if isinstance(key, str)}
+    return {key: entry for key, entry in value.items() if isinstance(key, str)}
 
 
 def _count(value: object, name: str) -> int | None:
@@ -265,13 +265,13 @@ def _openai_result(raw: object, response: object, expected: int) -> Completion:
         raise ValueError(f"expected {expected} completion choices")
     ordered: dict[int, tuple[str, str | None]] = {}
     for choice in choices:
-        item = _object(choice, "completion choice")
-        index, text = item.get("index"), item.get("text")
+        entry = _object(choice, "completion choice")
+        index, text = entry.get("index"), entry.get("text")
         if type(index) is not int or index < 0 or index >= expected or index in ordered:
             raise ValueError("choice indices must be a permutation of the expected prompt-choice indices")
         if not isinstance(text, str):
             raise ValueError("each completion choice needs string text")
-        ordered[index] = text, _reason(item.get("finish_reason"))
+        ordered[index] = text, _reason(entry.get("finish_reason"))
     usage = None
     if fields.get("usage") is not None:
         supplied = _object(fields["usage"], "usage")

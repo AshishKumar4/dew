@@ -277,12 +277,12 @@ class ImageDataset(DatasetSpec):
 
     def load(self, *, batch: int, tokenize=None) -> Dataset:
         source = self.source()
-        train, val = hold_out(source, self.records(source),
+        train, validation = hold_out(source, self.records(source),
                               (self.val_batches or 0) * batch, type(self).__name__)
         return Dataset(
             train=tokenized(train_stream(train, [ImageTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
-            val=None if val is None else tokenized(
-                validation_pass(val, [ImageTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
+            val=None if validation is None else tokenized(
+                validation_pass(validation, [ImageTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
             records=len(train),
             batch=batch,
         )

@@ -293,11 +293,11 @@ class Checkpoints:
         asynchronously, in place of the local step before it. The placement
         rides along; a resume onto another one raises before reading shards
         from directories that do not hold them."""
-        item = self._item(state, saved)
-        written = placement(item)
+        state_tree = self._item(state, saved)
+        written = placement(state_tree)
         if saved is not None:
-            item['position'] = jax.tree.map(
-                lambda leaf: jax.device_put(leaf, state.step.sharding), item['position'])
+            state_tree['position'] = jax.tree.map(
+                lambda leaf: jax.device_put(leaf, state.step.sharding), state_tree['position'])
         annotation = None
         active = active_profile()
         if active is not None and active.running:
@@ -305,7 +305,7 @@ class Checkpoints:
             annotation.__enter__()
         try:
             self._open_local().save(
-                step, args=ocp.args.PyTreeSave(item), force=True,
+                step, args=ocp.args.PyTreeSave(state_tree), force=True,
                 custom_metadata={'processes': jax.process_count(), 'placement': written})
         finally:
             if annotation is not None:
@@ -313,10 +313,10 @@ class Checkpoints:
 
     @staticmethod
     def _item(state: Any, saved: bytes | None) -> dict[str, Any]:
-        item = {name: getattr(state, name) for name in STATE_LEAVES}
+        state_tree = {name: getattr(state, name) for name in STATE_LEAVES}
         if saved is not None:
-            item['position'] = gather_positions(saved)
-        return item
+            state_tree['position'] = gather_positions(saved)
+        return state_tree
     def stored(self, step: int | None = None) -> dict[str, Any]:
         """What the checkpoint at `step` (the latest by default) holds, as
         shape/dtype trees per state field; an unset field is None."""
@@ -324,8 +324,8 @@ class Checkpoints:
             step = self.latest
             if step is None:
                 raise FileNotFoundError(f"{self.directory} holds no checkpoint")
-        manager = self._open_local() if step == self._local_latest() else self._open()
-        metadata = manager.item_metadata(step)
+        checkpointer = self._open_local() if step == self._local_latest() else self._open()
+        metadata = checkpointer.item_metadata(step)
         return {name: None if value is None else
                 jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
                 for name, value in dict(metadata).items()}
@@ -333,8 +333,8 @@ class Checkpoints:
     def accumulation_template(self, step: int):
         """The persisted pending-array shapes, without reading their values."""
         from dew.training.state import Accumulation
-        manager = self._open_local() if step == self._local_latest() else self._open()
-        metadata = manager.item_metadata(step)
+        checkpointer = self._open_local() if step == self._local_latest() else self._open()
+        metadata = checkpointer.item_metadata(step)
         missing = set(STATE_LEAVES).difference(metadata.keys())
         if missing:
             raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
@@ -367,7 +367,7 @@ class Checkpoints:
             if step is None:
                 raise FileNotFoundError(f"{self.directory} holds no checkpoint")
         from_local = step == local
-        manager = self._open_local() if from_local else self._open()
+        checkpointer = self._open_local() if from_local else self._open()
         where = self.local_path if from_local else self.path(step)
         if from_local and template is None and jax.process_count() > 1:
             raise ValueError(
@@ -375,7 +375,7 @@ class Checkpoints:
                 f"so a pool cannot read step {step} as host arrays; restore it with "
                 f"the template of a run placed as it was written, or read the "
                 f"persistent checkpoint at {self.path(step)}")
-        metadata = manager.item_metadata(step)
+        metadata = checkpointer.item_metadata(step)
         stored = metadata.keys()
         if template is not None and not isinstance(template, Mapping):
             missing = set(STATE_LEAVES).difference(stored)
@@ -392,19 +392,19 @@ class Checkpoints:
             untyped = (
                 ocp.ArrayRestoreArgs(sharding=jax.sharding.SingleDeviceSharding(jax.devices()[0]))
                 if from_local else ocp.ArrayRestoreArgs(restore_type=np.ndarray))
-            restored = manager.restore(step, args=ocp.args.PyTreeRestore(
+            restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                 restore_args=jax.tree.map(lambda _: untyped, dict(metadata))))
             if from_local:
                 restored = jax.tree.map(np.asarray, restored)
         else:
-            item = {name: getattr(template, name) for name in STATE_LEAVES} \
+            state_tree = {name: getattr(template, name) for name in STATE_LEAVES} \
                 if not isinstance(template, Mapping) else dict(template)
             if from_local:
-                self._check_placement(step, item)
+                self._check_placement(step, state_tree)
             restore_args = jax.tree.map(
                 lambda leaf: ocp.ArrayRestoreArgs(
                     sharding=leaf.sharding if isinstance(leaf, jax.ShapeDtypeStruct) else None),
-                item)
+                state_tree)
             if 'position' in stored and not isinstance(template, Mapping):
                 # A mapping names the leaves it wants and nothing else; a
                 # resume takes the whole state, the data position included.
@@ -412,25 +412,25 @@ class Checkpoints:
                 # iterator's position, so it comes from the checkpoint's own
                 # metadata, not from the template. A local checkpoint
                 # holds it as a device array, replicated like the step.
-                target = next(iter(jax.tree.leaves(item)), None)
+                target = next(iter(jax.tree.leaves(state_tree)), None)
                 target_sharding = getattr(target, "sharding", None)
                 position_sharding = (
                     jax.sharding.NamedSharding(target_sharding.mesh, jax.sharding.PartitionSpec())
                     if isinstance(target_sharding, jax.sharding.NamedSharding) else
                     jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
-                item["position"] = jax.tree.map(
+                state_tree["position"] = jax.tree.map(
                     lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),
                     dict(metadata['position']))
                 restore_args['position'] = jax.tree.map(
                     lambda leaf: (ocp.ArrayRestoreArgs(sharding=position_sharding,
                                                        global_shape=leaf.shape)
                                   if from_local else ocp.RestoreArgs()),
-                    item['position'])
+                    state_tree['position'])
             try:
                 # partial_restore: a key the checkpoint holds and the template
                 # does not is skipped instead of refused.
-                restored = manager.restore(step, args=ocp.args.PyTreeRestore(
-                    item=item, restore_args=restore_args, partial_restore=True))
+                restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
+                    item=state_tree, restore_args=restore_args, partial_restore=True))
             except (TypeError, ValueError) as mismatch:
                 # Model, optimizer and retained record shapes are a resume contract.
                 raise ValueError(
@@ -452,7 +452,7 @@ class Checkpoints:
             restored = template.replace(**restored)
         return restored, saved
 
-    def _check_placement(self, step: int, item: Mapping[str, Any]) -> None:
+    def _check_placement(self, step: int, state_tree: Mapping[str, Any]) -> None:
         """Refuse a local step written for another placement of the state."""
         annotation = None
         active = active_profile()
@@ -461,7 +461,7 @@ class Checkpoints:
             annotation.__enter__()
         try:
             written = self._open_local().metadata(step).custom_metadata or {}
-            wanted = placement(item)
+            wanted = placement(state_tree)
             moved = [path for path in wanted if written.get('placement', {}).get(path) != wanted[path]]
             processes = written.get('processes')
             if processes == jax.process_count() and not moved:
@@ -496,10 +496,10 @@ class Checkpoints:
             annotation.__enter__()
         try:
             error = None
-            for manager in (self._manager, self._local_manager):
-                if manager is not None:
+            for checkpointer in (self._manager, self._local_manager):
+                if checkpointer is not None:
                     try:
-                        manager.wait_until_finished()
+                        checkpointer.wait_until_finished()
                     except BaseException as failure:
                         if error is None:
                             error = failure

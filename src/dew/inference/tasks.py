@@ -50,8 +50,8 @@ def _prepared(processor: Processor | None, request: Request, *, images: object |
     """Classify raw text without changing numeric token identities or row order."""
     if isinstance(request, str):
         text = [request]
-    elif isinstance(request, Sequence) and request and all(isinstance(item, str) for item in request):
-        text = [item for item in request if isinstance(item, str)]
+    elif isinstance(request, Sequence) and request and all(isinstance(entry, str) for entry in request):
+        text = [entry for entry in request if isinstance(entry, str)]
     else:
         text = None
     if text is not None:
@@ -187,14 +187,14 @@ class TextGeneration:
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key, seed=seed)
             chain = self.logits if sampling is None else None
-            result = generate(self.model, self.variables, inputs, budget, key=random_key,
+            generated = generate(self.model, self.variables, inputs, budget, key=random_key,
                               sampling=self.sampling if sampling is None else sampling,
                               n=self.n if n is None else n,
                               logits=chain if logits is None else logits,
                               stopping=self.stopping if stopping is None else stopping,
                               strategy=self.strategy if strategy is None else strategy)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
-            return replace(result, decoder=decoder)
+            return replace(generated, decoder=decoder)
         finally:
             if annotation is not None:
                 annotation.__exit__(None, None, None)
@@ -264,12 +264,12 @@ class BlockGeneration:
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key, seed=seed)
-            result = (self.process if process is None else process).generate(
+            generated = (self.process if process is None else process).generate(
                 self.model, self.variables, inputs, budget, key=random_key,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
-            return replace(result, decoder=decoder)
+            return replace(generated, decoder=decoder)
         finally:
             if annotation is not None:
                 annotation.__exit__(None, None, None)
@@ -340,12 +340,12 @@ class MaskedGeneration:
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
                 max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                 max_length=self.max_length, key=key, seed=seed)
-            result = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
+            generated = self.process.generate(self.model, self.variables, inputs, budget, key=random_key,
                 sampler=self.sampler, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
-            return replace(result, decoder=decoder)
+            return replace(generated, decoder=decoder)
         finally:
             if annotation is not None:
                 annotation.__exit__(None, None, None)

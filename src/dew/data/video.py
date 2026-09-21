@@ -107,11 +107,11 @@ class VideoDataset(DatasetSpec):
         records = len(source) if self.count is None else self.count
         if records > len(source):
             raise ValueError(f"count {self.count} is more than the {len(source)} records of {name}")
-        train, val = hold_out(source, records, (self.val_batches or 0) * batch, name)
+        train, validation = hold_out(source, records, (self.val_batches or 0) * batch, name)
         return Dataset(
             train=tokenized(train_stream(train, [AudioVideoTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
-            val=None if val is None else tokenized(
-                validation_pass(val, [AudioVideoTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
+            val=None if validation is None else tokenized(
+                validation_pass(validation, [AudioVideoTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
             records=len(train),
             batch=batch,
         )

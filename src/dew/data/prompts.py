@@ -241,17 +241,17 @@ class Prompts(DatasetSpec):
             source = PromptSource.from_records(
                 self.records, self.tokenizer, self.max_prompt_len, self.pad_id)
         per_process = local_batch(batch)
-        val = None
+        validation = None
         if self.val_path is not None:
             val_source = PromptSource.from_parquet(
                 self.val_path, self.tokenizer, self.max_prompt_len, self.pad_id)
-            val = bounded(validation_pass(
+            validation = bounded(validation_pass(
                 val_source, [], batch=per_process, seed=self.seed,
                 loading=self.loading), self.val_batches)
         return Dataset(
             train=train_stream(source, [], batch=per_process, seed=self.seed,
                                loading=self.loading),
-            val=val,
+            val=validation,
             records=len(source),
             batch=batch,
         )

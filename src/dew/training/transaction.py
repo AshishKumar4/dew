@@ -129,9 +129,9 @@ class Transaction:
         self.stats_tree = jax.tree.structure(stats_shape)
         self.effects_tree = jax.tree.structure(self.aux_shape.effects)
 
-    def realize(self, variables: Variables, batch: Batch, info: Step) -> Realization:
+    def realize(self, variables: Variables, batch: Batch, step_info: Step) -> Realization:
         def loss(trainable):
-            return self.objective.loss({**variables, "params": trainable}, batch, info)
+            return self.objective.loss({**variables, "params": trainable}, batch, step_info)
         stats, back, aux = jax.vjp(loss, variables["params"], has_aux=True)
         return Realization(stats, aux, lambda cotangent: back(cotangent)[0])
 
@@ -200,10 +200,10 @@ class Transaction:
         batch = jax.tree.map(lambda x: x[index], previous.batches)
         variables = state.params if previous.variables is None else {
             **state.params, **jax.tree.map(lambda x: x[index], previous.variables)}
-        info = Step(state.microstep - fill + index,
+        step_info = Step(state.microstep - fill + index,
                     jax.random.fold_in(state.key, previous.attempts[index]),
                     with_ema(variables, state.ema))
-        return variables, batch, info
+        return variables, batch, step_info
 
     @staticmethod
     def unscaled(gradient, factor):
@@ -273,10 +273,10 @@ class Transaction:
                     else jnp.zeros_like(x), acc.qk_stats))
             numerical = dataclasses.replace(
                 numerical, accumulation=jax.lax.cond(pending.due, clear, retain, candidate))
-        result = jax.lax.cond(accepted, lambda _: numerical, lambda _: state, None)
+        advanced = jax.lax.cond(accepted, lambda _: numerical, lambda _: state, None)
         if scale is not None:
-            result = dataclasses.replace(result, scale=_advance_scale(scale, finite))
-        return result, loss, aux
+            advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
+        return advanced, loss, aux
 
     def step(self, *, realize=None, host=False):
         """One orchestration over the shared phases; host replay crosses eager
@@ -291,10 +291,10 @@ class Transaction:
         add = compile_phase(self.add_contribution)
 
         def run(state, batch):
-            info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
+            step_info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
                         with_ema(state.params, state.ema))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
-            realized = realize(state.params, batch, info)
+            realized = realize(state.params, batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
             gradient = unscale(realized.pullback(cotangent), factor)
             pending = prepare(state, realized.stats, realized.aux, loss, gradient)

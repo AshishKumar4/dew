@@ -567,8 +567,8 @@ def expert_dispatch[Parameters](
 
         initial = jax.lax.pcast(jnp.zeros((slots, x.shape[-1]), output_dtype),
                                 EXPERT_AXIS, to='varying')
-        result, _ = jax.lax.scan(step, initial, jnp.arange(shards))
-        return result[jnp.argsort(order)].reshape(*indices.shape, x.shape[-1])
+        combined, _ = jax.lax.scan(step, initial, jnp.arange(shards))
+        return combined[jnp.argsort(order)].reshape(*indices.shape, x.shape[-1])
 
     # Sentinel assignments from token-axis padding never enter send counts.
     padding = -tokens.shape[0] % shards
@@ -576,8 +576,8 @@ def expert_dispatch[Parameters](
                             constant_values=num_experts)
     padded_weights = (None if input_weights is None else
                       jnp.pad(input_weights.reshape(-1, top_k), ((0, padding), (0, 0))))
-    result = local(jnp.pad(tokens, ((0, padding), (0, 0))), token_indices, parameters, padded_weights)
-    return result[:tokens.shape[0]].reshape(*indices.shape, x.shape[-1])
+    combined = local(jnp.pad(tokens, ((0, padding), (0, 0))), token_indices, parameters, padded_weights)
+    return combined[:tokens.shape[0]].reshape(*indices.shape, x.shape[-1])
 
 
 

@@ -29,14 +29,14 @@ def json_value(value: object) -> JSON:
         return {field.name: json_value(getattr(value, field.name))
                 for field in dataclasses.fields(value)}
     if isinstance(value, Mapping):
-        result: dict[str, JSON] = {}
-        for key, item in value.items():
+        encoded: dict[str, JSON] = {}
+        for key, entry in value.items():
             if not isinstance(key, str):
                 raise TypeError('report metadata keys must be strings')
-            result[key] = json_value(item)
-        return result
+            encoded[key] = json_value(entry)
+        return encoded
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
-        return [json_value(item) for item in value]
+        return [json_value(entry) for entry in value]
     raise TypeError(f'{type(value).__name__} is not JSON reporting metadata')
 
 

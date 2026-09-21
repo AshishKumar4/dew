@@ -178,16 +178,16 @@ class PreferencePairs(DatasetSpec):
         else:
             source = PreferenceSource.from_records(self.records, self.pad_id, self.seq_len)
         per_process = local_batch(batch)
-        val = None
+        validation = None
         if self.val_path is not None:
             val_source = PreferenceSource.from_parquet(self.val_path, self.pad_id, self.seq_len)
-            val = bounded(validation_pass(
+            validation = bounded(validation_pass(
                 val_source, [], batch=per_process, seed=self.seed,
                 loading=self.loading), self.val_batches)
         return Dataset(
             train=train_stream(source, [], batch=per_process, seed=self.seed,
                                loading=self.loading),
-            val=val,
+            val=validation,
             records=len(source),
             batch=batch,
         )

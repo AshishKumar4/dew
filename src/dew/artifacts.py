@@ -126,14 +126,14 @@ def collective_host[T](value: T, *, phase: str) -> T:
             error = failure
         agree_process_phase(error, phase=f"{phase} transfer leaf {index}")
     error = None
-    result = value
+    materialized = value
     try:
         assert tree is not None
-        result = jax.tree.unflatten(tree, leaves)
+        materialized = jax.tree.unflatten(tree, leaves)
     except BaseException as failure:
         error = failure
     agree_process_phase(error, phase=f"{phase} tree reconstruction")
-    return result
+    return materialized
 
 
 def broadcast_from_process_zero(value):

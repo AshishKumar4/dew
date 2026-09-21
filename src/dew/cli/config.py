@@ -98,7 +98,7 @@ def save(cfg: TpuConfig, path: Path | None = None) -> Path:
 
 def _toml(value: object) -> str:
     if isinstance(value, tuple):
-        return "[" + ", ".join(_toml(item) for item in value) + "]"
+        return "[" + ", ".join(_toml(element) for element in value) + "]"
     # TOML basic strings escape exactly like JSON strings.
     return json.dumps(value)
 

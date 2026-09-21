@@ -322,11 +322,18 @@ def names(module: Module) -> Iterator[Finding]:
     comprehended = {id(target) for node in ast.walk(module.tree)
                     if isinstance(node, ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp)
                     for generator in node.generators for target in ast.walk(generator.target)}
+    # An annotated name in a class body is a field: a config key, a CLI flag
+    # and a pytree entry a checkpoint is written with. Renaming one is a
+    # migration with a converter, which is not something a linter asks for.
+    fields = {id(node.target) for node in ast.walk(module.tree)
+              if isinstance(node, ast.ClassDef)
+              for statement in node.body if isinstance(statement, ast.AnnAssign)
+              for node in [statement]}
     for node in ast.walk(module.tree):
         if isinstance(node, ast.arg):
             found, line, col = node.arg, node.lineno, node.col_offset
         elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            if id(node) in comprehended and len(node.id) <= 3:
+            if id(node) in fields or (id(node) in comprehended and len(node.id) <= 3):
                 continue
             found, line, col = node.id, node.lineno, node.col_offset
         elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):

@@ -181,8 +181,8 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
                 if metrics:
                     error = None
                     try:
-                        info = replace(context, key=jax.random.fold_in(score_key, scored))
-                        produced = objective.evaluate(variables, batch, info)
+                        context_at = replace(context, key=jax.random.fold_in(score_key, scored))
+                        produced = objective.evaluate(variables, batch, context_at)
                     except BaseException as failure:
                         error = failure
                     agree_process_phase(error, phase=f"scoring batch {scored}")
@@ -205,8 +205,8 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
                     error = None
                     produced_preview = None
                     try:
-                        info = replace(context, key=preview_key)
-                        produced_preview = objective.preview(variables, batch, info, scored=produced)
+                        context_at = replace(context, key=preview_key)
+                        produced_preview = objective.preview(variables, batch, context_at, scored=produced)
                     except BaseException as failure:
                         error = failure
                     agree_process_phase(error, phase="preview generation/decoding")

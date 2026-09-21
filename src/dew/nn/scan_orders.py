@@ -92,10 +92,10 @@ def zigzag_indices(H_P: int, W_P: int) -> np.ndarray:
     return grid.reshape(-1)
 
 
-def inverse_permutation(idx: np.ndarray) -> np.ndarray:
+def inverse_permutation(order: np.ndarray) -> np.ndarray:
     """`inv` with inv[idx[i]] = i: the row-major index into the scan order."""
-    inv = np.empty_like(idx)
-    inv[idx] = np.arange(idx.shape[0], dtype=idx.dtype)
+    inv = np.empty_like(order)
+    inv[order] = np.arange(order.shape[0], dtype=order.dtype)
     return inv
 
 
@@ -117,8 +117,8 @@ def unpatchify(x: jnp.ndarray, patch_size: int, H: int, W: int, C: int) -> jnp.n
         x, 'b (h w) (p1 p2 c) -> b (h p1) (w p2) c', h=H_P, w=W_P, p1=patch_size, p2=patch_size, c=C)
 
 
-def _ordered_patchify(x: jnp.ndarray, patch_size: int, idx: np.ndarray):
-    return patchify(x, patch_size)[:, idx, :], inverse_permutation(idx)
+def _ordered_patchify(x: jnp.ndarray, patch_size: int, order: np.ndarray):
+    return patchify(x, patch_size)[:, order, :], inverse_permutation(order)
 
 
 def hilbert_patchify(x: jnp.ndarray, patch_size: int) -> tuple[jnp.ndarray, np.ndarray]:

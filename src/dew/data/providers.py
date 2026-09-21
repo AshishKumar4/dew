@@ -270,13 +270,13 @@ def load(source: str | Mapping[str, float], *, batch: int, split: str = "train",
                 "so it takes no records=")
         train = mixed_stream(corpora, transforms, batch=rows, seed=seed, loading=loading)
         pass_records = mixed_records(corpora)
-    val = None
+    validation = None
     if val_split is not None:
         held = corpora_over(val_split)
         ordered = held[0].source if len(held) == 1 else mixture(held, None)
-        val = bounded(validation_pass(ordered, transforms, batch=rows, seed=seed,
+        validation = bounded(validation_pass(ordered, transforms, batch=rows, seed=seed,
                                       loading=loading), val_batches)
-    return Dataset(train=train, val=val, records=pass_records, batch=batch)
+    return Dataset(train=train, val=validation, records=pass_records, batch=batch)
 
 
 type Reader = Callable[[str, str], pygrain.RandomAccessDataSource[object]]

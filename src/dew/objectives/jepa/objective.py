@@ -120,8 +120,8 @@ class JepaObjective(Objective[Mean]):
         return {"params": {CONTEXT_ENCODER: encoder["params"],
                            PREDICTOR: predictor["params"]}}
 
-    def encode(self, encoder_params, data, token_idx=None, train=False, rngs=None) -> jax.Array:
-        features = self.encoder.apply({"params": encoder_params}, data, token_idx,
+    def encode(self, encoder_params, samples, token_idx=None, train=False, rngs=None) -> jax.Array:
+        features = self.encoder.apply({"params": encoder_params}, samples, token_idx,
                                       train=train, rngs=rngs)
         assert not isinstance(features, tuple)  # no mutable collections were asked for
         return features
@@ -138,14 +138,14 @@ class JepaObjective(Objective[Mean]):
         return step.ema["params"][CONTEXT_ENCODER]
 
     def loss(self, params, batch, step: Step):
-        data = unit_range(batch[self.sample.key])
-        batch_size = data.shape[0]
+        samples = unit_range(batch[self.sample.key])
+        batch_size = samples.shape[0]
         mask_key, dropout_key = jax.random.split(step.key)
         context_idx, target_idx = self.mask.sample(mask_key, batch_size)
         num_targets = self.mask.num_targets
 
         # The target branch reads the whole view through the EMA encoder, without gradients.
-        full = normalize_targets(self.encode(self._target_params(step), data))
+        full = normalize_targets(self.encode(self._target_params(step), samples))
         # [B, (T,) S, F] -> [B, M, (T,) n_tgt, F]
         frame_axis = (1,) if self.is_video else ()
         gather_idx = target_idx.reshape(batch_size, num_targets, *frame_axis, -1, 1)
@@ -153,7 +153,7 @@ class JepaObjective(Objective[Mean]):
             jnp.take_along_axis(full[:, None], gather_idx, axis=-2))
 
         context = self.encode(
-            params["params"][CONTEXT_ENCODER], data, context_idx,
+            params["params"][CONTEXT_ENCODER], samples, context_idx,
             train=True, rngs={"dropout": dropout_key})
 
         # Each target block is predicted from the same context. Fold the block

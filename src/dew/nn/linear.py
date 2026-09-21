@@ -218,16 +218,16 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
         decay_i, kd_i, gc_i = step['decay'], step['kd'], step['gc']
         attn_i = q_i @ jnp.swapaxes(k_i, -1, -2) * decay_i
         v_prime = kd_i @ s
-        v_new = v_i - v_prime
+        v_corrected = v_i - v_prime
         attn_inter = (q_i * jnp.exp(gc_i)[..., None]) @ s
-        out = attn_inter + attn_i @ v_new
+        out = attn_inter + attn_i @ v_corrected
         # The chunk's write into the memory, the reference's
         # `s * exp(gc[-1]) + (k * exp(gc[-1] - gc))^T @ v_new`
         # (modeling_qwen3_next.py:443-446).
         s = (s * jnp.exp(gc_i[..., -1])[..., None, None]
              + jnp.swapaxes(
                  k_i * jnp.exp(gc_i[..., -1][..., None] - gc_i)[..., None],
-                 -1, -2) @ v_new)
+                 -1, -2) @ v_corrected)
         return s, out
     state, core = jax.lax.scan(
         one_chunk, state,

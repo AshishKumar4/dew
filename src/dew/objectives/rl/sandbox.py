@@ -69,9 +69,9 @@ class _ProcessEnvironment:
         self.identity, self.limits = identity, limits
         self.deadline = time.monotonic() + limits.wall_seconds
         self.output = bytearray()
-        helper = str(Path(__file__).with_name("_sandbox_exec.py"))
+        launcher = str(Path(__file__).with_name("_sandbox_exec.py"))
         self.process = subprocess.Popen(
-            [sys.executable, "-I", helper, str(limits.cpu_seconds), str(limits.memory_bytes),
+            [sys.executable, "-I", launcher, str(limits.cpu_seconds), str(limits.memory_bytes),
              str(os.getpid()), *command], cwd=directory,
             env={"PATH": os.defpath, "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1"},
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

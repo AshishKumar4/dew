@@ -148,9 +148,9 @@ class DiscreteProcess:
             valid = padded.token_fields.get("attention_mask", jnp.ones(padded.tokens.shape, bool))
             padded = replace(padded, token_fields={**padded.token_fields,
                 "attention_mask": jnp.asarray(valid, bool) & ~plan.padding[:, None]})
-        result = _compiled(plan.sharding)(model, variables, plan.place(padded), plan.keys(request),
+        generated = _compiled(plan.sharding)(model, variables, plan.place(padded), plan.keys(request),
             self, solver, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
-        return replace(result, rows=plan.rows * n, prompt_width=prepared.tokens.shape[1])
+        return replace(generated, rows=plan.rows * n, prompt_width=prepared.tokens.shape[1])
 
 
 @dataclass(frozen=True)
@@ -309,8 +309,8 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
                                     active & is_eos.any(), jnp.where(active, steps, 0))
         return jax.lax.map(continued, continuation_keys(key, n))
 
-    result = jax.vmap(row)(full, mutable, keys)
-    return jax.tree.map(lambda leaf: leaf.reshape((batch * n, *leaf.shape[2:])), result)
+    generated = jax.vmap(row)(full, mutable, keys)
+    return jax.tree.map(lambda leaf: leaf.reshape((batch * n, *leaf.shape[2:])), generated)
 
 
 @functools.cache

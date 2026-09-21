@@ -176,35 +176,35 @@ class TrainerConfig:
         if self.steps is not None and self.epochs is not None:
             raise ValueError("steps and epochs both name the run length; set one")
 
-    def total_steps(self, data: Dataset) -> int:
+    def total_steps(self, dataset: Dataset) -> int:
         """The run's length in steps, from `steps` or from `epochs` over `data`."""
         if self.steps is not None:
             return self.steps
         if self.epochs is None:
             raise ValueError("the run length is --trainer.steps or --trainer.epochs")
-        if data.steps_per_epoch is None:
+        if dataset.steps_per_epoch is None:
             raise ValueError(
                 "epochs need a dataset with a record count; this one streams without "
                 "one, so give the run length as --trainer.steps")
-        return self.epochs * data.steps_per_epoch
+        return self.epochs * dataset.steps_per_epoch
 
-    def eval_interval(self, data: Dataset) -> int | None:
+    def eval_interval(self, dataset: Dataset) -> int | None:
         """Steps between validation passes over `data`, or None for never."""
-        return self._interval(self.eval_every, data, "eval-every")
+        return self._interval(self.eval_every, dataset, "eval-every")
 
-    def checkpoint_interval(self, data: Dataset) -> int | None:
+    def checkpoint_interval(self, dataset: Dataset) -> int | None:
         """Steps between checkpoints over `data`, or None for never."""
-        return self._interval(self.checkpoint_every, data, "checkpoint-every")
+        return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
     @staticmethod
-    def _interval(value, data: Dataset, flag: str) -> int | None:
+    def _interval(value, dataset: Dataset, field_name: str) -> int | None:
         if value is None or isinstance(value, int):
             return value
-        if data.steps_per_epoch is None:
+        if dataset.steps_per_epoch is None:
             raise ValueError(
-                f"--trainer.{flag} epoch needs a dataset with a record count; this "
+                f"--trainer.{field_name} epoch needs a dataset with a record count; this "
                 f"one streams without one, so give the interval in steps or None")
-        return data.steps_per_epoch
+        return dataset.steps_per_epoch
 
 
 def _registry_for(annotation):
@@ -239,11 +239,12 @@ def _to_json(value, annotation) -> Any:
                 else {"name": name, "fields": fields})
     if isinstance(value, (list, tuple)):
         entries = registry.entry_types(annotation, len(value))
-        return [_to_json(item, entry) for item, entry in zip(value, entries)]
+        return [_to_json(entry_value, entry)
+                for entry_value, entry in zip(value, entries, strict=True)]
     if isinstance(value, Mapping):
         entries = registry.entry_types(annotation, len(value))
-        return {key: _to_json(item, entry)
-                for (key, item), entry in zip(value.items(), entries, strict=True)}
+        return {key: _to_json(entry_value, entry)
+                for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
     return value
 
 
@@ -266,7 +267,7 @@ def _rebuild(annotation, value) -> Any:
     if held is not None:
         if held.record == "kind":
             member = held[value["kind"]]
-            fields = {name: item for name, item in value.items() if name != "kind"}
+            fields = {name: entry for name, entry in value.items() if name != "kind"}
         else:
             member, fields = held[value["name"]], value["fields"]
         return member(**_fields(member, fields))
@@ -280,8 +281,8 @@ def _rebuild(annotation, value) -> Any:
     if isinstance(value, list):
         # JSON writes every sequence as a list; the field says which are tuples.
         entries = registry.entry_types(annotation, len(value))
-        items = [_rebuild(entry, item) for entry, item in zip(entries, value, strict=True)]
-        return tuple(items) if registry.wants_tuple(annotation) else items
+        rebuilt = [_rebuild(entry, entry) for entry, entry in zip(entries, value, strict=True)]
+        return tuple(rebuilt) if registry.wants_tuple(annotation) else rebuilt
     return value
 
 
@@ -326,7 +327,7 @@ class RunConfig:
         """The config a run in `directory` was built from, as this class."""
         return cls.from_dict(json.loads((epath.Path(directory) / RUN_FILE).read_text()))
 
-    def train(self, objective: Objective[Loss, Effects], data: Dataset, *, name: str,
+    def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
               metrics: Sequence[Metric] = (),
               summary: Mapping[str, object] | None = None) -> TrainState:
         """Train `objective` on `data` as this run says; every recipe calls
@@ -347,8 +348,8 @@ class RunConfig:
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early
         # and a pass over the data is that many steps longer.
-        data = data if trainer.batch_ramp is None else ramped(data, trainer.batch_ramp)
-        steps = trainer.total_steps(data)
+        dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
+        steps = trainer.total_steps(dataset)
         tracker = None
         try:
             wandb_tracker = None
@@ -385,10 +386,10 @@ class RunConfig:
                 tracker=tracker,
                 profile=trainer.profile,
             ).fit(
-                data, steps=steps,
+                dataset, steps=steps,
                 log_every=trainer.log_every,
-                eval_every=trainer.eval_interval(data),
-                checkpoint_every=trainer.checkpoint_interval(data),
+                eval_every=trainer.eval_interval(dataset),
+                checkpoint_every=trainer.checkpoint_interval(dataset),
                 metrics=metrics, preview=trainer.wandb is not None,
             )
             error = None
