@@ -262,8 +262,8 @@ class Trainer(Generic[Loss, Effects]):
             return jax.tree.map(lambda s: NamedSharding(mesh, P(None, *s.spec)), layout)
         pending = dataclasses.replace(pending,
             gradient=None if accumulation.gradient is None else placed.params["params"],
-            batches=buffered_shardings(accumulation.batches, True),
-            variables=buffered_shardings(accumulation.variables, False))
+            batches=buffered_shardings(accumulation.batches, batches=True),
+            variables=buffered_shardings(accumulation.variables, batches=False))
         return dataclasses.replace(placed, accumulation=pending)
 
     def _fetched(self, state: TrainState, shardings: Placement) -> TrainState:

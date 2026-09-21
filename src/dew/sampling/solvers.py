@@ -957,7 +957,7 @@ class DEIS:
                      - _deis_third(rho_s0, rho_s2, rho_s0, rho_s1))
             return alpha_t * (x / alpha_s0 + coef1 * m0 + coef2 * m1 + coef3 * m2)
 
-        order = _tapered_order(self.order, history, self.lower_order_final, False)
+        order = _tapered_order(self.order, history, self.lower_order_final, euler_at_final=False)
         stepped = lax.switch(order - 1, [first, second, third][:self.order], None)
         return stepped, history.advance()
 

@@ -459,17 +459,17 @@ class Gemma4Conformer(nn.Module):
     def __call__(self, x, valid):
         cfg = self.config
         x = AudioFeedForward(cfg.hidden_size, cfg.residual_weight, cfg.gradient_clipping,
-                             cfg.use_clipped_linears, cfg.hidden_act, True, dtype=self.dtype,
+                             cfg.use_clipped_linears, cfg.hidden_act, wrapped=True, dtype=self.dtype,
                              precision=self.precision, initializer_range=cfg.initializer_range, name="feed_forward1")(x)
         residual = x
         x = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_pre_attn")(_clip(x, cfg.gradient_clipping))
         x = Gemma4Attention(cfg, dtype=self.dtype, precision=self.precision, name="self_attn")(x, valid)
         x = residual + RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_post_attn")(_clip(x, cfg.gradient_clipping))
         x = AudioLightConv(cfg.hidden_size, cfg.conv_kernel_size, cfg.rms_norm_eps, cfg.gradient_clipping,
-                           cfg.use_clipped_linears, cfg.hidden_act, True, dtype=self.dtype,
+                           cfg.use_clipped_linears, cfg.hidden_act, wrapped=True, dtype=self.dtype,
                            precision=self.precision, initializer_range=cfg.initializer_range, name="lconv1d")(x)
         x = AudioFeedForward(cfg.hidden_size, cfg.residual_weight, cfg.gradient_clipping,
-                             cfg.use_clipped_linears, cfg.hidden_act, True, dtype=self.dtype,
+                             cfg.use_clipped_linears, cfg.hidden_act, wrapped=True, dtype=self.dtype,
                              precision=self.precision, initializer_range=cfg.initializer_range, name="feed_forward2")(x)
         return RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_out")(_clip(x, cfg.gradient_clipping))
 

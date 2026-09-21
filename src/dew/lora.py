@@ -452,7 +452,8 @@ def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
         module, _, factor = rest.rpartition(".lora_")
         if factor == "B.weight":
             ranks.setdefault(component, {})[module] = tensor.shape[1]
-    return {component: _Config(next(iter(found.values())), float(next(iter(found.values()))), found, {}, False, 0.0)
+    return {component: _Config(next(iter(found.values())), float(next(iter(found.values()))),
+                               found, {}, rslora=False, dropout=0.0)
             for component, found in ranks.items()}
 
 

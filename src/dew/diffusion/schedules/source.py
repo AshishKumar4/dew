@@ -482,7 +482,7 @@ class SourceSchedule:
             count=value("num_train_timesteps"), start=value("beta_start"),
             end=value("beta_end"), schedule=value("beta_schedule"),
             trained=value("trained_betas"),
-            zero_snr=_boolean(value("rescale_betas_zero_snr", False), "rescale_betas_zero_snr"),
+            zero_snr=_boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr"),
             schedules=source.schedules))
         betas.setflags(write=False)
         policy, sampler = _resolve(kind, source, value, betas)
@@ -818,7 +818,7 @@ def _flow_controls(value: Callable[..., object]) -> _Flow:
     terminal = value("shift_terminal")
     return _Flow(
         shift=_number(value("shift", 1.0), "shift"),
-        dynamic=_boolean(value("use_dynamic_shifting", False), "use_dynamic_shifting"),
+        dynamic=_boolean(value("use_dynamic_shifting", absent=False), "use_dynamic_shifting"),
         base_shift=_number(value("base_shift", 0.5), "base_shift"),
         max_shift=_number(value("max_shift", 1.15), "max_shift"),
         base_tokens=_integer(value("base_image_seq_len", 256), "base_image_seq_len"),
@@ -857,7 +857,7 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
     elif value("variance_type") in ("learned", "learned_range"):
         raise ValueError("Native source scheduling does not implement learned variance")
     clip, threshold = _x0_limit(kind, declared, value)
-    zero_snr = _boolean(value("rescale_betas_zero_snr", False), "rescale_betas_zero_snr")
+    zero_snr = _boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr")
     zero_snr_tail = zero_snr and kind in ("DPMSolverMultistep", "UniPCMultistep",
                                           "EulerDiscrete", "EulerAncestralDiscrete")
     lambda_clipped = 0
@@ -896,7 +896,7 @@ def _resolve(kind: str, source: _Class, value: Callable[..., object],
         rho=_number(value("rho", 7.0), "rho"),
         stride=kind in ("DDIM", "PNDM"),
         clean_terminal=(kind == "DDPM"
-                        or _boolean(value("set_alpha_to_one", True), "set_alpha_to_one")),
+                        or _boolean(value("set_alpha_to_one", absent=True), "set_alpha_to_one")),
         clip=clip, threshold=threshold,
         recompute_epsilon=(kind in ("DDPM", "DEISMultistep")
                            or (family == "lambda" and algorithm in ("dpmsolver", "sde-dpmsolver"))),

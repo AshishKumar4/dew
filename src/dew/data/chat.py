@@ -365,7 +365,7 @@ def render_prompt(tokenizer: PreTrainedTokenizerBase, conversation: Conversation
     All-text parts concatenate in order; nontext parts require a processor.
     """
     return _token_ids(tokenizer, conversation.text_rows(source), conversation.tools,
-                      True, source)
+                      generation_prompt=True, source=source)
 
 
 def _agreement(rendered: Sequence[int], full: Sequence[int]) -> int:
@@ -401,12 +401,12 @@ def render_conversation(tokenizer: PreTrainedTokenizerBase, conversation: Conver
     """
     rows = conversation.text_rows(source)
     tools = conversation.tools
-    full = _token_ids(tokenizer, rows, tools, False, source)
+    full = _token_ids(tokenizer, rows, tools, generation_prompt=False, source=source)
     roles = np.zeros(len(full), np.int8)
     agreed = 0
     for position, message in enumerate(conversation.messages):
         role = message.role
-        following = _token_ids(tokenizer, rows[:position + 1], tools, False, source)
+        following = _token_ids(tokenizer, rows[:position + 1], tools, generation_prompt=False, source=source)
         if role is Role.ASSISTANT:
             if position == 0:
                 raise ValueError(
@@ -414,7 +414,7 @@ def render_conversation(tokenizer: PreTrainedTokenizerBase, conversation: Conver
                     "opening header cannot be separated from its completion "
                     "through the template; start the conversation with a system "
                     "or user message")
-            prefix = _token_ids(tokenizer, rows[:position], tools, True, source)
+            prefix = _token_ids(tokenizer, rows[:position], tools, generation_prompt=True, source=source)
             if full[:len(prefix)] != prefix or len(prefix) < agreed:
                 raise ValueError(
                     f"tokenizer {source!r} does not render incrementally at message "
