@@ -131,7 +131,7 @@ CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python examples/train_flowers.py \
 
 Use `--steps 20` for a short run, or increase `--steps` to train longer.
 
-[`examples/train_diffusion.py`](examples/train_diffusion.py) adds pretrained CLIP text conditioning. For an offline run without a dataset download, [`examples/readme_demo.py`](examples/readme_demo.py) demonstrates language modeling, checkpoint continuation, DPO, and flow matching.
+[`examples/train_diffusion.py`](examples/train_diffusion.py) adds pretrained CLIP text conditioning, and [`examples/train_flowers_tpu.py`](examples/train_flowers_tpu.py) runs the same job across a TPU slice and scores what it trained. For an offline run without a dataset download, [`examples/readme_demo.py`](examples/readme_demo.py) demonstrates language modeling, checkpoint continuation, DPO, and flow matching.
 
 ### Change the training setup
 
@@ -767,6 +767,8 @@ Which call continues a run depends on the artifact you kept:
 `Pretrained.save` writes the weights, the config it derives, and the
 tokenizer or processor files. It does not include optimizer state or data
 position; retain the native checkpoint to resume the training state.
+[`examples/sft_gemma4.py`](examples/sft_gemma4.py) trains a run and exports
+it through the last row of that table.
 
 Reproducing a run bitwise on CUDA needs deterministic GPU reductions, which
 `--xla_gpu_deterministic_ops=true` requests and `TrainerConfig.xla_flags`
@@ -834,7 +836,7 @@ with LocalTracker("runs/lm-report", plots=True) as tracker:
     print(result.scores)
 ```
 
-This run reports perplexity around 1.002 and saves the training-loss curve, scalar journal, and generated text under `runs/lm-report`. Plots render when the tracker closes, rather than on every training step. Use `plots=False` for scalar/artifact recording only, or call `tracker.plot()` explicitly.
+This run reports perplexity around 1.002 and saves the training-loss curve, scalar journal, and generated text under `runs/lm-report`. Plots render when the tracker closes, rather than on every training step. Use `plots=False` for scalar/artifact recording only, or call `tracker.plot()` explicitly. [`examples/evaluate_and_serve.py`](examples/evaluate_and_serve.py) scores a finished run the same way and adds an lm-eval-harness suite, image metrics, and a served-model comparison.
 
 `Trackers` sends the same reports to several backends, and switching one is a constructor. Install `dew-ml[wandb]`, `dew-ml[mlflow]` or `dew-ml[tensorboard]` for the sink you want:
 
@@ -1383,6 +1385,13 @@ Consult the [JAX installation guide](https://docs.jax.dev/en/latest/installation
 - [Representation learning](docs/guides/representation-learning.md): JEPA encoders and predictors.
 - [API reference](docs/reference/core-api.md): constructors, arguments, and state contracts.
 - [Examples](examples/) and [recipes](docs/recipes.md): complete programs to adapt.
+
+The four scripts below run a whole job, from data to scored weights. Each takes real-hardware settings by default and a `--smoke` flag that trades them for the repository's tiny fixtures, a few steps, and one CPU device. [End-to-end examples](docs/guides/end-to-end.md) gives both command lines for each.
+
+- [`examples/train_flowers_tpu.py`](examples/train_flowers_tpu.py): a text-to-image DiT trained on Oxford Flowers across a TPU slice, then sampled and scored with FID and CLIPScore.
+- [`examples/sft_diffusion_gemma.py`](examples/sft_diffusion_gemma.py): LoRA SFT of DiffusionGemma with the base weights held in host memory, publishing a PEFT adapter directory.
+- [`examples/sft_gemma4.py`](examples/sft_gemma4.py): full-weight SFT of a Gemma 4 decoder on a Hub chat dataset, exported to the Hugging Face layout.
+- [`examples/evaluate_and_serve.py`](examples/evaluate_and_serve.py): perplexity, an lm-eval-harness suite, image metrics, and a served-model comparison over one finished run.
 
 ## Contributing and acknowledgements
 
