@@ -658,7 +658,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
 
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
-                       packing: dict[str, object], layers: Sequence[int] = ()):
+                       packing: dict[str, jax.Array | Mapping[str, jax.Array]],
+                       layers: Sequence[int] = ()):
         """The model's final states over `inputs`, with what the open
         `collections` gathered (empty when none was opened) and, under
         `intermediates`, the outputs of every layer when `layers` asks for

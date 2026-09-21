@@ -28,6 +28,13 @@ TreeT = TypeVar("TreeT")
 # own processor is the only code that reads it; dew moves it.
 type Media = np.ndarray | Image | Sequence[Media]
 
+# A request as the pytree utilities walk it: the numeric inputs themselves,
+# the arrays a caller assembled them from, and the tuples and records those
+# travel in. A digest reads the structure and each leaf's shape and dtype, so
+# a record's values are leaves to it and are not narrowed here.
+type InputTree = (ModelInputs | jax.Array | np.ndarray | None
+                  | Sequence[InputTree] | Mapping[str, object])
+
 PredictionPhase = Literal["ordinary", "extend", "draft"]
 BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 """The mesh axes a request's rows split over: every axis but sequence and stage."""
@@ -169,9 +176,9 @@ class ModelInputs:
         return replace(self, tokens=shift(self.tokens),
                             token_fields={name: shift(value) for name, value in self.token_fields.items()})
 
-    def kwargs(self) -> dict[str, object]:
+    def kwargs(self) -> dict[str, jax.Array | Mapping[str, jax.Array]]:
         """Keywords for a native model call, excluding the token argument."""
-        prepared: dict[str, object] = dict(self.token_fields)
+        prepared: dict[str, jax.Array | Mapping[str, jax.Array]] = dict(self.token_fields)
         if self.conditioning:
             prepared["conditioning"] = self.conditioning
         return prepared
@@ -194,13 +201,14 @@ class AttentionMetadata:
     key_positions: jax.Array | None = None
     token_ids: jax.Array | None = None
 
-def generation_signature(inputs: object, controls: object) -> np.ndarray:
+def generation_signature(inputs: InputTree, controls: tuple) -> np.ndarray:
     """Digest execution shapes and stable host controls without reading payloads.
 
     Algorithms agree this fixed-width signature after local validation and
-    before distributed execution. Controls must have a deterministic repr,
-    such as frozen configuration values, tuples and dictionaries of scalars.
-    Tensor contents are excluded: this is not a prefix-cache identity.
+    before distributed execution. The controls are one tuple, and each entry
+    must have a deterministic repr, such as a frozen configuration value, a
+    scalar, or a tuple or dictionary of them. Tensor contents are excluded:
+    this is not a prefix-cache identity.
     """
     schema = (str(jax.tree.structure(inputs)),
               [(leaf.shape, str(leaf.dtype)) for leaf in jax.tree.leaves(inputs)], controls)
@@ -211,7 +219,7 @@ VALIDITY_FIELD = "attention_mask"
 """The token field that marks real slots. Absent means every slot is real."""
 
 
-def validity_sites(tree: object) -> list[ModelInputs]:
+def validity_sites(tree: InputTree) -> list[ModelInputs]:
     """The tree's `ModelInputs` nodes, in flatten order.
 
     A node is a site whether or not it carries validity, so every process
@@ -231,7 +239,7 @@ def _validity_agnostic[TreeT](tree: TreeT) -> TreeT:
         tree, is_leaf=lambda node: isinstance(node, ModelInputs))
 
 
-def assembly_signature(tree: object, controls: object = ()) -> np.ndarray:
+def assembly_signature(tree: InputTree, controls: tuple = ()) -> np.ndarray:
     """`generation_signature` of the tree with validity left out.
 
     Whether a process's own rows needed padding is rank-local, so a digest
@@ -268,8 +276,8 @@ def filled_validity[TreeT](tree: TreeT, wanted: bool | Sequence[bool] = True) ->
     return jax.tree.map(fill, tree, is_leaf=lambda node: isinstance(node, ModelInputs))
 
 
-def agreed_validity[TreeT](tree: TreeT, processes: int, *, controls: object = (),
-                           phase: str = "input") -> TreeT:
+def agreed_validity[TreeT: InputTree](tree: TreeT, processes: int, *, controls: tuple = (),
+                                      phase: str = "input") -> TreeT:
     """One validity schema for the whole pool, agreed before arrays are built.
 
     A host that padded nothing carries no validity, which is what keeps

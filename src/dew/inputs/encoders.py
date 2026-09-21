@@ -14,11 +14,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Mapping, Self, Sequence, TypeVar
+from typing import TYPE_CHECKING, ClassVar, Generic, Mapping, Self, Sequence
 
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
+from typing_extensions import TypeVar
 
 from dew.nn.dit import TextContext
 from dew.nn.text_encoders import (
@@ -39,8 +40,13 @@ if TYPE_CHECKING:
 Raw = TypeVar("Raw")
 """One item of a modality's raw data: a prompt, a waveform."""
 
+Encoded = TypeVar("Encoded", default=object)
+"""The conditioning value a modality's encoder produces: a `TextContext`, a
+`DenoisingCondition`, an array. An encoder that leaves it unstated promises
+its callers nothing about the value beyond what it hands the model."""
 
-class ConditionEncoder(ABC, Generic[Raw]):
+
+class ConditionEncoder(ABC, Generic[Raw, Encoded]):
     """A modality's path from raw data to a conditioning value."""
 
     params: Variables
@@ -64,7 +70,7 @@ class ConditionEncoder(ABC, Generic[Raw]):
         """Raw data to the host arrays `encode` reads, one row per item."""
 
     @abstractmethod
-    def encode(self, params: Variables, tokens) -> Any:
+    def encode(self, params: Variables, tokens) -> Encoded:
         """Tokens to the conditioning value, on device, under `params`."""
 
     def captions(self, tokens) -> tuple[str, ...]:
@@ -77,20 +83,26 @@ class ConditionEncoder(ABC, Generic[Raw]):
         """The keyword fields `from_pretrained` rebuilds this encoder from."""
 
 
-def rebuild(name: str, fields: Mapping[str, Any], *,
-            params: Variables | None = None) -> ConditionEncoder[Any]:
+def rebuild(name: str, fields: Mapping[str, object], *,
+            params: Variables | None = None) -> ConditionEncoder:
     """The named encoder rebuilt from its JSON fields.
 
     A run's record stores the registry name with the keyword fields `to_json`
     wrote. Those fields are unpacked here, so each encoder's
-    `from_pretrained` keeps its own concrete signature.
+    `from_pretrained` keeps its own concrete signature. The checkpoint is the
+    one field every encoder takes, so it is read here; the rest are the
+    encoder's own and are checked by its signature.
     """
-    return encoders[name].from_pretrained(**fields, params=params)
+    checkpoint = fields.get("checkpoint")
+    if not isinstance(checkpoint, str):
+        raise ValueError(f"the {name} record names no checkpoint to rebuild from")
+    rest = {key: value for key, value in fields.items() if key != "checkpoint"}
+    return encoders[name].from_pretrained(checkpoint, **rest, params=params)
 
 
 @encoders("clip_text")
 @dataclass(frozen=True, eq=False)
-class CLIPText(ConditionEncoder[str]):
+class CLIPText(ConditionEncoder[str, TextContext]):
     """The CLIP text tower, vendored in `dew.nn.text_encoders`, with the
     checkpoint's tokenizer.
 
@@ -152,7 +164,7 @@ class CLIPText(ConditionEncoder[str]):
 
 @encoders("t5")
 @dataclass(frozen=True, eq=False)
-class T5Text(ConditionEncoder[str]):
+class T5Text(ConditionEncoder[str, TextContext]):
     """The T5 encoder tower, vendored in `dew.nn.text_encoders`, with the
     checkpoint's tokenizer.
 
@@ -214,7 +226,7 @@ class T5Text(ConditionEncoder[str]):
 
 @encoders("char_table")
 @dataclass(frozen=True, eq=False)
-class CharTable(ConditionEncoder[str]):
+class CharTable(ConditionEncoder[str, TextContext]):
     """Text as a table lookup: each character is an id and each id a fixed
     random vector. It costs nothing and downloads nothing, so it is the text
     encoder of tests, benchmarks and smoke runs, and it has the shape of a
