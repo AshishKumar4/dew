@@ -18,6 +18,8 @@ dependencies = [
     "orbax-checkpoint>=0.12.4",
     "numpy",
     "pillow",
+    # dew.data.images decodes, resizes and jitters every image record with it.
+    "opencv-python-headless",
     "einops",
     "tqdm",
     "grain",
@@ -69,9 +71,8 @@ test = [
     "ollama>=0.6.2,<0.7",
     "openai>=3.8,<4",
 ]
-# The video specs: moviepy reads the clips and brings ffmpeg, cv2 resizes
-# the frames (lazy imports in dew.data)
-av = ["opencv-python", "moviepy"]
+# The video specs: moviepy reads the clips and brings ffmpeg (lazy imports in dew.data)
+av = ["moviepy"]
 # FID (scipy sqrtm) and Inception weight download
 metrics = ["scipy", "requests"]
 # Explicit LocalTracker.plot()/plots=True rendering.
