@@ -20,13 +20,16 @@ preserve_source_layout=True, tied_head_names=('lm_head.weight',
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TypedDict
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.text_encoders import checkpoint_array
 from dew.objectives.base import Variables
+
+if TYPE_CHECKING:
+    from dew.interop.hf_decoders import DecoderFields
 
 MODEL_TYPE = "mamba2"
 
@@ -44,24 +47,6 @@ def _float(value: object) -> float:
     raise ValueError(f"expected a number, got {value!r}")
 
 
-class DecoderFields(TypedDict):
-    """The `CausalTransformer` kwargs a Mamba-2 config sets; the rest keep
-    the backbone's defaults. `mixer` is the kind value, which a run config
-    writes as its `{"kind": "mamba2", ...}` record."""
-
-    vocab_size: int
-    emb_features: int
-    num_layers: int
-    num_heads: int
-    num_kv_heads: int
-    head_dim: int
-    mlp_features: int
-    qk_norm: bool
-    norm_eps: float
-    tie_embeddings: bool
-    mixer: Mamba2Mixer
-
-
 def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None) -> DecoderFields:
     """`Mamba2Config` fields as `CausalTransformer` kwargs.
 
@@ -76,11 +61,17 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
 
     def integer(key: str, default: int) -> int:
         read.add(key)
-        return int(str(hf_config.get(key, default)))
+        value = hf_config.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{key}={value!r}: an integer was expected")
+        return value
 
     def flag(key: str, *, default: bool) -> bool:
         read.add(key)
-        return bool(hf_config.get(key, default))
+        value = hf_config.get(key, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"{key}={value!r}: a boolean was expected")
+        return value
 
     hidden, expand = integer("hidden_size", 4096), integer("expand", 2)
     heads, head_dim = integer("num_heads", 128), integer("head_dim", 64)
@@ -109,18 +100,20 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
         use_bias=flag("use_bias", default=False),
         use_conv_bias=flag("use_conv_bias", default=True),
         time_step_limit=(lower, upper))
-    return DecoderFields(
-        vocab_size=integer("vocab_size", 32768),
-        emb_features=hidden,
-        num_layers=integer("num_hidden_layers", 64),
-        num_heads=1,
-        num_kv_heads=1,
-        head_dim=hidden,
-        mlp_features=0,
-        qk_norm=False,
-        norm_eps=_float(hf_config.get("layer_norm_epsilon", 1e-5)),
-        tie_embeddings=flag("tie_word_embeddings", default=False),
-        mixer=mixer)
+    fields: DecoderFields = {
+        "vocab_size": integer("vocab_size", 32768),
+        "emb_features": hidden,
+        "num_layers": integer("num_hidden_layers", 64),
+        "num_heads": 1,
+        "num_kv_heads": 1,
+        "head_dim": hidden,
+        "mlp_features": 0,
+        "qk_norm": False,
+        "norm_eps": _float(hf_config.get("layer_norm_epsilon", 1e-5)),
+        "tie_embeddings": flag("tie_word_embeddings", default=False),
+        "mixer": mixer,
+    }
+    return fields
 
 
 def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -149,6 +142,34 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
             if leaf == ["norm", "weight"]:
                 return ("params", layer, "self_attn", "norm", "weight")
     raise ValueError(f"{name!r} has no place in a Mamba-2 CausalTransformer")
+
+
+def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
+    """The inverse of `weight_path`: one flattened dew parameter path as its
+    `Mamba2ForCausalLM` tensor name, or None for the tied head, whose
+    embedding copy is written instead."""
+    parts = dew_name.split(".")
+    if parts == ["embed_tokens", "embedding"]:
+        return "backbone.embeddings.weight"
+    if parts == ["norm", "scale"]:
+        return "backbone.norm_f.weight"
+    if parts == ["lm_head", "kernel"]:
+        return None if config.get("tie_embeddings") else "lm_head.weight"
+    if len(parts) >= 3 and parts[0].startswith("layers_"):
+        prefix = f"backbone.layers.{parts[0].removeprefix('layers_')}"
+        if parts[1:] == ["input_layernorm", "scale"]:
+            return f"{prefix}.norm.weight"
+        if parts[1] == "self_attn":
+            leaf = parts[2:]
+            if len(leaf) == 1 and leaf[0] in _MIXER_LEAVES:
+                return f"{prefix}.mixer.{leaf[0]}"
+            if len(leaf) == 2 and leaf[0] in _MIXER_LINEARS and leaf[1] in ("kernel", "bias"):
+                return f"{prefix}.mixer.{leaf[0]}.{'weight' if leaf[1] == 'kernel' else 'bias'}"
+            if len(leaf) == 2 and leaf[0] == "conv1d" and leaf[1] in ("weight", "bias"):
+                return f"{prefix}.mixer.conv1d.{leaf[1]}"
+            if leaf == ["norm", "weight"]:
+                return f"{prefix}.mixer.norm.weight"
+    raise ValueError(f"{dew_name!r} is not a Mamba-2 CausalTransformer parameter")
 
 
 def translate(state_dict: Mapping[str, np.ndarray], config: Mapping[str, object], *,

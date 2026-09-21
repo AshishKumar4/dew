@@ -44,6 +44,7 @@ from typing import Callable, Collection, Literal, Mapping, NoReturn, Protocol, T
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
 
+from dew.interop import mamba2
 from dew.interop.safetensors_io import read_file
 from dew.nn import audio as audio_nn, llama4, vision as vision_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture, RematPolicy
@@ -54,6 +55,7 @@ from dew.nn.kda import KimiDeltaAttentionMixer
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 from dew.nn.text_encoders import ParamTree, checkpoint_array
 from dew.objectives.base import Variables
@@ -315,7 +317,9 @@ class DecoderFields(TypedDict, total=False):
     per_layer_input_vocab: int | None
     num_kv_shared_layers: int
     kv_shared_layers: tuple[int, ...] | None
-    mixer: Mapping[str, object] | None
+    mixer: Mapping[str, object] | MixerBase | None
+    """The mixer as its registry record, or as the built value a family
+    constructs directly (`_mixer_value` accepts both)."""
     num_nextn_predict_layers: int
     index_share_for_mtp_iteration: bool
     mtp_layer_type: str | None
@@ -4703,6 +4707,12 @@ _FAMILY_ENTRIES = (
                   weight_path=_mixtral_path, preserve_source_layout=True),
     DecoderFamily(('mistral',), _mistral_config, _every_layer_windowed,
                   'mistral', 'MistralForCausalLM', lambda model: {}, preserve_source_layout=False),
+    DecoderFamily(('mamba2',), mamba2.config_from_hf,
+                  lambda fields: isinstance(_mixer_value(fields), Mamba2Mixer),
+                  'mamba2', 'Mamba2ForCausalLM', lambda model: {},
+                  weight_path=mamba2.weight_path, export_path=mamba2.export_path,
+                  preserve_source_layout=True,
+                  tied_head_names=('lm_head.weight', 'backbone.embeddings.weight')),
     DecoderFamily(('llama',), _base_config, lambda fields: True,
                   'llama', 'LlamaForCausalLM', lambda model: {}, preserve_source_layout=False),
 )
