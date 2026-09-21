@@ -1,7 +1,5 @@
 # Working on Dew
 
-An AI assistant maintains this file. It is provided as-is.
-
 Read `CONTRIBUTING.md` for design, reference parity, code, tests, and writing standards. This checklist adds agent workflow rules; it does not duplicate that contract. Follow the user's current scope and approval boundaries.
 
 ## Scope and implementation
