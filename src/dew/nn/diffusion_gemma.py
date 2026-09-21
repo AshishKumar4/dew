@@ -115,16 +115,23 @@ class DiffusionGemma(nn.Module):
     def encode(self, tokens, *, positions=None, segment_ids=None, image_indices=None,
                attention_mask=None, image_groups=None, rotary_positions=None,
                attention_pairwise_mask=None, attention_key_positions=None,
-               conditioning: Mapping[str, jax.Array] | None = None, train: bool = False):
-        """Append a clean prompt or committed canvas, evaluating media only when supplied."""
+               conditioning: Mapping[str, jax.Array] | None = None, train: bool = False,
+               states: bool = False):
+        """Append a clean prompt or committed canvas, evaluating media only when supplied.
+
+        The logits, or with `states` the final normalized states before the
+        head: what a loss that scores the vocabulary a tile at a time reads,
+        so the vocabulary-sized logits of a whole row never exist at once.
+        """
+        read = self.text.hidden_states if states else self.text
         if not conditioning:
             if image_indices is not None:
                 raise ValueError("image_indices require conditioning payloads")
-            return self.text(tokens, decode=True, train=train, positions=positions,
-                             segment_ids=segment_ids, attention_mask=attention_mask,
-                             image_groups=image_groups, rotary_positions=rotary_positions,
-                             attention_pairwise_mask=attention_pairwise_mask,
-                             attention_key_positions=attention_key_positions)
+            return read(tokens, decode=True, train=train, positions=positions,
+                        segment_ids=segment_ids, attention_mask=attention_mask,
+                        image_groups=image_groups, rotary_positions=rotary_positions,
+                        attention_pairwise_mask=attention_pairwise_mask,
+                        attention_key_positions=attention_key_positions)
         if self.conditioner is None or image_indices is None:
             raise ValueError("image conditioning requires a vision conditioner and image_indices")
         safe = jnp.where(image_indices >= 0, 0, tokens)
@@ -133,16 +140,29 @@ class DiffusionGemma(nn.Module):
                      self.text.embed_tokens.embedding.dtype)).astype(embedded.dtype)
         fused = self.conditioner.fuse(safe, embedded, image_indices, conditioning, train=train)
         slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
-        return self.text(fused.tokens, decode=True, train=train, positions=positions,
-                         segment_ids=segment_ids, input_embeddings=fused.embeddings,
-                         embedding_positions=slots, attention_mask=attention_mask,
-                         image_groups=image_groups, rotary_positions=rotary_positions,
-                         attention_pairwise_mask=attention_pairwise_mask,
-                         attention_key_positions=attention_key_positions)
+        return read(fused.tokens, decode=True, train=train, positions=positions,
+                    segment_ids=segment_ids, input_embeddings=fused.embeddings,
+                    embedding_positions=slots, attention_mask=attention_mask,
+                    image_groups=image_groups, rotary_positions=rotary_positions,
+                    attention_pairwise_mask=attention_pairwise_mask,
+                    attention_key_positions=attention_key_positions)
+
+    def head_weight(self, params):
+        """The `[D, vocab]` head the encoder and the decoder score with, from
+        the text tree of `params`, in its stored dtype (`CausalTransformer.head_weight`)."""
+        return self.text.head_weight(params["text"])
+
+    def head_table(self, params):
+        """The head as the text tree stores it and whether its rows are the
+        vocabulary (`CausalTransformer.head_table`)."""
+        return self.text.head_table(params["text"])
 
     def __call__(self, tokens, *, self_conditioning_logits=None,
                  self_conditioning_mask=None, train: bool = False, positions=None,
-                 attention_pairwise_mask=None, attention_key_positions=None):
+                 attention_pairwise_mask=None, attention_key_positions=None,
+                 states: bool = False):
+        """The canvas logits, or with `states` the final normalized states
+        before the head (`encode` says why)."""
         tokens = jnp.asarray(tokens, jnp.int32)
         embedded = self.decoder.embed_tokens(tokens)
         table = self.decoder.embed_tokens.embedding
@@ -158,10 +178,11 @@ class DiffusionGemma(nn.Module):
         indices = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         # Parameter initialization needs no prefix. Loaded inference always
         # takes the frozen-cache branch, which refuses an absent prefill.
-        return self.decoder(tokens, train=train, decode=not self.is_initializing(),
-                            input_embeddings=conditioned, embedding_positions=indices,
-                            positions=positions, attention_pairwise_mask=attention_pairwise_mask,
-                            attention_key_positions=attention_key_positions)
+        read = self.decoder.hidden_states if states else self.decoder
+        return read(tokens, train=train, decode=not self.is_initializing(),
+                    input_embeddings=conditioned, embedding_positions=indices,
+                    positions=positions, attention_pairwise_mask=attention_pairwise_mask,
+                    attention_key_positions=attention_key_positions)
 
 
 def translate_weights(

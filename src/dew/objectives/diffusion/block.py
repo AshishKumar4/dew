@@ -33,6 +33,7 @@ from dew.objectives.base import (
     mean_loss,
     thaw,
 )
+from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
 from dew.registry import objectives
 
 if TYPE_CHECKING:
@@ -115,6 +116,13 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     takes it; the rest of the tree is kept under `frozen`, which `init`
     returns and a checkpoint stores. An adapter's own filter
     (`dew.lora.LoRA.trainable`) goes here. None trains every leaf.
+
+    Both cross-entropies score the final states through the bounded head
+    (`dew.objectives.lm.chunked.chunked_cross_entropy`), `head_chunks`
+    vocabulary tiles at a time, so no vocabulary-sized fp32 logits or
+    softmax of a whole row is held for the backward pass. The first
+    denoising pass, whose logits condition the second and carry no
+    gradient, is the one place a full row of logits exists.
     """
 
     def __init__(self, model: DiffusionGemma, *, prompt_length: int,
@@ -123,10 +131,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  self_cond_prob: float = 0.5, safety_epsilon: float = 1e-4,
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
-                 ema_decay: float | None = None, trainable: PathFilter | None = None):
+                 ema_decay: float | None = None, trainable: PathFilter | None = None,
+                 head_chunks: int = 4):
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
-                            ("canvas_size", canvas_size)):
+                            ("canvas_size", canvas_size), ("head_chunks", head_chunks)):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
         if not 0 <= self_cond_prob <= 1 or not math.isfinite(self_cond_prob):
@@ -161,6 +170,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
         self.ema = None if ema_decay is None else EMASpec(optax.constant_schedule(ema_decay))
         self.trainable = trainable
+        self.head_chunks = head_chunks
 
     def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> BlockGeneration:
         """The DiffusionGemma over the state's published weights as a
@@ -269,13 +279,19 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             full_valid, selected, self.prompt_length, self.canvas_size,
             fields.get("positions"), fields.get("image_groups"))
         model = self.training_model
+        softcap, precision = model.text.final_logit_softcap, model.text.precision
+        # The head as stored, so what the losses keep for their backward is
+        # the table itself and not a transposed copy of it.
+        head, stored = model.apply(params, params["params"], method=type(model).head_table)
+        vocab_major = bool(stored)
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
         encoder_kwargs = prepared.kwargs()
         encoder_kwargs.update(positions=positions, attention_mask=full_valid)
-        encoder_logits, mutated = model.apply(
+        encoder_states, mutated = model.apply(
             {**params, "cache": cache}, tokens, **encoder_kwargs,
             attention_pairwise_mask=encoder_mask, attention_key_positions=encoder_keys,
-            method=model.encode, train=True, mutable=["cache"], rngs=None, capture_intermediates=False)
+            method=model.encode, train=True, states=True, mutable=["cache"], rngs=None,
+            capture_intermediates=False)
         cache = mutated["cache"]
         if self.stop_gradient_from_denoiser_to_encoder:
             cache = jax.lax.stop_gradient(cache)
@@ -283,21 +299,28 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             predicted = model.apply(
                 {**params, "cache": cache}, noisy, self_conditioning_logits=sc_logits,
                 train=True, positions=positions[:, self.prompt_length:],
-                attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys)
+                attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
+                states=True)
             if not isinstance(predicted, jax.Array):
-                raise TypeError("a diffusion forward must return logits")
+                raise TypeError("a diffusion forward must return its final states")
             return predicted
 
         zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), jnp.float32)
-        first = denoise(zero_logits)
+        # The conditioning pass carries no gradient, so its states stop it
+        # before the head and nothing of that pass is kept for the backward.
+        first = jax.lax.stop_gradient(head_logits(
+            jax.lax.stop_gradient(denoise(zero_logits)), head, softcap=softcap,
+            precision=precision, vocab_major=vocab_major))
         use_sc = jax.random.uniform(sc_key, (tokens.shape[0],)) < self.self_cond_prob
-        sc_logits = jnp.where(use_sc[:, None, None], jax.lax.stop_gradient(first), zero_logits)
-        logits = denoise(sc_logits)
+        sc_logits = jnp.where(use_sc[:, None, None], first, zero_logits)
+        states = denoise(sc_logits)
         chosen = jnp.arange(response.shape[1])[None, :] // self.canvas_size == selected[:, None]
         target_mask = canvas_mask & chosen
         if text_slots is not None:
             target_mask &= text_slots[:, self.prompt_length:]
-        canvas_losses = optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), response)
+        canvas_losses, _, _ = chunked_cross_entropy(
+            states, head, response, self.head_chunks, softcap=softcap, precision=precision,
+            vocab_major=vocab_major)
         shifted = jnp.concatenate([tokens[:, 1:], jnp.full((tokens.shape[0], 1), self.pad_token_id, jnp.int32)], axis=-1)
         adjacent = full_valid & jnp.concatenate([full_valid[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
         encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), jnp.float32)
@@ -308,7 +331,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         if text_slots is not None:
             encoder_target_mask *= jnp.concatenate([text_slots[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
         shifted = jnp.where(encoder_target_mask != 0, shifted, 0)
-        encoder_losses = optax.softmax_cross_entropy_with_integer_labels(encoder_logits.astype(jnp.float32), shifted)
+        encoder_losses, _, _ = chunked_cross_entropy(
+            encoder_states, head, shifted, self.head_chunks, softcap=softcap, precision=precision,
+            vocab_major=vocab_major)
         canvas_stats, encoder_stats = _row_mean(canvas_losses, target_mask), _row_mean(encoder_losses, encoder_target_mask)
         support = self.decoder_loss_weight * target_mask.sum() + self.encoder_loss_weight * encoder_target_mask.sum()
         stats = BlockSFTStatistics(canvas_stats, encoder_stats, support)
