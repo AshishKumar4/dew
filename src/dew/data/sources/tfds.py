@@ -15,11 +15,13 @@ check that every shard of the split is present.
 
 from __future__ import annotations
 
+import dataclasses
 import os
-from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated
 
 from etils import epath
+
+from ..dataset import Records, json_argument
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
     from tensorflow_datasets import DecoderTree
@@ -167,7 +169,7 @@ def shards(builder, split: str, directory: epath.Path) -> None:
 
 def prepared_source(path: str, split: str, *, builder: str | None = None,
                     config: str | None = None, version: str | None = None,
-                    decoders: DecoderTree | None = None) -> Sequence[object]:
+                    decoders: DecoderTree | None = None) -> Records:
     """Random access over one split of a prepared TFDS dataset.
 
     The builder's own `as_data_source` is already grain's protocol, so what
@@ -180,10 +182,46 @@ def prepared_source(path: str, split: str, *, builder: str | None = None,
     the builder unchanged, so a caller can hand it `SkipDecoding()` for a
     feature it wants as the bytes on disk. A record is whatever the prepared
     features and those decoders make it, which for a features dict is a
-    mapping and for a single feature a bare array, so the type here says
-    `object` and the run's own `preprocess` is where it becomes batch fields.
+    mapping and for a single feature a bare array, which is what `Records`
+    says and the run's own `preprocess` is where it becomes batch fields.
     """
     directory = prepared(path, builder=builder, config=config, version=version)
     reader = read_only_builder(directory, builder=builder, config=config, version=version)
     shards(reader, split, directory)
     return reader.as_data_source(split, decoders=decoders)
+
+
+@dataclasses.dataclass(frozen=True)
+class TFDSOptions:
+    """Where a prepared TFDS dataset is and which of it to read, as one value.
+
+    `path` is what a preparation run wrote, either the version directory or
+    the `data_dir` above it; `config` and `version` say which directory
+    inside a data_dir, and the prepared metadata is what confirms both.
+    `decoders` is TFDS's own decoder tree and reaches the builder unchanged,
+    so a caller can ask for the bytes on disk with `SkipDecoding()`.
+
+    The name of the builder and the split expression are not here: a mixture
+    reads several builders through one set of these options.
+    """
+
+    path: str | None = None
+    config: str | None = None
+    version: str | None = None
+    decoders: DecoderTree | None = None
+
+    def source(self, name: str, split: str) -> Records:
+        """Random access over `split` of the prepared builder `name`."""
+        if not self.path:
+            raise ValueError(
+                "a tfds source needs path= naming what a preparation run wrote: its "
+                "builder.data_dir, or the version directory under it. Training "
+                "never prepares its own data.")
+        return prepared_source(self.path, split, builder=name, config=self.config,
+                               version=self.version, decoders=self.decoders)
+
+
+PreparedOptions = Annotated[TFDSOptions, json_argument(TFDSOptions)]
+"""`TFDSOptions` as a dataset spec declares it: one JSON object on the
+command line, because a decoder tree is a tree of TFDS objects with no
+command-line spelling."""

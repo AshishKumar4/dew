@@ -1,8 +1,9 @@
-"""Datasets a provider already holds: `dew.data.load("tfds/...")`, `"hf/..."`.
+"""Datasets a provider already holds: `datasets["tfds"]`, `datasets["hf"]`.
 
-One function routes a `"<provider>/<name>"` string to the source that reads
-it and returns the same `Dataset` every spec returns, over the same grain
-plumbing: `train_stream` for the order, the sharding and the position,
+Each provider is a registered spec like every other dataset, so a run config
+can name one, `to_dict` can write it and `from_dict` can load it back. Both
+return the same `Dataset` every spec returns, over the same grain plumbing:
+`train_stream` for the order, the sharding and the position,
 `validation_pass` for an ordered pass, `bounded` for its length, and grain's
 own iterator transformations where the rows only stream. There is no second
 pipeline here.
@@ -10,8 +11,8 @@ pipeline here.
 What each provider does:
 
 - `tfds/<builder>` reads the ArrayRecords a preparation run wrote under
-  `path=`. Nothing is prepared, downloaded or generated: TFDS's read-only
-  builder is used, so the training process needs no TensorFlow.
+  `TFDSOptions.path`. Nothing is prepared, downloaded or generated: TFDS's
+  read-only builder is used, so the training process needs no TensorFlow.
 - `hf/<name>` reads one Arrow-backed split through `datasets.load_dataset`,
   which downloads the dataset and writes its Arrow cache if the local cache
   has neither. That is the library's own behaviour on its own terms.
@@ -19,29 +20,37 @@ What each provider does:
   no length, so `records=None` unless a caller supplies one, and a position
   only where an unshuffled stream can be restored exactly.
 
-Every provider option is a named argument with the type the library gives
-it, so a name neither provider knows is a `TypeError` from Python and an
-option belonging to the other provider is named here. `preprocess(record,
-rng)` is where a record becomes batch fields; there is no default, because a
-provider's rows are its own shape and a loader that guessed would decode
-images meant to stay bytes or drop a column a run needs.
+Each provider's own options are one frozen value of its own type,
+`HFOptions` or `TFDSOptions`, which is the field the spec holds and the
+argument `load` takes. An option of the other provider is then a type its
+spec has no field for rather than a name checked at run time.
+`preprocess(record, rng)` is where a record becomes batch fields; there is
+no default, because a provider's rows are its own shape and a loader that
+guessed would decode images meant to stay bytes or drop a column a run
+needs.
 """
 
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Iterator, Mapping, Sequence
+import dataclasses
+from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import jax
 import numpy as np
 
+from dew.registry import datasets
+
 from .dataset import (
     Batch,
     Corpus,
     Dataset,
+    DatasetSpec,
     Loading,
+    Records,
+    Tokenize,
     local_batch,
     mixed_records,
     mixed_stream,
@@ -49,20 +58,12 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
-from .sources.hf import HFOptions
+from .sources.hf import HFOptions, HubOptions
+from .sources.tfds import PreparedOptions, TFDSOptions
 from .tokens import bounded
 
 if TYPE_CHECKING:
-    from datasets import (
-        Dataset as ArrowDataset,
-        DownloadConfig,
-        DownloadMode,
-        Features,
-        IterableDataset,
-        VerificationMode,
-        Version,
-    )
-    from tensorflow_datasets import DecoderTree
+    from datasets import Dataset as ArrowDataset, IterableDataset
 
 PROVIDERS = ("tfds", "hf")
 
@@ -127,208 +128,263 @@ def counted(source: object, given: int | None, name: str) -> int:
     return held
 
 
-def _unwanted(provider: str, given: Mapping[str, object]) -> None:
-    """Refuse the options that belong to the other provider."""
-    named = sorted(name for name, value in given.items() if value is not None)
-    if named:
-        raise TypeError(
-            f"the {provider} provider does not take {named}; those belong to "
-            f"{'hf' if provider == 'tfds' else 'tfds'}")
+type Named = str | Mapping[str, float]
+"""Which dataset a provider spec reads: one name, or several with the share
+of a step each one fills."""
 
 
-def load(source: str | Mapping[str, float], *, batch: int, split: str = "train",
-         val_split: str | None = None,
-         val_batches: int | None = None, records: int | None = None,
-         preprocess: Preprocess | None = None, seed: int = 0,
-         shuffle_buffer: int = 0, loading: Loading = Loading(),
-         # which configuration of the dataset, for either provider
-         config: str | None = None,
-         # what the tfds provider reads
-         path: str | None = None, version: str | None = None,
-         decoders: DecoderTree | None = None,
-         # what the hf provider reads
-         streaming: bool = False,
-         dataset: ArrowDataset | IterableDataset | None = None,
-         data_dir: str | None = None,
-         data_files: str | Sequence[str] | Mapping[str, str | Sequence[str]] | None = None,
-         cache_dir: str | None = None, features: Features | None = None,
-         download_config: DownloadConfig | None = None,
-         download_mode: DownloadMode | str | None = None,
-         verification_mode: VerificationMode | str | None = None,
-         keep_in_memory: bool | None = None, save_infos: bool = False,
-         revision: str | Version | None = None,
-         token: str | bool | None = None, num_proc: int | None = None,
-         storage_options: Mapping[str, object] | None = None) -> Dataset:
+@dataclasses.dataclass(frozen=True)
+class ProviderDataset(DatasetSpec):
+    """What both providers hold: which dataset, which splits, and how a row
+    becomes batch fields.
+
+    `name` is the provider's own name for the dataset, or a mapping of
+    several to the share of a step each fills, whose semantics are
+    `mixture`'s. The corpora are read in name order, so the mixture is the
+    same whichever order the mapping was written in, and every one of them
+    is read through the same options: a mixture of two providers, or of two
+    datasets needing different options, is two specs whose sources a caller
+    mixes with `dew.data.dataset.mixed_stream`.
+
+    `split` is the provider's own split expression and `val_split` a second
+    one read as an ordered validation pass, bounded by `val_batches`. A
+    mixture's validation pass mixes the same corpora at the same weights,
+    each split in its own order, and stops before any of them would come
+    round again, so a pass scores each held-out record at most once and
+    scores the same records every time. `records` is the record count for a
+    source that cannot report its own; a mixture computes its own and takes
+    none, since one pass over it is the records in which every corpus has
+    been read at least once.
+    """
+
+    name: Named = ""
+    split: str = "train"
+    val_split: str | None = None
+    val_batches: int | None = None
+    records: int | None = None
+    preprocess: Preprocess | None = None
+
+    @property
+    def weighted(self) -> dict[str, float]:
+        """Each dataset this reads and the share of a step it fills, in name
+        order: which corpus a record of a mixture comes from depends on the
+        order they are mixed in, and a run is not two runs because its
+        weights were written the other way round."""
+        weighted = {self.name: 1.0} if isinstance(self.name, str) else dict(self.name)
+        if not weighted or not all(weighted):
+            raise ValueError(f"{type(self).__name__} needs name= set to a dataset")
+        return {name: weighted[name] for name in sorted(weighted)}
+
+    @property
+    def transforms(self) -> list[pygrain.Transformation]:
+        """`preprocess` as the transformation the workers run, or none."""
+        return [] if self.preprocess is None else [Preprocessing(self.preprocess)]
+
+    def read(self, name: str, split: str) -> Records:
+        """One split of one of this spec's datasets, read at random."""
+        raise NotImplementedError
+
+    def random_access(self, *, batch: int) -> Dataset:
+        """The batches of a provider whose splits are read at random.
+
+        The mixture, the ordered validation pass and the record count are
+        the same for both providers; what differs is `read`.
+        """
+        rows = local_batch(batch)
+        corpora = [Corpus(name, self.read(name, self.split), weight)
+                   for name, weight in self.weighted.items()]
+        if len(corpora) == 1:
+            train = train_stream(corpora[0].source, self.transforms, batch=rows,
+                                 seed=self.seed, loading=self.loading)
+            pass_records = counted(corpora[0].source, self.records, corpora[0].name)
+        else:
+            if self.records is not None:
+                raise ValueError(
+                    "a mixture's pass is the records in which every corpus has been "
+                    "read at least once, which its corpora's lengths and weights give, "
+                    "so it takes no records=")
+            train = mixed_stream(corpora, self.transforms, batch=rows, seed=self.seed,
+                                 loading=self.loading)
+            pass_records = mixed_records(corpora)
+        validation = None
+        if self.val_split is not None:
+            held = [Corpus(name, self.read(name, self.val_split), weight)
+                    for name, weight in self.weighted.items()]
+            ordered = held[0].source if len(held) == 1 else mixture(held, None)
+            validation = bounded(validation_pass(ordered, self.transforms, batch=rows,
+                                                 seed=self.seed, loading=self.loading),
+                                 self.val_batches)
+        return Dataset(train=train, val=validation, records=pass_records, batch=batch)
+
+
+@datasets("tfds")
+@dataclasses.dataclass(frozen=True)
+class PreparedTFDS(ProviderDataset):
+    """Splits of a prepared TFDS builder, read where preparation left them."""
+
+    options: PreparedOptions = TFDSOptions()
+
+    def read(self, name: str, split: str) -> Records:
+        return self.options.source(name, split)
+
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
+        self.uncaptioned(tokenize)
+        return self.random_access(batch=batch)
+
+
+@datasets("hf")
+@dataclasses.dataclass(frozen=True)
+class HubDataset(ProviderDataset):
+    """One Hugging Face split, Arrow-backed or streamed.
+
+    `streaming` reads the split as it comes instead of at random:
+    `shuffle_buffer` is then how many rows the shuffle holds, zero being
+    file order, and a pass has no length, so `records` is whatever a caller
+    knows. A validation pass is never shuffled either way.
+    """
+
+    streaming: bool = False
+    shuffle_buffer: int = 0
+    options: HubOptions = HFOptions()
+
+    def read(self, name: str, split: str) -> Records:
+        from .sources.hf import HFDatasetSource
+
+        return HFDatasetSource(name=name, split=split, options=self.options)
+
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
+        self.uncaptioned(tokenize)
+        return self.rows(batch=batch, dataset=None)
+
+    def rows(self, *, batch: int,
+             dataset: ArrowDataset | IterableDataset | None) -> Dataset:
+        """This spec's batches, over `dataset` when a caller already holds
+        the split.
+
+        A table in memory is not a config: it has no JSON form, so it is an
+        argument here rather than a field, and `dew.data.load(dataset=)` is
+        the one caller that passes one.
+        """
+        if self.streaming:
+            return self._streamed(batch=batch, dataset=dataset)
+        if self.shuffle_buffer:
+            raise TypeError(
+                "shuffle_buffer is the streamed shuffle; an Arrow split is read at "
+                "random and shuffled whole from seed=")
+        if dataset is None:
+            return self.random_access(batch=batch)
+        return dataclasses.replace(self, name=_GIVEN)._given(batch=batch, dataset=dataset)
+
+    def _given(self, *, batch: int, dataset: ArrowDataset | IterableDataset) -> Dataset:
+        """The batches of an Arrow table the caller built, read at random."""
+        from .sources.hf import HFDatasetSource
+
+        source = HFDatasetSource(split=self.split, dataset=dataset)
+        rows = local_batch(batch)
+        return Dataset(
+            train=train_stream(source, self.transforms, batch=rows, seed=self.seed,
+                               loading=self.loading),
+            val=None if self.val_split is None else bounded(
+                validation_pass(HFDatasetSource(split=self.val_split, dataset=dataset),
+                                self.transforms, batch=rows, seed=self.seed,
+                                loading=self.loading), self.val_batches),
+            records=counted(source, self.records, _GIVEN),
+            batch=batch)
+
+    def _streamed(self, *, batch: int,
+                  dataset: ArrowDataset | IterableDataset | None) -> Dataset:
+        """Endless training over the streamed split, one ordered pass for val."""
+        named = self.weighted
+        if len(named) > 1:
+            raise TypeError(
+                "a mixture reads its corpora at random, so it can hold their "
+                "proportions and report one record count as its position; a "
+                "streamed split is read as it comes and has neither. Mix "
+                "splits read at random, or train on one stream")
+        if self.records is not None and self.records < 1:
+            raise ValueError("records over a stream is a positive count or None")
+        name, rows = next(iter(named)), local_batch(batch)
+        return Dataset(
+            train=_stream(name, self.split, options=self.options, dataset=dataset,
+                          batch=rows, seed=self.seed, shuffle_buffer=self.shuffle_buffer,
+                          loading=self.loading, epochs=None, preprocess=self.preprocess),
+            # A validation pass is the split in its own order, so it is never
+            # shuffled: a score over other rows every time is not a score.
+            val=None if self.val_split is None else bounded(
+                _stream(name, self.val_split, options=self.options, dataset=dataset,
+                        batch=rows, seed=self.seed, shuffle_buffer=0,
+                        loading=self.loading, epochs=1, preprocess=self.preprocess),
+                self.val_batches),
+            records=self.records,
+            batch=batch,
+        )
+
+
+_GIVEN = "the dataset load() was given"
+"""What a table a caller built is called, in a refusal and in a record count."""
+
+
+def load(source: Named, *, batch: int,
+         options: HFOptions | TFDSOptions | None = None, split: str = "train",
+         val_split: str | None = None, val_batches: int | None = None,
+         records: int | None = None, preprocess: Preprocess | None = None,
+         seed: int = 0, shuffle_buffer: int = 0, streaming: bool = False,
+         loading: Loading = Loading(),
+         dataset: ArrowDataset | IterableDataset | None = None) -> Dataset:
     """The `Dataset` behind `source`, read where the provider already holds it.
 
+    The registered spec is what this builds, so `load("hf/wiki", batch=32,
+    options=HFOptions(config="20231101.en"))` and
+    `datasets["hf"](name="wiki", options=HFOptions(config="20231101.en"))
+    .load(batch=32)` are the same dataset, and a run that wants the second
+    in its config writes it there.
+
     `source` is `"tfds/<builder>"` or `"hf/<name>"`, or several of them with
-    the share of a step each one fills: `load({"hf/wiki": 0.7, "hf/code":
-    0.3}, ...)` reads a weighted mixture, whose semantics are `mixture`'s.
-    The corpora are read in name order, so the mixture is the same whichever
-    order the mapping was written in, and every source in it is the same
-    provider read with the same options: a mixture of two providers, or of
-    two datasets that need different `data_files`, is two `load` calls whose
-    sources a caller mixes with `dew.data.dataset.mixed_stream`.
-
-    `batch` is the global batch, `split` the provider's own split expression
-    and `val_split` a second one read as an ordered validation pass, bounded
-    by `val_batches`. A mixture's validation pass mixes the same corpora at
-    the same weights, each split in its own order, and stops before any of
-    them would come round again, so a pass scores each held-out record at
-    most once and scores the same records every time.
-    `preprocess(record, rng)` turns one of the provider's records into the
-    batch fields a run reads. `records` is the record count for a source that
-    cannot report its own; a mixture computes its own and takes none, since
-    one pass over it is the records in which every corpus has been read at
-    least once.
-
-    `seed` and `shuffle_buffer` decide which records a step trains on:
-    `seed` keys the order and the per-record rng, and `shuffle_buffer` is how
-    many rows a streamed split shuffles through, zero being file order. A
-    validation pass is never shuffled. `loading` is performance only, as
-    everywhere else.
-
-    `config` names which configuration of the dataset to read, for either
-    provider. `path`, `version` and `decoders` are the tfds provider's, and
-    everything from `streaming` down is the hf provider's: `dataset` reads a split the caller
-    already has, and the rest are `datasets.load_dataset`'s own arguments
-    with its own types. `config` is that function's `name`. Naming an option
-    of the other provider is refused, and a name neither knows is a
-    `TypeError` from this signature.
+    the share of a step each one fills. `options` is the provider's own
+    value, `TFDSOptions` for tfds and `HFOptions` for hf, so an option of
+    the other provider is a type error rather than a name; everything else
+    is what both providers take, and `dataset=` is a split the caller
+    already holds, which is an argument rather than a spec field because a
+    table in memory has no record in a config.
     """
+    provider, names = _sources(source)
+    if provider == "tfds":
+        if options is not None and not isinstance(options, TFDSOptions):
+            raise TypeError(
+                f"the tfds provider reads TFDSOptions; {type(options).__name__} is "
+                f"the other provider's")
+        if streaming or shuffle_buffer or dataset is not None:
+            raise TypeError(
+                "streaming, shuffle_buffer and dataset= are the hf provider's; a "
+                "prepared tfds split is read at random and shuffled whole from seed=")
+        return PreparedTFDS(
+            name=names, split=split, val_split=val_split, val_batches=val_batches,
+            records=records, preprocess=preprocess, options=options or TFDSOptions(),
+            seed=seed, loading=loading).load(batch=batch)
+    if options is not None and not isinstance(options, HFOptions):
+        raise TypeError(
+            f"the hf provider reads HFOptions; {type(options).__name__} is the "
+            f"other provider's")
+    return HubDataset(
+        name=names, split=split, val_split=val_split, val_batches=val_batches,
+        records=records, preprocess=preprocess, streaming=streaming,
+        shuffle_buffer=shuffle_buffer, options=options or HFOptions(),
+        seed=seed, loading=loading).rows(batch=batch, dataset=dataset)
+
+
+def _sources(source: Named) -> tuple[str, Named]:
+    """`source` split into the one provider it names and the dataset names
+    without it. A mixture reads one provider through one set of its
+    options, so two providers in one mapping is refused here."""
     weighted = {source: 1.0} if isinstance(source, str) else dict(source)
-    # Name order, not the mapping's: which corpus a record of the mixture
-    # comes from depends on the order they are mixed in, and a run is not two
-    # runs because its weights were written the other way round.
-    named = sorted(weighted)
-    dataset_of = {name: provider_of(name)[1] for name in named}
-    providers = {provider_of(name)[0] for name in named}
+    providers = {provider_of(name)[0] for name in weighted}
     if len(providers) != 1:
         raise ValueError(
             f"a mixture reads one provider through one set of its options, and "
-            f"{named} names {sorted(providers)}; load each provider on its own "
-            f"and mix what they read")
-    provider = providers.pop()
-    rows = local_batch(batch)
-    transforms = [] if preprocess is None else [Preprocessing(preprocess)]
-    if provider == "tfds":
-        _unwanted("tfds", {
-            "streaming": streaming or None, "dataset": dataset,
-            "data_dir": data_dir, "data_files": data_files, "cache_dir": cache_dir,
-            "features": features, "download_config": download_config,
-            "download_mode": download_mode, "verification_mode": verification_mode,
-            "keep_in_memory": keep_in_memory, "save_infos": save_infos or None,
-            "revision": revision, "token": token, "num_proc": num_proc,
-            "storage_options": storage_options})
-        if shuffle_buffer:
-            raise TypeError(
-                "shuffle_buffer is the streamed shuffle; a prepared tfds split is "
-                "read at random and shuffled whole from seed=")
-        read = _tfds(path=path, config=config, version=version, decoders=decoders)
-    else:
-        _unwanted("hf", {"path": path, "version": version, "decoders": decoders})
-        options = HFOptions(
-            config=config, data_dir=data_dir, data_files=data_files,
-            cache_dir=cache_dir, features=features, download_config=download_config,
-            download_mode=download_mode, verification_mode=verification_mode,
-            keep_in_memory=keep_in_memory, save_infos=save_infos, revision=revision,
-            token=token, num_proc=num_proc, storage_options=storage_options)
-        if streaming:
-            if len(named) > 1:
-                raise TypeError(
-                    "a mixture reads its corpora at random, so it can hold their "
-                    "proportions and report one record count as its position; a "
-                    "streamed split is read as it comes and has neither. Mix "
-                    "splits read at random, or train on one stream")
-            return _streamed(dataset_of[named[0]], split, val_split,
-                             options=options, dataset=dataset,
-                             batch=batch, rows=rows, seed=seed,
-                             shuffle_buffer=shuffle_buffer, loading=loading,
-                             records=records, val_batches=val_batches,
-                             preprocess=preprocess)
-        read = _arrow(options=options, dataset=dataset)
-    if shuffle_buffer and provider == "hf":
-        raise TypeError(
-            "shuffle_buffer is the streamed shuffle; an Arrow split is read at "
-            "random and shuffled whole from seed=")
-
-    def corpora_over(which: str) -> list[Corpus]:
-        """Every corpus of the mixture, over one of the provider's splits."""
-        return [Corpus(name, read(dataset_of[name], which), weighted[name])
-                for name in named]
-
-    corpora = corpora_over(split)
-    if len(corpora) == 1:
-        train = train_stream(corpora[0].source, transforms, batch=rows, seed=seed,
-                             loading=loading)
-        pass_records = counted(corpora[0].source, records, named[0])
-    else:
-        if records is not None:
-            raise ValueError(
-                "a mixture's pass is the records in which every corpus has been "
-                "read at least once, which its corpora's lengths and weights give, "
-                "so it takes no records=")
-        train = mixed_stream(corpora, transforms, batch=rows, seed=seed, loading=loading)
-        pass_records = mixed_records(corpora)
-    validation = None
-    if val_split is not None:
-        held = corpora_over(val_split)
-        ordered = held[0].source if len(held) == 1 else mixture(held, None)
-        validation = bounded(validation_pass(ordered, transforms, batch=rows, seed=seed,
-                                      loading=loading), val_batches)
-    return Dataset(train=train, val=validation, records=pass_records, batch=batch)
-
-
-type Reader = Callable[[str, str], pygrain.RandomAccessDataSource[object]]
-"""A reader of one dataset's one split at a time: the provider's own options
-are bound, the name and the split are not, because a mixture reads several
-names through the same options."""
-
-
-def _tfds(*, path: str | None, config: str | None,
-          version: str | None, decoders: DecoderTree | None) -> Reader:
-    """A reader of prepared splits."""
-    from .sources.tfds import prepared_source
-
-    if not path:
-        raise ValueError(
-            "a tfds source needs path= naming what a preparation run wrote: its "
-            "builder.data_dir, or the version directory under it. Training "
-            "never prepares its own data.")
-    return lambda name, split: prepared_source(path, split, builder=name, config=config,
-                                               version=version, decoders=decoders)
-
-
-def _arrow(*, options: HFOptions,
-           dataset: ArrowDataset | IterableDataset | None) -> Reader:
-    """A reader of Arrow-backed splits, through grain's random access."""
-    from .sources.hf import HFDatasetSource
-
-    if dataset is None:
-        return lambda name, split: HFDatasetSource(name=name, split=split, options=options)
-    return lambda name, split: HFDatasetSource(split=split, dataset=dataset)
-
-
-def _streamed(name: str, split: str, val_split: str | None, *, options: HFOptions,
-              dataset: ArrowDataset | IterableDataset | None, batch: int, rows: int,
-              seed: int, shuffle_buffer: int, loading: Loading, records: int | None,
-              val_batches: int | None, preprocess: Preprocess | None) -> Dataset:
-    """The streamed split's `Dataset`: endless training, one ordered pass for val."""
-    if records is not None and records < 1:
-        raise ValueError("records over a stream is a positive count or None")
-    return Dataset(
-        train=_stream(name, split, options=options, dataset=dataset, batch=rows,
-                      seed=seed, shuffle_buffer=shuffle_buffer, loading=loading,
-                      epochs=None, preprocess=preprocess),
-        # A validation pass is the split in its own order, so it is never
-        # shuffled: a score over other rows every time is not a score.
-        val=None if val_split is None else bounded(
-            _stream(name, val_split, options=options, dataset=dataset, batch=rows,
-                    seed=seed, shuffle_buffer=0, loading=loading, epochs=1,
-                    preprocess=preprocess), val_batches),
-        records=records,
-        batch=batch,
-    )
+            f"{sorted(weighted)} names {sorted(providers)}; load each provider on "
+            f"its own and mix what they read")
+    named = {provider_of(name)[1]: weight for name, weight in weighted.items()}
+    return providers.pop(), next(iter(named)) if len(named) == 1 else named
 
 
 def _stream(name: str, split: str, *, options: HFOptions,
@@ -352,8 +408,7 @@ def _stream(name: str, split: str, *, options: HFOptions,
     # object could leave it somewhere other than its beginning. Copied once
     # rather than per pass, because copying an object another thread is
     # iterating reads its attributes as they change.
-    own = None if dataset is None else copy.deepcopy(
-        _iterable(dataset, "the dataset load() was given"))
+    own = None if dataset is None else copy.deepcopy(_iterable(dataset, _GIVEN))
 
     def open_split() -> IterableDataset:
         if own is None:

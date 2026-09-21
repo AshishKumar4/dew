@@ -45,9 +45,10 @@ from .images import (
 from .preferences import IDS_KEY, MASK_KEY, PreferencePairs
 from .processors import AutoAudioProcessor, AutoTextTokenizer
 from .prompts import Prompts
-from .providers import load
-from .sources.hf import HFDatasetSource
+from .providers import HubDataset, PreparedTFDS, load
+from .sources.hf import HFDatasetSource, HFOptions
 from .sources.text import TokenDocumentSource, TokenFileSource
+from .sources.tfds import TFDSOptions
 from .streaming import CombinedOnline, OnlineImages
 from .text import ByteTokenizer, HFTokenizer, tokenizer_for
 from .tokens import PackedTokens, TokenWindows
@@ -56,8 +57,10 @@ from .video import LocalVideos, VideoDataset, VoxCeleb2
 __all__ = ["CC3M", "CC12M", "IDS_KEY", "MASK_KEY", "AestheticCoyo", "AutoAudioProcessor", "AutoTextTokenizer",
            "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable", "Combined30M", "CombinedAesthetic",
            "CombinedMsml612", "CombinedOnline", "Corpus", "Dataset", "DatasetSpec", "DiffusionDB",
-           "HFDatasetSource", "HFImages", "HFTokenizer", "ImageDataset", "Laion2bAesthetic", "Laion12mCoco",
+           "HFDatasetSource", "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "ImageDataset",
+           "Laion2bAesthetic", "Laion12mCoco",
            "LaionaCoco", "LaionaCocoCoyo", "Loading", "LocalVideos", "OnlineImages", "OxfordFlowers",
-           "PackedTokens", "PreferencePairs", "Prompts", "Ramp", "Role", "Stage", "TokenDocumentSource",
+           "PackedTokens", "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Role", "Stage",
+           "TFDSOptions", "TokenDocumentSource",
            "TokenFileSource", "TokenWindows", "VideoDataset", "VoxCeleb2", "load", "local_batch", "mixture",
            "ramped", "tokenizer_for"]

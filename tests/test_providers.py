@@ -27,7 +27,7 @@ if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
 import dew.data
-from dew.data import Checkpointable, Loading
+from dew.data import Checkpointable, HFOptions, Loading, TFDSOptions
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tfds"
 PREPARED = FIXTURES / "dew_images" / "1.0.0"
@@ -74,10 +74,57 @@ def test_a_hub_name_keeps_its_slashes():
 
 
 # ---------------------------------------------------------------------------
+# A provider is a registered spec
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name, options", [
+    ("hf", HFOptions(config="20231101.en", revision="main", num_proc=2)),
+    ("tfds", TFDSOptions(path="/data/prepared", config="small", version="1.0.0")),
+])
+def test_a_provider_spec_round_trips_through_a_run_config(name, options):
+    """`dew.data.load` used to hand back a Dataset, which a run config cannot
+    hold: nothing named the provider, so `to_dict` had nothing to write and a
+    resumed run could not say which dataset it had read."""
+    from dew.config import RunConfig
+    from dew.registry import datasets as registry
+
+    spec = registry[name](name="owner/rows", split="train[:80%]", val_split="test",
+                          val_batches=2, options=options, seed=3)
+    config = RunConfig(data=spec)
+
+    record = config.to_dict()
+    assert record["data"]["name"] == name
+    assert record["data"]["fields"]["options"]["config"] == options.config
+    assert RunConfig.from_dict(json.loads(json.dumps(record))) == config
+
+
+# ---------------------------------------------------------------------------
 # Prepared TFDS ArrayRecords
 # ---------------------------------------------------------------------------
 
 pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
+
+
+def test_the_load_function_and_the_spec_read_the_same_dataset():
+    """`load` is the spec built and called, so the two routes cannot drift."""
+    from dew.registry import datasets as registry
+
+    through_load = dew.data.load("tfds/dew_images", batch=4,
+                                 options=TFDSOptions(path=str(PREPARED)),
+                                 preprocess=image_and_label, **READ)
+    spec = registry["tfds"](name="dew_images", options=TFDSOptions(path=str(PREPARED)),
+                            preprocess=image_and_label, **READ)
+    through_spec = spec.load(batch=4)
+
+    assert through_load.records == through_spec.records
+    for left, right in zip(indices_of(through_load, 2), indices_of(through_spec, 2),
+                           strict=True):
+        np.testing.assert_array_equal(left, right)
+
+
+def indices_of(data, batches):
+    """The first pixel of each image of the first `batches` batches."""
+    return [batch["image"][:, 0, 0, 0] for batch in itertools.islice(data.train(), batches)]
 
 
 def test_prepared_records_reach_batches_without_importing_tensorflow():
@@ -85,7 +132,8 @@ def test_prepared_records_reach_batches_without_importing_tensorflow():
     TensorFlow, and a training process that imported it would be paying for a
     dependency it never calls."""
     data = dew.data.load("tfds/dew_images", batch=4, split="train", val_split="test",
-                         val_batches=1, path=str(PREPARED), preprocess=image_and_label,
+                         val_batches=1, options=TFDSOptions(path=str(PREPARED)),
+                         preprocess=image_and_label,
                          **READ)
 
     assert data.records == 16 and data.batch == 4 and data.steps_per_epoch == 4
@@ -99,7 +147,8 @@ def test_prepared_records_reach_batches_without_importing_tensorflow():
 
 
 def test_a_pass_over_the_prepared_split_reads_every_record_once():
-    data = dew.data.load("tfds/dew_images", batch=4, split="train", path=str(PREPARED),
+    data = dew.data.load("tfds/dew_images", batch=4, split="train",
+                         options=TFDSOptions(path=str(PREPARED)),
                          preprocess=image_and_label, **READ)
 
     epoch = list(itertools.islice(iter(data.train()), data.steps_per_epoch))
@@ -110,7 +159,8 @@ def test_a_pass_over_the_prepared_split_reads_every_record_once():
 def test_the_data_dir_above_a_prepared_version_resolves_by_name():
     """A caller who prepared into a data_dir names the builder, not the
     version directory TFDS chose inside it."""
-    data = dew.data.load("tfds/dew_images", batch=4, path=str(FIXTURES),
+    data = dew.data.load("tfds/dew_images", batch=4,
+                         options=TFDSOptions(path=str(FIXTURES)),
                          preprocess=image_and_label, **READ)
 
     assert data.records == 16
@@ -119,12 +169,14 @@ def test_the_data_dir_above_a_prepared_version_resolves_by_name():
 def test_a_version_named_beside_a_resolved_path_is_an_identity_constraint():
     """A caller who has the version directory may still say which version it
     must hold; the metadata answers, so a match reads and a mismatch stops."""
-    data = dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED),
-                         version="1.0.0", preprocess=image_and_label, **READ)
+    data = dew.data.load("tfds/dew_images", batch=4,
+                         options=TFDSOptions(path=str(PREPARED), version="1.0.0"),
+                         preprocess=image_and_label, **READ)
     assert data.records == 16
 
     with pytest.raises(ValueError, match="holds version '1.0.0'"):
-        dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED), version="2.0.0",
+        dew.data.load("tfds/dew_images", batch=4,
+                      options=TFDSOptions(path=str(PREPARED), version="2.0.0"),
                       preprocess=image_and_label, **READ)
 
 
@@ -132,9 +184,10 @@ def test_a_builder_config_or_version_the_prepared_data_does_not_hold_is_refused(
     for options, message in (({"config": "nope"}, "no 'nope' config"),
                              ({"version": "9.9.9"}, "no version '9.9.9'")):
         with pytest.raises(FileNotFoundError, match=message):
-            dew.data.load("tfds/dew_images", batch=4, path=str(FIXTURES), **options)
+            dew.data.load("tfds/dew_images", batch=4,
+                          options=TFDSOptions(path=str(FIXTURES), **options))
     with pytest.raises(FileNotFoundError, match="no prepared 'other'"):
-        dew.data.load("tfds/other", batch=4, path=str(FIXTURES))
+        dew.data.load("tfds/other", batch=4, options=TFDSOptions(path=str(FIXTURES)))
 
 
 def test_prepared_metadata_decides_which_dataset_a_directory_holds(tmp_path):
@@ -146,13 +199,15 @@ def test_prepared_metadata_decides_which_dataset_a_directory_holds(tmp_path):
     shutil.copytree(PREPARED, elsewhere)
 
     with pytest.raises(ValueError, match="holds builder 'dew_images'"):
-        dew.data.load("tfds/other_builder", batch=4, path=str(tmp_path),
+        dew.data.load("tfds/other_builder", batch=4,
+                      options=TFDSOptions(path=str(tmp_path)),
                       preprocess=image_and_label, **READ)
 
 
 def test_a_split_the_prepared_data_does_not_hold_is_refused():
     with pytest.raises(ValueError, match="holds no split 'valid'"):
-        dew.data.load("tfds/dew_images", batch=4, split="valid", path=str(PREPARED))
+        dew.data.load("tfds/dew_images", batch=4, split="valid",
+                      options=TFDSOptions(path=str(PREPARED)))
 
 
 def test_a_half_copied_prepared_dataset_is_refused_before_the_run(tmp_path):
@@ -164,20 +219,30 @@ def test_a_half_copied_prepared_dataset_is_refused_before_the_run(tmp_path):
     next(copy.glob("*train.array_record*")).unlink()
 
     with pytest.raises(FileNotFoundError, match="Missing prepared ArrayRecord shard"):
-        dew.data.load("tfds/dew_images", batch=4, path=str(copy))
+        dew.data.load("tfds/dew_images", batch=4, options=TFDSOptions(path=str(copy)))
 
 
 def test_an_option_no_provider_knows_is_refused_by_the_signature():
     with pytest.raises(TypeError, match="builder_name"):
-        dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED),
+        dew.data.load("tfds/dew_images", batch=4,
+                      options=TFDSOptions(path=str(PREPARED)),
                       builder_name="x")  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="data_files"):
+        TFDSOptions(path=str(PREPARED), data_files="x")  # type: ignore[call-arg]
 
 
 def test_an_option_of_the_other_provider_is_named():
-    with pytest.raises(TypeError, match=r"tfds provider does not take \['streaming'\]"):
-        dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED), streaming=True)
-    with pytest.raises(TypeError, match=r"hf provider does not take \['path'\]"):
-        dew.data.load("hf/json", batch=4, path="/tmp")
+    """One value per provider, so an option of the other one is the wrong
+    type rather than a name checked against a list."""
+    with pytest.raises(TypeError, match="the tfds provider reads TFDSOptions"):
+        dew.data.load("tfds/dew_images", batch=4,
+                      options=HFOptions(data_dir="/tmp"))  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="the hf provider reads HFOptions"):
+        dew.data.load("hf/json", batch=4,
+                      options=TFDSOptions(path="/tmp"))  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="are the hf provider's"):
+        dew.data.load("tfds/dew_images", batch=4,
+                      options=TFDSOptions(path=str(PREPARED)), streaming=True)
 
 
 def test_a_decoder_the_caller_supplies_reaches_the_builder():
@@ -185,8 +250,9 @@ def test_a_decoder_the_caller_supplies_reaches_the_builder():
     decodes images itself wants; the option is TFDS's and is forwarded."""
     import tensorflow_datasets as tfds
 
-    data = dew.data.load("tfds/dew_images", batch=4, path=str(PREPARED),
-                         decoders={"image": tfds.decode.SkipDecoding()},
+    data = dew.data.load("tfds/dew_images", batch=4,
+                         options=TFDSOptions(path=str(PREPARED),
+                                             decoders={"image": tfds.decode.SkipDecoding()}),
                          preprocess=lambda record, rng: {"raw": np.frombuffer(
                              record["image"], np.uint8)[:4]},
                          **READ)
@@ -226,7 +292,7 @@ def jsonl(tmp_path_factory):
 
 def test_an_arrow_split_reads_by_index_and_carries_its_position(jsonl):
     data = dew.data.load("hf/json", batch=4, split="train", preprocess=just_index,
-                         data_files=jsonl, **READ)
+                         options=HFOptions(data_files=jsonl), **READ)
 
     assert data.records == ROWS and data.steps_per_epoch == 6
     stream = data.train()
@@ -244,7 +310,8 @@ def test_an_arrow_split_reads_by_index_and_carries_its_position(jsonl):
 
 def test_an_arrow_split_holds_a_named_validation_split(jsonl):
     data = dew.data.load("hf/json", batch=4, split="train", val_split="train",
-                         val_batches=2, preprocess=just_index, data_files=jsonl, **READ)
+                         val_batches=2, preprocess=just_index,
+                         options=HFOptions(data_files=jsonl), **READ)
 
     assert data.val is not None
     assert indices(data.val(), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
@@ -253,7 +320,7 @@ def test_an_arrow_split_holds_a_named_validation_split(jsonl):
 def test_a_record_count_that_disagrees_with_the_split_is_refused(jsonl):
     with pytest.raises(ValueError, match="disagrees with the 24 records"):
         dew.data.load("hf/json", batch=4, records=8, preprocess=just_index,
-                      data_files=jsonl, **READ)
+                      options=HFOptions(data_files=jsonl), **READ)
 
 
 def test_the_library_own_arguments_are_forwarded_with_their_own_types(jsonl):
@@ -261,14 +328,15 @@ def test_the_library_own_arguments_are_forwarded_with_their_own_types(jsonl):
     `load_dataset`'s arguments, so they reach it as they are."""
     typed = dew.data.load(
         "hf/json", batch=4, preprocess=just_index,
-        data_files={"train": jsonl}, storage_options={},
-        features=datasets.Features({"index": datasets.Value("int32")}), **READ)
+        options=HFOptions(
+            data_files={"train": jsonl}, storage_options={},
+            features=datasets.Features({"index": datasets.Value("int32")})), **READ)
 
     assert typed.records == ROWS
     assert next(iter(typed.train()))["index"].dtype == np.int32
 
     both = dew.data.load("hf/json", batch=4, preprocess=just_index,
-                         data_files=[jsonl, jsonl], **READ)
+                         options=HFOptions(data_files=[jsonl, jsonl]), **READ)
     assert both.records == 2 * ROWS, "a sequence of files is read as one split"
 
 
@@ -292,7 +360,7 @@ def test_a_streamed_split_reports_no_length(jsonl):
     """A stream cannot be listed, so it reports no record count and the run
     gives its length in steps."""
     data = dew.data.load("hf/json", batch=4, split="train", streaming=True,
-                         preprocess=just_index, data_files=jsonl, **READ)
+                         preprocess=just_index, options=HFOptions(data_files=jsonl), **READ)
 
     assert data.records is None and data.steps_per_epoch is None
     stream = data.train()
@@ -314,7 +382,7 @@ def test_an_unshuffled_streamed_split_resumes_on_the_record_it_stopped_at(jsonl)
     that with the transform and the batch behind it, so both the records and
     their own draws come back."""
     data = dew.data.load("hf/json", batch=4, split="train", streaming=True,
-                         preprocess=just_index, data_files=jsonl, **READ)
+                         preprocess=just_index, options=HFOptions(data_files=jsonl), **READ)
 
     stream = data.train()
     assert isinstance(stream, Checkpointable)
@@ -336,7 +404,7 @@ def test_a_shuffled_streamed_split_withholds_its_position(jsonl):
     a shuffled stream reports no position and `Trainer.fit` refuses
     checkpoints over it."""
     data = dew.data.load("hf/json", batch=4, split="train", streaming=True,
-                         shuffle_buffer=4, preprocess=just_index, data_files=jsonl,
+                         shuffle_buffer=4, preprocess=just_index, options=HFOptions(data_files=jsonl),
                          **READ)
 
     stream = data.train()
@@ -358,7 +426,7 @@ def test_a_streamed_share_with_no_rows_is_refused_rather_than_waited_on(monkeypa
     monkeypatch.setattr(jax, "process_count", lambda: 4)
     monkeypatch.setattr(jax, "process_index", lambda: 3)
     one = dew.data.load("hf/json", batch=4, split="train", streaming=True,
-                        preprocess=just_index, data_files=one_row, **READ)
+                        preprocess=just_index, options=HFOptions(data_files=one_row), **READ)
 
     stream = one.train()
     try:
@@ -377,7 +445,7 @@ def test_a_streamed_validation_pass_is_ordered_whatever_the_tuning(
     neither may change which rows a score is over."""
     data = dew.data.load("hf/json", batch=4, split="train", val_split="train",
                          val_batches=2, streaming=True, shuffle_buffer=shuffle_buffer,
-                         preprocess=just_index, data_files=jsonl,
+                         preprocess=just_index, options=HFOptions(data_files=jsonl),
                          loading=Loading(workers=0, threads=1, read_buffer=read_buffer,
                                          worker_buffer=2))
 
@@ -392,7 +460,7 @@ def test_a_streamed_validation_pass_is_ordered_whatever_the_tuning(
 def test_a_streamed_pass_ends_and_a_bounded_one_ends_sooner(jsonl):
     data = dew.data.load("hf/json", batch=4, split="train", val_split="train",
                          val_batches=2, streaming=True, preprocess=just_index,
-                         data_files=jsonl, **READ)
+                         options=HFOptions(data_files=jsonl), **READ)
 
     assert data.val is not None
     passed = data.val()
@@ -407,7 +475,7 @@ def test_a_streamed_row_is_transformed_by_its_own_rng(jsonl):
     row and repeats across two readings of the same stream."""
     def read():
         data = dew.data.load("hf/json", batch=4, split="train", streaming=True,
-                             preprocess=just_index, data_files=jsonl, **READ)
+                             preprocess=just_index, options=HFOptions(data_files=jsonl), **READ)
         stream = data.train()
         try:
             return [(int(i), int(d)) for batch in itertools.islice(stream, 3)
@@ -434,7 +502,7 @@ def test_a_streamed_split_is_shared_over_the_processes_without_losing_rows(
     for index in range(processes):
         monkeypatch.setattr(jax, "process_index", lambda index=index: index)
         data = dew.data.load("hf/json", batch=processes, split="train", streaming=True,
-                             shuffle_buffer=4, preprocess=just_index, data_files=jsonl,
+                             shuffle_buffer=4, preprocess=just_index, options=HFOptions(data_files=jsonl),
                              loading=Loading(workers=0, threads=1, read_buffer=4,
                                              worker_buffer=2))
         stream = data.train()
@@ -578,7 +646,7 @@ def test_a_streamed_read_over_http_is_bounded_and_its_reader_is_joined(served):
 
     batch, ahead = 4, 2
     data = dew.data.load("hf/json", batch=batch, split="train", streaming=True,
-                         preprocess=counted, data_files=served,
+                         preprocess=counted, options=HFOptions(data_files=served),
                          loading=Loading(workers=0, threads=1, read_buffer=4,
                                          worker_buffer=ahead))
     before = _prefetchers()

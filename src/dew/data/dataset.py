@@ -19,17 +19,32 @@ from __future__ import annotations
 import bisect
 import dataclasses
 import itertools
+import json
 import math
 import sys
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterator,
+    Mapping,
+    Protocol,
+    Sequence,
+    overload,
+    runtime_checkable,
+)
 
 import grain.python as pygrain
 import jax
 import numpy as np
+import tyro
 from absl import flags
 
 from dew import position
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 # grain's worker processes read absl flags; a script that never runs absl.app
 # would crash on any worker_count > 0 with UnparsedFlagAccessError.
@@ -42,6 +57,37 @@ type Tokenize = Callable[[Sequence[str]], Batch]
 """A run's caption reader: the batch's captions in, the batch fields its
 conditions want out. The dataset carries the text, the encoder behind this
 decides what tokens it becomes."""
+
+type Records = pygrain.RandomAccessDataSource[object]
+"""A source the loaders read by index. A record is whatever the source
+holds, which is a mapping of fields for every dataset dew writes and, for a
+prepared TFDS split of one feature, a bare array; the spec's own transform
+is where it becomes batch fields, and `Preprocessing` refuses what it
+cannot read there."""
+
+
+def json_argument[Options: DataclassInstance](
+        options: type[Options]) -> tyro.constructors.PrimitiveConstructorSpec[Options]:
+    """`options` written as one JSON object on the command line.
+
+    A spec holds a provider's options as one frozen value, and some of that
+    value's fields are the library's own objects: a `datasets.Features`, a
+    tfds decoder tree. Their types are imported on use, so a flag per field
+    would need annotations this process has not resolved and has no spelling
+    for the objects anyway. The whole value is one argument instead, the way
+    `--model.config` is one JSON object.
+    """
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="JSON",
+        instance_from_str=lambda given: options(**json.loads(given[0])),
+        is_instance=lambda given: isinstance(given, options),
+        # Only for the help text, where a library object is best shown as
+        # itself; nothing reads this back.
+        str_from_instance=lambda given: [json.dumps(
+            {field.name: getattr(given, field.name)
+             for field in dataclasses.fields(given)}, default=repr)],
+    )
 
 
 @runtime_checkable
@@ -818,7 +864,7 @@ def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
     return dataclasses.replace(dataset, train=train, ramp=ramp)
 
 
-def train_stream(source: pygrain.RandomAccessDataSource[object], operations: Sequence[pygrain.Transformation], *,
+def train_stream(source: Records, operations: Sequence[pygrain.Transformation], *,
                  batch: int, seed: int,
                  loading: Loading) -> Callable[[], Iterator[Batch]]:
     """An endless shuffled stream over `source`, batched per process.
@@ -875,7 +921,7 @@ def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transfo
     return stream
 
 
-def validation_pass(source: pygrain.RandomAccessDataSource[object], transformations: Sequence[pygrain.Transformation], *,
+def validation_pass(source: Records, transformations: Sequence[pygrain.Transformation], *,
                     batch: int, seed: int,
                     loading: Loading) -> Callable[[], Iterator[Batch]]:
     """One pass over `source` in record order, in batches of `batch`.
