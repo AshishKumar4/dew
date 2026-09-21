@@ -43,7 +43,7 @@ from __future__ import annotations
 import functools
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 
@@ -205,23 +205,66 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, state: Slots,
             Draws(token, drawn, stopped, jnp.where(drawn, behavior, 0.0), jnp.where(drawn, raw, 0.0)))
 
 
-def _stepped(model: nn.Module, params: Variables, pad_id: int, state: Slots,
+def _split(state: Slots) -> tuple[Slots, Slots]:
+    """The state as the buffers a step updates in place and the vectors it rewrites.
+
+    A donated input is aliased with its output, and XLA copies a donated
+    buffer whose old value is still needed once the output is written:
+    every layer's cache cursor, the step count and the active flags are
+    read after they are advanced, so donating the whole state cost 30
+    copy launches of 32-element vectors per step. The matrices are what
+    donation is for, the cache above all; the vectors travel undonated
+    and get fresh buffers. Each half carries None where the other holds
+    the leaf, and `_joined` puts them back together. A `Formats` tree of
+    chosen layouts splits the same way, by the rank each layout describes.
+    """
+    def matrix(leaf: jax.Array | Format) -> bool:
+        if isinstance(leaf, Format):
+            return isinstance(leaf.layout, Layout) and len(leaf.layout.major_to_minor) >= 2
+        return leaf.ndim >= 2
+
+    return (jax.tree.map(lambda leaf: leaf if matrix(leaf) else None, state),
+            jax.tree.map(lambda leaf: None if matrix(leaf) else leaf, state))
+
+
+def _joined(resident: Slots, carried: Slots) -> Slots:
+    return jax.tree.map(lambda held, other: other if held is None else held, resident, carried,
+                        is_leaf=lambda leaf: leaf is None)
+
+
+def _stepped(model: nn.Module, params: Variables, pad_id: int, resident: Slots, carried: Slots,
              admission: Admission | None, transforms: tuple[LogitsTransform, ...],
              stopping: tuple[Stopping, ...]) -> tuple[checkify.Error, tuple[Slots, Draws]]:
-    """`_advanced` with its device checks carried out as a value, the way
-    `text._checked` carries them; the host throws the error when it reads
-    the draws, one step later."""
+    """`_advanced` over the state `_split` gave, with its device checks
+    carried out as a value, the way `text._checked` carries them; the host
+    throws the error when it reads the draws, one step later."""
 
-    def run(params, state, admission, transforms, stopping):
-        return _advanced(model, params, pad_id, state, admission, transforms, stopping)
+    def run(params, resident, carried, admission, transforms, stopping):
+        return _advanced(model, params, pad_id, _joined(resident, carried), admission, transforms, stopping)
 
-    return checkify.checkify(run, errors=checkify.user_checks)(params, state, admission, transforms, stopping)
+    return checkify.checkify(run, errors=checkify.user_checks)(
+        params, resident, carried, admission, transforms, stopping)
 
-
-_OPEN = jax.jit(_opened, static_argnums=(0, 2, 3, 4))
 
 Formats = Slots
 """A `Slots` whose leaves are `Format`s: the resident layout of each leaf."""
+
+def _compiled(resident: Formats, carried: Formats) -> jax.stages.Wrapped:
+    """The step program over a state in the formats `_split` gave.
+
+    The matrices are donated, so the cache is updated in place rather than
+    copied: without donation the 32 x 1024 step copied its cache and took
+    22.5 ms against 9.9. XLA's default already captures the step's fusions
+    and GEMMs into CUDA graphs (`xla_gpu_enable_command_buffer`); with the
+    capture off the same step took 10.4 ms, forcing every category with a
+    minimum graph size of one was within noise of the default, cuBLAS in
+    place of the Triton GEMMs took 13.3 ms and Triton for every dot changed
+    nothing, so the step sets no flag of its own and a run that wants
+    another setting passes it through XLA_FLAGS.
+    """
+    return jax.jit(_stepped, static_argnums=(0, 2), donate_argnums=(3,),
+                   in_shardings=(None, resident, carried, None, None, None),
+                   out_shardings=(None, (_joined(resident, carried), None)))
 
 
 def _resident_formats(model: nn.Module, params: Variables, pad_id: int, state: Slots,
@@ -237,41 +280,37 @@ def _resident_formats(model: nn.Module, params: Variables, pad_id: int, state: S
     compiled once with the layouts left to XLA, and what it chose for its
     outputs becomes the format every step program takes and returns, so
     the cache is written in the layout it is read in and donation reuses
-    the buffer.
+    the buffer. `state` is the abstract state, shapes and dtypes: nothing
+    is allocated to choose the layout, so the opened state is allocated
+    in it once rather than allocated row-major and copied.
     """
-    free = jax.tree.map(lambda leaf: Format(Layout.AUTO, leaf.sharding), state)
-    program = jax.jit(_stepped, static_argnums=(0, 2), donate_argnums=(3,),
-                      in_shardings=(None, free, None, None, None), out_shardings=(None, (free, None)))
-    compiled = program.lower(model, params, pad_id, state, None, transforms, stopping).compile()
+    device = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+    resident, carried = _split(state)
+    program = _compiled(*(jax.tree.map(lambda leaf: Format(Layout.AUTO, device), half)
+                          for half in (resident, carried)))
+    compiled = program.lower(model, params, pad_id, resident, carried, None, transforms, stopping).compile()
     return compiled.output_formats[1][0]
 
 
-_PROGRAMS: dict[tuple[tuple[Format, ...], str], Callable[..., tuple[checkify.Error, tuple[Slots, Draws]]]] = {}
+def _opened_in(formats: Formats) -> jax.stages.Wrapped:
+    """`_opened`, allocating its state in `formats`."""
+    return jax.jit(_opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
+
+
+_PROGRAMS: dict[tuple[tuple[Format, ...], str], jax.stages.Wrapped] = {}
 """One step program per resident layout; see `_program`."""
 
 
-def _program(formats: Formats) -> Callable[..., tuple[checkify.Error, tuple[Slots, Draws]]]:
-    """The step program over a resident state in `formats`.
-
-    The state is donated, so the cache is updated in place rather than
-    copied: without donation the 32 x 1024 step copied its cache and took
-    22.5 ms against 9.9. One compile per (model, admission shape) serves
-    every server that keeps its state in the same layout; the formats tree
-    holds the cache mapping and is not hashable itself, so its leaves and
-    its structure's text key the programs. XLA's default already captures
-    the step's fusions and GEMMs into CUDA graphs
-    (`xla_gpu_enable_command_buffer`); with the capture off the same step
-    took 10.4 ms, and forcing every category with a minimum graph size of
-    one was within noise of the default, so the step sets no flag of its
-    own and a run that wants another setting passes it through XLA_FLAGS.
-    """
+def _program(formats: Formats) -> jax.stages.Wrapped:
+    """`_compiled` over `formats`, once per layout: one compile per (model,
+    admission shape) serves every server that keeps its state in the same
+    layout. The formats tree holds the cache mapping and is not hashable
+    itself, so its leaves and its structure's text key the programs."""
     leaves, structure = jax.tree_util.tree_flatten(formats)
     key = (tuple(leaves), str(structure))
     program = _PROGRAMS.get(key)
     if program is None:
-        program = _PROGRAMS[key] = jax.jit(
-            _stepped, static_argnums=(0, 2), donate_argnums=(3,),
-            in_shardings=(None, formats, None, None, None), out_shardings=(None, (formats, None)))
+        program = _PROGRAMS[key] = _compiled(*_split(formats))
     return program
 
 
@@ -333,10 +372,11 @@ class Server:
         self._rows: dict[int, _Row] = {}
         self._pending: tuple[checkify.Error, Draws] | None = None
         self._failed: BaseException | None = None
-        opened = _OPEN(model, variables, self.pad_id, slots, capacity)
-        formats = _resident_formats(model, variables, self.pad_id, opened, transforms, stopping)
+        shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
+                                                  capacity=capacity), variables)
+        formats = _resident_formats(model, variables, self.pad_id, shapes, transforms, stopping)
         self._step = _program(formats)
-        self._state: Slots = jax.device_put(opened, formats)
+        self._state: Slots = _opened_in(formats)(model, variables, self.pad_id, slots, capacity)
 
     @classmethod
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
@@ -425,7 +465,7 @@ class Server:
         if self._failed is not None:
             raise RuntimeError("the server stopped after a device check failed") from self._failed
         admission = self._admit()
-        error, (self._state, draws) = self._step(self.model, self.variables, self.pad_id, self._state,
+        error, (self._state, draws) = self._step(self.model, self.variables, self.pad_id, *_split(self._state),
                                                  admission, self.transforms, self.stopping)
         self.steps += 1
         self._settle()
