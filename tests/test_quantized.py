@@ -149,7 +149,11 @@ def test_an_fp8_config_outside_deepseeks_format_is_refused(field, value):
 
 
 def write_safetensors(path, tensors):
-    """One safetensors file from named arrays, fp8 included, without torch."""
+    """One safetensors file from named arrays, fp8 included, without torch.
+
+    Published by rename, as `safetensors_io._publish` does: a re-ship writes
+    arrays that are memmaps of `path`, and truncating that inode under them
+    is SIGBUS on the next read."""
     names = {np.dtype(np.float32): "F32", np.dtype(FP8): "F8_E4M3"}
     header, offset = {}, 0
     for name, array in tensors.items():
@@ -157,11 +161,14 @@ def write_safetensors(path, tensors):
                         "data_offsets": [offset, offset + array.nbytes]}
         offset += array.nbytes
     encoded = json.dumps(header).encode()
-    with open(path, "wb") as handle:
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.writing")
+    with open(temporary, "wb") as handle:
         handle.write(struct.pack("<Q", len(encoded)))
         handle.write(encoded)
         for array in tensors.values():
             handle.write(np.ascontiguousarray(array).tobytes())
+    os.replace(temporary, path)
 
 
 def torch_per_block_cast(weight, block, ue8m0):
@@ -260,6 +267,33 @@ def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path):
     assert np.array_equal(bits(kv_b), bits(expected["model.layers.0.self_attn.kv_b_proj.weight"].T))
     assert np.array_equal(params["layers_0"]["mlp"]["gate_proj"]["kernel"],
                           tensors["model.layers.0.mlp.gate_proj.weight"].T)
+
+
+def test_a_re_ship_writes_over_the_shard_its_own_tensors_are_mapped_from(tmp_path):
+    """A re-ship rewrites the shard its inputs are memmapped from; the maps
+    must keep reading their old bytes and the shard must hold the new table.
+    The fp8 payload is a quarter of the fp32 it replaces, so a truncating
+    writer leaves the mapped bytes past end-of-file and SIGBUS is certain."""
+    from dew.interop.hf_decoders import _read_shard
+    directory = tmp_path / "reship"
+    shutil.copytree(FIXTURE, directory)
+    shard = directory / "model.safetensors"
+    name = "model.layers.0.mlp.up_proj.weight"
+    tensors = _read_shard(shard)
+    assert isinstance(tensors[name].base, np.memmap), "the shard is not mapped; nothing to lose"
+    held = {key: array.tobytes() for key, array in tensors.items()}
+    shipped = dict(tensors)
+    shipped[name], shipped[name + SCALE_SUFFIX] = quantize_fp8_blocks(tensors[name], 16)
+    assert shipped[name].nbytes < tensors[name].nbytes, "the payload did not shrink"
+
+    write_safetensors(shard, shipped)
+
+    for key, array in tensors.items():
+        assert array.tobytes() == held[key], f"{key} changed under the map it was read through"
+    written = read_safetensors(shard)
+    assert set(written) == set(shipped)
+    for key, (_, shape, payload) in written.items():
+        assert shape == shipped[key].shape and payload == shipped[key].tobytes(), key
 
 
 # --------------------------------------------------------------------------
