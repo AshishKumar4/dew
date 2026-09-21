@@ -281,7 +281,8 @@ def _rebuild(annotation, value) -> Any:
     if isinstance(value, list):
         # JSON writes every sequence as a list; the field says which are tuples.
         entries = registry.entry_types(annotation, len(value))
-        rebuilt = [_rebuild(entry, entry) for entry, entry in zip(entries, value, strict=True)]
+        rebuilt = [_rebuild(entry, record)
+                   for entry, record in zip(entries, value, strict=True)]
         return tuple(rebuilt) if registry.wants_tuple(annotation) else rebuilt
     return value
 
