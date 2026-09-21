@@ -4,7 +4,10 @@ Sample a noise level, corrupt, predict, weight. The convention (schedule,
 parameterization, weighting) is the `Process`; the sample field and the
 conditions are the `InputSpec`; every draw comes from the step's key. The
 frozen encoders' weights live in the tree's `encoders` collection, so they
-reach the compiled step as arguments and the optimizer never sees them.
+reach the compiled step as arguments and the optimizer never sees them. The
+unconditional branch is a pure function of those frozen weights and a fixed
+prompt, so the objective encodes it once, when it is built, and the step
+reads that: the tower runs over the batch and nothing else, once a step.
 
 Evaluation samples a few images from the validation batch's conditions with
 the averaged weights, through the same `sample` inference uses.
@@ -16,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import linen as nn
 
@@ -82,6 +86,13 @@ class DiffusionObjective(Objective[Mean]):
         self.pretrained = pretrained
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
+        # The unconditional branch is a pure function of the frozen towers
+        # and each condition's fixed datum, so it is encoded here, once, and
+        # not inside every step and every sample. A few hundred kilobytes of
+        # host arrays, which a compiled step takes as a constant; the towers
+        # themselves stay in the state, for the reason `held_variables` gives.
+        self.unconditional_conditions = jax.tree.map(
+            np.asarray, self.encode(self.encoder_params()))
         self.unconditional_prob = unconditional_prob
         self.sampler = sampler
         self.guidance = guidance
@@ -125,6 +136,12 @@ class DiffusionObjective(Objective[Mean]):
         return {keyword: condition.encoder.encode(encoders[keyword], tokens[keyword])
                 for keyword, condition in self.inputs.conditions.items()}
 
+    def blank_conditions(self, like: dict) -> dict:
+        """The unconditional branch in the dtypes `like` - the conditional
+        branch - has, from the value encoded when this objective was built."""
+        return jax.tree.map(lambda blank, value: jnp.asarray(blank, value.dtype),
+                            self.unconditional_conditions, like)
+
     def held_variables(self) -> Variables:
         """Every array `init` starts from rather than draws: a whole pretrained
         tree, or the frozen towers.
@@ -167,7 +184,9 @@ class DiffusionObjective(Objective[Mean]):
         tokens = {keyword: batch[condition.field]
                   for keyword, condition in self.inputs.conditions.items()}
         given = self.encode(params["encoders"], tokens)
-        unconditional = self.encode(params["encoders"])
+        # Encoded once, when the objective was built, so the tower runs over
+        # the batch and nothing else.
+        unconditional = self.blank_conditions(given)
         if dropout:
             count = batch[self.inputs.sample.key].shape[0]
             dropped = jax.random.bernoulli(key, self.unconditional_prob, (count,))

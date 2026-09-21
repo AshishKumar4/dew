@@ -100,6 +100,10 @@ class TextToImage:
     grid: Callable[[int], tuple[Process, jax.Array]] | None = None
     final_denoise: bool = True
     finish: Callable[[Variables, jax.Array], jax.Array] | None = None
+    blank: Callable[[dict], dict] | None = None
+    """The task's own unconditional branch in the dtypes of a conditional one,
+    encoded once by whoever built this task (`DiffusionObjective.blank_conditions`);
+    None encodes it on every call, for a source that has none."""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "params", freeze(dict(self.params)))
@@ -112,7 +116,8 @@ class TextToImage:
     def from_objective(cls, objective: DiffusionObjective, variables: Variables) -> TextToImage:
         """The objective's model over `variables`, sampling the way its evaluation does."""
         return cls(objective.model, objective.process, objective.inputs, variables, objective.autoencoder,
-                   steps=objective.steps, guidance=objective.guidance, sampler=objective.sampler)
+                   steps=objective.steps, guidance=objective.guidance, sampler=objective.sampler,
+                   blank=objective.blank_conditions)
 
     @classmethod
     def from_run(cls, directory: str, *, ema: bool = True, step: int | None = None,
@@ -176,7 +181,11 @@ class TextToImage:
     def _conditions(self) -> tuple[tuple[str, object], ...]:
         return tuple((keyword, condition.encoder) for keyword, condition in self.inputs.conditions.items())
 
-    def _unconditional(self, tokens, plan: RowPlan) -> dict:
+    def _unconditional(self, tokens, plan: RowPlan, given: dict, *, configured: bool) -> dict:
+        """The unconditional branch: the value already encoded for the task's
+        own unconditional prompt, and an encode of the caller's negatives."""
+        if configured and self.blank is not None:
+            return self.blank(given)
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
             return _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
@@ -288,7 +297,7 @@ class TextToImage:
             annotation.__enter__()
         try:
             given = _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
-            null = self._unconditional(null_tokens, plan)
+            null = self._unconditional(null_tokens, plan, given, configured=unconditional is None)
             if samples:
                 start = process.times(count)[0] if selected is None else selected[0]
                 initial_state, spatial = _image_start(plan.sharding)(
