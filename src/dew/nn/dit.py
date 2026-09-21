@@ -263,15 +263,44 @@ class PatchSequenceOutput(nn.Module):
         return unpatchify(x_out, self.patch_size, H, W, self.output_channels)
 
 
+# A fused attention forward reaches a remat policy as one of these
+# primitives, not as a dot: jax wraps its cuDNN kernel in a custom_vjp whose
+# forward returns the attention output together with the softmax statistics
+# its backward pass consumes.
+FUSED_ATTENTION_FORWARD = frozenset(
+    {'dot_product_attention_fwd', 'dot_product_attention_fwd_wrapper'})
+
+_DOTS_AND_ATTENTION_OUTPUT = jax.checkpoint_policies.save_from_both_policies(
+    jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+    jax.checkpoint_policies.save_only_these_names('attention_output'))
+
+
+def saved_through_remat(prim, *args, **params) -> bool:
+    """The values a rematerialized block keeps instead of recomputing.
+
+    Three kinds. Unbatched matmul outputs, which keeps the recompute cheap
+    while leaving the reference path's [B, H, Q, K] scores, a batched dot, out
+    of the residuals. Whatever `scaled_dot_product_attention` returns, which
+    it labels 'attention_output'. And the whole fused attention forward: a
+    name can only mark that primitive's output, and its backward pass also
+    needs the softmax statistics, so a policy that saves the output alone
+    still replays the entire flash forward. Saving the primitive keeps both,
+    which is what takes a step's fused forward calls from two per layer back
+    to one.
+    """
+    return (str(prim) in FUSED_ATTENTION_FORWARD
+            or _DOTS_AND_ATTENTION_OUTPUT(prim, *args, **params))
+
+
 def remat_block(block_cls, enabled: bool, policy: Optional[str] = 'dots'):
     """Optionally rematerialize a block class.
 
     Recomputing a block during the backward pass trades extra compute for a
-    large drop in activation memory, which caps trainable model size.
-    The default policy keeps the big matmul outputs so the recompute stays
-    cheap. Blocks carrying complex intermediates (the S5 mixer) must pass
-    policy=None: saving a residual goes through jax.lax.reduce_precision,
-    which only accepts floating dtypes.
+    large drop in activation memory, which caps trainable model size. The
+    default policy is `saved_through_remat`, which keeps the block's cheap
+    matmul outputs and its attention forward. Blocks carrying complex
+    intermediates (the S5 mixer) must pass policy=None: saving a residual
+    goes through jax.lax.reduce_precision, which only accepts floating dtypes.
 
     `train` selects a Python branch, so it has to stay static; that also means
     callers must pass it positionally for jax to see it as such.
@@ -282,8 +311,7 @@ def remat_block(block_cls, enabled: bool, policy: Optional[str] = 'dots'):
     return nn.remat(
         block_cls,
         static_argnums=tuple(i for i, name in enumerate(names) if name == 'train'),
-        policy=(jax.checkpoint_policies.dots_with_no_batch_dims_saveable
-                if policy == 'dots' else None),
+        policy=(saved_through_remat if policy == 'dots' else None),
     )
 
 
