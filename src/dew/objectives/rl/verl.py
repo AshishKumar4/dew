@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 
 from .episodes import Episode
-from .records import episode_from_record, episode_record, integer, object_record, sequence
+from .records import episode_from_record, episode_record, integer, object_record, real, sequence
 
 
 def to_verl(episodes: Sequence[Episode]) -> list[dict[str, object]]:
@@ -62,8 +62,8 @@ def from_verl(rows: Sequence[Mapping[str, object]]) -> tuple[Episode, ...]:
                 extra = object_record(object_record(row["extra_fields"])["dew"])
                 if extra["episode"] != header or integer(extra["turn"]) != index or extra["turns"] != count:
                     raise ValueError("verl rows must contain contiguous complete episode turns")
-                response = sequence(row["response_ids"])
-                mask = sequence(row["response_mask"])
+                response = sequence(row["response_ids"], integer)
+                mask = sequence(row["response_mask"], integer)
                 if tuple(mask) != (1,) * len(response):
                     raise ValueError("verl call rows must mask only the recorded model actions")
                 if count == 0:
@@ -72,7 +72,7 @@ def from_verl(rows: Sequence[Mapping[str, object]]) -> tuple[Episode, ...]:
                     continue
                 action = dict(object_record(extra["action"]))
                 action.update(context=row["prompt_ids"], tokens=response,
-                              behavior_log_probs=sequence(row["response_logprobs"]))
+                              behavior_log_probs=sequence(row["response_logprobs"], real))
                 if row["reward_score"] != header["reward"]:
                     raise ValueError("verl reward_score disagrees with the episode reward")
                 transitions.append({"action": action, "observation": extra["observation"]})

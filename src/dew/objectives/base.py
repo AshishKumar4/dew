@@ -24,7 +24,7 @@ from flax import struct
 from jax.tree_util import Partial
 from typing_extensions import TypeVar
 
-from dew.artifacts import Artifacts
+from dew.artifacts import Artifact, Artifacts
 
 if TYPE_CHECKING:
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -364,8 +364,9 @@ class Metric(Protocol[S]):
         """The scoring artifact type this metric reads."""
         ...
 
-    def __call__(self, artifact: Any, batch: Batch, /) -> S:
-        """One complete batch's sufficient statistics."""
+    def __call__(self, artifact: Artifact, batch: Batch, /) -> S:
+        """One complete batch's sufficient statistics, out of the scoring
+        artifact `reads` names."""
         ...
 
     def merge(self, accumulated: S, contribution: S, /) -> S:

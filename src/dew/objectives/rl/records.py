@@ -1,10 +1,12 @@
 """JSON-compatible episode records for interchange and turn-boundary recovery."""
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
+from typing import TypedDict
 
 from dew.sampling.text import Sampling
+from dew.telemetry.records import JSON
 
 from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Transition
 
@@ -15,10 +17,11 @@ def object_record(value: object) -> Mapping[str, object]:
     return value
 
 
-def sequence(value: object) -> Sequence[object]:
+def sequence[ItemT](value: object, read: Callable[[JSON], ItemT]) -> tuple[ItemT, ...]:
+    """Every entry of a JSON array, each one through `read`."""
     if not isinstance(value, (list, tuple)):
         raise ValueError("episode field must be an array")
-    return value
+    return tuple(read(entry) for entry in value)
 
 
 def integer(value: object) -> int:
@@ -39,49 +42,71 @@ def text(value: object) -> str:
     return value
 
 
-def observation_record(value: object) -> Observation:
+def observation_record(value: Mapping[str, object]) -> Observation:
     record = object_record(value)
-    return Observation(tuple(integer(token) for token in sequence(record["context"])),
+    return Observation(sequence(record["context"], integer),
                        EpisodeStatus(integer(record["status"])), text(record["detail"]))
 
 
-def action_record(value: object) -> Action:
+def action_record(value: Mapping[str, object]) -> Action:
     record = object_record(value)
     controls = object_record(record["sampling"])
     eos, top_k = controls["eos_id"], controls["top_k"]
     sampling = Sampling(temperature=real(controls["temperature"]),
                         top_k=None if top_k is None else integer(top_k),
-                        eos_id=None if eos is None else tuple(integer(token) for token in sequence(eos)),
+                        eos_id=None if eos is None else sequence(eos, integer),
                         pad_id=integer(controls["pad_id"]), top_p=real(controls["top_p"]),
                         min_p=real(controls["min_p"]))
     terminated = record["terminated"]
     if not isinstance(terminated, bool):
         raise ValueError("episode terminated must be a boolean")
-    return Action(tuple(integer(token) for token in sequence(record["context"])),
-                  tuple(integer(token) for token in sequence(record["tokens"])),
-                  tuple(real(value) for value in sequence(record["raw_log_probs"])),
-                  tuple(real(value) for value in sequence(record["behavior_log_probs"])),
+    return Action(sequence(record["context"], integer),
+                  sequence(record["tokens"], integer),
+                  sequence(record["raw_log_probs"], real),
+                  sequence(record["behavior_log_probs"], real),
                   terminated, integer(record["policy_step"]), sampling,
                   _binding_id=text(record["_binding_id"]))
 
 
-def episode_record(episode: Episode) -> dict[str, object]:
+class EpisodeFields(TypedDict, total=False):
+    """Every field of `Episode` a record carries, under the field's own name.
+
+    The keys are the dataclass's own init fields, which
+    `tests/test_verl_episodes.py` pins, so a field renamed there is a failing
+    test here rather than a key a reader never looks for. The nested records
+    are what `asdict` made of the identity, the observations and the turns,
+    and `to_verl` takes the turns back out of its copy, so this is a dict and
+    not a frozen mapping. Every key is written, and an exporter that drops one
+    is what `total=False` states.
+    """
+
+    identity: Mapping[str, object]
+    policy_step: int
+    initial: Mapping[str, object] | None
+    transitions: tuple[Mapping[str, object], ...]
+    status: EpisodeStatus
+    detail: str
+    reward: float | None
+    _binding_id: str
+
+
+def episode_record(episode: Episode) -> EpisodeFields:
     """Retain exact turns, observations, likelihoods and private collection origin."""
-    return asdict(episode)
+    return EpisodeFields(**asdict(episode))
 
 
-def episode_from_record(value: object) -> Episode:
+def episode_from_record(value: Mapping[str, object]) -> Episode:
     """Read an episode without reconstructing actions from rendered text."""
     record = object_record(value)
     identity = object_record(record["identity"])
     initial, reward = record["initial"], record["reward"]
-    transitions = []
-    for entry in sequence(record["transitions"]):
-        transition = object_record(entry)
-        transitions.append(Transition(action_record(transition["action"]),
-                                      observation_record(transition["observation"])))
+    transitions = tuple(
+        Transition(action_record(object_record(turn["action"])),
+                   observation_record(object_record(turn["observation"])))
+        for turn in sequence(record["transitions"], object_record))
     return Episode(EpisodeId(integer(identity["task"]), integer(identity["attempt"]),
-                             integer(identity["sample"]), tuple(integer(token) for token in sequence(identity["seed"]))),
-                   integer(record["policy_step"]), None if initial is None else observation_record(initial),
-                   tuple(transitions), EpisodeStatus(integer(record["status"])), text(record["detail"]),
+                             integer(identity["sample"]), sequence(identity["seed"], integer)),
+                   integer(record["policy_step"]),
+                   None if initial is None else observation_record(object_record(initial)),
+                   transitions, EpisodeStatus(integer(record["status"])), text(record["detail"]),
                    None if reward is None else real(reward), _binding_id=text(record["_binding_id"]))
