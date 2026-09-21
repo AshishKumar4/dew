@@ -217,7 +217,7 @@ def behavior_importance_weights(old_log_probs: jax.Array, behavior_log_probs: ja
     or rejection sampling is implied. Token TIS and filtered sampling do
     not recover an unbiased full-trajectory raw-policy expectation.
     """
-    if isinstance(cap, bool) or not cap > 0:
+    if type(cap) is bool or not cap > 0:
         raise ValueError("behavior importance cap must be positive")
     ratio = token_log_ratio(old_log_probs, behavior_log_probs)
     weights = jnp.where(mask != 0, jnp.exp(ratio) * mask, 0)

@@ -275,6 +275,7 @@ def probes(module: Module) -> Iterator[Finding]:
                for node in ast.walk(module.tree) if isinstance(node, ast.Import)
                for alias in node.names}
     document = ast.get_docstring(module.tree) or ""
+    unions = _union_aliases(module.tree)
     for function in [None, *(node for node in ast.walk(module.tree)
                              if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef
                                            | ast.Lambda))]:
@@ -282,7 +283,7 @@ def probes(module: Module) -> Iterator[Finding]:
             own = ast.get_docstring(function) or ""
             if function.name.startswith("_") and "boundary" in (own + document).lower():
                 continue
-        declared = _declared(function)
+        declared = _declared(function, unions)
         for node in _own(function or module.tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -308,8 +309,15 @@ def probes(module: Module) -> Iterator[Finding]:
                                   f"selects a path its own type already decided")
 
 
-def _declared(function: ast.AST | None) -> dict[str, str]:
-    """Names with a written, non-union annotation in this scope."""
+def _declared(function: ast.AST | None, unions: set[str]) -> dict[str, str]:
+    """Names with a written, non-union annotation in this scope.
+
+    `unions` holds the same-file aliases that resolve to a union, because an
+    isinstance over a union's members is narrowing, not a redundant check. A
+    dotted annotation belongs to another module and is not resolved here, so
+    it is not treated as narrow either: that is the boundary this checker
+    documents rather than guesses across.
+    """
     if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
         return {}
     written: dict[str, ast.expr] = dict(_annotations(function))
@@ -317,13 +325,33 @@ def _declared(function: ast.AST | None) -> dict[str, str]:
         if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             written[node.target.id] = node.annotation
     resolved = {}
+    opaque = {"Any", "object", "Optional", "Union"}
     for name, annotation in written.items():
         if isinstance(annotation, ast.BinOp) or name == "return":
             continue
         spelling = _named(annotation) or _named(getattr(annotation, "value", None))
-        if spelling and spelling.rsplit(".", 1)[-1] not in {"Any", "object", "Optional", "Union"}:
+        if spelling and "." not in spelling and spelling not in unions | opaque:
             resolved[name] = spelling
     return resolved
+
+
+def _union_aliases(tree: ast.Module) -> set[str]:
+    """The module's own aliases whose target is a union of several members."""
+    aliases = set()
+    for node in tree.body:
+        if isinstance(node, ast.TypeAlias) and isinstance(node.name, ast.Name):
+            name, target = node.name.id, node.value
+        elif (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value):
+            name, target = node.target.id, node.value
+        elif (isinstance(node, ast.Assign) and len(node.targets) == 1
+              and isinstance(node.targets[0], ast.Name)):
+            name, target = node.targets[0].id, node.value
+        else:
+            continue
+        head = _named(target) or _named(getattr(target, "value", None))
+        if isinstance(target, ast.BinOp) or head.rsplit(".", 1)[-1] in {"Union", "Optional"}:
+            aliases.add(name)
+    return aliases
 
 
 def names(module: Module) -> Iterator[Finding]:

@@ -39,25 +39,62 @@ if not flags.FLAGS.is_parsed():
 Batch = dict[str, Any]
 
 
+@runtime_checkable
+class Closeable(Protocol):
+    """A stream that holds something a stopped run has to give back: worker
+    processes, file handles, a shared memory block."""
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class Stoppable(Protocol):
+    """A stream that can be asked to stop before it is drained."""
+
+    def request_stop(self) -> None: ...
+
+
+@runtime_checkable
+class Budgeted(Protocol):
+    """A stream that says how long stopping may take. Separate from
+    `Stoppable` because a stream can report a budget without taking a stop
+    request, and the wrapper forwards each on its own."""
+
+    @property
+    def stop_seconds(self) -> float | None: ...
+
+
 class Forwarding:
     """A stream wrapper whose stop signal, stop budget and close are its
     source's. Subclasses keep the source at `_source` and override `close`
     for their own cleanup around `super().close()`."""
 
+    def _forwarded(self) -> object:
+        """The wrapped source, or None before a subclass sets one.
+
+        This is the boundary between the wrapper and whatever it wraps: a
+        subclass declares `_source` with its own stream type, narrower than
+        anything this base could state, and a wrapper may be constructed
+        before it has a source. One lookup lives here so the three hooks
+        below can ask the Stoppable and Closeable protocols instead.
+        """
+        return getattr(self, "_source", None)
+
     def request_stop(self) -> None:
-        request_stop = getattr(getattr(self, "_source", None), "request_stop", None)
-        if request_stop is not None:
-            request_stop()
+        source = self._forwarded()
+        if isinstance(source, Stoppable):
+            source.request_stop()
 
     @property
     def stop_seconds(self) -> float | None:
-        seconds = getattr(getattr(self, "_source", None), "stop_seconds", None)
+        source = self._forwarded()
+        seconds = source.stop_seconds if isinstance(source, Budgeted) else None
         return None if seconds is None else float(seconds)
 
     def close(self) -> None:
-        close = getattr(getattr(self, "_source", None), "close", None)
-        if close is not None:
-            close()
+        source = self._forwarded()
+        if isinstance(source, Closeable):
+            source.close()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -742,9 +779,8 @@ def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
             state = stream.get_state()
             if isinstance(state, bytes) and position.translates(state):
                 return RampedStream(stream, stages)
-        close = getattr(stream, "close", None)
-        if close is not None:
-            close()
+        if isinstance(stream, Closeable):
+            stream.close()
         raise TypeError(
             f"a batch ramp cuts the step out of a global record order, and "
             f"{type(stream).__name__} hands over batches it has cut itself; ramp "

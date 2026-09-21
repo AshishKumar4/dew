@@ -283,7 +283,7 @@ class CanvasDecodeState:
 def _validated(model: DiffusionGemma, process: BlockProcess, inputs: ModelInputs, max_new_tokens: int,
                eos_token_ids: tuple[int, ...], pad_token_id: int, n: int) -> None:
     """Host checks before the compiled loop."""
-    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
+    if type(max_new_tokens) is not int or max_new_tokens < 0:
         raise ValueError("max_new_tokens must be a nonnegative integer")
     if type(n) is not int or n < 1:
         raise ValueError("n must be a positive integer number of continuations")
