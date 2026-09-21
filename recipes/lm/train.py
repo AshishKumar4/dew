@@ -293,7 +293,8 @@ def main(config: LmRunConfig) -> TrainState:
             config.pretrained, config.model, vocab_size, context, meta)
     # run.json records the resolved model as
     # built, vocabulary and context included, so `dew.pipeline` rebuilds it.
-    resolved = {name: value for name, value in fields.items() if name not in ("dtype", "attention_impl")}
+    settings = config.model.precision_settings()
+    resolved = {name: value for name, value in fields.items() if name not in settings}
     if config.objective == "block_diffusion":
         resolved["max_seq_len"] = model.max_seq_len
     config = replace(config, model=replace(config.model, config=resolved))

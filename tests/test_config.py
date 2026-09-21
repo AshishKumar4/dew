@@ -5,17 +5,21 @@ import json
 import os
 from typing import TYPE_CHECKING, Any, Mapping, Optional
 
+import jax
 import jax.numpy as jnp
 import pytest
 import tyro
+from flax import linen as nn
+from flax.typing import Dtype, PrecisionLike
 from test_instrumentation import Regression, batches
 
 import dew.config
 import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.data import Dataset
+from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.registry import Registry, datasets
+from dew.registry import Registry, datasets, models
 from dew.training import Layout, MeshSpec
 
 
@@ -111,6 +115,72 @@ def test_the_model_config_builds_with_the_run_precision():
         params, ids)
     assert logits.dtype == jnp.float32
     assert jnp.array_equal(logits, expected)
+
+
+class PrecisionProbe(nn.Module):
+    """A one-layer model that declares every field the run's precision
+    settings write: the compute dtype and the attention kernel each model
+    takes, and the parameter storage and matmul precision only some do."""
+
+    features: int = 4
+    dtype: Dtype = jnp.float32
+    param_dtype: Dtype = jnp.float32
+    precision: PrecisionLike = None
+    attention_impl: AttentionImpl | None = None
+
+    def setup(self):
+        self.dense = nn.Dense(self.features, dtype=self.dtype,
+                              param_dtype=self.param_dtype, precision=self.precision)
+
+    def __call__(self, x):
+        return self.dense(x)
+
+
+def test_the_run_stores_its_parameters_and_names_its_matmul_precision(monkeypatch):
+    """`--model.param-dtype` and `--model.matmul-precision` reach the fields
+    a model declares for them: the parameters are stored in the dtype the run
+    named, and the precision is the one every Dense of the model asks XLA
+    for. The probe is registered for this test alone, since the model table
+    is what the recipes and the qualification tools iterate."""
+    monkeypatch.setitem(models._members, "precision_probe", PrecisionProbe)
+    config = ModelConfig("precision_probe", {"features": 4}, dtype="float32",
+                         param_dtype="bfloat16", matmul_precision="highest")
+
+    model = config.build()
+    variables = model.init(jax.random.key(0), jnp.ones((1, 3), jnp.float32))
+
+    assert variables["params"]["dense"]["kernel"].dtype == jnp.bfloat16
+    assert model.bind(variables).dense.precision == "highest"
+    assert config.precision_settings() == {
+        "dtype", "attention_impl", "param_dtype", "precision"}
+
+
+def test_a_model_takes_the_precision_settings_it_declares_and_no_others():
+    """A run names storage and precision whatever it trains; each reaches the
+    model only where the model has a field for it. `causal_transformer`
+    declares `precision` and no `param_dtype`, so it takes the one and not
+    the other, and a record keeps neither: the config writes them again."""
+    fields = {"vocab_size": 64, "emb_features": 32, "num_layers": 1, "num_heads": 2}
+    config = ModelConfig("causal_transformer", fields, dtype="float32",
+                         param_dtype="bfloat16", matmul_precision="high")
+
+    built = config.fields()
+
+    assert built["precision"] == "high" and "param_dtype" not in built
+    assert config.precision_settings() == {"dtype", "attention_impl", "precision"}
+    assert config.build().precision == "high"
+    assert ModelConfig("causal_transformer", fields).fields().keys() == {
+        *fields, "dtype", "attention_impl"}
+
+
+def test_a_model_config_that_carries_a_precision_setting_the_run_names_is_refused():
+    """The run owns these fields, so a --model.config that carries one names
+    it twice and is refused with the flag that sets it."""
+    fields = {"vocab_size": 64, "precision": "highest"}
+    with pytest.raises(ValueError, match="--model.matmul-precision"):
+        ModelConfig("causal_transformer", fields, matmul_precision="high").fields()
+    # Unset, the run claims nothing and the config keeps its own precision.
+    assert ModelConfig("causal_transformer", fields).fields()["precision"] == "highest"
 
 
 def test_a_model_config_that_names_the_precision_twice_is_refused():

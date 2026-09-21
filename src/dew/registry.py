@@ -277,31 +277,52 @@ def dtype_name(value: DTypeLike | None) -> DtypeName | None:
     raise ValueError(f"{value!r} is not a dtype a config can name")
 
 
+# The flag each precision field is set by, for the error a model config that
+# carries one of them raises.
+_PRECISION_FLAGS = {"dtype": "--model.dtype", "attention_impl": "--model.attention-impl",
+                    "param_dtype": "--model.param-dtype",
+                    "precision": "--model.matmul-precision"}
+
+
 def with_precision(name: str, config: Mapping[str, Any], *,
-                   dtype: str, attention_impl: str) -> dict[str, Any]:
+                   dtype: str, attention_impl: str, param_dtype: str | None = None,
+                   matmul_precision: str | None = None) -> dict[str, Any]:
     """A model config with the run's compute dtype and attention kernel in it.
 
     `attention_impl` is an `AttentionImpl` and travels as it is written: the
     kernel reads 'reference' as the reference path, so nothing here rewrites
     the name a run recorded into the None a module field also accepts.
 
-    Params stay float32 whatever `dtype` says; it is the compute dtype. The
-    UNets keep per-stage attention settings in `attention_configs`, which do
-    not inherit the model dtype and default `force_fp32_for_softmax` off,
-    which no fused kernel can honour, so the knobs reach into them.
+    `dtype` is the compute dtype; `param_dtype` is where the parameters are
+    stored and `matmul_precision` what every matmul asks XLA for. Those two
+    reach the model only where it declares the field (`param_dtype`,
+    `precision`), so a model that declares neither takes neither and a run
+    that names neither writes neither. Unset, parameters stay float32 and
+    the model keeps its own precision, which is what every run did before
+    the fields existed.
+
+    The UNets keep per-stage attention settings in `attention_configs`,
+    which do not inherit the model dtype and default `force_fp32_for_softmax`
+    off, which no fused kernel can honour, so the knobs reach into them.
 
     A stage arrives either way: as a record, whose `dtype` name `build`
     resolves at the boundary with every other field, or as a built `Stage`,
     which nothing resolves afterwards, so its dtype is resolved here. The two
     agree once built, which `tests/test_models.py` asserts.
     """
-    duplicate = sorted(set(config) & {"dtype", "attention_impl"})
+    member = models[name]
+    declared = {f.name for f in dataclasses.fields(member) if f.init}
+    written = {"dtype": dtype, "attention_impl": attention_impl}
+    if param_dtype is not None and "param_dtype" in declared:
+        written["param_dtype"] = param_dtype
+    if matmul_precision is not None and "precision" in declared:
+        written["precision"] = matmul_precision
+    duplicate = sorted(set(config) & set(written))
     if duplicate:
         raise ValueError(
             f"the model config carries {duplicate}, which the run's precision "
-            "settings own; set --model.dtype and --model.attention-impl instead")
-    member = models[name]
-    fields = {**config, "dtype": dtype, "attention_impl": attention_impl}
+            f"settings own; set {', '.join(_PRECISION_FLAGS[held] for held in duplicate)} instead")
+    fields = {**config, **written}
     stages = {f.name: f for f in dataclasses.fields(member)}.get("attention_configs")
     if stages is not None:
         fields["attention_configs"] = [
