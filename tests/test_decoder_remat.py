@@ -37,7 +37,7 @@ from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training.distributed import Layout, MeshSpec, build_mesh, shard_batch
 from dew.training.state import TrainState
-from dew.training.trainer import write_back
+from dew.training.transaction import write_back
 
 
 SHAPES = {
