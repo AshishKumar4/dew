@@ -75,7 +75,9 @@ def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
     return (jax.nn.logsumexp(logits, axis=-1),
             jnp.where(inside, picked, 0.0),
             jnp.max(logits, axis=-1),
-            jnp.argmax(logits, axis=-1) + start)
+            # A vocabulary column is int32 whatever the run's default integer
+            # width; argmax widens to int64 under x64.
+            jnp.argmax(logits, axis=-1).astype(jnp.int32) + start)
 
 
 def _over_tiles(carry, count: int, width: int, body: Callable):
