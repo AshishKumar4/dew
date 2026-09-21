@@ -8,12 +8,14 @@ cross-host device_put between different device sets (dispatch.py:488-516).
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 
+from dew.objectives.base import Variables
 from dew.training.distributed import Placement
 
 
@@ -67,6 +69,57 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
             "CPU transaction execution requires distributed CPU collectives; configure "
             "JAX_CPU_COLLECTIVES_IMPLEMENTATION=gloo (or MPI) before backend initialization") from error
     return mesh
+
+
+def stream(tree: Variables, placement, held: Variables | None = None) -> Variables:
+    """`tree` moved into `placement` one leaf at a time, each source let go as its copy lands.
+
+    A leaf is placed and the tree's own node updated before the next leaf
+    is read, so at most one leaf is held twice. `held` is the tree the
+    sources came from, the one an objective keeps and hands the trainer as
+    data: a dict node of it that holds a placed source is updated to the
+    placed array, so what the objective holds afterwards is what the state
+    holds, and the source copy is released rather than kept beside it. A
+    node that is not a dict is left as it is. Every dict node of `tree` is
+    updated in place, so the caller's other references to it see the placed
+    arrays too.
+    """
+    holders: dict[int, list[tuple[dict, object]]] = {}
+
+    def index(node):
+        if not isinstance(node, dict):
+            return
+        for name, child in node.items():
+            if isinstance(child, Mapping):
+                index(child)
+            else:
+                holders.setdefault(id(child), []).append((node, name))
+
+    if held is not None:
+        index(held)
+
+    def placed(value, target):
+        if isinstance(value, jax.Array) and (isinstance(value.sharding, NamedSharding)
+                                             or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
+            return transfer(value, target)
+        # A host array, or one device's: each process cuts its own shards
+        # out of it, so a sharded placement lands sharded.
+        source = np.asarray(value)
+        return jax.make_array_from_callback(source.shape, target, lambda index: source[index])
+
+    def place_dict(node, target):
+        for name in list(node):
+            child, wanted = node[name], target[name]
+            if isinstance(child, dict):
+                place_dict(child, wanted)
+                continue
+            landed = placed(child, wanted)
+            for holder, key in holders.get(id(child), ()):
+                holder[key] = landed
+            node[name] = landed
+
+    place_dict(tree, placement)
+    return tree
 
 
 def transfer(tree, placement: Placement):

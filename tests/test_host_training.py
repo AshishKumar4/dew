@@ -525,3 +525,21 @@ def test_frozen_leaves_stay_resident_and_snapshots_alias_them(scan):
         state, *_ = step(state, tokens())
     assert _pointers(state.params[FROZEN]) == before
     assert _pointers(state.params["params"]) != _pointers(frozen) and set(state.params["params"]) == {"layers_0", "layers_1"}
+
+def test_place_streams_the_held_tree_and_releases_each_source():
+    """The objective's held leaves become the placed arrays as they land, so
+    the state and the objective share one array per leaf and no numpy copy
+    stays beside it."""
+    model = decoder()
+    held = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+    objective = LMObjective(model, 8, head_chunks=1, pretrained=held,
+                            trainable=lambda path: path[-2:] == ("q_proj", "kernel"))
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
+    state, _, _ = trainer.place()
+    for path, leaf in _named_leaves(held["params"]):
+        assert isinstance(leaf, jax.Array), path
+    assert state.params[FROZEN]["layers_1"]["mlp"]["gate_proj"]["kernel"] is held["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"]
+    assert state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"] is held["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
+    resident = updated(LMObjective(model, 8, head_chunks=1, pretrained=held,
+                                   trainable=lambda path: path[-2:] == ("q_proj", "kernel")), tokens(), DEVICE)
+    close(updated(objective, tokens(), HOST).params, resident.params)
