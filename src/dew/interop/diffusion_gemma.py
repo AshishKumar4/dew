@@ -29,11 +29,11 @@ from dew.objectives.base import Variables
 from dew.registry import with_precision
 
 
-def _section(config: Mapping[str, object], name: str) -> dict[str, object]:
+def _section(config: Mapping[str, object], name: str) -> Mapping[str, object]:
     value = config[name]
     if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
         raise ValueError(f"{name} must be a string-keyed configuration record")
-    return dict(value)
+    return value
 
 
 def _integer(config: Mapping[str, object], name: str, default: int | None = None) -> int:
@@ -50,7 +50,7 @@ def _number(config: Mapping[str, object], name: str, default: float) -> float:
     return float(value)
 
 
-def text_config(config: Mapping[str, object]) -> dict[str, object]:
+def text_config(config: Mapping[str, object]) -> Mapping[str, object]:
     if config.get("model_type") != "diffusion_gemma":
         raise ValueError("the DiffusionGemma assembly requires a diffusion_gemma wrapper")
     return _section(config, "text_config")

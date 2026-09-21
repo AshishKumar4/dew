@@ -21,6 +21,8 @@ from typing import Literal, Protocol, Self, runtime_checkable
 
 import jax
 
+from dew.telemetry.records import JSON
+
 
 @runtime_checkable
 class _Converter(Protocol):
@@ -28,7 +30,7 @@ class _Converter(Protocol):
 
     def xspace_to_tool_data(
         self, paths: Sequence[str], tool: str, params: Mapping[str, object]
-    ) -> tuple[object, str]: ...
+    ) -> tuple[bytes | str | None, str]: ...
 
 
 _active: Profiler | None = None
@@ -58,10 +60,10 @@ def _drain() -> None:
     jax.effects_barrier()
 
 
-def _reports(directory: Path, converter: _Converter, metadata: dict[str, object]) -> None:
+def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) -> None:
     paths = sorted(directory.glob("plugins/profile/*/*.xplane.pb"))
     failures: list[Exception] = []
-    records: list[dict[str, object]] = []
+    records: list[JSON] = []
     metadata["reports"] = records
     reports = directory / "reports"
     reports.mkdir()
@@ -80,7 +82,7 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, object]
             failures.append(error)
             continue
         for tool in tools:
-            record: dict[str, object] = {"tool": tool, "session": str(session.relative_to(directory))}
+            record: dict[str, JSON] = {"tool": tool, "session": str(session.relative_to(directory))}
             records.append(record)
             if tool in ("graph_viewer", "memory_viewer", "trace_viewer@", "trace_viewer"):
                 record.update(status="interactive", reason="Use the native XProf viewer and retained trace/HLO files")
@@ -91,7 +93,7 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, object]
                 failures.append(error)
                 continue
             groups = [[host] for host in hosts] if tool == "memory_profile" else [hosts]
-            artifacts: list[str] = []
+            artifacts: list[JSON] = []
             record["artifacts"] = artifacts
             record["status"] = "completed"
             for host_index, group in enumerate(groups):
@@ -113,7 +115,9 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, object]
                 except Exception as error:
                     record.update(status="error", error=str(error))
                     failures.append(error)
-    metadata["artifacts"] = [str(path.relative_to(directory)) for path in sorted(directory.rglob("*")) if path.is_file()]
+    written: list[JSON] = [str(path.relative_to(directory))
+                           for path in sorted(directory.rglob("*")) if path.is_file()]
+    metadata["artifacts"] = written
     metadata["export_status"] = "failed" if failures else "completed"
     (directory / "manifest.json").write_text(json.dumps(metadata, indent=2) + "\n")
     if failures:
@@ -135,7 +139,7 @@ class Profiler:
         self._options = options
         self._capture: Path | None = None
         self._converter: _Converter | None = None
-        self._metadata: dict[str, object] = {}
+        self._metadata: dict[str, JSON] = {}
         self._temporary = directory is None
         self._phase: Literal["starting", "running", "stopping"] | None = None
 
@@ -176,7 +180,7 @@ class Profiler:
                 root = root / f"process-{rank}"
             root.mkdir(parents=True, exist_ok=True)
             capture = Path(tempfile.mkdtemp(prefix="capture-", dir=root))
-            metadata: dict[str, object] = {
+            metadata: dict[str, JSON] = {
                 "versions": {name: version(name) for name in ("jax", "jaxlib", "xprof")},
                 "backend": backend, "devices": [str(device) for device in jax.local_devices()],
                 "device_kinds": [device.device_kind for device in jax.local_devices()],

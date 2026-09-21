@@ -39,7 +39,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path as FilePath
-from typing import ClassVar
+from typing import ClassVar, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -318,7 +318,26 @@ def _pattern(patterns: Mapping[str, object], relative: str) -> str:
     return next((key for key in patterns if re.match(rf"(.*\.)?({key})$", relative)), relative)
 
 
-def _config(lora: LoRA, named: Mapping[str, Target]) -> dict[str, object]:
+class PeftConfig(TypedDict):
+    """`adapter_config.json` as PEFT writes and reads it: the defaults every
+    target takes, the per-module exceptions, and the flags whose values dew
+    fixes because its adapters are built one way."""
+
+    peft_type: str
+    r: int
+    lora_alpha: float
+    rank_pattern: dict[str, int]
+    alpha_pattern: dict[str, float]
+    target_modules: list[str]
+    use_rslora: bool
+    lora_dropout: float
+    fan_in_fan_out: bool
+    bias: str
+    init_lora_weights: bool
+    inference_mode: bool
+
+
+def _config(lora: LoRA, named: Mapping[str, Target]) -> PeftConfig:
     """The PEFT config of `named` targets, keyed by the relative module name;
     the commonest rank and alpha are the defaults, the rest the patterns."""
     ranks = [target.rank for target in named.values()]
