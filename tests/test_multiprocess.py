@@ -35,6 +35,8 @@ pytestmark = pytest.mark.mesh
 
 import multiprocess_worker as worker
 
+from dew.position import ENVELOPE
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("multiprocess_worker.py")
 
@@ -557,7 +559,7 @@ def elastic_checkpoint(tmp_path_factory):
                        records=RECORDS)
     positions = {report["dataset_state"] for report in reports}
     assert len(positions) == 1, "the processes saved different global positions"
-    saved = json.loads(positions.pop())[worker.ENVELOPE]
+    saved = json.loads(positions.pop())[ENVELOPE]
     assert saved["records"] == POOL_STEPS * worker.BATCH
     return {"run_dir": directory / "run", "reports": reports}
 
@@ -588,7 +590,7 @@ def test_a_pool_position_resumes_on_another_process_count(tmp_path, elastic_chec
 
     for index, report in enumerate(resumed):
         assert report["restored_step"] == POOL_STEPS
-        assert json.loads(report["restored_dataset_state"])[worker.ENVELOPE]["records"] == (
+        assert json.loads(report["restored_dataset_state"])[ENVELOPE]["records"] == (
             POOL_STEPS * worker.BATCH)
         assert report["step"] == 2 * POOL_STEPS
         assert report["dataset_state"] == whole[index]["dataset_state"]
@@ -609,7 +611,7 @@ def packed_checkpoint(tmp_path_factory):
                        tokens=corpus, seq_len=PACKED_SEQ_LEN)
     positions = {report["dataset_state"] for report in reports}
     assert len(positions) == 1, "the processes saved different global positions"
-    saved = json.loads(positions.pop())[worker.ENVELOPE]
+    saved = json.loads(positions.pop())[ENVELOPE]
     assert saved["records"] == POOL_STEPS * worker.BATCH
     assert "PackedWindows" in saved["order"], "the order has to name the packing"
     return {"run_dir": directory / "run", "corpus": corpus, "reports": reports}
@@ -640,7 +642,7 @@ def test_a_packed_pool_position_resumes_on_another_process_count(tmp_path,
 
     for index, report in enumerate(resumed):
         assert report["restored_step"] == POOL_STEPS
-        assert json.loads(report["restored_dataset_state"])[worker.ENVELOPE]["records"] == (
+        assert json.loads(report["restored_dataset_state"])[ENVELOPE]["records"] == (
             POOL_STEPS * worker.BATCH)
         assert report["step"] == 2 * POOL_STEPS
         assert report["windows"] == whole[index]["windows"][POOL_STEPS:], (
