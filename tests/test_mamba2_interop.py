@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file
 
-from dew.interop.mamba2 import config_from_hf, translate, weight_path
+from dew.interop.mamba2 import config_from_hf, export_path, translate, weight_path
+from dew.interop.pretrained import load_pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
@@ -120,3 +121,25 @@ def test_a_tied_head_is_checked_and_dropped(hf_config, tensors):
 def test_the_source_pins_the_reference():
     source = json.loads((FIXTURE / "source.json").read_text())
     assert source["transformers"]["version"] == "5.16.1"
+
+
+def test_export_path_inverts_weight_path(hf_config, tensors):
+    """Every fixture tensor's place maps back to its own name, and the tied
+    head's copy is the one name with no place and no export."""
+    config = config_from_hf(hf_config)
+    for name in tensors:
+        path = weight_path(name, config)
+        if path is None:
+            assert export_path("lm_head.kernel", config) is None
+            continue
+        assert export_path(".".join(path[1:]), config) == name
+
+
+def test_the_public_loader_reads_the_fixture(tensors):
+    """`load_pretrained` dispatches the `mamba2` model type through the
+    decoder family table and reproduces the reference logits."""
+    source = load_pretrained(FIXTURE, dtype="float32", attention_impl="reference")
+    ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
+    logits = source.model.apply(source.variables, ids)
+    reference = np.load(FIXTURE / "logits.npy")
+    assert largest(logits, reference) < 1e-5
