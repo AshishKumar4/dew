@@ -22,7 +22,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import from_record, towers
 
-from .attention import RMSNorm
+from .attention import LayerNorm, RMSNorm
 from .sharding import logical_axes
 from .text_encoders import checkpoint_array
 from .vision import TowerBase, TowerGeometry
@@ -212,7 +212,7 @@ class AudioSubsampleLayer(nn.Module):
         if self.cumulative:
             x = CumulativeGroupNorm(self.norm_eps, name="norm")(x)
         else:
-            x = nn.LayerNorm(epsilon=self.norm_eps, use_bias=False, dtype=self.dtype,
+            x = LayerNorm(epsilon=self.norm_eps, use_bias=False, dtype=self.dtype,
                              name="norm")(x)
         return jax.nn.relu(x), _every_nth_frame(mask, self.stride[0])[:, :x.shape[1]]
 

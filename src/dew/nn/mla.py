@@ -37,6 +37,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.scipy.special import xlogy
 
 from dew.nn.attention import (
+    LayerNorm,
     RMSNorm,
     _cache_positions,
     _write_cache,
@@ -346,7 +347,7 @@ class SparseIndexer(nn.Module):
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6: the reference
         # names no config for it (modeling_deepseek_v32.py, DeepseekV32Indexer).
-        self.k_norm = nn.LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
+        self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
         self.weights_proj = dense(self.n_heads, name='weights_proj')
 
     def keys(self, hidden):

@@ -43,7 +43,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.nn.attention import normalized_in_fp32, scaled_dot_product_attention
+from dew.nn.attention import LayerNorm, normalized_in_fp32, scaled_dot_product_attention
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
@@ -194,7 +194,7 @@ class CLIPTextTransformer(nn.Module):
                 layer_norm_eps=self.layer_norm_eps, dtype=self.dtype, activation=self.activation,
                 precision=self.precision, name=f"layers_{index}")
             for index in range(self.num_layers)]
-        self.final_layer_norm = nn.LayerNorm(
+        self.final_layer_norm = LayerNorm(
             epsilon=self.layer_norm_eps, dtype=self.dtype, name="final_layer_norm")
 
     def __call__(self, input_ids, attention_mask=None) -> CLIPTowerOutput:

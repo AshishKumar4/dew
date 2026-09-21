@@ -21,7 +21,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import rotary_freqs
+from ..attention import LayerNorm, rotary_freqs
 from ..dit import ROPE_THETA, ModulatedBlock, PatchSequenceEmbed, build_block_pattern, scan_ordered_pos_embed
 from ..sharding import logical_axes
 
@@ -171,7 +171,7 @@ class JepaEncoder(nn.Module):
             norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
             attention_impl=self.attention_impl,
         )
-        self.norm = nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
+        self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
 
     def __call__(self, x, token_idx=None, train: bool = False):
         tokens, _ = self.embed(x)
@@ -223,7 +223,7 @@ class JepaVideoEncoder(nn.Module):
             norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
             attention_impl=self.attention_impl,
         )
-        self.norm = nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
+        self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
 
     def __call__(self, x, token_idx=None, train: bool = False):
         B, T, H, W, C = x.shape
@@ -277,7 +277,7 @@ class JepaPredictor(nn.Module):
             norm_epsilon=self.norm_epsilon, qk_norm=self.qk_norm,
             attention_impl=self.attention_impl,
         )
-        self.norm = nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
+        self.norm = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")
         self.proj_out = nn.Dense(features=self.emb_features, dtype=self.dtype,
                                  precision=self.precision, name="proj_out")
 

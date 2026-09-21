@@ -27,7 +27,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.diffusion.process import DenoisingCondition
-from dew.nn.attention import RMSNorm, scaled_dot_product_attention
+from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.sharding import logical_axes
 from dew.registry import models
@@ -173,7 +173,7 @@ class _FeedForward(nn.Module):
 
 def _layer_norm(dtype):
     """The source's `LayerNorm(elementwise_affine=False, eps=1e-6)`."""
-    return nn.LayerNorm(epsilon=1e-6, use_scale=False, use_bias=False, dtype=dtype)
+    return LayerNorm(epsilon=1e-6, use_scale=False, use_bias=False, dtype=dtype)
 
 
 class SD3Block(nn.Module):

@@ -43,7 +43,13 @@ from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from .attention import RMSNorm, causal_attention_mask, max_attention_logits, scaled_dot_product_attention
+from .attention import (
+    LayerNorm,
+    RMSNorm,
+    causal_attention_mask,
+    max_attention_logits,
+    scaled_dot_product_attention,
+)
 from .inputs import AttentionMetadata, PredictionPhase
 from .mixers import MixerBase, MixerContext, mixers
 from .mla import INDEXER, open_expanded_cache
@@ -108,7 +114,7 @@ class KPoolIndexer(nn.Module):
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6 (modeling_glm5_next.py:763).
-        self.k_norm = nn.LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
+        self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
         self.weights_proj = dense(self.n_heads, name='weights_proj')
         self.index_kpool_compress_ape = self.param(
             'index_kpool_compress_ape', nn.initializers.zeros, (self.kpool, self.head_dim), jnp.float32)
