@@ -8,6 +8,27 @@ tokenizer on first use, so a host without the hub cache still imports
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from jax.typing import ArrayLike
+
+
+@runtime_checkable
+class TokenArray(Protocol):
+    """Ids held as an array rather than a list.
+
+    numpy's and jax's arrays both hand their ids over through `tolist`, and
+    a decode takes either beside a plain sequence, because a sampler returns
+    a row of a device array and a caller writes a list. A row has a length;
+    the scalars `ArrayLike` also covers hand over a single id and have none.
+    """
+
+    def __len__(self) -> int: ...
+
+    def tolist(self) -> list[int]: ...
+
 
 class ByteTokenizer:
     """Vocabulary 256, one id per utf-8 byte of the text.
@@ -25,10 +46,11 @@ class ByteTokenizer:
     def encode(self, text: str) -> list[int]:
         return list(text.encode("utf-8"))
 
-    def decode(self, ids) -> str:
-        if hasattr(ids, "tolist"):
-            ids = ids.tolist()
-        return bytes(int(i) for i in ids).decode("utf-8", errors="replace")
+    def decode(self, ids: ArrayLike | Sequence[int]) -> str:
+        values = ids.tolist() if isinstance(ids, TokenArray) else ids
+        if not isinstance(values, Sequence):
+            raise TypeError("decode takes a row of token ids, not one id")
+        return bytes(int(i) for i in values).decode("utf-8", errors="replace")
 
     def __repr__(self):
         return self.__class__.__name__ + "()"
@@ -68,10 +90,8 @@ class HFTokenizer:
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)
 
-    def decode(self, ids) -> str:
-        if hasattr(ids, "tolist"):
-            ids = ids.tolist()
-        return self.tokenizer.decode(ids)
+    def decode(self, ids: ArrayLike | Sequence[int]) -> str:
+        return self.tokenizer.decode(ids.tolist() if isinstance(ids, TokenArray) else ids)
 
     def save_pretrained(self, directory) -> None:
         """Write this tokenizer's own files into an export directory.

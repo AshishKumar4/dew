@@ -130,7 +130,7 @@ class LoRA:
         applied on a subtree.
         """
         base = type(model)
-        if hasattr(base, "_dew_lora_interceptor"):
+        if isinstance(base, _Adapted):
             raise ValueError("The model is already adapted")
         branch = self._branch(root)
 
@@ -633,6 +633,18 @@ def save(model: nn.Module, variables: Variables, layouts: Mapping[str, WeightLay
                 for field, value in _config(lora, targets).items()}
     write_file(tensors, path / DIFFUSERS_WEIGHTS,
                {"format": "pt", DIFFUSERS_METADATA: json.dumps(metadata, indent=2, sort_keys=True)})
+
+
+@runtime_checkable
+class _Adapted(Protocol):
+    """A module class `adapt` already wrapped.
+
+    The wrapper subclass declares the interceptor its `apply` and `init` run
+    under, which is the whole record that a class was adapted: a second
+    adapter over it would run one branch inside the other.
+    """
+
+    _dew_lora_interceptor: ClassVar[Interceptor]
 
 
 @runtime_checkable

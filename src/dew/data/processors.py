@@ -3,6 +3,19 @@ into the arrays a batch carries. They run inside grain's workers, so the
 device only sees ready tensors. `transformers` is imported on construction,
 not on import."""
 
+from typing import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class Sampled(Protocol):
+    """A feature extractor that states the rate it expects its audio at.
+
+    Whisper's and wav2vec2's do; one that states none is read at the 16 kHz
+    every released speech model here is trained on.
+    """
+
+    sampling_rate: int
+
 
 class AutoTextTokenizer:
     """The CLIP tokenizer, padded and truncated to the model's context."""
@@ -37,7 +50,8 @@ class AutoAudioProcessor:
         from transformers import AutoFeatureExtractor
         self.processor = AutoFeatureExtractor.from_pretrained(modelname)
         self.tensor_type = tensor_type
-        self.sampling_rate = sampling_rate or getattr(self.processor, "sampling_rate", 16000)
+        stated = self.processor.sampling_rate if isinstance(self.processor, Sampled) else 16000
+        self.sampling_rate = sampling_rate or stated
 
     def __call__(self, audio):
         features = self.processor(audio, sampling_rate=self.sampling_rate,

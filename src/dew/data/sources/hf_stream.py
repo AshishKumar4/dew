@@ -107,18 +107,15 @@ def refusal(rows: IterableDataset, *, shuffled: bool, given: bool) -> str | None
     whether dew shuffled the stream, whether a caller supplied it and dew
     therefore does not know what it has been through, and whether `datasets`
     implements the state pair for its source at all, which is what calling
-    `state_dict` once answers.
+    `state_dict` once answers: `IterableDataset` declares the pair, and a
+    source that cannot keep one raises from it rather than returning a state.
     """
     if shuffled:
         return SHUFFLED
     if given:
         return GIVEN
-    state = getattr(rows, "state_dict", None)
-    load = getattr(rows, "load_state_dict", None)
-    if state is None or load is None:
-        return UNSUPPORTED
     try:
-        state()
+        rows.state_dict()
     except (NotImplementedError, AttributeError, TypeError, KeyError):
         return UNSUPPORTED
     return None
