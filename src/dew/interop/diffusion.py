@@ -163,7 +163,7 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         cosine_first=_boolean(config.get("flip_sin_to_cos", True), "flip_sin_to_cos"),
         dropout=_number(config.get("dropout", 0), "dropout"), norm_groups=groups, norm_epsilon=epsilon,
         attention_norm_epsilon=1e-5 if flax_semantics else 1e-6, approximate_gelu=flax_semantics,
-        dtype=resolve_dtype(dtype), attention_impl=None if attention_impl == "reference" else attention_impl)
+        dtype=resolve_dtype(dtype), attention_impl=attention_impl)
 
 
 def _unet_path(name: str, rank: int) -> tuple[str, ...]:
@@ -313,7 +313,7 @@ def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float
         sample_size=_integer(config["sample_size"], "sample_size"),
         pos_embed_max_size=_integer(config["pos_embed_max_size"], "pos_embed_max_size"),
         dual_attention_layers=tuple(dual), qk_norm=qk_norm, dtype=resolve_dtype(dtype),
-        attention_impl=None if attention_impl == "reference" else attention_impl)
+        attention_impl=attention_impl)
 
 
 _SD3_EMBEDDERS = {
@@ -440,7 +440,7 @@ def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         pooled_projection_dim=_integer(config["pooled_projection_dim"], "pooled_projection_dim"),
         guidance_embeds=_boolean(config.get("guidance_embeds", False), "guidance_embeds"),
         axes_dims_rope=tuple(axes), dtype=resolve_dtype(dtype),
-        attention_impl=None if attention_impl == "reference" else attention_impl)
+        attention_impl=attention_impl)
 
 
 _FLUX_EMBEDDERS = {
