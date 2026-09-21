@@ -4125,6 +4125,8 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> dict
                            'hc_sinkhorn_iters': _record_int(hf_config, 'hc_sinkhorn_iters', 20),
                            'head': 'weighted'},
     )
+    if depth:
+        config['mtp_hyper_connections'] = {**config['hyper_connections']}
     return config
 
 

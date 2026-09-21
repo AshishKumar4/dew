@@ -146,9 +146,9 @@ def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None
         produced.append(out)
         held = jnp.zeros_like(upstream[:, 0]) if head is None else head
         predecessor_ready = jnp.any(valid & (ordinal >= depth), axis=1)
-        tails.append(jnp.where(predecessor_ready[:, None],
-                               jnp.take_along_axis(upstream, last[:, None, None], axis=1)[:, 0],
-                               held))
+        tail = upstream[jnp.arange(upstream.shape[0]), last]
+        mask = predecessor_ready.reshape((predecessor_ready.shape[0],) + (1,) * (tail.ndim - 1))
+        tails.append(jnp.where(mask, tail, held))
         upstream = out
     return state, produced, tuple(tails)
 
