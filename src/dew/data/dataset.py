@@ -58,6 +58,13 @@ type Tokenize = Callable[[Sequence[str]], Batch]
 conditions want out. The dataset carries the text, the encoder behind this
 decides what tokens it becomes."""
 
+type GrainDataset = pygrain.MapDataset[Batch] | pygrain.IterDataset[Batch]
+"""A grain pipeline a caller built: read by index, or read as it comes.
+`Dataset.from_grain` takes either, and which of the two it is decides what a
+saved position can be. Its elements are one example's fields, the shape
+`Batch` names, because grain stacks them into a batch of those same
+fields."""
+
 type Records = pygrain.RandomAccessDataSource[object]
 """A source the loaders read by index. A record is whatever the source
 holds, which is a mapping of fields for every dataset dew writes and, for a
@@ -297,6 +304,56 @@ class Dataset:
     records: int | None
     batch: int
     ramp: Ramp | None = None
+
+    @classmethod
+    def from_grain(cls, train: GrainDataset, *, batch: int,
+                   validation: GrainDataset | None = None,
+                   records: int | None = None,
+                   loading: Loading = Loading()) -> Dataset:
+        """A run over grain datasets a caller built themselves.
+
+        The order, the shuffle and what a record becomes are the caller's;
+        what this adds is what every spec's `load` adds, through the same
+        helpers: the per-process batch, whole batches only, and the state
+        pair a checkpoint saves.
+
+        A `MapDataset` is read by index, so it gets the training stream
+        every spec gets: endlessly repeated, cut into this process's share,
+        and saved as one global record count that resumes on any process
+        count. An `IterDataset` is read as it comes, so it is batched where
+        it is and reports grain's own iterator state, which `dew.checkpoints`
+        will only restore into the process count that wrote it.
+
+        `records` is the records of one pass, which `steps_per_epoch`
+        divides; it defaults to a MapDataset's own length, and a caller who
+        repeated their dataset before handing it over should give the length
+        of one pass instead. A grain pipeline has no description of its own,
+        so the saved position names the pipeline's type and length rather
+        than the corpus under it: swapping the corpus under one pipeline is
+        the caller's to keep straight.
+        """
+        rows = local_batch(batch)
+        mapped = train if isinstance(train, pygrain.MapDataset) else None
+        if mapped is not None:
+            endless = mapped.repeat(None)
+            order = f"{describe(mapped)}, {len(mapped)} records"
+
+            def training() -> Iterator[Batch]:
+                return GlobalStream(
+                    lambda offset: _per_process(endless, rows=rows, loading=loading,
+                                                offset=offset),
+                    rows * jax.process_count(), order, loading.stop_seconds)
+        else:
+            def training() -> Iterator[Batch]:
+                return _per_process(train, rows=rows, loading=loading)
+
+        return cls(
+            train=training,
+            val=None if validation is None else (
+                lambda: _per_process(validation, rows=rows, loading=loading)),
+            records=len(mapped) if records is None and mapped is not None else records,
+            batch=batch,
+        )
 
     @property
     def steps_per_epoch(self) -> int | None:
@@ -612,7 +669,7 @@ def mixed_records(corpora: Sequence[Corpus]) -> int:
                for corpus, share in zip(corpora, _shares(corpora), strict=True))
 
 
-class _WorkerBatches(pygrain.MapDataset[object]):
+class _WorkerBatches[Record](pygrain.MapDataset[Record]):
     """`parent` re-indexed so that grain's per-worker stride slice (index i
     goes to worker i % W) hands each worker whole, contiguous batches:
     index `q*W*B + p*W + w` is record `p` of batch `b = q*W + w`. Worker w
@@ -624,7 +681,7 @@ class _WorkerBatches(pygrain.MapDataset[object]):
 
     _MUTATES_ELEMENT_SPEC = False
 
-    def __init__(self, parent: pygrain.MapDataset[object], batch: int, workers: int):
+    def __init__(self, parent: pygrain.MapDataset[Record], batch: int, workers: int):
         super().__init__(parent)
         self._batch, self._workers = batch, workers
         self._whole = len(parent) // batch
@@ -634,11 +691,11 @@ class _WorkerBatches(pygrain.MapDataset[object]):
         return self._length
 
     @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset[object]: ...
+    def __getitem__(self, index: slice) -> pygrain.MapDataset[Record]: ...
     @overload
-    def __getitem__(self, index: int) -> object | None: ...
+    def __getitem__(self, index: int) -> Record | None: ...
 
-    def __getitem__(self, index: int | slice) -> object | None:
+    def __getitem__(self, index: int | slice) -> Record | pygrain.MapDataset[Record] | None:
         if isinstance(index, slice):
             return self.slice(index)
         worker, within = index % self._workers, index // self._workers
@@ -647,8 +704,9 @@ class _WorkerBatches(pygrain.MapDataset[object]):
         return None if which >= self._whole else self._parent[which * self._batch + row]
 
 
-def _batches(records: pygrain.MapDataset[object], *, batch: int, loading: Loading,
-             offset: int = 0) -> pygrain.DatasetIterator[Batch]:
+def _batches[Record](records: pygrain.MapDataset[Record], *, batch: int,
+                     loading: Loading, offset: int = 0
+                     ) -> pygrain.DatasetIterator[Batch]:
     """This process's share of `records`, in batches of `batch` records.
 
     The slice is `offset + process_index :: process_count`, so global batch k
@@ -673,6 +731,25 @@ def _batches(records: pygrain.MapDataset[object], *, batch: int, loading: Loadin
             num_workers=loading.workers,
             per_worker_buffer_size=loading.worker_buffer))
     return iter(stream)
+
+
+def _per_process(source: GrainDataset, *, rows: int, loading: Loading,
+                 offset: int = 0) -> pygrain.DatasetIterator[Batch]:
+    """This process's share of `source`, in batches of `rows` records.
+
+    A `MapDataset` is read by index, which is what `_batches` needs to cut a
+    process's slice and to start that slice at a record offset. An
+    `IterDataset` has neither, so it is batched where it is and what it
+    yields is whatever the caller's own pipeline ordered and sharded; an
+    offset into one would have to replay it, which is not a resume.
+    """
+    if isinstance(source, pygrain.MapDataset):
+        return _batches(source, batch=rows, loading=loading, offset=offset)
+    if offset:
+        raise ValueError(
+            "a streamed grain dataset cannot start at a record offset; it is "
+            "read as it comes, so its position is grain's own iterator state")
+    return iter(source.batch(rows, drop_remainder=True))
 
 
 def rows_of(batch: Mapping[str, Any]) -> int:

@@ -16,6 +16,7 @@ import sys
 import cv2
 import grain.python as pygrain
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -1216,3 +1217,112 @@ def test_a_jpeg_decodes_at_the_coarsest_scale_that_still_covers_the_target():
     assert decode_image(encoded, at_least=128).shape[:2] == (200, 300)
     assert decode_image(encoded, at_least=256).shape[:2] == (400, 600)
     assert decode_image(encoded).shape[:2] == (400, 600)
+
+
+# ---------------------------------------------------------------------------------
+# A run over grain datasets the caller built
+# ---------------------------------------------------------------------------------
+
+class _Points:
+    """`length` points whose target is twice the input, addressed by index."""
+
+    def __init__(self, length):
+        self.length = length
+
+    def __repr__(self):
+        return f"_Points({self.length})"
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        x = np.full((3,), index, np.float32) / self.length
+        return {"x": x, "y": 2 * x[:2], "index": np.int32(index)}
+
+
+def _grain_points(length=16):
+    """The pipeline a caller writes themselves: a source, shuffled."""
+    return pygrain.MapDataset.source(_Points(length)).seed(0).shuffle(0)
+
+
+def test_from_grain_batches_a_map_dataset_per_process_and_counts_its_records():
+    data = Dataset.from_grain(_grain_points(), batch=4, **WORKERS)
+
+    assert data.records == 16 and data.batch == 4 and data.steps_per_epoch == 4
+    batch = next(data.train())
+    assert batch["x"].shape == (4, 3) and batch["index"].shape == (4,)
+
+
+def test_from_grain_repeats_a_map_dataset_so_a_run_outlasts_the_corpus():
+    """`Dataset.train` is endless; a caller's finite pipeline would otherwise
+    stop the run one pass in."""
+    stream = Dataset.from_grain(_grain_points(8), batch=4, **WORKERS).train()
+
+    assert len(_indices(stream, 6)) == 6
+
+
+def test_from_grain_takes_a_streamed_pipeline_and_carries_grains_own_state():
+    """An IterDataset has no index, so it is batched where it is and reports
+    the position grain keeps for it."""
+    rows = pygrain.MapDataset.source(_Points(8)).repeat(None).to_iter_dataset()
+    data = Dataset.from_grain(rows, batch=4, records=8, **WORKERS)
+
+    stream = data.train()
+    assert isinstance(stream, Checkpointable)
+    first = _indices(stream, 1)
+    state = stream.get_state()
+    rest = _indices(stream, 1)
+
+    resumed = data.train()
+    resumed.set_state(state)
+    assert _indices(resumed, 1) == rest != first
+
+
+def test_from_grain_scores_a_validation_pass_that_ends():
+    data = Dataset.from_grain(_grain_points(16), batch=4,
+                              validation=pygrain.MapDataset.source(_Points(8)),
+                              **WORKERS)
+
+    assert data.val is not None
+    assert _indices(data.val(), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
+def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path):
+    """The seam is only worth having if the trainer treats it as any other
+    dataset: a run over it checkpoints its iterator position, and a resume
+    reads the batches after the checkpoint rather than replaying them."""
+    import optax
+    from flax import linen as nn
+
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Checkpoints, Layout, Trainer
+
+    class Regression(Objective):
+        """Squared error of an affine map against twice its input."""
+
+        def __init__(self):
+            self.model = nn.Dense(2)
+
+        def init(self, key, variables=None):
+            return self.model.init(key, jnp.zeros((1, 3)))
+
+        def loss(self, params, batch, step):
+            return jnp.mean((self.model.apply(params, batch["x"]) - batch["y"]) ** 2), Aux({})
+
+    def run(steps, directory=None):
+        trainer = Trainer(
+            Regression(), optax.sgd(0.1), key=jax.random.key(0),
+            layout=Layout(min_shard=1, tolerance=1.0),
+            checkpoints=None if directory is None else Checkpoints(str(directory)))
+        # The simulated mesh is eight devices wide, so a step is eight records.
+        return trainer.fit(Dataset.from_grain(_grain_points(), batch=8, **WORKERS),
+                           steps=steps, log_every=1,
+                           checkpoint_every=None if directory is None else 2)
+
+    run(2, tmp_path / "run")
+    resumed = run(4, tmp_path / "run")
+    whole = run(4)
+
+    for expected, actual in zip(jax.tree.leaves(whole.params),
+                                jax.tree.leaves(resumed.params), strict=True):
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
