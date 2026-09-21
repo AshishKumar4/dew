@@ -9,7 +9,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.linen.dtypes import promote_dtype
+from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
@@ -112,6 +112,73 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
     return jnp.max(logits, axis=(-2, -1))
 
 
+def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
+    """`normalize` rematerialized, so the residual stream crosses into the
+    backward pass in the dtype the caller holds it in.
+
+    Every norm here reduces over the width in fp32, which is what keeps a
+    bf16 run stable. Differentiated as written, that upcast is also what the
+    backward pass keeps: the fp32 copy of the norm's input and the fp32
+    normalized activations are both residuals, so a bf16 stream is saved at
+    fp32 twice per norm. On a SimpleDiT step (patch 4, emb 256, 8 layers, 4
+    heads, bf16, 128px, batch 64) that was 36 fp32 [64, 1024, 256] tensors,
+    2.35 GiB, against 48 bf16 ones for the stream itself; under this it is
+    one, the fp32 output head's own promoted input.
+
+    The checkpoint saves nothing, so what the backward pass holds is the
+    arguments: the norm's input, its weight and its bias. It recomputes the
+    reductions rather than naming them, which keeps the recomputed block's
+    residuals a matter for the policy that recomputes it
+    (`causal_transformer.RESIDUALS`) and not for the norms underneath.
+
+    The wrapped function takes arrays first and its static arguments last, so
+    a caller reads its own parameters out of the variable tree and hands them
+    over as plain arrays: the checkpoint stays a jax transform over a pure
+    function, with no flax lifting between it and the module. The forward
+    values are the same ones in the same order, so a checkpoint and a
+    converged run are untouched; only the buffer assignment moves.
+    """
+    return jax.checkpoint(normalize, policy=jax.checkpoint_policies.nothing_saveable,
+                          static_argnums=static_argnums)
+
+
+@functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5))
+def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool):
+    """`RMSNorm`'s body: the root-mean-square normalization in fp32 and the
+    learned weight applied on whichever side of the cast the family puts it.
+    `scale` of None is the weightless norm."""
+    y = x.astype(jnp.float32)
+    y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + epsilon)
+    if scale is None:
+        # A pure normalization with no learned weight, as Gemma 4 norms
+        # its values (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
+        return y.astype(dtype)
+    weight = (1.0 + scale) if scale_offset else scale
+    if scale_after_cast:
+        return y.astype(dtype) * weight.astype(dtype)
+    return (y * weight).astype(dtype)
+
+
+@functools.partial(normalized_in_fp32, static_argnums=(3, 4))
+def layer_normalized(x, scale, bias, epsilon: float, dtype):
+    """`LayerNorm`'s body, op for op as flax computes it: E[x] and E[x^2] over
+    the width in fp32, the variance from the pair and clipped at zero, the
+    learned weight folded into the inverse deviation before it meets the
+    centered activations. `scale` and `bias` of None are the affine-free
+    norm."""
+    y = x.astype(jnp.float32)
+    row_mean = jnp.mean(y, axis=-1)
+    variance = jnp.maximum(0.0, jnp.mean(jax.lax.square(y), axis=-1) - jax.lax.square(row_mean))
+    scaling = jax.lax.rsqrt(jnp.expand_dims(variance, -1) + epsilon)
+    width = (1,) * (x.ndim - 1) + (-1,)
+    if scale is not None:
+        scaling = scaling * jnp.reshape(scale, width)
+    y = (y - jnp.expand_dims(row_mean, -1)) * scaling
+    if bias is not None:
+        y = y + jnp.reshape(bias, width)
+    return y.astype(dtype)
+
+
 class RMSNorm(nn.Module):
     """RMSNorm normalized in fp32, with Gemma's (1 + w) scale behind a flag.
 
@@ -124,6 +191,9 @@ class RMSNorm(nn.Module):
     Llama and Qwen3 cast the normalized activations first and multiply by
     the scale in that dtype (modeling_qwen3.py:61-64), which
     scale_after_cast reproduces. The two agree at fp32 and differ under bf16.
+
+    The fp32 reduction runs under `normalized_in_fp32`, so what the backward
+    pass keeps is this call's input in its own dtype, not an fp32 copy.
     """
     epsilon: float = 1e-5
     scale_offset: bool = False
@@ -134,20 +204,45 @@ class RMSNorm(nn.Module):
     @nn.compact
     def __call__(self, x):
         dtype = self.dtype if self.dtype is not None else x.dtype
-        y = x.astype(jnp.float32)
-        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + self.epsilon)
-        if not self.with_scale:
-            # A pure normalization with no learned weight, as Gemma 4 norms
-            # its values (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
-            return y.astype(dtype)
         scale = self.param(
             'scale',
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
-            (x.shape[-1],), jnp.float32)
-        weight = (1.0 + scale) if self.scale_offset else scale
-        if self.scale_after_cast:
-            return y.astype(dtype) * weight.astype(dtype)
-        return (y * weight).astype(dtype)
+            (x.shape[-1],), jnp.float32) if self.with_scale else None
+        return rms_normalized(x, scale, self.epsilon, dtype,
+                              self.scale_offset, self.scale_after_cast)
+
+
+class LayerNorm(nn.Module):
+    """flax's `nn.LayerNorm` over the last axis, keeping the residual stream
+    in the dtype the caller holds it in.
+
+    Same parameter tree, same names, same fp32 arithmetic, so a checkpoint
+    written by either loads into the other and the forward values match bit
+    for bit. What differs is what the backward pass keeps: flax's version
+    leaves it the fp32 copy of the input and the fp32 centered activations,
+    and this one, through `normalized_in_fp32`, leaves it the input as it
+    arrived.
+
+    The fields are the subset the tree sets. A norm over other axes, under a
+    mask, across a pmapped axis or on the slower exact variance is flax's to
+    serve, and a caller that needs one takes `nn.LayerNorm` and its fp32
+    residual with it.
+    """
+    epsilon: float = 1e-6
+    use_scale: bool = True
+    use_bias: bool = True
+    dtype: Dtype | None = None
+    param_dtype: Dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, x):
+        width = (x.shape[-1],)
+        scale = self.param('scale', nn.initializers.ones, width,
+                           self.param_dtype) if self.use_scale else None
+        bias = self.param('bias', nn.initializers.zeros, width,
+                          self.param_dtype) if self.use_bias else None
+        return layer_normalized(x, scale, bias, self.epsilon,
+                                canonicalize_dtype(x, scale, bias, dtype=self.dtype))
 
 
 @dataclasses.dataclass(frozen=True)

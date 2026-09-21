@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import apply_rotary, rotary_freqs, scaled_dot_product_attention
+from ..attention import LayerNorm, apply_rotary, rotary_freqs, scaled_dot_product_attention
 from ..dit import (
     ROPE_THETA,
     AdaLNParams,
@@ -77,7 +77,7 @@ class MMDiTBlock(nn.Module):
             ], name=name)
 
         def norm(name):
-            return nn.LayerNorm(
+            return LayerNorm(
                 epsilon=self.norm_epsilon, use_scale=False, use_bias=False,
                 dtype=self.dtype, name=name)
 
@@ -255,7 +255,7 @@ class PatchMerging(nn.Module):
             'b (h p1) (w p2) c -> b h w (p1 p2 c)',
             p1=self.merge_size, p2=self.merge_size
         )
-        merged = nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(merged)
+        merged = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(merged)
         merged = nn.Dense(
             features=self.out_features,
             dtype=self.dtype,
@@ -292,7 +292,7 @@ class PatchExpanding(nn.Module):
             precision=self.precision,
             name="projection"
         )(x)
-        x = nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
+        x = LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
 
         x = x.reshape(B, H_patches, W_patches, expanded_features)
         expanded = einops.rearrange(
@@ -405,7 +405,7 @@ class HierarchicalMMDiT(nn.Module):
         ]
         self.fusion_layers = [
             nn.Sequential([
-                nn.LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype),
+                LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype),
                 nn.Dense(features=self.emb_features[s], dtype=self.dtype,
                          precision=self.precision),
             ], name=f"fusion_{s}") for s in decoder_stages

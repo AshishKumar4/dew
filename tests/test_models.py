@@ -10,8 +10,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 
-from dew.nn.attention import Stage
+from dew.nn.attention import LayerNorm, Stage
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
@@ -491,3 +492,27 @@ def test_a_block_pattern_that_misses_a_layer_is_refused():
                                       block_pattern=("attn", "attn"))
     with pytest.raises(ValueError, match="2 entries for 4 layers"):
         factorized.init(jax.random.PRNGKey(0), jnp.zeros((1, 2, 4, 16)))
+
+
+@pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize('dtype', [None, jnp.bfloat16, jnp.float32])
+def test_layer_norm_matches_flax_bit_for_bit(rng, use_scale, use_bias, dtype):
+    """`dew.nn.attention.LayerNorm` exists to change which values the backward
+    pass keeps, not which values the forward pass produces, so it computes
+    flax's `nn.LayerNorm` op for op: E[x] and E[x^2] in fp32, the variance
+    from the pair and clipped at zero, the weight folded into the inverse
+    deviation before it meets the centered activations, the result cast by
+    flax's own dtype rule. A flax release that changes any of those moves a
+    checkpoint's outputs, and this is where that shows."""
+    x = jax.random.normal(rng, (2, 6, 16), jnp.float32)
+    x = x.astype(jnp.bfloat16) if dtype is jnp.bfloat16 else x
+    fields = dict(epsilon=1e-5, use_scale=use_scale, use_bias=use_bias, dtype=dtype)
+    ours, reference = LayerNorm(**fields), nn.LayerNorm(**fields)
+    params, flax_params = ours.init(rng, x), reference.init(rng, x)
+
+    assert jax.tree_util.tree_structure(params) == jax.tree_util.tree_structure(flax_params)
+    for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(flax_params), strict=True):
+        assert a.shape == b.shape and a.dtype == b.dtype
+    found, expected = ours.apply(params, x), reference.apply(flax_params, x)
+    assert found.dtype == expected.dtype
+    assert jnp.array_equal(found, expected)
