@@ -165,7 +165,7 @@ def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path
     (directory / "config.json").write_text(json.dumps(config))
     loaded = load_pretrained(directory, dtype="float32", attention_impl="reference")
     ids = np.load(original / "input_ids.npy")
-    actual = loaded.model.apply(loaded.variables, ids)
+    actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     expected = np.load(original / "logits.npy")
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
 
@@ -331,6 +331,7 @@ def test_olmo3_config_translates_to_the_post_norm_block():
     bare = {**fixture_config("olmo3-tiny"), 'num_hidden_layers': 6}
     del bare['layer_types']
     reference = Olmo3Config(**{**bare, 'layer_types': None}).layer_types
+    assert reference is not None
     assert translate_config(bare)['layer_types'] == tuple(reference)
 
 
@@ -401,8 +402,9 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
 
     released = fixture_config("olmo-3-7b")
     reference = Olmo3Config.from_dict(released)
-    assert reference.rope_parameters['sliding_attention']['rope_type'] == 'default'
-    assert reference.rope_parameters['full_attention']['rope_type'] == 'yarn'
+    ropes = reference.to_dict()["rope_parameters"]
+    assert ropes['sliding_attention']['rope_type'] == 'default'
+    assert ropes['full_attention']['rope_type'] == 'yarn'
 
     expected, attention_factor = ROPE_INIT_FUNCTIONS['yarn'](
         reference, None, layer_type='full_attention')
@@ -552,6 +554,7 @@ def test_a_gemma2_config_without_layer_types_alternates_like_the_reference():
     config = {**fixture_config("gemma2-tiny"), "num_hidden_layers": 5}
     del config["layer_types"]
     reference = Gemma2Config(**{**config, "layer_types": None}).layer_types
+    assert reference is not None
     assert translate_config(config)["layer_types"] == tuple(reference)
     assert translate_config(config)["layer_types"][-1] == "sliding_attention"
 
@@ -1290,6 +1293,7 @@ def test_a_gemma4_config_without_layer_types_derives_the_reference_pattern():
     derived = translate_config(config)["layer_types"]
 
     reference = Gemma4TextConfig(**{**config, "layer_types": None}).layer_types
+    assert reference is not None
     assert derived == tuple(reference)
     assert derived.count("sliding_attention") == 11
     assert derived[-1] == "full_attention"
@@ -1583,6 +1587,7 @@ def test_a_qwen35_config_without_layer_types_derives_the_reference_pattern():
     derived = translate_config(config)["layer_types"]
 
     reference = Qwen3_5TextConfig(**{**config, "layer_types": None}).layer_types
+    assert reference is not None
     assert derived == tuple(reference)
     assert derived == ("linear_attention", "linear_attention", "full_attention") * 2
 
@@ -2833,6 +2838,7 @@ def test_a_gemma3n_config_without_its_lists_takes_the_reference_defaults():
 
     translated = translate_config(config)
     assert translated["layer_types"] == tuple(reference.layer_types or ())
+    assert isinstance(reference.activation_sparsity_pattern, list)
     assert translated["activation_sparsity_pattern"] == tuple(reference.activation_sparsity_pattern)
     assert translated["mlp_features"] == 48 and reference.intermediate_size == [48] * 12
     assert translated["kinds"]["sliding_attention"]["rope_theta"] == 10000.0
@@ -3047,6 +3053,167 @@ def test_llada_logits_match_the_reference_implementation():
     assert (np.asarray(model.apply(variables, ids)).argmax(-1) == reference.argmax(-1)).all()
     causal = model.clone(causal=True)
     assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
+
+
+@pytest.fixture(scope='module')
+def glm5_next_source():
+    return load_pretrained(FIXTURES / 'glm5-next-tiny', dtype='float32', attention_impl='reference')
+
+
+def test_glm5_next_translates_the_released_text_config_and_refuses_the_wrapper():
+    wrapper = fixture_config('glm-5.3-flash')
+    config = translate_config(wrapper['text_config'])
+    assert config['num_layers'] == 45
+    assert config['layer_types'].count('linear_attention') == 34
+    assert config['layer_types'].count('full_attention') == 11
+    assert config['mixture']['experts'] == 288 and config['mixture']['top_k'] == 8
+    assert config['mixture']['layers'] == tuple(range(3, 45))
+    assert config['hyper_connections'] == {'hc_mult': 4, 'hc_eps': 1e-6,
+                                           'hc_sinkhorn_iters': 20, 'head': 'mean'}
+    assert config["index_share_for_mtp_iteration"]
+    with pytest.raises(ValueError, match='text_config'):
+        translate_config(wrapper)
+
+
+def test_glm5_next_logits_and_prediction_depth_match_reference(glm5_next_source):
+    source = glm5_next_source
+    ids = jnp.asarray(np.load(source.source / 'input_ids.npy'), jnp.int32)
+    logits = np.asarray(source.model.apply(source.variables, ids))
+    expected = np.load(source.source / 'logits.npy')
+    assert scaled_difference(logits, expected) < 1e-4
+    np.testing.assert_array_equal(logits.argmax(-1), expected.argmax(-1))
+    hidden = source.model.apply(source.variables, ids, method=source.model.hidden_states)
+    mtp = source.model.apply(source.variables, hidden, ids, method=source.model.mtp_logits)[0]
+    assert scaled_difference(np.asarray(mtp), np.load(source.source / 'mtp_logits.npy')) < 1e-4
+
+
+def test_glm5_prediction_index_reuse_does_not_change_forward_or_sft(glm5_next_source):
+    source = glm5_next_source
+    ids = jnp.asarray(np.load(source.source / "input_ids.npy")[:, :6], jnp.int32)
+    enabled = source.model
+    disabled = enabled.clone(index_share_for_mtp_iteration=False)
+
+    def loss(model, params):
+        variables = {**source.variables, "params": params}
+        hidden = model.apply(variables, ids, method="hidden_states")
+        predicted = model.apply(variables, hidden, ids, train=True, method="mtp_logits")[0]
+        return jnp.mean(predicted ** 2)
+
+    expected, expected_grad = jax.jit(jax.value_and_grad(lambda p: loss(disabled, p)))(source.variables["params"])
+    actual, actual_grad = jax.jit(jax.value_and_grad(lambda p: loss(enabled, p)))(source.variables["params"])
+    np.testing.assert_array_equal(actual, expected)
+    for actual_leaf, expected_leaf in zip(jax.tree.leaves(actual_grad), jax.tree.leaves(expected_grad), strict=True):
+        np.testing.assert_array_equal(actual_leaf, expected_leaf)
+    np.testing.assert_array_equal(enabled.apply(source.variables, ids), disabled.apply(source.variables, ids))
+
+
+def test_glm5_prediction_index_reuse_preserves_public_padded_greedy_generation(glm5_next_source):
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling import Sampling, Speculative
+
+    source = glm5_next_source
+    tokens = np.load(source.source / "input_ids.npy")[[0, 1, 0], :5].copy()
+    valid = np.arange(5)[None, :] >= np.asarray([0, 2, 4])[:, None]
+    tokens[~valid] = 0
+    inputs = ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)})
+    task = source.text_generation(sampling=Sampling(temperature=0))
+    ordinary = task(inputs, max_new_tokens=7, seed=0).host()
+    speculative = task(inputs, max_new_tokens=7, seed=0, strategy=Speculative(block=3)).host()
+    np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
+    np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
+    np.testing.assert_array_equal(speculative.terminated, ordinary.terminated)
+
+
+def test_glm5_next_prefill_and_token_steps_match_parallel(glm5_next_source):
+    source = glm5_next_source
+    model, variables = source.model, source.variables
+    ids = jnp.asarray(np.load(source.source / 'input_ids.npy'), jnp.int32)
+    full = np.asarray(model.apply(variables, ids))
+    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
+    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
+    pieces = [np.asarray(out)]
+    for index in range(4, ids.shape[1]):
+        out, state = model.apply({**variables, **state}, ids[:, index:index + 1], decode=True, mutable=['cache'])
+        pieces.append(np.asarray(out))
+    actual = np.concatenate(pieces, axis=1)
+    assert scaled_difference(actual, full) < 1e-4
+    np.testing.assert_array_equal(actual.argmax(-1), full.argmax(-1))
+
+
+def test_glm5_next_mapping_preserves_every_leaf_and_dynamic_stream_mixing(glm5_next_source):
+    source = glm5_next_source
+    ids = jnp.asarray(np.load(source.source / 'input_ids.npy'), jnp.int32)
+    expected = flat_tree(jax.eval_shape(source.model.init, jax.random.key(0), ids))
+    loaded = flat_tree(source.variables)
+    assert {name: leaf.shape for name, leaf in loaded.items()} == {
+        name: leaf.shape for name, leaf in expected.items()}
+    changed = jax.tree.map(lambda x: x, source.variables)
+    changed['params']['layers_0']['attn_hc']['scale'] = jnp.zeros(3)
+    actual = np.asarray(source.model.apply(changed, ids))
+    assert scaled_difference(actual, np.load(source.source / 'logits.npy')) > 1e-4
+
+
+@pytest.mark.parametrize('field,value', [
+    ('mhc', False), ('mla_use_nope', False), ('qk_rope_head_dim', 2),
+    ('indexer_types', ['full', 'full', 'full', 'shared', 'full']),
+    ('moe_router_dtype', 'bfloat16'), ('scoring_func', 'softmax'),
+    ('index_topk', 3), ('num_nextn_predict_layers', 2),
+    ('attention_dropout', 0.1),
+])
+def test_glm5_next_refuses_unimplemented_variants_by_name(field, value):
+    with pytest.raises(ValueError, match=field):
+        translate_config({**fixture_config('glm5-next-tiny'), field: value})
+
+
+def test_glm5_next_empty_nested_config_still_applies_safe_gate():
+    config = fixture_config('glm5-next-tiny')
+    del config['linear_attn_config']
+    config['linear_lower_bound'] = None
+    absent = translate_config(config)['kinds']['linear_attention']['mixer']
+    empty = translate_config({**config, 'linear_attn_config': {}})['kinds']['linear_attention']['mixer']
+    disabled = translate_config({**config, 'linear_attn_config': {'safe_gate': False}})[
+        'kinds']['linear_attention']['mixer']
+    assert absent['linear_lower_bound'] is None
+    assert empty['linear_lower_bound'] == -5.0
+    assert disabled['linear_lower_bound'] is None
+
+
+def test_glm5_next_null_kv_head_count_uses_query_heads():
+    config = fixture_config('glm5-next-tiny')
+    assert translate_config({**config, 'num_key_value_heads': None}) == translate_config(config)
+
+
+def test_glm5_next_refuses_disagreeing_layer_schedules():
+    config = fixture_config('glm5-next-tiny')
+    linear = {**config['linear_attn_config'], 'kda_layers': [0, 1]}
+    with pytest.raises(ValueError, match='linear_attn_config.kda_layers'):
+        translate_config({**config, 'linear_attn_config': linear})
+
+
+def test_glm5_mlp_schedule_and_router_normalization_follow_source_config():
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+
+    config = {**fixture_config("glm5-next-tiny"), "first_k_dense_replace": 1,
+              "mlp_layer_types": ["dense", "sparse", "dense", "sparse", "sparse"],
+              "norm_topk_prob": False}
+    reference = Glm5NextTextConfig.from_dict(config)
+    assert reference.mlp_layer_types is not None
+    native = translate_config(config)["mixture"]
+    assert native["layers"] == tuple(index for index, kind in enumerate(reference.mlp_layer_types)
+                                      if kind == "sparse") == (1, 3, 4)
+    assert native["norm_topk_prob"] is reference.norm_topk_prob is False
+
+
+@pytest.mark.parametrize("field,value", [
+    ("layer_scalar", "trainable"), ("scale_offset", True),
+    ("final_logit_softcap", 20.0), ("num_nextn_predict_layers", 2),
+    ("hyper_connections", {"hc_mult": 4, "head": "weighted"}),
+])
+def test_standalone_glm5_refuses_computation_without_a_source_inverse(field, value, glm5_next_source, tmp_path):
+    with pytest.raises(ValueError, match=field):
+        save_pretrained_decoder(glm5_next_source.model.clone(**{field: value}),
+                                glm5_next_source.variables, tmp_path)
+    assert not (tmp_path / "config.json").exists()
 
 
 def test_dream_logits_match_the_reference_implementation():

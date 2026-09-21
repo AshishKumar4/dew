@@ -93,15 +93,19 @@ from safetensors.numpy import load_file, save_file
 from transformers import (
     DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma3nTextConfig, Gemma4TextConfig, Glm4MoeConfig, Glm4MoeForCausalLM,
-    GlmMoeDsaConfig, GlmMoeDsaForCausalLM, Llama4TextConfig,
+    Glm5NextTextConfig, GlmMoeDsaConfig, GlmMoeDsaForCausalLM, Llama4TextConfig,
     Qwen3NextConfig, Qwen3NextForCausalLM,
 )
 from transformers.masking_utils import create_causal_mask, create_chunked_causal_mask
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.gemma3n.modeling_gemma3n import (
     Gemma3nForCausalLM, Gemma3nTextAltUp, Gemma3nTextLaurelBlock, Gemma3nTextMLP,
 )
 from transformers.models.gemma4.modeling_gemma4 import Gemma4ForCausalLM, Gemma4TextDecoderLayer
 from transformers.models.glm4_moe.modeling_glm4_moe import Glm4MoeDecoderLayer, Glm4MoeRMSNorm
+from transformers.models.glm5_next.modeling_glm5_next import (
+    Glm5NextPreTrainedModel, Glm5NextTextDecoderLayer, Glm5NextTextModel, Glm5NextTextRMSNorm,
+)
 from transformers.models.glm_moe_dsa.modeling_glm_moe_dsa import (
     GlmMoeDsaDecoderLayer, GlmMoeDsaRMSNorm,
 )
@@ -346,6 +350,84 @@ def write_glm_mtp(name: str, model, depth: GlmMTP, seed: int = 2026) -> None:
           f"mtp logits {tuple(logits.shape)}")
 
 
+# Qwen/Qwen3-Next-80B-A3B-Instruct at revision 9c7f2fbe, scaled to a
+# fixture. The release's proportions at a hidden width of 64: the dense
+# intermediate_size 2.5x that width (160), the routed and shared expert
+# widths 0.25x (16), the attention's q heads spanning 2x the width (8 heads
+# of 16) over one key/value head (the release's 16:2), the delta net with
+# twice as many value heads as key heads and a 3:1 linear-to-full pattern
+# derived from full_attention_interval 4, as the release leaves layer_types
+# unset. Its own values, unscaled: rope_theta 1e7 with partial_rotary_factor
+# 0.25, every layer routed (mlp_only_layers [], decoder_sparse_step 1),
+# norm_topk_prob, rms_norm_eps 1e-6, untied embeddings. 512 experts with 10
+# per token do not survive a fixture; eight with two per token keep a
+# routed layer whose renormalised top-k the reference computes.
+# `num_nextn_predict_layers` declares the prediction layer the release ships
+# as mtp.* tensors (vllm qwen3_next_mtp.py:59 reads it, defaulting to 1);
+# the released config leaves it unset and transformers ignores the tensors.
+QWEN3_NEXT_TINY = dict(
+    vocab_size=256, hidden_size=64, intermediate_size=160, moe_intermediate_size=16,
+    shared_expert_intermediate_size=16, num_hidden_layers=4, num_attention_heads=8,
+    num_key_value_heads=1, head_dim=16, linear_num_key_heads=2, linear_num_value_heads=4,
+    linear_key_head_dim=8, linear_value_head_dim=12, linear_conv_kernel_dim=4,
+    num_experts=8, num_experts_per_tok=2, decoder_sparse_step=1, mlp_only_layers=[],
+    norm_topk_prob=True, full_attention_interval=4, rope_theta=1e7, partial_rotary_factor=0.25,
+    hidden_act="silu", max_position_embeddings=64, rms_norm_eps=1e-6,
+    tie_word_embeddings=False, attention_bias=False, num_nextn_predict_layers=1,
+)
+
+
+def tiny_qwen3_next() -> Qwen3NextForCausalLM:
+    torch.manual_seed(0)
+    return Qwen3NextForCausalLM(Qwen3NextConfig.from_dict(dict(QWEN3_NEXT_TINY)))
+
+
+def write_qwen3_next_mtp(name: str, model: Qwen3NextForCausalLM, repo: str,
+                         seed: int = 2027) -> None:
+    """The prediction layer's tensors under vLLM's mtp.* names beside the
+    fixture's, its logits over the trunk's hidden states, and the release
+    the fixture was scaled from.
+
+    The trunk's experts are one tensor per expert, the release's layout,
+    which `save_pretrained` writes by reversing its load-time packing; the
+    depth's are written the same way. `Qwen3NextConfig` neither declares nor
+    writes `num_nextn_predict_layers`, so the saved config gets it back, and
+    `full_attention_interval` beside the derived layer_types, the way the
+    release spells its pattern.
+    """
+    from huggingface_hub import model_info
+
+    directory = FIXTURES / name
+    depth = QwenMTP(model.config).eval()
+    scatter_weights(depth, seed)
+    ids = torch.from_numpy(np.load(directory / "input_ids.npy").astype(np.int64))
+    with torch.no_grad():
+        hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state
+        embeddings = model.model.embed_tokens(ids)
+        positions = torch.arange(ids.shape[1])[None].expand(ids.shape[0], -1)
+        valid = torch.ones(ids.shape[0], ids.shape[1] - 1, dtype=torch.bool)
+        logits = model.lm_head(depth(hidden[:, :-1], embeddings[:, 1:], positions[:, 1:], valid))
+    tensors = load_file(str(directory / "model.safetensors"))
+    for tensor_name, tensor in depth.state_dict().items():
+        if not tensor_name.startswith("layers.0.mlp.experts."):
+            tensors["mtp." + tensor_name] = tensor.to(torch.float32).numpy()
+    for tensor_name, tensor in expert_tensors(depth.layers[0].get_submodule("mlp.experts")).items():
+        tensors["mtp.layers.0." + tensor_name] = tensor
+    save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+    np.savez(directory / "mtp_reference.npz", logits=logits.numpy(), hidden=hidden.numpy(),
+             embeddings=embeddings.numpy(), positions=positions.numpy(), valid=valid.numpy())
+    config = json.loads((directory / "config.json").read_text())
+    config.update(num_nextn_predict_layers=QWEN3_NEXT_TINY["num_nextn_predict_layers"],
+                  full_attention_interval=QWEN3_NEXT_TINY["full_attention_interval"])
+    (directory / "config.json").write_text(json.dumps(dict(sorted(config.items())), indent=1) + "\n")
+    (directory / "source.json").write_text(json.dumps({
+        "released": {"repo": repo, "revision": model_info(repo).sha},
+        "transformers": {"version": transformers.__version__,
+                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
+        "vllm": {"revision": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
+                 "mtp_file": "vllm/model_executor/models/qwen3_next_mtp.py"},
+    }, indent=1) + "\n")
+    print(f"{directory}: mtp.* depth with {len(tensors)} tensors, mtp logits {tuple(logits.shape)}")
 # zai-org/GLM-5.3 at toy width. The release's proportions on a hidden width
 # of 32: intermediate_size twice the width (64), moe_intermediate_size and
 # the query LoRA a third of it (12 each), qk_nope three times qk_rope with
@@ -429,84 +511,241 @@ def write_glm_moe_dsa_head_dim(name: str) -> None:
           f"{saved['qk_rope_head_dim']} reloads bit for bit")
 
 
-# Qwen/Qwen3-Next-80B-A3B-Instruct at revision 9c7f2fbe, scaled to a
-# fixture. The release's proportions at a hidden width of 64: the dense
-# intermediate_size 2.5x that width (160), the routed and shared expert
-# widths 0.25x (16), the attention's q heads spanning 2x the width (8 heads
-# of 16) over one key/value head (the release's 16:2), the delta net with
-# twice as many value heads as key heads and a 3:1 linear-to-full pattern
-# derived from full_attention_interval 4, as the release leaves layer_types
-# unset. Its own values, unscaled: rope_theta 1e7 with partial_rotary_factor
-# 0.25, every layer routed (mlp_only_layers [], decoder_sparse_step 1),
-# norm_topk_prob, rms_norm_eps 1e-6, untied embeddings. 512 experts with 10
-# per token do not survive a fixture; eight with two per token keep a
-# routed layer whose renormalised top-k the reference computes.
-# `num_nextn_predict_layers` declares the prediction layer the release ships
-# as mtp.* tensors (vllm qwen3_next_mtp.py:59 reads it, defaulting to 1);
-# the released config leaves it unset and transformers ignores the tensors.
-QWEN3_NEXT_TINY = dict(
+# zai-org/GLM-5.3-Flash at revision eb9eb208, scaled to a fixture. What the
+# release's numbers become at a hidden width of 64: a dense MLP 2.5x that
+# width (160) over routed and shared experts a quarter of it (16), where the
+# release runs 3x and a half; KDA heads spanning twice the width, as the
+# release's 64 heads of 128 span twice its 4096 (four heads of 32); the MLA
+# widths all a quarter of it (q_lora, kv_lora, qk_nope and the values 16
+# each), since the release puts two of its 1536, 512, 256 and 256 at a
+# sixteenth of 4096, and a sixteenth of 64 is four, too narrow for a head to
+# carry a key and a value; and an indexer at half the attention's heads (two
+# of 16 beside four of 16, from 32 of 128 beside 64 of 256). Its own values,
+# unscaled: routed_scaling_factor 2.5, one group holding every expert, three
+# dense layers before the routed ones, one shared expert, one prediction
+# depth, hc_mult 4 collapsed over 20 Sinkhorn iterations, swiglu_limit 10 on
+# every gated MLP, rms_norm_eps 1e-5, the tail rule on, and no rope
+# anywhere: qk_rope_head_dim 0, which the config validates
+# (configuration_glm5_next.py:225-228). 288 experts with 8 per token become
+# 8 with 2, and index_topk 2048 over pools of 4 becomes 4 over pools of 2,
+# so a twelve-token prompt holds six candidate pools of which a query takes
+# two, with the incomplete tail appended beside them.
+#
+# The indexer scores pools through a relu, which zeroes a pool whenever
+# every head disagrees with the query, and two heads leave a quarter of the
+# pools at exactly zero: at the default seed the trunk's second and third
+# candidates are both zero, a tie torch and jax break differently. Seed 1266
+# keeps the last selected pool 0.142 above the first rejected one on every
+# row of the trunk's indexer, and 2718 keeps the depth's own 0.105 apart.
+GLM5_NEXT_SEED = 1266
+GLM5_NEXT_MTP_SEED = 2718
+GLM5_NEXT_TINY = dict(
     vocab_size=256, hidden_size=64, intermediate_size=160, moe_intermediate_size=16,
-    shared_expert_intermediate_size=16, num_hidden_layers=4, num_attention_heads=8,
-    num_key_value_heads=1, head_dim=16, linear_num_key_heads=2, linear_num_value_heads=4,
-    linear_key_head_dim=8, linear_value_head_dim=12, linear_conv_kernel_dim=4,
-    num_experts=8, num_experts_per_tok=2, decoder_sparse_step=1, mlp_only_layers=[],
-    norm_topk_prob=True, full_attention_interval=4, rope_theta=1e7, partial_rotary_factor=0.25,
-    hidden_act="silu", max_position_embeddings=64, rms_norm_eps=1e-6,
-    tie_word_embeddings=False, attention_bias=False, num_nextn_predict_layers=1,
+    num_hidden_layers=5, num_attention_heads=4, num_key_value_heads=4,
+    n_shared_experts=1, n_routed_experts=8, routed_scaling_factor=2.5,
+    q_lora_rank=16, kv_lora_rank=16, qk_nope_head_dim=16, qk_rope_head_dim=0,
+    v_head_dim=16, n_group=1, topk_group=1, num_experts_per_tok=2, norm_topk_prob=True,
+    index_n_heads=2, index_head_dim=16, index_topk=4, index_kpool=2,
+    index_kpool_always_select_tail=True, linear_num_heads=4, linear_head_dim=32,
+    linear_conv_kernel_dim=4, linear_lower_bound=-5.0, hc_mult=4, hc_eps=1e-6,
+    hc_sinkhorn_iters=20, swiglu_limit=10.0, hidden_act="silu",
+    max_position_embeddings=64, rms_norm_eps=1e-5, tie_word_embeddings=False,
+    attention_bias=False, attention_dropout=0.0, use_cache=True,
+    pad_token_id=None, bos_token_id=None, eos_token_id=None,
+)
+# The fields the release ships that `Glm5NextTextConfig` does not declare:
+# the linear layer's four widths arrive as one dict (__post_init__ reads
+# head_dim, num_heads, short_conv_kernel_size and gate_lower_bound off it,
+# configuration_glm5_next.py:191-199) beside the layer lists it derives, and
+# the rest are the training-time names transformers ignores.
+GLM5_NEXT_RELEASED = dict(
+    first_k_dense_replace=3, index_kpool_compress=True,
+    index_share_for_mtp_iteration=True, indexer_rope_interleave=True,
+    linear_attn_config={"num_heads": 4, "gate_lower_bound": -5.0, "head_dim": 32,
+                        "short_conv_kernel_size": 4, "kda_layers": [0, 1, 2, 4],
+                        "full_attn_layers": [3]},
+    mhc=True, mla_use_nope=True, moe_router_dtype="float32",
+    num_nextn_predict_layers=1, scoring_func="sigmoid", topk_method="noaux_tc",
 )
 
 
-def tiny_qwen3_next() -> Qwen3NextForCausalLM:
-    torch.manual_seed(0)
-    return Qwen3NextForCausalLM(Qwen3NextConfig.from_dict(dict(QWEN3_NEXT_TINY)))
+def glm5_next_tiny_config() -> Glm5NextTextConfig:
+    """The tiny config, with the experts pinned to the reference's own loop.
 
-
-def write_qwen3_next_mtp(name: str, model: Qwen3NextForCausalLM, repo: str,
-                         seed: int = 2027) -> None:
-    """The prediction layer's tensors under vLLM's mtp.* names beside the
-    fixture's, its logits over the trunk's hidden states, and the release
-    the fixture was scaled from.
-
-    The trunk's experts are one tensor per expert, the release's layout,
-    which `save_pretrained` writes by reversing its load-time packing; the
-    depth's are written the same way. `Qwen3NextConfig` neither declares nor
-    writes `num_nextn_predict_layers`, so the saved config gets it back, and
-    `full_attention_interval` beside the derived layer_types, the way the
-    release spells its pattern.
+    The dispatcher decides between that loop and a grouped matmul by reading
+    the defining module's source for the `use_experts_implementation`
+    decorator (modeling_utils.py:2017-2039), which a class defined in this
+    tool does not carry: naming the loop keeps the fixture, its prediction
+    depth and the reload on one path whatever this file happens to contain.
     """
-    from huggingface_hub import model_info
+    return Glm5NextTextConfig.from_dict(
+        dict(GLM5_NEXT_TINY, experts_implementation="eager"))
 
+
+class Glm5NextTextForCausalLM(Glm5NextPreTrainedModel):
+    """Transformers' text trunk under its untied head, without the vision tower.
+    5.16.1 supplies no text-only causal-LM class (modeling_glm5_next.py:2072-2075).
+    """
+
+    config_class = Glm5NextTextConfig
+
+    def __init__(self, config: Glm5NextTextConfig) -> None:
+        super().__init__(config)
+        self.model = Glm5NextTextModel(config)
+        self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.post_init()
+
+    def forward(self, input_ids: torch.Tensor, use_cache: bool = False,
+                labels: torch.Tensor | None = None) -> CausalLMOutputWithPast:
+        hidden = self.model(input_ids=input_ids, use_cache=use_cache).last_hidden_state
+        logits = self.lm_head(hidden)
+        loss = None if labels is None else torch.nn.functional.cross_entropy(
+            logits[:, :-1].reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1))
+        return CausalLMOutputWithPast(logits=logits, loss=loss)
+
+
+def tiny_glm5_next() -> Glm5NextTextForCausalLM:
+    """Reuse the wrapper's conversion for the text-only model_type so saving
+    reverses the HC/forget-gate renames and conv/expert packing
+    (conversion_mapping.py:535-580)."""
+    from transformers.conversion_mapping import (
+        get_checkpoint_conversion_mapping, register_checkpoint_conversion_mapping,
+    )
+
+    conversion = get_checkpoint_conversion_mapping("glm5_next")
+    if conversion is None:
+        raise SystemExit("transformers 5.16.1 registers a glm5_next conversion to reuse")
+    register_checkpoint_conversion_mapping("glm5_next_text", conversion, overwrite=True)
+    torch.manual_seed(0)
+    return Glm5NextTextForCausalLM(glm5_next_tiny_config())
+
+
+class Glm5NextMTP(torch.nn.Module):
+    """One GLM-5.3-Flash prediction depth, composed the way GLM-4.5's is.
+
+    The release ships model.layers.45 with eh_proj over enorm and hnorm, a
+    sparse-attention block that runs its own indexer, a routed MLP and
+    shared_head.norm, and no hyper-connection tensors at all: the depth is a
+    plain pre-norm block, not the trunk's mHC layer, which reads attn_hc and
+    ffn_hc around each site (modeling_glm5_next.py:1293-1327). It ships no
+    embedding or head copy either, so the depth reads the trunk's.
+    """
+
+    def __init__(self, config: Glm5NextTextConfig, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.enorm = Glm5NextTextRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.hnorm = Glm5NextTextRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.eh_proj = torch.nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        # The upstream decoder factory has the text-config contract; reuse
+        # its parts without running its mHC forward (modeling_glm5_next.py:1259-1276).
+        layer = Glm5NextTextDecoderLayer(config, layer_idx)
+        self.input_layernorm = layer.input_layernorm
+        self.self_attn = layer.self_attn
+        self.post_attention_layernorm = layer.post_attention_layernorm
+        self.mlp = layer.mlp
+        self.shared_head_norm = Glm5NextTextRMSNorm(config.hidden_size, config.rms_norm_eps)
+
+    def forward(self, model: Glm5NextTextForCausalLM, hidden: torch.Tensor,
+                ids: torch.Tensor) -> torch.Tensor:
+        fused = self.eh_proj(torch.cat(
+            [self.enorm(model.model.embed_tokens(ids)), self.hnorm(hidden)], dim=-1))
+        # The block's mask is the padding mask the indexer reads, not a causal
+        # one: the selection it returns is what becomes the attention mask
+        # (modeling_glm5_next.py:1462-1475).
+        valid = torch.ones(fused.shape[:2], dtype=torch.bool, device=fused.device)
+        attended, _, _ = self.self_attn(
+            hidden_states=self.input_layernorm(fused), attention_mask=valid)
+        states = fused + attended
+        states = states + self.mlp(self.post_attention_layernorm(states))
+        return model.lm_head(self.shared_head_norm(states))
+
+
+def glm5_next_mtp(config: Glm5NextTextConfig) -> Glm5NextMTP:
+    """The depth's parts read their kind at its index, past the trunk's
+    lists, so they are built from a copy one layer deeper: the released depth
+    is a full sparse-attention layer that routes."""
+    depth = config.num_hidden_layers
+    extended = Glm5NextTextConfig.from_dict(dict(
+        config.to_dict(), num_hidden_layers=depth + 1,
+        indexer_types=[*(config.indexer_types or ()), "full"],
+        mlp_layer_types=[*(config.mlp_layer_types or ()), "sparse"],
+        layer_types=[*(config.layer_types or ()), "deepseek_sparse_attention"],
+        attn_implementation="eager", experts_implementation="eager"))
+    return Glm5NextMTP(extended, depth)
+
+
+def write_glm5_next_mtp(name: str, model: Glm5NextTextForCausalLM, depth: Glm5NextMTP,
+                        seed: int = GLM5_NEXT_MTP_SEED) -> None:
+    """The depth's tensors under the released names beside the fixture's, and
+    its logits over the trunk's hidden states."""
     directory = FIXTURES / name
-    depth = QwenMTP(model.config).eval()
+    depth = depth.eval()
     scatter_weights(depth, seed)
     ids = torch.from_numpy(np.load(directory / "input_ids.npy").astype(np.int64))
     with torch.no_grad():
         hidden = model.model(input_ids=ids, use_cache=False).last_hidden_state
-        embeddings = model.model.embed_tokens(ids)
-        positions = torch.arange(ids.shape[1])[None].expand(ids.shape[0], -1)
-        valid = torch.ones(ids.shape[0], ids.shape[1] - 1, dtype=torch.bool)
-        logits = model.lm_head(depth(hidden[:, :-1], embeddings[:, 1:], positions[:, 1:], valid))
+        logits = depth(model, hidden[:, :-1], ids[:, 1:])
+    prefix = f"model.layers.{depth.layer_idx}."
     tensors = load_file(str(directory / "model.safetensors"))
     for tensor_name, tensor in depth.state_dict().items():
-        if not tensor_name.startswith("layers.0.mlp.experts."):
-            tensors["mtp." + tensor_name] = tensor.to(torch.float32).numpy()
-    for tensor_name, tensor in expert_tensors(depth.layers[0].get_submodule("mlp.experts")).items():
-        tensors["mtp.layers.0." + tensor_name] = tensor
+        if not tensor_name.startswith("mlp.experts."):
+            released = tensor_name.replace("shared_head_norm", "shared_head.norm")
+            tensors[prefix + released] = tensor.to(torch.float32).numpy()
+    for tensor_name, tensor in expert_tensors(depth.get_submodule("mlp.experts")).items():
+        tensors[prefix + tensor_name] = tensor
     save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
-    np.savez(directory / "mtp_reference.npz", logits=logits.numpy(), hidden=hidden.numpy(),
-             embeddings=embeddings.numpy(), positions=positions.numpy(), valid=valid.numpy())
-    config = json.loads((directory / "config.json").read_text())
-    config.update(num_nextn_predict_layers=QWEN3_NEXT_TINY["num_nextn_predict_layers"],
-                  full_attention_interval=QWEN3_NEXT_TINY["full_attention_interval"])
-    (directory / "config.json").write_text(json.dumps(dict(sorted(config.items())), indent=1) + "\n")
+    np.save(directory / "mtp_logits.npy", logits.to(torch.float32).numpy())
+    print(f"{directory}: depth {prefix}* with {len(tensors)} tensors, "
+          f"mtp logits {tuple(logits.shape)}")
+
+
+def write_glm5_next_config(name: str, repo: str) -> None:
+    """Overlay the released nested linear-attention spelling and prove the
+    trunk plus saved head reloads bitwise; only the MTP depth remains unused."""
+    from huggingface_hub import model_info
+
+    directory = FIXTURES / name
+    saved = json.loads((directory / "config.json").read_text())
+    for field in ("linear_conv_kernel_dim", "linear_head_dim", "linear_lower_bound",
+                  "linear_num_heads"):
+        saved.pop(field, None)
+    config = {**saved, **GLM5_NEXT_RELEASED, "architectures": ["Glm5NextTextModel"],
+              "model_type": "glm5_next_text",
+              "transformers_version": transformers.__version__}
+    (directory / "config.json").write_text(
+        json.dumps(dict(sorted(config.items())), indent=1) + "\n")
     (directory / "source.json").write_text(json.dumps({
         "released": {"repo": repo, "revision": model_info(repo).sha},
         "transformers": {"version": transformers.__version__,
                          "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
-        "vllm": {"revision": "51da0ca66c8065619c79e35dff97aa99aeaf5644",
-                 "mtp_file": "vllm/model_executor/models/qwen3_next_mtp.py"},
     }, indent=1) + "\n")
-    print(f"{directory}: mtp.* depth with {len(tensors)} tensors, mtp logits {tuple(logits.shape)}")
+
+    loaded = Glm5NextTextModel.from_pretrained(
+        str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True,
+        attn_implementation="eager", experts_implementation="eager")
+    if not isinstance(loaded, tuple):
+        raise SystemExit("output_loading_info returns the model and its report")
+    trunk, report = loaded
+    trunk.eval()
+    unread = {key: sorted(report[key]) for key in
+              ("missing_keys", "mismatched_keys", "error_msgs") if report[key]}
+    depth = f"model.layers.{saved['num_hidden_layers']}."
+    stray = sorted(key for key in report["unexpected_keys"]
+                   if key != "lm_head.weight" and not key.startswith(depth))
+    if unread or stray:
+        raise SystemExit(f"{directory}: the released config does not read its own weights: "
+                         f"{unread} {stray}")
+    ids = torch.from_numpy(np.load(directory / "input_ids.npy").astype(np.int64))
+    head = torch.from_numpy(load_file(str(directory / "model.safetensors"))["lm_head.weight"])
+    with torch.no_grad():
+        hidden = trunk(input_ids=ids, use_cache=False).last_hidden_state
+        logits = torch.nn.functional.linear(hidden, head).numpy()
+    difference = float(np.max(np.abs(logits - np.load(directory / "logits.npy"))))
+    if difference != 0.0:
+        raise SystemExit(f"{directory}: the released spelling moved the logits by {difference:.3e}")
+    print(f"{directory}: model_type {config['model_type']}, {len(config)} fields, "
+          f"released spelling reloads bit for bit")
 
 
 def llama4_tiny_config() -> Llama4TextConfig:
@@ -712,14 +951,19 @@ def main() -> None:
     glm = tiny_glm4_moe()
     write_tiny("glm4-moe-tiny", glm)
     write_glm_mtp("glm4-moe-tiny", glm, glm4_moe_mtp(glm.config))
-    dsa = tiny_glm_moe_dsa()
-    write_tiny("glm-moe-dsa-tiny", dsa, seed=GLM_MOE_DSA_SEED)
-    write_glm_mtp("glm-moe-dsa-tiny", dsa, glm_moe_dsa_mtp(dsa.config))
-    write_glm_moe_dsa_head_dim("glm-moe-dsa-tiny")
     qwen3_next = tiny_qwen3_next()
     write_tiny("qwen3-next-tiny", qwen3_next)
     write_qwen3_next_mtp("qwen3-next-tiny", qwen3_next, "Qwen/Qwen3-Next-80B-A3B-Instruct")
     write_released_config("qwen3-next-80b-a3b", "Qwen/Qwen3-Next-80B-A3B-Instruct")
+    glm5_next = tiny_glm5_next()
+    write_tiny("glm5-next-tiny", glm5_next, seed=GLM5_NEXT_SEED)
+    write_glm5_next_mtp("glm5-next-tiny", glm5_next, glm5_next_mtp(glm5_next_tiny_config()))
+    write_glm5_next_config("glm5-next-tiny", "zai-org/GLM-5.3-Flash")
+    write_released_config("glm-5.3-flash", "zai-org/GLM-5.3-Flash")
+    dsa = tiny_glm_moe_dsa()
+    write_tiny("glm-moe-dsa-tiny", dsa, seed=GLM_MOE_DSA_SEED)
+    write_glm_mtp("glm-moe-dsa-tiny", dsa, glm_moe_dsa_mtp(dsa.config))
+    write_glm_moe_dsa_head_dim("glm-moe-dsa-tiny")
     write_tiny("llama4-tiny", tiny_llama4())
     write_llama4_blocks(FIXTURES.parent / "llama4")
     write_mirrored_config("llama-4-scout", "unsloth/Llama-4-Scout-17B-16E")

@@ -7,10 +7,6 @@ line for line into NumPy at float64, with `DeepseekV4HyperHead.forward`
 share the mapping token for token (modeling_deepseek_v4.py:915-943).
 Nothing here imports torch, so the oracle holds the module to the math and
 not to another implementation's rounding.
-
-Observed on CPU: the fp32 module against the oracle to 2.4e-07 scaled on the
-mixed streams, its gradients against central differences of the oracle to
-1.6e-05 scaled, with the bound 1e-4 on both.
 """
 
 import numpy as np

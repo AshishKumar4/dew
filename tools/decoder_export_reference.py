@@ -64,6 +64,8 @@ class Case:
     balance_rate: float | None = None
     mtp_weight: float | None = None
     reference_class: str | None = None
+    reference_module: str = 'transformers'
+    conversion_type: str | None = None
 
 
 CASES = (
@@ -79,6 +81,9 @@ CASES = (
     Case("llama4_text", "llama4-tiny"),
     Case("olmo3", "olmo3-yarn-tiny"),
     Case("qwen3_next", "qwen3-next-tiny", mtp_weight=0.3),
+    Case("glm5_next", "glm5-next-tiny", balance_rate=1e-2, mtp_weight=0.3,
+         reference_class="Glm5NextTextForCausalLM", reference_module="tools.hf_reference_b",
+         conversion_type="glm5_next"),
 )
 
 
@@ -134,6 +139,14 @@ def train(case: Case, source: Pretrained, ids: np.ndarray):
     return state
 
 
+def _prediction_prefixes(config) -> tuple[str, ...]:
+    """The declared prediction tensors omitted by the upstream trunk class."""
+    if config.model_type in ('glm4_moe', 'glm_moe_dsa', 'glm5_next_text'):
+        return tuple(f'model.layers.{config.num_hidden_layers + depth}.'
+                     for depth in range(getattr(config, 'num_nextn_predict_layers', 0)))
+    return ('mtp.',) if config.model_type == 'qwen3_next' else ()
+
+
 def reference_model(case: Case, directory: Path):
     """The reference implementation over the exported directory, with its
     loading report.
@@ -156,23 +169,20 @@ def reference_model(case: Case, directory: Path):
             get_checkpoint_conversion_mapping, register_checkpoint_conversion_mapping,
         )
 
-        factory = getattr(transformers, case.reference_class)
+        from importlib import import_module
+        factory = getattr(import_module(case.reference_module), case.reference_class)
         model_type = json.loads((directory / "config.json").read_text())["model_type"]
+        conversion = get_checkpoint_conversion_mapping(case.conversion_type or factory.config_class.model_type)
+        if conversion is None:
+            raise ValueError(f"no reference conversion for {model_type}")
         register_checkpoint_conversion_mapping(
-            model_type, get_checkpoint_conversion_mapping(factory.config_class.model_type),
-            overwrite=True)
+            model_type, conversion, overwrite=True)
     loaded = factory.from_pretrained(
-        str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True)
+        str(directory), dtype=torch.float32, local_files_only=True, output_loading_info=True,
+        experts_implementation="eager")
     if not isinstance(loaded, tuple) or len(loaded) != 2:
         raise TypeError("output_loading_info must return a model and its loading report")
-    return loaded
-
-
-def reference_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray:
-    """transformers 5.16.1 over the exported directory, fp32 on the eager path."""
-    import torch
-
-    model, report = reference_model(case, directory)
+    model, report = loaded
     for category in ("missing_keys", "mismatched_keys", "error_msgs"):
         if report.get(category):
             raise ValueError(f"reference load {category}: {report[category]}")
@@ -182,18 +192,82 @@ def reference_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray
     # Qwen3NextPreTrainedModel ignores `^mtp.*` on load
     # (modeling_qwen3_next.py:877). Only those may remain unconsumed; an
     # unrelated tensor is an export bug.
-    config = model.config
-    depths = tuple(f"model.layers.{config.num_hidden_layers + depth}."
-                   for depth in range(config.num_nextn_predict_layers))
-    prefixes = {"glm4_moe": depths, "glm_moe_dsa": depths,
-                "qwen3_next": ("mtp.",)}.get(config.model_type, ())
+    prefixes = _prediction_prefixes(model.config)
     if any(not name.startswith(prefixes) for name in unexpected):
         raise ValueError(f"reference load unexpected tensors: {unexpected}")
+    return model, report
+
+
+def reference_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray:
+    """transformers 5.16.1 over the exported directory, fp32 on the eager path."""
+    import torch
+
+    model, _ = reference_model(case, directory)
     model.eval()
     model.set_attn_implementation("eager")
     with torch.no_grad():
         out = model(input_ids=torch.from_numpy(np.asarray(ids, np.int64)), use_cache=False)
     return out.logits.to(torch.float32).numpy()
+
+
+def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.ndarray:
+    """Read the trained GLM depth, using the unchanged reference composition.
+
+    Native NextN at SGLang 97c6978 passes final-normalized target states
+    (glm5_next.py:1068-1075, eagle_worker_v2.py:1229-1235) into the plain
+    NoPE block (deepseek_nextn.py:177-187,247-298). This reads new weights;
+    it neither redraws a tensor nor changes the existing fixture oracle.
+    """
+    from concurrent.futures import Future
+    from copy import deepcopy
+
+    import torch
+    from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+    from transformers.core_model_loading import WeightConverter, dot_natural_key
+    from tools.hf_reference_b import glm5_next_mtp
+
+    model, _ = reference_model(case, directory)
+    if model.config.model_type != 'glm5_next_text':
+        raise ValueError('GLM prediction composition requires glm5_next_text')
+    model.eval()
+    model.set_attn_implementation('eager')
+    depth = glm5_next_mtp(model.config).float().eval()
+    registered = get_checkpoint_conversion_mapping('glm5_next')
+    if registered is None:
+        raise ValueError('glm5_next has no reference checkpoint conversion')
+    rules = deepcopy(registered)
+    prefix = f'model.layers.{model.config.num_hidden_layers}.'
+    tensors = source_tensors(directory)
+    prepared: dict[str, torch.Tensor] = {}
+    pending: dict[str, WeightConverter] = {}
+    for source_name in sorted((name for name in tensors if name.startswith(prefix)),
+                              key=dot_natural_key):
+        name = source_name.removeprefix(prefix).replace('shared_head.norm.', 'shared_head_norm.')
+        value = torch.from_numpy(tensors[source_name])
+        for rule in rules:
+            target, matched = rule.rename_source_key(name)
+            if matched is None:
+                continue
+            if isinstance(rule, WeightConverter):
+                converter = pending.get(target)
+                if converter is None:
+                    converter = deepcopy(rule)
+                    pending[target] = converter
+                future: Future[torch.Tensor] = Future()
+                future.set_result(value)
+                converter.add_tensor(target, name, matched, future)
+                break
+            name = target
+        else:
+            prepared[name] = value
+    for target, converter in pending.items():
+        prepared.update(converter.convert(target, config=model.config))
+    depth.load_state_dict(prepared, strict=True)
+    tokens = torch.from_numpy(np.asarray(ids, np.int64))
+    with torch.no_grad():
+        hidden = model.model(input_ids=tokens, use_cache=False).last_hidden_state
+        logits = depth(model, hidden[:, :-1], tokens[:, 1:])
+    return logits.float().numpy()
 
 
 def round_trip(case: Case, workspace: Path) -> RoundTrip:
@@ -270,28 +344,49 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
     model.set_attn_implementation("eager")
     labels = torch.from_numpy(np.asarray(trip.ids, np.int64))
     model(input_ids=labels, labels=labels, use_cache=False).loss.backward()
-    theirs = {name: parameter.grad for name, parameter in model.named_parameters()}
+    from transformers.core_model_loading import revert_weight_conversion
 
-    def reference_grad(layout) -> np.ndarray | None:
-        grad = theirs.get(layout.name)
-        if grad is None and layout.expert_index is not None:
-            experts, projection = layout.name.rsplit(".", 3)[0], layout.name.rsplit(".", 2)[1]
-            fused = theirs.get(f"{experts}.{'down_proj' if projection == 'down_proj' else 'gate_up_proj'}")
-            if fused is not None:
-                grad = fused[layout.expert_index]
-                if projection != "down_proj":
-                    width = grad.shape[0] // 2
-                    grad = grad[:width] if projection == "gate_proj" else grad[width:]
-        return None if grad is None else grad.to(torch.float32).numpy()
-
-    errors = {}
+    parameters = dict(model.named_parameters())
+    prediction_prefixes = _prediction_prefixes(model.config)
+    excluded = {name for name in parameters
+                if '.indexer.' in name or name.startswith(prediction_prefixes)}
+    unexpected_missing = {name for name, parameter in parameters.items()
+                          if parameter.requires_grad and parameter.grad is None and name not in excluded}
+    unexpected_present = {name for name in excluded if parameters[name].grad is not None}
+    if unexpected_missing or unexpected_present:
+        raise ValueError(f'reference gradient participation differs: missing {sorted(unexpected_missing)}, '
+                         f'excluded but present {sorted(unexpected_present)}')
+    upstream = {name: parameter.grad for name, parameter in parameters.items()
+                if parameter.grad is not None}
+    # The inverse converter processes every supplied upstream name, including
+    # unmatched pass-throughs (core_model_loading.py:1833-1860). Check its
+    # scalar count as well, so a rename collision cannot silently drop data.
+    converted = revert_weight_conversion(model, upstream)
+    if sum(value.numel() for value in upstream.values()) != sum(value.numel() for value in converted.values()):
+        raise ValueError('reference gradient conversion lost or duplicated scalar entries')
+    # Prediction-owned serialized embedding/head copies alias trunk leaves;
+    # exclude their declared source prefix as well as independent MTP paths.
+    layouts = {layout.name: layout for layout in source.weight_layouts
+               if layout.paths[0][0] == 'params' and 'indexer' not in layout.paths[0]
+               and not layout.paths[0][1].startswith('mtp_')
+               and not layout.name.startswith(prediction_prefixes)}
+    if set(converted) != set(layouts):
+        raise ValueError(f'gradient source/layout bijection differs: '
+                         f'upstream only {sorted(set(converted) - set(layouts))}, '
+                         f'Dew only {sorted(set(layouts) - set(converted))}')
     for layout in source.weight_layouts:
-        reference = reference_grad(layout) if layout.paths[0][0] == "params" else None
-        if reference is None:
-            continue
-        ours = layout.export(grads)
-        errors[layout.name] = float(np.max(
-            np.abs(ours - reference) / np.maximum(1.0, np.maximum(np.abs(ours), np.abs(reference)))))
+        path = layout.paths[0]
+        if path[0] == 'params' and ('indexer' in path or path[1].startswith('mtp_')):
+            if np.any(layout.export(grads) != 0):
+                raise ValueError(f'{layout.name} has an unexpected trunk-loss gradient')
+    errors = {}
+    for name, reference in converted.items():
+        ours = layouts[name].export(grads)
+        theirs = reference.to(torch.float32).numpy()
+        if ours.shape != theirs.shape:
+            raise ValueError(f'{name} gradient shapes differ: {ours.shape} versus {theirs.shape}')
+        errors[name] = float(np.max(
+            np.abs(ours - theirs) / np.maximum(1.0, np.maximum(np.abs(ours), np.abs(theirs)))))
     return errors
 
 
@@ -318,4 +413,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     main()
