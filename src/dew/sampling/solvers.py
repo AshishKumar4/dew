@@ -27,18 +27,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import reduce
-from typing import Literal, NamedTuple, Protocol, TypeVar
+from typing import Literal, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
 from jax import lax
+from typing_extensions import TypeVar
 
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import GeneralizedNoiseScheduler
 from dew.diffusion.transforms import broadcast_rates
 from dew.registry import samplers
 
-StateT = TypeVar("StateT", covariant=True)
+# A solver whose state nobody names is a solver over any state: `StateT` is
+# covariant, so `Solver` written bare is the type every concrete solver
+# satisfies, and a call site that carries the state names it.
+StateT = TypeVar("StateT", covariant=True, default=object)
 
 
 class Solver(Protocol[StateT]):

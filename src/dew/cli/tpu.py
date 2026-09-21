@@ -409,6 +409,8 @@ class List(Base):
             payload = gcloud.json("compute", "tpus", "tpu-vm", "list",
                                   f"--zone={zone}", default=[])
             for entry in payload if isinstance(payload, list) else ():
+                if not isinstance(entry, dict):
+                    raise ValueError(f"gcloud listed {entry!r}, which is not a TPU record")
                 node = Node.parse(entry)
                 rows.append((node.name, node.accelerator_type, node.state,
                              node.health or "-", str(node.workers), zone,

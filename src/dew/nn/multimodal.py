@@ -67,12 +67,11 @@ class VisionConditioner(nn.Module):
         need only one pooling/merge block to create resolution-independent
         parameters; real batches supply their processed geometry later.
         """
-        side = getattr(self.vision, "image_size", None)
+        geometry = self.vision.geometry()
+        side = geometry.image_size
         if side is None:
-            patch = getattr(self.vision, "patch_size", 16)
-            block = getattr(self.vision, "pooling_kernel_size", getattr(self.vision, "spatial_merge_size", 2))
-            side = patch * block
-        channels = getattr(self.vision, "num_channels", getattr(self.vision, "in_channels", getattr(self.vision, "in_chans", 3)))
+            side = (geometry.patch_size or 16) * (geometry.block_size or 2)
+        channels = geometry.channels or 3
         self({"pixel_values": jnp.zeros((1, 1, channels, side, side), self.dtype or jnp.float32)})
 
 
@@ -131,7 +130,7 @@ class AudioConditioner(nn.Module):
 
     def initialize_parameters(self) -> None:
         """Create the audio leaves during a token-only model init."""
-        mel = getattr(self.audio, "input_feat_size", getattr(self.audio, "subsampling_conv_channels", (128,))[0])
+        mel = self.audio.geometry().mel_features or 128
         frames = 16 if self.soft_tokens is None else 16 * self.soft_tokens
         self({"input_features": jnp.zeros((1, 1, frames, mel), self.dtype or jnp.float32),
               "input_features_mask": jnp.ones((1, 1, frames), bool)})

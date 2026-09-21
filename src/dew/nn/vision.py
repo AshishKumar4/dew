@@ -65,6 +65,25 @@ class ProjectorBase:
             f"{type(self).__name__} names a projector kind but builds no module")
 
 
+@dataclasses.dataclass(frozen=True)
+class TowerGeometry:
+    """The shapes a conditioner has to invent to create a tower's media leaves.
+
+    A token-only init has no batch, so `VisionConditioner` and
+    `AudioConditioner` build one smallest input the tower accepts. What that
+    is differs by kind: a fixed-resolution tower states its `image_size`, a
+    patch-and-pool tower states the patch and block that make one, and an
+    audio tower states how many mel bins a frame carries. None means this
+    tower has no such field, and the conditioner uses its own default.
+    """
+
+    image_size: int | None = None
+    patch_size: int | None = None
+    block_size: int | None = None
+    channels: int | None = None
+    mel_features: int | None = None
+
+
 class TowerBase:
     """One tower kind's value: its fields, and how it builds its module."""
 
@@ -72,6 +91,15 @@ class TowerBase:
         """The Flax module for this value."""
         raise NotImplementedError(
             f"{type(self).__name__} names a tower kind but builds no module")
+
+    def geometry(self) -> TowerGeometry:
+        """What an initialising input has to look like for this tower.
+
+        Nothing by default: a tower states the fields it has, and a
+        conditioner reads them here instead of asking the value at runtime
+        whether it carries each one.
+        """
+        return TowerGeometry()
 
 
 def projector_from_record(record: Mapping[str, object]) -> ProjectorBase:
@@ -88,7 +116,7 @@ def projector_from_record(record: Mapping[str, object]) -> ProjectorBase:
             f"a projector kind is a registered name, not {kind!r}; known: "
             f"{', '.join(sorted(projectors))}")
     try:
-        built = projectors.build(kind, **fields)
+        built = projectors.build(kind, fields)
     except KeyError:
         raise ValueError(
             f"a projector kind is a registered name, not {kind!r}; known: "
@@ -114,7 +142,7 @@ def tower_from_record(record: Mapping[str, object]) -> TowerBase:
             f"a tower kind is a registered name, not {kind!r}; known: "
             f"{', '.join(sorted(towers))}")
     try:
-        built = towers.build(kind, **fields)
+        built = towers.build(kind, fields)
     except KeyError:
         raise ValueError(
             f"a tower kind is a registered name, not {kind!r}; known: "
@@ -246,6 +274,10 @@ class SiglipVision(TowerBase):
             image_size=self.image_size, patch_size=self.patch_size,
             num_channels=self.num_channels, hidden_act=self.hidden_act,
             layer_norm_eps=self.layer_norm_eps)
+
+    def geometry(self) -> TowerGeometry:
+        return TowerGeometry(image_size=self.image_size, patch_size=self.patch_size,
+                             channels=self.num_channels)
 
 
 def _llama4_vision_rope(values: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
@@ -579,6 +611,10 @@ class Llama4Vision(TowerBase):
             rope_theta=self.rope_theta, pixel_shuffle_ratio=self.pixel_shuffle_ratio,
             projector_input_dim=self.projector_input_dim,
             projector_output_dim=self.projector_output_dim)
+
+    def geometry(self) -> TowerGeometry:
+        return TowerGeometry(image_size=self.image_size, patch_size=self.patch_size,
+                             channels=self.num_channels)
 
 
 class Llama4ProjectorModule(nn.Module):
@@ -934,6 +970,9 @@ class Gemma4Vision(TowerBase):
             rope_theta=self.rope_theta, standardize=self.standardize,
             use_clipped_linears=self.use_clipped_linears)
 
+    def geometry(self) -> TowerGeometry:
+        return TowerGeometry(patch_size=self.patch_size, block_size=self.pooling_kernel_size)
+
 
 class Gemma4ProjectorModule(nn.Module):
     """Soft tokens to text width: a scale-free RMS norm, then the map.
@@ -1194,6 +1233,10 @@ class Qwen35Vision(TowerBase):
             temporal_patch_size=self.temporal_patch_size,
             out_hidden_size=self.out_hidden_size,
             num_position_embeddings=self.num_position_embeddings)
+
+    def geometry(self) -> TowerGeometry:
+        return TowerGeometry(patch_size=self.patch_size, block_size=self.spatial_merge_size,
+                             channels=self.in_channels)
 
 
 class Qwen35ProjectorModule(nn.Module):
@@ -1901,6 +1944,9 @@ class Gemma3nVision(TowerBase):
 
     def build(self) -> nn.Module:
         return MobileNetV5Encoder(**dataclasses.asdict(self))
+
+    def geometry(self) -> TowerGeometry:
+        return TowerGeometry(channels=self.in_chans)
 
 
 class Gemma3nProjectorModule(nn.Module):

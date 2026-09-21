@@ -314,7 +314,7 @@ class Trainer(Generic[Loss, Effects]):
         from dew.training.host import companion_mesh
         return companion_mesh(self.device_mesh)
 
-    def shardings(self, state: TrainState) -> Placement:
+    def shardings(self, state: TrainState) -> Placement[TrainState]:
         """Parameter gradients follow parameters; replay records follow batches;
         the layout's host-resident fields sit in pinned host memory. Under a
         CPU-owned state the frozen collection is the exception: it sits where
@@ -347,7 +347,7 @@ class Trainer(Generic[Loss, Effects]):
             variables=buffered_shardings(accumulation.variables, batches=False))
         return dataclasses.replace(placed, accumulation=pending)
 
-    def _fetched(self, state: TrainState, shardings: Placement) -> TrainState:
+    def _fetched(self, state: TrainState, shardings: Placement[TrainState]) -> TrainState:
         """`state` with the layout's host-resident fields brought to the
         device, where a step or an evaluation reads them."""
         if self.host_master:
@@ -357,7 +357,7 @@ class Trainer(Generic[Loss, Effects]):
                 lambda s: s.with_memory_kind("device"), getattr(shardings, field)))
             for field in self.layout.host})
 
-    def place(self) -> tuple[TrainState, Placement, bytes | None]:
+    def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """The state itself, fresh or restored, on the mesh, with its shardings
         and the data position a resume continues from."""
         # Resolved once: the shapes and the values are then the same inputs
@@ -388,7 +388,7 @@ class Trainer(Generic[Loss, Effects]):
         print(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
 
-    def _placed_host(self, initializer, key, shardings: Placement) -> TrainState:
+    def _placed_host(self, initializer, key, shardings: Placement[TrainState]) -> TrainState:
         """A fresh CPU-owned state, its leaves streamed into place one at a time.
 
         The tree is built eagerly on the CPU, where the held leaves the
@@ -947,7 +947,7 @@ class Trainer(Generic[Loss, Effects]):
     # Validation
     # ------------------------------------------------------------------
 
-    def _evaluate(self, state: TrainState, shardings: Placement, dataset: Dataset,
+    def _evaluate(self, state: TrainState, shardings: Placement[TrainState], dataset: Dataset,
                   metrics: Sequence[Metric], preview: bool, mesh) -> None:
         params = state.params
         averaged = with_ema(state.params, self._fetched(state, shardings).ema)

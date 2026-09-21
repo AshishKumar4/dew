@@ -50,6 +50,17 @@ Transforms = LogitsTransform | Sequence[LogitsTransform]
 Criteria = Stopping | Sequence[Stopping]
 Components = tuple[tuple[LogitsTransform, ...], tuple[Stopping, ...], Strategy]
 
+# A resolved component's configuration as every process can spell it: a repr,
+# a number (an array's shape is a tuple of them), or a tuple of either nested
+# as deep as the component is. Only `repr` and `==` are applied to one, by the
+# pool agreement in `dew.nn.inputs` and by the digest that precedes it.
+type Identity = str | int | tuple[Identity, ...]
+# What carries its own qualified name, and so names a component: a class, a
+# function, a bound method, a library builtin. Anything else is named by its
+# class, which is one of these.
+type SelfNaming = type | types.FunctionType | types.MethodType | types.BuiltinFunctionType
+SELF_NAMING = (type, types.FunctionType, types.MethodType, types.BuiltinFunctionType)
+
 
 @dataclass(frozen=True)
 class Sampling:
@@ -412,19 +423,16 @@ def resolve(sampling: Sampling, logits: Transforms | None, stopping: Criteria | 
             Sample() if strategy is None else strategies.as_pytree(strategy))
 
 
-def _named(value: object) -> str:
+def _named(value: SelfNaming) -> str:
     """A component's identity, the same string in every process.
 
     A repr would carry the object's address, and two processes that resolved
     the same chain would then look like they disagreed.
     """
-    if not isinstance(value, type) and hasattr(value, "__qualname__"):
-        return f"{getattr(value, '__module__', '?')}.{value.__qualname__}"
-    kind = value if isinstance(value, type) else type(value)
-    return f"{kind.__module__}.{kind.__qualname__}"
+    return f"{value.__module__}.{value.__qualname__}"
 
 
-def _stable(value: object, seen: frozenset[int] = frozenset()) -> object:
+def _stable(value: object, seen: frozenset[int] = frozenset()) -> Identity:
     """A component's configuration as something every process can compare.
 
     The description reaches every part a rank could differ in: a dataclass's
@@ -448,13 +456,13 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> object:
     if isinstance(value, Mapping):
         return ("mapping", tuple(sorted((repr(name), _stable(entry, seen))
                                         for name, entry in value.items())))
-    if hasattr(value, "shape") and hasattr(value, "dtype"):
+    if isinstance(value, (np.ndarray, np.generic, jax.Array)):
         return ("array", *_hashed(value))
     if isinstance(value, functools.partial):
         return ("partial", _stable(value.func, seen), _stable(value.args, seen),
                 _stable(dict(value.keywords), seen))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return (_named(value), *tuple(
+        return (_named(type(value)), *tuple(
             (field.name, _stable(getattr(value, field.name), seen))
             for field in dataclasses.fields(value)))
     if isinstance(value, types.FunctionType):
@@ -468,22 +476,23 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> object:
             cells.append(_stable(captured, seen))
         return ("function", _named(value), tuple(cells), _stable(value.__defaults__ or (), seen),
                 _stable(value.__kwdefaults__ or {}, seen))
+    kind = value if isinstance(value, SELF_NAMING) else type(value)
     text = repr(value)
     if "0x" in text:
         raise ValueError(
-            f"a decoding component holds {_named(value)}, whose identity is this process's "
+            f"a decoding component holds {_named(kind)}, whose identity is this process's "
             "memory address; give the configuration as arrays or plain values so a pool can "
             "agree on it")
-    return (_named(value), text)
+    return (_named(kind), text)
 
 
-def _hashed(value: object) -> tuple[object, ...]:
+def _hashed(value: np.ndarray | np.generic | jax.Array) -> tuple[tuple[int, ...], str, str]:
     """An array's shape, dtype and contents, as a comparable triple."""
     array = np.ascontiguousarray(np.asarray(value))
     return (array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest())
 
 
-def _digest(components: object) -> tuple[object, ...]:
+def _digest(components: Components) -> tuple[Identity, str]:
     """Resolved components as a value every process can compare.
 
     The configuration arrays are part of the identity: two processes holding
@@ -503,7 +512,7 @@ def _request(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              key: jax.Array | None, seed: int | None, sampling: Sampling, n: int,
              logits: Transforms | None, stopping: Criteria | None, strategy: Strategy | None,
-             *, pooled: bool) -> tuple[ModelInputs, jax.Array, Components, tuple[object, ...]]:
+             *, pooled: bool) -> tuple[ModelInputs, jax.Array, Components, tuple[Identity, ...]]:
     """This process's validated request and the controls a pool compares.
 
     Everything a rank can get wrong on its own is raised from here, the

@@ -14,8 +14,9 @@ Objective classes, and a registry cannot share its name. It is
 `dew.registry.objectives`.
 """
 
+from collections.abc import Callable, Mapping
 from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
@@ -78,7 +79,7 @@ _EXPORTS = {
 }
 
 
-def __getattr__(name: str) -> Any:
+def __getattr__(name: str) -> type | Callable | Mapping[str, object]:
     module = _EXPORTS.get(name)
     if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

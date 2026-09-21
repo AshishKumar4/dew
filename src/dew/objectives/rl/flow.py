@@ -74,7 +74,7 @@ class FlowGRPOObjective(DiffusionObjective):
                  sde: FlowSDE = FlowSDE(), beta: float = 0.0,
                  clip_range: float = 1e-4, adv_clip_max: float = 5.0,
                  autoencoder: AutoEncoder | None = None,
-                 guidance: CFG | None = CFG(3.0), sampler: Solver[object] = Euler(),
+                 guidance: CFG | None = CFG(3.0), sampler: Solver = Euler(),
                  steps: int = 41, pretrained: Variables | None = None):
         sde.validate(process)
         if not math.isfinite(beta) or beta < 0:

@@ -23,8 +23,8 @@ import re
 import sys
 import types
 import typing
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Annotated, Any, Literal, Mapping, Self
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Annotated, Literal, Mapping, Self
 
 import jax
 import tyro
@@ -111,10 +111,10 @@ class ModelConfig:
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Inverse of the record `RunConfig.to_dict` writes for this field."""
-        return _rebuild(cls, values)
+        return _built(cls, values)
 
     def build(self):
-        return models.build(self.architecture, **self.fields())
+        return models.build(self.architecture, self.fields())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -280,7 +280,19 @@ def _to_json(value, annotation) -> JSON:
         f"registered values this writes as their name and fields")
 
 
-def _fields(cls, values):
+def _instantiate(member: Callable, fields: Mapping[str, registry.Configured]) -> registry.Configured:
+    """The member called with the record's fields, as a value a config carries.
+
+    The call is written here, behind `Callable[...]`, because a record names
+    its fields at runtime and the class it builds cannot check them at type
+    time; `_fields` has already refused any the class does not declare.
+    """
+    return registry.configured(member(**fields))
+
+
+def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Configured]:
+    if not isinstance(values, Mapping):
+        raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
     declared = [f.name for f in dataclasses.fields(cls) if f.init]
     unknown = sorted(set(values) - set(declared))
     missing = [name for name in declared if name not in values]
@@ -288,23 +300,41 @@ def _fields(cls, values):
         raise ValueError(
             f"{cls.__name__} does not match the record: unknown fields {unknown}, "
             f"missing fields {missing}")
-    return {name: _rebuild(_declared_type(cls, name), values[name]) for name in declared}
+    return {name: _rebuild(_declared_type(cls, name), registry.configured(values[name]))
+            for name in declared}
 
 
-def _rebuild(annotation, value) -> Any:
-    """The value `annotation` asks for, built out of a record. It returns
-    whatever type the field declares, so the annotation is Any."""
+def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:
+    """One record as the class it describes, or a refusal naming what it built."""
+    rebuilt = _rebuild(cls, values)
+    if not isinstance(rebuilt, cls):
+        raise ValueError(f"{values!r} builds a {type(rebuilt).__name__}, not a {cls.__name__}")
+    return rebuilt
+
+
+def _rebuild(annotation: registry.Annotation, value: registry.Configured) -> registry.Configured:
+    """The value `annotation` asks for, built out of a record.
+
+    It hands back what the field declares, which only the annotation knows,
+    so the width here is what a config field can carry; `_built` is the same
+    walk for a caller that holds the class and reads a value of it back."""
     annotation = registry.resolve_alias(annotation)
     held = _registry_for(annotation)
     if held is not None:
-        if held.record == "kind":
-            member = held[value["kind"]]
-            fields = {name: entry for name, entry in value.items() if name != "kind"}
-        else:
-            member, fields = held[value["name"]], value["fields"]
-        return member(**_fields(member, fields))
+        if not isinstance(value, Mapping):
+            raise ValueError(f"a {held.kind} is the record that names it, not {value!r}")
+        named = value["kind" if held.record == "kind" else "name"]
+        if not isinstance(named, str):
+            raise ValueError(f"a {held.kind} names a registered member, not {named!r}")
+        member = held[named]
+        if not isinstance(member, type):
+            raise ValueError(f"the {held.kind} {named!r} is a function, and a record "
+                             f"names the fields of a class")
+        fields = ({name: entry for name, entry in value.items() if name != "kind"}
+                  if held.record == "kind" else value["fields"])
+        return _instantiate(member, _fields(member, registry.configured(fields)))
     if isinstance(annotation, type) and dataclasses.is_dataclass(annotation):
-        return annotation(**_fields(annotation, value))
+        return _instantiate(annotation, _fields(annotation, value))
     if typing.get_origin(annotation) in (typing.Union, types.UnionType):
         inner = [m for m in typing.get_args(annotation) if m is not type(None)]
         if value is None or len(inner) != 1:
@@ -341,7 +371,7 @@ class RunConfig:
     def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Inverse of `to_dict`, for subclasses too; an unknown or a missing
         field raises."""
-        return _rebuild(cls, values)
+        return _built(cls, values)
 
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.

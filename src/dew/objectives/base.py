@@ -40,6 +40,15 @@ type Variables = Mapping[str, Any]
 the modules keep (`moe`, `batch_stats`, an objective's frozen encoders)."""
 
 type Batch = Mapping[str, Any]
+"""One training example set, as the trainer and every objective read it.
+
+Declared once here and imported by `dew.data.dataset`, so a field added on
+one side is the same type on the other. The leaves are heterogeneous by
+measurement, not by omission: alongside the arrays a step consumes, a batch
+carries the prepared text inputs of a language run, the file paths a video
+corpus resolves lazily, the integer row counts a packer keeps and the record
+lists a mixture reads, so a narrower leaf type is untrue of what `dew.data`
+already builds."""
 type Path = tuple[str, ...]
 type PathFilter = Callable[[Path], bool]
 """Selects leaves of a variables tree by the tuple of dict keys above them.

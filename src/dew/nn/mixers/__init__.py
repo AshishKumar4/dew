@@ -128,7 +128,7 @@ def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
         raise ValueError(
             f"a mixer kind is a registered name, not {kind!r}; known: "
             f"{', '.join(sorted(mixers))}")
-    built: MixerBase = mixers.build(kind, **fields)
+    built: MixerBase = mixers.build(kind, fields)
     if not isinstance(built, MixerBase):
         raise ValueError(
             f"mixer {kind!r} built {type(built).__name__}, which is not a "

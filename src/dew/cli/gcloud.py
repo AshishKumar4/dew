@@ -14,6 +14,8 @@ import sys
 import threading
 from collections.abc import Iterable, Sequence
 
+from dew.records import JSON
+
 #: The binary every command in this module goes through.
 GCLOUD = "gcloud"
 
@@ -121,7 +123,7 @@ class Gcloud:
             raise SystemExit(outcome.text or f"{argv[0]} failed with code {outcome.code}")
         return outcome
 
-    def json(self, *args: str, default: object = None) -> object:
+    def json(self, *args: str, default: JSON = None) -> JSON:
         """Run a gcloud command that speaks JSON and parse it."""
         outcome = self.run(self.argv(*args, "--format=json"))
         if not outcome.ok or not outcome.out.strip():

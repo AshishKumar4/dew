@@ -205,7 +205,7 @@ class DocumentChunks(pygrain.MapDataset[Batch]):
     @overload
     def __getitem__(self, index: int) -> Batch: ...
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch]:
         # grain's slice is the sharding and windowing API (ds[shard::count]),
         # and an index past the end wraps, so `repeat` is a length change.
         if isinstance(index, slice):
@@ -269,7 +269,7 @@ class PackedWindows(pygrain.MapDataset[Batch]):
     @overload
     def __getitem__(self, index: int) -> Batch: ...
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch]:
         # grain's slice is the sharding and windowing API (ds[shard::count]),
         # and an index past the end wraps, so `repeat` is a length change.
         if isinstance(index, slice):

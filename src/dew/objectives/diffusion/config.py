@@ -216,7 +216,7 @@ class DiffusionRunConfig(RunConfig):
             params=None if variables is None else variables["encoders"]["textcontext"],
             dtype=self.model.dtype)}
         inputs = InputSpec(sample=self.sample_field(), conditions=conditions)
-        model = models.build(self.model.architecture, **self.model_fields(autoencoder))
+        model = models.build(self.model.architecture, self.model_fields(autoencoder))
         process = self.preset()
         if not isinstance(process, Process):
             raise ValueError(

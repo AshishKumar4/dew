@@ -10,12 +10,14 @@ import math
 import os
 from functools import partial
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from dew.nn.text_encoders import ParamTree
 
 
 class FlaxUpsample2D(nn.Module):
@@ -656,7 +658,7 @@ def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
     return (*path, leaf)
 
 
-def translate_vae_weights(torch_tensors: Mapping[str, Any]) -> dict:
+def translate_vae_weights(torch_tensors: ParamTree) -> dict:
     """diffusers AutoencoderKL tensors into the vendored modules' param tree.
 
     Convolution kernels transpose from torch's [out, in, kh, kw] to linen's
@@ -666,6 +668,8 @@ def translate_vae_weights(torch_tensors: Mapping[str, Any]) -> dict:
     """
     params: dict = {}
     for name, tensor in torch_tensors.items():
+        if isinstance(tensor, dict):
+            raise ValueError(f"{name} is a subtree; a diffusers VAE table is flat")
         leaf = np.asarray(tensor, dtype=np.float32)
         path = _vae_path(name, leaf.ndim)
         if path[-1] == "kernel":

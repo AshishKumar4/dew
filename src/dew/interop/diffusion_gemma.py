@@ -14,7 +14,7 @@ from flax import linen as nn
 
 from dew import records
 from dew.diffusion.block import BlockProcess
-from dew.interop.hf_decoders import translate_config, translate_denoiser_weights
+from dew.interop.hf_decoders import DecoderFields, translate_config, translate_denoiser_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
@@ -27,7 +27,7 @@ from dew.nn.vision import (
     translate_gemma4_vision_weights,
 )
 from dew.objectives.base import Variables
-from dew.registry import with_precision
+from dew.registry import models, precision_fields
 
 
 # The wrapper config states these three with a default this assembly supplies
@@ -57,8 +57,11 @@ def build(config: Mapping[str, object], *, dtype: str = "bfloat16",
     fields["causal"] = True
     if max_seq_len is not None:
         fields["max_seq_len"] = max_seq_len
-    text = CausalTransformer(**with_precision(
-        "causal_transformer", fields, dtype=dtype, attention_impl=attention_impl))
+    precise: DecoderFields = {**fields, **precision_fields(
+        "causal_transformer", fields, dtype=dtype, attention_impl=attention_impl)}
+    text = models.build("causal_transformer", precise)
+    if not isinstance(text, CausalTransformer):
+        raise TypeError("the causal_transformer registry entry must build a CausalTransformer")
     conditioner = None
     if config.get("vision_config") is not None:
         tower = translate_gemma4_vision_config(_section(config, "vision_config"))

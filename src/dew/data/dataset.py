@@ -23,17 +23,7 @@ import json
 import math
 import sys
 from abc import ABC, abstractmethod
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Iterator,
-    Mapping,
-    Protocol,
-    Sequence,
-    overload,
-    runtime_checkable,
-)
+from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Protocol, Sequence, overload, runtime_checkable
 
 import grain.python as pygrain
 import jax
@@ -43,15 +33,20 @@ from absl import flags
 
 from dew import position
 
+# `Batch` is declared once, in dew.objectives.base, and read from here by
+# the whole data layer, which imported it from this module before the
+# second declaration was removed.
+from dew.objectives.base import Batch
+
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
+
 
 # grain's worker processes read absl flags; a script that never runs absl.app
 # would crash on any worker_count > 0 with UnparsedFlagAccessError.
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
-Batch = dict[str, Any]
 
 type Tokenize = Callable[[Sequence[str]], Batch]
 """A run's caption reader: the batch's captions in, the batch fields its

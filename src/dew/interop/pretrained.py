@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, NamedTuple, Protocol
+from typing import Literal, NamedTuple, Protocol, TypedDict, Unpack
 
 import jax
 import jax.numpy as jnp
@@ -44,26 +44,36 @@ from dew.nn.text_encoders import ParamTree
 from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
 from dew.records import JSON
-from dew.registry import dtype_name, models, resolve_dtype, with_precision
+from dew.registry import dtype_name, models, precision_fields, resolve_dtype, with_precision
 from dew.sampling import decoding
 from dew.sampling.guidance import CFG
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling
 
-# One keyword a host processor takes: the text it tokenizes, the flags and
-# tensor format that shape what it hands back, the media a caller loaded, and
-# the per-clip records that travel with a video.
-type ProcessorArgument = str | bool | None | Sequence[str] | Media | Sequence[Mapping[str, object]]
+
+class ProcessorCall(TypedDict, total=False):
+    """Every keyword dew hands a host processor beside `images`.
+
+    A source processor takes far more than these; these are the ones dew
+    passes, so the bag names them rather than standing for any keyword at
+    all. `tests/test_interop.py` reads a real processor through this call.
+    """
+
+    text: str | list[str]
+    padding: bool
+    truncation: bool
+    return_tensors: str | None
+    audio: Media
+    videos: Media
+    video_metadata: Sequence[Mapping[str, object]]
 
 
 class HostProcessor(Protocol):
     """The HF processor operations kept outside compiled model computation."""
 
-    # `images` is the one keyword dew cannot name yet: the protocol it has to
-    # satisfy, dew.inference.tasks.Processor, still takes `object` for it.
-    def __call__(self, *, images: object | None = None,
-                 **kwargs: ProcessorArgument) -> Mapping[str, object]: ...
+    def __call__(self, *, images: Media | None = None,
+                 **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]: ...
     # The files it wrote are its own bookkeeping; dew calls this for the effect.
     def save_pretrained(self, save_directory: str) -> None: ...
     def apply_chat_template(self, conversation: Sequence[Mapping[str, object]],
@@ -85,9 +95,7 @@ class Processor:
     record: Mapping[str, object]
     vocab_size: int
 
-    # `images` stays unnarrowed until dew.inference.tasks.Processor, the
-    # protocol this one has to satisfy, takes `Media` for it too.
-    def __call__(self, text: str | Sequence[str], *, images: object | None = None,
+    def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
                  audio: Media | None = None, videos: Media | None = None,
                  video_metadata: Sequence[Mapping[str, object]] | None = None) -> ModelInputs:
         if images is None and audio is None and videos is None:
@@ -109,7 +117,7 @@ class Processor:
             return self.from_hf({"input_ids": tokens, **fields})
         # truncation is off for text anyway; reloaded Gemma processors forward
         # the tokenizer's unset max_length into audio kwargs otherwise.
-        arguments: dict[str, ProcessorArgument] = {
+        arguments: ProcessorCall = {
             "text": text if isinstance(text, str) else list(text),
             "padding": not isinstance(text, str) and len(text) > 1, "truncation": False, "return_tensors": "pt"}
         if audio is not None:
@@ -2054,11 +2062,11 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             kinds["full_attention"] = full
             text_fields["kinds"] = kinds
 
-        text = decoders.DecoderFields(**with_precision(
-            "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl))
+        text: decoders.DecoderFields = {**text_fields, **precision_fields(
+            "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
         wrapper: decoders.WrapperFields = {**record, "text": text}
         built = wrapper
-        language_model = models.build("causal_transformer", **wrapper["text"])
+        language_model = models.build("causal_transformer", wrapper["text"])
         if not isinstance(language_model, CausalTransformer):
             raise TypeError("causal_transformer registry entry must build CausalTransformer")
         audio_record = record["audio"]
@@ -2082,7 +2090,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         if max_seq_len is not None:
             record["max_seq_len"] = max_seq_len
         built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
-        model = models.build("causal_transformer", **built)
+        model = models.build("causal_transformer", built)
         variables = decoders.translate_weights(tensors, record, family, param_dtype=param_dtype)
         decoders._check_tree(variables, model)
         # The bindings are what an adapter loader resolves source names

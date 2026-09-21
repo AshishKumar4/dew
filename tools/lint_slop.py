@@ -54,10 +54,13 @@ ENFORCED = frozenset({"SLOP003", "SLOP005", "SLOP006", "SLOP007", "SLOP008"})
 # decoder split and is the one rule that may stay here.
 ADOPTING = frozenset({"SLOP001", "SLOP002", "SLOP004", "SLOP009"})
 
-# The two sanctioned open-mapping aliases: one variables tree, one batch. Every
-# other open dictionary in a contract is SLOP002, and a second declaration of
-# either name is an import that was not written.
-SANCTIONED_ALIASES = {"Variables": "src/dew/objectives/base.py", "Batch": "src/dew/data/dataset.py"}
+# The two sanctioned open-mapping aliases: one variables tree, one batch, both
+# declared in dew.objectives.base, which is the layer both the trainer and the
+# data pipeline already depend on. Every other open dictionary in a contract is
+# SLOP002, and a second declaration of either name is an import that was not
+# written.
+SANCTIONED_ALIASES = {"Variables": "src/dew/objectives/base.py",
+                      "Batch": "src/dew/objectives/base.py"}
 MAPPINGS = {"dict", "Dict", "Mapping", "MutableMapping", "defaultdict", "OrderedDict"}
 OPEN_VALUES = {("dict", "Any"), ("Dict", "Any"), ("Mapping", "Any"), ("MutableMapping", "Any"),
                ("defaultdict", "Any"), ("OrderedDict", "Any"), ("dict", "object"),
@@ -144,14 +147,18 @@ def _named(node: ast.expr | None) -> str:
 def _mapping_kind(node: ast.expr) -> str:
     """"open" for a dictionary type that promises nothing, "boundary" for the
     read-only mapping of unnarrowed values, "" for anything else."""
-    if not isinstance(node, ast.Subscript) or not isinstance(node.slice, ast.Tuple):
+    if not isinstance(node, ast.Subscript):
         return ""
     container = _named(node.value).rsplit(".", 1)[-1]
     if container not in MAPPINGS | {"MappingProxyType", "Sequence", "tuple"}:
         return ""
-    if len(node.slice.elts) != 2:
+    # A mapping names its key and its value; a sequence names one element, and
+    # `Sequence[object]` is one of the boundary forms below, so both arities
+    # are read here rather than only the pair.
+    arguments = node.slice.elts if isinstance(node.slice, ast.Tuple) else [node.slice]
+    if len(arguments) not in (1, 2):
         return ""
-    pair = (container, _named(node.slice.elts[-1]).rsplit(".", 1)[-1])
+    pair = (container, _named(arguments[-1]).rsplit(".", 1)[-1])
     return "open" if pair in OPEN_VALUES else "boundary" if pair in BOUNDARY_MAPPING else ""
 
 
