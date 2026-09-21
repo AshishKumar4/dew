@@ -18,6 +18,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol, overload
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import freeze
@@ -36,6 +37,20 @@ from dew.telemetry.profile import active_profile
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
+
+SHAPE_BUCKETS = tuple(1 << exponent for exponent in range(5, 21))
+"""The shapes a text request is rounded up to: powers of two from 32.
+
+Every distinct prompt width, batch, budget and continuation count is its
+own several-second XLA compile, and served requests are rarely the same
+length twice. So a prompt pads left to the smallest bucket of 64 or more,
+where the attention mask hides the filler as it already hides the padding
+a ragged batch needs; a budget rounds up to the smallest bucket of 32 or
+more, and the trips past the request come off the result. Rows are the
+caller's and are not bucketed. A request whose buckets would not fit the
+model's `max_seq_len` keeps its own shapes, so the ceiling refuses what
+it refuses today.
+"""
 
 
 class Processor(Protocol):
@@ -118,6 +133,78 @@ def _budget(requested: int | None, default: int | None, max_length: int | None, 
     raise ValueError("max_new_tokens is required; the source declares no default budget")
 
 
+def _bucket(value: int, smallest: int) -> int:
+    """The smallest shape bucket that holds `value`, never below `smallest`."""
+    for bucket in SHAPE_BUCKETS:
+        if bucket >= value and bucket >= smallest:
+            return bucket
+    return value
+
+
+def _ceiling(model: nn.Module) -> int | None:
+    """The largest cache the model admits, or None where it declares none.
+
+    The model is a boundary the task reads a shape across: `nn.Module`
+    declares no context length, a decoder declares `max_seq_len` and a
+    wrapper answers for the decoder it holds. `dew.sampling.text._validated`
+    reads the same field the same way to refuse a request too large for it.
+    """
+    declared = getattr(model, "max_seq_len", None)
+    return declared if type(declared) is int else None
+
+
+def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None) -> tuple[ModelInputs, int]:
+    """The request at bucket shapes: padded inputs and the trips to scan.
+
+    A request the buckets cannot hold keeps its own shapes, so it is refused
+    where it is refused today. So does one carrying media or logical
+    positions: validity is the only sequence field a filler slot has a value
+    for, since such a slot holds no coordinate and no media feature.
+    """
+    if ceiling is None or budget < 1:
+        return inputs, budget
+    if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
+        return inputs, budget
+    width = _bucket(inputs.tokens.shape[1], 64)
+    trips = _bucket(budget, 32)
+    if width + trips > ceiling:
+        return inputs, budget
+    return _padded(inputs, width), trips
+
+
+def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
+    """`inputs` left-padded to `width` slots, with the filler marked invalid."""
+    extra = width - inputs.tokens.shape[1]
+    if extra < 1:
+        return inputs
+    valid = inputs.token_fields.get("attention_mask")
+    if valid is None:
+        valid = jnp.ones(inputs.tokens.shape, bool)
+    return replace(inputs, tokens=jnp.pad(inputs.tokens, ((0, 0), (extra, 0))),
+                   token_fields={"attention_mask": jnp.pad(valid, ((0, 0), (extra, 0)))})
+
+
+def _requested(generated: Generation, budget: int, padding: int) -> Generation:
+    """`generated` cut back to the shapes the caller asked for.
+
+    A bucket pads the prompt on the left and scans past the budget, so the
+    filler comes off the front of the rows and the extra trips off the back.
+    A row the scan stopped in one of those trips did not stop inside the
+    budget: it reaches the caller at the budget's length, unterminated,
+    which is what the unbucketed scan reports for it.
+    """
+    trips = generated.behavior_log_probs.shape[1]
+    if not padding and trips == budget:
+        return generated
+    lengths = generated.lengths
+    return replace(generated,
+                   tokens=generated.tokens[:, padding:generated.tokens.shape[1] - trips + budget],
+                   lengths=jnp.minimum(lengths, budget),
+                   terminated=generated.terminated & (lengths <= budget),
+                   behavior_log_probs=generated.behavior_log_probs[:, :budget],
+                   raw_log_probs=generated.raw_log_probs[:, :budget])
+
+
 @dataclass(frozen=True)
 class TextGeneration:
     """Next-token generation bound to a decoder, its weights and its processor.
@@ -138,6 +225,10 @@ class TextGeneration:
     `logits=task.logits + (mine,)`, and an explicit `sampling=` on a call
     replaces a bound chain with its own, because the policy it overrides is
     what that chain was built from.
+
+    A call runs at `SHAPE_BUCKETS` shapes and hands back the shapes the
+    request asked for, so two requests of nearby lengths share one compiled
+    executable.
     """
 
     model: nn.Module
@@ -186,15 +277,17 @@ class TextGeneration:
                                           collective=mesh_of(self.variables) is not None,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key, seed=seed)
+            shaped, trips = _bucketed(inputs, budget, _ceiling(self.model))
             chain = self.logits if sampling is None else None
-            generated = generate(self.model, self.variables, inputs, budget, key=random_key,
+            generated = generate(self.model, self.variables, shaped, trips, key=random_key,
                               sampling=self.sampling if sampling is None else sampling,
                               n=self.n if n is None else n,
                               logits=chain if logits is None else logits,
                               stopping=self.stopping if stopping is None else stopping,
                               strategy=self.strategy if strategy is None else strategy)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
-            return replace(generated, decoder=decoder)
+            padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
+            return replace(_requested(generated, budget, padding), decoder=decoder)
         finally:
             if annotation is not None:
                 annotation.__exit__(None, None, None)

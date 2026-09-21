@@ -15,11 +15,12 @@ from transformers.generation.logits_process import (
     TopPLogitsWarper,
 )
 
-from dew.inference import TextGeneration
+from dew.inference import TextGeneration, tasks
 from dew.nn.inputs import ModelInputs
-from dew.sampling import Sampling
+from dew.sampling import Sampling, text
 from dew.sampling.decoding import StepState, chain
 from dew.sampling.strategies import draw
+from dew.sampling.text import generate
 
 
 @pytest.fixture
@@ -27,6 +28,19 @@ def task():
     model = decoder()
     variables = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     return TextGeneration(model, variables)
+
+
+@pytest.fixture
+def roomy():
+    """The same decoder with a context wide enough to hold a shape bucket."""
+    model = decoder().clone(max_seq_len=1024)
+    variables = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    return TextGeneration(model, variables, sampling=Sampling(temperature=0))
+
+
+def ramp(width):
+    """A prompt of `width` in-vocabulary ids."""
+    return np.tile(np.arange(1, 13, dtype=np.int32), width)[None, :width]
 
 
 @pytest.mark.parametrize("bad", [
@@ -351,3 +365,65 @@ def test_neutral_beam_controls_preserve_the_search(task):
     actual = declared.text_generation()([[1, 2]], 3, seed=7)
     for name in ("tokens", "lengths", "terminated", "raw_log_probs", "behavior_log_probs"):
         np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
+
+
+def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draws(roomy):
+    """A 100-token and a 120-token prompt both pad to 128, so the second call
+    reuses the first's executable, and the padding changes nothing: both
+    results are what generation at the exact width and the model's own cache
+    produces, token for token and likelihood for likelihood."""
+    exact = {width: generate(roomy.model, roomy.variables, ramp(width), 8, seed=0,
+                             sampling=roomy.sampling) for width in (100, 120)}
+    compiled = text._compiled(None)
+    traced = compiled._cache_size()
+    for width, reference in exact.items():
+        drawn = roomy(ramp(width), 8, seed=0)
+        assert drawn.tokens.shape == (1, width + 8)
+        np.testing.assert_array_equal(drawn.tokens, reference.tokens)
+        np.testing.assert_array_equal(drawn.raw_log_probs, reference.raw_log_probs)
+        np.testing.assert_array_equal(drawn.behavior_log_probs, reference.behavior_log_probs)
+    assert compiled._cache_size() - traced == 1
+
+
+def test_a_request_the_ceiling_refuses_keeps_refusing_at_its_own_shapes(roomy):
+    """A prompt and budget over `max_seq_len` cannot be bucketed into one that
+    fits, so the request keeps its own shapes and meets the cache ceiling."""
+    with pytest.raises(ValueError, match="exceeds max_seq_len"):
+        roomy(ramp(1000), 100, seed=0)
+
+
+def test_a_budget_inside_a_bucket_returns_the_budget_and_what_the_budget_draws(roomy):
+    """A 100-token budget scans the 128-trip bucket and hands back 100 tokens
+    per row: the same tokens, lengths and likelihoods the 100-trip scan over
+    the same cache produces, and one executable for both budgets."""
+    prompt, budget = ramp(40), 100
+    shaped, trips = tasks._bucketed(ModelInputs.from_value(prompt), budget,
+                                    roomy.model.max_seq_len)
+    assert (shaped.tokens.shape[1], trips) == (64, 128)
+    exact = generate(roomy.model, roomy.variables, shaped, budget, seed=3,
+                     sampling=roomy.sampling)
+    compiled = text._compiled(None)
+    traced = compiled._cache_size()
+    drawn = roomy(prompt, budget, seed=3)
+    assert drawn.tokens.shape == (1, 40 + budget) and drawn.behavior_log_probs.shape == (1, budget)
+    np.testing.assert_array_equal(drawn.tokens[:, -budget:], exact.tokens[:, -budget:])
+    np.testing.assert_array_equal(drawn.lengths, exact.lengths)
+    np.testing.assert_array_equal(drawn.terminated, exact.terminated)
+    np.testing.assert_array_equal(drawn.raw_log_probs, exact.raw_log_probs)
+    assert compiled._cache_size() - traced == 1
+    roomy(prompt, 128, seed=3)
+    assert compiled._cache_size() - traced == 1
+
+
+def stop_at_110(state, token):
+    """A criterion no draw inside a 100-token budget can reach."""
+    return state.step >= 110
+
+
+def test_a_criterion_the_budget_never_reaches_leaves_the_row_unterminated(roomy):
+    """The 128-trip bucket runs 28 trips past a 100-token budget. A row that
+    stops in one of them stopped outside the request: it comes back at the
+    budget's length, unterminated, as it does without the bucket."""
+    drawn = roomy(ramp(40), 100, seed=3, stopping=stop_at_110)
+    np.testing.assert_array_equal(drawn.lengths, [100])
+    np.testing.assert_array_equal(drawn.terminated, [False])
