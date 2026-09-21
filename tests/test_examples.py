@@ -149,3 +149,17 @@ def test_train_flowers_tpu_smoke_samples_a_grid_and_scores_it(tmp_path):
     assert grid.shape == (16, 4 * 16, 3) and grid.dtype == np.uint8
     assert "clip_score" in json.loads((tmp_path / "eval.json").read_text())
     assert (tmp_path / "checkpoints" / "smoke" / "run.json").is_file()
+
+
+def test_sft_diffusion_gemma_smoke_writes_an_adapter_and_generates_from_it(tmp_path):
+    """LoRA over a host-streamed base: the PEFT directory the run publishes,
+    and the canvas `dew.pipeline` decodes once that directory is read back
+    onto the base weights."""
+    smoke("sft_diffusion_gemma", tmp_path)
+
+    adapter = tmp_path / "adapter"
+    assert (adapter / "adapter_config.json").is_file()
+    assert (adapter / "adapter_model.safetensors").is_file()
+    config = json.loads((adapter / "adapter_config.json").read_text())
+    assert config["peft_type"] == "LORA" and config["target_modules"]
+    assert len((tmp_path / "samples.txt").read_text().splitlines()) == 2
