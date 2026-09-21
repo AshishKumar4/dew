@@ -119,7 +119,7 @@ Import `Dataset` and `Loading` from `dew.data`.
 
 ```text
 Dataset(train, val, records, batch)
-Loading(workers=32, threads=64, read_buffer=128, worker_buffer=20)
+Loading(workers=32, threads=64, read_buffer=128, worker_buffer=2)
 ```
 
 `train` opens a training iterator, and `val` opens one finite validation pass or is `None`. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count.
