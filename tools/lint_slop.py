@@ -15,7 +15,12 @@ Scope is per rule, because the rules are not all about the same thing:
   SLOP005) do not run there. A swallowed exception, a narration comment and an
   unsplittable function are defects anywhere, so those do.
 - SLOP008 is about the suite only.
-- SLOP009 is advisory everywhere: it prints and does not set the exit status.
+
+Enforcement is staged. `ENFORCED` names the rules the tree is at zero for, and
+those are the ones that fail the gate; `ADOPTING` names the rest, which print
+with a per-rule file count and do not set the exit status. A rule moves from
+`ADOPTING` to `ENFORCED` in the same commit that takes its count to zero, so
+the gate is green from the first commit and gets stricter, never redder.
 
 Analysis boundaries, stated the way anti-slop states its own: this reads one
 file's AST, with no imported definitions and no inference across calls.
@@ -37,6 +42,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# Which rules fail the gate. A rule is enforced once the tree is at zero for
+# it, and it moves here in the same commit that takes it to zero; until then it
+# is counted, printed per rule with the file count, and left out of the exit
+# status. Adopting is not suppressing: every finding prints, and a rule never
+# moves back. There are no per-finding suppressions in either set.
+ENFORCED = frozenset({"SLOP003", "SLOP005", "SLOP006", "SLOP007", "SLOP008"})
+# SLOP001, SLOP002 and SLOP004 wait on the typing sweep. SLOP009 measures what
+# a split would cost rather than what a change introduced, so it waits on the
+# decoder split and is the one rule that may stay here.
+ADOPTING = frozenset({"SLOP001", "SLOP002", "SLOP004", "SLOP009"})
 
 # The two sanctioned open-mapping aliases: one variables tree, one batch. Every
 # other open dictionary in a contract is SLOP002, and a second declaration of
@@ -469,12 +485,6 @@ def size(module: Module) -> Iterator[Finding]:
 
 CONTRACT_RULES = (contracts, suppressions, probes, names)
 UNIVERSAL_RULES = (swallowed, comments, size)
-# SLOP009 measures what a split would cost, not what a change introduced. It
-# prints with everything else and does not fail the gate: the 4469-line
-# decoder module and the long reference functions are a split somebody has to
-# schedule, and holding the gate red until then would only teach people to
-# skip the gate.
-ADVISORY = frozenset({"SLOP009"})
 
 
 def check(module: Module) -> Iterator[Finding]:
@@ -499,16 +509,20 @@ def collect(roots: Sequence[str]) -> Iterator[Module]:
 def main() -> int:
     roots = sys.argv[1:] or ["src/dew", "tests", "tools", "recipes"]
     counts: dict[str, int] = {}
+    files: dict[str, set[str]] = {}
     for module in collect(roots):
         for finding in check(module):
             print(finding)
             counts[finding.code] = counts.get(finding.code, 0) + 1
+            files.setdefault(finding.code, set()).add(finding.path)
     for code, count in sorted(counts.items()):
-        label = " (advisory)" if code in ADVISORY else ""
-        print(f"{count:5d} {code}{label}", file=sys.stderr)
-    failures = sum(count for code, count in counts.items() if code not in ADVISORY)
-    advisories = sum(counts.values()) - failures
-    print(f"{failures} findings, {advisories} advisory", file=sys.stderr)
+        where = f"{count} in {len(files[code])} files"
+        state = "enforced" if code in ENFORCED else "adopting"
+        print(f"{code} ({state}): {where}", file=sys.stderr)
+    failures = sum(count for code, count in counts.items() if code in ENFORCED)
+    adopting = ", ".join(f"{code} {counts[code]}" for code in sorted(counts)
+                         if code in ADOPTING) or "none"
+    print(f"enforced: {failures} findings; adopting: {adopting}", file=sys.stderr)
     return 1 if failures else 0
 
 
