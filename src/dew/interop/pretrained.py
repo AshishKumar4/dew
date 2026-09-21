@@ -255,7 +255,7 @@ class Processor:
                 if (frames.ndim != ndim or not np.issubdtype(frames.dtype, np.floating)
                         or min(frames.shape[1:]) < 1):
                     raise ValueError(f"{pixel_name} must contain floating patch frames of rank {ndim}")
-                if (coordinates.shape != frames.shape[:-1] + (2,)
+                if (coordinates.shape != (*frames.shape[:-1], 2)
                         or not np.issubdtype(coordinates.dtype, np.integer)):
                     raise ValueError(f"{position_name} must contain aligned integer patch coordinates")
                 if frames.shape[-1] != 3 * patch_size ** 2:
@@ -456,7 +456,7 @@ class Processor:
                 offsets[token] += 1
         if not ordered or any(offsets[token] != len(items) for token, items in streams.items()):
             raise ValueError("visual payloads and placeholder frame counts disagree")
-        chunks, grids = zip(*ordered)
+        chunks, grids = zip(*ordered, strict=True)
         widths = {chunk.shape[-1] for chunk in chunks}
         if len(widths) != 1:
             raise ValueError("image and video patch widths must agree")

@@ -144,7 +144,7 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
     epsilon = _number(config.get("norm_eps", 1e-5), "norm_eps")
     if groups < 1 or epsilon <= 0 or any(width < 1 or width % groups for width in widths):
         raise ValueError("UNet normalization requires positive epsilon and widths divisible by its group count")
-    if any(head < 1 or width % head or depth < 1 for width, head, depth in zip(widths, heads, depths)):
+    if any(head < 1 or width % head or depth < 1 for width, head, depth in zip(widths, heads, depths, strict=True)):
         raise ValueError("UNet stage heads must divide their width and transformer depth must be positive")
     source_name = config.get("_class_name", "UNet2DConditionModel")
     if source_name not in ("UNet2DConditionModel", "FlaxUNet2DConditionModel"):
@@ -154,7 +154,7 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
         raise ValueError("The published Flax UNet has fixed normalization groups and epsilon")
     return UNetFields(
         stages=tuple(UNetStage(width, head, depth, attended, cross_only)
-                     for width, head, depth, attended, cross_only in zip(widths, heads, depths, cross, only_cross)),
+                     for width, head, depth, attended, cross_only in zip(widths, heads, depths, cross, only_cross, strict=True)),
         in_channels=_integer(config["in_channels"], "in_channels"), out_channels=_integer(config["out_channels"], "out_channels"),
         blocks_per_level=_integer(config.get("layers_per_block", 2), "layers_per_block"),
         linear_projection=_boolean(config.get("use_linear_projection", False), "use_linear_projection"),
@@ -645,7 +645,7 @@ def save_source(source, values, destination: Path) -> None:
         if isinstance(declared, (list, tuple)) and len(declared) == 2 and isinstance(declared[1], str) and declared[1].startswith("Flax"):
             write_flax_component(destination, component, tensors)
     encoder = source.inputs.conditions["conditioning"].encoder
-    for name, tokenizer in zip(encoder.names, encoder.tokenizers):
+    for name, tokenizer in zip(encoder.names, encoder.tokenizers, strict=True):
         folder = destination / ("tokenizer" + name.removeprefix("text_encoder"))
         tokenizer.save_pretrained(folder)
         # A CLIP tokenizer's own vocabulary and merges beside its config.

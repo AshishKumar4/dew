@@ -1,4 +1,5 @@
 import functools
+import logging
 import warnings
 from dataclasses import dataclass
 
@@ -13,6 +14,8 @@ from dew.registry import metrics
 
 from .common import metric_device
 
+_log = logging.getLogger(__name__)
+
 
 @functools.cache
 def _get_inception():
@@ -20,7 +23,7 @@ def _get_inception():
     process. The FID InceptionV3 is about 90 MB of weights, and every metric
     built from this module shares the copy."""
     from .inception import InceptionV3
-    print("[metrics] Loading InceptionV3 FID weights (cached for reuse)...")
+    _log.info("loading InceptionV3 FID weights (cached for reuse)")
     model = InceptionV3(pretrained=True)
     params = model.init(jax.random.PRNGKey(0), jnp.ones((1, 299, 299, 3)))
     return model, params
@@ -162,8 +165,8 @@ class FID:
                 f"got generated={generated.count}, real={real.count}")
         result = frechet_distance(generated.mean, generated.covariance(population="generated"),
                                   real.mean, real.covariance(population="real"))
-        print(f"FID populations: generated={generated.count}, real={real.count}; "
-              f"features={self.feature_identity}")
+        _log.info("FID populations: generated=%d, real=%d; features=%s",
+                  generated.count, real.count, self.feature_identity)
         return result
 
 

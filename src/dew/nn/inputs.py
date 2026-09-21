@@ -52,19 +52,19 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
     tokens = np.full((len(arrays), width), pad_id, np.int32)
     valid = np.zeros(tokens.shape, bool)
     slots = [slice(width - row.size, width) if padding_side == "left" else slice(0, row.size) for row in arrays]
-    for index, (row, slot) in enumerate(zip(arrays, slots)):
+    for index, (row, slot) in enumerate(zip(arrays, slots, strict=True)):
         tokens[index, slot] = row
         valid[index, slot] = True
     padded = {"attention_mask": valid}
     for name, values in (fields or {}).items():
         aligned = [np.asarray(row) for row in values]
-        if len(aligned) != len(arrays) or any(value.shape != row.shape for value, row in zip(aligned, arrays)):
+        if len(aligned) != len(arrays) or any(value.shape != row.shape for value, row in zip(aligned, arrays, strict=True)):
             raise ValueError(f"token field {name!r} must align with the token rows")
         if name == "attention_mask" and any(np.any((row != 0) & (row != 1)) for row in aligned):
             raise ValueError("attention_mask must contain only zero or one")
         dtype = bool if name == "attention_mask" else np.result_type(*(row.dtype for row in aligned))
         value = np.zeros(tokens.shape, dtype=dtype)
-        for index, (row, slot) in enumerate(zip(aligned, slots)):
+        for index, (row, slot) in enumerate(zip(aligned, slots, strict=True)):
             value[index, slot] = row
         padded[name] = value
     if padded["attention_mask"].all():
@@ -214,7 +214,7 @@ def validity_sites(tree: object) -> list[ModelInputs]:
     return [leaf for leaf in leaves if isinstance(leaf, ModelInputs)]
 
 
-def _validity_agnostic(tree: TreeT) -> TreeT:
+def _validity_agnostic[TreeT](tree: TreeT) -> TreeT:
     """`tree` with every validity field dropped."""
     return jax.tree.map(
         lambda node: (replace(node, token_fields={
@@ -236,7 +236,7 @@ def assembly_signature(tree: object, controls: object = ()) -> np.ndarray:
     return generation_signature(_validity_agnostic(tree), controls)
 
 
-def filled_validity(tree: TreeT, wanted: bool | Sequence[bool] = True) -> TreeT:
+def filled_validity[TreeT](tree: TreeT, wanted: bool | Sequence[bool] = True) -> TreeT:
     """All-true validity at the sites that want it and do not carry it.
 
     `wanted` is one flag per site of `validity_sites`, or one flag for all of
@@ -260,8 +260,8 @@ def filled_validity(tree: TreeT, wanted: bool | Sequence[bool] = True) -> TreeT:
     return jax.tree.map(fill, tree, is_leaf=lambda node: isinstance(node, ModelInputs))
 
 
-def agreed_validity(tree: TreeT, processes: int, *, controls: object = (),
-                    phase: str = "input") -> TreeT:
+def agreed_validity[TreeT](tree: TreeT, processes: int, *, controls: object = (),
+                           phase: str = "input") -> TreeT:
     """One validity schema for the whole pool, agreed before arrays are built.
 
     A host that padded nothing carries no validity, which is what keeps

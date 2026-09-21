@@ -143,8 +143,8 @@ class LoRA:
                 axes = (-1,)
             axes = tuple(sorted(axis % x.ndim for axis in axes))
             kernel = module.get_variable("params", "kernel")
-            a = module.param("lora_A", INIT_A, kernel.shape[:len(axes)] + (target.rank,), module.param_dtype)
-            b = module.param("lora_B", INIT_B, (target.rank,) + kernel.shape[len(axes):], module.param_dtype)
+            a = module.param("lora_A", INIT_A, (*kernel.shape[:len(axes)], target.rank), module.param_dtype)
+            b = module.param("lora_B", INIT_B, (target.rank, *kernel.shape[len(axes):]), module.param_dtype)
             # The branch drops out its input when the forward carries the
             # dropout stream, which is how a training forward is marked; an
             # evaluation forward carries none.
@@ -172,7 +172,7 @@ class LoRA:
             dtype = jnp.promote_types(kernel.dtype, jnp.float32)
             delta = jnp.tensordot(a.astype(dtype), b.astype(dtype), axes=1,
                                   precision=jax.lax.Precision.HIGHEST)
-            _insert(merged, path + ("kernel",), (kernel.astype(dtype) + self.scale(target) * delta).astype(kernel.dtype))
+            _insert(merged, (*path, "kernel"), (kernel.astype(dtype) + self.scale(target) * delta).astype(kernel.dtype))
         return select(overlay(variables, merged), lambda path: not self.trainable(path))
 
 
@@ -213,7 +213,7 @@ class _Factors:
 
     def shapes(self, rank: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """The tree's `lora_A` and `lora_B` shapes at `rank`."""
-        return self.kernel_shape[:self.contracted] + (rank,), (rank,) + self.kernel_shape[self.contracted:]
+        return (*self.kernel_shape[:self.contracted], rank), (rank, *self.kernel_shape[self.contracted:])
 
 
 def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -> _Factors:
@@ -242,9 +242,9 @@ def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -
     prefix = name.removesuffix(".weight")
     return _Factors(
         module, kernel_shape, contracted,
-        WeightLayout(f"{prefix}.lora_A.weight", (module + ("lora_A",),), (rank, inner),
+        WeightLayout(f"{prefix}.lora_A.weight", ((*module, "lora_A"),), (rank, inner),
                      (contracted, *transpose[split:])),
-        WeightLayout(f"{prefix}.lora_B.weight", (module + ("lora_B",),), (out, rank),
+        WeightLayout(f"{prefix}.lora_B.weight", ((*module, "lora_B"),), (out, rank),
                      (*(1 + axis - contracted for axis in transpose[:split]), 0)))
 
 
@@ -407,8 +407,8 @@ def _place(source: Pretrained, entries: Sequence[_Entry]) -> tuple[LoRA, Variabl
                 f"on a weight the source stores as {layout.shape}")
         shape_a, shape_b = factors.shapes(rank)
         targets[factors.module] = Target(rank, entry.config.alpha_of(relative))
-        _insert(leaves, factors.module + ("lora_A",), factors.a.restore(entry.a, shape_a))
-        _insert(leaves, factors.module + ("lora_B",), factors.b.restore(entry.b, shape_b))
+        _insert(leaves, (*factors.module, "lora_A"), factors.a.restore(entry.a, shape_a))
+        _insert(leaves, (*factors.module, "lora_B"), factors.b.restore(entry.b, shape_b))
     return LoRA(targets, rslora, dropout), overlay(source.variables, leaves)
 
 
@@ -486,12 +486,12 @@ def fresh(source: Pretrained, *, rank: int, alpha: float, modules: Sequence[str]
     matched = _named(source, modules)
     targets: dict[Path, Target] = {}
     leaves: dict = {}
-    for name, factor_key in zip(sorted(matched), jax.random.split(key, len(matched))):
+    for name, factor_key in zip(sorted(matched), jax.random.split(key, len(matched)), strict=True):
         factors = _factors(name, matched[name], source.variables, rank)
         shape_a, shape_b = factors.shapes(rank)
         targets[factors.module] = Target(rank, alpha)
-        _insert(leaves, factors.module + ("lora_A",), INIT_A(factor_key, shape_a, jnp.float32))
-        _insert(leaves, factors.module + ("lora_B",), INIT_B(factor_key, shape_b, jnp.float32))
+        _insert(leaves, (*factors.module, "lora_A"), INIT_A(factor_key, shape_a, jnp.float32))
+        _insert(leaves, (*factors.module, "lora_B"), INIT_B(factor_key, shape_b, jnp.float32))
     return LoRA(targets, rslora, dropout), overlay(source.variables, leaves)
 
 

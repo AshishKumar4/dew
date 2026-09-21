@@ -74,8 +74,8 @@ def rotate_trailing(x, cos, sin):
     pairs = cos.shape[-1]
     lead = x.shape[:-1]
     if cos.ndim == 2:
-        cos = jnp.broadcast_to(cos, (lead[0],) + cos.shape)
-        sin = jnp.broadcast_to(sin, (lead[0],) + sin.shape)
+        cos = jnp.broadcast_to(cos, (lead[0], *cos.shape))
+        sin = jnp.broadcast_to(sin, (lead[0], *sin.shape))
     if x.ndim == 4:
         cos, sin = cos[:, :, None, :], sin[:, :, None, :]
     rope = x[..., -2 * pairs:].astype(jnp.float32).reshape(*lead, pairs, 2)
@@ -170,7 +170,7 @@ def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
             indices = _write_cache(indices[..., None], (position // rate)[:, None, None], at)[..., 0]
             if old is not None:
                 old = tuple(jnp.where(closed[:, None, None], current[..., :width], before)
-                            for current, before in zip(buffered, old))
+                            for current, before in zip(buffered, old, strict=True))
             return old, values, indices, count + closed.astype(jnp.int32)
 
         prior, values, indices, count = jax.lax.cond(
@@ -364,7 +364,7 @@ class Compressor(CompressedEntries):
         if self.index_topk is not None:
             return entries, self.indexer.select(x, q_resid, positions, cos, sin, cache)
         visible = entries_visible(positions, entries.shape[1], self.rate)
-        return entries, jnp.broadcast_to(visible, (x.shape[0],) + visible.shape[1:])
+        return entries, jnp.broadcast_to(visible, (x.shape[0], *visible.shape[1:]))
 
 
 @logical_axes({

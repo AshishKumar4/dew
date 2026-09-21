@@ -297,7 +297,7 @@ def _gemma_layer_types(hf_config: Mapping[str, Any], used: set[str], *,
         types = tuple('sliding_attention' if (index + 1) % pattern else 'full_attention'
                       for index in range(int(hf_config['num_hidden_layers'])))
     # Gemma4TextConfig rewrites the final layer before building the model.
-    return types[:-1] + ('full_attention',) if last_full and types else types
+    return (*types[:-1], 'full_attention') if last_full and types else types
 
 
 def _kinds(layer_types: tuple[str, ...], window: int | None,
@@ -2267,7 +2267,7 @@ def _dew_path(hf_name: str, config: Mapping[str, Any]) -> tuple[str, ...] | None
             and parts[3:5] == ['mlp', 'gate'] and parts[5] in _MOE_STATE):
         return ('moe', f'layers_{parts[2]}', 'mlp', 'gate', parts[5])
     path = _param_path(parts, config)
-    return None if path is None else ('params',) + path
+    return None if path is None else ('params', *path)
 
 
 def _param_path(parts: list[str], config: Mapping[str, Any]) -> tuple[str, ...] | None:
@@ -2383,14 +2383,14 @@ def _v4_attention_leaf(tail: list[str]) -> tuple[str, ...] | None:
     """
     prefix: tuple[str, ...] = ()
     while len(tail) > 1 and tail[0] in _V4_MODULES:
-        prefix, tail = prefix + (tail[0],), tail[1:]
+        prefix, tail = (*prefix, tail[0]), tail[1:]
     if len(tail) == 1 and tail[0] in _V4_TENSORS:
-        return prefix + (tail[0],)
+        return (*prefix, tail[0])
     if len(tail) == 2 and tail[1] == 'weight':
         if tail[0] in _V4_PROJECTIONS:
-            return prefix + (tail[0], 'kernel')
+            return (*prefix, tail[0], 'kernel')
         if tail[0] in _V4_NORMS:
-            return prefix + (tail[0], 'scale')
+            return (*prefix, tail[0], 'scale')
     return None
 
 

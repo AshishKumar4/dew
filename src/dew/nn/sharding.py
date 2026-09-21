@@ -34,12 +34,11 @@ import contextlib
 import contextvars
 import fnmatch
 from collections.abc import Iterable, Iterator, Mapping
-from typing import TypeAlias
 
 import jax
 
-LogicalAxes: TypeAlias = tuple[str | None, ...]
-Suffix: TypeAlias = tuple[str, ...]
+type LogicalAxes = tuple[str | None, ...]
+type Suffix = tuple[str, ...]
 
 DATA_AXIS = 'data'
 EXPERT_AXIS = 'expert'
@@ -177,6 +176,6 @@ def is_heuristic(path) -> bool:
     for pattern in HEURISTIC:
         for start in range(len(names) - len(pattern) + 1):
             if all(fnmatch.fnmatchcase(name, glob)
-                   for name, glob in zip(names[start:], pattern)):
+                   for name, glob in zip(names[start:], pattern, strict=False)):
                 return True
     return False

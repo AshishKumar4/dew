@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Sequence
-from typing import TypeAlias
 
 import jax
 import jax.numpy as jnp
@@ -18,7 +17,7 @@ from dew.sampling.text import Sampling
 
 from ..lm import LMObjective
 
-Reward: TypeAlias = Callable[[str, str, str, str], float]
+type Reward = Callable[[str, str, str, str], float]
 """Score ``(data_source, completion, ground_truth, extra_info)``."""
 
 IDS_KEY = "input_ids"

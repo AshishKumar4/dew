@@ -9,7 +9,7 @@ import math
 import queue
 import threading
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Iterator, TypeAlias
+from typing import TYPE_CHECKING, Any, Iterator
 
 if TYPE_CHECKING:
     from dew.telemetry.profile import Profiler
@@ -47,13 +47,13 @@ PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 # stage to stage itself. Only parameters distinguish the axes further.
 BATCH_SPEC = P(BATCH_AXES, SEQUENCE_AXIS)
 
-MeshAxes: TypeAlias = str | tuple[str, ...] | None
-Placement: TypeAlias = Any
+type MeshAxes = str | tuple[str, ...] | None
+type Placement = Any
 """A pytree shaped like what it places, with a `NamedSharding` at every leaf.
 Python has no way to say "this tree's structure with those leaves", so the
 name carries what the annotation cannot."""
 
-LogicalAxisRules: TypeAlias = tuple[tuple[str, MeshAxes], ...]
+type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 
 # Rule order is precedence when two logical dimensions target the one fsdp axis.
 # It reproduces the largest-axis choice for the declared model shapes while

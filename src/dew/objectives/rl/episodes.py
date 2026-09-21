@@ -209,7 +209,7 @@ class _StatusStop(RuntimeError):
     """An environment returned an explicit error or cancellation outcome."""
 
 
-def _phase(operation: Callable[[], _T], name: str) -> _T:
+def _phase[T](operation: Callable[[], _T], name: str) -> _T:
     result: tuple[_T] | None = None
     error = None
     try:

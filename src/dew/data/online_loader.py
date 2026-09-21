@@ -14,6 +14,7 @@ import dataclasses
 import http.client
 import io
 import itertools
+import logging
 import multiprocessing
 import multiprocessing.queues
 import multiprocessing.synchronize
@@ -57,6 +58,9 @@ that yielded an image. A dropped url is queued as the url."""
 # the fork context is unlinked as soon as it exists and a spawned worker
 # cannot reopen it.
 _WORKER_CONTEXT = multiprocessing.get_context("spawn")
+
+
+_log = logging.getLogger(__name__)
 
 
 def load_rows(sources: Sequence[str]) -> Dataset:
@@ -369,8 +373,8 @@ class ImageStream:
         if not self._done.is_set():
             if not self._waiting_logged:
                 self._waiting_logged = True
-                print(f"No sample in {self.queue_timeout}s, still fetching "
-                      f"({self.dropped} dropped so far)")
+                _log.warning("no sample in %ss, still fetching (%d dropped so far)",
+                             self.queue_timeout, self.dropped)
             return
         if self._error is not None:
             raise RuntimeError("the url fetcher died") from self._error

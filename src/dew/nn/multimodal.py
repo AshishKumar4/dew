@@ -192,7 +192,7 @@ class MultimodalTransformer(nn.Module):
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
-        return tuple(DecoderBank(("language_model",) + site.namespace, site.view)
+        return tuple(DecoderBank(("language_model", *site.namespace), site.view)
                      for site in self.language_model.bank_sites)
 
     @property

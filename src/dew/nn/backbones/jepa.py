@@ -124,7 +124,7 @@ class FactorizedTokenStack(nn.Module):
         freqs_temporal = rotary_freqs(jnp.arange(T), self.features // self.num_heads, ROPE_THETA)
 
         tokens = tokens.reshape(B * T, N, F)
-        for spatial, temporal in zip(self.spatial, self.temporal):
+        for spatial, temporal in zip(self.spatial, self.temporal, strict=True):
             tokens = spatial(tokens, train=train)
             tokens = tokens.reshape(B, T, N, F).transpose(0, 2, 1, 3).reshape(B * N, T, F)
             tokens = temporal(tokens, freqs_cis=freqs_temporal, train=train)

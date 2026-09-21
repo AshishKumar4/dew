@@ -124,6 +124,8 @@ class InputSpec:
                    mask=Field(data["mask"]["key"], tuple(data["mask"]["shape"])) if "mask" in data else None)
 
 
+# The conditioner builds the Condition and InputSpec declared above, so its
+# import comes after them and either import order resolves.
 from .diffusion import DiffusionConditioner
 
 __all__ = ["CLIPText", "CharTable", "Condition", "ConditionEncoder", "DiffusionConditioner", "Field",

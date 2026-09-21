@@ -173,7 +173,7 @@ class DiffusionRunConfig(RunConfig):
             prefix = ("encoders", "textcontext")
             collections = encoders[self.text.encoder].parameter_collections
             roots.extend((prefix,) if collections is None else
-                         (prefix + (collection,) for collection in collections))
+                         ((*prefix, collection) for collection in collections))
         if self.autoencoder is not None:
             roots.append(("autoencoder",))
         return tuple(roots)

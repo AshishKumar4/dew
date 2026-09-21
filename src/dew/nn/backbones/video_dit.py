@@ -108,7 +108,7 @@ class VideoDiT(nn.Module):
         # Time is a genuine 1D axis, RoPE applies directly
         freqs_temporal = rotary_freqs(jnp.arange(T), dim_head, ROPE_THETA)
 
-        for spatial, temporal in zip(self.spatial_blocks, self.temporal_blocks):
+        for spatial, temporal in zip(self.spatial_blocks, self.temporal_blocks, strict=True):
             tokens = spatial(tokens, cond_spatial, freqs_spatial, train)
             # [B*T, S, F] -> [B*S, T, F]
             tokens = tokens.reshape(B, T, S, -1).transpose(0, 2, 1, 3).reshape(B * S, T, -1)

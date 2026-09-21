@@ -819,7 +819,7 @@ def byte_alphabet() -> dict[str, int]:
             used.append(byte)
             mapped.append(256 + spare)
             spare += 1
-    return {chr(code): byte for byte, code in zip(used, mapped)}
+    return {chr(code): byte for byte, code in zip(used, mapped, strict=True)}
 
 
 def _decoder_has(config: object, name: str) -> bool:
@@ -878,7 +878,7 @@ def vocabulary_pieces(tokenizer: Vocabulary, mode: str | None,
     for token, index in tokenizer.get_vocab().items():
         piece = _piece_bytes(token, mode, alphabet)
         if piece is None:
-            text = tokenizer.convert_tokens_to_string(base + [token])
+            text = tokenizer.convert_tokens_to_string([*base, token])
             if prefix not in text:
                 raise ValueError(
                     f"the tokenizer cannot spell the probe {prefix!r}, so a piece's own text "
@@ -947,7 +947,7 @@ def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
         backwards = target[::-1]
         inside: dict[int, list[int]] = {}
         ending: dict[int, list[int]] = {}
-        for piece, index in zip(pieces, ids):
+        for piece, index in zip(pieces, ids, strict=True):
             reversed_piece = piece[::-1]
             for start in range(1 - len(piece), len(target)):
                 if start < 0:
@@ -967,13 +967,13 @@ def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
     ends = max(len(item) for row in overlaps for item in row.values())
     width = len(strings) * (positions + ends) + 1
     table = np.full((max(rows, max(ids) + 2), width), -1, np.int32)
-    for order, (inside, ending) in enumerate(zip(valid, overlaps)):
+    for order, (inside, ending) in enumerate(zip(valid, overlaps, strict=True)):
         for index, items in inside.items():
             table[index, positions * order:positions * order + len(items)] = items
         for index, items in ending.items():
             start = positions * len(strings) + ends * order
             table[index, start:start + len(items)] = items
-    for piece, index in zip(pieces, ids):
+    for piece, index in zip(pieces, ids, strict=True):
         table[index, -1] = len(piece)
     return StopStrings(jnp.asarray(table), jnp.asarray([len(value) for value in strings], jnp.int32),
                        positions, ends, max(len(value) for value in strings))

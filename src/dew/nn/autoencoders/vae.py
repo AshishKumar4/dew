@@ -188,7 +188,7 @@ class FlaxAttentionBlock(nn.Module):
         self.proj_attn = dense()
 
     def transpose_for_scores(self, projection):
-        new_projection_shape = projection.shape[:-1] + (self.num_heads, -1)
+        new_projection_shape = (*projection.shape[:-1], self.num_heads, -1)
         # move heads to 2nd position (B, T, H * D) -> (B, T, H, D)
         new_projection = projection.reshape(new_projection_shape)
         # (B, T, H, D) -> (B, H, T, D)
@@ -220,7 +220,7 @@ class FlaxAttentionBlock(nn.Module):
         hidden_states = jnp.einsum("...kc,...qk->...qc", value, attn_weights)
 
         hidden_states = jnp.transpose(hidden_states, (0, 2, 1, 3))
-        new_hidden_states_shape = hidden_states.shape[:-2] + (self.channels,)
+        new_hidden_states_shape = (*hidden_states.shape[:-2], self.channels)
         hidden_states = hidden_states.reshape(new_hidden_states_shape)
 
         hidden_states = self.proj_attn(hidden_states)
@@ -407,7 +407,7 @@ class FlaxUNetMidBlock2D(nn.Module):
 
     def __call__(self, hidden_states, deterministic=True):
         hidden_states = self.resnets[0](hidden_states, deterministic=deterministic)
-        for attn, resnet in zip(self.attentions, self.resnets[1:]):
+        for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
             hidden_states = attn(hidden_states)
             hidden_states = resnet(hidden_states, deterministic=deterministic)
 
@@ -653,7 +653,7 @@ def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
             continue
         path.append(name)
         index += 1
-    return tuple(path + [leaf])
+    return (*path, leaf)
 
 
 def translate_vae_weights(torch_tensors: Mapping[str, Any]) -> dict:

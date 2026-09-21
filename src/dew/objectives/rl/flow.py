@@ -16,7 +16,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -255,7 +255,7 @@ class FlowGRPOObjective(DiffusionObjective):
 
 
 
-FlowReward: TypeAlias = Callable[[np.ndarray, Batch], np.ndarray | jax.Array | Sequence[float]]
+type FlowReward = Callable[[np.ndarray, Batch], np.ndarray | jax.Array | Sequence[float]]
 """Score decoded [-1, 1] samples and repeated source rows, one scalar per sample."""
 
 

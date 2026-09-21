@@ -497,7 +497,7 @@ def mixed_records(corpora: Sequence[Corpus]) -> int:
     weights, which is what `steps_per_epoch` counts everywhere else.
     """
     return max(math.ceil(len(corpus.source) / share)
-               for corpus, share in zip(corpora, _shares(corpora)))
+               for corpus, share in zip(corpora, _shares(corpora), strict=True))
 
 
 class _WorkerBatches(pygrain.MapDataset[object]):
@@ -798,7 +798,7 @@ def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transfo
     order = "mixture reshuffled from seed {} of [{}]".format(seed, ", ".join(
         f"{corpus.name} at {share:.6g}: {describe(corpus.source)}, "
         f"{len(corpus.source)} records"
-        for corpus, share in zip(corpora, shares)))
+        for corpus, share in zip(corpora, shares, strict=True)))
 
     def open(offset: int) -> pygrain.DatasetIterator[Batch]:
         records = mixture(corpora, seed).seed(seed).apply(list(operations))

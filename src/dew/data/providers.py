@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import jax
@@ -279,7 +279,7 @@ def load(source: str | Mapping[str, float], *, batch: int, split: str = "train",
     return Dataset(train=train, val=val, records=pass_records, batch=batch)
 
 
-Reader: TypeAlias = Callable[[str, str], pygrain.RandomAccessDataSource[object]]
+type Reader = Callable[[str, str], pygrain.RandomAccessDataSource[object]]
 """A reader of one dataset's one split at a time: the provider's own options
 are bound, the name and the split are not, because a mixture reads several
 names through the same options."""
