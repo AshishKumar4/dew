@@ -55,7 +55,7 @@ from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mla import MLAMixer
-from dew.nn.text_encoders import checkpoint_array
+from dew.nn.text_encoders import ParamTree, checkpoint_array
 from dew.objectives.base import Variables
 from dew.registry import from_record
 
@@ -161,11 +161,6 @@ def _integers(value: object, key: str) -> tuple[int, ...]:
     if not isinstance(value, (list, tuple)):
         _refuse(f"{key}={value!r}", "this field is a list of integers")
     return tuple(_int(entry, key) for entry in value)
-
-
-# A collection of a variables tree: the arrays a checkpoint holds, under the
-# module names that read them.
-type ParamTree = dict[str, np.ndarray | ParamTree]
 
 
 def _kind_name(record: Mapping[str, object], section: str) -> str:
