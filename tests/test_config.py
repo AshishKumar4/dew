@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Optional
 import jax.numpy as jnp
 import pytest
 import tyro
+from test_instrumentation import Regression, batches
 
 import dew.config
 import dew.nn.backbones
@@ -272,6 +273,21 @@ def test_an_interval_is_steps_a_pass_or_never():
     assert TrainerConfig(eval_every=100).eval_interval(data) == 100
     assert TrainerConfig(checkpoint_every=None).checkpoint_interval(data) is None
     assert TrainerConfig(eval_every=None).eval_interval(data) is None
+
+
+def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path):
+    """The batch is one number: the recipes load the data at
+    `trainer.batch_size` and `train` refuses a dataset that reads another,
+    naming both, instead of training at one batch and reporting the other."""
+    run = RunConfig(trainer=TrainerConfig(
+        name="batch", checkpoint_dir=str(tmp_path / "runs"), steps=1, batch_size=8,
+        eval_every=None, checkpoint_every=None))
+
+    with pytest.raises(ValueError, match="batch-size is 8 and this dataset reads 16"):
+        run.train(Regression(), Dataset(batches, None, None, 16), name="batch")
+
+    state = run.train(Regression(), Dataset(batches, None, None, 8), name="batch")
+    assert int(state.step) == 1
 
 
 def test_a_pass_over_the_data_needs_a_record_count():
