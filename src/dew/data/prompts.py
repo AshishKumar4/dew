@@ -58,30 +58,30 @@ class _Row:
 
 
 def _text(value: object) -> str:
-    """One reward column as a string: missing is empty, anything else that is
-    not a string travels as JSON."""
+    """One reward column as a string: missing is empty, a string is itself,
+    and anything else travels as JSON, which is refused where it is not."""
     if value is None:
         return ""
     if isinstance(value, str):
         return value
-    return json.dumps(value, sort_keys=True)
-
-
-def _list_ids(tokenizer: str, prompt: list[object], tools: object, origin: str) -> list[int]:
-    """Read token ids directly, or render messages through the SFT parser."""
-    ids: list[int] = []
-    for token in prompt:
-        if not isinstance(token, int):
-            conversation = Conversation.parse(prompt, tools, origin)
-            return render_prompt(load_tokenizer(tokenizer), conversation, origin)
-        ids.append(token)
-    if tools is not None:
-        raise ValueError(f"{origin}: tools require chat messages, not pretokenized ids")
-    return ids
+    try:
+        return json.dumps(value, sort_keys=True)
+    except TypeError:
+        raise ValueError(
+            f"a reward column holds text or a JSON value, got {value!r}") from None
 
 
 def _prompt_ids(tokenizer: str, prompt: object, tools: object, origin: str) -> list[int]:
-    """Encode a prompt, retaining structured messages until text rendering."""
+    """Encode a prompt, retaining structured messages until text rendering.
+
+    A row's prompt is a string, a list of token ids, or the messages of a
+    conversation; a list of anything else is read as messages, which is
+    where a part that is not one is named. Tools belong to messages only.
+    """
+    if tools is not None and not isinstance(tools, (str, list)):
+        raise ValueError(
+            f"{origin}: tools are a list of schemas or the JSON text of one, "
+            f"got {tools!r}")
     if isinstance(prompt, str):
         if tools is not None:
             raise ValueError(f"{origin}: tools require chat messages, not a plain string")
@@ -89,7 +89,12 @@ def _prompt_ids(tokenizer: str, prompt: object, tools: object, origin: str) -> l
             raise ValueError(f"{origin}: the prompt is blank")
         ids = load_tokenizer(tokenizer).encode(prompt, add_special_tokens=False)
     elif isinstance(prompt, list):
-        ids = _list_ids(tokenizer, prompt, tools, origin)
+        ids = [token for token in prompt if isinstance(token, int)]
+        if len(ids) != len(prompt):
+            conversation = Conversation.parse(prompt, tools, origin)
+            ids = render_prompt(load_tokenizer(tokenizer), conversation, origin)
+        elif tools is not None:
+            raise ValueError(f"{origin}: tools require chat messages, not pretokenized ids")
     else:
         raise ValueError(
             f"{origin}: a prompt is messages, a string or token ids, "

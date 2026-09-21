@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import os
 import struct as st
-from typing import Any, Literal
+from typing import Literal
 
 import grain.python as pygrain
 import numpy as np
@@ -26,8 +26,10 @@ from dew.registry import datasets
 
 from .dataset import (
     CAPTION,
+    Batch,
     Dataset,
     DatasetSpec,
+    Records,
     Tokenize,
     hold_out,
     local_batch,
@@ -217,6 +219,20 @@ def record_caption(element) -> str:
         f"{sorted(element)}")
 
 
+def _fields(element: Batch | bytes, name: str) -> Batch:
+    """A record's fields, or the refusal that this source holds bytes.
+
+    The three hooks a spec fills in belong together: a spec whose `source`
+    reads a table of features reads them by name here, and one whose source
+    is arrayrecord bytes unpacks them itself.
+    """
+    if isinstance(element, bytes):
+        raise TypeError(
+            f"{name} reads records of named fields, and this source holds "
+            f"{len(element)} bytes; unpack them in record() instead")
+    return element
+
+
 class ImageTransform(pygrain.RandomMapTransform):
     """Resize, augment and caption one record, seeded by the record's own rng."""
 
@@ -224,7 +240,7 @@ class ImageTransform(pygrain.RandomMapTransform):
         self.spec = spec
         self.augments = image_augmentations(spec.augmentation)
 
-    def random_map(self, element: Any, rng: np.random.Generator) -> dict[str, Any]:
+    def random_map(self, element: Batch | bytes, rng: np.random.Generator) -> Batch:
         image, caption, label = self.spec.record(element, rng)
         if isinstance(image, bytes):
             image = decode_image(image, at_least=self.spec.image_size)
@@ -258,7 +274,7 @@ class ImageDataset(DatasetSpec):
     val_split: str | None = None
     count: int | None = None
 
-    def source(self, split: str | None = None) -> Any:
+    def source(self, split: str | None = None) -> Records:
         """Random access over the records (`__getitem__`, and `__len__` unless
         `count` says how many there are).
 
@@ -268,7 +284,8 @@ class ImageDataset(DatasetSpec):
         """
         raise NotImplementedError
 
-    def record(self, element, rng: np.random.Generator) -> tuple[np.ndarray | bytes, str, int | None]:
+    def record(self, element: Batch | bytes,
+               rng: np.random.Generator) -> tuple[np.ndarray | bytes, str, int | None]:
         """One record as `(image, caption, class index or None)`; the image is
         RGB uint8, or the encoded bytes for the transform to decode at the size
         it needs."""
@@ -341,7 +358,8 @@ class OxfordFlowers(ImageDataset):
         return prepared_source(self.path, split or self.split,
                                decoders={"image": tfds.decode.SkipDecoding()})
 
-    def record(self, element, rng):
+    def record(self, element: Batch | bytes, rng):
+        element = _fields(element, "OxfordFlowers")
         label = int(element["label"])
         # The template comes from the record's rng, like the augmentation.
         # A module-global random.choice would key a record's caption to how
@@ -378,7 +396,8 @@ class HFImages(ImageDataset):
         return HFDatasetSource(name=self.name, split=split or self.split,
                                options=self.options)
 
-    def record(self, element, rng):
+    def record(self, element: Batch | bytes, rng):
+        element = _fields(element, "HFImages")
         label = element.get("label")
         return element["image"], record_caption(element), None if label is None else int(label)
 
@@ -415,7 +434,11 @@ class ArrayRecordImages(ImageDataset):
                       if 'array_record' in f]
         return pygrain.ArrayRecordDataSource(files)
 
-    def record(self, element, rng):
+    def record(self, element: Batch | bytes, rng):
+        if not isinstance(element, bytes):
+            raise TypeError(
+                f"{type(self).__name__} reads arrayrecord shards, whose records "
+                f"are packed bytes; this one is {type(element).__name__}")
         element = unpack_dict_of_byte_arrays(element)
         if 'image' in element:
             height, width = np.frombuffer(element['shape'], dtype=np.int32)

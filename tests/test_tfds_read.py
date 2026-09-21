@@ -34,6 +34,19 @@ def test_prepared_records_decode_pixels_labels_and_caption_names():
     assert [int(test_split[i]["image"][0, 0, 0]) for i in range(len(test_split))] == [26, 27, 28, 29]
 
 
+def test_a_prepared_source_describes_the_directory_and_split_it_reads():
+    """A saved position names the order it counts into by naming its source,
+    and the builder's own source describes itself by its address in this
+    process, which no resume can match."""
+    from dew.data.dataset import describe
+
+    source = OxfordFlowers(path=str(FIXTURE)).source()
+    other = OxfordFlowers(path=str(FIXTURE), split="test").source()
+
+    assert describe(source) == f"Prepared(directory={str(FIXTURE)!r}, split='all')"
+    assert describe(other) != describe(source)
+
+
 @pytest.mark.parametrize("workers", [0, 2])
 def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
     data = OxfordFlowers(

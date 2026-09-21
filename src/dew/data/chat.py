@@ -99,9 +99,13 @@ def _mapping(raw: object, name: str, where: str) -> Mapping[str, object]:
     return raw
 
 
-def _sequence(raw: object, name: str, where: str) -> list[object]:
-    """A list, or a JSON string holding one: parquet carries structured
-    columns as JSON text when their schema varies across rows."""
+def _records(raw: object, name: str, where: str) -> list[Mapping[str, object]]:
+    """A list of objects, or a JSON string holding one: parquet carries
+    structured columns as JSON text when their schema varies across rows.
+
+    Every array this file reads is an array of objects, messages, content
+    parts, tool calls and tool schemas alike, so the entries are narrowed
+    here and the readers below take a record rather than an unknown."""
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
@@ -109,7 +113,7 @@ def _sequence(raw: object, name: str, where: str) -> list[object]:
             raise ValueError(f"{where}: {name} is not JSON: {exc}") from None
     if not isinstance(raw, list):
         raise ValueError(f"{where}: {name} is a list, got {raw!r}")
-    return raw
+    return [_mapping(entry, f"an entry of {name}", where) for entry in raw]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -125,15 +129,14 @@ class ContentPart:
     fields: Mapping[str, object]
 
     @classmethod
-    def parse(cls, raw: object, where: str) -> ContentPart:
-        part = _mapping(raw, "a content part", where)
+    def parse(cls, part: Mapping[str, object], where: str) -> ContentPart:
         kind = _text(part.get("type"), "a content part's type", where)
         fields = {key: value for key, value in part.items() if key != "type"}
         if kind == "text":
             _text(fields.get("text"), "a text part's text", where)
         return cls(kind, fields)
 
-    def as_template(self) -> dict[str, object]:
+    def as_template(self) -> Mapping[str, object]:
         return {"type": self.type, **self.fields}
 
 
@@ -156,8 +159,7 @@ class ToolCall:
     type: str = "function"
 
     @classmethod
-    def parse(cls, raw: object, where: str) -> ToolCall:
-        call = _mapping(raw, "a tool call", where)
+    def parse(cls, call: Mapping[str, object], where: str) -> ToolCall:
         outer = {key: value for key, value in call.items() if value is not None}
         function = outer.pop("function", None)
         if function is not None:
@@ -195,7 +197,7 @@ class ToolCall:
             None if call_id is None else _text(call_id, "a tool call's id", where),
             _text(kind, "a tool call's type", where))
 
-    def as_template(self) -> dict[str, object]:
+    def as_template(self) -> Mapping[str, object]:
         call: dict[str, object] = {
             "type": self.type,
             "function": {"name": self.name, "arguments": dict(self.arguments)},
@@ -231,22 +233,21 @@ class Message:
     extra: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
     @classmethod
-    def parse(cls, raw: object, where: str) -> Message:
-        message = _mapping(raw, "a message", where)
+    def parse(cls, message: Mapping[str, object], where: str) -> Message:
         role = _role(message.get("role"), where)
         content = message.get("content")
         if isinstance(content, str) or content is None:
             parts = content
         else:
             parts = tuple(ContentPart.parse(part, where)
-                          for part in _sequence(content, "content", where))
+                          for part in _records(content, "content", where))
         calls = message.get("tool_calls")
         if calls is not None and role is not Role.ASSISTANT:
             raise ValueError(
                 f"{where}: only an assistant message calls tools, "
                 f"this one is {role.name.lower()}")
         tool_calls = () if calls is None else tuple(
-            ToolCall.parse(call, where) for call in _sequence(calls, "tool_calls", where))
+            ToolCall.parse(call, where) for call in _records(calls, "tool_calls", where))
         call_id = message.get("tool_call_id")
         if call_id is not None and role is not Role.TOOL:
             raise ValueError(
@@ -261,7 +262,7 @@ class Message:
             None if name is None else _text(name, "name", where),
             extra)
 
-    def as_template(self) -> dict[str, object]:
+    def as_template(self) -> Mapping[str, object]:
         """The structured HF message, retaining content parts and metadata.
         Conversation.text_rows adapts these fields for text tokenizers."""
         if isinstance(self.content, tuple):
@@ -294,36 +295,47 @@ class Conversation:
     @classmethod
     def parse(cls, messages: object, tools: object = None,
               where: str = "conversation") -> Conversation:
+        """One row's messages and tool schemas, as a parquet column holds
+        them: a list, or the JSON text a column of varying schema carries."""
+        if not isinstance(messages, (str, list)):
+            raise ValueError(
+                f"{where}: messages are a list of turns or the JSON text of one, "
+                f"got {messages!r}")
+        if tools is not None and not isinstance(tools, (str, list)):
+            raise ValueError(
+                f"{where}: tools are a list of schemas or the JSON text of one, "
+                f"got {tools!r}")
         parsed = tuple(Message.parse(message, f"{where} message {index}")
-                       for index, message in enumerate(_sequence(messages, "messages", where)))
+                       for index, message in enumerate(_records(messages, "messages", where)))
         if not parsed:
             raise ValueError(f"{where} holds an empty conversation, which has no tokens to train on")
-        schemas = () if tools is None else tuple(
-            _mapping(tool, "a tool schema", where) for tool in _sequence(tools, "tools", where))
+        schemas = () if tools is None else tuple(_records(tools, "tools", where))
         return cls(parsed, schemas)
 
-    def rows(self) -> list[dict[str, object]]:
+    def rows(self) -> list[Mapping[str, object]]:
         return [message.as_template() for message in self.messages]
 
-    def text_rows(self, source: str) -> list[dict[str, object]]:
+    def text_rows(self, source: str) -> list[Mapping[str, object]]:
         """The text-tokenizer input, with all-text parts joined in order.
 
         The stored messages and `rows` retain their structured content.
         Media needs a processor to expand its payload into model inputs;
         a text tokenizer cannot do that, even if its template emits a marker.
         """
-        rows = self.rows()
-        for index, (message, row) in enumerate(zip(self.messages, rows, strict=True)):
-            if isinstance(message.content, tuple):
-                texts: list[str] = []
-                for part in message.content:
-                    where = f"{source} message {index}"
-                    if part.type != "text":
-                        raise ValueError(
-                            f"{where}: content part {part.type!r} requires a processor; "
-                            "text tokenizers accept only text parts")
-                    texts.append(_text(part.fields.get("text"), "a text part's text", where))
-                row["content"] = "".join(texts)
+        rows = []
+        for index, (message, row) in enumerate(zip(self.messages, self.rows(), strict=True)):
+            if not isinstance(message.content, tuple):
+                rows.append(row)
+                continue
+            texts: list[str] = []
+            for part in message.content:
+                where = f"{source} message {index}"
+                if part.type != "text":
+                    raise ValueError(
+                        f"{where}: content part {part.type!r} requires a processor; "
+                        "text tokenizers accept only text parts")
+                texts.append(_text(part.fields.get("text"), "a text part's text", where))
+            rows.append({**row, "content": "".join(texts)})
         return rows
 
 

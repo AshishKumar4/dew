@@ -28,7 +28,7 @@ if TYPE_CHECKING:  # the imports themselves happen on the first record
 
 import numpy as np
 
-from ..dataset import json_argument
+from ..dataset import Batch, json_argument
 
 _STREAMING_HINT = (
     "reading Hugging Face datasets needs the streaming extra: "
@@ -104,14 +104,9 @@ annotation says how the command line writes it, which for a value carrying
 field."""
 
 
-def _plain_value(value: Any) -> Any:
-    """A record value as an array or a Python scalar.
-
-    `datasets` decodes an image column into a PIL image and every transform in
-    the data layer is numpy and cv2. PIL images carry the array interface, so
-    they convert here; strings, numbers and lists pass through.
-    """
-    return np.asarray(value) if hasattr(value, "__array_interface__") else value
+type Held = Mapping[str, object]
+"""What a source carries into a grain worker: its own attributes, with the
+table and the lock left behind."""
 
 
 class HFDatasetSource:
@@ -192,12 +187,17 @@ class HFDatasetSource:
     def __len__(self) -> int:
         return len(self._table())
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        row: Mapping[str, Any] = self._table()[index]
-        return {key: _plain_value(value) for key, value in row.items()}
+    def __getitem__(self, index: int) -> Batch:
+        # `datasets` decodes an image column into a PIL image and every
+        # transform in the data layer is numpy and cv2. PIL images carry the
+        # array interface, so they convert here; strings, numbers and lists
+        # travel as they are.
+        row: Mapping[str, object] = self._table()[index]
+        return {key: np.asarray(value) if hasattr(value, "__array_interface__") else value
+                for key, value in row.items()}
 
 
-    def __getstate__(self) -> dict[str, Any]:
+    def __getstate__(self) -> Held:
         # grain pickles the source into every worker process, so the table
         # must not be part of it. That would be a copy per worker of a dataset
         # that is already on disk. A named dataset reloads from the hub cache
@@ -212,6 +212,6 @@ class HFDatasetSource:
         state["_lock"] = None  # a lock does not pickle; the worker gets its own
         return state
 
-    def __setstate__(self, state: dict[str, Any]) -> None:
+    def __setstate__(self, state: Held) -> None:
         self.__dict__.update(state)
         self._lock = threading.Lock()

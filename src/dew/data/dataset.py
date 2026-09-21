@@ -65,12 +65,31 @@ saved position can be. Its elements are one example's fields, the shape
 `Batch` names, because grain stacks them into a batch of those same
 fields."""
 
-type Records = pygrain.RandomAccessDataSource[object]
-"""A source the loaders read by index. A record is whatever the source
-holds, which is a mapping of fields for every dataset dew writes and, for a
-prepared TFDS split of one feature, a bare array; the spec's own transform
-is where it becomes batch fields, and `Preprocessing` refuses what it
-cannot read there."""
+@runtime_checkable
+class Records(Protocol):
+    """A source the loaders read by index.
+
+    A record is one example's fields, the shape `Batch` names, or the packed
+    bytes an arrayrecord holds, which the spec's own transform unpacks
+    before the fields exist. A grain dataset answers None where its padding
+    covers an index, and grain's reader skips those rather than batching
+    them.
+
+    Grain's own `RandomAccessDataSource` says the same two methods with the
+    record as a type parameter, which is invariant, so a source declared
+    through it cannot be handed to a loader that named a different record.
+    This one names what the loaders actually read.
+    """
+
+    def __len__(self) -> int: ...
+
+    def __getitem__(self, index: int) -> Batch | bytes | None: ...
+
+
+type Indexed = Records | Sequence[Batch]
+"""Records read by index: a source that answers grain's two methods, or a
+plain sequence of them, which is what a spec that lists its records in
+memory (the video specs list their clips) hands over."""
 
 
 def json_argument[Options: DataclassInstance](
@@ -127,7 +146,7 @@ class Forwarding:
     source's. Subclasses keep the source at `_source` and override `close`
     for their own cleanup around `super().close()`."""
 
-    def _forwarded(self) -> object:
+    def _forwarded(self) -> Iterator[Batch] | None:
         """The wrapped source, or None before a subclass sets one.
 
         This is the boundary between the wrapper and whatever it wraps: a
@@ -416,6 +435,13 @@ CAPTION = "caption"
 conditions read it."""
 
 
+type Position = bytes | Mapping[str, object]
+"""Where a stream stopped, as it reports it: dew's own envelope is bytes and
+grain reports a JSON object, which `dew.training.distributed` encodes before
+a checkpoint holds it. `dew.position` says which of the two kinds a saved
+position is."""
+
+
 @runtime_checkable
 class Checkpointable(Protocol):
     """A data stream that can say where it stopped and be put back there.
@@ -426,9 +452,9 @@ class Checkpointable(Protocol):
     a checkpoint holds.
     """
 
-    def get_state(self) -> Any: ...
+    def get_state(self) -> Position: ...
 
-    def set_state(self, state: Any) -> None: ...
+    def set_state(self, state: Position) -> None: ...
 
 
 def tokenized(stream: Callable[[], Iterator[Batch]],
@@ -478,13 +504,13 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
         protocol reads attributes statically, where a forwarding `__getattr__`
         would only satisfy `hasattr`."""
 
-        def get_state(self) -> Any:
+        def get_state(self) -> Position:
             source = self._source
             if not isinstance(source, Checkpointable):
                 raise RuntimeError("the tokenized iterator is closed")
             return source.get_state()
 
-        def set_state(self, state: Any) -> None:
+        def set_state(self, state: Position) -> None:
             source = self._source
             if not isinstance(source, Checkpointable):
                 raise RuntimeError("the tokenized iterator is closed")
@@ -522,7 +548,7 @@ class SourceSlice:
     because grain pickles the source to its workers.
     """
 
-    def __init__(self, source: Any, start: int, stop: int):
+    def __init__(self, source: Indexed, start: int, stop: int):
         self.source = source
         self.start = start
         self.length = stop - start
@@ -546,7 +572,8 @@ class SourceSlice:
         return self.source[self.start + index]
 
 
-def hold_out(source: Any, records: int, held_out: int, name: str):
+def hold_out(source: Indexed, records: int, held_out: int,
+             name: str) -> tuple[SourceSlice, SourceSlice | None]:
     """`(train_source, val_source)`: the first `held_out` of `records` records,
     in canonical order, as the validation split, and the rest as training.
 
@@ -564,7 +591,7 @@ def hold_out(source: Any, records: int, held_out: int, name: str):
             SourceSlice(source, 0, held_out))
 
 
-def describe(source: object) -> str:
+def describe(source: Indexed | GrainDataset) -> str:
     """`source`'s own description, or its type when it has none.
 
     A saved position names the order it counts into, and the order is named
@@ -589,7 +616,7 @@ class Corpus:
     """
 
     name: str
-    source: pygrain.RandomAccessDataSource[object]
+    source: Records
     weight: float
 
 
@@ -614,7 +641,7 @@ def _shares(corpora: Sequence[Corpus]) -> tuple[float, ...]:
     return tuple(weight / total for weight in weights)
 
 
-def mixture(corpora: Sequence[Corpus], seed: int | None) -> pygrain.MapDataset[object]:
+def mixture(corpora: Sequence[Corpus], seed: int | None) -> pygrain.MapDataset[Batch]:
     """`corpora` read together at their weights, as one order over records.
 
     Grain's own proportional interleave decides which corpus record k comes
@@ -648,7 +675,7 @@ def mixture(corpora: Sequence[Corpus], seed: int | None) -> pygrain.MapDataset[o
     """
     shares = _shares(corpora)
 
-    def order(corpus: Corpus) -> pygrain.MapDataset[object]:
+    def order(corpus: Corpus) -> pygrain.MapDataset[Batch]:
         records = pygrain.MapDataset.source(corpus.source)
         return records if seed is None else records.shuffle(seed).repeat(None)
 
@@ -752,7 +779,7 @@ def _per_process(source: GrainDataset, *, rows: int, loading: Loading,
     return iter(source.batch(rows, drop_remainder=True))
 
 
-def rows_of(batch: Mapping[str, Any]) -> int:
+def rows_of(batch: Mapping[str, object]) -> int:
     """The records `batch` holds, read off its first field that has rows.
 
     A batch may carry a field that is one value for the whole step rather
@@ -839,6 +866,20 @@ class Resumable(Checkpointable, Protocol):
     def __next__(self) -> Batch: ...
 
 
+def _global(state: Position) -> bytes:
+    """A global position's own bytes, or the refusal that this is not one.
+
+    A ramp cuts its step out of a global record order, so it reads the
+    source's position; grain's own state counts one process's shard and has
+    no global count in it.
+    """
+    if not isinstance(state, bytes):
+        raise TypeError(
+            f"a batch ramp reads a global record position, and this stream "
+            f"reports {type(state).__name__}, which counts one process's shard")
+    return state
+
+
 class RampedStream(Forwarding):
     """A training stream whose step grows over the run's first records.
 
@@ -892,7 +933,7 @@ class RampedStream(Forwarding):
         return step
 
     def get_state(self) -> bytes:
-        place = position.read(self._source.get_state())
+        place = position.read(_global(self._source.get_state()))
         return position.encode(dataclasses.replace(place, records=self._records))
 
     def set_state(self, state: bytes) -> None:

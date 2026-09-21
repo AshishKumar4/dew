@@ -39,10 +39,14 @@ from typing import TYPE_CHECKING
 
 import grain.python as pygrain
 
+from ..dataset import Batch
+
 if TYPE_CHECKING:  # `datasets` is imported on the first row, not at import
     from datasets import IterableDataset
 
-Row = dict[str, object]
+Row = Batch
+"""One streamed row: the fields of one example, which is what a batch of
+them carries."""
 
 SHUFFLED = (
     "a shuffled streamed split cannot be put back where it stopped: what "

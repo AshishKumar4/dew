@@ -84,7 +84,7 @@ class Preprocessing(pygrain.RandomMapTransform):
     def __init__(self, preprocess: Preprocess):
         self.preprocess = preprocess
 
-    def random_map(self, element: object, rng: np.random.Generator) -> dict[str, object]:
+    def random_map(self, element: object, rng: np.random.Generator) -> Batch:
         if not isinstance(element, Mapping):
             raise TypeError(
                 f"a provider record is a mapping of fields; this one is "
