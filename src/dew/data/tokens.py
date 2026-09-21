@@ -28,7 +28,7 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .dataset import (Batch, Dataset, DatasetSpec, Loading, describe, local_batch,
+from .dataset import (Batch, Dataset, DatasetSpec, Forwarding, Loading, describe, local_batch,
                       train_stream, validation_pass)
 
 
@@ -51,7 +51,7 @@ def token_files(path: str | None, name: str) -> tuple[str, str]:
     return str(train_bin), str(val_bin)
 
 
-class _BoundedIterator:
+class _BoundedIterator(Forwarding):
     def __init__(self, source: Iterator[Batch], batches: int):
         self._source: Iterator[Batch] | None = source
         self._iterator: Iterator[Batch] = itertools.islice(source, batches)
@@ -62,16 +62,9 @@ class _BoundedIterator:
     def __next__(self):
         return next(self._iterator)
 
-    def request_stop(self):
-        stop = getattr(self._source, "request_stop", None)
-        if stop is not None:
-            stop()
-
     def close(self):
         try:
-            close = getattr(self._source, "close", None)
-            if close is not None:
-                close()
+            super().close()
         finally:
             self._iterator = iter(())
             self._source = None

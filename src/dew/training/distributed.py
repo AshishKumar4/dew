@@ -608,14 +608,19 @@ class DevicePrefetchIterator:
             except queue.Empty:
                 return
 
-    def close(self, *, timeout: float = 5.0) -> None:
+    def close(self, *, timeout: float | None = None) -> None:
         """Cancel and join, discarding unread batches, not consumed position.
 
-        A timeout leaves cancellation requested; a later close may join again.
+        The join waits `timeout`, else the source's own `stop_seconds` (a
+        grain pipeline joins one worker process after another), else 5 s. A
+        timeout leaves cancellation requested; a later close may join again.
         It does not mean the source's in-flight work or buffers were released.
         """
         if threading.current_thread() is self._thread:
             raise RuntimeError("a prefetch worker cannot close itself")
+        if timeout is None:
+            seconds = getattr(self._iterator, "stop_seconds", None)
+            timeout = 5.0 if seconds is None else float(seconds)
         if timeout < 0:
             raise ValueError("close timeout must be nonnegative")
         first_stop = not self._stop.is_set()

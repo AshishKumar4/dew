@@ -22,7 +22,7 @@ import dew.data
 from dew.data import (Checkpointable, Dataset, DatasetSpec, HFDatasetSource, ImageDataset,
                       LocalVideos, VoxCeleb2, local_batch)
 from dew.data import Loading, images, video
-from dew.data.dataset import _batches, hold_out, train_stream, validation_pass
+from dew.data.dataset import Forwarding, _batches, hold_out, train_stream, validation_pass
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
 from dew.data.sources.av_utils import choose_clip_start
@@ -681,6 +681,18 @@ def test_a_records_pixels_and_caption_do_not_depend_on_worker_count(
 
     assert sorted(serial) == list(range(16))
     assert serial == parallel
+
+
+def test_the_close_budget_is_the_sources_worker_count():
+    """A grain pipeline joins its workers one by one, so the prefetch close
+    waits what the stream's Loading says, through every wrapper over it."""
+    loading = Loading(workers=8, threads=1, read_buffer=1)
+    stream = Augmenting(length=16, image_size=8, seed=3, val_batches=None,
+                        loading=loading).load(batch=4, tokenize=keep_captions).train()
+    assert isinstance(stream, Forwarding)
+    assert stream.stop_seconds == loading.stop_seconds > 5.0
+    stream.close()
+    assert stream.stop_seconds is None
 
 
 def test_augmentation_really_moves_the_pixels():
