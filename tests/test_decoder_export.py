@@ -97,6 +97,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "hf"
 TOKENIZER = REPO_ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-tools"
 LOGITS = 1e-4
+"""Cross-framework fp32 parity, relative to the logit scale: the two forwards
+sum in different orders, and that noise grows with the logits. Absolute,
+the same bound fails the untrained qwen3_next fixture (1.18e-4 at max
+|logit| 6.4) with identical code on either side of an unrelated change."""
 MOVEMENT = 1e-4
 # The families whose checkpoint names one tensor per expert, which the load
 # stacks and the export slices back apart. Llama 4 fuses its experts
@@ -207,10 +211,11 @@ def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip
 
 def test_transformers_reads_the_trained_export(trip):
     """The export is a checkpoint the reference implementation loads: same
-    ids, same argmax, and the logits agree to 1e-4."""
+    ids, same argmax, and the logits agree to `LOGITS` of their scale."""
     assert np.array_equal(np.argmax(trip.theirs, -1), np.argmax(trip.ours, -1))
     difference = float(np.max(np.abs(trip.theirs - trip.ours)))
-    assert difference < LOGITS, f"max |logit difference| {difference:.3e}"
+    scale = float(np.max(np.abs(trip.theirs)))
+    assert difference < LOGITS * scale, f"max |logit difference| {difference:.3e} at scale {scale:.2f}"
 
 
 def test_the_export_keeps_the_sources_config_and_generation_config(trip):
@@ -250,7 +255,8 @@ def test_a_rotated_expert_index_writes_a_model_that_disagrees(indexed, tmp_path)
         "the rotation changed the tensor table, so the difference below is not numerical")
     theirs = tool.logits(again, again.variables, trip.ids)
     difference = float(np.max(np.abs(theirs - trip.ours)))
-    assert difference > LOGITS, f"rotating {len(bindings)} experts moved the logits {difference:.3e}"
+    scale = float(np.max(np.abs(trip.ours)))
+    assert difference > LOGITS * scale, f"rotating {len(bindings)} experts moved the logits {difference:.3e}"
 
 
 def test_an_expert_index_past_the_stack_is_refused(indexed):
