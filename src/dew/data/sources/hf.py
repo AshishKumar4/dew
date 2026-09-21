@@ -14,7 +14,7 @@ import dataclasses
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # the imports themselves happen on the first record
     from datasets import (
@@ -109,6 +109,16 @@ type Held = Mapping[str, object]
 table and the lock left behind."""
 
 
+@runtime_checkable
+class ArrayInterface(Protocol):
+    """A value numpy reads without being told how: `datasets` decodes an
+    image column into a PIL image, and a PIL image describes its buffer
+    here. Strings, numbers and lists describe none and travel as they are."""
+
+    @property
+    def __array_interface__(self) -> Mapping[str, object]: ...
+
+
 class HFDatasetSource:
     """Random access over a Hugging Face `datasets.Dataset`.
 
@@ -193,7 +203,7 @@ class HFDatasetSource:
         # array interface, so they convert here; strings, numbers and lists
         # travel as they are.
         row: Mapping[str, object] = self._table()[index]
-        return {key: np.asarray(value) if hasattr(value, "__array_interface__") else value
+        return {key: np.asarray(value) if isinstance(value, ArrayInterface) else value
                 for key, value in row.items()}
 
 

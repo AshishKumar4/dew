@@ -21,7 +21,7 @@ import types
 import typing
 from collections.abc import Iterator, Mapping, Sequence
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, TypedDict, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, Generic, Literal, Protocol, TypedDict, TypeVar, Union
 
 import jax
 import jax.numpy as jnp
@@ -113,7 +113,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
         if attr.startswith("_"):
             raise AttributeError(attr)
         for member in self._members.values():
-            if getattr(member, "__name__", None) == attr:
+            if _describe(member) == attr:
                 return member
         raise AttributeError(
             f"no {self.kind} is called {attr!r}; known: "
@@ -128,7 +128,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
     def __repr__(self) -> str:
         return f"Registry({self.kind!r}, {sorted(self._members)})"
 
-    def name_of[Made](self, member: Callable[..., Made]) -> str:
+    def name_of(self, member: Named) -> str:
         """The name a member was registered under. The table is scanned by
         identity, so this takes a member of any registry, whatever it makes."""
         for name, held in self._members.items():
@@ -179,8 +179,22 @@ class Registry(Mapping[str, T], Generic[T, Built]):
         return functools.reduce(operator.or_, members)
 
 
-def _describe[Made](member: Callable[..., Made]) -> str:
-    return getattr(member, "__name__", repr(member))
+class Named(Protocol):
+    """The name a registry member carries of its own.
+
+    A member is a class or a function -- the decorator takes both -- and each
+    declares `__name__`, which is what the attribute view matches on and what
+    an error names a member by. The registry's table holds members as the
+    concrete type their decorator handed back, so this is the one thing read
+    off them without the caller's own type.
+    """
+
+    @property
+    def __name__(self) -> str: ...
+
+
+def _describe(member: Named) -> str:
+    return member.__name__
 
 
 def _declared_type(member: type, field: str) -> Annotation:

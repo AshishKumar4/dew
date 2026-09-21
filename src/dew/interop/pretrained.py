@@ -81,6 +81,21 @@ class HostProcessor(Protocol):
     def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]: ...
 
 
+def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"]]:
+    """The id and the side to pad text rows with, at the boundary a host
+    processor draws: it delegates text to the tokenizer it wraps, a tokenizer
+    is its own, and either may state neither field, so both names are read off
+    the object here and narrowed once for the rows.
+    """
+    tokenizer = getattr(reference, "tokenizer", reference)
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    side = getattr(tokenizer, "padding_side", "right")
+    if side not in ("left", "right"):
+        raise ValueError("the tokenizer padding_side must be left or right")
+    return (0 if pad_id is None else records.integer(pad_id, "pad_token_id"),
+            "left" if side == "left" else "right")
+
+
 @dataclass(frozen=True)
 class Processor:
     """Host text/image preprocessing followed by numeric layout normalization.
@@ -103,17 +118,12 @@ class Processor:
                 raise ValueError("video_metadata requires videos")
             rows = [text] if isinstance(text, str) else list(text)
             values = self.reference(text=rows, padding=False, truncation=False, return_tensors=None)
-            tokenizer = getattr(self.reference, "tokenizer", self.reference)
-            pad_id = getattr(tokenizer, "pad_token_id", None)
-            side = getattr(tokenizer, "padding_side", "right")
-            if side not in ("left", "right"):
-                raise ValueError("the tokenizer padding_side must be left or right")
+            pad_id, side = _row_padding(self.reference)
             ids = values["input_ids"]
             ids = ids if isinstance(ids, Sequence) else np.asarray(ids)
             fields = {name: value if isinstance(value, Sequence) else np.asarray(value)
                       for name, value in values.items() if name != "input_ids"}
-            tokens, fields = pad_token_rows(ids, pad_id=0 if pad_id is None else pad_id,
-                                           padding_side=side, fields=fields)
+            tokens, fields = pad_token_rows(ids, pad_id=pad_id, padding_side=side, fields=fields)
             return self.from_hf({"input_ids": tokens, **fields})
         # truncation is off for text anyway; reloaded Gemma processors forward
         # the tokenizer's unset max_length into audio kwargs otherwise.
@@ -646,7 +656,9 @@ def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
         if not isinstance(node, Mapping) or part not in node:
             raise ValueError(f"the loaded tree holds no {path}, which {part!r} names")
         node = node[part]
-    rank = getattr(node, "ndim", 0) - (0 if expert_index is None else 1)
+    if not isinstance(node, np.ndarray | jax.Array):
+        return 0
+    rank = node.ndim - (0 if expert_index is None else 1)
     return max(rank - 2, 0)
 
 
@@ -901,8 +913,9 @@ class Pretrained:
             raise TypeError("a latent diffusion source generates through text_to_image")
         if isinstance(self.model, DiffusionGemma):
             raise TypeError("a DiffusionGemma source generates through block_generation")
-        mask_id = getattr(self.model, "mask_token_id", None)
-        if not getattr(self.model, "causal", True) and mask_id is not None:
+        decoder = self.model if isinstance(self.model, CausalTransformer) else None
+        mask_id = None if decoder is None else decoder.mask_token_id
+        if decoder is not None and not decoder.causal and mask_id is not None:
             from dew.diffusion.discrete import MDLM
             if sampling is not None:
                 raise TypeError("native MDLM accepts denoising steps, not autoregressive sampling controls")
@@ -1279,13 +1292,24 @@ def _audit(config: Mapping[str, object], generation_config: Mapping[str, object]
 
 
 
+def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | None:
+    """The decoder a source built, or None for a model that is not one.
+
+    `CausalTransformer` declares what native decoding reads off a model, and
+    `MultimodalTransformer` forwards those four fields to the decoder it
+    holds, so the two answer together for everything but the decoder's own.
+    """
+    return model if isinstance(model, CausalTransformer | MultimodalTransformer) else None
+
+
 def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str, object],
                     model: nn.Module) -> None:
     """A declared cache length is real, and has to fit the model's own."""
     value = _generation_value(config, generation_config, "max_cache_len")
     if value is None:
         return
-    capacity = getattr(model, "max_seq_len", None)
+    decoder = _decoder(model)
+    capacity = None if decoder is None else decoder.max_seq_len
     if type(value) is not int or value < 1:
         raise ValueError("max_cache_len must be a positive integer")
     if capacity is not None and value > capacity:
@@ -1494,7 +1518,8 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
                     stop_ids=len(_eos_ids(config, generation_config)))
     if not speculating:
         return None
-    if not int(getattr(model, "num_nextn_predict_layers", 0) or 0):
+    decoder = _decoder(model)
+    if decoder is None or not decoder.num_nextn_predict_layers:
         raise ValueError("the source asks for multi-token-prediction speculation, but this "
                          "checkpoint carries no prediction-depth weights")
     length = read("num_assistant_tokens")
@@ -1535,8 +1560,9 @@ def _source_decoding(config: Mapping[str, object], generation_config: Mapping[st
     _audit(config, generation_config, model, do_sample,
            _generation_value(config, generation_config, "num_beams"), override is not None)
     strategy = _source_strategy(config, generation_config, model, do_sample, rows)
+    decoder = _decoder(model)
     criteria = _source_stopping(config, generation_config, processor,
-                                getattr(model, "vocab_size", None))
+                                None if decoder is None else decoder.vocab_size)
     policy = override if override is not None else _source_sampling(config, generation_config, do_sample)
     transforms = (None if override is not None else
                   _source_transforms(config, generation_config, policy, do_sample, isinstance(strategy, Beam)))

@@ -37,6 +37,7 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
+from .providers import Counted
 from .sources.hf import HFOptions, HubOptions
 from .tokens import bounded
 
@@ -291,16 +292,20 @@ class ImageDataset(DatasetSpec):
         it needs."""
         raise NotImplementedError
 
-    def records(self, source) -> int:
-        """The records the run uses, from the head of the source."""
+    def records(self, source: Records) -> int:
+        """The records the run uses, from the head of the source.
+
+        A source that cannot count itself is `Counted`'s other case: the
+        spec's own `count` is then the whole record of how many there are.
+        """
         name = type(self).__name__
         if self.count is None:
-            if not hasattr(source, "__len__"):
+            if not isinstance(source, Counted):
                 raise ValueError(
                     f"{name} reports no length, so it needs count= set to the "
                     "records it holds")
             return len(source)
-        if hasattr(source, "__len__") and self.count > len(source):
+        if isinstance(source, Counted) and self.count > len(source):
             raise ValueError(
                 f"count {self.count} is more than the {len(source)} records of {name}")
         return self.count

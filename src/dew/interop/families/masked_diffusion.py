@@ -66,7 +66,7 @@ _LLADA_READ = ('hidden_size', 'd_model', 'num_hidden_layers', 'n_layers', 'num_l
                'hidden_activation', 'activation_type')
 
 
-def _llada_geometry(hf_config: Mapping[str, object]) -> dict[str, object]:
+def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """LLaDA's own config spellings (d_model, n_layers, n_heads, n_kv_heads,
     mlp_hidden_size, embedding_size, max_sequence_length) under the standard
     names `_base_config` reads, each alias beside the spelling it stands in for.
@@ -310,11 +310,11 @@ def _llada_export_path(name: str, config: Mapping[str, object]) -> str | None:
 
 
 def _llada_export(model: CausalTransformer) -> Mapping[str, object]:
-    return {'mask_token_id': getattr(model, 'mask_token_id', None)}
+    return {'mask_token_id': model.mask_token_id}
 
 
 def _dream_export(model: CausalTransformer) -> Mapping[str, object]:
-    return {'mask_token_id': getattr(model, 'mask_token_id', None)}
+    return {'mask_token_id': model.mask_token_id}
 
 
 def _diffusion_gemma_export(model: CausalTransformer) -> Mapping[str, object]:

@@ -35,14 +35,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from flax import struct
+from flax import linen as nn, struct
 
 from dew.artifacts import TextSamples, TokenScores, agree_process_phase, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor
 from dew.inputs import Field, InputSpec
-from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
+from dew.nn.backbones.causal_transformer import INTERMEDIATES, CausalTransformer, layer_output, layer_outputs
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION, MLAMixer
 from dew.nn.moe import (
@@ -52,6 +52,7 @@ from dew.nn.moe import (
     router_moments,
     sequence_router_losses,
 )
+from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import (
     FROZEN,
     Aux,
@@ -111,11 +112,35 @@ class IndexerTraining:
                 f"{self.weight}")
 
 
-def indexed_mixers(model) -> list[MLAMixer]:
+def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | None:
+    """The decoder an objective trains, or None for a model that is not one.
+
+    `CausalTransformer` declares the two fields read here before anything is
+    traced, and `MultimodalTransformer` forwards both to the decoder it
+    holds, so either answers for them.
+    """
+    return model if isinstance(model, CausalTransformer | MultimodalTransformer) else None
+
+
+def _streamed_depths(model: nn.Module) -> bool:
+    """Whether the prediction depths read and write their own residual
+    streams, which is the decoder's own field: the multimodal wrapper
+    forwards the depth count and no hyper-connections of its own.
+    """
+    return isinstance(model, CausalTransformer) and model.mtp_hyper_connections is not None
+
+
+def indexed_mixers(model: nn.Module) -> list[MLAMixer]:
     """The model's mla mixers that carry the indexer, the model's own and
-    each layer kind's, in that order."""
-    candidates = [getattr(model, "mixer", None)]
-    candidates += [kind.mixer for kind in (getattr(model, "kinds", None) or {}).values()]
+    each layer kind's, in that order.
+
+    A mixer is a decoder's own field: the multimodal wrapper forwards the
+    geometry its callers read and no mixer, so a model that is not a
+    `CausalTransformer` carries none to train.
+    """
+    if not isinstance(model, CausalTransformer):
+        return []
+    candidates = [model.mixer, *(kind.mixer for kind in (model.kinds or {}).values())]
     return [mixer for mixer in candidates
             if isinstance(mixer, MLAMixer) and mixer.indexed]
 
@@ -419,7 +444,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         indexer, so `init` returns it and a checkpoint stores it. An
         adapter's own filter (`dew.lora.LoRA.trainable`) goes here. None
         trains every leaf."""
-        if getattr(model, "causal", True) is False:
+        decoder = _decoder(model)
+        if decoder is not None and decoder.causal is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")
         self.model = model
         self.seq_len = seq_len
@@ -436,7 +462,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.seq_aux = seq_aux
         self.loss_role = loss_role
         if mtp_weight is not None:
-            depths = getattr(model, "num_nextn_predict_layers", 0)
+            depths = 0 if decoder is None else decoder.num_nextn_predict_layers
             if depths < 1:
                 raise ValueError(
                     "mtp_weight scales the prediction depths' cross entropy, so "
@@ -592,7 +618,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         params = thaw(params)
         collections = ((["router"] if routing else []) + (["qk"] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []))
-        stream_depth = depths and getattr(self.model, 'mtp_hyper_connections', None) is not None
+        stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
         hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
                                                packing, layers)

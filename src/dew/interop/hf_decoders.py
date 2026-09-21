@@ -39,7 +39,17 @@ import os
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Callable, Collection, Literal, Mapping, NoReturn, Protocol, TypedDict, Unpack
+from typing import (
+    Callable,
+    Collection,
+    Literal,
+    Mapping,
+    NoReturn,
+    Protocol,
+    TypedDict,
+    Unpack,
+    runtime_checkable,
+)
 
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
@@ -1595,6 +1605,15 @@ class ExportTokenizer(Protocol):
     """The files it wrote, which transformers returns and this module does not read."""
 
 
+@runtime_checkable
+class NamedTokenizer(Protocol):
+    """A tokenizer that knows the name it was resolved from, which is what
+    `dew.data.text.HFTokenizer` keeps and a host tokenizer object states
+    nowhere. An export records the name beside the files."""
+
+    name: str
+
+
 def save_export_assets(
     directory,
     *,
@@ -1625,8 +1644,7 @@ def save_export_assets(
         writer = None if isinstance(resolved, ByteTokenizer) else resolved
     elif tokenizer is not None:
         writer = tokenizer
-        recorded = getattr(tokenizer, 'name', None)
-        name = recorded if isinstance(recorded, str) else None
+        name = tokenizer.name if isinstance(tokenizer, NamedTokenizer) else None
     os.makedirs(directory, exist_ok=True)
     if writer is not None:
         writer.save_pretrained(str(directory))

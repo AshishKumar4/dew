@@ -85,7 +85,8 @@ def _all_finite(tree) -> jax.Array:
 
 def compact_qk(tree):
     def compact(path, leaf):
-        is_maximum = any(getattr(entry, "key", None) == "max_logits" for entry in path)
+        is_maximum = any(isinstance(entry, jax.tree_util.DictKey) and entry.key == "max_logits"
+                         for entry in path)
         return jnp.max(leaf, axis=-2, keepdims=True) if is_maximum and leaf.ndim > 1 else leaf
     return jax.tree_util.tree_map_with_path(compact, tree)
 
