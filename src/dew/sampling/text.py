@@ -9,7 +9,7 @@ import math
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic, overload
+from typing import Generic, Protocol, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -60,6 +60,57 @@ type Identity = str | int | tuple[Identity, ...]
 # class, which is one of these.
 type SelfNaming = type | types.FunctionType | types.MethodType | types.BuiltinFunctionType
 SELF_NAMING = (type, types.FunctionType, types.MethodType, types.BuiltinFunctionType)
+
+
+@runtime_checkable
+class Bounded(Protocol):
+    """A model that declares its vocabulary and the capacity of its cache.
+
+    `nn.Module` declares neither; a decoder (`CausalTransformer`, the
+    multimodal wrapper, a test policy) declares both, and the host checks
+    read them to refuse an id outside the vocabulary or a request that
+    would overflow the cache. A model that declares neither is checked
+    for neither.
+    """
+
+    @property
+    def vocab_size(self) -> int: ...
+
+    @property
+    def max_seq_len(self) -> int | None: ...
+
+
+@runtime_checkable
+class Exposing(Protocol):
+    """A decoder that hands back its hidden states beside its logits.
+
+    A strategy that drafts seeds its draft from them. A model without the
+    method still decodes; it only cannot draft.
+    """
+
+    def states_and_logits(self, tokens: jax.Array, **kwargs: jax.Array | bool | None
+                          ) -> tuple[jax.Array, jax.Array]: ...
+
+
+@runtime_checkable
+class Selective(Protocol):
+    """A decoder that scores one position per row instead of them all.
+
+    Its prefill runs the head on the slot the first draw reads and nothing
+    else; a model without the method scores every prompt position and pays
+    for the ones it discards.
+    """
+
+    def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: jax.Array | bool | None
+                             ) -> tuple[jax.Array, jax.Array]: ...
+
+
+@runtime_checkable
+class Predicting(Protocol):
+    """A decoder that declares how many multi-token prediction depths it carries."""
+
+    @property
+    def num_nextn_predict_layers(self) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -250,23 +301,18 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
 
 
 def _exposes_states(model: nn.Module) -> bool:
-    """Whether the model hands back its hidden states beside its logits.
-
-    A decoder that does seeds a speculative draft from them. One that does
-    not still decodes; it only cannot draft.
-    """
-    return hasattr(type(model), "states_and_logits")
+    """Whether the model is `Exposing`: hidden states come back with the logits."""
+    return isinstance(model, Exposing)
 
 
 def _scores_one_slot(model: nn.Module) -> bool:
-    """Whether the model can score one position per row instead of them all.
+    """Whether the model is `Selective`: one position per row is scored."""
+    return isinstance(model, Selective)
 
-    A decoder is a boundary the sampler calls across: `nn.Module` declares
-    no forward, so what a model offers is what it defines. One that defines
-    no `states_and_logits_at` still prefills, with the head over every
-    prompt position, which is the work this spares.
-    """
-    return hasattr(type(model), "states_and_logits_at")
+
+def prediction_depths(model: nn.Module) -> int:
+    """How many multi-token prediction depths the model declares; none unless it is `Predicting`."""
+    return model.num_nextn_predict_layers if isinstance(model, Predicting) else 0
 
 
 def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -> DecodeOps:
@@ -349,8 +395,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         empty = jnp.zeros((batch * n, 0), jnp.float32)
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
                           jnp.zeros(batch * n, bool), empty, empty)
-    ops = _operations(model, params, pad_id,
-                      int(getattr(model, "num_nextn_predict_layers", 0) or 0))
+    ops = _operations(model, params, pad_id, prediction_depths(model))
     state, real = _prefill(model, params, inputs, ops)
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, max_new_tokens), jnp.int32)], axis=1),
@@ -381,10 +426,10 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
         raise ValueError("attention_mask must be binary [B, P] aligned with token ids")
     if not np.all(valid.any(axis=1)):
         raise ValueError("each prompt must contain at least one valid token")
-    cache_len = getattr(model, "max_seq_len", None)
+    cache_len = model.max_seq_len if isinstance(model, Bounded) else None
     if cache_len is not None and int(valid.sum(axis=1).max()) + max_new_tokens > cache_len:
         raise ValueError("prompt plus max_new_tokens exceeds max_seq_len; raise the cache capacity")
-    vocab = getattr(model, "vocab_size", None)
+    vocab = model.vocab_size if isinstance(model, Bounded) else None
     if np.any(ids < 0):
         raise ValueError("token ids must be non-negative")
     media = np.asarray(fields.get("image_indices", np.full(ids.shape, -1))) >= 0

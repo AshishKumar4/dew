@@ -28,13 +28,14 @@ from jax.typing import ArrayLike
 from dew.artifacts import agree_process_phase
 from dew.diffusion.block import BlockProcess, CanvasGeneration
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
 from dew.objectives.base import Variables
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
-from dew.sampling.text import Criteria, Generation, Sampling, Transforms, generate
+from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate
 from dew.telemetry.profile import active_profile
 
 if TYPE_CHECKING:
@@ -153,12 +154,11 @@ def _bucket(value: int, smallest: int) -> int:
 def _ceiling(model: nn.Module) -> int | None:
     """The largest cache the model admits, or None where it declares none.
 
-    The model is a boundary the task reads a shape across: `nn.Module`
-    declares no context length, a decoder declares `max_seq_len` and a
-    wrapper answers for the decoder it holds. `dew.sampling.text._validated`
-    reads the same field the same way to refuse a request too large for it.
+    A `Bounded` decoder declares `max_seq_len`, and a wrapper answers for
+    the decoder it holds; `dew.sampling.text._validated` reads the same
+    field to refuse a request too large for it.
     """
-    declared = getattr(model, "max_seq_len", None)
+    declared = model.max_seq_len if isinstance(model, Bounded) else None
     return declared if type(declared) is int else None
 
 
@@ -628,9 +628,9 @@ class MaskedGeneration:
         processor = _saved_processor(record)
         budget = _saved_budget(record)
         model = model_config.build()
-        mask_id = getattr(model, "mask_token_id", None)
-        if getattr(model, "causal", True) or type(mask_id) is not int:
-            raise ValueError("a saved masked run requires causal=False and a mask_token_id")
+        if not isinstance(model, CausalTransformer) or model.causal or type(model.mask_token_id) is not int:
+            raise ValueError("a saved masked run requires a CausalTransformer with causal=False and a mask_token_id")
+        mask_id = model.mask_token_id
         variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
                                       param_dtype=param_dtype)
         return cls(model, variables, MDLM(mask_id=mask_id)(), processor,

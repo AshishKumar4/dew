@@ -26,7 +26,7 @@ import dataclasses
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -35,6 +35,9 @@ from flax import struct
 from jax import lax
 
 from dew.records import JSON
+
+if TYPE_CHECKING:
+    from dew.interop.pretrained import HostProcessor
 
 FILTER = -jnp.inf
 """The score a removed token keeps, as `logits_process.py`'s filter value."""
@@ -825,11 +828,54 @@ def byte_alphabet() -> dict[str, int]:
 
 
 def _decoder_has(config: JSON, name: str) -> bool:
-    if isinstance(config, dict):
-        return config.get("type") == name or any(_decoder_has(entry, name) for entry in config.values())
-    if isinstance(config, list):
-        return any(_decoder_has(entry, name) for entry in config)
+    match config:
+        case dict():
+            return config.get("type") == name or any(_decoder_has(entry, name) for entry in config.values())
+        case list():
+            return any(_decoder_has(entry, name) for entry in config)
     return False
+
+
+class PieceDecoder(Protocol):
+    """A `tokenizers` decoder, which pickles as the JSON that configures it;
+    `matching_mode` reads the decoder kinds that JSON names."""
+
+    def __getstate__(self) -> bytes | str | None: ...
+
+
+class Backend(Protocol):
+    """The Rust tokenizer a fast Transformers tokenizer wraps: its decoder
+    says how pieces spell bytes, and is None on a tokenizer without one."""
+
+    @property
+    def decoder(self) -> PieceDecoder | None: ...
+
+
+@runtime_checkable
+class Fast(Protocol):
+    """A fast Transformers tokenizer, which carries its Rust backend; a slow
+    one has no backend and its pieces are read through their text."""
+
+    @property
+    def backend_tokenizer(self) -> Backend: ...
+
+
+@runtime_checkable
+class Referencing(Protocol):
+    """A processor that holds the source's own processor or tokenizer as
+    `reference`, as `dew.interop.pretrained.Processor` does."""
+
+    @property
+    def reference(self) -> Vocabulary | Tokenizing | HostProcessor: ...
+
+
+@runtime_checkable
+class Tokenizing(Protocol):
+    """A processor that holds its tokenizer: a Transformers processor, a
+    run's `RunProcessor`, or `dew.data.HFTokenizer` over the hub one."""
+
+    @property
+    def tokenizer(self) -> Vocabulary | Tokenizing: ...
 
 
 def matching_mode(tokenizer: Vocabulary) -> str | None:
@@ -840,12 +886,16 @@ def matching_mode(tokenizer: Vocabulary) -> str | None:
     bytes `<0xNN>`. Either way the match runs over bytes, so a stop string is
     encoded to UTF-8 and a piece that is half a code point still counts.
     """
-    decoder = getattr(getattr(tokenizer, "backend_tokenizer", None), "decoder", None)
+    if not isinstance(tokenizer, Fast):
+        return None
+    decoder = tokenizer.backend_tokenizer.decoder
     if decoder is None:
         return None
     if type(decoder).__name__ == "ByteLevel":
         return "byte_level"
-    state = getattr(decoder, "__getstate__", lambda: None)()
+    # A tokenizers decoder pickles as its JSON; any other object's state
+    # is not text and reads as no configuration.
+    state = decoder.__getstate__()
     if isinstance(state, str):
         state = state.encode()
     config = None
@@ -904,7 +954,7 @@ def _piece_bytes(token: str, mode: str | None, alphabet: dict[str, int] | None) 
     return None
 
 
-def stop_strings(tokenizer: object, strings: str | Sequence[str],
+def stop_strings(tokenizer: Vocabulary | Referencing | Tokenizing, strings: str | Sequence[str],
                  vocab_size: int | None = None) -> StopStrings:
     """Compile a tokenizer's vocabulary against `strings` into a `StopStrings`.
 
@@ -922,8 +972,16 @@ def stop_strings(tokenizer: object, strings: str | Sequence[str],
         raise ValueError("stop_strings needs non-empty strings")
     # A tokenizer is read as it stands; dew's own processor holds the source
     # processor as `reference`, and that processor holds the tokenizer.
-    source = tokenizer if isinstance(tokenizer, Vocabulary) else getattr(tokenizer, "reference", tokenizer)
-    source = source if isinstance(source, Vocabulary) else getattr(source, "tokenizer", source)
+    source = tokenizer
+    for _ in range(3):
+        if isinstance(source, Vocabulary):
+            break
+        if isinstance(source, Referencing):
+            source = source.reference
+        elif isinstance(source, Tokenizing):
+            source = source.tokenizer
+        else:
+            break
     if not isinstance(source, Vocabulary):
         raise TypeError("stop_strings needs a tokenizer that can list its vocabulary")
     mode = matching_mode(source)
