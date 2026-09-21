@@ -28,6 +28,7 @@ from dew.objectives.base import Variables
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.pipelines import TextToImage, restore_variables
 from dew.sampling.text import Sampling
+from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
 
 if TYPE_CHECKING:
     from dew.training.distributed import Layout, MeshSpec
@@ -46,7 +47,11 @@ def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None
     parameter storage: None preserves a run's stored dtypes and uses FP32
     masters for a source. ema reads a run's averaged weights; step selects
     its checkpoint and revision pins a Hub source.
+
+    Loading a task also points XLA at the on-disk executable cache, so a
+    restarted process reuses what it already compiled.
     """
+    _persist_compilations()
     resolve_dtype(dtype)
     resolve_dtype(param_dtype)
     root = epath.Path(source)
@@ -59,6 +64,21 @@ def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
                         revision=revision)
+
+
+def _persist_compilations() -> None:
+    """Point XLA at the on-disk executable cache, unless a directory is set.
+
+    A served request compiles for several seconds the first time its shapes
+    are seen, and a serving process restarts. Training turns the same cache
+    on in `prepare_process`; inference has no such entry point, and
+    `pipeline` is the one place every task is built, so it goes here.
+    Reading the setting is what makes it idempotent and what leaves a
+    trainer's own directory, or a caller's, alone.
+    """
+    if jax.config.jax_compilation_cache_dir:
+        return
+    enable_compilation_cache(default_compilation_cache_dir())
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,

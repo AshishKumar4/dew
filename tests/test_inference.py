@@ -360,6 +360,30 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
                                atol=2e-6, rtol=2e-6)
 
 
+def test_pipeline_points_xla_at_the_persistent_compilation_cache(tmp_path, monkeypatch):
+    """Loading a task turns the on-disk executable cache on, in the directory
+    the library picks, and a directory somebody already chose survives the
+    next load: a serving process compiles a shape once, ever."""
+    from pathlib import Path
+
+    from dew.telemetry.instrumentation import default_compilation_cache_dir
+
+    make_lm_run(tmp_path)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    previous = jax.config.jax_compilation_cache_dir
+    try:
+        jax.config.update("jax_compilation_cache_dir", None)
+        dew.pipeline(str(tmp_path))
+        chosen = default_compilation_cache_dir()
+        assert jax.config.jax_compilation_cache_dir == chosen
+        assert Path(chosen).is_dir() and str(tmp_path / "xdg") in chosen
+        jax.config.update("jax_compilation_cache_dir", str(tmp_path / "mine"))
+        dew.pipeline(str(tmp_path))
+        assert jax.config.jax_compilation_cache_dir == str(tmp_path / "mine")
+    finally:
+        jax.config.update("jax_compilation_cache_dir", previous)
+
+
 def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
     """An LM run directory becomes a `TextGeneration` over the rebuilt model
     and restored weights, decoding through the run's tokenizer, budgeted by
