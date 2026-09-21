@@ -246,10 +246,10 @@ class BlockProcess:
                 "canvas input schemas, model geometry and generation policy must agree")
         plan = RowPlan.over(mesh_of(variables), prepared.tokens.shape[0])
         placed = plan.place(plan.pad(prepared))
-        result = _compiled(plan.sharding)(
+        generation = _compiled(plan.sharding)(
             model, variables, placed, request,
             CanvasPlan(self, tuple(eos_token_ids), pad_token_id, max_new_tokens), n)
-        return replace(result, rows=plan.rows * n, prompt_width=prepared.tokens.shape[1])
+        return replace(generation, rows=plan.rows * n, prompt_width=prepared.tokens.shape[1])
 
 
 @dataclass(frozen=True)
@@ -308,7 +308,7 @@ def _begin(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
     output = jnp.full((batch, prompt_length + plan.blocks * plan.process.canvas_length),
                       plan.pad_token_id, jnp.int32)
     output = output.at[:, :prompt_length].set(inputs.tokens)
-    result = CanvasGeneration(
+    generation = CanvasGeneration(
         tokens=output, lengths=jnp.zeros((batch,), jnp.int32),
         terminated=jnp.zeros((batch,), bool), decoder_steps=jnp.zeros((batch,), jnp.int32))
     cache = {}
@@ -318,31 +318,31 @@ def _begin(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
             {**variables, "cache": cache}, inputs,
             method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
             mutable=["cache"])[1]["cache"]
-    return CanvasDecodeState(cache, result, jnp.asarray(0, jnp.int32))
+    return CanvasDecodeState(cache, generation, jnp.asarray(0, jnp.int32))
 
 
 def _advance(model: DiffusionGemma, variables: Variables, state: CanvasDecodeState,
              key: jax.Array, plan: CanvasPlan) -> CanvasDecodeState:
-    cache, result, index = state.cache, state.result, state.index
+    cache, generation, index = state.cache, state.result, state.index
     process, length = plan.process, plan.process.canvas_length
     blocks = plan.blocks
-    batch, width = result.tokens.shape
+    batch, width = generation.tokens.shape
     prompt_length = width - blocks * length
     canvas_key = jax.random.fold_in(key, index)
-    refined = process.refine(model, variables, cache, canvas_key, batch, result.terminated)
+    refined = process.refine(model, variables, cache, canvas_key, batch, generation.terminated)
     available = jnp.minimum(length, plan.max_new_tokens - index * length)
     is_eos = jnp.isin(refined.argmax, jnp.asarray(plan.eos_token_ids, jnp.int32))
     valid = jnp.arange(length)[None, :] < available
     is_eos = is_eos & valid
     first_eos = jnp.min(jnp.where(is_eos, jnp.arange(length)[None, :], length), axis=-1)
-    emitted = jnp.where(result.terminated, 0, jnp.minimum(first_eos + 1, available))
+    emitted = jnp.where(generation.terminated, 0, jnp.minimum(first_eos + 1, available))
     keep = jnp.arange(length)[None, :] < emitted[:, None]
     clean = jnp.where(keep, refined.argmax, plan.pad_token_id)
-    tokens = jax.lax.dynamic_update_slice(result.tokens, clean, (0, prompt_length + index * length))
-    result = CanvasGeneration(
-        tokens=tokens, lengths=result.lengths + emitted,
-        terminated=result.terminated | jnp.any(is_eos, axis=-1),
-        decoder_steps=result.decoder_steps + refined.decoder_steps)
+    tokens = jax.lax.dynamic_update_slice(generation.tokens, clean, (0, prompt_length + index * length))
+    generation = CanvasGeneration(
+        tokens=tokens, lengths=generation.lengths + emitted,
+        terminated=generation.terminated | jnp.any(is_eos, axis=-1),
+        decoder_steps=generation.decoder_steps + refined.decoder_steps)
     # This branch depends only on the request's canvas counter, never on a
     # rank-local sampled token or termination outcome.
     cache = jax.lax.cond(
@@ -350,7 +350,7 @@ def _advance(model: DiffusionGemma, variables: Variables, state: CanvasDecodeSta
         lambda old: model.apply({**variables, "cache": old}, clean, method=model.encode,
                                 mutable=["cache"])[1]["cache"],
         lambda old: old, cache)
-    return CanvasDecodeState(cache, result, index + 1)
+    return CanvasDecodeState(cache, generation, index + 1)
 
 
 def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: int) -> CanvasGeneration:

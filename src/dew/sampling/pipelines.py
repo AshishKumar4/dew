@@ -257,21 +257,21 @@ class TextToImage:
                 raise ValueError("a mask requires its image pixels")
             if encode_key is not None:
                 encode_key = request_key(encode_key, None)
-            data = {}
+            samples = {}
             if image is not None:
                 pixels = _image_rows(image, len(rows), self.inputs.sample.shape, "image")
-                data["image"] = pixels.astype(np.float32) / 127.5 - 1 if pixels.dtype == np.uint8 else pixels
+                samples["image"] = pixels.astype(np.float32) / 127.5 - 1 if pixels.dtype == np.uint8 else pixels
             for name, value in (("image_latents", image_latents), ("noise", noise), ("initial", initial)):
                 if value is not None:
-                    data[name] = _image_rows(value, len(rows), shape, name)
+                    samples[name] = _image_rows(value, len(rows), shape, name)
             if mask is not None:
                 value = _image_rows(mask, len(rows), (*self.inputs.sample.shape[:-1], 1), "mask")
-                data["mask"] = (value >= (128 if value.dtype == np.uint8 else 0.5)).astype(np.float32)
+                samples["mask"] = (value >= (128 if value.dtype == np.uint8 else 0.5)).astype(np.float32)
             controls = (plan.rows, count, selected, shape,
                         tuple(np.asarray(jax.random.key_data(request))),
                         None if encode_key is None else tuple(np.asarray(jax.random.key_data(encode_key))))
-            signature = generation_signature((tokens, null_tokens, data), controls)
-            prepared = plan, process, request, tokens, null_tokens, shape, count, selected, data, signature
+            signature = generation_signature((tokens, null_tokens, samples), controls)
+            prepared = plan, process, request, tokens, null_tokens, shape, count, selected, samples, signature
         except Exception as failure:
             error = failure
         if mesh is not None:
@@ -279,7 +279,7 @@ class TextToImage:
         elif error is not None:
             raise error
         assert prepared is not None
-        plan, process, request, tokens, null_tokens, shape, count, selected, data, signature = prepared
+        plan, process, request, tokens, null_tokens, shape, count, selected, samples, signature = prepared
         if plan.processes > 1:
             multihost_utils.assert_equal(signature, "image input shapes and sampling must agree across processes")
         annotation = None
@@ -289,10 +289,10 @@ class TextToImage:
         try:
             given = _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
             null = self._unconditional(null_tokens, plan)
-            if data:
+            if samples:
                 start = process.times(count)[0] if selected is None else selected[0]
                 initial_state, spatial = _image_start(plan.sharding)(
-                    self.autoencoder, process, shape, self.params, plan.place(plan.pad(data)),
+                    self.autoencoder, process, shape, self.params, plan.place(plan.pad(samples)),
                     plan.keys(request), encode_key, start)
                 if spatial:
                     given = {**given, **spatial}
@@ -394,14 +394,14 @@ class TextToImage:
         try:
             assert prepared.rows is not None
             plan = RowPlan.over(mesh, prepared.rows)
-            result = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
+            generated = _run(plan.sharding)(self.model, process, self.autoencoder, self.finish, count,
                                          solver, chosen, self.final_denoise, times, decode, self.params,
                                          prepared.conditions, prepared.unconditional,
                                          prepared.noise, jax.random.fold_in(request, 1))
         finally:
             if annotation is not None:
                 annotation.__exit__(None, None, None)
-        return replace(result, rows=plan.rows)
+        return replace(generated, rows=plan.rows)
 
 
 def _time_grid(times) -> tuple[float, ...]:
@@ -428,26 +428,26 @@ def _image_rows(value, rows: int, shape: tuple[int, ...], name: str) -> np.ndarr
 
 @functools.cache
 def _image_start(rows: jax.sharding.NamedSharding | None):
-    def prepare(autoencoder, process, shape, params, data, keys, encode_key, start):
+    def prepare(autoencoder, process, shape, params, samples, keys, encode_key, start):
         spatial = {}
-        pixels = data.get("image")
-        if "initial" in data:
-            value = data["initial"]
+        pixels = samples.get("image")
+        if "initial" in samples:
+            value = samples["initial"]
         else:
-            clean = data.get("image_latents")
+            clean = samples.get("image_latents")
             if clean is None:
                 if autoencoder is None:
                     clean = pixels
                 else:
                     clean = autoencoder.encode(params["autoencoder"], pixels, encode_key)
-            noise = data.get("noise")
+            noise = samples.get("noise")
             if noise is None:
                 noise = jax.vmap(lambda key: jax.random.normal(key, shape))(keys)
             alpha, sigma = process.sampler_schedule.rates(start)
             value = alpha * clean + sigma * noise
-        if "mask" in data:
+        if "mask" in samples:
             from dew.inputs.diffusion import latent_image_conditions
-            spatial = latent_image_conditions(autoencoder, params["autoencoder"], pixels, data["mask"], encode_key)
+            spatial = latent_image_conditions(autoencoder, params["autoencoder"], pixels, samples["mask"], encode_key)
         return value, spatial
     return jax.jit(prepare, static_argnums=(0, 1, 2),
                    in_shardings=(None, rows, rows, None, None), out_shardings=rows)

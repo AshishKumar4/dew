@@ -25,19 +25,19 @@ _stack = jax.jit(lambda *rows: jax.tree.map(lambda *leaves: jnp.stack(leaves), *
 
 def _replaced(tree, namespace, subtrees):
     """`tree` with each collection's namespace subtree replaced, spines copied."""
-    result = dict(tree)
+    replaced = dict(tree)
     for collection, subtree in subtrees.items():
         if not namespace:
-            result[collection] = subtree
+            replaced[collection] = subtree
             continue
-        spine = dict(result[collection])
-        result[collection] = spine
+        spine = dict(replaced[collection])
+        replaced[collection] = spine
         node = spine
         for name in namespace[:-1]:
             node[name] = dict(node[name])
             node = node[name]
         node[namespace[-1]] = subtree
-    return result
+    return replaced
 
 
 def _logical(tree, sites):
@@ -139,16 +139,16 @@ class HostExecution:
             return NamedSharding(self.accelerator, spec)
         return transfer(tree, jax.tree.map(placement, tree))
 
-    def realize(self, variables, batch, info):
+    def realize(self, variables, batch, step):
         with jax.set_mesh(self.cpu):
             store = self.snapshot(variables)
-            ema = self.snapshot(info.ema)
+            ema = self.snapshot(step.ema)
         assert store is not None, "a realization always receives model variables"
         moving = tuple(tuple(entry.key for entry in path) for path, _ in
                        jax.tree_util.tree_leaves_with_path(variables["params"]))
         with jax.set_mesh(self.accelerator):
             batch = transfer(batch, batch_shardings(self.accelerator, batch))
-            clock, key = self.on_accelerator((info.step, info.key))
+            clock, key = self.on_accelerator((step.step, step.key))
             execution_info = Step(clock, key, ema)
 
             def loss(trainable):

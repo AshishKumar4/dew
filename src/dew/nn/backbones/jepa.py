@@ -26,9 +26,9 @@ from ..dit import ROPE_THETA, ModulatedBlock, PatchSequenceEmbed, build_block_pa
 from ..sharding import logical_axes
 
 
-def gather_tokens(tokens, idx):
+def gather_tokens(tokens, indices):
     """Select tokens per sample: [B, S, F] and [B, N] -> [B, N, F]."""
-    return jnp.take_along_axis(tokens, idx[..., None], axis=-2)
+    return jnp.take_along_axis(tokens, indices[..., None], axis=-2)
 
 
 class TokenStack(nn.Module):
@@ -287,8 +287,8 @@ class JepaPredictor(nn.Module):
             scan_ordered_pos_embed(self.predictor_features, *self.grid, self.scan_order),
             dtype=self.dtype or jnp.float32)
 
-        def positions(idx):
-            pos = pos_embed[idx]                       # [B, N, P]
+        def positions(indices):
+            pos = pos_embed[indices]                       # [B, N, P]
             return pos[:, None] if self.factorized else pos
 
         num_target_tokens = target_idx.shape[-1]

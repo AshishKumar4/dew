@@ -154,15 +154,15 @@ def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, 
     params = variables["params"]
     text_variables = {collection: tree["text"] for collection, tree in variables.items()
                       if "text" in tree}
-    result: dict[str, np.ndarray] = {}
+    tensors: dict[str, np.ndarray] = {}
     for name, tensor in export_decoder_weights(model.text, text_variables, text_config(config)).items():
         target = "model.decoder." + name.removeprefix("model.") if name.startswith("model.") else name
-        result[target] = tensor
+        tensors[target] = tensor
         if name.endswith(".layer_scalar"):
-            result[target.replace("model.decoder.", "model.encoder.language_model.")] = tensor
+            tensors[target.replace("model.decoder.", "model.encoder.language_model.")] = tensor
     for name, leaf in _flatten(params["self_conditioning"]).items():
         module, kind = name.split(".")
-        result[f"model.decoder.self_conditioning.{module}.weight"] = np.ascontiguousarray(
+        tensors[f"model.decoder.self_conditioning.{module}.weight"] = np.ascontiguousarray(
             np.asarray(leaf).T if kind == "kernel" else np.asarray(leaf))
     if "conditioner" in params:
         inverse = {value: key for key, value in _GEMMA4_VISION_TENSORS.items()}
@@ -182,8 +182,8 @@ def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, 
                 else:
                     raise ValueError(f"unknown vision parameter {name!r}")
                 leaf = np.asarray(raw)
-                result["model.encoder.vision_tower." + target] = np.ascontiguousarray(
+                tensors["model.encoder.vision_tower." + target] = np.ascontiguousarray(
                     leaf.T if parts[-1] == "kernel" else leaf)
-        result["model.encoder.embed_vision.embedding_projection.weight"] = np.ascontiguousarray(
+        tensors["model.encoder.embed_vision.embedding_projection.weight"] = np.ascontiguousarray(
             np.asarray(params["conditioner"]["projector"]["projection"]["kernel"]).T)
-    return result
+    return tensors

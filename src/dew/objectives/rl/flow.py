@@ -381,7 +381,7 @@ class FlowRollout:
         rewards = np.asarray(broadcast_from_process_zero(
             None if rewards is None else rewards.tolist()), np.float64)
         error = None
-        result = None
+        prepared = None
         try:
             grouped = rewards.reshape(-1, self.groups)
             centered = grouped - grouped.mean(axis=1, keepdims=True)
@@ -394,10 +394,10 @@ class FlowRollout:
             selected = self.steps - 1 if self.train_steps is None else self.train_steps
             local_advantages = advantages[owned]
             shape = (local_advantages.shape[0], selected)
-            result = {condition.field: jax.tree.map(lambda leaf: np.asarray(leaf)[owned],
-                                                   context[condition.field])
-                      for condition in self.objective.inputs.conditions.values()}
-            result.update({
+            prepared = {condition.field: jax.tree.map(lambda leaf: np.asarray(leaf)[owned],
+                                                     context[condition.field])
+                        for condition in self.objective.inputs.conditions.values()}
+            prepared.update({
                 "latents": np.asarray(trajectory.states)[owned, :selected],
                 "next_latents": np.asarray(trajectory.states)[owned, 1:selected + 1],
                 "timesteps": np.broadcast_to(trajectory.times[:selected], shape),
@@ -411,8 +411,8 @@ class FlowRollout:
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="flow rollout batching")
-        assert result is not None
-        return result
+        assert prepared is not None
+        return prepared
 
 
 __all__ = ["FlowGRPOObjective", "FlowReward", "FlowRollout"]

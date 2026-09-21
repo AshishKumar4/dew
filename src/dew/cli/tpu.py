@@ -408,8 +408,8 @@ class List(Base):
         for zone in zones:
             payload = gcloud.json("compute", "tpus", "tpu-vm", "list",
                                   f"--zone={zone}", default=[])
-            for item in payload if isinstance(payload, list) else ():
-                node = Node.parse(item)
+            for entry in payload if isinstance(payload, list) else ():
+                node = Node.parse(entry)
                 rows.append((node.name, node.accelerator_type, node.state,
                              node.health or "-", str(node.workers), zone,
                              "yes" if node.spot else "-"))
@@ -498,10 +498,10 @@ class Run(Base):
         if not self.detach:
             return exit_code(tpu.fanout([(index, tpu_setup.wrap(command)) for index in workers]))
         job = _job(self.job, self.name)
-        results = tpu.fanout([
+        outcomes = tpu.fanout([
             (index, tpu_setup.detached(command, job, index)) for index in workers])
         emit(f"job {job}: dew-tpu logs {self.name} {job} --follow")
-        return exit_code(results)
+        return exit_code(outcomes)
 
 
 @dataclasses.dataclass
@@ -629,13 +629,13 @@ class Setup(Base):
 
 def _verify_devices(tpu: Tpu, count: int, expected: int) -> int:
     """Every worker must see the whole slice before a run is worth starting."""
-    results = tpu.fanout([(index, tpu_setup.DEVICE_COUNT) for index in range(count)],
+    outcomes = tpu.fanout([(index, tpu_setup.DEVICE_COUNT) for index in range(count)],
                          capture=True)
     if tpu.gcloud.dry_run:
         return 0
     rows, failed = [], 0
-    for index, result in enumerate(results):
-        reported = result.out.split()
+    for index, outcome in enumerate(outcomes):
+        reported = outcome.out.split()
         devices = int(reported[0]) if reported else 0
         local = reported[1] if len(reported) > 1 else "-"
         good = devices == expected
@@ -668,10 +668,10 @@ class Train(Base):
         if code:
             return code
         command = shlex.join(["python", *rest, "--trainer.multi-host", "True"])
-        results = tpu.fanout([
+        outcomes = tpu.fanout([
             (index, tpu_setup.detached(command, job, index, home_dir=root.name))
             for index in range(count)])
-        code = exit_code(results)
+        code = exit_code(outcomes)
         if code:
             return code
         emit(f"job {job} on {count} worker(s), following worker 0")
@@ -693,15 +693,15 @@ class Status(Base):
         if node is not None:
             emit(f"{node.name} {node.accelerator_type} {node.state} "
                  f"{node.health or 'health unknown'} in {node.zone}")
-        results = tpu.fanout([(index, tpu_setup.STATUS) for index in range(count)], capture=True)
+        outcomes = tpu.fanout([(index, tpu_setup.STATUS) for index in range(count)], capture=True)
         if gcloud.dry_run:
             return 0
         rows = []
-        for index, result in enumerate(results):
-            fields = (result.out.strip().split("|") + ["-"] * 4)[:4]
+        for index, outcome in enumerate(outcomes):
+            fields = (outcome.out.strip().split("|") + ["-"] * 4)[:4]
             rows.append((str(index), fields[0] or "-", fields[1], fields[2], fields[3]))
         _table(("WORKER", "UPTIME", "DEW PROCS", "DEVICES BUSY", "DEVICES"), rows)
-        return exit_code(results)
+        return exit_code(outcomes)
 
 
 @dataclasses.dataclass

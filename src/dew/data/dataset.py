@@ -723,7 +723,7 @@ class RampedStream(Forwarding):
         super().close()
 
 
-def ramped(data: Dataset, ramp: Ramp) -> Dataset:
+def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
     """`data` with the training batch growing to `data.batch` over `ramp`.
 
     A validation pass keeps the whole batch: a score over a growing number
@@ -734,10 +734,10 @@ def ramped(data: Dataset, ramp: Ramp) -> Dataset:
     be the records it handed over. A stream that batches its own records
     reports a shard offset and is refused, by name.
     """
-    stages = ramp.stages(data.batch)  # An impossible schedule fails here, not mid-run.
+    stages = ramp.stages(dataset.batch)  # An impossible schedule fails here, not mid-run.
 
     def train() -> Iterator[Batch]:
-        stream = data.train()
+        stream = dataset.train()
         if isinstance(stream, Resumable):
             state = stream.get_state()
             if isinstance(state, bytes) and position.translates(state):
@@ -750,7 +750,7 @@ def ramped(data: Dataset, ramp: Ramp) -> Dataset:
             f"{type(stream).__name__} hands over batches it has cut itself; ramp "
             f"a dataset read through train_stream or mixed_stream")
 
-    return dataclasses.replace(data, train=train, ramp=ramp)
+    return dataclasses.replace(dataset, train=train, ramp=ramp)
 
 
 def train_stream(source: pygrain.RandomAccessDataSource[object], operations: Sequence[pygrain.Transformation], *,

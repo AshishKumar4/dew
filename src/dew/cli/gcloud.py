@@ -114,19 +114,19 @@ class Gcloud:
             return Result(tuple(argv), 0)
         if capture:
             done = subprocess.run(argv, capture_output=True, text=True)
-            result = Result(tuple(argv), done.returncode, done.stdout, done.stderr)
+            outcome = Result(tuple(argv), done.returncode, done.stdout, done.stderr)
         else:
-            result = Result(tuple(argv), subprocess.call(argv))
-        if check and not result.ok:
-            raise SystemExit(result.text or f"{argv[0]} failed with code {result.code}")
-        return result
+            outcome = Result(tuple(argv), subprocess.call(argv))
+        if check and not outcome.ok:
+            raise SystemExit(outcome.text or f"{argv[0]} failed with code {outcome.code}")
+        return outcome
 
     def json(self, *args: str, default: object = None) -> object:
         """Run a gcloud command that speaks JSON and parse it."""
-        result = self.run(self.argv(*args, "--format=json"))
-        if not result.ok or not result.out.strip():
+        outcome = self.run(self.argv(*args, "--format=json"))
+        if not outcome.ok or not outcome.out.strip():
             return default
-        return json.loads(result.out)
+        return json.loads(outcome.out)
 
     def config_value(self, name: str) -> str:
         """Read one value from the local gcloud config.
@@ -174,19 +174,19 @@ class Gcloud:
             prefix, argv = job
             if not capture:
                 return self.stream(argv, prefix)
-            result = self.run(argv)
-            if not result.ok:
+            outcome = self.run(argv)
+            if not outcome.ok:
                 # Captured output goes nowhere, so a failure would be silent.
-                emit(prefix + (result.text or f"exit {result.code}"))
-            return result
+                emit(prefix + (outcome.text or f"exit {outcome.code}"))
+            return outcome
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
             return list(pool.map(one, jobs))
 
 
-def exit_code(results: Iterable[Result]) -> int:
+def exit_code(outcomes: Iterable[Result]) -> int:
     """The first failure, so a fan-out reports what went wrong."""
-    return next((result.code for result in results if not result.ok), 0)
+    return next((outcome.code for outcome in outcomes if not outcome.ok), 0)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -214,7 +214,7 @@ class Tpu:
         args = ["ssh", self.host, f"--zone={self.zone}", f"--worker={worker}"]
         if command:
             args.append(f"--command={command}")
-        args += [f"--ssh-flag={flag}" for flag in ssh_flags]
+        args += [f"--ssh-flag={option}" for option in ssh_flags]
         return self.vm(*args)
 
     def scp_argv(self, sources: Sequence[str], target: str, worker: str = "0",

@@ -581,14 +581,14 @@ class ChatMessages(DatasetSpec):
                                  f"{describe(source)} rendered by {self.tokenizer!r}")
 
         train = packed(self.path)
-        val = None
+        validation = None
         if self.val_path is not None:
-            val = bounded(validation_pass(packed(self.val_path), [], batch=rows,
+            validation = bounded(validation_pass(packed(self.val_path), [], batch=rows,
                                           seed=self.seed, loading=self.loading),
                           self.val_batches)
         return Dataset(
             train=train_stream(train, [], batch=rows, seed=self.seed, loading=self.loading),
-            val=val,
+            val=validation,
             records=len(train),
             batch=batch,
         )

@@ -312,9 +312,9 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _loss_shape(self, state: TrainState, batch: Batch):
-        info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
+        step_info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
                     with_ema(state.params, state.ema))
-        return jax.eval_shape(self.objective.loss, state.params, batch, info)
+        return jax.eval_shape(self.objective.loss, state.params, batch, step_info)
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, shape_only=False):
         if self.accumulation == 1 or self.step is not None or state.accumulation is not None:
@@ -387,9 +387,9 @@ class Trainer(Generic[Loss, Effects]):
             def step(current, batch):
                 # The body sees every field on the device; the out shardings
                 # return the host-resident ones to pinned host memory.
-                result, loss, aux = body(self._fetched(current, shardings), batch)
-                return (dataclasses.replace(result, step=current.step + 1), loss, aux.metrics,
-                        jnp.isfinite(loss), result.microstep > current.microstep)
+                advanced, loss, aux = body(self._fetched(current, shardings), batch)
+                return (dataclasses.replace(advanced, step=current.step + 1), loss, aux.metrics,
+                        jnp.isfinite(loss), advanced.microstep > current.microstep)
 
             jitted = jax.jit(step, in_shardings=(shardings, batch_shardings(mesh, batch)),
                              out_shardings=(shardings, replicated, replicated, replicated, replicated))
@@ -423,18 +423,18 @@ class Trainer(Generic[Loss, Effects]):
             with jax.set_mesh(cpu), pipeline_microbatches(self.mesh.microbatches):
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes)
-                result, loss, aux = body(current, batch)
-                result = dataclasses.replace(result, step=current.step + 1)
-                result = jax.device_put(result, placement)
-                return (result, loss, aux.metrics, jnp.isfinite(loss),
-                        result.microstep > current.microstep)
+                advanced, loss, aux = body(current, batch)
+                advanced = dataclasses.replace(advanced, step=current.step + 1)
+                advanced = jax.device_put(advanced, placement)
+                return (advanced, loss, aux.metrics, jnp.isfinite(loss),
+                        advanced.microstep > current.microstep)
         return run
 
     # ------------------------------------------------------------------
     # The loop
     # ------------------------------------------------------------------
 
-    def fit(self, data: Dataset, *, steps: int, log_every: int = 100,
+    def fit(self, dataset: Dataset, *, steps: int, log_every: int = 100,
             eval_every: int | None = None, checkpoint_every: int | None = None,
             metrics: Sequence[Metric] = (), preview: bool = False) -> TrainState:
         """Train to `steps` total steps, resuming from the checkpoints' latest
@@ -529,7 +529,7 @@ class Trainer(Generic[Loss, Effects]):
             first_step = None
 
             if current < steps:
-                source = data.train()
+                source = dataset.train()
                 if (checkpoint_every or local_every) and not isinstance(source, Checkpointable):
                     raise ValueError(
                         f"checkpoint_every needs a training stream with get_state and "
@@ -699,7 +699,7 @@ class Trainer(Generic[Loss, Effects]):
                             annotation = jax.profiler.TraceAnnotation("evaluate")
                             annotation.__enter__()
                         try:
-                            self._evaluate(state, shardings, data, metrics, preview, mesh)
+                            self._evaluate(state, shardings, dataset, metrics, preview, mesh)
                         finally:
                             if annotation is not None:
                                 annotation.__exit__(None, None, None)
@@ -754,7 +754,7 @@ class Trainer(Generic[Loss, Effects]):
                 loss.block_until_ready()
             paused = time.perf_counter()
             if eval_every:
-                self._evaluate(state, shardings, data, metrics, preview, mesh)
+                self._evaluate(state, shardings, dataset, metrics, preview, mesh)
             if checkpoints is not None and last_saved != current:
                 # The in-loop saves are conditional, so the state the run ends on
                 # may never have been written. It goes out under its real step,
@@ -770,12 +770,15 @@ class Trainer(Generic[Loss, Effects]):
             primary = sys.exception()
             error = primary
             close = train.close if train is not None else getattr(source, "close", None)
-            stop_trace = None
+            stop_trace: Callable[[], None] | None = None
             if tracing and profile is not None:
                 tracing = False
                 assert profiler is not None
-                def stop_trace() -> None:
+
+                def finish_trace() -> None:
                     self._stop_trace(traced, loss, profile, profiler, step=current)
+
+                stop_trace = finish_trace
 
             for label, cleanup in (
                 ("Training iterator", close),
@@ -835,7 +838,7 @@ class Trainer(Generic[Loss, Effects]):
     # Validation
     # ------------------------------------------------------------------
 
-    def _evaluate(self, state: TrainState, shardings: Placement, data: Dataset,
+    def _evaluate(self, state: TrainState, shardings: Placement, dataset: Dataset,
                   metrics: Sequence[Metric], preview: bool, mesh) -> None:
         params = state.params
         averaged = with_ema(state.params, self._fetched(state, shardings).ema)
@@ -848,24 +851,24 @@ class Trainer(Generic[Loss, Effects]):
             key = execution.on_accelerator(key)
         assert params is not None, "evaluation always has model variables"
         self._report_evaluation(evaluate(
-            self.objective, params, data.val, metrics=metrics, key=key,
+            self.objective, params, dataset.val, metrics=metrics, key=key,
             step=state.step, schedule_step=state.microstep,
             averaged=averaged,
             preview=preview, mesh=mesh))
 
-    def _report_evaluation(self, result: Evaluation) -> None:
+    def _report_evaluation(self, advanced: Evaluation) -> None:
         error = None
         if jax.process_index() == 0:
             try:
-                print(f"Evaluation {result.split} at step {result.step}: "
-                      f"{result.coordinated_batches} coordinated batches, {result.records} records, "
-                      f"uneven_shards={result.uneven_shards}, event_key={result.event_key}: {result.scores}")
+                print(f"Evaluation {advanced.split} at step {advanced.step}: "
+                      f"{advanced.coordinated_batches} coordinated batches, {advanced.records} records, "
+                      f"uneven_shards={advanced.uneven_shards}, event_key={advanced.event_key}: {advanced.scores}")
                 if self.tracker is not None:
-                    for artifact in result.previews:
-                        self.tracker.artifact(artifact, result.step)
-                    scalars = result.scalars
+                    for artifact in advanced.previews:
+                        self.tracker.artifact(artifact, advanced.step)
+                    scalars = advanced.scalars
                     if scalars:
-                        self.tracker.log(scalars, result.step)
+                        self.tracker.log(scalars, advanced.step)
             except BaseException as failure:
                 error = failure
         agree_process_phase(error, phase="evaluation reporting")

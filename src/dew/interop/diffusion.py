@@ -527,22 +527,22 @@ def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
     index = folder / f"{weights}.safetensors.index.json"
     def arrays(path: Path) -> dict[str, np.ndarray]:
         values = load_params(path)
-        result: dict[str, np.ndarray] = {}
+        tensors: dict[str, np.ndarray] = {}
         for name, value in values.items():
             if not isinstance(value, np.ndarray):
                 raise ValueError(f"Published component tensors must be flat named arrays: {path}")
-            result[name] = value
-        return result
+            tensors[name] = value
+        return tensors
     if index.is_file():
         record = json.loads(index.read_text())
         shards = sorted(set(record["weight_map"].values()))
-        result = {}
+        tensors = {}
         for name in shards:
             values = arrays(folder / name)
-            if result.keys() & values.keys():
+            if tensors.keys() & values.keys():
                 raise ValueError(f"Duplicate tensors across {component} shards")
-            result.update(values)
-        return result
+            tensors.update(values)
+        return tensors
     return arrays(folder / f"{weights}.safetensors")
 
 

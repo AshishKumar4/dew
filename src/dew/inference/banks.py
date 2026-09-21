@@ -113,12 +113,12 @@ def in_namespace(variables: Variables, namespace: tuple[str, ...]) -> Variables:
 
 def at_namespace(subtrees: Variables, namespace: tuple[str, ...]) -> Variables:
     """Place collection-local subtrees back under their canonical namespace."""
-    result = {}
+    collected = {}
     for collection, tree in subtrees.items():
         for name in reversed(namespace):
             tree = {name: tree}
-        result[collection] = tree
-    return result
+        collected[collection] = tree
+    return collected
 
 
 
@@ -227,7 +227,7 @@ def _stored(directory: str, step: int) -> Variables:
 
 def narrowed(tree: Mapping, selection: Mapping) -> dict:
     """The leaf-level intersection of tree and selection, retaining canonical paths."""
-    result = {}
+    collected = {}
     for name, selected in selection.items():
         if name not in tree:
             continue
@@ -240,8 +240,8 @@ def narrowed(tree: Mapping, selection: Mapping) -> dict:
                 continue
         elif isinstance(value, Mapping):
             raise ValueError(f"selection treats subtree {name!r} as a leaf")
-        result[name] = value
-    return result
+        collected[name] = value
+    return collected
 
 
 def _typed(shapes: Variables, placement: Placement) -> Variables:
@@ -312,7 +312,7 @@ def entry_tree(variables: Variables, sites: Sequence[DecoderBank]) -> Variables:
               for first, count in site.view.groups for index in range(first, first + count)}
 
     def outside(tree: Mapping, path: tuple[str, ...]) -> dict:
-        result = {}
+        collected = {}
         for name, value in tree.items():
             current = (*path, name)
             if current in layers:
@@ -321,8 +321,8 @@ def entry_tree(variables: Variables, sites: Sequence[DecoderBank]) -> Variables:
                 value = outside(value, current)
                 if not value:
                     continue
-            result[name] = value
-        return result
+            collected[name] = value
+        return collected
 
     return {collection: held for collection, tree in variables.items()
             if (held := outside(tree, ()))}

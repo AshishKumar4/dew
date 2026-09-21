@@ -110,10 +110,10 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
         # decay is zero above the diagonal, so this is the reference's
         # inclusive-lower `masked_fill(triu(1), 0)` (modeling_glm5_next.py:560).
         attn_intra = jnp.einsum('...sd,...td,...std->...st', q_i, k_i, decay_i)
-        v_new = v_i - kd_i @ s
-        out = attn_inter + attn_intra @ v_new
+        v_corrected = v_i - kd_i @ s
+        out = attn_inter + attn_intra @ v_corrected
         last = gc_i[..., -1:, :]
-        s = s * jnp.exp(last)[..., 0, :, None] + jnp.swapaxes(k_i * jnp.exp(last - gc_i), -1, -2) @ v_new
+        s = s * jnp.exp(last)[..., 0, :, None] + jnp.swapaxes(k_i * jnp.exp(last - gc_i), -1, -2) @ v_corrected
         return s, out
 
     state, core = jax.lax.scan(

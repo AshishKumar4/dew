@@ -256,7 +256,7 @@ def _rope(hf_config: Mapping[str, Any], used: set,
     for key in ('rope_parameters', 'rope_scaling'):
         entry = hf_config.get(key)
         if isinstance(entry, Mapping):
-            rope = _rope_entry(entry, field, yarn_max_pos)
+            rope = _rope_entry(entry, key, yarn_max_pos)
             theta = rope.theta or theta
             scaling = rope.scaling or scaling
     if theta is None:
@@ -3516,7 +3516,7 @@ def _llama4_config(hf_config: Mapping[str, Any], used: set[str]) -> dict[str, An
     if no_rope is None:
         no_rope = llama4.default_no_rope_layers(
             layers, int(hf_config.get('no_rope_layer_interval', 4)))
-    no_rope = tuple(int(flag) for flag in no_rope)
+    no_rope = tuple(int(enabled) for enabled in no_rope)
     if len(no_rope) != layers or set(no_rope) - {0, 1}:
         _refuse(f"no_rope_layers {list(no_rope)!r}", f"it names a flag per layer of {layers}")
     layer_types = llama4.rope_layer_types(no_rope)

@@ -189,19 +189,19 @@ class DiffusionObjective(Objective[Mean]):
         return {name: batch[name] for name in fields}
 
     def loss(self, params, batch, step: Step):
-        data = unit_range(batch[self.inputs.sample.key])
+        samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
         if self.autoencoder is not None:
-            data = self.autoencoder.encode(params["autoencoder"], data, encode_key)
-        count = data.shape[0]
+            samples = self.autoencoder.encode(params["autoencoder"], samples, encode_key)
+        count = samples.shape[0]
 
         conditions, _ = self._conditions(params, batch, drop_key, dropout=True)
 
         schedule = self.process.schedule
         t = schedule.sample_t(time_key, count)
-        noise = jax.random.normal(noise_key, data.shape, dtype=jnp.float32)
-        rates = broadcast_rates(schedule, t, data)
-        noisy, c_in, target = self.process.prediction.forward_diffusion(data, noise, rates)
+        noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
+        rates = broadcast_rates(schedule, t, samples)
+        noisy, c_in, target = self.process.prediction.forward_diffusion(samples, noise, rates)
 
         variables = self.trainable(params)
         preds = self.model.apply(

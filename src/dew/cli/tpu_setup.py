@@ -203,8 +203,8 @@ def detached(command: str, job: str, worker: int, home_dir: str = "") -> str:
 
 
 def tail(job: str, worker: int, follow: bool, lines: int = 200) -> str:
-    flag = "-f " if follow else ""
-    return f"tail {flag}-n {lines} {log_path(job, worker)}"
+    following = "-f " if follow else ""
+    return f"tail {following}-n {lines} {log_path(job, worker)}"
 
 
 def disk_startup_script() -> str:

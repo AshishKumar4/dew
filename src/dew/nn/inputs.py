@@ -99,9 +99,9 @@ class ModelInputs:
         this method itself performs no collectives or model execution.
         """
         if isinstance(value, cls):
-            result = value
+            prepared = value
         elif isinstance(value, jax.Array):
-            result = cls(value)
+            prepared = cls(value)
         else:
             array = np.asarray(value)
             if array.ndim != 2 or not np.issubdtype(array.dtype, np.integer):
@@ -109,9 +109,9 @@ class ModelInputs:
             bounds = np.iinfo(np.int32)
             if np.any(array < bounds.min) or np.any(array > bounds.max):
                 raise ValueError("token IDs must be representable as int32")
-            result = cls(jnp.asarray(array, jnp.int32))
-        result.validate()
-        return result
+            prepared = cls(jnp.asarray(array, jnp.int32))
+        prepared.validate()
+        return prepared
 
 
     def validate(self) -> None:
@@ -163,10 +163,10 @@ class ModelInputs:
 
     def kwargs(self) -> dict[str, object]:
         """Keywords for a native model call, excluding the token argument."""
-        result: dict[str, object] = dict(self.token_fields)
+        prepared: dict[str, object] = dict(self.token_fields)
         if self.conditioning:
-            result["conditioning"] = self.conditioning
-        return result
+            prepared["conditioning"] = self.conditioning
+        return prepared
 
 
 @struct.dataclass
@@ -290,7 +290,7 @@ def agreed_validity[TreeT](tree: TreeT, processes: int, *, controls: object = ()
     present = np.asarray([VALIDITY_FIELD in site.token_fields
                           for site in validity_sites(tree)], np.int32)
     gathered = np.asarray(multihost_utils.process_allgather(present)).reshape(-1, count)
-    return filled_validity(tree, [bool(flag) for flag in gathered.max(axis=0)])
+    return filled_validity(tree, [bool(present) for present in gathered.max(axis=0)])
 
 
 @overload
@@ -457,8 +457,8 @@ class RowPlan:
         sharding = self.sharding
         if sharding is None:
             return row_keys
-        data = jax.make_array_from_process_local_data(sharding, jax.random.key_data(row_keys))
-        return jax.random.wrap_key_data(data, impl=jax.random.key_impl(key))
+        sharded = jax.make_array_from_process_local_data(sharding, jax.random.key_data(row_keys))
+        return jax.random.wrap_key_data(sharded, impl=jax.random.key_impl(key))
 
     def host(self, leaf) -> np.ndarray:
         """This process's real rows of a result leaf as a host array."""

@@ -111,11 +111,11 @@ class TokenWindows(DatasetSpec):
 
         train_bin, val_bin = token_files(self.path, "TokenWindows")
         train = TokenFileSource(train_bin, self.seq_len)
-        val = TokenFileSource(val_bin, self.seq_len)
+        validation = TokenFileSource(val_bin, self.seq_len)
         return Dataset(
             train=train_stream(train, [], batch=local_batch(batch),
                                seed=self.seed, loading=self.loading),
-            val=bounded(validation_pass(val, [], batch=local_batch(batch), seed=self.seed, loading=self.loading), self.val_batches),
+            val=bounded(validation_pass(validation, [], batch=local_batch(batch), seed=self.seed, loading=self.loading), self.val_batches),
             records=len(train),
             batch=batch,
         )
@@ -364,11 +364,11 @@ class PackedTokens(DatasetSpec):
             return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
                                  self.packing_bins, describe(source))
 
-        train, val = packed(train_bin), packed(val_bin)
+        train, validation = packed(train_bin), packed(val_bin)
 
         return Dataset(
             train=train_stream(train, [], batch=rows, seed=self.seed, loading=self.loading),
-            val=bounded(validation_pass(val, [], batch=rows, seed=self.seed,
+            val=bounded(validation_pass(validation, [], batch=rows, seed=self.seed,
                                         loading=self.loading), self.val_batches),
             records=len(train),
             batch=batch,

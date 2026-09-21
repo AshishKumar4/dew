@@ -132,9 +132,9 @@ def _rule_table(rules: LogicalAxisRules | Mapping[str, MeshAxes]) -> LogicalAxis
     """`rules` as the tuple of pairs flax reads, in precedence order. They are
     written as a mapping in code, as pairs on the command line, and arrive as
     lists from a JSON record."""
-    items = rules.items() if isinstance(rules, Mapping) else rules
+    pairs = rules.items() if isinstance(rules, Mapping) else rules
     return tuple((name, axes if axes is None or isinstance(axes, str) else tuple(axes))
-                 for name, axes in items)
+                 for name, axes in pairs)
 
 
 

@@ -288,7 +288,7 @@ class _Config:
     def read(cls, config: Mapping[str, object], where: str) -> _Config:
         if config.get("peft_type", "LORA") != "LORA":
             raise ValueError(f"{where} is a {config['peft_type']} adapter, not LoRA")
-        refused = [flag for flag in _REFUSED_FLAGS if config.get(flag)]
+        refused = [name for name in _REFUSED_FLAGS if config.get(name)]
         if config.get("bias", "none") != "none":
             refused.append("bias")
         if refused:

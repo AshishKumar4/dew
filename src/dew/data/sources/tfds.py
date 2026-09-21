@@ -122,16 +122,16 @@ def read_only_builder(directory: epath.Path, *, builder: str | None,
             "reading prepared TFDS data needs the tfds extra: "
             "pip install 'dew-ml[tfds]'") from missing
     reader = tfds.builder_from_directory(directory)
-    info = reader.info
-    if info.file_format != tfds.core.FileFormat.ARRAY_RECORD:
+    dataset_info = reader.info
+    if dataset_info.file_format != tfds.core.FileFormat.ARRAY_RECORD:
         raise ValueError(
-            f"Prepared data at {directory} uses {info.file_format}, and dew reads "
+            f"Prepared data at {directory} uses {dataset_info.file_format}, and dew reads "
             f"ArrayRecords, which is what needs no TensorFlow in the training "
             f"process. Prepare file_format='array_record' in a directory of its "
             f"own.")
-    for asked, found, what in ((builder, info.name, "builder"),
-                               (config, info.config_name or None, "config"),
-                               (version, str(info.version), "version")):
+    for asked, found, what in ((builder, dataset_info.name, "builder"),
+                               (config, dataset_info.config_name or None, "config"),
+                               (version, str(dataset_info.version), "version")):
         if asked is not None and asked != found:
             raise ValueError(
                 f"{directory} holds {what} {found!r}, and load() asked for "

@@ -193,9 +193,9 @@ class Processor:
             conditioning = {**conditioning, **audio_conditioning}
         if np.any(tokens < 0) or np.any(tokens >= self.vocab_size):
             raise ValueError("input_ids must lie in the text vocabulary, including any hard media ranges")
-        result = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
-        result.validate()
-        return result
+        prepared = ModelInputs(jnp.asarray(tokens, jnp.int32), token_fields, conditioning)
+        prepared.validate()
+        return prepared
 
     def _images(self, values: Mapping[str, object], tokens: np.ndarray
                 ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
@@ -433,18 +433,19 @@ class Processor:
                 raise ValueError(f"{pixel_name} must be floating packed patch vectors")
             if int(np.prod(grid, axis=1).sum()) != pixels.shape[0]:
                 raise ValueError(f"{pixel_name} does not match {grid_name}")
-            items = []
+            pieces = []
             offset = 0
             for time, height, width in grid:
                 count = int(height * width)
                 for _ in range(int(time) if split else 1):
                     frames = 1 if split else int(time)
-                    items.append((pixels[offset:offset + frames * count], (frames, int(height), int(width))))
+                    pieces.append((pixels[offset:offset + frames * count],
+                                   (frames, int(height), int(width))))
                     offset += frames * count
             token_id = self.config[token_name]
             if type(token_id) is not int:
                 raise ValueError(f"{token_name} must be an integer")
-            streams[token_id] = items
+            streams[token_id] = pieces
         offsets = dict.fromkeys(streams, 0)
         ordered = []
         for row, spans in enumerate(runs):
@@ -454,7 +455,7 @@ class Processor:
                     raise ValueError("visual placeholders exceed their image/video frame payloads")
                 ordered.append(streams[token][offsets[token]])
                 offsets[token] += 1
-        if not ordered or any(offsets[token] != len(items) for token, items in streams.items()):
+        if not ordered or any(offsets[token] != len(stream) for token, stream in streams.items()):
             raise ValueError("visual payloads and placeholder frame counts disagree")
         chunks, grids = zip(*ordered, strict=True)
         widths = {chunk.shape[-1] for chunk in chunks}
@@ -478,7 +479,7 @@ class Processor:
         if type(merge) is not int or merge < 1:
             raise ValueError("spatial_merge_size must be a positive integer")
         image_groups, grid_values = np.asarray(groups), np.asarray(grids)
-        result = np.zeros((*tokens.shape, 3), np.int32)
+        prepared = np.zeros((*tokens.shape, 3), np.int32)
         for row in range(tokens.shape[0]):
             slots = np.flatnonzero(valid[row])
             start = cursor = 0
@@ -489,17 +490,17 @@ class Processor:
                     stop += 1
                 span = slots[start:stop]
                 if group < 0:
-                    result[row, span] = (cursor + np.arange(len(span)))[:, None]
+                    prepared[row, span] = (cursor + np.arange(len(span)))[:, None]
                     cursor += len(span)
                 else:
                     time, height, width = (int(value) for value in grid_values[row, group])
                     coordinates = np.indices((time, height // merge, width // merge)).reshape(3, -1).T
                     if len(span) != len(coordinates):
                         raise ValueError("image tokens do not match their multimodal rotary grid")
-                    result[row, span] = coordinates + cursor
+                    prepared[row, span] = coordinates + cursor
                     cursor += max(height, width) // merge
                 start = stop
-        return jnp.asarray(result)
+        return jnp.asarray(prepared)
 
 
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
@@ -978,7 +979,7 @@ def _eos_ids(config: Mapping[str, object], generation_config: Mapping[str, objec
     if value is None:
         return ()
     values = (value,) if type(value) is int else value
-    if not isinstance(values, (tuple, list)) or any(type(item) is not int or item < 0 for item in values):
+    if not isinstance(values, (tuple, list)) or any(type(entry) is not int or entry < 0 for entry in values):
         raise ValueError("eos_token_id must be an integer or a sequence of integers")
     return tuple(values)
 
@@ -1175,8 +1176,8 @@ def _neutral(value: object, neutral: tuple[object, ...]) -> bool:
     if value is None:
         return True
     numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
-    return any(value == item and ((numeric and not isinstance(item, bool)) or type(value) is type(item))
-               for item in neutral)
+    return any(value == entry and ((numeric and not isinstance(entry, bool)) or type(value) is type(entry))
+               for entry in neutral)
 
 
 def _active(config: Mapping[str, object], generation_config: Mapping[str, object],
@@ -1324,10 +1325,10 @@ def _as_strings(value: object) -> tuple[str, ...]:
     strings = (value,) if isinstance(value, str) else value
     if not isinstance(strings, (list, tuple)) or not strings:
         raise ValueError("stop_strings must be a string or a non-empty list of strings")
-    for item in strings:
-        if not isinstance(item, str) or not item:
+    for entry in strings:
+        if not isinstance(entry, str) or not entry:
             raise ValueError("stop_strings must hold non-empty strings")
-    return tuple(item for item in strings if isinstance(item, str))
+    return tuple(entry for entry in strings if isinstance(entry, str))
 
 
 def _source_transforms(config: Mapping[str, object], generation_config: Mapping[str, object],

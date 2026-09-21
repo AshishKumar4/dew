@@ -163,11 +163,11 @@ class FID:
             raise ValueError(
                 "fid generated and real populations require at least two rows each; "
                 f"got generated={generated.count}, real={real.count}")
-        result = frechet_distance(generated.mean, generated.covariance(population="generated"),
+        distance = frechet_distance(generated.mean, generated.covariance(population="generated"),
                                   real.mean, real.covariance(population="real"))
         _log.info("FID populations: generated=%d, real=%d; features=%s",
                   generated.count, real.count, self.feature_identity)
-        return result
+        return distance
 
 
 @metrics("fid")

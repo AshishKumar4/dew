@@ -399,10 +399,10 @@ class RemoveInvalidValues:
     """
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        info = jnp.finfo(logits.dtype)
+        limits = jnp.finfo(logits.dtype)
         cleaned = jnp.where(jnp.isnan(logits), 0.0, logits)
-        cleaned = jnp.where(logits == jnp.inf, info.max, cleaned)
-        return jnp.where(logits == -jnp.inf, info.min, cleaned)
+        cleaned = jnp.where(logits == jnp.inf, limits.max, cleaned)
+        return jnp.where(logits == -jnp.inf, limits.min, cleaned)
 
 
 @struct.dataclass
@@ -824,9 +824,9 @@ def byte_alphabet() -> dict[str, int]:
 
 def _decoder_has(config: object, name: str) -> bool:
     if isinstance(config, dict):
-        return config.get("type") == name or any(_decoder_has(item, name) for item in config.values())
+        return config.get("type") == name or any(_decoder_has(entry, name) for entry in config.values())
     if isinstance(config, list):
-        return any(_decoder_has(item, name) for item in config)
+        return any(_decoder_has(entry, name) for entry in config)
     return False
 
 
@@ -963,16 +963,16 @@ def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
         overlaps.append(ending)
     if not any(overlaps):
         raise ValueError("no token in the vocabulary can end any of the stop strings")
-    positions = max((len(item) for row in valid for item in row.values()), default=1)
-    ends = max(len(item) for row in overlaps for item in row.values())
+    positions = max((len(entry) for row in valid for entry in row.values()), default=1)
+    ends = max(len(entry) for row in overlaps for entry in row.values())
     width = len(strings) * (positions + ends) + 1
     table = np.full((max(rows, max(ids) + 2), width), -1, np.int32)
     for order, (inside, ending) in enumerate(zip(valid, overlaps, strict=True)):
-        for index, items in inside.items():
-            table[index, positions * order:positions * order + len(items)] = items
-        for index, items in ending.items():
+        for index, entries in inside.items():
+            table[index, positions * order:positions * order + len(entries)] = entries
+        for index, entries in ending.items():
             start = positions * len(strings) + ends * order
-            table[index, start:start + len(items)] = items
+            table[index, start:start + len(entries)] = entries
     for piece, index in zip(pieces, ids, strict=True):
         table[index, -1] = len(piece)
     return StopStrings(jnp.asarray(table), jnp.asarray([len(value) for value in strings], jnp.int32),

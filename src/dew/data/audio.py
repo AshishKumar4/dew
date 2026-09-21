@@ -48,9 +48,9 @@ class AudioProcessor:
         arrays = [np.asarray(waveform, dtype=np.float32) for waveform in batch]
         if any(array.ndim != 1 or not array.size for array in arrays):
             raise ValueError("audio waveforms must be nonempty mono arrays")
-        result = self.extractor(
+        features = self.extractor(
             arrays, padding="longest", max_length=max_length, truncation=truncation,
             pad_to_multiple_of=pad_to_multiple_of, return_tensors="np",
             return_attention_mask=True)
-        return {"input_features": np.asarray(result["input_features"], dtype=np.float32),
-                "input_features_mask": np.asarray(result["input_features_mask"], dtype=np.bool_)}
+        return {"input_features": np.asarray(features["input_features"], dtype=np.float32),
+                "input_features_mask": np.asarray(features["input_features_mask"], dtype=np.bool_)}

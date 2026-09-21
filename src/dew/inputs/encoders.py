@@ -60,7 +60,7 @@ class ConditionEncoder(ABC, Generic[Raw]):
         """
 
     @abstractmethod
-    def tokenize(self, data: Sequence[Raw]) -> Mapping[str, np.ndarray]:
+    def tokenize(self, texts: Sequence[Raw]) -> Mapping[str, np.ndarray]:
         """Raw data to the host arrays `encode` reads, one row per item."""
 
     @abstractmethod
@@ -125,8 +125,8 @@ class CLIPText(ConditionEncoder[str]):
                    tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
                    dtype=dtype, param_dtype=param_dtype, revision=revision)
 
-    def tokenize(self, data: Sequence[str]) -> dict[str, np.ndarray]:
-        tokens = self.tokenizer(list(data), padding="max_length",
+    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
+        tokens = self.tokenizer(list(texts), padding="max_length",
                                 max_length=self.tokenizer.model_max_length,
                                 truncation=True, return_tensors="np")
         return {"input_ids": np.asarray(tokens["input_ids"], np.int32),
@@ -189,8 +189,8 @@ class T5Text(ConditionEncoder[str]):
                    tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
                    max_length=max_length, dtype=dtype, param_dtype=param_dtype, revision=revision)
 
-    def tokenize(self, data: Sequence[str]) -> dict[str, np.ndarray]:
-        tokens = self.tokenizer(list(data), padding="max_length", max_length=self.max_length,
+    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
+        tokens = self.tokenizer(list(texts), padding="max_length", max_length=self.max_length,
                                 truncation=True, return_tensors="np")
         return {"input_ids": np.asarray(tokens["input_ids"], np.int32),
                 "attention_mask": np.asarray(tokens["attention_mask"], np.int32)}
@@ -243,11 +243,11 @@ class CharTable(ConditionEncoder[str]):
         return cls(params=params, tokens=tokens, features=features, vocab=vocab, seed=seed,
                    dtype=compute, param_dtype=param_dtype)
 
-    def tokenize(self, data: Sequence[str]) -> dict[str, np.ndarray]:
+    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
         # id 0 is padding, 1 is the start token, characters follow.
-        ids = np.zeros((len(data), self.tokens), np.int32)
-        mask = np.zeros((len(data), self.tokens), np.int32)
-        for row, text in enumerate(data):
+        ids = np.zeros((len(texts), self.tokens), np.int32)
+        mask = np.zeros((len(texts), self.tokens), np.int32)
+        for row, text in enumerate(texts):
             codes = [1] + [2 + (ord(char) % (self.vocab - 2)) for char in text[:self.tokens - 1]]
             ids[row, :len(codes)] = codes
             mask[row, :len(codes)] = 1

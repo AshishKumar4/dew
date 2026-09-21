@@ -104,11 +104,11 @@ class SampledRollout:
         policy = self.objective.policy(state.params, self.sampling)
         generated = [policy(inputs, self.max_new_tokens, key=jax.random.fold_in(key, group)).host()
                      for group in range(self.groups)]
-        sampled = np.stack([result.tokens[:, width:] for result in generated], axis=1)
-        lengths = np.stack([result.lengths for result in generated], axis=1)
-        terminated = np.stack([result.terminated for result in generated], axis=1)
-        raw = np.stack([result.raw_log_probs for result in generated], axis=1)
-        behavior = np.stack([result.behavior_log_probs for result in generated], axis=1)
+        sampled = np.stack([generation.tokens[:, width:] for generation in generated], axis=1)
+        lengths = np.stack([generation.lengths for generation in generated], axis=1)
+        terminated = np.stack([generation.terminated for generation in generated], axis=1)
+        raw = np.stack([generation.raw_log_probs for generation in generated], axis=1)
+        behavior = np.stack([generation.behavior_log_probs for generation in generated], axis=1)
         rewards = np.asarray([
             [self.reward(sources[row], self.decode(sampled[row, group,
                          :int(lengths[row, group]) - int(terminated[row, group])].tolist()),

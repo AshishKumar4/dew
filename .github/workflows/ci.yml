@@ -38,6 +38,11 @@ jobs:
       run: |
         # stop the build if there are Python syntax errors or undefined names
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+    - name: Lint
+      run: |
+        pip install uv
+        uvx ruff@0.14.3 check src/dew tools/lint_slop.py
+        python tools/lint_slop.py
     - name: Type check the Python 3.12 compatibility floor
       if: matrix.python-version == '3.12'
       run: |

@@ -67,10 +67,10 @@ class Condition:
                 "unconditional": self.unconditional}
 
     @classmethod
-    def from_json(cls, data: Mapping, *, params: Variables | None = None) -> Condition:
-        encoder = data["encoder"]
+    def from_json(cls, record: Mapping, *, params: Variables | None = None) -> Condition:
+        encoder = record["encoder"]
         return cls(encoder=rebuild(encoder["name"], encoder["fields"], params=params),
-                   field=data["field"], unconditional=data["unconditional"])
+                   field=record["field"], unconditional=record["unconditional"])
 
 
 @dataclass(frozen=True)
@@ -114,14 +114,14 @@ class InputSpec:
                 **({"mask": {"key": self.mask.key, "shape": list(self.mask.shape)}} if self.mask is not None else {})}
 
     @classmethod
-    def from_json(cls, data: Mapping, *, params: Mapping[str, Variables] | None = None) -> InputSpec:
+    def from_json(cls, record: Mapping, *, params: Mapping[str, Variables] | None = None) -> InputSpec:
         """Rebuild metadata around supplied condition parameters, or load source weights."""
-        sample = data["sample"]
+        sample = record["sample"]
         return cls(sample=Field(sample["key"], tuple(sample["shape"])),
                    conditions={keyword: Condition.from_json(
                        condition, params=None if params is None else params[keyword])
-                               for keyword, condition in data["conditions"].items()},
-                   mask=Field(data["mask"]["key"], tuple(data["mask"]["shape"])) if "mask" in data else None)
+                               for keyword, condition in record["conditions"].items()},
+                   mask=Field(record["mask"]["key"], tuple(record["mask"]["shape"])) if "mask" in record else None)
 
 
 # The conditioner builds the Condition and InputSpec declared above, so its

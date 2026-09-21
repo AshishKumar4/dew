@@ -133,7 +133,7 @@ def reseed(ops: DecodeOps, state: DecoderState, carry: Sequence[jax.Array | None
     propose = ops.propose
     produced: list[jax.Array] = []
     if propose is None:
-        return state, produced, tuple(item for item in carry if item is not None)
+        return state, produced, tuple(entry for entry in carry if entry is not None)
     ordinal = prior_tokens[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
     upstream, tails = states, []
     for depth in range(ops.depths):
@@ -552,7 +552,7 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                      - jnp.take_along_axis(jax.nn.log_softmax(drafts[at]), chosen, -1)[:, 0])
             uniform = jax.vmap(jax.random.uniform)(keys[:, gamma + at])
             accepted.append((jnp.log(uniform) <= ratio) & offered[at])
-        available = 1 + sum(flag.astype(jnp.int32) for flag in offered[1:])
+        available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
         matched = (1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1), axis=1)
                    if accepted else jnp.ones(rows, jnp.int32)).astype(jnp.int32)
 

@@ -159,15 +159,15 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
             # Flux's `_get_t5_prompt_embeds` has no such path.
             raise ValueError("Flux conditioning needs its T5 encoder")
 
-    def tokenize(self, data: Sequence[str | Mapping[str, object]]):
+    def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         """One row per item, with each text slot routed to the tower whose
         source pipeline reads it: `text` to the first CLIP tower, `second` to
         the second one, and the T5 tower's own slot, which is `third` where a
         family has two CLIP towers beside it and `second` where it has one.
         """
         rows, second, third, zero, negative, guidance = [], [], [], [], [], []
-        for item in data:
-            record: Mapping[str, object] = {"text": item} if isinstance(item, str) else item
+        for prompt in texts:
+            record: Mapping[str, object] = {"text": prompt} if isinstance(prompt, str) else prompt
             text = _prompt(record, "text", "")
             rows.append(text)
             second.append(_prompt(record, "second", text))
