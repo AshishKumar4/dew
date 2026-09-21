@@ -357,11 +357,17 @@ def test_deepseek_v4_trained_mtp_export_matches_reference(trips):
 
     handle = reference.model.layers[-1].register_forward_hook(capture)
     ids = torch.from_numpy(trip.ids.astype(np.int64))
+    # The trained step puts indexer scores on exact ties, which torch's
+    # top-k and jax's break differently; the reference runs under Dew's
+    # tie rule so the comparison is of the composition, not of the split.
     try:
-        with torch.no_grad():
+        with torch.no_grad(), tool.reference_tie_contract(reference):
             reference(input_ids=ids, use_cache=False)
     finally:
         handle.remove()
+    # The depth's own layer is sliding attention and selects nothing, so
+    # the contract scopes the trunk run alone, which is what ties the
+    # streams it reads.
     depth = load_mtp_reference(trip.export, reference.config)
     with torch.no_grad():
         expected = depth(reference, captured[0][:, :-1], ids[:, 1:]).numpy()

@@ -156,6 +156,20 @@ def train(case: Case, source: Pretrained, ids: np.ndarray):
     return state
 
 
+def _text_half_prefixes(model) -> tuple[str, ...]:
+    """Where a wrapper reference keeps the decoder a text-only claim covers.
+
+    Kimi K2.5's reference is `Kimi_K25ForConditionalGeneration`, run on
+    input_ids alone: its vision tower and projector see no input and hold
+    no gradient. That is not missing participation, it is the half this
+    qualifies nothing about, and the source retains those tensors byte for
+    byte instead of binding them. A plain causal LM has no such half and
+    names no prefix, so every parameter of it stays in scope.
+    """
+    inner = getattr(getattr(model, 'model', None), 'language_model', None)
+    return () if inner is None else ('model.language_model.', 'lm_head.')
+
+
 def _prediction_prefixes(config) -> tuple[str, ...]:
     """The declared prediction tensors omitted by the upstream trunk class."""
     if config.model_type in ('glm4_moe', 'glm_moe_dsa', 'glm5_next_text'):
@@ -468,8 +482,10 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
 
     parameters = dict(model.named_parameters())
     prediction_prefixes = _prediction_prefixes(model.config)
+    text_half = _text_half_prefixes(model)
     excluded = {name for name in parameters
-                if '.indexer.' in name or name.startswith(prediction_prefixes)}
+                if '.indexer.' in name or name.startswith(prediction_prefixes)
+                or (text_half and not name.startswith(text_half))}
     unexpected_missing = {name for name, parameter in parameters.items()
                           if parameter.requires_grad and parameter.grad is None and name not in excluded}
     unexpected_present = {name for name in excluded if parameters[name].grad is not None}
@@ -509,10 +525,16 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
             held[key] = (name, value)
         return held
 
+    # The reversal writes the checkpoint spelling of the model_type it was
+    # handed, which is not always the release's own: DeepSeek V4 names the
+    # block's halves `attn`/`ffn`, and Kimi K2.5's repo holds its text
+    # stack at `layers.N` where the reversal writes `blocks.N`.
     if model.config.model_type == 'deepseek_v4':
         from tools.deepseek_v4_reference import deepseek_v4_source_name
         converted = {deepseek_v4_source_name(name): value for name, value in converted.items()}
-    reference = indexed(converted.items())
+    elif model.config.model_type == 'kimi_k25':
+        converted = {name.replace('.blocks.', '.layers.'): value
+                     for name, value in converted.items()}
     # Prediction-owned serialized embedding/head copies alias trunk leaves;
     # exclude their declared source prefix as well as independent MTP paths.
     layouts = indexed(
@@ -520,6 +542,17 @@ def gradient_parity(trip: RoundTrip) -> dict[str, float]:
         if layout.paths[0][0] == 'params' and 'indexer' not in layout.paths[0]
         and not layout.paths[0][1].startswith('mtp_')
         and not layout.name.startswith(prediction_prefixes))
+    # The reversal keys a gradient by the checkpoint spelling of the
+    # model_type it was handed, which is not always the release's: Kimi
+    # K2.5's text stack is `layers.N` in its repo and `blocks.N` through
+    # the reversal. A tensor the reversal only renamed is the parameter
+    # itself, so where the module tree already names it the way a binding
+    # does, that name stands; what the reversal built rather than passed
+    # through, a fused expert kernel split apart, keeps the name it was
+    # built under.
+    named = {id(grad): name for name, grad in upstream.items() if bare(name) in layouts}
+    reference = indexed((named.get(id(value), name), value)
+                        for name, value in converted.items())
     if set(reference) != set(layouts):
         raise ValueError(f'gradient source/layout bijection differs: '
                          f'upstream only {sorted(reference[key][0] for key in set(reference) - set(layouts))}, '
