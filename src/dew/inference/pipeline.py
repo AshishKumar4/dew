@@ -12,8 +12,8 @@ uses the current pool's devices. A just-trained state needs no reload; its objec
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 import jax
@@ -25,9 +25,8 @@ from dew.checkpoints import RUN_FILE
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.objectives.base import Variables
-from dew.registry import dtype_name, resolve_dtype
-from dew.sampling.pipelines import TextToImage, restore_variables
-from dew.sampling.text import Sampling
+from dew.registry import resolve_dtype
+from dew.sampling.pipelines import TextToImage
 from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
 
 if TYPE_CHECKING:
@@ -81,82 +80,33 @@ def _persist_compilations() -> None:
     enable_compilation_cache(default_compilation_cache_dir())
 
 
+SAVED_TASKS: Mapping[str, type[TextToImage] | type[TextGeneration] | type[BlockGeneration]
+                     | type[MaskedGeneration]] = {
+    "diffusion": TextToImage, "lm": TextGeneration, "dpo": TextGeneration,
+    "grpo": TextGeneration, "ppo": TextGeneration, "block_diffusion": BlockGeneration,
+    "masked_diffusion": MaskedGeneration}
+"""Which task each saved objective kind generates through.
+
+One entry per kind a run publishes weights for; each task's own `from_run`
+holds the construction, so this is the whole of what the front door knows
+about a run beyond the name its `run.json` records.
+"""
+
+
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool,
               step: int | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
-    import dew.objectives.lm  # registers the saved objective kinds
-    import dew.objectives.rl  # noqa: F401 registers the saved objective kinds
-    from dew.config import ModelConfig
-    from dew.data import tokenizer_for
-    from dew.objectives.base import thaw
-    from dew.registry import objectives
-
     record = json.loads((root / RUN_FILE).read_text())
     if not isinstance(record, dict) or not isinstance(record.get("objective"), str):
         raise ValueError("run.json must name its objective kind")
     kind = record["objective"]
-    directory = str(root)
-    if kind == "diffusion":
-        return TextToImage.from_run(directory, ema=ema, step=step, mesh=mesh, layout=layout,
-                                    dtype=dtype, param_dtype=param_dtype)
-    if kind not in ("lm", "dpo", "grpo", "ppo", "block_diffusion", "masked_diffusion"):
-        raise TypeError(f"{kind!r} has no saved generation task; supported kinds are diffusion, lm, dpo, grpo, ppo, block_diffusion and masked_diffusion")
-    model_config = ModelConfig.from_dict(record["model"])
-    compute = dtype_name(resolve_dtype(dtype))
-    if compute is not None:
-        model_config = replace(model_config, dtype=compute)
-    tokenizer = tokenizer_for(record["tokenizer"])
-    if kind == "block_diffusion":
-        from dew.diffusion.block import BlockProcess
-        from dew.interop import diffusion_gemma
-        canvas = model_config.config["max_seq_len"]
-        if not isinstance(canvas, int):
-            raise ValueError(
-                f"run.json records max_seq_len as {canvas!r}; the canvas a "
-                f"block-diffusion run decodes is a number of tokens")
-        model = diffusion_gemma.build(model_config.config, dtype=model_config.dtype,
-                                      attention_impl=model_config.attention_impl,
-                                      max_seq_len=canvas)
-        model = model.clone(text=model.text.clone(layer_scalar="trainable"))
-        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
-                                      param_dtype=param_dtype)
-        return BlockGeneration(model, variables, BlockProcess(model.canvas_length, model.vocab_size),
-                               RunProcessor(tokenizer), pad_token_id=int(record.get("pad_token_id", 0)))
-    budget = record.get("sample_tokens")
-    if budget is not None and (type(budget) is not int or budget < 0):
-        raise ValueError("sample_tokens must be a nonnegative integer")
-    if kind == "masked_diffusion":
-        from dew.diffusion.discrete import MDLM
-        model = model_config.build()
-        mask_id = getattr(model, "mask_token_id", None)
-        if getattr(model, "causal", True) or type(mask_id) is not int:
-            raise ValueError("a saved masked run requires causal=False and a mask_token_id")
-        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
-                                      param_dtype=param_dtype)
-        return MaskedGeneration(model, variables, MDLM(mask_id=mask_id)(), RunProcessor(tokenizer),
-                                pad_token_id=int(record.get("pad_token_id", 0)),
-                                max_new_tokens=budget or None)
-    objective_type = objectives[kind]
-    variables = restore_variables(directory, ema=ema and not objective_type._ema_is_reference,
-                                  step=step, mesh=mesh, layout=layout, param_dtype=param_dtype)
-    if kind == "ppo":
-        from dew.objectives.rl.ppo import _part
-        variables = _part(variables, "policy")
-    model = model_config.build()
-    # The knob is the trainer's; a run.json written before it moved there
-    # carries it at the top level, where the LM recipe kept its own flag.
-    quantization = record.get("trainer", {}).get("quantization") or record.get("quantization")
-    if quantization is not None:
-        from dew.training.quantization import Quantization, apply_quantization
-        model = apply_quantization(model, Quantization(**quantization))
-    controls = record.get("sampling")
-    if controls is None and budget:
-        raise ValueError("run.json lacks the sampling policy for its text previews")
-    if controls is not None and not isinstance(controls, dict):
-        raise ValueError("the run's sampling policy must be a Sampling record")
-    sampling = Sampling() if controls is None else Sampling(**controls)
-    return TextGeneration(model, thaw(variables), RunProcessor(tokenizer), sampling=sampling,
-                          max_new_tokens=budget if budget else None)
+    task = SAVED_TASKS.get(kind)
+    if task is None:
+        supported = ", ".join(list(SAVED_TASKS)[:-1]) + f" and {list(SAVED_TASKS)[-1]}"
+        raise TypeError(f"{kind!r} has no saved generation task; supported kinds are {supported}")
+    return task.from_run(str(root), ema=ema, step=step, mesh=mesh, layout=layout,
+                         dtype=dtype, param_dtype=param_dtype)
+
 
 def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,

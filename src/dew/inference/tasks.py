@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Protocol, overload
+from typing import TYPE_CHECKING, Protocol, overload
 
 import jax
 import jax.numpy as jnp
@@ -31,10 +31,16 @@ from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
 from dew.objectives.base import Variables
+from dew.records import integer, record as named_fields, text as named
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
 from dew.sampling.text import Criteria, Generation, Sampling, Transforms, generate
 from dew.telemetry.profile import active_profile
+
+if TYPE_CHECKING:
+    from dew.config import ModelConfig
+    from dew.training.distributed import Layout, MeshSpec
+    from dew.training.quantization import Quantization
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
@@ -228,6 +234,82 @@ def _requested(generated: Generation, budget: int, padding: int) -> Generation:
                    raw_log_probs=generated.raw_log_probs[:, :budget])
 
 
+def _pulled(repo_id: str) -> str:
+    """A run directory published to the Hub, on this host."""
+    import os
+
+    from dew.interop.hub import pull_from_hub
+    return os.fspath(pull_from_hub(repo_id))
+
+
+def _run_record(directory: str) -> Mapping[str, object]:
+    """The `run.json` a run directory publishes beside its checkpoints."""
+    import json
+
+    from etils import epath
+
+    from dew.checkpoints import RUN_FILE
+    return named_fields(json.loads((epath.Path(directory) / RUN_FILE).read_text()), RUN_FILE)
+
+
+def _saved_model(record: Mapping[str, object], dtype: str | None) -> ModelConfig:
+    """The run's model record, with `dtype` overriding the computation it saved."""
+    from dew.config import ModelConfig
+    from dew.registry import dtype_name, resolve_dtype
+
+    config = ModelConfig.from_dict(named_fields(record["model"], "model"))
+    compute = dtype_name(resolve_dtype(dtype))
+    return config if compute is None else replace(config, dtype=compute)
+
+
+def _saved_processor(record: Mapping[str, object]) -> Processor:
+    """The run's tokenizer as a task's host processor."""
+    from dew.data import tokenizer_for
+    from dew.inference.pipeline import RunProcessor
+
+    return RunProcessor(tokenizer_for(named(record["tokenizer"], "tokenizer")))
+
+
+def _saved_budget(record: Mapping[str, object]) -> int | None:
+    """How many tokens the run's own previews drew, where it drew any."""
+    budget = record.get("sample_tokens")
+    if budget is None:
+        return None
+    if type(budget) is not int or budget < 0:
+        raise ValueError("sample_tokens must be a nonnegative integer")
+    return budget
+
+
+def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Sampling:
+    """The policy the run drew its previews under; the basic one where it drew none."""
+    controls = record.get("sampling")
+    if controls is None:
+        if budget:
+            raise ValueError("run.json lacks the sampling policy for its text previews")
+        return Sampling()
+    if not isinstance(controls, dict):
+        raise ValueError("the run's sampling policy must be a Sampling record")
+    return Sampling(**controls)
+
+
+def _saved_quantization(record: Mapping[str, object]) -> Quantization | None:
+    """The run's quantization spec, wherever its `run.json` carries it.
+
+    The knob is the trainer's; a run.json written before it moved there
+    carries it at the top level, where the LM recipe kept its own flag.
+    The record reads back through the config layer that wrote it, which is
+    the one place a saved dataclass record becomes its class again.
+    """
+    from dew.config import _built
+    from dew.training.quantization import Quantization
+
+    trainer = record.get("trainer")
+    section = None if trainer is None else named_fields(trainer, "trainer").get("quantization")
+    if section is None:
+        section = record.get("quantization")
+    return None if section is None else _built(Quantization, named_fields(section, "quantization"))
+
+
 @dataclass(frozen=True)
 class TextGeneration:
     """Next-token generation bound to a decoder, its weights and its processor.
@@ -272,6 +354,56 @@ class TextGeneration:
     def bind(self, variables: Variables) -> TextGeneration:
         """The same task over other weights, such as a training policy snapshot."""
         return replace(self, variables=variables)
+
+    @classmethod
+    def from_run(cls, directory: str, *, ema: bool = True, step: int | None = None,
+                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
+        """The causal run in `directory`: the model its `run.json` records,
+        rebuilt the way the recipe built it, over the weights of its latest
+        checkpoint (or `step`), decoding through the run's own tokenizer.
+
+        `ema` reads the averaged weights, except under an objective whose
+        average is a reference policy rather than the trained one. With
+        `mesh` the weights restore straight onto that mesh under `layout`,
+        the way the trainer places them. dtype overrides computation;
+        param_dtype overrides parameter storage, and None preserves what the
+        checkpoint stored. The run's preview budget and sampling policy
+        become the task's defaults.
+        """
+        import dew.objectives.lm  # registers the saved objective kinds
+        import dew.objectives.rl  # noqa: F401 registers the saved objective kinds
+        from dew.objectives.base import thaw
+        from dew.registry import objectives
+        from dew.sampling.pipelines import restore_variables
+
+        record = _run_record(directory)
+        kind = named(record["objective"], "objective")
+        model_config = _saved_model(record, dtype)
+        processor = _saved_processor(record)
+        budget = _saved_budget(record)
+        objective_type = objectives[kind]
+        variables = restore_variables(directory, ema=ema and not objective_type._ema_is_reference,
+                                      step=step, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        if kind == "ppo":
+            from dew.objectives.rl.ppo import _part
+            variables = _part(variables, "policy")
+        model = model_config.build()
+        quantization = _saved_quantization(record)
+        if quantization is not None:
+            from dew.training.quantization import apply_quantization
+            model = apply_quantization(model, quantization)
+        return cls(model, thaw(variables), processor, sampling=_saved_sampling(record, budget),
+                   max_new_tokens=budget if budget else None)
+
+    @classmethod
+    def from_pretrained(cls, repo_id: str, *, ema: bool = True, step: int | None = None,
+                        mesh: MeshSpec | None = None, layout: Layout | None = None,
+                        dtype: str | None = None, param_dtype: str | None = None) -> TextGeneration:
+        """A run directory published to the Hugging Face Hub, as
+        `dew.interop.hub.push_to_hub` writes it."""
+        return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
+                            dtype=dtype, param_dtype=param_dtype)
 
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
@@ -360,6 +492,47 @@ class BlockGeneration:
         """The same task over other weights."""
         return replace(self, variables=variables)
 
+    @classmethod
+    def from_run(cls, directory: str, *, ema: bool = True, step: int | None = None,
+                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
+        """The block-diffusion run in `directory`: the DiffusionGemma its
+        `run.json` records over the weights of its latest checkpoint (or
+        `step`), sampling over the canvas the model declares.
+
+        The arguments carry what `TextGeneration.from_run` carries: `ema`
+        selects the averaged weights, `mesh` and `layout` place them, and
+        the two dtypes override computation and storage.
+        """
+        from dew.interop import diffusion_gemma
+        from dew.sampling.pipelines import restore_variables
+
+        record = _run_record(directory)
+        model_config = _saved_model(record, dtype)
+        processor = _saved_processor(record)
+        canvas = model_config.config["max_seq_len"]
+        if not isinstance(canvas, int):
+            raise ValueError(
+                f"run.json records max_seq_len as {canvas!r}; the canvas a "
+                f"block-diffusion run decodes is a number of tokens")
+        model = diffusion_gemma.build(model_config.config, dtype=model_config.dtype,
+                                      attention_impl=model_config.attention_impl,
+                                      max_seq_len=canvas)
+        model = model.clone(text=model.text.clone(layer_scalar="trainable"))
+        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
+                                      param_dtype=param_dtype)
+        return cls(model, variables, BlockProcess(model.canvas_length, model.vocab_size),
+                   processor, pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"))
+
+    @classmethod
+    def from_pretrained(cls, repo_id: str, *, ema: bool = True, step: int | None = None,
+                        mesh: MeshSpec | None = None, layout: Layout | None = None,
+                        dtype: str | None = None, param_dtype: str | None = None) -> BlockGeneration:
+        """A run directory published to the Hugging Face Hub, as
+        `dew.interop.hub.push_to_hub` writes it."""
+        return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
+                            dtype=dtype, param_dtype=param_dtype)
+
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
                  n: int | None = None, process: BlockProcess | None = None,
@@ -435,6 +608,43 @@ class MaskedGeneration:
     def bind(self, variables: Variables) -> MaskedGeneration:
         """The same native MDLM task over another weight snapshot."""
         return replace(self, variables=variables)
+
+    @classmethod
+    def from_run(cls, directory: str, *, ema: bool = True, step: int | None = None,
+                 mesh: MeshSpec | None = None, layout: Layout | None = None,
+                 dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
+        """The masked-diffusion run in `directory`: the bidirectional model
+        its `run.json` records over the weights of its latest checkpoint (or
+        `step`), refined with MDLM over the run's own mask token.
+
+        The arguments carry what `TextGeneration.from_run` carries, and the
+        run's preview budget becomes the response length a call omits.
+        """
+        from dew.diffusion.discrete import MDLM
+        from dew.sampling.pipelines import restore_variables
+
+        record = _run_record(directory)
+        model_config = _saved_model(record, dtype)
+        processor = _saved_processor(record)
+        budget = _saved_budget(record)
+        model = model_config.build()
+        mask_id = getattr(model, "mask_token_id", None)
+        if getattr(model, "causal", True) or type(mask_id) is not int:
+            raise ValueError("a saved masked run requires causal=False and a mask_token_id")
+        variables = restore_variables(directory, ema=ema, step=step, mesh=mesh, layout=layout,
+                                      param_dtype=param_dtype)
+        return cls(model, variables, MDLM(mask_id=mask_id)(), processor,
+                   pad_token_id=integer(record.get("pad_token_id", 0), "pad_token_id"),
+                   max_new_tokens=budget or None)
+
+    @classmethod
+    def from_pretrained(cls, repo_id: str, *, ema: bool = True, step: int | None = None,
+                        mesh: MeshSpec | None = None, layout: Layout | None = None,
+                        dtype: str | None = None, param_dtype: str | None = None) -> MaskedGeneration:
+        """A run directory published to the Hugging Face Hub, as
+        `dew.interop.hub.push_to_hub` writes it."""
+        return cls.from_run(_pulled(repo_id), ema=ema, step=step, mesh=mesh, layout=layout,
+                            dtype=dtype, param_dtype=param_dtype)
 
     @overload
     def __call__(self, request: Request, max_new_tokens: int | None = None, *, key: jax.Array,
