@@ -19,6 +19,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 
+import dew
 from dew.interop import hub, load_params, pull_from_hub, push_to_hub, save_hf_layout, save_params
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.dit import TextContext
@@ -333,12 +334,17 @@ class _RecordingApi:
     def __init__(self):
         self.created = []
         self.uploaded = []
+        self.files = []
 
     def create_repo(self, repo_id, **kwargs):
         self.created.append((repo_id, kwargs))
 
     def upload_folder(self, **kwargs):
+        # The real client reads the folder during the call, and a staged
+        # export is gone by the time the test looks, so the listing is taken
+        # here, where the client would take it.
         self.uploaded.append(kwargs)
+        self.files.append({entry.name for entry in Path(kwargs["folder_path"]).iterdir()})
 
 
 @pytest.fixture
@@ -396,3 +402,109 @@ def test_pull_returns_the_snapshot_directory(tmp_path, monkeypatch):
         {"repo_id": "acme/dew-export", "revision": "v2"},
         {"repo_id": "acme/dew-export", "revision": None},
     ]
+
+
+# ---------------------------------------------------------------------------------
+# A trained run out to the published layout
+# ---------------------------------------------------------------------------------
+
+
+def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
+    """The whole way out of a run directory: run.json and the checkpoint in,
+    a Hugging Face directory out, and `load_pretrained` reads it back at the
+    logits the run's own task computes."""
+    from test_inference import make_lm_run
+
+    import dew
+    from dew.interop import export_run, load_pretrained
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_lm_run(run)
+    task = dew.pipeline(str(run))
+    destination = tmp_path / "export"
+
+    export_run(str(run), destination)
+
+    assert {entry.name for entry in destination.iterdir()} == {
+        "config.json", "generation_config.json", "model.safetensors"}
+    assert json.loads((destination / "generation_config.json").read_text())["tokenizer_name"] == "byte"
+    reloaded = load_pretrained(destination, dtype="float32", attention_impl="reference")
+    ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
+                                  np.asarray(task.model.apply(task.variables, ids)))
+
+
+def test_exporting_a_run_whose_model_has_no_published_layout_names_it(tmp_path):
+    """A latent diffusion run: the denoiser is a native model with no file
+    to be written back into, so the refusal names the model and what does
+    export."""
+    from test_inference import make_run
+
+    from dew.interop import export_run
+
+    make_run(tmp_path)
+    with pytest.raises(ValueError, match="SimpleDiT has no published layout"):
+        export_run(str(tmp_path), tmp_path / "export")
+
+
+def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path, capsys):
+    """`dew export <run> <dest>` is the same call with two positional names."""
+    from test_inference import make_lm_run
+
+    from dew.cli.main import main
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_lm_run(run)
+    destination = tmp_path / "export"
+
+    assert main(["export", str(run), str(destination)]) == 0
+    assert (destination / "model.safetensors").is_file()
+    assert "exported" in capsys.readouterr().out
+    with pytest.raises(FileNotFoundError):
+        main(["export", str(tmp_path / "nothing"), str(tmp_path / "other")])
+
+
+def test_push_exports_a_run_directory_and_uploads_that(tmp_path, api):
+    """A run directory is Dew's format and nothing on the Hub reads it, so
+    the push uploads what `export_run` writes; `raw` uploads the run itself,
+    which is the form `from_pretrained` pulls back."""
+    from test_inference import make_lm_run
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_lm_run(run)
+
+    push_to_hub(run, "acme/lm")
+
+    assert Path(api.uploaded[0]["folder_path"]) != run
+    assert api.files[0] == {"config.json", "generation_config.json", "model.safetensors"}
+
+    push_to_hub(run, "acme/lm-raw", raw=True)
+    assert api.uploaded[1]["folder_path"] == str(run)
+
+
+def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
+    """DiffusionGemma writes the reference's own encoder/decoder names, over
+    the published config the run recorded rather than a derived one."""
+    from test_inference import make_block_run
+
+    from dew.interop import export_run, load_pretrained
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_block_run(run)
+    destination = tmp_path / "export"
+
+    export_run(str(run), destination, ema=False)
+
+    reloaded = load_pretrained(destination, dtype="float32", attention_impl="xla", max_seq_len=32)
+    task = dew.pipeline(str(run), ema=False)
+    # The export writes the layer scalars into the reference's buffers, so
+    # the reloaded tree is the source's shape, not the run's; what has to
+    # survive is the canvas the two decode.
+    wanted = task([[1, 5, 7]], 3, seed=4).host()
+    actual = reloaded.block_generation()([[1, 5, 7]], 3, seed=4).host()
+    np.testing.assert_array_equal(actual.tokens, wanted.tokens)
+    np.testing.assert_array_equal(actual.decoder_steps, wanted.decoder_steps)

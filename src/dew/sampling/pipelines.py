@@ -150,7 +150,7 @@ class TextToImage:
                         layout: Layout | None = None, dtype: str | None = None,
                         param_dtype: str | None = None) -> TextToImage:
         """A run directory published to the Hugging Face Hub, as
-        `dew.interop.hub.push_to_hub` writes it."""
+        `dew.interop.hub.push_to_hub(..., raw=True)` writes it."""
         from dew.interop.hub import pull_from_hub
 
         return cls.from_run(os.fspath(pull_from_hub(repo_id)), ema=ema, mesh=mesh, layout=layout,
