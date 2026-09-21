@@ -24,7 +24,7 @@ the newest checkpoint every process can read wins.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, overload
 
 import jax
 import numpy as np
@@ -35,7 +35,20 @@ from orbax.checkpoint.checkpoint_manager import MultiprocessingOptions
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import position
+from dew.objectives.base import Variables
 from dew.telemetry.profile import active_profile
+
+if TYPE_CHECKING:
+    import optax
+    from flax.training.dynamic_scale import DynamicScale
+
+    from dew.training.state import Accumulation, TrainState
+
+# One field of the train state as a checkpoint holds it: a scalar array, a
+# tree of arrays, or one of the records the state carries beside them. The
+# gathered data position rides along under its own name as uint8 rows.
+type StateLeaf = (jax.Array | np.ndarray | Variables | optax.OptState
+                  | DynamicScale | Accumulation | None)
 
 STATE_LEAVES = ("step", "microstep", "updates", "params", "opt_state", "ema", "key",
                 "scale", "window_size", "accumulation")
@@ -133,7 +146,7 @@ def read_position(table: dict, where: str) -> bytes:
     return saved
 
 
-def placement(tree: Any) -> dict[str, str]:
+def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
     """Where each array leaf of `tree` sits, by path, as the string of its
     sharding; a local checkpoint restores onto this placement and no other."""
     leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
@@ -263,7 +276,7 @@ class Checkpoints:
         persistent one."""
         return self.local_path if step == self._local_latest() else self.directory
 
-    def save(self, step: int, state: Any, saved: bytes | None,
+    def save(self, step: int, state: TrainState, saved: bytes | None,
              metrics: Mapping[str, float] | None = None) -> None:
         """Write `state` under `step`, asynchronously.
 
@@ -288,7 +301,7 @@ class Checkpoints:
             if annotation is not None:
                 annotation.__exit__(None, None, None)
 
-    def save_local(self, step: int, state: Any, saved: bytes | None) -> None:
+    def save_local(self, step: int, state: TrainState, saved: bytes | None) -> None:
         """Write `state` under `step` to this process's local directory,
         asynchronously, in place of the local step before it. The placement
         rides along; a resume onto another one raises before reading shards
@@ -312,12 +325,12 @@ class Checkpoints:
                 annotation.__exit__(None, None, None)
 
     @staticmethod
-    def _item(state: Any, saved: bytes | None) -> dict[str, Any]:
+    def _item(state: TrainState, saved: bytes | None) -> dict[str, StateLeaf]:
         state_tree = {name: getattr(state, name) for name in STATE_LEAVES}
         if saved is not None:
             state_tree['position'] = gather_positions(saved)
         return state_tree
-    def stored(self, step: int | None = None) -> dict[str, Any]:
+    def stored(self, step: int | None = None) -> Variables:
         """What the checkpoint at `step` (the latest by default) holds, as
         shape/dtype trees per state field; an unset field is None."""
         if step is None:
@@ -346,7 +359,15 @@ class Checkpoints:
         arrays["effects"] = tuple(arrays["effects"])
         return Accumulation(**arrays)
 
-    def restore(self, template=None, step: int | None = None) -> tuple[Any, bytes | None]:
+    @overload
+    def restore[StateT](self, template: StateT,
+                        step: int | None = None) -> tuple[StateT, bytes | None]: ...
+
+    @overload
+    def restore(self, template: None = None,
+                step: int | None = None) -> tuple[Variables, bytes | None]: ...
+
+    def restore(self, template=None, step: int | None = None):
         """The state at `step` (the latest by default) and this process's data position.
 
         `template` is a pytree of `jax.ShapeDtypeStruct` naming the state
@@ -452,7 +473,7 @@ class Checkpoints:
             restored = template.replace(**restored)
         return restored, saved
 
-    def _check_placement(self, step: int, state_tree: Mapping[str, Any]) -> None:
+    def _check_placement(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
         """Refuse a local step written for another placement of the state."""
         annotation = None
         active = active_profile()
