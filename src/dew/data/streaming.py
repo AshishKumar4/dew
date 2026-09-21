@@ -8,7 +8,7 @@ import jax
 
 from dew.registry import datasets
 
-from .dataset import Dataset, DatasetSpec, Loading, local_batch, tokenized
+from .dataset import Dataset, DatasetSpec, Loading, Tokenize, local_batch, tokenized
 
 
 @dataclasses.dataclass(frozen=True)
@@ -29,13 +29,17 @@ class OnlineImages(DatasetSpec):
     sources: tuple[str, ...] = ()
     image_size: int = 256
     min_image_size: int = 128
-    loading: Loading = Loading(workers=16, threads=512, worker_buffer=20)
-    """The fetch pool has no grain reader, so `read_buffer` does not reach
-    this path; `worker_buffer` is how many batches the fetchers run ahead."""
+    loading: Loading = dataclasses.field(
+        default=Loading(workers=16, threads=512, worker_buffer=20), kw_only=True)
+    """The fetch pool is this spec's own, not a grain reader: `workers` and
+    `threads` are the fetch pool's, `read_buffer` does not reach this path at
+    all, and `worker_buffer` is how many batches the fetchers run ahead. The
+    grain default would read 32 processes of 64 threads two batches ahead of
+    a step, which is the wrong shape for a pool waiting on urls."""
     timeout: int = 15
     retries: int = 3
 
-    def load(self, *, batch: int, tokenize=None) -> Dataset:
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         if not self.sources:
             raise ValueError(f"{type(self).__name__} needs sources= set to one or more datasets")
         from .online_loader import ImageStream, load_rows

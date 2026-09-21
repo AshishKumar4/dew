@@ -7,6 +7,7 @@ requires an optional dependency skips.
 """
 
 import dataclasses
+import inspect
 import itertools
 import json
 import os
@@ -88,6 +89,71 @@ def test_the_streaming_spec_needs_sources_before_it_needs_the_streaming_stack():
     """Asking for nothing must fail on the spec, not on the missing dependency."""
     with pytest.raises(ValueError, match="sources="):
         dew.data.OnlineImages().load(batch=4)
+
+
+# ---------------------------------------------------------------------------------
+# What every dataset kind declares
+# ---------------------------------------------------------------------------------
+
+def _from_defaults(name):
+    """The registered kind, built from its own defaults. A field with no
+    default is one the kind cannot guess (the chat and prompt tokenizers),
+    so the test names one rather than skipping the kind."""
+    kind = datasets[name]
+    required = {field.name: "byte" for field in dataclasses.fields(kind)
+                if field.default is dataclasses.MISSING
+                and field.default_factory is dataclasses.MISSING}
+    return kind(**required)
+
+
+@pytest.mark.parametrize("name", sorted(datasets))
+def test_every_dataset_kind_carries_a_seed_and_a_loading(name):
+    """Both belong to reading any dataset, so they are declared once on
+    DatasetSpec; a kind that redeclares either can drift from it, which is
+    how the streamed spec lost its seed."""
+    spec = _from_defaults(name)
+
+    assert spec.seed == 0
+    assert isinstance(spec.loading, Loading)
+    assert dataclasses.replace(spec, seed=7, loading=Loading(workers=0)).seed == 7
+
+
+@pytest.mark.parametrize("name", sorted(datasets))
+def test_every_dataset_kind_takes_the_base_load_signature(name):
+    """A recipe holds a DatasetSpec, not the kind it named, so `load(batch=,
+    tokenize=)` has to bind on all of them."""
+    spec = _from_defaults(name)
+
+    inspect.signature(type(spec).load).bind(spec, batch=8, tokenize=None)
+
+
+def test_a_dataset_that_writes_no_captions_refuses_a_caption_reader(tmp_path):
+    """tokenize= is on every load so one caller can load any spec. A token
+    corpus has no captions, and dropping the reader silently would train a
+    conditional run on nothing."""
+    (tmp_path / "train.bin").write_bytes(np.arange(64, dtype=np.uint16).tobytes())
+    (tmp_path / "val.bin").write_bytes(np.arange(64, dtype=np.uint16).tobytes())
+    spec = dew.data.TokenWindows(path=str(tmp_path), seq_len=8, **WORKERS)
+
+    with pytest.raises(TypeError, match="TokenWindows writes no captions"):
+        spec.load(batch=2, tokenize=keep_captions)
+    assert spec.load(batch=2).records == 7
+
+
+def test_a_run_config_loads_its_dataset_through_the_base_spec(tmp_path):
+    """`RunConfig.data` is typed as the base, so the config layer reaches
+    `load` without knowing which kind it holds."""
+    from dew.config import RunConfig
+
+    (tmp_path / "train.bin").write_bytes(np.arange(64, dtype=np.uint16).tobytes())
+    (tmp_path / "val.bin").write_bytes(np.arange(64, dtype=np.uint16).tobytes())
+    config = RunConfig(data=dew.data.TokenWindows(path=str(tmp_path), seq_len=8, **WORKERS))
+
+    spec: DatasetSpec = config.data
+    data = spec.load(batch=2)
+
+    assert data.batch == 2
+    assert next(data.train())["text"].shape == (2, 9)
 
 
 # ---------------------------------------------------------------------------------

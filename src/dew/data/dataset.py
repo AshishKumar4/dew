@@ -38,6 +38,11 @@ if not flags.FLAGS.is_parsed():
 
 Batch = dict[str, Any]
 
+type Tokenize = Callable[[Sequence[str]], Batch]
+"""A run's caption reader: the batch's captions in, the batch fields its
+conditions want out. The dataset carries the text, the encoder behind this
+decides what tokens it becomes."""
+
 
 @runtime_checkable
 class Closeable(Protocol):
@@ -265,17 +270,42 @@ class Dataset:
         return epochs * self.steps_per_epoch
 
 
+@dataclasses.dataclass(frozen=True)
 class DatasetSpec(ABC):
     """What a dataset is and how it is read; a frozen dataclass per kind.
 
-    A dataset that captions its records takes `tokenize` as well. The
-    captions are the dataset's own product, and the run's condition decides
-    which encoder reads them and at which context length.
+    `seed` and `loading` belong to every kind, so they are declared once
+    here: the seed decides the record order and keys the per-record rng, and
+    `loading` is how fast the records are read, which changes no record and
+    no order. Both are keyword-only, so a kind can still declare a field of
+    its own without a default.
+
+    `load` takes `tokenize` on every kind, so a caller holding a
+    `DatasetSpec` can load any of them. A dataset that captions its records
+    hands it the captions and writes back what it returns; the captions are
+    the dataset's own product, and the run's condition decides which encoder
+    reads them and at which context length. A dataset that carries no
+    captions has nothing for a reader to read and says so (`uncaptioned`).
     """
 
+    seed: int = dataclasses.field(default=0, kw_only=True)
+    loading: Loading = dataclasses.field(default=Loading(), kw_only=True)
+
     @abstractmethod
-    def load(self, *, batch: int) -> Dataset:
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         """The dataset's batches, `batch` records a step across every process."""
+
+    def uncaptioned(self, tokenize: Tokenize | None) -> None:
+        """Refuse a caption reader handed to a dataset that writes no captions.
+
+        The parameter is on every `load` so one caller can load any spec;
+        silently dropping it would train a conditional run on nothing and
+        report no reason.
+        """
+        if tokenize is not None:
+            raise TypeError(
+                f"{type(self).__name__} writes no captions, so tokenize= has "
+                f"nothing to read; an image or video dataset takes one")
 
 
 CAPTION = "caption"
@@ -299,8 +329,7 @@ class Checkpointable(Protocol):
 
 
 def tokenized(stream: Callable[[], Iterator[Batch]],
-              tokenize: Callable[[Sequence[str]], Mapping[str, Any]] | None
-              ) -> Callable[[], Iterator[Batch]]:
+              tokenize: Tokenize | None) -> Callable[[], Iterator[Batch]]:
     """`stream` with each batch's captions replaced by what `tokenize` reads
     out of them.
 

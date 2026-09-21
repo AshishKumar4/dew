@@ -134,6 +134,8 @@ Grain lifecycle limits: the installed `DataLoaderIterator` exposes no public clo
 
 `Loading` controls Grain concurrency and buffers for built-in specifications. Use zero worker processes for small local examples; the defaults may be excessive for a tiny dataset. See [data preparation](../concepts/data.md) for field layouts and process partitioning.
 
+Every dataset specification declares `seed` and `loading` as keyword-only fields of `DatasetSpec`, and `spec.load(batch=, tokenize=None)` is the call on all of them; a specification that writes no captions raises `TypeError` for a `tokenize` reader it cannot use.
+
 
 ## Checkpoints
 

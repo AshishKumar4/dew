@@ -18,7 +18,7 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .dataset import Batch, Dataset, DatasetSpec, Loading, local_batch, train_stream, validation_pass
+from .dataset import Batch, Dataset, DatasetSpec, Tokenize, local_batch, train_stream, validation_pass
 from .tokens import bounded
 
 IDS_KEY = "input_ids"
@@ -165,10 +165,9 @@ class PreferencePairs(DatasetSpec):
     seq_len: int = 256
     pad_id: int = 0
     val_batches: int | None = 4
-    seed: int = 0
-    loading: Loading = Loading()
 
-    def load(self, *, batch: int) -> Dataset:
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
+        self.uncaptioned(tokenize)
         if (self.path is None) == (not self.records):
             raise ValueError(
                 "PreferencePairs reads one source: --data.path names a parquet file, "
