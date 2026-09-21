@@ -32,6 +32,7 @@ divides the query by sqrt(head_dim) before the logits, where the reference
 multiplies the logits after (modeling_clip.py, eager_attention_forward).
 """
 
+import dataclasses
 import json
 import os
 import shutil
@@ -45,6 +46,11 @@ from dew.nn.text_encoders import (
     CLIPModel,
     CLIPTextModel,
     CLIPTextTransformer,
+    CLIPVisionTransformer,
+    T5EncoderTransformer,
+    T5Fields,
+    TextFields,
+    VisionFields,
     translate_clip_config,
     translate_clip_weights,
     translate_config,
@@ -87,6 +93,22 @@ def image_processor(directory_or_repo):
 
 def largest_difference(actual, expected) -> float:
     return float(np.max(np.abs(np.asarray(actual, np.float32) - expected)))
+
+
+# What a translated config carries, against the module it builds. Each pair is
+# one TypedDict and the module whose init fields it names, so a field added,
+# renamed or dropped there fails here instead of becoming a key nobody reads.
+# `dtype` and `precision` are the caller's execution choices and `parent` and
+# `name` are flax's binding, so a config states none of the four.
+@pytest.mark.parametrize("record, module", [
+    (TextFields, CLIPTextTransformer),
+    (VisionFields, CLIPVisionTransformer),
+    (T5Fields, T5EncoderTransformer),
+])
+def test_a_translated_config_names_every_field_of_the_tower_it_builds(record, module):
+    declared = {field.name for field in dataclasses.fields(module)
+                if field.init} - {"parent", "name", "dtype", "precision"}
+    assert set(record.__required_keys__) | set(record.__optional_keys__) == declared
 
 
 def test_tiny_checkpoint_matches_the_reference():

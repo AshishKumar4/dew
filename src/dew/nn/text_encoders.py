@@ -34,7 +34,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Any, Mapping, NamedTuple
+from typing import Mapping, NamedTuple, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -324,7 +324,80 @@ class CLIP(nn.Module):
                 self.get_text_features(input_ids, attention_mask))
 
 
-def _quick_gelu_only(config: Mapping[str, Any]) -> None:
+# A published config is JSON, so each field arrives unnarrowed and is read
+# here or refused with the expectation named. `nn.vision` and
+# `interop.hf_decoders` read their own source configs through the same three.
+def _int(value: object, field: str) -> int:
+    """One integer field of a source config; a bool is a flag, not a width."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{field} is {value!r}, this field is an integer")
+    return value
+
+
+def _float(value: object, field: str) -> float:
+    """One real field of a source config: an epsilon, a rate, a dropout."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} is {value!r}, this field is a number")
+    return float(value)
+
+
+def _str(value: object, field: str) -> str:
+    """One named field of a source config: an activation, a projection."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field} is {value!r}, this field is a name")
+    return value
+
+
+def _record(value: object, field: str) -> Mapping[str, object]:
+    """One nested section of a source config, read field by field."""
+    if not isinstance(value, Mapping) or any(not isinstance(name, str) for name in value):
+        raise ValueError(f"{field} is {value!r}, not a config")
+    return value
+
+
+class TextFields(TypedDict):
+    """Every field of `CLIPTextTransformer` a config states, all of them read.
+
+    The keys are the module's own init fields, which
+    `tests/test_text_encoders.py` pins, so a field renamed there is a failing
+    test here rather than a key the tower never reads. `dtype` and `precision`
+    are the caller's execution choices, not the checkpoint's, so a translated
+    config carries neither and the loader passes them itself.
+    """
+
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_layers: int
+    num_heads: int
+    max_position_embeddings: int
+    layer_norm_eps: float
+    eos_token_id: int
+    activation: str
+
+
+class VisionFields(TypedDict):
+    """Every field of `CLIPVisionTransformer` a config states, minus dtype."""
+
+    hidden_size: int
+    intermediate_size: int
+    num_layers: int
+    num_heads: int
+    image_size: int
+    patch_size: int
+    num_channels: int
+    layer_norm_eps: float
+
+
+class CLIPFields(TypedDict):
+    """A full CLIP config: one record per tower, and the shared head width."""
+
+    text: TextFields
+    vision: VisionFields
+    projection_dim: int
+
+
+def _quick_gelu_only(config: Mapping[str, object]) -> None:
     activation = config.get("hidden_act", "quick_gelu")
     if activation != "quick_gelu":
         raise ValueError(
@@ -332,7 +405,7 @@ def _quick_gelu_only(config: Mapping[str, Any]) -> None:
             "quick-GELU")
 
 
-def translate_config(hf_config: Mapping[str, Any]) -> dict[str, Any]:
+def translate_config(hf_config: Mapping[str, object]) -> TextFields:
     """A CLIP config into `CLIPTextTransformer` fields.
 
     Reads a full CLIP config, which nests the tower's fields under
@@ -342,56 +415,56 @@ def translate_config(hf_config: Mapping[str, Any]) -> dict[str, Any]:
     4.16 dump of it; the loaded tree is checked against the module afterwards,
     so a config that disagrees with its weights fails there.
     """
-    text = dict(hf_config.get("text_config", hf_config))
+    text = _record(hf_config.get("text_config", hf_config), "text_config")
 
-    activation = text.get("hidden_act", "quick_gelu")
+    activation = _str(text.get("hidden_act", "quick_gelu"), "hidden_act")
     if activation not in ("quick_gelu", "gelu", "gelu_pytorch_tanh"):
         raise ValueError(f"Unsupported CLIP text activation: {activation}")
     eos_token_id = text.get("eos_token_id", 49407)
-    if not isinstance(eos_token_id, int):
+    if isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int):
         raise ValueError(
             f"eos_token_id {eos_token_id!r} names no single token, so the "
             "pooled row has no position")
 
     return {
-        "vocab_size": int(text["vocab_size"]),
-        "hidden_size": int(text["hidden_size"]),
-        "intermediate_size": int(text["intermediate_size"]),
-        "num_layers": int(text["num_hidden_layers"]),
-        "num_heads": int(text["num_attention_heads"]),
-        "max_position_embeddings": int(text["max_position_embeddings"]),
-        "layer_norm_eps": float(text.get("layer_norm_eps", 1e-5)),
+        "vocab_size": _int(text["vocab_size"], "vocab_size"),
+        "hidden_size": _int(text["hidden_size"], "hidden_size"),
+        "intermediate_size": _int(text["intermediate_size"], "intermediate_size"),
+        "num_layers": _int(text["num_hidden_layers"], "num_hidden_layers"),
+        "num_heads": _int(text["num_attention_heads"], "num_attention_heads"),
+        "max_position_embeddings": _int(text["max_position_embeddings"], "max_position_embeddings"),
+        "layer_norm_eps": _float(text.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
         "eos_token_id": eos_token_id,
         "activation": activation,
     }
 
 
-def translate_vision_config(hf_config: Mapping[str, Any]) -> dict[str, Any]:
+def translate_vision_config(hf_config: Mapping[str, object]) -> VisionFields:
     """A CLIP config into `CLIPVisionTransformer` fields, read the way
     `translate_config` reads the text ones: from `vision_config` of a full
     config or from a `CLIPVisionConfig` on its own."""
-    vision = dict(hf_config.get("vision_config", hf_config))
+    vision = _record(hf_config.get("vision_config", hf_config), "vision_config")
 
     _quick_gelu_only(vision)
     return {
-        "hidden_size": int(vision["hidden_size"]),
-        "intermediate_size": int(vision["intermediate_size"]),
-        "num_layers": int(vision["num_hidden_layers"]),
-        "num_heads": int(vision["num_attention_heads"]),
-        "image_size": int(vision["image_size"]),
-        "patch_size": int(vision["patch_size"]),
-        "num_channels": int(vision.get("num_channels", 3)),
-        "layer_norm_eps": float(vision.get("layer_norm_eps", 1e-5)),
+        "hidden_size": _int(vision["hidden_size"], "hidden_size"),
+        "intermediate_size": _int(vision["intermediate_size"], "intermediate_size"),
+        "num_layers": _int(vision["num_hidden_layers"], "num_hidden_layers"),
+        "num_heads": _int(vision["num_attention_heads"], "num_attention_heads"),
+        "image_size": _int(vision["image_size"], "image_size"),
+        "patch_size": _int(vision["patch_size"], "patch_size"),
+        "num_channels": _int(vision.get("num_channels", 3), "num_channels"),
+        "layer_norm_eps": _float(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
     }
 
 
-def translate_clip_config(hf_config: Mapping[str, Any]) -> dict[str, Any]:
+def translate_clip_config(hf_config: Mapping[str, object]) -> CLIPFields:
     """A full CLIP config into the two towers' fields and the width both
     projection heads share."""
     return {
         "text": translate_config(hf_config),
         "vision": translate_vision_config(hf_config),
-        "projection_dim": int(hf_config["projection_dim"]),
+        "projection_dim": _int(hf_config["projection_dim"], "projection_dim"),
     }
 
 
@@ -531,40 +604,47 @@ def checkpoint_leaf(
 # builds one, here and in `nn.vision` and `interop.hf_decoders`.
 type ParamTree = dict[str, np.ndarray | ParamTree]
 
+# One leaf as a tree check reads it: a stored array, or the shape-and-dtype
+# stand-in `jax.eval_shape` builds a template out of.
+type Shaped = np.ndarray | jax.Array | jax.ShapeDtypeStruct
 
-def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> dict[str, Any]:
-    params: dict[str, Any] = {}
+
+def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> ParamTree:
+    params: ParamTree = {}
     for name, tensor in hf_tensors.items():
         path = path_of(name)
         if path is None:
             continue
         node = params
         for key in path[:-1]:
-            node = node.setdefault(key, {})
+            child = node.setdefault(key, {})
+            if not isinstance(child, dict):
+                raise ValueError(f"{name} crosses the tensor already at {key!r}")
+            node = child
         node[path[-1]] = checkpoint_leaf(path, tensor, param_dtype)
     return params
 
 
 def translate_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> dict[str, Any]:
+) -> ParamTree:
     """Text-tower parameters; storage precision is independent of compute dtype."""
     return _translate(hf_tensors, _text_path, param_dtype)
 
 
 def translate_clip_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> dict[str, Any]:
+) -> ParamTree:
     """Full CLIP parameters, with FP32 storage unless explicitly requested otherwise."""
     return _translate(hf_tensors, _clip_path, param_dtype)
 
 
-def _flat(tree) -> dict[str, Any]:
+def _flat(tree: Mapping[str, object]) -> dict[str, Shaped]:
     leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
     return {".".join(entry.key for entry in path): leaf for path, leaf in leaves}
 
 
-def _check_tree(params: Mapping[str, Any], module: nn.Module, *inputs) -> None:
+def _check_tree(params: Mapping[str, object], module: nn.Module, *inputs) -> None:
     """Refuse a tree the module would not accept, naming what is off.
 
     jax.eval_shape builds the template from shapes alone, so checking the real
@@ -602,9 +682,9 @@ def _checkpoint_dir(name_or_dir: str, revision: str | None, *, weights: bool = T
                                   allow_patterns=[CONFIG_FILE, *(["model*.safetensors"] if weights else [])]))
 
 
-def _read_config(directory: Path) -> dict[str, Any]:
+def _read_config(directory: Path) -> Mapping[str, object]:
     with open(directory / CONFIG_FILE) as handle:
-        return json.load(handle)
+        return _record(json.load(handle), CONFIG_FILE)
 
 
 def _read_tensors(directory: Path) -> dict[str, np.ndarray]:
@@ -623,6 +703,8 @@ def _read_tensors(directory: Path) -> dict[str, np.ndarray]:
         for name, tensor in load_params(shard).items():
             if name in tensors:
                 raise ValueError(f"tensor {name!r} is in more than one shard")
+            if not isinstance(tensor, np.ndarray):
+                raise ValueError(f"{name!r} holds a group of tensors; a checkpoint name is one array")
             tensors[name] = tensor
     return tensors
 
@@ -978,20 +1060,38 @@ class T5EncoderTransformer(nn.Module):
         return self.dropout(hidden_states, deterministic=not train)
 
 
-def translate_t5_config(hf_config: Mapping[str, Any]) -> dict[str, Any]:
+class T5Fields(TypedDict):
+    """Every field of `T5EncoderTransformer` a config states, minus dtype."""
+
+    vocab_size: int
+    d_model: int
+    d_ff: int
+    num_layers: int
+    num_heads: int
+    head_dim: int
+    num_buckets: int
+    max_distance: int
+    feed_forward_proj: str
+    dropout_rate: float
+    layer_norm_epsilon: float
+
+
+def translate_t5_config(hf_config: Mapping[str, object]) -> T5Fields:
     """A T5 config into `T5EncoderTransformer` fields."""
     return {
-        "vocab_size": hf_config["vocab_size"],
-        "d_model": hf_config["d_model"],
-        "d_ff": hf_config["d_ff"],
-        "num_layers": hf_config["num_layers"],
-        "num_heads": hf_config["num_heads"],
-        "head_dim": hf_config["d_kv"],
-        "num_buckets": hf_config.get("relative_attention_num_buckets", 32),
-        "max_distance": hf_config.get("relative_attention_max_distance", 128),
-        "feed_forward_proj": hf_config.get("feed_forward_proj", "relu"),
-        "dropout_rate": hf_config.get("dropout_rate", 0.0),
-        "layer_norm_epsilon": hf_config.get("layer_norm_epsilon", 1e-6),
+        "vocab_size": _int(hf_config["vocab_size"], "vocab_size"),
+        "d_model": _int(hf_config["d_model"], "d_model"),
+        "d_ff": _int(hf_config["d_ff"], "d_ff"),
+        "num_layers": _int(hf_config["num_layers"], "num_layers"),
+        "num_heads": _int(hf_config["num_heads"], "num_heads"),
+        "head_dim": _int(hf_config["d_kv"], "d_kv"),
+        "num_buckets": _int(hf_config.get("relative_attention_num_buckets", 32),
+                            "relative_attention_num_buckets"),
+        "max_distance": _int(hf_config.get("relative_attention_max_distance", 128),
+                             "relative_attention_max_distance"),
+        "feed_forward_proj": _str(hf_config.get("feed_forward_proj", "relu"), "feed_forward_proj"),
+        "dropout_rate": _float(hf_config.get("dropout_rate", 0.0), "dropout_rate"),
+        "layer_norm_epsilon": _float(hf_config.get("layer_norm_epsilon", 1e-6), "layer_norm_epsilon"),
     }
 
 
@@ -1057,7 +1157,7 @@ def t5_embedding(hf_tensors: Mapping[str, np.ndarray]) -> None:
 
 def translate_t5_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> dict[str, Any]:
+) -> ParamTree:
     """HF T5 encoder tensors into a parameter tree at the requested precision.
 
     Dense kernels transpose from torch to Linen; embeddings, norms and
