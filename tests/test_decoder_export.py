@@ -1,21 +1,16 @@
-"""Trained source-format exports of the routed and per-kind-rope decoder
-families.
+"""Source-format decoder lifecycles on committed tiny fixtures.
 
-`load_pretrained` binds every tensor of these checkpoints to the leaf it
-loaded into, so a trained model writes back into the source's own tensor
-names beside the config and generation config it came with, rather than a
-config derived from the built model. These cases run that path end to end
-on the committed tiny checkpoints: one real `Trainer` step of plain SGD
-under `LMObjective`, `Pretrained.save`, then the export read back by
-`load_pretrained` and by transformers 5.16.1 on the same ids.
+One real Trainer step under LMObjective is exported through Pretrained.save,
+reloaded by Dew, and read by the declared Transformers implementation. Tests
+enforce source names, layouts, tokenizer assets, numerical bounds and gradient
+coverage; tools/decoder_export_reference.py reports per-run measurements.
 
 tools/decoder_export_reference.py owns the pipeline and prints the numbers:
 
     JAX_PLATFORMS=cpu PYTHONPATH=src python tools/decoder_export_reference.py
 
 Observed on CPU in fp32, every position's argmax equal and the tolerance
-1e-4 on the logit difference scaled by the largest reference logit (the
-logits are of magnitude 6), over the trained export:
+1e-4 on logits of magnitude 6, over the trained export:
 
 | family       | source tensors | per-expert | max abs logit difference |
 | ------------ | -------------- | ---------- | ------------------------ |
@@ -63,6 +58,12 @@ missing and 36 unexpected keys.
 
 The tiny checkpoints carry no tokenizer, so the tokenizer half of an export
 is exercised on a copy of one with the committed byte-level BPE beside it.
+
+Fused and per-expert layouts exercise their respective inverse mappings.
+Prediction tensors omitted by upstream trunk classes are checked separately,
+not treated as evidence of an executed upstream prediction layer. Gradient
+scope is stated by each gate. Released-scale and tied-selector behavior are
+not established by the tiny untied-cutoff fixtures.
 """
 
 import dataclasses
@@ -87,16 +88,17 @@ MOVEMENT = 1e-4
 # stacks and the export slices back apart. Llama 4 fuses its experts
 # instead and is covered by every other case here.
 INDEXED = ("mixtral", "qwen3_moe", "glm4_moe", "glm_moe_dsa", "deepseek_v2",
-           "deepseek_v3", "deepseek_v32", "kimi_k2", "qwen3_next")
+           "deepseek_v3", "deepseek_v32", "kimi_k2", "qwen3_next", "glm5_next")
 
 
 CASES = {case.name: case for case in tool.CASES}
 BALANCED = tuple(name for name, case in CASES.items() if case.balance_rate is not None)
-MTP = tuple(name for name, case in CASES.items() if case.mtp_weight is not None)
+# GLM-4 and GLM DSA ship embedding/head copies; GLM-5.3-Flash and Qwen do not.
+COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # The families whose training claim is held to the reference's gradients
 # too: dew's gradient of the next-token cross entropy, written back into
 # the source's tensor layout, against the reference's `.grad`.
-GRADIENTS = ("glm_moe_dsa",)
+GRADIENTS = ("glm_moe_dsa", "qwen3_next", "glm5_next")
 GRADIENT = 1e-4
 
 
@@ -187,10 +189,10 @@ def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip
 
 def test_transformers_reads_the_trained_export(trip):
     """The export is a checkpoint the reference implementation loads: same
-    argmax at every position and the same logits within fp32 rounding."""
-    assert np.array_equal(np.argmax(trip.ours, axis=-1), np.argmax(trip.theirs, axis=-1))
-    difference = float(np.max(np.abs(trip.ours - trip.theirs)) / np.max(np.abs(trip.theirs)))
-    assert difference < LOGITS, f"max scaled |logit difference| {difference:.3e}"
+    ids, same argmax, and the logits agree to 1e-4."""
+    assert np.array_equal(np.argmax(trip.theirs, -1), np.argmax(trip.ours, -1))
+    difference = float(np.max(np.abs(trip.theirs - trip.ours)))
+    assert difference < LOGITS, f"max |logit difference| {difference:.3e}"
 
 
 def test_the_export_keeps_the_sources_config_and_generation_config(trip):
@@ -199,9 +201,13 @@ def test_the_export_keeps_the_sources_config_and_generation_config(trip):
     reference reads and the loader ignores."""
     directory = FIXTURES / trip.case.fixture
 
-    for name in ("config.json", "generation_config.json"):
-        assert (json.loads((trip.export / name).read_text())
-                == json.loads((directory / name).read_text())), name
+    assert json.loads((trip.export / 'config.json').read_text()) == json.loads(
+        (directory / 'config.json').read_text())
+    source_file = directory / 'generation_config.json'
+    exported_file = trip.export / 'generation_config.json'
+    expected = json.loads(source_file.read_text()) if source_file.exists() else {}
+    actual = json.loads(exported_file.read_text()) if exported_file.exists() else {}
+    assert actual == expected, 'generation_config.json'
 
 
 def test_a_rotated_expert_index_writes_a_model_that_disagrees(indexed, tmp_path):
@@ -241,7 +247,7 @@ def test_an_expert_index_past_the_stack_is_refused(indexed):
         beyond.export(trip.trained)
 
 
-@pytest.mark.parametrize("name", MTP, ids=MTP)
+@pytest.mark.parametrize("name", COPIED_MTP, ids=COPIED_MTP)
 def test_the_mtp_copies_carry_the_trained_embedding_and_head(name, trips):
     """GLM's prediction depth ships copies of the trunk's embedding and
     head, which it shares. The export writes the trained weights into both
@@ -258,14 +264,35 @@ def test_the_mtp_copies_carry_the_trained_embedding_and_head(name, trips):
         assert moved > MOVEMENT, f"{copy} still holds the checkpoint's values"
 
 
+def test_glm5_next_trained_prediction_depth_reads_its_export(trips):
+    trip = trips('glm5_next')
+    model = trip.source.model
+    states, _ = model.apply(trip.trained, trip.ids, method=model.states_and_logits)
+    assert np.shape(states) == (*trip.ids.shape, model.emb_features)
+    actual = np.asarray(model.apply(
+        trip.trained, states, trip.ids, method=model.mtp_logits)[0])
+    expected = tool.glm5_prediction_logits(trip.case, trip.export, trip.ids)
+    np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
+    difference = float(np.max(np.abs(actual - expected)))
+    assert difference < LOGITS, f"max |prediction-logit difference| {difference:.3e}"
+    projection = f'model.layers.{model.num_layers}.eh_proj.weight'
+    assert np.any(trip.exported_tensors[projection] != trip.source_tensors[projection])
+
+
 @pytest.mark.parametrize("name", GRADIENTS, ids=GRADIENTS)
 def test_the_gradients_match_the_reference_implementation(name, trips):
-    """One training step is what the export carries, so the step's
-    gradient is held to the reference's: every source tensor the reference
-    holds a gradient for, at a scaled error below 1e-4 (glm_moe_dsa:
-    224 tensors, observed 1.5e-06)."""
-    errors = tool.gradient_parity(trips(name))
-    assert len(errors) > 100, f"{name} compared {len(errors)} tensors"
+    """Compare all trunk next-token CE gradients by source tensor name.
+
+    This gate does not claim prediction-loss gradient parity: the ordinary
+    reference classes do not execute those depths. Selector gradients must
+    be absent in the reference and exactly zero in Dew. The helper starts
+    from every non-None upstream gradient and enforces the source/layout
+    bijection before reporting errors.
+    """
+    trip = trips(name)
+    errors = tool.gradient_parity(trip)
+    nonfinite = {tensor: error for tensor, error in errors.items() if not np.isfinite(error)}
+    assert not nonfinite, nonfinite
     worst = max(errors, key=errors.__getitem__)
     assert errors[worst] < GRADIENT, f"{worst} gradient scaled error {errors[worst]:.3e}"
 
@@ -673,3 +700,96 @@ def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tm
         collection = "params" if mode == "trainable" else "constants"
         np.testing.assert_array_equal(restored.variables["constants"][layer]["layer_scalar"],
                                       variables[collection][layer]["layer_scalar"])
+
+
+def glm5_native_export_case(variant):
+    import jax.numpy as jnp
+    from flax.core import unfreeze
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
+    from dew.nn.kda import KimiDeltaAttentionMixer
+
+    source = load_pretrained(FIXTURES / "glm5-next-tiny", dtype="float32", attention_impl="reference")
+    model, variables = source.model, unfreeze(dict(source.variables))
+    assert isinstance(model, CausalTransformer)
+    params = variables["params"]
+    if variant == "native_geometry":
+        assert model.kinds is not None
+        kinds = dict(model.kinds)
+        linear, sparse = kinds["linear_attention"].mixer, kinds["full_attention"].mixer
+        assert isinstance(linear, KimiDeltaAttentionMixer) and isinstance(sparse, KPoolSparseAttentionMixer)
+        kinds["linear_attention"] = dataclasses.replace(
+            kinds["linear_attention"], mixer=dataclasses.replace(linear, linear_lower_bound=None))
+        kinds["full_attention"] = dataclasses.replace(
+            kinds["full_attention"], mixer=dataclasses.replace(
+                sparse, index_kpool=3, index_topk=6, index_kpool_always_select_tail=False))
+        assert model.mixture is not None
+        model = model.clone(kinds=kinds, tie_embeddings=True, index_share_for_mtp_iteration=False,
+                            mixture=dataclasses.replace(model.mixture, layers=(1, 3, 4), norm_topk_prob=False))
+        del params["lm_head"]
+        params["layers_1"]["mlp"] = jax.tree.map(lambda leaf: leaf, params["layers_4"]["mlp"])
+        variables["moe"]["layers_1"] = jax.tree.map(lambda leaf: leaf, variables["moe"]["layers_4"])
+        for block in (params["layers_3"], params["mtp_0"]["block"]):
+            indexer = block["self_attn"]["indexer"]
+            ape = indexer["index_kpool_compress_ape"]
+            indexer["index_kpool_compress_ape"] = jnp.concatenate([ape, ape[:1]], axis=0)
+    elif variant == "dense":
+        model = model.clone(mixture=None, num_nextn_predict_layers=0, index_share_for_mtp_iteration=False)
+        for index in (3, 4):
+            params[f"layers_{index}"]["mlp"] = jax.tree.map(lambda leaf: leaf, params["layers_0"]["mlp"])
+        del params["mtp_0"]
+        del variables["moe"]
+    params["norm"]["scale"] = params["norm"]["scale"] * jnp.float32(1.125)
+    for index in range(model.num_layers):
+        for site in ("attn_hc", "ffn_hc"):
+            params[f"layers_{index}"][site]["scale"] = (
+                params[f"layers_{index}"][site]["scale"] * jnp.float32(0.8) + jnp.float32(0.1))
+    if model.num_nextn_predict_layers:
+        params["mtp_0"]["final_norm"]["scale"] = params["mtp_0"]["final_norm"]["scale"] * jnp.float32(1.25)
+    if "moe" in variables:
+        variables["moe"] = jax.tree.map(
+            lambda leaf: leaf + jnp.linspace(-0.01, 0.01, leaf.size, dtype=leaf.dtype).reshape(leaf.shape),
+            variables["moe"])
+    ids = np.load(FIXTURES / "glm5-next-tiny" / "input_ids.npy")
+    return model, variables, ids
+
+
+@pytest.mark.parametrize("variant", ["released", "native_geometry", "dense"])
+def test_standalone_glm5_export_preserves_native_and_source_computation(variant, tmp_path):
+    import jax.numpy as jnp
+    from dew.interop.hf_decoders import save_pretrained_decoder
+    from dew.sampling import Sampling, Speculative, generate
+
+    model, variables, ids = glm5_native_export_case(variant)
+    expected = np.asarray(jax.jit(model.apply)(variables, jnp.asarray(ids)))
+    cache = model.apply(variables, ids.shape[0], method="init_cache", mutable=["cache"])[1]
+    if model.num_nextn_predict_layers:
+        cache = model.apply({**variables, **cache}, ids.shape[0], method="init_mtp_cache", mutable=["cache"])[1]
+    save_pretrained_decoder(model, {**variables, **cache}, tmp_path)
+    restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
+    actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, jnp.asarray(ids)))
+    np.testing.assert_allclose(actual, expected, atol=LOGITS, rtol=0)
+    np.testing.assert_allclose(tool.reference_logits(CASES["glm5_next"], tmp_path, ids),
+                               expected, atol=LOGITS, rtol=0)
+    written = json.loads((tmp_path / "config.json").read_text())
+    assert written["index_share_for_mtp_iteration"] == model.index_share_for_mtp_iteration
+    if model.num_nextn_predict_layers:
+        states = model.apply(variables, jnp.asarray(ids), method="hidden_states")
+        prediction = model.apply(variables, states, jnp.asarray(ids), method="mtp_logits")[0]
+        reloaded_states = restored.model.apply(restored.variables, jnp.asarray(ids), method="hidden_states")
+        reloaded_prediction = restored.model.apply(
+            restored.variables, reloaded_states, jnp.asarray(ids), method="mtp_logits")[0]
+        np.testing.assert_allclose(reloaded_prediction, prediction, atol=LOGITS, rtol=0)
+        np.testing.assert_allclose(tool.glm5_prediction_logits(CASES["glm5_next"], tmp_path, ids),
+                                   prediction, atol=LOGITS, rtol=0)
+        ordinary = generate(model, variables, jnp.asarray(ids[:, :5]), 4, key=jax.random.key(0),
+                            sampling=Sampling(temperature=0)).host()
+        speculative = restored.text_generation(sampling=Sampling(temperature=0))(
+            ids[:, :5], max_new_tokens=4, seed=0, strategy=Speculative(block=3)).host()
+        np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
+        np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
+    for collection in ("params", "moe"):
+        if collection in variables:
+            actual_leaves = flat(restored.variables[collection])
+            for name, value in flat(variables[collection]).items():
+                np.testing.assert_array_equal(actual_leaves[name], value)

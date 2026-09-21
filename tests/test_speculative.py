@@ -46,7 +46,7 @@ def scripted(target, drafts, rows):
         return (state, jnp.broadcast_to(target, (rows, width, VOCAB)),
                 jnp.zeros((rows, width, HIDDEN), jnp.float32))
 
-    def propose(state, states, tokens, embeds, valid, positions, depth):
+    def propose(state, states, tokens, embeds, valid, positions, depth, prediction_phase):
         width = valid.shape[1]
         scores = drafts[calls["index"] % len(drafts)]
         calls["index"] += width
@@ -274,8 +274,9 @@ def test_a_rejected_prefix_leaves_the_prediction_cache_teacher_forced():
         jnp.ones((2, 2), bool),
         jnp.broadcast_to(jnp.arange(prompt.shape[1], width)[None, :], (2, 2)),
         jnp.ones(2, jnp.int32), prior_tokens=jnp.full(2, prompt.shape[1], jnp.int32))
-    _, cached, _ = ops.propose(state, ahead[:, -1:], jnp.asarray([[7], [7]], jnp.int32), None,
-                               jnp.ones((2, 1), bool), jnp.full((2, 1), width, jnp.int32), 0)
+    _, cached, _ = ops.propose(
+        state, ahead[:, -1:], jnp.asarray([[7], [7]], jnp.int32), None,
+        jnp.ones((2, 1), bool), jnp.full((2, 1), width, jnp.int32), 0, "ordinary")
 
     grown = jnp.concatenate([realized, jnp.asarray([[7], [7]], jnp.int32)], axis=1)
     after = model.apply(params, grown, method=model.hidden_states)
@@ -338,9 +339,9 @@ def test_the_prediction_cache_matches_a_teacher_forced_reference():
 
     ops = _operations(model, params, 0, 1)
     seeded, _ = _prefill(model, params, ModelInputs(prompt[:, :-1]), ops)
-    _, cached, _ = ops.propose(seeded, states[:, width - 2:width - 1], prompt[:, width - 1:width],
-                               None, jnp.ones((2, 1), bool),
-                               jnp.full((2, 1), width - 1, jnp.int32), 0)
+    _, cached, _ = ops.propose(
+        seeded, states[:, width - 2:width - 1], prompt[:, width - 1:width], None,
+        jnp.ones((2, 1), bool), jnp.full((2, 1), width - 1, jnp.int32), 0, "ordinary")
     largest = float(np.max(np.abs(np.asarray(cached)[:, 0] - np.asarray(reference)[:, -1])))
     assert largest < 2e-5, f"largest difference {largest:g}"
 
@@ -353,9 +354,9 @@ def test_the_prediction_cache_matches_a_teacher_forced_reference():
                   model.apply(params, grown[:, width:width + 1], method=model.token_embeddings),
                   jnp.ones((2, 1), bool), jnp.full((2, 1), width, jnp.int32),
                   jnp.zeros(2, jnp.int32), prior_tokens=jnp.full(2, width, jnp.int32))[0]
-    _, after, _ = ops.propose(full, ahead[:, width:width + 1], jnp.asarray([[5], [5]], jnp.int32),
-                              None, jnp.ones((2, 1), bool),
-                              jnp.full((2, 1), width + 1, jnp.int32), 0)
+    _, after, _ = ops.propose(
+        full, ahead[:, width:width + 1], jnp.asarray([[5], [5]], jnp.int32), None,
+        jnp.ones((2, 1), bool), jnp.full((2, 1), width + 1, jnp.int32), 0, "ordinary")
     plain = model.apply(
         params, jnp.concatenate([ahead, ahead[:, -1:]], axis=1)[:, :-1],
         jnp.concatenate([grown[:, 1:], jnp.asarray([[5], [5]], jnp.int32)], axis=1), depth=0,
@@ -417,7 +418,7 @@ def test_explicit_prompt_coordinates_reach_the_prediction_cache():
     seeded, _ = _prefill(model, params,
                          ModelInputs(prompt[:, :-1], {"positions": coordinates[:, :-1]}), ops)
     _, cached, _ = ops.propose(seeded, states[:, -2:-1], prompt[:, -1:], None,
-                               jnp.ones((1, 1), bool), coordinates[:, -1:], 0)
+                               jnp.ones((1, 1), bool), coordinates[:, -1:], 0, "ordinary")
     largest = float(np.max(np.abs(np.asarray(cached)[:, 0] - np.asarray(reference)[:, -1])))
     assert largest < 3e-5, f"largest difference {largest:g}"
 
@@ -459,7 +460,7 @@ def test_a_draft_after_an_advance_is_proposed_at_the_advanced_coordinate():
                             prior_tokens=jnp.full(1, 3, jnp.int32))
     assert ops.propose is not None
     _, proposed, _ = ops.propose(advanced, states[:, 3:4], grown[:, 4:5], None,
-                                 jnp.ones((1, 1), bool), base[:, :1], 0)
+                                 jnp.ones((1, 1), bool), base[:, :1], 0, "ordinary")
     np.testing.assert_allclose(proposed[:, 0], reference[:, -1], atol=3e-6, rtol=0)
 
 
@@ -516,8 +517,9 @@ def test_a_media_prompt_seeds_the_depths_with_its_prepared_embeddings():
     seeded, _ = _prefill(model, params,
                          ModelInputs(prompt[:, :-1], {"image_indices": indices[:, :-1]},
                                      {"pixel_values": pixels}), ops)
-    _, _, produced = ops.propose(seeded, states[:, -2:-1], prompt[:, -1:], None,
-                                 jnp.ones((1, 1), bool), jnp.full((1, 1), width - 1, jnp.int32), 0)
+    _, _, produced = ops.propose(
+        seeded, states[:, -2:-1], prompt[:, -1:], None,
+        jnp.ones((1, 1), bool), jnp.full((1, 1), width - 1, jnp.int32), 0, "ordinary")
     largest = float(np.max(np.abs(np.asarray(produced)[:, 0] - np.asarray(reference)[:, -1])))
     assert largest < 3e-5, f"largest difference {largest:g}"
 
@@ -552,8 +554,9 @@ def test_multi_axis_rotary_coordinates_reach_the_depths():
     ops = _operations(model, params, 0, 1)
     seeded, _ = _prefill(model, params,
                          ModelInputs(tokens[:, :-1], {"rotary_positions": rotary[:, :-1]}), ops)
-    _, _, produced = ops.propose(seeded, states[:, -2:-1], tokens[:, -1:], None,
-                                 jnp.ones((1, 1), bool), jnp.full((1, 1), 5, jnp.int32), 0)
+    _, _, produced = ops.propose(
+        seeded, states[:, -2:-1], tokens[:, -1:], None,
+        jnp.ones((1, 1), bool), jnp.full((1, 1), 5, jnp.int32), 0, "ordinary")
     largest = float(np.max(np.abs(np.asarray(produced)[:, 0] - np.asarray(reference)[:, -1])))
     assert largest < 3e-5, f"largest difference {largest:g}"
     # The continuation coordinate is the model's own, not the token count.
@@ -606,7 +609,7 @@ def test_a_padded_prompt_seeds_the_depths_at_its_logical_coordinates():
     ops = _operations(model, params, 0, 1)
     seeded, _ = _prefill(model, params, ModelInputs(padded, {"attention_mask": mask}), ops)
     _, cached, _ = ops.propose(seeded, states[:, 2:3], grown[:, 3:4], None,
-                               jnp.ones((1, 1), bool), jnp.asarray([[3]], jnp.int32), 0)
+                               jnp.ones((1, 1), bool), jnp.asarray([[3]], jnp.int32), 0, "ordinary")
     largest = float(np.max(np.abs(np.asarray(cached)[:, 0] - np.asarray(reference)[:, -1])))
     assert largest < 3e-5, f"largest difference {largest:g}"
 
@@ -669,5 +672,50 @@ def test_prediction_depths_resume_from_real_history_not_rotary_coordinates(prefi
         jnp.asarray([emitted.shape[1] - 1], jnp.int32),
         prior_tokens=jnp.asarray([prefix], jnp.int32))
     _, proposed, _ = ops.propose(state, carried[1][:, None], whole[:, -1:], None,
-                                 jnp.ones((1, 1), bool), positions[:, -1:], 1)
+                                 jnp.ones((1, 1), bool), positions[:, -1:], 1, "ordinary")
     np.testing.assert_allclose(proposed[:, 0], reference[:, -1], atol=3e-6, rtol=0)
+
+
+def test_prediction_index_reuse_reseeds_each_rows_accepted_history():
+    from dataclasses import replace
+    from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.strategies import reseed
+    from dew.sampling.text import _operations, _prefill
+
+    mixer = KPoolSparseAttentionMixer(
+        q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=8, v_head_dim=8,
+        index_n_heads=2, index_head_dim=8, index_topk=2, index_kpool=2)
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+        mlp_features=32, max_seq_len=16, dtype="float32", mixer=mixer,
+        num_nextn_predict_layers=1, index_share_for_mtp_iteration=True)
+    prompt = jnp.asarray([[1, 2, 3, 4], [0, 0, 5, 6]], jnp.int32)
+    valid = prompt != 0
+    params = params_of(model, prompt)
+    ops = _operations(model, params, 0, 1)
+    assert ops.propose is not None and ops.verify is not None and ops.embed is not None
+    seeded, _ = _prefill(model, params, ModelInputs(prompt, {"attention_mask": valid}), ops)
+    assert seeded.hidden is not None
+    saved = seeded.cache
+    drafted, _, produced = ops.propose(
+        seeded, seeded.hidden[:, None], jnp.asarray([[10], [11]]), None,
+        jnp.ones((2, 1), bool), jnp.asarray([[4], [2]]), 0, "draft")
+    drafted, _, _ = ops.propose(
+        drafted, produced, jnp.asarray([[11], [12]]), None,
+        jnp.ones((2, 1), bool), jnp.asarray([[5], [3]]), 0, "draft")
+    emitted = jnp.asarray([[7, 8], [9, 0]])
+    keep = emitted != 0
+    replayed, _, seen = ops.verify(replace(drafted, cache=saved), emitted, keep)
+    assert seen is not None
+    positions = jnp.asarray([[4, 5], [2, 3]])
+    corrected, _, _ = reseed(
+        ops, replayed, (seeded.hidden,), seen, ops.embed(emitted), keep, positions,
+        jnp.asarray([1, 0]), prior_tokens=jnp.asarray([4, 2]))
+    whole = jnp.concatenate([prompt, emitted], axis=1)
+    canonical, _ = _prefill(model, params, ModelInputs(whole, {"attention_mask": whole != 0}), ops)
+    seed = corrected.cache["mtp_0"]["block"]["self_attn"]
+    np.testing.assert_array_equal(seed["selection_position"], [4, 1])
+    for wanted, actual in zip(jax.tree.leaves(canonical.cache["mtp_0"]),
+                              jax.tree.leaves(corrected.cache["mtp_0"]), strict=True):
+        np.testing.assert_allclose(actual, wanted, atol=1e-4, rtol=0)

@@ -283,3 +283,122 @@ def test_the_kind_builds_from_the_configs_fields_and_is_nope():
 def test_a_budget_the_pool_does_not_divide_is_refused():
     with pytest.raises(ValueError, match="divisible"):
         module(index_topk=5).init(jax.random.key(0), jnp.zeros((1, 4, E), jnp.float32))
+
+
+def selection_step(block, variables, cache, x, valid, phase):
+    return jax.jit(lambda state, values, active: block.apply(
+        {**variables, "cache": state}, values, decode=True,
+        attention_metadata=AttentionMetadata(valid=active),
+        prediction_phase=phase, mutable=["cache"]))(cache, x, valid)
+
+
+def test_prediction_selection_seed_miss_hit_and_fixed_tail():
+    block = module()
+    variables = translated(reference_block())
+    hidden, valid = inputs()
+    x, active = jnp.asarray(hidden), jnp.asarray(valid)
+    _, allocated = block.apply(variables, x[:, :1], decode=True,
+                               prediction_phase="extend", mutable=["cache"])
+    np.testing.assert_array_equal(allocated["cache"]["selection_position"], [-1, -1])
+    _, extended = selection_step(block, variables, allocated["cache"], x[:, :5], active[:, :5], "extend")
+    seed = extended["cache"]
+    np.testing.assert_array_equal(seed["selection_position"], [4, 1])
+    assert 4 in np.asarray(seed["selection_indices"])[0]
+    mixed = {**seed, "selection_position": seed["selection_position"].at[1].set(-1)}
+    _, drafted = selection_step(block, variables, mixed, x[:, 5:6], active[:, 5:6], "draft")
+    np.testing.assert_array_equal(drafted["cache"]["selection_indices"][0], seed["selection_indices"][0])
+    np.testing.assert_array_equal(drafted["cache"]["selection_position"], [4, 2])
+    assert 2 in np.asarray(drafted["cache"]["selection_indices"])[1]
+    _, next_draft = selection_step(block, variables, drafted["cache"], x[:, 6:7], active[:, 6:7], "draft")
+    np.testing.assert_array_equal(next_draft["cache"]["selection_indices"], drafted["cache"]["selection_indices"])
+    assert 6 not in np.asarray(next_draft["cache"]["selection_indices"])[0]
+    ordinary, cleared = selection_step(block, variables, next_draft["cache"], x[:, 7:8], active[:, 7:8], "ordinary")
+    canonical = {name: value for name, value in next_draft["cache"].items()
+                 if name not in ("selection_indices", "selection_position")}
+    expected, _ = selection_step(block, variables, canonical, x[:, 7:8], active[:, 7:8], "ordinary")
+    np.testing.assert_allclose(ordinary, expected, atol=BOUND, rtol=0)
+    np.testing.assert_array_equal(cleared["cache"]["selection_position"], [-1, -1])
+
+
+def test_prediction_selection_empty_seed_inactive_rows_and_reordering():
+    from dew.nn.backbones.causal_transformer import gather_cache_rows
+
+    block = module(index_kpool_always_select_tail=False)
+    variables = translated(reference_block())
+    hidden, _ = inputs()
+    x = jnp.asarray(hidden)
+    valid = jnp.asarray([[True], [False]])
+    _, allocated = block.apply(variables, x[:, :1], decode=True,
+                               prediction_phase="extend", mutable=["cache"])
+    _, extended = selection_step(block, variables, allocated["cache"], x[:, :1], valid, "extend")
+    np.testing.assert_array_equal(extended["cache"]["selection_position"], [0, -1])
+    np.testing.assert_array_equal(extended["cache"]["selection_indices"], -jnp.ones((2, 4), jnp.int32))
+    out, drafted = selection_step(block, variables, extended["cache"], x[:, 1:2], valid, "draft")
+    np.testing.assert_array_equal(drafted["cache"]["selection_indices"][0], [-1, -1, -1, -1])
+    for name, value in extended["cache"].items():
+        np.testing.assert_array_equal(drafted["cache"][name][1], value[1])
+    rows = jnp.asarray([1, 0, 0])
+    reordered, _ = selection_step(block, variables, gather_cache_rows(extended["cache"], rows),
+                                  x[rows, 1:2], valid[rows], "draft")
+    np.testing.assert_allclose(reordered, out[rows], atol=BOUND, rtol=0)
+
+
+def test_prediction_selection_rewind_recomputes_only_invalidated_row():
+    block = module()
+    variables = translated(reference_block())
+    hidden, _ = inputs()
+    x, valid = jnp.asarray(hidden), jnp.ones((2, 5), bool)
+    _, allocated = block.apply(variables, x[:, :1], decode=True,
+                               prediction_phase="extend", mutable=["cache"])
+    _, extended = selection_step(block, variables, allocated["cache"], x[:, :5], valid, "extend")
+    cache = {**extended["cache"], "cache_index": jnp.asarray([3, 5], jnp.int32)}
+    _, drafted = selection_step(block, variables, cache, x[:, 5:6], valid[:, :1], "draft")
+    np.testing.assert_array_equal(drafted["cache"]["selection_position"], [3, 4])
+    np.testing.assert_array_equal(drafted["cache"]["selection_indices"][1], cache["selection_indices"][1])
+    assert 4 not in np.asarray(drafted["cache"]["selection_indices"])[0]
+    fresh = {**cache, "selection_position": jnp.full((2,), -1, jnp.int32)}
+    _, recomputed = selection_step(block, variables, fresh, x[:, 5:6], valid[:, :1], "draft")
+    np.testing.assert_array_equal(drafted["cache"]["selection_indices"][0],
+                                  recomputed["cache"]["selection_indices"][0])
+    inactive_rewound = {
+        **drafted["cache"],
+        "cache_index": drafted["cache"]["cache_index"].at[1].set(3),
+        "cache_valid": drafted["cache"]["cache_valid"].at[1].set(jnp.arange(block.max_seq_len) < 3),
+    }
+    _, held = selection_step(block, variables, inactive_rewound, x[:, 6:7],
+                              jnp.asarray([[True], [False]]), "draft")
+    for name, value in inactive_rewound.items():
+        np.testing.assert_array_equal(held["cache"][name][1], value[1])
+    actual, reactivated = selection_step(block, variables, held["cache"], x[:, 7:8], valid[:, :1], "draft")
+    np.testing.assert_array_equal(reactivated["cache"]["selection_position"], [3, 3])
+    fresh = {**held["cache"], "selection_position": held["cache"]["selection_position"].at[1].set(-1)}
+    expected, recomputed = selection_step(block, variables, fresh, x[:, 7:8], valid[:, :1], "draft")
+    np.testing.assert_allclose(actual[1], expected[1], atol=BOUND, rtol=0)
+    np.testing.assert_array_equal(reactivated["cache"]["selection_indices"][1],
+                                  recomputed["cache"]["selection_indices"][1])
+
+
+def test_the_pool_selection_breaks_a_tie_at_the_lower_token_index():
+    """Pools that score equally go to the lower token indices, and a pool
+    the query cannot see stays unselected however the tie falls: every pool
+    scores exactly zero with the head weights zeroed, so the tie rule alone
+    decides the twelve-token selection."""
+    from dew.nn.dsa_kpool import KPoolIndexer
+
+    indexer = KPoolIndexer(emb_features=E, n_heads=2, head_dim=4, top_k=6, kpool=3,
+                           always_select_tail=False)
+    total = 12
+    x = jax.random.normal(jax.random.key(0), (1, total, E), jnp.float32)
+    packed = jnp.concatenate(
+        [jax.random.normal(jax.random.key(1), (1, total, 8), jnp.float32),
+         jnp.ones((1, total, 1), jnp.float32)], axis=-1)
+    visible = jnp.tril(jnp.ones((total, total), jnp.bool_))[None]
+    params = dict(indexer.init(jax.random.key(2), x, x, packed, visible,
+                               method="select_indices")["params"])
+    params["weights_proj"] = {"kernel": jnp.zeros_like(params["weights_proj"]["kernel"])}
+    tokens = indexer.apply({"params": params}, x, x, packed, visible, method="select_indices")
+
+    np.testing.assert_array_equal(tokens[0, -1], [0, 1, 2, 3, 4, 5])
+    # The query at index 4 sees one whole pool, so the second chosen pool is
+    # no candidate and contributes empty slots instead of later tokens.
+    np.testing.assert_array_equal(tokens[0, 4], [0, 1, 2, -1, -1, -1])
