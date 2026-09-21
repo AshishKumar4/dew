@@ -707,6 +707,46 @@ def test_augmentation_really_moves_the_pixels():
     assert len({caption for _, caption in records.values()}) > 1
 
 
+def test_augment_image_is_deterministic_for_one_seed():
+    """A record's augmentation is keyed by its rng alone: the same seed
+    reproduces it exactly, a different seed moves the pixels."""
+    augment = images.image_augmentations("flip_jitter")
+    image = _Images(1)[0]["image"]
+
+    first = images.augment_image(augment, image, np.random.default_rng(7))
+    again = images.augment_image(augment, image, np.random.default_rng(7))
+    other = images.augment_image(augment, image, np.random.default_rng(8))
+
+    assert np.array_equal(first, again)
+    assert not np.array_equal(first, other)
+
+
+def test_flip_only_reorders_pixels_without_changing_them():
+    """flip_only may mirror an image but never touches its values, so the
+    sorted pixels are identical with and without it."""
+    augment = images.image_augmentations("flip_only")
+    image = _Images(1)[0]["image"]
+
+    flipped = images.augment_image(augment, image, np.random.default_rng(0))
+
+    assert np.array_equal(np.sort(flipped.ravel()), np.sort(image.ravel()))
+    assert flipped.shape == image.shape
+
+
+def test_the_jitter_stays_inside_the_brightness_envelope():
+    """On a constant grey image the output ratio is bounded by the widest
+    brightness*contrast product the draws allow, plus one uint8 of rounding;
+    a factor outside [0.8, 1.2]x[0.95, 1.05] would show here."""
+    augment = images.image_augmentations("flip_jitter")
+    grey = np.full((8, 8, 3), 100, np.uint8)
+    low, high = 0.8 * 0.95, 1.2 * 1.05
+
+    for seed in range(64):
+        out = images.augment_image(augment, grey, np.random.default_rng(seed))
+        ratio = out.astype(np.float64) / 100
+        assert ratio.min() >= low - 0.01 and ratio.max() <= high + 0.01, seed
+
+
 @pytest.mark.parametrize("worker_count", [0, pytest.param(2, marks=pytest.mark.slow)])
 def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
         worker_count):
@@ -754,12 +794,10 @@ def _validated(length, val_batches, batch, **read):
 
 def test_validation_pixels_do_not_depend_on_the_read_thread_count():
     """The validation pass transforms its records inside grain's prefetch
-    threads, and albumentations keeps the generators a call draws from on the
-    pipeline itself, so a pipeline shared by those threads had one record's
-    seed applied to another record's pixels: 75 to 82 of these 256 records
-    differed between a 32-thread pass and a serial one, pass to pass, before
-    each thread got a copy of its own. The captions come from the per-record
-    rng directly and never moved."""
+    threads, so a record's augmentation has to come only from its per-record
+    rng: keyed by the thread's call order instead, one record's seed would
+    reach another record's pixels. Every draw here is record-keyed, and the
+    captions come from the same rng directly."""
     serial = _validated(512, 64, 4, threads=1, read_buffer=1)
     threaded = _validated(512, 64, 4, threads=32, read_buffer=128)
 

@@ -6,20 +6,17 @@ the three hooks a subclass fills in. Records leave as
 `{"image": uint8 [size, size, 3], "caption": str}`, plus `"label"` when the
 source carries a class index, and `load(tokenize=)` is where a run's own
 condition reads the captions: the dataset carries the text, the encoder
-decides what tokens it becomes. cv2, albumentations, tensorflow_datasets
+decides what tokens it becomes. cv2, tensorflow_datasets
 and HF datasets are imported on use, so `import dew.data` costs none of
 them.
 """
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import functools
 import os
 import struct as st
-import threading
-import weakref
 from typing import Any, Literal
 
 import grain.python as pygrain
@@ -109,47 +106,73 @@ def resize_image(image: np.ndarray, size: int) -> np.ndarray:
     return cv2.resize(image, (size, size), interpolation=interpolation)
 
 
-def image_augmentations(mode: Augmentation):
-    """The albumentations pipeline for one augmentation mode: flip_only (DiT
-    style), flip_jitter, or none (deterministic evaluation and debugging)."""
-    import albumentations as A
+@dataclasses.dataclass(frozen=True)
+class Augment:
+    """The augmentations one mode applies: flip for flip_only, both for
+    flip_jitter. 'none' maps to no Augment at all."""
 
+    flip: bool
+    jitter: bool
+
+
+def image_augmentations(mode: Augmentation) -> Augment | None:
+    """The augmentations for one mode: flip_only (DiT style), flip_jitter,
+    or none (deterministic evaluation and debugging)."""
     if mode == 'none':
-        return A.Compose([])
+        return None
     if mode == 'flip_only':
-        return A.Compose([A.HorizontalFlip(p=0.5)])
+        return Augment(flip=True, jitter=False)
     if mode == 'flip_jitter':
-        return A.Compose([
-            A.HorizontalFlip(p=0.5),
-            A.ColorJitter(brightness=0.2, contrast=0.05, saturation=0.2, hue=0, p=1.0),
-        ])
+        return Augment(flip=True, jitter=True)
     raise ValueError(f"augmentation {mode!r} is not one of none, flip_only, flip_jitter")
 
 
-# Each thread's copies of the pipelines it has augmented with, keyed by the
-# shared pipeline they were copied from.
-_thread_pipelines = threading.local()
+# ColorJitter(brightness=0.2, contrast=0.05, saturation=0.2, hue=0): the three
+# factors' uniform ranges, applied in a random order per record.
+_JITTER_RANGES = ((0.8, 1.2), (0.95, 1.05), (0.8, 1.2))
+_LUMA = np.array([0.299, 0.587, 0.114], np.float32)
 
 
-def augment_image(augments, image, rng: np.random.Generator):
-    """Apply a pipeline from image_augmentations to one image.
+def _gray(pixels: np.ndarray) -> np.ndarray:
+    """0.299 R + 0.587 G + 0.114 B as float32; cvtColor is the fast path here."""
+    import cv2
+    return cv2.cvtColor(pixels, cv2.COLOR_RGB2GRAY)
 
-    The seed is drawn from grain's per-record rng (Philox keyed by the record
-    index), so every record gets the same augmentation regardless of how many
-    workers, threads or processes produced the batch. albumentations keeps the
-    generators a call draws from on the pipeline itself, so a pipeline shared
-    between grain's prefetch threads would apply one record's seed to another
-    record's pixels. Each thread seeds and runs a copy of its own. numpy's
-    global RNG is never touched from inside data-loading workers.
+
+def augment_image(augment: Augment | None, image: np.ndarray,
+                  rng: np.random.Generator) -> np.ndarray:
+    """Flip and colour-jitter `image`, seeded by the record's own rng.
+
+    Every draw comes from grain's per-record rng (Philox keyed by the record
+    index), so a record's augmentation is the same however many workers,
+    threads or processes produced its batch. uint8 pixels go through float32
+    and are rounded and clipped once at the end.
     """
-    copies = getattr(_thread_pipelines, "copies", None)
-    if copies is None:
-        copies = _thread_pipelines.copies = weakref.WeakKeyDictionary()
-    pipeline = copies.get(augments)
-    if pipeline is None:
-        pipeline = copies[augments] = copy.deepcopy(augments)
-    pipeline.set_random_seed(int(rng.integers(0, 2**32 - 1)))
-    return pipeline(image=image)['image']
+    if augment is None:
+        return image
+    if augment.flip and rng.random() < 0.5:
+        image = image[:, ::-1]
+    if not augment.jitter:
+        return np.ascontiguousarray(image)
+
+    import cv2
+    brightness, contrast, saturation = (rng.uniform(low, high) for low, high in _JITTER_RANGES)
+    pixels = image.astype(np.float32)
+    for index in rng.permutation(3):
+        if index == 0:
+            pixels = pixels * brightness
+        elif index == 1:
+            # Contrast is measured against the image as it stands at its
+            # place in the order, not the incoming one.
+            mean = _gray(pixels).mean()
+            pixels = pixels * contrast + mean * (1 - contrast)
+        else:
+            # Saturation as one matrix: out_c = s * x_c + (1 - s) * gray.
+            matrix = np.eye(3, dtype=np.float32) * saturation + np.outer(
+                np.ones(3, np.float32), (1 - saturation) * _LUMA)
+            pixels = cv2.transform(pixels, matrix)
+    np.rint(pixels, out=pixels)
+    return np.clip(pixels, 0, 255, out=pixels).astype(np.uint8)
 
 
 PROMPT_TEMPLATES = (
