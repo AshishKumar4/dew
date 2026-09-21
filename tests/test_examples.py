@@ -1,8 +1,16 @@
-"""The three examples run end to end on stub data: train, evaluate, export."""
+"""Every example runs end to end on stub data: train, evaluate, export.
+
+The older three are called in process, with a stub dataset built here. The
+end-to-end four ship their own `--smoke` mode over the repo's fixtures, and
+run the way a reader runs them: their own process, their own command line,
+one artifact each to show they got to the end.
+"""
 
 import importlib.util
 import itertools
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -15,9 +23,30 @@ from dew.data import Dataset
 from dew.inputs import Condition, Field, InputSpec
 from dew.interop import load_params
 
-pytestmark = pytest.mark.mesh
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def smoke(name, out, *arguments):
+    """One example's `--smoke` run, in its own process, on one CPU device.
+
+    The environment is the one the docstrings tell a reader to use, minus
+    the suite's eight simulated devices: a smoke run is a single-device run,
+    and `HF_HUB_OFFLINE` keeps a fixture path from becoming a download.
+    """
+    environment = {**os.environ,
+                   "PYTHONPATH": str(REPO_ROOT / "src"),
+                   "JAX_PLATFORMS": "cpu",
+                   "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
+                   "HF_HUB_OFFLINE": "1",
+                   "TOKENIZERS_PARALLELISM": "false"}
+    finished = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "examples" / f"{name}.py"), "--smoke",
+         "--out", str(out), *arguments],
+        cwd=REPO_ROOT, env=environment, capture_output=True, text=True, timeout=900)
+    assert finished.returncode == 0, (
+        f"{name} --smoke exited {finished.returncode}\n"
+        f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}")
+    return finished
 
 
 def load_example(name):
@@ -49,6 +78,7 @@ def fake_dataset(batch, classes=None, size=RES):
                    records=4 * batch, batch=batch)
 
 
+@pytest.mark.mesh
 def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
     example = load_example("train_diffusion")
     config = example.Config(image_size=RES, batch_size=8, steps=3, prompts=("a", "b"),
@@ -67,6 +97,7 @@ def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
     assert (tmp_path / "checkpoints" / "3").is_dir(), "the last step was not checkpointed"
 
 
+@pytest.mark.mesh
 def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
     example = load_example("train_jepa")
     # An 8x8 patch grid, the smallest the default mask geometry fits on.
@@ -83,6 +114,7 @@ def test_train_jepa_example_trains_probes_and_saves_the_encoder(tmp_path):
         jax.tree.leaves(averaged), jax.tree.leaves(saved), strict=True))
 
 
+@pytest.mark.mesh
 def test_train_lm_example_trains_and_generates(tmp_path):
     tokens = tmp_path / "tokens"
     tokens.mkdir()
@@ -101,3 +133,19 @@ def test_train_lm_example_trains_and_generates(tmp_path):
     assert int(state.step) == 3
     sample = (tmp_path / "run" / "sample.txt").read_text()
     assert sample.startswith("ab") and len(sample) > 2
+
+
+# ---------------------------------------------------------------------------------
+# The end-to-end scripts, run the way their docstrings say to run them
+# ---------------------------------------------------------------------------------
+
+def test_train_flowers_tpu_smoke_samples_a_grid_and_scores_it(tmp_path):
+    """The diffusion run's whole arc: synthetic ArrayRecords in, a run
+    directory with its record and checkpoint, a samples grid out of
+    `dew.pipeline`, and the CLIPScore of that grid."""
+    smoke("train_flowers_tpu", tmp_path)
+
+    grid = np.asarray(__import__("PIL.Image").Image.open(tmp_path / "samples.png"))
+    assert grid.shape == (16, 4 * 16, 3) and grid.dtype == np.uint8
+    assert "clip_score" in json.loads((tmp_path / "eval.json").read_text())
+    assert (tmp_path / "checkpoints" / "smoke" / "run.json").is_file()
