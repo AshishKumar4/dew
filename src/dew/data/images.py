@@ -36,6 +36,7 @@ from .dataset import (
     validation_pass,
 )
 from .sources.hf import HFOptions, HubOptions
+from .tokens import bounded
 
 Augmentation = Literal["none", "flip_only", "flip_jitter"]
 
@@ -239,9 +240,14 @@ class ImageTransform(pygrain.RandomMapTransform):
 class ImageDataset(DatasetSpec):
     """Captioned images through grain, resized to `image_size`.
 
-    `val_batches` batches of records are held out of the head of the source,
-    in canonical order, as the validation split, so FID and CLIP are never
-    measured on records the model trained on; None or 0 holds nothing out.
+    Validation comes from one of two places. `val_split` names a split of
+    the dataset's own, which is opened as a second source and scored in
+    record order, `val_batches` batches of it or all of it when that is
+    None. Without one, `val_batches` batches of records are held out of the
+    head of the training source, in canonical order, so FID and CLIP are
+    still never measured on records the model trained on; None or 0 holds
+    nothing out and validates nothing.
+
     `count` takes that many records from the head of the source. A source
     that reports no length needs it set.
     """
@@ -249,11 +255,17 @@ class ImageDataset(DatasetSpec):
     image_size: int = 128
     augmentation: Augmentation = "flip_jitter"
     val_batches: int | None = 4
+    val_split: str | None = None
     count: int | None = None
 
-    def source(self) -> Any:
+    def source(self, split: str | None = None) -> Any:
         """Random access over the records (`__getitem__`, and `__len__` unless
-        `count` says how many there are)."""
+        `count` says how many there are).
+
+        `split` names a split other than the one this spec reads, which is
+        how `val_split` opens a second source; a dataset whose records are
+        one pile refuses it.
+        """
         raise NotImplementedError
 
     def record(self, element, rng: np.random.Generator) -> tuple[np.ndarray | bytes, str, int | None]:
@@ -278,12 +290,22 @@ class ImageDataset(DatasetSpec):
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         source = self.source()
-        train, validation = hold_out(source, self.records(source),
-                              (self.val_batches or 0) * batch, type(self).__name__)
+        # A named split is its own records, so nothing is held out of
+        # training; without one the head of the source is the split.
+        held_out = 0 if self.val_split else (self.val_batches or 0) * batch
+        train, validation = hold_out(source, self.records(source), held_out,
+                                     type(self).__name__)
+        rows = local_batch(batch)
+        if self.val_split:
+            validation = self.source(self.val_split)
+        scored = None if validation is None else tokenized(
+            validation_pass(validation, [ImageTransform(self)], batch=rows,
+                            seed=self.seed, loading=self.loading), tokenize)
+        if self.val_split and scored is not None:
+            scored = bounded(scored, self.val_batches)
         return Dataset(
-            train=tokenized(train_stream(train, [ImageTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
-            val=None if validation is None else tokenized(
-                validation_pass(validation, [ImageTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
+            train=tokenized(train_stream(train, [ImageTransform(self)], batch=rows, seed=self.seed, loading=self.loading), tokenize),
+            val=scored,
             records=len(train),
             batch=batch,
         )
@@ -305,7 +327,7 @@ class OxfordFlowers(ImageDataset):
     labels: str | None = None
     """Class-name file override; unset reads label.labels.txt in path."""
 
-    def source(self):
+    def source(self, split: str | None = None):
         if not self.path:
             raise ValueError(
                 "OxfordFlowers needs path= (--data.path) pointing to prepared "
@@ -316,7 +338,8 @@ class OxfordFlowers(ImageDataset):
 
         from .sources.tfds import prepared_source
 
-        return prepared_source(self.path, self.split, decoders={"image": tfds.decode.SkipDecoding()})
+        return prepared_source(self.path, split or self.split,
+                               decoders={"image": tfds.decode.SkipDecoding()})
 
     def record(self, element, rng):
         label = int(element["label"])
@@ -348,11 +371,12 @@ class HFImages(ImageDataset):
     split: str = "train"
     options: HubOptions = HFOptions()
 
-    def source(self):
+    def source(self, split: str | None = None):
         from .sources.hf import HFDatasetSource
         if not self.name:
             raise ValueError("HFImages needs name= set to a hub dataset repo id")
-        return HFDatasetSource(name=self.name, split=self.split, options=self.options)
+        return HFDatasetSource(name=self.name, split=split or self.split,
+                               options=self.options)
 
     def record(self, element, rng):
         label = element.get("label")
@@ -373,7 +397,12 @@ class ArrayRecordImages(ImageDataset):
     path: str | None = None
     shards: tuple[str, ...] = ()
 
-    def source(self):
+    def source(self, split: str | None = None):
+        if split is not None:
+            raise ValueError(
+                f"{type(self).__name__} reads the shards under path= as one pile "
+                f"and holds no named split, so val_split={split!r} names nothing; "
+                "leave it unset and val_batches holds records out of the head")
         if not self.path:
             raise ValueError(
                 f"{type(self).__name__} needs path= set: its records live under "

@@ -264,6 +264,22 @@ def test_the_caption_comes_from_the_record(hub):
     assert list(map(str, batch["caption"])) == _captions(0, 1)
 
 
+def test_a_hub_dataset_scores_a_named_split_instead_of_the_head(hub):
+    """The hub dataset that ships a validation split was being scored on
+    records held out of training instead, which cost the run those records
+    and scored nothing the dataset's authors held out."""
+    data = _hub_images(val_split="validation", val_batches=1).load(
+        batch=4, tokenize=keep_captions)
+
+    assert data.records == RECORDS, "the named split holds nothing out"
+    assert data.val is not None
+    assert len(list(data.val())) == 1, "val_batches bounds the pass"
+    assert list(map(str, next(data.val())["caption"])) == _captions(0, 1, 2, 3)
+    # The training records come from `split` and the pass from `val_split`,
+    # each opened as its own source.
+    assert {call["split"] for call in hub} == {"train", "validation"}
+
+
 def test_a_hub_dataset_holds_its_validation_batches_out_of_training(hub):
     data = _hub_images(val_batches=1).load(batch=4, tokenize=keep_captions)
 
