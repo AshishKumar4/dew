@@ -963,3 +963,17 @@ def test_a_run_with_no_condition_leaves_no_captions_in_the_batch():
     batch = next(spec.load(batch=4, tokenize=inputs.tokenize).train())
 
     assert sorted(batch) == ["image", "label"]
+
+
+def test_a_jpeg_decodes_at_the_coarsest_scale_that_still_covers_the_target():
+    """The DCT reduction is the largest of 8, 4, 2 that keeps both sides at
+    or above the target, so the resize after it only ever shrinks; a target
+    the image cannot cover at any reduction decodes at full size."""
+    rows = np.random.RandomState(0).randint(0, 256, (400, 600, 3), np.uint8)
+    encoded = cv2.imencode(".jpg", rows)[1].tobytes()
+
+    assert decode_image(encoded, at_least=50).shape[:2] == (50, 75)
+    assert decode_image(encoded, at_least=64).shape[:2] == (100, 150)
+    assert decode_image(encoded, at_least=128).shape[:2] == (200, 300)
+    assert decode_image(encoded, at_least=256).shape[:2] == (400, 600)
+    assert decode_image(encoded).shape[:2] == (400, 600)
