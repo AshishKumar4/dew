@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
-from .attention import NormalAttention, rotary_freqs
+from .attention import LayerNorm, NormalAttention, rotary_freqs
 from .blocks import FourierEmbedding, TimeProjection
 from .scan_orders import (
     build_2d_sincos_pos_embed,
@@ -238,7 +238,7 @@ class PatchSequenceOutput(nn.Module):
     @nn.compact
     def __call__(self, tokens, inv_idx, H, W, conditioning=None):
         features = tokens.shape[-1]
-        x_out = nn.LayerNorm(
+        x_out = LayerNorm(
             epsilon=self.norm_epsilon, use_scale=not self.modulated,
             use_bias=not self.modulated, dtype=self.dtype, name="final_norm")(tokens)
         if self.modulated:
@@ -362,10 +362,10 @@ class ModulatedBlock(nn.Module):
         # Without modulation the norms carry their own affine, since there is
         # no conditioning vector left to supply the shift and scale
         affine = not self.modulated
-        self.norm1 = nn.LayerNorm(
+        self.norm1 = LayerNorm(
             epsilon=self.norm_epsilon, use_scale=affine, use_bias=affine,
             dtype=self.dtype, name="norm1")
-        self.norm2 = nn.LayerNorm(
+        self.norm2 = LayerNorm(
             epsilon=self.norm_epsilon, use_scale=affine, use_bias=affine,
             dtype=self.dtype, name="norm2")
 

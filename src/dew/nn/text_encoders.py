@@ -43,7 +43,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention import normalized_in_fp32, scaled_dot_product_attention
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
@@ -802,6 +802,19 @@ def _t5_relative_position_bucket(relative_position, bidirectional, num_buckets, 
     return relative_buckets + jnp.where(is_small, relative_position, large)
 
 
+@functools.partial(normalized_in_fp32, static_argnums=(2, 3))
+def t5_normalized(hidden_states, weight, epsilon: float, dtype):
+    """`T5LayerNorm`'s body, rematerialized so the width-shaped fp32
+    activations stay out of the backward pass. The division promotes, so
+    `dtype` of None leaves the result in fp32, which is the dtype the
+    reference returns too."""
+    deviation = jnp.sqrt(jnp.mean(jnp.square(hidden_states.astype(jnp.float32)),
+                                  axis=-1, keepdims=True) + epsilon)
+    normalized = hidden_states / deviation
+    return (weight.astype(normalized.dtype) * normalized).astype(
+        normalized.dtype if dtype is None else dtype)
+
+
 class T5LayerNorm(nn.Module):
     """T5's norm: RMS over the width, a weight, no mean subtraction and no
     bias, modeling_t5.py `T5LayerNorm`."""
@@ -810,13 +823,9 @@ class T5LayerNorm(nn.Module):
 
     @nn.compact
     def __call__(self, hidden_states):
-        variance = jnp.mean(jnp.square(hidden_states.astype(jnp.float32)),
-                            axis=-1, keepdims=True)
-        hidden_states = hidden_states / jnp.sqrt(variance + self.epsilon)
         weight = self.param("scale", nn.initializers.ones,
                             (hidden_states.shape[-1],), jnp.float32)
-        return (weight.astype(hidden_states.dtype) * hidden_states).astype(
-            self.dtype if self.dtype is not None else hidden_states.dtype)
+        return t5_normalized(hidden_states, weight, self.epsilon, self.dtype)
 
 
 @logical_axes({("q_proj",): ("embed", "heads"), ("k_proj",): ("embed", "kv"), ("v_proj",): ("embed", "kv"), ("out_proj",): ("attention", "embed"), ("rel_bias",): (None, "heads")})

@@ -101,6 +101,40 @@ def test_remat_recompute_is_bit_exact(rng):
         assert jnp.allclose(a, b, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize('remat', [False, True])
+def test_norms_keep_the_residual_stream_in_its_compute_dtype(rng, remat):
+    """A norm reduces over the width in fp32, and differentiated as flax
+    writes it that upcast is a residual twice over: the fp32 copy of the
+    input, and the fp32 normalized activations. A bf16 stream was therefore
+    saved at fp32 twice per norm, which on a SimpleDiT step at batch 64 and
+    128px was 36 fp32 [64, 1024, 256] tensors, 2.35 GiB, against 48 bf16 ones
+    for the stream itself.
+
+    `normalized_in_fp32` recomputes that half. What is left at the stream's
+    shape is one fp32 tensor for the whole model, the fp32 output head's own
+    promoted input, and one bf16 tensor per norm: the norm's input, which is
+    the stream as the block already holds it.
+    """
+    batch, features, layers = 2, 64, 2
+    tokens = (RES // 4) ** 2
+    model = SimpleDiT(patch_size=4, emb_features=features, num_layers=layers, num_heads=2,
+                      mlp_ratio=2, dtype=jnp.bfloat16, remat=remat)
+    x, temb = jnp.zeros((batch, RES, RES, 3), jnp.bfloat16), jnp.ones((batch,))
+    params = model.init(rng, x, temb, None)
+    lines = saved_residuals(
+        lambda p: jnp.sum(model.apply(p, x, temb, None).astype(jnp.float32) ** 2), params)
+
+    stream = f'[{batch},{tokens},{features}]'
+    in_fp32 = [line for line in lines if f'f32{stream}' in line]
+    assert len(in_fp32) == 1 and 'promote_dtype' in in_fp32[0], in_fp32
+    assert [line for line in lines if f'bf16{stream}' in line]
+    # What a norm leaves behind is its own cast output and nothing else: the
+    # fp32 reductions are recomputed rather than named, so a block's remat
+    # policy still accounts for every name it keeps (`RESIDUALS`).
+    assert all('bf16' in line for line in lines if '(layer_normalized)' in line)
+    assert not [line for line in lines if "named 'norm" in line]
+
+
 class BatchedDotBlock(nn.Module):
     """A batched einsum, the shape attention scores have, optionally carrying
     the name `scaled_dot_product_attention` puts on its output."""

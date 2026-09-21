@@ -11,7 +11,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import TransformerBlock, rotary_freqs
+from ..attention import LayerNorm, TransformerBlock, rotary_freqs
 from ..blocks import FourierEmbedding, TimeProjection
 from ..dit import (
     ROPE_THETA,
@@ -58,7 +58,7 @@ class UViT(nn.Module):
     def setup(self):
         assert self.num_layers % 2 == 0, "num_layers must be even for U-Net structure"
         half_layers = self.num_layers // 2
-        norm = partial(nn.LayerNorm, epsilon=self.norm_epsilon, dtype=self.dtype)
+        norm = partial(LayerNorm, epsilon=self.norm_epsilon, dtype=self.dtype)
 
         self.patch_embed = PatchEmbedding(
             patch_size=self.patch_size,
