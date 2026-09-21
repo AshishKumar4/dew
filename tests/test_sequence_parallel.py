@@ -20,9 +20,12 @@ import pytest
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
 
-import dew.nn.backbones.causal_transformer  # registers the model built below
 from dew.nn.attention import (
-    NormalAttention, causal_attention_mask, rotary_freqs, scaled_dot_product_attention, stripe,
+    NormalAttention,
+    causal_attention_mask,
+    rotary_freqs,
+    scaled_dot_product_attention,
+    stripe,
     unstripe,
 )
 from dew.objectives.lm import LMObjective

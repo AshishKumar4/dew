@@ -6,11 +6,11 @@ Each worker process releases its JAX executable caches after the comparison.
 """
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -110,8 +110,9 @@ def test_a_matching_image_task_variant_loads(saved_pipelines, tmp_path, case, de
 @pytest.mark.parametrize("family", ["sd", "xl", "safety", "sd3", "flux"])
 def test_public_source_precision_covers_denoiser_and_frozen_component_weights(saved_pipelines, tmp_path, family):
     import jax.numpy as jnp
-    from dew.interop import load_pretrained
     from test_interop import assert_parameter_storage
+
+    from dew.interop import load_pretrained
 
     if family in ("sd3", "flux"):
         with tarfile.open(ROOT / f"tests/fixtures/{family}_source.tar.xz") as archive:
@@ -135,6 +136,7 @@ def test_public_source_precision_covers_denoiser_and_frozen_component_weights(sa
 
 def test_component_binding_preserves_large_integer_indices():
     import numpy as np
+
     from dew.interop.diffusion import record_layouts
 
     indices = np.asarray([1, 16777217], np.int64)
@@ -147,6 +149,7 @@ def test_component_binding_preserves_large_integer_indices():
 
 def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(saved_pipelines, tmp_path):
     import numpy as np
+
     from dew.interop import load_pretrained
 
     source = load_pretrained(saved_pipelines / "sd", dtype="float32", attention_impl="xla")
@@ -179,9 +182,11 @@ def test_public_diffusion_export_preserves_mapped_snapshot_when_republished(save
 def test_conditioner_rebuild_uses_supplied_weights_without_reading_any_source_shard(
         saved_pipelines, tmp_path, monkeypatch, family):
     from dataclasses import replace
+
     import jax
     import jax.numpy as jnp
     import numpy as np
+
     from dew.inputs.diffusion import DiffusionConditioner
     from dew.inputs.encoders import rebuild
     from dew.interop import diffusion, load_pretrained
@@ -198,6 +203,7 @@ def test_conditioner_rebuild_uses_supplied_weights_without_reading_any_source_sh
     assert isinstance(encoder, DiffusionConditioner)
     tokens = encoder.tokenize(["a red bird"])
     from fnmatch import fnmatch
+
     import huggingface_hub
 
     cache = tmp_path / "hub" / ("a" * 40)

@@ -17,17 +17,20 @@ pytestmark = pytest.mark.mesh
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.objectives.base import Aux, EMASpec, Objective
 import dew
 import dew.nn.backbones  # registers the decoder the FLOP formula test builds
+from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Profile, Trainer
-from dew.training.distributed import shard_batch
 from dew.telemetry.instrumentation import (
-    compiled_flops, enable_compilation_cache, hlo_flops, model_flops_utilization,
+    compiled_flops,
+    enable_compilation_cache,
+    hlo_flops,
+    model_flops_utilization,
     step_flops,
 )
+from dew.training import Profile, Trainer
+from dew.training.distributed import shard_batch
 
 BATCH = 8
 
@@ -585,9 +588,9 @@ def test_a_peer_start_failure_keeps_the_cleanup_note(tmp_path, monkeypatch):
     stop that itself fails must land on the error being raised, not on the
     cleanup failure."""
     _capture_env(monkeypatch)
+    import dew.telemetry.profile as telemetry_profile
     import dew.training.trainer as trainer_module
     from dew.telemetry.profile import Profiler
-    import dew.telemetry.profile as telemetry_profile
 
     def refused(error, phase):
         if phase == "profiling window start":

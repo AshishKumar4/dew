@@ -18,7 +18,6 @@ import pytest
 
 from dew.interop import load_pretrained
 from dew.interop.hf_decoders import translate_config
-
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective

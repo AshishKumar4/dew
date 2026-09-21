@@ -9,11 +9,11 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from test_diffusion_objective import RES, TOKENS, StubText
 
 from dew.data import Dataset
 from dew.inputs import Condition, Field, InputSpec
 from dew.interop import load_params
-from test_diffusion_objective import RES, TOKENS, StubText
 
 pytestmark = pytest.mark.mesh
 

@@ -21,7 +21,7 @@ import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step, scalar_loss
-from dew.objectives.lm import LMObjective, TEXT_KEY
+from dew.objectives.lm import TEXT_KEY, LMObjective
 
 VOCAB = 37
 SEQ = 8

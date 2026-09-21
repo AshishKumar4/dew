@@ -16,8 +16,8 @@ import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 from scipy.special import erfc
 
-from dew.nn.moe import ExpertMLP, exact_gelu, expert_projection
 from dew.nn.gpt_oss import GptOssExperts
+from dew.nn.moe import ExpertMLP, exact_gelu, expert_projection
 from dew.training import MeshSpec, build_mesh
 
 # The multi-device layouts need the eight simulated CPU devices conftest

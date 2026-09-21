@@ -8,10 +8,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_text_rollout_contract import decoder
 
 from dew.sampling import Sample, Sampling, decoding, generate
 from dew.sampling.decoding import StepState
-from test_text_rollout_contract import decoder
 
 VOCAB = 13
 

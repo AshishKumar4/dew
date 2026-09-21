@@ -9,14 +9,14 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+from dew.diffusion.schedules import CosineNoiseScheduler, KarrasVENoiseScheduler
 from dew.diffusion.transforms import (
-    EpsilonPredictionTransform,
     DirectPredictionTransform,
-    VPredictionTransform,
+    EpsilonPredictionTransform,
     KarrasPredictionTransform,
+    VPredictionTransform,
     broadcast_rates,
 )
-from dew.diffusion.schedules import CosineNoiseScheduler, KarrasVENoiseScheduler
 
 TRANSFORMS = [
     ("epsilon", EpsilonPredictionTransform()),

@@ -5,21 +5,20 @@ AdamW keeps the embeddings, the head and the norms, Muon takes the matrices.
 Each group's update is asserted against the transform it is supposed to be,
 because a parameter in the wrong group still trains, only worse.
 """
+import json
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
-import json
 import numpy as np
 import optax
 import pytest
-from pathlib import Path
 
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
-import dew.nn.moe  # declares the expert and gate axes the two MoE cases read
 from dew.objectives.base import scalar_loss
-from dew.training.optim import (
-    build_optimizer, muon_weight_dimension_numbers, scale_by_qk_clip)
+from dew.training.optim import build_optimizer, muon_weight_dimension_numbers, scale_by_qk_clip
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
 LR = 1e-3

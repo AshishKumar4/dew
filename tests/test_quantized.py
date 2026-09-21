@@ -21,9 +21,18 @@ import numpy as np
 import pytest
 
 from dew.interop import load_pretrained
-from dew.interop.quantized import (AMAX_FLOOR, BLOCK, E4M3_MAX, SCALE_SUFFIX,
-                                   dequantize_checkpoint, dequantize_fp8_blocks, fp8_format,
-                                   pack_fp8, quantize_fp8_blocks, scaled_names)
+from dew.interop.quantized import (
+    AMAX_FLOOR,
+    BLOCK,
+    E4M3_MAX,
+    SCALE_SUFFIX,
+    dequantize_checkpoint,
+    dequantize_fp8_blocks,
+    fp8_format,
+    pack_fp8,
+    quantize_fp8_blocks,
+    scaled_names,
+)
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "hf" / "deepseek-v3-tiny"
 

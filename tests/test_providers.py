@@ -19,7 +19,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
 from absl import flags
 
 # grain's worker processes read absl flags; a test that never ran absl.app

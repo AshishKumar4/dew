@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.inputs import CLIPText, Condition, InputSpec, Field, unit_range
+from dew.inputs import CLIPText, Condition, Field, InputSpec, unit_range
 from dew.nn.dit import ConditioningEmbed, TextContext, masked_mean
 
 CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"

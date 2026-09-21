@@ -8,9 +8,9 @@ source-format export of both families lives in test_masked_diffusion_export.py.
 """
 
 import json
-
-from pathlib import Path
 from dataclasses import asdict, replace
+from pathlib import Path
+
 import grain.python as grain
 import jax
 import jax.numpy as jnp
@@ -19,21 +19,20 @@ import optax
 import pytest
 
 import dew.nn.backbones.causal_transformer  # noqa: F401, registers the backbone
-from dew.diffusion.discrete import MDLM, Unmask
-from dew.interop import load_pretrained
-from dew.inference import pipeline
-from dew.nn.inputs import BATCH_AXES, ModelInputs
-from dew.sampling import Sampling, sample
+from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig
 from dew.data import Dataset
-from dew.checkpoints import Checkpoints
-from dew.training import Layout, MeshSpec
-from dew.training.distributed import build_mesh
+from dew.diffusion.discrete import MDLM, Unmask
+from dew.inference import pipeline
+from dew.interop import load_pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
+from dew.nn.inputs import BATCH_AXES, ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.registry import models, with_precision
-from dew.training import Trainer
+from dew.sampling import Sampling, sample
+from dew.training import Layout, MeshSpec, Trainer
+from dew.training.distributed import build_mesh
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 

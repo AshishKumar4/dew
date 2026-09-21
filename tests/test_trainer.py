@@ -11,21 +11,26 @@ import dataclasses
 import json
 import os
 
-from flax import linen as nn
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
+from flax import linen as nn
 
 from dew import position
 from dew.artifacts import Representations
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
-from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training import trainer as trainer_module
-from dew.training import ema_update, write_back
+from dew.training import (
+    Checkpoints,
+    Layout,
+    MeshSpec,
+    Trainer,
+    ema_update,
+    trainer as trainer_module,
+    write_back,
+)
 
 BATCH = 8
 FEATURES = 3

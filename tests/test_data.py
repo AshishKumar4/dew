@@ -19,9 +19,19 @@ import numpy as np
 import pytest
 
 import dew.data
-from dew.data import (Checkpointable, Dataset, DatasetSpec, HFDatasetSource, ImageDataset,
-                      LocalVideos, VoxCeleb2, local_batch)
-from dew.data import Loading, images, video
+from dew.data import (
+    Checkpointable,
+    Dataset,
+    DatasetSpec,
+    HFDatasetSource,
+    ImageDataset,
+    Loading,
+    LocalVideos,
+    VoxCeleb2,
+    images,
+    local_batch,
+    video,
+)
 from dew.data.dataset import Forwarding, _batches, hold_out, train_stream, validation_pass
 from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils

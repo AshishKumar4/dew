@@ -879,8 +879,8 @@ def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
     normalized activations and scale in bf16 (modeling_qwen3.py:61-64). The
     two agree at fp32 and differ under bf16, and the HF translation picks per
     family."""
-    from dew.nn.backbones.causal_transformer import RMSNorm
     from dew.interop.hf_decoders import translate_config
+    from dew.nn.backbones.causal_transformer import RMSNorm
 
     x = jax.random.normal(rng, (2, 4, 32), jnp.bfloat16) * 3
     variables = {"params": {"scale": jax.random.uniform(rng, (32,), minval=0.5, maxval=1.5)}}

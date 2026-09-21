@@ -2,17 +2,17 @@
 import dataclasses
 import json
 
-from flax import struct
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import struct
 
 from dew.checkpoints import Checkpoints
 from dew.objectives import Aux, EMASpec, Mean, Objective, mean_loss, scalar_loss
-from dew.training import Trainer
 from dew.objectives.base import under
+from dew.training import Trainer
 
 
 @struct.dataclass

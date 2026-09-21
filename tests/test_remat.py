@@ -14,14 +14,12 @@ from flax import linen as nn
 from jax.ad_checkpoint import checkpoint_name, print_saved_residuals
 
 from dew.nn.attention import cudnn_runs
-from dew.nn.dit import (
-    FUSED_ATTENTION_FORWARD, TextContext, remat_block, saved_through_remat,
-)
 from dew.nn.backbones.dit import SimpleDiT
-from dew.nn.backbones.mmdit import SimpleMMDiT, HierarchicalMMDiT
-from dew.nn.backbones.uvit import SimpleUDiT
+from dew.nn.backbones.mmdit import HierarchicalMMDiT, SimpleMMDiT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
+from dew.nn.backbones.uvit import SimpleUDiT
 from dew.nn.backbones.video_dit import VideoDiT
+from dew.nn.dit import FUSED_ATTENTION_FORWARD, TextContext, remat_block, saved_through_remat
 
 RES = 32
 

@@ -14,7 +14,6 @@ import json
 from pathlib import Path
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -22,7 +21,7 @@ from flax import linen as nn
 
 from dew.data import Loading, PreferencePairs
 from dew.data.preferences import IDS_KEY, MASK_KEY, PreferenceSource
-from dew.objectives.base import Step
+from dew.objectives.base import Step, scalar_loss
 from dew.objectives.rl import DPOObjective
 from dew.rl import preference_logsigmoid
 

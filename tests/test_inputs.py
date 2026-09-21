@@ -36,6 +36,7 @@ def test_soft_tokens_land_at_the_image_marks():
 def test_row_plan_preserves_resident_rows_padding_and_random_keys():
     import jax
     import jax.numpy as jnp
+
     from dew.nn.inputs import RowPlan, local_rows
     from dew.training import MeshSpec
     from dew.training.distributed import build_mesh
@@ -65,6 +66,7 @@ def test_row_plan_folds_a_mesh_replicated_request_key_on_device():
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
+
     from dew.nn.inputs import BATCH_AXES, RowPlan
     from dew.training import MeshSpec
     from dew.training.distributed import build_mesh
@@ -85,6 +87,7 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     import jax
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
+
     from dew.nn.inputs import ModelInputs
     from dew.training.distributed import build_mesh, shard_batch
 
@@ -116,6 +119,7 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
 
 def test_char_table_compute_override_preserves_supplied_storage():
     import jax.numpy as jnp
+
     from dew.inputs import CharTable
     from dew.inputs.encoders import rebuild
 

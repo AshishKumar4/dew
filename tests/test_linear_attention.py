@@ -37,7 +37,11 @@ from flax import linen as nn
 
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.linear import (
-    GatedDeltaNet, _masked_conv1d, causal_conv1d, chunk_gated_delta_rule, l2norm,
+    GatedDeltaNet,
+    _masked_conv1d,
+    causal_conv1d,
+    chunk_gated_delta_rule,
+    l2norm,
     recurrent_gated_delta_rule,
 )
 

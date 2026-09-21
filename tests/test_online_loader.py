@@ -9,14 +9,15 @@ network: every url is a file:// url, of a file under tmp_path or of one that
 does not exist.
 """
 
+import contextlib
 import functools
-from contextlib import closing, contextmanager
 import io
 import os
 import queue
 import sys
 import threading
 import time
+from contextlib import closing, contextmanager
 
 import jax
 import jax.numpy as jnp
@@ -369,7 +370,7 @@ def _producer_of(rows, passes):
                         sink.put(_sample(index, size=4), timeout=0.05)
                         break
                     except queue.Full:
-                        pass
+                        continue
                 if kwargs["stop"].is_set():
                     return
         kwargs["stop"].wait()
@@ -557,9 +558,8 @@ def _cancel_image_packet_probe(directory):
 
     def consume():
         try:
-            next(stream)
-        except StopIteration:
-            pass
+            with contextlib.suppress(StopIteration):
+                next(stream)
         except BaseException as error:
             failures.append(error)
         finally:

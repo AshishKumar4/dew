@@ -11,10 +11,10 @@ import jax.numpy as jnp
 import pytest
 
 from dew import models
-from dew.nn.attention import scaled_dot_product_attention
-from dew.nn.dit import TextContext
 from dew.diffusion.process import DenoisingCondition
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.dit import TextContext
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.registry import dtype_name, resolve_dtype, with_precision

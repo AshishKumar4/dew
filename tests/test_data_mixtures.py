@@ -28,8 +28,7 @@ from flax import linen as nn
 
 import dew.data
 from dew.data import Corpus, Loading, PackedTokens, Ramp, ramped
-from dew.data.dataset import (CAPTION, Dataset, mixed_records, mixed_stream, mixture, tokenized,
-                              train_stream)
+from dew.data.dataset import CAPTION, Dataset, mixed_records, mixed_stream, mixture, tokenized, train_stream
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 

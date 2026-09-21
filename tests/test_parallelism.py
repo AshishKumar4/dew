@@ -9,12 +9,13 @@ not the ones we meant.
 import json
 
 import jax
-from dew.objectives.base import scalar_loss
-from dew.data import Loading
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+
+from dew.data import Loading
+from dew.objectives.base import scalar_loss
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -28,9 +29,7 @@ from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.sharding import DECLARED, logical_axes
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, build_mesh
-from dew.training.distributed import (
-    DEFAULT_RULES, DevicePrefetchIterator, parameter_spec, shard_batch,
-)
+from dew.training.distributed import DEFAULT_RULES, DevicePrefetchIterator, parameter_spec, shard_batch
 from dew.training.optim import OPTIMIZER_MAP
 
 RES = 8

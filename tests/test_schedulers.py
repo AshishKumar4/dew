@@ -14,8 +14,15 @@ import pytest
 
 import dew.diffusion.schedules as schedulers
 from dew.diffusion import (
-    EpsilonPredictionTransform, KarrasPredictionTransform, MinSNR, Process, ScheduleWeighting,
-    VPredictionTransform, broadcast_rates, expand, presets,
+    EpsilonPredictionTransform,
+    KarrasPredictionTransform,
+    MinSNR,
+    Process,
+    ScheduleWeighting,
+    VPredictionTransform,
+    broadcast_rates,
+    expand,
+    presets,
 )
 from dew.diffusion.schedules import (
     CosineContinuousNoiseScheduler,
@@ -310,6 +317,7 @@ def test_presets_rebuild_from_their_fields():
     """What run.json stores is the preset's fields; building the registry
     member from them is the same process."""
     import dataclasses
+
     from dew.registry import presets as registry
     preset = registry.Flow(shift=3.0, logit_mean=0.5)
     rebuilt = registry.build("flow", **dataclasses.asdict(preset))

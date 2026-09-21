@@ -276,9 +276,9 @@ def test_the_sampled_rows_keep_their_sharding_and_host_reads_them_back(rng):
     did not compute, and `host()` hands back the rows a process owns in
     order. Without the pinned output layout the placement would be the
     compiler's choice."""
+    from dew.nn.inputs import BATCH_AXES
     from dew.training import Layout, MeshSpec
     from dew.training.distributed import batch_shardings, build_mesh
-    from dew.nn.inputs import BATCH_AXES
 
     model = tiny(max_seq_len=8)
     mesh = build_mesh(MeshSpec(fsdp=2))
@@ -304,9 +304,9 @@ def test_row_padding_pads_prompts_and_hands_back_only_their_continuations(rng):
     continuations exist, so a process's real rows are its own prompts' `n`
     continuations and nothing else. The padded prompt groups stay on the
     global array, which is why `rows` counts real prompts times `n`."""
+    from dew.nn.inputs import BATCH_AXES, local_rows
     from dew.training import Layout, MeshSpec
     from dew.training.distributed import build_mesh
-    from dew.nn.inputs import BATCH_AXES, local_rows
 
     model = tiny(max_seq_len=8)
     mesh = build_mesh(MeshSpec(fsdp=2))

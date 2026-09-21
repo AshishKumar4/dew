@@ -5,6 +5,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
 
 from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
@@ -13,7 +14,6 @@ from dew.objectives.base import FROZEN, Aux, EMASpec, Mean, Objective
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
-from test_training_transactions import Terms, Tiny, ShortScaleTrainer, batches
 
 HOST = Layout(host=("params",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)

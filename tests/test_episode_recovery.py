@@ -1,20 +1,20 @@
 """Completed tools survive SIGKILL; pending actions and policy provenance survive too."""
 
-from dataclasses import replace
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import time
+from dataclasses import replace
+from pathlib import Path
 
 import jax
 import numpy as np
 import pytest
-
-from dew.objectives.rl import EpisodeFailure, EpisodeJournal, RecoverableEnvironment
 from test_sandbox import IDENTITY, action, environment
 from test_tool_episodes import CALL_THREE, EOS, NINE, START, build, collect
+
+from dew.objectives.rl import EpisodeFailure, EpisodeJournal, RecoverableEnvironment
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("episode_recovery_worker.py")

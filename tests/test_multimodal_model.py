@@ -30,7 +30,6 @@ from dew.objectives.lm import LMObjective
 from dew.sampling.text import Sampling
 from dew.training import Layout, MeshSpec, Trainer
 
-
 FIXTURE = Path(__file__).parent / "fixtures" / "hf" / "gemma3-native-tiny"
 
 

@@ -29,11 +29,7 @@ import numpy as np
 import pytest
 from safetensors.numpy import load_file
 
-from dew.interop.hf_decoders import (
-    translate_config,
-    translate_wrapper_config,
-    translate_wrapper_weights,
-)
+from dew.interop.hf_decoders import translate_config, translate_wrapper_config, translate_wrapper_weights
 from dew.nn import vision as V
 from dew.registry import models, with_precision
 

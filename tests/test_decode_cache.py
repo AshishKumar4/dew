@@ -6,12 +6,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
-from dew.nn.attention import (
-    causal_attention_mask,
-    open_kv_cache,
-    scaled_dot_product_attention,
-)
-
+from dew.nn.attention import causal_attention_mask, open_kv_cache, scaled_dot_product_attention
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mla import MultiHeadLatentAttention

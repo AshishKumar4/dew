@@ -7,8 +7,8 @@ where TensorFlow is not installed. They require no downloads or preparation.
 
 import itertools
 import json
-from pathlib import Path
 import shutil
+from pathlib import Path
 
 import numpy as np
 import pytest

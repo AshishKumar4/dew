@@ -10,9 +10,9 @@ import pytest
 
 from dew import Dataset, Trainer, evaluate
 from dew.artifacts import TextSamples, TokenScores
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, Objective
 from dew.objectives.lm import LMObjective, Samples, perplexity
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.sampling import Sampling
 
 

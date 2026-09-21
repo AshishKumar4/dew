@@ -9,12 +9,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from test_text_rollout_contract import decoder
 
 from dew.inference import BlockGeneration, TextGeneration
 from dew.interop import load_pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling, generate
-from test_text_rollout_contract import decoder
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 SAMPLING = Sampling(temperature=0.8, top_k=5, eos_id=(3, 9))
@@ -256,13 +256,14 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
 
 @pytest.mark.parametrize("kind", ["dpo", "grpo", "ppo"])
 def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tmp_path):
+    from dataclasses import asdict
+
+    import dew
+    from dew.config import ModelConfig
     from dew.data import Dataset
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
-    from dew.training import Trainer, Checkpoints
-    from dew.config import ModelConfig
-    from dataclasses import asdict
-    import dew
+    from dew.training import Checkpoints, Trainer
 
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=8, dtype="float32", attention_impl="xla")
@@ -313,7 +314,9 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     np.testing.assert_allclose(restored.raw_log_probs, expected.raw_log_probs, atol=1e-7, rtol=1e-7)
 
     from dataclasses import replace
+
     import jax.numpy as jnp
+
     from dew.inference import TextGeneration
 
     baseline = dew.pipeline(str(tmp_path))

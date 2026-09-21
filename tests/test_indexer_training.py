@@ -130,7 +130,7 @@ def test_the_kl_moves_the_indexer_scores_and_not_the_attention():
 
 
 def v32_block(**overrides):
-    from test_mla import block_variables, mla_module, fixture as mla_fixture
+    from test_mla import block_variables, fixture as mla_fixture, mla_module
 
     tensors = mla_fixture("mla_v32")
     module = mla_module(dict(MLA_CONFIG["v32"], **overrides))

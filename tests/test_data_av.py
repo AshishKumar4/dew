@@ -119,6 +119,7 @@ def test_a_video_without_audio_is_refused(tmp_path):
 def test_a_missing_decoded_frame_reports_its_time(monkeypatch):
     from contextlib import nullcontext
     from types import SimpleNamespace
+
     import moviepy
 
     video = SimpleNamespace(duration=2.0, get_frame=lambda timestamp: None)

@@ -15,12 +15,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_text_rollout_contract import decoder
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, gather_cache_rows
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling, generate
 from dew.sampling.text import _operations, _prefill
-from test_text_rollout_contract import decoder
 
 VOCAB = 13
 

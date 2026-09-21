@@ -15,19 +15,23 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
-from dew.objectives.base import Step
-from dew.sampling import Sampling
+from dew.objectives.base import Step, scalar_loss
 from dew.objectives.rl import GRPOObjective
-from dew.objectives.rl.rollout import (ADVANTAGES_KEY, IDS_KEY, OLD_LOG_PROBS_KEY,
-                                       RESPONSE_MASK_KEY, SampledRollout)
+from dew.objectives.rl.rollout import (
+    ADVANTAGES_KEY,
+    IDS_KEY,
+    OLD_LOG_PROBS_KEY,
+    RESPONSE_MASK_KEY,
+    SampledRollout,
+)
 from dew.rl import clipped_surrogate, k3_kl, token_log_ratio, token_mean
+from dew.sampling import Sampling
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "grpo.npz"
 VOCAB = 8

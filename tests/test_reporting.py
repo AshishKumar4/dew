@@ -9,12 +9,12 @@ import numpy as np
 import optax
 import pytest
 from PIL import Image
-
-from dew.artifacts import ImageGrid, TextSamples, VideoGrid, Representations, TokenScores
-from dew.data import Dataset
-from dew.telemetry.records import RunRecord, FitEnded, json_value
-from dew.training import LocalTracker, Trackers, Trainer, Checkpoints
 from test_instrumentation import Regression, batches
+
+from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
+from dew.data import Dataset
+from dew.telemetry.records import RunRecord, json_value
+from dew.training import Checkpoints, LocalTracker, Trackers, Trainer
 
 
 def records(path):
@@ -144,10 +144,12 @@ def test_local_scalar_sink_does_not_enable_preview_computation(tmp_path, preview
 @pytest.mark.parametrize('body_failure', [False, True])
 def test_close_failure_reaches_later_wandb_offline_outcome(tmp_path, monkeypatch, request, body_failure):
     import functools
+
     import wandb
-    from dew.training import WandbTracker
     from wandb.proto import wandb_internal_pb2
     from wandb.sdk.internal.datastore import DataStore
+
+    from dew.training import WandbTracker
     request.addfinalizer(wandb.teardown)
     monkeypatch.setenv('WANDB_DIR', str(tmp_path))
     monkeypatch.setenv('WANDB_MODE', 'offline')
@@ -212,6 +214,7 @@ def mlflow_store(tmp_path, monkeypatch):
 def test_mlflow_run_holds_the_fit_read_back_with_mlflows_client(tmp_path, monkeypatch):
     store = mlflow_store(tmp_path, monkeypatch)
     import mlflow.artifacts
+
     from dew.training import MLflowTracker
 
     with MLflowTracker('dew-reporting', 'tiny-fit', uri=store) as tracker:
@@ -251,8 +254,12 @@ def test_mlflow_marks_the_run_of_a_failed_fit_failed(tmp_path, monkeypatch):
 def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path):
     pytest.importorskip('tensorboard')
     from tensorboard.backend.event_processing.event_accumulator import (
-        EventAccumulator, IMAGES, SCALARS, TENSORS,
+        IMAGES,
+        SCALARS,
+        TENSORS,
+        EventAccumulator,
     )
+
     from dew.training import TensorBoardTracker
 
     with TensorBoardTracker(tmp_path / 'events') as tracker:
@@ -279,9 +286,8 @@ def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path
 
 def test_the_previews_tensorboard_can_show_render_and_the_rest_raises(tmp_path):
     pytest.importorskip('tensorboard')
-    from tensorboard.backend.event_processing.event_accumulator import (
-        EventAccumulator, IMAGES, TENSORS,
-    )
+    from tensorboard.backend.event_processing.event_accumulator import IMAGES, TENSORS, EventAccumulator
+
     from dew.training import TensorBoardTracker
 
     with TensorBoardTracker(tmp_path / 'events') as tracker:

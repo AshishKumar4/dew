@@ -20,9 +20,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from dew.telemetry.instrumentation import (
-    default_compilation_cache_dir, enable_compilation_cache,
-)
+from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
 
 # The suite compiles the same kernels every run, on both lanes, in every xdist
 # worker. XLA's persistent cache is keyed by the executable, so a second run

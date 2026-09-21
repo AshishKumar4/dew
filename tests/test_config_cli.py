@@ -11,13 +11,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 import tyro
+from test_diffusion_objective import RES, StubText
 
 from dew.config import RunConfig
 from dew.data import Dataset, OxfordFlowers, PackedTokens
 from dew.data.dataset import tokenized
 from dew.registry import datasets, encoders, presets, samplers
 from dew.training import MeshSpec
-from test_diffusion_objective import RES, StubText
 
 # The manifest names the encoder through the registry.
 encoders("stub_text")(StubText)

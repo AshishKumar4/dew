@@ -22,11 +22,12 @@ import sys
 from pathlib import Path
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+
+from dew.objectives.base import scalar_loss
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -34,9 +35,7 @@ from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, GatedMLP, Mixture
-from dew.nn.moe import (
-    ExpertMLP, Router, SparseMLP, calculate_load_balance_updates,
-)
+from dew.nn.moe import ExpertMLP, Router, SparseMLP, calculate_load_balance_updates
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models

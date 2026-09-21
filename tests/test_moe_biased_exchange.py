@@ -178,6 +178,7 @@ def test_biased_mlp_matches_transformers_outputs_and_every_parameter_gradient(sk
 @pytest.mark.mesh
 def test_decoder_mixture_can_select_biased_expert_exchange():
     from dataclasses import replace
+
     from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
 
     mixture = Mixture(experts=4, top_k=2)
@@ -261,6 +262,7 @@ def test_full_biased_router_and_experts_take_identical_pooled_adam_steps(dtype, 
 def test_biased_router_updates_pool_across_two_real_cpu_processes(tmp_path):
     import subprocess
     import sys
+
     from test_multiprocess import free_port, report_of, terminate, worker_env
 
     coordinator = f'127.0.0.1:{free_port()}'

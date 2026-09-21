@@ -156,7 +156,7 @@ def _declared_type(member: type, field: str) -> object:
                 localns=vars(sys.modules[owner.__module__]))[field]
         except NameError:
             # Only this field's unavailable dependency leaves its value opaque.
-            return None
+            break
     return None
 
 

@@ -13,9 +13,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from test_text_rollout_contract import decoder
 
 from dew.sampling import Beam, Sampling, decoding, generate
-from test_text_rollout_contract import decoder
 
 VOCAB = 13
 DEAD = -1.0e9

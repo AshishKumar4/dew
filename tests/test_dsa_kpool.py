@@ -21,15 +21,14 @@ the dense softmax over the same causal keys sits 0.35 from the sparse
 output. The selection margin at these weights and inputs is 1.5e-02.
 """
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
 from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
-
-import jax
-import jax.numpy as jnp
 
 from dew.nn.dsa_kpool import KPoolSparseAttention, KPoolSparseAttentionMixer
 from dew.nn.inputs import AttentionMetadata

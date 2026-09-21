@@ -4,8 +4,8 @@ Argument one selects a failure mode: ok, hang, allocate, garbage, crash or
 fork. The square tool vocabulary matches tests/test_tool_episodes.py.
 """
 
-import json
 import base64
+import json
 import os
 import sys
 import time

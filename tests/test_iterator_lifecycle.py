@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from test_instrumentation import Regression, batches
 
 from dew.artifacts import Representations
 from dew.data import Dataset
@@ -19,7 +20,6 @@ from dew.data.dataset import tokenized
 from dew.data.tokens import bounded
 from dew.training import Checkpoints, Profile, Trainer, build_mesh
 from dew.training.distributed import DevicePrefetchIterator
-from test_instrumentation import Regression, batches
 
 
 class Source:

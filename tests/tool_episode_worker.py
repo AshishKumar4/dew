@@ -1,11 +1,11 @@
 """Run the same task cohort on one process or a real two-process CPU pool."""
 
-from dataclasses import asdict, replace
-from contextlib import contextmanager
 import itertools
 import json
-from pathlib import Path
 import sys
+from contextlib import contextmanager
+from dataclasses import asdict, replace
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -17,11 +17,12 @@ def main() -> None:
     if processes > 1:
         jax.distributed.initialize(coordinator_address=coordinator, num_processes=processes,
                                    process_id=rank, local_device_ids=[0], initialization_timeout=30)
+    from test_tool_episodes import Harness, SquareSession, build
+
     from dew.artifacts import collective_host
     from dew.data import Dataset
     from dew.objectives.rl import EpisodeStatus, Observation
     from dew.training.distributed import shard_batch
-    from test_tool_episodes import Harness, SquareSession, build
 
     harness = Harness()
     records = []

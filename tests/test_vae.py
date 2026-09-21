@@ -40,8 +40,9 @@ def test_latent_normalization_defaults_to_the_identity(rng):
 @pytest.mark.parametrize("remote", [False, True])
 def test_vae_reconstructs_metadata_without_reloading_supplied_weights(tmp_path, monkeypatch, remote):
     import json
-    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
+
     import dew.nn.autoencoders.vae as loader
+    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
 
     config = dict(block_out_channels=[8, 16], latent_channels=4, in_channels=3,
                   layers_per_block=1, norm_num_groups=4, use_quant_conv=False,

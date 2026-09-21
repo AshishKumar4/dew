@@ -14,17 +14,15 @@ value: bit-identical before and after.
 import dataclasses
 import json
 
-from flax import linen as nn
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 
 from dew.objectives.base import Aux, EMASpec, Objective
-from dew.training import Checkpoints, Layout, Trainer
-from dew.training import ema_update
+from dew.training import Checkpoints, Layout, Trainer, ema_update
 
 FEATURES = 3
 

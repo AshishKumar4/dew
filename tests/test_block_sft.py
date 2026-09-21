@@ -5,9 +5,9 @@ row one selects its first, three-token canvas. Encoder target supports also
 differ. The self-conditioning draw enables row zero and disables row one.
 """
 
-from pathlib import Path
 import math
 from dataclasses import replace
+from pathlib import Path
 
 import grain.python as grain
 import jax

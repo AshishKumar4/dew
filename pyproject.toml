@@ -151,6 +151,9 @@ split-on-trailing-comma = false
 "src/dew/training/runtime.py" = ["T201"]
 # `dew config show` prints the resolved configuration for a person to read.
 "src/dew/config/__init__.py" = ["T201"]
+# A stalled url loader says so on stdout instead of inventing a batch;
+# tests/test_online_loader.py asserts that line. Its other diagnostics log.
+"src/dew/data/online_loader.py" = ["T201"]
 # Three modules import at the bottom on purpose. The mixer hub imports each
 # kind module after the base class those modules subclass; `mla` imports the
 # hub back after the YarnScaling ramp the hub reads, so either import order

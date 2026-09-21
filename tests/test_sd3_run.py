@@ -36,17 +36,13 @@ runs, `caption_projection_dim` is `emb_features` through `txt_embed`,
 from pathlib import Path
 
 import jax
-from dew.objectives.base import scalar_loss
 import jax.numpy as jnp
 import numpy as np
 import optax
-import pytest
 
-import dew.nn.backbones  # registers the models
-from dew.artifacts import ImageGrid
 from dew.config import ModelConfig, TrainerConfig
 from dew.data import Dataset, OxfordFlowers
-from dew.objectives.base import Step
+from dew.objectives.base import Step, scalar_loss
 from dew.objectives.diffusion import DiffusionRunConfig, StableDiffusionAutoencoder, TextCondition
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES
 from dew.registry import presets, samplers

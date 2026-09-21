@@ -1,15 +1,27 @@
 """PPO actor/critic math against pinned verl and a real episode training run."""
 
-from dataclasses import replace
 import itertools
+from dataclasses import replace
 from pathlib import Path
 
-from flax import linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
+from test_tool_episodes import (
+    EOS,
+    GROUPS,
+    PROMPT,
+    RESPONSE,
+    SAMPLING,
+    TURNS,
+    VOCAB,
+    Harness,
+    ToolPolicy,
+    verify,
+)
 
 from dew.data import Dataset
 from dew.objectives.base import Step, scalar_loss
@@ -17,7 +29,6 @@ from dew.objectives.rl import EpisodeRollout, PPOObjective, PPORollout, ValueHea
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
 from dew.rl import clipped_surrogate, clipped_value_loss_terms, gae, token_log_ratio, token_mean
 from dew.training import Trainer
-from test_tool_episodes import EOS, GROUPS, PROMPT, RESPONSE, SAMPLING, TURNS, VOCAB, Harness, ToolPolicy, verify
 
 FIXTURE = Path(__file__).parent / "fixtures/rl/ppo.npz"
 
@@ -138,7 +149,8 @@ def test_composite_objective_and_parameter_gradients_match_verl():
 @pytest.mark.parametrize("active", [0, 1])
 def test_ppo_refuses_undefined_gae_whitening(active):
     from contextlib import contextmanager
-    from dew.objectives.rl import Observation, EpisodeStatus
+
+    from dew.objectives.rl import EpisodeStatus, Observation
 
     class Terminal:
         def __init__(self, sample):

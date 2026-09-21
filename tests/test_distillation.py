@@ -27,7 +27,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives import DistillationObjective
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.distillation import PROJECTIONS, TEACHER
-from dew.objectives.lm import LMObjective, TEXT_KEY
+from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "distillation"

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import fnmatch
 import json
+import logging
 import math
 import queue
 import threading
@@ -80,6 +82,9 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("output", FSDP_AXIS),
     ("exp", EXPERT_AXIS),
 )
+
+
+_log = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -587,13 +592,15 @@ class DevicePrefetchIterator:
                             self._queue.put((placed, state), timeout=0.05)
                             break
                         except queue.Full:
-                            pass
+                            continue
                 finally:
                     if annotation is not None:
                         annotation.__exit__(None, None, None)
                 placed = state = None
         except StopIteration:
-            pass
+            # A drained source is how a prefetch thread ends; the finally
+            # below publishes the end, and no error goes with it.
+            _log.debug("%s drained; the prefetch thread is done", self._source_name)
         except BaseException as error:
             self._error = error
         finally:
@@ -614,11 +621,9 @@ class DevicePrefetchIterator:
                 self._done.set()
 
     def _discard(self) -> None:
-        while True:
-            try:
+        with contextlib.suppress(queue.Empty):
+            while True:
                 self._queue.get_nowait()
-            except queue.Empty:
-                return
 
     def close(self, *, timeout: float | None = None) -> None:
         """Cancel and join, discarding unread batches, not consumed position.

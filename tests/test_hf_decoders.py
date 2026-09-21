@@ -106,9 +106,7 @@ import numpy as np
 import pytest
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import (
-    save_pretrained_decoder, translate_config, translate_weights,
-)
+from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
 from dew.nn.gpt_oss import dequantize_mxfp4, quantize_mxfp4
 from dew.registry import models, with_precision
 
@@ -129,6 +127,7 @@ def fixture_config(name):
 
 def test_registered_family_alias_preserves_its_source_when_exported(tmp_path, monkeypatch):
     from shutil import copytree
+
     from dew.interop import hf_decoders
 
     alias = "dream_registered_alias"
@@ -2337,6 +2336,7 @@ def test_a_kimi_k25_tied_head_binds_to_the_nested_embedding(tmp_path):
     embedding's leaf, and a copy that is a different matrix is refused
     under those names rather than the unnested ones."""
     from shutil import copytree
+
     from dew.interop.hf_decoders import _load_shards
     from dew.interop.safetensors_io import write_file
 
@@ -2478,6 +2478,7 @@ GLM_MOE_DSA = FIXTURES / "glm-moe-dsa-tiny"
 
 def test_kimi_k25_text_only_placeholders_match_reference():
     import torch
+
     from tools.decoder_export_reference import Case, reference_model
 
     directory = FIXTURES / "kimi-k25-tiny"
@@ -2997,6 +2998,7 @@ def test_deepseek_v4_public_speculation_preserves_padded_rows():
 
 def test_deepseek_v4_cached_chunks_match_transformers():
     import torch
+
     from tools.decoder_export_reference import Case, reference_model
 
     source = load_pretrained(DEEPSEEK_V4, dtype='float32', attention_impl='reference')

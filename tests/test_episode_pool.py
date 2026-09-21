@@ -1,12 +1,11 @@
 """Real pool agreement, variable episode lengths and global-update parity."""
 
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
-
 from test_multiprocess import free_port, report_of, terminate, worker_env
 
 WORKER = Path(__file__).with_name("tool_episode_worker.py")

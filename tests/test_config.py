@@ -1,9 +1,9 @@
 """RunConfig: the typed record of a run, its round trip, and what it builds."""
 
+import dataclasses
 import json
 import os
 from typing import TYPE_CHECKING, Any, Mapping, Optional
-import dataclasses
 
 import jax.numpy as jnp
 import pytest
@@ -340,6 +340,7 @@ def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
 
 def test_a_saved_model_retains_nested_mixer_behavior(tmp_path):
     import jax
+
     from dew.nn.backbones.causal_transformer import LayerKind
     from dew.nn.mixers import AttentionMixer
     from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
@@ -363,6 +364,7 @@ def test_a_saved_model_retains_nested_mixer_behavior(tmp_path):
 
 def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     import jax
+
     from dew.nn.vision import GemmaProjector, SiglipVision, projector_from_record, tower_from_record
 
     @dataclasses.dataclass(frozen=True)
@@ -391,6 +393,7 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
 
 def test_a_bare_tuple_record_builds_a_jitted_residual_block():
     import jax
+
     from dew.nn.blocks import ResidualBlock
 
     registry = Registry("block")

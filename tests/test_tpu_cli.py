@@ -9,9 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from dew.cli import config as tpu_config
-from dew.cli import tpu as tpu_cli
-from dew.cli import tpu_setup
+from dew.cli import config as tpu_config, tpu as tpu_cli, tpu_setup
 from dew.cli.gcloud import Node, Result, exit_code
 
 REPO = Path(__file__).resolve().parents[1]
@@ -838,6 +836,7 @@ def test_a_corrupt_zone_cache_is_named_rather_than_emptied(fake):
 
 def _write_process_zone_cache(directory, worker):
     import os
+
     from dew.cli import config
 
     os.environ["DEW_CONFIG_DIR"] = directory

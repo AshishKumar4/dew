@@ -53,6 +53,7 @@ def test_device_timeline_covers_nested_and_disjoint_kernels(
     tmp_path, monkeypatch, intervals, busy, window,
 ):
     from types import SimpleNamespace
+
     import jax.profiler
 
     trace = tmp_path / "trace.xplane.pb"

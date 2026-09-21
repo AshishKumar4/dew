@@ -59,7 +59,9 @@ def decode(position: bytes) -> Global | None:
     try:
         stored = json.loads(position)
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
+        # Bytes that are not JSON take the same path as JSON that is not this
+        # envelope, which is the one the docstring promises.
+        stored = None
     envelope = stored.get(ENVELOPE) if isinstance(stored, dict) else None
     if not isinstance(envelope, dict):
         return None
