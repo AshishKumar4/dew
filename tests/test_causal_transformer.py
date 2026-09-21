@@ -209,7 +209,8 @@ def test_hidden_states_times_head_weight_are_the_logits(rng, config):
         logits = cap * jnp.tanh(logits / cap)
 
     assert hidden.shape == (ids.shape[0], SEQ, model.emb_features)
-    assert head.shape == (model.emb_features, VOCAB) and head.dtype == jnp.float32
+    stored = params['params']['embed_tokens']['embedding'].dtype
+    assert head.shape == (model.emb_features, VOCAB) and head.dtype == stored
     reference = model.apply(params, ids)
     largest = jnp.abs(reference).max()
     assert jnp.abs(logits - reference).max() <= 1e-5 * largest

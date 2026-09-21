@@ -2011,12 +2011,15 @@ class CausalTransformer(nn.Module):
 
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
-        # fp32 head, as in the DiT output projection: the loss is computed in fp32
+        # fp32 head, as in the DiT output projection: the loss is computed in
+        # fp32. The table is contracted in its stored dtype with fp32
+        # accumulation: a bf16 product is exact in fp32, so the scores are
+        # the upcast table's up to summation order, and no fp32 copy of the
+        # vocabulary-sized table is materialised or saved for the backward.
         if self.tie_embeddings:
             logits = jnp.einsum(
-                '...d,vd->...v', x.astype(jnp.float32),
-                self.embed_tokens.embedding.astype(jnp.float32),
-                precision=self.precision)
+                '...d,vd->...v', x.astype(jnp.float32), self.embed_tokens.embedding,
+                precision=self.precision, preferred_element_type=jnp.float32)
         else:
             logits = self.lm_head(x)
         logits = logits.astype(jnp.float32)
@@ -2562,17 +2565,19 @@ class CausalTransformer(nn.Module):
 
 
     def head_weight(self, params):
-        """The `[D, vocab]` head matrix in fp32, as the forward multiplies it.
+        """The `[D, vocab]` head matrix in its stored dtype, as the forward
+        contracts it (`_logits`: fp32 accumulation over the stored operand).
 
         `params` is the parameter tree the forward runs under, so this is a
         plain read: a tied head is the embedding table transposed, an untied
         one is `lm_head`'s kernel, which is `[D, vocab]` already. The Gemma
         embedding scale multiplies the input embeddings only, so it has no
-        place here.
+        place here. A vocabulary-sized fp32 copy is what a loss over this
+        head would hold for its backward, so none is made here.
         """
         if self.tie_embeddings:
-            return params['embed_tokens']['embedding'].astype(jnp.float32).T
-        return params['lm_head']['kernel'].astype(jnp.float32)
+            return params['embed_tokens']['embedding'].T
+        return params['lm_head']['kernel']
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.

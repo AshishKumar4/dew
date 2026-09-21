@@ -58,10 +58,15 @@ class SelfConditioning(nn.Module):
 
 def soft_embeddings(logits: jax.typing.ArrayLike, embed_weight: jax.typing.ArrayLike,
                     scale: float) -> jax.Array:
-    """Previous logits as soft embeddings: fp32 softmax against the table."""
+    """Previous logits as soft embeddings: fp32 softmax against the table.
+
+    The table is contracted in its stored dtype with fp32 accumulation, which
+    is the upcast product up to summation order and materialises no fp32 copy
+    of the vocabulary-sized table.
+    """
     probs = jax.nn.softmax(jnp.asarray(logits, jnp.float32), axis=-1)
-    return (probs @ jnp.asarray(embed_weight, jnp.float32)) * jnp.asarray(
-        scale, jnp.float32)
+    return jnp.einsum('...v,vd->...d', probs, jnp.asarray(embed_weight),
+                      preferred_element_type=jnp.float32) * jnp.asarray(scale, jnp.float32)
 
 
 @models("diffusion_gemma")
