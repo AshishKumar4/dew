@@ -37,8 +37,9 @@ from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.gpt_oss import mxfp4_stems, mxfp4_tensor_names, pack_mxfp4, read_mxfp4_tensor, unpack_mxfp4
-from dew.nn.inputs import ModelInputs, pad_token_rows
+from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.nn.multimodal import MultimodalTransformer
+from dew.nn.text_encoders import ParamTree
 from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, models, resolve_dtype, with_precision
@@ -47,14 +48,25 @@ from dew.sampling.guidance import CFG
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling
+from dew.telemetry.records import JSON
+
+# One keyword a host processor takes: the text it tokenizes, the flags and
+# tensor format that shape what it hands back, the media a caller loaded, and
+# the per-clip records that travel with a video.
+type ProcessorArgument = str | bool | None | Sequence[str] | Media | Sequence[Mapping[str, object]]
 
 
 class HostProcessor(Protocol):
     """The HF processor operations kept outside compiled model computation."""
 
-    def __call__(self, **kwargs: object) -> Mapping[str, object]: ...
-    def save_pretrained(self, save_directory: str) -> object: ...
-    def apply_chat_template(self, conversation: Sequence[Mapping[str, object]], **kwargs: object) -> object: ...
+    # `images` is the one keyword dew cannot name yet: the protocol it has to
+    # satisfy, dew.inference.tasks.Processor, still takes `object` for it.
+    def __call__(self, *, images: object | None = None,
+                 **kwargs: ProcessorArgument) -> Mapping[str, object]: ...
+    # The files it wrote are its own bookkeeping; dew calls this for the effect.
+    def save_pretrained(self, save_directory: str) -> None: ...
+    def apply_chat_template(self, conversation: Sequence[Mapping[str, object]],
+                            **kwargs: JSON) -> str | Sequence[int] | Mapping[str, object]: ...
     def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]: ...
 
 
@@ -72,9 +84,11 @@ class Processor:
     record: Mapping[str, object]
     vocab_size: int
 
+    # `images` stays unnarrowed until dew.inference.tasks.Processor, the
+    # protocol this one has to satisfy, takes `Media` for it too.
     def __call__(self, text: str | Sequence[str], *, images: object | None = None,
-                 audio: object | None = None, videos: object | None = None,
-                 video_metadata: object | None = None) -> ModelInputs:
+                 audio: Media | None = None, videos: Media | None = None,
+                 video_metadata: Sequence[Mapping[str, object]] | None = None) -> ModelInputs:
         if images is None and audio is None and videos is None:
             if video_metadata is not None:
                 raise ValueError("video_metadata requires videos")
@@ -94,11 +108,9 @@ class Processor:
             return self.from_hf({"input_ids": tokens, **fields})
         # truncation is off for text anyway; reloaded Gemma processors forward
         # the tokenizer's unset max_length into audio kwargs otherwise.
-        arguments: dict[str, object] = {
+        arguments: dict[str, ProcessorArgument] = {
             "text": text if isinstance(text, str) else list(text),
             "padding": not isinstance(text, str) and len(text) > 1, "truncation": False, "return_tensors": "pt"}
-        if images is not None:
-            arguments["images"] = images
         if audio is not None:
             arguments["audio"] = audio
         if videos is not None:
@@ -107,10 +119,14 @@ class Processor:
             if videos is None:
                 raise ValueError("video_metadata requires videos")
             arguments["video_metadata"] = video_metadata
-        return self._from_tensors(self.reference(**arguments))
+        # An audio-only processor takes no images keyword at all, so the
+        # absent one is left out of the call rather than passed as None.
+        if images is None:
+            return self._from_tensors(self.reference(**arguments))
+        return self._from_tensors(self.reference(images=images, **arguments))
 
     def chat(self, messages: Sequence[Mapping[str, object]], *, add_generation_prompt: bool = True,
-             **template_options: object) -> ModelInputs:
+             **template_options: JSON) -> ModelInputs:
         """Run the source's actual chat template and processor into numeric inputs.
 
         Template controls such as reasoning_effort and preserve_thinking are
@@ -958,20 +974,43 @@ class Pretrained:
 
 
 
-def _native_variables(parts: Mapping[str, Mapping[str, object]]) -> dict[str, dict[str, object]]:
-    collections: dict[str, dict[str, object]] = {}
+def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:
+    collections: dict[str, dict[str, ParamTree]] = {}
     for component, variables in parts.items():
         for collection, tree in variables.items():
             collections.setdefault(collection, {})[component] = tree
     return collections
 
 
+def _json(value: object, name: str) -> JSON:
+    """One source config field, narrowed to the JSON its file carries.
+
+    config.json and generation_config.json are read with `json.loads`, so a
+    field is a scalar, a list or a record of them; anything else reached this
+    mapping from somewhere other than the source.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json(entry, name) for entry in value]
+    if isinstance(value, Mapping):
+        return {_json_key(key, name): _json(entry, name) for key, entry in value.items()}
+    raise ValueError(f"{name}={value!r} is not a value a JSON config carries")
+
+
+def _json_key(key: object, name: str) -> str:
+    """One record field name, which JSON always spells as a string."""
+    if not isinstance(key, str):
+        raise ValueError(f"{name} record key {key!r} is not a string")
+    return key
+
+
 def _generation_value(config: Mapping[str, object], generation_config: Mapping[str, object],
-                      name: str, default: object = None) -> object:
+                      name: str, default: JSON = None) -> JSON:
     text = config.get("text_config", config)
     if not isinstance(text, Mapping):
         raise ValueError("text_config must be a mapping")
-    return generation_config.get(name, config.get(name, text.get(name, default)))
+    return _json(generation_config.get(name, config.get(name, text.get(name, default))), name)
 
 
 def _eos_ids(config: Mapping[str, object], generation_config: Mapping[str, object]) -> tuple[int, ...]:
@@ -979,9 +1018,14 @@ def _eos_ids(config: Mapping[str, object], generation_config: Mapping[str, objec
     if value is None:
         return ()
     values = (value,) if type(value) is int else value
-    if not isinstance(values, (tuple, list)) or any(type(entry) is not int or entry < 0 for entry in values):
+    if not isinstance(values, (tuple, list)):
         raise ValueError("eos_token_id must be an integer or a sequence of integers")
-    return tuple(values)
+    ids: list[int] = []
+    for entry in values:
+        if type(entry) is not int or entry < 0:
+            raise ValueError("eos_token_id must be an integer or a sequence of integers")
+        ids.append(entry)
+    return tuple(ids)
 
 
 def _pad_id(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int:
@@ -1028,10 +1072,10 @@ class _Control:
 
     owner: Literal["policy", "task", "metadata", "inapplicable", "transform",
                    "criterion", "strategy", "capacity", "unsupported"]
-    neutral: tuple[object, ...] = ()
+    neutral: tuple[JSON, ...] = ()
     mode: Literal["always", "sampling", "beam"] = "always"
     refusal: str | None = None
-    masked_neutral: tuple[object, ...] | None = None
+    masked_neutral: tuple[JSON, ...] | None = None
 
 
 # GenerationConfig is external data. Keep each control's disposition and
@@ -1172,16 +1216,17 @@ _CONTROLS = {
 
 
 
-def _neutral(value: object, neutral: tuple[object, ...]) -> bool:
+def _neutral(value: JSON, neutral: tuple[JSON, ...]) -> bool:
     if value is None:
         return True
-    numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+    # A config flag is not a config number, so 0 does not neutralize False.
+    numeric = type(value) in (int, float)
     return any(value == entry and ((numeric and not isinstance(entry, bool)) or type(value) is type(entry))
                for entry in neutral)
 
 
 def _active(config: Mapping[str, object], generation_config: Mapping[str, object],
-            name: str, *, masked: bool = False) -> object:
+            name: str, *, masked: bool = False) -> JSON:
     """The control's value when it is active, None when it changes nothing."""
     value = _generation_value(config, generation_config, name)
     rule = _CONTROLS.get(name)
@@ -1205,7 +1250,7 @@ def _audit_masked(config: Mapping[str, object], generation_config: Mapping[str, 
 
 
 def _audit(config: Mapping[str, object], generation_config: Mapping[str, object],
-           model: nn.Module, do_sample: bool, beams: object, overridden: bool) -> None:
+           model: nn.Module, do_sample: bool, beams: JSON, overridden: bool) -> None:
     """Refuse active unsupported controls after applying the caller's override."""
     refused: list[str] = []
     for name in sorted(_CONTROLS.keys() | generation_config.keys()):
@@ -1292,7 +1337,7 @@ def _as_float(name: str, value: object) -> float:
 
 
 def _as_int(name: str, value: object) -> int:
-    if type(value) is not int:
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{name} must be an integer")
     return value
 
