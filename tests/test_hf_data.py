@@ -23,7 +23,7 @@ import grain.python as pygrain
 
 datasets = pytest.importorskip("datasets")
 
-from dew.data import HFImages, Loading  # noqa: E402
+from dew.data import HFImages, HFOptions, Loading  # noqa: E402
 from dew.data.sources.hf import HFDatasetSource  # noqa: E402
 
 RECORDS = 16
@@ -69,6 +69,20 @@ def hub(monkeypatch):
         # The dataset and the split are what a reload has to get right; the
         # rest of what dew names are the library's own defaults.
         calls.append({"name": path, "split": split})
+        return _table()
+
+    monkeypatch.setattr(datasets, "load_dataset", load_dataset)
+    return calls
+
+
+@pytest.fixture
+def forwarded(monkeypatch):
+    """Every argument `load_dataset` was called with, the library replaced at
+    its own entry point and nothing of dew's."""
+    calls = []
+
+    def load_dataset(path, **kwargs):
+        calls.append({"path": path, **kwargs})
         return _table()
 
     monkeypatch.setattr(datasets, "load_dataset", load_dataset)
@@ -204,6 +218,37 @@ def test_the_split_is_a_field(hub):
     _hub_images(split="validation", val_batches=None).load(batch=4)
 
     assert hub == [{"name": "acme/pets", "split": "validation"}]
+
+
+def test_the_hub_options_reach_load_dataset(forwarded):
+    """A hub image dataset behind a config name, a revision or its own
+    `data_files` was unreadable from the image spec: only the provider route
+    forwarded them, and it does not build image batches."""
+    options = HFOptions(config="full", data_files={"train": "shard-*.parquet"},
+                        revision="refs/convert/parquet", token="hf_x", num_proc=2)
+
+    _hub_images(options=options, val_batches=None).load(batch=4)
+
+    assert forwarded == [{
+        "path": "acme/pets", "name": "full", "split": "train", "streaming": False,
+        "data_dir": None, "data_files": {"train": "shard-*.parquet"},
+        "cache_dir": None, "features": None, "download_config": None,
+        "download_mode": None, "verification_mode": None, "keep_in_memory": None,
+        "save_infos": False, "revision": "refs/convert/parquet", "token": "hf_x",
+        "num_proc": 2, "storage_options": None}]
+
+
+def test_the_options_travel_to_a_worker_with_the_source(forwarded):
+    """grain pickles the source into every worker, which reloads the table
+    there; a worker that lost the options would read another dataset."""
+    source = _hub_images(options=HFOptions(config="full", revision="v2")).source()
+    len(source)
+
+    reloaded = pickle.loads(pickle.dumps(source))
+    len(reloaded)
+
+    assert [call["name"] for call in forwarded] == ["full", "full"]
+    assert [call["revision"] for call in forwarded] == ["v2", "v2"]
 
 
 def test_the_caption_comes_from_the_record(hub):
