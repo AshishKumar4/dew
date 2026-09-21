@@ -12,6 +12,7 @@ not mutate, donate or delete those buffers while the task is using them.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -46,10 +47,11 @@ own several-second XLA compile, and served requests are rarely the same
 length twice. So a prompt pads left to the smallest bucket of 64 or more,
 where the attention mask hides the filler as it already hides the padding
 a ragged batch needs; a budget rounds up to the smallest bucket of 32 or
-more, and the trips past the request come off the result. Rows are the
-caller's and are not bucketed. A request whose buckets would not fit the
-model's `max_seq_len` keeps its own shapes, so the ceiling refuses what
-it refuses today.
+more, and the trips past the request come off the result; the cache for
+the call is the two together, rounded up again, in place of the model's
+whole `max_seq_len`. Rows are the caller's and are not bucketed. A request
+whose buckets would need more capacity than the model's `max_seq_len`
+keeps its own shapes, so the ceiling refuses what it refuses today.
 """
 
 
@@ -153,23 +155,27 @@ def _ceiling(model: nn.Module) -> int | None:
     return declared if type(declared) is int else None
 
 
-def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None) -> tuple[ModelInputs, int]:
-    """The request at bucket shapes: padded inputs and the trips to scan.
+def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
+              ) -> tuple[ModelInputs, int, int | None]:
+    """The request at bucket shapes: padded inputs, scan trips and cache capacity.
 
-    A request the buckets cannot hold keeps its own shapes, so it is refused
-    where it is refused today. So does one carrying media or logical
-    positions: validity is the only sequence field a filler slot has a value
-    for, since such a slot holds no coordinate and no media feature.
+    A capacity of None leaves the request its own shapes and the model its
+    own cache. That is what a request too large for the ceiling gets, so it
+    is refused where it is refused today, and what one carrying media or
+    logical positions gets: validity is the only sequence field a filler
+    slot has a value for, since such a slot holds no coordinate and no
+    media feature.
     """
     if ceiling is None or budget < 1:
-        return inputs, budget
+        return inputs, budget, None
     if set(inputs.token_fields) - {"attention_mask"} or inputs.conditioning:
-        return inputs, budget
+        return inputs, budget, None
     width = _bucket(inputs.tokens.shape[1], 64)
     trips = _bucket(budget, 32)
-    if width + trips > ceiling:
-        return inputs, budget
-    return _padded(inputs, width), trips
+    capacity = _bucket(width + trips, 64)
+    if capacity > ceiling:
+        return inputs, budget, None
+    return _padded(inputs, width), trips, capacity
 
 
 def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
@@ -182,6 +188,22 @@ def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
         valid = jnp.ones(inputs.tokens.shape, bool)
     return replace(inputs, tokens=jnp.pad(inputs.tokens, ((0, 0), (extra, 0))),
                    token_fields={"attention_mask": jnp.pad(valid, ((0, 0), (extra, 0)))})
+
+
+@functools.cache
+def _sized(model: nn.Module, capacity: int | None) -> nn.Module:
+    """`model` with a decode cache of `capacity` slots, one clone per capacity.
+
+    A model's `max_seq_len` is the only channel its layers read a cache size
+    from (`dew.nn.attention.open_kv_cache`), so a per-request capacity is a
+    model per capacity. The clones are kept because the model is a static
+    argument of the compiled generation: one object per capacity is one
+    compile per capacity rather than one per call.
+    """
+    if capacity is None or not any(field.name == "max_seq_len"
+                                   for field in dataclasses.fields(model)):
+        return model
+    return model.clone(max_seq_len=capacity)
 
 
 def _requested(generated: Generation, budget: int, padding: int) -> Generation:
@@ -226,9 +248,10 @@ class TextGeneration:
     replaces a bound chain with its own, because the policy it overrides is
     what that chain was built from.
 
-    A call runs at `SHAPE_BUCKETS` shapes and hands back the shapes the
-    request asked for, so two requests of nearby lengths share one compiled
-    executable.
+    A call runs at `SHAPE_BUCKETS` shapes over a cache the bucket sizes,
+    and hands back the shapes the request asked for, so two requests of
+    nearby lengths share one compiled executable and neither pays for the
+    model's whole context.
     """
 
     model: nn.Module
@@ -277,9 +300,9 @@ class TextGeneration:
                                           collective=mesh_of(self.variables) is not None,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key, seed=seed)
-            shaped, trips = _bucketed(inputs, budget, _ceiling(self.model))
+            shaped, trips, capacity = _bucketed(inputs, budget, _ceiling(self.model))
             chain = self.logits if sampling is None else None
-            generated = generate(self.model, self.variables, shaped, trips, key=random_key,
+            generated = generate(_sized(self.model, capacity), self.variables, shaped, trips, key=random_key,
                               sampling=self.sampling if sampling is None else sampling,
                               n=self.n if n is None else n,
                               logits=chain if logits is None else logits,

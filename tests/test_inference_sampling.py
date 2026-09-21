@@ -385,6 +385,25 @@ def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draw
     assert compiled._cache_size() - traced == 1
 
 
+def test_the_cache_a_call_builds_holds_the_request_not_the_model_context(roomy, monkeypatch):
+    """A 200-token prompt with a 100-token budget runs over 512 cache slots:
+    the buckets are 256 and 128, and the model's own 1024 is the ceiling that
+    refuses a request, not the capacity every request pays for."""
+    seen = {}
+    unwrapped = tasks.generate
+
+    def record(model, *args, **kwargs):
+        seen["model"] = model
+        return unwrapped(model, *args, **kwargs)
+
+    monkeypatch.setattr(tasks, "generate", record)
+    roomy(ramp(200), 100, seed=0)
+    cache = seen["model"].apply(roomy.variables, 1, method="init_cache", mutable=["cache"])[1]["cache"]
+    slots = {path[-1].key: leaf.shape[1]
+             for path, leaf in jax.tree_util.tree_flatten_with_path(cache)[0] if leaf.ndim > 1}
+    assert slots == {"cache_valid": 512, "cached_key": 512, "cached_value": 512}
+
+
 def test_a_request_the_ceiling_refuses_keeps_refusing_at_its_own_shapes(roomy):
     """A prompt and budget over `max_seq_len` cannot be bucketed into one that
     fits, so the request keeps its own shapes and meets the cache ceiling."""
@@ -397,11 +416,11 @@ def test_a_budget_inside_a_bucket_returns_the_budget_and_what_the_budget_draws(r
     per row: the same tokens, lengths and likelihoods the 100-trip scan over
     the same cache produces, and one executable for both budgets."""
     prompt, budget = ramp(40), 100
-    shaped, trips = tasks._bucketed(ModelInputs.from_value(prompt), budget,
-                                    roomy.model.max_seq_len)
-    assert (shaped.tokens.shape[1], trips) == (64, 128)
-    exact = generate(roomy.model, roomy.variables, shaped, budget, seed=3,
-                     sampling=roomy.sampling)
+    shaped, trips, capacity = tasks._bucketed(ModelInputs.from_value(prompt), budget,
+                                              roomy.model.max_seq_len)
+    assert (shaped.tokens.shape[1], trips, capacity) == (64, 128, 256)
+    exact = generate(tasks._sized(roomy.model, capacity), roomy.variables, shaped, budget,
+                     seed=3, sampling=roomy.sampling)
     compiled = text._compiled(None)
     traced = compiled._cache_size()
     drawn = roomy(prompt, budget, seed=3)
