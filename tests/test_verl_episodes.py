@@ -1,5 +1,6 @@
 """Lossless episode interchange through pinned verl's real rollout models."""
 
+import dataclasses
 import json
 from copy import deepcopy
 from dataclasses import replace
@@ -9,9 +10,18 @@ import numpy as np
 import pytest
 from test_tool_episodes import build, collect
 
+from dew.objectives.rl.episodes import Episode
+from dew.objectives.rl.records import EpisodeFields
 from dew.objectives.rl.verl import from_verl, to_verl
 
 FIXTURE = Path(__file__).parent / "fixtures/rl/verl_episodes.json"
+
+
+def test_an_episode_record_names_every_field_of_the_episode_it_carries():
+    """The exported record is the dataclass's own fields, so a field added,
+    renamed or dropped there fails here instead of leaving the wire silently."""
+    declared = {field.name for field in dataclasses.fields(Episode) if field.init}
+    assert set(EpisodeFields.__optional_keys__) | set(EpisodeFields.__required_keys__) == declared
 
 
 def test_verl_model_and_tensor_mapping_preserve_actions_and_likelihoods():
