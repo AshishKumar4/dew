@@ -14,18 +14,22 @@ and backward at compute capability 8.9.
 
 Tolerances and the differences actually observed, fp32 on CPU:
 
-- forward, every shape below       : output 1.9e-06 on outputs of magnitude 30,
-  final state 4.3e-06 on states of magnitude 6.2, tolerance 1e-5
-- gradients, chunk 32 over 70 steps : at most 9.1e-06 on gradients of
-  magnitude up to 36, tolerance 1e-5
-- gradients, one chunk of 128       : at most 1.6e-05 on gradients of magnitude
-  up to 41, which is 4e-07 of them and about three fp32 ulps, tolerance 2e-5.
-  The difference is the XLA path's rounding rather than the kernel's: against
-  the same scan evaluated in float64, the kernel sits 3.0e-06 from it where
-  the XLA path sits 1.5e-05, and
-  `test_the_kernel_is_at_least_as_exact_as_the_xla_scan` asserts that ordering.
-- bfloat16 through `chunk_ssd`      : the kernel and the XLA path round to the
-  same bf16 output, 0.0 apart
+- forward, both chunk sizes        : output 1.9e-06 on outputs of magnitude 30;
+  final state 1.4e-06 at a chunk of 32 and 4.3e-06 at one chunk of 128, on
+  states of magnitude 6.2. Tolerance 1e-5.
+- gradients, 70 steps at a chunk of 32 : at most 6.7e-06, on gradients of
+  magnitude up to 40. Tolerance 1e-5.
+- gradients, the same 70 steps as one chunk of 128 : at most 1.6e-05, on the
+  `A dt` gradient of magnitude 49, which is 3.3e-07 of it and under three fp32
+  ulps. Tolerance 2e-5. The difference is the XLA path's rounding rather than
+  the kernel's: against the same scan in float64 the kernel sits 8.0e-06 from
+  it where the XLA path sits 1.6e-05, and the final state 2.9e-07 against
+  4.2e-06. `test_the_kernel_is_at_least_as_exact_as_the_xla_scan` asserts that
+  ordering for every one of them rather than leaving it written here.
+- bfloat16 through `chunk_ssd`      : the two round to the same bf16 output,
+  0.0 apart over 65536 entries; the final state differs in one entry of 32768,
+  0.271484 against 0.273438, which is the one bf16 ulp of that binade. The
+  scan itself is fp32 on both paths, and there they sit 1.2e-06 apart.
 """
 
 import json
@@ -234,10 +238,21 @@ def test_chunk_ssd_returns_the_same_gradients_through_either_path(monkeypatch, p
         assert largest(want, got) / scale < 1e-5, name
 
 
+def within_one_ulp(got, expected) -> bool:
+    """One bfloat16 ulp of each entry, `2 ** (binade - 8)`: bf16 carries 8
+    significand bits, so the spacing at a value is that value's power of two
+    over 128. Read per entry rather than from the largest one, which is what
+    holds the small entries to the same bound."""
+    got, expected = np.asarray(got, np.float32), np.asarray(expected, np.float32)
+    binade = np.frexp(np.maximum(np.abs(got), np.abs(expected)))[1]
+    return bool(np.all(np.abs(got - expected) <= np.ldexp(1.0, binade - 8)))
+
+
 @pytest.mark.parametrize("platform", KERNELS)
 def test_bfloat16_keeps_the_state_in_f32_and_rounds_the_output_the_same(monkeypatch, platform):
     """The scan is fp32 either way, so what bf16 inputs change is the cast at
-    the ends; the kernel and the XLA path land on the same bf16 numbers."""
+    the ends; the kernel and the XLA path land within one bf16 ulp, and on the
+    output itself on the same numbers."""
     operands = mixer_operands((2, 128, 4, 64, 64, 2))
     narrow = (*(jnp.asarray(t, jnp.bfloat16) for t in operands[:6]), operands[6])
     expected, expected_final = chunk_ssd(*narrow, 64)
@@ -246,9 +261,8 @@ def test_bfloat16_keeps_the_state_in_f32_and_rounds_the_output_the_same(monkeypa
     scanned, final = chunk_ssd(*narrow, 64)
 
     assert scanned.dtype == jnp.bfloat16 and final.dtype == jnp.bfloat16
-    ulp = float(np.max(np.abs(np.asarray(expected, np.float32)))) / 256
-    assert largest(scanned, expected) <= ulp
-    assert largest(final, expected_final) <= ulp
+    assert largest(scanned, expected) == 0.0
+    assert within_one_ulp(final, expected_final)
 
 
 def test_the_kernel_is_refused_on_cpu():
