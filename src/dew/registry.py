@@ -228,18 +228,19 @@ def from_record(annotation: object, value: Any) -> Any:
             # per-stage attention settings: entries are walked and a "dtype"
             # entry resolves the same way as a dtype field.
             entries = entry_types(annotation, len(value))
-            return {key: resolve_dtype(entry) if key == "dtype" else from_record(entry, entry)
-                    for entry, (key, entry) in zip(entries, value.items(), strict=True)}
+            return {key: resolve_dtype(record) if key == "dtype" else from_record(entry, record)
+                    for entry, (key, record) in zip(entries, value.items(), strict=True)}
         declared = sorted(f.name for f in dataclasses.fields(held) if f.init)
         unknown = sorted(set(value) - set(declared))
         if unknown:
             raise ValueError(f"{_describe(held)} has no field for {unknown}; its "
                              f"fields are {declared}")
-        return held(**{key: _field_value(held, key, entry)
-                       for key, entry in value.items()})
+        return held(**{key: _field_value(held, key, record)
+                       for key, record in value.items()})
     if isinstance(value, (list, tuple)):
         entries = entry_types(annotation, len(value))
-        rebuilt = [from_record(entry, entry) for entry, entry in zip(entries, value, strict=True)]
+        rebuilt = [from_record(entry, record)
+                   for entry, record in zip(entries, value, strict=True)]
         return tuple(rebuilt) if wants_tuple(annotation) else type(value)(rebuilt)
     return value
 
