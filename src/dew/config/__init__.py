@@ -45,7 +45,7 @@ from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import build_optimizer
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
-from dew.training.trainer import Profile, Trainer
+from dew.training.trainer import ProfileWindow, Trainer
 
 JsonDict = Annotated[
     dict[str, Any],
@@ -156,7 +156,7 @@ class TrainerConfig:
     dynamic_scale: bool = False
     mesh: MeshSpec = MeshSpec()
     layout: Layout = Layout()
-    profile: Profile | None = None
+    profile: ProfileWindow | None = None
     """One profiler window: the steps to trace, the warmup before it and the
     directory it is written to. Unset traces nothing."""
     compilation_cache_dir: str | None = dataclasses.field(

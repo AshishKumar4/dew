@@ -45,7 +45,13 @@ from dew.objectives.base import (
 )
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
-from dew.telemetry.records import CheckpointRequested, FitEnded, FitStarted, ProfileWindow, Record
+from dew.telemetry.records import (
+    CheckpointRequested,
+    FitEnded,
+    FitStarted,
+    ProfileWindow as ProfileWindowRecord,
+    Record,
+)
 from dew.training.distributed import (
     DevicePrefetchIterator,
     Layout,
@@ -108,10 +114,15 @@ class Rollout(Protocol):
 
 
 @dataclasses.dataclass(frozen=True)
-class Profile:
+class ProfileWindow:
     """One profiler window per fit: `steps` steps traced into `directory`
     after `warmup` steps have run, so the trace holds the loop and not the
-    compile."""
+    compile.
+
+    `dew.profile` is the other way to capture one, a context manager around
+    any code at all; a fit refuses to schedule a window inside one. The
+    window the loop wrote is reported as the `ProfileWindow` record of
+    `dew.telemetry.records`."""
     directory: str
     steps: int
     warmup: int = 2
@@ -177,7 +188,7 @@ class Trainer(Generic[Loss, Effects]):
         tracker: Tracker | None = None,
         step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None,
         rollout: Rollout | None = None,
-        profile: Profile | None = None,
+        profile: ProfileWindow | None = None,
     ):
         """Accumulate accepted microbatches before an optimizer commit.
 
@@ -976,7 +987,7 @@ class Trainer(Generic[Loss, Effects]):
     # Telemetry
     # ------------------------------------------------------------------
 
-    def _stop_trace(self, traced: int, loss, profile: Profile,
+    def _stop_trace(self, traced: int, loss, profile: ProfileWindow,
                     profiler: Profiler, *, step: int) -> None:
         """Stop the window's owned capture before reporting it on process zero.
 
@@ -999,7 +1010,7 @@ class Trainer(Generic[Loss, Effects]):
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="profile stop")
-        self._report(ProfileWindow(profile.directory, traced), step)
+        self._report(ProfileWindowRecord(profile.directory, traced), step)
         error = None
         try:
             if jax.process_index() == 0:

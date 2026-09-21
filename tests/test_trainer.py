@@ -27,7 +27,7 @@ from dew.training import (
     Checkpoints,
     Layout,
     MeshSpec,
-    Profile,
+    ProfileWindow,
     Trainer,
     ema_update,
     trainer as trainer_module,
@@ -166,7 +166,7 @@ def test_from_config_is_the_construction_a_run_config_used_to_write(tmp_path):
     config = TrainerConfig(
         batch_size=8, seed=7, steps=3, accumulation=2, dynamic_scale=True,
         mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
-        profile=Profile(str(tmp_path / "trace"), steps=2, warmup=1))
+        profile=ProfileWindow(str(tmp_path / "trace"), steps=2, warmup=1))
     objective, optimizer = Regression(), optax.sgd(0.1)
     key = jax.random.key(config.seed)
     checkpoints, tracker = Checkpoints(str(tmp_path / "run")), RecordingTracker()

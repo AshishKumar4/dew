@@ -617,7 +617,7 @@ def mode_profile_failure(args) -> dict:
 
     import dew.telemetry.profile as telemetry_profile
     from dew.artifacts import agree_process_phase
-    from dew.training import Profile, Trainer
+    from dew.training import ProfileWindow, Trainer
 
     # The optional XProf package is absent in the test environment; stubbing
     # its converter keeps the start path real while export becomes a no-op.
@@ -638,7 +638,7 @@ def mode_profile_failure(args) -> dict:
         profile_dir.write_text("occupied")  # a file where the capture must mkdir
     loader = indexed_loader(args.records, BATCH // args.processes)
     trainer = Trainer(make_objective(), optax.adam(1e-3), key=jax.random.key(0),
-                      profile=Profile(str(profile_dir), steps=2, warmup=0))
+                      profile=ProfileWindow(str(profile_dir), steps=2, warmup=0))
     error = None
     try:
         trainer.fit(Data(lambda: iter(loader)), steps=args.steps, log_every=1)
