@@ -14,6 +14,7 @@ import functools
 import math
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
 from .attention_sinks import attention_with_sinks
+from dew.telemetry.devices import deterministic_ops_requested
 
 def repeat_kv_heads(x, num_heads: int):
     """Repeat grouped key/value heads out to the query heads: [B, S, K, D] -> [B, S, N, D].
@@ -484,6 +485,11 @@ def cudnn_runs(query, softcap=None) -> bool:
     fused kernel applies. 'auto' asks this; an explicit 'cudnn' refuses by
     name instead.
 
+    A run under `--xla_gpu_deterministic_ops` is excluded as well, because
+    XLA's cudnn attention backward path crashes at execution time when one
+    executable holds two structurally identical backward calls under that
+    flag, which every multi-layer model has (openxla/xla#46500).
+
     The query's head width is the one every fused kernel runs at, values
     included: a narrower value (DeepSeek's latent attention) is padded to it
     by `widen_value_heads`, so this predicate reads the query alone and holds
@@ -491,7 +497,7 @@ def cudnn_runs(query, softcap=None) -> bool:
     head_dim = query.shape[-1]
     return (jax.default_backend() == 'gpu' and query.dtype in CUDNN_DTYPES
             and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM
-            and softcap is None)
+            and softcap is None and not deterministic_ops_requested())
 
 
 def softcapped_attention(query, key, value, softcap: float, dtype=None, precision=None,
@@ -543,8 +549,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
       and the only path that reads dtype, precision and force_fp32_for_softmax.
     - 'auto': 'cudnn' where its kernel runs (a gpu backend, bf16 or fp16
       inputs, a query head width that is a multiple of 8 and at most 128, no
-      softcap), 'xla' anywhere else. Resolved per trace, so a config logged
-      as 'auto' still runs on the next machine.
+      softcap, and no `--xla_gpu_deterministic_ops` on the run), 'xla'
+      anywhere else. Resolved per trace, so a config logged as 'auto' still
+      runs on the next machine.
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
@@ -552,7 +559,9 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
       ValueError, and so do a HIGH or HIGHEST precision and
       force_fp32_for_softmax=False. cudnn takes any sequence length
       (`cudnn_attention` pads an odd one), and only bf16 or fp16 inputs. A
-      value wider than the query has no fused rewrite and raises.
+      value wider than the query has no fused rewrite and raises, and so does
+      an explicit 'cudnn' under `--xla_gpu_deterministic_ops`, whose backward
+      pass XLA cannot execute (openxla/xla#46500).
     - 'tpu': the pallas TPU flash kernel, with the 1/sqrt(d) scale passed
       explicitly (the deleted EfficientAttention passed none, which inflated
       the logits by sqrt(d) and made its checkpoints poisonous).
@@ -624,6 +633,14 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             f"attention logit softcap of {softcap}: the fused kernel has no tanh "
             "between its scaling and its softmax. Use attention_impl 'xla' or "
             "the reference implementation (attention_impl 'reference').")
+    if implementation == 'cudnn' and deterministic_ops_requested():
+        raise ValueError(
+            "attention implementation 'cudnn' cannot run under "
+            "--xla_gpu_deterministic_ops: on this JAX and XLA its backward pass "
+            "is unusable, because an executable holding two identical fused "
+            "attention backward calls, which every multi-layer model has, fails "
+            "at execution time (openxla/xla#46500). Use attention_impl 'xla', "
+            "which is deterministic, or drop the flag.")
 
     if implementation is None or softcap is not None:
         heads = query.shape[-2]
