@@ -95,12 +95,61 @@ inference-clients = ["ollama>=0.6.2,<0.7", "openai>=3.8,<4"]
 # HF image processors use torchvision on the host; model computation stays JAX.
 vision = ["torchvision>=0.29"]
 
+[tool.ruff]
+target-version = "py312"
+# The tree's own width. A length histogram over src/dew puts p99 at 104 and
+# leaves 291 of 56986 lines past 110, against 890 past 100, so 110 is the
+# width the code was written to. Nothing is reflowed to reach it.
+line-length = 110
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W", "I", "UP", "B", "C4", "PERF", "PIE", "RET", "SIM", "PGH",
+    "ANN401", "T20", "ERA", "FBT003", "PLW0120", "RUF",
+]
+ignore = [
+    "E501",    # the formatter owns width; line-length above is its target, not a gate
+    "RUF012",  # mutable class attributes are Flax module fields, not shared state
+    "RUF001",  # unicode in docstrings is mathematical notation
+    "RUF002",  # unicode in docstrings is mathematical notation
+    "RUF003",  # unicode in comments is mathematical notation
+    "UP035",   # typing imports; the floor is 3.12, not 3.13
+    "SIM108",  # a ternary is not clearer than the if/else it replaces
+    "RET505",  # else-after-return keeps symmetric branches symmetric
+    "B008",    # nn.Module field defaults are evaluated once at class creation
+    "B023",    # every flagged closure is consumed inside its own iteration (nn.scan,
+               # jax.lax.*, an immediate call); ruff cannot see the consumption site
+    "RUF009",  # dataclass defaults are frozen dataclasses, so the shared instance is safe
+]
+
+[tool.ruff.lint.flake8-boolean-trap]
+# Two library contracts take their flag positionally and have no keyword worth
+# writing: jnp.asarray's `a` is the value itself, and nn.map_variables' second
+# parameter selects the collections. Every other boolean positional is ours.
+extend-allowed-calls = ["jax.numpy.asarray", "flax.linen.map_variables"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dew"]
+
+[tool.ruff.lint.per-file-ignores]
+# The suite prints its own diagnostics and calls library predicates positionally.
+"tests/**" = ["T20", "FBT003"]
+# Reference generators and recipes are scripts; stdout is their interface.
+"tools/**" = ["T20"]
+"recipes/**" = ["T20"]
+# The progress line the README documents ("step N: loss ..."), the device count
+# and the resume banner are the trainer's user-facing output, not logging.
+"src/dew/training/trainer.py" = ["T201"]
+"src/dew/training/runtime.py" = ["T201"]
+# `dew config show` prints the resolved configuration for a person to read.
+"src/dew/config/__init__.py" = ["T201"]
+
 [tool.pyright]
 # The declared boundary: dew's own source, checked against the project venv.
 # Vendored numeric code is included, not excluded; a checker finding is either
 # a real weakness or a type that is not yet true, and both get fixed rather
 # than silenced. No file list, no ignore comments, no lowered severity.
-include = ["src/dew"]
+include = ["src/dew", "tools/lint_slop.py"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 # Name the environment, or two people get two counts for the same tree.
