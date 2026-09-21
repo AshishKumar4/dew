@@ -526,6 +526,12 @@ def checkpoint_leaf(
     return leaf
 
 
+# One collection of a variables tree: the arrays `checkpoint_leaf` returns,
+# under the module names that read them. Shared by every translator that
+# builds one, here and in `nn.vision` and `interop.hf_decoders`.
+type ParamTree = dict[str, np.ndarray | ParamTree]
+
+
 def _translate(hf_tensors: Mapping[str, np.ndarray], path_of, param_dtype: str) -> dict[str, Any]:
     params: dict[str, Any] = {}
     for name, tensor in hf_tensors.items():
