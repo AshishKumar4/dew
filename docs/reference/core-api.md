@@ -394,6 +394,10 @@ TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_to
 task(request, max_new_tokens=None, *, key=None, seed=None, n=None, sampling=None,
      images=None, logits=None, stopping=None, strategy=None) -> Generation
 task.bind(variables) -> TextGeneration      task.decode(generation) -> tuple[str, ...]
+TextGeneration.from_run / BlockGeneration.from_run / MaskedGeneration.from_run
+    (directory, *, ema=True, step=None, mesh=None, layout=None, dtype=None, param_dtype=None)
+TextGeneration.from_pretrained / BlockGeneration.from_pretrained / MaskedGeneration.from_pretrained
+    (repo_id, *, ema=True, step=None, mesh=None, layout=None, dtype=None, param_dtype=None)
 BlockGeneration(model, variables, process, processor=None, eos_token_ids=(), pad_token_id=0,
                 max_new_tokens=None, max_length=None, n=1)
 task(request, max_new_tokens=None, *, key=None, seed=None, n=None, process=None,
@@ -421,7 +425,7 @@ A task captures the variables mapping at construction and on `bind`. Replacing t
 
 `max_new_tokens` takes precedence over a source default. If only `max_length` is declared, the budget is that total minus the padded prompt width. Otherwise an LM run records its `sample_tokens` and `sampling` value; an objective uses its `Samples`. With no limit the call must provide one. A call's `n` takes precedence over the task's bound count the same way, including `n=1` over a source that asks for more; omitting it uses the bound count. Equal shapes and controls reuse the compiled executable across calls and `bind`.
 
-`LMObjective.policy(params)` binds those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy, not their frozen loss reference; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent. Use `ema=False` for live weights. `TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, merging the EMA copy over the live parameters unless `ema=False`; `from_pretrained` pulls a published run directory from the Hub first.
+`LMObjective.policy(params)` binds those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy, not their frozen loss reference; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent. Use `ema=False` for live weights. `TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, merging the EMA copy over the live parameters unless `ema=False`; `from_pretrained` pulls a published run directory from the Hub first. The three text tasks construct the same way from the kinds they generate for, and `dew.pipeline` is the dispatch from `run.json`'s objective name to the task class.
 
 Source-default text tasks preserve temperature, top-k, top-p, min-p, EOS and padding settings as their `Sampling` value, bind the source's complete chain as `logits`, its criteria as `stopping` and the strategy its config names, and take their return count from `num_return_sequences`. An explicit `sampling=` replaces the policy and the chain, and the controls behind them are then neither built nor judged, so a distribution control the caller just replaced cannot block the call; the criteria, the strategy and the return count still come from the source, and every control the task keeps is judged as always. An unknown name always refuses, because nothing says who would own it. A control the native decoder does not implement raises when the default task is created, naming the control and the reason; the table above lists every one. Loading weights for training or export does not select a decoding policy.
 

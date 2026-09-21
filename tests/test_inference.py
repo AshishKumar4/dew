@@ -538,12 +538,87 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
                                   live("the ", seed=7).host().tokens)
 
 
+def make_block_run(directory):
+    """A block-diffusion run directory: the committed DiffusionGemma fixture's
+    weights under a checkpoint, and the `run.json` a block run writes."""
+    from pathlib import Path
+
+    from dew.interop import load_pretrained
+    from dew.objectives.diffusion.block import BlockDiffusionObjective
+
+    fixture = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-workflow"
+    bundle = load_pretrained(str(fixture), dtype="float32", attention_impl="xla", max_seq_len=32)
+    objective = BlockDiffusionObjective(bundle.model, prompt_length=3, pretrained=bundle.variables)
+    state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
+    checkpoints = Checkpoints(str(directory))
+    checkpoints.save(0, state, None)
+    checkpoints.wait()
+    config = ModelConfig("diffusion_gemma",
+                         {**bundle.config, "max_seq_len": bundle.model.max_seq_len},
+                         dtype="float32", attention_impl="auto")
+    (directory / "run.json").write_text(json.dumps({
+        "objective": "block_diffusion", "model": dataclasses.asdict(config),
+        "tokenizer": "byte", "pad_token_id": 0}))
+
+
+def make_masked_run(directory):
+    """A masked-diffusion run directory: the committed llada-tiny weights under
+    a checkpoint, and the `run.json` a masked run writes."""
+    from pathlib import Path
+
+    from dew.diffusion.discrete import MDLM
+    from dew.interop import load_pretrained
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+
+    fixture = Path(__file__).resolve().parent / "fixtures/hf/llada-tiny"
+    source = load_pretrained(fixture, dtype="float32", attention_impl="xla")
+    objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=120)(), 8,
+                                         pretrained=source.variables, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.05), key=jax.random.PRNGKey(19)).initial_state()
+    checkpoints = Checkpoints(str(directory))
+    checkpoints.save(0, state, None)
+    checkpoints.wait()
+    fields = {name: value for name, value in source.model_config.items()
+              if name not in ("dtype", "attention_impl")}
+    config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="xla")
+    (directory / "run.json").write_text(json.dumps({
+        "objective": "masked_diffusion", "model": dataclasses.asdict(config),
+        "tokenizer": "byte", "sample_tokens": 8}))
+
+
+@pytest.mark.parametrize("make,task_type,prompt,budget", [
+    (make_lm_run, "TextGeneration", "the ", None),
+    (make_block_run, "BlockGeneration", [[1, 5, 7]], 3),
+    (make_masked_run, "MaskedGeneration", "ab", None)])
+def test_every_saved_text_kind_constructs_through_its_own_task_class(
+        tmp_path, make, task_type, prompt, budget):
+    """`dew.pipeline` is the dispatch and nothing else: for each saved text
+    kind the task class's own `from_run` builds the same task from the same
+    run directory, and both draw the same text at the same seed."""
+    from dew.inference import tasks
+
+    make(tmp_path)
+    front = dew.pipeline(str(tmp_path), ema=False)
+    direct = getattr(tasks, task_type).from_run(str(tmp_path), ema=False)
+    assert type(direct) is type(front) is getattr(tasks, task_type)
+    drawn = direct(prompt, budget, seed=5)
+    expected = front(prompt, budget, seed=5)
+    np.testing.assert_array_equal(drawn.host().tokens, expected.host().tokens)
+    assert direct.decode(drawn) == front.decode(expected)
+    assert all(isinstance(row, str) for row in direct.decode(drawn))
+
+
 @pytest.mark.parametrize("kind", ["jepa", "unregistered"])
 def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
     import json
     (tmp_path / "run.json").write_text(json.dumps({"objective": kind}))
-    with pytest.raises(TypeError, match="no saved generation task"):
+    with pytest.raises(TypeError, match="no saved generation task") as refusal:
         dew.pipeline(str(tmp_path))
+    named = str(refusal.value)
+    assert kind in named
+    for supported in ("diffusion", "lm", "dpo", "grpo", "ppo", "block_diffusion",
+                      "masked_diffusion"):
+        assert supported in named
 
 
 def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
