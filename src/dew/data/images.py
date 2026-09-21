@@ -341,6 +341,7 @@ class HFImages(ImageDataset):
         return element["image"], record_caption(element), None if label is None else int(label)
 
 
+@datasets("array_record_images")
 @dataclasses.dataclass(frozen=True)
 class ArrayRecordImages(ImageDataset):
     """Image and caption pairs in arrayrecord shards under `path/<shard>/`,

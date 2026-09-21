@@ -53,6 +53,37 @@ def test_a_record_with_an_unknown_or_a_missing_field_is_refused():
         RunConfig.from_dict({**record, "data": {"name": "flowers", "fields": {}}})
 
 
+def test_a_registered_arrayrecord_spec_round_trips(tmp_path):
+    """The unregistered-base bug: data=ArrayRecordImages used to write bare
+    fields that from_dict could not rebuild. Registered, it records as
+    {'name', 'fields'} like every other dataset and loads back."""
+    from dew.data.images import ArrayRecordImages
+
+    config = RunConfig(
+        data=ArrayRecordImages(path=str(tmp_path), image_size=8),
+        trainer=TrainerConfig(steps=1))
+    loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
+
+    assert loaded == config
+    assert config.to_dict()["data"]["name"] == "array_record_images"
+
+
+def test_an_unregistered_member_fails_at_write_not_at_reload(tmp_path):
+    """A spec the registry does not know cannot be written: to_dict raises
+    now, instead of saving a record from_dict can never load back."""
+    from dew.data.images import ImageDataset
+
+    @dataclasses.dataclass(frozen=True)
+    class Unregistered(ImageDataset):
+        path: str | None = None
+
+    config = RunConfig(
+        data=Unregistered(path=str(tmp_path), image_size=8),
+        trainer=TrainerConfig(steps=1))
+    with pytest.raises(ValueError, match="Unregistered is not a registered dataset"):
+        config.to_dict()
+
+
 def test_save_and_load_carry_a_subclass_with_its_own_knobs(tmp_path):
     @dataclasses.dataclass(frozen=True)
     class LMRunConfig(RunConfig):

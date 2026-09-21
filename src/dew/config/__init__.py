@@ -218,11 +218,21 @@ def _registry_for(annotation):
     return None
 
 
-def _to_json(value) -> Any:
-    """`value` as JSON: a dict, a list, or a scalar json.dump can write."""
+def _to_json(value, annotation) -> Any:
+    """`value` as JSON: a dict, a list, or a scalar json.dump can write.
+    `annotation` is the declared field type, so the write side names the same
+    registry and member types the read side rebuilds from."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        held = _registry_for(type(value))
-        fields = {f.name: _to_json(getattr(value, f.name))
+        held = _registry_for(annotation)
+        if held is not None and not any(type(value) is member
+                                      for member in held.values()):
+            raise ValueError(
+                f"{type(value).__qualname__} is not a registered {held.kind}; a "
+                f"run config can only record members that load back, register "
+                f"it with @{held.kind}s(...)")
+        if held is None:
+            held = _registry_for(type(value))
+        fields = {f.name: _to_json(getattr(value, f.name), _declared_type(type(value), f.name))
                   for f in dataclasses.fields(value)}
         if held is None:
             return fields
@@ -230,9 +240,12 @@ def _to_json(value) -> Any:
         return ({"kind": name, **fields} if held.record == "kind"
                 else {"name": name, "fields": fields})
     if isinstance(value, (list, tuple)):
-        return [_to_json(item) for item in value]
+        entries = registry.entry_types(annotation, len(value))
+        return [_to_json(item, entry) for item, entry in zip(value, entries)]
     if isinstance(value, Mapping):
-        return {key: _to_json(item) for key, item in value.items()}
+        entries = registry.entry_types(annotation, len(value))
+        return {key: _to_json(item, entry)
+                for (key, item), entry in zip(value.items(), entries, strict=True)}
     return value
 
 
@@ -287,7 +300,8 @@ class RunConfig:
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe record of the run; a registered member is written as its
         name and fields."""
-        return {field.name: _to_json(getattr(self, field.name))
+        return {field.name: _to_json(getattr(self, field.name),
+                                     _declared_type(type(self), field.name))
                 for field in dataclasses.fields(self)}
 
     @classmethod
