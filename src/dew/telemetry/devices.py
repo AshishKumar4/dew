@@ -18,3 +18,30 @@ def apply_xla_flags(flags: str | None) -> None:
         return
     existing = os.environ.get('XLA_FLAGS', '')
     os.environ['XLA_FLAGS'] = f"{existing} {flags}".strip()
+
+
+def xla_flag(name: str) -> str | None:
+    """The value `--<name>` carries in XLA_FLAGS, or None when it is absent.
+
+    A bare `--<name>` reads as 'true' and the last occurrence wins, which is
+    how XLA's own parser resolves a repeated flag. XLA reads the variable
+    when it initializes a backend, so this reports what the run asked for,
+    not what a live backend was built with.
+    """
+    value = None
+    for token in os.environ.get('XLA_FLAGS', '').split():
+        if token == f"--{name}":
+            value = 'true'
+        elif token.startswith(f"--{name}="):
+            value = token.split('=', 1)[1]
+    return value
+
+
+def deterministic_ops_requested() -> bool:
+    """Whether the run asked XLA for deterministic ops.
+
+    `--xla_gpu_deterministic_ops` orders the reductions that make a GPU step
+    bitwise reproducible. Kernel selection reads it: `dew.nn.attention` keeps
+    cudnn's fused attention away from a run that set it.
+    """
+    return (xla_flag('xla_gpu_deterministic_ops') or '').lower() in ('true', '1')
