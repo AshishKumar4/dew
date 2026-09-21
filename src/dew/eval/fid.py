@@ -1,11 +1,20 @@
+"""FID between two populations of images.
+
+`fid(generated, reference)` scores two image sets against each other, and the
+registered `fid` metric pools the same features, statistics and distance over
+the populations a validation pass consumes.
+"""
+
 import functools
 import logging
 import warnings
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import ArrayLike
 from numpy.typing import NDArray
 
 from dew.artifacts import ImageGrid
@@ -15,6 +24,10 @@ from dew.registry import metrics
 from .common import metric_device
 
 _log = logging.getLogger(__name__)
+
+# Two FID values are comparable only when the features behind them and the
+# population counts agree, so every distance is logged with this line.
+FEATURES = "FID InceptionV3 pool3, bilinear 299x299, [-1, 1]"
 
 
 @functools.cache
@@ -136,21 +149,90 @@ def _get_activations():
     return activations
 
 
+def _pooled_stats(batches: Iterable[ArrayLike], *, population: str) -> GaussianStats:
+    """Pool3 statistics over batches of pixels in [-1, 1], pooled as they come.
+
+    The extractor is asked for inside the loop, so the weights load with the
+    first batch and an image set that is refused costs no download.
+    """
+    pooled: GaussianStats | None = None
+    for images in batches:
+        contribution = GaussianStats.from_features(_get_activations()(images), population=population)
+        pooled = contribution if pooled is None else pooled.merge(contribution)
+    if pooled is None:
+        raise ValueError(f"fid {population}: no images to score")
+    return pooled
+
+
+def _unit_range_batches(images: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike], *,
+                        population: str, batch_size: int) -> Iterator[jax.Array]:
+    """A uint8 [N, H, W, 3] array, or an iterable of them, as [-1, 1] batches
+    of at most `batch_size` rows."""
+    blocks = [images] if isinstance(images, np.ndarray | jax.Array) else images
+    for block in blocks:
+        pixels = np.asarray(block)
+        if pixels.dtype != np.uint8 or pixels.ndim != 4 or pixels.shape[-1] != 3:
+            raise ValueError(f"fid {population}: expected uint8 [N, H, W, 3] images, got "
+                             f"{pixels.dtype} {list(pixels.shape)}")
+        for start in range(0, pixels.shape[0], batch_size):
+            yield unit_range(pixels[start:start + batch_size])
+
+
+def _pooled_distance(stats: FIDStats) -> float:
+    """The distance between two pooled populations, logged with the counts and
+    the features it holds for."""
+    generated, real = stats.generated, stats.real
+    if generated.count < 2 or real.count < 2:
+        raise ValueError(
+            "fid generated and real populations require at least two rows each; "
+            f"got generated={generated.count}, real={real.count}")
+    distance = frechet_distance(generated.mean, generated.covariance(population="generated"),
+                                real.mean, real.covariance(population="real"))
+    _log.info("FID populations: generated=%d, real=%d; features=%s",
+              generated.count, real.count, FEATURES)
+    return distance
+
+
+def fid(generated: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
+        reference: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
+        *, batch_size: int = 64) -> float:
+    """FID between two sets of uint8 [N, H, W, 3] images.
+
+    Each side is one array or an iterable of arrays, so a directory of samples
+    can stream past in blocks of `batch_size` rows instead of being held at
+    once. The value is the distance between the two populations passed in,
+    which is FID-50k only at 50,000 images a side.
+    """
+    if batch_size < 1:
+        raise ValueError(f"fid: a batch holds at least one image, got batch_size={batch_size}")
+    with metric_device():
+        stats = FIDStats(
+            _pooled_stats(_unit_range_batches(generated, population="generated",
+                                              batch_size=batch_size), population="generated"),
+            _pooled_stats(_unit_range_batches(reference, population="real",
+                                              batch_size=batch_size), population="real"))
+    return _pooled_distance(stats)
+
+
+@metrics("fid")
 @dataclass(frozen=True)
 class FID:
-    """Pooled-population FID with O(D²) pass state and one final distance."""
+    """Pooled-population FID with O(D²) pass state and one final distance.
+
+    The call gathers the sampled grid and the batch's reference field. The
+    features, the statistics and the distance are the ones `fid` runs, so a
+    pass over 50,000 images a side reports the number `fid` reports.
+    """
 
     field: str = "image"
     name = "fid"
     reads = ImageGrid
-    feature_identity = "FID InceptionV3 pool3, bilinear 299x299, [-1, 1]"
+    feature_identity = FEATURES
 
     def __call__(self, artifact: ImageGrid, batch) -> FIDStats:
         with metric_device():
-            activations = _get_activations()
-            generated = GaussianStats.from_features(activations(artifact.images), population="generated")
-            real = GaussianStats.from_features(activations(unit_range(batch[self.field])), population="real")
-        return FIDStats(generated, real)
+            return FIDStats(_pooled_stats([artifact.images], population="generated"),
+                            _pooled_stats([unit_range(batch[self.field])], population="real"))
 
     def merge(self, accumulated: FIDStats, contribution: FIDStats) -> FIDStats:
         accumulated.generated = accumulated.generated.merge(contribution.generated)
@@ -158,23 +240,4 @@ class FID:
         return accumulated
 
     def finalize(self, accumulated: FIDStats) -> float:
-        generated, real = accumulated.generated, accumulated.real
-        if generated.count < 2 or real.count < 2:
-            raise ValueError(
-                "fid generated and real populations require at least two rows each; "
-                f"got generated={generated.count}, real={real.count}")
-        distance = frechet_distance(generated.mean, generated.covariance(population="generated"),
-                                  real.mean, real.covariance(population="real"))
-        _log.info("FID populations: generated=%d, real=%d; features=%s",
-                  generated.count, real.count, self.feature_identity)
-        return distance
-
-
-@metrics("fid")
-def fid(field: str = "image") -> FID:
-    """FID of the generated and real populations actually consumed in the pass.
-
-    This is FID-50k only when 50,000 generated and real observations were
-    consumed with the matching feature and preprocessing definition.
-    """
-    return FID(field)
+        return _pooled_distance(accumulated)
