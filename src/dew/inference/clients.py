@@ -114,6 +114,11 @@ def _reason(value: object) -> str | None:
 
 
 def _prompts(prompts: str | Sequence[str], budget: int, seed: int | None) -> list[str]:
+    """Return `prompts` as a list of rows, refusing a bad budget, seed or row.
+
+    A caller with nothing to tokenize passes "" and discards the rows, using
+    this for the budget and seed checks alone.
+    """
     if type(budget) is not int or budget < 0:
         raise ValueError("max_new_tokens must be a nonnegative integer")
     if seed is not None and type(seed) is not int:
@@ -398,12 +403,21 @@ class OpenAICompletion:
         create: Callable[..., Stream[OpenAIResponse]] = self._sync().completions.create
         return _invoke(create, fields)
 
-    def chat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
-             stream: bool = False, **parameters: RequestField) -> ChatCompletion | Stream[ChatCompletionChunk]:
+    def _chat_body(self, messages: Sequence[ChatMessage], max_new_tokens: int,
+                   seed: int | None, stream: bool,
+                   parameters: Mapping[str, RequestField]) -> Mapping[str, object]:
+        """Build the chat request body for `messages`.
+
+        `_prompts` runs for its checks on the budget and the seed; a chat
+        request carries messages where a completion carries prompt strings.
+        """
         _prompts("", max_new_tokens, seed)
         fields = _bound(self._parameters(parameters), {"model": self.model, "messages": messages, "max_completion_tokens": max_new_tokens, "stream": stream})
-        if seed is not None:
-            fields = _bound(fields, {"seed": seed})
+        return fields if seed is None else _bound(fields, {"seed": seed})
+
+    def chat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
+             stream: bool = False, **parameters: RequestField) -> ChatCompletion | Stream[ChatCompletionChunk]:
+        fields = self._chat_body(messages, max_new_tokens, seed, stream, parameters)
         create: Callable[..., ChatCompletion | Stream[ChatCompletionChunk]] = self._sync().chat.completions.create
         return _invoke(create, fields)
 
@@ -421,8 +435,5 @@ class OpenAICompletion:
 
     async def achat(self, messages: Sequence[ChatMessage], max_new_tokens: int, *, seed: int | None = None,
                     stream: bool = False, **parameters: RequestField) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
-        _prompts("", max_new_tokens, seed)
-        fields = _bound(self._parameters(parameters), {"model": self.model, "messages": messages, "max_completion_tokens": max_new_tokens, "stream": stream})
-        if seed is not None:
-            fields = _bound(fields, {"seed": seed})
+        fields = self._chat_body(messages, max_new_tokens, seed, stream, parameters)
         return await _ainvoke(self._async().chat.completions.create, fields)

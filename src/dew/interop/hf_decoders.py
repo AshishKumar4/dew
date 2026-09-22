@@ -109,6 +109,29 @@ def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
 
 
+def _fixed_fields(model: object, fixed: Mapping[str, object], message: str) -> None:
+    """Refuse `model` wherever it disagrees with a value its family fixes.
+
+    `message` is formatted with the expected value, so each family's refusal
+    names itself and what it computes.
+    """
+    for name, expected in fixed.items():
+        if getattr(model, name) != expected:
+            _refuse(name, message.format(expected))
+
+
+def _fixed_mixture(mixture: object, defaults: object, represented: Collection[str],
+                   detail: str) -> None:
+    """Refuse a mixture field outside `represented` that leaves its family's default.
+
+    `represented` names the fields the export writes back; nothing carries the
+    rest to a file, so they have to hold what `defaults` holds.
+    """
+    for entry in dataclasses.fields(mixture):
+        if entry.name not in represented and getattr(mixture, entry.name) != getattr(defaults, entry.name):
+            _refuse(f'mixture.{entry.name}', detail)
+
+
 def _kind_name(record: Mapping[str, object], section: str) -> str:
     """Return the registry name of one nested value record."""
     return records.text(records.record(record[section], section)['kind'], f"{section} kind")
@@ -315,12 +338,6 @@ def _kinds_of(config: DecoderFields) -> dict[str, KindFields]:
 
 _LLAMA3_FIELDS: tuple[str, ...] = ('factor', 'low_freq_factor', 'high_freq_factor',
                                    'original_max_position_embeddings')
-
-# Which model or kind field holds a ramp record, by the rope_type it names:
-# `rope_scaling` is the llama3 ramp the mixer applies over its plain
-# frequencies, `yarn` is the frequency table that replaces them.
-_RAMP_FIELDS = {'llama3': 'rope_scaling', 'yarn': 'yarn'}
-
 
 @dataclass(frozen=True)
 class _Rope:
@@ -760,7 +777,7 @@ _NO_AUDIO: AudioFields = {"audio": None, "audio_projector": None,
                           "audio_token_id": None, "audio_soft_tokens": None}
 
 
-def _wrapper_tokens(hf_config: Mapping[str, object], used: set) -> None:
+def _wrapper_tokens(used: set) -> None:
     """Mark the wrapper-level keys every multimodal repo carries as read."""
     used.update(("architectures", "tie_word_embeddings", "torch_dtype",
                  "transformers_version", "initializer_range", "boi_token_id",
@@ -788,7 +805,7 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     projector = vision_nn.translate_gemma_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"), mm)
     image = _wrapper_image_id(hf_config, used, "image_token_index", "image_token_id")
-    _wrapper_tokens(hf_config, used)
+    _wrapper_tokens(used)
     return {
         "model_type": "gemma3",
         "text_model_type": "gemma3_text",
@@ -809,7 +826,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     projector = vision_nn.translate_llama4_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_image_id(hf_config, used, "image_token_index", "image_token_id")
-    _wrapper_tokens(hf_config, used)
+    _wrapper_tokens(used)
     grid = _record_int(tower, "image_size") // _record_int(tower, "patch_size")
     ratio = _record_float(tower, "pixel_shuffle_ratio")
     tokens = grid * grid * ratio ** 2
@@ -870,7 +887,7 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     projector = vision_nn.translate_gemma4_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_image_id(hf_config, used, "image_token_id", "image_token_index")
-    _wrapper_tokens(hf_config, used)
+    _wrapper_tokens(used)
     # The soft-token count follows the image resolution, so the record leaves
     # it open and each call reads it off the tower output. The wrapper's
     # vision_soft_tokens_per_image is the processor's budget, not the count.
@@ -899,7 +916,7 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     projector = vision_nn.translate_qwen35_projector_config(
         tower, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_image_id(hf_config, used, "image_token_id")
-    _wrapper_tokens(hf_config, used)
+    _wrapper_tokens(used)
     # One resolution per call, so the soft-token count varies with the image
     # and the record leaves it open the way the Gemma 4 wrapper does.
     used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
@@ -925,7 +942,7 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
     if hf_config.get("vision_soft_tokens_per_image", count) != count:
         _refuse("vision_soft_tokens_per_image", f"the MobileNet adapter produces {count} tokens")
     image = _wrapper_image_id(hf_config, used, "image_token_id")
-    _wrapper_tokens(hf_config, used)
+    _wrapper_tokens(used)
     used.update(("vision_soft_tokens_per_image", "boa_token_id", "eoa_token_id"))
     return {"model_type": "gemma3n", "text_model_type": "gemma3n_text", "text": text,
             "tower": tower, "projector": projector, "image_token_id": image,
@@ -966,37 +983,44 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     return record
 
 
+# Each tower kind's params map. Gemma 4 is absent because its map returns
+# whole collections rather than one params tree.
+_WRAPPER_TOWER_PARAMS = {
+    "siglip": vision_nn.translate_siglip_vision_weights,
+    "llama4": vision_nn.translate_llama4_vision_weights,
+    "qwen3_5": vision_nn.translate_qwen35_vision_weights,
+    "gemma3n": vision_nn.translate_gemma3n_vision_weights,
+}
+
+_WRAPPER_PROJECTOR_WEIGHTS = {
+    "gemma": vision_nn.translate_gemma_projector_weights,
+    "llama4": vision_nn.translate_llama4_projector_weights,
+    "gemma4": vision_nn.translate_gemma4_projector_weights,
+    "qwen3_5": vision_nn.translate_qwen35_projector_weights,
+    "gemma3n": vision_nn.translate_gemma3n_projector_weights,
+}
+
+
 def _wrapper_tower_variables(
     kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
 ) -> Variables:
-    if kind == "siglip":
-        return {"params": vision_nn.translate_siglip_vision_weights(hf_tensors, param_dtype=param_dtype)}
-    if kind == "llama4":
-        return {"params": vision_nn.translate_llama4_vision_weights(hf_tensors, param_dtype=param_dtype)}
+    """Return one vision tower's variables, in the requested storage."""
     if kind == "gemma4":
         return vision_nn.translate_gemma4_vision_weights(hf_tensors, param_dtype=param_dtype)
-    if kind == "qwen3_5":
-        return {"params": vision_nn.translate_qwen35_vision_weights(hf_tensors, param_dtype=param_dtype)}
-    if kind == "gemma3n":
-        return {"params": vision_nn.translate_gemma3n_vision_weights(hf_tensors, param_dtype=param_dtype)}
-    raise ValueError(f"tower kind {kind!r} has no weight map here")
+    translate = _WRAPPER_TOWER_PARAMS.get(kind)
+    if translate is None:
+        raise ValueError(f"tower kind {kind!r} has no weight map here")
+    return {"params": translate(hf_tensors, param_dtype=param_dtype)}
 
 
 def _wrapper_projector_weights(
     kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
 ) -> Variables:
     """Return the projector tensors for one projector kind, in the requested storage."""
-    if kind == "gemma":
-        return vision_nn.translate_gemma_projector_weights(hf_tensors, param_dtype=param_dtype)
-    if kind == "llama4":
-        return vision_nn.translate_llama4_projector_weights(hf_tensors, param_dtype=param_dtype)
-    if kind == "gemma4":
-        return vision_nn.translate_gemma4_projector_weights(hf_tensors, param_dtype=param_dtype)
-    if kind == "qwen3_5":
-        return vision_nn.translate_qwen35_projector_weights(hf_tensors, param_dtype=param_dtype)
-    if kind == "gemma3n":
-        return vision_nn.translate_gemma3n_projector_weights(hf_tensors, param_dtype=param_dtype)
-    raise ValueError(f"projector kind {kind!r} has no weight map here")
+    translate = _WRAPPER_PROJECTOR_WEIGHTS.get(kind)
+    if translate is None:
+        raise ValueError(f"projector kind {kind!r} has no weight map here")
+    return translate(hf_tensors, param_dtype=param_dtype)
 
 
 _WRAPPER_TOWER_PREFIX = {"siglip": "vision_tower.", "llama4": "vision_model.",
@@ -2012,11 +2036,10 @@ from dew.interop.families.masked_diffusion import (
     _diffusion_gemma_export,
     _diffusion_gemma_text_config,
     _dream_config,
-    _dream_export,
     _llada_config,
-    _llada_export,
     _llada_export_path,
     _llada_path,
+    _mask_token_export,
 )
 from dew.interop.families.olmo import _olmo3_config
 from dew.interop.families.qwen import (
@@ -2050,7 +2073,7 @@ _FAMILY_ENTRIES = (
                   lambda fields: bool(fields.get('causal') is False
                                       and fields.get('attention_bias')
                                       and fields.get('o_proj_bias') is False),
-                  'dream', 'DreamModel', _dream_export, preserve_source_layout=True),
+                  'dream', 'DreamModel', _mask_token_export, preserve_source_layout=True),
     DecoderFamily(('llada',), _llada_config,
                   lambda fields: bool(fields.get('causal') is False
                                       and not fields.get('attention_bias')
@@ -2060,7 +2083,7 @@ _FAMILY_ENTRIES = (
                                                or fields.get('num_kv_shared_layers'))
                                       and not fields.get('output_gate')
                                       and not fields.get('qk_norm')),
-                  'llada', 'LLaDAModelLM', _llada_export,
+                  'llada', 'LLaDAModelLM', _mask_token_export,
                   weight_path=_llada_path, export_path=_llada_export_path, preserve_source_layout=True),
     DecoderFamily(('gpt_oss',), _gpt_oss_config,
                   lambda fields: fields.get('mlp') == 'swigluoai',

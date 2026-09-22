@@ -287,6 +287,11 @@ def _rebuilt(annotation: Annotation, value: object) -> Configured:
     Containers are walked, so a mapping of records and a tuple of records
     build their values too, and a model config is a dict from the command
     line all the way to the module.
+
+    `dew.config._rebuild` is the sibling walk over a run record. It reads a
+    registered member out of its `kind`/`name` record and honours the
+    `record: False` field metadata, neither of which a module field has; this
+    one resolves a `dtype` entry and walks a record with no value class.
     """
     annotation = resolve_alias(annotation)
     if typing.get_origin(annotation) in (Union, types.UnionType) and _unwrapped(annotation) is None:

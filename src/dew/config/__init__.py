@@ -34,7 +34,7 @@ import dew.data  # registers the datasets a config names
 import dew.io
 import dew.nn.backbones  # registers the models a config names
 from dew import registry
-from dew.artifacts import agree_process_phase
+from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import RUN_FILE, Checkpoints
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
 from dew.lora import LoRA, attach
@@ -234,6 +234,15 @@ class TrainerConfig:
         return dataset.steps_per_epoch
 
 
+def _artifact_name(name: str) -> str:
+    """Return `name` with every character a path or a tracker id cannot hold replaced.
+
+    A run name is the caller's and may hold spaces or slashes; a directory
+    entry and a tracker artifact id take neither.
+    """
+    return re.sub(r"[^\w.-]", "-", name)
+
+
 def _registry_for(annotation):
     """Return the registry whose members the annotation names, or None."""
     members = typing.get_args(annotation) or (annotation,)
@@ -353,8 +362,13 @@ def _rebuild(annotation: registry.Annotation, value: registry.Configured) -> reg
     """Build the value `annotation` asks for, out of a record.
 
     It hands back what the field declares, which only the annotation knows,
-    so the width here is what a config field can carry; `_built` is the same
-    walk for a caller that holds the class and reads a value of it back."""
+    so the width here is what a config field can carry. `_built` is the same
+    walk for a caller that holds the class and reads a value of it back.
+
+    `dew.registry._rebuilt` is the sibling walk over a module field. That one
+    resolves a `dtype` entry and walks a record with no value class behind it;
+    this one reads registered members and honours `record: False`.
+    """
     annotation = registry.resolve_alias(annotation)
     held = _registry_for(annotation)
     if held is not None:
@@ -494,20 +508,19 @@ class RunConfig:
             local = LocalTracker(os.path.join(checkpoints.directory, "tracking"))
             if "://" in checkpoints.directory:
                 local = LocalTracker(os.path.join(os.path.expanduser("~/.cache/dew/tracking"),
-                                                 re.sub(r"[^\w.-]", "-", name) + "-"
+                                                 _artifact_name(name) + "-"
                                                  + hashlib.sha256(checkpoints.directory.encode()).hexdigest()[:12]))
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
-            error = None
-            try:
+            def record_run() -> None:
+                """Write the run's record and name where it is tracked, on rank zero."""
                 if jax.process_index() == 0:
                     print("Experiment_Name:", name)
                     print(f"Local tracking: {local.directory}")
                     self.save(checkpoints.directory)
                     tracker.artifact(RunRecord(name, json_value(self.to_dict()),
                         json_value(summary or {}), steps, packages_installed()), 0)
-            except BaseException as failure:
-                error = failure
-            agree_process_phase(error, phase="run metadata")
+
+            agreed("run metadata", record_run)
             state = Trainer.from_config(
                 trainer, objective, build_optimizer(self.optim, steps),
                 key=jax.random.key(trainer.seed),
@@ -520,15 +533,14 @@ class RunConfig:
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 metrics=metrics, preview=trainer.wandb is not None,
             )
-            error = None
-            try:
+            def publish_checkpoint() -> None:
+                """Upload the checkpoint the run ended on, where a tracker takes one."""
                 if wandb_tracker is not None:
                     # fit wrote the step it ended on, so that checkpoint is the run's.
-                    dew.io.publish(checkpoints.path(int(state.step)), re.sub(r"[^\w.-]", "-", name),
+                    dew.io.publish(checkpoints.path(int(state.step)), _artifact_name(name),
                                    tracker=wandb_tracker)
-            except BaseException as failure:
-                error = failure
-            agree_process_phase(error, phase="checkpoint publishing")
+
+            agreed("checkpoint publishing", publish_checkpoint)
             return state
 
         finally:

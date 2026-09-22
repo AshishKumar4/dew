@@ -23,6 +23,8 @@ from dew.interop.hf_decoders import (
     DecoderFields,
     _base_config,
     _dew_path,
+    _fixed_fields,
+    _fixed_mixture,
     _flatten,
     _hf_name,
     _kinds,
@@ -373,9 +375,7 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
     fixed = {'qk_norm': True, 'v_norm': True, 'sandwich_norms': True, 'pre_norms': True,
              'embedding_scale': True, 'attention_scale': 1.0, 'scale_offset': False,
              'scale_after_cast': False, 'qk_norm_scope': 'head', 'causal': True}
-    for name, expected in fixed.items():
-        if getattr(model, name) != expected:
-            _refuse(name, f'Gemma4 computes {expected!r} for this field')
+    _fixed_fields(model, fixed, 'Gemma4 computes {0!r} for this field')
     for name in ('output_gate', 'attention_sinks', 'attn_logit_softcap', 'altup',
                  'laurel_rank', 'activation_sparsity_pattern', 'num_nextn_predict_layers', 'dropout_rate'):
         if getattr(model, name):
@@ -439,9 +439,8 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
                            expert_features=mixture.expert_features, parallel=True)
         represented = {'experts', 'top_k', 'expert_features', 'parallel', 'layers', 'every',
                        'implementation', 'dispatch'}
-        for entry in dataclasses.fields(mixture):
-            if entry.name not in represented and getattr(mixture, entry.name) != getattr(defaults, entry.name):
-                _refuse(f'mixture.{entry.name}', 'Gemma4 has its fixed parallel router and expert computation')
+        _fixed_mixture(mixture, defaults, represented,
+                       'Gemma4 has its fixed parallel router and expert computation')
         fields.update(num_experts=mixture.experts, top_k_experts=mixture.top_k,
                       moe_intermediate_size=mixture.expert_features or model.hidden_features)
     return fields
