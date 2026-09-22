@@ -178,6 +178,60 @@ class CausalSelfAttention(nn.Module):
         angles = selected.astype(jnp.float32) * inv
         return jnp.cos(angles), jnp.sin(angles)
 
+    def _shared_kv(self, kv_store):
+        """Read the keys, values and positions the provider layer stashed.
+
+        The provider ran earlier in the same forward pass and left them
+        post-norm and post-rope, so a sharing layer projects, norms,
+        rotates and caches nothing of its own.
+        """
+        if kv_store is None or self.kv_store_key not in kv_store:
+            raise ValueError(
+                f"layer shares K/V under {self.kv_store_key!r} but no provider "
+                "stashed them; the model has to pass one kv_store dict down "
+                "its layer stack")
+        return kv_store[self.kv_store_key]
+
+    def _projected_kv(self, x, whole: bool):
+        """Project the keys and values, norm them, and split them into heads.
+
+        `whole` norms the key projection before the head split, which is
+        OLMo 3's scope. Otherwise the key norm runs per head, after it.
+        """
+        batch, length, _ = x.shape
+        key = checkpoint_name(self.k_proj(x), 'k_proj')
+        # attention_k_eq_v reads the values off the key projection before
+        # its norm (modeling_gemma4.py, Gemma4TextAttention.forward).
+        value = (key if self.k_eq_v else checkpoint_name(self.v_proj(x), 'v_proj')).reshape(
+            batch, length, self.num_kv_heads, self.head_dim)
+        if whole:
+            key = self.k_norm(key)
+        key = key.reshape(batch, length, self.num_kv_heads, self.head_dim)
+        if self.qk_norm and not whole:
+            key = self.k_norm(key)
+        if self.v_norm:
+            value = self.values_norm(value)
+        return key, value
+
+    def _rotary_angles(self, rotary_positions):
+        """Build the rotary cos and sin this layer rotates its heads by.
+
+        Interleaved mRoPE, YaRN and the plain rope each build their own
+        angles; YaRN rotates whole heads at its own frequencies, so it
+        takes neither a partial rotary nor a Llama 3.1 ramp.
+        """
+        if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
+            return self._multimodal_rotary(rotary_positions)
+        if self.yarn is None:
+            return rotary_freqs(
+                rotary_positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
+                partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling)
+        if self.partial_rotary_factor is not None or self.rope_scaling is not None:
+            raise ValueError(
+                "yarn rotates whole heads at its own frequencies, so it takes "
+                "neither partial_rotary_factor nor rope_scaling")
+        return mla_rope_freqs(rotary_positions, self.head_dim, self.rope_theta, self.yarn)
+
     def _metadata_mask(self, metadata: AttentionMetadata | None, slots,
                        batch: int, length: int, key_length: int, decode: bool):
         """Combine key validity, causality, image groups and the layer's window."""
@@ -265,28 +319,9 @@ class CausalSelfAttention(nn.Module):
         else:
             query = projected.reshape(B, S, self.num_heads, self.head_dim)
         if self.kv_shared:
-            # The provider ran earlier in the same forward pass and stashed
-            # its post-norm, post-rope keys and values with their positions,
-            # so there is nothing to project, norm, rotate or cache here.
-            if kv_store is None or self.kv_store_key not in kv_store:
-                raise ValueError(
-                    f"layer shares K/V under {self.kv_store_key!r} but no provider "
-                    "stashed them; the model has to pass one kv_store dict down "
-                    "its layer stack")
-            key, value, positions = kv_store[self.kv_store_key]
+            key, value, positions = self._shared_kv(kv_store)
         else:
-            key = checkpoint_name(self.k_proj(x), 'k_proj')
-            # attention_k_eq_v reads the values off the key projection before
-            # its norm (modeling_gemma4.py, Gemma4TextAttention.forward).
-            value = (key if self.k_eq_v else checkpoint_name(self.v_proj(x), 'v_proj')).reshape(
-                B, S, self.num_kv_heads, self.head_dim)
-            if whole:
-                key = self.k_norm(key)
-            key = key.reshape(B, S, self.num_kv_heads, self.head_dim)
-            if self.qk_norm and not whole:
-                key = self.k_norm(key)
-            if self.v_norm:
-                value = self.values_norm(value)
+            key, value = self._projected_kv(x, whole)
         if self.qk_norm and not whole:
             query = self.q_norm(query)
 
@@ -325,19 +360,7 @@ class CausalSelfAttention(nn.Module):
         rotary_positions = positions if logical_positions is None else logical_positions
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             rotary_positions = attention_metadata.rotary_positions
-        if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
-            freqs_cos, freqs_sin = self._multimodal_rotary(rotary_positions)
-        elif self.yarn is None:
-            freqs_cos, freqs_sin = rotary_freqs(
-                rotary_positions, self.head_dim, self.rope_theta, rot_dim=self._rot_dim(),
-                partial_rotary_type=self.partial_rotary_type, rope_scaling=self.rope_scaling)
-        else:
-            if self.partial_rotary_factor is not None or self.rope_scaling is not None:
-                raise ValueError(
-                    "yarn rotates whole heads at its own frequencies, so it takes "
-                    "neither partial_rotary_factor nor rope_scaling")
-            freqs_cos, freqs_sin = mla_rope_freqs(
-                rotary_positions, self.head_dim, self.rope_theta, self.yarn)
+        freqs_cos, freqs_sin = self._rotary_angles(rotary_positions)
         # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
         # query carries the ratio to the scale the checkpoint asks for.
         query = apply_rotary(
