@@ -1,5 +1,7 @@
 # Domain recommendation for Dew
 
+> An AI assistant maintains this document. It is presented as-is.
+
 Measured 2026-09-02 (17:00 to 17:40 UTC). Every registration fact below comes from the authoritative RDAP or WHOIS server for that TLD, and every price from a registrar page or public price API fetched in this session. Aggregator sites were not used: one of them had already reported `dew.sh` as available, and the registry says it is registered (see the availability table).
 
 ## Recommendation
@@ -25,7 +27,7 @@ Scores per criterion: 2 good, 1 mixed, 0 poor. Brand match uses 3 for the bare w
 | 11 | dew.build | 3 | 2 | 1 | 1 | 0 (premium, 164.27 to 195.00/yr) | 0 (.build not listed) | 1 | 8 | Skip |
 | 12 | dew.ml | 3 | 1 | 0 (Mali ccTLD; `ml` reads as machine learning only to insiders) | 1 | 0 (registry premium, price not offered by Cloudflare or Porkbun) | 0 (.ml not listed) | 0 | 5 | Skip |
 
-Tie-breaks and reading the totals. `dewml.dev` over `dew-ml.dev`: people drop hyphens when they type or say a name, and the package imports as `dew`, not `dew_ml`. `dewml.dev` over `getdew.dev` and the other verb-prefix names: they score 12 on cost and safety alone, but none carries the package name, and a second cheap `.dev` adds a renewal without adding identity. `dew.page` is the highest-scoring exact match; it loses to the `.dev` names only on price, premium handling and the `dew.dev` collision. `dew.page` over `dew.day`: `.page` is neutral, `.day` is a mismatch for a training framework. `dew.tools` is scored but cannot be bought today; it is in `pendingDelete` (see below).
+`dewml.dev` beats `dew-ml.dev` on the tie-break because people drop hyphens when they type or say a name, and the package imports as `dew`, not `dew_ml`. `dewml.dev` also beats `getdew.dev` and the other verb-prefix names. Those score 12 on cost and safety alone, but none carries the package name, and a second cheap `.dev` adds a renewal without adding identity. `dew.page` is the highest-scoring exact match; it loses to the `.dev` names only on price, premium handling and the `dew.dev` collision. `dew.page` beats `dew.day` because `.page` is neutral and `.day` is a mismatch for a training framework. `dew.tools` is scored but cannot be bought today; it is in `pendingDelete` (see below).
 
 ## Availability table
 
@@ -114,9 +116,9 @@ Checked 2026-09-02:
 
 - GitHub: `https://api.github.com/repos/AshishKumar4/dew` returns the repository ("A nice ML framework based on Jax/Flax"). The login `Dew` is a user account created 2012-09-04, so a `dew` organisation is not available. `dew-ml`, `dewml` and `dew-framework` return 404 from `https://api.github.com/users/<login>`, so those logins are unclaimed.
 - PyPI: `pyproject.toml` names the distribution `dew-ml`, but `https://pypi.org/pypi/dew-ml/json` returns 404. The name is not published or reserved. `https://pypi.org/pypi/dew/json` returns a package `dew` 0.0.1 with an empty summary, one release, so the bare name is taken by a placeholder. Publish `dew-ml` (a real early release, not an empty one) before announcing the domain, or the first thing a visitor tries, `pip install dew-ml`, fails.
-- npm: `https://registry.npmjs.org/dew` is an active, unrelated project ("Sandboxed Linux compute, agent-native and human-friendly", repository `solcreek/dew`, 42 versions, last modified 2026-07-09). GitHub search also shows `gudaoxuri/dew` (400 stars, a Spring Cloud microservice stack). The bare word `dew` is shared with these and with `dew.dev` (DewDev). None of them touches the JAX or Python space, so the collision is a search-result nuisance, not a naming conflict.
+- npm: `https://registry.npmjs.org/dew` is an active, unrelated project ("Sandboxed Linux compute, agent-native and human-friendly", repository `solcreek/dew`, 42 versions, last modified 2026-07-09). GitHub search also shows `gudaoxuri/dew` (400 stars, a Spring Cloud microservice stack). The bare word `dew` is shared with these and with `dew.dev` (DewDev). None of them touches the JAX or Python space, so the shared word only crowds search results; it does not create a naming conflict.
 
-What this means for the domain. The three identities do not need to be the same string. The repo is found through GitHub, the package through PyPI, and the domain only has to be memorable and consistent with them. `dewml.dev` is the PyPI name minus a hyphen, the import stays `dew`, and the README can state all three on one line: `github.com/AshishKumar4/dew`, `pip install dew-ml`, `dewml.dev`. If a GitHub organisation is ever wanted, `dew-ml` is free and matches the package. An exact-match domain such as `dew.page` would not change any of this; it would only add a second string that differs from the package name and a premium renewal.
+The three identities do not need to be the same string. The repo is found through GitHub, the package through PyPI, and the domain only has to be memorable and consistent with them. `dewml.dev` is the PyPI name minus a hyphen, the import stays `dew`, and the README can state all three on one line: `github.com/AshishKumar4/dew`, `pip install dew-ml`, `dewml.dev`. If a GitHub organisation is ever wanted, `dew-ml` is free and matches the package. An exact-match domain such as `dew.page` would not change any of this; it would only add a second string that differs from the package name and a premium renewal.
 
 ## Method
 
