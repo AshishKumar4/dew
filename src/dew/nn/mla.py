@@ -642,6 +642,19 @@ class MultiHeadLatentAttention(nn.Module):
             return apply_rotary_interleave(part, freqs_cos, freqs_sin)
         return apply_rotary(part, freqs_cos, freqs_sin)
 
+    def _rotated(self, q_rot, rot, positions):
+        """Rotate the query's and the latent's rope heads at `positions`.
+
+        Returns the rotated pair and the angles, which the indexer rotates
+        its own keys with. The decoupled rope head is shared by every query
+        head, so it rotates with a head axis added and taken away again.
+        """
+        freqs_cos, freqs_sin = mla_rope_freqs(
+            positions, self.qk_rope_head_dim, self.rope_theta, self.yarn)
+        return (self._rotate(q_rot, freqs_cos, freqs_sin),
+                self._rotate(rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :],
+                freqs_cos, freqs_sin)
+
     def _expand(self, latent, rot):
         """Latent and rope head into per-head keys and values."""
         batch, length = latent.shape[0], latent.shape[1]
@@ -685,12 +698,9 @@ class MultiHeadLatentAttention(nn.Module):
                 positions, append = open_expanded_cache(
                     self, shape_key, shape_value, index_keys,
                     self.max_seq_len, valid=valid)
-                freqs_cos, freqs_sin = mla_rope_freqs(
-                    positions if logical_positions is None else logical_positions,
-                    self.qk_rope_head_dim, self.rope_theta, self.yarn)
-                q_rot = self._rotate(q_rot, freqs_cos, freqs_sin)
-                rot = self._rotate(
-                    rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :]
+                q_rot, rot, freqs_cos, freqs_sin = self._rotated(
+                    q_rot, rot,
+                    positions if logical_positions is None else logical_positions)
                 if index_keys is not None:
                     index_keys = self.indexer.rotated_keys(index_keys, freqs_cos, freqs_sin)
                 key, value, index_full = append(
@@ -707,12 +717,9 @@ class MultiHeadLatentAttention(nn.Module):
             else:
                 positions, append = open_latent_cache(
                     self, latent, rot, None, self.max_seq_len, valid=valid)
-                freqs_cos, freqs_sin = mla_rope_freqs(
-                    positions if logical_positions is None else logical_positions,
-                    self.qk_rope_head_dim, self.rope_theta, self.yarn)
-                q_rot = self._rotate(q_rot, freqs_cos, freqs_sin)
-                rot = self._rotate(
-                    rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :]
+                q_rot, rot, _, _ = self._rotated(
+                    q_rot, rot,
+                    positions if logical_positions is None else logical_positions)
                 latent, rot, _ = append(latent, rot, None)
                 key, value = self._expand(latent, rot)
                 mask = causal_attention_mask(
@@ -724,11 +731,7 @@ class MultiHeadLatentAttention(nn.Module):
                              jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0))
             else:
                 positions = jnp.asarray(positions)
-            freqs_cos, freqs_sin = mla_rope_freqs(
-                positions, self.qk_rope_head_dim, self.rope_theta, self.yarn)
-            q_rot = self._rotate(q_rot, freqs_cos, freqs_sin)
-            rot = self._rotate(
-                rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :]
+            q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions)
             key, value = self._expand(latent, rot)
             if segment_ids is not None:
                 inside = document_mask(segment_ids)[:, None]
