@@ -1,10 +1,12 @@
 # Train an image diffusion model
 
-This guide assumes the [first training run](../getting-started.md), image tensors, and the idea of predicting a clean signal from a noisy input. It introduces Dew's diffusion configuration through a small flow-matching run. No data or model download is required.
+> An AI assistant maintains this document. It is presented as-is.
+
+This guide assumes you have done the [first training run](../getting-started.md), know how image tensors are laid out, and know the idea of predicting a clean signal from a noisy input. It walks through Dew's diffusion configuration with a small flow-matching run. You do not need to download any data or model.
 
 ## Train on synthetic images
 
-The example creates eight stripe images, trains a small DiT, and writes four generated preview images to a NumPy file. It demonstrates the API and output range, not image quality.
+The example makes eight striped images, trains a small DiT on them, and saves one generated image per batch row, eight in all, to a NumPy file. It shows the API and the output range. It says nothing about image quality.
 
 ```python
 import itertools
@@ -36,7 +38,7 @@ state = trainer.fit(data, steps=3, log_every=1)
 info = Step(step=state.step, key=jax.random.key(1), ema=state.averaged)
 preview = objective.evaluate(state.params, batch, info)
 output = np.asarray(preview.images)
-assert output.shape == (4, 8, 8, 3)
+assert output.shape == (8, 8, 8, 3)
 assert np.all(np.isfinite(output))
 assert output.min() >= -1 and output.max() <= 1
 np.save("preview.npy", output)
@@ -44,34 +46,44 @@ assert Path("preview.npy").is_file()
 print("Saved preview.npy:", output.shape)
 ```
 
-The image batch is NHWC: batch, height, width, channels. The source uses uint8 pixels in `[0, 255]`; the objective converts them to the model's normalized range. `Field("image", (8, 8, 3))` describes one sample, excluding the batch dimension.
+The image batch is NHWC: batch, height, width, channels. The source images are uint8 pixels in `[0, 255]`, and the objective converts them to the model's normalized range. `Field("image", (8, 8, 3))` describes one sample, without the batch dimension.
 
-The DiT divides each 8×8 image into 4×4 patches, producing four spatial tokens. These tiny dimensions keep the example suitable for a CPU smoke run. Real training requires more data, capacity, and optimization steps.
+The DiT cuts each 8×8 image into 4×4 patches, which gives four spatial tokens. The sizes are this small so the example runs in seconds. Real training needs more data, a larger model and many more optimizer steps.
 
 ## Understand the process and solver
 
-`Flow()` is a configuration value. Calling it builds the `Process` used for noise sampling, target construction, and prediction conversion. That explains the two calls in `Flow()()`: construct the preset, then construct its process.
+`Flow()` is a configuration value. Calling it builds the `Process`, which samples noise, builds the training target and converts the model's prediction. That is why the example writes `Flow()()`: the first call makes the preset and the second makes its process.
 
-The objective samples noise and noise levels and computes the flow-matching loss. Its `steps=4` setting controls evaluation sampling, not the number of optimizer updates. `trainer.fit(..., steps=3)` controls the training target.
+The objective samples noise and noise levels and computes the flow-matching loss. Its `steps=4` sets the number of sampling steps for evaluation previews, not the number of optimizer updates. `trainer.fit(..., steps=3)` sets the training target.
 
-`Euler()` is the numerical solver used for preview generation. Changing a solver, noise schedule, or prediction transform changes sampling semantics; choose a compatible process and solver. Other supplied solvers include DDPM, DDIM, Heun, RK4 and Euler ancestral, and the Diffusers scheduler updates: `DPMSolverMultistep` (every algorithm, order and second-order form of `DPMSolverMultistepScheduler`, and the EDM scheduler's update over the EDM process), `DPMSolverSinglestep`, `DPMSolverSDE`, `DEIS`, `UniPC`, `PNDM`, `LMS`, `KDPM2` (plain and ancestral), `TCD`, and `Consistency` with the `ConsistencyBoundary` prediction transform for latent consistency models. Each reproduces Diffusers 0.34.0's trajectories on the fixtures `tools/diffusers_reference.py` records. The named `MultiStepDPM` implementation is a finite-difference sigma integrator, not a Diffusers scheduler.
+`Euler()` is the numerical solver that generates the preview. A different solver, noise schedule or prediction transform samples differently, so pick a process and solver that work together. Dew also has DDPM, DDIM, Heun, RK4 and Euler ancestral, plus solvers that follow the Diffusers schedulers:
 
-`DPMSolverSDE` is `DPMSolverSDEScheduler`'s own solver, not the SDE algorithms of `DPMSolverMultistep`: each interval takes two ancestral steps from its own start, and both draw from one keyed dyadic Brownian bridge over the schedule's positive sigma domain, so they are correlated as nested increments of a single path. `DDPM(variance="large")` selects the published wide posterior variance, the variance-preserving forward step's beta; it is zero wherever alpha is one, so a variance-exploding grid is refused rather than sampled without noise, and neither variance draws on the step whose own time is the schedule's zero. Source clipping and dynamic thresholding are `SourceLimitedPrediction`, part of the process's conversion rather than of a solver, so a solver that reads the clean prediction twice sees the limited one both times.
+- `DPMSolverMultistep` covers every algorithm, order and second-order form of `DPMSolverMultistepScheduler`, and the EDM scheduler's update over the EDM process.
+- `DPMSolverSinglestep`, `DPMSolverSDE`, `DEIS`, `UniPC`, `PNDM`, `LMS`, `KDPM2` (plain and ancestral) and `TCD`.
+- `Consistency`, used with the `ConsistencyBoundary` prediction transform, for latent consistency models.
 
-The former `DPMSolverPP()` configuration is `DPMSolverMultistep(order=2, algorithm="dpmsolver++", solver_type="midpoint", lower_order_final=False, euler_at_final=False)`. Keep `lower_order_final=False` when migrating existing short runs; the general solver defaults to Diffusers’ short-run lowering. Solver initialization takes `(x_T, times, process, key=key)`, with a concrete grid, so invalid endpoint combinations fail before the compiled scan; `key` is the walk's root key, which only `DPMSolverSDE` reads, for its Brownian state.
+Each of these reproduces the Diffusers 0.34.0 trajectories recorded by `tools/diffusers_reference.py`. `MultiStepDPM` has a similar name but is a different thing: a finite-difference integrator in sigma, not a Diffusers scheduler.
 
-`CFG(scale, interval=..., rescale=...)` guides the model's raw outputs and lets the process convert them once, the order a published pipeline runs its scheduler in, so a nonlinear conversion never sees the two branches separately. `rescale` is Diffusers' `guidance_rescale`, the standard-deviation correction of Lin et al. 2023; 0 is the plain guided output.
+`DPMSolverSDE` is the solver of `DPMSolverSDEScheduler`. It is not one of the SDE algorithms of `DPMSolverMultistep`. Each interval takes two ancestral steps from its own start. Both steps draw noise from one keyed dyadic Brownian bridge over the schedule's positive sigma range, so the two draws are correlated as nested increments of a single path.
+
+`DDPM(variance="large")` uses the wider published posterior variance, which is the beta of the variance-preserving forward step. That beta is zero wherever alpha is one, so DDPM refuses a variance-exploding grid instead of sampling it without noise. Neither variance adds noise on the step whose own time is the schedule's zero.
+
+Source clipping and dynamic thresholding live in `SourceLimitedPrediction`. They are part of the process's prediction conversion, not part of a solver, so a solver that reads the clean prediction twice sees the limited value both times.
+
+DPM-Solver++ 2M without any lowering of order at the end is `DPMSolverMultistep(order=2, algorithm="dpmsolver++", solver_type="midpoint", lower_order_final=False, euler_at_final=False)`. By default `lower_order_final=True`, which follows Diffusers: in a walk of fewer than 15 steps, the last step is first order and the one before it at most second order. A solver's `init` takes `(x_T, times, process, key=key)` with a concrete time grid, so an invalid pair of endpoints fails before the compiled loop starts. `key` is the root key of the walk; only `DPMSolverSDE` reads it, for its Brownian state.
+
+`CFG(scale, interval=..., rescale=...)` applies guidance to the model's raw outputs, and then the process converts the guided output once. Published pipelines run their scheduler in the same order, so a nonlinear conversion never sees the two branches separately. `rescale` is Diffusers' `guidance_rescale`, the standard-deviation correction of Lin et al. 2023. `rescale=0` gives the plain guided output.
 
 ## Inspect the preview
 
-The script writes `preview.npy` in its working directory. It contains four float32-compatible image arrays in `[-1, 1]`. For display, convert with `(output + 1) / 2` and clip to `[0, 1]`. Three updates on stripe images will not produce a useful generative model.
+The script writes `preview.npy` to its working directory. It holds eight float32 images with values in `[-1, 1]`: `evaluate` draws one sample for every real row of the batch it is given. To display them, compute `(output + 1) / 2` and clip to `[0, 1]`. Three updates on striped images do not give you a useful generative model.
 
-The manual call to `evaluate` uses an explicit independent key. For evaluation scheduled by `Trainer.fit`, current RNG reuse and preview/scoring limitations apply. A four-image preview is not a dataset-level generative-quality metric; see [evaluation and tracking](evaluation.md).
+The call to `evaluate` passes its own independent key. When `Trainer.fit` schedules evaluation, it derives the keys from the run key and the step instead; [evaluation and tracking](evaluation.md) describes this. Eight samples are not a dataset-level measure of generative quality; that guide also covers the metrics.
 
 ## Add conditions or a latent encoder
 
-For text conditioning, `InputSpec.conditions` maps model keyword arguments to condition encoders and their batch fields. Tokenize captions with the same encoder/tokenizer configuration used for training. A pretrained text tower can require a model download and significant memory.
+For text conditioning, `InputSpec.conditions` maps a model keyword argument to a condition encoder and the batch field it reads. Tokenize captions with the same encoder and tokenizer settings you train with. A pretrained text tower may need a model download and a lot of memory.
 
-A configured autoencoder changes training from pixels to latent tensors. Match the denoising model's channel count and spatial shape to the encoder output and retain the correct scaling convention. Loading a VAE does not by itself load an external diffusion transformer's weights.
+With an autoencoder configured, training runs on latent tensors instead of pixels. Set the denoising model's channel count and spatial shape to match the encoder output, and keep the encoder's scaling convention. Loading a VAE does not load the weights of an external diffusion transformer.
 
-Use [training recipes](../recipes.md) for dataset-backed runs. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names the checkpoints that load.
+Use [training recipes](../recipes.md) for runs on real datasets. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names the checkpoints that load.
