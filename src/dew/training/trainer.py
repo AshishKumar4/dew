@@ -32,7 +32,6 @@ from termcolor import colored
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
-from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import (
     FROZEN,
     Aux,
@@ -64,6 +63,7 @@ from dew.training.distributed import (
     batch_divisor,
     batch_shardings,
     build_mesh,
+    scheduled,
     shard_batch,
 )
 from dew.training.evaluation import Evaluation, evaluate
@@ -584,7 +584,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             return self._compile_host(state, batch)
         mesh = self.device_mesh
-        with jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches):
+        with jax.set_mesh(mesh), scheduled(self.mesh):
             shapes = None if self.step is not None else self._loss_shape(state, batch)
             prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
             body = self.step(self.objective, self.optimizer) if self.step is not None else self._default_step(shapes)
@@ -606,7 +606,7 @@ class Trainer(Generic[Loss, Effects]):
             self.flops_per_step = step_flops(jitted, prepared, batch)
 
         def run(current, batch):
-            with jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches):
+            with jax.set_mesh(mesh), scheduled(self.mesh):
                 if current.accumulation is None and self.accumulation > 1 and self.step is None:
                     current = self._initialize_accumulation(current, batch, shapes)
                     current = jax.device_put(current, shardings)
@@ -619,7 +619,7 @@ class Trainer(Generic[Loss, Effects]):
         cpu = self.state_mesh
         execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
-        with jax.set_mesh(cpu), pipeline_microbatches(self.mesh.microbatches):
+        with jax.set_mesh(cpu), scheduled(self.mesh):
             shapes = self._loss_shape(state, cpu_batch)
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, shape_only=True)
             placement = self.shardings(prepared)
@@ -628,7 +628,7 @@ class Trainer(Generic[Loss, Effects]):
 
         def run(current, batch):
             batch = transfer(batch, batch_shardings(cpu, batch))
-            with jax.set_mesh(cpu), pipeline_microbatches(self.mesh.microbatches):
+            with jax.set_mesh(cpu), scheduled(self.mesh):
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes)
                 advanced, loss, aux = body(current, batch)

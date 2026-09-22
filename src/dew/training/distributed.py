@@ -17,6 +17,7 @@ import jax
 import numpy as np
 from flax import linen as nn
 from flax.linen import spmd
+from jax.experimental import mesh_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, Stoppable
@@ -29,7 +30,10 @@ from dew.nn.sharding import (
     STAGE_AXIS,
     TENSOR_AXIS,
     LogicalAxes,
+    SequenceExchange,
     declared_axes,
+    pipeline_microbatches,
+    sequence_exchange_of,
 )
 from dew.objectives.base import Batch, Variables
 from dew.telemetry.profile import region
@@ -132,10 +136,26 @@ class MeshSpec:
     is one per stage, the smallest schedule. A stage runs one microbatch while
     the next runs the one before it. So more microbatches shrink the idle time
     at either end of the step, and make each iteration's matmuls smaller."""
+    sequence_exchange: SequenceExchange = 'all_to_all'
+    """The collective attention runs over a sequence axis above one.
+    'all_to_all' (Ulysses) trades sequence rows for heads, so no device holds
+    a whole key or value; the heads must divide by tensor times sequence.
+    'all_gather' gathers keys and values whole beside split queries and takes
+    any head count. `dew.nn.attention.sequence_parallel_attention` has both."""
+    replicas: int = 1
+    """Groups of hosts the data axis spans, for hybrid sharded data
+    parallelism: every other axis, fsdp included, stays inside one group,
+    so the parameter gathers and gradient reduce-scatters run over the fast
+    links and only the gradient all-reduce between replicas crosses the
+    slow one. A group is a whole number of granules, which are TPU slices
+    on a multislice run and processes (hosts) anywhere else. 1 lets
+    `jax.make_mesh` place every device."""
 
     def __post_init__(self):
         if self.stage < 1:
             raise ValueError(f"stage counts pipeline stages, got {self.stage}")
+        if self.replicas < 1:
+            raise ValueError(f"replicas counts host groups, got {self.replicas}")
         if self.microbatches is None:
             return
         if self.stage == 1:
@@ -146,6 +166,30 @@ class MeshSpec:
             raise ValueError(
                 f"microbatches must be a positive multiple of stage "
                 f"({self.stage}), got {self.microbatches}")
+
+
+@contextlib.contextmanager
+def scheduled(spec: MeshSpec) -> Iterator[None]:
+    """Put `spec`'s schedule in context for a model tracing under its mesh:
+    the pipeline's microbatches and the sequence axis's collective, the two
+    choices a mesh itself does not carry."""
+    with pipeline_microbatches(spec.microbatches), sequence_exchange_of(spec.sequence_exchange):
+        yield
+
+
+def granules(devices: list) -> list[list]:
+    """`devices` grouped by the unit the slow network joins, in index order.
+
+    That is the TPU slice where the devices span more than one, and the
+    process otherwise: GPU and CPU devices report slice 0, and so does
+    every host of one TPU slice, whose hosts `replicas` then groups.
+    """
+    slices = {device.slice_index for device in devices}
+    attribute = 'slice_index' if len(slices) > 1 else 'process_index'
+    grouped: dict[int, list] = {}
+    for device in devices:
+        grouped.setdefault(getattr(device, attribute), []).append(device)
+    return [grouped[index] for index in sorted(grouped)]
 
 
 def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
@@ -184,6 +228,13 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
     Sizes of 1 degenerate to plain data parallelism, so the same code path
     serves every topology without a flag. Axes are Auto so GSPMD infers the
     collectives.
+
+    `spec.replicas` above 1 builds the mesh the way MaxText builds a
+    multislice one, through `mesh_utils.create_hybrid_device_mesh`: the
+    data axis takes `replicas` groups of granules as its outer factor, and
+    each group lays out the rest of the mesh over its own devices. A group
+    of more than one granule splits fsdp across them, the one axis whose
+    traffic, a gather and a reduce-scatter per layer, tolerates it.
     """
     devices = list(devices) if devices is not None else jax.devices()
     sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence * spec.stage
@@ -193,13 +244,33 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
             f"fsdp {spec.fsdp} times expert {spec.expert} times tensor "
             f"{spec.tensor} times sequence {spec.sequence} times stage "
             f"{spec.stage} must be a positive divisor of device count {len(devices)}")
-    return jax.make_mesh(
-        (len(devices) // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence,
-         spec.stage),
-        (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS),
-        devices=devices,
-        axis_types=(AxisType.Auto,) * 6,
-    )
+    shape = (len(devices) // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence,
+             spec.stage)
+    names = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
+    if spec.replicas == 1:
+        return jax.make_mesh(shape, names, devices=devices, axis_types=(AxisType.Auto,) * 6)
+    return Mesh(hybrid_devices(spec, shape, devices), names, axis_types=(AxisType.Auto,) * 6)
+
+
+def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.ndarray:
+    """The device array of a mesh whose data axis spans `spec.replicas` host groups."""
+    groups = granules(devices)
+    data = shape[0]
+    if len(groups) % spec.replicas or data % spec.replicas:
+        raise ValueError(
+            f"replicas {spec.replicas} must divide both the {len(groups)} granules "
+            f"(slices, or processes) the devices form and the data axis of {data}")
+    per_replica = len(groups) // spec.replicas
+    if spec.fsdp % per_replica:
+        raise ValueError(
+            f"each of the {spec.replicas} replicas spans {per_replica} granules, "
+            f"which only the fsdp axis may cross, and fsdp {spec.fsdp} does not "
+            "divide over them")
+    dcn = (spec.replicas, 1, per_replica, 1, 1, 1)
+    ici = tuple(size // outer for size, outer in zip(shape, dcn, strict=True))
+    return mesh_utils.create_hybrid_device_mesh(
+        ici, dcn, devices, process_is_granule=len({d.slice_index for d in devices}) == 1,
+        allow_split_physical_axes=True)
 
 
 def batch_divisor(mesh: Mesh, spec: MeshSpec) -> int:

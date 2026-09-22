@@ -22,7 +22,14 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
 from .precision import precision_names
-from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
+from .sharding import (
+    SEQUENCE_AXIS,
+    STAGE_AXIS,
+    TENSOR_AXIS,
+    logical_axes,
+    sequence_exchange,
+    sequence_shards,
+)
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
 """Names which kernel an attention call runs.
@@ -562,13 +569,116 @@ def unstripe(x, shards: int, axis: int = 1):
 
 
 def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causal,
-                                sliding_window, mask, bias):
+                                sliding_window, mask, bias, sinks):
+    """Run `kernel` over a sequence the mesh's sequence axis splits.
+
+    `sequence_exchange` in context picks the collective: 'all_to_all' runs
+    `exchanged_heads_attention`, 'all_gather' runs
+    `gathered_keys_attention`. Both are exact; they differ in what every
+    shard holds and what crosses the interconnect.
+    """
+    run = (exchanged_heads_attention if sequence_exchange() == 'all_to_all'
+           else gathered_keys_attention)
+    return run(kernel, query, key, value, shards, causal=causal,
+               sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks)
+
+
+def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
+                              sliding_window, mask, bias, sinks):
+    """DeepSpeed Ulysses: trade a slice of the sequence for a slice of the heads.
+
+    Each shard holds S/n rows of every head. One all-to-all per operand over
+    the sequence axis hands it all S rows of H/n heads instead, the kernel
+    attends those heads over the whole sequence, and one more all-to-all
+    puts the output back in rows (Jacobs et al. 2023, arXiv:2309.14509).
+    The kernel sees whole sequences, so causality, a window, a packed
+    document mask and splash's block skipping work as on one device, every
+    shard does the same causal work without a reorder, and autodiff
+    transposes each all-to-all into the reverse one for the backward pass.
+    No shard ever holds the whole of any key or value, which is what the
+    all-gather exchange costs: a shard holds S*K*D of each against
+    S*K*D/n here.
+
+    Heads split over the tensor axis first and the sequence axis within
+    that, so H has to divide by tensor times sequence. Grouped key and value
+    heads are repeated only as far as that split needs, to the least common
+    multiple of their count and the split, which keeps each shard's query
+    heads beside the key heads they read. A mask or bias with a head
+    dimension is split with the heads, and its query and key dimensions
+    arrive whole, as the kernel reads them. Learned sinks split with the
+    heads they belong to.
+
+    Batch rows split over every batch axis that still divides them, in mesh
+    order; a batch too small for the rest is attended alike on those axes'
+    shards, the way GSPMD replicates a dimension it cannot split.
+    """
+    mesh = jax.sharding.get_abstract_mesh()
+    usable = [axis for axis in mesh.axis_names
+              if axis not in mesh.manual_axes and mesh.shape[axis] > 1]
+    batch, _, heads, _ = query.shape
+    rows: tuple[str, ...] = ()
+    for axis in usable:
+        if (axis not in (TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
+                and batch % (math.prod(mesh.shape[a] for a in rows) * mesh.shape[axis]) == 0):
+            rows = (*rows, axis)
+    tensor = (TENSOR_AXIS,) if TENSOR_AXIS in usable else ()
+    split = shards * math.prod(mesh.shape[axis] for axis in tensor)
+    if heads % split:
+        raise ValueError(
+            f"the all-to-all sequence exchange splits the {heads} query heads "
+            f"{split} ways (tensor times sequence), which does not divide them. "
+            "MeshSpec(sequence_exchange='all_gather') gathers the keys and values "
+            "instead and takes any head count.")
+    kv_heads = math.lcm(key.shape[-2], split)
+    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+
+    row_entry = rows or None
+    head_entry = (*tensor, SEQUENCE_AXIS)
+    in_rows = P(row_entry, SEQUENCE_AXIS, tensor or None, None)
+
+    def whole_rows(x):
+        # [.., Q, K] broadcastable to [B, H, Q, K]: split its rows and heads
+        # where it has them, keep its query and key dimensions whole.
+        x = x.reshape((1,) * (4 - x.ndim) + x.shape)
+        return x, P(row_entry if x.shape[0] == batch else None,
+                    head_entry if x.shape[1] == heads else None, None, None)
+
+    extras = {name: whole_rows(x) for name, x in (('mask', mask), ('bias', bias)) if x is not None}
+    if sinks is not None:
+        extras['sinks'] = (sinks, P(head_entry))
+    names = tuple(extras)
+
+    def local(query, key, value, *arrays):
+        query, key, value = (jax.lax.all_to_all(x, SEQUENCE_AXIS, 2, 1, tiled=True)
+                             for x in (query, key, value))
+        given = dict(zip(names, arrays, strict=True))
+        out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
+                     mask=given.get('mask'), bias=given.get('bias'), sinks=given.get('sinks'))
+        return jax.lax.all_to_all(out, SEQUENCE_AXIS, 1, 2, tiled=True)
+
+    # The pipeline vmaps its stages with spmd_axis_name=stage, and a vmapped
+    # shard_map can only split the new dimension over an axis it holds
+    # manual. Outside a pipeline nothing here varies over stage.
+    stage = (STAGE_AXIS,) if STAGE_AXIS in usable else ()
+    # Pallas kernels state no varying-manual-axes type for their outputs, so
+    # splash inside the map needs the check off, as MaxText wraps it. Every
+    # operand here is split on the axes the specs name and nothing is
+    # reduced, so the check has nothing to catch.
+    exchanged = jax.shard_map(
+        local, in_specs=(in_rows,) * 3 + tuple(spec for _, spec in extras.values()),
+        out_specs=in_rows, axis_names={*rows, *tensor, SEQUENCE_AXIS, *stage}, check_vma=False)
+    return exchanged(query, key, value, *(x for x, _ in extras.values()))
+
+
+def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
+                            sliding_window, mask, bias, sinks):
     """Run `kernel` with the queries split along the mesh's sequence axis.
 
     The keys and values are gathered whole once. Batch rows stay split over
     every other mesh axis but tensor and stage, which hold a width and a
     pipeline stage and never a row. The heads are left to GSPMD, so a width
-    the rules put on the tensor axis stays there.
+    the rules put on the tensor axis stays there. This takes any head count,
+    and costs every shard the whole of every key and value.
 
     A causal, windowed or masked call reorders the queries with `stripe` so
     each shard holds equal causal work, and puts the output back with
@@ -588,7 +698,7 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     key, value = constrain(key, whole), constrain(value, whole)
     if not (causal or sliding_window is not None or mask is not None):
         return constrain(kernel(query, key, value, causal=False, sliding_window=None,
-                                mask=None, bias=bias), split)
+                                mask=None, bias=bias, sinks=sinks), split)
 
     q_len, kv_len = query.shape[-3], key.shape[-3]
     query = constrain(stripe(query, shards), split)
@@ -604,7 +714,8 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
         structural = causal_attention_mask(
             stripe(jnp.arange(q_len), shards, axis=0), kv_len, sliding_window)
         mask = structural if mask is None else jnp.logical_and(mask, structural)
-    out = kernel(query, key, value, causal=False, sliding_window=None, mask=mask, bias=bias)
+    out = kernel(query, key, value, causal=False, sliding_window=None, mask=mask, bias=bias,
+                 sinks=sinks)
     return constrain(unstripe(constrain(out, split), shards), split)
 
 
@@ -716,15 +827,15 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-        sinks=sinks, softcap=softcap)
+        softcap=softcap)
     shards = sequence_shards()
     if shards > 1:
         out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
-            sliding_window=sliding_window, mask=mask, bias=bias)
+            sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks)
     else:
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
-                     mask=mask, bias=bias)
+                     mask=mask, bias=bias, sinks=sinks)
     return checkpoint_name(out, 'attention_output')
 
 
