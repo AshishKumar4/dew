@@ -204,7 +204,8 @@ def _raise_stopped(signum: int, _frame: object) -> None:
 
 def supervise(processes: Sequence[Process], cwd: str | None) -> int:
     """Run the pool with each line prefixed by its rank, and return the
-    first failure's exit code, or 0.
+    first failure's exit code, or 0. A rank killed by signal N counts as
+    128 + N, the way a shell reports it.
 
     A process that fails leaves its peers waiting in a collective for a
     partner that is gone, which on most backends is a hang rather than an
@@ -242,7 +243,8 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
             if failed:
                 emit(f"a process exited {failed[0]}; stopping the pool")
                 _stop(running)
-                return failed[0]
+                # Popen reports death by signal N as -N; a shell reports 128 + N.
+                return 128 - failed[0] if failed[0] < 0 else failed[0]
             if all(code == 0 for code in codes):
                 return 0
             time.sleep(POLL_SECONDS)

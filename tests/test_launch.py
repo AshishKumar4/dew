@@ -91,3 +91,12 @@ def test_a_rank_printing_bytes_that_are_not_utf8_still_finishes():
         launch.kill()
     assert launch.returncode == 0
     assert "[0] \ufffd\ufffd" in output.decode()
+
+
+def test_a_rank_killed_by_a_signal_exits_the_launch_128_plus_it():
+    """The OOM killer's SIGKILL reads as 137, the shell's convention, which
+    wrappers test for; Python's -9 would reach the shell as 247."""
+    program = "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n"
+    launch = launcher("--port", "1", "--", sys.executable, "-c", program)
+    launch.communicate(timeout=60)
+    assert launch.returncode == 137
