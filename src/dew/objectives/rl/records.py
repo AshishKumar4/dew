@@ -18,7 +18,7 @@ def object_record(value: object) -> Mapping[str, object]:
 
 
 def sequence[ItemT](value: object, read: Callable[[JSON], ItemT]) -> tuple[ItemT, ...]:
-    """Every entry of a JSON array, each one through `read`."""
+    """Read every entry of a JSON array, each one through `read`."""
     if not isinstance(value, (list, tuple)):
         raise ValueError("episode field must be an array")
     return tuple(read(entry) for entry in value)
@@ -69,7 +69,7 @@ def action_record(value: Mapping[str, object]) -> Action:
 
 
 class EpisodeFields(TypedDict, total=False):
-    """Every field of `Episode` a record carries, under the field's own name.
+    """Name every field of `Episode` a record carries, under the field's own name.
 
     The keys are the dataclass's own init fields, which
     `tests/test_verl_episodes.py` pins, so a field renamed there is a failing
@@ -91,7 +91,7 @@ class EpisodeFields(TypedDict, total=False):
 
 
 def episode_record(episode: Episode) -> EpisodeFields:
-    """Retain exact turns, observations, likelihoods and private collection origin."""
+    """Write an episode's exact turns, observations, likelihoods and collection origin."""
     return EpisodeFields(**asdict(episode))
 
 

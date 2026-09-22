@@ -28,7 +28,7 @@ from flax.typing import PrecisionLike
 
 
 def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ...]:
-    """`chunks` half-open column ranges covering `range(vocab_size)`.
+    """Cut `range(vocab_size)` into `chunks` half-open column ranges.
 
     The last chunk is the short one when the count does not divide the
     vocabulary. Uneven tiles are free here: the full-width chunks are the
@@ -141,7 +141,7 @@ def _forward(hidden, table, targets, chunks: int, token_tile: int,
 
 def _bounded_head_impl(hidden, table, targets, chunks: int, tile: tuple[int, int],
                        softcap, precision: PrecisionLike):
-    """`_forward` behind a backward that recomputes its logits."""
+    """Run `_forward` behind a backward that recomputes its logits."""
     return _forward(hidden, table, targets, chunks, tile[0], softcap, precision)
 
 
@@ -153,6 +153,14 @@ def _bounded_head_fwd(hidden, table, targets, chunks, tile, softcap, precision):
 
 
 def _bounded_head_bwd(chunks, tile, precision, residuals, cotangents):
+    """Pull the cotangents back through logits recomputed one tile at a time.
+
+    The outer loop walks vocabulary tiles carrying `(d_states, d_table,
+    d_cap)`: the full-width state gradient, the head gradient stored tile by
+    tile, and the softcap's. The inner loop walks token tiles carrying
+    `(d_states, d_matrix, d_cap)`, where `d_matrix` accumulates one
+    vocabulary tile's head gradient in fp32 before it is stored.
+    """
     del chunks  # The backward tiles by column, not by the forward's chunks.
     hidden, table, targets, log_z, softcap = residuals
     loss_cotangent, _, partition_cotangent = cotangents

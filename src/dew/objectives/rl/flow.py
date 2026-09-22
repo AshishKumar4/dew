@@ -44,7 +44,7 @@ Predictor = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
 
 
 def _source(inputs: InputSpec, batch: Batch) -> jax.Array:
-    """The real row-bearing field used by rollout, scoring, and preview."""
+    """Read the real row-bearing field used by rollout, scoring and preview."""
     conditions = inputs.conditions
     name = next(iter(conditions.values())).field if conditions else inputs.sample.key
     source = jnp.asarray(jax.tree.leaves(batch[name])[0])
@@ -56,7 +56,9 @@ def _source(inputs: InputSpec, batch: Batch) -> jax.Array:
 
 @objectives("flow_grpo")
 class FlowGRPOObjective(DiffusionObjective):
-    """Clipped, coordinate-normalized policy gradients with conditional transition KL.
+    """Train a rectified-flow policy on clipped, coordinate-normalized gradients.
+
+    A conditional transition KL regularizes it.
 
     Batches carry latents/next_latents [N, K, ...], timesteps/next_timesteps,
     joint old_log_probs and transition_mask [N, K], and advantages [N] or
@@ -114,6 +116,7 @@ class FlowGRPOObjective(DiffusionObjective):
         return state
 
     def _predictor(self, params: Variables, batch: Batch) -> Predictor:
+        """Build the denoiser this batch's conditions select, guidance included."""
         tokens = {keyword: batch[condition.field]
                   for keyword, condition in self.inputs.conditions.items()}
         given = self.encode(params["encoders"], tokens)
@@ -128,6 +131,12 @@ class FlowGRPOObjective(DiffusionObjective):
         return self.sde.transition(x, t, following, denoised, eps, self.process)
 
     def _window(self, batch: Batch) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Read and validate one batch's recorded transitions.
+
+        Returns the latents, the latents they step to, and both endpoints'
+        times, all detached: a rollout's record is data, not a path the
+        gradient runs back through.
+        """
         latents = jnp.asarray(batch["latents"], jnp.float32)
         following = jnp.asarray(batch["next_latents"], jnp.float32)
         times = jnp.asarray(batch["timesteps"], jnp.float32)
@@ -156,6 +165,12 @@ class FlowGRPOObjective(DiffusionObjective):
         return values.T
 
     def loss(self, params: Variables, batch: Batch, step: Step) -> tuple[Mean, Aux]:
+        """Score the clipped policy gradient over the recorded transitions.
+
+        The scan carries nothing between transitions; each one contributes
+        its surrogate, its KL to the frozen reference, whether it counted,
+        and whether the ratio was clipped.
+        """
         latents, following, times, next_times = self._window(batch)
         old = jax.lax.stop_gradient(jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32))
         mask = jax.lax.stop_gradient(jnp.asarray(batch["transition_mask"], jnp.bool_))
@@ -207,6 +222,11 @@ class FlowGRPOObjective(DiffusionObjective):
 
     def _draw(self, params: Variables, batch: Batch, key: jax.Array,
               limit: int | None = None) -> tuple[jax.Array, Batch]:
+        """Sample the batch's conditions on every rank, agreeing at each phase.
+
+        `limit` caps the rows drawn, which is what a preview takes.
+        Returns the samples and the condition tokens behind them.
+        """
         error = None
         prepared = None
         try:
@@ -307,6 +327,7 @@ class FlowRollout:
 
     def _generate_impl(self, params: Variables, batch: Batch,
                        key: jax.Array) -> tuple[FlowTrajectory, jax.Array]:
+        """Sample one SDE trajectory per row and decode its final samples."""
         objective = self.objective
         tokens = {keyword: batch[condition.field]
                   for keyword, condition in objective.inputs.conditions.items()}
@@ -325,6 +346,11 @@ class FlowRollout:
         return trajectory, jnp.clip(samples, -1, 1)
 
     def _owned_rows(self, source: jax.Array) -> slice | np.ndarray:
+        """Select the expanded rows this process owns.
+
+        Each source row becomes `groups` consecutive rows, so a rank's
+        shard of the source picks out that many rows of the result.
+        """
         if jax.process_count() == 1:
             return slice(None)
         owned: set[int] = set()
@@ -336,6 +362,14 @@ class FlowRollout:
         return (rows[:, None] * self.groups + np.arange(self.groups)).reshape(-1)
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
+        """Collect one batch of trajectories and return this rank's training rows.
+
+        The phases are: expand each prompt into its group, generate on
+        every rank, score on rank zero and broadcast, then centre the
+        rewards within each group and cut the trajectory into the first
+        `train_steps` transitions. Every phase agrees across ranks before
+        the next collective.
+        """
         error = None
         expanded = None
         owned = slice(None)

@@ -33,11 +33,13 @@ from .rollout import ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, IDS_KEY, OLD_LOG_PR
 
 @objectives("grpo")
 class GRPOObjective(LMObjective):
-    """The GRPO loss (arXiv:2402.03300, eq. 4) with verl's presentation: the
-    dual-clipped surrogate token-meaned over the response mask, plus `beta`
-    times the token-mean k3 KL to the frozen reference
-    (`verl/trainer/ppo/core_algos.py`, `compute_policy_loss_vanilla` with
-    `token-mean` and `kl_penalty_forward` with `k3`).
+    """Train a policy on sampled rollouts with the GRPO loss (arXiv:2402.03300, eq. 4).
+
+    The composition is verl's: the dual-clipped surrogate, token-meaned
+    over the response mask, plus `beta` times the token-mean k3 KL to the
+    frozen reference (`verl/trainer/ppo/core_algos.py`,
+    `compute_policy_loss_vanilla` with `token-mean` and
+    `kl_penalty_forward` with `k3`).
 
     `beta` is the KL strength; 0.0 allocates no frozen reference.
     `epsilon_low`, `epsilon_high` and `dual_clip` are the clip points;
@@ -79,10 +81,12 @@ class GRPOObjective(LMObjective):
         self.behavior_importance_cap = behavior_importance_cap
 
     def _window(self, batch):
-        """The rollout batch validated: the concatenation width, the response
-        width, and the response slice. Position p of the concatenation
-        predicts token p + 1, so the response starts one before the prompt
-        width."""
+        """Validate the rollout batch and locate its response slice.
+
+        Returns the concatenation, where the response starts and how wide
+        it is. Position p of the concatenation predicts token p + 1, so
+        the response starts one before the prompt width.
+        """
         try:
             ids = jnp.asarray(batch[IDS_KEY])
         except KeyError:
@@ -118,6 +122,11 @@ class GRPOObjective(LMObjective):
         return ids, start, old.shape[1]
 
     def loss(self, params, batch, step):
+        """Score the clipped surrogate over the response, plus the KL to the reference.
+
+        The policy is rescored from the rollout's own concatenation, so
+        every term reads the tokens that were actually drawn.
+        """
         ids, start, width = self._window(batch)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         importance = None
@@ -160,9 +169,12 @@ class GRPOObjective(LMObjective):
         return super().preview(params, batch, dataclasses.replace(step, ema=None), scored=scored)
 
     def evaluate(self, params, batch, step):
-        """The prompts' perplexity under the policy: each row's shifted
-        cross entropy with the real suffix as weights, off the row's
-        `prompt_length`. Pads predict nothing and count nothing."""
+        """Score the prompts' perplexity under the policy.
+
+        Each row is its shifted cross entropy with the real suffix as
+        weights, taken off the row's `prompt_length`. Pads predict nothing
+        and count nothing.
+        """
         try:
             prompts = jnp.asarray(batch[PROMPT_KEY])
         except KeyError:

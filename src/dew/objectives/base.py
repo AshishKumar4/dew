@@ -63,9 +63,10 @@ function is not one of these; `jax.jit` cannot take it as an argument."""
 
 @struct.dataclass
 class Mean:
-    """A scalar sum with nonnegative, parameter-independent support mass.
+    """Carry a scalar sum together with the mass it is averaged over.
 
-    Zero mass declares a zero numerator and no contribution.
+    The mass is nonnegative and does not depend on the parameters. Zero
+    mass declares a zero numerator and no contribution.
     """
     total: jax.Array
     mass: jax.Array
@@ -86,7 +87,12 @@ Effects = TypeVar("Effects", default=None)
 
 @struct.dataclass
 class Step:
-    """Accepted-microbatch schedule index, attempted-work key, and EMA view."""
+    """What the trainer tells an objective about the current step.
+
+    `step` is the count of accepted microbatches, which is what an
+    objective's own schedules index by. `key` is drawn fresh for every
+    attempt, so a replayed microbatch draws the same randomness.
+    """
     step: jax.Array
     key: jax.Array
     ema: Variables | None
@@ -96,7 +102,12 @@ class Step:
 
 @struct.dataclass
 class Aux(Generic[Effects]):
-    """Reports, sequential mutable replacements, and deferred effects."""
+    """Everything a loss returns besides its statistics.
+
+    `metrics` go to the tracker. `variables` replace nonparameter
+    collections outright. `effects` are additive observations the
+    optimizer applies once per commit rather than per microbatch.
+    """
     metrics: dict[str, jax.Array]
     variables: Variables | None = None
     """Complete nonparameter replacements from one accepted microbatch,
@@ -116,7 +127,7 @@ class Aux(Generic[Effects]):
 
 @struct.dataclass
 class Prediction:
-    """What a token objective scored a batch with, for a teacher to compare.
+    """Hold what a token objective scored a batch with, for a teacher to compare.
 
     `logits` are the `[B, S, vocab]` fp32 scores the model's forward
     produces, `losses` and `weights` the `[B, S]` per-position loss the
@@ -134,12 +145,15 @@ def everything(path: Path) -> bool:
 
 
 def under(*prefix: str) -> PathFilter:
-    """Leaves below `prefix`, as in `under("params", "context_encoder")`."""
+    """Build a filter that accepts the leaves below `prefix`.
+
+    As in `under("params", "context_encoder")`.
+    """
     return lambda path: path[:len(prefix)] == prefix
 
 
 def select(tree: Variables, keep: PathFilter) -> Variables:
-    """The subtree of `tree` whose leaves `keep` accepts, with the same nesting.
+    """Return the subtree of `tree` whose leaves `keep` accepts, nested the same way.
 
     A branch that keeps no leaf is dropped, so the result is what the EMA
     stores and what `merge` puts back.
@@ -157,7 +171,7 @@ def select(tree: Variables, keep: PathFilter) -> Variables:
 
 
 def merge(tree: Variables, overlay: Variables) -> Variables:
-    """`tree` with every leaf `overlay` holds replaced by the overlay's."""
+    """Return `tree` with every leaf `overlay` holds replaced by the overlay's."""
     merged = dict(tree)
     for name, child in overlay.items():
         held = tree.get(name)
@@ -175,7 +189,7 @@ and the model sees them merged by `thaw`."""
 
 
 def freeze(variables: Variables, trainable: PathFilter) -> Variables:
-    """`variables` with the `params` leaves `trainable` rejects moved under `FROZEN`.
+    """Move the `params` leaves `trainable` rejects under `FROZEN`.
 
     Paths are full leaf paths, `("params", ...)`. A filter that keeps every
     leaf or none names nothing to split and is refused.
@@ -192,7 +206,7 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
 
 
 def thaw(variables: Variables) -> Variables:
-    """The tree with its frozen split undone, one `params` collection again."""
+    """Undo a frozen split, leaving one `params` collection again."""
     if FROZEN not in variables:
         return variables
     rest = {name: value for name, value in variables.items() if name != FROZEN}
@@ -201,7 +215,7 @@ def thaw(variables: Variables) -> Variables:
 
 @dataclass(frozen=True)
 class EMASpec:
-    """Which leaves of the variables the EMA copy tracks, and how fast.
+    """Say which leaves the EMA copy tracks, and how fast it follows them.
 
     decay is a step-indexed schedule, since momentum ramps matter for some
     objectives (I-JEPA anneals 0.996 to 1.0). The step it reads is the count
@@ -212,7 +226,7 @@ class EMASpec:
 
 
 class Objective(ABC, Generic[Loss, Effects]):
-    """What is being learned: parameters, loss, what evaluation produces."""
+    """Define what is being learned: the parameters, the loss, what evaluation produces."""
 
     inputs: InputSpec
     """Per-example shapes and dtypes the parameter tree is initialised from."""
@@ -358,7 +372,9 @@ S = TypeVar("S")
 
 
 class Metric(Protocol[S]):
-    """Host-local statistics, merged immediately and finalized once.
+    """Reduce a validation pass to one scalar, on the host.
+
+    Statistics are merged as each batch arrives and finalized once.
 
     The first contribution initializes a pass. State belongs to that pass
     alone; merge may update its owned buffers in place. Metrics must never
@@ -374,8 +390,8 @@ class Metric(Protocol[S]):
         ...
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> S:
-        """One complete batch's sufficient statistics, out of the scoring
-        artifact `reads` names."""
+        """Compute one complete batch's sufficient statistics, out of the
+        scoring artifact `reads` names."""
         ...
 
     def merge(self, accumulated: S, contribution: S, /) -> S:

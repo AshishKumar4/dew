@@ -39,7 +39,7 @@ class ValueBackbone(Protocol):
 
 
 class ValueHead(nn.Module):
-    """A decoder's hidden states projected to one float32 value per position."""
+    """Project a decoder's hidden states to one float32 value per position."""
 
     backbone: ValueBackbone
 
@@ -50,10 +50,20 @@ class ValueHead(nn.Module):
 
 
 def _part(variables: Variables, name: str) -> Variables:
+    """Cut the `name` subtree out of every collection that holds one.
+
+    The joint tree nests the collection above the side, `params/policy`,
+    so a side's own tree is the same collections one level down.
+    """
     return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
 
 
 def _join(policy: Variables, critic: Variables) -> Variables:
+    """Nest a policy and a critic tree under one collection per side.
+
+    The inverse of `_part`: each collection the two share becomes a
+    `{"policy": ..., "critic": ...}` node.
+    """
     return {collection: {name: tree[collection] for name, tree in (("policy", policy), ("critic", critic))
                          if collection in tree} for collection in policy.keys() | critic.keys()}
 
@@ -72,7 +82,7 @@ class _Policy:
 
 @objectives("ppo")
 class PPOObjective(Objective[Mean, Variables]):
-    """The PPO policy objective and clipped critic error on the same token mass.
+    """Train a policy and a critic together on one token mass.
 
     The params collection holds policy and critic subtrees, both optimized by
     the ordinary Trainer. The unit-decay reference selects only policy leaves.
@@ -98,7 +108,7 @@ class PPOObjective(Objective[Mean, Variables]):
             lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])))
 
     def held_variables(self) -> Variables | None:
-        """Whatever the actor starts from: a loaded policy checkpoint.
+        """Return whatever the actor starts from: a loaded policy checkpoint.
 
         The critic is drawn from the key, so the actor's tree is the only
         held data here, and it reaches the trainer's state JIT as the
@@ -116,12 +126,12 @@ class PPOObjective(Objective[Mean, Variables]):
         return _Policy(self.actor.policy(_part(variables, "policy")))
 
     def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> TextGeneration:
-        """Publish the trained actor without the critic or the frozen KL reference."""
+        """Publish the trained actor, without the critic or the frozen KL reference."""
         actor_state = replace(state, params=_part(state.params, "policy"))
         return self.actor.pipeline(actor_state, ema=ema, processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
-        """Values of states before each response action, with left padding removed."""
+        """Score the states before each response action, with left padding removed."""
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         start = ids.shape[1] - mask.shape[1] - 1
@@ -139,6 +149,7 @@ class PPOObjective(Objective[Mean, Variables]):
         return _shift_rows(values, -padding)[:, start:start + mask.shape[1]]
 
     def loss(self, params: Variables, batch, step: Step) -> tuple[Mean, Aux[Variables]]:
+        """Add the actor's policy loss to the clipped value error on the same mass."""
         for field in (OLD_VALUES_KEY, RETURNS_KEY):
             if field not in batch or jnp.shape(batch[field]) != jnp.shape(batch[RESPONSE_MASK_KEY]):
                 raise ValueError(f"PPO requires response-aligned {field} from the rollout")
@@ -160,7 +171,7 @@ class PPOObjective(Objective[Mean, Variables]):
 
 @dataclass(frozen=True)
 class PPORollout:
-    """Episode collection followed by critic baselines and verl's masked GAE.
+    """Collect episodes, then add critic baselines and verl's masked GAE.
 
     GAE continues across the action tokens of all turns in one episode. Tool
     observations and unused slots have no support. The terminal verifier
@@ -180,6 +191,11 @@ class PPORollout:
             raise ValueError("PPO objective and episode token budgets must agree")
 
     def _targets(self, variables: Variables, batch) -> dict[str, jax.Array]:
+        """Compute the critic's baselines, the GAE advantages and the returns.
+
+        The reward of an episode lands on its last action token, and GAE
+        runs across the action tokens of all its turns at once.
+        """
         values = self.objective.values(variables, batch)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY]).reshape(-1, self.episodes.max_turns * values.shape[1])
         baselines = values.reshape(mask.shape)
@@ -196,6 +212,7 @@ class PPORollout:
         return jax.jit(self._targets)
 
     def __call__(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> dict[str, np.ndarray]:
+        """Collect one cohort of episodes and return its rows with critic targets."""
         episodes = self.episodes.collect(state, batch, key)
         projected = agreed("PPO episode tensors", lambda: self.episodes.tensors(episodes))
         count = np.asarray(min(2, np.count_nonzero(projected[RESPONSE_MASK_KEY])), np.int32)

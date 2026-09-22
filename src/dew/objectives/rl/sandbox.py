@@ -28,7 +28,7 @@ from .episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
 
 @dataclass(frozen=True)
 class SandboxLimits:
-    """Per-process RLIMIT_CPU/RLIMIT_AS and parent-enforced session/IO limits.
+    """Bound one worker by RLIMIT_CPU and RLIMIT_AS, plus parent-enforced session and IO limits.
 
     Forked children inherit the resource limits. Process-group cleanup handles
     descendants that stay in that group; this is not a cgroup aggregate limit.
@@ -48,6 +48,7 @@ class SandboxLimits:
 
 
 def _observation(value: object) -> Observation:
+    """Read one decoded JSON response as an `Observation`."""
     if not isinstance(value, Mapping):
         raise ValueError("sandbox response must be an observation object")
     context, status, detail = value.get("context"), value.get("status"), value.get("detail", "")
@@ -66,6 +67,8 @@ def _observation(value: object) -> Observation:
 
 
 class _ProcessEnvironment:
+    """Drive one sandboxed worker process over a line-delimited JSON protocol."""
+
     def __init__(self, command: tuple[str, ...], limits: SandboxLimits,
                  identity: EpisodeId, directory: str):
         self.identity, self.limits = identity, limits
@@ -84,6 +87,14 @@ class _ProcessEnvironment:
             os.set_blocking(stream.fileno(), False)
 
     def _request(self, operation: str, payload: Mapping[str, object]) -> JSON:
+        """Send one request and return the worker's decoded reply.
+
+        The loop selects over all three streams at once, because a worker
+        that never reads its input can still fill the pipe with output,
+        and a deadlock there would outlive the wall clock. It carries how
+        much of the request is `sent`, the undecoded `self.output`, and the
+        stderr `diagnostic` an exit reports.
+        """
         request = json.dumps({"operation": operation, **payload}, allow_nan=False).encode() + b"\n"
         if len(request) > self.limits.message_bytes:
             raise ValueError("sandbox request exceeds message_bytes")

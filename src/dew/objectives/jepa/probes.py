@@ -27,7 +27,7 @@ type ProbeParams = dict[str, jax.Array]
 
 
 def _probe_params(tree: optax.Params) -> ProbeParams:
-    """The probe's two arrays out of the tree optax gives back.
+    """Read the probe's two arrays out of the tree optax gives back.
 
     optax declares every parameter tree as an arbitrary pytree, so the arrays
     that go into the optimizer have to be recognised again on the way out.
@@ -51,7 +51,7 @@ def _split(embeddings, labels):
 
 def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100,
                           learning_rate: float = 1e-2, weight_decay: float = 1e-4):
-    """Accuracy of a logistic regression fit on half the batch, scored on the rest."""
+    """Fit a logistic regression on half the batch and score its accuracy on the rest."""
     fit_x, fit_y, test_x, test_y = _split(embeddings, labels)
     mean, std = jnp.mean(fit_x, axis=0), jnp.std(fit_x, axis=0) + 1e-6
     fit_x, test_x = (fit_x - mean) / std, (test_x - mean) / std
@@ -76,7 +76,7 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
 
 
 def knn_probe_accuracy(embeddings, labels, num_classes: int, k: int = 20):
-    """Cosine k-NN accuracy, fit half against scored half."""
+    """Score cosine k-NN accuracy, fitting on half the batch and scoring the rest."""
     fit_x, fit_y, test_x, test_y = _split(embeddings, labels)
     fit_x = fit_x / (jnp.linalg.norm(fit_x, axis=-1, keepdims=True) + 1e-8)
     test_x = test_x / (jnp.linalg.norm(test_x, axis=-1, keepdims=True) + 1e-8)
@@ -89,7 +89,7 @@ def knn_probe_accuracy(embeddings, labels, num_classes: int, k: int = 20):
 
 @dataclass(frozen=True)
 class LinearProbe:
-    """Linear probe accuracy over each validation batch's representations."""
+    """Report linear probe accuracy over each validation batch's representations."""
     num_classes: int
     steps: int = 100
     learning_rate: float = 1e-2
@@ -115,7 +115,7 @@ class LinearProbe:
 
 @dataclass(frozen=True)
 class KnnProbe:
-    """Cosine k-NN accuracy over each validation batch's representations."""
+    """Report cosine k-NN accuracy over each validation batch's representations."""
     num_classes: int
     k: int = 20
 

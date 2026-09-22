@@ -64,8 +64,8 @@ DEFAULT_MODEL_CONFIG = {
 
 @dataclasses.dataclass(frozen=True)
 class TextCondition:
-    """The text the model is conditioned on: which registered encoder reads
-    the batch's tokens, from which checkpoint."""
+    """Condition the model on text: which registered encoder reads the
+    batch's tokens, and from which checkpoint."""
 
     encoder: str = "clip_text"
     checkpoint: str = DEFAULT_MODEL
@@ -104,7 +104,7 @@ class TextCondition:
 
 @dataclasses.dataclass(frozen=True)
 class StableDiffusionAutoencoder:
-    """Latent diffusion behind the vendored Stable Diffusion VAE."""
+    """Run latent diffusion behind the vendored Stable Diffusion VAE."""
 
     modelname: str = "pcuenq/sd-vae-ft-mse-flax"
     revision: str = "bf16"
@@ -126,7 +126,7 @@ class StableDiffusionAutoencoder:
 
 @dataclasses.dataclass(frozen=True)
 class DiffusionRunConfig(RunConfig):
-    """A run, plus the diffusion objective's own knobs."""
+    """Describe a run, plus the diffusion objective's own knobs."""
 
     objective: str = "diffusion"
     model: ModelConfig = dataclasses.field(

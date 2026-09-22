@@ -1,10 +1,15 @@
-"""Google's published DiffusionGemma fine-tuning loss, not the original SD·RL stage.
+"""Supervised fine-tuning for DiffusionGemma: a clean encoder pass and a denoising pass.
+
+A row is a prompt followed by fixed-size canvases. The encoder scores the
+whole row with next-token cross entropy; the denoiser scores one uniformly
+chosen canvas from its corrupted tokens. Both losses average within a row
+before averaging rows, and their sufficient statistics stay separate so
+gradient accumulation does not token-weight the pair.
+
+This is the published post-release SFT loss, not the earlier SD·RL stage.
 
 Reference: gemma bf0b49901a428d13e9c2b2629f0eb9c153d3cbd3,
 ``diffusion/hackable_diffusion_adapter/hd/sft_model.py`` and the Sudoku config.
-The two losses normalize tokens within each row and then average rows. Their
-sufficient statistics remain separate so accumulation does not token-weight
-the composite loss.
 """
 
 from __future__ import annotations
@@ -45,19 +50,30 @@ if TYPE_CHECKING:
 
 @struct.dataclass
 class BlockSFTStatistics:
+    """Carry the two SFT losses separately, with the mass that supports them.
+
+    Each is already a row mean, so the pair is not token-weighted when
+    microbatches accumulate. `support` is the weighted token count behind
+    both, which is what says the step scored anything at all.
+    """
+
     canvas: Mean
     encoder: Mean
     support: jax.Array
 
 
 def _positions(valid: jax.Array) -> jax.Array:
+    """Number the valid tokens of each row from zero, padding included."""
     counts = jnp.cumsum(valid, axis=-1)
     return counts - (counts >= 1)
 
 
 def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, canvas_size: int,
                     positions: jax.Array | None = None, image_groups: jax.Array | None = None):
-    """Represent the reference's circular overlay without mutating encoder K/V.
+    """Build the attention masks and positions of one SFT step.
+
+    They represent the reference's circular overlay without mutating the
+    encoder's K/V.
 
     Google evaluates the whole response, not only the selected canvas. Its
     noisy keys overwrite physical slots modulo the full prompt+response cache
@@ -94,6 +110,11 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
 
 
 def _row_mean(losses: jax.Array, mask: jax.Array) -> Mean:
+    """Average the masked losses within each row, then sum the rows.
+
+    The mass is the row count, so accumulation weighs rows equally however
+    many tokens each one counted.
+    """
     mass = mask.sum(axis=-1)
     row_losses = jnp.sum(jnp.where(mask != 0, losses, 0) * mask, axis=-1) / jnp.maximum(mass, 1)
     return Mean(row_losses.sum(), jnp.asarray(losses.shape[0], jnp.int32))
@@ -101,7 +122,7 @@ def _row_mean(losses: jax.Array, mask: jax.Array) -> Mean:
 
 @objectives("block_diffusion")
 class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
-    """Official post-release SFT over clean ``text`` rows split into prompt and canvases.
+    """Fine-tune DiffusionGemma on clean ``text`` rows split into prompt and canvases.
 
     A row has ``prompt_length + canvas_size * num_canvases`` tokens. ``text``
     accepts token arrays or ModelInputs; media conditions only the clean encoder.
@@ -174,9 +195,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.head_chunks = head_chunks
 
     def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> BlockGeneration:
-        """The DiffusionGemma over the state's published weights as a
-        `BlockGeneration` task with the published sampler defaults; the
-        tokenizer's EOS ids are the caller's to set."""
+        """Publish the state's weights as a `BlockGeneration` task.
+
+        The sampler keeps the published defaults, and the tokenizer's EOS
+        ids are the caller's to set.
+        """
         from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import BlockGeneration
 
@@ -186,11 +209,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """The shared text stack, as the training model declares it."""
+        """Name the shared text stack, as the training model declares it."""
         return self.training_model.bank_sites
 
     def held_variables(self) -> Variables | None:
-        """The SFT source this objective starts from."""
+        """Return the SFT source this objective starts from."""
         return self.pretrained
 
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
@@ -198,8 +221,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return tree if self.trainable is None else freeze(tree, self.trainable)
 
     def _whole_tree(self, key: jax.Array, variables: Variables | None) -> Variables:
-        """The model's variables in one `params` collection: the source with
-        its frozen split undone and the layer scalars moved, or a fresh init."""
+        """Return the model's variables in one `params` collection.
+
+        Either the source with its frozen split undone and the layer
+        scalars moved, or a fresh init.
+        """
         pretrained = self.pretrained if variables is None else variables
         if pretrained is not None:
             if "params" not in pretrained:
@@ -252,7 +278,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                                   "encoder_ce": mean_loss(encoder_stats)[0]})
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
-        """The denoiser's cross entropy on every canvas target of the batch.
+        """Score the denoiser's cross entropy on every canvas target of the batch.
 
         One noise level and one canvas per row are drawn from the pass's key,
         as training draws them, with dropout off and the averaged weights
@@ -264,8 +290,12 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
 
     def _token_losses(self, params: Variables, batch: Batch, key: jax.Array, *, train: bool
                       ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        """Per-token cross entropies of the denoiser over the response and of the
-        encoder over the full row, each with the mask of the targets it counts."""
+        """Score both SFT passes over one batch.
+
+        Returns the denoiser's per-token cross entropies over the response
+        and the encoder's over the full row, each with the mask of the
+        targets it counts.
+        """
         params = thaw(params)
         value = batch["text"]
         prepared = value if isinstance(value, ModelInputs) else ModelInputs(jnp.asarray(value))

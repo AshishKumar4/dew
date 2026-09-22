@@ -77,8 +77,11 @@ class DiffusionObjective(Objective[Mean]):
         steps: int = 200,
         pretrained: Variables | None = None,
     ):
-        """`sampler`, `guidance` and `steps` are how evaluation samples;
-        `guidance` None is the plain conditional prediction."""
+        """Build a denoising objective over `model` for the `inputs` field.
+
+        `sampler`, `guidance` and `steps` are how evaluation samples;
+        `guidance` None is the plain conditional prediction.
+        """
         self.model = model
         self.process = process
         self.inputs = inputs
@@ -137,8 +140,11 @@ class DiffusionObjective(Objective[Mean]):
                 for keyword, condition in self.inputs.conditions.items()}
 
     def blank_conditions(self, like: dict) -> dict:
-        """The unconditional branch in the dtypes `like` - the conditional
-        branch - has, from the value encoded when this objective was built."""
+        """Cast the stored unconditional conditions to the conditional branch's dtypes.
+
+        `like` is the conditional branch. The values themselves were
+        encoded once at construction, so this only changes dtype.
+        """
         return jax.tree.map(lambda blank, value: jnp.asarray(blank, value.dtype),
                             self.unconditional_conditions, like)
 
@@ -175,8 +181,7 @@ class DiffusionObjective(Objective[Mean]):
         return state
 
     def trainable(self, params) -> dict:
-        """The model's own collections: what is left once the frozen towers
-        are taken out."""
+        """Return the model's own collections, without the frozen towers."""
         return {name: value for name, value in params.items()
                 if name not in ("encoders", "autoencoder")}
 
@@ -184,8 +189,8 @@ class DiffusionObjective(Objective[Mean]):
         tokens = {keyword: batch[condition.field]
                   for keyword, condition in self.inputs.conditions.items()}
         given = self.encode(params["encoders"], tokens)
-        # Encoded once, when the objective was built, so the tower runs over
-        # the batch and nothing else.
+        # The unconditional prompt is fixed, so its encoding is a constant
+        # and the text tower runs over the batch alone, once per step.
         unconditional = self.blank_conditions(given)
         if dropout:
             count = batch[self.inputs.sample.key].shape[0]

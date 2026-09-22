@@ -19,7 +19,7 @@ from .records import episode_from_record, episode_record, integer, object_record
 
 
 class VerlRow(TypedDict):
-    """One AgentLoopOutput row, under verl's own field names.
+    """Hold one AgentLoopOutput row, under verl's own field names.
 
     `extra_fields.dew` is this exporter's own: verl's fields carry neither
     raw-policy likelihoods nor turn boundaries, so an import that had only

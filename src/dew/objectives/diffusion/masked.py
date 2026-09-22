@@ -1,12 +1,13 @@
 """Masked diffusion language modelling (MDLM, Sahoo et al. 2024).
 
 A row of token ids is corrupted by masking each position with the process's
-probability at a drawn time; the model, a `CausalTransformer` with
+probability at a drawn time. The model, a `CausalTransformer` with
 `causal=False`, reads the whole corrupted row and predicts the original
-tokens; the loss is the cross entropy at the masked positions weighted by the
-process's NELBO weight, averaged over every position of the batch, which is
-the continuous-time negative ELBO the paper trains. The cross entropy is the
-LM objective's chunked one, which holds one vocabulary slice of logits at a time.
+tokens. The loss is the cross entropy at the masked positions, weighted by
+the process's NELBO weight and averaged over every position of the batch.
+That average is the continuous-time negative ELBO the paper trains. The
+cross entropy is the LM objective's chunked one, which holds one vocabulary
+slice of logits at a time.
 
 Evaluation generates one token row per input row for custom text metrics.
 The separate preview hook generates and decodes the configured display count.
@@ -44,7 +45,10 @@ TEXT_KEY = "text"
 
 @objectives("masked_diffusion")
 class MaskedDiffusionObjective(Objective[Mean]):
-    """The MDLM negative ELBO over `[B, seq_len]` rows of `batch["text"]`."""
+    """Train a masked diffusion model on the MDLM negative ELBO.
+
+    The rows are `[B, seq_len]` token ids under `batch["text"]`.
+    """
 
     artifact = TextSamples
 
@@ -62,9 +66,11 @@ class MaskedDiffusionObjective(Objective[Mean]):
         decode: Callable[[Sequence[int]], str] | None = None,
         pretrained: Variables | None = None,
     ):
-        """`seq_len` is the width of a batch row; `sampler`, `steps` and
-        `samples` are how evaluation unmasks; `decode` turns a row of ids into
-        the text the artifact shows, and None shows the ids alone.
+        """Build an MDLM objective over `model` for `seq_len`-token rows.
+
+        `sampler`, `steps` and `samples` are how evaluation unmasks.
+        `decode` turns a row of ids into the text the artifact shows, and
+        None shows the ids alone.
 
         `pretrained` is a released masked-diffusion checkpoint's variables as
         `load_pretrained` returns them, so a run continues from LLaDA's or
@@ -87,14 +93,14 @@ class MaskedDiffusionObjective(Objective[Mean]):
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def pipeline(self, state: TrainState, *, ema: bool = True, processor: Processor | None = None) -> MaskedGeneration:
-        """The published weights as a native full-response MDLM task."""
+        """Publish the state's weights as a native full-response MDLM task."""
         from dew.inference.tasks import MaskedGeneration
 
         return MaskedGeneration(self.model, self._pipeline_weights(state, ema), self.process,
                                 processor, sampler=self.sampler, steps=self.steps)
 
     def held_variables(self) -> Variables | None:
-        """The checkpoint this run continues from, or None for a fresh init."""
+        """Return the checkpoint this run continues from, or None for a fresh init."""
         return self.pretrained
 
     def init(self, key, variables: Variables | None = None):
@@ -117,7 +123,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
         })
 
     def evaluate(self, params, batch, step: Step) -> TokenScores:
-        """The negative ELBO of every token in the batch.
+        """Score the negative ELBO of every token in the batch.
 
         One noise level and one masking are drawn from the pass's key, as
         training draws them, with dropout off and the averaged weights when
@@ -130,8 +136,12 @@ class MaskedDiffusionObjective(Objective[Mean]):
         return TokenScores(losses=losses * weights, weights=jnp.ones_like(losses))
 
     def _token_losses(self, params, batch, key, *, train: bool):
-        """The rows, their per-token cross entropies under one corruption, the
-        time weight of each masked token, the mask itself, and the argmax."""
+        """Corrupt the batch once and score it.
+
+        Returns the rows, their per-token cross entropies under that
+        corruption, the time weight of each masked token, the mask itself,
+        and the argmax prediction.
+        """
         tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
         if tokens.shape[-1] != self.seq_len:
             raise ValueError(
