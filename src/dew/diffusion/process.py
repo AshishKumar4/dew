@@ -19,14 +19,17 @@ class DenoisingCondition:
     """Carries text conditioning as the published families read it.
 
     The fields are the token states, a pooled vector, the size and crop ids
-    the XL towers add, and the distilled guidance value a guidance-embedded
-    transformer takes as a model input rather than as two guided branches.
+    the XL towers add, the distilled guidance value a guidance-embedded
+    transformer takes as a model input rather than as two guided branches,
+    and the `[B, tokens]` mask of the real token states in a right-padded
+    `context`, which a family that excludes padded keys reads.
     """
 
     context: jax.Array
     pooled: jax.Array | None = None
     time_ids: jax.Array | None = None
     guidance: jax.Array | None = None
+    mask: jax.Array | None = None
 
     def aligned(self, given: DenoisingCondition) -> DenoisingCondition:
         """This conditioning with `given`'s own model inputs.
