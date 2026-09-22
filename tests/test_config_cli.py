@@ -146,7 +146,9 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
         "--trainer.log-every", "1", "--model.architecture", "simple_dit", "--model.dtype", "float32",
         "--model.config", '{"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2}',
         "--sampling-steps", "2"])
-    config = dataclasses.replace(config, val_metrics=())
+    # A validation pass needs a consumer; psnr scores samples against the
+    # batch and downloads nothing, unlike the default clip metric.
+    config = dataclasses.replace(config, val_metrics=("psnr",))
 
     state = recipe.main(config)
 
@@ -195,7 +197,8 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
         "--data.image-size", str(size), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
         "--trainer.checkpoint-dir", str(tmp_path), "--trainer.name", "run",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--trainer.log-every", "1", "--model.architecture", "jepa_encoder", "--model.dtype", "float32",
+        "--trainer.log-every", "1", "--trainer.eval-every", "None",  # no probes, so no validation pass
+        "--model.architecture", "jepa_encoder", "--model.dtype", "float32",
         "--model.config", '{"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 2}'])
 
     state = recipe.main(config)

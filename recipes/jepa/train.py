@@ -50,9 +50,16 @@ class JepaRunConfig(RunConfig):
     momentum_steps: Optional[int] = None
     """Defaults to the full training run."""
     probe_classes: Optional[int] = None
-    """Number of classes for the frozen-encoder probes."""
+    """Number of classes for the frozen-encoder probes, which are what a
+    validation pass scores; a run without them schedules no pass."""
     probe_label_key: str = 'label'
     knn_k: int = 20
+
+    def __post_init__(self) -> None:
+        if self.probe_classes is None and self.trainer.eval_every is not None:
+            raise ValueError(
+                "a JEPA validation pass scores the frozen-encoder probes; set probe_classes, "
+                "or --trainer.eval-every None for a run without them")
 
 
 def sample_field(config: JepaRunConfig) -> Field:
