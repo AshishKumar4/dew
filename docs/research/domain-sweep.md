@@ -405,6 +405,8 @@ connection to Somalia, which also settles `dew.so` and its 5,990 USD asking pric
 
 ## Appendix A: every TLD for the `dew` stem
 
+In both appendices the Title column quotes each site's HTML title, with any dash in it written as a comma.
+
 | Domain | Registered | Evidence | Registrar | Expires | Live site | Sale or note | Porkbun first year / renewal | Cloudflare | HTTPS forced |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | dew.com | yes | RDAP 200 | GoDaddy.com, LLC | 2029-05-02 | HTTP 200, no title | none | 11.08 / 11.08 | yes | no |
@@ -436,7 +438,7 @@ connection to Somalia, which also settles `dew.so` and its 5,990 USD asking pric
 | dew.tech | no | RDAP 404; registry WHOIS confirms available | none | none | none | none | 6.99 / 50.98 | yes | no |
 | dew.foundation | no | RDAP 404 | none | none | none | none | 5.99 / 22.66 | yes | no |
 | dew.institute | no | RDAP 404 | none | none | none | none | 7.72 / 22.14 | yes | no |
-| dew.academy | yes | RDAP 200 | united-domains GmbH | 2026-11-01 | "dew involvement GmbH — coming soon" | none | 11.84 / 37.59 | yes | no |
+| dew.academy | yes | RDAP 200 | united-domains GmbH | 2026-11-01 | "dew involvement GmbH, coming soon" | none | 11.84 / 37.59 | yes | no |
 | dew.works | no | RDAP 404 | none | none | none | none | 4.63 / 31.41 | yes | no |
 | dew.team | no | RDAP 404 | none | none | none | none | 4.63 / 29.35 | yes | no |
 | dew.place | no | RDAP 404 | none | none | none | none | 18.02 / 18.02 | yes | no |
@@ -455,7 +457,7 @@ connection to Somalia, which also settles `dew.so` and its 5,990 USD asking pric
 | dew.live | yes | RDAP 200 | Name.com, Inc. | 2027-07-31 | no DNS | none | 2.57 / 26.26 | yes | no |
 | dew.site | no | RDAP 404; registry WHOIS confirms available | none | none | none | reserved by registry | 1.96 / 28.84 | yes | no |
 | dew.online | no | RDAP 404; registry WHOIS confirms available | none | none | none | none | 1.96 / 28.84 | yes | no |
-| dew.fyi | yes | RDAP 200 | Porkbun LLC | 2027-08-31 | "dew.fyi — Coming Soon" | none | 5.66 / 5.66 | yes | no |
+| dew.fyi | yes | RDAP 200 | Porkbun LLC | 2027-08-31 | "dew.fyi, Coming Soon" | none | 5.66 / 5.66 | yes | no |
 | dew.link | no | RDAP 404; registry WHOIS confirms available | none | none | none | none | 7.72 / 7.72 | no | no |
 | dew.click | no | RDAP 404; registry WHOIS confirms available | none | none | none | none | 1.54 / 10.81 | no | no |
 | dew.wiki | yes | RDAP 200 | GoDaddy.com, LLC | 2026-12-19 | no DNS | none | 2.06 / 26.26 | yes | no |
@@ -606,7 +608,7 @@ connection to Somalia, which also settles `dew.so` and its 5,990 USD asking pric
 | dewlabs.com | yes | RDAP 200 | TurnCommerce, Inc. DBA NameBright.com | 2026-11-29 | "DewLabs.com is for sale \| HugeDomains" | buy now 100 (HugeDomains) | 11.08 / 11.08 | yes | no |
 | dewlabs.dev | no | RDAP 404 | none | none | none | none | 8.75 / 12.87 | yes | yes |
 | dewlabs.in | no | RDAP 404 | none | none | none | none | 7.83 / 7.83 | no | no |
-| dewlabs.io | yes | registry WHOIS 200 | Cloudflare, Inc | 2027-02-12 | "Dew Labs – Dew point based humidity control" | none | 28.12 / 51.80 | yes | no |
+| dewlabs.io | yes | registry WHOIS 200 | Cloudflare, Inc | 2027-02-12 | "Dew Labs, Dew point based humidity control" | none | 28.12 / 51.80 | yes | no |
 | dewlabs.is | no | RDAP 404 | none | none | none | none | not carried by Porkbun | no | no |
 | dewlabs.ml | no | RDAP 404 | none | none | none | none | not carried by Porkbun | no | no |
 | dewlabs.org | yes | RDAP 200 | Tucows Domains Inc. | 2027-03-30 | "DEW - DEW" | none | 7.98 / 11.84 | yes | no |
@@ -739,7 +741,7 @@ connection to Somalia, which also settles `dew.so` and its 5,990 USD asking pric
 | morningdew.page | no | RDAP 404 | none | none | none | none | 10.81 / 10.81 | yes | yes |
 | morningdew.so | no | registry WHOIS: not found | none | none | none | none | not carried by Porkbun | no | no |
 | trydew.ai | no | RDAP 404 | none | none | none | none | 82.70 / 82.70 | yes | no |
-| trydew.app | yes | RDAP 200 | CloudFlare, Inc. | 2027-05-26 | "Dew — Private period tracker for iPhone" | for sale | 8.75 / 14.93 | yes | yes |
+| trydew.app | yes | RDAP 200 | CloudFlare, Inc. | 2027-05-26 | "Dew, Private period tracker for iPhone" | for sale | 8.75 / 14.93 | yes | yes |
 | trydew.com | yes | RDAP 200 | GoDaddy.com, LLC | 2026-09-17 | HTTP 200, no title | parked on afternic | 11.08 / 11.08 | yes | no |
 | trydew.dev | no | RDAP 404 | none | none | none | none | 8.75 / 12.87 | yes | yes |
 | trydew.in | no | RDAP 404 | none | none | none | none | 7.83 / 7.83 | no | no |
@@ -750,7 +752,7 @@ connection to Somalia, which also settles `dew.so` and its 5,990 USD asking pric
 | trydew.page | no | RDAP 404 | none | none | none | none | 10.81 / 10.81 | yes | yes |
 | trydew.so | no | registry WHOIS: not found | none | none | none | none | not carried by Porkbun | no | no |
 | usedew.ai | no | RDAP 404 | none | none | none | none | 82.70 / 82.70 | yes | no |
-| usedew.app | yes | RDAP 200 | Squarespace Domains II LLC. | 2027-01-13 | "Dew — AI Image Generation Studio" | none | 8.75 / 14.93 | yes | yes |
+| usedew.app | yes | RDAP 200 | Squarespace Domains II LLC. | 2027-01-13 | "Dew, AI Image Generation Studio" | none | 8.75 / 14.93 | yes | yes |
 | usedew.com | yes | RDAP 200 | Spaceship, Inc. | 2027-02-16 | HTTP 200, no title | parked on afternic | 11.08 / 11.08 | yes | no |
 | usedew.dev | no | RDAP 404 | none | none | none | none | 8.75 / 12.87 | yes | yes |
 | usedew.in | no | RDAP 404 | none | none | none | none | 7.83 / 7.83 | no | no |
