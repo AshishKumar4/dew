@@ -29,18 +29,14 @@ from .dataset import (
 from .images import (
                       CC3M,
                       CC12M,
-                      AestheticCoyo,
                       ArrayRecordImages,
                       Combined30M,
-                      CombinedAesthetic,
                       CombinedMsml612,
                       DiffusionDB,
                       HFImages,
                       ImageDataset,
                       Laion2bAesthetic,
                       Laion12mCoco,
-                      LaionaCoco,
-                      LaionaCocoCoyo,
                       OxfordFlowers,
 )
 from .preferences import IDS_KEY, MASK_KEY, PreferencePairs
@@ -62,13 +58,13 @@ from .text import ByteTokenizer, HFTokenizer, tokenizer_for
 from .tokens import PackedTokens, TokenWindows
 from .video import LocalVideos, VideoDataset, VoxCeleb2
 
-__all__ = ["CC3M", "CC12M", "IDS_KEY", "MASK_KEY", "AestheticCoyo", "ArrayRecordImages",
+__all__ = ["CC3M", "CC12M", "IDS_KEY", "MASK_KEY", "ArrayRecordImages",
            "AutoAudioProcessor", "AutoTextTokenizer",
-           "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable", "Combined30M", "CombinedAesthetic",
+           "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable", "Combined30M",
            "CombinedMsml612", "CombinedOnline", "Corpus", "Dataset", "DatasetSpec", "DiffusionDB",
            "HFDatasetSource", "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "ImageDataset",
            "Laion2bAesthetic", "Laion12mCoco",
-           "LaionaCoco", "LaionaCocoCoyo", "Loading", "LocalVideos", "OnlineImages", "OxfordFlowers",
+           "Loading", "LocalVideos", "OnlineImages", "OxfordFlowers",
            "PackedTokens", "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Role", "Stage",
            "TFDSOptions", "TokenBytes", "TokenColumn",
            "TokenDocumentSource", "TokenRecords", "TokenSource", "TokenWindowSource",

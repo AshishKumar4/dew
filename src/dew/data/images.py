@@ -508,50 +508,17 @@ class CombinedMsml612(ArrayRecordImages):
     )
 
 
-# Older shard layouts; the paths may not exist on the current bucket.
-
 @datasets("cc12m")
 @dataclasses.dataclass(frozen=True)
 class CC12M(ArrayRecordImages):
+    """Conceptual Captions 12M, in the arrayrecord2 layout of the msml612 bucket."""
     shards: tuple[str, ...] = ("arrayrecord2/cc12m",)
-
-
-@datasets("laiona_coco")
-@dataclasses.dataclass(frozen=True)
-class LaionaCoco(ArrayRecordImages):
-    shards: tuple[str, ...] = ("arrayrecord2/laion-aesthetics-12m+mscoco-2017",)
-
-
-@datasets("aesthetic_coyo")
-@dataclasses.dataclass(frozen=True)
-class AestheticCoyo(ArrayRecordImages):
-    shards: tuple[str, ...] = ("arrayrecords/aestheticCoyo_0.25clip_6aesthetic",)
-
-
-@datasets("combined_aesthetic")
-@dataclasses.dataclass(frozen=True)
-class CombinedAesthetic(ArrayRecordImages):
-    shards: tuple[str, ...] = (
-        "arrayrecord2/laion-aesthetics-12m+mscoco-2017",
-        "arrayrecords/aestheticCoyo_0.25clip_6aesthetic",
-        "arrayrecord2/cc12m",
-        "arrayrecords/aestheticCoyo_0.25clip_6aesthetic",
-    )
-
-
-@datasets("laiona_coco_coyo")
-@dataclasses.dataclass(frozen=True)
-class LaionaCocoCoyo(ArrayRecordImages):
-    shards: tuple[str, ...] = (
-        "arrayrecords/aestheticCoyo_0.25clip_6aesthetic",
-        "arrayrecord2/laion-aesthetics-12m+mscoco-2017",
-        "arrayrecords/aestheticCoyo_0.25clip_6aesthetic",
-    )
 
 
 @datasets("combined_30m")
 @dataclasses.dataclass(frozen=True)
 class Combined30M(ArrayRecordImages):
+    """Four arrayrecord2 shard sets of the msml612 bucket, about 30M samples."""
     shards: tuple[str, ...] = (
         "arrayrecord2/laion-aesthetics-12m+mscoco-2017",
         "arrayrecord2/cc12m",
