@@ -58,7 +58,7 @@ def yarn_of(settings: dict) -> YarnScaling:
 
 
 def mla_module(settings: dict, max_seq_len: int = 64,
-               attention_impl: str | None = None
+               attention_impl: str = "reference"
                ) -> MultiHeadLatentAttention:
     """The fixture's reference config as a dew mixer."""
     return MultiHeadLatentAttention(
@@ -96,7 +96,7 @@ def block_variables(tensors: dict) -> dict:
 
 
 def block_output(name: str, settings: dict,
-                 attention_impl: str | None = None) -> float:
+                 attention_impl: str = "reference") -> float:
     """Largest difference between the dew mixer and the fixture block."""
     tensors = fixture(name)
     module = mla_module(settings, attention_impl=attention_impl)
@@ -308,7 +308,7 @@ def mla_model(settings: dict, **overrides) -> CausalTransformer:
         mlp_features=48, max_seq_len=64, rope_theta=float(settings["rope_theta"]),
         norm_eps=float(settings["rms_norm_eps"]), qk_norm=False,
         attention_bias=bool(settings["attention_bias"]),
-        mixer=mla_record(settings))
+        mixer=mla_record(settings), attention_impl="reference")
     return CausalTransformer(**{**fields, **overrides})
 
 
