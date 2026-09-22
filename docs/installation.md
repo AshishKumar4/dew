@@ -1,8 +1,10 @@
 # Install Dew
 
-This guide assumes you can create a Python virtual environment and run commands in a terminal. Dew requires Python 3.12 or newer; Python 3.14 is the recommended training runtime and primary CI version. This is a compatibility and maintenance choice, not a claim that changing Python accelerates compiled JAX kernels.
+> An AI assistant maintains this document. It is presented as-is.
 
-These commands use a POSIX shell and require [uv](https://docs.astral.sh/uv/getting-started/installation/) on your PATH. Install uv first if the command is unavailable; use the equivalent environment activation for your shell.
+This guide assumes you can create a Python virtual environment and run commands in a terminal. Dew needs Python 3.12 or newer. I recommend Python 3.14 for training, and it is the main version CI runs. That choice is about compatibility and maintenance. A newer Python does not make compiled JAX kernels faster.
+
+The commands below use a POSIX shell and need [uv](https://docs.astral.sh/uv/getting-started/installation/) on your PATH. If the `uv` command is missing, install it first. If your shell is not POSIX, use its own way of activating a virtual environment.
 
 ## Install from source
 
@@ -12,9 +14,9 @@ source .venv/bin/activate
 uv pip install "dew-ml @ git+https://github.com/AshishKumar4/dew"
 ```
 
-The distribution name is `dew-ml`; import it as `dew`. The command installs the current repository revision. Pin a Git commit in your experiment environment when you need to reproduce a run. The declared dependency lower bounds do not establish that every older JAX/Flax combination has been tested.
+The package is called `dew-ml`, and you import it as `dew`. This command installs whatever revision the repository has today. If you need to reproduce a run later, pin a Git commit in your experiment environment. The minimum JAX and Flax versions in the package metadata are lower bounds; I have not tested every older combination.
 
-For a checkout you plan to edit:
+If you plan to edit the code, clone it instead:
 
 ```bash
 git clone https://github.com/AshishKumar4/dew.git
@@ -25,9 +27,9 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cp
 uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients,vision]'
 ```
 
-This development install includes the reference tests, data providers, metrics, inference clients, and vision processors. Install CPU PyTorch and torchvision first; Dew model computation uses JAX. CI installs these extras on Python 3.12 and 3.14 and checks types against the 3.12 compatibility floor. The base installation above remains smaller.
+This development install adds the reference tests, the data providers, the metrics, the inference clients, and the vision processors. Install the CPU builds of PyTorch and torchvision first, since Dew runs its model computation in JAX. CI installs the same extras on Python 3.12 and 3.14, and type-checks against 3.12, the oldest supported version. The plain install above is smaller.
 
-Local reporting works with the base package. Add `[plots]` for Matplotlib charts, or `[wandb]`, `[mlflow]`, `[tensorboard]` for the optional tracker adapters.
+Local reporting works with the plain install. Add `[plots]` for Matplotlib charts, or `[wandb]`, `[mlflow]`, or `[tensorboard]` for those trackers.
 
 ## Check the environment
 
@@ -42,19 +44,19 @@ print("Flax:", flax.__version__)
 print("Devices:", jax.devices())
 ```
 
-A CPU device is enough for [the first training example](getting-started.md). `jax.devices()` lists the devices visible to this process, not every accelerator physically installed in the machine.
+A CPU is enough for [the first training example](getting-started.md). `jax.devices()` lists the devices this process can see. That can be fewer than the accelerators physically in the machine.
 
-Compiled executables go to `~/.cache/dew/xla/python3.X`, one directory per Python minor version, so two interpreters on one machine never read each other's entries. JAX 0.11.1 compresses cache entries with the standard-library `compression.zstd` module on Python 3.14 but still labels them `zlib` in its cache key, so an older interpreter reading the same directory fails to decode them. A run that passes an explicit `compilation_cache_dir` keeps that exact path; do not share one explicit directory between Python versions until upstream JAX keys the codec.
+Dew stores compiled executables in `~/.cache/dew/xla/python3.X`, or under `$XDG_CACHE_HOME/dew/xla/` when that variable is set. Each Python minor version gets its own directory, so two interpreters on one machine never read each other's entries. The reason is a JAX 0.11.1 problem: on Python 3.14 it compresses cache entries with the standard-library `compression.zstd` module, but its cache key still says `zlib`. An older interpreter that reads the same directory then fails to decode them. If a run passes its own `compilation_cache_dir`, Dew uses that exact path. Until JAX puts the codec in its cache key, do not share one explicit cache directory between Python versions.
 
 ## Use a GPU or TPU
 
-Install the JAX build appropriate to your operating system, driver, and accelerator using the [official JAX installation guide](https://docs.jax.dev/en/latest/installation.html). Configure the backend before importing JAX. For example, `JAX_PLATFORMS=cpu python train.py` selects CPU for a small smoke run.
+Install the JAX build for your operating system, driver, and accelerator by following the [official JAX installation guide](https://docs.jax.dev/en/latest/installation.html). Choose the backend before you import JAX. For example, `JAX_PLATFORMS=cpu python train.py` runs a small smoke test on the CPU.
 
-For NVIDIA hardware, validate that JAX reports a CUDA device before running a GPU example. Dew can select cuDNN attention for supported GPU shapes and dtypes, but availability depends on the installed JAX and CUDA stack. A TPU requires its own runtime setup. [The TPU guide](tpu.md) describes Dew's provisioning commands; creating a cloud resource can incur charges and is not part of this quickstart.
+On NVIDIA hardware, check that JAX lists a CUDA device before you run a GPU example. Dew can use cuDNN attention for the GPU shapes and dtypes that support it, but whether it is available depends on your JAX and CUDA install. A TPU needs its own runtime setup. [The TPU guide](tpu.md) describes Dew's provisioning commands. Creating a cloud resource can cost money, so it is not part of this quickstart.
 
 ## Add optional dependencies
 
-The base package currently installs Transformers, Hugging Face Hub, and image-processing dependencies. These are not all optional in the package metadata. Additional extras cover the following uses:
+The plain install already includes Transformers, Hugging Face Hub, and the image-processing libraries. The package metadata does not make these optional. The extras below add more:
 
 | Extra | Use |
 |---|---|
@@ -62,9 +64,12 @@ The base package currently installs Transformers, Hugging Face Hub, and image-pr
 | `inference-clients` | Official Ollama/OpenAI Python clients, including vLLM-compatible endpoints |
 | `vision` | Run the checkpoint's HF image processor using torchvision on the host |
 | `streaming` | Hugging Face datasets and online sources |
-| `av` | Video readers and image resizing |
+| `av` | Video readers (moviepy, which brings ffmpeg) |
 | `metrics` | SciPy and download support used by image metrics |
 | `tfds` | Read prepared TFDS ArrayRecords without TensorFlow |
+| `profile` | The xprof profiler |
+| `hpo` | Optuna, the backend of `dew.config.sweep`'s Optuna search |
+| `eval-harness` | lm-evaluation-harness task suites through `dew.eval.harness.DewLM` |
 | `test` | Development tests and pinned reference-library version |
 
 For example:
@@ -73,24 +78,18 @@ For example:
 uv pip install 'dew-ml[interop,streaming] @ git+https://github.com/AshishKumar4/dew'
 ```
 
-For HF vision processors, install matching CPU PyTorch and torchvision wheels first,
-then add Dew's vision extra. This keeps image preprocessing on the host without
-installing CUDA PyTorch packages beside JAX's accelerator runtime. The native
-Gemma4 processor path was checked with torch 2.14.0+cpu and torchvision 0.29.0+cpu; without the extra, the native multimodal checkpoints load but their processors raise on images.
+For HF vision processors, install matching CPU PyTorch and torchvision wheels first, then add Dew's `vision` extra. The image preprocessing then runs on the host, and no CUDA PyTorch packages sit next to JAX's accelerator runtime. I checked the native Gemma4 processor path with torch 2.14.0+cpu and torchvision 0.29.0+cpu. Without the extra, the native multimodal checkpoints still load, but their processors raise an error when given images.
 
 ```bash
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 uv pip install 'dew-ml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 ```
 
-Qwix quantization and tokamax kernels need their own packages; neither is a declared Dew extra. `uv pip install qwix` adds the quantization one.
+Qwix quantization and tokamax kernels need their own packages, and Dew has no extra for either. `uv pip install qwix` adds Qwix.
 
 ## Prepare TFDS data separately
 
-The training environment reads prepared ArrayRecords without TensorFlow.
-Dataset preparation can require TensorFlow and dataset-specific packages;
-Oxford Flowers uses SciPy to read its MATLAB label and split files. Keep
-those dependencies in a separate Python 3.13 environment:
+Training reads prepared ArrayRecords and does not need TensorFlow. Preparing a dataset can need TensorFlow and packages specific to that dataset. Oxford Flowers, for example, uses SciPy to read its MATLAB label and split files. Keep those in a separate Python 3.13 environment:
 
 ```bash
 uv venv --python 3.13 .venv-tfds-prepare
@@ -110,9 +109,7 @@ print("export DEW_FLOWERS_PATH=" + shlex.quote(str(builder.data_dir)))
 PY
 ```
 
-Preparation downloads the corpus when needed. Copy its final printed export
-line into the training shell. The path is the prepared version directory,
-not the parent TFDS cache directory:
+Preparation downloads the data if it is not there yet. Copy the `export` line it prints last into the shell you train from. The path is the prepared version directory, not the parent TFDS cache directory:
 
 ```python
 import os
@@ -125,14 +122,7 @@ data = OxfordFlowers(
 ).load(batch=4)
 ```
 
-Recipes receive the same location as `--data.path "$DEW_FLOWERS_PATH"`.
-TFDS writes `label.labels.txt` there; `labels=None` reads that file, and
-`--data.labels` can supply a different class-name file. The reader uses
-`tfds.builder_from_directory(...).as_data_source(...)`. Missing metadata or
-selected shards produce an error requesting external preparation; training
-does not download, prepare, or fall back to dataset generation code.
-TensorFlow 2.21.0 has no Python 3.14 wheels; that restricts preparation, not
-this TensorFlow-free training path.
+Recipes take the same path as `--data.path "$DEW_FLOWERS_PATH"`. TFDS writes `label.labels.txt` into that directory. With `labels=None`, Dew reads the class names from that file; `--data.labels` points at a different class-name file. The reader uses `tfds.builder_from_directory(...).as_data_source(...)`. If the metadata or the selected shards are missing, it raises an error that asks you to prepare the data first. Training never downloads or prepares data, and never falls back to the dataset's generation code. TensorFlow 2.21.0 has no Python 3.14 wheels. That only limits the preparation environment; the training path does not use TensorFlow.
 
 ## Build the documentation
 
@@ -144,4 +134,4 @@ python -m mkdocs build --strict
 python -m mkdocs serve
 ```
 
-Open the address printed by `mkdocs serve`. Documentation builds do not run accelerator examples or download model weights. Example execution is a separate validation step.
+Open the address that `mkdocs serve` prints. Building the docs does not run the accelerator examples or download model weights. Running the examples is a separate check.
