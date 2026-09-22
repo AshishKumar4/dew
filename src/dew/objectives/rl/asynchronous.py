@@ -12,13 +12,14 @@ trainer's: a resumed run re-reads and resubmits whatever was in flight.
 
 Every draw carries the policy version its request was submitted under
 (`RolloutServer.version`, the trainer's `updates` count when the weights were
-pushed), and the batch carries it per row under `policy_version`. The lag of a
-batch is the trainer's `updates` minus that version. Weights are pushed when
-the served version falls `sync_every` updates behind, so a batch is at most
-`ahead + sync_every - 1` updates stale, and construction refuses a
-`max_lag` below that. The bound is enforced, not assumed: a batch that arrives
-staler than `max_lag` (a resumed run, a stalled push) is discarded, the
-weights are pushed, and its prompts are drawn again.
+pushed), and each row carries its draw's version under `policy_version`. The
+lag of a batch is the trainer's `updates` minus its oldest row's version.
+Weights are pushed when the served version falls `sync_every` updates behind,
+so a batch is at most `ahead + sync_every - 1` updates stale, and
+construction refuses a `max_lag` below that. At consumption, a batch
+submitted staler than `max_lag` (a resumed run, a stalled push) is discarded
+before anyone waits on it, the weights are pushed, and its prompts are drawn
+once more; a push that still leaves it too stale raises.
 
 Off-policy correction is decoupled PPO (AReaL, arXiv:2505.24298): the ratio's
 old policy is the proximal one, the trainer's current weights, rescored over
@@ -82,7 +83,8 @@ class _Entry:
     sources: list[str]
     truths: list[str]
     infos: list[str]
-    version: int = -1
+    submitted: int = -1
+    """The served version when the draws were submitted; each draw reports its own."""
     draws: list[list[Future[Scored]]] = field(default_factory=list)
 
 
@@ -228,7 +230,7 @@ class AsyncRollout:
         seeds = np.random.default_rng(
             [*np.asarray(jax.random.key_data(key)).ravel().tolist(), entry.serial, attempt]
         ).integers(0, 2 ** 31 - 1, (rows, self.groups))
-        entry.version = self.server.version
+        entry.submitted = self.server.version
         entry.draws = [[self._scored(self.server.submit(
             entry.prompts[row, width - int(entry.lengths[row]):].tolist(), self.max_new_tokens,
             seed=int(seeds[row, group])), entry, row) for group in range(self.groups)] for row in range(rows)]
@@ -250,17 +252,28 @@ class AsyncRollout:
             if not pending.draws:
                 self._submit(pending, key, attempt=0)
         began = time.perf_counter()
-        scored = [[draw.result() for draw in row] for row in entry.draws]
         redrawn = 0
-        while updates - entry.version > self.max_lag:
-            redrawn += 1
+        # The submission version is known before any draw finishes, so a batch
+        # bound for the bin is never waited on or scored, and its failed draws
+        # cannot abort the run.
+        if updates - entry.submitted > self.max_lag:
+            redrawn = 1
             self.server.load(state.params, updates)
             self._submit(entry, key, attempt=redrawn)
-            scored = [[draw.result() for draw in row] for row in entry.draws]
+            if updates - entry.submitted > self.max_lag:
+                raise RuntimeError(f"the weights pushed at update {updates} did not take: the server still "
+                                   f"serves version {entry.submitted}, past max_lag={self.max_lag}")
+        scored = [[draw.result() for draw in row] for row in entry.draws]
         waited = time.perf_counter() - began
-        packed = self._packed(state, entry, scored, updates - entry.version)
+        versions = np.asarray([[draw.version for draw, _ in row] for row in scored], np.int32)
+        oldest = int(versions.min())
+        if updates - oldest > self.max_lag:
+            raise RuntimeError(f"a draw reports version {oldest}, {updates - oldest} updates behind; "
+                               f"max_lag is {self.max_lag}")
+        packed = self._packed(state, entry, scored, updates - oldest)
+        packed[POLICY_VERSION_KEY] = versions.reshape(-1)
         if self.log is not None:
-            self.log(RolloutRecord(updates, entry.version, updates - entry.version,
+            self.log(RolloutRecord(updates, oldest, updates - oldest,
                                    float(np.mean([[value for _, value in row] for row in scored])), redrawn, waited))
         return packed
 
@@ -293,5 +306,4 @@ class AsyncRollout:
             padding = width - packed[LENGTH_KEY].astype(np.int32)
             proximal = np.asarray(self._rescore(state.params, ids, padding))[:, width - 1:width - 1 + budget]
             packed[OLD_LOG_PROBS_KEY] = (proximal * packed[RESPONSE_MASK_KEY]).astype(np.float32)
-        packed[POLICY_VERSION_KEY] = np.full(rows * self.groups, entry.version, np.int32)
         return packed
