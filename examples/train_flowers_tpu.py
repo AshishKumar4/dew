@@ -48,6 +48,10 @@ PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
 # tokens of context and 32 features, so the smoke run exercises the same
 # conditioning path as the real one without reaching the Hub.
 SMOKE_CLIP = Path(__file__).resolve().parents[1] / "tests/fixtures/clip/tiny"
+# The FID extractor at a sixteenth of every channel width, drawn rather than
+# trained: the same pooled statistics and distance, on numbers of its own.
+SMOKE_INCEPTION = (Path(__file__).resolve().parents[1]
+                   / "tests/fixtures/inception/tiny/inception_v3_fid.pickle")
 
 
 @dataclass
@@ -63,9 +67,9 @@ class Config:
     guidance: float = 3.0
     clip_model: str = "openai/clip-vit-large-patch14"
     """The checkpoint CLIPScore is read from, for conditioning and for scoring."""
-    score_fid: bool = True
-    """FID's Inception weights are a Hub download and the repo ships no tiny
-    stand-in, so an offline run turns the number off rather than reaching out."""
+    inception_weights: Path | None = None
+    """The FID extractor's parameters as a file; unset downloads the published
+    checkpoint. --smoke reads the committed tiny one instead."""
     model: dict = field(default_factory=lambda: {
         "patch_size": 2, "emb_features": 1024, "num_layers": 24, "num_heads": 16})
     smoke: bool = False
@@ -164,7 +168,7 @@ def grid(images: np.ndarray, path: Path) -> None:
 
 def main(config: Config) -> Path:
     if config.smoke:
-        config = replace(config, clip_model=str(SMOKE_CLIP), score_fid=False)
+        config = replace(config, clip_model=str(SMOKE_CLIP), inception_weights=SMOKE_INCEPTION)
     run = smoke_config(config, config.out) if config.smoke else slice_config(config)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
@@ -182,9 +186,8 @@ def main(config: Config) -> Path:
     grid(drawn, config.out / "samples.png")
 
     generated = np.clip(np.rint((drawn + 1.0) * 127.5), 0, 255).astype(np.uint8)
-    report = {"clip_score": clip_score(generated, list(PROMPTS), modelname=config.clip_model)}
-    if config.score_fid:
-        report["fid"] = fid(generated, held_out(run))
+    report = {"clip_score": clip_score(generated, list(PROMPTS), modelname=config.clip_model),
+              "fid": fid(generated, held_out(run), weights=config.inception_weights)}
     (config.out / "eval.json").write_text(json.dumps(report, indent=2))
     print(f"samples {config.out / 'samples.png'}  {report}")
     return run_dir
