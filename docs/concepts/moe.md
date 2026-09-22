@@ -1,6 +1,8 @@
 # Mixture of experts
 
-This page assumes basic transformer feed-forward layers and the [language model guide](language_models.md). A mixture-of-experts layer contains several feed-forward networks. A router scores the experts for each token, selects a subset, and combines their outputs with routing weights.
+> An AI assistant maintains this document. It is presented as-is.
+
+This page assumes you know transformer feed-forward layers and have read the [language model guide](language_models.md). A mixture-of-experts layer holds several feed-forward networks, called experts. For each token, a router scores the experts, picks a few of them, and mixes their outputs with routing weights.
 
 ## Construct a small sparse decoder
 
@@ -23,34 +25,41 @@ assert bool(jnp.all(jnp.isfinite(logits)))
 print("Sparse decoder logits:", logits.shape)
 ```
 
-The example initializes four experts per selected layer and routes each token to two experts. The logits retain the usual `(batch, sequence, vocabulary)` shape. The shape check explains the interface; numerical parity of a particular released family requires its reference weights and computation.
+The example builds four experts in each routed layer and sends each token to two of them. The logits keep the usual `(batch, sequence, vocabulary)` shape. The shape check shows the interface only. To check that a released model family computes the same numbers as its reference, you need the reference weights and computation.
 
-`mixture` accepts a configuration record or a `Mixture` value. `experts` sets the number of experts, `top_k` the number selected per token, and `layers` or `every` chooses the routed layers. A checkpoint's configuration determines these choices; changing them changes the architecture and may invalidate its weights.
+`mixture` takes a configuration record or a `Mixture` value. `experts` is the number of experts and `top_k` the number picked per token. `layers` or `every` chooses which layers are routed. For a checkpoint, its configuration fixes these values. Changing them changes the architecture and can make the weights unusable.
 
 ## Router behavior
 
-Router conventions vary by family. Important choices include softmax versus sigmoid scores, normalization of selected weights, output scaling, group-limited routing, shared experts, and a selection bias. These settings are not interchangeable merely because the tensor shapes agree.
+Model families route in different ways. They differ in softmax or sigmoid scores, whether the selected weights are normalized, output scaling, group-limited routing, shared experts and a selection bias. Two routers are not interchangeable just because their tensor shapes match.
 
-For auxiliary-loss-free balancing, a per-expert bias affects selection. The router reads it; the objective updates it through non-parameter state. An auxiliary balancing loss is a separate objective term. Check the selected family's algorithm and configuration before enabling either.
+For balancing without an auxiliary loss, a per-expert bias changes which experts are picked. The router reads the bias, and the objective updates it through non-parameter state. An auxiliary balancing loss is a separate term in the objective. Check the algorithm and configuration of your model family before you turn on either one.
 
 ## Expert computation and placement
 
-Dew gathers tokens into expert order and uses grouped matrix multiplication through `jax.lax.ragged_dot`. The mixture's `implementation` field selects the kernel: `"xla"` (the default) is `jax.lax.ragged_dot`, and `"tokamax"` is `tokamax.ragged_dot`, which runs tokamax's Mosaic or Triton kernel where one exists and lowers to XLA elsewhere. Every routed expert module the decoder builds honours the field, GPT OSS's included. Kernel availability and speed depend on the installed package and device; an optional path is not automatically faster, and a model that names `"tokamax"` fails to initialise where the package is not importable rather than running the XLA kernel under that name.
+Dew sorts tokens into expert order and runs the experts as one grouped matrix multiplication. The mixture's `implementation` field picks the kernel. `"xla"`, the default, uses `jax.lax.ragged_dot`. `"tokamax"` uses `tokamax.ragged_dot`, which runs tokamax's Mosaic or Triton kernel where one exists and lowers to XLA elsewhere. Every routed expert module the decoder builds follows this field, GPT OSS's included. Which kernels exist and how fast they are depends on the installed package and the device. The optional kernel is not faster by default. If a model names `"tokamax"` and the package cannot be imported, initialization fails. Dew does not fall back to the XLA kernel under that name.
 
-tokamax is not a Dew dependency, and its current release does not install cleanly next to one. tokamax 0.0.13 pins `typeguard==2.13.3`; tyro 1.0.16, which parses every recipe's command line, requires `typeguard>=4.0.0`. Installing tokamax into a Dew environment downgrades typeguard, `uv pip check` reports the conflict, and each recipe fails while parsing its arguments with `AttributeError: module 'typeguard' has no attribute 'TypeCheckError'`. Use the tokamax kernel path from a separate environment that drives Dew through Python rather than a recipe command line, as `tools/benchmark_attention.py` documents in [performance](../performance.md), until a tokamax release relaxes the pin. The dependency conflict is between two packages' declared requirements, and Dew neither pins around it nor falls back at runtime.
+tokamax is not a Dew dependency, and its current release cannot be installed cleanly next to Dew. tokamax 0.0.13 pins `typeguard==2.13.3`. tyro 1.0.16, which parses every recipe's command line, needs `typeguard>=4.0.0`. Installing tokamax into a Dew environment downgrades typeguard, `uv pip check` reports the conflict, and every recipe fails while parsing its arguments with `AttributeError: module 'typeguard' has no attribute 'TypeCheckError'`. Until a tokamax release relaxes the pin, use the tokamax kernel from a separate environment that drives Dew from Python rather than from a recipe command line. `tools/benchmark_attention.py` does this, as described in [performance](../performance.md). The conflict is between the two packages' declared requirements. Dew does not pin around it or fall back at runtime.
 
-The `expert` mesh axis partitions the expert dimension. Dense parameter dimensions can use FSDP or tensor placement independently. See [distributed training](distributed.md) for the global batch and layout requirements.
+The `expert` mesh axis splits the expert dimension across devices. Dense parameter dimensions can use FSDP or tensor placement on their own. See [distributed training](distributed.md) for the global batch and layout requirements.
 
-The mixture's separate `dispatch` field defaults to `"global"`, the global sort/gather. `"exchange"` opts into bounded token exchange through public JAX `all_to_all` collectives. It needs an `expert` mesh axis larger than one that divides the expert count. Every selected token is retained, including when all traffic goes to one shard: later rounds drain that shard's bucket. Initialisation still works outside a mesh; applying the exchange model requires the mesh. Gated experts and GPT OSS's interleaved biased experts use the same transport, retaining their own activation and output-weight arithmetic.
+The mixture's `dispatch` field defaults to `"global"`, which sorts and gathers tokens globally. `"exchange"` sends tokens to their experts through a bounded exchange with public JAX `all_to_all` collectives. It needs an `expert` mesh axis larger than one that divides the number of experts. Every selected token is kept, even when all traffic goes to one shard: later rounds empty that shard's bucket. You can initialize the model outside a mesh, but applying the exchange model needs the mesh. Gated experts and GPT OSS's interleaved biased experts use the same transport and keep their own activation and output-weight arithmetic.
 
-Both dispatches run their expert projections through `moe.expert_projection`, which fixes the arithmetic a routed layer trains under whatever the activation dtype and placement: each contraction accumulates in at least fp32 and rounds once to the compute dtype, kernel gradients keep the master dtype, input gradients keep their input's dtype, and the exact GELU rounds once. Forward and reverse differentiation follow the same law. `tests/test_moe_precision.py` checks it against float64 arithmetic on the rounded operands and through three Adam steps of both dispatches in bf16. `tools/moe_exchange_probe.py` measures the exchange's working memory against the global path on CPU; no multiaccelerator throughput claim follows from it.
+Both dispatch modes run their expert projections through `moe.expert_projection`. It fixes the arithmetic of a routed layer during training, whatever the activation dtype and placement:
 
-GPT OSS's per-expert biases use `moe.gather_expert_bias`, which accumulates bias cotangents at master/compute precision before returning to the parameter dtype. Padding and idle experts contribute no bias gradient. The stored fused kernel and bias leaves, router choices, clipping limits and SwiGLU scaling remain unchanged. `tests/test_moe_biased_exchange.py` checks the complete router and experts against pinned transformers fixtures and compares forward, backward and optimizer updates across both dispatches.
+- each contraction accumulates in at least fp32 and rounds once to the compute dtype;
+- kernel gradients keep the master dtype;
+- input gradients keep their input's dtype;
+- the exact GELU rounds once.
 
-More experts increase parameter storage even when `top_k` is fixed. Routing, communication, shared experts, and load imbalance still contribute to runtime. Estimate optimizer and EMA storage as well as the parameters, and measure a representative forward/backward step on the intended topology.
+Forward-mode and reverse-mode differentiation follow the same rules. `tests/test_moe_precision.py` checks this against float64 arithmetic on the rounded operands, and through three Adam steps of both dispatch modes in bf16. `tools/moe_exchange_probe.py` measures the exchange's working memory against the global path on CPU. It says nothing about throughput on several accelerators.
+
+GPT OSS's per-expert biases go through `moe.gather_expert_bias`. It accumulates the bias gradients at master or compute precision, then converts them back to the parameter dtype. Padding and idle experts add no bias gradient. The stored fused kernel and bias leaves, router choices, clipping limits and SwiGLU scaling are unchanged. `tests/test_moe_biased_exchange.py` checks the full router and experts against pinned transformers fixtures, and compares the forward pass, backward pass and optimizer updates of both dispatch modes.
+
+More experts need more parameter storage, even with a fixed `top_k`. Routing, communication, shared experts and load imbalance all add to runtime. Estimate the optimizer and EMA storage along with the parameters, and time a representative forward and backward step on the topology you plan to use.
 
 ## Validate a sparse run
 
-For a reference model, compare router selections and weights, the sparse layer output, the loss, and parameter updates. For distributed training, verify that the balancing statistics represent the global batch and that replicated state remains identical across shards.
+Against a reference model, compare the router's selections and weights, the sparse layer output, the loss and the parameter updates. For distributed training, check that the balancing statistics cover the global batch and that replicated state stays identical across shards.
 
-The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which sparse checkpoints load and which lack an export writer.
+The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) says which sparse checkpoints load and which have no export writer.
