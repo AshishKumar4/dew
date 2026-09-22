@@ -1,0 +1,297 @@
+"""Asynchronous GRPO rollouts from a rollout server, with bounded policy staleness.
+
+`AsyncRollout` is a trainer `Rollout` that keeps generation running while the
+trainer updates. Wrap the prompt dataset with `rollout.prompts(dataset)`: the
+wrapped stream registers each prompt batch as the trainer's prefetch reads it,
+so when the trainer hands over batch `i` the rollout already knows batches
+`i + 1 ... i + ahead` and submits them to the server at once, under the
+weights it serves now. Batch `i`'s own draws were submitted `ahead` calls
+earlier and have been generating and scoring since. Nothing is read ahead of
+the trainer's own prefetch, so the checkpointed data position stays the
+trainer's: a resumed run re-reads and resubmits whatever was in flight.
+
+Every draw carries the policy version its request was submitted under
+(`RolloutServer.version`, the trainer's `updates` count when the weights were
+pushed), and the batch carries it per row under `policy_version`. The lag of a
+batch is the trainer's `updates` minus that version. Weights are pushed when
+the served version falls `sync_every` updates behind, so a batch is at most
+`ahead + sync_every - 1` updates stale, and construction refuses a
+`max_lag` below that. The bound is enforced, not assumed: a batch that arrives
+staler than `max_lag` (a resumed run, a stalled push) is discarded, the
+weights are pushed, and its prompts are drawn again.
+
+Off-policy correction is decoupled PPO (AReaL, arXiv:2505.24298): the ratio's
+old policy is the proximal one, the trainer's current weights, rescored over
+the drawn tokens whenever the batch is stale or the server reports no raw
+likelihood; the recorded behavior likelihoods stay as the server reported
+them, and the objective's `behavior_importance_cap` weights each token by
+proximal over behavior. A run that allows any lag must set that cap.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import math
+import threading
+import time
+from collections import deque
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+
+import jax
+import numpy as np
+
+from dew.data.dataset import Batch, Checkpointable, Dataset, Forwarding, Position
+from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
+from dew.inference.rollouts import Draw, RolloutServer
+from dew.nn.inputs import local_rows
+from dew.training.state import TrainState
+
+from .grpo import GRPOObjective
+from .rollout import IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY, Reward, _texts, grouped_rows
+
+POLICY_VERSION_KEY = "policy_version"
+"""Per row, the policy version the row's draw was submitted under."""
+
+
+@dataclass(frozen=True)
+class RolloutRecord:
+    """What one trainer call consumed: its `updates` clock, the batch's policy
+    version and lag, its mean reward, how many times it was redrawn for
+    staleness, and the seconds the trainer waited on it."""
+
+    updates: int
+    version: int
+    lag: int
+    reward: float
+    redrawn: int
+    waited: float
+
+
+type Scored = tuple[Draw, float]
+
+
+@dataclass
+class _Entry:
+    """One registered prompt batch, host-side, and its submitted draws."""
+
+    serial: int
+    prompts: np.ndarray
+    lengths: np.ndarray
+    sources: list[str]
+    truths: list[str]
+    infos: list[str]
+    version: int = -1
+    draws: list[list[Future[Scored]]] = field(default_factory=list)
+
+
+class _Lookahead(Forwarding):
+    """The prompt stream, registering every batch it yields with the rollout."""
+
+    def __init__(self, source: Iterator[Batch], rollout: AsyncRollout):
+        self._source: Iterator[Batch] | None = source
+        self._rollout = rollout
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Batch:
+        if self._source is None:
+            raise StopIteration
+        batch = next(self._source)
+        self._rollout._register(batch)
+        return batch
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            self._source = None
+
+
+class _CheckpointableLookahead(_Lookahead):
+    """The same stream over a source that reports and restores its position."""
+
+    def get_state(self) -> Position:
+        source = self._source
+        if not isinstance(source, Checkpointable):
+            raise RuntimeError("the prompt stream is closed")
+        return source.get_state()
+
+    def set_state(self, state: Position) -> None:
+        source = self._source
+        if not isinstance(source, Checkpointable):
+            raise RuntimeError("the prompt stream is closed")
+        source.set_state(state)
+
+
+class AsyncRollout:
+    """Draw `groups` completions per prompt on a `RolloutServer`, `ahead` batches early.
+
+    `reward` scores decoded completions (EOS excluded) on `scorers` threads
+    as each draw finishes, so verification overlaps generation and the
+    update. `log`, when given, receives a `RolloutRecord` per call. The
+    objective's context must be the prompt width plus `max_new_tokens`
+    minus one. Single-process trainers only: the server is one endpoint and
+    the weights it receives are one process's full tree.
+    """
+
+    def __init__(self, objective: GRPOObjective, server: RolloutServer, reward: Reward, *,
+                 decode: Callable[[Sequence[int]], str], groups: int = 4, max_new_tokens: int = 32,
+                 max_lag: int = 1, ahead: int = 1, sync_every: int = 1, sample: str = "group",
+                 scorers: int = 16, log: Callable[[RolloutRecord], None] | None = None):
+        if type(groups) is not int or groups < 2:
+            raise ValueError(f"groups is {groups}: an advantage needs at least two completions")
+        if type(max_new_tokens) is not int or max_new_tokens < 1:
+            raise ValueError("a rollout generates at least one token")
+        if sample not in ("group", "rloo"):
+            raise ValueError("the advantage families are 'group' and 'rloo'")
+        for name, value, least in (("ahead", ahead, 0), ("sync_every", sync_every, 1), ("max_lag", max_lag, 0)):
+            if type(value) is not int or value < least:
+                raise ValueError(f"{name} must be an integer of at least {least}")
+        if ahead + sync_every - 1 > max_lag:
+            raise ValueError(
+                f"ahead={ahead} and sync_every={sync_every} let a batch fall {ahead + sync_every - 1} "
+                f"updates behind, past max_lag={max_lag}")
+        if max_lag > 0 and objective.behavior_importance_cap is None:
+            raise ValueError("stale rollouts need the objective's behavior_importance_cap: "
+                             "the proximal-to-behavior importance weight is the off-policy correction")
+        self.objective, self.server, self.reward, self.decode = objective, server, reward, decode
+        self.groups, self.max_new_tokens, self.sample = groups, max_new_tokens, sample
+        self.max_lag, self.ahead, self.sync_every, self.log = max_lag, ahead, sync_every, log
+        self._scorers = ThreadPoolExecutor(max_workers=scorers, thread_name_prefix="dew-reward")
+        self._lock = threading.Lock()
+        self._registered: deque[_Entry] = deque()
+        self._serial = 0
+        self._rescore = jax.jit(lambda params, ids, padding: objective.per_token_log_probs(
+            params, ids, left_padding=padding))
+
+    def prompts(self, dataset: Dataset) -> Dataset:
+        """`dataset` with a training stream that registers each batch ahead of the step."""
+        def train() -> Iterator[Batch]:
+            with self._lock:
+                self._registered.clear()
+            source = iter(dataset.train())
+            if isinstance(source, Checkpointable):
+                return _CheckpointableLookahead(source, self)
+            return _Lookahead(source, self)
+
+        return dataclasses.replace(dataset, train=train)
+
+    def close(self) -> None:
+        """Stop the reward threads; the server belongs to the caller."""
+        self._scorers.shutdown(wait=True, cancel_futures=True)
+
+    def _register(self, batch: Batch) -> None:
+        prompts = np.asarray(batch[PROMPT_KEY])
+        lengths = np.asarray(batch[LENGTH_KEY])
+        rows, width = prompts.shape
+        if width + self.max_new_tokens != self.objective.seq_len + 1:
+            raise ValueError("size the objective one below the prompt width plus max_new_tokens")
+        if (lengths.shape != (rows,) or not np.issubdtype(lengths.dtype, np.integer)
+                or np.any(lengths < 1) or np.any(lengths > width)):
+            raise ValueError("prompt_length must contain one valid integer length per row")
+        sources, truths, infos = (_texts(np.asarray(batch[name])) for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
+        with self._lock:
+            self._registered.append(_Entry(self._serial, prompts, lengths, sources, truths, infos))
+            self._serial += 1
+
+    def _scored(self, draw: Future[Draw], entry: _Entry, row: int) -> Future[Scored]:
+        """The draw's future, chained into its reward on a scorer thread."""
+        scored: Future[Scored] = Future()
+
+        def score() -> None:
+            try:
+                result = draw.result()
+                text = self.decode(result.tokens[:len(result.tokens) - int(result.terminated)])
+                value = float(self.reward(entry.sources[row], text, entry.truths[row], entry.infos[row]))
+                if not math.isfinite(value):
+                    raise ValueError("the reward returned a non-finite score")
+                scored.set_result((result, value))
+            except BaseException as failure:
+                scored.set_exception(failure)
+
+        def chained(_: Future[Draw]) -> None:
+            try:
+                self._scorers.submit(score)
+            except RuntimeError as closed:
+                # The rollout closed while this draw was in flight.
+                scored.set_exception(closed)
+
+        draw.add_done_callback(chained)
+        return scored
+
+    def _submit(self, entry: _Entry, key: jax.Array, attempt: int) -> None:
+        """Submit every row's group of draws under the served weights."""
+        rows, width = entry.prompts.shape
+        seeds = np.random.default_rng(
+            [*np.asarray(jax.random.key_data(key)).ravel().tolist(), entry.serial, attempt]
+        ).integers(0, 2 ** 31 - 1, (rows, self.groups))
+        entry.version = self.server.version
+        entry.draws = [[self._scored(self.server.submit(
+            entry.prompts[row, width - int(entry.lengths[row]):].tolist(), self.max_new_tokens,
+            seed=int(seeds[row, group])), entry, row) for group in range(self.groups)] for row in range(rows)]
+
+    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> dict[str, np.ndarray]:
+        if jax.process_count() != 1:
+            raise ValueError("AsyncRollout serves one trainer process; the server takes one full weight tree")
+        updates = int(state.updates)
+        if updates - self.server.version >= self.sync_every:
+            self.server.load(state.params, updates)
+        with self._lock:
+            if not self._registered:
+                raise ValueError("an AsyncRollout batch comes from the stream of AsyncRollout.prompts(dataset)")
+            entry = self._registered.popleft()
+            upcoming = list(self._registered)[:self.ahead]
+        if not np.array_equal(entry.prompts, local_rows(batch[PROMPT_KEY])):
+            raise ValueError("the trainer's batch is not the next registered prompt batch")
+        for pending in (entry, *upcoming):
+            if not pending.draws:
+                self._submit(pending, key, attempt=0)
+        began = time.perf_counter()
+        scored = [[draw.result() for draw in row] for row in entry.draws]
+        redrawn = 0
+        while updates - entry.version > self.max_lag:
+            redrawn += 1
+            self.server.load(state.params, updates)
+            self._submit(entry, key, attempt=redrawn)
+            scored = [[draw.result() for draw in row] for row in entry.draws]
+        waited = time.perf_counter() - began
+        packed = self._packed(state, entry, scored, updates - entry.version)
+        if self.log is not None:
+            self.log(RolloutRecord(updates, entry.version, updates - entry.version,
+                                   float(np.mean([[value for _, value in row] for row in scored])), redrawn, waited))
+        return packed
+
+    def _packed(self, state: TrainState, entry: _Entry, scored: list[list[Scored]], lag: int) -> dict[str, np.ndarray]:
+        rows, width = entry.prompts.shape
+        budget, pad = self.max_new_tokens, self.server.sampling.pad_id
+        sampled = np.full((rows, self.groups, budget), pad, np.int32)
+        lengths = np.zeros((rows, self.groups), np.int32)
+        behavior = np.zeros((rows, self.groups, budget), np.float32)
+        raw = np.zeros_like(behavior)
+        rewards = np.zeros((rows, self.groups), np.float32)
+        reported = True
+        for row in range(rows):
+            prompt = tuple(entry.prompts[row, width - int(entry.lengths[row]):].tolist())
+            for group, (draw, value) in enumerate(scored[row]):
+                count = len(draw.tokens)
+                if draw.prompt != prompt or not 0 < count <= budget:
+                    raise ValueError("the server returned a draw for another prompt or past the budget")
+                sampled[row, group, :count] = draw.tokens
+                lengths[row, group] = count
+                behavior[row, group, :count] = draw.behavior_log_probs
+                if draw.raw_log_probs is None:
+                    reported = False
+                else:
+                    raw[row, group, :count] = draw.raw_log_probs
+                rewards[row, group] = value
+        packed = grouped_rows(entry.prompts, entry.lengths, sampled, lengths, raw, behavior, rewards, self.sample)
+        if lag > 0 or not reported:
+            ids = packed[IDS_KEY]
+            padding = width - packed[LENGTH_KEY].astype(np.int32)
+            proximal = np.asarray(self._rescore(state.params, ids, padding))[:, width - 1:width - 1 + budget]
+            packed[OLD_LOG_PROBS_KEY] = (proximal * packed[RESPONSE_MASK_KEY]).astype(np.float32)
+        packed[POLICY_VERSION_KEY] = np.full(rows * self.groups, entry.version, np.int32)
+        return packed

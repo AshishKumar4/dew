@@ -40,6 +40,37 @@ def _texts(rows: np.ndarray) -> list[str]:
             for row in np.asarray(rows, np.int32)]
 
 
+def grouped_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np.ndarray,
+                 lengths: np.ndarray, raw: np.ndarray, behavior: np.ndarray,
+                 rewards: np.ndarray, sample: str) -> dict[str, np.ndarray]:
+    """Pack `[rows, groups, ...]` draws and their rewards as GRPO rows.
+
+    `prompts` is `[rows, width]` left-padded ids with `prompt_lengths` real
+    tokens each; `sampled`, `raw` and `behavior` are `[rows, groups, R]`
+    with `lengths` valid actions per draw; `rewards` is `[rows, groups]`.
+    Each prompt's group is advantaged by the `sample` family and stays
+    contiguous in the output.
+    """
+    rows, groups, budget = sampled.shape
+    width = prompts.shape[1]
+    flat = jnp.asarray(rewards.reshape(-1))
+    advantages = np.asarray(
+        group_advantage(flat, groups) if sample == "group" else rloo_advantage(flat, groups), np.float32)
+    mask = np.arange(budget)[None, None, :] < lengths[..., None]
+    full = np.concatenate([np.broadcast_to(prompts[:, None, :], (rows, groups, width)), sampled], axis=-1)
+    return {
+        IDS_KEY: full.reshape(-1, full.shape[-1]),
+        RESPONSE_MASK_KEY: mask.reshape(-1, budget).astype(np.float32),
+        OLD_LOG_PROBS_KEY: raw.reshape(-1, budget),
+        BEHAVIOR_LOG_PROBS_KEY: behavior.reshape(-1, budget),
+        ADVANTAGES_KEY: np.broadcast_to(advantages[:, None], (rows * groups, budget)),
+        REWARDS_KEY: np.asarray(rewards, np.float32).reshape(-1),
+        LENGTH_KEY: np.repeat(prompt_lengths, groups),
+    }
+
+
+
+
 @dataclasses.dataclass(frozen=True)
 class SampledRollout:
     """Draw G completions per prompt, in prompt-major group order.
@@ -127,22 +158,4 @@ class SampledRollout:
                          :int(lengths[row, group]) - int(terminated[row, group])].tolist()),
                          truths[row], infos[row]) for group in range(self.groups)]
             for row in range(rows)], np.float32)
-        flat = jnp.asarray(rewards.reshape(-1))
-        advantages = np.asarray(
-            group_advantage(flat, self.groups) if self.sample == "group"
-            else rloo_advantage(flat, self.groups), np.float32)
-        mask = np.arange(self.max_new_tokens)[None, None, :] < lengths[..., None]
-        full = np.concatenate([
-            np.broadcast_to(prompts[:, None, :], (rows, self.groups, width)), sampled], axis=-1)
-        repeated_lengths = np.repeat(prompt_lengths, self.groups)
-
-        return {
-            IDS_KEY: full.reshape(-1, full.shape[-1]),
-            RESPONSE_MASK_KEY: mask.reshape(-1, self.max_new_tokens).astype(np.float32),
-            OLD_LOG_PROBS_KEY: raw.reshape(-1, self.max_new_tokens),
-            BEHAVIOR_LOG_PROBS_KEY: behavior.reshape(-1, self.max_new_tokens),
-            ADVANTAGES_KEY: np.broadcast_to(advantages[:, None],
-                                           (rows * self.groups, self.max_new_tokens)),
-            REWARDS_KEY: rewards.reshape(-1),
-            LENGTH_KEY: repeated_lengths,
-        }
+        return grouped_rows(prompts, prompt_lengths, sampled, lengths, raw, behavior, rewards, self.sample)
