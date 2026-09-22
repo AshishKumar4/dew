@@ -1065,11 +1065,14 @@ def tpu_runs(query, key, softcap=None, *, causal=False, sliding_window=None,
     like any other minor axis. The sequence axes are the ones the kernel and
     its mask blocking state a divisibility for.
 
-    A mesh that splits the sequence is turned down as well. Splash states
-    its own sharding as a `shard_map` partition spec, while Dew's sequence
-    parallelism is GSPMD constraints around a whole-sequence kernel. A
-    pallas call with no partitioning rule would have the queries gathered
-    back to serve it, which is the split this code exists to keep.
+    A call under an automatic sequence axis above one is turned down as
+    well: that is `gathered_keys_attention`, whose split is GSPMD constraints
+    around a whole-sequence kernel. A pallas call with no partitioning rule
+    would have the queries gathered back to serve it, which is the split
+    that exchange exists to keep. `exchanged_heads_attention` calls the
+    kernel inside a `shard_map` that holds the sequence axis manual, where
+    `sequence_shards` is 1 and each instance holds whole sequences, so
+    splash does take the calls that exchange runs.
     """
     if jax.default_backend() != 'tpu' or query.dtype not in SPLASH_DTYPES:
         return False

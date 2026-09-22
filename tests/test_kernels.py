@@ -266,12 +266,12 @@ def test_tpu_runs_needs_the_tpu_backend(monkeypatch):
 
 @pytest.mark.mesh
 def test_auto_stays_on_xla_where_the_mesh_splits_the_sequence(tpu_backend):
-    """Splash states its sharding as a shard_map spec, and Dew's sequence
-    parallelism is GSPMD constraints around a whole-sequence kernel: a pallas
-    call with no partitioning rule would have the queries gathered back to
-    serve it, undoing the split. An unmasked call is the only one that could
-    reach splash under that mesh at all, because a causal one arrives with a
-    striped mask that is a value of the trace."""
+    """Outside a shard_map the sequence axis is automatic, which is where
+    the gather exchange runs: GSPMD constraints around a whole-sequence
+    kernel, and a pallas call with no partitioning rule would have the
+    queries gathered back to serve it, undoing the split. The all-to-all
+    exchange calls the kernel with the sequence axis manual, and splash
+    takes those calls (tests/test_sequence_parallel.py)."""
     query, key, _ = qkv((8, 512, 8, 128))
     assert tpu_runs(query, key)
     with jax.set_mesh(build_mesh(MeshSpec(fsdp=4, sequence=2))):
