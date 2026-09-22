@@ -393,7 +393,7 @@ print(np.asarray(continuation.tokens))
 
 The continuation includes the prompt and follows the learned pattern: `[[1, 2, 3, 4, 1, 2, 3, 4, 1, 2]]`. `temperature=0` selects the highest-probability token. Validation uses EMA weights, which can lag the live parameters during a short run.
 
-For corpus training, `TokenWindows` reads tokenized binary files and `PackedTokens` packs documents with segment IDs and positions. `ChatMessages` renders chat templates and tracks token roles. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+For corpus training, `TokenWindows` reads tokenized binary files and `PackedTokens` packs documents with segment IDs and positions. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset id, renders them with the tokenizer's chat template and tracks token roles. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
 ### Supervised fine-tuning
 
