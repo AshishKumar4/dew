@@ -1,4 +1,4 @@
-"""Parameter banks for generation, built and placed one bank at a time.
+"""Build and place parameter banks for generation, one bank at a time.
 
 A scanned run of like layers reads its parameters as one array with the layer
 axis in front, and `dew.nn.backbones.causal_transformer.StackView` is the
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 
 class LayerBanks(Protocol):
-    """Where a banked store's values come from, read one bank at a time.
+    """Serves a banked store's values, read one bank at a time.
 
     Paths are canonical below each collection. A namespace selects a decoder
     inside a wrapper; the source knows nothing about how runs are grouped
@@ -53,7 +53,7 @@ class LayerBanks(Protocol):
     """
 
     def shapes(self) -> Variables:
-        """The whole store as `jax.ShapeDtypeStruct` leaves, one per layer."""
+        """Return the whole store as `jax.ShapeDtypeStruct` leaves, one per layer."""
         ...
 
     def entry(self, placement: Placement) -> Variables:
@@ -62,33 +62,32 @@ class LayerBanks(Protocol):
 
     def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
-        """One run's bank, on those shardings: those layers stacked on a new
+        """Return one run's bank, on those shardings: those layers stacked on a new
         leading axis in the order given, or, for a run of one layer, that
         layer's own subtree. Returned collections are local to namespace."""
         ...
 
 
 def layer_index(name: str) -> int | None:
-    """`layers_3` as 3; anything that is not one layer of the stack as None."""
+    """Return the layer index a `layers_N` module name holds, or None."""
     if not name.startswith("layers_"):
         return None
     rest = name[len("layers_"):]
     return int(rest) if rest.isdigit() else None
 
 
-
-
-
-
 def one_layer(variables: Variables, index: int, *, namespace: tuple[str, ...] = ()) -> Variables:
-    """One layer's subtree per collection, local to its decoder namespace."""
+    """Return one layer's subtree per collection, local to its decoder namespace."""
     name = f"layers_{index}"
     local = in_namespace(variables, namespace) if namespace else variables
     return {collection: tree[name] for collection, tree in local.items() if name in tree}
 
 
 def at_layer(subtrees: Variables, index: int, *, namespace: tuple[str, ...] = ()) -> Variables:
-    """The inverse of one_layer, preserving the canonical module namespace."""
+    """Place one layer's subtrees back under the canonical module namespace.
+
+    The inverse of `one_layer`.
+    """
     return at_namespace({collection: {f"layers_{index}": tree}
                          for collection, tree in subtrees.items()}, namespace)
 
@@ -124,16 +123,13 @@ def at_namespace(subtrees: Variables, namespace: tuple[str, ...]) -> Variables:
 
 @dataclasses.dataclass(frozen=True)
 class HeldBanks:
-    """A store already in memory, banked as it is read.
+    """Serve banks from a variables tree already held in memory.
 
     The tree is the one `model.init` or a loader produced, one subtree per
-    layer. It is borrowed: every array stays live and unchanged, nothing is
-    donated or deleted, and the caller's tree is as usable afterwards as
-    before. So a load through this holds the whole source *and* the growing
-    banked destination, and by the last bank it holds two copies of the
-    model. It is for weights that fit twice, which is what a test and a
-    fixture have; it is not evidence that a store larger than memory can be
-    built, and `CheckpointBanks` is what reads one that does not fit.
+    layer. Arrays are borrowed: nothing is donated or deleted, so the caller's
+    tree stays usable. A load therefore holds the source and the growing banked
+    store at once, which costs two copies of the model. Use `CheckpointBanks`
+    for weights that do not fit twice.
     """
 
     variables: Variables
@@ -156,7 +152,7 @@ class HeldBanks:
 
 @dataclasses.dataclass(frozen=True)
 class CheckpointBanks:
-    """A run's published weights, read one bank at a time.
+    """Serve banks by restoring a run's published weights one bank at a time.
 
     `ema` merges the averaged copy over the live weights, as
     `dew.sampling.pipelines.restore_variables` does, so a bank holds what the
@@ -205,7 +201,7 @@ class CheckpointBanks:
         return stacked(*rows)
 
     def _restored(self, placement: Placement) -> Variables:
-        """The variables `placement` names, restored onto its shardings."""
+        """Restore the variables `placement` names onto its shardings."""
         from dew.checkpoints import Checkpoints
 
         shapes = narrowed(self.shapes(), placement)
@@ -226,7 +222,7 @@ def _stored(directory: str, step: int) -> Variables:
 
 
 def narrowed(tree: Mapping, selection: Mapping) -> dict:
-    """The leaf-level intersection of tree and selection, retaining canonical paths."""
+    """Return the leaf-level intersection of `tree` and `selection`, paths kept."""
     collected = {}
     for name, selected in selection.items():
         if name not in tree:
@@ -251,7 +247,7 @@ def _typed(shapes: Variables, placement: Placement) -> Variables:
 
 
 def _row_placement(placement: Placement) -> Placement:
-    """One layer's shardings out of a bank's: the layer axis dropped, in device
+    """Return one layer's shardings out of a bank's: the layer axis dropped, in device
     memory, which is where the rows a bank is stacked out of are read."""
     return jax.tree.map(
         lambda sharding: NamedSharding(sharding.mesh, P(*sharding.spec[1:]),
@@ -259,7 +255,7 @@ def _row_placement(placement: Placement) -> Placement:
 
 
 def _bank_placement(placement: Placement, stacked: bool) -> Placement:
-    """A run's shardings: the layer axis whole in front of each leaf's own
+    """Return a run's shardings: the layer axis whole in front of each leaf's own
     spec, in the memory space the layout chose for that leaf."""
     if not stacked:
         return placement
@@ -275,7 +271,7 @@ class BankedModel(Protocol):
 
 
 def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
-    """The model's declared stacks, deduplicated by canonical namespace.
+    """Return the model's declared stacks, deduplicated by canonical namespace.
 
     Two readers of one physical scope declare the same site, so a shared
     decoder is packed once. Conflicting views of a namespace, overlapping
@@ -307,7 +303,7 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
 
 
 def entry_tree(variables: Variables, sites: Sequence[DecoderBank]) -> Variables:
-    """The leaf complement of declared decoder layers and their runs' banks,
+    """Return the leaf complement of declared decoder layers and their runs' banks,
     including nested media."""
     layers = {(*site.namespace, f"layers_{index}") for site in sites
               for first, count in site.view.groups for index in range(first, first + count)}
@@ -352,7 +348,7 @@ def _check_shapes(shapes: Variables, site: DecoderBank) -> None:
 
 def host_banked(model: BankedModel, source: LayerBanks, *,
                 mesh: MeshSpec | None = None, layout: Layout | None = None) -> Variables:
-    """`source`'s weights as the banked store `model`'s runs read.
+    """Build the banked store `model`'s runs read from `source`'s weights.
 
     Each run's bank is read, stacked and placed on its own, and the copies of
     one bank are waited for before the next bank is read, so the transfers a
@@ -408,7 +404,7 @@ def host_banked(model: BankedModel, source: LayerBanks, *,
 
 
 def _places(subtree) -> dict[str, tuple[str, str]]:
-    """Where each leaf of one layer goes, by its path inside the layer: the
+    """Return where each leaf of one layer goes, by its path inside the layer: the
     memory kind and the spec, which is what a bank has to hold in common."""
     leaves, _ = jax.tree_util.tree_flatten_with_path(subtree)
     return {jax.tree_util.keystr(path): (str(sharding.memory_kind), str(sharding.spec))

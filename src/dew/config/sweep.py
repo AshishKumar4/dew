@@ -1,4 +1,4 @@
-"""Hyperparameter search over the ordinary training path.
+"""Search hyperparameters over the ordinary training path.
 
 A sweep overrides a `RunConfig` through its own record, hands each trial to
 the recipe's train entry point, and records the score that entry point
@@ -39,7 +39,7 @@ class Search(Protocol):
 
 
 def override[C: RunConfig](config: C, point: Point) -> C:
-    """`config` with each dotted path in `point` replaced, through its record.
+    """Return `config` with each dotted path in `point` replaced, through its record.
 
     `RunConfig.from_dict` refuses a leaf the class does not declare, so a
     misspelled path raises instead of training the unchanged config.
@@ -58,13 +58,13 @@ def override[C: RunConfig](config: C, point: Point) -> C:
 
 
 def random_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:
-    """One independent draw per field, reproducible from the trial's number."""
+    """Draw one independent value per field, reproducible from the trial's number."""
     rng = np.random.default_rng([seed, len(finished)])
     return {path: values[int(rng.integers(len(values)))] for path, values in space.items()}
 
 
 def grid_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:
-    """The next point of the space's cartesian product, in order."""
+    """Return the next point of the space's cartesian product, in order."""
     points = list(itertools.product(*space.values()))
     if len(finished) >= len(points):
         raise ValueError(f'the grid holds {len(points)} points and trial '
@@ -73,7 +73,7 @@ def grid_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> P
 
 
 def optuna_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:
-    """Optuna's sampler over the same space, told the ledger's trials.
+    """Ask Optuna's sampler for the next point over the same space.
 
     The study is built from the ledger on every call rather than kept across
     them, so a resumed sweep asks from the same trials a fresh one would.
@@ -91,12 +91,12 @@ def optuna_search(space: Space, finished: Sequence[TrialFinished], seed: int) ->
 
 
 def _recorded(space: Space) -> dict[str, list[Choice]]:
-    """The space as the ledger holds it; JSON has no tuple."""
+    """Return the space as the ledger holds it. JSON has no tuple."""
     return {field: list(values) for field, values in space.items()}
 
 
 def _read(path: Path, space: Space) -> list[TrialFinished]:
-    """The ledger's finished trials, refusing a ledger of another space."""
+    """Read the ledger's finished trials, refusing a ledger of another space."""
     if not path.exists():
         return []
     ledger = json.loads(path.read_text())

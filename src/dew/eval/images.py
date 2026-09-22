@@ -1,4 +1,4 @@
-"""CLIP metrics on generated images.
+"""Measure CLIP metrics on generated images.
 
 `clip_score(images, prompts)` scores a set of images against the prompts they
 were sampled from, and the registered metrics take the same cosine over a
@@ -34,7 +34,7 @@ DEFAULT_MODEL = "openai/clip-vit-large-patch14"
 
 @functools.cache
 def _get_clip(modelname: str):
-    """The vendored CLIP towers and the checkpoint's image processor, loaded
+    """Load the vendored CLIP towers and the checkpoint's image processor,
     once per model name. CLIP-L/14 is about 600 MB in HBM, and every metric
     built from this module shares the copy."""
     from transformers import CLIPImageProcessorPil
@@ -46,7 +46,7 @@ def _get_clip(modelname: str):
 
 @functools.cache
 def _get_tokenizer(modelname: str):
-    """The checkpoint's prompt tokenizer, loaded once per model name. It pads
+    """Load the checkpoint's prompt tokenizer, once per model name. It pads
     and truncates to the model's context exactly as the loader does, so a
     prompt scored here is the prompt a run's batch would carry."""
     from dew.data.processors import AutoTextTokenizer
@@ -55,21 +55,24 @@ def _get_tokenizer(modelname: str):
 
 
 def _equal_counts(images: int, prompts: int) -> None:
-    """CLIP pairs one prompt with one image, so the two counts have to agree."""
+    """Refuse a prompt count and an image count that disagree.
+
+    CLIP pairs one prompt with one image.
+    """
     if images != prompts:
         raise ValueError(f"CLIP scored {images} images against {prompts} prompts; "
                          "equal counts are required")
 
 
 def _uint8_pixels(images: ArrayLike) -> NDArray[np.uint8]:
-    """A sampler's [-1, 1] pixels as uint8, nearest value and clipped, because
+    """Convert a sampler's [-1, 1] pixels to uint8, nearest value and clipped, because
     a sample can leave the range."""
     return np.clip(np.round((np.asarray(images) + 1.0) * 127.5), 0, 255).astype(np.uint8)
 
 
 def clip_image_text_cosine(images: ArrayLike, input_ids: ArrayLike, attention_mask: ArrayLike, *,
                            modelname: str = DEFAULT_MODEL) -> jax.Array:
-    """Per-image cosine between uint8 [N, H, W, 3] images and tokenized prompts.
+    """Return the per-image cosine between uint8 [N, H, W, 3] images and prompts.
 
     The images go through the checkpoint's own processor, so the embeddings are
     the ones the reference produces for these pixels and tokens.
@@ -91,7 +94,7 @@ def clip_image_text_cosine(images: ArrayLike, input_ids: ArrayLike, attention_ma
 
 def clip_score(images: ArrayLike, prompts: Sequence[str], *, modelname: str = DEFAULT_MODEL,
                batch_size: int = 64) -> float:
-    """CLIPScore of uint8 [N, H, W, 3] images against one prompt each.
+    """Score CLIPScore of uint8 [N, H, W, 3] images against one prompt each.
 
     100 * mean(max(cos(image, prompt), 0)), higher is better; typical T2I
     models score around 25-35 on natural prompts. The images are scored
@@ -122,7 +125,7 @@ def clip_score(images: ArrayLike, prompts: Sequence[str], *, modelname: str = DE
 
 
 def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: str) -> jax.Array:
-    """The per-image cosine for one sampled grid and the prompts of its batch."""
+    """Return the per-image cosine for one sampled grid and its batch's prompts."""
     text = batch[field]
     return clip_image_text_cosine(_uint8_pixels(artifact.images), text["input_ids"],
                                   text["attention_mask"], modelname=modelname)
@@ -130,7 +133,7 @@ def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: s
 
 @metrics("clip")
 def clip(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
-    """CLIP distance, mean(1 - cos(image, text)), lower is better. It logs as
+    """Score CLIP distance, mean(1 - cos(image, text)); lower is better. It logs as
     val/clip_similarity; `clip_score` is the standard number for a new run.
     """
 
@@ -142,7 +145,7 @@ def clip(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
 
 @metrics("clip_score")
 def clip_score_metric(modelname: str = DEFAULT_MODEL, field: str = "text") -> ImageMetric:
-    """Standard CLIPScore over a validation pass, the same number `clip_score`
+    """Score standard CLIPScore over a validation pass, the same number `clip_score`
     reports for the images and prompts the pass consumed.
     """
 

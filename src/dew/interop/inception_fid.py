@@ -1,4 +1,4 @@
-"""The upstream jax-fid FID weights, converted to a Flax variables tree.
+"""Convert the upstream jax-fid FID weights into a Flax variables tree.
 
 The published extractor is a pickle of numpy arrays, so this module is the one
 place in Dew that unpickles a file, behind a pinned digest and an unpickler
@@ -32,8 +32,11 @@ CONVERTED_FILE = 'inception_v3_fid.safetensors'
 
 
 def _check_digest(path: str, repo: str, filename: str, revision: str, digest: str) -> str:
-    """Separate verification lets tests check the pin against local bytes
-    without downloading the weights."""
+    """Return `path` if its SHA-256 matches `digest`, and raise otherwise.
+
+    This is separate from `fetch` so a test can check the pin against local
+    bytes without downloading the weights.
+    """
     with open(path, 'rb') as handle:
         found = hashlib.file_digest(handle, 'sha256').hexdigest()
     if found != digest:
@@ -44,8 +47,11 @@ def _check_digest(path: str, repo: str, filename: str, revision: str, digest: st
 
 
 def fetch(repo: str, filename: str, revision: str, digest: str) -> str:
-    """The digest check rejects altered weight bytes before unpickling, even
-    when the download resolves to the pinned revision."""
+    """Download `filename` from `repo` at `revision` and return its local path.
+
+    The digest is checked before the caller unpickles the file, so altered bytes
+    are rejected even when the revision resolves correctly.
+    """
     from huggingface_hub import hf_hub_download
 
     return _check_digest(hf_hub_download(repo, filename, revision=revision),
@@ -77,7 +83,7 @@ class _ArrayUnpickler(pickle.Unpickler):
 
 
 def load_arrays(path) -> ParamTree:
-    """The nested dict of arrays in a numpy-only pickle at `path`."""
+    """Read the nested dict of arrays in a numpy-only pickle at `path`."""
     with open(path, 'rb') as handle:
         return _ArrayUnpickler(handle).load()
 
@@ -138,8 +144,11 @@ _HEAD = ('fc', 'AuxLogits')
 
 
 def _upstream(path: tuple[str, ...]) -> tuple[str, ...]:
-    """The upstream name of a module leaf, `BasicConv2d_0/Conv_0/kernel` and
-    the like without its collection."""
+    """Return the upstream name of a module leaf.
+
+    `path` is a variables path without its collection, such as
+    `BasicConv2d_0/Conv_0/kernel`.
+    """
     module, *rest = path
     if module not in _MODULES:
         raise ValueError(
@@ -164,7 +173,7 @@ def _upstream(path: tuple[str, ...]) -> tuple[str, ...]:
 
 
 def _module_leaves() -> list[tuple[str, ...]]:
-    """Every leaf the extractor initialises, collection first."""
+    """Return every leaf the extractor initialises, collection first."""
     from dew.eval.inception import InceptionV3
 
     variables = jax.eval_shape(
@@ -184,7 +193,7 @@ def _pickle_leaves(tree: Mapping, prefix: tuple[str, ...] = ()) -> list[tuple[st
 
 
 def upstream_names() -> dict[str, tuple[str, ...]]:
-    """Every leaf the extractor initialises, against its jax-fid name.
+    """Return every leaf the extractor initialises, against its jax-fid name.
 
     The keys are the '/'-joined variables paths, collection first, and they are
     what a converted file stores; this mapping is the whole of what the two
@@ -194,7 +203,7 @@ def upstream_names() -> dict[str, tuple[str, ...]]:
 
 
 def convert(pickle_path) -> Variables:
-    """The jax-fid pickle as the variables tree `InceptionV3` initialises.
+    """Read the jax-fid pickle into the variables tree `InceptionV3` initialises.
 
     The extractor's own tree says which arrays are wanted and what they are
     called; every leaf of it is looked up under its upstream name, and a pickle
@@ -241,8 +250,11 @@ def load(path) -> Variables:
 
 
 def channel_divisor(path) -> int:
-    """The `InceptionV3(channel_divisor=)` a file was written at, from its
-    header: the published weights are the whole network and say 1."""
+    """Return the `InceptionV3(channel_divisor=)` a file was written at.
+
+    It is read from the file's header. The published weights are the whole
+    network and say 1.
+    """
     _, metadata = read_file(path)
     if "channel_divisor" not in metadata:
         raise ValueError(
@@ -253,7 +265,7 @@ def channel_divisor(path) -> int:
 
 
 def cached_weights() -> Path:
-    """The converted weights, beside the pickle in the Hub cache.
+    """Return the converted weights, beside the pickle in the Hub cache.
 
     The download and the conversion happen on the first call; every call after
     it finds the file already there.

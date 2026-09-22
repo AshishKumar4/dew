@@ -76,7 +76,7 @@ else:
 
 @dataclasses.dataclass(frozen=True)
 class ModelConfig:
-    """Architecture name and the fields `models.build` receives."""
+    """Holds the architecture name and the fields `models.build` receives."""
 
     architecture: str = "simple_dit"
     config: JsonDict = dataclasses.field(default_factory=dict)
@@ -84,8 +84,7 @@ class ModelConfig:
     """Compute dtype; parameter storage is independent."""
     param_dtype: registry.DtypeName | None = None
     """Parameter storage, where the model declares the field. Unset stores
-    float32, which is what a model's own default is and what the optimizer
-    and the checkpoint have always held."""
+    float32, which is the model's own default."""
     matmul_precision: Literal["default", "high", "highest"] | None = None
     """What every matmul of the model asks XLA for, where the model declares
     a `precision` field: `default` is the backend's fastest algorithm,
@@ -96,14 +95,14 @@ class ModelConfig:
     supports and xla for the rest, xla on any other backend."""
 
     def fields(self) -> Mapping[str, object]:
-        """The model's fields with the run's precision settings in them."""
+        """Return the model's fields with the run's precision settings in them."""
         return with_precision(self.architecture, self.config,
                               dtype=self.dtype, attention_impl=self.attention_impl,
                               param_dtype=self.param_dtype,
                               matmul_precision=self.matmul_precision)
 
     def precision_settings(self) -> frozenset[str]:
-        """The names `fields()` writes that `config` did not carry: the run's
+        """Return the names `fields()` writes that `config` did not carry: the run's
         precision settings, as this architecture takes them. A resolved
         record leaves them out, since this value writes them again every
         time it builds."""
@@ -111,7 +110,7 @@ class ModelConfig:
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
-        """Inverse of the record `RunConfig.to_dict` writes for this field."""
+        """Read back the record `RunConfig.to_dict` writes for this field."""
         return _built(cls, values)
 
     def build(self):
@@ -120,7 +119,7 @@ class ModelConfig:
 
 @dataclasses.dataclass(frozen=True)
 class OptimConfig:
-    """Optimizer, learning-rate schedule and gradient clipping."""
+    """Holds the optimizer, learning-rate schedule and gradient clipping."""
 
     optimizer: Literal["adam", "adamw", "lamb", "muon", "muonclip"] = "adamw"
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
@@ -137,7 +136,7 @@ class OptimConfig:
 
 @dataclasses.dataclass(frozen=True)
 class Wandb:
-    """Where a run reports to. Setting it turns tracking on; the entity and
+    """Says where a run reports to. Setting it turns tracking on; the entity and
     the offline switch mean nothing without a project."""
 
     project: str
@@ -147,7 +146,7 @@ class Wandb:
 
 @dataclasses.dataclass(frozen=True)
 class TrainerConfig:
-    """Run length, checkpointing, sharding and run tracking."""
+    """Holds the run length, checkpointing, sharding and run tracking."""
 
     name: str | None = None
     checkpoint_dir: str = "./checkpoints"
@@ -205,7 +204,7 @@ class TrainerConfig:
             raise ValueError("steps and epochs both name the run length; set one")
 
     def total_steps(self, dataset: Dataset) -> int:
-        """The run's length in steps, from `steps` or from `epochs` over `data`."""
+        """Return the run's length in steps, from `steps` or from `epochs` over `data`."""
         if self.steps is not None:
             return self.steps
         if self.epochs is None:
@@ -217,11 +216,11 @@ class TrainerConfig:
         return self.epochs * dataset.steps_per_epoch
 
     def eval_interval(self, dataset: Dataset) -> int | None:
-        """Steps between validation passes over `data`, or None for never."""
+        """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
 
     def checkpoint_interval(self, dataset: Dataset) -> int | None:
-        """Steps between checkpoints over `data`, or None for never."""
+        """Return the steps between checkpoints over `data`, or None for never."""
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
     @staticmethod
@@ -236,7 +235,7 @@ class TrainerConfig:
 
 
 def _registry_for(annotation):
-    """The registry whose members the annotation names, or None."""
+    """Return the registry whose members the annotation names, or None."""
     members = typing.get_args(annotation) or (annotation,)
     for held in REGISTRIES:
         if all(any(member is m for m in held.values()) for member in members):
@@ -245,7 +244,7 @@ def _registry_for(annotation):
 
 
 def _to_json(value, annotation) -> JSON:
-    """`value` as JSON: a dict, a list, or a scalar json.dump can write.
+    """Return `value` as JSON: a dict, a list, or a scalar json.dump can write.
     `annotation` is the declared field type, so the write side names the same
     registry and member types the read side rebuilds from."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -282,7 +281,7 @@ def _to_json(value, annotation) -> JSON:
 
 
 def _key(key: object) -> str:
-    """One mapping key as JSON names it, since JSON has only string keys.
+    """Return one mapping key as JSON names it, since JSON has only string keys.
 
     A tree path is its parts joined the way every message in this tree joins
     them, `params/layers_0/self_attn/q_proj`, which is the spelling
@@ -300,12 +299,12 @@ def _key(key: object) -> str:
 
 
 def _rebuild_key(annotation: registry.Annotation, key: str) -> str | tuple[str, ...]:
-    """One record key as the field declares it: a name, or the path `_key` joined."""
+    """Return one record key as the field declares it: a name, or the joined path."""
     return tuple(key.split("/")) if registry.wants_tuple(annotation) else key
 
 
 def _instantiate(member: Callable, fields: Mapping[str, registry.Configured]) -> registry.Configured:
-    """The member called with the record's fields, as a value a config carries.
+    """Call the member with the record's fields, as a value a config carries.
 
     The call is written here, behind `Callable[...]`, because a record names
     its fields at runtime and the class it builds cannot check them at type
@@ -315,7 +314,7 @@ def _instantiate(member: Callable, fields: Mapping[str, registry.Configured]) ->
 
 
 def _recorded(field: dataclasses.Field) -> bool:
-    """Whether a field is part of the run record.
+    """Return whether a field is part of the run record.
 
     A field marked `metadata={"record": False}` is a binding the value picked
     up at runtime, not something the record describes: an adapter's source
@@ -340,7 +339,7 @@ def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Config
 
 
 def _built[ValueT](cls: type[ValueT], values: Mapping[str, object]) -> ValueT:
-    """One record as the class it describes, or a refusal naming what it built."""
+    """Build one record into the class it describes, or raise naming what it built."""
     rebuilt = _rebuild(cls, values)
     if not isinstance(rebuilt, cls):
         raise ValueError(f"{values!r} builds a {type(rebuilt).__name__}, not a {cls.__name__}")
@@ -351,7 +350,7 @@ _MAPPINGS = (dict, MappingABC, MutableMapping)
 
 
 def _rebuild(annotation: registry.Annotation, value: registry.Configured) -> registry.Configured:
-    """The value `annotation` asks for, built out of a record.
+    """Build the value `annotation` asks for, out of a record.
 
     It hands back what the field declares, which only the annotation knows,
     so the width here is what a config field can carry; `_built` is the same
@@ -396,7 +395,7 @@ def _rebuild(annotation: registry.Annotation, value: registry.Configured) -> reg
 
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
-    """A whole run. Recipes add their objective's knobs by subclassing this."""
+    """Describes a whole run. Recipes add their objective's knobs by subclassing this."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     data: DataSpec = dataclasses.field(
@@ -410,15 +409,17 @@ class RunConfig:
     adapts the objective's module and freezes every other leaf."""
 
     def to_dict(self) -> dict[str, JSON]:
-        """JSON-safe record of the run; a registered member is written as its
-        name and fields."""
+        """Return a JSON-safe record of the run.
+
+        A registered member is written as its name and its fields.
+        """
         return {field.name: _to_json(getattr(self, field.name),
                                      _declared_type(type(self), field.name))
                 for field in dataclasses.fields(self)}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
-        """Inverse of `to_dict`, for subclasses too; an unknown or a missing
+        """Read back what `to_dict` wrote, for subclasses too. An unknown or a missing
         field raises."""
         return _built(cls, values)
 
@@ -436,7 +437,7 @@ class RunConfig:
 
     @classmethod
     def load(cls, directory: str) -> Self:
-        """The config a run in `directory` was built from, as this class."""
+        """Read the config a run in `directory` was built from, as this class."""
         return cls.from_dict(json.loads((epath.Path(directory) / RUN_FILE).read_text()))
 
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,

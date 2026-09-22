@@ -1,10 +1,9 @@
-"""A saved run as an lm-evaluation-harness model.
+"""Run a saved run as an lm-evaluation-harness model.
 
-The trainer scores perplexity over its own validation stream, which says how
-well a run predicts the data it was trained on and nothing about what it can
-do. A task suite is the other question, and lm-eval-harness is where those
-suites live: `DewLM` puts a `TextGeneration` behind the three calls its `LM`
-interface asks for, so any of them runs against a run directory.
+`DewLM` puts a `TextGeneration` behind the three calls lm-eval-harness's `LM`
+interface asks for, so any task suite runs against a run directory. The
+trainer's own perplexity says how well a run predicts its training data and
+nothing about what it can do, which is the other question a suite answers.
 
 `lm_eval` is an optional extra (`pip install dew-ml[eval-harness]`), so this
 module is the only one that imports it and `dew.eval` does not import this
@@ -49,7 +48,7 @@ DEFAULT_CONTEXT = 2048
 
 @functools.partial(jax.jit, static_argnums=(0,))
 def _scored(model, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Per-target log-probability and whether the target was the argmax.
+    """Return the per-target log-probability and whether the target was the argmax.
 
     `rows` is `[B, T]` of token ids; both results are `[B, T - 1]`, entry `i`
     belonging to `rows[:, i + 1]`. Rows are right-padded by the caller, which
@@ -63,14 +62,14 @@ def _scored(model, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 
 def _batches(count: int, size: int) -> list[range]:
-    """`count` indices in runs of at most `size`, in order."""
+    """Yield `count` indices in runs of at most `size`, in order."""
     if type(size) is not int or size < 1:
         raise ValueError(f"batch_size is a positive integer, got {size!r}")
     return [range(start, min(start + size, count)) for start in range(0, count, size)]
 
 
 def _padded(rows: Sequence[Sequence[int]]) -> np.ndarray:
-    """One batch's token rows, right-padded to the longest with zeros."""
+    """Return one batch's token rows, right-padded to the longest with zeros."""
     width = max(len(row) for row in rows)
     return np.asarray([[*row, *([0] * (width - len(row)))] for row in rows], np.int32)
 
@@ -91,7 +90,7 @@ def _windows(tokens: Sequence[int], width: int) -> list[list[int]]:
 
 @register_model("dew")
 class DewLM(LM):
-    """A `TextGeneration` behind lm-eval-harness's `LM` interface.
+    """Puts a `TextGeneration` behind lm-eval-harness's `LM` interface.
 
     `task` is the run's own generation task, with its model, its weights and
     its processor; `batch_size` is how many rows one scoring call runs at
@@ -121,26 +120,26 @@ class DewLM(LM):
     @classmethod
     def from_run(cls, run: str, *, batch_size: int = 1, ema: bool = True,
                  step: int | None = None, dtype: str | None = None) -> DewLM:
-        """The run in `run` as a harness model, built the way `dew.pipeline` builds it."""
+        """Load the run in `run` as a harness model, the way `dew.pipeline` builds it."""
         return cls(TextGeneration.from_run(run, ema=ema, step=step, dtype=dtype),
                    batch_size=batch_size)
 
     @classmethod
     def create_from_arg_string(cls, arg_string: str,
                                additional_config: dict | None = None) -> DewLM:
-        """`--model_args run=<directory>,batch_size=4` as the harness parses it."""
+        """Build the model from `--model_args run=<directory>,batch_size=4`."""
         return cls._from_arguments(utils.simple_parse_args_string(arg_string),
                                    additional_config)
 
     @classmethod
     def create_from_arg_obj(cls, arg_dict: dict,
                             additional_config: dict | None = None) -> DewLM:
-        """The same arguments already parsed, which is the route the CLI takes."""
+        """Build the model from arguments already parsed, the route the CLI takes."""
         return cls._from_arguments(dict(arg_dict), additional_config)
 
     @classmethod
     def _from_arguments(cls, arguments: dict, additional: dict | None) -> DewLM:
-        """One `--model_args` record as the run it names.
+        """Load the run one `--model_args` record names.
 
         The harness passes `batch_size` in both halves when the command line
         carries it in both, so the explicit configuration wins and the pair
@@ -164,7 +163,7 @@ class DewLM(LM):
 
     @property
     def eot_token_id(self) -> int:
-        """The id a row with no context is conditioned on: the policy's EOS.
+        """Return the id a row with no context is conditioned on: the policy's EOS.
 
         `Sampling` normalises its own field to a tuple, and declares the
         form a caller may write, so both spellings are read here.
@@ -176,7 +175,7 @@ class DewLM(LM):
 
     @property
     def max_length(self) -> int:
-        """How many ids one scoring row may hold, as the model declares it.
+        """Return how many ids one scoring row may hold, as the model declares it.
 
         `_ceiling` is the same read a call already makes to size its cache,
         so a harness row and a generated row are bounded by the same field.
@@ -185,7 +184,7 @@ class DewLM(LM):
         return DEFAULT_CONTEXT if declared is None else declared
 
     def tok_encode(self, text: str) -> list[int]:
-        """`text` as the run's own tokenizer reads it, one row of ids."""
+        """Encode `text` with the run's own tokenizer, one row of ids."""
         return [int(token) for token in np.asarray(self._processor([text]).tokens)[0]]
 
     def tok_decode(self, tokens: Sequence[int]) -> str:
@@ -199,7 +198,7 @@ class DewLM(LM):
         return processor
 
     def _rows(self, rows: Sequence[Sequence[int]]) -> list[tuple[np.ndarray, np.ndarray]]:
-        """Every row's per-target log-probabilities and argmax agreement."""
+        """Return every row's per-target log-probabilities and argmax agreement."""
         scored: list[tuple[np.ndarray, np.ndarray]] = []
         for batch in _batches(len(rows), self.batch_size):
             tokens = _padded([rows[index] for index in batch])
@@ -212,7 +211,7 @@ class DewLM(LM):
         return scored
 
     def loglikelihood(self, requests: list[Instance]) -> list[tuple[float, bool]]:
-        """Each `(context, continuation)`'s summed log-probability, and whether
+        """Return each `(context, continuation)`'s summed log-probability, and whether
         greedy decoding of the context would have produced it.
 
         A request with no context is conditioned on `eot_token_id`, which is
@@ -236,7 +235,7 @@ class DewLM(LM):
                 for (values, matched), width in zip(self._rows(rows), widths, strict=True)]
 
     def loglikelihood_rolling(self, requests: list[Instance]) -> list[float]:
-        """Each string's own log-probability, every token after the first scored.
+        """Return each string's own log-probability, every token after the first scored.
 
         A string longer than the model's context is scored in consecutive
         windows, each conditioned on what it holds, which is the harness's
@@ -257,7 +256,7 @@ class DewLM(LM):
         return answers
 
     def generate_until(self, requests: list[Instance]) -> list[str]:
-        """Each context continued until one of its stop strings or its budget.
+        """Continue each context until one of its stop strings or its budget.
 
         The stop strings cut the decoded text, so a sequence that spans two
         tokens ends the answer the way the harness expects it to.

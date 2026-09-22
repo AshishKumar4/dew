@@ -171,18 +171,17 @@ def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array) -> jax.Ar
 
 
 def _admitted(model: nn.Module, params: Variables, pad_id: int, state: Slots, admission: Admission) -> Slots:
-    """`state` with the admitted prompts prefilled into their slots.
+    """Return `state` with the admitted prompts prefilled into their slots.
 
-    The prompts run as their own forward over a fresh cache of their row
-    count and their bucket width, so the prefill's attention reads the
-    prompt's keys and not the resident capacity: over a 1024-slot cache an
-    admission of eight 512-wide prompts took a third of a served batch's
-    wall through the decode-mode attention's [rows x heads, width,
-    capacity] f32 scores. Every leaf of the result is scattered into the
-    resident state; a resident row's slots past the prompt keep a former
-    occupant's keys, which the cache's validity hides, since the validity
-    is written whole. An unused admission row points past the last slot
-    and the scatter drops it.
+    The prompts run as their own forward over a fresh cache sized to their row
+    count and bucket width. The prefill's attention then reads only the prompt's
+    keys, not the resident capacity, which would cost a large share of the
+    batch's wall time in f32 attention scores.
+
+    Every leaf of the result is scattered into the resident state. A resident
+    row's slots past the prompt keep a former occupant's keys, which the
+    cache's validity hides, since the validity is written whole. An unused
+    admission row points past the last slot and the scatter drops it.
     """
     width = admission.prompts.tokens.shape[1]
     narrow = _sized(model, width)
@@ -235,17 +234,13 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, state: Slots,
 
 
 def _split(state: Slots) -> tuple[Slots, Slots]:
-    """The state as the buffers a step updates in place and the vectors it rewrites.
+    """Split the state into the matrices a step donates and the vectors it rewrites.
 
-    A donated input is aliased with its output, and XLA copies a donated
-    buffer whose old value is still needed once the output is written:
-    every layer's cache cursor, the step count and the active flags are
-    read after they are advanced, so donating the whole state cost 30
-    copy launches of 32-element vectors per step. The matrices are what
-    donation is for, the cache above all; the vectors travel undonated
-    and get fresh buffers. Each half carries None where the other holds
-    the leaf, and `_joined` puts them back together. A `Formats` tree of
-    chosen layouts splits the same way, by the rank each layout describes.
+    XLA copies a donated buffer whose old value is still read after the output
+    is written, which is true of every cursor, step count and active flag. So
+    only the matrices are donated; the vectors get fresh buffers. Each half
+    holds None where the other holds the leaf, and `_joined` recombines them.
+    A `Formats` tree splits the same way, by the rank each layout describes.
     """
     def matrix(leaf: jax.Array | Format) -> bool:
         if isinstance(leaf, Format):
@@ -264,9 +259,11 @@ def _joined(resident: Slots, carried: Slots) -> Slots:
 def _stepped(model: nn.Module, params: Variables, pad_id: int, resident: Slots, carried: Slots,
              admission: Admission | None, transforms: tuple[LogitsTransform, ...],
              stopping: tuple[Stopping, ...]) -> tuple[checkify.Error, tuple[Slots, Draws]]:
-    """`_advanced` over the state `_split` gave, with its device checks
-    carried out as a value, the way `text._checked` carries them; the host
-    throws the error when it reads the draws, one step later."""
+    """Run `_advanced` over a split state, carrying its device checks as a value.
+
+    `text._checked` carries them the same way. The host throws the error when
+    it reads the draws, one step later.
+    """
 
     def run(params, resident, carried, admission, transforms, stopping):
         return _advanced(model, params, pad_id, _joined(resident, carried), admission, transforms, stopping)
@@ -279,17 +276,11 @@ Formats = Slots
 """A `Slots` whose leaves are `Format`s: the resident layout of each leaf."""
 
 def _compiled(resident: Formats, carried: Formats) -> jax.stages.Wrapped:
-    """The step program over a state in the formats `_split` gave.
+    """Compile the step program over a state split into resident and carried halves.
 
-    The matrices are donated, so the cache is updated in place rather than
-    copied: without donation the 32 x 1024 step copied its cache and took
-    22.5 ms against 9.9. XLA's default already captures the step's fusions
-    and GEMMs into CUDA graphs (`xla_gpu_enable_command_buffer`); with the
-    capture off the same step took 10.4 ms, forcing every category with a
-    minimum graph size of one was within noise of the default, cuBLAS in
-    place of the Triton GEMMs took 13.3 ms and Triton for every dot changed
-    nothing, so the step sets no flag of its own and a run that wants
-    another setting passes it through XLA_FLAGS.
+    The matrix half is donated so XLA updates the cache in place instead of
+    copying it. The step sets no XLA flag of its own; pass XLA_FLAGS to change
+    the backend's defaults. See docs/performance.md for the measurements.
     """
     return jax.jit(_stepped, static_argnums=(0, 2), donate_argnums=(3,),
                    in_shardings=(None, resident, carried, None, None, None),
@@ -298,20 +289,14 @@ def _compiled(resident: Formats, carried: Formats) -> jax.stages.Wrapped:
 
 def _resident_formats(model: nn.Module, params: Variables, pad_id: int, state: Slots,
                       transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...]) -> Formats:
-    """The layout the resident state keeps: what XLA picks for the decode step.
+    """Choose the memory layout the resident state keeps, by asking XLA for it.
 
-    The attention dot wants the cached keys and values with the slot axis
-    minor, [rows, heads, dim, slots] physically, and inside `generate`'s
-    scan XLA lays the carried cache out that way. Across a jit boundary an
-    array is row-major unless told otherwise, so a step over a row-major
-    cache transposed the whole cache twice per layer: 56 launches and 29
-    of the 40 ms a 32 x 1024 step took on the 4080. The decode-only step is
-    compiled once with the layouts left to XLA, and what it chose for its
-    outputs becomes the format every step program takes and returns, so
-    the cache is written in the layout it is read in and donation reuses
-    the buffer. `state` is the abstract state, shapes and dtypes: nothing
-    is allocated to choose the layout, so the opened state is allocated
-    in it once rather than allocated row-major and copied.
+    The attention dot reads the cached keys and values with the slot axis
+    minor. Across a jit boundary an array is row-major unless a layout is
+    given, which would transpose the whole cache twice per layer. So the
+    decode-only step is compiled once with layouts left to XLA, and the
+    output formats it chose become the format every step takes and returns.
+    `state` is abstract: choosing the layout allocates nothing.
     """
     device = jax.sharding.SingleDeviceSharding(jax.devices()[0])
     resident, carried = _split(state)

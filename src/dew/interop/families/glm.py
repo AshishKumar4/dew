@@ -1,10 +1,10 @@
-"""GLM decoders: glm4_moe, glm_moe_dsa and glm5_next_text.
+"""Translate the GLM decoders: glm4_moe, glm_moe_dsa and glm5_next_text.
 
 GLM 4.5 biases q/k/v over a bias-free output projection and rotates half the
-head; glm_moe_dsa is DeepSeek V3.2's sparse MLA block under those names, told
-apart by the indexer rotating interleaved pairs. GLM 5.3's text block pools
-its MLA keys without position, runs KDA layers beside them and carries mHC,
-so its export writes the whole variables tree rather than a leaf at a time.
+head. glm_moe_dsa is DeepSeek V3.2's sparse MLA block under those names, told
+apart by the indexer rotating interleaved pairs. GLM 5.3's text block pools its
+MLA keys without position, runs KDA layers beside them and carries mHC, so its
+export writes the whole variables tree rather than a leaf at a time.
 """
 
 from __future__ import annotations
@@ -39,7 +39,15 @@ from dew.nn.kda import KimiDeltaAttentionMixer
 
 
 def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """GLM-5.3-Flash text: NoPE pooled MLA, KDA and mHC (modeling_glm5_next.py:1259-1329)."""
+    """Read a GLM-5.3-Flash text config into `CausalTransformer` fields.
+
+    The block is NoPE pooled MLA, KDA and mHC
+    (modeling_glm5_next.py:1259-1329). The reader builds four things from the
+    config: `types`, one attention kind per layer; `linear`, the KDA mixer's
+    fields; `sparse`, the k-pool mixer's; and `mixture`, the routed layers'
+    geometry. Every field the reference fixes is checked and refused rather
+    than dropped.
+    """
     layers = _record_int(hf_config, 'num_hidden_layers')
     types = _specified_layer_types(hf_config, used, tuple(
         'deepseek_sparse_attention' if i % 4 == 3 else 'linear_attention' for i in range(layers)))
@@ -148,6 +156,13 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
 
 
 def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
+    """Return the config fields a GLM-5.3-Flash checkpoint declares for `model`.
+
+    It first refuses any model setting GLM-5.3 does not carry, then reads the
+    two mixers back out of the model's kinds: `linear` for KDA,
+    `sparse` for k-pool attention. The routed geometry is added from
+    `model.mixture` when the model routes at all.
+    """
     fixed = {
         'causal': True, 'pre_norms': True, 'sandwich_norms': False,
         'scale_offset': False, 'scale_after_cast': True, 'embedding_scale': False,
@@ -275,9 +290,12 @@ def _glm5_next_export_weights(model: CausalTransformer, variables: Mapping[str, 
 
 
 def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """GLM 4.5 and 5: biased q/k/v over a bias-free o_proj, a half rotary in
-    the 'default' convention, DeepSeek V3's router with the shared experts
-    and dense first layers, and the MTP depths the checkpoint ships."""
+    """Read a glm4_moe config into `CausalTransformer` fields.
+
+    GLM 4.5 and 5 bias q/k/v over a bias-free o_proj and rotate half the head
+    in the 'default' convention. Routing is DeepSeek V3's, with the shared
+    experts and the dense first layers. The MTP depths are the checkpoint's.
+    """
     # The released configs spell the rotary flat (rope_theta beside
     # partial_rotary_factor); a config transformers wrote nests both under
     # rope_parameters, the spelling Glm4MoeRotaryEmbedding reads.
@@ -311,15 +329,17 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
 
 
 def _glm4_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """GLM's MTP depths are the layers past num_hidden_layers, one block each.
+    """Return the variables-tree path for one GLM tensor name.
 
+    GLM's MTP depths are the layers past num_hidden_layers, one block each.
     Depth d arrives as model.layers.{num_layers + d}.*: its own enorm, hnorm,
-    eh_proj and shared_head.norm around a decoder block named like any
-    layer, plus copies of the trunk's embedding and head, which the depth
-    shares here as in the reference (translate_weights checks the copies).
-    Those two copies name the trunk's leaves, the values they hold: the
-    tree has one embedding and one head for the trunk and every depth, so
-    a trained export writes the copies from the weights the depth read.
+    eh_proj and shared_head.norm around a decoder block named like any layer,
+    plus copies of the trunk's embedding and head. The depth shares those two
+    here as in the reference, and `translate_weights` checks the copies.
+
+    The copies map to the trunk's own leaves, since the tree holds one
+    embedding and one head for the trunk and every depth. A trained export
+    therefore writes the copies from the weights the depth read.
     """
     parts = name.split('.')
     if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
@@ -350,13 +370,15 @@ def _glm4_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] |
 
 
 def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[str]) -> tuple[str, ...]:
-    """Which layers run their own indexer ('full') and which reuse the
-    previous full layer's top-k ('shared'), as GlmMoeDsaConfig.__post_init__
-    resolves them (configuration_glm_moe_dsa.py:136-148): an explicit
-    `indexer_types` as it stands, else the `index_topk_pattern` string,
-    else the `index_topk_freq` / `index_skip_topk_offset` schedule. The
-    released configs ship the list beside the schedule that produced it,
-    and the reference reads the list alone when both are present.
+    """Return each layer's indexer mode, 'full' or 'shared'.
+
+    A 'full' layer runs its own indexer; a 'shared' one reuses the previous
+    full layer's top-k. `GlmMoeDsaConfig.__post_init__` resolves them in this
+    order (configuration_glm_moe_dsa.py:136-148): an explicit `indexer_types`
+    as it stands, else the `index_topk_pattern` string, else the
+    `index_topk_freq` / `index_skip_topk_offset` schedule. The released configs
+    ship the list beside the schedule that produced it, and the reference reads
+    the list alone when both are present.
     """
     used.update(('indexer_types', 'index_topk_pattern', 'index_topk_freq',
                  'index_skip_topk_offset'))
@@ -390,11 +412,14 @@ def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[s
 
 
 def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """GLM-5, 5.1, 5.2 and 5.3: DeepSeek V3.2's sparse MLA block under GLM's
+    """Read a glm_moe_dsa config into `CausalTransformer` fields.
+
+    GLM-5, 5.1, 5.2 and 5.3 are DeepSeek V3.2's sparse MLA block under GLM's
     choices. The indexer rotates interleaved pairs like the main rope head
-    (modeling_glm_moe_dsa.py:231-232), IndexShare layers own no indexer and
-    attend the previous full layer's top-k (:313-318, :739-748), and the
-    MTP depth ships past num_hidden_layers as GLM 4.5's does."""
+    (modeling_glm_moe_dsa.py:231-232). IndexShare layers own no indexer and
+    attend the previous full layer's top-k (:313-318, :739-748). The MTP depth
+    ships past num_hidden_layers as GLM 4.5's does.
+    """
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     # GlmMoeDsaConfig.__post_init__:152 points head_dim at the rope slice
     # whatever the config says (GLM-5.2 ships 192 over a rope width of 64),

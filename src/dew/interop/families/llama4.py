@@ -1,8 +1,8 @@
-"""Llama 4's text decoder.
+"""Translate Llama 4's text decoder.
 
-Chunked local attention on the rotated layers around global layers with no
-rotary at all, QK-norm by layer kind, and a routed feed-forward whose fused
-`gate_up_proj` the checkpoint stores as one kernel per expert.
+Its rotated layers run chunked local attention around global layers with no
+rotary at all. QK-norm is set by layer kind. Its routed feed-forward stores a
+fused `gate_up_proj`, one kernel per expert.
 """
 
 from __future__ import annotations
@@ -27,9 +27,12 @@ from dew.nn import llama4 as llama4_nn
 
 
 def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Llama 4's text decoder: chunked rotated local layers around global
-    layers with no rope, every interleaved layer routed with a shared
-    expert, and the wider dense MLP of the other layers."""
+    """Read a Llama 4 text config into `CausalTransformer` fields.
+
+    Chunked rotated local layers surround global layers with no rope. Every
+    interleaved layer is routed and carries a shared expert. The remaining
+    layers take the wider dense MLP.
+    """
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     no_rope = hf_config.get('no_rope_layers') or None
     if no_rope is None:
@@ -97,11 +100,11 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
 
 
 def _llama4_prepare(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """The fused `experts.gate_up_proj` split into the two stacked kernels.
+    """Split each fused `experts.gate_up_proj` into the two stacked kernels.
 
-    `Llama4TextExperts` holds `[E, hidden, 2 * expert]` with the gate in
-    the first half (`gate_up.chunk(2)`), already in the `[E, in, out]`
-    layout dew's stacked expert kernels keep.
+    `Llama4TextExperts` holds `[E, hidden, 2 * expert]` with the gate in the
+    first half (`gate_up.chunk(2)`), already in the `[E, in, out]` layout dew's
+    stacked expert kernels keep.
     """
     prepared: dict[str, np.ndarray] = {}
     for name, tensor in tensors.items():
@@ -116,9 +119,12 @@ def _llama4_prepare(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
 
 
 def _llama4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Llama 4 names its feed-forward `feed_forward`, its router `router` and
-    its dense branch `shared_expert`; the stacked expert kernels arrive
-    without a `.weight` suffix."""
+    """Return the variables-tree path for one Llama 4 tensor name.
+
+    Llama 4 names its feed-forward `feed_forward`, its router `router` and its
+    dense branch `shared_expert`. Its stacked expert kernels arrive without a
+    `.weight` suffix.
+    """
     parts = name.split('.')
     if len(parts) >= 5 and parts[:2] == ['model', 'layers'] and parts[2].isdigit() and parts[3] == 'feed_forward':
         layer = ('params', f'layers_{parts[2]}', 'mlp')

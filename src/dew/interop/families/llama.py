@@ -1,9 +1,9 @@
-"""Llama, Mistral and Mixtral: the dense block the other families vary.
+"""Translate Llama, Mistral and Mixtral, the dense block the other families vary.
 
 Llama's own translation is the shared `_base_config`, so what stands here is
-what the two variants add to it: Mistral's sliding window on every layer,
-Mixtral's softmax-routed feed-forward, and the expert tensor names that
-routing brings.
+only what the two variants add to it. Mistral adds a sliding window on every
+layer. Mixtral adds a softmax-routed feed-forward and the expert tensor names
+that routing brings.
 """
 
 from __future__ import annotations

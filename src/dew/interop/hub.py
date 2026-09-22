@@ -1,6 +1,6 @@
-"""Moving an export directory to and from the Hugging Face Hub.
+"""Move an export directory to and from the Hugging Face Hub.
 
-`save_hf_layout` writes the directory; these two carry it. They wrap the two
+`save_hf_layout` writes the directory; these two carry it. They wrap the
 `huggingface_hub` calls involved, creating the repo on the way up and handing
 back the snapshot path on the way down. Retries, progress and caching stay the
 hub client's behaviour.
@@ -43,7 +43,7 @@ def push_to_hub(directory, repo_id: str, *, private: bool = False,
 
 
 def _upload(folder: str, repo_id: str, *, private: bool, commit_message: str) -> None:
-    """The two hub calls one upload is, over a directory already on disk."""
+    """Create the repo if needed and upload every file in `folder` to it."""
     api = HfApi()
     api.create_repo(repo_id, private=private, exist_ok=True)
     api.upload_folder(
