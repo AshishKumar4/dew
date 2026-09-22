@@ -40,6 +40,35 @@ def _texts(rows: np.ndarray) -> list[str]:
             for row in np.asarray(rows, np.int32)]
 
 
+def prompt_rows(batch, seq_len: int, max_new_tokens: int
+                ) -> tuple[np.ndarray, np.ndarray, list[str], list[str], list[str]]:
+    """Read one host prompt batch: left-padded ids, lengths and the three reward strings.
+
+    The objective's `seq_len` must be one below the prompt width plus
+    `max_new_tokens`, and every row needs a length between one and the width.
+    """
+    prompts = local_rows(batch[PROMPT_KEY])
+    prompt_lengths = local_rows(batch[LENGTH_KEY])
+    sources, truths, infos = (_texts(local_rows(batch[name])) for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
+    rows, width = prompts.shape
+    if width + max_new_tokens != seq_len + 1:
+        raise ValueError("size the objective one below the prompt width plus max_new_tokens")
+    if (prompt_lengths.shape != (rows,) or not np.issubdtype(prompt_lengths.dtype, np.integer)
+            or np.any(prompt_lengths < 1) or np.any(prompt_lengths > width)):
+        raise ValueError("prompt_length must contain one valid integer length per row")
+    return prompts, prompt_lengths, sources, truths, infos
+
+
+def check_rollout(groups: int, max_new_tokens: int, sample: str) -> None:
+    """Refuse a group, budget or advantage family no GRPO rollout can use."""
+    if type(groups) is not int or groups < 2:
+        raise ValueError(f"groups is {groups}: an advantage needs at least two completions")
+    if type(max_new_tokens) is not int or max_new_tokens < 1:
+        raise ValueError("a rollout generates at least one token")
+    if sample not in ("group", "rloo"):
+        raise ValueError("the advantage families are 'group' and 'rloo'")
+
+
 def grouped_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np.ndarray,
                  lengths: np.ndarray, raw: np.ndarray, behavior: np.ndarray,
                  rewards: np.ndarray, sample: str) -> dict[str, np.ndarray]:
@@ -89,12 +118,7 @@ class SampledRollout:
     sampling: Sampling = Sampling()
 
     def __post_init__(self) -> None:
-        if self.groups < 2:
-            raise ValueError(f"groups is {self.groups}: an advantage needs at least two completions")
-        if self.max_new_tokens < 1:
-            raise ValueError("a rollout generates at least one token")
-        if self.sample not in ("group", "rloo"):
-            raise ValueError("the advantage families are 'group' and 'rloo'")
+        check_rollout(self.groups, self.max_new_tokens, self.sample)
 
     def _prepared(self, batch, key: jax.Array):
         """Validate one prompt batch and build the inputs generation reads.
@@ -106,16 +130,9 @@ class SampledRollout:
         key = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
         if key.shape != ():
             raise ValueError("key must be a single JAX PRNG key")
-        prompts = local_rows(batch[PROMPT_KEY])
-        prompt_lengths = local_rows(batch[LENGTH_KEY])
-        sources, truths, infos = (_texts(local_rows(batch[name]))
-                                  for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
-        rows, width = prompts.shape
-        if width + self.max_new_tokens != self.objective.seq_len + 1:
-            raise ValueError("size the objective one below the prompt width plus max_new_tokens")
-        if (prompt_lengths.shape != (rows,) or not np.issubdtype(prompt_lengths.dtype, np.integer)
-                or np.any(prompt_lengths < 1) or np.any(prompt_lengths > width)):
-            raise ValueError("prompt_length must contain one valid integer length per row")
+        prompts, prompt_lengths, sources, truths, infos = prompt_rows(
+            batch, self.objective.seq_len, self.max_new_tokens)
+        width = prompts.shape[1]
         # The lengths are already here on the host, so a batch of whole
         # prompts states its validity by carrying none.
         padded = bool(np.any(prompt_lengths < width))

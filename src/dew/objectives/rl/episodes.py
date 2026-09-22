@@ -120,8 +120,7 @@ class Action:
                 raise ValueError("sampled action likelihoods must be finite")
         if type(self.terminated) is not bool:
             raise ValueError("sampled action terminated must be a boolean")
-        eos = self.sampling.eos_id
-        stops = () if eos is None else (eos,) if isinstance(eos, int) else eos
+        stops = self.sampling.stops
         if self.terminated != (self.tokens[-1] in stops):
             raise ValueError("inference termination disagrees with the sampled EOS token")
         for index, token in enumerate(self.tokens):

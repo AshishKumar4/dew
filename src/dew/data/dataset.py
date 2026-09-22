@@ -469,21 +469,48 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
     takes numbers. Pass None for an unconditional run, or a reader that hands
     the words back to keep them.
     """
+    def stage(batch: Batch) -> Batch:
+        fields = dict(batch)
+        captions = [str(caption) for caption in fields.pop(CAPTION)]
+        if tokenize is not None:
+            fields.update(tokenize(captions))
+        return fields
+
+    return mapped(stream, stage)
+
+
+def tapped(stream: Callable[[], Iterator[Batch]],
+           on_batch: Callable[[Batch], None]) -> Callable[[], Iterator[Batch]]:
+    """`stream` with `on_batch` called on every batch as it is read, the batch unchanged.
+
+    It runs on whatever thread reads the stream, the trainer's prefetch
+    worker included, so a consumer learns of each batch the moment it is read.
+    """
+    def stage(batch: Batch) -> Batch:
+        on_batch(batch)
+        return batch
+
+    return mapped(stream, stage)
+
+
+def mapped(stream: Callable[[], Iterator[Batch]],
+           stage: Callable[[Batch], Batch]) -> Callable[[], Iterator[Batch]]:
+    """`stream` with `stage` applied to each batch, forwarding stop, close and position."""
     def start() -> Iterator[Batch]:
         source = iter(stream())
         if isinstance(source, Checkpointable):
-            return _CheckpointableTokenizing(source, tokenize)
-        return _Tokenizing(source, tokenize)
+            return _CheckpointableMapping(source, stage)
+        return _Mapping(source, stage)
 
     return start
 
 
-class _Tokenizing(Forwarding):
-    """The stream's iterator with each batch's captions tokenized."""
+class _Mapping(Forwarding):
+    """The stream's iterator with one stage applied to each batch."""
 
-    def __init__(self, source: Iterator[Batch], tokenize: Tokenize | None):
+    def __init__(self, source: Iterator[Batch], stage: Callable[[Batch], Batch]):
         self._source: Iterator[Batch] | None = source
-        self._tokenize = tokenize
+        self._stage = stage
 
     def __iter__(self):
         return self
@@ -491,11 +518,7 @@ class _Tokenizing(Forwarding):
     def __next__(self) -> Batch:
         if self._source is None:
             raise StopIteration
-        batch = dict(next(self._source))
-        captions = [str(caption) for caption in batch.pop(CAPTION)]
-        if self._tokenize is not None:
-            batch.update(self._tokenize(captions))
-        return batch
+        return self._stage(next(self._source))
 
     def close(self) -> None:
         try:
@@ -505,7 +528,7 @@ class _Tokenizing(Forwarding):
             self._source = None
 
 
-class _CheckpointableTokenizing(_Tokenizing):
+class _CheckpointableMapping(_Mapping):
     """Runs the same stage over a stream that reports and restores its
     position, forwarding both. The methods are written out because the
     protocol reads attributes statically, where a forwarding
@@ -514,13 +537,13 @@ class _CheckpointableTokenizing(_Tokenizing):
     def get_state(self) -> Position:
         source = self._source
         if not isinstance(source, Checkpointable):
-            raise RuntimeError("the tokenized iterator is closed")
+            raise RuntimeError("the mapped iterator is closed")
         return source.get_state()
 
     def set_state(self, state: Position) -> None:
         source = self._source
         if not isinstance(source, Checkpointable):
-            raise RuntimeError("the tokenized iterator is closed")
+            raise RuntimeError("the mapped iterator is closed")
         source.set_state(state)
 
 

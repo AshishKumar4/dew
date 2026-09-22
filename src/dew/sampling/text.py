@@ -162,6 +162,12 @@ class Sampling:
                 raise ValueError("eos_id must contain non-negative token ids")
             object.__setattr__(self, "eos_id", stops)
 
+    @property
+    def stops(self) -> tuple[int, ...]:
+        """The EOS ids that end a draw, none when the policy names no EOS."""
+        eos = self.eos_id
+        return () if eos is None else (eos,) if isinstance(eos, int) else tuple(eos)
+
     def transforms(self) -> tuple[LogitsTransform, ...]:
         """The complete default chain for a request without explicit transforms.
 
