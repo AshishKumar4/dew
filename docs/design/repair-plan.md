@@ -1,6 +1,10 @@
 # Dew repair and capability plan
 
-Status: proposed implementation order after the September 2026 research and documentation review. The documentation restructuring and isolated registry/timeline/CI repairs are implemented. The training-contract changes below are not implemented or qualified by the documentation tests.
+> An AI assistant maintains this document. It is presented as-is.
+
+Status: proposed implementation order after the September 2026 research and documentation review. The documentation restructuring and the isolated registry, timeline, and CI repairs are implemented. The training-contract changes below are not implemented, and the documentation tests do not cover them.
+
+Correction (2026-09-22): the training-contract tickets C01 to C04 have since landed in source. `TrainState` has the three clocks and checkpoints the scaler and partial accumulation window (`src/dew/training/state.py:15-61`); evaluation derives per-batch keys (`src/dew/training/evaluation.py:304`); `fit` closes the training source on every exit (`src/dew/training/trainer.py:844-856`). The documentation page runner mentioned under "Qualification and documentation" was deleted in `93a8ee10`, so no test executes the documentation pages today. I checked these by reading source and git history; I did not audit the R, I and S tickets.
 
 ## Evidence
 
@@ -10,13 +14,13 @@ Status: proposed implementation order after the September 2026 research and docu
 - [All 695 MaxText configuration controls](../research/maxtext-parity.md).
 - [JAX/Flax features and device constraints](../research/jax-features.md).
 
-The research notes pin source versions and distinguish implementation from experiments. Their fit recommendations are inputs to design review, not authority to add every upstream flag to Dew.
+The research notes pin source versions and keep implementation apart from experiments. Their fit recommendations feed design review. They do not license adding every upstream flag to Dew.
 
 ## Design constraints
 
-Keep Flax models, objectives, data, trainer state, and effectful capabilities separate. Reuse existing JAX/Flax, Optax, Grain, Orbax, and engine implementations when they provide the required semantics. Add state only when it represents information needed for correct execution or recovery. Do not replace individual scientific choices with a family-name bundle, and do not introduce a second trainer.
+Keep Flax models, objectives, data, trainer state, and effectful capabilities separate. Reuse existing JAX/Flax, Optax, Grain, Orbax, and engine implementations when they have the required semantics. Add state only when it holds information that correct execution or recovery needs. Do not replace individual scientific choices with a family-name bundle, and do not add a second trainer.
 
-Preserve normal float32 behavior and reference layouts during transparent optimizations. Quantization, token dropping, approximate attention, and changed loss reductions are explicit method choices with their own accuracy requirements. A speed improvement does not establish unchanged training semantics.
+Keep normal float32 behavior and reference layouts unchanged during transparent optimizations. Quantization, token dropping, approximate attention, and changed loss reductions are explicit method choices with their own accuracy requirements. A faster step does not show that training semantics are unchanged.
 
 ## First: repair the training contracts
 
@@ -28,11 +32,11 @@ Preserve normal float32 behavior and reference layouts during transparent optimi
 | C04 | Own prefetch and related resources explicitly. Make blocked queue operations cancellation-aware and close/join owned producers on every exit path. State requirements for sources whose next call can block. | Bounded completion, zero steps, loader/metric failures, and repeated runs release producers and queued buffers. Accelerator release is checked separately. Cleanup does not replace the original failure with a secondary exception. |
 | C05 | Repair registry target, nested timeline denominator, and CI missing-report behavior. | Implemented in e5ee70d with failing-before/passing-after regressions and local lint/report checks. A new remote CI run remains a separate observation. |
 
-C01 should preserve a distinction between work consumed and updates accepted. Simply assigning the Python loop counter from `state.step` changes termination and can cause an unbounded run under repeated rejection. C02 must not multiply the entire composite loss by one token count without establishing every auxiliary term's denominator and state-update timing.
+C01 should keep work consumed apart from updates accepted. Setting the Python loop counter from `state.step` changes termination and can loop forever under repeated rejection. C02 must not multiply the whole composite loss by one token count before it has established every auxiliary term's denominator and state-update timing.
 
 C01 must include overflow before and on an accumulation boundary, checkpoints with a partially filled accumulator, and restoration of the scaler's finite-step and growth history. C02 must also cover an entire accumulation window with zero valid targets and define whether weight decay, optimizer updates, and schedules advance in that case.
 
-Review the complete state and reduction proposal together before implementing it. Migrate all callers and checkpoint fields as one pre-1.0 cutover; do not add compatibility shims to conceal the old contract.
+Review the complete state and reduction proposal together before implementing it. Migrate all callers and checkpoint fields in one pre-1.0 cutover, with no compatibility shims that hide the old contract.
 
 ## Then: make rollouts mathematically and operationally correct
 
@@ -49,7 +53,7 @@ Review the complete state and reduction proposal together before implementing it
 | R09 | Add teacher scoring and on-policy distillation with explicit tokenizer and version requirements. | Selected-token and full-distribution losses match their separate references; teacher failures do not become training labels. |
 | R10 | Complete FlowGRPO on the diffusion process/solver contract. | Transition density, log-probability, path sampling, policy loss, and gradients match an independently checked reference; no placeholder denoiser or reward loop. |
 
-Begin with a synchronous local implementation whose semantics are proved. An external engine can supply serving features without moving optimizer ownership out of Dew. A generic OpenAI-compatible HTTP endpoint alone does not provide behavior log probabilities, live weight transfer, tool parsing, or model-family compatibility.
+Start with a synchronous local implementation whose semantics are proved. An external engine can supply serving features while Dew keeps ownership of the optimizer. A generic OpenAI-compatible HTTP endpoint alone does not provide behavior log probabilities, live weight transfer, tool parsing, or model-family compatibility.
 
 ## Inference and performance
 
@@ -65,12 +69,12 @@ Begin with a synchronous local implementation whose semantics are proved. An ext
 | S05 | Complete remaining architecture, adapter, and multimodal paths, including Gemma 3n vision and requested frontier mechanisms. | Separate configuration, forward, backward/update, generation/cache, real-checkpoint, and hardware evidence for each path. |
 | S06 | Test realistic dependency ranges and separate optional runtime dependencies where justified. | Clean environment imports and relevant workflows pass at declared bounds; no checker or warning suppression substitutes for compatibility. |
 
-The MaxText matrix distinguishes an equivalent capability from a copied configuration field. The JAX feature note also records primitives already present, deprecated upstream interfaces, and unmeasured proposals. Use it to avoid redundant changes.
+The MaxText matrix separates an equivalent capability from a copied configuration field. The JAX feature note also records primitives Dew already has, deprecated upstream interfaces, and unmeasured proposals. Use it to avoid redundant changes.
 
 ## Qualification and documentation
 
-Run small deterministic logic tests on CPU and representative kernel/memory cases on the local GPU. Keep synchronization outside measured timing loops as specified by the benchmark method. Real small checkpoints need explicit download approval and cleanup consistent with the owner's model-retention policy. Multi-host GPU/TPU qualification needs separate hardware access; request RunPod only when the local tests and the exact deployment experiment are ready.
+Run small deterministic logic tests on CPU and representative kernel and memory cases on the local GPU. Keep synchronization outside measured timing loops, as the benchmark method specifies. Real small checkpoints need explicit download approval and cleanup that follows the owner's model-retention policy. Multi-host GPU/TPU qualification needs separate hardware access; request RunPod only when the local tests and the exact deployment experiment are ready.
 
 For each capability, update its task guide and reference entry with the actual contract, setup, verified outputs, and limitations. The user documentation now executes pages from fresh offline CPU processes and a temporary working directory. Keep those checks independent of research fixtures and hidden test state.
 
-Finish each ticket with independent review, its relevant numerical or lifecycle proof, integrated checks, and cleanup of its completed worktree. Do not mark the mission complete while a required item is represented only by a note, a synthetic fixture, or an unverified deployment claim.
+Finish each ticket with an independent review, its numerical or lifecycle proof, integrated checks, and cleanup of its worktree. Do not mark the mission complete while a required item exists only as a note, a synthetic fixture, or an unverified deployment claim.
