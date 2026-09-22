@@ -177,21 +177,6 @@ def scheduled(spec: MeshSpec) -> Iterator[None]:
         yield
 
 
-def granules(devices: list) -> list[list]:
-    """`devices` grouped by the unit the slow network joins, in index order.
-
-    That is the TPU slice where the devices span more than one, and the
-    process otherwise: GPU and CPU devices report slice 0, and so does
-    every host of one TPU slice, whose hosts `replicas` then groups.
-    """
-    slices = {device.slice_index for device in devices}
-    attribute = 'slice_index' if len(slices) > 1 else 'process_index'
-    grouped: dict[int, list] = {}
-    for device in devices:
-        grouped.setdefault(getattr(device, attribute), []).append(device)
-    return [grouped[index] for index in sorted(grouped)]
-
-
 def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
     """Read one entry of a spec or a rule as the mesh axes it names."""
     if assignment is None:
@@ -253,14 +238,22 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
 
 
 def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.ndarray:
-    """The device array of a mesh whose data axis spans `spec.replicas` host groups."""
-    groups = granules(devices)
+    """The device array of a mesh whose data axis spans `spec.replicas` host groups.
+
+    A granule, the unit the slow network joins, is the TPU slice where the
+    devices span more than one and the process otherwise: GPU and CPU
+    devices report slice 0, and so does every host of one TPU slice, whose
+    hosts `replicas` then groups.
+    """
+    by_process = len({device.slice_index for device in devices}) == 1
+    granules = len({device.process_index if by_process else device.slice_index
+                    for device in devices})
     data = shape[0]
-    if len(groups) % spec.replicas or data % spec.replicas:
+    if granules % spec.replicas or data % spec.replicas:
         raise ValueError(
-            f"replicas {spec.replicas} must divide both the {len(groups)} granules "
+            f"replicas {spec.replicas} must divide both the {granules} granules "
             f"(slices, or processes) the devices form and the data axis of {data}")
-    per_replica = len(groups) // spec.replicas
+    per_replica = granules // spec.replicas
     if spec.fsdp % per_replica:
         raise ValueError(
             f"each of the {spec.replicas} replicas spans {per_replica} granules, "
@@ -269,8 +262,7 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
     dcn = (spec.replicas, 1, per_replica, 1, 1, 1)
     ici = tuple(size // outer for size, outer in zip(shape, dcn, strict=True))
     return mesh_utils.create_hybrid_device_mesh(
-        ici, dcn, devices, process_is_granule=len({d.slice_index for d in devices}) == 1,
-        allow_split_physical_axes=True)
+        ici, dcn, devices, process_is_granule=by_process, allow_split_physical_axes=True)
 
 
 def batch_divisor(mesh: Mesh, spec: MeshSpec) -> int:
