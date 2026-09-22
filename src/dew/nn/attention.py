@@ -1129,9 +1129,9 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     `segment_ids` keeps each packed document to itself (0 is padding) and
     `valid` `[B, S]` drops the keys it marks False.
 
-    No `[S, S]` array is built above two spans. A sliding window that
-    cudnn or splash takes as a flag runs there, whose kernels skip the
-    blocks outside it. Chunks that start at row multiples fold into the
+    No `[S, S]` array is built above two spans. A sliding window without
+    sinks that cudnn or splash takes as a flag runs there, whose kernels
+    skip the blocks outside it. Chunks that start at row multiples fold into the
     batch, one causal call per chunk, which every kernel takes. Everything
     else runs banded: the queries in blocks of the span, each against its
     own block and the one before, which holds every key a query of the
@@ -1164,7 +1164,9 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
             implementation, query, key, dtype=dtype, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, causal=True,
             sliding_window=window)
-        if resolved in ('cudnn', 'tpu') or length <= 2 * span:
+        # No fused kernel honours sinks, so a sink call bands wherever the
+        # window would otherwise go to one.
+        if (resolved in ('cudnn', 'tpu') and sinks is None) or length <= 2 * span:
             return scaled_dot_product_attention(
                 query, key, value, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
