@@ -326,7 +326,6 @@ class GatedDeltaNet(nn.Module):
     head_k_dim: int
     head_v_dim: int
     conv_kernel: int = 4
-    max_seq_len: int | None = None
     chunk_size: int = CHUNK_SIZE
     norm_eps: float = 1e-6
     gate_activation: str = 'silu'  # the norm's gate: 'silu' | 'sigmoid', qwen4_exp's output_gate_type

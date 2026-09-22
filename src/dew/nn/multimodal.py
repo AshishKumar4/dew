@@ -169,7 +169,6 @@ class MultimodalTransformer(nn.Module):
     audio_soft_tokens: int | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = None
 
     def setup(self):
         self.conditioner = VisionConditioner(

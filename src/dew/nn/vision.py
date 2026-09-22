@@ -717,7 +717,6 @@ class Gemma4VisionAttention(nn.Module):
     hidden_size: int
     num_heads: int
     num_key_value_heads: int
-    rope_theta: float = 100.0
     rms_norm_eps: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -817,7 +816,7 @@ class Gemma4VisionEncoderLayer(nn.Module):
         self.input_layernorm = norm(name="input_layernorm")
         self.self_attn = Gemma4VisionAttention(
             self.hidden_size, self.num_heads, self.num_key_value_heads,
-            rope_theta=self.rope_theta, rms_norm_eps=self.rms_norm_eps,
+            rms_norm_eps=self.rms_norm_eps,
             dtype=self.dtype, precision=self.precision,
             use_clipped_linears=self.use_clipped_linears, name="self_attn")
         self.post_attention_layernorm = norm(name="post_attention_layernorm")

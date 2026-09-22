@@ -52,7 +52,6 @@ class GatedDeltaNetMixer(MixerBase):
             head_k_dim=self.linear_key_head_dim,
             head_v_dim=self.linear_value_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
-            max_seq_len=ctx.max_seq_len,
             chunk_size=CHUNK_SIZE,
             norm_eps=ctx.norm_eps,
             gate_activation=self.output_gate_type,

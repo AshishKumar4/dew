@@ -45,7 +45,6 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from flax.typing import Dtype
 
 from .attention import unweighted_rmsnorm
 from .sharding import logical_axes
@@ -118,7 +117,6 @@ class HyperConnection(nn.Module):
     spec: HyperConnections
     emb_features: int
     norm_eps: float = 1e-5
-    dtype: Dtype | None = None
 
     @nn.compact
     def __call__(self, streams):

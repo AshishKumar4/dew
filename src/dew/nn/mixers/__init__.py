@@ -69,6 +69,9 @@ class MixerContext:
     o_proj_bias: bool | None = None
     attention_scale: float | None = None
     attention_sinks: bool = False
+    # `mla` arrives with the kind modules at the foot of this file, which
+    # is late enough because `from __future__ import annotations` defers
+    # this name until something resolves it.
     yarn: mla.YarnScaling | None = None
     attn_logit_softcap: float | None = None
     partial_rotary_factor: float | None = None

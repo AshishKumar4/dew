@@ -108,25 +108,6 @@ def deepseek_v2_aux_loss(scores, indices, alpha: float, seq_aux: bool = True):
     return global_router_loss(router_moments(scores, indices), alpha)
 
 
-def calculate_load_balance_updates(top_k_indices, num_experts, rate):
-    """
-    Computes a bias adjustment update based on expert load.
-    Used in DeepSeek V3: https://arxiv.org/html/2412.19437v1.
-    Implementation reference: https://arxiv.org/pdf/2408.15664.
-
-    Args:
-        top_k_indices: Shape (batch, sequence, top_k).
-        num_experts: Total number of experts.
-        rate: The update rate.
-
-    Returns:
-        update: The value to add to the expert bias. Shape (num_experts,).
-    """
-    flat_indices = top_k_indices.ravel()
-    expert_counts = jnp.sum(jax.nn.one_hot(flat_indices, num_experts, dtype=jnp.int32), axis=0)
-    return load_balance_update(expert_counts, rate)
-
-
 def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Array:
     """Bias displacement from nonnegative per-expert counts.
 
@@ -171,8 +152,8 @@ class Router(nn.Module):
     from the unbiased scores, so moving the bias changes which experts a token
     uses without changing what they contribute. Nothing here writes it;
     transformers holds it in an `nn.Buffer` and MaxText hands the update back
-    to its caller (`layers/moe.py:965-972`). `calculate_load_balance_updates`
-    is that update, and the step that applies it owns the write. Gradients
+    to its caller (`layers/moe.py:965-972`). `load_balance_update` is that
+    update, and the step that applies it owns the write. Gradients
     cannot reach the bias either, since it feeds only `jax.lax.top_k`'s
     integer indices.
 
