@@ -33,8 +33,8 @@ from PIL import Image
 
 import dew
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import Loading, OxfordFlowers
-from dew.data.images import ArrayRecordImages, pack_dict_of_byte_arrays
+from dew.data import ArrayRecordImages, Loading, OxfordFlowers
+from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.eval import clip_score, fid
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition

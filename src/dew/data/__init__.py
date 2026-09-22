@@ -30,6 +30,7 @@ from .images import (
                       CC3M,
                       CC12M,
                       AestheticCoyo,
+                      ArrayRecordImages,
                       Combined30M,
                       CombinedAesthetic,
                       CombinedMsml612,
@@ -61,7 +62,8 @@ from .text import ByteTokenizer, HFTokenizer, tokenizer_for
 from .tokens import PackedTokens, TokenWindows
 from .video import LocalVideos, VideoDataset, VoxCeleb2
 
-__all__ = ["CC3M", "CC12M", "IDS_KEY", "MASK_KEY", "AestheticCoyo", "AutoAudioProcessor", "AutoTextTokenizer",
+__all__ = ["CC3M", "CC12M", "IDS_KEY", "MASK_KEY", "AestheticCoyo", "ArrayRecordImages",
+           "AutoAudioProcessor", "AutoTextTokenizer",
            "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable", "Combined30M", "CombinedAesthetic",
            "CombinedMsml612", "CombinedOnline", "Corpus", "Dataset", "DatasetSpec", "DiffusionDB",
            "HFDatasetSource", "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "ImageDataset",
