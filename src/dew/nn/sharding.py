@@ -24,8 +24,10 @@ tests/test_architectures.py reports a declared or heuristic name that no
 parameter carries any more, so a renamed submodule fails there.
 
 The mesh axis names live here too, with the readers of the mesh in context:
-`pipeline_stages` for the decoder's stage count and `microbatches` for the
-schedule the trainer puts in context around its compiled step.
+`pipeline_stages` for the decoder's stage count, `microbatches` for the
+schedule the trainer puts in context around its compiled step, and
+`sequence_shards` with `sequence_exchange` for how attention splits a
+sequence.
 """
 
 from __future__ import annotations
@@ -34,11 +36,13 @@ import contextlib
 import contextvars
 import fnmatch
 from collections.abc import Iterable, Iterator, Mapping
+from typing import Literal
 
 import jax
 
 type LogicalAxes = tuple[str | None, ...]
 type Suffix = tuple[str, ...]
+type SequenceExchange = Literal['all_to_all', 'all_gather']
 
 DATA_AXIS = 'data'
 EXPERT_AXIS = 'expert'
@@ -60,6 +64,8 @@ HEURISTIC: set[Suffix] = set()
 
 _MICROBATCHES: contextvars.ContextVar[int | None] = contextvars.ContextVar(
     'pipeline_microbatches', default=None)
+_SEQUENCE_EXCHANGE: contextvars.ContextVar[SequenceExchange] = contextvars.ContextVar(
+    'sequence_exchange', default='all_to_all')
 
 
 def pipeline_stages() -> int:
@@ -98,10 +104,36 @@ def sequence_shards() -> int:
 
     The trainer runs its compiled step under `jax.set_mesh`, so the mesh is
     in context while the step traces; a model called outside
-    it sees whole sequences.
+    it sees whole sequences. So does code inside a `shard_map` that took the
+    sequence axis manual: each of its instances holds whatever it was handed,
+    which is how the all-to-all exchange runs a whole-sequence kernel.
     """
     mesh = jax.sharding.get_abstract_mesh()
-    return 1 if mesh.empty else mesh.shape.get(SEQUENCE_AXIS, 1)
+    if mesh.empty or SEQUENCE_AXIS in mesh.manual_axes:
+        return 1
+    return mesh.shape.get(SEQUENCE_AXIS, 1)
+
+
+@contextlib.contextmanager
+def sequence_exchange_of(exchange: SequenceExchange) -> Iterator[None]:
+    """Which collective attention uses over the sequence axis, for the model
+    that traces inside; `sequence_exchange` reads it."""
+    token = _SEQUENCE_EXCHANGE.set(exchange)
+    try:
+        yield
+    finally:
+        _SEQUENCE_EXCHANGE.reset(token)
+
+
+def sequence_exchange() -> SequenceExchange:
+    """The collective in context, 'all_to_all' unless a caller set another.
+
+    'all_to_all' is DeepSpeed Ulysses: every shard trades its slice of the
+    sequence for a slice of the heads, attends whole sequences, and trades
+    back. 'all_gather' keeps the queries split and gathers every key and
+    value whole. `dew.nn.attention.sequence_parallel_attention` runs both.
+    """
+    return _SEQUENCE_EXCHANGE.get()
 
 
 def logical_axes(declared: Mapping[Suffix, LogicalAxes], *,
