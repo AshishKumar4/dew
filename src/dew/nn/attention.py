@@ -21,6 +21,7 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
+from .precision import precision_names
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
@@ -710,22 +711,6 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
                      mask=mask, bias=bias)
     return checkpoint_name(out, 'attention_output')
-
-
-def precision_names(precision: PrecisionLike) -> frozenset[str]:
-    """The names a `PrecisionLike` spells, upper case and unordered.
-
-    flax's alias is four shapes at once: None, a string, a
-    `jax.lax.Precision`, or a pair of either for the two operands. A fused
-    path has to refuse HIGH and HIGHEST whichever shape the caller wrote, so
-    this reads the union rather than asking each member what it is: the enum
-    carries the name, a string is the name, and the pair is both operands'.
-    """
-    if precision is None:
-        return frozenset()
-    written = (precision,) if isinstance(precision, str | jax.lax.Precision) else precision
-    return frozenset((one.name if isinstance(one, jax.lax.Precision) else one).upper()
-                     for one in written if one is not None)
 
 
 def refuse_reference_only_arguments(implementation, query, dtype, precision,

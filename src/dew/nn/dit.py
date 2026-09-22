@@ -20,6 +20,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from .attention import LayerNorm, NormalAttention, rotary_freqs
 from .blocks import FourierEmbedding, TimeProjection
+from .precision import fp32_result_dot_general
 from .scan_orders import (
     build_2d_sincos_pos_embed,
     hilbert_indices,
@@ -257,8 +258,11 @@ class PatchSequenceOutput(nn.Module):
 
         x_out = nn.Dense(
             features=self.patch_size * self.patch_size * self.output_channels,
-            dtype=jnp.float32,  # the loss is computed in fp32
+            dtype=self.dtype,
             precision=self.precision,
+            # The loss is computed in fp32, so the result and the accumulation
+            # are fp32 while the operands stay in the compute dtype.
+            dot_general=fp32_result_dot_general(self.precision),
             kernel_init=nn.initializers.zeros,
             name="final_proj",
         )(x_out)
