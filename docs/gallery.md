@@ -1,14 +1,16 @@
 # Gallery: historical FlaxDiff experiments
 
-These images come from the project's earlier FlaxDiff experiments. The settings below preserve the recorded run descriptions, including their old scheduler and model names. They are historical results, not runnable configurations for today's Dew API or evidence that a current checkout reproduces the images.
+> An AI assistant maintains this document. It is presented as-is.
 
-The gallery records training data, image sizes, sampling settings, and some model fields. It does not provide a complete environment, checkpoint, seed record, or quality evaluation for each run. For a current workflow, start with [recipes](recipes.md) and the [diffusion guide](guides/diffusion.md). For timed measurements with revision and hardware context, see [benchmarks](benchmarks.md).
+These images come from my earlier experiments with FlaxDiff, the project Dew grew out of. The settings below copy the run descriptions I recorded at the time, including the old scheduler and model names. You cannot run them as configurations with today's Dew API, and they do not show that a current checkout reproduces these images.
+
+For each run the gallery records the training data, the image size, the sampling settings, and some model fields. It has no complete environment, checkpoint, seed record, or quality evaluation for any of them. For a current workflow, start with [recipes](recipes.md) and the [diffusion guide](guides/diffusion.md). For timed measurements with their revision and hardware, see [benchmarks](benchmarks.md).
 
 ## Text-to-image on a mixed captioned dataset
 
-The recorded model trained on LAION-Aesthetics 12M, CC12M, MS COCO, and a one-million-image aesthetic-6+ subset of COYO-700M on a TPU-v4-32 slice. Sampling used Euler ancestral sampling for 200 steps with classifier-free guidance (CFG). CFG combines conditional and unconditional predictions to control how strongly sampling follows the text condition.
+This model trained on LAION-Aesthetics 12M, CC12M, MS COCO, and a one-million-image subset of COYO-700M with aesthetic score 6 or higher, on a TPU-v4-32 slice. Sampling used Euler ancestral sampling for 200 steps with classifier-free guidance (CFG). CFG mixes the model's conditional and unconditional predictions to control how closely sampling follows the text.
 
-The displayed batch used repetitions of the prompt “a beautiful landscape with a river with mountains.” The historical record does not give the guidance scale for this grid.
+Every image in the grid used the same prompt, "a beautiful landscape with a river with mountains." My record does not give the guidance scale for this grid.
 
 | Setting | Recorded value |
 | --- | --- |
@@ -24,7 +26,7 @@ The displayed batch used repetitions of the prompt “a beautiful landscape with
 
 ## Text-to-image on Oxford Flowers
 
-This run used Oxford Flowers 102, Euler ancestral sampling for 200 steps, and CFG scale 2. The recorded prompt sequence was:
+This run used Oxford Flowers 102, Euler ancestral sampling for 200 steps, and CFG scale 2. The prompts, in grid order, were:
 
 > water tulip; a water lily; a water lily; a water lily; a photo of a marigold; a water lily; a water lily; a photo of a lotus; a photo of a lotus; a photo of a lotus; a photo of a rose; a photo of a rose; a photo of a rose; a photo of a rose; a photo of a rose
 
@@ -41,7 +43,7 @@ This run used Oxford Flowers 102, Euler ancestral sampling for 200 steps, and CF
 
 ## Unconditional Oxford Flowers with DDPM
 
-An unconditional model generates without a text prompt. This grid used DDPM sampling for 1,000 steps, with `CosineNoiseScheduler` for both training and inference.
+An unconditional model generates images without a text prompt. This grid used DDPM sampling for 1,000 steps, with `CosineNoiseScheduler` for both training and inference.
 
 | Setting | Recorded value |
 | --- | --- |
@@ -56,13 +58,13 @@ An unconditional model generates without a text prompt. This grid used DDPM samp
 | Residual blocks | 2 |
 | Middle residual blocks | 1 |
 
-The attention list and feature-depth list above reproduce the old record, not a constructor call for the current UNet.
+The attention list and the feature-depth list copy the old record. They are not arguments you can pass to the current UNet.
 
 ![Historical unconditional Oxford Flowers grid using 1000-step DDPM sampling](assets/gallery/ddpm2.png)
 
 ## Unconditional Oxford Flowers with Heun
 
-This grid used a recorded 10-step Heun sampler. Heun uses a predictor and a correction evaluation on a sampling interval; exact network-evaluation counts depend on the solver's endpoint handling. The older caption reported 20 model evaluations, but the gallery does not retain a trace that verifies that count.
+This grid used a 10-step Heun sampler. Heun takes a prediction step and then a correction on each sampling interval, so the exact number of network evaluations depends on how the solver handles the last step. The old caption said 20 model evaluations, but I kept no trace that confirms that count.
 
 | Setting | Recorded value |
 | --- | --- |
@@ -76,4 +78,4 @@ This grid used a recorded 10-step Heun sampler. Heun uses a predictor and a corr
 
 ![Historical unconditional Oxford Flowers grid using 10-step Heun sampling](assets/gallery/heun.png)
 
-These grids do not form a controlled sampler comparison: the descriptions do not establish identical checkpoints, seeds, or training settings. Keep the dataset licenses and any access conditions in mind if you prepare a new run with the named data; the gallery does not redistribute those datasets. [References and attribution](references.md) identifies the research and upstream implementations behind these methods.
+Do not read these grids as a controlled comparison of samplers. The records do not show that they used the same checkpoints, seeds, or training settings. If you prepare a new run with any of these datasets, check its license and access conditions; the gallery does not redistribute the datasets. [References and attribution](references.md) lists the research and the upstream implementations behind these methods.
