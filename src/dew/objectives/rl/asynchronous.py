@@ -205,12 +205,12 @@ class AsyncRollout:
 
         def score() -> None:
             try:
-                result = draw.result()
-                text = self.decode(result.tokens[:len(result.tokens) - int(result.terminated)])
+                drawn = draw.result()
+                text = self.decode(drawn.tokens[:len(drawn.tokens) - int(drawn.terminated)])
                 value = float(self.reward(entry.sources[row], text, entry.truths[row], entry.infos[row]))
                 if not math.isfinite(value):
                     raise ValueError("the reward returned a non-finite score")
-                scored.set_result((result, value))
+                scored.set_result((drawn, value))
             except BaseException as failure:
                 scored.set_exception(failure)
 
