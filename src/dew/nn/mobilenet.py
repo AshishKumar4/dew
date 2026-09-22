@@ -29,6 +29,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .attention import scaled_dot_product_attention
+from .blocks import torch_nearest_resize
 from .sharding import logical_axes
 
 
@@ -352,14 +353,6 @@ class MobileStage(nn.Module):
         return x
 
 
-def _nearest(x, height: int, width: int):
-    # PyTorch's 'nearest' uses floor(dst * src / dst_size), not the
-    # half-pixel coordinates of JAX's nearest resize.
-    rows = jnp.arange(height) * x.shape[1] // height
-    columns = jnp.arange(width) * x.shape[2] // width
-    return jnp.take(jnp.take(x, rows, axis=1), columns, axis=2)
-
-
 class MobileMultiScaleFusion(nn.Module):
     resolution: int
     dtype: Dtype | None = None
@@ -368,7 +361,7 @@ class MobileMultiScaleFusion(nn.Module):
     @nn.compact
     def __call__(self, inputs: tuple[jax.Array, ...]):
         height, width = inputs[0].shape[1:3]
-        resized = tuple(_nearest(x, height, width) if x.shape[1:3] != (height, width)
+        resized = tuple(torch_nearest_resize(x, height, width) if x.shape[1:3] != (height, width)
                         else x for x in inputs)
         x = jnp.concatenate(resized, axis=-1)
         x = MobileResidual(_Block("inverted", 2048, expansion=2), 2048,

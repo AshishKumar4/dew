@@ -58,6 +58,18 @@ class TimeProjection(nn.Module):
         return self.activation(nn.DenseGeneral(self.features)(x))
 
 
+def torch_nearest_resize(x, height: int, width: int):
+    """Resample `[B, H, W, C]` to `height` by `width`, torch's nearest rule.
+
+    PyTorch's 'nearest' reads source index `floor(dst * src / dst_size)`,
+    not the half-pixel coordinates of `jax.image.resize`, so a converted
+    checkpoint only reproduces its reference through this arithmetic.
+    """
+    rows = jnp.arange(height) * x.shape[1] // height
+    columns = jnp.arange(width) * x.shape[2] // width
+    return jnp.take(jnp.take(x, rows, axis=1), columns, axis=2)
+
+
 @logical_axes({}, heuristic=(("Conv_*",),))
 class Upsample(nn.Module):
     """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`."""
