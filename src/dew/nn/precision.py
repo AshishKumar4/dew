@@ -39,7 +39,7 @@ def precision_names(precision: PrecisionLike) -> frozenset[str]:
 
 
 def bf16_operand_precision(dtype: Dtype | None,
-                           precision: PrecisionLike = None) -> PrecisionLike:
+                           precision: PrecisionLike = None) -> jax.lax.PrecisionLike:
     """The precision that keeps a bf16 dot bf16 in both directions.
 
     A caller that asked for more than the default precision keeps what it
