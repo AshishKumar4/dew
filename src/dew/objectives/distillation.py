@@ -65,13 +65,13 @@ FeatureLoss = Literal["cosine", "l2"]
 
 
 def _schedule(value: Weight) -> optax.Schedule:
-    """A constant as the step-indexed schedule every weight is read as."""
+    """Wrap a constant as the step-indexed schedule every weight is read as."""
     return value if callable(value) else optax.constant_schedule(value)
 
 
 @objectives("distillation")
 class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
-    """The student's loss mixed with a frozen teacher's soft targets."""
+    """Mix the student's own loss with a frozen teacher's soft targets."""
 
     def __init__(
         self,
@@ -84,9 +84,11 @@ class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
         beta: Weight = 0.0,
         feature_loss: FeatureLoss = "cosine",
     ):
-        """`alpha` weights the KL against the student's own loss (MaxText's
-        `distill_alpha`), `temperature` softens both distributions before
-        the KL and scales it by its square (`distill_temperature`).
+        """Build a distillation of `teacher` into `student` over one batch.
+
+        `alpha` weights the KL against the student's own loss (MaxText's
+        `distill_alpha`), and `temperature` softens both distributions
+        before the KL and scales it by its square (`distill_temperature`).
 
         `features` names `(teacher layer, student layer)` pairs whose output
         states the feature term compares, `beta` weights it
@@ -121,7 +123,7 @@ class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
             select=lambda path: path[0] != TEACHER and averaged.select(path))
 
     def held_variables(self) -> Variables | None:
-        """The student's held tree, if any, with the teacher's under `teacher`."""
+        """Return the student's held tree, if any, with the teacher's under `teacher`."""
         held = dict(self.student.held_variables() or {})
         teacher = self.teacher.held_variables()
         if teacher is not None:
@@ -152,8 +154,11 @@ class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
         return tree
 
     def student_variables(self, params: Variables) -> Variables:
-        """The student's own tree out of the whole: what its methods read,
-        and what a distilled checkpoint hands on to a plain student run."""
+        """Cut the student's own tree out of the whole.
+
+        That is what the student's methods read, and what a distilled
+        checkpoint hands on to a plain student run.
+        """
         own = {name: value for name, value in params.items() if name != TEACHER}
         if PROJECTIONS in own["params"]:
             own["params"] = {name: value for name, value in own["params"].items() if name != PROJECTIONS}
@@ -164,7 +169,7 @@ class DistillationObjective(Objective[Mean, Effects], Generic[Loss, Effects]):
 
     def _predictions(self, params: Variables, batch: Batch, step: Step
                      ) -> tuple[Mean, Aux[Effects], Prediction, Prediction]:
-        """Both sides over the batch: the student training, the teacher not."""
+        """Score both sides over the batch: the student training, the teacher not."""
         statistics, aux, student = self.student.predict(
             self.student_variables(params), batch, self._student_step(step), train=True,
             layers=tuple(student_layer for _, student_layer in self.features))

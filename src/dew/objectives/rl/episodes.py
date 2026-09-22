@@ -55,7 +55,7 @@ class EpisodeStatus(IntEnum):
 
 @dataclass(frozen=True)
 class EpisodeId:
-    """An attempt-local sample identity, reproducible from checkpointed work.
+    """Identify one sample within an attempt, reproducibly from checkpointed work.
 
     The harness can use this identity for its own idempotency records. Dew
     does not guarantee exactly-once external effects across process failure.
@@ -69,7 +69,7 @@ class EpisodeId:
 
 @dataclass(frozen=True)
 class Observation:
-    """The exact next model context, or a terminal environment result.
+    """Carry the exact next model context, or a terminal environment result.
 
     The harness owns chat formatting, tool-call parsing, and context
     compaction. Terminal contexts may be empty. Detail can hold a verifier
@@ -91,7 +91,7 @@ class Observation:
 
 @dataclass(frozen=True)
 class Action:
-    """One actual model call, including EOS and both likelihood distributions.
+    """Record one actual model call, including EOS and both likelihood distributions.
 
     Raw probabilities belong to the unmodified model; behavior probabilities
     include Sampling controls. EOS ends the model turn, not the episode.
@@ -163,7 +163,7 @@ class Environment(Protocol):
 
 @runtime_checkable
 class RecoverableEnvironment(Environment, Protocol):
-    """Opaque snapshots restore tool state without replaying completed calls."""
+    """Restore tool state from an opaque snapshot, without replaying completed calls."""
 
     def get_state(self) -> bytes: ...
 
@@ -175,7 +175,7 @@ EpisodeRecorder = Callable[[Episode], None]
 
 
 class EpisodeInference(Protocol):
-    """A bindable autoregressive policy returning actual sampling likelihoods."""
+    """Draw actions from a bound policy, returning the actual sampling likelihoods."""
 
     def bind(self, variables: Variables, /) -> EpisodeInference: ...
 
@@ -184,7 +184,7 @@ class EpisodeInference(Protocol):
 
 
 class EpisodeFailure(RuntimeError):
-    """Collection failed; the partial episode remains available to the caller."""
+    """Report a failed collection, keeping the partial episode available to the caller."""
 
     def __init__(self, episode: Episode):
         self.episode = episode
@@ -219,6 +219,11 @@ class _Session:
     error: BaseException | None = None
 
     def invoke(self, operation: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs) -> _T:
+        """Call `operation`, remembering the error it raised on this slot.
+
+        The abort path names the slot that failed first, which is what
+        separates the one true error from the cancellations beside it.
+        """
         try:
             return operation(*args, **kwargs)
         except BaseException as error:
@@ -226,6 +231,11 @@ class _Session:
             raise
 
     def observe(self, observation: Observation) -> None:
+        """Adopt an environment's observation as this slot's current state.
+
+        An explicit error or cancellation stops the slot here, so the
+        cohort aborts instead of sampling another turn from it.
+        """
         if not isinstance(observation, Observation):
             raise TypeError("environment methods must return an Observation")
         self.observation = observation
@@ -234,12 +244,13 @@ class _Session:
             raise _StatusStop(self.detail)
 
     def episode(self, policy_step: int, binding_id: str) -> Episode:
+        """Freeze this slot's progress into an `Episode` record."""
         return Episode(self.identity, policy_step, self.initial, tuple(self.transitions),
                        self.status, self.detail, self.reward, _binding_id=binding_id)
 
 @dataclass(frozen=True)
 class EpisodeRollout:
-    """Collect complete groups under one policy snapshot, then train actions.
+    """Collect complete episode groups under one policy snapshot, then train on their actions.
 
     Input batches contain integer task_id rows. The environment factory
     resolves each task and owns its tools, timeouts and isolation. A finite
@@ -282,6 +293,7 @@ class EpisodeRollout:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
 
     def _persist(self, slot: _Session, run: JournalRun | None, policy_step: int, binding: str) -> None:
+        """Commit one slot's turn and environment snapshot, when a journal is open."""
         if run is not None:
             environment = slot.environment
             if not isinstance(environment, RecoverableEnvironment):
@@ -293,6 +305,11 @@ class EpisodeRollout:
 
     def _open(self, slots: list[_Session], stack: ExitStack, run: JournalRun | None,
               policy_step: int, binding: str) -> None:
+        """Enter every slot's environment and put it at its starting observation.
+
+        A journalled slot with a saved turn restores that snapshot instead
+        of resetting, so a resumed cohort never repeats a completed call.
+        """
         for slot in slots:
             slot.environment = slot.invoke(lambda: stack.enter_context(self.environment(slot.identity)))
             saved = None if run is None else slot.invoke(run.load, slot.identity)
@@ -312,6 +329,12 @@ class EpisodeRollout:
                 slot.status, slot.detail = episode.status, episode.detail
 
     def _inputs(self, slots: list[_Session], turn: int) -> ModelInputs:
+        """Pack this turn's contexts into one right-aligned cohort of rows.
+
+        A slot that is finished, or whose context does not fit, still
+        occupies its row: the shapes have to match across ranks, and its
+        draw is discarded rather than skipped.
+        """
         tokens = np.full((len(slots), self.max_prompt_tokens), self.sampling.pad_id, np.int32)
         valid = np.zeros_like(tokens, bool)
         for row, slot in enumerate(slots):
@@ -335,6 +358,11 @@ class EpisodeRollout:
 
     def _advance(self, slots: list[_Session], generation: Generation, policy_step: int,
                  binding_id: str, turn: int, run: JournalRun | None) -> None:
+        """Record this turn's draws, then step each slot's environment with them.
+
+        A model turn that stopped on its token limit instead of EOS
+        truncates the episode rather than calling the environment.
+        """
         if not isinstance(generation, Generation):
             raise TypeError("tool episodes require an autoregressive Generation")
         rows = generation.host()
@@ -366,6 +394,11 @@ class EpisodeRollout:
             self._persist(slot, run, policy_step, binding_id)
 
     def _verify(self, slots: list[_Session], policy_step: int, binding_id: str, run: JournalRun | None) -> None:
+        """Score every unscored slot with the verifier and persist the reward.
+
+        A slot still running when the turn budget ran out is truncated
+        first, so it is scored as the episode it actually produced.
+        """
         for slot in slots:
             if slot.reward is not None:
                 continue
@@ -381,6 +414,12 @@ class EpisodeRollout:
 
     def _failed(self, slots: list[_Session], error: BaseException,
                 policy_step: int, binding_id: str) -> None:
+        """Abort the whole cohort and raise for the slot that failed first.
+
+        One slot carries the error and the rest are cancelled, so a
+        partial group never reaches an update. Every started slot is
+        recorded before the exception propagates.
+        """
         started = [slot for slot in slots if slot.environment is not None or slot.error is not None]
         if not started:
             raise error
@@ -410,7 +449,11 @@ class EpisodeRollout:
 
     def _action(self, generation: Generation[np.ndarray], row: int, context: tuple[int, ...], policy_step: int,
                 binding_id: str) -> Action:
-        """Validate a cohort row's provenance before an environment acts."""
+        """Read one cohort row as an `Action`, validating its provenance first.
+
+        The environment acts on this record, so the row has to carry back
+        the exact context that was requested.
+        """
         tokens = np.asarray(generation.tokens)[row]
         lengths, ended = np.asarray(generation.lengths), np.asarray(generation.terminated)
         raw, behavior = np.asarray(generation.raw_log_probs)[row], np.asarray(generation.behavior_log_probs)[row]
@@ -513,7 +556,7 @@ class EpisodeRollout:
         return agreed("episode projection", lambda: self.project(episodes))
 
     def project(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
-        """GRPO action rows with one group-relative advantage per episode."""
+        """Build GRPO action rows with one group-relative advantage per episode."""
         batch = self.tensors(episodes)
         rewards = jnp.asarray([episode.reward for episode in episodes], jnp.float32)
         advantages = np.asarray(group_advantage(rewards, self.groups))
@@ -522,7 +565,9 @@ class EpisodeRollout:
         return batch
 
     def tensors(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
-        """Project action tokens from one collection; padded turns have zero support.
+        """Project one collection's action tokens into fixed-width rows.
+
+        Padded turns have zero support.
 
         Every episode and action must retain that collection's private binding
         origin. Equal training clocks do not establish equal weight snapshots.

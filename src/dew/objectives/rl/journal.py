@@ -35,16 +35,30 @@ def policy_digest(variables: Variables) -> str:
 
 @dataclass(frozen=True)
 class SavedTurn:
+    """One committed turn: the episode so far, any pending action, the snapshot."""
+
     episode: Episode
     pending: Action | None
     snapshot: bytes
 
 
 class JournalRun:
+    """Read and write one cohort's turns in an open journal connection.
+
+    Every write commits before the next tool call, so a run that dies
+    between turns resumes from the last committed one.
+    """
+
     def __init__(self, connection: sqlite3.Connection, cohort: str, binding: str):
         self.connection, self.cohort, self.binding = connection, cohort, binding
 
     def align(self, binding: str) -> None:
+        """Adopt `binding` as this cohort's collection origin.
+
+        A cohort that already holds turns keeps the binding it was
+        recorded under, so ranks cannot disagree about which snapshot the
+        stored actions were drawn from.
+        """
         if binding == self.binding:
             return
         if self.connection.execute("SELECT 1 FROM turns WHERE cohort=? LIMIT 1", (self.cohort,)).fetchone():
@@ -54,6 +68,7 @@ class JournalRun:
         self.binding = binding
 
     def load(self, identity: EpisodeId) -> SavedTurn | None:
+        """Read one sample's saved turn, or None when it has none yet."""
         row = self.connection.execute("SELECT episode, pending, snapshot FROM turns WHERE cohort=? AND sample=?",
                                       (self.cohort, identity.sample)).fetchone()
         if row is None:
@@ -64,6 +79,7 @@ class JournalRun:
         return SavedTurn(episode, None if row[1] is None else action_record(json.loads(row[1])), bytes(row[2]))
 
     def save(self, episode: Episode, pending: Action | None, snapshot: bytes) -> None:
+        """Commit one sample's episode, its pending action and the environment snapshot."""
         if episode._binding_id != self.binding:
             raise ValueError("journal cannot mix collection bindings")
         encoded = json.dumps(episode_record(episode), allow_nan=False)
@@ -89,6 +105,12 @@ class EpisodeJournal:
 
     @contextmanager
     def open(self, cohort: str, signature: str, binding: str) -> Iterator[JournalRun]:
+        """Open this rank's journal file and yield the run for one cohort.
+
+        The file is locked for the caller alone. A cohort that is already
+        recorded has to present the same signature, and its stored binding
+        wins over the caller's.
+        """
         directory = Path(self.directory)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"rank-{jax.process_index()}.sqlite"

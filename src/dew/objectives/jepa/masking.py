@@ -27,7 +27,7 @@ import jax.numpy as jnp
 
 
 def _factorizations(area: int, grid: tuple[int, int], aspect: tuple[float, float]):
-    """(h, w) pairs of the given area that fit the grid and the aspect range."""
+    """List the (h, w) pairs of the given area that fit the grid and the aspect range."""
     H_P, W_P = grid
     pairs = []
     for h in range(1, min(H_P, area) + 1):
@@ -41,7 +41,7 @@ def _factorizations(area: int, grid: tuple[int, int], aspect: tuple[float, float
 
 @dataclass(frozen=True)
 class MultiBlockMask:
-    """Static mask geometry for one patch grid, plus the sampler over it."""
+    """Hold one patch grid's static mask geometry, and sample masks over it."""
     grid: tuple[int, int]
     num_targets: int
     block_shapes: tuple[tuple[int, int], ...]
@@ -57,7 +57,11 @@ class MultiBlockMask:
         return h * w
 
     def sample(self, rng: jax.Array, batch_size: int):
-        """Draw (context_idx [B, num_context], target_idx [B, M, block_area])."""
+        """Draw one batch of context and target token indices.
+
+        Returns the context indices, `[B, num_context]`, and the target
+        indices, `[B, num_targets, block_area]`.
+        """
         H_P, W_P = self.grid
         S = self.num_patches
         M = self.num_targets

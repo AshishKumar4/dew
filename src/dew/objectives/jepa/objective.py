@@ -43,7 +43,7 @@ LABEL_KEY = "label"
 
 
 def representation_health(z) -> dict[str, jax.Array]:
-    """Collapse telemetry for pooled embeddings [B, D].
+    """Report collapse telemetry for pooled embeddings [B, D].
 
     repr_std is the per-dimension standard deviation across the batch. It goes
     to zero exactly when the encoder stops distinguishing inputs. repr_cov_offdiag
@@ -123,7 +123,8 @@ class JepaObjective(Objective[Mean]):
     def encode(self, encoder_params, samples, token_idx=None, train=False, rngs=None) -> jax.Array:
         features = self.encoder.apply({"params": encoder_params}, samples, token_idx,
                                       train=train, rngs=rngs)
-        assert not isinstance(features, tuple)  # no mutable collections were asked for
+        # `mutable` is unset, so apply returns the output alone, not a pair.
+        assert not isinstance(features, tuple)
         return features
 
     def _target_params(self, step: Step):
@@ -166,7 +167,8 @@ class JepaObjective(Objective[Mean]):
             target_idx.reshape(batch_size * num_targets, -1),
             train=True, rngs={"dropout": dropout_key},
         )
-        assert not isinstance(predictions, tuple)  # no mutable collections were asked for
+        # `mutable` is unset, so apply returns the output alone, not a pair.
+        assert not isinstance(predictions, tuple)
         predictions = predictions.reshape(targets.shape)
 
         squared = (predictions.astype(jnp.float32) - targets.astype(jnp.float32)) ** 2

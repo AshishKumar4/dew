@@ -44,7 +44,7 @@ def _texts(rows: np.ndarray) -> list[str]:
 
 @dataclasses.dataclass(frozen=True)
 class SampledRollout:
-    """G completions per prompt, in prompt-major group order.
+    """Draw G completions per prompt, in prompt-major group order.
 
     EOS is a valid action in the response mask but excluded from reward text.
     Output rectangles preserve the input prompt width and configured response
@@ -68,6 +68,12 @@ class SampledRollout:
             raise ValueError("the advantage families are 'group' and 'rloo'")
 
     def __call__(self, state, batch, key: jax.Array) -> dict[str, np.ndarray]:
+        """Draw `groups` completions per prompt and pack them as GRPO rows.
+
+        Every group is drawn from one policy snapshot, scored by `reward`
+        and centred within its prompt's group. The returned columns are
+        the batch a GRPO loss reads.
+        """
         # Validation completes on every rank before generation enters collectives.
         prepared = None
         error = None

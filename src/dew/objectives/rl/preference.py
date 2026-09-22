@@ -26,7 +26,9 @@ from ..lm import LMObjective
 
 @objectives("dpo")
 class DPOObjective(LMObjective):
-    """The DPO loss (arXiv:2305.18290, eq. 7) on a frozen reference.
+    """Train a policy on preference pairs with the DPO loss (arXiv:2305.18290, eq. 7).
+
+    The reference is frozen.
 
     `beta` is the KL strength; `model` and `seq_len` are the LMObjective's,
     with `seq_len` one below the row width. The reference never moves, so an
@@ -52,9 +54,12 @@ class DPOObjective(LMObjective):
         self.beta = beta
 
     def _halves(self, batch):
-        """The batch as chosen and rejected halves with the shifted mask: the
-        pair index read out explicitly, so shuffling never fuses two pairs.
-        Refuses flat stacks, misaligned masks and rows outside the window."""
+        """Split the batch into chosen and rejected halves with the shifted mask.
+
+        The pair index is read out explicitly, so shuffling never fuses
+        two pairs. Flat stacks, misaligned masks and rows outside the
+        window are refused.
+        """
         try:
             ids = jnp.asarray(batch[IDS_KEY])
         except KeyError:
@@ -84,6 +89,7 @@ class DPOObjective(LMObjective):
         return (ids[:, 0], ids[:, 1], mask[:, 0, 1:], mask[:, 1, 1:])
 
     def loss(self, params, batch, step):
+        """Score the preference term over each pair's completion tokens."""
         if step.ema is None:
             raise ValueError(
                 "the DPO reference reads step.ema, but the objective keeps no EMA; "
@@ -108,8 +114,11 @@ class DPOObjective(LMObjective):
         return super().preview(params, batch, dataclasses.replace(step, ema=None), scored=scored)
 
     def evaluate(self, params, batch, step):
-        """The chosen responses' perplexity under the policy: the per-token
-        cross entropies with the shifted completion mask as weights."""
+        """Score the chosen responses' perplexity under the policy.
+
+        The per-token cross entropies carry the shifted completion mask as
+        weights.
+        """
         chosen_ids, _, chosen_mask, _ = self._halves(batch)
         losses = -self.per_token_log_probs(params, chosen_ids)
         weights = chosen_mask.astype(losses.dtype)
