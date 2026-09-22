@@ -28,8 +28,8 @@ carries the choice: a `ModelConfig`, the modules' `attention_impl` field and
 dtype, precision and force_fp32_for_softmax; 'xla' and 'cudnn' are
 `jax.nn.dot_product_attention`'s own two; 'tpu' is the pallas splash kernel,
 with the older pallas flash kernel behind it for the calls splash's mask
-descriptor cannot carry; 'auto' is cudnn where its kernel runs and xla anywhere
-else, resolved per trace. A module field
+descriptor cannot carry; 'auto' is cudnn where its kernel runs, 'tpu' where
+splash's does, and xla anywhere else, resolved per trace. A module field
 spells 'reference' as None as well, which is what a module built in code
 without the field set runs.
 """
@@ -664,10 +664,12 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
       that reads dtype, precision and force_fp32_for_softmax.
     - 'auto': 'cudnn' where its kernel runs (a gpu backend, bf16 or fp16
       inputs, a query head width that is a multiple of 8 and at most 128, no
-      softcap, and no `--xla_gpu_deterministic_ops` on the run), 'xla'
-      anywhere else. Resolved per trace, so a config logged as 'auto' still
-      runs on the next machine. A tpu backend gets xla here until the rule
-      reads splash's own constraints.
+      softcap, and no `--xla_gpu_deterministic_ops` on the run), then 'tpu'
+      where splash's does (`tpu_runs`: a tpu backend, bf16 or fp32 inputs,
+      query and key lengths that are multiples of 128, no bias, no mesh
+      splitting the sequence, and a mask splash can describe), 'xla' anywhere
+      else. Resolved per trace, so a config logged as 'auto' still runs on
+      the next machine.
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
@@ -777,7 +779,13 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             precision=precision, force_fp32_for_softmax=force_fp32_for_softmax)
 
     if implementation == 'auto':
-        implementation = 'cudnn' if cudnn_runs(query, softcap) else 'xla'
+        if cudnn_runs(query, softcap):
+            implementation = 'cudnn'
+        elif tpu_runs(query, key, softcap, causal=causal, sliding_window=sliding_window,
+                      mask=mask, bias=bias):
+            implementation = 'tpu'
+        else:
+            implementation = 'xla'
     if softcap is not None and implementation in ('cudnn', 'tpu'):
         raise ValueError(
             f"attention implementation '{implementation}' cannot apply an "
@@ -888,6 +896,49 @@ SPLASH_DTYPES = (jnp.bfloat16, jnp.float32)
 # stored dense inside it, so this bounds host and executable bytes, not
 # device memory that grows with the batch. 4 Mi cells is a 16-head 512x512.
 SPLASH_DENSE_MASK_CELLS = 1 << 22
+
+
+def tpu_runs(query, key, softcap=None, *, causal=False, sliding_window=None,
+             mask=None, bias=None) -> bool:
+    """Whether splash takes this call: a tpu backend, one of the two dtypes a
+    TPU matmul reads, sequence lengths its mask blocking can tile, a mask it
+    can describe, and neither of the two things no fused kernel does.
+
+    'auto' asks this after `cudnn_runs`, and only 'auto' asks it: an explicit
+    'tpu' keeps the older pallas flash kernel for exactly the calls this
+    turns down, so what the predicate decides is whether a TPU run that asked
+    for nothing in particular gets the block-sparse kernel or XLA's.
+
+    The head width is not read, because splash does not constrain it. The
+    kernel pads the value width to a whole number of lanes itself and slices
+    the result back (`pl.cdiv(head_dim_v, NUM_LANES)`,
+    splash_attention_kernel.py:732 with 826 and 841), and the query and key
+    width is only the contraction dimension of a dot_general inside the
+    kernel, which Mosaic pads to a lane multiple like any other minor axis.
+    The sequence axes are the ones the kernel and its mask blocking state a
+    divisibility for, so those are the ones here.
+
+    A mesh that splits the sequence is turned down as well. Splash states its
+    own sharding as a `shard_map` partition spec (`manual_sharding_spec`, and
+    the `head_shards`/`q_seq_shards` the descriptor is built with), while
+    Dew's sequence parallelism is GSPMD constraints around a whole-sequence
+    kernel; a pallas call with no partitioning rule would have the queries
+    gathered back to serve it, which is the split this code exists to keep.
+    A causal or masked sequence-parallel call never reaches here anyway,
+    because `sequence_parallel_attention` hands the kernel a striped mask
+    that is a value of the trace.
+    """
+    if jax.default_backend() != 'tpu' or query.dtype not in SPLASH_DTYPES:
+        return False
+    if sequence_shards() > 1:
+        return False
+    if softcap is not None or bias is not None:
+        return False
+    q_len, kv_len = query.shape[-3], key.shape[-3]
+    if q_len % SPLASH_LANES or kv_len % SPLASH_LANES:
+        return False
+    return splash_mask_descriptor(
+        q_len, kv_len, query.shape[-2], causal, sliding_window, mask) is not None
 
 
 def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,

@@ -1,9 +1,13 @@
-"""The GPU kernel paths: the fused cudnn kernel the 'auto' rule reaches for,
-and the XLA flags a run passes to the backend.
+"""Which kernel the 'auto' rule reaches for, and the XLA flags a run passes
+to the backend.
 
-Everything that needs a CUDA device skips elsewhere; the flag handling is a
-plain function and runs anywhere. Run the GPU half with
-`JAX_PLATFORMS=cuda python -m pytest tests/test_kernels.py`.
+'auto' asks two predicates per trace: `cudnn_runs` for the fused cudnn kernel
+and then `tpu_runs` for the pallas splash kernel. Both read the backend, so
+both selections are testable anywhere by monkeypatching `jax.default_backend`
+and tracing the call without running it. What actually executes on a CUDA
+device skips elsewhere; run that half with
+`JAX_PLATFORMS=cuda python -m pytest tests/test_kernels.py`. The splash
+kernel's own numbers are tests/test_attention_splash.py.
 """
 
 import os
@@ -13,8 +17,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.attention import cudnn_runs, scaled_dot_product_attention
+from dew.nn.attention import (
+    SPLASH_LANES,
+    attention_kernel,
+    cudnn_runs,
+    scaled_dot_product_attention,
+    tpu_runs,
+)
 from dew.telemetry.devices import apply_xla_flags, deterministic_ops_requested, xla_flag
+from dew.training import MeshSpec, build_mesh
 
 on_gpu = pytest.mark.skipif(jax.default_backend() != 'gpu',
                             reason="needs a cuda device")
@@ -175,3 +186,118 @@ def test_an_explicit_cudnn_call_stands_without_the_flag(without_deterministic_op
     """The refusal belongs to the flag, not to the implementation: the same
     call traces to its output shape when the run asked for nothing."""
     assert cudnn_shape(*qkv((1, 8, 2, 64))).shape == (1, 8, 2, 64)
+
+
+@pytest.fixture
+def tpu_backend(monkeypatch):
+    """A tpu backend for the selection rules. The pallas kernels lower at
+    compile time, not at trace time, so a traced call under this fixture
+    names the kernel the rule picked without needing the device that runs
+    it, the way `cudnn_shape` reads the cudnn selection off a host with no
+    cudnn."""
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+
+
+def kernel_chosen(query, key, value, **kwargs):
+    """The names of the kernels one traced dispatch holds."""
+    text = jax.make_jaxpr(
+        lambda q, k, v: attention_kernel(q, k, v, **kwargs))(query, key, value)
+    printed = text.pretty_print(use_color=False)
+    return {name for name in ('splash', 'flash_attention') if name in printed}
+
+
+@pytest.mark.parametrize("structure", [
+    {}, {"causal": True}, {"sliding_window": 128},
+])
+def test_auto_picks_the_splash_kernel_on_a_tpu_backend(tpu_backend, structure):
+    """The shapes a decoder trains at meet the kernel's constraints, so a run
+    that asked for nothing gets the block-sparse kernel instead of XLA's
+    attention, which is the whole point of the rule."""
+    query, key, value = qkv((2, 512, 8, 128))
+    assert tpu_runs(query, key, **structure)
+    assert kernel_chosen(query, key, value, implementation='auto', **structure) == {'splash'}
+
+
+@pytest.mark.parametrize("shape, reason", [
+    ((2, 200, 8, 128), "a length the mask blocking has no block size for"),
+    ((2, 1, 8, 128), "a decode step's single query row"),
+])
+def test_auto_stays_on_xla_where_splash_cannot_tile_the_sequence(tpu_backend, shape, reason):
+    """Every length splash takes is a multiple of 128; the lengths that are
+    not fall back rather than failing at compile time."""
+    query, key, value = qkv(shape)
+    assert not tpu_runs(query, key), reason
+    assert kernel_chosen(query, key, value, implementation='auto', causal=True) == set()
+
+
+def test_auto_stays_on_xla_where_the_call_carries_a_bias(tpu_backend):
+    """Splash has no bias argument at all, so T5's relative position table
+    keeps XLA's attention under 'auto' and the older flash kernel under an
+    explicit 'tpu'."""
+    query, key, value = qkv((2, 512, 8, 128))
+    bias = jnp.zeros((2, 8, 512, 512), jnp.bfloat16)
+    assert not tpu_runs(query, key, bias=bias)
+    assert kernel_chosen(query, key, value, implementation='auto', bias=bias) == set()
+    assert kernel_chosen(query, key, value, implementation='tpu',
+                         bias=bias) == {'flash_attention'}
+
+
+def test_auto_stays_on_xla_where_the_mask_is_a_value_of_the_trace(tpu_backend):
+    """A decode mask over cache slots exists only inside the trace, and the
+    descriptor is built while the executable is."""
+    query, key, value = qkv((2, 512, 8, 128))
+
+    def traced(q, k, v, mask):
+        assert not tpu_runs(q, k, mask=mask)
+        return attention_kernel(q, k, v, implementation='auto', mask=mask)
+
+    printed = jax.make_jaxpr(traced)(
+        query, key, value, jnp.ones((1, 1, 512, 512), bool)).pretty_print(use_color=False)
+    assert 'splash' not in printed
+
+
+@pytest.mark.parametrize("dtype, taken", [
+    (jnp.bfloat16, True), (jnp.float32, True), (jnp.float16, False),
+])
+def test_tpu_runs_reads_the_dtypes_a_tpu_matmul_takes(tpu_backend, dtype, taken):
+    """fp16 has no MXU path, so it is the one dtype the rule turns down."""
+    keys = jax.random.split(jax.random.PRNGKey(0), 2)
+    query, key = (jax.random.normal(k, (2, 512, 8, 128), dtype) for k in keys)
+    assert tpu_runs(query, key) is taken
+
+
+def test_tpu_runs_needs_the_tpu_backend(monkeypatch):
+    """Everything else the predicate reads holds; only the backend says no,
+    because the interpreter that runs splash elsewhere is far slower than the
+    XLA attention 'auto' falls back to."""
+    query, key, _ = qkv((2, SPLASH_LANES, 8, 128))
+    assert not tpu_runs(query, key)
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    assert tpu_runs(query, key)
+
+
+@pytest.mark.mesh
+def test_auto_stays_on_xla_where_the_mesh_splits_the_sequence(tpu_backend):
+    """Splash states its sharding as a shard_map spec, and Dew's sequence
+    parallelism is GSPMD constraints around a whole-sequence kernel: a pallas
+    call with no partitioning rule would have the queries gathered back to
+    serve it, undoing the split. An unmasked call is the only one that could
+    reach splash under that mesh at all, because a causal one arrives with a
+    striped mask that is a value of the trace."""
+    query, key, _ = qkv((8, 512, 8, 128))
+    assert tpu_runs(query, key)
+    with jax.set_mesh(build_mesh(MeshSpec(fsdp=4, sequence=2))):
+        assert not tpu_runs(query, key)
+
+
+def test_a_softcapped_call_never_reaches_either_tpu_kernel(tpu_backend):
+    """No fused kernel has Gemma 2's tanh between the scaling and the
+    softmax, so 'auto' resolves it to xla and an explicit 'tpu' refuses by
+    name."""
+    query, key, value = qkv((2, 512, 8, 128))
+    assert not tpu_runs(query, key, 30.0)
+    assert kernel_chosen(query, key, value, implementation='auto', softcap=30.0) == set()
+    with pytest.raises(ValueError, match="'tpu'"):
+        jax.eval_shape(
+            lambda q, k, v: attention_kernel(q, k, v, implementation='tpu', softcap=30.0),
+            query, key, value)
