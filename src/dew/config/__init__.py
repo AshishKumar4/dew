@@ -234,6 +234,41 @@ class TrainerConfig:
         return dataset.steps_per_epoch
 
 
+def _local_tracker(directory: str, name: str):
+    """Return the journal directory for a run, beside its checkpoints where it can be.
+
+    A bucket URI is not a directory this process can write journals into, so a
+    remote run journals under ~/.cache/dew/tracking, keyed by the run name and
+    a digest of the bucket path.
+    """
+    if "://" not in directory:
+        return LocalTracker(os.path.join(directory, "tracking"))
+    return LocalTracker(os.path.join(os.path.expanduser("~/.cache/dew/tracking"),
+                                     _artifact_name(name) + "-"
+                                     + hashlib.sha256(directory.encode()).hexdigest()[:12]))
+
+
+def _closed(tracker, primary: BaseException | None) -> None:
+    """Close `tracker` on every rank and agree on the outcome.
+
+    `primary` is the exception the run is already unwinding with, if any. A
+    close that fails is noted on it rather than replacing it, since the run's
+    own failure is the one a caller wants.
+    """
+    error = None
+    try:
+        if tracker is not None:
+            tracker.__exit__(type(primary), primary, None)
+    except BaseException as failure:
+        error = failure
+    try:
+        agree_process_phase(error, phase="tracker close")
+    except BaseException as failure:
+        if primary is None:
+            raise
+        primary.add_note(f"Tracker close failed: {failure!r}")
+
+
 def _artifact_name(name: str) -> str:
     """Return `name` with every character a path or a tracker id cannot hold replaced.
 
@@ -454,6 +489,17 @@ class RunConfig:
         """Read the config a run in `directory` was built from, as this class."""
         return cls.from_dict(json.loads((epath.Path(directory) / RUN_FILE).read_text()))
 
+    def _naming(self, objective: Objective[Loss, Effects]) -> Self:
+        """Return this config with `objective` named the way the record spells it.
+
+        A registered objective is written under its registry name and anything
+        else under its import path, so a record always says what was trained.
+        """
+        objective_type = type(objective)
+        kind = (registry.objectives.name_of(objective_type) if objective_type in registry.objectives.values()
+                else f"{objective_type.__module__}.{objective_type.__qualname__}")
+        return dataclasses.replace(self, objective=kind)
+
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
               metrics: Sequence[Metric] = (),
               summary: Mapping[str, object] | None = None) -> TrainState:
@@ -488,10 +534,7 @@ class RunConfig:
             quantize(objective, self.trainer.quantization)
         if self.lora is not None:
             attach(objective, self.lora)
-        objective_type = type(objective)
-        kind = (registry.objectives.name_of(objective_type) if objective_type in registry.objectives.values()
-                else f"{objective_type.__module__}.{objective_type.__qualname__}")
-        self = dataclasses.replace(self, objective=kind)
+        self = self._naming(objective)
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early
         # and a pass over the data is that many steps longer.
@@ -505,11 +548,7 @@ class RunConfig:
                     trainer.wandb.project, name, entity=trainer.wandb.entity,
                     offline=trainer.wandb.offline)
             checkpoints = Checkpoints(os.path.join(trainer.checkpoint_dir, name), keep=trainer.keep)
-            local = LocalTracker(os.path.join(checkpoints.directory, "tracking"))
-            if "://" in checkpoints.directory:
-                local = LocalTracker(os.path.join(os.path.expanduser("~/.cache/dew/tracking"),
-                                                 _artifact_name(name) + "-"
-                                                 + hashlib.sha256(checkpoints.directory.encode()).hexdigest()[:12]))
+            local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
@@ -544,16 +583,4 @@ class RunConfig:
             return state
 
         finally:
-            primary = sys.exception()
-            error = None
-            try:
-                if tracker is not None:
-                    tracker.__exit__(type(primary), primary, None)
-            except BaseException as failure:
-                error = failure
-            try:
-                agree_process_phase(error, phase="tracker close")
-            except BaseException as failure:
-                if primary is None:
-                    raise
-                primary.add_note(f"Tracker close failed: {failure!r}")
+            _closed(tracker, sys.exception())
