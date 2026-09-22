@@ -24,20 +24,20 @@ Every node runs the same script. Each copy is one process of a `jax.distributed`
 List the hosts, process 0's first, then the command after `--`:
 
 ```bash
-dew launch --hosts node0 node1 -- python recipes/lm/train.py --trainer.multi-host True
+dew launch --hosts node0 node1 -- /opt/dew/.venv/bin/python recipes/lm/train.py --trainer.multi-host True
 ```
 
-The launcher starts the command on each host over `ssh -o BatchMode=yes`, so passwordless keys must already work. It runs a host named `localhost` directly. Each process starts in the current directory, which must exist at the same path on every host, or in the directory `--cwd` names. The coordinator listens on port 43217 of the first host; change it with `--port`, and set `--coordinator` when the other hosts reach that host by another name.
+The launcher starts the command on each host over `ssh -o BatchMode=yes`, so passwordless keys must already work. The remote side runs in the user's shell without a login profile, so a virtualenv activated there is not active: give the interpreter as an absolute path, as above. It runs a host named `localhost` directly. Each process starts in the current directory, which must exist at the same path on every host, or in the directory `--cwd` names. The coordinator listens on port 43217 of the first host; change it with `--port`, and set `--coordinator` when the other hosts reach that host by another name.
 
 Every output line carries its rank, such as `[1] Joined the JAX process pool: process 1 of 2`. When one process exits with an error, the launcher stops the others and exits with that code. Without this, the survivors would wait in a collective for a peer that is gone.
 
 To run one process per GPU instead of one per host:
 
 ```bash
-dew launch --hosts node0 node1 --processes-per-host 8 --devices-per-process 1 -- python train.py
+dew launch --hosts node0 node1 --processes-per-host 8 --devices-per-process 1 -- /opt/dew/.venv/bin/python train.py
 ```
 
-`--env NAME=VALUE` passes a variable to every process, for example `--env XLA_FLAGS=--xla_gpu_enable_latency_hiding_scheduler=true`. Add `--dry-run` to print the exact commands without running them.
+`--env NAME=VALUE` passes a variable to every process. The name must be a shell variable name, for example `--env XLA_FLAGS=--xla_gpu_enable_latency_hiding_scheduler=true`. Add `--dry-run` to print the exact commands without running them.
 
 ## Launch under Slurm
 
