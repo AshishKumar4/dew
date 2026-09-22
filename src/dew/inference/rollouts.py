@@ -27,7 +27,6 @@ from __future__ import annotations
 import os
 import shutil
 import threading
-from collections import deque
 from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -136,7 +135,6 @@ class NativeRolloutServer:
         self._server = server
         self._version = version
         self._lock = threading.Condition()
-        self._incoming: deque[tuple[tuple[int, ...], int, int, int, Future[Draw]]] = deque()
         self._outstanding: set[Future[Draw]] = set()
         self._closed = False
         self._failure: BaseException | None = None
@@ -152,6 +150,7 @@ class NativeRolloutServer:
         return self._version
 
     def submit(self, prompt: Sequence[int], max_new_tokens: int, *, seed: int) -> Future[Draw]:
+        """Queue one draw; a request the server refuses raises here and leaves the rest running."""
         ids, budget = _prompt(prompt), _budget(max_new_tokens)
         future: Future[Draw] = Future()
         with self._lock:
@@ -159,23 +158,11 @@ class NativeRolloutServer:
                 raise RuntimeError("the rollout server stopped") from self._failure
             if self._closed:
                 raise RuntimeError("the rollout server is closed")
-            self._incoming.append((ids, budget, seed, self._version, future))
-            self._outstanding.add(future)
-            self._lock.notify()
-        return future
-
-    def load(self, variables: Variables, version: int) -> None:
-        with self._lock:
-            self._server.reload(thaw(variables))
-            self._version = version
-
-    def _admit(self) -> None:
-        """Hand every queued submission to the server; called under the lock."""
-        while self._incoming:
-            ids, budget, seed, version, future = self._incoming.popleft()
             ticket = self._server.submit(np.asarray(ids, np.int32), budget, seed=seed)
+            self._outstanding.add(future)
+            version = self._version
 
-            def resolve(done, ids=ids, version=version, future=future) -> None:
+            def resolve(done: Future[Generation[np.ndarray]]) -> None:
                 self._outstanding.discard(future)
                 failure = done.exception()
                 if failure is not None:
@@ -184,26 +171,30 @@ class NativeRolloutServer:
                     future.set_result(_native_draw(ids, done.result(), version))
 
             ticket.add_done_callback(resolve)
+            self._lock.notify()
+        return future
+
+    def load(self, variables: Variables, version: int) -> None:
+        with self._lock:
+            self._server.reload(thaw(variables))
+            self._version = version
 
     def _run(self) -> None:
         try:
             while True:
                 with self._lock:
-                    while not (self._closed or self._incoming
-                               or self._server.occupancy or self._server.queued):
+                    while not (self._closed or self._server.occupancy or self._server.queued):
                         self._lock.wait()
                     if self._closed:
                         return
-                    self._admit()
                     self._server.step()
         except BaseException as failure:
             with self._lock:
                 self._failure = failure
-                for future in [*self._outstanding, *(entry[-1] for entry in self._incoming)]:
+                for future in self._outstanding:
                     if not future.done():
                         future.set_exception(failure)
                 self._outstanding.clear()
-                self._incoming.clear()
 
     def close(self) -> None:
         with self._lock:
@@ -211,7 +202,7 @@ class NativeRolloutServer:
             self._lock.notify()
         self._thread.join()
         cancelled = RuntimeError("the rollout server closed before this draw finished")
-        for future in [*self._outstanding, *(entry[-1] for entry in self._incoming)]:
+        for future in list(self._outstanding):
             if not future.done():
                 future.set_exception(cancelled)
 
