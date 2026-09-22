@@ -9,7 +9,7 @@ The encoder is --model, the predictor takes the encoder's width and heads plus
 """
 
 from dataclasses import dataclass, field
-from typing import Mapping, Optional
+from typing import Mapping
 
 import tyro
 
@@ -47,9 +47,9 @@ class JepaRunConfig(RunConfig):
     target_aspect: tuple[float, float] = (0.75, 1.5)
     momentum: tuple[float, float] = (0.996, 1.0)
     """Target-encoder EMA momentum, ramped over momentum_steps."""
-    momentum_steps: Optional[int] = None
+    momentum_steps: int | None = None
     """Defaults to the full training run."""
-    probe_classes: Optional[int] = None
+    probe_classes: int | None = None
     """Number of classes for the frozen-encoder probes, which are what a
     validation pass scores; a run without them schedules no pass."""
     probe_label_key: str = 'label'
