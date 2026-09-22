@@ -11,6 +11,7 @@ The names on disk are the module names in the tree.
 
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Callable, Mapping
@@ -178,6 +179,42 @@ def _tensor_offsets(path: str, header: object) -> dict[str, int]:
             raise ValueError(f"tensor {name!r} in {path} has malformed data_offsets")
         offsets[name] = start
     return offsets
+
+
+def _header(filename: str) -> dict:
+    """A safetensors file's header table, read without touching its data."""
+    with open(filename, "rb") as stream:
+        length = int.from_bytes(stream.read(8), "little")
+        header = json.loads(stream.read(length))
+    if not isinstance(header, dict):
+        raise ValueError(f"{filename} is not a safetensors file: its header is not a table")
+    return header
+
+
+def layer_bytes(directory) -> int:
+    """How many bytes a checkpoint's numbered layers hold, from the headers alone.
+
+    A host-streamed run keeps every layer of its stacks in pinned host
+    memory, and the pool that memory comes from is sized by a process
+    limit that must be set before the JAX backend starts. This reads only
+    the headers of the shards `directory` holds, so a launcher can size the
+    limit before importing anything that starts a backend. Layers are the
+    tensors named under `layers.<n>.`, as Hugging Face layouts name them.
+    """
+    directory = Path(directory)
+    index = directory / "model.safetensors.index.json"
+    if index.is_file():
+        shards = sorted({directory / name for name in json.loads(index.read_text())["weight_map"].values()})
+    else:
+        shards = [directory / "model.safetensors"]
+    total = 0
+    for shard in shards:
+        for name, entry in _header(os.fspath(shard)).items():
+            if name == "__metadata__" or not re.search(r"\.layers\.\d+\.", name):
+                continue
+            offsets = entry["data_offsets"]
+            total += int(offsets[1]) - int(offsets[0])
+    return total
 
 
 def read_file(path) -> tuple[dict[str, np.ndarray], dict[str, str]]:

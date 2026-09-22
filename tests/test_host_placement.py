@@ -530,3 +530,40 @@ def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
     identical(unpack(separate, one.bank_sites, source.shapes()),
               unpack(resident, sites, source.shapes()))
 
+
+
+def _resident_shared_bytes() -> int:
+    with open("/proc/self/status") as handle:
+        for line in handle:
+            if line.startswith("RssShmem"):
+                return int(line.split()[1]) * 1024
+    return -1
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="pinned host memory is the GPU pool")
+def test_the_host_memory_limit_is_what_stops_the_bank_pool_from_doubling(monkeypatch):
+    """XLA's pinned pool grows by power-of-two regions, capped at the process
+    host memory limit. Banks placed one at a time land in a pool that ends
+    at that limit, so the limit is the lever; a limit below the banks is
+    refused by name before anything is placed."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.training.execution import HOST_LIMIT, check_bank_pool
+    from dew.training.host import place_leaf
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:1]), ("x",))
+    monkeypatch.setenv(HOST_LIMIT, "1")
+    with pytest.raises(ValueError, match="set it to at least"):
+        check_bank_pool(3 * (1 << 30), mesh)
+    monkeypatch.setenv(HOST_LIMIT, "8")
+    check_bank_pool(3 * (1 << 30), mesh)
+    memory = NamedSharding(mesh, P(), memory_kind="pinned_host")
+    bank = 96 << 20
+    before = _resident_shared_bytes()
+    held = [place_leaf(np.full((bank // 2,), index, jnp.bfloat16), memory) for index in range(5)]
+    assert all(int(np.asarray(placed)[0]) == index for index, placed in enumerate(held))
+    grown = _resident_shared_bytes() - before
+    # Five 96 MiB banks land in power-of-two regions that a bank cannot
+    # straddle, so the pool runs well past the 480 MiB used. The process
+    # limit is the one thing that caps it, and it is fixed at backend start,
+    # which is why the check above reads it rather than the pool.
+    assert grown >= 5 * bank * 1.2, grown

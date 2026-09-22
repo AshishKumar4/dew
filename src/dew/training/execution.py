@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 from collections.abc import Mapping
 
 import jax
@@ -50,6 +51,42 @@ def _in_stack(path: tuple[str, ...], sites) -> bool:
                and len(path) > len(site.namespace)
                and layer_index(path[len(site.namespace)]) is not None
                for site in sites)
+
+
+def bank_bytes(tree, sites) -> int:
+    """How many bytes of a frozen collection a host layout keeps in bank memory.
+
+    The leaves of every declared stack's layers land there, banked or not;
+    the rest stays on the device. `resident` places by the same rule.
+    """
+    return sum(leaf.nbytes for path, leaf in jax.tree_util.tree_leaves_with_path(tree)
+               if _in_stack(tuple(entry.key for entry in path), sites))
+
+
+HOST_LIMIT = "XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB"
+
+
+def check_bank_pool(nbytes: int, mesh) -> None:
+    """Refuse a GPU pinned-host pool that cannot hold `nbytes` of banks.
+
+    XLA grows the pool by regions, each a power of two at least as large as
+    the request and the one before it, capped at the process's host memory
+    limit; a region is never returned. Banks placed one at a time therefore
+    reserve up to the next power of two above their size unless the limit
+    stops them: 69 GB for 49 GB of banks on an A100 at the 72 GB limit that
+    run set. Set `XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB` to the banks plus a few
+    gigabytes for transfers before the backend starts, and the pool ends
+    there. The limit is read here because it is the only lever there is;
+    the backend is already running.
+    """
+    if mesh.devices.flat[0].platform != "gpu":
+        return
+    limit = os.environ.get(HOST_LIMIT)
+    if limit is not None and float(limit) * 1e9 < nbytes:
+        raise ValueError(
+            f"the frozen banks need {nbytes / 1e9:.1f} GB of pinned host memory, more than "
+            f"{HOST_LIMIT}={limit} allows; set it to at least {nbytes / 1e9 + 4:.0f} before "
+            "the JAX backend starts")
 
 
 def resident(placement, sites, accelerator):

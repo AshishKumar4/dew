@@ -10,6 +10,7 @@ network.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -531,3 +532,16 @@ def test_the_fid_converter_refuses_a_pickle_that_is_missing_a_key(tmp_path):
     path.write_bytes(pickle.dumps(tree))
     with pytest.raises(ValueError, match="Mixed_7c/branch_pool/bn/var"):
         convert(path)
+
+
+def test_layer_bytes_reads_the_headers_of_a_checkpoint():
+    """The bytes a host-streamed run pins are the numbered layers' tensors;
+    the count comes from the shard headers alone, so a launcher can size
+    the pinned pool before any backend starts, and it equals what the
+    loaded tensors weigh."""
+    from dew.interop.safetensors_io import layer_bytes, read_file
+    directory = Path(__file__).parent / "fixtures/hf/diffusion-gemma-sft"
+    tensors, _ = read_file(directory / "model.safetensors")
+    expected = sum(tensor.nbytes for name, tensor in tensors.items() if re.search(r"\.layers\.\d+\.", name))
+    assert expected > 0
+    assert layer_bytes(directory) == expected
