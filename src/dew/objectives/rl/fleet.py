@@ -214,8 +214,8 @@ class ContainerRunner:
     directory is mounted read-only at `/work`, the working directory; `/tmp`
     is a small writable tmpfs. Memory is capped at `memory_bytes` with no
     swap, CPU time at `cpu_seconds` (SIGXCPU, then SIGKILL a second later), the processor share at `cpus` and the
-    process count at `pids`. At the wall deadline the container is killed
-    by name, as is the client that runs it. A runtime that exits without
+    process count at `pids`. At the wall deadline the client that runs
+    it is killed, then the container is force-removed by name. A runtime that exits without
     creating the container (no daemon, no permission, no image) raises.
     """
 
@@ -261,9 +261,12 @@ class ContainerRunner:
                 streams, stopped = _collected(process, program.stdin.encode(), deadline, limits.message_bytes)
             finally:
                 if process.poll() is None:
-                    subprocess.run([self.runtime, "kill", name], capture_output=True, timeout=30, check=False)
+                    # The client dies first so it makes no further API call;
+                    # `rm --force` then removes the container whether it is
+                    # still being created, created or running.
                     with contextlib.suppress(ProcessLookupError):
                         os.killpg(process.pid, signal.SIGKILL)
+                    subprocess.run([self.runtime, "rm", "--force", name], capture_output=True, timeout=60, check=False)
             try:
                 outcome = _outcome(process, streams, stopped, started, deadline)
             finally:
