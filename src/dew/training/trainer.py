@@ -724,8 +724,7 @@ class Trainer(Generic[Loss, Effects]):
                 source = dataset.train()
                 self._check_stream(source, mesh,
                                    checkpointing=bool(checkpoint_every or local_every))
-                train = DevicePrefetchIterator(source, mesh, source_state=position,
-                                               profiler=tracer)
+                train = DevicePrefetchIterator(source, mesh, source_state=position)
                 source = None  # Lifetime transferred to the prefetch worker.
 
             def announce() -> None:

@@ -11,10 +11,7 @@ import math
 import queue
 import threading
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Iterator
-
-if TYPE_CHECKING:
-    from dew.telemetry.profile import Profiler
+from typing import Iterator
 
 import jax
 import numpy as np
@@ -550,8 +547,7 @@ class DevicePrefetchIterator:
     """
 
     def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = 2,
-                 source_state: bytes | None = None,
-                 profiler: Profiler | None = None):
+                 source_state: bytes | None = None):
         if depth <= 0:
             raise ValueError("prefetch depth must be positive")
         self._iterator: Iterator | None = iter(iterator)
@@ -563,7 +559,6 @@ class DevicePrefetchIterator:
         self._start_lock = threading.Lock()
         self._error: BaseException | None = None
         self._cleanup_error: BaseException | None = None
-        self._profiler = profiler
         self.source_state = source_state
         self._thread = threading.Thread(target=self._prefetch, name="dew-prefetch", daemon=True)
         # No source work may start until the caller owns this object. In
