@@ -45,6 +45,10 @@ from dew.sampling import Sampling
 from dew.training import evaluate
 
 GREEDY = Sampling(temperature=0.0)
+FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
+# An InceptionV3 at a sixteenth of every channel width with drawn
+# parameters: the FID path runs offline on it, and the value is its own.
+SMOKE_INCEPTION = FIXTURES / "inception/tiny/inception_v3_fid.pickle"
 
 
 @dataclass
@@ -65,7 +69,10 @@ class Config:
     image_run: Path | None = None
     """A diffusion run to sample and score; unset skips the image metrics."""
     reference_images: Path | None = None
-    """Directory of PNGs FID is measured against; unset skips FID."""
+    """Directory of PNGs FID is measured against; --smoke draws its own."""
+    inception_weights: Path | None = None
+    """The FID extractor's parameters as a file; unset downloads the
+    published checkpoint. --smoke reads the committed tiny one."""
     image_prompts: tuple[str, ...] = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
     image_steps: int = 40
     clip_model: str = "openai/clip-vit-large-patch14"
@@ -151,6 +158,12 @@ def harness(task: TextGeneration, config: Config) -> dict[str, float]:
             for metric, value in scores.items() if isinstance(value, float)}
 
 
+def draw(pipe: TextToImage, config: Config, *, seed: int) -> np.ndarray:
+    """The prompts sampled once, as the uint8 images both metrics read."""
+    drawn = pipe(list(config.image_prompts), steps=config.image_steps, seed=seed).host().images
+    return np.clip(np.rint((drawn + 1.0) * 127.5), 0, 255).astype(np.uint8)
+
+
 def image_metrics(config: Config) -> dict[str, float]:
     """FID and CLIPScore of a diffusion run's samples against a reference set."""
     if config.image_run is None:
@@ -158,8 +171,7 @@ def image_metrics(config: Config) -> dict[str, float]:
     pipe = dew.pipeline(str(config.image_run))
     if not isinstance(pipe, TextToImage):
         raise TypeError(f"--image-run holds a {type(pipe).__name__}, not a diffusion run")
-    drawn = pipe(list(config.image_prompts), steps=config.image_steps, seed=0).host().images
-    generated = np.clip(np.rint((drawn + 1.0) * 127.5), 0, 255).astype(np.uint8)
+    generated = draw(pipe, config, seed=0)
     scores = {"clip_score": clip_score(generated, list(config.image_prompts),
                                        modelname=config.clip_model)}
     if config.reference_images is not None:
@@ -167,7 +179,14 @@ def image_metrics(config: Config) -> dict[str, float]:
 
         reference = np.stack([np.asarray(Image.open(path).convert("RGB"))
                               for path in sorted(config.reference_images.glob("*.png"))])
-        scores["fid"] = fid(generated, reference)
+    elif config.smoke:
+        # A held-out set is what FID is measured against, and a smoke has
+        # none: a second draw of the same run is a population to measure, so
+        # the metric runs end to end on a number that says nothing.
+        reference = draw(pipe, config, seed=1)
+    else:
+        return scores
+    scores["fid"] = fid(generated, reference, weights=config.inception_weights)
     return scores
 
 
@@ -210,7 +229,8 @@ def main(config: Config) -> Path:
         config.out.mkdir(parents=True, exist_ok=True)
         run, tokens = smoke_run(config.out)
         config = replace(config, run=run, tokens=tokens, sequence_length=32, batch_size=2,
-                         prompt="to be", max_new_tokens=8, image_steps=2)
+                         prompt="to be", max_new_tokens=8, image_steps=2,
+                         inception_weights=SMOKE_INCEPTION)
     if config.run is None:
         raise ValueError("--run names the run directory, checkpoint or Hub repo to score")
 

@@ -1,0 +1,8 @@
+{
+  "of": "hayden-donnelly/inception-v3-fid",
+  "module": "dew.eval.inception.InceptionV3",
+  "channel_divisor": 16,
+  "seed": 20260921,
+  "pool3_features": 128,
+  "parameters": 88424
+}
