@@ -11,7 +11,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import FlaxFeedForward, LayerNorm, scaled_dot_product_attention
-from dew.nn.blocks import ResidualBlock
+from dew.nn.blocks import ResidualBlock, torch_nearest_resize
 from dew.registry import models
 
 
@@ -209,9 +209,7 @@ class _Level(nn.Module):
                 if upsample_shape is None:
                     raise ValueError("Upsampling requires the next skip spatial shape")
                 height, width = upsample_shape
-                rows = jnp.arange(height) * x.shape[1] // height
-                columns = jnp.arange(width) * x.shape[2] // width
-                x = jnp.take(jnp.take(x, rows, axis=1), columns, axis=2)
+                x = torch_nearest_resize(x, height, width)
             stride = (2, 2) if self.direction == "down" else (1, 1)
             x = nn.Conv(self.stage.features, (3, 3), strides=stride, padding=((1, 1), (1, 1)),
                         dtype=self.dtype, precision=self.precision, name="resize")(x)
