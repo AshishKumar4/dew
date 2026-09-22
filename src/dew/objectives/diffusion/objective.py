@@ -23,7 +23,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 
-from dew.artifacts import ImageGrid, VideoGrid, agree_process_phase, collective_host
+from dew.artifacts import ImageGrid, VideoGrid, agreed, collective_host
 from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
@@ -185,10 +185,23 @@ class DiffusionObjective(Objective[Mean]):
         return {name: value for name, value in params.items()
                 if name not in ("encoders", "autoencoder")}
 
-    def _conditions(self, params, batch, key, *, dropout):
+    def encoded_conditions(self, params, batch) -> dict:
+        """Encode each condition's own batch field under the tree's frozen towers."""
         tokens = {keyword: batch[condition.field]
                   for keyword, condition in self.inputs.conditions.items()}
-        given = self.encode(params["encoders"], tokens)
+        return self.encode(params["encoders"], tokens)
+
+    def denoiser(self, params, given, unconditional):
+        """Build the process's denoiser over the model's own collections.
+
+        The unconditional branch is passed only when this objective is
+        guided; without guidance the sampler never evaluates it.
+        """
+        return self.process.denoiser(self.model, self.trainable(params), given,
+                                     None if self.guidance is None else unconditional)
+
+    def _conditions(self, params, batch, key, *, dropout):
+        given = self.encoded_conditions(params, batch)
         # The unconditional prompt is fixed, so its encoding is a constant
         # and the text tower runs over the batch alone, once per step.
         unconditional = self.blank_conditions(given)
@@ -239,9 +252,7 @@ class DiffusionObjective(Objective[Mean]):
 
     def _sample_impl(self, params, batch, key, *, count: int):
         given, unconditional = self._conditions(params, batch, key, dropout=False)
-        variables = self.trainable(params)
-        denoise = self.process.denoiser(
-            self.model, variables, given, None if self.guidance is None else unconditional)
+        denoise = self.denoiser(params, given, unconditional)
         noise_key, sample_key = jax.random.split(key)
         x_T = self.process.noise(noise_key, (count, *self.latent_shape))
         samples = sample(denoise, x_T, self.steps, solver=self.sampler,
@@ -260,31 +271,22 @@ class DiffusionObjective(Objective[Mean]):
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """A separate small draw for display, with root-only caption decoding."""
-        error = None
-        prepared = None
-        try:
-            params = params if step.ema is None else step.ema
+        def setup():
+            weights = params if step.ema is None else step.ema
             count = min(VALIDATION_SAMPLES, batch[self.inputs.sample.key].shape[0])
-            prepared = (self._sample, count, self._sampling_batch(batch))
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="diffusion preview setup")
-        error = None
-        samples = tokens = None
-        try:
-            assert prepared is not None
-            sample, count, raw_batch = prepared
+            return weights, count, self._sampling_batch(batch)
+
+        def generate():
             selected = jax.tree.map(lambda value: value[:count], raw_batch)
-            samples = sample(params, selected, step.key, count=count)
-            tokens = {keyword: selected[condition.field]
-                      for keyword, condition in self.inputs.conditions.items()}
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="diffusion preview generation")
+            return (self._sample(weights, selected, step.key, count=count),
+                    {keyword: selected[condition.field]
+                     for keyword, condition in self.inputs.conditions.items()})
+
+        weights, count, raw_batch = agreed("diffusion preview setup", setup)
+        samples, tokens = agreed("diffusion preview generation", generate)
         samples, tokens = collective_host((samples, tokens), phase="diffusion preview")
         if jax.process_index() != 0:
             return None
-        assert samples is not None and tokens is not None
         captions = ()
         for keyword, condition in self.inputs.conditions.items():
             captions = condition.encoder.captions(tokens[keyword])

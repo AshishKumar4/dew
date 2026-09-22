@@ -27,7 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.artifacts import TextSamples, TokenScores, agree_process_phase, collective_host
+from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables
@@ -166,27 +166,15 @@ class MaskedDiffusionObjective(Objective[Mean]):
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Generate the configured display count, then decode on process zero."""
-        error = None
-        prepared = None
-        try:
-            params = params if step.ema is None else step.ema
-            prepared = (self._sample, self.samples)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="masked diffusion preview setup")
-        error = None
-        tokens = None
-        try:
-            assert prepared is not None
-            sample, count = prepared
-            tokens = sample(params, step.key, count=count)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="masked diffusion preview generation")
+        def setup():
+            return params if step.ema is None else step.ema, self.samples
+
+        weights, count = agreed("masked diffusion preview setup", setup)
+        tokens = agreed("masked diffusion preview generation",
+                        lambda: self._sample(weights, step.key, count=count))
         tokens = collective_host(tokens, phase="masked diffusion preview")
         if jax.process_index() != 0:
             return None
-        assert tokens is not None
         texts = () if self.decode is None else tuple(
             self.decode(row.tolist()) for row in np.asarray(tokens))
         return TextSamples(tokens=tokens, texts=texts)

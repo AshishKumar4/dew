@@ -117,12 +117,8 @@ class FlowGRPOObjective(DiffusionObjective):
 
     def _predictor(self, params: Variables, batch: Batch) -> Predictor:
         """Build the denoiser this batch's conditions select, guidance included."""
-        tokens = {keyword: batch[condition.field]
-                  for keyword, condition in self.inputs.conditions.items()}
-        given = self.encode(params["encoders"], tokens)
-        denoise = self.process.denoiser(
-            self.model, self.trainable(params), given,
-            None if self.guidance is None else self.blank_conditions(given))
+        given = self.encoded_conditions(params, batch)
+        denoise = self.denoiser(params, given, self.blank_conditions(given))
         return denoise if self.guidance is None else self.guidance(denoise)
 
     def _transition(self, predict: Predictor, x: jax.Array,
@@ -329,12 +325,8 @@ class FlowRollout:
                        key: jax.Array) -> tuple[FlowTrajectory, jax.Array]:
         """Sample one SDE trajectory per row and decode its final samples."""
         objective = self.objective
-        tokens = {keyword: batch[condition.field]
-                  for keyword, condition in objective.inputs.conditions.items()}
-        given = objective.encode(params["encoders"], tokens)
-        denoise = objective.process.denoiser(
-            objective.model, objective.trainable(params), given,
-            None if objective.guidance is None else objective.blank_conditions(given))
+        given = objective.encoded_conditions(params, batch)
+        denoise = objective.denoiser(params, given, objective.blank_conditions(given))
         noise_key, sample_key = jax.random.split(key)
         count = _source(objective.inputs, batch).shape[0]
         initial = objective.process.noise(noise_key, (count, *objective.latent_shape))

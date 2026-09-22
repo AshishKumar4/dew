@@ -13,8 +13,6 @@ samples.
 
 from __future__ import annotations
 
-import dataclasses
-
 import jax
 import jax.numpy as jnp
 
@@ -27,7 +25,7 @@ from dew.rl import behavior_importance_weights, k3_kl, token_log_ratio
 from dew.rl.surrogate import clipped_surrogate_terms
 
 from ..lm import LMObjective
-from ..lm.objective import _shift_rows
+from ..lm.objective import _shift_rows, _unpadded
 from .rollout import ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY
 
 
@@ -164,10 +162,6 @@ class GRPOObjective(LMObjective):
             return Mean(pg.total + self.beta * kl.total, mass), Aux[Variables](metrics)
         return pg, Aux[Variables](metrics)
 
-    def preview(self, params, batch, step, *, scored=None):
-        """Draw policy text; this objective's EMA holds the frozen reference."""
-        return super().preview(params, batch, dataclasses.replace(step, ema=None), scored=scored)
-
     def evaluate(self, params, batch, step):
         """Score the prompts' perplexity under the policy.
 
@@ -200,6 +194,5 @@ class GRPOObjective(LMObjective):
             hidden, head, aligned[:, 1:], self.head_chunks,
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision)
-        losses = _shift_rows(losses, -padding)
-        weights = (jnp.arange(losses.shape[1])[None, :] >= padding[:, None]).astype(losses.dtype)
-        return TokenScores(losses=losses, weights=weights)
+        losses, valid = _unpadded(losses, padding)
+        return TokenScores(losses=losses, weights=valid.astype(losses.dtype))
