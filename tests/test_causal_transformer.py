@@ -62,6 +62,21 @@ def test_bf16_compute_keeps_params_and_logits_fp32(rng):
     assert model.apply(params, ids).dtype == jnp.float32
 
 
+def test_bf16_compute_runs_the_feed_forward_in_bf16(rng):
+    """The compute dtype reaches every matmul of a block, the gated MLP
+    included: under bf16 no layer's hidden activation is an fp32 tensor.
+    An fp32 feed-forward costs a quarter of a dense step and doubles the
+    largest activation, which is what once capped the batch size."""
+    model = tiny(dtype=jnp.bfloat16)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    _, intermediates = model.apply(params, ids, capture_intermediates=True, mutable=["intermediates"])
+    mlp_outputs = [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(intermediates)[0]
+                   if "mlp" in jax.tree_util.keystr(path) and "__call__" in jax.tree_util.keystr(path)]
+    assert mlp_outputs, "the capture saw no gated MLP call"
+    assert {leaf.dtype for leaf in mlp_outputs} == {jnp.dtype(jnp.bfloat16)}
+
+
 def test_logits_ignore_every_later_token(rng):
     """Causality, stated as the property a trainer depends on: rewriting the
     tail of a sequence cannot move the logits before it."""
