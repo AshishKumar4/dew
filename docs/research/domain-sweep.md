@@ -405,7 +405,7 @@ connection to Somalia, which also settles `dew.so` and its 5,990 USD asking pric
 
 ## Appendix A: every TLD for the `dew` stem
 
-In both appendices the Title column quotes each site's HTML title, with any dash in it written as a comma.
+In both appendices the Live site column quotes each site's HTML title, with any dash in it written as a comma.
 
 | Domain | Registered | Evidence | Registrar | Expires | Live site | Sale or note | Porkbun first year / renewal | Cloudflare | HTTPS forced |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
