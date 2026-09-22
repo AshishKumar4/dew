@@ -93,12 +93,14 @@ class LoRA:
     targets: Mapping[Path, Target]
     rslora: bool = False
     dropout: float = 0.0
-    layouts: Mapping[str, WeightLayout] = dataclasses.field(default_factory=dict, compare=False)
+    layouts: Mapping[str, WeightLayout] = dataclasses.field(
+        default_factory=dict, compare=False, metadata={"record": False})
     """The bindings the targets were bound over, by the name a file writes
     them under, which is what `save` writes the factors back through.
     `fresh` and `load` fill it with the source's own projections; an adapter
     a run config declares carries its targets alone, so it compares by them
-    and cannot save itself."""
+    and cannot save itself. A run record leaves it out: the source the
+    record names is where the bindings come from."""
 
     def scale(self, target: Target) -> float:
         return target.alpha / (math.sqrt(target.rank) if self.rslora else target.rank)

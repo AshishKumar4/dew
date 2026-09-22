@@ -259,7 +259,7 @@ def _to_json(value, annotation) -> JSON:
         if held is None:
             held = _registry_for(type(value))
         fields = {f.name: _to_json(getattr(value, f.name), _declared_type(type(value), f.name))
-                  for f in dataclasses.fields(value)}
+                  for f in dataclasses.fields(value) if _recorded(f)}
         if held is None:
             return fields
         name = held.name_of(type(value))
@@ -314,10 +314,21 @@ def _instantiate(member: Callable, fields: Mapping[str, registry.Configured]) ->
     return registry.configured(member(**fields))
 
 
+def _recorded(field: dataclasses.Field) -> bool:
+    """Whether a field is part of the run record.
+
+    A field marked `metadata={"record": False}` is a binding the value picked
+    up at runtime, not something the record describes: an adapter's source
+    names, say, which follow from the source the record already names. It is
+    neither written nor required, and a rebuilt value takes its default.
+    """
+    return field.init and field.metadata.get("record", True)
+
+
 def _fields(cls: type, values: registry.Configured) -> dict[str, registry.Configured]:
     if not isinstance(values, Mapping):
         raise ValueError(f"{cls.__name__} is built from a record of its fields, not {values!r}")
-    declared = [f.name for f in dataclasses.fields(cls) if f.init]
+    declared = [f.name for f in dataclasses.fields(cls) if _recorded(f)]
     unknown = sorted(set(values) - set(declared))
     missing = [name for name in declared if name not in values]
     if unknown or missing:
