@@ -729,11 +729,11 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
     assert jnp.all(jnp.isfinite(changed))
 
 
-def test_a_segment_masked_batch_leaves_the_cudnn_kernel(rng):
+def test_a_segment_masked_batch_leaves_the_cudnn_kernel(rng, without_deterministic_ops):
     """cuDNN takes causality as a flag and turns any mask into a materialized
     bias, so packed batches ride the xla kernel instead. Pinning cudnn here is
-    what proves the routing: this host has no cudnn to fall back on, so an
-    unpacked batch is refused while a packed one runs."""
+    what proves the routing: the model computes in fp32, which cudnn refuses,
+    so an unpacked batch is refused while a packed one runs."""
     # The param tree does not depend on the kernel, so the tree comes from a
     # twin whose init is allowed to run: initialising the cudnn model itself
     # would trip the same refusal before the test could make its point.
@@ -751,11 +751,13 @@ def test_a_segment_masked_batch_leaves_the_cudnn_kernel(rng):
         params, ids, positions=positions, segment_ids=segment_ids))
 
 
-def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(rng):
+def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(
+        rng, without_deterministic_ops):
     """Rotary positions rotate q and k and narrow nobody's view, so a batch
     that carries them keeps causality as a kernel flag. Pinning cudnn is what
-    proves the routing, as in the packed case above: this host has no cudnn,
-    so a call that reaches it is refused, and a call a mask sent to xla runs.
+    proves the routing, as in the packed case above: cudnn refuses the fp32
+    model, so a call that reaches it is refused, and a call a mask sent to xla
+    runs.
 
     Validity is the other half of the contract. An array is opaque at trace
     time, so an all-true one still builds the mask and still rides xla."""
