@@ -100,7 +100,32 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     """
     started = time.perf_counter()
     root = jax.process_index() == 0
+    _agree_configuration(metrics, batches, split)
+    preview_enabled = bool(broadcast_from_process_zero(root and preview))
+    event_step, context, event_words = _event(key, step, schedule_step, averaged)
+    score_key = jax.random.fold_in(context.key, 0x53434F52)
+    preview_key = jax.random.fold_in(context.key, 0x50524556)
+    scores: dict[str, float] = {}
+    previews: tuple[Artifact, ...] = ()
+    scored = records = 0
+    uneven = False
+    if batches is not None and (metrics or preview_enabled):
+        scores, previews, scored, records, uneven = _score_split(
+            objective, variables, batches, context, mesh, metrics=metrics, split=split,
+            root=root, preview_enabled=preview_enabled, score_key=score_key,
+            preview_key=preview_key)
+    elapsed = time.perf_counter() - started
+    scores, elapsed = broadcast_from_process_zero((scores, elapsed))
+    return Evaluation(event_step, split, scores, scored, records, uneven, event_words, elapsed, previews)
 
+
+def _agree_configuration(metrics: Sequence[Metric], batches, split: str) -> None:
+    """Check this rank's evaluation settings, then agree they match root's.
+
+    Ranks that disagree about the split, the metrics or whether there is a
+    validation stream would walk different phases below, and hang at a
+    collective one of them never reaches.
+    """
     def checked() -> dict[str, object]:
         names = [metric.name for metric in metrics]
         if len(names) != len(set(names)):
@@ -116,7 +141,16 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     error = None if configuration == root_configuration else ValueError(
         "validation availability, split and ordered metric names/types must agree across ranks")
     agree_process_phase(error, phase="configuration agreement")
-    preview_enabled = bool(broadcast_from_process_zero(root and preview))
+
+
+def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | None,
+           averaged: Variables | None) -> tuple[int, Step, tuple[int, ...]]:
+    """Draw the event's clocks and RNG, and the identity every rank reports.
+
+    The clocks come home through a collective, so a rank whose own step
+    differs uses root's. The key folds in 'EVAL' and that step, so an
+    evaluation never draws what a training step at the same clock drew.
+    """
     step_home, schedule_home = collective_host(
         (step, step if schedule_step is None else schedule_step), phase="evaluation clocks")
 
@@ -129,104 +163,173 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     event_step, context, event_data = agreed("evaluation context", event)
     event_words = tuple(int(word) for word in np.asarray(collective_host(
         event_data, phase="event identity")))
-    score_key = jax.random.fold_in(context.key, 0x53434F52)
-    preview_key = jax.random.fold_in(context.key, 0x50524556)
+    return event_step, context, event_words
+
+
+def _score_split(objective: Objective[Loss, Effects], variables: Variables, batches,
+                 context: Step, mesh: Mesh | None, *, metrics: Sequence[Metric],
+                 split: str, root: bool, preview_enabled: bool,
+                 score_key: jax.Array, preview_key: jax.Array,
+                 ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int, bool]:
+    """Score the coordinated prefix of a validation split.
+
+    Returns the finalized scores, root's previews, and the three counts every
+    rank agrees on: the batches scored, the records read, and whether the
+    prefix ended because some ranks ran out of batches before others.
+
+    Every rank walks these phases in the same order, so a rank that drains
+    early stops the pool at the batch agreement rather than at a collective
+    its peers have already left.
+    """
     summaries: dict[str, object] = {}
     scores: dict[str, float] = {}
     previews: tuple[Artifact, ...] = ()
     source = iterator = None
     scored = records = 0
     uneven = False
-    if batches is not None and (metrics or preview_enabled):
-        try:
-            def open_source() -> None:
-                # Each name is bound as it is built, so a failure part way
-                # through still leaves the cleanup below what to close.
-                nonlocal mesh, source, iterator
-                mesh = build_mesh() if mesh is None else mesh
-                source = batches()
-                iterator = iter(source)
+    try:
+        def open_source() -> None:
+            # Each name is bound as it is built, so a failure part way
+            # through still leaves the cleanup below what to close.
+            nonlocal mesh, source, iterator
+            mesh = build_mesh() if mesh is None else mesh
+            source = batches()
+            iterator = iter(source)
 
-            agreed("iterator construction", open_source)
-            assert iterator is not None and mesh is not None
-            while True:
-                error = None
+        agreed("iterator construction", open_source)
+        assert iterator is not None and mesh is not None
+        while True:
+            batch, available = _next_batch(iterator, scored)
+            if available != jax.process_count():
+                uneven = available > 0
                 batch = None
-                try:
-                    # A drained iterator is the end of the split, which the
-                    # phase below agrees on; anything else is a failure.
-                    with contextlib.suppress(StopIteration):
-                        batch = next(iterator)
-                except BaseException as failure:
-                    error = failure
-                available = agree_process_phase(
-                    error, phase=f"iterator next batch {scored}", available=batch is not None)
-                if available != jax.process_count():
-                    uneven = available > 0
-                    batch = None
-                    break
-                assert batch is not None
+                break
+            assert batch is not None
+            batch, rows = _placed_batch(mesh, batch, scored)
+            records += rows
+            produced = None
+            if metrics:
+                produced = _scored_batch(objective, variables, batch, context, scored,
+                                         metrics=metrics, summaries=summaries,
+                                         score_key=score_key, root=root)
+            if scored == 0 and preview_enabled:
+                previews = _previewed(objective, variables, batch, context,
+                                      preview_key=preview_key, scored=produced, root=root)
+            produced = batch = None
+            scored += 1
+            if not metrics:
+                break
+        if scored:
+            scores = _finalized(metrics, summaries, split=split, root=root)
+    finally:
+        _close_source(iterator if iterator is not None else source)
+    return scores, previews, scored, records, uneven
 
-                def place() -> None:
-                    nonlocal batch, records
-                    batch = shard_batch(mesh, batch)
-                    rows = next((leaf.shape[0] for leaf in jax.tree.leaves(batch) if leaf.ndim), None)
-                    if rows is None:
-                        raise ValueError("validation batch has no row-bearing array")
-                    records += int(rows)
 
-                agreed(f"batch placement {scored}", place)
-                produced = None
-                if metrics:
-                    produced = agreed(f"scoring batch {scored}", lambda: objective.evaluate(
-                        variables, batch, replace(context, key=jax.random.fold_in(score_key, scored))))
-                    produced, home = collective_host((produced, batch), phase=f"scoring batch {scored}")
-                    artifacts = _artifacts(produced)
-                    for metric in metrics:
-                        def merge() -> None:
-                            if not root:
-                                return
-                            contribution = metric(_pick(artifacts, metric.reads), home)
-                            summaries[metric.name] = (
-                                metric.merge(summaries[metric.name], contribution)
-                                if metric.name in summaries else contribution)
+def _next_batch(iterator: Iterator, index: int) -> tuple[Batch | None, int]:
+    """Read one batch, and agree how many ranks still had one to read.
 
-                        agreed(f"metric {metric.name} batch {scored}", merge)
-                    del home, artifacts
-                if scored == 0 and preview_enabled:
-                    produced_preview = agreed(
-                        "preview generation/decoding", lambda: objective.preview(
-                            variables, batch, replace(context, key=preview_key), scored=produced))
-                    produced_preview = collective_host(produced_preview, phase="preview artifacts")
-                    if root:
-                        previews = _artifacts(produced_preview)
-                    produced_preview = None
-                produced = batch = None
-                scored += 1
-                if not metrics:
-                    break
-            if scored:
-                for metric in metrics:
-                    def finalize() -> None:
-                        if root:
-                            scores[f"{split}/{metric.name}"] = float(
-                                metric.finalize(summaries[metric.name]))
+    The count is how many ranks hold a batch, so every rank ends the
+    coordinated prefix at the same batch.
+    """
+    error = None
+    batch = None
+    try:
+        # A drained iterator is the end of the split, which the phase below
+        # agrees on; anything else is a failure.
+        with contextlib.suppress(StopIteration):
+            batch = next(iterator)
+    except BaseException as failure:
+        error = failure
+    available = agree_process_phase(
+        error, phase=f"iterator next batch {index}", available=batch is not None)
+    return batch, available
 
-                    agreed(f"finalizing metric {metric.name}", finalize)
-        finally:
-            primary = sys.exception()
-            error = None
-            try:
-                held = iterator if iterator is not None else source
-                if isinstance(held, Closeable):
-                    held.close()
-            except BaseException as failure:
-                if primary is not None:
-                    primary.add_note(f"Validation iterator cleanup failed: {failure!r}")
-                else:
-                    error = failure
-            if primary is None:
-                agree_process_phase(error, phase="iterator cleanup")
-    elapsed = time.perf_counter() - started
-    scores, elapsed = broadcast_from_process_zero((scores, elapsed))
-    return Evaluation(event_step, split, scores, scored, records, uneven, event_words, elapsed, previews)
+
+def _placed_batch(mesh: Mesh, batch: Batch, index: int) -> tuple[Batch, int]:
+    """Shard one validation batch onto the mesh, and count the rows it holds."""
+    def place() -> tuple[Batch, int]:
+        placed = shard_batch(mesh, batch)
+        rows = next((leaf.shape[0] for leaf in jax.tree.leaves(placed) if leaf.ndim), None)
+        if rows is None:
+            raise ValueError("validation batch has no row-bearing array")
+        return placed, int(rows)
+
+    return agreed(f"batch placement {index}", place)
+
+
+def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, batch: Batch,
+                  context: Step, index: int, *, metrics: Sequence[Metric],
+                  summaries: dict[str, object], score_key: jax.Array, root: bool):
+    """Score one batch into `summaries`, returning what the objective produced.
+
+    The report and the batch come home together, so each metric on root
+    reads hosted arrays. Every rank reaches every metric's agreement,
+    whether or not it holds an accumulator.
+    """
+    produced = agreed(f"scoring batch {index}", lambda: objective.evaluate(
+        variables, batch, replace(context, key=jax.random.fold_in(score_key, index))))
+    produced, home = collective_host((produced, batch), phase=f"scoring batch {index}")
+    artifacts = _artifacts(produced)
+    for metric in metrics:
+        def merge() -> None:
+            if not root:
+                return
+            contribution = metric(_pick(artifacts, metric.reads), home)
+            summaries[metric.name] = (metric.merge(summaries[metric.name], contribution)
+                                      if metric.name in summaries else contribution)
+
+        agreed(f"metric {metric.name} batch {index}", merge)
+    return produced
+
+
+def _previewed(objective: Objective[Loss, Effects], variables: Variables, batch: Batch,
+               context: Step, *, preview_key: jax.Array, scored,
+               root: bool) -> tuple[Artifact, ...]:
+    """Ask the objective for one preview of the first batch, hosted on root.
+
+    Every rank takes part in the generation agreement and the transfer that
+    brings the artifacts home; only root keeps them.
+    """
+    produced = agreed("preview generation/decoding", lambda: objective.preview(
+        variables, batch, replace(context, key=preview_key), scored=scored))
+    produced = collective_host(produced, phase="preview artifacts")
+    return _artifacts(produced) if root else ()
+
+
+def _finalized(metrics: Sequence[Metric], summaries: dict[str, object], *,
+               split: str, root: bool) -> dict[str, float]:
+    """Reduce each metric's accumulator to one number, agreeing per metric.
+
+    Only root holds accumulators, so its peers reach each agreement with
+    nothing to reduce; a failure on root stops them here.
+    """
+    scores: dict[str, float] = {}
+    for metric in metrics:
+        def finalize() -> None:
+            if root:
+                scores[f"{split}/{metric.name}"] = float(metric.finalize(summaries[metric.name]))
+
+        agreed(f"finalizing metric {metric.name}", finalize)
+    return scores
+
+
+def _close_source(held) -> None:
+    """Close the validation iterator, agreeing a failure the pass itself had not.
+
+    A cleanup failure on top of a failing pass becomes a note on that
+    failure: the pass's own error is the one worth raising, and the peers
+    are already unwinding with it.
+    """
+    primary = sys.exception()
+    error = None
+    try:
+        if isinstance(held, Closeable):
+            held.close()
+    except BaseException as failure:
+        if primary is not None:
+            primary.add_note(f"Validation iterator cleanup failed: {failure!r}")
+        else:
+            error = failure
+    if primary is None:
+        agree_process_phase(error, phase="iterator cleanup")
