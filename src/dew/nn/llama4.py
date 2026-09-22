@@ -194,15 +194,15 @@ class Llama4Mixer(MixerBase):
     """The `llama4` kind: `Llama4TextAttention` under the reference's names.
 
     `use_rope` is the layer's `no_rope_layers` entry, so a config names the
-    local kind with the chunk and the global kind without rope; the other
+    local kind with the chunk (`LayerKind.chunk`, the config's
+    `attention_chunk_size`) and the global kind without rope; the other
     fields are the config's. The head geometry, rope base and its llama3
-    ramp, bias, norm epsilon and kernel choice come from the backbone
+    ramp, bias, norm epsilon, chunk and kernel choice come from the backbone
     through the context.
     """
 
     use_rope: bool = True
     use_qk_norm: bool = True
-    attention_chunk_size: int | None = None
     attn_temperature_tuning: bool = True
     floor_scale: float = 8192.0
     attn_scale: float = 0.1
@@ -214,7 +214,6 @@ class Llama4Mixer(MixerBase):
             "k_eq_v": ctx.k_eq_v,
             "kv_shared": ctx.kv_shared,
             "sliding_window": ctx.sliding_window,
-            "attention_chunk": ctx.attention_chunk,
             "attention_scale": ctx.attention_scale,
             "attention_sinks": ctx.attention_sinks,
             "yarn": ctx.yarn,
@@ -241,7 +240,7 @@ class Llama4Mixer(MixerBase):
             rope_scaling=ctx.rope_scaling,
             use_rope=self.use_rope,
             use_qk_norm=self.use_qk_norm,
-            attention_chunk_size=self.attention_chunk_size,
+            attention_chunk_size=ctx.attention_chunk,
             attn_temperature_tuning=self.attn_temperature_tuning,
             floor_scale=self.floor_scale,
             attn_scale=self.attn_scale,
