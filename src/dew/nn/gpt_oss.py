@@ -24,7 +24,7 @@ class GptOssExperts(nn.Module):
     hidden_size: int
     intermediate_size: int
     num_local_experts: int
-    implementation: str = 'xla'
+    implementation: str = 'auto'
     dispatch: str = 'global'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -81,7 +81,7 @@ class GptOssMLP(nn.Module):
     intermediate_size: int
     num_local_experts: int
     num_experts_per_tok: int
-    implementation: str = 'xla'
+    implementation: str = 'auto'
     dispatch: str = 'global'
     dtype: Dtype | None = None
     precision: PrecisionLike = None

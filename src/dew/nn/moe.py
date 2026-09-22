@@ -39,6 +39,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from .blocks import normal_kernel
+from .precision import rounded_operand
 from .sharding import EXPERT_AXIS, logical_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
@@ -48,7 +49,8 @@ from .sharding import EXPERT_AXIS, logical_axes
 # where a sigmoid saturates.
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
-GROUPED_MATMULS = ('xla', 'tokamax')
+# 'auto' resolves per backend through GROUPED_MATMUL_BY_BACKEND below.
+GROUPED_MATMULS = ('auto', 'xla', 'tiled', 'tokamax')
 EXPERT_DISPATCHES = ('global', 'exchange')
 
 # DeepSeek divides the selected weights by their sum plus this, so a token
@@ -309,6 +311,83 @@ class Router(nn.Module):
         return jnp.repeat(kept > 0, per_group, axis=-1)
 
 
+# The grouped matmul 'auto' runs, per backend: the measured winner at
+# lm-moe's shape (8192 rows, 768 -> 2048, 8 experts, bf16). The numbers are
+# in docs/performance.md.
+GROUPED_MATMUL_BY_BACKEND = {'gpu': 'tiled', 'tpu': 'xla'}
+
+# tokamax's own dispatch tries its Mosaic kernel first: on TPU that is the v1
+# kernel, 13x slower than XLA on a v6e, and on an Ada or Ampere card a Mosaic
+# GPU config that exceeds shared memory and raises. The kernel is named.
+TOKAMAX_KERNEL_BY_BACKEND = {'gpu': 'triton', 'tpu': 'mosaic_tpu_v2'}
+
+# Rows per tile of the 'tiled' grouped matmul. Each expert's rows are padded
+# to whole tiles, so the loop multiplies at most one tile of padding per
+# expert beyond the routed rows.
+TILE_ROWS = 512
+
+
+def resolve_grouped_matmul(implementation: str) -> str:
+    """The grouped matmul `implementation` names on the default backend:
+    itself, or the backend's measured one for 'auto'."""
+    if implementation not in GROUPED_MATMULS:
+        raise ValueError(
+            f"implementation must be one of {list(GROUPED_MATMULS)}, got "
+            f"{implementation!r}")
+    if implementation != 'auto':
+        return implementation
+    return GROUPED_MATMUL_BY_BACKEND.get(jax.default_backend(), 'xla')
+
+
+def _tiled_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
+                  precision: PrecisionLike, preferred_element_type: Dtype | None,
+                  tile: int) -> jax.Array:
+    """The grouped matmul as a loop of dense `[tile, in] @ [in, out]` products.
+
+    Each expert's rows are gathered into whole zero-padded tiles, so a tile
+    belongs to one expert and the loop multiplies it by that expert's matrix;
+    a second gather puts the rows back in order. The shapes are static: the
+    tile count is the bound `ceil(rows / tile) + experts`, and a tile past
+    the routed rows multiplies zeros. Both gathers transpose to scatter-adds
+    and the loop to a loop, so the product differentiates in both
+    directions. Rows past `sum(group_sizes)` come out zero, as ragged_dot's
+    do.
+    """
+    rows = tokens.shape[0]
+    experts, _, features = kernel.shape
+    tile = max(1, min(tile, rows))
+    tiles = -(-rows // tile) + experts
+    sizes = group_sizes.astype(jnp.int32)
+    per_expert = (sizes + tile - 1) // tile
+    tile_ends = jnp.cumsum(per_expert)
+    tile_starts = tile_ends - per_expert
+    row_ends = jnp.cumsum(sizes)
+    row_starts = row_ends - sizes
+    # Each tile's expert, and the row of that expert each tile slot reads.
+    index = jnp.arange(tiles)
+    owner = jnp.minimum(jnp.searchsorted(tile_ends, index, side='right'), experts - 1)
+    offset = (index - tile_starts[owner])[:, None] * tile + jnp.arange(tile)[None, :]
+    # An out-of-range source reads the fill value: the zero padding.
+    source = jnp.where((offset >= 0) & (offset < sizes[owner][:, None]),
+                       row_starts[owner][:, None] + offset, rows)
+    padded = tokens.at[source].get(mode='fill', fill_value=0)
+
+    def product(operands):
+        block, expert = operands
+        return jax.lax.dot_general(
+            block, jax.lax.dynamic_index_in_dim(kernel, expert, keepdims=False),
+            (((1,), (0,)), ((), ())), precision=precision,
+            preferred_element_type=preferred_element_type)
+
+    products = jax.lax.map(product, (padded, owner)).reshape(tiles * tile, features)
+    # Row r of expert e sits in slot tile_starts[e] * tile + r - row_starts[e].
+    row = jnp.arange(rows)
+    expert = jnp.minimum(jnp.searchsorted(row_ends, row, side='right'), experts - 1)
+    slot = jnp.where(row < row_ends[-1],
+                     tile_starts[expert] * tile + row - row_starts[expert], tiles * tile)
+    return products.at[slot].get(mode='fill', fill_value=0)
+
+
 def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
                    implementation: str, precision: PrecisionLike = None,
                    preferred_element_type: Dtype | None = None) -> jax.Array:
@@ -316,46 +395,38 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     `kernel`, `[exp, in, out]`, for rows already sorted by expert.
 
     `group_sizes` is how many leading rows belong to expert 0, then to expert
-    1, and so on, the form both grouped matmuls take. `implementation` picks
+    1, and so on, the form every grouped matmul takes. `implementation` picks
     between them, the seam `dew.nn.attention.scaled_dot_product_attention`
     has:
 
-    - 'xla': `jax.lax.ragged_dot`, which lowers on every backend.
+    - 'auto': the backend's measured one, `GROUPED_MATMUL_BY_BACKEND`, and
+      'xla' on a backend the table does not name.
+    - 'xla': `jax.lax.ragged_dot`, which lowers on every backend. On a GPU
+      it lowers to a dense product over every expert.
+    - 'tiled': `_tiled_matmul`, a loop of dense per-tile products in JAX.
     - 'tokamax': `tokamax.ragged_dot`, the same call against tokamax's own
-      kernels (`maxtext layers/moe.py:1633`); tokamax picks its Mosaic or
-      Triton kernel where one exists and lowers to XLA elsewhere.
+      kernels (`maxtext layers/moe.py:1633`), the kernel named per backend
+      by `TOKAMAX_KERNEL_BY_BACKEND` and XLA elsewhere.
 
     This is the raw kernel call and JAX's own differentiation rules.
     `expert_projection` adds the precision contract routed experts train
     under.
     """
-    if implementation not in GROUPED_MATMULS:
-        raise ValueError(
-            f"implementation must be one of {list(GROUPED_MATMULS)}, got "
-            f"{implementation!r}")
+    implementation = resolve_grouped_matmul(implementation)
     if implementation == 'tokamax':
         # tokamax is not a dependency (docs/concepts/moe.md), so it is
         # imported at the call.
         tokamax = importlib.import_module('tokamax')
         return tokamax.ragged_dot(
             tokens, kernel, group_sizes, precision=precision,
-            preferred_element_type=preferred_element_type)
+            preferred_element_type=preferred_element_type,
+            implementation=TOKAMAX_KERNEL_BY_BACKEND.get(jax.default_backend(), 'xla'))
+    if implementation == 'tiled':
+        return _tiled_matmul(tokens, kernel, group_sizes, precision=precision,
+                             preferred_element_type=preferred_element_type, tile=TILE_ROWS)
     return jax.lax.ragged_dot(
         tokens, kernel, group_sizes, precision=precision,
         preferred_element_type=preferred_element_type)
-
-
-@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
-def _rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
-    # The value an operand takes in the compute dtype, held in its own dtype
-    # so the straight-through tangent below never rounds a second time.
-    return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
-
-
-@_rounded_operand.defjvp
-def _rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array],
-                         tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
-    return jnp.asarray(_rounded_operand(primals[0], dtype)), tangents[0]
 
 
 def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
@@ -366,7 +437,7 @@ def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> 
     or scan carry from rounding partial bias gradients.
     """
     work = jnp.result_type(bias.dtype, dtype, jnp.float32)
-    values = jnp.asarray(_rounded_operand(bias, dtype)).astype(work)
+    values = jnp.asarray(rounded_operand(bias, dtype)).astype(work)
     return values.at[expert_ids].get(mode='fill', fill_value=0).astype(dtype)
 
 
@@ -385,12 +456,16 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     the widest of the compute, input and kernel dtypes. The contract holds
     in both differentiation directions and does not depend on placement.
 
-    The tangent contractions are `jax.lax.ragged_dot`, whose transposes JAX
-    defines, so both directions differentiate under either kernel; tokamax's
-    own rules stop at reverse mode. Measured against NumPy float64 sums of
-    the rounded operands and three Adam steps of the global path on every
-    expert/fsdp layout in tests/test_moe_precision.py; with fp32 operands
-    the forward pass is the call it wraps.
+    The tangent contractions run on the same grouped matmul as the forward
+    where JAX can transpose it ('xla', 'tiled'), and on `jax.lax.ragged_dot`
+    under 'tokamax', whose own rules stop at reverse mode. Their operands
+    are in the work dtype, not the compute dtype, even where the values are
+    exact in bf16: forward-over-reverse differentiates a tangent
+    contraction again, and a bf16 dot there would round the master-dtype
+    kernel tangent. Measured against NumPy float64 sums of the rounded
+    operands and three Adam steps of the global path on every expert/fsdp
+    layout in tests/test_moe_precision.py; with fp32 operands the forward
+    pass is the call it wraps.
     """
     x, kernel = promote_dtype(x, kernel, dtype=dtype)
     accumulated = grouped_matmul(
@@ -412,14 +487,16 @@ def _expert_projection_jvp(dtype: Dtype | None, implementation: str,
     dx, dkernel = jax.lax.optimization_barrier((dx, dkernel))
     output = jnp.asarray(expert_projection(x, kernel, group_sizes, dtype, implementation, precision))
     work = jnp.result_type(output.dtype, x.dtype, kernel.dtype, jnp.float32)
-    inputs = jnp.asarray(_rounded_operand(x, output.dtype))
-    matrix = jnp.asarray(_rounded_operand(kernel, output.dtype))
-    input_term = jax.lax.ragged_dot(
-        dx.astype(work), matrix.astype(work), group_sizes, precision=precision,
-        preferred_element_type=work)
-    kernel_term = jax.lax.ragged_dot(
-        inputs.astype(work), dkernel.astype(work), group_sizes, precision=precision,
-        preferred_element_type=work)
+    inputs = jnp.asarray(rounded_operand(x, output.dtype))
+    matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
+    tangents_on = resolve_grouped_matmul(implementation)
+    tangents_on = 'xla' if tangents_on == 'tokamax' else tangents_on
+    input_term = grouped_matmul(
+        dx.astype(work), matrix.astype(work), group_sizes, implementation=tangents_on,
+        precision=precision, preferred_element_type=work)
+    kernel_term = grouped_matmul(
+        inputs.astype(work), dkernel.astype(work), group_sizes, implementation=tangents_on,
+        precision=precision, preferred_element_type=work)
     tangent = jax.lax.optimization_barrier((input_term + kernel_term).astype(output.dtype))
     return output, tangent
 
@@ -493,8 +570,8 @@ class ExpertLinear(nn.Module):
     num_experts: int
     in_features: int
     features: int
-    implementation: str = 'xla'
     init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
+    implementation: str = 'auto'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -672,7 +749,7 @@ class ExpertMLP(nn.Module):
     num_experts: int
     hidden_features: int
     out_features: int
-    activation: GatedActivation = 'swiglu'
+    activation: str = 'swiglu'
     implementation: str = 'xla'
     dispatch: str = 'global'
     swiglu_limit: float | None = None
@@ -780,7 +857,7 @@ class SparseMLP(nn.Module):
     top_k: int
     hidden_features: int
     out_features: int
-    activation: GatedActivation = 'swiglu'
+    activation: str = 'swiglu'
     implementation: str = 'xla'
     dispatch: str = 'global'
     score_function: str = 'softmax'
