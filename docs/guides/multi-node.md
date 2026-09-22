@@ -17,7 +17,7 @@ Every node runs the same script. Each copy is one process of a `jax.distributed`
 | Open MPI (`mpirun`) | The `OMPI_*` variables. JAX reads them. |
 | Plain machines over ssh | `dew launch`, through `JAX_COORDINATOR_ADDRESS`, `DEW_PROCESS_COUNT` and `DEW_PROCESS_ID`. |
 
-`dew launch` also sets `JAX_LOCAL_DEVICE_IDS` when a host runs more than one process, so each process takes its own accelerators.
+`--devices-per-process N` makes `dew launch` set `JAX_LOCAL_DEVICE_IDS`, so each of a host's processes takes its own N accelerators. Without it every process takes every local device, which is right for one process per host and wrong for several.
 
 ## Launch on plain machines
 
