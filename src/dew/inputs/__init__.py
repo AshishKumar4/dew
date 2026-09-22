@@ -2,13 +2,13 @@
 
 `InputSpec` names the batch field the model learns to generate and, keyed by
 the model's own keyword arguments, the conditions it is given. A `Condition`
-is an encoder, the batch field it reads and the raw datum that stands for
+is an encoder, the batch field it reads, and the raw datum that stands for
 "no condition", which classifier-free guidance and conditioning dropout
-substitute. Nothing here runs a model; the spec is a description, and the
+substitute. Nothing here runs a model: the spec is a description, and the
 objective does the encoding.
 
 Image and video batches arrive as uint8 pixels in [0, 255], the way the data
-workers write them; `unit_range` is the one conversion to the [-1, 1] range
+workers write them. `unit_range` is the one conversion to the [-1, 1] range
 every diffusion loss, sample, artifact and image metric lives in.
 """
 
@@ -34,9 +34,11 @@ def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
 
 
 def pixel_field(height: int, width: int, channels: int = 3) -> Field:
-    """The batch field carrying one image per row for a vision tower: float32
-    [channels, height, width] as the checkpoint's processor emitted it, beside
-    the decoder's token field."""
+    """The batch field carrying one image per row for a vision tower.
+
+    It is float32 [channels, height, width], as the checkpoint's processor
+    emitted it, and rides beside the decoder's token field.
+    """
     return Field(PIXEL_VALUES_KEY, (channels, height, width))
 
 
@@ -53,7 +55,7 @@ class Field:
 
 @dataclass(frozen=True)
 class Condition:
-    """One conditioning input: the encoder, the batch field holding its
+    """Names one conditioning input: its encoder, the batch field holding its
     tokens, and the raw datum for the unconditional branch."""
 
     encoder: ConditionEncoder
@@ -75,12 +77,12 @@ class Condition:
 
 @dataclass(frozen=True)
 class InputSpec:
-    """The sample field and the conditions, keyed by the model keyword each
-    is passed under: `{"textcontext": Condition(...)}`.
+    """Names the sample field and the conditions, keyed by the model keyword
+    each is passed under: `{"textcontext": Condition(...)}`.
 
-    `tokenize` is what a captioning dataset hands its text to: every
+    `tokenize` is what a captioning dataset hands its text to. Every
     condition tokenizes the batch's captions under its own field, so the
-    encoder a run names decides the ids and the context length and a
+    encoder a run names decides the ids and the context length while the
     dataset carries the words alone.
     """
 
@@ -115,7 +117,8 @@ class InputSpec:
 
     @classmethod
     def from_json(cls, record: Mapping, *, params: Mapping[str, Variables] | None = None) -> InputSpec:
-        """Rebuild metadata around supplied condition parameters, or load source weights."""
+        """Rebuilds the spec around supplied condition parameters, or loads
+        each encoder's own weights when none are given."""
         sample = record["sample"]
         return cls(sample=Field(sample["key"], tuple(sample["shape"])),
                    conditions={keyword: Condition.from_json(
