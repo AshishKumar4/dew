@@ -72,6 +72,11 @@ class Completion:
 
     Per-choice counts stay None when only aggregate usage was reported.
     finish_reasons retain the backend's values, including an absent reason.
+    `tokens` and `log_probs` hold each choice's sampled ids and their
+    log-probabilities where the backend reported them: a vLLM completion
+    asked for `logprobs` with `return_tokens_as_token_ids` in extra_body
+    reports both. The log-probabilities are whatever distribution the engine
+    was configured to report; this record does not relabel them.
     """
 
     texts: tuple[str, ...]
@@ -79,6 +84,8 @@ class Completion:
     token_counts: tuple[int | None, ...]
     usage: Usage | None
     responses: tuple[OllamaResponse | OpenAIResponse, ...]
+    tokens: tuple[tuple[int, ...] | None, ...]
+    log_probs: tuple[tuple[float, ...] | None, ...]
 
 
 def _invoke[T](call: Callable[..., T], fields: Mapping[str, object]) -> T:
@@ -201,7 +208,9 @@ def _ollama_result(responses: Sequence[OllamaResponse]) -> Completion:
         texts.append(response.response)
         counts.append(_count(response.eval_count, "eval_count"))
         reasons.append(_reason(response.done_reason))
-    return Completion(tuple(texts), tuple(reasons), tuple(counts), None, tuple(responses))
+    unreported = (None,) * len(texts)
+    return Completion(tuple(texts), tuple(reasons), tuple(counts), None, tuple(responses),
+                      unreported, unreported)
 
 
 @dataclass(frozen=True)
@@ -285,6 +294,32 @@ class OllamaCompletion:
         return await _ainvoke(self._async().chat, body)
 
 
+def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None, tuple[float, ...] | None]:
+    """Read one choice's reported sampled ids and log-probabilities, if any.
+
+    Ids are read only from vLLM's `token_id:<n>` rendering of the tokens;
+    text tokens are not reverse-mapped through a vocabulary.
+    """
+    logprobs = entry.get("logprobs")
+    if logprobs is None:
+        return None, None
+    record = _object(logprobs, "choice logprobs")
+    rendered, values = record.get("tokens"), record.get("token_logprobs")
+    if not isinstance(rendered, list) or not isinstance(values, list) or len(rendered) != len(values):
+        raise ValueError("choice logprobs need aligned tokens and token_logprobs lists")
+    probabilities: list[float] = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("each reported token log-probability must be a number")
+        probabilities.append(float(value))
+    ids: list[int] = []
+    for token in rendered:
+        if not isinstance(token, str) or not token.startswith("token_id:"):
+            return None, tuple(probabilities)
+        ids.append(int(token.removeprefix("token_id:")))
+    return tuple(ids), tuple(probabilities)
+
+
 def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
     from openai.types import Completion as SDKCompletion
     if not isinstance(response, SDKCompletion):
@@ -293,7 +328,7 @@ def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
     choices = fields.get("choices")
     if not isinstance(choices, list) or len(choices) != expected:
         raise ValueError(f"expected {expected} completion choices")
-    ordered: dict[int, tuple[str, str | None]] = {}
+    ordered: dict[int, tuple[str, str | None, tuple[int, ...] | None, tuple[float, ...] | None]] = {}
     for choice in choices:
         entry = _object(choice, "completion choice")
         index, text = entry.get("index"), entry.get("text")
@@ -301,29 +336,60 @@ def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
             raise ValueError("choice indices must be a permutation of the expected prompt-choice indices")
         if not isinstance(text, str):
             raise ValueError("each completion choice needs string text")
-        ordered[index] = text, _reason(entry.get("finish_reason"))
+        ordered[index] = (text, _reason(entry.get("finish_reason")), *_choice_tokens(entry))
     usage = None
     if fields.get("usage") is not None:
         supplied = _object(fields["usage"], "usage")
         usage = Usage(*(_count(supplied.get(name), name) for name in
                         ("prompt_tokens", "completion_tokens", "total_tokens")))
     per_choice = (usage.completion_tokens,) if expected == 1 and usage is not None else (None,) * expected
-    return Completion(tuple(ordered[index][0] for index in range(expected)),
-                      tuple(ordered[index][1] for index in range(expected)), per_choice, usage, (response,))
+    choice = [ordered[index] for index in range(expected)]
+    return Completion(tuple(entry[0] for entry in choice), tuple(entry[1] for entry in choice),
+                      per_choice, usage, (response,), tuple(entry[2] for entry in choice),
+                      tuple(entry[3] for entry in choice))
 
 
-def _openai_fields(model: str, prompts: str | Sequence[str], budget: int, seed: int | None,
+type TokenRows = Sequence[Sequence[int]]
+"""Prompts as token ids, one row per prompt, which the completions API accepts in place of text."""
+
+
+def _token_rows(prompts: object) -> list[list[int]] | None:
+    """Read `prompts` as token-id rows, or None when they are text."""
+    if isinstance(prompts, str) or not isinstance(prompts, Sequence) or not prompts:
+        return None
+    if all(isinstance(row, str) for row in prompts):
+        return None
+    rows: list[list[int]] = []
+    for row in prompts:
+        if isinstance(row, str) or not isinstance(row, Sequence) or not row:
+            raise ValueError("token prompts must be nonempty rows of token ids")
+        if any(type(token) is not int or token < 0 for token in row):
+            raise ValueError("token prompts must hold nonnegative integer ids")
+        rows.append(list(row))
+    return rows
+
+
+def _openai_fields(model: str, prompts: str | Sequence[str] | TokenRows, budget: int, seed: int | None,
                    parameters: Mapping[str, object], *,
                    stream: bool = False) -> tuple[Mapping[str, object], int]:
-    rows = _prompts(prompts, budget, seed)
+    tokens = _token_rows(prompts)
+    if tokens is None:
+        # No token rows: one string, or rows that are all strings (an empty
+        # list reaches `_prompts` empty and is refused there).
+        texts = _prompts(prompts if isinstance(prompts, str) else [row for row in prompts if isinstance(row, str)],
+                         budget, seed)
+        count = len(texts)
+        prompt: object = prompts if isinstance(prompts, str) else texts
+    else:
+        _prompts("", budget, seed)
+        count, prompt = len(tokens), tokens
     n = parameters.get("n", 1)
     if isinstance(n, bool) or not isinstance(n, int) or n < 1:
         raise ValueError("n must be a positive integer")
-    fixed: dict[str, object] = {"model": model, "prompt": prompts if isinstance(prompts, str) else rows,
-                                "max_tokens": budget, "stream": stream}
+    fixed: dict[str, object] = {"model": model, "prompt": prompt, "max_tokens": budget, "stream": stream}
     if seed is not None:
         fixed["seed"] = seed
-    return _bound(parameters, fixed), len(rows) * n
+    return _bound(parameters, fixed), count * n
 
 
 @dataclass(frozen=True)
@@ -334,6 +400,8 @@ class OpenAICompletion:
     vLLM-only controls such as top_k/min_p/stop_token_ids belong explicitly in
     extra_body. SDK responses and streaming chunks retain backend logprobs,
     token IDs/extensions, tool calls and structured output fields unchanged.
+    Completion prompts are text or token-id rows; a row of ids reaches the
+    engine as ids, with no detokenize/retokenize round trip.
     """
 
     model: str
@@ -389,14 +457,14 @@ class OpenAICompletion:
             raise TypeError("async methods require AsyncOpenAI")
         return self.client
 
-    def __call__(self, prompts: str | Sequence[str], max_new_tokens: int, *,
+    def __call__(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *,
                  seed: int | None = None, **parameters: RequestField) -> Completion:
         fields, expected = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
         create: Callable[..., _RawResponse[object]] = self._sync().completions.with_raw_response.create
         raw = _invoke(create, fields)
         return _openai_result(raw.http_response.json(), raw.parse(), expected)
 
-    def stream(self, prompts: str | Sequence[str], max_new_tokens: int, *, seed: int | None = None,
+    def stream(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *, seed: int | None = None,
                **parameters: RequestField) -> Stream[OpenAIResponse]:
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
@@ -421,13 +489,13 @@ class OpenAICompletion:
         create: Callable[..., ChatCompletion | Stream[ChatCompletionChunk]] = self._sync().chat.completions.create
         return _invoke(create, fields)
 
-    async def acall(self, prompts: str | Sequence[str], max_new_tokens: int, *,
+    async def acall(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *,
                     seed: int | None = None, **parameters: RequestField) -> Completion:
         fields, expected = _openai_fields(self.model, prompts, max_new_tokens, seed, self._parameters(parameters))
         raw = await _ainvoke(self._async().completions.with_raw_response.create, fields)
         return _openai_result(raw.http_response.json(), raw.parse(), expected)
 
-    async def astream(self, prompts: str | Sequence[str], max_new_tokens: int, *, seed: int | None = None,
+    async def astream(self, prompts: str | Sequence[str] | TokenRows, max_new_tokens: int, *, seed: int | None = None,
                       **parameters: RequestField) -> AsyncStream[OpenAIResponse]:
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
