@@ -10,6 +10,7 @@ import logging
 import warnings
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -30,14 +31,48 @@ _log = logging.getLogger(__name__)
 FEATURES = "FID InceptionV3 pool3, bilinear 299x299, [-1, 1]"
 
 
-@functools.cache
-def _get_inception():
-    """The pool3 feature extractor and its parameters, loaded once per
-    process. The FID InceptionV3 is about 90 MB of weights, and every metric
-    built from this module shares the copy."""
+def _features(weights: str | None) -> str:
+    """What a distance was measured with, for the line every one is logged
+    with: two FID values are comparable only when this string matches."""
+    return FEATURES if weights is None else f"{FEATURES}, weights {weights}"
+
+
+def _extractor(weights: str | None):
+    """The feature extractor, from the published checkpoint or a file.
+
+    A local file is read by the same loader the download feeds: a pickle of
+    numpy arrays in the layout the published FID checkpoint uses, which the
+    module takes as the parameters of every convolution and norm it builds.
+    """
     from .inception import InceptionV3
-    _log.info("loading InceptionV3 FID weights (cached for reuse)")
-    model = InceptionV3(pretrained=True)
+    if weights is None:
+        return InceptionV3(pretrained=True)
+
+    class LocalInceptionV3(InceptionV3):
+        """InceptionV3 whose parameters come from a file instead of the Hub.
+
+        `setup` is the download in the base class, and the only thing it
+        does is hand the module the parameter dict every convolution and
+        norm below reads its own arrays out of."""
+
+        ckpt_path: str = ""
+
+        def setup(self):
+            from . import utils
+            self.params_dict = utils.load_arrays(self.ckpt_path)
+            self.num_classes_ = self.num_classes
+
+    return LocalInceptionV3(ckpt_path=weights)
+
+
+@functools.cache
+def _get_inception(weights: str | None = None):
+    """The pool3 feature extractor and its parameters, loaded once per
+    process and per weights. The FID InceptionV3 is about 90 MB of weights,
+    and every metric built from this module shares the copy."""
+    _log.info("loading InceptionV3 FID weights from %s (cached for reuse)",
+              "the hub" if weights is None else weights)
+    model = _extractor(weights)
     params = model.init(jax.random.PRNGKey(0), jnp.ones((1, 299, 299, 3)))
     return model, params
 
@@ -128,13 +163,13 @@ class FIDStats:
 
 
 @functools.cache
-def _get_activations():
+def _get_activations(weights: str | None = None):
     """The jitted pool3 feature extractor, built on first use.
 
     Building it loads the ~90MB weights, so it happens here, on first use.
     Constructing the metric opens nothing.
     """
-    model, params = _get_inception()
+    model, params = _get_inception(weights)
 
     @jax.jit
     def activations(images):
@@ -149,7 +184,8 @@ def _get_activations():
     return activations
 
 
-def _pooled_stats(batches: Iterable[ArrayLike], *, population: str) -> GaussianStats:
+def _pooled_stats(batches: Iterable[ArrayLike], *, population: str,
+                  weights: str | None = None) -> GaussianStats:
     """Pool3 statistics over batches of pixels in [-1, 1], pooled as they come.
 
     The extractor is asked for inside the loop, so the weights load with the
@@ -157,7 +193,8 @@ def _pooled_stats(batches: Iterable[ArrayLike], *, population: str) -> GaussianS
     """
     pooled: GaussianStats | None = None
     for images in batches:
-        contribution = GaussianStats.from_features(_get_activations()(images), population=population)
+        contribution = GaussianStats.from_features(_get_activations(weights)(images),
+                                                   population=population)
         pooled = contribution if pooled is None else pooled.merge(contribution)
     if pooled is None:
         raise ValueError(f"fid {population}: no images to score")
@@ -178,7 +215,7 @@ def _unit_range_batches(images: NDArray[np.uint8] | jax.Array | Iterable[ArrayLi
             yield unit_range(pixels[start:start + batch_size])
 
 
-def _pooled_distance(stats: FIDStats) -> float:
+def _pooled_distance(stats: FIDStats, weights: str | None = None) -> float:
     """The distance between two pooled populations, logged with the counts and
     the features it holds for."""
     generated, real = stats.generated, stats.real
@@ -189,29 +226,38 @@ def _pooled_distance(stats: FIDStats) -> float:
     distance = frechet_distance(generated.mean, generated.covariance(population="generated"),
                                 real.mean, real.covariance(population="real"))
     _log.info("FID populations: generated=%d, real=%d; features=%s",
-              generated.count, real.count, FEATURES)
+              generated.count, real.count, _features(weights))
     return distance
 
 
 def fid(generated: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
         reference: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
-        *, batch_size: int = 64) -> float:
+        *, batch_size: int = 64, weights: str | Path | None = None) -> float:
     """FID between two sets of uint8 [N, H, W, 3] images.
 
     Each side is one array or an iterable of arrays, so a directory of samples
     can stream past in blocks of `batch_size` rows instead of being held at
     once. The value is the distance between the two populations passed in,
     which is FID-50k only at 50,000 images a side.
+
+    `weights` is the feature extractor's parameters as a file, the way
+    `clip_score(modelname=)` names a local CLIP: a pickle of numpy arrays in
+    the layout the published FID checkpoint uses. Unset downloads that
+    checkpoint. Two distances are comparable only when both were measured
+    with the same one, which is why every distance logs which it was.
     """
     if batch_size < 1:
         raise ValueError(f"fid: a batch holds at least one image, got batch_size={batch_size}")
+    named = None if weights is None else str(weights)
     with metric_device():
         stats = FIDStats(
             _pooled_stats(_unit_range_batches(generated, population="generated",
-                                              batch_size=batch_size), population="generated"),
+                                              batch_size=batch_size),
+                          population="generated", weights=named),
             _pooled_stats(_unit_range_batches(reference, population="real",
-                                              batch_size=batch_size), population="real"))
-    return _pooled_distance(stats)
+                                              batch_size=batch_size),
+                          population="real", weights=named))
+    return _pooled_distance(stats, named)
 
 
 @metrics("fid")
@@ -221,18 +267,25 @@ class FID:
 
     The call gathers the sampled grid and the batch's reference field. The
     features, the statistics and the distance are the ones `fid` runs, so a
-    pass over 50,000 images a side reports the number `fid` reports.
+    pass over 50,000 images a side reports the number `fid` reports, and
+    `weights` names the extractor's parameters there the same way.
     """
 
     field: str = "image"
+    weights: str | None = None
     name = "fid"
     reads = ImageGrid
-    feature_identity = FEATURES
+
+    @property
+    def feature_identity(self) -> str:
+        return _features(self.weights)
 
     def __call__(self, artifact: ImageGrid, batch) -> FIDStats:
         with metric_device():
-            return FIDStats(_pooled_stats([artifact.images], population="generated"),
-                            _pooled_stats([unit_range(batch[self.field])], population="real"))
+            return FIDStats(_pooled_stats([artifact.images], population="generated",
+                                          weights=self.weights),
+                            _pooled_stats([unit_range(batch[self.field])], population="real",
+                                          weights=self.weights))
 
     def merge(self, accumulated: FIDStats, contribution: FIDStats) -> FIDStats:
         accumulated.generated = accumulated.generated.merge(contribution.generated)
@@ -240,4 +293,4 @@ class FID:
         return accumulated
 
     def finalize(self, accumulated: FIDStats) -> float:
-        return _pooled_distance(accumulated)
+        return _pooled_distance(accumulated, self.weights)

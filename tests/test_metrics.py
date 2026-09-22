@@ -4,7 +4,8 @@ PSNR and SSIM are checked against their closed forms and against the
 properties they exist to report (degradation ordering, shape handling).
 The Frechet distance itself is checked against closed forms that need no
 weights; the end-to-end InceptionV3 path downloads the FID checkpoint and is
-network-marked. The CLIP metrics build on the tiny checkpoint under
+network-marked, apart from the offline case, which reads the drawn
+sixteenth-width extractor committed under tests/fixtures/inception. The CLIP metrics build on the tiny checkpoint under
 tests/fixtures/clip and score against the cosines of the reference's own
 embeddings.
 """
@@ -33,6 +34,8 @@ from dew.eval.fid import frechet_distance
 from dew.registry import metrics as registry
 
 CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"
+INCEPTION_TINY = (Path(__file__).resolve().parent / "fixtures" / "inception" / "tiny"
+                  / "inception_v3_fid.pickle")
 
 
 def test_frechet_distance_of_a_distribution_with_itself_is_zero(rng):
@@ -111,6 +114,39 @@ def test_fid_of_a_set_against_itself_is_zero_and_a_shifted_set_scores_above_it()
 
     assert abs(fid(images, images)) < 1e-3
     assert fid(brighter, images) > 0
+
+
+def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
+    """`weights` names the extractor's parameters as a file, the way
+    `clip_score(modelname=)` names a local CLIP, so a distance is computable
+    with no download.
+
+    The committed fixture is this module's own InceptionV3 at a sixteenth of
+    every channel width, its parameters drawn rather than trained, so the
+    values are its own and not the published checkpoint's. What a distance
+    promises is the ordering, and that holds: a population against itself is
+    zero to rounding (observed -1.3e-15), the same pixels brightened by 40
+    counts sit above it (6.6e-09), and a flat gray field sits fifty times
+    further out (3.3e-07). The registered metric reads the same file and
+    lands on the same number. `source.json` says how wide the features it
+    pools are, and the extractor agrees.
+    """
+    from dew.eval.fid import _get_activations
+    from dew.inputs import unit_range
+
+    images, brighter = fid_sets()
+    weights = str(INCEPTION_TINY)
+    record = json.loads((INCEPTION_TINY.parent / "source.json").read_text())
+
+    assert abs(fid(images, images, weights=weights)) < 1e-12
+    shifted = fid(brighter, images, weights=weights)
+    assert 0 < shifted < fid(np.full_like(images, 128), images, weights=weights)
+
+    metric = FID(weights=weights)
+    pooled = metric.finalize(metric(ImageGrid(unit_range(brighter)), {"image": images}))
+    assert pooled == pytest.approx(shifted, rel=1e-6)
+    assert metric.feature_identity.endswith(weights)
+    assert _get_activations(weights)(unit_range(images[:1])).shape[1] == record["pool3_features"]
 
 
 @pytest.mark.network
