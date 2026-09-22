@@ -1111,6 +1111,7 @@ def mode_builtin_preview_failures(args) -> dict:
                     trainer._report_evaluation(result)
                 except (AttributeError, ValueError, RuntimeError) as error:
                     reports[case] = {"type": type(error).__name__, "error": str(error),
+                                     "runtime": isinstance(error, RuntimeError),
                                      "original": error is fault, "closed": case in closed}
                 else:
                     reports[case] = {"error": None}
