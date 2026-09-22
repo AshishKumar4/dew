@@ -1398,11 +1398,12 @@ The optional extras are `av`, `eval-harness`, `hpo`, `inference-clients`, `inter
 - [API reference](docs/reference/core-api.md): constructors, arguments, and state contracts.
 - [Examples](examples/) and [recipes](docs/recipes.md): complete programs to adapt.
 
-The four scripts below run a whole job, from data to scored weights. Each takes real-hardware settings by default and a `--smoke` flag that trades them for the repository's tiny fixtures, a few steps, and one CPU device. [End-to-end examples](docs/guides/end-to-end.md) gives both command lines for each.
+The five scripts below run a whole job, from data to scored weights. Each takes real-hardware settings by default and a `--smoke` flag that trades them for the repository's tiny fixtures, a few steps, and one CPU device. [End-to-end examples](docs/guides/end-to-end.md) gives both command lines for each.
 
 - [`examples/train_flowers_tpu.py`](examples/train_flowers_tpu.py): a text-to-image DiT trained on Oxford Flowers across a TPU slice, then sampled and scored with FID and CLIPScore.
 - [`examples/sft_diffusion_gemma.py`](examples/sft_diffusion_gemma.py): LoRA SFT of DiffusionGemma with the base weights held in host memory, publishing a PEFT adapter directory.
 - [`examples/sft_gemma4.py`](examples/sft_gemma4.py): full-weight SFT of a Gemma 4 decoder on a Hub chat dataset, exported to the Hugging Face layout.
+- [`examples/train_rlvr.py`](examples/train_rlvr.py): GRPO with verifiable rewards, where each completion is a program run against hidden tests in a sandbox fleet, and rollouts come from Dew's own server or a vLLM server one update ahead of training.
 - [`examples/evaluate_and_serve.py`](examples/evaluate_and_serve.py): perplexity, an lm-eval-harness suite, image metrics, and a served-model comparison over one finished run.
 
 ## Contributing and acknowledgements

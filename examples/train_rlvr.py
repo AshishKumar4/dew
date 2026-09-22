@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import shutil
 import subprocess
 import time
 from dataclasses import asdict, dataclass, replace
@@ -138,7 +139,11 @@ def launch_vllm(config: Config, directory: Path) -> subprocess.Popen:
          "--gpu-memory-utilization", str(config.vllm_memory), "--dtype", "bfloat16",
          "--max-model-len", str(config.prompt_tokens + config.new_tokens), "--generation-config", "vllm",
          "--enable-prefix-caching", "--seed", str(config.seed)],
-        env={**os.environ, "VLLM_SERVER_DEV_MODE": "1"}, stdout=log, stderr=subprocess.STDOUT)
+        # vLLM runs build tools (ninja) from its own environment's bin directory.
+        env={**os.environ, "VLLM_SERVER_DEV_MODE": "1",
+             "PATH": os.pathsep.join((str(Path(shutil.which(config.vllm) or config.vllm).parent),
+                                      os.environ.get("PATH", "")))},
+        stdout=log, stderr=subprocess.STDOUT)
     deadline = time.monotonic() + 900
     while time.monotonic() < deadline:
         if process.poll() is not None:
