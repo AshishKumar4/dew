@@ -22,14 +22,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
 from .precision import precision_names
-from .sharding import (
-    SEQUENCE_AXIS,
-    STAGE_AXIS,
-    TENSOR_AXIS,
-    logical_axes,
-    sequence_exchange,
-    sequence_shards,
-)
+from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_exchange, sequence_shards
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
 """Names which kernel an attention call runs.
