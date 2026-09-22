@@ -7,7 +7,7 @@ count and its own rank in the environment. A TPU VM, a Slurm step and an
 Open MPI launch leave those in variables jax reads by itself. A plain set of
 machines leaves nothing, and this command is what fills the gap: it starts
 the processes over ssh, or directly for the machine it runs on, with the
-three values in the variables below.
+three values in the variables `dew.pool` names.
 
 Under Slurm, `--slurm` hands the launch to `srun` and jax reads the rank
 from Slurm's own variables, so the same program runs unchanged either way.
@@ -32,15 +32,7 @@ from typing import Annotated, TextIO
 import tyro
 
 from dew.cli.gcloud import emit
-
-COORDINATOR = "JAX_COORDINATOR_ADDRESS"
-"""host:port of process 0's coordinator service, which jax reads itself."""
-LOCAL_DEVICES = "JAX_LOCAL_DEVICE_IDS"
-"""The accelerators a process takes on its host, which jax reads itself."""
-PROCESS_COUNT = "DEW_PROCESS_COUNT"
-"""How many processes the pool holds; `prepare_process` passes it to jax."""
-PROCESS_ID = "DEW_PROCESS_ID"
-"""This process's rank in the pool; `prepare_process` passes it to jax."""
+from dew.pool import COORDINATOR, LOCAL_DEVICES, PROCESS_COUNT, PROCESS_ID
 
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 POLL_SECONDS = 0.2

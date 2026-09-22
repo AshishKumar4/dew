@@ -17,7 +17,7 @@ import jax
 from jax.experimental import multihost_utils
 
 from dew.artifacts import broadcast_from_process_zero
-from dew.cli.launch import PROCESS_COUNT, PROCESS_ID
+from dew.pool import PROCESS_COUNT, PROCESS_ID
 from dew.telemetry.devices import apply_xla_flags
 from dew.telemetry.instrumentation import enable_compilation_cache
 
