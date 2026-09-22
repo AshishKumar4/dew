@@ -312,7 +312,7 @@ def parameter_movement(tool, case, steps: int = 2):
     trainer = tool.build_trainer(case, "reference")
     source = tool.batches(case)
     state = jax.jit(trainer.initial_state)()
-    before = named(state.params)
+    before = jax.tree.map(np.asarray, named(state.params))  # the step consumes the state
     compiled = trainer.compile(state, next(source))
     for _ in range(steps):
         state, loss, _, finite, _ = compiled(state, next(source))
