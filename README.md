@@ -125,7 +125,7 @@ if __name__ == "__main__":
 
 The `__main__` guard allows Grain to start its data-loading workers. `Field` describes one image; the dataset supplies batches of 16. The objective adds noise and constructs the denoising targets. The trainer runs optimization and checkpoints; `state.averaged` contains the EMA weights used for sampling.
 
-Run the full script, which also saves `samples.png`:
+Run the full script. It also saves a sample grid to `runs/flowers64/samples.png`:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python examples/train_flowers.py \
