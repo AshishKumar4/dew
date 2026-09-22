@@ -74,7 +74,7 @@ The placement helper treats rank-two and rank-three arrays as sequences. It can 
 
 ## Use sequence-parallel attention
 
-Sequence-parallel attention splits the queries between devices and gathers the key and value context those queries need. Masked paths stripe query chunks to balance the work. For them, the model's sequence length must divide by twice the number of sequence shards.
+`MeshSpec(sequence=N)` splits the token positions of every sequence over N devices. `MeshSpec.sequence_exchange` picks how attention exchanges data between them. The default, `'all_to_all'`, follows DeepSpeed Ulysses: each device trades its slice of the positions for a slice of the heads, attends the whole sequence and trades back, so no device holds a whole key or value. The query heads must divide by `tensor` times `sequence`. `'all_gather'` gathers the whole keys and values beside split queries and takes any head count. Its masked paths stripe query chunks to balance the work, so the model's sequence length must divide by twice the number of sequence shards. [Training on several nodes](../guides/multi-node.md#split-long-sequences) compares the two.
 
 A token window has `seq_len + 1` IDs, and the model reads `seq_len` positions. Check the model length as well as the shape of the batch array. Packed segments, windows and rotary positions must stay aligned.
 
@@ -98,7 +98,7 @@ Qwix quantization is an optional, experimental training path with int8 and fp8 c
 
 ## Run across hosts
 
-Initialize the JAX process pool before you create any device arrays or models. The built-in recipes call their process setup function early. Each host needs compatible software, access to the data and a coordinator it can reach. Test remote checkpoint storage and iterator partitioning separately.
+Initialize the JAX process pool before you create any device arrays or models. The built-in recipes call their process setup function early. Each host needs compatible software, access to the data and a coordinator it can reach. `dew launch` starts a pool over ssh or under Slurm, and `MeshSpec(replicas=N)` keeps fsdp inside a node while the data axis spans the nodes. [Training on several nodes](../guides/multi-node.md) covers both and how to rehearse them on one machine. Test remote checkpoint storage and iterator partitioning separately.
 
 The local process-pool tests run real `jax.distributed` processes. They do not test network failures, remote storage, TPU collectives or cluster preemption. [TPU setup](../tpu.md) describes provisioning, which can cost money on the cloud.
 

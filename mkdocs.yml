@@ -40,6 +40,7 @@ nav:
       - Training recipes: recipes.md
       - End-to-end examples: guides/end-to-end.md
       - TPU setup: tpu.md
+      - Training on several nodes: guides/multi-node.md
       - Moving from FlaxDiff: from-flaxdiff.md
   - Concepts:
       - Distributed training: concepts/distributed.md

@@ -1192,7 +1192,7 @@ accept them.
 
 `MeshSpec` describes the device topology; `Layout` maps model dimensions onto it. For example, `MeshSpec(fsdp=4)` splits eligible parameters and optimizer state over four devices. The remaining devices form the data-parallel axis. Use the same `Trainer` interface on one device or a mesh.
 
-The mesh also supports expert, tensor, sequence, and stage axes. Sequence-parallel attention exchanges the keys and values that local queries need. The stage axis runs a GPipe schedule: each stage computes its own layers on its own devices. The stored parameters and optimizer state stay replicated across stages, so a stage split saves activation memory and does not save parameter memory.
+The mesh also supports expert, tensor, sequence, and stage axes. Sequence-parallel attention defaults to Ulysses: devices trade sequence rows for heads with all-to-alls, so none holds a whole key or value. The GPipe stage axis partitions the execution view; parameters and optimizer state stay replicated across stages, so a stage split saves activation memory rather than parameter memory. `MeshSpec(fsdp=8, replicas=2)` is hybrid sharding over two nodes: fsdp inside each node, replicas across them.
 
 Models use configurable compute dtypes and hardware-dependent attention kernels: cuDNN on compatible NVIDIA GPU shapes, a Pallas TPU path, and XLA implementations for other configurations. Qwix supplies optional int8/fp8 computation, and MuonClip adds per-head QK clipping to Muon. Quantized weight loading is separate from quantized training.
 
@@ -1202,7 +1202,7 @@ Start with [distributed training](docs/concepts/distributed.md) and the [TPU gui
 
 ### Multiple hosts
 
-Use the same script on each host. The example below uses two hosts with two visible GPUs each and shards model state over all four devices. Both hosts must read the same token files and checkpoint directory.
+Use the same script on each host. The example below uses two hosts with two visible GPUs each and shards model state over all four devices. Both hosts must read the same token files and checkpoint directory. [Training on several nodes](docs/guides/multi-node.md) covers Slurm, hybrid sharding and long sequences.
 
 Prepare byte-token data from your corpus and place it on shared storage:
 
@@ -1214,7 +1214,7 @@ python tools/tokenize_text.py \
     --val-fraction 0.01
 ```
 
-Save as `train_multihost.py`. Initialize the process group before constructing device arrays.
+Save as `train_multihost.py`. `prepare_process` joins the process pool, so it comes before any device array.
 
 ```python
 import os
@@ -1224,11 +1224,9 @@ import optax
 
 
 def main():
-    jax.distributed.initialize(
-        coordinator_address=os.environ["DEW_COORDINATOR"],
-        num_processes=int(os.environ["DEW_WORLD_SIZE"]),
-        process_id=int(os.environ["DEW_RANK"]),
-    )
+    from dew.training.runtime import prepare_process
+
+    prepare_process(multi_host=True)
     try:
         from dew import Checkpoints, MeshSpec, Trainer, models
         from dew.data import Loading, TokenWindows
@@ -1271,18 +1269,16 @@ if __name__ == "__main__":
     main()
 ```
 
-Set these variables on both hosts, changing `DEW_RANK` to `1` on the second host and using the first host's reachable address for the coordinator:
+Launch it from the first host. `dew launch` starts one process on each host over ssh and gives each its coordinator, process count and rank:
 
 ```bash
-export DEW_COORDINATOR="10.0.0.1:43217"
-export DEW_WORLD_SIZE=2
-export DEW_RANK=0
-export DEW_TOKEN_DIR=/shared/tokens
-export DEW_CHECKPOINT_DIR=/shared/runs/lm
-CUDA_VISIBLE_DEVICES=0,1 JAX_PLATFORMS=cuda python train_multihost.py
+dew launch --hosts 10.0.0.1 10.0.0.2 \
+    --env DEW_TOKEN_DIR=/shared/tokens --env DEW_CHECKPOINT_DIR=/shared/runs/lm \
+    --env CUDA_VISIBLE_DEVICES=0,1 --env JAX_PLATFORMS=cuda \
+    -- python train_multihost.py
 ```
 
-`batch=16` is global, so each process reads eight rows. To rehearse the launch on one machine, point the coordinator at `127.0.0.1`, set `XLA_FLAGS=--xla_force_host_platform_device_count=2` and `JAX_PLATFORMS=cpu`, and start rank 0 and rank 1 side by side: two processes of two simulated devices fill the same `MeshSpec(fsdp=4)`, and each prints `20 updates` for `DEW_STEPS=20`.
+`batch=16` is global, so each process reads eight rows. To rehearse the launch on one machine, run `dew launch --processes-per-host 2 --env JAX_PLATFORMS=cpu --env XLA_FLAGS=--xla_force_host_platform_device_count=2 --env DEW_STEPS=20 ...` with local directories: two processes of two simulated devices fill the same `MeshSpec(fsdp=4)`, and each prints `20 updates`.
 
 ### Generating text with Gemma 4 on one GPU
 
