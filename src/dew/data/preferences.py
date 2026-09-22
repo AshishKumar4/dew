@@ -66,7 +66,7 @@ class PreferenceSource:
     compares against (`describe`).
     """
 
-    def __init__(self, rows: Sequence[Mapping[str, object]], origin: str, pad_id: int,
+    def __init__(self, rows: Sequence[object], origin: str, pad_id: int,
                  seq_len: int):
         if seq_len < 1:
             raise ValueError(f"seq_len is {seq_len}: pairs need at least one token")

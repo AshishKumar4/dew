@@ -131,7 +131,7 @@ class PromptSource:
     saved position compares against (`describe`).
     """
 
-    def __init__(self, rows: Sequence[Mapping[str, object]], origin: str,
+    def __init__(self, rows: Sequence[object], origin: str,
                  tokenizer: str, max_prompt_len: int, pad_id: int):
         if max_prompt_len < 1:
             raise ValueError(
