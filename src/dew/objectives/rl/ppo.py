@@ -15,6 +15,7 @@ from jax.experimental import multihost_utils
 from dew.data.prompts import LENGTH_KEY
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
+from dew.artifacts import agreed
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
 from dew.objectives.lm.objective import _shift_rows
 from dew.registry import objectives
@@ -24,7 +25,7 @@ from dew.sampling.text import Generation, Sampling
 from dew.training.distributed import shard_batch
 from dew.training.state import TrainState
 
-from .episodes import EpisodeInference, EpisodeRollout, _phase
+from .episodes import EpisodeInference, EpisodeRollout
 from .grpo import GRPOObjective
 from .rollout import ADVANTAGES_KEY, IDS_KEY, RESPONSE_MASK_KEY, REWARDS_KEY
 
@@ -196,13 +197,13 @@ class PPORollout:
 
     def __call__(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> dict[str, np.ndarray]:
         episodes = self.episodes.collect(state, batch, key)
-        projected = _phase(lambda: self.episodes.tensors(episodes), "PPO episode tensors")
+        projected = agreed("PPO episode tensors", lambda: self.episodes.tensors(episodes))
         count = np.asarray(min(2, np.count_nonzero(projected[RESPONSE_MASK_KEY])), np.int32)
         if jax.process_count() > 1:
             count = np.sum(multihost_utils.process_allgather(count))
         if int(count) < 2:
             raise ValueError("PPO GAE whitening requires at least two action tokens globally")
         mesh = mesh_of(state.params)
-        device = _phase(lambda: projected if mesh is None else shard_batch(mesh, projected), "PPO critic inputs")
-        targets = _phase(lambda: self._compiled_targets(state.params, device), "PPO critic targets")
+        device = agreed("PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected))
+        targets = agreed("PPO critic targets", lambda: self._compiled_targets(state.params, device))
         return {**projected, **{name: local_rows(value) for name, value in targets.items()}}

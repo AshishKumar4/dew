@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import multihost_utils
 
-from dew.artifacts import agree_process_phase
+from dew.artifacts import PeerFailure, agree_process_phase, agreed
 from dew.data.prompts import LENGTH_KEY
 from dew.nn.inputs import ModelInputs, local_rows
 from dew.objectives.base import Variables
@@ -201,29 +201,8 @@ _T = TypeVar("_T")
 _P = ParamSpec("_P")
 
 
-class _PeerFailure(RuntimeError):
-    """Another rank failed before the next collective generation call."""
-
-
 class _StatusStop(RuntimeError):
     """An environment returned an explicit error or cancellation outcome."""
-
-
-def _phase[T](operation: Callable[[], T], name: str) -> T:
-    held: tuple[T] | None = None
-    error = None
-    try:
-        held = (operation(),)
-    except BaseException as failure:
-        error = failure
-    try:
-        agree_process_phase(error, phase=name)
-    except BaseException as failure:
-        if error is None:
-            raise _PeerFailure(str(failure)) from failure
-        raise
-    assert held is not None
-    return held[0]
 
 
 @dataclass
@@ -406,7 +385,7 @@ class EpisodeRollout:
         if not started:
             raise error
         primary = next((slot for slot in started if slot.error is not None), started[0])
-        cancelled = isinstance(error, (AsyncCancelledError, CancelledError, KeyboardInterrupt, _PeerFailure))
+        cancelled = isinstance(error, (AsyncCancelledError, CancelledError, KeyboardInterrupt, PeerFailure))
         explicit = isinstance(error, _StatusStop)
         if explicit:
             cancelled = primary.status == EpisodeStatus.CANCELLED
@@ -422,7 +401,7 @@ class EpisodeRollout:
             if self.record is not None:
                 for episode in records:
                     self.record(episode)
-        _phase(record, "episode abort recording")
+        agreed("episode abort recording", record)
         episode = records[started.index(primary)]
         failure = EpisodeCancelled(episode) if cancelled else EpisodeFailure(episode)
         if explicit:
@@ -468,7 +447,7 @@ class EpisodeRollout:
                          self.max_new_tokens, self.sampling, int(state.step), int(state.updates),
                          tuple(np.asarray(jax.random.key_data(key)).tolist()), self.journal is not None)
             return tasks, policy, np.frombuffer(hashlib.sha256(repr(signature).encode()).digest(), np.uint8)
-        tasks, policy, signature = _phase(prepare, "episode preparation")
+        tasks, policy, signature = agreed("episode preparation", prepare)
         processes, rank = jax.process_count(), jax.process_index()
         if processes > 1:
             multihost_utils.assert_equal(signature, "episode task counts, budgets, sampling and clocks must agree")
@@ -497,23 +476,23 @@ class EpisodeRollout:
                         fingerprint = repr((signature.tobytes().hex(), tasks.tolist(), processes, rank,
                                             policy_digest(state.params)))
                         return journal_stack.enter_context(journal.open(cohort, fingerprint, binding_id))
-                    run = _phase(open_journal, "episode journal open")
+                    run = agreed("episode journal open", open_journal)
                     origin = np.frombuffer(bytes.fromhex(run.binding), np.uint8)
                     if processes > 1:
                         origin = multihost_utils.broadcast_one_to_all(origin)
                     binding_id = origin.tobytes().hex()
-                    _phase(lambda: run.align(binding_id), "episode journal binding")
+                    agreed("episode journal binding", lambda: run.align(binding_id))
                 with ExitStack() as stack:
-                    _phase(lambda: self._open(slots, stack, run, policy_step, binding_id), "episode reset")
+                    agreed("episode reset", lambda: self._open(slots, stack, run, policy_step, binding_id))
                     for turn in range(self.max_turns):
-                        inputs = _phase(lambda: self._inputs(slots, turn), "episode context preparation")
+                        inputs = agreed("episode context preparation", lambda: self._inputs(slots, turn))
                         active = any(slot.status == EpisodeStatus.RUNNING for slot in slots)
                         if not agree_process_phase(None, phase="episode availability", available=active):
                             break
-                        generation = _phase(lambda: policy(inputs, self.max_new_tokens,
-                            key=jax.random.fold_in(key, turn), sampling=self.sampling), "episode generation")
-                        _phase(lambda: self._advance(slots, generation, policy_step, binding_id, turn, run), "episode tool step")
-                    _phase(lambda: self._verify(slots, policy_step, binding_id, run), "episode verification")
+                        generation = agreed("episode generation", lambda: policy(inputs, self.max_new_tokens,
+                            key=jax.random.fold_in(key, turn), sampling=self.sampling))
+                        agreed("episode tool step", lambda: self._advance(slots, generation, policy_step, binding_id, turn, run))
+                    agreed("episode verification", lambda: self._verify(slots, policy_step, binding_id, run))
         except BaseException as failure:
             error = failure
         try:
@@ -525,13 +504,13 @@ class EpisodeRollout:
             if self.record is not None:
                 for episode in records:
                     self.record(episode)
-        _phase(record, "episode recording")
+        agreed("episode recording", record)
         return records
 
 
     def __call__(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> dict[str, np.ndarray]:
         episodes = self.collect(state, batch, key)
-        return _phase(lambda: self.project(episodes), "episode projection")
+        return agreed("episode projection", lambda: self.project(episodes))
 
     def project(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
         """GRPO action rows with one group-relative advantage per episode."""

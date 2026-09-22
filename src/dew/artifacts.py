@@ -8,6 +8,7 @@ cross jit, while optional captions and decoded text remain host metadata.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import TypeVar
 
 import jax
@@ -143,6 +144,34 @@ def broadcast_from_process_zero(value):
     if jax.process_index() != 0:
         payload = np.zeros(length, np.uint8)
     return json.loads(multihost_utils.broadcast_one_to_all(payload).tobytes())
+
+
+def agreed[T](phase: str, operation: Callable[[], T]) -> T:
+    """Run `operation` on every rank, then agree on the outcome before going on.
+
+    A rank that fails reports its error at the agreement point instead of
+    raising alone, so its peers hear about it there rather than hanging at
+    the next collective. The peers raise `PeerFailure`; the failing rank
+    re-raises its own error. On one process this is a plain call.
+    """
+    held: tuple[T] | None = None
+    error: BaseException | None = None
+    try:
+        held = (operation(),)
+    except BaseException as failure:
+        error = failure
+    try:
+        agree_process_phase(error, phase=phase)
+    except BaseException as failure:
+        if error is None:
+            raise PeerFailure(str(failure)) from failure
+        raise
+    assert held is not None
+    return held[0]
+
+
+class PeerFailure(RuntimeError):
+    """Another rank failed at a phase agreement this rank passed."""
 
 
 def agree_process_phase(error: BaseException | None, *, phase: str,
