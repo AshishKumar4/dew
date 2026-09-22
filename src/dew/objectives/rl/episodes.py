@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import math
 from asyncio import CancelledError as AsyncCancelledError
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import CancelledError
 from contextlib import AbstractContextManager, ExitStack
 from dataclasses import dataclass, field
@@ -26,7 +26,7 @@ from jax.experimental import multihost_utils
 from dew.artifacts import PeerFailure, agree_process_phase, agreed
 from dew.data.prompts import LENGTH_KEY
 from dew.nn.inputs import ModelInputs, local_rows
-from dew.objectives.base import Variables
+from dew.objectives.base import Batch, Variables
 from dew.rl import group_advantage
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
@@ -434,7 +434,7 @@ class EpisodeRollout:
                       tuple(float(value) for value in behavior[:count]),
                       bool(ended[row]), policy_step, self.sampling, _binding_id=binding_id)
 
-    def collect(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> tuple[Episode, ...]:
+    def collect(self, state: TrainState, batch: Batch, key: jax.Array) -> tuple[Episode, ...]:
         """Collect fixed cohorts, agreeing host phases before every generation."""
         def prepare():
             tasks = local_rows(batch["task_id"])
@@ -508,7 +508,7 @@ class EpisodeRollout:
         return records
 
 
-    def __call__(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> dict[str, np.ndarray]:
+    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> dict[str, np.ndarray]:
         episodes = self.collect(state, batch, key)
         return agreed("episode projection", lambda: self.project(episodes))
 
