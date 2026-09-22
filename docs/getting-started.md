@@ -1,12 +1,14 @@
 # Your first training run
 
-This tutorial assumes Python, NumPy-style arrays, and the idea of minimizing a loss with gradients. It introduces the Flax Linen and JAX concepts needed for this example. Complete [installation](installation.md) first.
+> An AI assistant maintains this document. It is presented as-is.
 
-This example fits a line to 32 synthetic examples. The target is `y = 2x + 1`, so you can measure the trained model's error without a downloaded dataset or pretrained checkpoint. This is a training demonstration, not a benchmark or generalization result.
+This tutorial assumes you know Python, NumPy-style arrays, and the idea of lowering a loss with gradients. It explains the Flax Linen and JAX ideas the example needs as they come up. Finish [installation](installation.md) first.
+
+We will fit a line to 32 made-up examples. The target is `y = 2x + 1`, so you can measure the trained model's error yourself, without downloading a dataset or a pretrained checkpoint. The point is to see training work end to end. It says nothing about benchmarks or how a model generalizes.
 
 ## Prepare a batch
 
-Create `train.py` and add the following blocks in order. They form one complete script.
+Create `train.py` and add the blocks below in order. Together they make one complete script.
 
 ```python
 import itertools
@@ -28,15 +30,15 @@ data = Dataset(train=lambda: itertools.repeat(batch), val=None,
                records=32, batch=32)
 ```
 
-Each array has shape `(32, 1)`: the first dimension is the batch dimension, and the second contains one feature or target. Both arrays use float32. The mean squared error therefore has units of the target squared; here the target is dimensionless.
+Each array has shape `(32, 1)`. The first dimension is the batch, and the second holds one feature or one target. Both arrays are float32. The mean squared error has the units of the target squared, and here the target has no units.
 
-`Dataset` receives functions that open iterators. Its `train` function returns an endless repetition of this batch. `records=32` describes the number of training examples; `batch=32` is the global batch size. `val=None` means there is no validation split. Real datasets need independent training and validation records; repeating one batch only demonstrates optimization.
+`Dataset` takes functions that open iterators. Its `train` function returns this one batch repeated forever. `records=32` is the number of training examples, and `batch=32` is the global batch size. `val=None` means there is no validation split. A real dataset needs separate training and validation records. Repeating one batch only shows that the optimizer works.
 
 ## Define initialization and loss
 
-A Flax Linen module describes computation. Its variables are separate from the module object. `model.init(key, sample_input)` creates those variables; `model.apply(variables, input)` computes a prediction.
+A Flax Linen module describes a computation. It does not hold its variables. `model.init(key, sample_input)` creates the variables, and `model.apply(variables, input)` computes a prediction with them.
 
-An `Objective` defines initialization and the loss statistics to differentiate:
+An `Objective` says how to initialize the variables and which loss statistics to differentiate:
 
 ```python
 class Regression(Objective):
@@ -59,9 +61,9 @@ model = nn.Dense(features=1)
 objective = Regression(model)
 ```
 
-`nn.Dense(features=1)` learns a matrix and a bias. For this input shape they represent the line's slope and intercept. The sample passed to `init` defines one input feature; it does not restrict later training to a batch size of one.
+`nn.Dense(features=1)` learns a weight matrix and a bias. With this input shape they are the slope and the intercept of the line. The sample passed to `init` tells Flax there is one input feature. It does not fix the batch size to one for training.
 
-`loss` receives the full Flax variables tree, a batch, and a `Step`. It returns `Mean(total, mass)` and `Aux` training metrics. Dew sums the numerators and masses across an accumulation window before normalizing the gradient. Here the mass counts squared-error elements; it does not weight all objectives by batch size. `step.step` counts accepted microbatches, and `step.key` identifies the consumed attempt. This deterministic objective uses neither.
+`loss` receives the full Flax variables tree, a batch, and a `Step`. It returns a `Mean(total, mass)` and an `Aux` holding training metrics. Dew adds up the totals and the masses over an accumulation window, and only then divides to get the gradient. Here the mass is the number of squared-error elements. Other objectives choose their own mass, so it is not always the batch size. `step.step` counts accepted microbatches, and `step.key` is the random key for the current attempt. This loss is deterministic, so it uses neither.
 
 ## Optimize the parameters
 
@@ -71,11 +73,11 @@ trainer = Trainer(objective, optax.sgd(learning_rate=0.1),
 state = trainer.fit(data, steps=100, log_every=50)
 ```
 
-The Optax optimizer applies stochastic gradient descent. `Trainer` initializes the variables, places them on the visible device mesh, compiles the training step, and consumes batches. The first call includes compilation work; its duration is not a steady-state throughput measurement.
+The Optax optimizer here is plain stochastic gradient descent. `Trainer` initializes the variables, places them on the visible device mesh, compiles the training step, and reads batches. The first call includes compilation, so its time does not tell you the steady-state speed.
 
-The key fixes initialization and the training random stream. JAX keys are explicit values. For a stochastic loss, split `step.key` into separate keys for each random operation. Reusing the same key repeats the same random draw.
+The key fixes the initialization and the random stream used during training. In JAX a key is an explicit value. If your loss is random, split `step.key` into one key per random operation. Using the same key twice gives the same random draw twice.
 
-In this run there is no gradient accumulation or dynamic loss scaling. `steps=100` sets the final step target. The loop prints training loss every 50 steps. It writes no checkpoints because no `Checkpoints` object was supplied, and it performs no validation because `eval_every` is unset.
+This run uses no gradient accumulation and no dynamic loss scaling. `steps=100` is the step to stop at. The loop prints the training loss every 50 steps. It writes no checkpoints because we did not pass a `Checkpoints` object, and it runs no validation because `eval_every` is not set.
 
 ## Inspect the result
 
@@ -92,14 +94,14 @@ Run the file:
 JAX_PLATFORMS=cpu python train.py
 ```
 
-The validation run printed a loss of approximately `0.0002` at step 50 and `Final mean squared error: 0.000000` after step 100. Small differences across backends and library versions are expected. The numerical assertion checks the learned relation and tolerates those differences.
+When I ran it, it printed a loss of about `0.0002` at step 50 and `Final mean squared error: 0.000000` after step 100. You may see small differences on another backend or with other library versions. The assertion checks that the model learned the line, and it allows for those differences.
 
-`state.step` counts consumed attempts, `state.microstep` counts accepted microbatches, and `state.updates` counts optimizer commits. `TrainState` also holds variables, optimizer state, the root key, optional EMA, scaler history, and any partial accumulation window. Use `state.params` with `model.apply`. This objective requests no EMA, so `state.averaged` is unavailable.
+`state.step` counts attempts, `state.microstep` counts accepted microbatches, and `state.updates` counts optimizer updates. `TrainState` also holds the variables, the optimizer state, the root key, the optional EMA, the loss-scaler history, and any unfinished accumulation window. Pass `state.params` to `model.apply`. This objective asks for no EMA, so `state.averaged` raises an error.
 
 ## Adapt the example
 
-For a model with several input features, change the batch to `(batch_size, features)` and change the initialization sample to `(1, features)`. Keep target and prediction shapes compatible with the loss. Replace `nn.Dense` with a Linen module for a nonlinear model; the data and objective still need to agree on field names, shapes, and dtypes.
+For a model with several input features, give the batch shape `(batch_size, features)` and the initialization sample shape `(1, features)`. Keep the target and prediction shapes compatible in the loss. For a nonlinear model, replace `nn.Dense` with your own Linen module. The data and the objective still have to agree on field names, shapes, and dtypes.
 
-For data that changes between steps, return an iterator over your batches instead of `itertools.repeat`. To continue from checkpoints, that iterator must expose a restorable position. [Supplying training data](concepts/data.md) and [resuming training](guides/checkpoints.md) explain the requirements.
+If your data changes between steps, return an iterator over your batches instead of `itertools.repeat`. To resume from a checkpoint, that iterator must be able to save and restore its position. [Supplying training data](concepts/data.md) and [resuming training](guides/checkpoints.md) explain what it needs.
 
-Next, read [writing a custom objective](concepts/objectives.md) for state and evaluation, or [language models](concepts/language_models.md) for a built-in objective with tokenized inputs.
+Next, read [writing a custom objective](concepts/objectives.md) for state and evaluation, or [language models](concepts/language_models.md) for a built-in objective that takes tokenized input.
