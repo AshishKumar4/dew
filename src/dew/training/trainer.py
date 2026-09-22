@@ -664,16 +664,7 @@ class Trainer(Generic[Loss, Effects]):
         Previews are generated only when `preview=True` and a tracker
         receives them; scalar reporting never triggers preview work.
         """
-        if eval_every and not metrics and not (preview and self.tracker is not None):
-            # A validation pass hands its batches to metrics and to the
-            # preview; scheduled with neither, it would open nothing and
-            # report nothing, so the contradiction is refused here.
-            raise ValueError(
-                f"eval_every={eval_every} schedules a validation pass that nothing consumes: "
-                + ("preview=True needs a tracker to receive the samples; "
-                   if preview else "")
-                + "pass metrics to score it, preview=True with a tracker to sample from it, "
-                "or leave eval_every unset")
+        self._check_validation_is_read(eval_every, metrics, preview=preview)
         preview = preview and self.tracker is not None
         started = time.perf_counter()
         profile, checkpoints = self.profile, self.checkpoints
@@ -684,26 +675,7 @@ class Trainer(Generic[Loss, Effects]):
         current = 0
         first_step = None
         process_zero = jax.process_index() == 0
-        # A configured window must own the capture. When another profiler
-        # already holds it, refuse before the dataset or the mesh do any
-        # work, so neither trace is silently dropped or cut short. The window
-        # also resolves its optional dependency up front, rather than after
-        # warmup steps have run.
-        profiler = None
-        if profile is not None:
-            def own_window() -> Profiler:
-                if telemetry_profile.active_profile() is not None:
-                    raise ValueError(
-                        "Trainer.profile cannot schedule a window while an explicit "
-                        "dew.profile capture is active; drop one or stop the outer "
-                        "profiler before fitting")
-                telemetry_profile.require_profile_support()
-                return telemetry_profile.profile(profile.directory)
-
-            # Every rank either leaves this block owning a stopped Profiler or
-            # raises together; a rank that proceeds alone would deadlock its
-            # peers at the first collective of training.
-            profiler = agreed("profiling window setup", own_window)
+        profiler = self._own_profile_window()
         outer = telemetry_profile.active_profile()
         # One boundary lookup at setup: the prefetch worker and the step
         # scopes share whichever profiler owns the capture.
@@ -750,28 +722,8 @@ class Trainer(Generic[Loss, Effects]):
 
             if current < steps:
                 source = dataset.train()
-                if (checkpoint_every or local_every) and not isinstance(source, Checkpointable):
-                    raise ValueError(
-                        f"checkpoint_every needs a training stream with get_state and "
-                        f"set_state, and {type(source).__name__} lacks one; a checkpoint "
-                        f"written without the data position would replay the data on "
-                        f"resume. Train it with checkpoint_every=None "
-                        f"(--trainer.checkpoint-every None)")
-                if isinstance(source, RampedStream):
-                    if self.accumulation > 1:
-                        raise ValueError(
-                            f"a batch ramp grows the records a step reads, and an "
-                            f"accumulation window of {self.accumulation} pools "
-                            f"microbatches of one shape into one update; ramp the "
-                            f"batch or accumulate, not both")
-                    divisor = batch_divisor(mesh, self.mesh)
-                    refused = [stage.batch for stage in source.stages if stage.batch % divisor]
-                    if refused:
-                        raise ValueError(
-                            f"the batch ramp reads {refused} records a step at some of "
-                            f"its stages, and {dict(mesh.shape)} with "
-                            f"{self.mesh.microbatches or self.mesh.stage} microbatch(es) "
-                            f"holds a batch that is a multiple of {divisor}")
+                self._check_stream(source, mesh,
+                                   checkpointing=bool(checkpoint_every or local_every))
                 train = DevicePrefetchIterator(source, mesh, source_state=position,
                                                profiler=tracer)
                 source = None  # Lifetime transferred to the prefetch worker.
@@ -790,24 +742,7 @@ class Trainer(Generic[Loss, Effects]):
                 if (profiler is not None and profile is not None
                         and not tracing and traced == 0
                         and seen >= profile.warmup):
-                    def start_capture() -> None:
-                        nonlocal tracing
-                        assert profiler is not None
-                        profiler.start()
-                        tracing = True
-
-                    try:
-                        agreed("profiling window start", start_capture)
-                    except BaseException as primary:
-                        # A peer failed while this capture did start: closing it
-                        # here keeps a live trace from outliving the aborted run.
-                        if tracing:
-                            tracing = False
-                            try:
-                                profiler.stop()
-                            except BaseException as failure:
-                                primary.add_note(f"Profiler stop failed: {failure!r}")
-                        raise
+                    tracing = self._start_window(profiler)
                 capturing = tracer is not None and tracer.running
                 step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=current)
                               if capturing else contextlib.nullcontext())
@@ -815,24 +750,14 @@ class Trainer(Generic[Loss, Effects]):
                     with region("input.wait"):
                         batch = next(train)
                     if self.rollout is not None:
-                        # Host-side and untraceable: sampling, scoring, advantages.
-                        # The key folds the step key once more, keeping the
-                        # rollout's draws off the step's stream; both are
-                        # checkpointed, so a resumed run samples forward. Fixed
-                        # shapes mean the compile below traces once.
-                        began = time.perf_counter()
-                        key = jax.random.fold_in(
-                            jax.random.fold_in(state.key, state.step), 1)
-                        batch = shard_batch(mesh, self.rollout(state, batch, key))
-                        rollout_seconds += time.perf_counter() - began
-                    shapes = batch_shapes(batch)
-                    if shapes not in compiled:
-                        with region("compile"):
-                            compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
-                        if len(compiled) == 1:
-                            last_log_time = time.time()
-                    train_step, measured_flops = compiled[shapes]
-
+                        batch, sampled = self._rolled_out(state, batch, mesh)
+                        rollout_seconds += sampled
+                    first_compile = not compiled
+                    train_step, measured_flops = self._compiled_for(compiled, state, batch)
+                    if first_compile:
+                        # Rebound once the step is compiled, so the first tick
+                        # measures steps, not the compile.
+                        last_log_time = time.time()
                     with region("train.step"):
                         state, loss, aux, finite, accepted = train_step(state, batch)
                     position = train.source_state
@@ -852,56 +777,32 @@ class Trainer(Generic[Loss, Effects]):
                         interval_loss, _, worst_bad_run = book
                         self._check_finite(worst_bad_run, current)
                         book = (interval_loss, book[1], jnp.zeros((), jnp.int32))
-                        def report_interval() -> None:
-                            nonlocal last_log_time, steps_since_log, rollout_seconds
-                            nonlocal interval_samples, interval_flops
-                            if process_zero:
-                                # The interval's numbers need the loss on the host, so
-                                # this is where the loop waits on the device.
-                                loss.block_until_ready()
-                                now = time.time()
-                                scalars = {"train/loss": float(loss),
-                                           **{f"train/{k}": float(v) for k, v in aux.items()},
-                                           **self._throughput(now - last_log_time, steps_since_log,
-                                                              interval_samples, interval_flops)}
-                                scalars["train/accepted"] = float(accepted)
-                                if state.scale is not None:
-                                    scalars["train/loss_scale"] = float(state.scale.scale)
-                                if self.rollout is not None:
-                                    scalars["train/rollout_seconds"] = rollout_seconds
-                                print(f"step {current}: loss {scalars['train/loss']:.4f}")
-                                if self.tracker is not None:
-                                    self.tracker.log(scalars, current)
-                                last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
-                                interval_samples, interval_flops = 0, 0.0
-
-                        with region("log"):
-                            agreed("training reporting", report_interval)
+                        now = self._log_interval(
+                            current, loss, aux, accepted, state, since=last_log_time,
+                            steps=steps_since_log, samples=interval_samples,
+                            flops=interval_flops, rollout_seconds=rollout_seconds,
+                            process_zero=process_zero)
+                        if now is not None:
+                            last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
+                            interval_samples, interval_flops = 0, 0.0
 
                     if eval_every and current % eval_every == 0 and current < steps:
-                        paused = time.perf_counter()
-                        with region("evaluate"):
-                            self._evaluate(state, shardings, dataset, metrics, preview, mesh)
-                        other += time.perf_counter() - paused
+                        other += self._timed_evaluation(
+                            state, shardings, dataset, metrics, preview, mesh)
 
                     # On its own clock, not the logging one, so that a cadence
                     # which does not divide log_every still fires.
                     if (checkpoint_every and checkpoints is not None
                             and current % checkpoint_every == 0 and current < steps):
-                        paused = time.perf_counter()
-                        checkpoints.save(current, state, position,
-                                         {"loss": float(book[0] / interval_steps)})
-                        self._report(CheckpointRequested(checkpoints.directory), current)
-                        other += time.perf_counter() - paused
+                        other += self._saved_checkpoint(checkpoints, current, state, position,
+                                                        book, interval_steps)
                         last_saved = current
                         book = (jnp.zeros_like(book[0]), book[1], book[2])
                         interval_steps = 0
                     if (local_every and checkpoints is not None
                             and current % local_every == 0 and current < steps):
-                        paused = time.perf_counter()
-                        checkpoints.save_local(current, state, position)
-                        self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), current)
-                        other += time.perf_counter() - paused
+                        other += self._saved_local_checkpoint(
+                            checkpoints, current, state, position)
                 # The step row is complete once its scope exits; closing the
                 # window here keeps the last iteration inside the capture.
                 if tracing and profile is not None:
@@ -944,62 +845,281 @@ class Trainer(Generic[Loss, Effects]):
         finally:
             paused = time.perf_counter()
             primary = sys.exception()
-            error = primary
             close = (train.close if train is not None else
                      source.close if isinstance(source, Closeable) else None)
             stop_trace: Callable[[], None] | None = None
             if tracing and profile is not None:
                 tracing = False
                 assert profiler is not None
-
-                def finish_trace() -> None:
-                    self._stop_trace(traced, loss, profile, profiler, step=current)
-
-                stop_trace = finish_trace
-
-            for label, cleanup in (
-                ("Training iterator", close),
-                ("Profiler", stop_trace),
-                ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
-            ):
-                if cleanup is not None:
-                    try:
-                        cleanup()
-                    except BaseException as failure:
-                        if error is None:
-                            error = failure
-                        else:
-                            error.add_note(f"{label} cleanup failed: {failure!r}")
-            source = train = close = cleanup = None
+                stop_trace = functools.partial(
+                    self._stop_trace, traced, loss, profile, profiler, step=current)
+            error = self._cleaned_up(primary, close, stop_trace, checkpoints)
+            # The traceback of a failed run holds this frame, and with it
+            # whatever these names still point at.
+            source = train = close = stop_trace = None
             other += time.perf_counter() - paused
-            try:
-                agree_process_phase(error, phase="fit cleanup")
-            except BaseException as failure:
-                if error is None:
-                    error = failure
-            if error is None:
-                def report_goodput() -> None:
-                    if process_zero:
-                        scalars = goodput(time.perf_counter() - started, first_step, other)
-                        print(f"Goodput: first step after {scalars.get('goodput/time_to_first_step_s', 0.0):.2f} s, "
-                              f"{scalars['goodput/step_fraction']:.1%} of the wall time in steps")
-                        if self.tracker is not None:
-                            self.tracker.log(scalars, current)
+            error = self._reported_outcome(error, started, first_step, other, current,
+                                           process_zero=process_zero)
+            if primary is None and error is not None:
+                raise error
+        return state
 
+    def _check_validation_is_read(self, eval_every: int | None,
+                                  metrics: Sequence[Metric], *, preview: bool) -> None:
+        """Refuse a validation cadence whose batches nothing would read.
+
+        A validation pass hands its batches to metrics and to the preview.
+        Scheduled with neither, it would open nothing and report nothing, so
+        the contradiction is refused before the run does any work.
+        """
+        if eval_every and not metrics and not (preview and self.tracker is not None):
+            raise ValueError(
+                f"eval_every={eval_every} schedules a validation pass that nothing consumes: "
+                + ("preview=True needs a tracker to receive the samples; "
+                   if preview else "")
+                + "pass metrics to score it, preview=True with a tracker to sample from it, "
+                "or leave eval_every unset")
+
+    def _own_profile_window(self) -> Profiler | None:
+        """Take ownership of the capture a configured window will write.
+
+        A configured window must own the capture. When another profiler
+        already holds it, refuse before the dataset or the mesh do any work,
+        so neither trace is silently dropped or cut short. The window also
+        resolves its optional dependency here, rather than after warmup steps
+        have run.
+
+        Every rank either leaves owning a stopped Profiler or raises
+        together; a rank that proceeded alone would deadlock its peers at the
+        first collective of training.
+        """
+        profile = self.profile
+        if profile is None:
+            return None
+
+        def own_window() -> Profiler:
+            if telemetry_profile.active_profile() is not None:
+                raise ValueError(
+                    "Trainer.profile cannot schedule a window while an explicit "
+                    "dew.profile capture is active; drop one or stop the outer "
+                    "profiler before fitting")
+            telemetry_profile.require_profile_support()
+            return telemetry_profile.profile(profile.directory)
+
+        return agreed("profiling window setup", own_window)
+
+    def _check_stream(self, source, mesh: Mesh, *, checkpointing: bool) -> None:
+        """Refuse a training stream this run cannot checkpoint or cannot shard.
+
+        A checkpoint written without the data position would replay the data
+        on resume. A ramp stage whose batch the mesh cannot divide fails
+        where it is placed or traced, which for a later stage is an hour in.
+        """
+        if checkpointing and not isinstance(source, Checkpointable):
+            raise ValueError(
+                f"checkpoint_every needs a training stream with get_state and "
+                f"set_state, and {type(source).__name__} lacks one; a checkpoint "
+                f"written without the data position would replay the data on "
+                f"resume. Train it with checkpoint_every=None "
+                f"(--trainer.checkpoint-every None)")
+        if not isinstance(source, RampedStream):
+            return
+        if self.accumulation > 1:
+            raise ValueError(
+                f"a batch ramp grows the records a step reads, and an "
+                f"accumulation window of {self.accumulation} pools "
+                f"microbatches of one shape into one update; ramp the "
+                f"batch or accumulate, not both")
+        divisor = batch_divisor(mesh, self.mesh)
+        refused = [stage.batch for stage in source.stages if stage.batch % divisor]
+        if refused:
+            raise ValueError(
+                f"the batch ramp reads {refused} records a step at some of "
+                f"its stages, and {dict(mesh.shape)} with "
+                f"{self.mesh.microbatches or self.mesh.stage} microbatch(es) "
+                f"holds a batch that is a multiple of {divisor}")
+
+    def _start_window(self, profiler: Profiler) -> bool:
+        """Open the profiler's capture on every rank, and say it is capturing.
+
+        A peer that failed to start raises here. A capture this rank did
+        start is closed first, so no live trace outlives the aborted run.
+        """
+        capturing = False
+
+        def start() -> None:
+            nonlocal capturing
+            profiler.start()
+            capturing = True
+
+        try:
+            agreed("profiling window start", start)
+        except BaseException as primary:
+            if capturing:
                 try:
-                    agreed("goodput reporting", report_goodput)
+                    profiler.stop()
                 except BaseException as failure:
-                    error = failure
+                    primary.add_note(f"Profiler stop failed: {failure!r}")
+            raise
+        return capturing
+
+    def _rolled_out(self, state: TrainState, batch: Batch, mesh: Mesh) -> tuple[Batch, float]:
+        """Sample one batch through the rollout, with the seconds it took.
+
+        Host-side and untraceable: sampling, scoring, advantages. The key
+        folds the step key once more, keeping the rollout's draws off the
+        step's stream; both are checkpointed, so a resumed run samples
+        forward. Fixed shapes mean the step still compiles once.
+        """
+        began = time.perf_counter()
+        assert self.rollout is not None
+        key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
+        batch = shard_batch(mesh, self.rollout(state, batch, key))
+        return batch, time.perf_counter() - began
+
+    def _compiled_for(self, compiled: dict[Shapes, tuple[CompiledStep, float | None]],
+                      state: TrainState, batch: Batch) -> tuple[CompiledStep, float | None]:
+        """Return the step compiled for this batch's shapes, compiling on first sight.
+
+        A ramped run reads a new shape at every stage, so `compiled` keeps
+        one step per stage with the FLOPs measured for it.
+        """
+        shapes = batch_shapes(batch)
+        if shapes not in compiled:
+            with region("compile"):
+                compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
+        return compiled[shapes]
+
+    def _timed_evaluation(self, state: TrainState, shardings: Placement[TrainState],
+                          dataset: Dataset, metrics: Sequence[Metric], preview: bool,
+                          mesh) -> float:
+        """Score the validation split, returning the seconds it took.
+
+        Those seconds are the run's, but not its steps', which is what the
+        goodput fraction is measured against."""
+        paused = time.perf_counter()
+        with region("evaluate"):
+            self._evaluate(state, shardings, dataset, metrics, preview, mesh)
+        return time.perf_counter() - paused
+
+    def _saved_checkpoint(self, checkpoints: Checkpoints, step: int, state: TrainState,
+                          position: bytes | None, book: Book, interval_steps: int) -> float:
+        """Write one checkpoint with the interval's mean loss, and report it.
+
+        Returns the seconds it took, the reading of the interval's loss
+        included: that read waits on the device, and the wait is time the
+        steps did not have."""
+        paused = time.perf_counter()
+        checkpoints.save(step, state, position, {"loss": float(book[0] / interval_steps)})
+        self._report(CheckpointRequested(checkpoints.directory), step)
+        return time.perf_counter() - paused
+
+    def _saved_local_checkpoint(self, checkpoints: Checkpoints, step: int,
+                                state: TrainState, position: bytes | None) -> float:
+        """Write one checkpoint to the local directory, and report it.
+
+        Returns the seconds it took. The local copy carries no metadata; it
+        is the one a restarted node reads back, not the run's record."""
+        paused = time.perf_counter()
+        checkpoints.save_local(step, state, position)
+        self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
+        return time.perf_counter() - paused
+
+    def _log_interval(self, step: int, loss: jax.Array, aux: dict[str, jax.Array],
+                      accepted: jax.Array, state: TrainState, *, since: float, steps: int,
+                      samples: int, flops: float | None, rollout_seconds: float,
+                      process_zero: bool) -> float | None:
+        """Report one logging interval, returning the clock the next one starts from.
+
+        Rank zero builds the row and returns the time it read; every other
+        rank has nothing to report and returns None. The report is agreed, so
+        a tracker that failed on rank zero stops its peers here rather than
+        at their next collective.
+        """
+        def report() -> float | None:
+            if not process_zero:
+                return None
+            # The interval's numbers need the loss on the host, so this is
+            # where the loop waits on the device.
+            loss.block_until_ready()
+            now = time.time()
+            scalars = {"train/loss": float(loss),
+                       **{f"train/{k}": float(v) for k, v in aux.items()},
+                       **self._throughput(now - since, steps, samples, flops)}
+            scalars["train/accepted"] = float(accepted)
+            if state.scale is not None:
+                scalars["train/loss_scale"] = float(state.scale.scale)
+            if self.rollout is not None:
+                scalars["train/rollout_seconds"] = rollout_seconds
+            print(f"step {step}: loss {scalars['train/loss']:.4f}")
+            if self.tracker is not None:
+                self.tracker.log(scalars, step)
+            return now
+
+        with region("log"):
+            return agreed("training reporting", report)
+
+    def _cleaned_up(self, primary: BaseException | None, close: Callable[[], None] | None,
+                    stop_trace: Callable[[], None] | None,
+                    checkpoints: Checkpoints | None) -> BaseException | None:
+        """Run every teardown step, returning the failure the run ends on.
+
+        Each step runs even when an earlier one failed, and a later failure
+        becomes a note on the first, so one broken sink cannot hide the error
+        that ended the run.
+        """
+        error = primary
+        for label, cleanup in (
+            ("Training iterator", close),
+            ("Profiler", stop_trace),
+            ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
+        ):
+            if cleanup is None:
+                continue
             try:
-                self._report(FitEnded.outcome(time.perf_counter() - started, error), current)
+                cleanup()
             except BaseException as failure:
                 if error is None:
                     error = failure
                 else:
-                    error.add_note(f'Reporting fit outcome failed: {failure!r}')
-            if primary is None and error is not None:
-                raise error
-        return state
+                    error.add_note(f"{label} cleanup failed: {failure!r}")
+        return error
+
+    def _reported_outcome(self, error: BaseException | None, started: float,
+                          first_step: float | None, other: float, step: int, *,
+                          process_zero: bool) -> BaseException | None:
+        """Agree the run's cleanup, report its goodput and its outcome.
+
+        Every rank reaches the cleanup agreement, so a rank that failed alone
+        is heard here. Goodput is only reported for a run that reached this
+        point without an error, since its numbers describe a run that ran.
+        """
+        try:
+            agree_process_phase(error, phase="fit cleanup")
+        except BaseException as failure:
+            if error is None:
+                error = failure
+        if error is None:
+            def report_goodput() -> None:
+                if process_zero:
+                    scalars = goodput(time.perf_counter() - started, first_step, other)
+                    print(f"Goodput: first step after {scalars.get('goodput/time_to_first_step_s', 0.0):.2f} s, "
+                          f"{scalars['goodput/step_fraction']:.1%} of the wall time in steps")
+                    if self.tracker is not None:
+                        self.tracker.log(scalars, step)
+
+            try:
+                agreed("goodput reporting", report_goodput)
+            except BaseException as failure:
+                error = failure
+        try:
+            self._report(FitEnded.outcome(time.perf_counter() - started, error), step)
+        except BaseException as failure:
+            if error is None:
+                error = failure
+            else:
+                error.add_note(f'Reporting fit outcome failed: {failure!r}')
+        return error
 
     def _report(self, value: Record, step: int) -> None:
         """Hand one record to the tracker on rank zero, then agree with the pool.
