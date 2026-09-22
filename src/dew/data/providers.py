@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import grain.python as pygrain
@@ -77,6 +77,54 @@ class Counted(Protocol):
 
     def __len__(self) -> int: ...
 
+
+
+def name_ordered(named: str | Mapping[str, float] | None) -> dict[str, float]:
+    """One name at weight one, or each name of a mapping at its weight, in
+    name order; empty when nothing is named.
+
+    Which corpus record k comes from depends on the order the corpora are
+    mixed in, so sorting by name keeps one written mapping to one run.
+    """
+    if not named:
+        return {}
+    weighted = {named: 1.0} if isinstance(named, str) else dict(named)
+    return {} if not all(weighted) else {name: weighted[name] for name in sorted(weighted)}
+
+
+def corpora_dataset(train: Sequence[Corpus], held: Sequence[Corpus] | None,
+                    operations: Sequence[pygrain.Transformation], *, batch: int, seed: int,
+                    loading: Loading, val_batches: int | None,
+                    records: int | None = None) -> Dataset:
+    """The batches of one corpus, or of several mixed at their weights.
+
+    One corpus streams reshuffled every epoch, and a pass is its records
+    (`records` for a source that cannot count itself). Several mix
+    (`mixed_stream`), and a pass is the records in which every corpus has
+    been read at least once (`mixed_records`), so a mixture takes no
+    `records`. `held` holds the same corpora's validation splits: one
+    ordered pass, a mixture's mixed at the same weights with each split in
+    its own order, bounded by `val_batches`.
+    """
+    rows = local_batch(batch)
+    if len(train) == 1:
+        stream = train_stream(train[0].source, operations, batch=rows, seed=seed,
+                              loading=loading)
+        pass_records = counted(train[0].source, records, train[0].name)
+    else:
+        if records is not None:
+            raise ValueError(
+                "a mixture's pass is the records in which every corpus has been "
+                "read at least once, which its corpora's lengths and weights give, "
+                "so it takes no records=")
+        stream = mixed_stream(train, operations, batch=rows, seed=seed, loading=loading)
+        pass_records = mixed_records(train)
+    validation = None
+    if held is not None:
+        ordered = held[0].source if len(held) == 1 else mixture(held, None)
+        validation = bounded(validation_pass(ordered, operations, batch=rows, seed=seed,
+                                             loading=loading), val_batches)
+    return Dataset(train=stream, val=validation, records=pass_records, batch=batch)
 
 class Preprocessing(pygrain.RandomMapTransform):
     """`preprocess` as the grain transformation that runs inside the workers."""
@@ -168,15 +216,12 @@ class ProviderDataset(DatasetSpec):
 
     @property
     def weighted(self) -> dict[str, float]:
-        """Each dataset this reads and the share of a step it fills, in name order.
-
-        Which corpus record k comes from depends on the order the corpora are
-        mixed in. Sorting by name keeps one written mapping to one run.
-        """
-        weighted = {self.name: 1.0} if isinstance(self.name, str) else dict(self.name)
-        if not weighted or not all(weighted):
+        """Each dataset this reads and the share of a step it fills, in name
+        order (`name_ordered`)."""
+        weighted = name_ordered(self.name)
+        if not weighted:
             raise ValueError(f"{type(self).__name__} needs name= set to a dataset")
-        return {name: weighted[name] for name in sorted(weighted)}
+        return weighted
 
     @property
     def transforms(self) -> list[pygrain.Transformation]:
@@ -193,31 +238,14 @@ class ProviderDataset(DatasetSpec):
         The mixture, the ordered validation pass and the record count are the
         same for both providers; only `read` differs.
         """
-        rows = local_batch(batch)
-        corpora = [Corpus(name, self.read(name, self.split), weight)
-                   for name, weight in self.weighted.items()]
-        if len(corpora) == 1:
-            train = train_stream(corpora[0].source, self.transforms, batch=rows,
-                                 seed=self.seed, loading=self.loading)
-            pass_records = counted(corpora[0].source, self.records, corpora[0].name)
-        else:
-            if self.records is not None:
-                raise ValueError(
-                    "a mixture's pass is the records in which every corpus has been "
-                    "read at least once, which its corpora's lengths and weights give, "
-                    "so it takes no records=")
-            train = mixed_stream(corpora, self.transforms, batch=rows, seed=self.seed,
-                                 loading=self.loading)
-            pass_records = mixed_records(corpora)
-        validation = None
-        if self.val_split is not None:
-            held = [Corpus(name, self.read(name, self.val_split), weight)
-                    for name, weight in self.weighted.items()]
-            ordered = held[0].source if len(held) == 1 else mixture(held, None)
-            validation = bounded(validation_pass(ordered, self.transforms, batch=rows,
-                                                 seed=self.seed, loading=self.loading),
-                                 self.val_batches)
-        return Dataset(train=train, val=validation, records=pass_records, batch=batch)
+        held = None if self.val_split is None else [
+            Corpus(name, self.read(name, self.val_split), weight)
+            for name, weight in self.weighted.items()]
+        return corpora_dataset(
+            [Corpus(name, self.read(name, self.split), weight)
+             for name, weight in self.weighted.items()],
+            held, self.transforms, batch=batch, seed=self.seed, loading=self.loading,
+            val_batches=self.val_batches, records=self.records)
 
 
 @datasets("tfds")
