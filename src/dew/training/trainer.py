@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 import jax
@@ -85,8 +85,10 @@ the loss and the objective's report out."""
 
 CompiledStep = Callable[
     [TrainState, Batch],
-    tuple[TrainState, jax.Array, Mapping[str, jax.Array], jax.Array, jax.Array]]
-"""A call returns state, scalar loss, metrics, loss_finite, and accepted."""
+    tuple[TrainState, jax.Array, dict[str, jax.Array], jax.Array, jax.Array]]
+"""A call returns the stepped state, the scalar loss, the objective's whole
+report (`Aux.metrics`), whether that loss was finite, and whether the
+microbatch was accepted."""
 
 ObjectiveLoss = TypeVar("ObjectiveLoss")
 ObjectiveEffects = TypeVar("ObjectiveEffects")
