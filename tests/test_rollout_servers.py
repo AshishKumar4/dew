@@ -21,7 +21,7 @@ import pytest
 openai = pytest.importorskip("openai", reason="optional inference-clients extra")
 import httpx2
 
-from dew.inference import OpenAICompletion, OpenAIRolloutServer, SafetensorsReload
+from dew.inference import OpenAICompletion, VLLMRolloutServer, SafetensorsReload
 from dew.interop import load_pretrained
 from dew.sampling import Sampling
 
@@ -55,7 +55,7 @@ def pushed(variables):
 
 def test_a_draw_is_the_reported_ids_and_behavior_likelihoods():
     completion, calls = vllm(choice([3, 5, EOS], [-.5, -1., -.25], "stop"))
-    server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed, version=4)
+    server = VLLMRolloutServer(completion, Sampling(eos_id=EOS), pushed, version=4)
     try:
         draw = server.submit([1, 2, 9], 8, seed=11).result()
     finally:
@@ -71,7 +71,7 @@ def test_a_draw_is_the_reported_ids_and_behavior_likelihoods():
 
 def test_a_budget_stop_is_unterminated_and_a_disagreeing_reason_is_refused():
     completion, _ = vllm(choice([3, 5], [-.5, -1.], "length"))
-    server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed)
+    server = VLLMRolloutServer(completion, Sampling(eos_id=EOS), pushed)
     try:
         assert not server.submit([1], 2, seed=0).result().terminated
         with pytest.raises(ValueError, match="disagrees"):
@@ -83,8 +83,8 @@ def test_a_budget_stop_is_unterminated_and_a_disagreeing_reason_is_refused():
 def test_raw_engine_likelihoods_are_not_taken_for_a_transformed_policy():
     completion, _ = vllm(choice([EOS], [0.], "stop"))
     with pytest.raises(ValueError, match="processed_logprobs"):
-        OpenAIRolloutServer(completion, Sampling(temperature=.7, eos_id=EOS), pushed)
-    OpenAIRolloutServer(completion, Sampling(temperature=.7, eos_id=EOS), pushed, processed_logprobs=True).close()
+        VLLMRolloutServer(completion, Sampling(temperature=.7, eos_id=EOS), pushed)
+    VLLMRolloutServer(completion, Sampling(temperature=.7, eos_id=EOS), pushed, processed_logprobs=True).close()
 
 
 class Engine(BaseHTTPRequestHandler):
