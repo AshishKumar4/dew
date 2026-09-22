@@ -5,8 +5,11 @@
 
 Every prompt asks for a Python program that reads two integers from stdin
 and prints a stated function of them. A completion's reward is the fraction
-of three hidden test cases its program passes, run in a `SandboxFleet` of
-resource-limited processes with a wall clock, CPU time and memory cap.
+of three hidden test cases its program passes, run in a `SandboxFleet`.
+`--runner container` runs each program in a network-less `python:3.12-slim`
+container. `--runner process` (the default, and the only choice where Docker
+is absent, as on Colab) runs it as a process with a wall clock, CPU time and
+memory cap; that process has your user's filesystem and network.
 
 Rollouts run on a rollout server while the trainer updates. `--backend
 native` serves them from Dew's own continuous-batching `Server` in this
@@ -44,19 +47,20 @@ import tyro
 
 from dew.data import Loading, tokenizer_for
 from dew.data.prompts import Prompts
-from dew.inference.tasks import SHAPE_BUCKETS
 from dew.inference import (
     NativeRolloutServer,
     OpenAICompletion,
-    VLLMRolloutServer,
     SafetensorsReload,
     Server,
     TextGeneration,
+    VLLMRolloutServer,
 )
+from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop import load_pretrained
 from dew.objectives.rl import (
     AsyncRollout,
     CodeReward,
+    ContainerRunner,
     GRPOObjective,
     ProcessRunner,
     RolloutRecord,
@@ -122,6 +126,9 @@ class Config:
     tasks: int = 2048
     window: int = 10
     """Updates averaged at each end of the run for the reward comparison."""
+    runner: str = "process"
+    """process: limited local processes; container: network-less Docker containers of --image."""
+    image: str = "python:3.12-slim"
     vllm: str = "vllm"
     port: int = 8011
     vllm_memory: float = 0.12
@@ -133,29 +140,30 @@ class Config:
 
 def launch_vllm(config: Config, directory: Path) -> subprocess.Popen:
     """Start vLLM on the exported checkpoint and wait until it answers."""
-    log = open(config.out / "vllm.log", "w")
-    process = subprocess.Popen(
-        [config.vllm, "serve", str(directory), "--served-model-name", "policy", "--port", str(config.port),
-         "--gpu-memory-utilization", str(config.vllm_memory), "--dtype", "bfloat16",
-         "--max-model-len", str(config.prompt_tokens + config.new_tokens), "--generation-config", "vllm",
-         "--enable-prefix-caching", "--seed", str(config.seed)],
-        # vLLM runs build tools (ninja) from its own environment's bin directory.
-        env={**os.environ, "VLLM_SERVER_DEV_MODE": "1",
-             "PATH": os.pathsep.join((str(Path(shutil.which(config.vllm) or config.vllm).parent),
-                                      os.environ.get("PATH", "")))},
-        stdout=log, stderr=subprocess.STDOUT)
+    with open(config.out / "vllm.log", "w") as log:
+        process = subprocess.Popen(
+            [config.vllm, "serve", str(directory), "--served-model-name", "policy", "--port", str(config.port),
+             "--gpu-memory-utilization", str(config.vllm_memory), "--dtype", "bfloat16",
+             "--max-model-len", str(config.prompt_tokens + config.new_tokens), "--generation-config", "vllm",
+             "--enable-prefix-caching", "--seed", str(config.seed)],
+            # vLLM runs build tools (ninja) from its own environment's bin directory.
+            env={**os.environ, "VLLM_SERVER_DEV_MODE": "1",
+                 "PATH": os.pathsep.join((str(Path(shutil.which(config.vllm) or config.vllm).parent),
+                                          os.environ.get("PATH", "")))},
+            stdout=log, stderr=subprocess.STDOUT)
     deadline = time.monotonic() + 900
+    unanswered: httpx.HTTPError | None = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"vLLM exited with {process.returncode}; see {config.out / 'vllm.log'}")
         try:
             if httpx.get(f"http://127.0.0.1:{config.port}/health", timeout=2).status_code == 200:
                 return process
-        except httpx.HTTPError:
-            pass
+        except httpx.HTTPError as error:
+            unanswered = error
         time.sleep(2)
     process.kill()
-    raise TimeoutError("vLLM did not come up within fifteen minutes")
+    raise TimeoutError("vLLM did not come up within fifteen minutes") from unanswered
 
 
 def main(config: Config) -> dict:
@@ -208,7 +216,10 @@ def main(config: Config) -> dict:
               f"lag {record.lag}  redrawn {record.redrawn}  waited {record.waited:.1f}s", flush=True)
 
     limits = SandboxLimits(wall_seconds=5.0, cpu_seconds=2, memory_bytes=512 * 1024 ** 2, message_bytes=65536)
-    fleet = SandboxFleet(ProcessRunner(), limits=limits, workers=max(os.cpu_count() or 1, 4))
+    if config.runner not in ("process", "container"):
+        raise ValueError(f"runner is process or container, got {config.runner!r}")
+    runner = ProcessRunner() if config.runner == "process" else ContainerRunner(config.image)
+    fleet = SandboxFleet(runner, limits=limits, workers=max(os.cpu_count() or 1, 4))
     rollout = AsyncRollout(objective, server, CodeReward(fleet), decode=words.decode, groups=config.groups,
                            max_new_tokens=config.new_tokens, max_lag=config.max_lag, ahead=config.max_lag,
                            log=log)
