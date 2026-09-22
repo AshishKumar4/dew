@@ -316,6 +316,15 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
                  stopping: Callable[[StepState, jax.Array], jax.Array],
                  budget: int, n: int, search: Beam) -> Draws:
+    """`Beam`'s scan: one step per position, keeping `width` live beams.
+
+    The carry is the model state, the beams' `StepState`, each beam's running
+    score, the tokens and raw log probabilities drawn so far, whether the
+    prompt is still worth extending, and the completed set. A step scores
+    every live beam's continuations, keeps the best `Beam.keep`, moves the
+    ended ones into the completed set at their length-penalized score, and
+    reparents the cache rows of the ones it continues with.
+    """
     prompts, width, keep = start.rows, search.width, search.keep
     penalty, never = search.length_penalty, search.early_stopping == "never"
     real = jnp.repeat(start.active, width)
@@ -492,6 +501,15 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                transform: Callable[[StepState, jax.Array], jax.Array],
                stopping: Callable[[StepState, jax.Array], jax.Array],
                budget: int, plan: Speculative) -> Draws:
+    """`Speculative`'s loop: propose `plan.block` tokens, then verify them.
+
+    The carry is the draft and target model states, the `StepState` the
+    accepted tokens leave behind, the tokens and their two log probabilities,
+    and the rows still running. One block drafts `gamma` tokens, scores them
+    and the one after them in a single target call, accepts the longest
+    prefix the acceptance test allows, and emits the bonus or corrected token
+    after it.
+    """
     gamma, rows = plan.block, start.rows
     propose, verify = ops.propose, ops.verify
     assert propose is not None and verify is not None

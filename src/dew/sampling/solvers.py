@@ -671,8 +671,9 @@ class DPMSolverMultistep:
     extension: Diffusers refuses a literal zero-terminal non-++ config.
     EDM uses the ++ algorithms over its existing process.
 
-    The former DPMSolverPP configuration is order=2, algorithm="dpmsolver++",
-    solver_type="midpoint", lower_order_final=False, euler_at_final=False.
+    DPM-Solver++ 2M with no order taper is order=2,
+    algorithm="dpmsolver++", solver_type="midpoint", lower_order_final=False,
+    euler_at_final=False.
     """
 
     order: int = 2

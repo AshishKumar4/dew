@@ -34,6 +34,12 @@ if TYPE_CHECKING:
     from dew.training.distributed import Layout, MeshSpec
 
 class _Default(Enum):
+    """The sentinel that tells `guidance=None` from an omitted `guidance=`.
+
+    None is a value a caller passes to turn guidance off, so the default
+    cannot be None.
+    """
+
     GUIDANCE = "guidance"
 
 

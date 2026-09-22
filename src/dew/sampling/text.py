@@ -1,4 +1,16 @@
-"""Cached text generation with explicit lengths and sampling likelihoods."""
+"""Cached text generation with explicit lengths and sampling likelihoods.
+
+`generate` validates a request on the host, prefills the prompt once, and
+hands the decode loop to a `Strategy`. `Sampling` is the default policy:
+temperature, top-k, top-p and min-p with an EOS criterion. `Generation`
+carries the tokens with one length and two log probabilities per row, the
+behaviour policy's and the model's own.
+
+On a pool every process resolves the same request. `_request` raises what a
+rank can get wrong on its own, `_digest` reduces the resolved components to a
+value every rank can compare, and the ranks agree on both before any of them
+enters a collective.
+"""
 
 from __future__ import annotations
 

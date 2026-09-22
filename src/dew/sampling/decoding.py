@@ -1063,7 +1063,11 @@ def as_pytree(value: LogitsTransform) -> LogitsTransform:
 
 def components(values: LogitsTransform | Sequence[LogitsTransform],
                kind: str) -> tuple[LogitsTransform, ...]:
-    """A user-supplied transform or criterion, or a sequence of them, for `jit`."""
+    """`values` as a tuple of pytrees `jax.jit` accepts as data.
+
+    Takes one transform or criterion or a sequence of either. `kind` names
+    the argument in the refusal a non-callable earns.
+    """
     if callable(values):
         return (as_pytree(values),)
     if not isinstance(values, (tuple, list)):
