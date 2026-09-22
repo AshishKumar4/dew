@@ -131,8 +131,16 @@ class _TextTower(ConditionEncoder[str, TextContext]):
         raise NotImplementedError
 
     def states(self, answer: object) -> jnp.ndarray:
-        """The tower's last hidden state, out of what `apply` handed back."""
-        raise NotImplementedError
+        """The tower's last hidden state, out of what `apply` handed back.
+
+        Flax's `apply` is typed as returning anything. The CLIP tower returns
+        its output record and the T5 tower the states themselves; anything
+        else means collections were mutated that no tower asks for."""
+        if isinstance(answer, CLIPTowerOutput):
+            return answer.last_hidden_state
+        if isinstance(answer, jnp.ndarray):
+            return answer
+        raise TypeError(f"{type(self).__name__} returned {type(answer).__name__}, not hidden states")
 
     @property
     def recorded(self) -> dict:
@@ -189,11 +197,6 @@ class CLIPText(_TextTower):
     def context(self) -> int:
         return self.tokenizer.model_max_length
 
-    def states(self, answer):
-        # The tower returns its own output type; apply's mutable-collections
-        # pair would mean collections were asked for, and none were.
-        assert isinstance(answer, CLIPTowerOutput)
-        return answer.last_hidden_state
 
 
 @encoders("t5")
@@ -232,11 +235,6 @@ class T5Text(_TextTower):
     def recorded(self) -> dict:
         return {"max_length": self.max_length}
 
-    def states(self, answer):
-        # The tower returns one array; a tuple would mean apply() returned
-        # mutable collections, and none were asked for.
-        assert not isinstance(answer, tuple)
-        return answer
 
 
 @encoders("char_table")

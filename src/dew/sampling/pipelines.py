@@ -19,7 +19,7 @@ from jax.typing import ArrayLike
 
 from dew.artifacts import agreed
 from dew.diffusion.process import Process
-from dew.inputs import InputSpec, host_rows
+from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import ArrayT, RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import FROZEN, Variables
@@ -97,7 +97,9 @@ class Images(Generic[ArrayT]):
     latents: ArrayT | None = None
 
     def host(self) -> Images[np.ndarray]:
-        return host_rows(self, self.rows)
+        """This process's real rows as host arrays, without the padding a
+        row plan added to fill the devices."""
+        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
 
 
 @dataclass(frozen=True, eq=False)

@@ -626,6 +626,7 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
     candidates = [select(keys[:, 0], scores[0], opening.active)]
     offered = [jnp.ones(rows, bool)]
     states = [opening, opening.commit(candidates[0], active)]
+    assert state.hidden is not None, "a drafting pass reads the last hidden state"
     hidden, drafting, live, ending = state.hidden, state, opening.active, []
     sure = jnp.ones(rows, bool)
     for depth in range(1, block_size):
@@ -775,10 +776,9 @@ def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget
                        transform, stopping)
     states, candidates = drafted.steps, drafted.candidates
     proposed = jnp.stack(candidates, axis=1)
-    drafting, verified, _ = verify(
+    _, verified, _ = verify(
         drafted.state, proposed,
         jnp.stack([active & (step.step + at < budget) for at in range(block_size)], axis=1))
-    assert state.hidden is not None
     raw = [state.logits.astype(jnp.float32)] + [verified[:, at].astype(jnp.float32)
                                                 for at in range(block_size)]
     targets = [drafted.scores[0]] + [transform(states[at], raw[at])

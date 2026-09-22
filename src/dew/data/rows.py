@@ -9,7 +9,7 @@ each spec is its own row validation and nothing else.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from .dataset import Dataset, DatasetSpec, Records, local_batch, train_stream, validation_pass
 from .tokens import bounded
@@ -30,7 +30,7 @@ def parquet_names(path: str, what: str) -> list[str]:
 
 
 def parquet_rows(path: str, fields: Sequence[str],
-                 names: Sequence[str]) -> list[dict[str, object]]:
+                 names: Sequence[str]) -> list[Mapping[str, object]]:
     """`path`'s rows over the `fields` it has, one dict per row.
 
     `names` is the file's own columns, as `parquet_names` read them, so a
@@ -42,14 +42,17 @@ def parquet_rows(path: str, fields: Sequence[str],
     return table.to_pylist()
 
 
-def json_records(records: Sequence[str]) -> list[object]:
-    """Each string of `records` parsed as one JSON value, refused by index."""
-    rows: list[object] = []
+def json_records(records: Sequence[str]) -> list[Mapping[str, object]]:
+    """Each string of `records` parsed as one JSON object, refused by index."""
+    rows: list[Mapping[str, object]] = []
     for index, record in enumerate(records):
         try:
-            rows.append(json.loads(record))
+            row = json.loads(record)
         except json.JSONDecodeError as exc:
             raise ValueError(f"record {index} is not JSON: {exc}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"record {index} is not a JSON object: {type(row).__name__}")
+        rows.append(row)
     return rows
 
 
