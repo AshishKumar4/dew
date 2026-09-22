@@ -71,7 +71,11 @@ def write_back(params: Variables, variables: Variables | None) -> Variables:
 
 
 def _unscale(gradient: jax.Array, factor: jax.typing.ArrayLike) -> jax.Array:
-    """Working gradients use at least fp32, preserving higher precision."""
+    """Divide a gradient by the loss scale it was computed under.
+
+    The division happens in fp32 or wider, so a bf16 gradient does not round
+    twice on the way back to its true magnitude.
+    """
     dtype = jnp.promote_types(gradient.dtype, jnp.float32)
     return gradient.astype(dtype) / jnp.asarray(factor, dtype)
 
@@ -84,6 +88,11 @@ def _all_finite(tree) -> jax.Array:
 
 
 def compact_qk(tree):
+    """Reduce every sowed `max_logits` leaf over its rows, keeping the heads.
+
+    The clip reads each head's strongest logit alone, so a retained window
+    holds one row per layer instead of the batch's.
+    """
     def compact(path, leaf):
         is_maximum = any(isinstance(entry, jax.tree_util.DictKey) and entry.key == "max_logits"
                          for entry in path)
@@ -104,6 +113,11 @@ def _advance_scale(scale: dynamic_scale_lib.DynamicScale, finite: jax.Array):
 
 @dataclasses.dataclass(frozen=True)
 class Realization(Generic[Loss, Effects]):
+    """What one objective evaluation produced, with the pullback that undoes it.
+
+    `pullback` closes over the forward's residuals, so it belongs to the
+    attempt that made it and never travels on a TrainState.
+    """
     stats: Loss
     aux: Aux[Effects]
     pullback: Callable[[Loss], Variables]
@@ -111,6 +125,13 @@ class Realization(Generic[Loss, Effects]):
 
 @struct.dataclass
 class PendingAttempt(Generic[Loss]):
+    """The window after one microbatch, before the commit decides on it.
+
+    `fill` is the slot this microbatch took and `due` whether it closed the
+    window. `active` is whether the reduction found any statistical support,
+    `local_finite` whether this microbatch alone produced finite values, and
+    `candidate` the accumulation the state keeps if the attempt is admitted.
+    """
     fill: jax.Array
     due: jax.Array
     active: jax.Array
@@ -125,8 +146,19 @@ class PendingAttempt(Generic[Loss]):
 
 
 class Transaction:
-    """The existing full-tree update and replay algebra, staged at its seams."""
+    """Turn one or more microbatches into one optimizer update.
+
+    Pooling, replay, admission, effects, EMA and the three clocks are written
+    once here. `step` composes them for a resident run or for a host-master
+    run; only where each phase executes differs.
+    """
     def __init__(self, objective, optimizer, accumulation: int, shapes):
+        """Hold the objective, the optimizer and the shapes a step traces for.
+
+        `shapes` is the traced result of the objective's loss, statistics and
+        `Aux`. Statistics that are a `Mean` or a bare scalar pool into one
+        shared mean, which the window can sum and never has to replay.
+        """
         self.objective = objective
         self.optimizer = optimizer
         self.size = accumulation
@@ -136,16 +168,35 @@ class Transaction:
         self.effects_tree = jax.tree.structure(self.aux_shape.effects)
 
     def realize(self, variables: Variables, batch: Batch, step_info: Step) -> Realization:
+        """Evaluate the objective's loss and keep the pullback of that trace.
+
+        This is the resident implementation, differentiating the whole
+        parameter tree where the state lives. `HostExecution.realize` is the
+        other one, and `step` takes either.
+        """
         def loss(trainable):
             return self.objective.loss({**variables, "params": trainable}, batch, step_info)
         stats, back, aux = jax.vjp(loss, variables["params"], has_aux=True)
         return Realization(stats, aux, lambda cotangent: back(cotangent)[0])
 
     def local_reduction(self, stats, factor):
+        """Reduce one microbatch's statistics to its loss and its cotangent.
+
+        The cotangent is seeded with `factor`, the loss scale, so the
+        gradient the pullback returns is the scaled one `unscaled` divides.
+        """
         loss, back = jax.vjp(lambda s: self.objective.reduce_loss(s)[0], stats)
         return loss, back(jnp.asarray(factor, loss.dtype))[0]
 
     def prepare_attempt(self, state, stats, aux, loss, gradient):
+        """Pool this microbatch into the window and weigh up the commit.
+
+        Returns a `PendingAttempt`: the pooled statistics and gradient,
+        whether this attempt closes the window, and whether the pooled loss
+        needs a replay. A shared mean pools its gradient by mass here and
+        never replays. A general statistics tree reduces only once pooled, so
+        its gradient has to be recomputed under the pooled cotangent.
+        """
         previous = state.accumulation
         fill = state.microstep % self.size
         due = (fill + 1) == self.size
@@ -193,6 +244,12 @@ class Transaction:
                               pooled, effects, qk, candidate, gradient)
 
     def pooled_cotangent(self, pooled, current_stats, factor):
+        """Seed the pooled statistics' cotangent, in the live leaves' dtypes.
+
+        Replay differentiates the pooled loss rather than each microbatch's
+        own, so every microbatch of the window contributes under this one
+        cotangent.
+        """
         value, back = jax.vjp(lambda s: self.objective.reduce_loss(s)[0], pooled)
         return jax.tree.map(
             lambda cot, leaf: cot.astype(leaf.dtype)
@@ -201,6 +258,12 @@ class Transaction:
 
     @staticmethod
     def replay_input(state, fill, index):
+        """Rebuild the inputs of the window's `index`-th microbatch.
+
+        The batch and the mutable collections come from the retained buffers.
+        The key folds in the attempt that first read them, so a replayed
+        microbatch draws the randomness it drew before.
+        """
         previous = state.accumulation
         assert previous is not None and previous.attempts is not None
         batch = jax.tree.map(lambda x: x[index], previous.batches)
@@ -213,13 +276,27 @@ class Transaction:
 
     @staticmethod
     def unscaled(gradient, factor):
+        """Divide a whole gradient tree by the loss scale it was taken under."""
         return jax.tree.map(lambda x: _unscale(x, factor), gradient)
 
     @staticmethod
     def add_contribution(accumulated, contribution, factor):
+        """Add one replayed microbatch's unscaled gradient into the running sum."""
         return jax.tree.map(lambda a, b: a + _unscale(b, factor), accumulated, contribution)
 
     def finish_attempt(self, state, batch, aux, pending, gradient):
+        """Commit the window when it is due, then advance the state's clocks.
+
+        The commit runs under `lax.cond`, so a rejected attempt costs the
+        same trace as an accepted one. With a dynamic scaler an attempt is
+        admitted only when every value it produced is finite, the committed
+        parameters and optimizer state included; a rejected attempt returns
+        `state` untouched and only the scaler moves.
+
+        A window that is not due retains this microbatch's batch and read
+        snapshots in its slot, so a later replay can reproduce it; a window
+        that committed is zeroed for the next one.
+        """
         scale, previous = state.scale, state.accumulation
         effects, qk, loss = pending.effects, pending.qk, pending.loss
         finite = pending.local_finite & _all_finite((loss, gradient, effects, qk, aux.variables))
@@ -285,8 +362,13 @@ class Transaction:
         return advanced, loss, aux
 
     def step(self, *, realize=None, host=False):
-        """One orchestration over the shared phases; host replay crosses eager
-        execution boundaries, resident replay remains inside lax control flow."""
+        """Build the function that runs one attempt over the shared phases.
+
+        A host-master step compiles each phase on its own and replays in a
+        Python loop, because its realizations cross an eager transport
+        boundary. A resident step traces the phases together and replays
+        inside `lax` control flow.
+        """
         realize = self.realize if realize is None else realize
         compile_phase = jax.jit if host else lambda f: f
         reduce = compile_phase(self.local_reduction)

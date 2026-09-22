@@ -2,10 +2,12 @@
 
 What is learned is the objective's business (`dew.objectives.base`). The
 trainer materialises the objective's tree on the mesh, compiles one step over
-the global batch, keeps the EMA copy on the optimizer's clock, and hands
-effects to the capabilities it was given: a `Checkpoints` for disk, a
-`Tracker` for numbers and artifacts. Constructing one opens nothing; the mesh,
-the compiled step and the capabilities' resources come into being in `fit`.
+the global batch, and keeps the EMA copy on the optimizer's clock. Effects go
+to the capabilities it was given: a `Checkpoints` for disk, a `Tracker` for
+numbers and artifacts.
+
+Constructing one opens nothing; the mesh, the compiled step and the
+capabilities' resources come into being in `fit`.
 """
 
 from __future__ import annotations
@@ -86,10 +88,11 @@ CompiledStep = Callable[
 
 ObjectiveLoss = TypeVar("ObjectiveLoss")
 ObjectiveEffects = TypeVar("ObjectiveEffects")
-"""The two parameters of the objective `Trainer.from_config` is handed. A
-classmethod cannot solve the class's own `Loss` and `Effects` from an
+"""The two parameters of the objective `Trainer.from_config` is handed.
+
+A classmethod cannot solve the class's own `Loss` and `Effects` from an
 argument, since an unparameterized `Trainer.from_config` binds them to their
-defaults, so the factory carries its own pair and names the class it builds."""
+defaults. So the factory carries its own pair and names the class it builds."""
 
 Shapes = tuple[tuple[int, ...], ...]
 """A batch's leaf shapes in tree order, the key a compiled step is held
@@ -98,13 +101,14 @@ each compiled on the first step that reads it."""
 
 
 def batch_shapes(batch: Batch) -> Shapes:
+    """List a batch's leaf shapes in tree order."""
     return tuple(np.shape(leaf) for leaf in jax.tree.leaves(batch))
 
 
 class Rollout(Protocol):
-    """A host-side batch producer the trainer runs before the compiled step.
+    """Produces a batch on the host, before the compiled step reads it.
 
-    Sampling is effectful and untraceable, so it lives outside `jit`: the
+    Sampling is effectful and untraceable, so it lives outside `jit`. The
     trainer calls the rollout with the state, the prefetched batch and a key
     folded from the run key and the step, then reshards what comes back with
     `shard_batch`. The returned batch must hold arrays in fixed shapes, so
@@ -115,9 +119,9 @@ class Rollout(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class ProfileWindow:
-    """One profiler window per fit: `steps` steps traced into `directory`
-    after `warmup` steps have run, so the trace holds the loop and not the
-    compile.
+    """Asks for one profiler window per fit: `steps` steps traced into
+    `directory` after `warmup` steps have run, so the trace holds the loop
+    and not the compile.
 
     `dew.profile` is the other way to capture one, a context manager around
     any code at all; a fit refuses to schedule a window inside one. The
@@ -134,17 +138,18 @@ streak of non-finite losses, and the longest streak since the last check."""
 
 
 def fresh_book() -> Book:
+    """Return the counters a fresh logging interval starts from."""
     return jnp.zeros((), jnp.float32), jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32)
 
 
 @jax.jit
 def bookkeep(book: Book, loss: jax.Array, finite: jax.Array) -> Book:
-    """The counters after one step, in one dispatch.
+    """Advance the loop's counters for one step, in one dispatch.
 
-    As five eager ops (the cast, the add, the where, the add, the maximum)
-    each dispatched an executable of its own, 176 us a step on an i9-12900K
-    against 37 us for this one call, measured over 2000 steps on the CPU
-    backend with the result blocked on at the end.
+    The same work as five eager ops, the cast, the add, the where, the add
+    and the maximum, each dispatching an executable of its own. Those cost
+    176 us a step on an i9-12900K against 37 us for this one call, measured
+    over 2000 steps on the CPU backend with the result blocked on at the end.
     """
     interval_loss, bad_run, worst_bad_run = book
     bad_run = jnp.where(finite, 0, bad_run + 1)
@@ -153,15 +158,17 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array) -> Book:
 
 
 def goodput(wall: float, first_step: float | None, other: float) -> dict[str, float]:
-    """The two goodput numbers of MaxText's report dew can compute locally.
+    """Compute the two goodput numbers from MaxText's report that need no
+    cluster telemetry.
 
     `first_step` is the time from the start of `fit` to the first step's
     result: the placement or restore, the first batch, the compile and the
-    step itself, or None when no step ran. `other` is the time spent
-    outside steps after that (evaluations, checkpoint writes and the wait
-    for them at the end). The step fraction is what is left of `wall`,
-    which counts a step's own data stall as step time, as MaxText's
-    start-to-start step time does.
+    step itself. It is None when no step ran. `other` is the time spent
+    outside steps after that: evaluations, checkpoint writes and the wait for
+    them at the end.
+
+    The step fraction is what is left of `wall`. That counts a step's own
+    data stall as step time, as MaxText's start-to-start step time does.
     """
     numbers = {}
     if first_step is not None:
@@ -190,11 +197,17 @@ class Trainer(Generic[Loss, Effects]):
         rollout: Rollout | None = None,
         profile: ProfileWindow | None = None,
     ):
-        """Accumulate accepted microbatches before an optimizer commit.
+        """Hold everything a run needs, without opening any of it.
 
-        A custom step owns accepted/update clocks, scaler, EMA and mutable
-        writes. The compiled wrapper owns attempted-work advancement. Host
-        rollout collection runs once per consumed batch, outside replay.
+        The mesh, the compiled step and the capabilities' resources come into
+        being in `fit`, so constructing a Trainer allocates nothing.
+
+        `accumulation` is how many microbatches pool into one optimizer
+        commit. `step` replaces the built-in transaction. A custom step then
+        owns the clocks, the scaler, the EMA and the mutable writes, and the
+        compiled wrapper owns only the attempted-step counter. `rollout` runs
+        once per batch read, before the step and outside replay. `layout` and
+        `mesh` say where the state lives.
         """
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
@@ -212,8 +225,8 @@ class Trainer(Generic[Loss, Effects]):
         self.step = step
         self.rollout = rollout
         self.profile = profile
-        # Measured off the step `compile` last compiled, which for a ramped
-        # run is the stage it was called for; `fit` keeps one per stage.
+        # Set by `compile`, for the batch shape it was called with. A ramped
+        # run has one value per stage; `fit` keeps them beside each step.
         self.flops_per_step = None
 
     @classmethod
@@ -225,22 +238,25 @@ class Trainer(Generic[Loss, Effects]):
                         optax.GradientTransformation], StepFn] | None = None,
         rollout: Rollout | None = None,
     ) -> Trainer[ObjectiveLoss, ObjectiveEffects]:
-        """The trainer a `TrainerConfig` describes, so the mapping from the
-        config's field names to this constructor's is written once.
+        """Build the trainer a `TrainerConfig` describes.
 
-        `mesh`, `layout`, `accumulation`, `dynamic_scale` and `profile` are
-        the config fields a trainer holds; `key` is the run key, which
-        `RunConfig.train` draws from `config.seed`. The rest of the config
-        belongs to the capabilities and to the loop, and reaches them from
-        their own owners: `checkpoint_dir` and `keep` build the `Checkpoints`
-        passed in here, `wandb` the tracker, `xla_flags`, `multi_host` and
-        `compilation_cache_dir` are read by `prepare_process` before JAX opens
-        a backend, `batch_ramp` wraps the dataset with `dew.data.ramped`, and
-        `steps`, `epochs`, `log_every`, `eval_every` and `checkpoint_every`
-        are arguments of `fit`. `step` and `rollout` are not configurable:
-        they are code a caller hands over.
+        The mapping from the config's field names to this constructor's is
+        written once, here. `mesh`, `layout`, `accumulation`,
+        `dynamic_scale` and `profile` are the config fields a trainer holds.
+        `key` is the run key, which `RunConfig.train` draws from
+        `config.seed`.
 
-        It builds a `Trainer`, whatever it is called on: the objective's two
+        The rest of the config belongs to the capabilities and to the loop,
+        and reaches them from their own owners. `checkpoint_dir` and `keep`
+        build the `Checkpoints` passed in here, and `wandb` the tracker.
+        `xla_flags`, `multi_host` and `compilation_cache_dir` are read by
+        `prepare_process` before JAX opens a backend. `batch_ramp` wraps the
+        dataset with `dew.data.ramped`. `steps`, `epochs`, `log_every`,
+        `eval_every` and `checkpoint_every` are arguments of `fit`. `step`
+        and `rollout` are not configurable: they are code a caller hands
+        over.
+
+        It builds a `Trainer`, whatever it is called on. The objective's two
         parameters are the factory's own, so a subclass that wants one of
         itself constructs it.
         """
@@ -264,11 +280,13 @@ class Trainer(Generic[Loss, Effects]):
 
     def initial_state(self, initializer: Initializer | None = None,
                       key: jax.Array | None = None) -> TrainState:
-        """The state a fresh run starts from. Pure, so `fit` traces it once
-        for its shapes and once, sharded, for its values.
+        """Build the state a fresh run starts from.
+
+        It is pure, so `fit` traces it once for its shapes and once, sharded,
+        for its values.
 
         Both inputs are the run's own by default, and `place` passes them
-        explicitly so what it compiles takes them as arguments: a held
+        explicitly so that what it compiles takes them as arguments. A held
         checkpoint then reaches the device as an argument instead of as a
         constant embedded in the executable. Passing None means resolve the
         configured input, which is what a no-argument call does. This is the
@@ -302,8 +320,8 @@ class Trainer(Generic[Loss, Effects]):
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
-        """The mesh `MeshSpec` describes over this process pool's devices,
-        built on first use."""
+        """Build the mesh `MeshSpec` describes over this process pool's devices,
+        on first use."""
         return build_mesh(self.mesh)
 
     @property
@@ -318,10 +336,13 @@ class Trainer(Generic[Loss, Effects]):
         return companion_mesh(self.device_mesh)
 
     def shardings(self, state: TrainState) -> Placement[TrainState]:
-        """Parameter gradients follow parameters; replay records follow batches;
-        the layout's host-resident fields sit in pinned host memory. Under a
-        CPU-owned state the frozen collection is the exception: it sits where
-        the realization reads it (`execution.resident`) for the whole run."""
+        """Place every field of `state`, each on the axes its own kind takes.
+
+        Parameter gradients follow parameters, replay records follow batches,
+        and the layout's host-resident fields sit in pinned host memory.
+        Under a CPU-owned state the frozen collection is the exception: it
+        sits where the realization reads it (`execution.resident`) for the
+        whole run."""
         mesh = self.state_mesh
         params = dict(state.params)
         frozen = params.pop(FROZEN, None) if self.host_master else None
@@ -349,8 +370,8 @@ class Trainer(Generic[Loss, Effects]):
         return dataclasses.replace(placed, accumulation=pending)
 
     def _fetched(self, state: TrainState, shardings: Placement[TrainState]) -> TrainState:
-        """`state` with the layout's host-resident fields brought to the
-        device, where a step or an evaluation reads them."""
+        """Bring the layout's host-resident fields to the device, where a step
+        or an evaluation reads them."""
         if self.host_master:
             return state
         return dataclasses.replace(state, **{
@@ -359,11 +380,13 @@ class Trainer(Generic[Loss, Effects]):
             for field in self.layout.host})
 
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
-        """The state itself, fresh or restored, on the mesh, with its shardings
-        and the data position a resume continues from."""
-        # Resolved once: the shapes and the values are then the same inputs
-        # through the same overridable method, and the objective is asked for
-        # what it holds exactly once.
+        """Put the state on the mesh, fresh or restored.
+
+        Returns it with its shardings and the data position a resume
+        continues from."""
+        # Resolved once, so that the shapes and the values are the same
+        # inputs through the same overridable method, and the objective is
+        # asked for what it holds exactly once.
         initializer, key = self.objective.initializer, self.key
         if self.host_master:
             from dew.training.host import transfer
@@ -394,13 +417,13 @@ class Trainer(Generic[Loss, Effects]):
         return state, shardings, position
 
     def _frozen_shardings(self, state: TrainState, frozen):
-        """Where the frozen collection sits for a CPU-owned run.
+        """Return where the frozen collection sits for a CPU-owned run.
 
-        Before placement the layout names each row's shards and `resident`
-        moves the stack's rows to bank memory, a scanned run's shared rows
-        as one bank. Once placed, the collection holds those banks, whose
-        leading layer axis the layout's rules do not name, and its arrays
-        say where they sit.
+        Before placement the layout names each row's shards, and `resident`
+        moves the stack's rows to bank memory, a scanned run's shared rows as
+        one bank. Once placed, the collection holds those banks, whose
+        leading layer axis the layout's rules do not name, and its arrays say
+        where they sit.
         """
         leaves = jax.tree.leaves(frozen)
         if leaves and all(isinstance(leaf, jax.Array) for leaf in leaves):
@@ -412,14 +435,16 @@ class Trainer(Generic[Loss, Effects]):
 
     @functools.cached_property
     def bank_sites(self):
-        """The objective's declared layer stacks, which a host layout streams as banks."""
+        """List the objective's declared layer stacks, which a host layout streams as banks."""
         from dew.inference.banks import bank_sites
         return bank_sites(self.objective) if self.objective.bank_sites else ()
 
     def _banked_frozen(self, tree, stack, release=None):
-        """`tree`, a frozen collection, with each scanned run's shared leaves as
-        one bank (`execution.banked`): the shape a placement and a checkpoint
-        template take, and the arrays the state holds."""
+        """Stack each scanned run's shared leaves of `tree` into one bank
+        (`execution.banked`).
+
+        That is the shape a placement and a checkpoint template take, and the
+        arrays the state holds."""
         from dew.training.execution import banked
         return banked(tree, self.bank_sites, stack, release)
 
@@ -428,9 +453,9 @@ class Trainer(Generic[Loss, Effects]):
 
         The tree is built eagerly on the CPU, where the held leaves the
         objective hands over are read by reference and nothing of size is
-        computed, then each leaf is moved to its placement and the source
-        let go as it lands (`host.stream`): a moving leaf to the companion,
-        a frozen one to where it stays resident (`execution.resident`). The
+        computed. Each leaf is then moved to its placement and the source let
+        go as it lands (`host.stream`): a moving leaf to the companion, a
+        frozen one to where it stays resident (`execution.resident`). The
         transient is one leaf, not the tree, and one JIT could not have
         returned to the two device sets anyway.
         """
@@ -537,14 +562,16 @@ class Trainer(Generic[Loss, Effects]):
     def compile(self, state: TrainState, batch: Batch) -> CompiledStep:
         """Compile a transaction over state and one already-produced global batch.
 
-        The step consumes the state it is given: the returned state takes
+        The step consumes the state it is given. The returned state takes
         over its buffers, so the update runs in place and peak memory holds
         one copy of the parameters and optimizer state, not two. Keep no
         reference to a state after stepping it; `new = step(old, batch)` is
-        the whole contract. A checkpoint saved before the step is safe:
-        orbax copies every array to the host before `save` returns, as long
-        as `Checkpoints` names no prioritized keys and no concurrent
-        transfer limit. The batch is not donated; the loader owns it.
+        the whole contract.
+
+        A checkpoint saved before the step is safe. Orbax copies every array
+        to the host before `save` returns, as long as `Checkpoints` names no
+        prioritized keys and no concurrent transfer limit. The batch is not
+        donated; the loader owns it.
         """
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
@@ -620,14 +647,18 @@ class Trainer(Generic[Loss, Effects]):
         step when the directory holds one.
 
         Every `log_every` steps the tracker receives the loss, the objective's
-        metrics and the throughput. Every `eval_every` steps, and at the end,
-        the validation split is scored: the objective's artifacts go to the
-        tracker and to `metrics`, whose reductions are logged as `val/<name>`.
-        Every `checkpoint_every` steps, and at the end, the state and the data
-        position are written; every `checkpoints.local_every` steps they are
-        written to the local directory as well.
-        Previews are generated only when `preview=True` and a tracker receives
-        them; scalar reporting never triggers preview work.
+        metrics and the throughput.
+
+        Every `eval_every` steps, and at the end, the validation split is
+        scored. The objective's artifacts go to the tracker and to `metrics`,
+        whose reductions are logged as `val/<name>`.
+
+        Every `checkpoint_every` steps, and at the end, the state and the
+        data position are written. Every `checkpoints.local_every` steps they
+        are written to the local directory as well.
+
+        Previews are generated only when `preview=True` and a tracker
+        receives them; scalar reporting never triggers preview work.
         """
         if eval_every and not metrics and not (preview and self.tracker is not None):
             # A validation pass hands its batches to metrics and to the
@@ -649,10 +680,10 @@ class Trainer(Generic[Loss, Effects]):
         current = 0
         first_step = None
         process_zero = jax.process_index() == 0
-        # A configured window must own the capture: refuse before the dataset
-        # or the mesh do any work when another profiler already holds it, so
-        # neither trace is silently dropped or cut short. A configured window
-        # also resolves its optional dependency up front rather than after
+        # A configured window must own the capture. When another profiler
+        # already holds it, refuse before the dataset or the mesh do any
+        # work, so neither trace is silently dropped or cut short. The window
+        # also resolves its optional dependency up front, rather than after
         # warmup steps have run.
         profiler = None
         if profile is not None:
@@ -708,11 +739,9 @@ class Trainer(Generic[Loss, Effects]):
             # Seconds spent sampling this interval, logged under
             # train/rollout_seconds when a rollout is set.
             rollout_seconds = 0.0
-            # The interval's loss and both bad-loss counters live on device, so the
-            # loop never blocks on a result, and move together in one dispatch.
-            # `worst_bad_run` remembers the longest streak of non-finite losses
-            # seen since the last host check; the host check reads it to decide
-            # whether to stop.
+            # The interval's loss and both bad-loss counters live on device,
+            # so the loop never blocks on a result, and they move together in
+            # one dispatch. The host reads them at the logging cadence.
             book = fresh_book()
             seen = 0
             first_step = None
@@ -894,8 +923,8 @@ class Trainer(Generic[Loss, Effects]):
                                 annotation.__exit__(None, None, None)
                         other += time.perf_counter() - paused
 
-                    # On its own clock, not the logging one: nested inside the log
-                    # tick, a cadence that did not divide log_every never fired at all.
+                    # On its own clock, not the logging one, so that a cadence
+                    # which does not divide log_every still fires.
                     if (checkpoint_every and checkpoints is not None
                             and current % checkpoint_every == 0 and current < steps):
                         paused = time.perf_counter()
@@ -945,10 +974,10 @@ class Trainer(Generic[Loss, Effects]):
             if eval_every:
                 self._evaluate(state, shardings, dataset, metrics, preview, mesh)
             if checkpoints is not None and last_saved != current:
-                # The in-loop saves are conditional, so the state the run ends on
-                # may never have been written. It goes out under its real step,
-                # because a step-0 checkpoint holding the final weights would make
-                # a resume restart the schedule from the beginning.
+                # The in-loop saves are conditional, so the state the run ends
+                # on may never have been written. It goes out under its real
+                # step: a step-0 checkpoint holding the final weights would
+                # make a resume restart the schedule from the beginning.
                 checkpoints.save(
                     current, state, position,
                     {"loss": float(interval_loss / interval_steps)} if interval_steps else None)
@@ -1030,6 +1059,11 @@ class Trainer(Generic[Loss, Effects]):
 
     def _evaluate(self, state: TrainState, shardings: Placement[TrainState], dataset: Dataset,
                   metrics: Sequence[Metric], preview: bool, mesh) -> None:
+        """Score the validation split with this state's variables and report it.
+
+        A CPU-owned run evaluates on the accelerator, over the same snapshot
+        a step realizes, so validation reads the weights where the loss
+        does."""
         params = state.params
         averaged = with_ema(state.params, self._fetched(state, shardings).ema)
         key = state.key
@@ -1070,11 +1104,11 @@ class Trainer(Generic[Loss, Effects]):
 
     def _stop_trace(self, traced: int, loss, profile: ProfileWindow,
                     profiler: Profiler, *, step: int) -> None:
-        """Stop the window's owned capture before reporting it on process zero.
+        """Stop the window's owned capture, then report it on process zero.
 
-        The core Profiler drains the backend and exports the native reports on
-        `stop`; the loss's block only orders the primary's failure ahead of
-        the profiler's own drain."""
+        The core Profiler drains the backend and exports the native reports
+        on `stop`. The loss's block only orders the primary's failure ahead
+        of the profiler's own drain."""
         error = None
         try:
             try:
@@ -1116,12 +1150,14 @@ class Trainer(Generic[Loss, Effects]):
 
     def _throughput(self, elapsed: float, steps: int, samples: int,
                     flops: float | None) -> dict[str, float]:
-        """The interval's rates from the records it read and the FLOPs the
-        compiler measured for each step's own shape; `flops` is None when a
-        shape's measurement was unavailable. An interval that spans a stage
-        boundary carries that stage's compile in its wall time, where MaxText
-        hides the performance metrics during a ramp
-        (`common/metric_logger.py:166-194`).
+        """Compute the interval's rates from the records it read and its FLOPs.
+
+        The FLOPs are the ones the compiler measured for each step's own
+        shape; `flops` is None when a shape's measurement was unavailable.
+
+        An interval that spans a stage boundary carries that stage's compile
+        in its wall time. MaxText instead hides the performance metrics
+        during a ramp (`common/metric_logger.py:166-194`).
         """
         if elapsed <= 0 or steps <= 0:
             return {}

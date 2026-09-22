@@ -28,7 +28,7 @@ from .distributed import build_mesh, shard_batch
 
 @dataclass(frozen=True)
 class Evaluation:
-    """One evaluation event, with bounded hosted previews on rank zero only.
+    """Holds one evaluation event, with bounded hosted previews on rank zero.
 
     Scores, logical row counts and RNG identity agree across ranks. Scores
     include the split prefix. elapsed_seconds is rank zero's wall time through
@@ -47,7 +47,7 @@ class Evaluation:
 
     @property
     def scalars(self) -> dict[str, float]:
-        """Metric values plus the evaluation/* count keys when a batch was scored."""
+        """Return the metric values, plus the evaluation/* counts if a batch was scored."""
         if not self.coordinated_batches:
             return dict(self.scores)
         return {**self.scores,
@@ -57,6 +57,7 @@ class Evaluation:
 
 
 def _pick(artifacts: tuple[Artifact, ...], reads: type):
+    """Find the one artifact a metric reads, refusing an ambiguous report."""
     matching = [artifact for artifact in artifacts if isinstance(artifact, reads)]
     if len(matching) != 1:
         raise ValueError(
@@ -66,6 +67,7 @@ def _pick(artifacts: tuple[Artifact, ...], reads: type):
 
 
 def _artifacts(value: Artifacts | None) -> tuple[Artifact, ...]:
+    """Read an objective's report as a tuple, whether it returned one or many."""
     return () if value is None else value if isinstance(value, tuple) else (value,)
 
 

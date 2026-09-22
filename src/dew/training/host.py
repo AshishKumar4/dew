@@ -73,17 +73,19 @@ def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
 
 
 def stream(tree: Variables, placement, held: Variables | None = None) -> Variables:
-    """`tree` moved into `placement` one leaf at a time, each source let go as its copy lands.
+    """Move a variables tree into `placement`, one leaf at a time.
 
-    A leaf is placed and the tree's own node updated before the next leaf
-    is read, so at most one leaf is held twice. `held` is the tree the
-    sources came from, the one an objective keeps and hands the trainer as
-    data: a dict node of it that holds a placed source is updated to the
-    placed array, so what the objective holds afterwards is what the state
-    holds, and the source copy is released rather than kept beside it. A
-    node that is not a dict is left as it is. Every dict node of `tree` is
-    updated in place, so the caller's other references to it see the placed
-    arrays too.
+    Each leaf is placed and written back into its parent node before the
+    next is read, so at most one leaf is held twice and the whole tree never
+    exists in two places.
+
+    `held` is the tree the sources came from, the one an objective keeps and
+    hands the trainer as data. A dict node of it that holds a placed source
+    is updated to the placed array, so the objective and the state share one
+    copy instead of two. A node that is not a dict is left as it is.
+
+    Every dict node of `tree` is updated in place, so the caller's other
+    references to it see the placed arrays too.
     """
     holders: dict[int, list[tuple[dict, object]]] = {}
 
@@ -115,11 +117,13 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
 
 
 def place_leaf(value, target: NamedSharding) -> jax.Array:
-    """`value` in `target`, its source pages let go once the copy has landed.
+    """Move one array into `target`, releasing the source once it lands.
 
-    A host array, or one device's: each process cuts its own shards out of
-    it, so a sharded placement lands sharded. An array already on the mesh
-    moves as it is."""
+    A host array or a single device's array is cut into shards by each
+    process, so a sharded placement lands sharded. An array already on the
+    mesh moves as it is. Memory-mapped source pages are given back to the
+    kernel, which is what keeps a large checkpoint from being resident
+    twice."""
     if isinstance(value, jax.Array) and (isinstance(value.sharding, NamedSharding)
                                          or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
         return transfer(value, target)
@@ -134,13 +138,14 @@ def evict(array: np.ndarray) -> None:
     """Drop a memory-mapped checkpoint tensor's pages from this process.
 
     A loader maps a checkpoint file once and hands out views into it, so
-    letting a view go frees nothing while any other view is alive: the
-    pages a placed tensor was read from stay resident, and for a base that
-    fills the host they are the second copy that does not fit. The pages
-    the view covers whole are given back to the kernel here; a boundary
-    page shared with a neighbour stays until the neighbour is placed, and a
-    later read of an evicted page faults it back from the file. An array
-    that is not such a view is left alone."""
+    letting a view go frees nothing while another view is alive. The pages a
+    placed tensor was read from stay resident, and for a base that fills the
+    host that is one copy too many.
+
+    The pages the view covers whole are given back to the kernel here. A
+    boundary page shared with a neighbour stays until the neighbour is
+    placed. A later read of an evicted page faults it back from the file. An
+    array that is not such a view is left alone."""
     root: np.ndarray = array
     while isinstance(root.base, np.ndarray):
         root = root.base
@@ -163,9 +168,10 @@ def transfer[TreeT](tree: TreeT, placement: Placement[TreeT] | NamedSharding) ->
     `placement` is the tree's own placement, or the single sharding that is
     one array's whole placement.
 
-    Host snapshots and CPU gradients are real copies unless the runtime proves
-    otherwise; no donation or aliasing assumption can invalidate retained states
-    or an asynchronous checkpoint. The caller bounds snapshot assembly by bank.
+    Host snapshots and CPU gradients are real copies unless the runtime
+    proves otherwise. No donation or aliasing assumption can invalidate a
+    retained state or an asynchronous checkpoint. The caller bounds snapshot
+    assembly by bank.
     """
     def leaf(path, value, target):
         # Integer statistic cotangents are symbolic float0 arrays. They have

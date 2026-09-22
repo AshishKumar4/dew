@@ -14,13 +14,16 @@ __all__ = ["Accumulation", "Aux", "Step", "TrainState", "Variables"]
 
 @struct.dataclass
 class Accumulation:
-    """Partial accepted work, without forward tapes or statistic Jacobians.
+    """Hold the microbatches pooled so far, waiting for an optimizer commit.
 
-    Statistics and effects retain their array leaves in canonical tree order;
-    the objective's traced result supplies their PyTree structure. Replay
-    buffers have a leading window-slot dimension, followed by the original
-    batch or mutable-collection dimensions. Only collections rewritten by
-    Aux.variables need per-record read snapshots.
+    It keeps sums, not tapes: no forward residuals and no statistic
+    Jacobians, so it survives a checkpoint. Statistics and effects retain
+    their array leaves in canonical tree order, and the objective's traced
+    result supplies their PyTree structure.
+
+    Replay buffers have a leading window-slot dimension, then the original
+    batch or mutable-collection dimensions. Only the collections
+    `Aux.variables` rewrites need a per-record read snapshot.
     """
     gradient: Variables | None
     mass: jax.Array | None
@@ -35,12 +38,16 @@ class Accumulation:
 
 @struct.dataclass
 class TrainState:
-    """Completed attempts, accepted microbatches, and committed updates.
+    """Hold everything a run must checkpoint to resume where it stopped.
 
-    The immutable root key and attempted step determine the next training
-    draw. microstep indexes objective schedules; updates indexes optimizer
-    and EMA schedules. The scaler and retained partial window are numerical
-    state and travel through the same checkpoint as the parameters.
+    Three clocks count separately. `step` counts attempts, and with the
+    immutable root key it determines the next training draw. `microstep`
+    counts accepted microbatches and indexes the objective's schedules.
+    `updates` counts committed updates and indexes the optimizer's and the
+    EMA's schedules.
+
+    The scaler and the retained partial window are numerical state, and
+    travel through the same checkpoint as the parameters.
     """
     step: jax.Array
     microstep: jax.Array

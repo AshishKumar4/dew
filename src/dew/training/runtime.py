@@ -33,7 +33,7 @@ def prepare_process(wandb: Wandb | None = None,
     """Raise the fd/core limits, set the env vars, join the JAX process pool.
 
     `wandb` is the run's `dew.config.Wandb`, or None for a run without a
-    tracker; only its offline switch is read, and it has to be read before
+    tracker. Only its offline switch is read, and it has to be read before
     wandb opens a run.
 
     jax.distributed.initialize() finds the coordinator from the environment on
@@ -43,16 +43,16 @@ def prepare_process(wandb: Wandb | None = None,
     would otherwise continue on one host. multi_host=True requires the pool,
     multi_host=False never asks for it.
 
-    xla_flags reaches XLA through the environment, which it reads when it
-    opens a backend, so this call has to come before the first JAX call in the
-    process. That makes it a recipe's first line. A library user, who never
-    runs a recipe, sets XLA_FLAGS in the environment.
+    xla_flags reaches XLA through the environment, which XLA reads when it
+    opens a backend. So this call has to come before the first JAX call in
+    the process, which makes it a recipe's first line. A library user, who
+    never runs a recipe, sets XLA_FLAGS in the environment.
 
     The same Layout passed to Trainer selects CPU transaction ownership when
-    host includes params. JAX_PLATFORMS must permit CPU beside the accelerator
-    and JAX_NUM_CPU_DEVICES (or the existing XLA flags) must establish one CPU
-    device per local accelerator before this call. Validation never changes
-    backend configuration after initialization.
+    host includes params. JAX_PLATFORMS must then permit CPU beside the
+    accelerator. JAX_NUM_CPU_DEVICES, or the existing XLA flags, must
+    establish one CPU device per local accelerator before this call.
+    Validation never changes backend configuration after initialization.
     """
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
@@ -78,12 +78,12 @@ def prepare_process(wandb: Wandb | None = None,
                   f"of {jax.process_count()}")
             # One collective while the processes are still in lockstep;
             # initialize() returns on every process once the last one has
-            # connected. On CPU, collectives rendezvous through the coordinator
-            # with a 30 second deadline. Without this the first collective would
-            # fall inside orbax's checkpoint-manager barrier in the trainer, by
-            # which time the processes are as far apart as a wandb init and
-            # their model builds, and a process that arrives late dies in gloo
-            # before the run can report it.
+            # connected. On CPU, collectives rendezvous through the
+            # coordinator with a 30 second deadline. Without this the first
+            # collective would fall inside orbax's checkpoint-manager barrier
+            # in the trainer. By then the processes are as far apart as a
+            # wandb init and their model builds, and one that arrives late
+            # dies in gloo before the run can report it.
             multihost_utils.sync_global_devices("dew process pool joined")
     if layout is not None and "params" in layout.host:
         from dew.training.distributed import build_mesh
@@ -93,7 +93,7 @@ def prepare_process(wandb: Wandb | None = None,
 
 
 def run_timestamp() -> str:
-    """Process 0's wall clock as `%Y-%m-%d_%H:%M:%S`, on every process.
+    """Return process 0's wall clock as `%Y-%m-%d_%H:%M:%S`, on every process.
 
     A default run name carries it, and the name is the checkpoint directory
     every process writes into, so a process that read its own clock a second
