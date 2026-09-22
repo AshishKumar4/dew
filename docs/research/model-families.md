@@ -1,8 +1,77 @@
 # Model families: what Dew's `CausalTransformer` needs for parity
 
+> An AI assistant maintains this document. It is presented as-is.
+
 Research note, 2026-09-02. Scope: the block-level inventory of the large open
 model families, the smallest checkpoint of each that can act as a parity
 fixture on a 16 GB card, and a dependency-ordered plan for Dew.
+
+## Correction, 2026-09-22
+
+This note describes Dew on 2026-09-02, and it is kept as written. Most of its
+plan has landed since then. The "Dew today" row of the master table, the list
+of "Dew's seams today" and many of the per-family verdicts no longer match the
+code. Checked against the source on 2026-09-22:
+
+- The token mixer is a registry of frozen dataclass kinds
+  (`src/dew/nn/mixers/__init__.py:93`), chosen with `CausalTransformer.mixer`
+  (`src/dew/nn/backbones/causal_transformer.py:1428`). The registered kinds are
+  `attention` (`src/dew/nn/mixers/attention.py:466`), `gated_delta_net`
+  (`src/dew/nn/mixers/gated_delta_net.py:11`), `kimi_delta_attention`
+  (`src/dew/nn/kda.py:275`), `mla` (`src/dew/nn/mla.py:820`),
+  `kpool_sparse_attention` (`src/dew/nn/dsa_kpool.py:393`), `deepseek_v4`
+  (`src/dew/nn/deepseek_v4.py:535`), `llama4` (`src/dew/nn/llama4.py:191`) and
+  `mamba2` (`src/dew/nn/mixers/mamba2.py:365`).
+- There is no module constant `LAYER_TYPES`. `layer_types` is a tuple of names,
+  and `kinds` says what each name does (`causal_transformer.py:1391-1392`).
+- Dew has MoE. `CausalTransformer.mixture` (`causal_transformer.py:1421`) turns
+  the chosen layers into `moe.SparseMLP`. The router scores with softmax,
+  sigmoid or sqrtsoftplus (`src/dew/nn/moe.py:47`), and supports the correction
+  bias, group-limited choice and DeepSeek V4's hash routing
+  (`src/dew/nn/moe.py:143-188`). `Mixture.parallel` is Gemma 4's MoE beside the
+  dense MLP (`causal_transformer.py:250,292`). `mlp='swigluoai'` selects
+  gpt-oss's clamped `(up + 1)` activation over interleaved gate and up columns
+  (`causal_transformer.py:1854`; `src/dew/nn/gpt_oss.py:192-194`).
+- The attention fields cover most of the Gemma 4, Qwen3.5 and MiniMax M2 items:
+  `sandwich_norms`, `qk_norm_scope` (`'head'` or `'projection'`), `v_norm`,
+  `attention_k_eq_v`, `layer_scalar`, `attention_scale`, `attention_sinks`,
+  `output_gate`, and partial rotary with the Gemma 4 or the Qwen3.5 convention
+  (`causal_transformer.py:1389-1409`). For text-only input, interleaved mRoPE
+  reduces to that partial rope (`causal_transformer.py:1344-1352`).
+- Per-layer embeddings (`per_layer_input_dim`), KV sharing
+  (`num_kv_shared_layers`, `kv_shared_layers`), MTP depths
+  (`num_nextn_predict_layers`, `MTPBlock`) and hyper-connections
+  (`hyper_connections`) are fields (`causal_transformer.py:782,1424-1438`;
+  `src/dew/nn/hyper_connections.py:56`). The LM objective weights the MTP term
+  with `mtp_weight` (`src/dew/objectives/lm/objective.py:139`).
+- `GatedMLP` has the `swiglu_limit` clamp (`causal_transformer.py:375,396-398`).
+  `geglu` still uses the tanh gelu (`causal_transformer.py:350`). There is no
+  `relu2`.
+- `causal=False` gives full bidirectional attention with no cache, and
+  `mask_token_id` names the token a masked-diffusion objective corrupts to
+  (`causal_transformer.py:1423,1441`). `src/dew/nn/diffusion_gemma.py` runs the
+  text model as the causal encoder and a `causal=False` copy as the decoder
+  (`src/dew/nn/diffusion_gemma.py:87-92`).
+- The embedding scale keeps `sqrt(d)` in the embedding table's dtype and rounds
+  only the product (`causal_transformer.py:2225-2234`). The bf16 difference from
+  Gemma described under Gemma 3 is gone.
+- `tie_embeddings` still defaults to `True` (`causal_transformer.py:1412`).
+- DeepSeek's block-scaled FP8 weights load through
+  `src/dew/interop/quantized.py`, and gpt-oss's MXFP4 weights through
+  `src/dew/nn/gpt_oss.py` and `src/dew/interop/families/gpt_oss.py:38`.
+- torch is in the `test` extra (`pyproject.toml:42-46`) and installed in the
+  venv. Reference fixtures live under `tests/fixtures/` (for example `hf`,
+  `moe`, `mla`, `gpt_oss`, `linear_attention`, `mamba2`), written by the
+  `tools/*_reference.py` scripts.
+- Dew translates these `model_type` values from a Hugging Face config
+  (`_FAMILY_ENTRIES`, `src/dew/interop/hf_decoders.py:2057`): `deepseek_v2`,
+  `deepseek_v3`, `deepseek_v32`, `deepseek_v4`, `diffusion_gemma_text`,
+  `dream`, `gemma`, `gemma2`, `gemma3_text`, `gemma3n_text`, `gemma4_text`,
+  `glm4_moe`, `glm5_next_text`, `glm_moe_dsa`, `gpt_oss`, `kimi_k2`,
+  `kimi_k25`, `llada`, `llama`, `llama4_text`, `mamba2`, `mistral`, `mixtral`,
+  `olmo3`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_next`, `qwen3_5_text` and
+  `qwen3_5_moe_text`. The MiniMax families, `nemotron_h`, `qwen4_exp`,
+  `kimi_linear` and `llada2_moe` are not in that list.
 
 ## How this was checked
 
@@ -19,7 +88,7 @@ Two primary sources only.
    `get_safetensors_metadata(repo)`. Every lineup below was listed with
    `HfApi().list_models(author=...)` before being written about. Parameter
    counts and byte sizes are the sums over the safetensors headers, not
-   marketing numbers from a card.
+   the numbers printed on a model card.
 
 Citation convention. `TF/...py:NNN` is a full path and line. A bare `(:NNN)`
 means the same file as the last full path in that paragraph. Line numbers into
@@ -71,6 +140,8 @@ Component by family. "Dew today" is the last row: what
 | Mixtral (`mixtral`) | GQA | RMSNorm | SwiGLU | softmax then top-2 of 8, renormalised | no | the reference simple MoE |
 | Nemotron-H (`nemotron_h`) | Mamba2 blocks with a few attention and MLP blocks, pattern string | RMSNorm | ReLU squared, no gate | optional sigmoid top-2 of 8 | field exists, 0 in the small checkpoints | `hybrid_override_pattern` |
 | **Dew today** | GQA, full or sliding, qk-norm, rotate-half rope | RMSNorm pre-attn and pre-MLP, optional `(1+w)` | SwiGLU or GeGLU | none | no | embedding scale, logit softcap, two rope thetas |
+
+> 2026-09-22: this row describes Dew on 2026-09-02. See the correction at the top.
 
 ## Per-family notes
 
@@ -127,8 +198,8 @@ tensors, `gate_up_proj [E, 2*I, H]` and `down_proj [E, H, I]` (`:727-728`).
 (`mtp.fc.weight [2048, 4096]`, `mtp.pre_fc_norm_embedding`,
 `mtp.pre_fc_norm_hidden`, one full decoder layer, `mtp.norm`).
 
-[borrow: reimplement the idea] GatedDeltaNet is the single highest-value new
-mixer. It plugs into the `mixer` slot of `DecoderBlock`
+[borrow: reimplement the idea] GatedDeltaNet is the new mixer that unlocks
+the most checkpoints in this survey. It plugs into the `mixer` slot of `DecoderBlock`
 (`DecoderBlock.mixer` in `src/dew/nn/backbones/causal_transformer.py`) with no change to the
 block. The chunked delta rule is about 80 lines of JAX with
 `jax.lax.scan` over chunks; the decode path is a second, shorter function.
@@ -154,20 +225,20 @@ the `Qwen` author, and no `qwen4_exp` checkpoint other than
 
 Three things are new against Qwen3-Next.
 
-**Gated attention.** `Qwen3_5Attention` projects
+Gated attention. `Qwen3_5Attention` projects
 `num_heads * head_dim * 2` from `q_proj`, splits it into the query and a gate,
 and multiplies the attention output by `sigmoid(gate)` before `o_proj`
 (`TF/models/qwen3_5/modeling_qwen3_5.py:645-704`). `q_norm` and `k_norm` are
 RMSNorms over `head_dim` only (`:656-657`). The config flag is
 `attn_output_gate: true` in every 3.5, 3.6 and 3.8 `config.json`.
 
-**Interleaved mRoPE.** `mrope_section = [11, 11, 10]` and the frequency layout
+Interleaved mRoPE. `mrope_section = [11, 11, 10]` and the frequency layout
 is interleaved `THWTHWTHW...TT` rather than sectioned
 (`TF/models/qwen3_5/modeling_qwen3_5.py:101,149-166`). Text-only positions
 collapse to plain rope, so a text parity test does not need the vision path,
 but the frequency order does have to match.
 
-**Dense MLP on every layer for `qwen3_5`.** `Qwen3_5DecoderLayer` builds
+Dense MLP on every layer for `qwen3_5`. `Qwen3_5DecoderLayer` builds
 `Qwen3_5MLP(config, config.intermediate_size)` unconditionally (`:752`); only
 `qwen3_5_moe` swaps in the sparse block. The `qwen3_5_moe` router drops the
 `norm_topk_prob` flag and always renormalises
@@ -209,10 +280,9 @@ Seam: a new mixer factory next to `CausalSelfAttention`, selected by
 
 ### Qwen3.8-Flash-Next (`qwen4_exp`): hyper-connections, PLE, a query-sparse indexer
 
-This is the most different model in the whole survey. Three mechanisms that no
-other family in transformers 5.16.1 has all at once.
+No other family in transformers 5.16.1 has all three of the mechanisms below.
 
-**Hyper-connections.** The residual stream is `hc_count=4` streams wide, so the
+Hyper-connections. The residual stream is `hc_count=4` streams wide, so the
 hidden state carries `4 * hidden_size` features.
 `Qwen4ExpTextGatedResidual` (`TF/models/qwen4_exp/modeling_qwen4_exp.py:941-969`)
 normalises the wide state with a grouped RMSNorm, computes a low-rank mixing
@@ -222,7 +292,7 @@ streams into one input for the block, and returns per-stream injection weights
 (`:1236-1243`). Every layer has two of these, one before attention and one
 before the MLP.
 
-**Per-layer embeddings from hashed n-grams.** `Qwen4ExpTextPLELayer`
+Per-layer embeddings from hashed n-grams. `Qwen4ExpTextPLELayer`
 (`:1117-1191`) and `Qwen4ExpTextNGramEmbedding` (`:1018-1116`) hash token
 n-grams (`ngram_size=3`, `heads_per_ngram=8`) into per-layer tables sized from
 `ngram_vocab_size_base=20_000_000`, with multipliers derived from a splitmix64
@@ -234,7 +304,7 @@ is why the repo is 180B parameters and 360 GB on disk while the compute path is
 small; the config comment says the embedding is around 45B parameters and is
 sharded on dim 0 across 512 shards (`configuration_qwen4_exp.py:97-99,157`).
 
-**QSA indexer.** `Qwen4ExpTextQSAIndexer` (`:611-719`) projects one query set
+QSA indexer. `Qwen4ExpTextQSAIndexer` (`:611-719`) projects one query set
 and a single key head (`indexer_kv_heads` must be 1), averages
 `indexer_compress_ratio=4` consecutive keys into blocks, scores blocks, keeps
 `indexer_budget // compress_ratio` of them plus the incomplete tail, and turns
@@ -337,8 +407,8 @@ Lineup, all ungated: `google/gemma-4-E2B`, `-E4B`, `-12B`, `-31B`,
 - `self.scaling = 1.0` (`:1181`). The scale is folded into the trained weights.
   A port that uses `head_dim ** -0.5` will be wrong by a factor of 16 at
   head_dim 256.
-- `q_norm`, `k_norm`, and a `v_norm` **without a scale parameter** (`:1196-1201`).
-  Norming the values is not something any other family here does.
+- `q_norm`, `k_norm`, and a `v_norm` without a scale parameter (`:1196-1201`).
+  No other family here norms the values.
 - `attention_k_eq_v` on non-sliding layers drops `v_proj` and reuses the key
   projection output as the value (`:1206-1212,1247`).
 - KV sharing: layers at or past `num_hidden_layers - num_kv_shared_layers`
@@ -349,16 +419,16 @@ Lineup, all ungated: `google/gemma-4-E2B`, `-E4B`, `-12B`, `-31B`,
 `Gemma4RMSNorm` (`:197-215`) normalises in fp32, multiplies by
 `weight.float()`, then casts back. There is no `(1+w)` offset, and the weights
 ship centred on 1. This is a change from Gemma 3 and it means Dew's
-`scale_offset` flag must be **off** for Gemma 4 and on for Gemma 3.
+`scale_offset` flag must be off for Gemma 4 and on for Gemma 3.
 
-`Gemma4TextDecoderLayer` (`:1359-1445`) is the most decorated block in the
-survey: four norms, an optional MoE branch that runs **in parallel** with the
+`Gemma4TextDecoderLayer` (`:1359-1445`) has more parts than any other block in
+the survey: four norms, an optional MoE branch that runs in parallel with the
 dense MLP and is summed (`:1418-1430`), a per-layer input gate and projection
 with its own norm (`:1435-1442`), and a `layer_scalar` buffer multiplying the
 block output (`:1444`).
 
-The router (`Gemma4TextRouter`, `:1322-1356`) is unlike every other router
-here: a norm without scale, then a learned `scale` vector times
+The router (`Gemma4TextRouter`, `:1322-1356`) differs from every other router
+here. It applies a norm without scale, then a learned `scale` vector times
 `hidden_size ** -0.5`, then a linear projection, then softmax in fp32, top-k,
 renormalise, then multiply by a learned `per_expert_scale` gathered at the
 selected indices.
@@ -401,7 +471,7 @@ It is an encoder-decoder over the same weights shape:
 - The head divides by 30, applies tanh, multiplies by 30, in fp32 (`:1666-1670`).
 
 There is no timestep embedding and no mask token. The sampler starts from a
-canvas of **uniform random token ids**
+canvas of uniform random token ids
 (`TF/models/diffusion_gemma/generation_diffusion_gemma.py:394-404`), accepts
 tokens by an entropy bound, and anneals a temperature linearly with the step
 index (`:276-316`). `generation_config.json` on the hub:
@@ -413,7 +483,7 @@ attention over the generation canvas", "8 active experts out of 128"
 (`google/diffusiongemma-26B-A4B-it/README.md`, blog at
 `https://blog.google/innovation-and-ai/technology/developers-tools/diffusion-gemma-faster-text-generation/`).
 
-[later] The mask plumbing is the interesting part for Dew and it is cheap: a
+[later] The part Dew can use is the mask plumbing, which is cheap. It is a
 flag that makes the attention mask bidirectional over a suffix of the sequence.
 The rest of DiffusionGemma is a sampler, which belongs in `src/dew/sampling`,
 and a Gemma 4 backbone, which is the Gemma 4 work above.
@@ -426,7 +496,7 @@ and a Gemma 4 backbone, which is the Gemma 4 work above.
 `DeepSeek-V4-Pro-Base`, `DeepSeek-V3.2`, plus the older V3, V2 and V2-Lite. All
 ungated, MIT license on the V4 cards.
 
-**MLA.** `DeepseekV3Attention`
+MLA. `DeepseekV3Attention`
 (`TF/models/deepseek_v3/modeling_deepseek_v3.py:361-494`):
 
 | Piece | Shape source | Note |
@@ -438,20 +508,20 @@ ungated, MIT license on the V4 cards.
 | `o_proj` | `heads * v_head_dim -> hidden` | note `v_head_dim != qk_head_dim` |
 
 Order matters in three places. The rope slice is rotated before the cache write
-(`:463-471`), and the cache stores the **compressed** latent plus the single
+(`:463-471`), and the cache stores the compressed latent plus the single
 rope key, not the expanded keys and values. `rope_interleave=True` selects
 `apply_rotary_pos_emb_interleave` instead of the rotate-half convention
 (`:464-467`). The attention scale is `qk_head_dim ** -0.5` multiplied by the
 YaRN mscale squared when rope scaling is on
 (`yarn_apply_mscale`, `:417` and `:280-289`).
 
-**Router.** `DeepseekV3TopkRouter` (`:131-170`): logits in fp32, `sigmoid`,
+Router. `DeepseekV3TopkRouter` (`:131-170`): logits in fp32, `sigmoid`,
 add `e_score_correction_bias` (a buffer, shape `[n_routed_experts]`, fp32 in
 the checkpoints), score each of `n_group` groups by the sum of its top 2,
 keep `topk_group` groups, mask the rest to `-inf`, take top-k, gather the
-**unbiased** sigmoid scores for the selected experts, renormalise if
-`norm_topk_prob`, multiply by `routed_scaling_factor`. Every detail of that
-sequence is load-bearing and easy to get subtly wrong.
+unbiased sigmoid scores for the selected experts, renormalise if
+`norm_topk_prob`, multiply by `routed_scaling_factor`. Each step in that
+sequence changes the result, and each is easy to get wrong.
 
 `deepseek-ai/DeepSeek-V3.2/config.json`: 61 layers, hidden 7168,
 128 heads, `q_lora_rank=1536`, `kv_lora_rank=512`, `qk_rope_head_dim=64`,
@@ -462,11 +532,11 @@ YaRN with `factor=40`, `original_max_position_embeddings=4096`,
 `mscale=1.0`, `mscale_all_dim=1.0`, `num_nextn_predict_layers=1`,
 `index_topk=2048`, `index_head_dim=128`, `index_n_heads=64`.
 
-**DSA indexer.** `DeepseekV32Indexer`
+DSA indexer. `DeepseekV32Indexer`
 (`TF/models/deepseek_v32/modeling_deepseek_v32.py:160-256`) is small and
 self-contained: `wq_b` from the query lora rank to `index_n_heads *
 index_head_dim`, `wk` from hidden to one `index_head_dim` key,
-`k_norm` a **LayerNorm with bias** (not RMSNorm), `weights_proj` from hidden to
+`k_norm` a LayerNorm with bias (not RMSNorm), `weights_proj` from hidden to
 `index_n_heads`. Scores are `relu(q . k * head_dim ** -0.5)` in fp32, weighted
 per head by `weights_proj(x) * n_heads ** -0.5`, summed over heads, masked, then
 top-`index_topk`. The transformers docstring records two deliberate
@@ -474,7 +544,7 @@ simplifications against the reference: no Hadamard rotation (orthogonal, so dot
 products are preserved) and no FP8 scoring kernel (`:191-207`). The indexer uses
 the half-split rope convention while the main MLA uses interleaved (`:232`).
 
-**V4.** `DeepseekV4Config`
+V4. `DeepseekV4Config`
 (`TF/models/deepseek_v4/configuration_deepseek_v4.py:40-97` for the field
 documentation, `:139-191` for the values) describes a different model again:
 
@@ -503,7 +573,7 @@ documentation, `:139-191` for the values) describes a different model again:
 (`:266-276`). V4-Pro is 61 layers, hidden 7168, 384 experts, `o_groups=16`,
 `index_topk=1024`. The card cites `https://arxiv.org/abs/2606.19348`.
 
-**MTP.** transformers does not put MTP layers in the model classes. It builds
+MTP. transformers does not put MTP layers in the model classes. It builds
 them on demand: `MtpLayer` (`TF/modeling_layers.py:316-361`) is
 `enorm(embeds)` and `hnorm(previous_hidden)` concatenated, then
 `eh_proj: 2*hidden -> hidden`, then one copy of the family's decoder layer,
@@ -516,7 +586,7 @@ The V3.2 safetensors carry exactly that, as layer 61:
 Qwen instead names them `mtp.fc` and `mtp.pre_fc_norm_{embedding,hidden}`, and
 GLM-4.7-Flash uses the DeepSeek names at layer 47.
 
-**FP8.** V3.2 ships `F8_E4M3` weights with a paired
+FP8. V3.2 ships `F8_E4M3` weights with a paired
 `*.weight_scale_inv` fp32 tensor per matrix, blocked 128x128
 (a `[18432, 7168]` weight has a `[144, 56]` scale). Dequantisation is
 `w.astype(f32) * scale[i // 128, j // 128]`. V4-Flash is more mixed: 141.7B
@@ -524,7 +594,7 @@ GLM-4.7-Flash uses the DeepSeek names at layer 47.
 
 [later] for MLA and DSA as trainable mixers, [borrow] for the router.
 The sigmoid-plus-bias group-limited router is the router that Qwen, GLM, Kimi,
-MiniMax and DeepSeek all converge on, so it is worth writing once and well.
+MiniMax and DeepSeek all converge on, so Dew should write it once.
 MLA is a self-contained mixer and fits the `mixer` slot; the only awkward part
 is that the decode cache holds latents of a different shape from Dew's current
 `[B, S, K, D]` key cache. DSA needs a top-k mask fed into
@@ -554,32 +624,32 @@ indexer's top-k selection is reused by the next three MLA layers
 (`TF/models/glm5_next/configuration_glm5_next.py:44-46`). That is a cheap idea,
 because the indexer is the expensive part of DSA and it is shared 4:1.
 
-`GLM-5.3-Flash` is the interesting one for Dew because it combines almost
-everything:
+`GLM-5.3-Flash` matters most for Dew because it combines almost every
+mechanism above:
 
-- **KDA linear attention.** `Glm5NextTextLinearAttention`
+- KDA linear attention. `Glm5NextTextLinearAttention`
   (`TF/models/glm5_next/modeling_glm5_next.py:584-733`), documented in the
   source as "Kimi-style KDA (Kimi Linear Attention)". Separate `q_proj`,
   `k_proj`, `v_proj` at `linear_head_dim=128` times `linear_num_heads=64`, one
   depthwise conv over the concatenation, a low-rank forget gate, a per-head
   `beta = sigmoid(b_proj(x))`, a low-rank output gate `g_b_proj(g_a_proj(x))`,
-  a gated RMSNorm whose activation is **sigmoid** not silu (`:344`), then
+  a gated RMSNorm whose activation is sigmoid not silu (`:344`), then
   `o_proj`.
-- **Forget gate.** `Glm5NextTextForgetGate` (`:305-335`): low-rank
+- Forget gate. `Glm5NextTextForgetGate` (`:305-335`): low-rank
   `f_b_proj(f_a_proj(x))` plus `dt_bias`, times `exp(A_log)`, and when
   `linear_lower_bound` is set the gate is
   `lower_bound * sigmoid(decay_rate * g)` instead of the softplus form. The
   checkpoint leaves `linear_lower_bound` unset, so the softplus branch with the
   `g > 20` guard runs.
-- **Hyper-connections with Sinkhorn.** `Glm5NextTextHyperConnection`
+- Hyper-connections with Sinkhorn. `Glm5NextTextHyperConnection`
   (`:219-296`) does `hc_sinkhorn_iters=20` row and column normalisations, and
   `Glm5NextTextHyperHead` (`:298-302`) collapses the streams by an unweighted
   mean, which the source explicitly contrasts with DeepSeek-V4. The checkpoint
   carries `hc_attn_base [24]`, `hc_attn_scale [3]`, `hc_attn_fn [24, 16384]`
   and the ffn equivalents per layer.
-- **Clamped SwiGLU.** `gate.clamp(max=swiglu_limit)` and
+- Clamped SwiGLU. `gate.clamp(max=swiglu_limit)` and
   `up.clamp(-limit, limit)` with `swiglu_limit=10.0` (`:96-103,139-140`).
-- **k-pooled indexer.** `Glm5NextTextIndexer` (`:736-1024`) pools
+- k-pooled indexer. `Glm5NextTextIndexer` (`:736-1024`) pools
   `index_kpool` consecutive keys with a learned positional code
   (`index_kpool_compress_ape [4, 128]`) and a gate
   (`index_kpool_compress_gate [128, 4096]`), selects
@@ -610,7 +680,7 @@ mixer.
 `Kimi-K2.5` reports `model_type=kimi_k25`. Its wrapper config maps the text
 config's model type to `deepseek_v3`, including the legacy `kimi_k2` name
 (`TF/models/kimi_k25/configuration_kimi_k25.py:83-92`). So the Kimi K2 text
-backbone **is** DeepSeek-V3 MLA plus a sigmoid router:
+backbone is DeepSeek-V3 MLA plus a sigmoid router:
 `Kimi-K2.5/config.json` has `kv_lora_rank=512`, `q_lora_rank=1536`,
 `qk_rope_head_dim=64`, `qk_nope_head_dim=128`, `v_head_dim=128`, 384 experts,
 8 active, 1 shared, `routed_scaling_factor=2.827`,
@@ -665,11 +735,11 @@ alternating full and linear layers every other layer (`:126`).
 
 `MiniMax-M2` went back to plain full attention on every layer:
 `MiniMaxM2Attention` (`TF/models/minimax_m2/modeling_minimax_m2.py:287-348`)
-is GQA with `q_norm` and `k_norm` over the **whole** projection
+is GQA with `q_norm` and `k_norm` over the whole projection
 (`num_heads * head_dim` and `num_kv_heads * head_dim`, `:303-304`), not per
 head. The checkpoint tensors agree: `q_norm.weight [6144]`,
 `k_norm.weight [1024]` with `head_dim=128`, 48 heads, 8 kv heads. Its router
-(`:46-64`) is sigmoid with **no** renormalisation, and the checkpoint carries
+(`:46-64`) is sigmoid with no renormalisation, and the checkpoint carries
 `block_sparse_moe.e_score_correction_bias [256]` and an fp32
 `block_sparse_moe.gate.weight [256, 3072]`. Expert tensors are named
 `w1`/`w2`/`w3`, not `gate_proj`/`up_proj`/`down_proj`.
@@ -681,7 +751,7 @@ top-4, 1 shared expert, `routed_scaling_factor=2.0`, `swiglu_limit=7.0`,
 `num_nextn_predict_layers=1`, `max_position_embeddings=1048576`.
 
 [skip] lightning attention. It is one family, one generation old, and that
-lab's own next model dropped it. Record it and move on.
+lab's own next model dropped it. This note records it and goes no further.
 [borrow] the M2 whole-projection qk-norm as a flag on the qk-norm, since it is
 a one-line difference and it silently changes the numbers. Seam: the `qk_norm`
 option inside `CausalSelfAttention`, which today norms per head. Also the
@@ -692,21 +762,20 @@ needs.
 
 `openai/gpt-oss-20b` and `-120b`, plus two safeguard variants. Ungated.
 
-Two things Dew does not have.
+gpt-oss has three mechanisms Dew does not have.
 
-**Attention sinks.** Each attention module owns a learned
+Attention sinks. Each attention module owns a learned
 `sinks` parameter of shape `[num_attention_heads]`
 (`TF/models/gpt_oss/modeling_gpt_oss.py:293`). In the forward, the sink logit
 is concatenated to the attention logits as one extra key, the max is subtracted
 for stability, softmax runs over the widened axis, and the sink column is
-dropped before multiplying by the values (`:251-259`). The effect is a learned
-escape valve: attention probabilities no longer have to sum to one over real
-tokens. The comment records that the max subtraction is not in the original
+dropped before multiplying by the values (`:251-259`). The effect is that the
+attention probabilities over the real tokens can sum to less than one. The comment records that the max subtraction is not in the original
 implementation and slightly changes results.
 
-**A router that softmaxes after top-k.** `GptOssTopKRouter` (`:117-130`)
+A router that softmaxes after top-k. `GptOssTopKRouter` (`:117-130`)
 takes `topk` over the raw logits and then softmaxes over the k selected values.
-Every other family softmaxes or sigmoids first. It also has a router **bias**
+Every other family softmaxes or sigmoids first. It also has a router bias
 (`router.bias [32]` in the 20b checkpoint).
 
 Layer pattern alternates sliding 128 and full
@@ -716,8 +785,8 @@ Layer pattern alternates sliding 128 and full
 Experts have biases too: `gate_up_proj_bias [32, 5760]`,
 `down_proj_bias [32, 2880]`.
 
-**A third thing: the expert activation is not plain SwiGLU.** `_apply_gate`
-(`:82-88`) splits the packed projection by **interleaving**,
+The third is the expert activation, which is not plain SwiGLU. `_apply_gate`
+(`:82-88`) splits the packed projection by interleaving,
 `gate_up[..., ::2]` and `gate_up[..., 1::2]`, clamps `gate` above at 7.0 and
 `up` to `[-7, 7]`, then computes `(up + 1) * gate * sigmoid(gate * 1.702)`.
 The alpha and the limit are hard-coded in `__init__` (`:79-80`), not config
@@ -725,20 +794,21 @@ fields. MiniMax M3 uses the same formula from config fields and its checkpoint
 calls it `swigluoai`. The `(up + 1)` term and the interleaved packing are both
 easy to miss and neither one fails loudly.
 
-**MXFP4.** The expert weights ship as
+MXFP4. The expert weights ship as
 `gate_up_proj_blocks [32, 5760, 90, 16]` and
 `gate_up_proj_scales [32, 5760, 90]`, both `U8`. Each byte of the blocks tensor
 holds two fp4 values, so 90 * 16 * 2 = 2880 input features per row, and the
 scale is one E8M0 exponent per group of 32 values. Dequantising 20b to bf16
-gives about 21B parameters, so 42 GB. That is the reason gpt-oss cannot be a
+gives about 21B parameters, so 42 GB. That is why gpt-oss cannot be a
 16 GB fixture without splitting the model.
 
 [borrow: reimplement the idea] Attention sinks are five lines inside
 `scaled_dot_product_attention` in `src/dew/nn/attention.py`: widen the
 logits by one column per head before the softmax and drop it after. They only
 work on the reference path, not on a fused kernel, so the flag has to force the
-reference implementation. Worth doing: sinks are cheap, they are in a
-frontier-lab open model, and they change training stability claims.
+reference implementation. Sinks are cheap, an open model from a large lab
+uses them, and they change claims about training stability, so they are worth
+doing.
 [later] the MXFP4 loader.
 
 ### Llama 4
@@ -774,8 +844,8 @@ flag.
 
 ### Mixtral
 
-The reference simple MoE, and the right first target for Dew's MoE work:
-`MixtralTopKRouter` (`TF/models/mixtral/modeling_mixtral.py:96-111`) is
+Mixtral is the reference simple MoE and the right first target for Dew's MoE
+work. `MixtralTopKRouter` (`TF/models/mixtral/modeling_mixtral.py:96-111`) is
 softmax over all experts, then top-k, then renormalise. No bias, no groups, no
 scaling factor, no shared expert. `num_local_experts=8`,
 `num_experts_per_tok=2` (`TF/models/mixtral/configuration_mixtral.py:86-87`).
@@ -839,20 +909,20 @@ Every value here is read from the checkpoint's own `config.json`.
 
 Four observations that matter for Dew.
 
-**Only the small dense models tie their embeddings.** Every MoE model in this
+Only the small dense models tie their embeddings. Every MoE model in this
 table unties, so `tie_embeddings=False` and a real `lm_head` is the common case
 for anything large. Dew defaults to tied
 (`CausalTransformer.tie_embeddings`), which is right for from-scratch small
 training and wrong for every checkpoint it might load.
 
-**Vocabularies are large and padded.** Qwen3.5's 248320 is described on the
+Vocabularies are large and padded. Qwen3.5's 248320 is described on the
 card as "248320 (Padded)". At `hidden_size=1024` the embedding is 254M
 parameters out of 873M, so 29 percent of that checkpoint is the embedding.
 An fp32 logits tensor at batch 1, sequence 128 is 127 MB, which is fine, but
 at sequence 2048 it is 2.0 GB, so a parity test should use short sequences.
 
-**`swigluoai` and `relu2` are activations Dew does not have, and there are two
-different clipped SwiGLUs, not one.** Dew's `GatedMLP` supports `swiglu` and
+`swigluoai` and `relu2` are activations Dew does not have, and there are two
+different clipped SwiGLUs, not one. Dew's `GatedMLP` supports `swiglu` and
 `geglu` only. The variants, all read from the code:
 
 | Name | Formula | Values | Used by |
@@ -866,7 +936,7 @@ Three traps here. The `(up + 1)` term in `swigluoai` is easy to miss and it
 shifts the whole function, so GLM's clamped SwiGLU and gpt-oss's are not the
 same activation despite both being described as clipped. `a = 1.702` is the
 sigmoid approximation of GELU, so `swigluoai` is closer to a clamped GeGLU than
-to a SwiGLU. And in gpt-oss the packed `gate_up_proj` **interleaves** gate and
+to a SwiGLU. And in gpt-oss the packed `gate_up_proj` interleaves gate and
 up, `gate_up[..., ::2]` and `gate_up[..., 1::2]`
 (`TF/models/gpt_oss/modeling_gpt_oss.py:83`), where everyone else who packs
 the two projections splits it in halves with `chunk(2, dim=-1)`, MiniMax M3
@@ -882,14 +952,14 @@ be a valid `ACT2FN` key
 translator that reads `hidden_act` from the config file and a translator that
 reads it from a constructed config object will disagree.
 
-**Dew's `geglu` is already the right gelu for Gemma.** Gemma 3 and Gemma 4 use
+Dew's `geglu` is already the right gelu for Gemma. Gemma 3 and Gemma 4 use
 `gelu_pytorch_tanh`. Dew's `GatedMLP` calls flax's `nn.gelu(gate)`, and
 `jax.nn.gelu` defaults to `approximate=True`, which is the tanh form. Measured
 on this machine at fp32 on `[-1.0, 0.3, 2.0]`, the jax default and PyTorch's
 `0.5x(1 + tanh(sqrt(2/pi)(x + 0.044715 x^3)))` agree to 2.98e-08 max absolute
-difference. So this is one Gemma detail that needs no work and no caveat.
+difference. This Gemma detail needs no work.
 
-**Tokenizers.** Qwen 3.5 ships its own class,
+Tokenizers. Qwen 3.5 ships its own class,
 `Qwen3_5Tokenizer(TokenizersBackend)` with `model = BPE`, NFC normalisation,
 a `Split` on `PRETOKENIZE_REGEX` then byte level with
 `add_prefix_space=False`, and `<|endoftext|>` as unk, eos and pad
@@ -916,7 +986,7 @@ logits fit a 16 GB card with room for the runtime. The card in this workstation
 is a 16 GB RTX 4080, so the rule of thumb below is: weights under about 11 GB
 are comfortable, 11 to 14 GB needs care, over 14 GB needs the CPU backend.
 
-**This column is about a forward pass, not about training.** A parity test runs
+This column is about a forward pass, not about training. A parity test runs
 one forward with no optimizer state, so the budget is roughly weights plus
 activations. Training the same checkpoint needs several times that. Measured on
 this workstation by the HfDecoders branch on 2026-09-02: continued pretraining
@@ -967,16 +1037,16 @@ than trusting a remembered number.
 
 Three consequences.
 
-**Only four families have a real single-card fixture.** Qwen3, Qwen3.5 dense,
+Only four families have a real single-card fixture. Qwen3, Qwen3.5 dense,
 Gemma 4 E2B, and Nemotron-H. Everything else is a CPU test or a partial test.
 
-**There is no torch in this venv, and that decides the shape of every parity
-test.** `transformers` is a declared runtime dependency of Dew
+There is no torch in this venv, and that decides the shape of every parity
+test. `transformers` is a declared runtime dependency of Dew
 (`pyproject.toml`), but `torch` is not, and it is not installed:
 `import torch` raises `ModuleNotFoundError`. On import, transformers prints
 "PyTorch was not found. Models won't be available and only tokenizers,
-configuration and file/data utilities can be used." So the reference **configs**
-are available today and the reference **models** are not. Three options, in
+configuration and file/data utilities can be used." So the reference configs
+are available today and the reference models are not. Three options, in
 order of preference:
 
 1. Commit reference tensors. A generator script under `tools/` runs the
@@ -992,7 +1062,7 @@ order of preference:
    pieces whose reference is a short formula, and not for anything with a
    projection layout to get wrong.
 
-Either way the **config translation** can be tested today with no new
+Either way the config translation can be tested today with no new
 dependency: build the real `Qwen3Config` or `Gemma4TextConfig`, let its
 `__post_init__` derive `layer_types`, `rope_parameters` and `per_layer_config`,
 then assert Dew's translated fields match. That catches the whole class of bugs
@@ -1001,7 +1071,7 @@ where a checkpoint says `full_attention` and the family rewrites it, as
 as Qwen3 and Gemma do.
 
 This was run in Dew's own venv on 2026-09-02 and it works with no torch. The
-output below is real, not illustrative:
+results in the comments below come from that run:
 
 ```python
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
@@ -1028,21 +1098,21 @@ Qwen4ExpTextConfig(num_hidden_layers=8,
 # the two 'full_attention' entries come back as 'qwen_sparse_attention'
 ```
 
-Note the two directions in the first two cases. Qwen3 makes the layers **from**
+Note the two directions in the first two cases. Qwen3 makes the layers from
 `max_window_layers` sliding, so the sliding layers are at the end. Gemma 4 makes
 every sixth layer full, so the full layers are the exceptions. A translator that
-gets this backwards still produces a valid model and quietly wrong numbers.
+gets this backwards still produces a valid model, and its numbers are wrong without any error.
 
-**For the numeric half, test one block, not one model.** Instantiate the
+For the numeric half, test one block, not one model. Instantiate the
 family's block class (`DeepseekV3Attention`, `Qwen3NextGatedDeltaNet`,
 `GptOssAttention`, `Glm5NextTextLinearAttention`, `DeepseekV3TopkRouter`) with a
 small config at fp32 on CPU, copy its `state_dict` into the Dew module, feed
-the same input, compare. No checkpoint, no gate, no GPU, and it pins exactly
-the thing being ported. A second test then loads the real checkpoint's first
+the same input, compare. It needs no checkpoint, no gated access and no GPU, and
+it tests exactly the code being ported. A second test then loads the real checkpoint's first
 two layers and compares hidden states, which is where a naming or transpose
 error shows up.
 
-**FP8 and MXFP4 dequantisation is a loader concern, not a model concern.** For
+FP8 and MXFP4 dequantisation is a loader concern, not a model concern. For
 DeepSeek V3.2 and GLM-5.3-Flash it is
 `w.astype(f32) * scale_inv[i // 128, j // 128]`. For gpt-oss it is
 unpack two fp4 nibbles per byte, then scale by the E8M0 exponent per 32
@@ -1073,6 +1143,10 @@ Dew's seams today, for reference:
   where sinks and top-k masks go.
 - The decode cache is opened per module in the flax style
   (`open_kv_cache` in `src/dew/nn/attention.py`).
+
+> 2026-09-22: this list describes Dew on 2026-09-02. The feed-forward can
+> be a `moe.SparseMLP`, `LAYER_TYPES` is gone and the mixer is a registry. See the
+> correction at the top.
 
 ### Step 0: widen the two seams. Small.
 
@@ -1114,7 +1188,7 @@ Parity test, no download: build `MixtralSparseMoeBlock` and
 `DeepseekV3MoE` from `transformers` at fp32 on CPU with 8 experts and hidden
 64, copy the state dict, assert identical argmax over expert indices and a
 stated max absolute output difference. The router is the part that must match
-bit for bit in its **selection**; a tie in the top-k is the one place where a
+bit for bit in its selection; a tie in the top-k is the one place where a
 tiny numeric difference changes the output a lot, so the test should use a seed
 whose scores are well separated and say so.
 
@@ -1171,14 +1245,14 @@ Unlocks, together with step 2: `Qwen/Qwen3.5-0.8B`, `-2B`, `-4B`, `-9B`,
 
 Parity test: full-model logits against `Qwen3_5ForConditionalGeneration`'s text
 tower at fp32 on `Qwen/Qwen3.5-0.8B-Base`, identical argmax and a stated max
-absolute logit difference. This is the first end-to-end frontier-model parity
-Dew can actually run on this workstation.
+absolute logit difference. This would be the first full-model parity test against
+a large lab's model that Dew can run on this workstation.
 
 ### Step 5: Gemma 4's block. Medium.
 
 Sandwich norms (four per block), `scaling = 1.0`, per-layer-type head_dim
 through a per-layer config, a scale-free v-norm, `attention_k_eq_v`, the
-`layer_scalar` buffer, and RMSNorm **without** the `(1+w)` offset. Then KV
+`layer_scalar` buffer, and RMSNorm without the `(1+w)` offset. Then KV
 sharing, which needs a block to read another block's keys and values, which is
 the second cache change: a shared slot keyed by layer type, written by the last
 non-sharing layer (`TF/models/gemma4/modeling_gemma4.py:1186-1191,1240-1259`).
@@ -1235,7 +1309,7 @@ the tied head (`TF/modeling_layers.py:316-361`). Two naming conventions to
 support: DeepSeek's `enorm`/`hnorm`/`eh_proj`/`shared_head` and Qwen's
 `mtp.pre_fc_norm_embedding`/`mtp.pre_fc_norm_hidden`/`mtp.fc`.
 
-For Dew this is more interesting as a **training** signal than as speculative
+For Dew this is more interesting as a training signal than as speculative
 decoding: an extra loss term on the second-next token. That is an objective
 change in `src/dew/objectives/lm`, not a backbone change, and it is the one
 item in this list that changes what Dew trains rather than what it can load.
@@ -1283,7 +1357,7 @@ Verified on the hub on 2026-09-02.
 
 What a diffusion LM forward needs that Dew's `CausalTransformer` does not have:
 
-1. **A bidirectional mask.** Dew's mask helper is
+1. A bidirectional mask. Dew's mask helper is
    `causal_attention_mask(query_positions, kv_len, sliding_window)`
    (`causal_attention_mask` in `src/dew/nn/attention.py`) and the block always asks for causal. Two
    modes are needed: fully bidirectional (LLaDA, Dream), and bidirectional over
@@ -1291,13 +1365,12 @@ What a diffusion LM forward needs that Dew's `CausalTransformer` does not have:
    the harder one and it is exactly what
    `create_diffusion_decoder_attention_mask` builds
    (`TF/models/diffusion_gemma/modeling_diffusion_gemma.py:1326-1440`).
-2. **A mask token in the vocabulary.** LLaDA and Dream reserve an id and train
+2. A mask token in the vocabulary. LLaDA and Dream reserve an id and train
    the model to fill it. This is a data and objective concern, not a backbone
    one: the objective samples a masking ratio, replaces that fraction of
    positions with the mask id, and computes the loss only on the masked
    positions.
-3. **Time conditioning: none of them need it.** This is the useful negative
-   result. LLaDA and Dream take no timestep input at all; the noise level is
+3. Time conditioning. None of them need it. LLaDA and Dream take no timestep input at all; the noise level is
    implicit in how many positions are masked. DiffusionGemma takes no timestep
    either; it takes the previous step's logits through the self-conditioning MLP
    and anneals temperature in the sampler. So Dew does not need to wire a
@@ -1351,3 +1424,6 @@ bf16, so the fixture is a CPU test.
   file.
 - Whether `src/dew/nn/ssm.py` is close to Mamba2 was not checked; that decides
   whether Nemotron-H is cheap or expensive.
+  (2026-09-22: Dew has since gained a separate `mamba2` mixer,
+  `src/dew/nn/mixers/mamba2.py:365`, and a `Mamba2ForCausalLM` loader,
+  `src/dew/interop/mamba2.py`.)
