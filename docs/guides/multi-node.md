@@ -87,16 +87,16 @@ Keep the sequence axis inside a node. Both exchanges run once per attention laye
 
 ## Rehearse on one machine
 
-Before you book nodes, run the same launch on one machine with CPU devices. This command starts two processes with four CPU devices each, which is the layout of two nodes with four accelerators:
+Before you book nodes, run the same launch on one machine with CPU devices. This command starts four processes with two CPU devices each, the layout of four hosts with two accelerators, grouped into two replicas of two hosts:
 
 ```bash
-JAX_PLATFORMS=cpu dew launch --processes-per-host 2 \
-    --env XLA_FLAGS=--xla_force_host_platform_device_count=4 \
+JAX_PLATFORMS=cpu dew launch --processes-per-host 4 \
+    --env XLA_FLAGS=--xla_force_host_platform_device_count=2 \
     -- python tests/distribution_worker.py --out /tmp/pool.json \
-       --mesh '{"fsdp": 4, "replicas": 2}'
+       --mesh '{"fsdp": 2, "replicas": 2}'
 ```
 
-`/tmp/pool.json` records the losses and, for every fsdp group, the processes its devices sit on. Hybrid sharding shows `"fsdp_groups": [[0], [1]]`. Run the worker again as one process with `--env XLA_FLAGS=--xla_force_host_platform_device_count=8` and `--mesh '{"fsdp": 8}'`. The two runs print the same losses to within 1e-6.
+`/tmp/pool.json` records the losses and, for every fsdp group, the processes its devices sit on. Hybrid sharding shows `"fsdp_groups": [[0, 1], [0, 1], [2, 3], [2, 3]]`: each fsdp group spans the two hosts of its replica. Without `replicas`, `jax.make_mesh` gives `[[0], [1], [2], [3]]`. Run the worker again as one process with `--env XLA_FLAGS=--xla_force_host_platform_device_count=8` and `--mesh '{"fsdp": 8}'`. The two runs print the same losses to within 1e-6.
 
 `tests/test_distribution.py` runs this comparison for hybrid sharding and for a split sequence across processes, and checks that a failing process stops the pool.
 
@@ -104,7 +104,8 @@ JAX_PLATFORMS=cpu dew launch --processes-per-host 2 \
 
 These checks passed:
 
-- two real processes of four CPU devices each, launched by `dew launch`, for `MeshSpec(fsdp=4, replicas=2)` and `MeshSpec(fsdp=2, sequence=2, replicas=2)`, each matching one process of plain fsdp over eight devices;
+- real process pools launched by `dew launch`: four processes of two CPU devices for `MeshSpec(fsdp=2, replicas=2)`, and two of four for `MeshSpec(fsdp=2, sequence=2, replicas=2)`, each matching one process of plain fsdp over eight devices;
+- `hybrid_devices` against stand-in devices for topologies this machine lacks: hosts as granules, and two slices of two hosts each;
 - both exchanges against whole-sequence attention, forward and backward, on the simulated eight-device mesh, with the compiled trainer step showing which exchange each mesh ran, including heads split over tensor and sequence at once, four sequence shards over two key heads, packed masks, biases, sinks and the pipeline's stage axis.
 - on one TPU v6e chip, `tools/qualify_sequence_exchange.py` ran the all-to-all exchange's `shard_map` around the Mosaic splash kernel, forward and backward, in fp32 and bf16. Its output and gradients equal whole-sequence splash exactly. One chip has one sequence shard, so this proves the lowering, not the exchange across chips.
 
