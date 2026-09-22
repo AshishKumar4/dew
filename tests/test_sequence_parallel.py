@@ -21,21 +21,28 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
 
+import functools
+
+import dew.training.trainer as trainer_module
 from dew.nn.attention import (
     NormalAttention,
+    all_to_all_moves_less,
+    attention_kernel,
     causal_attention_mask,
+    exchanged_heads_attention,
+    gathered_keys_attention,
     rotary_freqs,
     scaled_dot_product_attention,
     stripe,
     unstripe,
 )
-from dew.nn.sharding import sequence_exchange_of
+from dew.telemetry.instrumentation import compiled_flops
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import shard_batch
 
-EXCHANGES = ("all_to_all", "all_gather")
+EXCHANGES = {"all_to_all": exchanged_heads_attention, "all_gather": gathered_keys_attention}
 
 VOCAB = 64
 SEQ_LEN = 16
@@ -146,7 +153,17 @@ CALLS = {
 }
 
 
-@pytest.mark.parametrize("exchange", EXCHANGES)
+def through(exchange, query, key, value, *, implementation=None, **call):
+    """One attention call through the named exchange, over the mesh's
+    sequence axis, whichever the per-call choice would have taken."""
+    kernel = functools.partial(attention_kernel, implementation=implementation)
+    return EXCHANGES[exchange](
+        kernel, query, key, value, jax.sharding.get_abstract_mesh().shape["sequence"],
+        causal=call.get("causal", False), sliding_window=call.get("sliding_window"),
+        mask=call.get("mask"), bias=call.get("bias"), sinks=call.get("sinks"))
+
+
+@pytest.mark.parametrize("exchange", sorted(EXCHANGES))
 @pytest.mark.parametrize("implementation", [None, "xla"])
 @pytest.mark.parametrize("name", sorted(CALLS))
 def test_the_seam_agrees_with_whole_sequences(name, implementation, exchange):
@@ -156,9 +173,8 @@ def test_the_seam_agrees_with_whole_sequences(name, implementation, exchange):
     query, key, value = heads(jax.random.key(0), kv_heads=2)
     call = dict(CALLS[name], implementation=implementation)
     whole = scaled_dot_product_attention(query, key, value, **call)
-    with jax.set_mesh(build_mesh(SPLIT)), sequence_exchange_of(exchange):
-        split = jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))(
-            query, key, value)
+    with jax.set_mesh(build_mesh(SPLIT)):
+        split = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))(query, key, value)
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
 
@@ -177,34 +193,80 @@ def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec
     query, key, value = heads(jax.random.key(0), kv_heads=2)
     call = CALLS[name]
 
-    def loss(q, k, v):
-        return jnp.sum(scaled_dot_product_attention(q, k, v, **call) ** 2)
+    def loss(attend):
+        return lambda q, k, v: jnp.sum(attend(q, k, v) ** 2)
 
-    grads = jax.grad(loss, argnums=(0, 1, 2))
-    whole = grads(query, key, value)
-    with jax.set_mesh(build_mesh(spec)), sequence_exchange_of("all_to_all"):
-        split = jax.jit(grads)(query, key, value)
+    whole = jax.grad(loss(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)),
+                     argnums=(0, 1, 2))(query, key, value)
+    with jax.set_mesh(build_mesh(spec)):
+        split = jax.jit(jax.grad(loss(lambda q, k, v: through("all_to_all", q, k, v, **call)),
+                                 argnums=(0, 1, 2)))(query, key, value)
     for got, want in zip(split, whole, strict=True):
         np.testing.assert_allclose(np.asarray(got), np.asarray(want), atol=2e-5, rtol=1e-6)
 
 
+def placed_on(spec, query, key, value, sequence=True):
+    mesh = build_mesh(spec)
+    rows = NamedSharding(mesh, P(("data", "expert", "fsdp"), "sequence" if sequence else None))
+    return mesh, jax.device_put((query, key, value), rows)
+
+
+def exchanges_heads(spec, query, key, value, **call) -> bool:
+    """Whether the program one attention call lowers to holds the
+    all-to-all's shard_map, read before GSPMD adds collectives of its own."""
+    mesh, operands = placed_on(spec, query, key, value, sequence=False)
+    with jax.set_mesh(mesh):
+        attend = jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))
+        return "all_to_all" in attend.lower(*operands).as_text()
+
+
 def test_the_exchange_moves_heads_and_never_gathers_a_key():
-    """Ulysses's point: the compiled call trades rows for heads with
-    all-to-alls, and no device ever assembles the whole key or value, which
-    is what the all-gather exchange does once a layer."""
-    query, key, value = heads(jax.random.key(0), kv_heads=4)
-    mesh = build_mesh(SPLIT)
-    rows = NamedSharding(mesh, P(("data", "expert", "fsdp"), "sequence"))
-    placed = jax.device_put((query, key, value), rows)
+    """Ulysses's point: a causal call trades rows for heads with all-to-alls,
+    and no device ever assembles the whole key or value."""
+    mesh, operands = placed_on(SPLIT, *heads(jax.random.key(0), kv_heads=4))
+    with jax.set_mesh(mesh):
+        attend = jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=True))
+        text = attend.lower(*operands).compile().as_text()
+    assert "all-to-all" in text and "all-gather" not in text
 
-    def collectives(exchange):
-        with jax.set_mesh(mesh), sequence_exchange_of(exchange):
-            call = jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=True))
-            return call.lower(*placed).compile().as_text()
 
-    exchanged, gathered = collectives("all_to_all"), collectives("all_gather")
-    assert "all-to-all" in exchanged and "all-gather" not in exchanged
-    assert "all-gather" in gathered
+def test_the_byte_count_picks_the_exchange_the_arithmetic_favours():
+    """H=32, K=8, n=2: the all-to-all sends 20 units either way, the gather
+    8 unmasked and 24 causal. One tensor shard of two halves every side."""
+    assert not all_to_all_moves_less(32, 8, 1, 2, reordered=False)
+    assert all_to_all_moves_less(32, 8, 1, 2, reordered=True)
+    # Unmasked multi-head attention sends 4H / n against the gather's 2H:
+    # a tie at two shards, which the gather takes, and the exchange past it.
+    assert not all_to_all_moves_less(8, 8, 1, 2, reordered=False)
+    assert all_to_all_moves_less(8, 8, 1, 4, reordered=False)
+    # A tie goes to the gather: H=4, K=1, n=4 sends 2(4 + 4)/4 = 4 against
+    # 2 + 2 * 4 / 4 = 4.
+    assert not all_to_all_moves_less(4, 1, 1, 4, reordered=True)
+    assert all_to_all_moves_less(32, 8, 2, 2, reordered=True) == all_to_all_moves_less(
+        16, 4, 1, 2, reordered=True)
+
+
+@pytest.mark.parametrize("case, spec, shape, call, exchanged", [
+    ("causal", SPLIT, (BATCH, SEQ_LEN, 4, 2), dict(causal=True), True),
+    ("unmasked_grouped", SPLIT, (BATCH, SEQ_LEN, 8, 1), dict(), False),
+    ("heads_the_split_cannot_divide", MeshSpec(tensor=2, sequence=4),
+     (BATCH, SEQ_LEN, 4, 2), dict(causal=True), False),
+    ("odd_joint_length", SPLIT, (BATCH, 15, 4, 4), dict(), False),
+], ids=lambda value: value if isinstance(value, str) else "")
+def test_every_call_takes_the_exchange_its_shape_admits(case, spec, shape, call, exchanged):
+    """The choice is per call and falls to the gather for any shape the
+    all-to-all cannot split, so every shape the gather took still runs, and
+    runs exactly."""
+    batch, length, heads_, kv_heads = shape
+    keys = jax.random.split(jax.random.key(0), 3)
+    query = jax.random.normal(keys[0], (batch, length, heads_, 8))
+    key, value = (jax.random.normal(k, (batch, length, kv_heads, 8)) for k in keys[1:])
+    assert exchanges_heads(spec, query, key, value, **call) is exchanged
+    whole = scaled_dot_product_attention(query, key, value, **call)
+    with jax.set_mesh(build_mesh(spec)):
+        split = jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))(
+            query, key, value)
+    np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
 
 def test_splash_runs_inside_the_exchange():
@@ -216,22 +278,21 @@ def test_splash_runs_inside_the_exchange():
     shape = (2, 256, 4, 8)
     query, key, value = (jax.random.normal(k, shape, jnp.float32) for k in (q_key, k_key, v_key))
     whole = scaled_dot_product_attention(query, key, value, causal=True)
-    with jax.set_mesh(build_mesh(MeshSpec(fsdp=2, sequence=2))), sequence_exchange_of("all_to_all"):
-        split = jax.jit(lambda q, k, v: scaled_dot_product_attention(
-            q, k, v, causal=True, implementation="tpu"))(query, key, value)
+    with jax.set_mesh(build_mesh(MeshSpec(fsdp=2, sequence=2))):
+        split = jax.jit(lambda q, k, v: through(
+            "all_to_all", q, k, v, causal=True, implementation="tpu"))(query, key, value)
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
 
-def test_heads_the_split_cannot_divide_are_refused_by_name():
+def test_a_shape_the_exchange_cannot_split_is_refused_by_name():
     query, key, value = heads(jax.random.key(0), kv_heads=2)
     with jax.set_mesh(build_mesh(MeshSpec(tensor=2, sequence=4))):
-        with pytest.raises(ValueError, match="sequence_exchange='all_gather'"):
-            jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=True))(
+        with pytest.raises(ValueError, match="gathered_keys_attention"):
+            jax.jit(lambda q, k, v: through("all_to_all", q, k, v, causal=True))(
                 query, key, value)
 
 
-@pytest.mark.parametrize("exchange", EXCHANGES)
-def test_rotary_positions_and_the_causal_mask_survive_the_exchange(exchange):
+def test_rotary_positions_and_the_causal_mask_survive_the_exchange():
     """A full attention module: rotary angles from the row's position, then
     the causal mask. Both were applied in sequence order, and the exchanged
     call has to match them exactly (observed 4.8e-7)."""
@@ -240,7 +301,7 @@ def test_rotary_positions_and_the_causal_mask_survive_the_exchange(exchange):
     freqs = rotary_freqs(jnp.arange(SEQ_LEN), 8, 10000.0)
     variables = module.init(jax.random.key(2), x, freqs_cis=freqs)
     whole = module.apply(variables, x, freqs_cis=freqs)
-    with jax.set_mesh(build_mesh(SPLIT)), sequence_exchange_of(exchange):
+    with jax.set_mesh(build_mesh(SPLIT)):
         split = jax.jit(lambda v, x: module.apply(v, x, freqs_cis=freqs))(variables, x)
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
@@ -260,43 +321,64 @@ def test_decoding_is_refused_under_a_sequence_axis():
 # --------------------------------------------------------------------------
 
 
-def one_step(spec, batch):
+def one_step(spec, batch, monkeypatch=None, tolerance=0.02):
     """The loss of one step and the parameters after it, on `spec`; with
-    sgd(1.0) the parameters move by exactly the gradient."""
+    sgd(1.0) the parameters move by exactly the gradient. With
+    `monkeypatch`, also the program the trainer compiles for its own step,
+    as lowered, before GSPMD adds collectives of its own."""
+    lowered = []
+    if monkeypatch is not None:
+        def recording(jitted, *arguments):
+            program = jitted.lower(*arguments)
+            lowered.append(program.as_text())
+            return compiled_flops(program.compile())
+        monkeypatch.setattr(trainer_module, "step_flops", recording)
     trainer = Trainer(LMObjective(tiny(), SEQ_LEN), optax.sgd(1.0), key=jax.random.key(0),
-                      mesh=spec, layout=Layout(min_shard=TINY_SHARD))
+                      mesh=spec, layout=Layout(min_shard=TINY_SHARD, tolerance=tolerance))
     state, _, _ = trainer.place()
     placed = shard_batch(trainer.device_mesh, batch)
     state, loss, _, _, _ = trainer.compile(state, placed)(state, placed)
-    return float(loss), jax.tree.map(np.asarray, state.params["params"])
+    return float(loss), jax.tree.map(np.asarray, state.params["params"]), "".join(lowered)
 
 
-@pytest.mark.parametrize("exchange", EXCHANGES)
-@pytest.mark.parametrize("make_batch", [dense_batch, packed_batch])
-def test_loss_and_gradients_agree_with_whole_sequences(make_batch, exchange):
-    """Loss and every gradient leaf equal between fsdp=8 and fsdp=4,sequence=2,
-    on a dense batch and on a packed one with segment ids and positions,
-    with the exchange the trainer puts in context from its MeshSpec."""
-    batch = make_batch()
-    whole_loss, whole_params = one_step(WHOLE, batch)
-    split_loss, split_params = one_step(
-        MeshSpec(fsdp=4, sequence=2, sequence_exchange=exchange), batch)
-
+def assert_same_step(whole, split):
+    whole_loss, whole_params, _ = whole
+    split_loss, split_params, _ = split
     assert abs(whole_loss - split_loss) < TOLERANCE, (whole_loss, split_loss)
     differences = jax.tree.map(
         lambda a, b: float(np.max(np.abs(a - b))), whole_params, split_params)
     assert max(jax.tree.leaves(differences)) < TOLERANCE, differences
 
 
-def test_the_exchange_runs_inside_the_pipeline_stages():
+# The tiny decoder's causal layers, 4 query heads over 2 key heads: over two
+# sequence shards the all-to-all sends 6 units to the gather's 8, and over
+# tensor=2 by sequence=4 the heads do not divide, so the gather runs. That
+# mesh leaves the 32-wide output projections whole (fsdp is 1), which the
+# layout tolerance has to allow.
+TRAINED_EXCHANGES = {
+    "all_to_all": (MeshSpec(fsdp=4, sequence=2), 0.02),
+    "all_gather": (MeshSpec(tensor=2, sequence=4), 0.2),
+}
+
+
+@pytest.mark.parametrize("exchange", sorted(TRAINED_EXCHANGES))
+@pytest.mark.parametrize("make_batch", [dense_batch, packed_batch])
+def test_loss_and_gradients_agree_with_whole_sequences(make_batch, exchange, monkeypatch):
+    """Loss and every gradient leaf equal between fsdp=8 and a split
+    sequence, on a dense batch and on a packed one with segment ids and
+    positions. The trainer's compiled step shows which exchange ran."""
+    batch = make_batch()
+    spec, tolerance = TRAINED_EXCHANGES[exchange]
+    split = one_step(spec, batch, monkeypatch, tolerance)
+    assert ("all_to_all" in split[2]) is (exchange == "all_to_all")
+    assert_same_step(one_step(WHOLE, batch), split)
+
+
+def test_the_exchange_runs_inside_the_pipeline_stages(monkeypatch):
     """The pipeline vmaps its stages over the stage axis, and the exchange's
     shard_map runs inside that vmap: fsdp=2, stage=2, sequence=2 trains the
     step fsdp=8 does, loss and gradients."""
     batch = packed_batch()
-    whole_loss, whole_params = one_step(WHOLE, batch)
-    split_loss, split_params = one_step(MeshSpec(fsdp=2, stage=2, sequence=2), batch)
-
-    assert abs(whole_loss - split_loss) < TOLERANCE, (whole_loss, split_loss)
-    differences = jax.tree.map(
-        lambda a, b: float(np.max(np.abs(a - b))), whole_params, split_params)
-    assert max(jax.tree.leaves(differences)) < TOLERANCE, differences
+    split = one_step(MeshSpec(fsdp=2, stage=2, sequence=2), batch, monkeypatch)
+    assert "all_to_all" in split[2]
+    assert_same_step(one_step(WHOLE, batch), split)

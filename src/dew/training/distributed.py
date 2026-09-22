@@ -30,10 +30,7 @@ from dew.nn.sharding import (
     STAGE_AXIS,
     TENSOR_AXIS,
     LogicalAxes,
-    SequenceExchange,
     declared_axes,
-    pipeline_microbatches,
-    sequence_exchange_of,
 )
 from dew.objectives.base import Batch, Variables
 from dew.telemetry.profile import region
@@ -136,12 +133,6 @@ class MeshSpec:
     is one per stage, the smallest schedule. A stage runs one microbatch while
     the next runs the one before it. So more microbatches shrink the idle time
     at either end of the step, and make each iteration's matmuls smaller."""
-    sequence_exchange: SequenceExchange = 'all_to_all'
-    """The collective attention runs over a sequence axis above one.
-    'all_to_all' (Ulysses) trades sequence rows for heads, so no device holds
-    a whole key or value; the heads must divide by tensor times sequence.
-    'all_gather' gathers keys and values whole beside split queries and takes
-    any head count. `dew.nn.attention.sequence_parallel_attention` has both."""
     replicas: int = 1
     """Groups of hosts the data axis spans, for hybrid sharded data
     parallelism: every other axis, fsdp included, stays inside one group,
@@ -166,15 +157,6 @@ class MeshSpec:
             raise ValueError(
                 f"microbatches must be a positive multiple of stage "
                 f"({self.stage}), got {self.microbatches}")
-
-
-@contextlib.contextmanager
-def scheduled(spec: MeshSpec) -> Iterator[None]:
-    """Put `spec`'s schedule in context for a model tracing under its mesh:
-    the pipeline's microbatches and the sequence axis's collective, the two
-    choices a mesh itself does not carry."""
-    with pipeline_microbatches(spec.microbatches), sequence_exchange_of(spec.sequence_exchange):
-        yield
 
 
 def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
