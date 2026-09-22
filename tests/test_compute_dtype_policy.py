@@ -49,7 +49,6 @@ whose dtypes are worth counting.
 import math
 import re
 from dataclasses import dataclass
-from importlib import import_module
 
 import jax
 import jax.numpy as jnp
@@ -109,14 +108,6 @@ LOGITS = ("causal_transformer", "diffusion_gemma", "multimodal_transformer")
 # disappearing. Every registered family builds from its own fields today, so
 # the table is empty and the parametrization covers all of them.
 FIXTURES: dict[str, str] = {}
-
-# A family is registered by importing the module that defines it. Naming
-# `models` imports `dew.nn.backbones` (dew/__init__.py:53), whose `__init__`
-# lists sixteen of them and neither published transformer, so flux and sd3 are
-# imported by name: without this the case list is silently sixteen families
-# rather than eighteen, and the same either way is the point.
-for _published in ("dew.nn.backbones.flux", "dew.nn.backbones.sd3"):
-    import_module(_published)
 
 # The families whose loss reads a vocabulary head. dew multiplies that head in
 # fp32 whatever the compute dtype is, and says so where it is tested:
