@@ -12,10 +12,10 @@ import numpy as np
 from flax import linen as nn
 from jax.experimental import multihost_utils
 
+from dew.artifacts import agreed
 from dew.data.prompts import LENGTH_KEY
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.artifacts import agreed
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
 from dew.objectives.lm.objective import _shift_rows
 from dew.registry import objectives
