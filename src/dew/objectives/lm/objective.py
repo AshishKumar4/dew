@@ -122,6 +122,65 @@ def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | No
     return model if isinstance(model, CausalTransformer | MultimodalTransformer) else None
 
 
+def _check_terms(decoder: CausalTransformer | MultimodalTransformer | None, *,
+                 aux_loss_alpha: float | None, mtp_weight: float | None, z_loss: float) -> None:
+    """Refuse a weight the term it scales cannot carry, in the order the
+    constructor takes them: the balance loss and the prediction depths' cross
+    entropy are weighted positively or left out, the depths have to exist for
+    a weight on them to move anything, and the log partition's weight is
+    finite and nonnegative."""
+    if aux_loss_alpha is not None and aux_loss_alpha <= 0:
+        raise ValueError(
+            f"aux_loss_alpha scales the balance loss, so it is positive, "
+            f"got {aux_loss_alpha}; None adds no balance loss")
+    if mtp_weight is not None:
+        depths = 0 if decoder is None else decoder.num_nextn_predict_layers
+        if depths < 1:
+            raise ValueError(
+                "mtp_weight scales the prediction depths' cross entropy, so "
+                "the model needs num_nextn_predict_layers above zero")
+        if mtp_weight <= 0:
+            raise ValueError(
+                f"mtp_weight is a positive weight on the term, got {mtp_weight}; "
+                "None leaves the term out")
+    if not (0 <= z_loss < float("inf")):
+        raise ValueError(
+            f"z_loss weights the squared log partition, so it is finite and "
+            f"nonnegative, got {z_loss}; 0 adds nothing")
+
+
+def _check_indexer(model: nn.Module, indexer: IndexerTraining,
+                   lm_terms: Mapping[str, object]) -> None:
+    """Refuse an indexer phase the model or the other terms cannot serve.
+
+    Each phase names the attention it trains against: the warm-up learns
+    the indexer beside dense attention, so its mixers carry no `index_topk`,
+    and the sparse phase trains the model on the selection, so they do.
+    The warm-up moves the indexer alone, so any term of the main loss asked
+    for beside it would weight leaves the optimizer does not touch.
+    """
+    mixers = indexed_mixers(model)
+    if not mixers:
+        raise ValueError(
+            "indexer training needs an mla mixer with the indexer's "
+            "index_n_heads and index_head_dim")
+    sparse = {mixer.sparse for mixer in mixers}
+    if indexer.phase == "warmup" and sparse != {False}:
+        raise ValueError(
+            "the warm-up keeps dense attention while the indexer "
+            "learns it, so its mixers name no index_topk")
+    if indexer.phase == "sparse" and sparse != {True}:
+        raise ValueError(
+            "the sparse phase trains the model on its selection, so "
+            "its mixers name an index_topk")
+    if indexer.phase == "warmup":
+        asked = sorted(name for name, value in lm_terms.items() if value is not None)
+        if asked:
+            raise ValueError(
+                f"the warm-up trains the indexer alone, so {', '.join(asked)} "
+                "would move nothing")
+
+
 def _streamed_depths(model: nn.Module) -> bool:
     """Whether the prediction depths read and write their own residual
     streams, which is the decoder's own field: the multimodal wrapper
@@ -454,28 +513,11 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.samples = samples
         self.pretrained = pretrained
         self.balance_rate = balance_rate
-        if aux_loss_alpha is not None and aux_loss_alpha <= 0:
-            raise ValueError(
-                f"aux_loss_alpha scales the balance loss, so it is positive, "
-                f"got {aux_loss_alpha}; None adds no balance loss")
+        _check_terms(decoder, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss)
         self.aux_loss_alpha = aux_loss_alpha
         self.seq_aux = seq_aux
         self.loss_role = loss_role
-        if mtp_weight is not None:
-            depths = 0 if decoder is None else decoder.num_nextn_predict_layers
-            if depths < 1:
-                raise ValueError(
-                    "mtp_weight scales the prediction depths' cross entropy, so "
-                    "the model needs num_nextn_predict_layers above zero")
-            if mtp_weight <= 0:
-                raise ValueError(
-                    f"mtp_weight is a positive weight on the term, got {mtp_weight}; "
-                    "None leaves the term out")
         self.mtp_weight = mtp_weight
-        if not (0 <= z_loss < float("inf")):
-            raise ValueError(
-                f"z_loss weights the squared log partition, so it is finite and "
-                f"nonnegative, got {z_loss}; 0 adds nothing")
         self.z_loss = z_loss
         self.qk_stats = qk_stats
         self.indexer = indexer
@@ -484,29 +526,10 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.trainable: PathFilter | None = (
             _is_indexer if indexer is not None and indexer.phase == "warmup" else trainable)
         if indexer is not None:
-            mixers = indexed_mixers(model)
-            if not mixers:
-                raise ValueError(
-                    "indexer training needs an mla mixer with the indexer's "
-                    "index_n_heads and index_head_dim")
-            sparse = {mixer.sparse for mixer in mixers}
-            if indexer.phase == "warmup" and sparse != {False}:
-                raise ValueError(
-                    "the warm-up keeps dense attention while the indexer "
-                    "learns it, so its mixers name no index_topk")
-            if indexer.phase == "sparse" and sparse != {True}:
-                raise ValueError(
-                    "the sparse phase trains the model on its selection, so "
-                    "its mixers name an index_topk")
-            if indexer.phase == "warmup":
-                lm_terms = {"balance_rate": balance_rate, "aux_loss_alpha": aux_loss_alpha,
-                            "mtp_weight": mtp_weight, "loss_role": loss_role,
-                            "z_loss": z_loss or None}
-                asked = sorted(name for name, value in lm_terms.items() if value is not None)
-                if asked:
-                    raise ValueError(
-                        f"the warm-up trains the indexer alone, so {', '.join(asked)} "
-                        "would move nothing")
+            _check_indexer(model, indexer, {"balance_rate": balance_rate,
+                                            "aux_loss_alpha": aux_loss_alpha,
+                                            "mtp_weight": mtp_weight, "loss_role": loss_role,
+                                            "z_loss": z_loss or None})
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         # The EMA follows what moves; the frozen collection never does.
         self.ema = None if ema_decay is None else EMASpec(
