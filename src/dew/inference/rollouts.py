@@ -235,8 +235,11 @@ class SafetensorsReload:
 
     The vLLM reload is its development endpoint (`VLLM_SERVER_DEV_MODE=1`):
     `POST /collective_rpc {"method": "reload_weights"}`, which reloads from
-    the served directory, then `POST /reset_prefix_cache` so no cached
-    prefix outlives the weights that computed it.
+    the served directory, then `POST /reset_prefix_cache?reset_running_requests=true`.
+    That reset preempts running requests and recomputes them, so no cached
+    prefix outlives the weights that computed it; without the flag vLLM
+    answers 200 and skips the reset whenever a request holds KV blocks. A
+    reset vLLM still cannot make answers non-200 and fails the push.
     """
 
     source: Pretrained
@@ -261,10 +264,10 @@ class SafetensorsReload:
 
         self.write(variables)
         root = self.base_url.rstrip("/")
-        for path, body in (("/collective_rpc", {"method": "reload_weights"}), ("/reset_prefix_cache", None)):
+        for path, body in (("/collective_rpc", {"method": "reload_weights"}), ("/reset_prefix_cache?reset_running_requests=true", None)):
             response = httpx.post(root + path, json=body, timeout=self.timeout)
             if response.status_code != 200:
-                raise RuntimeError(f"{path} answered {response.status_code}: {response.text}")
+                raise RuntimeError(f"{path.split('?')[0]} answered {response.status_code}: {response.text}")
 
 
 class WeightSync(Protocol):

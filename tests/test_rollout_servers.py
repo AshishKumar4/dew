@@ -88,14 +88,26 @@ def test_raw_engine_likelihoods_are_not_taken_for_a_transformed_policy():
 
 
 class Engine(BaseHTTPRequestHandler):
-    """Records every POST path and body; answers 200."""
+    """Records every POST path and body; answers 200.
+
+    Like vLLM with a request in flight, a plain prefix-cache reset answers
+    200 and resets nothing; only `reset_running_requests=true` resets.
+    """
 
     seen: list = []
+    reset: list = []
+    refuse = False
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length)
-        Engine.seen.append((self.path, json.loads(body) if body else None))
+        Engine.seen.append((self.path.split("?")[0], json.loads(body) if body else None))
+        if self.path.startswith("/reset_prefix_cache"):
+            if Engine.refuse:
+                self.send_response(500)
+                self.end_headers()
+                return
+            Engine.reset.append("reset_running_requests=true" in self.path)
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"{}")
@@ -104,14 +116,18 @@ class Engine(BaseHTTPRequestHandler):
         pass
 
 
+def serving(handler):
+    engine = HTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=engine.serve_forever, daemon=True).start()
+    return engine
+
+
 def test_a_reload_writes_the_policy_as_safetensors_then_asks_the_engine(tmp_path):
     source = load_pretrained(FIXTURE, dtype="float32")
     changed = jax.tree.map(lambda leaf: leaf * 2 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf,
                            source.variables)
-    Engine.seen = []
-    engine = HTTPServer(("127.0.0.1", 0), Engine)
-    thread = threading.Thread(target=engine.serve_forever, daemon=True)
-    thread.start()
+    Engine.seen, Engine.reset, Engine.refuse = [], [], False
+    engine = serving(Engine)
     try:
         reload = SafetensorsReload(source, tmp_path / "served", f"http://127.0.0.1:{engine.server_port}")
         reload(changed)
@@ -119,9 +135,24 @@ def test_a_reload_writes_the_policy_as_safetensors_then_asks_the_engine(tmp_path
         engine.shutdown()
     assert [path for path, _ in Engine.seen] == ["/collective_rpc", "/reset_prefix_cache"]
     assert Engine.seen[0][1] == {"method": "reload_weights"}
+    # The reset preempts running requests, so no in-flight KV outlives the weights.
+    assert Engine.reset == [True]
     assert not (tmp_path / ".served.staging").exists()
     served = load_pretrained(tmp_path / "served", dtype="float32")
     for written, expected in zip(jax.tree.leaves(served.variables), jax.tree.leaves(changed), strict=True):
         # Served in bfloat16: equal to the pushed weights at that precision.
         np.testing.assert_array_equal(np.asarray(written),
                                       np.asarray(jnp.asarray(expected).astype(jnp.bfloat16).astype(jnp.float32)))
+
+
+def test_a_refused_prefix_cache_reset_fails_the_push(tmp_path):
+    source = load_pretrained(FIXTURE, dtype="float32")
+    Engine.seen, Engine.reset, Engine.refuse = [], [], True
+    engine = serving(Engine)
+    try:
+        reload = SafetensorsReload(source, tmp_path / "served", f"http://127.0.0.1:{engine.server_port}")
+        with pytest.raises(RuntimeError, match="reset_prefix_cache answered 500"):
+            reload(source.variables)
+    finally:
+        engine.shutdown()
+        Engine.refuse = False
