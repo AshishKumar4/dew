@@ -42,7 +42,7 @@ import optax
 import pytest
 from test_precision_policy import build_model, tiny_inputs
 
-import dew.nn.backbones.flux  # noqa: F401  registers "flux_transformer"
+import dew.nn.backbones.flux
 import dew.nn.backbones.sd3  # noqa: F401  registers "sd3_transformer"
 from dew import models  # the attribute import is what registers every family
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -52,8 +52,8 @@ from dew.objectives.lm.objective import TEXT_KEY
 from dew.telemetry.instrumentation import (
     _COMPUTATION,
     _INSTRUCTION,
-    _Instruction,
     _dims,
+    _Instruction,
     _instruction_flops,
     _parse,
     _split_operands,
