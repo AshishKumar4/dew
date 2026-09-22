@@ -8,7 +8,9 @@ The classes are exported for direct use in notebooks and tests.
 
 from .causal_transformer import CausalTransformer
 from .dit import SimpleDiT
+from .flux import FluxTransformer
 from .mmdit import HierarchicalMMDiT, SimpleMMDiT
+from .sd3 import SD3Transformer
 from .ssm_dit import HybridSSMAttentionDiT
 from .unet import Unet
 from .unet3d import UNet3D
@@ -16,5 +18,6 @@ from .unet_condition import UNet2DCondition, UNetStage
 from .uvit import SimpleUDiT, UViT
 from .video_dit import VideoDiT
 
-__all__ = ["CausalTransformer", "HierarchicalMMDiT", "HybridSSMAttentionDiT", "SimpleDiT", "SimpleMMDiT",
-           "SimpleUDiT", "UNet2DCondition", "UNet3D", "UNetStage", "UViT", "Unet", "VideoDiT"]
+__all__ = ["CausalTransformer", "FluxTransformer", "HierarchicalMMDiT", "HybridSSMAttentionDiT", "SD3Transformer",
+           "SimpleDiT", "SimpleMMDiT", "SimpleUDiT", "UNet2DCondition", "UNet3D", "UNetStage", "UViT", "Unet",
+           "VideoDiT"]
