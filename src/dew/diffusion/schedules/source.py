@@ -851,47 +851,88 @@ def _flow_controls(value: Control) -> _Flow:
                      ("exponential", "linear")))
 
 
+def _sigma_transform(family: str, declared: Mapping[str, JSON], value: Control) -> Transform:
+    """Which sigma grid the class applies over its spacing, or "none".
+
+    The three boolean controls are mutually exclusive, and an EDM file names
+    its grid outright instead.
+    """
+    active: list[Transform] = [name for name, key in _TRANSFORM_CONTROLS
+                               if key in declared and records.boolean(value(key), key)]
+    if len(active) > 1:
+        raise ValueError("Only one of the Karras, exponential and beta sigma grids can be used")
+    if family == "edm":
+        return _choice(value("sigma_schedule"), "sigma_schedule", _SIGMA_SCHEDULES)
+    return active[0] if active else "none"
+
+
+def _final_sigma(family: str, declared: Mapping[str, JSON], value: Control,
+                 algorithm: Algorithm) -> Terminal:
+    """The sigma the class appends past its last grid point.
+
+    A variance-exploding grid ends at zero; a log-SNR one ends where its own
+    `final_sigmas_type` says, and only the clean-prediction algorithms can
+    end at zero, as the source scheduler refuses the rest.
+    """
+    terminal: Terminal = "zero" if family in ("sigma", "stage") else "sigma_min"
+    if "final_sigmas_type" not in declared:
+        return terminal
+    terminal = _choice(value("final_sigmas_type"), "final_sigmas_type", _TERMINALS)
+    if terminal == "zero" and algorithm not in ("dpmsolver++", "sde-dpmsolver++"):
+        raise ValueError(f"final_sigmas_type=zero is not supported for algorithm_type "
+                         f"{algorithm}, as the source scheduler refuses")
+    return terminal
+
+
+def _variance_type(kind: str, value: Control) -> Variance:
+    """Which posterior variance a DDPM file's `step` adds.
+
+    Only DDPM has the control. A learned variance is a second model output
+    and is refused rather than approximated.
+    """
+    if kind == "DDPM":
+        mode = _choice(value("variance_type"), "variance_type",
+                       ("fixed_small", "fixed_small_log", "fixed_large"))
+        return "large" if mode == "fixed_large" else "small"
+    if value("variance_type") in ("learned", "learned_range"):
+        raise ValueError("Native source scheduling does not implement learned variance")
+    return "small"
+
+
+def _lambda_clipping(kind: str, value: Control, betas: np.ndarray) -> tuple[bool, int]:
+    """`(zero-SNR tail, clipped steps)`: how the class ends its training table.
+
+    The zero-SNR classes substitute a near-zero terminal alpha, and
+    `lambda_min_clipped` drops the steps whose half log-SNR falls below it,
+    counted off the training betas the way the source counts them.
+    """
+    zero_snr = records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr")
+    zero_snr_tail = zero_snr and kind in ("DPMSolverMultistep", "UniPCMultistep",
+                                          "EulerDiscrete", "EulerAncestralDiscrete")
+    limit = value("lambda_min_clipped", -float("inf"))
+    if limit == -float("inf"):
+        return zero_snr_tail, 0
+    alphas = np.cumprod(1 - betas.astype(np.float64))
+    if zero_snr_tail:
+        alphas[-1] = 2.0 ** -24
+    lambdas = 0.5 * (np.log(alphas) - np.log(1 - alphas))
+    return zero_snr_tail, int(np.searchsorted(np.flip(lambdas),
+                                              records.number(limit, "lambda_min_clipped")))
+
+
 def _resolve(kind: str, source: _Class, value: Control,
              betas: np.ndarray) -> tuple[_Policy, Solver]:
     """Every control the class declares, checked and turned into a number."""
     declared, family = source.fields, source.family
     train_steps = records.integer(value("num_train_timesteps"), "num_train_timesteps")
-    active: list[Transform] = [name for name, key in _TRANSFORM_CONTROLS
-              if key in declared and records.boolean(value(key), key)]
-    if len(active) > 1:
-        raise ValueError("Only one of the Karras, exponential and beta sigma grids can be used")
-    transform: Transform = active[0] if active else "none"
-    if family == "edm":
-        transform = _choice(value("sigma_schedule"), "sigma_schedule", _SIGMA_SCHEDULES)
+    transform = _sigma_transform(family, declared, value)
     algorithm = _algorithm(kind, family, declared, value)
     spacing: Spacing = _choice(value("timestep_spacing", "linspace"), "timestep_spacing",
                                _SPACINGS)
-    terminal: Terminal = "zero" if family in ("sigma", "stage") else "sigma_min"
-    if "final_sigmas_type" in declared:
-        terminal = _choice(value("final_sigmas_type"), "final_sigmas_type", _TERMINALS)
-        if terminal == "zero" and algorithm not in ("dpmsolver++", "sde-dpmsolver++"):
-            raise ValueError(f"final_sigmas_type=zero is not supported for algorithm_type "
-                             f"{algorithm}, as the source scheduler refuses")
-    variance: Variance = "small"
-    if kind == "DDPM":
-        mode = _choice(value("variance_type"), "variance_type",
-                       ("fixed_small", "fixed_small_log", "fixed_large"))
-        variance = "large" if mode == "fixed_large" else "small"
-    elif value("variance_type") in ("learned", "learned_range"):
-        raise ValueError("Native source scheduling does not implement learned variance")
+    terminal = _final_sigma(family, declared, value, algorithm)
+    variance = _variance_type(kind, value)
     clip, threshold = _x0_limit(kind, declared, value)
-    zero_snr = records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr")
-    zero_snr_tail = zero_snr and kind in ("DPMSolverMultistep", "UniPCMultistep",
-                                          "EulerDiscrete", "EulerAncestralDiscrete")
-    lambda_clipped = 0
-    limit = value("lambda_min_clipped", -float("inf"))
-    if limit != -float("inf"):
-        alphas = np.cumprod(1 - betas.astype(np.float64))
-        if zero_snr_tail:
-            alphas[-1] = 2.0 ** -24
-        lambdas = 0.5 * (np.log(alphas) - np.log(1 - alphas))
-        lambda_clipped = int(np.searchsorted(np.flip(lambdas),
-                                             records.number(limit, "lambda_min_clipped")))
+    zero_snr_tail, lambda_clipped = _lambda_clipping(kind, value, betas)
     original_steps = records.integer(value("original_inference_steps", train_steps),
                               "original_inference_steps")
     if not 0 < original_steps <= train_steps:

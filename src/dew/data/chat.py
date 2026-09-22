@@ -431,42 +431,68 @@ def render_conversation(tokenizer: PreTrainedTokenizerBase, conversation: Conver
     roles = np.zeros(len(full), np.int8)
     agreed = 0
     for position, message in enumerate(conversation.messages):
-        role = message.role
         following = _token_ids(tokenizer, rows[:position + 1], tools, generation_prompt=False, source=source)
-        if role is Role.ASSISTANT:
-            if position == 0:
-                raise ValueError(
-                    f"{source}: the first message is an assistant turn, so its "
-                    "opening header cannot be separated from its completion "
-                    "through the template; start the conversation with a system "
-                    "or user message")
-            prefix = _token_ids(tokenizer, rows[:position], tools, generation_prompt=True, source=source)
-            if full[:len(prefix)] != prefix or len(prefix) < agreed:
-                raise ValueError(
-                    f"tokenizer {source!r} does not render incrementally at message "
-                    f"{position} (assistant): the generation prompt tokenizes to "
-                    f"{prefix[-8:]}, the conversation to "
-                    f"{full[max(0, len(prefix) - 8):len(prefix)]}")
-            if full[:len(following)] != following:
-                raise ValueError(
-                    f"tokenizer {source!r} renders message {position} (assistant) "
-                    "differently once later messages follow it, so its completion "
-                    "cannot be masked from the whole conversation")
-            roles[len(prefix):len(following)] = role.value
-            agreed = len(following)
-            continue
-        end = _agreement(following, full)
-        if end < agreed:
-            raise ValueError(
-                f"tokenizer {source!r} rewrites message {position - 1}'s tokens when "
-                f"message {position} ({role.name.lower()}) follows it")
-        if end == agreed:
-            raise ValueError(
-                f"tokenizer {source!r} renders message {position} ({role.name.lower()}) "
-                "to no tokens; the template does not read this role or content")
-        roles[agreed:end] = role.value
+        if message.role is Role.ASSISTANT:
+            start, end = _completion_span(tokenizer, rows, tools, full, following, agreed,
+                                          position, source)
+        else:
+            start = agreed
+            end = _turn_end(full, following, agreed, message.role, position, source)
+        roles[start:end] = message.role.value
         agreed = end
     return np.asarray(full, np.int32), roles
+
+
+def _completion_span(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[str, object]],
+                     full: Sequence[int], following: Sequence[int], agreed: int,
+                     position: int, source: str) -> tuple[int, int]:
+    """Where assistant message `position`'s completion begins and ends in `full`.
+
+    The generation prompt over the messages before it is that turn's opening
+    header, so the completion is what follows it up to the turn's own render.
+    Both renders have to be prefixes of the whole conversation, or the span
+    the loss counts is not the span the model will see.
+    """
+    if position == 0:
+        raise ValueError(
+            f"{source}: the first message is an assistant turn, so its "
+            "opening header cannot be separated from its completion "
+            "through the template; start the conversation with a system "
+            "or user message")
+    prefix = _token_ids(tokenizer, rows[:position], tools, generation_prompt=True, source=source)
+    if full[:len(prefix)] != prefix or len(prefix) < agreed:
+        raise ValueError(
+            f"tokenizer {source!r} does not render incrementally at message "
+            f"{position} (assistant): the generation prompt tokenizes to "
+            f"{prefix[-8:]}, the conversation to "
+            f"{full[max(0, len(prefix) - 8):len(prefix)]}")
+    if full[:len(following)] != following:
+        raise ValueError(
+            f"tokenizer {source!r} renders message {position} (assistant) "
+            "differently once later messages follow it, so its completion "
+            "cannot be masked from the whole conversation")
+    return len(prefix), len(following)
+
+
+def _turn_end(full: Sequence[int], following: Sequence[int], agreed: int, role: Role,
+              position: int, source: str) -> int:
+    """Where message `position`'s span ends in `full`, for a turn that is not
+    an assistant's.
+
+    The span runs from where the previous turn ended to where this turn's own
+    render stops agreeing with the whole conversation. A turn that rewrites
+    an earlier turn's tokens, or renders to none of its own, fails here.
+    """
+    end = _agreement(following, full)
+    if end < agreed:
+        raise ValueError(
+            f"tokenizer {source!r} rewrites message {position - 1}'s tokens when "
+            f"message {position} ({role.name.lower()}) follows it")
+    if end == agreed:
+        raise ValueError(
+            f"tokenizer {source!r} renders message {position} ({role.name.lower()}) "
+            "to no tokens; the template does not read this role or content")
+    return end
 
 
 _tokenizer_lock = threading.Lock()

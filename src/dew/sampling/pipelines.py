@@ -43,6 +43,31 @@ class _Default(Enum):
     GUIDANCE = "guidance"
 
 
+@dataclass(frozen=True)
+class _Resolved:
+    """What `prepare` settles on the host before any process runs a model.
+
+    `plan` is this process's rows of the request, `process` and `times` the
+    trajectory it walks, `request` the key its noise is drawn from, and
+    `posterior` the key a VAE encode samples with. `tokens` and `null_tokens`
+    are the two conditioning branches, `samples` whatever image, mask, noise
+    or latent state the caller handed over, and `signature` the value the
+    pool compares before any of it reaches a device.
+    """
+
+    plan: RowPlan
+    process: Process
+    request: jax.Array
+    tokens: dict
+    null_tokens: dict
+    shape: tuple[int, ...]
+    count: int
+    times: tuple[float, ...] | None
+    samples: dict
+    posterior: jax.Array | None
+    signature: object
+
+
 @struct.dataclass
 class DenoisingInputs:
     """Encoded conditioning and initial noise, placed the way a call runs them.
@@ -234,85 +259,23 @@ class TextToImage:
         """
         mesh = mesh_of(self.params)
 
-        def resolve():
-            rows = [prompts] if isinstance(prompts, str) else list(prompts)
-            if not rows or not all(isinstance(prompt, (str, Mapping)) for prompt in rows):
-                raise ValueError("prompts must be a non-empty sequence of strings or conditioning records")
-            request = request_key(key, seed)
-            count = self.steps if steps is None else steps
-            process, source_times = self.prepared_process(count)
-            selected = _time_grid(times) if times is not None else source_times
-            plan = RowPlan.over(mesh, len(rows))
-            if unconditional is None:
-                negatives = None
-            else:
-                negatives = [unconditional] if isinstance(unconditional, str) else list(unconditional)
-                if len(negatives) not in (1, len(rows)):
-                    raise ValueError("unconditional inputs need one row or one row per prompt")
-            tokens = {keyword: condition.encoder.tokenize(rows)
-                      for keyword, condition in self.inputs.conditions.items()}
-            null_tokens = {keyword: condition.encoder.tokenize(
-                [condition.unconditional] if negatives is None else negatives)
-                for keyword, condition in self.inputs.conditions.items()}
-            for leaf in jax.tree.leaves(tokens):
-                if leaf.ndim < 1 or leaf.shape[0] != len(rows):
-                    raise ValueError("tokenized conditions must have one row per prompt")
-            for leaf in jax.tree.leaves(null_tokens):
-                if leaf.ndim < 1 or leaf.shape[0] not in (1, len(rows)):
-                    raise ValueError("unconditional tokens must have one row or one per prompt")
-            shape = self.latent_shape
-            if image is not None and image_latents is not None:
-                raise ValueError("pass image or image_latents, not both")
-            if mask is not None and self.autoencoder is None:
-                raise ValueError("masked-image conditioning requires an autoencoder")
-            if noise is not None and ((image is None and image_latents is None) or initial is not None):
-                raise ValueError("noise is for noising a clean image; initial is already noisy")
-            if mask is not None and image is None:
-                raise ValueError("a mask requires its image pixels")
-            posterior = encode_key
-            if posterior is not None:
-                posterior = request_key(posterior, None)
-            samples = {}
-            if image is not None:
-                pixels = _image_rows(image, len(rows), self.inputs.sample.shape, "image")
-                samples["image"] = pixels.astype(np.float32) / 127.5 - 1 if pixels.dtype == np.uint8 else pixels
-            for name, value in (("image_latents", image_latents), ("noise", noise), ("initial", initial)):
-                if value is not None:
-                    samples[name] = _image_rows(value, len(rows), shape, name)
-            if mask is not None:
-                value = _image_rows(mask, len(rows), (*self.inputs.sample.shape[:-1], 1), "mask")
-                samples["mask"] = (value >= (128 if value.dtype == np.uint8 else 0.5)).astype(np.float32)
-            controls = (plan.rows, count, selected, shape,
-                        tuple(np.asarray(jax.random.key_data(request))),
-                        None if posterior is None else tuple(np.asarray(jax.random.key_data(posterior))))
-            signature = generation_signature((tokens, null_tokens, samples), controls)
-            return (plan, process, request, tokens, null_tokens, shape, count, selected,
-                    samples, posterior, signature)
+        def resolve() -> _Resolved:
+            return self._resolved(mesh, prompts, key=key, seed=seed, steps=steps,
+                                  unconditional=unconditional, image=image,
+                                  image_latents=image_latents, mask=mask, noise=noise,
+                                  initial=initial, times=times, encode_key=encode_key)
 
-        prepared = (agreed("image input preparation", resolve) if mesh is not None else resolve())
-        (plan, process, request, tokens, null_tokens, shape, count, selected,
-         samples, encode_key, signature) = prepared
+        settled = (agreed("image input preparation", resolve) if mesh is not None else resolve())
+        plan, process, count, selected = settled.plan, settled.process, settled.count, settled.times
         if plan.processes > 1:
-            multihost_utils.assert_equal(signature, "image input shapes and sampling must agree across processes")
+            multihost_utils.assert_equal(settled.signature,
+                                         "image input shapes and sampling must agree across processes")
         annotation = None
         if active_profile() is not None:
             annotation = jax.profiler.TraceAnnotation("inference.image.prepare")
             annotation.__enter__()
         try:
-            given = _encode(plan.sharding)(self._conditions, self.params, plan.place(plan.pad(tokens)))
-            null = self._unconditional(null_tokens, plan, given, configured=unconditional is None)
-            if samples:
-                start = process.times(count)[0] if selected is None else selected[0]
-                initial_state, spatial = _image_start(plan.sharding)(
-                    self.autoencoder, process, shape, self.params, plan.place(plan.pad(samples)),
-                    plan.keys(request), encode_key, start)
-                if spatial:
-                    given = {**given, **spatial}
-                    null = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (plan.global_rows, *leaf.shape[1:]))
-                                        if leaf.shape[0] == 1 else leaf, null)
-                    null = {**null, **spatial}
-            else:
-                initial_state = _noise(plan.sharding)(process, plan.keys(request), shape)
+            given, null, initial_state = self._encoded(settled, configured=unconditional is None)
         finally:
             if annotation is not None:
                 annotation.__exit__(None, None, None)
@@ -320,6 +283,182 @@ class TextToImage:
         return DenoisingInputs(initial_state, given, null, rows=plan.rows,
                                grid_steps=count if owns_grid else None,
                                process=process if owns_grid else None, times=selected)
+
+    def _settings(self, mesh, prompts, *, steps, guidance, sampler, key, seed, decode):
+        """Everything one call settles on the host before it runs the model.
+
+        A caller who hands over `DenoisingInputs` gets them checked against
+        this task's geometry and this mesh here; everything else resolves
+        the grid, the solver and the guidance a call runs with. The value
+        ends with the signature a pool compares.
+        """
+        chosen = self.guidance if guidance is _Default.GUIDANCE else guidance
+        if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
+            chosen = CFG(float(chosen))
+        if chosen is not None and not isinstance(chosen, CFG):
+            raise ValueError("guidance must be a scale, a CFG value or None")
+        request = request_key(key, seed)
+        prepared = prompts if isinstance(prompts, DenoisingInputs) else None
+        default_count = (prepared.grid_steps if prepared is not None and prepared.grid_steps is not None
+                         else self.steps)
+        count = default_count if steps is None else steps
+        if prepared is not None and prepared.times is not None:
+            times = _time_grid(prepared.times)
+            process = self.process if prepared.process is None else prepared.process
+        else:
+            process, times = self.prepared_process(count)
+        if type(decode) is not bool:
+            raise ValueError("decode must be a boolean")
+        solver = self.sampler if sampler is None else sampler
+        if prepared is not None:
+            prepared = self._checked_inputs(prepared, mesh, count)
+        controls = (count, times, solver, chosen, self.final_denoise, decode,
+                    tuple(np.asarray(jax.random.key_data(request))), prepared is not None,
+                    None if prepared is None else prepared.rows)
+        arrays = None if prepared is None else (prepared.noise, prepared.conditions, prepared.unconditional)
+        signature = generation_signature(arrays, controls)
+        return prepared, request, count, process, times, solver, chosen, signature
+
+    def _checked_inputs(self, prepared: DenoisingInputs, mesh, count: int) -> DenoisingInputs:
+        """`prepared` with its row count filled in, checked against this call.
+
+        A caller may hand over inputs prepared for another step count, at
+        another geometry, or placed for another mesh; each is refused by
+        name. Global arrays carry no local row count of their own, so one
+        that reports none has to declare it.
+        """
+        if prepared.grid_steps is not None and count != prepared.grid_steps:
+            raise ValueError("prepared noise belongs to a different source grid; prepare it for these steps")
+        shape = self.latent_shape
+        if prepared.noise.ndim != len(shape) + 1 or prepared.noise.shape[1:] != shape:
+            raise ValueError(f"initial noise must have shape [batch, {shape}]")
+        if prepared.rows is None:
+            if isinstance(prepared.noise, jax.Array) and not prepared.noise.is_fully_addressable:
+                raise ValueError("global prepared arrays need the number of real local rows")
+            prepared = replace(prepared, rows=prepared.noise.shape[0])
+        if type(prepared.rows) is not int or prepared.rows < 1:
+            raise ValueError("prepared inputs must declare a positive number of local rows")
+        plan = RowPlan.over(mesh, prepared.rows)
+        if prepared.noise.shape[0] != plan.global_rows or mesh_of(prepared.noise) != mesh:
+            raise ValueError("the prepared inputs were placed for a different mesh")
+        for leaf in jax.tree.leaves(prepared.conditions):
+            if leaf.ndim < 1 or leaf.shape[0] != plan.global_rows:
+                raise ValueError("prepared conditions must match the noise batch")
+        return prepared
+
+    def _resolved(self, mesh, prompts, *, key, seed, steps, unconditional, image,
+                  image_latents, mask, noise, initial, times, encode_key) -> _Resolved:
+        """Everything `prepare` settles on the host, in one value.
+
+        This is the half a pool has to agree on: every refusal a caller can
+        earn is raised here, and the signature at the end is what the ranks
+        compare before any of them touches a device.
+        """
+        rows = [prompts] if isinstance(prompts, str) else list(prompts)
+        if not rows or not all(isinstance(prompt, (str, Mapping)) for prompt in rows):
+            raise ValueError("prompts must be a non-empty sequence of strings or conditioning records")
+        request = request_key(key, seed)
+        count = self.steps if steps is None else steps
+        process, source_times = self.prepared_process(count)
+        selected = _time_grid(times) if times is not None else source_times
+        plan = RowPlan.over(mesh, len(rows))
+        tokens, null_tokens = self._tokenized(rows, unconditional)
+        shape = self.latent_shape
+        if image is not None and image_latents is not None:
+            raise ValueError("pass image or image_latents, not both")
+        if mask is not None and self.autoencoder is None:
+            raise ValueError("masked-image conditioning requires an autoencoder")
+        if noise is not None and ((image is None and image_latents is None) or initial is not None):
+            raise ValueError("noise is for noising a clean image; initial is already noisy")
+        if mask is not None and image is None:
+            raise ValueError("a mask requires its image pixels")
+        posterior = encode_key
+        if posterior is not None:
+            posterior = request_key(posterior, None)
+        samples = self._supplied(len(rows), shape, image=image, image_latents=image_latents,
+                                 mask=mask, noise=noise, initial=initial)
+        controls = (plan.rows, count, selected, shape,
+                    tuple(np.asarray(jax.random.key_data(request))),
+                    None if posterior is None else tuple(np.asarray(jax.random.key_data(posterior))))
+        signature = generation_signature((tokens, null_tokens, samples), controls)
+        return _Resolved(plan, process, request, tokens, null_tokens, shape, count,
+                         selected, samples, posterior, signature)
+
+    def _tokenized(self, rows: list, unconditional) -> tuple[dict, dict]:
+        """The conditional and unconditional token fields, one row per prompt.
+
+        `unconditional` None is the task's own blank prompt; a caller's
+        negatives are one row or one per prompt, and an encoder that answers
+        a different count is refused here.
+        """
+        if unconditional is None:
+            negatives = None
+        else:
+            negatives = [unconditional] if isinstance(unconditional, str) else list(unconditional)
+            if len(negatives) not in (1, len(rows)):
+                raise ValueError("unconditional inputs need one row or one row per prompt")
+        tokens = {keyword: condition.encoder.tokenize(rows)
+                  for keyword, condition in self.inputs.conditions.items()}
+        null_tokens = {keyword: condition.encoder.tokenize(
+            [condition.unconditional] if negatives is None else negatives)
+            for keyword, condition in self.inputs.conditions.items()}
+        for leaf in jax.tree.leaves(tokens):
+            if leaf.ndim < 1 or leaf.shape[0] != len(rows):
+                raise ValueError("tokenized conditions must have one row per prompt")
+        for leaf in jax.tree.leaves(null_tokens):
+            if leaf.ndim < 1 or leaf.shape[0] not in (1, len(rows)):
+                raise ValueError("unconditional tokens must have one row or one per prompt")
+        return tokens, null_tokens
+
+    def _supplied(self, rows: int, shape: tuple[int, ...], *, image, image_latents,
+                  mask, noise, initial) -> dict[str, np.ndarray]:
+        """The caller's own arrays, checked and broadcast to `rows` rows.
+
+        Pixels arrive at the task's geometry and normalize to [-1, 1];
+        latents, noise and an already-noisy state arrive at the latent
+        shape, and a mask is thresholded to a float indicator. Which
+        combinations are allowed is settled before this runs; nothing is
+        drawn or encoded here.
+        """
+        samples: dict[str, np.ndarray] = {}
+        if image is not None:
+            pixels = _image_rows(image, rows, self.inputs.sample.shape, "image")
+            samples["image"] = pixels.astype(np.float32) / 127.5 - 1 if pixels.dtype == np.uint8 else pixels
+        for name, value in (("image_latents", image_latents), ("noise", noise), ("initial", initial)):
+            if value is not None:
+                samples[name] = _image_rows(value, rows, shape, name)
+        if mask is not None:
+            value = _image_rows(mask, rows, (*self.inputs.sample.shape[:-1], 1), "mask")
+            samples["mask"] = (value >= (128 if value.dtype == np.uint8 else 0.5)).astype(np.float32)
+        return samples
+
+    def _encoded(self, settled: _Resolved, *, configured: bool
+                 ) -> tuple[dict, dict, jax.Array]:
+        """The two encoded conditioning branches and the initial state.
+
+        With no caller-supplied pixels the state is fresh noise. With any,
+        the autoencoder runs over them, and a mask adds its spatial
+        conditioning to both branches, the unconditional one broadcast to the
+        batch first because its single row would not carry the mask.
+        """
+        plan, process = settled.plan, settled.process
+        given = _encode(plan.sharding)(self._conditions, self.params,
+                                       plan.place(plan.pad(settled.tokens)))
+        null = self._unconditional(settled.null_tokens, plan, given, configured=configured)
+        if not settled.samples:
+            return given, null, _noise(plan.sharding)(process, plan.keys(settled.request),
+                                                      settled.shape)
+        start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
+        initial_state, spatial = _image_start(plan.sharding)(
+            self.autoencoder, process, settled.shape, self.params,
+            plan.place(plan.pad(settled.samples)), plan.keys(settled.request),
+            settled.posterior, start)
+        if spatial:
+            given = {**given, **spatial}
+            null = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (plan.global_rows, *leaf.shape[1:]))
+                                if leaf.shape[0] == 1 else leaf, null)
+            null = {**null, **spatial}
+        return given, null, initial_state
 
     @overload
     def __call__(self, prompts: str | Sequence[str | Mapping[str, object]] | DenoisingInputs, *,
@@ -343,48 +482,8 @@ class TextToImage:
         mesh = mesh_of(self.params)
 
         def resolve():
-            chosen = self.guidance if guidance is _Default.GUIDANCE else guidance
-            if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
-                chosen = CFG(float(chosen))
-            if chosen is not None and not isinstance(chosen, CFG):
-                raise ValueError("guidance must be a scale, a CFG value or None")
-            request = request_key(key, seed)
-            prepared = prompts if isinstance(prompts, DenoisingInputs) else None
-            default_count = (prepared.grid_steps if prepared is not None and prepared.grid_steps is not None
-                             else self.steps)
-            count = default_count if steps is None else steps
-            if prepared is not None and prepared.times is not None:
-                times = _time_grid(prepared.times)
-                process = self.process if prepared.process is None else prepared.process
-            else:
-                process, times = self.prepared_process(count)
-            if type(decode) is not bool:
-                raise ValueError("decode must be a boolean")
-            solver = self.sampler if sampler is None else sampler
-            if prepared is not None:
-                if prepared.grid_steps is not None and count != prepared.grid_steps:
-                    raise ValueError("prepared noise belongs to a different source grid; prepare it for these steps")
-                shape = self.latent_shape
-                if prepared.noise.ndim != len(shape) + 1 or prepared.noise.shape[1:] != shape:
-                    raise ValueError(f"initial noise must have shape [batch, {shape}]")
-                if prepared.rows is None:
-                    if isinstance(prepared.noise, jax.Array) and not prepared.noise.is_fully_addressable:
-                        raise ValueError("global prepared arrays need the number of real local rows")
-                    prepared = replace(prepared, rows=prepared.noise.shape[0])
-                if type(prepared.rows) is not int or prepared.rows < 1:
-                    raise ValueError("prepared inputs must declare a positive number of local rows")
-                plan = RowPlan.over(mesh, prepared.rows)
-                if prepared.noise.shape[0] != plan.global_rows or mesh_of(prepared.noise) != mesh:
-                    raise ValueError("the prepared inputs were placed for a different mesh")
-                for leaf in jax.tree.leaves(prepared.conditions):
-                    if leaf.ndim < 1 or leaf.shape[0] != plan.global_rows:
-                        raise ValueError("prepared conditions must match the noise batch")
-            controls = (count, times, solver, chosen, self.final_denoise, decode,
-                        tuple(np.asarray(jax.random.key_data(request))), prepared is not None,
-                        None if prepared is None else prepared.rows)
-            arrays = None if prepared is None else (prepared.noise, prepared.conditions, prepared.unconditional)
-            signature = generation_signature(arrays, controls)
-            return prepared, request, count, process, times, solver, chosen, signature
+            return self._settings(mesh, prompts, steps=steps, guidance=guidance,
+                                  sampler=sampler, key=key, seed=seed, decode=decode)
 
         settings = (agreed("image sampling setup", resolve) if mesh is not None else resolve())
         prepared, request, count, process, times, solver, chosen, signature = settings
