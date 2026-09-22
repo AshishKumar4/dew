@@ -1,5 +1,7 @@
 # JAX and Flax features for Dew
 
+> An AI assistant maintains this document. It is presented as-is.
+
 Research date: 2026-09-06. Dew source: `65fd2f4`.
 
 This extends [google-jax-stack.md](google-jax-stack.md). The [MaxText inventory](maxtext-parity.md) names the missing training capabilities. This note identifies the upstream primitives that can implement them. Fit entries are recommendations, not approved designs.
@@ -14,11 +16,23 @@ The requested command printed JAX `0.11.1` and Flax `0.12.9`:
 
 Installed distribution metadata also reports jaxlib `0.11.1`, Optax `0.2.8`, Grain `0.2.18`, Orbax Checkpoint `0.12.4` and Qwix `0.1.8`. JAX source links below use tag `jax-v0.11.1`; Flax links use `v0.12.9`. MaxText links use the 0.2.4 commit `538fe7a3f3376d94cf3f04e77741aa6d7e8efa45`. Its base file matches the release tag byte for byte.
 
-“API verified” means the named API or source implementation exists in that installed release. It does not mean a TPU/GPU kernel ran. “Older floor not established” means no minimum historical release was proven. These features require no version upgrade in the current environment unless a row says otherwise. Dew's package metadata still advertises `jax>=0.4.28` and `flax>=0.8.4` (`pyproject.toml:14-23`); those old floors are not evidence that the current source or these additions work on them.
+"API verified" means the named API or source implementation exists in that installed release. It does not mean a TPU/GPU kernel ran. "Older floor not established" means no minimum historical release was proven. None of these features needs a version upgrade in the current environment unless a row says otherwise. Dew's package metadata still advertises `jax>=0.4.28` and `flax>=0.8.4` (`pyproject.toml:14-23`); those old floors are not evidence that the current source or these additions work on them.
 
 Tokamax `0.0.13` was installed without dependencies in `/tmp/dew-research-kernels` for source reading. Its metadata requires Python `>=3.12` and jax/jaxlib `>=0.11.0` ([release](https://pypi.org/project/tokamax/0.0.13/); wheel `METADATA:209-218`). The release wheel is the version authority for its file:line citations. GitHub `main` links locate the corresponding upstream modules and may move. No tagged tokamax release was listed by the official tags API. The wheel's public exports do not include the fused GDN function named in the earlier main-branch survey (`tokamax/__init__.py:15-41`). This note does not claim it as an available 0.0.13 feature.
 
 No cloud run, model download or GPU/TPU benchmark was performed. Expected wins are hypotheses unless the evidence column names a recorded measurement. The new experiment checked XLA flag parsing on the CPU backend only. Existing Dew measurements are cited with their original hardware and scope.
+
+## Correction, 2026-09-22
+
+Dew changed after this survey. Line numbers elsewhere in this note refer to `65fd2f4`. Checked against the current source, these statements are out of date:
+
+- The decoder has named-residual remat. `RematPolicy` and `REMAT_POLICIES` (`src/dew/nn/backbones/causal_transformer.py:433-520`) carry MaxText's recipes, `save_dot_except_mlp` among them, and can offload residuals to `pinned_host` through `save_and_offload_only_these_names` (`src/dew/nn/backbones/causal_transformer.py:474-481`). The "No decoder policy" gaps in the activation-memory table and item 1 under "What Dew needs" describe the older source.
+- A layout can keep `params`, `opt_state` or `ema` in pinned host memory between steps (`HOST_RESIDENT`, `src/dew/training/distributed.py:271-276`; `Trainer.shardings`, `src/dew/training/trainer.py:342-356`). The state-residency rows that say every field inherits device memory describe the older source.
+- TPU attention runs the Pallas Splash kernel, with the older Pallas flash kernel behind it for masks Splash cannot carry (`src/dew/nn/attention.py:35-38,961-1005`).
+- Weighted corpus mixtures exist: `mixture` builds a Grain `MapDataset.mix` over corpora and their shares (`src/dew/data/dataset.py:650-685`).
+- `pyproject.toml:15-16` requires `flax>=0.12.9` and `jax>=0.11.1`, so the old `jax>=0.4.28` and `flax>=0.8.4` floors quoted under "Versions and evidence" are gone.
+
+These still hold: the cuDNN head-dimension cap is 128 (`CUDNN_MAX_HEAD_DIM`, `src/dew/nn/attention.py:611`), and attention does not import tokamax.
 
 ## Already present and easy to misclassify
 
@@ -142,7 +156,7 @@ Dew already uses state donation, `jax.set_mesh`, `jax.shard_map` for pipeline tr
 
 The six shell recipes shipped under MaxText 0.2.4 `configs/gpu/` set the first flag table's scheduling, pipelining and threshold controls. The 1-, 2-, 4-, 8- and 16-node Llama 2 recipes use different reduction thresholds. The 128-node Llama 3.1 recipe has another configuration. The rows above quote the 16-node recipe; they are not suggested universal values.
 
-Neither collective-matmul flag in the final table occurs in those six recipes. NVIDIA's JAX-Toolbox documents both. Its `disable_async_collectives` override is also separate from MaxText's highest-priority async stream and pipelining flags. Calling all of these “the MaxText async flags” would hide the difference between a source example and a candidate experiment.
+Neither collective-matmul flag in the final table occurs in those six recipes. NVIDIA's JAX-Toolbox documents both. Its `disable_async_collectives` override is also separate from MaxText's highest-priority async stream and pipelining flags. Calling all of these "the MaxText async flags" would hide the difference between a source example and a candidate experiment.
 
 All 17 flag assignments in the two tables were accepted by the installed jaxlib 0.11.1 parser. Each ran in its own process with `JAX_PLATFORMS=cpu`, a single `jax.devices()` call and core dumps disabled. Each printed `cpu`. Reproduce any row by substituting its exact assignment:
 
@@ -152,9 +166,9 @@ JAX_PLATFORMS=cpu XLA_FLAGS='--xla_gpu_pipeline_all_gather=on' \
   /home/mrwhite0racle/Desktop/dew/.venv/bin/python -c 'import jax; print(jax.devices()[0].platform)'
 ```
 
-This checks spelling and parser availability. It does not exercise GPU lowering, collectives, kernels or performance. The note does not recommend enabling the flags without a target-topology run. Command-buffer disabling is particularly unsuitable as a copied default: Dew already measured slower single-card execution with it (`docs/performance.md:219-247`).
+This checks spelling and parser availability. It does not exercise GPU lowering, collectives, kernels or performance. The note does not recommend enabling the flags without a target-topology run. Copying the command-buffer setting as a default would hurt most, because Dew already measured slower single-card execution with command buffers disabled (`docs/performance.md:219-247`).
 
-## What dew needs
+## What Dew needs
 
 1. Decoder remat with named residuals. Begin with a full-remat baseline, then named saves and offload where HBM measurements justify them. MaxText's recipes use JAX policy constructors; they do not require NNX. Sources: [MaxText named policies](https://github.com/AI-Hypercomputer/maxtext/blob/538fe7a3f3376d94cf3f04e77741aa6d7e8efa45/src/maxtext/layers/nnx_decoders.py#L1140-L1268) and [JAX remat](https://docs.jax.dev/en/latest/301/remat.html). Dew has only the DiT helper (`src/dew/nn/dit.py:263-284`).
    Fit: Trainer execution capability and Linen decoder block boundaries. Check saved values and backward memory on the real layer graph.
