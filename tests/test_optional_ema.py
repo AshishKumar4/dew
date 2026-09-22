@@ -63,8 +63,12 @@ def test_disabled_ema_trains_previews_and_resumes_without_a_copy(tmp_path, kind)
     assert initial.ema is None
     with pytest.raises(ValueError, match="keeps no EMA"):
         _ = initial.averaged
-    reference = select(initial.params, frozen_objective.ema.select)
-    frozen_state = dataclasses.replace(initial, ema=reference)
+    # Each step consumes its state, so the two states share no buffer: the
+    # frozen one is a copy with the average as its own copy of the parameters,
+    # and the average's starting values are kept on the host to compare with.
+    reference = jax.tree.map(np.asarray, select(initial.params, frozen_objective.ema.select))
+    frozen_state = jax.tree.map(jnp.copy, dataclasses.replace(
+        initial, ema=select(initial.params, frozen_objective.ema.select)))
     state = initial
     step = trainer.compile(initial, batch)
     frozen_step = frozen_trainer.compile(frozen_state, batch)
