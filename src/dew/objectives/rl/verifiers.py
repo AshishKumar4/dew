@@ -109,10 +109,10 @@ def _rational(text: str) -> Fraction | None:
         numerator, denominator = int(fraction[1]), int(fraction[2])
         sign = -1 if cleaned.startswith("-") else 1
         return None if denominator == 0 else sign * Fraction(numerator, denominator)
-    try:
-        return Fraction(cleaned)
-    except (ValueError, ZeroDivisionError):
+    number = re.fullmatch(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:/(\d+))?", cleaned)
+    if number is None or (number[1] is not None and int(number[1]) == 0):
         return None
+    return Fraction(cleaned)
 
 
 @dataclass(frozen=True)

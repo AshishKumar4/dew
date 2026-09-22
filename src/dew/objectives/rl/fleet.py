@@ -9,16 +9,16 @@ programs on `workers` threads at once, each program in its own process.
 Two runners exist. `ProcessRunner` starts the program through the same
 launcher as `SubprocessEnvironment`: RLIMIT_CPU and RLIMIT_AS, no core
 dumps, its own session, SIGKILL on parent death, a minimal environment, and
-a process-group kill at the wall deadline. It keeps the caller's user and
-filesystem, so it bounds resources, not access. `ContainerRunner` runs the
+a process-group kill at the wall deadline. It keeps the caller's user,
+filesystem and network, so a program can read and reach whatever you can. `ContainerRunner` runs the
 program in a fresh Docker or Podman container with no network, a read-only
 root, the job directory mounted read-only, no capabilities, an unprivileged
 user and memory, CPU, process and CPU-time limits; that is the boundary for
 hostile code.
 
-A program that fails is an outcome, not an exception: the reward decides
-what a timeout or a crash is worth. Only a runner that cannot start a
-program at all raises.
+A program that fails returns an `Outcome`, and the reward decides what a
+timeout or a crash is worth. A runner raises only when it cannot start a
+program at all.
 """
 
 from __future__ import annotations
@@ -327,11 +327,13 @@ class SandboxFleet:
     def __enter__(self) -> SandboxFleet:
         return self
 
-    def __exit__(self, *exc: object) -> None:
+    def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
 
 def outputs_match(outcome: Outcome, expected: str) -> bool:
     """A completed program whose stdout equals `expected`, up to surrounding whitespace per line."""
-    lines = lambda text: [line.rstrip() for line in text.strip().splitlines()]
+    def lines(text: str) -> list[str]:
+        return [line.rstrip() for line in text.strip().splitlines()]
+
     return outcome.verdict is Verdict.COMPLETED and lines(outcome.stdout) == lines(expected)
