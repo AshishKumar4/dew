@@ -12,9 +12,9 @@ them, and the run directory itself scores through the harness:
     python -m dew.eval --model dew --model_args run=runs/gemma4-sft/gemma4-sft \\
         --tasks hellaswag --limit 64
 
-A Hub chat dataset is fetched once and written as the parquet
-`dew.data.ChatMessages` renders: that spec reads a local file, and the `hf`
-provider hands back raw rows with no chat template behind them.
+`dew.data.ChatMessages` reads the Hub dataset itself, so the id on the
+command line is what the run trains on: it renders every conversation with
+the checkpoint's own chat template and packs them into windows.
 
     JAX_PLATFORMS=cpu python examples/sft_gemma4.py --smoke --out /tmp/gemma4-smoke
 """
@@ -28,7 +28,7 @@ import jax
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import ChatMessages, HFOptions, Loading, tokenizer_for
+from dew.data import ChatMessages, Loading, tokenizer_for
 from dew.data.chat import Role
 from dew.interop import export_run, load_pretrained
 from dew.objectives.lm import LMObjective, LMRunConfig, Samples
@@ -56,7 +56,7 @@ SMOKE_CONVERSATIONS = [
 class Config:
     model: str = "google/gemma-4-E2B"
     dataset: str = "allenai/tulu-3-sft-mixture"
-    """Hub chat dataset; its `messages` column holds the conversations."""
+    """Hub chat dataset id, a parquet file or a .jsonl file of conversations."""
     split: str = "train"
     column: str = "messages"
     out: Path = Path("runs/gemma4-sft")
@@ -73,33 +73,11 @@ class Config:
 
 
 def write_conversations(conversations: list, out: Path) -> Path:
-    """The conversations as JSONL, then as the parquet ChatMessages reads.
-
-    The JSONL is the form a chat corpus arrives in and the form a reader can
-    open; the parquet is what `ConversationSource` indexes.
-    """
-    import pyarrow
-    import pyarrow.parquet
-
+    """The canned turns as the JSONL `ChatMessages` reads line by line."""
     out.mkdir(parents=True, exist_ok=True)
     jsonl = out / "chat.jsonl"
-    jsonl.write_text("".join(json.dumps({"prompt": turns}) + "\n" for turns in conversations))
-    rows = [json.loads(line)["prompt"] for line in jsonl.read_text().splitlines()]
-    parquet = out / "chat.parquet"
-    pyarrow.parquet.write_table(pyarrow.table({"prompt": rows}), parquet)
-    return parquet
-
-
-def hub_conversations(config: Config, out: Path) -> Path:
-    """One Hub split's chat column, through `datasets.load_dataset`.
-
-    `HFOptions` is the same value `datasets["hf"]` forwards, so the download,
-    the cache and the revision are the library's own on the library's terms.
-    """
-    split = HFOptions().load(config.dataset, config.split, streaming=False)
-    if config.rows is not None:
-        split = split.select(range(config.rows))
-    return write_conversations([list(row) for row in split[config.column]], out)
+    jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in conversations))
+    return jsonl
 
 
 def smoke_tokenizer(out: Path) -> str:
@@ -113,14 +91,16 @@ def smoke_tokenizer(out: Path) -> str:
     return str(directory)
 
 
-def run_config(config: Config, tokenizer: str, parquet: Path) -> LMRunConfig:
+def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
     """Everything the run is, before the checkpoint decides the architecture."""
     smoke = config.smoke
+    # A row budget is the split slice `datasets` already understands.
+    split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
     return LMRunConfig(
         model=ModelConfig("causal_transformer", {}, dtype="float32" if smoke else "bfloat16",
                           attention_impl="xla" if smoke else "auto"),
-        data=ChatMessages(tokenizer=tokenizer, path=str(parquet), val_path=str(parquet),
-                          seq_len=config.sequence_length, val_batches=1,
+        data=ChatMessages(tokenizer=tokenizer, path=chat, val_path=chat, column=config.column,
+                          split=split, seq_len=config.sequence_length, val_batches=1,
                           loading=Loading(workers=0, threads=1, read_buffer=2,
                                           worker_buffer=1) if smoke else Loading(workers=4)),
         tokenizer=tokenizer,
@@ -142,12 +122,12 @@ def main(config: Config) -> Path:
         config = replace(config, model=str(SMOKE_MODEL), sequence_length=15, batch_size=2,
                          accumulation=2, steps=2)
         tokenizer = smoke_tokenizer(config.out)
-        parquet = write_conversations(SMOKE_CONVERSATIONS, config.out)
+        chat = str(write_conversations(SMOKE_CONVERSATIONS, config.out))
     else:
         tokenizer = config.model
-        parquet = hub_conversations(config, config.out)
+        chat = config.dataset
 
-    run = run_config(config, tokenizer, parquet)
+    run = run_config(config, tokenizer, chat)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
 

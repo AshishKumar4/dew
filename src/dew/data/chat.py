@@ -1,8 +1,9 @@
 """Supervised fine-tuning data: conversations with a role on every token.
 
-A `ChatMessages` source reads a parquet file of conversations and renders
-each with the tokenizer's chat template. Every token gets the role of the
-message that wrote it, so `LMObjective` with `loss_role=Role.ASSISTANT`
+A `ChatMessages` source reads conversations from a parquet file, a JSONL
+file or a Hub dataset id, and renders each with the tokenizer's chat
+template. Every token gets the role of the message that wrote it, so
+`LMObjective` with `loss_role=Role.ASSISTANT`
 trains on assistant tokens only. Packing is the token pipeline's plan over
 the whole corpus (`PackedWindows`) with `text_roles` as one more per-token
 field, so a window carries `text`, `text_roles`, `text_segment_ids`,
@@ -29,6 +30,7 @@ import json
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from enum import Enum
+from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
 
 import grain.python as pygrain
@@ -47,6 +49,7 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
+from .sources.hf import HFOptions, HubOptions
 from .tokens import PackedWindows, bounded
 
 if TYPE_CHECKING:
@@ -474,38 +477,111 @@ def load_tokenizer(path: str) -> PreTrainedTokenizerBase:
         return AutoTokenizer.from_pretrained(path)
 
 
+def _conversation_column(names: Sequence[str], column: str, where: str) -> str:
+    """Which column of a source holds the conversations.
+
+    The one named, or `prompt` where the rows carry that instead, which is
+    what the verl layout and every file `dew.data.prompts` reads call it.
+    """
+    for name in (column, "prompt"):
+        if name in names:
+            return name
+    raise ValueError(f"{where}: no {column!r} or 'prompt' column of conversations, "
+                     f"only {list(names)}")
+
+
+def _parquet_conversations(path: str, column: str) -> tuple[list, list]:
+    """One parquet file, with only the two columns this reads taken off it."""
+    try:
+        import pyarrow.parquet as parquet
+    except ImportError as exc:
+        raise ImportError(
+            "reading chat parquet needs pyarrow: pip install pyarrow") from exc
+    names = [field.name for field in parquet.read_schema(path)]
+    held = _conversation_column(names, column, path)
+    columns = [held, "tools"] if "tools" in names else [held]
+    table = parquet.read_table(path, columns=columns)
+    return (table.column(held).to_pylist(),
+            table.column("tools").to_pylist() if "tools" in columns
+            else [None] * table.num_rows)
+
+
+def _jsonl_conversations(path: str, column: str) -> tuple[list, list]:
+    """One JSON object per line, the form a chat corpus is published in.
+
+    Lines are read one at a time and only the two keys this needs are kept,
+    so a corpus larger than memory costs its conversations and nothing else.
+    """
+    conversations: list = []
+    tools: list = []
+    with open(path, encoding="utf-8") as lines:
+        for number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            where = f"{path} line {number}"
+            row = json.loads(line)
+            if not isinstance(row, Mapping):
+                raise ValueError(f"{where}: a row is a JSON object of columns, "
+                                 f"not a {type(row).__name__}")
+            conversations.append(row[_conversation_column(list(row), column, where)])
+            tools.append(row.get("tools"))
+    return conversations, tools
+
+
+def _hub_conversations(path: str, split: str, options: HFOptions, column: str) -> tuple[list, list]:
+    """One Hub split, through `datasets.load_dataset` on the library's terms.
+
+    `options` is the value the `hf` provider forwards, so the cache, the
+    config name, a revision and a token are the library's own arguments.
+    """
+    loaded = options.load(path, split, streaming=False)
+    names = list(loaded.column_names)
+    held = _conversation_column(names, column, f"{path} split {split!r}")
+    return (list(loaded[held]),
+            list(loaded["tools"]) if "tools" in names else [None] * loaded.num_rows)
+
+
 class ConversationSource:
-    """Random access over the `prompt` column of a parquet file, with the
-    `tools` column beside it when the file has one.
+    """Random access over the conversations at `path`, with their tool
+    schemas beside them where the rows carry any.
+
+    Three things hold conversations and one iterator reads all three: a
+    parquet file, a `.jsonl` file, and a Hub dataset id resolved through
+    `HFOptions`. A suffix decides which, so `chat.jsonl` is lines,
+    `chat.parquet` is a table, an existing file without either suffix is a
+    table too, and anything else is a repo id at `split`.
 
     One record is one conversation, a list of messages in the verl layout,
-    and its tool schemas, a list or a JSON string. The table is read once;
-    rows come back as plain dicts, which pickle across to grain workers.
+    and its tool schemas, a list or a JSON string. The rows are read once;
+    they come back as plain dicts, which pickle across to grain workers.
     Other columns are not read.
     """
 
-    def __init__(self, path: str):
-        try:
-            import pyarrow.parquet as parquet
-        except ImportError as exc:
-            raise ImportError(
-                "reading chat parquet needs pyarrow: pip install pyarrow") from exc
-        names = [field.name for field in parquet.read_schema(path)]
-        if "prompt" not in names:
-            raise ValueError(f"{path}: the prompt column is required, the file has {names}")
-        columns = ["prompt", "tools"] if "tools" in names else ["prompt"]
-        table = parquet.read_table(path, columns=columns)
-        if table.num_rows == 0:
-            raise ValueError(f"{path} holds no conversations")
-        self._conversations = table.column("prompt").to_pylist()
-        self._tools = (table.column("tools").to_pylist() if "tools" in names
-                       else [None] * table.num_rows)
+    def __init__(self, path: str, *, column: str = "messages", split: str = "train",
+                 options: HFOptions | None = None):
         self.path = path
+        self.column = column
+        self.split = split
+        self.options = options if options is not None else HFOptions()
+        suffix = PurePath(path).suffix
+        if suffix == ".jsonl":
+            conversations, tools = _jsonl_conversations(path, column)
+        elif suffix == ".parquet" or Path(path).is_file():
+            conversations, tools = _parquet_conversations(path, column)
+        else:
+            conversations, tools = _hub_conversations(path, split, self.options, column)
+        if not conversations:
+            raise ValueError(f"{path} holds no conversations")
+        self._conversations = conversations
+        self._tools = tools
 
     def __repr__(self) -> str:
-        # A saved data position names its source, so a resumed run needs the
-        # file here, not an address in this process.
-        return f"{self.__class__.__name__}(path={self.path!r})"
+        # A saved data position names its source, so a resumed run needs
+        # what the rows came from here, not an address in this process: the
+        # file or repo id, and for a repo the split and the load's own
+        # arguments, which decide which rows those are.
+        return (f"{self.__class__.__name__}(path={self.path!r}, column={self.column!r}, "
+                f"split={self.split!r}, options={self.options!r})")
 
     def __len__(self) -> int:
         return len(self._conversations)
@@ -557,22 +633,33 @@ def _lengths(source: ConversationSource, tokenizer: str) -> list[int]:
 class ChatMessages(DatasetSpec):
     """Conversations rendered with the tokenizer's chat template, packed.
 
-    `path` is a parquet file whose `prompt` column holds lists of messages
-    and whose `tools` column, when present, holds each row's tool schemas;
-    `tokenizer` is the hub name or local path whose chat template renders
-    them. Each conversation (in chunks, when it outgrows the window) is one
-    element the packing plan adds to the first window with room, and every
-    window carries `text_roles` beside the ids, so the loss can count one
-    role's targets. The plan is over the whole file in row order, ahead of
-    the shard, as `PackedTokens` plans its documents, so `records` is the
+    `path` names the conversations: a parquet file, a `.jsonl` file, or a Hub
+    dataset id read at `split` through `options`, which is the same value the
+    `hf` provider forwards to `datasets.load_dataset`. Whichever it is, the
+    rows carry lists of messages under `column` (or `prompt`, which is what
+    the verl layout calls it) and their tool schemas under `tools` where they
+    have any; `tokenizer` is the hub name or local path whose chat template
+    renders them. Each conversation (in chunks, when it outgrows the window)
+    is one element the packing plan adds to the first window with room, and
+    every window carries `text_roles` beside the ids, so the loss can count
+    one role's targets. The plan is over the whole corpus in row order, ahead
+    of the shard, as `PackedTokens` plans its documents, so `records` is the
     windows of a pass exactly and a saved position is a global window count.
-    `val_path` is a second parquet file scored as one pass; None trains
-    without validation.
+    `val_path` is a second source of the same three kinds, read at
+    `val_split` and scored as one pass; None trains without validation.
     """
 
     tokenizer: str
     path: str | None = None
     val_path: str | None = None
+    column: str = "messages"
+    """The column of conversations; `prompt` is read where a row has that."""
+    split: str = "train"
+    """Which split `path` is read at, when it names a Hub dataset."""
+    val_split: str | None = None
+    """Which split `val_path` is read at; None reads `split`."""
+    options: HubOptions = HFOptions()
+    """What `datasets.load_dataset` takes beside the id and the split."""
     seq_len: int = 256
     val_batches: int | None = 4
     packing_bins: int = 8
@@ -580,23 +667,27 @@ class ChatMessages(DatasetSpec):
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         self.uncaptioned(tokenize)
         if self.path is None:
-            raise ValueError("ChatMessages reads a parquet file: --data.path names it")
+            raise ValueError(
+                "ChatMessages reads a parquet file, a .jsonl file or a hub dataset id: "
+                "--data.path names it")
         rows, window = local_batch(batch), self.seq_len + 1
 
-        def packed(path: str) -> PackedWindows:
-            source = ConversationSource(path)
+        def packed(path: str, split: str) -> PackedWindows:
+            source = ConversationSource(path, column=self.column, split=split,
+                                        options=self.options)
             rendered = pygrain.MapDataset.source(source).map_with_index(
                 RenderConversation(self.tokenizer))
             return PackedWindows(rendered, _lengths(source, self.tokenizer), window,
                                  self.packing_bins,
                                  f"{describe(source)} rendered by {self.tokenizer!r}")
 
-        train = packed(self.path)
+        train = packed(self.path, self.split)
         validation = None
         if self.val_path is not None:
-            validation = bounded(validation_pass(packed(self.val_path), [], batch=rows,
-                                          seed=self.seed, loading=self.loading),
-                          self.val_batches)
+            scored = packed(self.val_path, self.val_split or self.split)
+            validation = bounded(validation_pass(scored, [], batch=rows, seed=self.seed,
+                                                 loading=self.loading),
+                                 self.val_batches)
         return Dataset(
             train=train_stream(train, [], batch=rows, seed=self.seed, loading=self.loading),
             val=validation,

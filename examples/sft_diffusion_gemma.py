@@ -8,9 +8,9 @@ beside its factors on one accelerator:
         --model google/diffusiongemma-26B-A4B-it \\
         --chat data/tulu-3-sft.parquet --steps 2000
 
-`--chat` is a parquet file whose `prompt` column holds conversations in the
-verl layout, which is what `dew.data.ChatMessages` renders with the
-checkpoint's own chat template. The run writes two things: the PEFT adapter
+`--chat` is a Hub dataset id, a `.jsonl` file or a parquet file of
+conversations, which is what `dew.data.ChatMessages` reads and renders with
+the checkpoint's own chat template. The run writes two things: the PEFT adapter
 directory `LoRA.save` produces, which transformers loads, and the merged
 checkpoint in the source's own layout, which `dew.pipeline` generates from.
 
@@ -56,8 +56,8 @@ PROMPTS = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"]
 class Config:
     model: str = "google/diffusiongemma-26B-A4B-it"
     """Hub repo or local directory the base weights and tokenizer come from."""
-    chat: Path | None = None
-    """Parquet file of conversations; --smoke writes its own."""
+    chat: str | None = None
+    """Hub dataset id, .jsonl or parquet of conversations; --smoke writes its own."""
     out: Path = Path("runs/diffusion-gemma-lora")
     prompt_tokens: int = 256
     """Clean prompt prefix of a training row; the canvases follow it."""
@@ -76,16 +76,11 @@ class Config:
 
 
 def smoke_inputs(out: Path) -> tuple[str, Path]:
-    """A tokenizer with a chat template and a parquet of conversations.
+    """A tokenizer with a chat template and the canned turns as JSONL.
 
     The tokenizer is the fixture's own, so the ids stay inside the tiny
-    vocabulary; only the template is added. The conversations are written as
-    JSONL first, because that is the form a chat corpus arrives in, and as
-    the parquet `ChatMessages` reads.
+    vocabulary; only the template is added.
     """
-    import pyarrow
-    import pyarrow.parquet
-
     tokenizer = out / "tokenizer"
     tokenizer.mkdir(parents=True, exist_ok=True)
     shutil.copy(SMOKE_SOURCE / "tokenizer.json", tokenizer / "tokenizer.json")
@@ -94,24 +89,22 @@ def smoke_inputs(out: Path) -> tuple[str, Path]:
         json.dumps({**record, "chat_template": SMOKE_TEMPLATE}, indent=2))
 
     jsonl = out / "chat.jsonl"
-    jsonl.write_text("".join(json.dumps({"prompt": turns}) + "\n" for turns in CONVERSATIONS))
-    rows = [json.loads(line)["prompt"] for line in jsonl.read_text().splitlines()]
-    parquet = out / "chat.parquet"
-    pyarrow.parquet.write_table(pyarrow.table({"prompt": rows}), parquet)
-    return str(tokenizer), parquet
+    jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in CONVERSATIONS))
+    return str(tokenizer), jsonl
 
 
 def main(config: Config) -> Path:
     if config.smoke:
         config.out.mkdir(parents=True, exist_ok=True)
-        tokenizer, parquet = smoke_inputs(config.out)
-        config = replace(config, model=str(SMOKE_SOURCE), chat=parquet, prompt_tokens=8,
+        tokenizer, jsonl = smoke_inputs(config.out)
+        config = replace(config, model=str(SMOKE_SOURCE), chat=str(jsonl), prompt_tokens=8,
                          canvases=2, batch_size=2, steps=2, rank=2, alpha=4.0,
                          response_tokens=4)
     else:
         tokenizer = config.model
         if config.chat is None:
-            raise ValueError("--chat is the parquet file of conversations to fine-tune on")
+            raise ValueError("--chat names the conversations to fine-tune on: a hub "
+                             "dataset id, a .jsonl file or a parquet file")
 
     source = load_pretrained(config.model, dtype="bfloat16", param_dtype="float32")
     sequence_length = config.prompt_tokens + config.canvases * source.model.canvas_length
@@ -126,7 +119,7 @@ def main(config: Config) -> Path:
 
     # A packed window is seq_len + 1 ids wide, and the objective reads rows of
     # exactly prompt + canvases: the spec is asked for one less.
-    data = ChatMessages(tokenizer=tokenizer, path=str(config.chat),
+    data = ChatMessages(tokenizer=tokenizer, path=config.chat,
                         seq_len=sequence_length - 1, val_batches=None,
                         loading=Loading(workers=0, threads=1, read_buffer=2,
                                         worker_buffer=1)).load(batch=config.batch_size)
