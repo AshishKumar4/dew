@@ -149,3 +149,22 @@ def test_srun_receives_values_with_commas_whole(tmp_path):
     assert done.returncode == 0, done.stderr
     assert (tmp_path / "env").read_text() == "0,1|--a=1,--b=2"
     assert "--export=ALL" in (tmp_path / "argv").read_text().split()
+
+
+def test_slurm_runs_one_task_per_gpu_and_refuses_to_split_them_otherwise(tmp_path):
+    """Under Slurm jax gives each task the one GPU at its SLURM_LOCALID, so a
+    node's tasks are its GPUs. A per-task GPU count would narrow each task's
+    visible GPUs to one that jax then numbers by the local rank, and is
+    refused rather than passed to srun."""
+    from dew.cli.launch import Launch
+
+    with pytest.raises(ValueError, match="SLURM_LOCALID"):
+        Launch(command=("python",), slurm=True, devices_per_process=1)
+    done = subprocess.run(
+        [sys.executable, "-m", "dew.cli.main", "launch", "--slurm", "--processes-per-host", "8",
+         "--", "python", "train.py"],
+        cwd=REPO_ROOT, env=fake_srun(tmp_path), capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    argv = (tmp_path / "argv").read_text().split()
+    assert "--ntasks-per-node=8" in argv
+    assert not any(word.startswith("--gpus") for word in argv)
