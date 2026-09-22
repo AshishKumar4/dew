@@ -141,6 +141,8 @@ CALLS = {
     "bias": dict(causal=True,
                  bias=jax.random.normal(jax.random.key(3), (1, 4, SEQ_LEN, SEQ_LEN))),
     "full": dict(),
+    # One learned logit per query head, split with the heads by the exchange.
+    "sinks": dict(causal=True, sinks=jax.random.normal(jax.random.key(4), (4,))),
 }
 
 
@@ -166,7 +168,7 @@ HEAD_SPLITS = [MeshSpec(fsdp=2, tensor=2, sequence=2), MeshSpec(fsdp=2, sequence
 
 
 @pytest.mark.parametrize("spec", HEAD_SPLITS, ids=["tensor2_sequence2", "sequence4"])
-@pytest.mark.parametrize("name", ["causal", "packed", "bias"])
+@pytest.mark.parametrize("name", ["causal", "packed", "bias", "sinks"])
 def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec, name):
     """The all-to-all's gradients are its transposes: the query, key and
     value cotangents of a whole-sequence call come back in the split one,
