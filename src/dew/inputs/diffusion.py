@@ -28,10 +28,10 @@ def _prompt(record: Mapping[str, object], key: str, default: str) -> str:
 
 
 def latent_image_conditions(autoencoder, params, pixels, mask, key):
-    """Normalized image pixels and a binary pixel mask to native UNet inputs.
+    """Turns normalized pixels and a binary pixel mask into native UNet inputs.
 
-    Returns mask [B,h,w,1] and masked_image [B,h,w,C] under the model
-    keyword names. Spatial inputs stay present in both guidance branches.
+    Returns mask [B,h,w,1] and masked_image [B,h,w,C] under the model keyword
+    names. Spatial inputs stay present in both guidance branches.
     """
     if autoencoder is None:
         raise ValueError("Masked-image conditioning requires an autoencoder")
@@ -46,12 +46,24 @@ def latent_image_conditions(autoencoder, params, pixels, mask, key):
 
 
 class _TextFeatures(NamedTuple):
+    """The three states a family reads off one CLIP tower."""
+
     last: jax.Array
     penultimate: jax.Array
     pooled: jax.Array
 
 
 def _text_features(tower, ids):
+    """The CLIP tower's last, penultimate and pooled states for `ids`.
+
+    The layers run here rather than through the tower's own call because the
+    families that read the penultimate hidden states need the value from
+    before the last layer, which a plain forward does not keep.
+
+    The pooled slot is the tower's own: the checkpoints whose eos id is 2
+    take the largest id in the row, which is that eos, and the rest take the
+    first position that equals the eos id.
+    """
     hidden = tower.token_embedding(ids) + tower.position_embedding(jnp.arange(ids.shape[1]))
     penultimate = hidden
     for layer in tower.layers:
@@ -80,10 +92,13 @@ Composition = Literal["clip", "clip_pooled", "sd3", "flux"]
 
 @dataclass(frozen=True, eq=False)
 class T5Segment:
-    """The T5 tower a family reads beside its CLIP ones: the tower, its
-    tokenizer, the component name its parameters and tokenizer live under -
-    an SD3 directory's third text encoder, a Flux directory's second - and
-    the sequence budget its pipeline pads to."""
+    """Holds the T5 tower a family reads beside its CLIP ones.
+
+    The fields are the tower, its tokenizer, the component name its
+    parameters and tokenizer live under, and the sequence budget its pipeline
+    pads to. That name is an SD3 directory's third text encoder or a Flux
+    directory's second.
+    """
 
     tower: T5EncoderTransformer
     tokenizer: PreTrainedTokenizerBase
@@ -99,9 +114,9 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     One encoder owns every family's composition: which towers run, which of
     their states the model reads, and how the pooled vector is built. The
     towers themselves are the native CLIP and T5 towers, called the way their
-    own source pipelines call them - the SD3 and Flux pipelines pass their T5
-    ids with no attention mask, which is what `T5EncoderTransformer` does
-    with none, and no generic T5 default changes for it.
+    own source pipelines call them. The SD3 and Flux pipelines pass their T5
+    ids with no attention mask, which is what `T5EncoderTransformer` does with
+    none, and no generic T5 default changes for it.
     """
 
     towers: tuple[CLIPTextTransformer, ...]
@@ -133,10 +148,12 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
 
     @property
     def stacked(self) -> bool:
-        """Whether the CLIP ids ride one array with a tower axis, which every
-        family but plain Stable Diffusion does: the XL refiner carries a
-        single tower that way too, since its pipeline still writes a tower's
-        row rather than a bare batch."""
+        """Whether the CLIP ids ride one array with a tower axis.
+
+        Every family but plain Stable Diffusion does. The XL refiner carries
+        a single tower that way too, since its pipeline still writes a
+        tower's row rather than a bare batch.
+        """
         return self.composition != "clip"
 
     def __post_init__(self):
@@ -191,9 +208,12 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return tokens
 
     def _guidance(self, record: Mapping[str, object]) -> float:
-        """The guidance a row is walked at: its own where it names one, and
-        this checkpoint's pipeline default otherwise. A composition whose
-        model reads no guidance refuses a record that names one."""
+        """The guidance a row is walked at.
+
+        A record's own where it names one, and this checkpoint's pipeline
+        default otherwise. A composition whose model reads no guidance
+        refuses a record that names one.
+        """
         value = record.get("guidance")
         if value is None:
             return 0.0 if self.guidance is None else self.guidance
@@ -223,9 +243,11 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return pooled @ params[name]["text_projection"]["kernel"]
 
     def _t5_states(self, params, tokens, rows: int, dtype) -> jax.Array:
-        """The T5 segment, or the zero segment the SD3 pipeline writes when its
-        third encoder is absent, which is `tokenizer_max_length` long - the
-        CLIP tokenizer's window, not the T5 sequence the call asked for."""
+        """The T5 segment, or the zero segment SD3 writes without a third encoder.
+
+        That zero segment is `tokenizer_max_length` long, which is the CLIP
+        tokenizer's window and not the T5 sequence the call asked for.
+        """
         if self.t5 is None:
             return jnp.zeros((rows, self.tokenizers[0].model_max_length, self.context_width), dtype)
         # The SD3 and Flux pipelines call their T5 encoder with ids only.
@@ -252,6 +274,8 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
             if time_ids is None:
                 time_ids = self.time_ids(rows, hidden.dtype)
                 if self.aesthetics:
+                    # The refiner pipeline's own aesthetic scores: 6.0 for a
+                    # positive prompt and 2.5 for a negative one.
                     time_ids = time_ids.at[:, -1].set(jnp.where(tokens["negative"], 2.5, 6.0))
             return DenoisingCondition(self._zeroed(hidden, zero),
                                       self._zeroed(pooled, zero), time_ids)
@@ -307,7 +331,8 @@ def _cubic_weights(source: int, target: int) -> tuple[np.ndarray, np.ndarray]:
 
 @dataclass(frozen=True)
 class CLIPImageTransform:
-    """Published CLIP preprocessing as JAX arithmetic over uint8 NHWC pixels."""
+    """Runs the published CLIP preprocessing as JAX arithmetic over uint8 NHWC
+    pixels."""
     size: int | tuple[int, int]
     crop: tuple[int, int]
     mean: tuple[float, ...]
