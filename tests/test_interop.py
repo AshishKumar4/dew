@@ -508,3 +508,26 @@ def test_a_block_diffusion_run_exports_under_its_published_config(tmp_path):
     actual = reloaded.block_generation()([[1, 5, 7]], 3, seed=4).host()
     np.testing.assert_array_equal(actual.tokens, wanted.tokens)
     np.testing.assert_array_equal(actual.decoder_steps, wanted.decoder_steps)
+
+
+def test_the_fid_converter_refuses_a_pickle_that_is_missing_a_key(tmp_path):
+    """The extractor's own variables tree says which arrays the conversion
+    wants and what they are called, so a jax-fid pickle that cannot answer for
+    one of them is refused by the name it failed on rather than landing a tree
+    with a hole in it."""
+    import pickle
+
+    from dew.interop.inception_fid import convert, upstream_names
+
+    tree: dict = {}
+    for upstream in upstream_names().values():
+        node = tree
+        for step in upstream[:-1]:
+            node = node.setdefault(step, {})
+        node[upstream[-1]] = np.zeros(1, np.float32)
+    del tree["Mixed_7c"]["branch_pool"]["bn"]["var"]
+
+    path = tmp_path / "inception_v3_fid.pickle"
+    path.write_bytes(pickle.dumps(tree))
+    with pytest.raises(ValueError, match="Mixed_7c/branch_pool/bn/var"):
+        convert(path)

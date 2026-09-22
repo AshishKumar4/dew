@@ -1,8 +1,14 @@
 {
-  "of": "hayden-donnelly/inception-v3-fid",
+  "file": "inception_v3_fid.safetensors",
+  "stands_in_for": "hayden-donnelly/inception-v3-fid",
   "module": "dew.eval.inception.InceptionV3",
+  "contents": "a Flax variables tree, params and batch_stats, read with dew.interop.inception_fid.load and applied with model.apply",
+  "written_by": "tools/make_tiny_inception_weights.py",
+  "conversion": "drawn in the jax-fid layout and converted by dew.interop.inception_fid.convert, the path the published pickle takes; the header carries channel_divisor, which is what the extractor is built at",
   "channel_divisor": 16,
   "seed": 20260921,
   "pool3_features": 128,
-  "parameters": 88424
+  "parameters": 87168,
+  "batch_statistics": 2152,
+  "reference_features": "reference_features.npy, the pool3 features this extractor gave before dew/eval/inception.py stopped taking its weights as constructor fields, on np.random.default_rng(0).uniform(-1, 1, (4, 299, 299, 3))"
 }

@@ -35,7 +35,7 @@ from dew.registry import metrics as registry
 
 CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"
 INCEPTION_TINY = (Path(__file__).resolve().parent / "fixtures" / "inception" / "tiny"
-                  / "inception_v3_fid.pickle")
+                  / "inception_v3_fid.safetensors")
 
 
 def test_frechet_distance_of_a_distribution_with_itself_is_zero(rng):
@@ -117,7 +117,7 @@ def test_fid_of_a_set_against_itself_is_zero_and_a_shifted_set_scores_above_it()
 
 
 def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
-    """`weights` names the extractor's parameters as a file, the way
+    """`weights` names the extractor's variables as a safetensors file, the way
     `clip_score(modelname=)` names a local CLIP, so a distance is computable
     with no download.
 
@@ -125,11 +125,11 @@ def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
     every channel width, its parameters drawn rather than trained, so the
     values are its own and not the published checkpoint's. What a distance
     promises is the ordering, and that holds: a population against itself is
-    zero to rounding (observed -1.3e-15), the same pixels brightened by 40
-    counts sit above it (6.6e-09), and a flat gray field sits fifty times
-    further out (3.3e-07). The registered metric reads the same file and
-    lands on the same number. `source.json` says how wide the features it
-    pools are, and the extractor agrees.
+    zero to the rounding in the matrix square root (observed -3.2e-09), the
+    same pixels brightened by 40 counts sit above it (0.064), and a flat gray
+    field sits twenty times further out (1.3). The registered metric reads the
+    same file and lands on the same number. `source.json` says how wide the
+    features it pools are, and the extractor agrees.
     """
     from dew.eval.fid import _get_activations
     from dew.inputs import unit_range
@@ -138,7 +138,7 @@ def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
     weights = str(INCEPTION_TINY)
     record = json.loads((INCEPTION_TINY.parent / "source.json").read_text())
 
-    assert abs(fid(images, images, weights=weights)) < 1e-12
+    assert abs(fid(images, images, weights=weights)) < 1e-6
     shifted = fid(brighter, images, weights=weights)
     assert 0 < shifted < fid(np.full_like(images, 128), images, weights=weights)
 
@@ -147,6 +147,21 @@ def test_fid_takes_its_extractor_from_a_file_and_orders_populations_offline():
     assert pooled == pytest.approx(shifted, rel=1e-6)
     assert metric.feature_identity.endswith(weights)
     assert _get_activations(weights)(unit_range(images[:1])).shape[1] == record["pool3_features"]
+
+
+def test_the_converted_extractor_reproduces_the_features_it_gave_as_a_pickle():
+    """The extractor used to get its weights by unpickling a nested dict and
+    handing every convolution and norm an initializer that returned the stored
+    array. It is an ordinary Flax module now, applied to an ordinary variables
+    tree read from safetensors, and `reference_features.npy` is what the old
+    path gave for this fixture: the same arrays reach the same operations, so
+    the features are equal to the bit, not merely close."""
+    from dew.eval.fid import _get_activations
+
+    images = np.random.default_rng(0).uniform(-1, 1, (4, 299, 299, 3)).astype(np.float32)
+    features = np.asarray(_get_activations(str(INCEPTION_TINY))(images))
+    reference = np.load(INCEPTION_TINY.parent / "reference_features.npy")
+    np.testing.assert_array_equal(features, reference)
 
 
 @pytest.mark.network
@@ -561,7 +576,7 @@ def test_the_weights_loader_reads_arrays_and_refuses_the_rest(tmp_path):
     downloaded pickle cannot run code."""
     import pickle
 
-    from dew.eval.utils import load_arrays
+    from dew.interop.inception_fid import load_arrays
 
     tree = {"conv": {"kernel": np.arange(6, dtype=np.float32).reshape(2, 3),
                      "bias": np.zeros(3, np.float32)}}
@@ -583,7 +598,7 @@ def test_a_wrong_digest_is_refused_before_anything_reads_the_file(tmp_path):
     passes through untouched."""
     import hashlib
 
-    from dew.eval.utils import _check_digest
+    from dew.interop.inception_fid import _check_digest
 
     path = tmp_path / "weights.pickle"
     path.write_bytes(b"not the weights")
@@ -601,14 +616,13 @@ def test_the_weights_are_pinned_by_digest():
     ran. They come from a Hub revision now and the digest is checked as well,
     so a file that is not the one this code was written against is refused
     before anything reads it."""
-    from dew.eval import inception
-    from dew.eval.utils import fetch
+    from dew.interop import inception_fid
 
-    assert len(inception.FID_WEIGHTS_DIGEST) == 64
-    assert len(inception.FID_WEIGHTS_REVISION) == 40
+    assert len(inception_fid.FID_WEIGHTS_DIGEST) == 64
+    assert len(inception_fid.FID_WEIGHTS_REVISION) == 40
     with pytest.raises(ValueError, match="hashes to"):
-        fetch(inception.FID_WEIGHTS_REPO, inception.FID_WEIGHTS_FILE,
-              inception.FID_WEIGHTS_REVISION, "0" * 64)
+        inception_fid.fetch(inception_fid.FID_WEIGHTS_REPO, inception_fid.FID_WEIGHTS_FILE,
+                            inception_fid.FID_WEIGHTS_REVISION, "0" * 64)
 
 
 @pytest.mark.network
