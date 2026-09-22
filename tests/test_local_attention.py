@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
 
+from dew.nn import attention
 from dew.nn.attention import local_attention, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -135,6 +136,26 @@ def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
         q, k, v, window=window, implementation="xla"))
     assert dense >= heads * length * length * 4
     assert banded * 4 < dense
+
+
+def test_sinks_band_where_cudnn_would_take_the_window(monkeypatch):
+    """No fused kernel honours sinks, so a sink call that resolves to cuDNN
+    (a bf16 GPU call, stood in for here) still bands rather than handing the
+    window to the dense sink path's `[H, S, S]` logits."""
+    monkeypatch.setattr(attention, "cudnn_runs", lambda query, softcap=None: True)
+    length, window, heads = 4096, 128, 4
+    query, key, value = inputs(length, heads=heads, kv_heads=heads, batch=1)
+    sinks = jnp.zeros((heads,))
+    compiled = jax.jit(lambda q, k, v: local_attention(
+        q, k, v, window=window, sinks=sinks)).lower(query, key, value).compile()
+    assert compiled.memory_analysis().temp_size_in_bytes * 4 < heads * length * length * 4
+
+    query, key, value = inputs(64)
+    sinks = jax.random.normal(jax.random.key(4), (4,))
+    expected = scaled_dot_product_attention(query, key, value, causal=True, sliding_window=8,
+                                            sinks=sinks, implementation="reference")
+    actual = local_attention(query, key, value, window=8, sinks=sinks)
+    np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=2e-6, rtol=0)
 
 
 @pytest.mark.parametrize("span,length,packing", [
