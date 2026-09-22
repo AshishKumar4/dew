@@ -533,6 +533,103 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
     return parameters, buffers, layouts
 
 
+class QwenImageFields(TypedDict):
+    in_channels: int
+    out_channels: int
+    num_layers: int
+    heads: int
+    head_dim: int
+    context_in_dim: int
+    mlp_ratio: int
+    axes_dims_rope: tuple[int, ...]
+    eps: float
+    causal_condition: bool
+    dtype: object
+    attention_impl: str
+
+
+def qwen_image_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
+                      attention_impl="auto") -> QwenImageFields:
+    """Read a published `QwenImage21Transformer2DModel` config into native fields.
+
+    Every control the class declares is read. Its pipeline hands the latent
+    over unpatched, so a patch size other than one is a checkpoint no
+    published pipeline drives and is refused rather than folded.
+    """
+    from dew.interop.pretrained import resolve_dtype
+
+    if records.integer(config.get("patch_size", 1), "patch_size") != 1:
+        raise ValueError("Qwen-Image 2.1's pipeline reads its latent unpatched; patch_size must be 1")
+    channels = records.integer(config.get("in_channels", 64), "in_channels")
+    out_channels = config.get("out_channels", 64)
+    axes = config.get("axes_dims_rope", (16, 56, 56))
+    if (not isinstance(axes, (list, tuple)) or len(axes) != 3
+            or any(type(size) is not int or size % 2 for size in axes)):
+        raise ValueError("axes_dims_rope must be three even channel counts")
+    head_dim = records.integer(config.get("attention_head_dim", 128), "attention_head_dim")
+    if sum(axes) != head_dim:
+        raise ValueError(f"axes_dims_rope {tuple(axes)} must cover the {head_dim} head channels")
+    return QwenImageFields(
+        in_channels=channels,
+        out_channels=channels if out_channels is None else records.integer(out_channels, "out_channels"),
+        num_layers=records.integer(config.get("num_layers", 32), "num_layers"),
+        heads=records.integer(config.get("num_attention_heads", 32), "num_attention_heads"),
+        head_dim=head_dim,
+        context_in_dim=records.integer(config.get("context_in_dim", 4096), "context_in_dim"),
+        mlp_ratio=records.integer(config.get("mlp_ratio", 3), "mlp_ratio"),
+        axes_dims_rope=tuple(axes), eps=records.number(config.get("eps", 1e-6), "eps"),
+        causal_condition=records.boolean(config.get("causal_condition", True), "causal_condition"),
+        dtype=resolve_dtype(dtype), attention_impl=attention_impl)
+
+
+_QWEN_IMAGE_EMBEDDERS = {
+    "img_in": ("img_in",),
+    "proj_out": ("proj_out",),
+    "modulation.1": ("modulation",),
+    "norm_out.linear": ("norm_out_linear",),
+    "txt_in.in_layer": ("txt_in", "in_layer"),
+    "txt_in.out_layer": ("txt_in", "out_layer"),
+    "time_text_embed.timestep_embedder.linear_1": ("timestep_embedder_linear_1",),
+    "time_text_embed.timestep_embedder.linear_2": ("timestep_embedder_linear_2",),
+}
+
+
+def _qwen_image_path(name: str) -> tuple[str, ...]:
+    """Return the `QwenImageTransformer` path for a published Qwen-Image 2.1 tensor name.
+
+    The class holds no bias anywhere, so a bias is an unknown name. The text
+    projection's norm stores its scale zero-centred, which the native norm
+    reads the same way.
+    """
+    parts = name.split(".")
+    leaf, stem = parts[-1], ".".join(parts[:-1])
+    if leaf != "weight":
+        raise ValueError(f"unknown tensor name {name!r}")
+    if stem in _QWEN_IMAGE_EMBEDDERS:
+        return (*_QWEN_IMAGE_EMBEDDERS[stem], "kernel")
+    if stem == "txt_in.text_norm":
+        return ("txt_in", "text_norm", "scale")
+    if parts[0] == "transformer_blocks" and parts[1].isdigit():
+        block = (f"transformer_blocks_{parts[1]}",)
+        rest = parts[2:-1]
+        if rest == ["attn", "to_out", "0"]:
+            return (*block, "attn", "to_out_0", "kernel")
+        if len(rest) == 2 and rest[0] == "img_mlp" and rest[1] in ("proj", "gate_layer", "out"):
+            return (*block, "img_mlp", rest[1], "kernel")
+        if len(rest) > 1 and rest[0] == "attn":
+            return _dit_attention(block, "attn", rest[1:], leaf, name, joint=False)
+    raise ValueError(f"unknown tensor name {name!r}")
+
+
+def translate_qwen_image_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+                                 ) -> tuple[TensorTree, tuple[WeightLayout, ...]]:
+    """Map Qwen-Image 2.1 transformer tensors into a parameter tree and the
+    layouts that invert it. Its rotary table is computed from positions, so
+    it stores no buffer."""
+    return record_layouts("transformer", tensors, _qwen_image_path, ("params",),
+                          param_dtype=param_dtype)
+
+
 def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
     """Read one published component's weights: the shards its index names or
     its one weights file, never a precision variant beside them."""
