@@ -43,6 +43,7 @@ import tyro
 
 from dew.data import Loading, tokenizer_for
 from dew.data.prompts import Prompts
+from dew.inference.tasks import SHAPE_BUCKETS
 from dew.inference import (
     NativeRolloutServer,
     OpenAICompletion,
@@ -110,11 +111,11 @@ class Config:
     """native: Dew's own server in this process; vllm: a vLLM server this run starts."""
     out: Path = Path("runs/rlvr")
     steps: int = 40
-    prompts: int = 16
+    prompts: int = 8
     """Prompts per update; each gets `groups` completions."""
     groups: int = 8
     prompt_tokens: int = 128
-    new_tokens: int = 192
+    new_tokens: int = 128
     learning_rate: float = 2e-6
     max_lag: int = 1
     tasks: int = 2048
@@ -159,9 +160,10 @@ def main(config: Config) -> dict:
     config.out.mkdir(parents=True, exist_ok=True)
     tokenizer = str(SMOKE_MODEL.parents[0] / "diffusion-gemma-workflow") if config.smoke else config.model
     width = config.prompt_tokens + config.new_tokens
-    # The server's cache holds whole 64-token buckets; the model's context covers them.
+    # The server rounds its cache up to a power-of-two shape bucket; the model's context covers it.
+    context = next(bucket for bucket in SHAPE_BUCKETS if bucket >= width)
     source = load_pretrained(config.model, dtype="float32" if config.smoke else "bfloat16",
-                             param_dtype="float32", max_seq_len=-(-width // 64) * 64)
+                             param_dtype="float32", max_seq_len=context)
     stock = source.text_generation().sampling
     # Temperature one without filters: the engine's reported likelihoods are
     # then the behavior policy's, on either backend.
