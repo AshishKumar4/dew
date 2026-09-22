@@ -20,7 +20,6 @@ the checkpoint's own chat template and packs them into windows.
 """
 
 import json
-import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -39,13 +38,9 @@ FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 SMOKE_MODEL = FIXTURES / "hf/gemma4-ple"
 # The decoder fixtures ship weights and no tokenizer. This one holds the same
 # 64 ids they were written against, one per `t<n>` word, so a canned turn
-# tokenizes to distinct targets instead of a row of unknowns. The chat
-# template is this file's, since no fixture tokenizer carries one and an
-# instruct checkpoint always does.
+# tokenizes to distinct targets instead of a row of unknowns, and it carries
+# the prefix-preserving chat template an instruct checkpoint always does.
 SMOKE_VOCAB = FIXTURES / "hf/diffusion-gemma-workflow"
-SMOKE_TEMPLATE = ("{% for message in messages %}{{ message['role'] }} : "
-                  "{{ message['content'] }} {% endfor %}"
-                  "{% if add_generation_prompt %}assistant : {% endif %}")
 SMOKE_CONVERSATIONS = [
     [{"role": "user", "content": f"t{first} t{first + 2}"},
      {"role": "assistant", "content": f"t{first + 4} t{first + 6}"}]
@@ -80,17 +75,6 @@ def write_conversations(conversations: list, out: Path) -> Path:
     return jsonl
 
 
-def smoke_tokenizer(out: Path) -> str:
-    """The fixture's vocabulary with a prefix-preserving chat template on it."""
-    directory = out / "tokenizer"
-    directory.mkdir(parents=True, exist_ok=True)
-    shutil.copy(SMOKE_VOCAB / "tokenizer.json", directory / "tokenizer.json")
-    record = json.loads((SMOKE_VOCAB / "tokenizer_config.json").read_text())
-    (directory / "tokenizer_config.json").write_text(
-        json.dumps({**record, "chat_template": SMOKE_TEMPLATE}, indent=2))
-    return str(directory)
-
-
 def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
     """Everything the run is, before the checkpoint decides the architecture."""
     smoke = config.smoke
@@ -121,7 +105,7 @@ def main(config: Config) -> Path:
     if config.smoke:
         config = replace(config, model=str(SMOKE_MODEL), sequence_length=15, batch_size=2,
                          accumulation=2, steps=2)
-        tokenizer = smoke_tokenizer(config.out)
+        tokenizer = str(SMOKE_VOCAB)
         chat = str(write_conversations(SMOKE_CONVERSATIONS, config.out))
     else:
         tokenizer = config.model

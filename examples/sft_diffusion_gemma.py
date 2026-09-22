@@ -18,7 +18,6 @@ checkpoint in the source's own layout, which `dew.pipeline` generates from.
 """
 
 import json
-import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -42,12 +41,6 @@ CONVERSATIONS = [
     [{"role": "user", "content": "t6 t8"}, {"role": "assistant", "content": "t10 t12"}],
     [{"role": "user", "content": "t13 t15"}, {"role": "assistant", "content": "t17 t19"}],
 ]
-# A template that renders every turn as a prefix of the whole conversation,
-# which is what `render_conversation` needs to mask an assistant span. The
-# tiny fixture's tokenizer ships none; a real instruct checkpoint does.
-SMOKE_TEMPLATE = ("{% for message in messages %}{{ message['role'] }} : "
-                  "{{ message['content'] }} {% endfor %}"
-                  "{% if add_generation_prompt %}assistant : {% endif %}")
 
 PROMPTS = ["<bos> t5 t7 t9 t11", "<bos> t6 t8 t10 t12"]
 
@@ -75,31 +68,20 @@ class Config:
     """Fine-tune the committed tiny checkpoint on three canned turns instead."""
 
 
-def smoke_inputs(out: Path) -> tuple[str, Path]:
-    """A tokenizer with a chat template and the canned turns as JSONL.
-
-    The tokenizer is the fixture's own, so the ids stay inside the tiny
-    vocabulary; only the template is added.
-    """
-    tokenizer = out / "tokenizer"
-    tokenizer.mkdir(parents=True, exist_ok=True)
-    shutil.copy(SMOKE_SOURCE / "tokenizer.json", tokenizer / "tokenizer.json")
-    record = json.loads((SMOKE_SOURCE / "tokenizer_config.json").read_text())
-    (tokenizer / "tokenizer_config.json").write_text(
-        json.dumps({**record, "chat_template": SMOKE_TEMPLATE}, indent=2))
-
+def smoke_conversations(out: Path) -> Path:
+    """The canned turns as the JSONL `ChatMessages` reads line by line."""
     jsonl = out / "chat.jsonl"
     jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in CONVERSATIONS))
-    return str(tokenizer), jsonl
+    return jsonl
 
 
 def main(config: Config) -> Path:
     if config.smoke:
         config.out.mkdir(parents=True, exist_ok=True)
-        tokenizer, jsonl = smoke_inputs(config.out)
-        config = replace(config, model=str(SMOKE_SOURCE), chat=str(jsonl), prompt_tokens=8,
-                         canvases=2, batch_size=2, steps=2, rank=2, alpha=4.0,
-                         response_tokens=4)
+        tokenizer = str(SMOKE_SOURCE)
+        config = replace(config, model=tokenizer, chat=str(smoke_conversations(config.out)),
+                         prompt_tokens=8, canvases=2, batch_size=2, steps=2, rank=2,
+                         alpha=4.0, response_tokens=4)
     else:
         tokenizer = config.model
         if config.chat is None:
