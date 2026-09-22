@@ -405,16 +405,21 @@ def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
     """257 tokens is three tiles; rounding per tile would lose the last ones.
 
     A bf16 head gradient rounds once at the end, which 1e-5 would not admit.
+    The products run at HIGHEST: at the default precision bf16 compute rounds
+    the logits' cotangent to bf16 inside each product, and a cotangent that
+    lands on the other side of a rounding boundary in the recomputed tile
+    moves a cancelling sum by more than this bound, whatever the tiling.
     """
     hidden, head, targets = inputs(vocab=17, features=7, tokens=(257,), dtype=dtype)
     head = head.astype(dtype)
+    precision = jax.lax.Precision.HIGHEST
 
     def full(states, matrix):
-        return jnp.mean(oracle(states, matrix, targets)[0])
+        return jnp.mean(oracle(states, matrix, targets, precision=precision)[0])
 
     def tiled(states, matrix):
-        return jnp.mean(
-            chunked_cross_entropy(states, matrix, targets, 4, tile=RAGGED)[0])
+        return jnp.mean(chunked_cross_entropy(
+            states, matrix, targets, 4, tile=RAGGED, precision=precision)[0])
 
     expected = jax.grad(full, argnums=(0, 1))(hidden, head)
     got = jax.grad(tiled, argnums=(0, 1))(hidden, head)
