@@ -52,6 +52,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
+from flax.core import unfreeze
 from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.typing import ArrayLike
@@ -436,6 +437,36 @@ class Server:
     @property
     def queued(self) -> int:
         return len(self._queue)
+
+    def reload(self, variables: Variables) -> None:
+        """Serve `variables` from the next step on, in place of the current weights.
+
+        The tree must match the served one leaf for leaf in shape, and a
+        floating leaf is cast to the served precision (train in float32,
+        serve in bfloat16), so the compiled step runs on unchanged. The leaves
+        are copied onto the served placement: the caller may donate or
+        overwrite its own buffers right after this returns. Rows already running keep their cache and
+        draw their next token from the new weights; a caller that stamps a
+        policy version on a request takes the version it was submitted under.
+        Not thread-safe against `step`: the caller serializes the two.
+        """
+        # Frozen or plain mappings hold the same variables; compare them as plain ones.
+        incoming, served = unfreeze(variables), unfreeze(self.variables)
+        if jax.tree.structure(incoming) != jax.tree.structure(served):
+            raise ValueError("reloaded variables must have the served tree structure")
+        leaves = []
+        for new, old in zip(jax.tree.leaves(incoming), jax.tree.leaves(served), strict=True):
+            kind, served_kind = jnp.result_type(new), jnp.result_type(old)
+            if np.shape(new) != np.shape(old) or (kind != served_kind and not (
+                    jnp.issubdtype(kind, jnp.floating) and jnp.issubdtype(served_kind, jnp.floating))):
+                raise ValueError(
+                    f"a reloaded leaf is {kind}{list(np.shape(new))}, "
+                    f"the served leaf {served_kind}{list(np.shape(old))}")
+            # A placement can alias a shard of the caller's array; the copy
+            # owns its buffer whatever the caller donates next.
+            placement = old.sharding if isinstance(old, jax.Array) else None
+            leaves.append(jnp.array(jax.device_put(new, placement), dtype=served_kind, copy=True))
+        self.variables = jax.tree.unflatten(jax.tree.structure(self.variables), leaves)
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
                key: jax.Array | None = None, seed: int | None = None) -> Ticket:
