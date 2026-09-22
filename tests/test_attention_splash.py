@@ -10,9 +10,9 @@ Mosaic instead, because the interpreter is exactly what `jax.default_backend()
 is not worth running; `tools/qualify_splash.py` is that run plus a timing.
 
 The reference is `attention_impl 'reference'`, the einsum and softmax path,
-in the same dtype. fp32 holds to a few parts in a million and bf16 to one
-ulp of the output scale, which is the distance the cudnn parity in
-tests/test_kernels.py pins between two correct kernels.
+run in fp32 on the same inputs. fp32 holds to a few parts in a million and
+bf16 to two ulps of the output scale, which is the distance the cudnn parity
+in tests/test_kernels.py pins between two correct kernels.
 """
 
 import jax
@@ -40,6 +40,16 @@ on_tpu = pytest.mark.skipif(jax.default_backend() != 'tpu',
 # case below, forward and in all three gradients. The distance is the order
 # splash sums its blocks in, not an approximation: it runs the same fp32
 # softmax the reference does.
+#
+# That is why the reference runs in fp32 on the bf16 inputs rather than in
+# bf16. Splash keeps its logits, softmax and accumulators in fp32 whatever it
+# reads, so the fp32 attention of the same bf16 numbers is what it computes.
+# The reference in bf16 is a different computation whose distance from it
+# depends on the backend: XLA:CPU widens the bf16 dots and drops the rounding
+# between them, so there it equals the fp32 path exactly, while XLA:GPU rounds
+# the logits and the probabilities to bf16 as written, which alone moves a
+# query gradient by 2% of its scale (2^-5.5), outside the bound, while splash
+# sits at 2^-8 from the fp32 attention on both backends.
 TOLERANCE = {jnp.bfloat16: 2. ** -6, jnp.float32: 2. ** -18}
 
 
@@ -58,6 +68,12 @@ def value_and_grads(implementation, query, key, value, **kwargs):
     (_, out), grads = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True))(
         query, key, value)
     return [np.asarray(x, np.float32) for x in (out, *grads)]
+
+
+def reference(query, key, value, **kwargs):
+    """The reference attention of these inputs, computed in fp32."""
+    return value_and_grads('reference', *(x.astype(jnp.float32) for x in (query, key, value)),
+                           **kwargs)
 
 
 def assert_agrees(splash, reference, dtype):
@@ -80,7 +96,7 @@ def test_splash_computes_the_reference_attention(dtype, structure):
     and in all three gradients, in both dtypes."""
     query, key, value = qkv((2, 256, 4, 64), dtype)
     assert_agrees(value_and_grads('tpu', query, key, value, **structure),
-                  value_and_grads('reference', query, key, value, **structure), dtype)
+                  reference(query, key, value, **structure), dtype)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -92,7 +108,7 @@ def test_splash_groups_key_heads_without_repeating_them(dtype):
     query, _, _ = qkv((2, 256, 8, 64), dtype)
     _, key, value = qkv((2, 256, 2, 64), dtype, seed=1)
     assert_agrees(value_and_grads('tpu', query, key, value, causal=True),
-                  value_and_grads('reference', query, key, value, causal=True), dtype)
+                  reference(query, key, value, causal=True), dtype)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -101,7 +117,7 @@ def test_splash_reads_a_key_sequence_of_its_own_length(dtype):
     separately, so the two lengths take their own block size."""
     query, key, value = qkv((2, 256, 4, 64), dtype, kv_shape=(2, 512, 4, 64))
     assert_agrees(value_and_grads('tpu', query, key, value),
-                  value_and_grads('reference', query, key, value), dtype)
+                  reference(query, key, value), dtype)
 
 
 @on_tpu
@@ -114,7 +130,7 @@ def test_the_mosaic_kernel_agrees_at_a_length_only_a_tpu_affords(dtype):
     trains at and far past what the interpreter is worth running."""
     query, key, value = qkv((1, 2048, 8, 128), dtype)
     assert_agrees(value_and_grads('tpu', query, key, value, causal=True),
-                  value_and_grads('reference', query, key, value, causal=True), dtype)
+                  reference(query, key, value, causal=True), dtype)
 
 
 def segment_mask(lengths, length):
@@ -134,8 +150,7 @@ def test_splash_carries_a_packed_batch_as_dense_mask_blocks(dtype):
     query, key, value = qkv((2, 256, 4, 64), dtype)
     packed = segment_mask((100, 84, 72), 256)
     assert_agrees(value_and_grads('tpu', query, key, value, mask=packed, causal=True),
-                  value_and_grads('reference', query, key, value, mask=jnp.asarray(packed),
-                                  causal=True), dtype)
+                  reference(query, key, value, mask=jnp.asarray(packed), causal=True), dtype)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -150,8 +165,8 @@ def test_splash_leaves_padded_rows_out_of_the_real_rows(dtype):
     valid = np.zeros((1, 1, 256, 256), bool)
     valid[..., :real] = True
     splash = value_and_grads('tpu', query, key, value, mask=valid, causal=True)
-    reference = value_and_grads('reference', query, key[:, :real], value[:, :real], causal=True)
-    assert_agrees([splash[0][:, :real]], [reference[0][:, :real]], dtype)
+    expected = reference(query, key[:, :real], value[:, :real], causal=True)
+    assert_agrees([splash[0][:, :real]], [expected[0][:, :real]], dtype)
 
 
 def dense(descriptor, heads, q_len, kv_len):
