@@ -21,11 +21,11 @@ python examples/train_flowers_tpu.py --data prepared/flowers-256 --steps 200000
 JAX_PLATFORMS=cpu python examples/train_flowers_tpu.py --smoke --out /tmp/flowers-smoke
 ```
 
-The smoke run writes synthetic captioned records, conditions on the tiny CLIP fixture and trains three steps. FID stays off there, because its Inception weights are a Hub download rather than a committed fixture; `--score-fid` turns it back on once they are cached.
+The smoke run writes synthetic captioned records, conditions on the tiny CLIP fixture and trains three steps. Both metrics read a committed fixture rather than a download: the tiny CLIP tower, and the FID extractor `--inception-weights` names, which is an InceptionV3 at a sixteenth of every channel width with drawn parameters. Leave that flag unset for a real run and the published checkpoint comes down.
 
 ## LoRA SFT of DiffusionGemma
 
-[`examples/sft_diffusion_gemma.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma.py) fine-tunes a DiffusionGemma checkpoint on chat data with a low-rank adapter. `load_pretrained` brings the base weights and their layouts, `LoRA.fresh` puts factors on the projections `--modules` names, `BlockDiffusionObjective` trains the adapted module with the adapter's own filter as `trainable`, and `Layout(host=("params",))` keeps the state in host memory between steps so only the factors move. `adapter.save` writes the PEFT directory, and the second half reads it back with `LoRA.load` onto base weights loaded through `dew.pipeline`, merges, and decodes a canvas.
+[`examples/sft_diffusion_gemma.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma.py) fine-tunes a DiffusionGemma checkpoint on chat data with a low-rank adapter. `load_pretrained` brings the base weights and their layouts, `LoRA.fresh` puts factors on the projections `--modules` names, `BlockDiffusionObjective` trains the adapted module with the adapter's own filter as `trainable`, and `Layout(host=("params",))` keeps the state in host memory between steps so only the factors move. The decoder is cloned to `scan_layers=True` for that: a host layout streams one layer per scan iteration, and a plain loop's fetches would be hoisted together onto the device. `adapter.save` writes the PEFT directory, and the second half reads it back with `LoRA.load` onto base weights loaded through `dew.pipeline`, merges, and decodes a canvas.
 
 ```bash
 python examples/sft_diffusion_gemma.py \
@@ -37,7 +37,7 @@ python examples/sft_diffusion_gemma.py \
 JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma.py --smoke --out /tmp/dg-smoke
 ```
 
-`--chat` is a parquet file whose `prompt` column holds conversations in the verl layout, which is what [`ChatMessages`](../concepts/data.md) renders with the checkpoint's chat template. The smoke run adds a template to the fixture's tokenizer, since no fixture tokenizer carries one.
+`--chat` is a Hub dataset id, a `.jsonl` file or a parquet file of conversations, which [`ChatMessages`](../concepts/data.md) reads and renders with the checkpoint's chat template. The conversations sit under the `messages` column, or the verl layout's `prompt` wherever a row carries that instead. The smoke run writes three canned turns as JSONL and renders them with the fixture tokenizer's own template.
 
 ## Full-weight SFT of a Gemma 4 decoder
 
@@ -54,7 +54,7 @@ python -m dew.eval --model dew --model_args run=runs/gemma4-sft/gemma4-sft \
 JAX_PLATFORMS=cpu python examples/sft_gemma4.py --smoke --out /tmp/gemma4-smoke
 ```
 
-The Hub split comes down through `HFOptions` and is written as the parquet `ChatMessages` reads: that spec reads a local file, and the `hf` provider hands back raw rows with no chat template behind them. The smoke run writes its conversations as JSONL, converts them, and fine-tunes the committed tiny Gemma 4 for two steps.
+`--dataset` goes to `ChatMessages` as it stands: the spec resolves a Hub id through `HFOptions`, the same value the `hf` provider forwards, and renders each conversation with the checkpoint's chat template. `--rows` is the split slice `datasets` already understands. The smoke run writes its canned conversations as JSONL and fine-tunes the committed tiny Gemma 4 for two steps.
 
 ## Scoring and serving a finished run
 
@@ -71,4 +71,4 @@ python examples/evaluate_and_serve.py --run runs/shakespeare/lm-shakespeare \
 JAX_PLATFORMS=cpu python examples/evaluate_and_serve.py --smoke --out /tmp/eval-smoke
 ```
 
-The smoke run trains a two-step byte-level model first and scores that, so the script has a run to read without one being prepared for it.
+The smoke run trains a two-step byte-level model first and scores that, so the script has a run to read without one being prepared for it. Pointed at a diffusion run with `--image-run`, it scores CLIPScore and FID offline too: a smoke has no held-out set, so the reference population is a second draw of the same run, which measures the metric and not the model.

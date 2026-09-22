@@ -38,6 +38,7 @@ nav:
       - Inference: concepts/inference.md
       - SFT, DPO, and GRPO: concepts/post_training.md
       - Training recipes: recipes.md
+      - End-to-end examples: guides/end-to-end.md
       - TPU setup: tpu.md
       - Moving from FlaxDiff: from-flaxdiff.md
   - Concepts:
