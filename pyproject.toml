@@ -13,7 +13,7 @@ authors = [
 ]
 dependencies = [
     "flax>=0.12.9",
-    "jax>=0.11.1",
+    "jax>=0.11.2",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
