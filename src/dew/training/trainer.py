@@ -434,11 +434,13 @@ class Trainer(Generic[Loss, Effects]):
         transient is one leaf, not the tree, and one JIT could not have
         returned to the two device sets anyway.
         """
+        from dew.training.execution import bank_bytes, check_bank_pool
         from dew.training.host import evict, place_leaf, stream, transfer
         held = self.objective.held_variables()
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
             if FROZEN in state.params:
+                check_bank_pool(bank_bytes(state.params[FROZEN], self.bank_sites), self.device_mesh)
                 # A scanned run's frozen rows become its bank here and the
                 # bank lands where it stays resident before the next is
                 # stacked, so the host holds one bank in transit, not the
