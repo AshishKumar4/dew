@@ -124,7 +124,7 @@ class Config:
     """Updates averaged at each end of the run for the reward comparison."""
     vllm: str = "vllm"
     port: int = 8011
-    vllm_memory: float = 0.25
+    vllm_memory: float = 0.12
     """vLLM's --gpu-memory-utilization; the trainer takes the rest."""
     seed: int = 0
     smoke: bool = False
@@ -192,7 +192,9 @@ def main(config: Config) -> dict:
         weights = SafetensorsReload(source, directory, root)
         weights.write(source.variables)
         vllm = launch_vllm(config, directory)
-        completion = OpenAICompletion("policy", openai.OpenAI(base_url=f"{root}/v1", api_key="none", max_retries=0,
+        # A seeded request is safe to resend, so the SDK's retries cover a
+        # keep-alive connection the server closed between requests.
+        completion = OpenAICompletion("policy", openai.OpenAI(base_url=f"{root}/v1", api_key="none", max_retries=3,
                                                               timeout=600), provider="vllm")
         server = OpenAIRolloutServer(completion, sampling, weights, workers=config.prompts * config.groups * 2)
     else:
