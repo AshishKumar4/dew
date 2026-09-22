@@ -305,6 +305,13 @@ class MultimodalTransformer(nn.Module):
                       conditioning: Mapping[str, jax.Array] | None = None,
                       attention_mask=None, image_groups=None, rotary_positions=None,
                       audio_indices=None):
+        """Run the decoder over text with the media embeddings spliced in.
+
+        `conditioning` holds the towers' payloads and `image_indices` and
+        `audio_indices` say which token positions each one replaces. A
+        decode step tracks the next position in the `cache` collection,
+        because a media span advances a row by more than one token.
+        """
         if self.family == "gemma4":
             placeholder = tokens == self.image_token_id
             for token_id in self.extra_placeholder_ids:

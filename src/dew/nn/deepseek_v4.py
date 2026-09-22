@@ -3,15 +3,14 @@ a compressor.
 
 The reference is transformers 5.16.1
 `models/deepseek_v4/modeling_deepseek_v4.py`, read as the specification.
-Every layer is one attention (`DeepseekV4Attention`, :746-864): a low-rank
-query (`q_a_proj`, its RMSNorm, `q_b_proj`) normed per head without a
-weight (:780), one shared key/value head (`kv_proj` then `kv_norm`, :781-782)
-that is read as both key and value, rotary positions on the trailing
-`rope_head_dim` of each head in interleaved pairs (:326-350), a per-head
-attention sink beside the logits (:708-736), the values de-rotated at the
-query's position after the softmax (:853-859, since the values are the
-rotated keys), and a grouped low-rank output projection (:294-323,
-:861-863). A sliding layer attends the last `sliding_window` positions,
+Every layer is one attention (`DeepseekV4Attention`, :746-864). The query is
+low-rank and normed per head without a weight. One key/value head is shared
+by every query head. Rotary positions turn the trailing `rope_head_dim` of
+each head in interleaved pairs. A learned sink sits beside the logits. The
+values are the rotated keys, so the output is de-rotated at the query's
+position after the softmax. The output projection is grouped and low-rank.
+
+A sliding layer attends the last `sliding_window` positions,
 its own included (masking_utils sliding_window_overlay). A compressed layer
 concatenates onto those keys the entries its compressor emits, one per
 window of `compress_rate` tokens (:353-435 the heavily compressed HCA
@@ -38,7 +37,15 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.nn.attention import RMSNorm, _cache_positions, _write_cache, causal_attention_mask, rotary_freqs
+from dew.nn.attention import (
+    RMSNorm,
+    _cache_positions,
+    _write_cache,
+    causal_attention_mask,
+    document_mask,
+    rotary_freqs,
+    unweighted_rmsnorm,
+)
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, top_k_keys, yarn_inv_freq
@@ -82,14 +89,6 @@ def rotate_trailing(x, cos, sin):
     first, second = rope[..., 0], rope[..., 1]
     rotated = jnp.stack([first * cos - second * sin, second * cos + first * sin], axis=-1)
     return jnp.concatenate([x[..., :-2 * pairs], rotated.reshape(*lead, 2 * pairs).astype(x.dtype)], axis=-1)
-
-
-def unweighted_rmsnorm(x, eps: float):
-    """`x * rsqrt(mean(x^2) + eps)` with no scale, in fp32
-    (`DeepseekV4UnweightedRMSNorm`, modeling_deepseek_v4.py:66-72)."""
-    fp32 = x.astype(jnp.float32)
-    inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
-    return x * inverse.astype(x.dtype)
 
 
 def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
@@ -505,8 +504,7 @@ class DeepseekV4Attention(nn.Module):
                 slots, keys.shape[1], self.sliding_window,
                 key_valid=self.get_variable('cache', 'cache_valid'))[:, 0]
         if segment_ids is not None:
-            segment_ids = jnp.asarray(segment_ids)
-            allowed = allowed & (segment_ids[:, :, None] == segment_ids[:, None, :]) & (segment_ids[:, :, None] != 0)
+            allowed = allowed & document_mask(segment_ids)
         if valid is not None and not decode:
             allowed = allowed & valid[:, None, :]
 

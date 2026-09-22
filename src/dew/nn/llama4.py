@@ -22,6 +22,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import (
     RopeScaling,
     causal_attention_mask,
+    document_mask,
     open_kv_cache,
     rotary_freqs,
     scaled_dot_product_attention,
@@ -162,9 +163,7 @@ class Llama4Attention(nn.Module):
                 positions, key.shape[-3], key_valid=self.get_variable("cache", "cache_valid"))
             causal = False
         elif segment_ids is not None:
-            segment_ids = jnp.asarray(segment_ids)
-            inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])
-                      & (segment_ids[:, :, None] != 0))[:, None]
+            inside = document_mask(segment_ids)[:, None]
             mask = inside
             if causal:
                 mask = jnp.logical_and(inside, causal_attention_mask(jnp.arange(length), length))

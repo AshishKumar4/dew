@@ -44,14 +44,9 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .inputs import AttentionMetadata
-from .linear import CHUNK_SIZE, DepthwiseConv1d, RMSNormGated, _masked_conv1d, causal_conv1d
+from .linear import CHUNK_SIZE, DepthwiseConv1d, RMSNormGated, _masked_conv1d, causal_conv1d, l2norm
 from .mixers import MixerBase, MixerContext, mixers
 from .sharding import logical_axes
-
-
-def kda_l2norm(x, eps: float = 1e-6):
-    """`x / sqrt(sum x^2 + eps)`, the reference's spelling (modeling_glm5_next.py:423-424)."""
-    return x / jnp.sqrt(jnp.sum(jnp.square(x), axis=-1, keepdims=True) + eps)
 
 
 def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE):
@@ -260,7 +255,7 @@ class KimiDeltaAttention(nn.Module):
         mixed = jnp.moveaxis(mixed, 2, 1)
         query, key, value = (part.reshape(B, S, self.num_heads, self.head_dim)
                              for part in jnp.split(mixed, 3, axis=-1))
-        query, key = kda_l2norm(query), kda_l2norm(key)
+        query, key = l2norm(query), l2norm(key)
         g = self._decay(x)
         beta = nn.sigmoid(self.b_proj(x).astype(jnp.float32))
         if valid is not None:

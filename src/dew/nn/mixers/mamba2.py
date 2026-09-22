@@ -1,17 +1,18 @@
 """Mamba-2: the structured state-space duality mixer (Dao & Gu 2024).
 
-An SSD layer is a linear recurrence over a `[P, N]` state per head: with a
-scalar decay `a_t = exp(dt_t * A)` per head and step, the state reads
+An SSD layer is a linear recurrence over a `[P, N]` state per head:
 
     S_t <- a_t S_t-1 + dt_t x_t B_t^T          y_t = S_t C_t + D x_t
 
-where `x_t` is `[P]` (the head's channels), `B_t` and `C_t` are `[N]`
-(shared by the `H // G` heads of one group) and `dt_t = softplus(dt_raw +
-dt_bias)` is the selective step. `A = -exp(A_log)` is one scalar per head,
-so the decay is a scalar times the identity, which is what makes the
-chunked form a masked matmul: within a chunk the output is the "attention"
-`(C B^T * L) x` with `L[i, j] = exp(sum_{j<k<=i} dt_k A)`, and the chunk's
-state crosses to the next through one decayed rank-N write.
+`a_t = exp(dt_t * A)` is a scalar decay per head and step. `x_t` is `[P]`,
+the head's channels. `B_t` and `C_t` are `[N]`, shared by the `H // G` heads
+of a group. `dt_t = softplus(dt_raw + dt_bias)` is the selective step.
+
+`A = -exp(A_log)` is one scalar per head, so the decay is a scalar times the
+identity. That is what makes the chunked form a masked matmul: within a
+chunk the output is the "attention" `(C B^T * L) x` with
+`L[i, j] = exp(sum_{j<k<=i} dt_k A)`, and the chunk's state crosses to the
+next through one decayed rank-N write.
 
 dew computes transformers 5.16.1's `mamba2_chunk_scan`
 (modeling_mamba2.py:254-357) in the same order: `segment_sum` as its masked

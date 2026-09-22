@@ -77,6 +77,19 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
     return mask[:, None]
 
 
+def document_mask(segment_ids) -> jax.Array:
+    """Keep each packed document to itself: `[B, S, S]` boolean.
+
+    Two positions see each other when they carry the same segment id.
+    Segment 0 is padding, which sees nothing and is seen by nothing. A
+    packed batch carries its structure here, so the caller ANDs causality
+    in rather than handing the kernels their causal flag.
+    """
+    segment_ids = jnp.asarray(segment_ids)
+    return ((segment_ids[:, :, None] == segment_ids[:, None, :])
+            & (segment_ids[:, :, None] != 0))
+
+
 def combined_attention_mask(query_length: int, key_length: int, causal: bool,
                             sliding_window: int | None,
                             mask: jax.Array | None) -> jax.Array | None:
@@ -183,6 +196,18 @@ def layer_normalized(x, scale, bias, epsilon: float, dtype):
     if bias is not None:
         y = y + jnp.reshape(bias, width)
     return y.astype(dtype)
+
+
+def unweighted_rmsnorm(x, eps: float):
+    """Normalize the last axis by its root mean square, with no learned weight.
+
+    The reduction runs in fp32 and the inverse deviation is cast back
+    before it multiplies, which is what `DeepseekV4UnweightedRMSNorm`
+    (modeling_deepseek_v4.py:66-72) and its GLM twin do.
+    """
+    fp32 = x.astype(jnp.float32)
+    inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
+    return x * inverse.astype(x.dtype)
 
 
 class RMSNorm(nn.Module):

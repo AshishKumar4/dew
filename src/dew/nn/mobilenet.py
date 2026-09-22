@@ -33,11 +33,21 @@ from .sharding import logical_axes
 
 
 def _divisible(channels: float) -> int:
+    """Round a channel count to a multiple of 8, never below 90% of it.
+
+    This is timm's `make_divisible`, which every width in the architecture
+    passes through, so a scaled model keeps channel counts the kernels tile.
+    """
     rounded = max(8, int(channels + 4) // 8 * 8)
     return rounded + 8 if rounded < 0.9 * channels else rounded
 
 
 def _padding(kind: str, kernel: int):
+    """Translate timm's `pad_type` into flax's padding argument.
+
+    The empty string is timm's symmetric half-kernel padding, which is not
+    'SAME' for an even stride.
+    """
     if kind == "same":
         return "SAME"
     if kind == "valid":
@@ -50,6 +60,11 @@ def _padding(kind: str, kernel: int):
 def _conv(features: int, kernel: int, *, stride: int = 1, groups: int = 1,
           padding: str = "same", bias: bool = False, dtype: Dtype | None = None,
           precision: PrecisionLike = None, name: str) -> nn.Conv:
+    """Build a square convolution with timm's fan-out initializer.
+
+    The initializer's gain counts the groups, because a depthwise kernel's
+    fan-out is its own group's alone.
+    """
     return nn.Conv(
         features, (kernel, kernel), strides=(stride, stride),
         padding=_padding(padding, kernel), feature_group_count=groups,
@@ -59,6 +74,7 @@ def _conv(features: int, kernel: int, *, stride: int = 1, groups: int = 1,
 
 
 def _gelu(x):
+    """Apply the tanh-approximate GELU, evaluated in at least fp32."""
     # Torch's fused GELU evaluates the polynomial in fp32 for bf16/fp16
     # inputs. A bf16 polynomial changes its negative tail before rounding.
     compute = jnp.promote_types(x.dtype, jnp.float32)

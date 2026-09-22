@@ -87,7 +87,7 @@ def global_router_loss(stats: RouterMoments, alpha: float) -> jax.Array:
 
 def sequence_router_losses(scores: jax.Array, indices: jax.Array,
                            alpha: float) -> jax.Array:
-    """One DeepSeek V2 load-times-score loss per intact sequence."""
+    """Compute one DeepSeek V2 load-times-score loss per intact sequence."""
     _, length, experts = scores.shape
     scores = scores.astype(jnp.promote_types(scores.dtype, jnp.float32))
     chosen = jax.nn.one_hot(indices, experts, dtype=scores.dtype)
@@ -96,11 +96,12 @@ def sequence_router_losses(scores: jax.Array, indices: jax.Array,
 
 
 def deepseek_v2_aux_loss(scores, indices, alpha: float, seq_aux: bool = True):
-    """DeepSeek V2 expert balance (arXiv 2405.04434, section 2.1.4).
+    """Score DeepSeek V2's expert balance (arXiv 2405.04434, section 2.1.4).
 
     Scores are [batch, sequence, experts], choices [batch, sequence, top_k].
-    seq_aux forms the product within each sequence before averaging rows.
-    The global variant pools all routed positions before forming the product.
+    `seq_aux` forms the product within each sequence before averaging rows.
+    The global variant pools all routed positions before forming the
+    product.
     """
     if seq_aux:
         return jnp.mean(sequence_router_losses(scores, indices, alpha))
@@ -159,7 +160,7 @@ def load_balance_update(counts: jax.Array, rate: jax.typing.ArrayLike) -> jax.Ar
 
 
 class Router(nn.Module):
-    """Which experts a token goes to, and with what weight: `[..., k]` of each.
+    """Choose which experts a token goes to, and with what weight: `[..., k]`.
 
     The gate projection runs in fp32 whatever dtype the activations carry,
     as DeepSeek's router does (`modeling_deepseek_v3.py:146`).
@@ -483,18 +484,20 @@ def expert_dispatch[Parameters](
         x: jax.Array, indices: jax.Array, parameters: Parameters, *,
         num_experts: int, dispatch: str, output_dtype: Dtype,
         input_weights: jax.Array | None = None, initializing: bool = False) -> jax.Array:
-    """Run residual experts and return every selected slot in token order.
+    """Run every routed token through its expert, and return the slots in
+    token order.
 
-    `project` receives rows sorted by expert, group sizes, sorted expert IDs
-    and expert-major parameter leaves. Its output preserves the input width.
-    IDs are local to the owner under exchange; padding uses num_local_experts
-    and is discarded before the return exchange. The caller owns activation,
-    bias and output-weight arithmetic. Optional input weights are applied
-    before dispatch, as in Llama 4.
+    `project` takes rows sorted by expert, the group sizes, the sorted
+    expert ids and the expert-major parameters, and returns rows of the same
+    width. The caller owns the activation, the biases and the output
+    weights; `input_weights` scales each expert's input instead, as Llama 4
+    does.
 
-    With S expert shards and L local routing slots, each all-to-all carries
-    S * ceil(L/S) rows. At most S rounds drain every destination bucket;
-    capacity bounds messages, never the number of accepted assignments.
+    `dispatch='global'` sorts and gathers locally. `'exchange'` runs `shards`
+    rounds of all-to-all over the expert mesh axis, each carrying one
+    capacity-sized buffer per shard, so no expert capacity drops tokens.
+    Expert ids are local to their owner under exchange, and the padding that
+    fills a round is discarded before the return exchange.
     """
     if dispatch not in EXPERT_DISPATCHES:
         raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {dispatch!r}")
