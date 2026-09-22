@@ -208,7 +208,8 @@ class ConditioningEmbed(nn.Module):
     def setup(self):
         self.time_embed = nn.Sequential([
             FourierEmbedding(features=self.emb_features),
-            TimeProjection(features=self.emb_features * self.mlp_ratio),
+            TimeProjection(features=self.emb_features * self.mlp_ratio,
+                           dtype=self.dtype, precision=self.precision),
             nn.Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
         ], name="time_embed")
         self.text_proj = nn.Dense(

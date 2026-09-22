@@ -51,11 +51,15 @@ class TimeProjection(nn.Module):
     """Two dense layers with the activation after each."""
     features: int
     activation: Callable = jax.nn.gelu
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, x):
-        x = self.activation(nn.DenseGeneral(self.features)(x))
-        return self.activation(nn.DenseGeneral(self.features)(x))
+        dense = partial(nn.DenseGeneral, self.features,
+                        dtype=self.dtype, precision=self.precision)
+        x = self.activation(dense()(x))
+        return self.activation(dense()(x))
 
 
 def torch_nearest_resize(x, height: int, width: int):

@@ -26,7 +26,8 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
     into the 3D model.
     """
     temb = FourierEmbedding(features=model.emb_features)(temb)
-    temb = TimeProjection(features=model.emb_features)(temb)
+    temb = TimeProjection(features=model.emb_features, dtype=model.dtype,
+                          precision=model.precision)(temb)
 
     feature_depths = model.feature_depths
     attention_configs = model.attention_configs

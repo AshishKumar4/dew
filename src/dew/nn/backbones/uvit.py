@@ -90,7 +90,8 @@ class UViT(nn.Module):
 
         self.time_embed = nn.Sequential([
             FourierEmbedding(features=self.emb_features),
-            TimeProjection(features=self.emb_features)
+            TimeProjection(features=self.emb_features,
+                           dtype=self.dtype, precision=self.precision)
         ], name="time_embed")
 
         self.text_proj = nn.DenseGeneral(
