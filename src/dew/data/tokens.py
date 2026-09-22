@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from typing import Callable, Iterator, overload
+from typing import Callable, Iterator, Mapping, overload
 
 import grain.python as pygrain
 import numpy as np
@@ -31,12 +31,16 @@ from dew.registry import datasets
 
 from .dataset import (
     Batch,
+    Corpus,
     Dataset,
     DatasetSpec,
     Forwarding,
     Tokenize,
     describe,
     local_batch,
+    mixed_records,
+    mixed_stream,
+    mixture,
     train_stream,
     validation_pass,
 )
@@ -332,12 +336,22 @@ class PackedTokens(DatasetSpec):
     window is the same in every run over that corpus; the seed decides only
     the order the windows come in.
 
+    `path` names one tokenized directory, or several with the share of a
+    step each fills, MaxText's weighted `grain_train_files`. Each corpus is
+    packed by its own plan, so a window holds one corpus's documents, and
+    `mixture` interleaves the windows at their weights ahead of the shard:
+    the weights are shares of the windows, and so of the tokens, a step
+    reads, and a position is still one global window count. The corpora
+    have to come from one tokenizer, which their `meta.json` records.
+
     `records` counts the windows a pass over the split holds, exactly, so
-    `steps_per_epoch` is that pass. `val_batches` bounds a validation pass;
-    None scores the whole split.
+    `steps_per_epoch` is that pass; a mixture's pass is the windows in which
+    every corpus has been read at least once (`mixed_records`).
+    `val_batches` bounds a validation pass; None scores the whole split, a
+    mixture's split mixed at the same weights, each corpus in its own order.
     """
 
-    path: str | None = None
+    path: str | Mapping[str, float] | None = None
     seq_len: int = 256
     val_batches: int | None = 4
     field: str | None = None
@@ -348,10 +362,15 @@ class PackedTokens(DatasetSpec):
     in a window and let documents further apart in the file share one."""
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        from .sources.text import TokenDocumentSource, token_corpus
+        from .sources.text import TokenDocumentSource, same_tokenizer, token_corpus
 
         self.uncaptioned(tokenize)
-        corpus, held_out = token_corpus(self.path, "PackedTokens", field=self.field)
+        weighted = ({} if self.path is None else {self.path: 1.0} if isinstance(self.path, str)
+                    else {path: self.path[path] for path in sorted(self.path)})
+        if not weighted or not all(weighted):
+            raise ValueError("PackedTokens needs path= set to the directory "
+                             "tools/tokenize_text.py wrote, or several with weights")
+        same_tokenizer(list(weighted))
         rows, window = local_batch(batch), self.seq_len + 1
 
         # One source per split, and one plan over it. Finding the boundaries
@@ -362,12 +381,25 @@ class PackedTokens(DatasetSpec):
             return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
                                  self.packing_bins, describe(source))
 
-        train, validation = packed(corpus), packed(held_out)
-
+        splits = {path: token_corpus(path, "PackedTokens", field=self.field)
+                  for path in weighted}
+        train = [Corpus(path, packed(corpus), weight)
+                 for (path, weight), (corpus, _) in zip(weighted.items(), splits.values(),
+                                                        strict=True)]
+        held = [Corpus(path, packed(held_out), weight)
+                for (path, weight), (_, held_out) in zip(weighted.items(), splits.values(),
+                                                         strict=True)]
+        if len(train) == 1:
+            stream = train_stream(train[0].source, [], batch=rows, seed=self.seed,
+                                  loading=self.loading)
+            validation, records = held[0].source, len(train[0].source)
+        else:
+            stream = mixed_stream(train, [], batch=rows, seed=self.seed, loading=self.loading)
+            validation, records = mixture(held, None), mixed_records(train)
         return Dataset(
-            train=train_stream(train, [], batch=rows, seed=self.seed, loading=self.loading),
+            train=stream,
             val=bounded(validation_pass(validation, [], batch=rows, seed=self.seed,
                                         loading=self.loading), self.val_batches),
-            records=len(train),
+            records=records,
             batch=batch,
         )
