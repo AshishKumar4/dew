@@ -25,7 +25,7 @@ The smoke run writes synthetic captioned records, conditions on the tiny CLIP fi
 
 ## LoRA SFT of DiffusionGemma
 
-[`examples/sft_diffusion_gemma.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma.py) fine-tunes a DiffusionGemma checkpoint on chat data with a low-rank adapter. `load_pretrained` brings the base weights and their layouts, `dew.lora.fresh` puts factors on the projections `--modules` names, `BlockDiffusionObjective` trains the adapted module with the adapter's own filter as `trainable`, and `Layout(host=("params",))` keeps the state in host memory between steps so only the factors move. `dew.lora.save` writes the PEFT directory, and the second half reads it back onto base weights loaded through `dew.pipeline`, merges, and decodes a canvas.
+[`examples/sft_diffusion_gemma.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma.py) fine-tunes a DiffusionGemma checkpoint on chat data with a low-rank adapter. `load_pretrained` brings the base weights and their layouts, `LoRA.fresh` puts factors on the projections `--modules` names, `BlockDiffusionObjective` trains the adapted module with the adapter's own filter as `trainable`, and `Layout(host=("params",))` keeps the state in host memory between steps so only the factors move. `adapter.save` writes the PEFT directory, and the second half reads it back with `LoRA.load` onto base weights loaded through `dew.pipeline`, merges, and decodes a canvas.
 
 ```bash
 python examples/sft_diffusion_gemma.py \

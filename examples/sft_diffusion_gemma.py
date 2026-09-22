@@ -11,7 +11,7 @@ beside its factors on one accelerator:
 `--chat` is a parquet file whose `prompt` column holds conversations in the
 verl layout, which is what `dew.data.ChatMessages` renders with the
 checkpoint's own chat template. The run writes two things: the PEFT adapter
-directory `dew.lora.save` produces, which transformers loads, and the merged
+directory `LoRA.save` produces, which transformers loads, and the merged
 checkpoint in the source's own layout, which `dew.pipeline` generates from.
 
     JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma.py --smoke --out /tmp/dg-smoke
@@ -27,9 +27,9 @@ import optax
 import tyro
 
 import dew
-from dew import lora
 from dew.data import ChatMessages, Loading
 from dew.interop import load_pretrained
+from dew.lora import LoRA
 from dew.objectives.base import thaw
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -115,7 +115,7 @@ def main(config: Config) -> Path:
 
     source = load_pretrained(config.model, dtype="bfloat16", param_dtype="float32")
     sequence_length = config.prompt_tokens + config.canvases * source.model.canvas_length
-    adapter, variables = lora.fresh(source.model, source.variables, source.layouts,
+    adapter, variables = LoRA.fresh(source.model, source.variables, source.layouts,
                                     rank=config.rank, alpha=config.alpha,
                                     modules=list(config.modules), key=jax.random.key(0))
     objective = BlockDiffusionObjective(
@@ -140,13 +140,13 @@ def main(config: Config) -> Path:
     checkpoints.wait()
 
     adapter_dir = config.out / "adapter"
-    lora.save(source.model, thaw(state.params), source.layouts, adapter, adapter_dir)
+    adapter.save(thaw(state.params), adapter_dir)
 
     # The other half of the workflow, from the files alone: the base weights
     # back through `dew.pipeline`, the adapter directory read onto them, and
     # the factors folded into the kernels so the task runs the base model.
     base = dew.pipeline(config.model, dtype="float32")
-    trained, weights = lora.load(base.model, base.variables, source.layouts, adapter_dir)
+    trained, weights = LoRA.load(base.model, base.variables, source.layouts, adapter_dir)
     task = base.bind(trained.merge(weights))
     generated = task(PROMPTS, config.response_tokens, seed=3)
     (config.out / "samples.txt").write_text("\n".join(task.decode(generated)) + "\n")
