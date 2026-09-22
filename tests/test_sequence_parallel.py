@@ -153,7 +153,7 @@ CALLS = {
 }
 
 
-def through(exchange, query, key, value, *, implementation=None, **call):
+def through(exchange, query, key, value, *, implementation="reference", **call):
     """One attention call through the named exchange, over the mesh's
     sequence axis, whichever the per-call choice would have taken."""
     kernel = functools.partial(attention_kernel, implementation=implementation)
@@ -164,7 +164,7 @@ def through(exchange, query, key, value, *, implementation=None, **call):
 
 
 @pytest.mark.parametrize("exchange", sorted(EXCHANGES))
-@pytest.mark.parametrize("implementation", [None, "xla"])
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
 @pytest.mark.parametrize("name", sorted(CALLS))
 def test_the_seam_agrees_with_whole_sequences(name, implementation, exchange):
     """The same output, row for row, whether the sequence axis is one or two:

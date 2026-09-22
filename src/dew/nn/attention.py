@@ -35,9 +35,10 @@ field, a module's `attention_impl`, and `scaled_dot_product_attention`'s
 dtype, precision and force_fp32_for_softmax. 'xla' and 'cudnn' are
 `jax.nn.dot_product_attention`'s own two. 'tpu' is the pallas splash kernel,
 with the older pallas flash kernel behind it for the calls splash's mask
-descriptor cannot carry. 'auto' resolves per trace to cudnn where its kernel
-runs, tpu where splash's does, and xla anywhere else. A module field spells
-'reference' as None, which is what a module built without the field set runs.
+descriptor cannot carry. 'auto', every module's default, resolves per trace
+(`resolve_implementation`): cudnn where its kernel runs, tpu where splash's
+does, the reference path where the call asks for arithmetic only it
+honours, and xla anywhere else.
 """
 
 
@@ -89,6 +90,19 @@ def document_mask(segment_ids) -> jax.Array:
     segment_ids = jnp.asarray(segment_ids)
     return ((segment_ids[:, :, None] == segment_ids[:, None, :])
             & (segment_ids[:, :, None] != 0))
+
+
+def chunk_mask(query_positions, key_positions, chunk_size: int):
+    """Boolean `[.., 1, T, S]` keeping keys in the query's chunk, both absolute.
+
+    transformers' `chunked_overlay`: `kv // chunk == q // chunk`, positions
+    counted from the sequence start, so a packed document's positions place
+    its chunks from its own first token.
+    """
+    query_chunks = jnp.asarray(query_positions) // chunk_size
+    key_chunks = jnp.asarray(key_positions) // chunk_size
+    same = query_chunks[..., :, None] == key_chunks[..., None, :]
+    return same[..., None, :, :] if same.ndim == 3 else same[None, None]
 
 
 def combined_attention_mask(query_length: int, key_length: int, causal: bool,
@@ -832,7 +846,7 @@ def softcapped_attention(query, key, value, softcap: float, dtype=None, precisio
 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
-                                 force_fp32_for_softmax=True, implementation=None,
+                                 force_fp32_for_softmax=True, implementation='auto',
                                  causal=False, sliding_window=None, mask=None, bias=None,
                                  sinks=None, softcap=None):
     """Attend over [B, S, H, D] queries, keys and values.
@@ -950,7 +964,7 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
 
 
 def attention_kernel(query, key, value, dtype=None, precision=None,
-                     force_fp32_for_softmax=True, implementation=None,
+                     force_fp32_for_softmax=True, implementation='auto',
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
                      softcap=None):
     """Dispatch one whole-sequence attention call to the kernel it names.
@@ -963,7 +977,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
     if sinks is not None:
-        if implementation not in (None, 'reference', 'auto', 'xla'):
+        if implementation not in ('reference', 'auto', 'xla'):
             raise ValueError(f"attention implementation '{implementation}' cannot honor sinks")
         if softcap is not None:
             raise ValueError(
@@ -975,14 +989,10 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             query, key, value, sinks, mask=mask, bias=bias, dtype=dtype,
             precision=precision, force_fp32_for_softmax=force_fp32_for_softmax)
 
-    if implementation == 'auto':
-        if cudnn_runs(query, softcap):
-            implementation = 'cudnn'
-        elif tpu_runs(query, key, softcap, causal=causal, sliding_window=sliding_window,
-                      mask=mask, bias=bias):
-            implementation = 'tpu'
-        else:
-            implementation = 'xla'
+    implementation = resolve_implementation(
+        implementation, query, key, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, causal=causal,
+        sliding_window=sliding_window, mask=mask, bias=bias)
     if softcap is not None and implementation in ('cudnn', 'tpu'):
         raise ValueError(
             f"attention implementation '{implementation}' cannot apply an "
@@ -998,7 +1008,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             "at execution time (openxla/xla#46500). Use attention_impl 'xla', "
             "which is deterministic, or drop the flag.")
 
-    if implementation in (None, 'reference') or softcap is not None:
+    if implementation == 'reference' or softcap is not None:
         heads = query.shape[-2]
         key = repeat_kv_heads(key, heads)
         value = repeat_kv_heads(value, heads)
@@ -1022,6 +1032,177 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         implementation, query, dtype, precision, force_fp32_for_softmax)
     return fused_attention(query, key, value, bias, mask, causal, sliding_window,
                            implementation)
+
+
+def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
+    """Whether a call asks for arithmetic only the reference path performs.
+
+    The three are what `refuse_reference_only_arguments` raises for: a
+    matmul precision above DEFAULT, a softmax outside fp32, and a compute
+    dtype other than the inputs'. A fused kernel runs none of them.
+    """
+    return (bool(precision_names(precision) & {'HIGH', 'HIGHEST'})
+            or not force_fp32_for_softmax
+            or (dtype is not None and jnp.dtype(dtype) != query.dtype))
+
+
+def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
+                           force_fp32_for_softmax=True, softcap=None, causal=False,
+                           sliding_window=None, mask=None, bias=None) -> str:
+    """The concrete kernel an `AttentionImpl` names for this call.
+
+    Only 'auto' chooses, against the call's shapes and this machine's
+    backend: the reference path when the call asks for arithmetic no fused
+    kernel performs (`reference_only`), else cudnn where `cudnn_runs`, the
+    tpu kernel where `tpu_runs`, and xla anywhere else. Any other name is
+    returned as it is, so an explicit kernel still refuses what it cannot
+    honour by name.
+    """
+    if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'tpu'):
+        raise ValueError(f"Unknown attention implementation: {implementation}")
+    if implementation != 'auto':
+        return implementation
+    if reference_only(query, dtype, precision, force_fp32_for_softmax):
+        return 'reference'
+    if cudnn_runs(query, softcap):
+        return 'cudnn'
+    if tpu_runs(query, key, softcap, causal=causal, sliding_window=sliding_window,
+                mask=mask, bias=bias):
+        return 'tpu'
+    return 'xla'
+
+
+def kernel_for_materialized_mask(implementation: str) -> str:
+    """Send a call that built an explicit mask to the xla kernel.
+
+    cuDNN has no mask argument: causality and the window are flags, and jax
+    hands the kernel a bool mask as an additive bias of -2**41 in the
+    compute dtype instead (`combine_bias_and_mask` in
+    jax/_src/cudnn/fused_attention_stablehlo.py). That also makes
+    `check_is_flash_attention` refuse an odd length while training. The xla
+    kernel masks by exclusion, on every backend and with the same fp32
+    softmax. It costs 83.6 ms and 5.80 GiB a step where the fixed window on
+    cuDNN costs 75.8 ms and 4.99 GiB (docs/concepts/language_models.md).
+    """
+    return 'xla' if implementation in ('auto', 'cudnn') else implementation
+
+
+def _blocks(x, block: int, blocks: int):
+    """`[B, S, ...]` padded at the end to `blocks * block` rows, as `[B, blocks, block, ...]`."""
+    x = jnp.pad(x, [(0, 0), (0, blocks * block - x.shape[1])] + [(0, 0)] * (x.ndim - 2))
+    return x.reshape(x.shape[0], blocks, block, *x.shape[2:])
+
+
+def _banded(x):
+    """Each block of `[B, n, W, ...]` behind the block before it: `[B, n, 2W, ...]`.
+
+    The first block's predecessor is zeros, whose rows are negative and so
+    outside every query's causal reach.
+    """
+    previous = jnp.pad(x[:, :-1], [(0, 0), (1, 0)] + [(0, 0)] * (x.ndim - 2))
+    return jnp.concatenate([previous, x], axis=2)
+
+
+def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
+                    positions=None, segment_ids=None, valid=None, dtype=None, precision=None,
+                    force_fp32_for_softmax=True, implementation='auto', sinks=None,
+                    softcap=None):
+    """Causal self-attention in which each query reads only nearby keys, in
+    memory linear in the sequence.
+
+    `window=w` is sliding attention: a query reads itself and the w - 1 keys
+    before it (Mistral, Gemma, MaxText's `sliding_window_size`). `chunk=c`
+    is chunked local attention: a query reads the keys at or before it whose
+    position shares its chunk, `position // c` (Llama 4's
+    `attention_chunk_size`, MaxText's `chunk_attn_window_size`). Exactly one
+    of the two is set.
+
+    `positions` places the chunks: `[S]` or `[B, S]`, advancing by one per
+    row inside a document, as a packed batch's do; None is the row index.
+    `segment_ids` keeps each packed document to itself (0 is padding) and
+    `valid` `[B, S]` drops the keys it marks False.
+
+    No `[S, S]` array is built. A sliding window that cudnn or splash takes
+    as a flag runs there, whose kernels skip the blocks outside it. Chunks
+    that start at row multiples fold into the batch, one causal call per
+    chunk, which every kernel takes. Everything else runs banded: the
+    queries in blocks of the span, each against its own block and the one
+    before, which holds every key a query of the block may read, under a
+    `[W, 2W]` mask per block. The xla kernel's logits are then `[S, 2W]`
+    per head where a dense mask costs `[S, S]`.
+    """
+    if (window is None) == (chunk is None):
+        raise ValueError("local attention takes exactly one of window and chunk")
+    span = window if window is not None else chunk
+    assert span is not None
+    if span < 1:
+        raise ValueError(f"a local span is a positive number of keys, got {span}")
+    batch, length = query.shape[0], query.shape[1]
+    if key.shape[1] != length:
+        raise ValueError(
+            f"local attention is self-attention: {length} queries against "
+            f"{key.shape[1]} keys")
+    kernel = functools.partial(
+        attention_kernel, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
+    flags_only = segment_ids is None and valid is None
+    if window is not None and flags_only:
+        resolved = resolve_implementation(
+            implementation, query, key, dtype=dtype, precision=precision,
+            force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, causal=True,
+            sliding_window=window)
+        if resolved in ('cudnn', 'tpu') or length <= window:
+            return scaled_dot_product_attention(
+                query, key, value, dtype=dtype, precision=precision,
+                force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
+                causal=True, sliding_window=window, sinks=sinks, softcap=softcap)
+
+    blocks = -(-length // span)
+
+    def folded(x, width: int):
+        return x.reshape(batch * blocks, width, *x.shape[3:])
+
+    def row_blocks(x):
+        return _blocks(jnp.broadcast_to(jnp.asarray(x), (batch, length)), span, blocks)
+
+    if chunk is not None and positions is None:
+        mask = None
+        if not flags_only:
+            keep = jnp.ones((batch, blocks, span, span), bool)
+            if segment_ids is not None:
+                segments = row_blocks(segment_ids)
+                keep = keep & ((segments[..., :, None] == segments[..., None, :])
+                               & (segments[..., :, None] != 0))
+            if valid is not None:
+                keep = keep & row_blocks(jnp.asarray(valid, bool))[..., None, :]
+            mask = keep.reshape(batch * blocks, 1, span, span)
+            implementation = kernel_for_materialized_mask(implementation)
+        out = kernel(*(folded(_blocks(x, span, blocks), span) for x in (query, key, value)),
+                     implementation=implementation, causal=True, mask=mask)
+    else:
+        rows = jnp.arange(blocks * span).reshape(1, blocks, span)
+        key_rows = jnp.concatenate([rows - span, rows], axis=-1)
+        keep = ((key_rows[..., None, :] >= 0)
+                & (key_rows[..., None, :] <= rows[..., :, None]))
+        if window is not None:
+            keep = keep & (rows[..., :, None] - key_rows[..., None, :] < window)
+        keep = jnp.broadcast_to(keep, (batch, blocks, span, 2 * span))
+        if chunk is not None:
+            places = row_blocks(positions) // chunk
+            keep = keep & (places[..., :, None] == _banded(places)[..., None, :])
+        if segment_ids is not None:
+            segments = row_blocks(segment_ids)
+            keep = keep & ((segments[..., :, None] == _banded(segments)[..., None, :])
+                           & (segments[..., :, None] != 0))
+        if valid is not None:
+            keep = keep & _banded(row_blocks(jnp.asarray(valid, bool)))[..., None, :]
+        out = kernel(folded(_blocks(query, span, blocks), span),
+                     folded(_banded(_blocks(key, span, blocks)), 2 * span),
+                     folded(_banded(_blocks(value, span, blocks)), 2 * span),
+                     implementation=kernel_for_materialized_mask(implementation),
+                     mask=keep.reshape(batch * blocks, 1, span, 2 * span))
+    out = out.reshape(batch, blocks * span, *out.shape[2:])[:, :length]
+    return checkpoint_name(out, 'attention_output')
 
 
 # Splash's tile size. At 512 the forward kernel holds 1 MiB of fp32 logits
@@ -1300,7 +1481,7 @@ class NormalAttention(nn.Module):
     use_bias: bool = True
     force_fp32_for_softmax: bool = True
     qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
-    attention_impl: str | None = None  # an AttentionImpl, or None for 'reference'
+    attention_impl: str = "auto"  # an AttentionImpl
     causal: bool = False
     max_seq_len: int | None = None  # KV cache length, required to decode
 
@@ -1434,7 +1615,7 @@ class BasicTransformerBlock(nn.Module):
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-4
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
         attention = functools.partial(
@@ -1497,7 +1678,7 @@ class Stage:
     precision: PrecisionLike = None
 
 
-def stage_attention(stage: Stage, channels: int, attention_impl: str | None,
+def stage_attention(stage: Stage, channels: int, attention_impl: str,
                     precision: PrecisionLike, name: str) -> "TransformerBlock":
     """Build the block a `Stage` describes, at the stage's channel count.
 
@@ -1532,7 +1713,7 @@ class TransformerBlock(nn.Module):
     use_self_and_cross:bool = True
     only_pure_attention:bool = False
     force_fp32_for_softmax: bool = True
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     norm_inputs: bool = True
     explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-4

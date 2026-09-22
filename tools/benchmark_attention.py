@@ -83,7 +83,7 @@ def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, dty
             q, k, v, is_causal=causal, local_window_size=local,
             logits_soft_cap=softcap, implementation='triton')
     return lambda q, k, v: scaled_dot_product_attention(
-        q, k, v, implementation=None if implementation == 'reference' else implementation,
+        q, k, v, implementation=implementation,
         causal=causal, sliding_window=window, softcap=softcap, dtype=dtype)
 
 

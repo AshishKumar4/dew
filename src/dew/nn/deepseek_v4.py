@@ -565,6 +565,8 @@ class DeepseekV4Mixer(MixerBase):
             raise ValueError("the deepseek_v4 mixer is causal: its window and compressors read the past alone")
         if ctx.sliding_window is None:
             raise ValueError("every deepseek_v4 layer attends a sliding window, which its kind names")
+        if ctx.attention_chunk is not None:
+            raise ValueError("a deepseek_v4 layer attends a sliding window, not a chunk")
         if ctx.kv_shared:
             raise ValueError("the deepseek_v4 mixer shares no keys across layers")
         if ctx.yarn is not None and ctx.yarn.rope_theta != ctx.rope_theta:

@@ -53,7 +53,7 @@ class UViT(nn.Module):
     use_projection: bool = False
     use_self_and_cross: bool = False
     force_fp32_for_softmax: bool = True
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     activation: Callable = jax.nn.swish
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -225,7 +225,7 @@ class SimpleUDiT(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     remat: bool = False
     norm_epsilon: float = 1e-5
     scan_order: Literal["raster", "hilbert"] = "raster"

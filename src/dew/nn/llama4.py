@@ -22,7 +22,10 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.attention import (
     RopeScaling,
     causal_attention_mask,
+    chunk_mask,
     document_mask,
+    kernel_for_materialized_mask,
+    local_attention,
     open_kv_cache,
     rotary_freqs,
     scaled_dot_product_attention,
@@ -48,19 +51,6 @@ def temperature_scale(positions, floor_scale: float, attn_scale: float):
     """
     positions = jnp.asarray(positions, jnp.float32)
     return jnp.log1p(jnp.floor((positions + 1.0) / floor_scale)) * attn_scale + 1.0
-
-
-def chunk_mask(query_positions, key_positions, chunk_size: int):
-    """Boolean `[.., 1, T, S]` keeping keys in the query's chunk, both absolute.
-
-    transformers' `chunked_overlay`: `kv // chunk == q // chunk`, positions
-    counted from the sequence start, so a packed document's positions place
-    its chunks from its own first token.
-    """
-    query_chunks = jnp.asarray(query_positions) // chunk_size
-    key_chunks = jnp.asarray(key_positions) // chunk_size
-    same = query_chunks[..., :, None] == key_chunks[..., None, :]
-    return same[..., None, :, :] if same.ndim == 3 else same[None, None]
 
 
 @logical_axes({
@@ -97,7 +87,7 @@ class Llama4Attention(nn.Module):
     attention_bias: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     force_fp32_for_softmax: bool = True
 
     def setup(self):
@@ -154,6 +144,16 @@ class Llama4Attention(nn.Module):
             query = (query * scale[..., :, None, None].astype(query.dtype)
                      if scale.ndim == 2 else query * scale[None, :, None, None].astype(query.dtype))
 
+        if self.attention_chunk_size is not None and self.causal and not decode:
+            # A local layer's queries read their own chunk alone, which
+            # `local_attention` runs without the [S, S] mask below.
+            attention = local_attention(
+                query, key, value, chunk=self.attention_chunk_size,
+                positions=None if logical_positions is None else positions,
+                segment_ids=segment_ids, valid=valid, dtype=self.dtype,
+                precision=self.precision, force_fp32_for_softmax=self.force_fp32_for_softmax,
+                implementation=self.attention_impl)
+            return self.o_proj(attention.reshape(batch, length, self.num_heads * self.head_dim))
         causal, mask = self.causal, None
         key_positions = positions
         if append is not None:
@@ -177,10 +177,8 @@ class Llama4Attention(nn.Module):
             if not decode:
                 mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
         implementation = self.attention_impl
-        if mask is not None and implementation in ('auto', 'cudnn'):
-            # cuDNN takes no mask, and the reference mixer's measurement of
-            # the xla kernel under a mask stands here too.
-            implementation = 'xla'
+        if mask is not None:
+            implementation = kernel_for_materialized_mask(implementation)
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
@@ -214,6 +212,7 @@ class Llama4Mixer(MixerBase):
             "k_eq_v": ctx.k_eq_v,
             "kv_shared": ctx.kv_shared,
             "sliding_window": ctx.sliding_window,
+            "attention_chunk": ctx.attention_chunk,
             "attention_scale": ctx.attention_scale,
             "attention_sinks": ctx.attention_sinks,
             "yarn": ctx.yarn,

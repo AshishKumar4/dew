@@ -22,7 +22,11 @@ from dew.nn.attention import (
     RopeScaling,
     apply_rotary,
     causal_attention_mask,
+    chunk_mask,
+    combined_attention_mask,
     document_mask,
+    kernel_for_materialized_mask,
+    local_attention,
     max_attention_logits,
     open_kv_cache,
     rotary_freqs,
@@ -32,21 +36,6 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, mla_rope_freqs
 from dew.nn.sharding import logical_axes
-
-
-def kernel_for_materialized_mask(implementation: str | None) -> str | None:
-    """Send a call that built an explicit mask to the xla kernel.
-
-    cuDNN has no mask argument: causality and the window are flags, and jax
-    hands the kernel a bool mask as an additive bias of -2**41 in the
-    compute dtype instead (`combine_bias_and_mask` in
-    jax/_src/cudnn/fused_attention_stablehlo.py). That also makes
-    `check_is_flash_attention` refuse an odd length while training. The xla
-    kernel masks by exclusion, on every backend and with the same fp32
-    softmax. It costs 83.6 ms and 5.80 GiB a step where the fixed window on
-    cuDNN costs 75.8 ms and 4.99 GiB (docs/concepts/language_models.md).
-    """
-    return 'xla' if implementation in ('auto', 'cudnn') else implementation
 
 
 @logical_axes({
@@ -91,6 +80,7 @@ class CausalSelfAttention(nn.Module):
     kv_shared: bool = False
     kv_store_key: str | None = None
     sliding_window: int | None = None
+    attention_chunk: int | None = None  # chunked local attention: keys sharing the query's position // chunk
     attention_bias: bool = False  # q/k/v biases, as config.attention_bias in HF
     o_proj_bias: bool | None = None  # None follows attention_bias; Qwen2 biases q/k/v only
     attention_scale: float | None = None  # None: the kernel's own 1/sqrt(head_dim)
@@ -103,7 +93,7 @@ class CausalSelfAttention(nn.Module):
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     force_fp32_for_softmax: bool = True
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None
@@ -373,6 +363,19 @@ class CausalSelfAttention(nn.Module):
                 # Post-norm, post-rope, the same tensors the reference hands
                 # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
                 kv_store[self.kv_store_key] = (key, value, positions)
+        sinks = (self.param('sinks', nn.initializers.zeros, (self.num_heads,))
+                 if self.attention_sinks else None)
+        if self._runs_local(attention_metadata, decode):
+            attention = checkpoint_name(local_attention(
+                query, key, value, window=self.sliding_window, chunk=self.attention_chunk,
+                positions=None if logical_positions is None else positions,
+                segment_ids=segment_ids,
+                valid=None if attention_metadata is None else attention_metadata.valid,
+                dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax,
+                implementation=self.attention_impl, sinks=sinks,
+                softcap=self.attn_logit_softcap), 'context')
+            return self._output(attention, gate, B, S)
         causal, mask = self.causal, None
         implementation = self.attention_impl
         window = None if decode else self.sliding_window
@@ -441,6 +444,18 @@ class CausalSelfAttention(nn.Module):
                     mask = mask & (jnp.abs(distance) < self.sliding_window)[:, None]
             causal, window = False, None
             implementation = kernel_for_materialized_mask(implementation)
+        if self.attention_chunk is not None:
+            # The decode and diagnostic paths: the chunk joins the mask the
+            # branch above built, keys placed at their cache slots while
+            # decoding and at the positions the query side reads otherwise.
+            key_places = (jnp.arange(key.shape[-3]) if decode else positions)
+            if attention_metadata is not None and attention_metadata.key_positions is not None:
+                key_places = attention_metadata.key_positions
+            mask = jnp.logical_and(
+                combined_attention_mask(S, key.shape[-3], causal, window, mask),
+                chunk_mask(positions, key_places, self.attention_chunk))
+            causal, window = False, None
+            implementation = kernel_for_materialized_mask(implementation)
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
@@ -451,16 +466,35 @@ class CausalSelfAttention(nn.Module):
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=implementation, causal=causal,
-            sliding_window=window, mask=mask,
-            sinks=(self.param('sinks', nn.initializers.zeros, (self.num_heads,))
-                   if self.attention_sinks else None),
+            sliding_window=window, mask=mask, sinks=sinks,
             softcap=self.attn_logit_softcap), 'context')
+        return self._output(attention, gate, B, S)
+
+    def _runs_local(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
+        """Whether this call runs `local_attention`, which never builds the
+        `[S, S]` mask a window or chunk otherwise costs.
+
+        That is a causal local layer's whole-sequence pass, over row
+        validity and packed documents. A cache, a pairwise mask or
+        bidirectional image groups keep the mask path, and so does an open
+        `qk` collection, whose maxima read the dense logits anyway.
+        """
+        if (self.sliding_window is None and self.attention_chunk is None) or not self.causal:
+            return False
+        if decode or (not self.is_initializing() and self.is_mutable_collection("qk")):
+            return False
+        return metadata is None or (
+            metadata.pairwise_mask is None
+            and not (self.bidirectional_images and metadata.image_groups is not None))
+
+    def _output(self, attention, gate, batch: int, length: int):
+        """Gate the attended values where the layer gates, then project them."""
         if gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
             attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
         return checkpoint_name(
-            self.o_proj(attention.reshape(B, S, self.num_heads * self.head_dim)), 'o_proj')
+            self.o_proj(attention.reshape(batch, length, self.num_heads * self.head_dim)), 'o_proj')
 
 
 @mixers("attention")
@@ -502,6 +536,7 @@ class AttentionMixer(MixerBase):
             kv_shared=ctx.kv_shared,
             kv_store_key=ctx.kv_store_key,
             sliding_window=ctx.sliding_window,
+            attention_chunk=ctx.attention_chunk,
             attention_bias=ctx.attention_bias,
             o_proj_bias=ctx.o_proj_bias,
             attention_scale=ctx.attention_scale,

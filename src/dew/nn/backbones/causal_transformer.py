@@ -76,6 +76,12 @@ class LayerKind:
 
     window: int | None = None
     """Keys a layer of this kind attends, its own included; None attends all."""
+    chunk: int | None = None
+    """Chunked local attention: a layer of this kind reads only the keys at
+    or before each query whose position shares the query's
+    `position // chunk`, MaxText's `chunk_attn_window_size` and Llama 4's
+    `attention_chunk_size`. None attends all; a kind sets a window or a
+    chunk, not both."""
     num_kv_heads: int | None = None
     """This kind's key/value head count; None takes the model's. Gemma 4's
     global layers keep fewer than its sliding ones (num_global_key_value_heads)."""
@@ -117,6 +123,7 @@ class ResolvedKind:
     """
 
     window: int | None
+    chunk: int | None
     num_kv_heads: int
     rope_theta: float
     rope_scaling: RopeScaling | None
@@ -1417,7 +1424,7 @@ class CausalTransformer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     mixture: Mixture | None = None        # None: every layer is dense
     use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width
     causal: bool = True                      # False: full attention, no cache
@@ -1545,6 +1552,7 @@ class CausalTransformer(nn.Module):
         kind = (self.kinds or {}).get(layer_type, LayerKind())
         return ResolvedKind(
             window=kind.window,
+            chunk=kind.chunk,
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
@@ -1653,6 +1661,7 @@ class CausalTransformer(nn.Module):
             kv_shared=kv_shared,
             kv_store_key=layer_type,
             sliding_window=kind.window,
+            attention_chunk=kind.chunk,
             attention_bias=self.attention_bias,
             o_proj_bias=self.o_proj_bias,
             attention_scale=self.attention_scale,
@@ -1719,6 +1728,17 @@ class CausalTransformer(nn.Module):
             if kind.window is not None and kind.window < 1:
                 raise ValueError(
                     f"the window of {layer_type!r} must be positive, got {kind.window}")
+            if kind.chunk is not None and kind.chunk < 1:
+                raise ValueError(
+                    f"the chunk of {layer_type!r} must be positive, got {kind.chunk}")
+            if kind.chunk is not None and kind.window is not None:
+                raise ValueError(
+                    f"{layer_type!r} sets a window and a chunk; a local layer "
+                    f"reads one or the other")
+            if kind.chunk is not None and not self.causal:
+                raise ValueError(
+                    f"{layer_type!r} chunks a causal layer's keys, and this model "
+                    f"is not causal")
             if kind.num_kv_heads < 1 or self.num_heads % kind.num_kv_heads:
                 raise ValueError(
                     f"num_heads ({self.num_heads}) must be a multiple of the key/value "

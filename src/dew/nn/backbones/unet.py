@@ -118,7 +118,7 @@ class Unet(nn.Module):
     norm_groups:int=8
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
         if self.norm_groups > 0:

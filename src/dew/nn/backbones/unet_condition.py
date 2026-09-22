@@ -75,7 +75,7 @@ class _Attention(nn.Module):
     dropout: float
     dtype: Dtype
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
     def __call__(self, x, context=None, *, train=False):
@@ -103,7 +103,7 @@ class _Transformer(nn.Module):
     dropout: float
     dtype: Dtype
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     approximate_gelu: bool = True
 
     @nn.compact
@@ -134,7 +134,7 @@ class _SpatialAttention(nn.Module):
     dropout: float
     dtype: Dtype
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     norm_groups: int = 32
     norm_epsilon: float = 1e-5
     approximate_gelu: bool = True
@@ -183,7 +183,7 @@ class _Level(nn.Module):
     dropout: float
     dtype: Dtype
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     norm_groups: int = 32
     norm_epsilon: float = 1e-5
     attention_norm_epsilon: float = 1e-5
@@ -238,7 +238,7 @@ class UNet2DCondition(nn.Module):
     dropout: float = 0.0
     dtype: Dtype = jnp.float32
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     norm_groups: int = 32
     norm_epsilon: float = 1e-5
     attention_norm_epsilon: float = 1e-5

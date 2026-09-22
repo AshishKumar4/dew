@@ -93,7 +93,7 @@ def test_logits_ignore_every_later_token(rng):
     assert not jnp.allclose(baseline[:, cut + 1:], changed[:, cut + 1:])
 
 
-@pytest.mark.parametrize("attention_impl", [None, 'xla'])
+@pytest.mark.parametrize("attention_impl", ['reference', 'xla'])
 def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
     """The prefill plus single-token steps must reproduce the full-sequence
     logits position by position, on the reference kernel and on the fused one
@@ -828,7 +828,7 @@ def test_packed_kernels_agree_with_the_reference(rng, overrides):
     """The reference kernel applies the segment mask itself and xla applies it
     inside jax.nn.dot_product_attention, on the same weights."""
     kernel = tiny(**overrides)
-    reference = tiny(**{**overrides, "attention_impl": None})
+    reference = tiny(**{**overrides, "attention_impl": "reference"})
     ids, segment_ids, positions = packed_pair(rng)
     params = reference.init(rng, ids)
 

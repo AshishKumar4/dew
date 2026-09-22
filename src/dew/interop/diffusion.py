@@ -73,7 +73,7 @@ class UNetFields(TypedDict):
     attention_norm_epsilon: float
     approximate_gelu: bool
     dtype: Dtype
-    attention_impl: str | None
+    attention_impl: str
 
 
 def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
@@ -282,7 +282,7 @@ class SD3Fields(TypedDict):
     dual_attention_layers: tuple[int, ...]
     qk_norm: str | None
     dtype: object
-    attention_impl: str | None
+    attention_impl: str
 
 
 def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
@@ -416,7 +416,7 @@ class FluxFields(TypedDict):
     guidance_embeds: bool
     axes_dims_rope: tuple[int, ...]
     dtype: object
-    attention_impl: str | None
+    attention_impl: str
 
 
 def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",

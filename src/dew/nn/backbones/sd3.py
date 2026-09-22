@@ -106,7 +106,7 @@ class _JointAttention(nn.Module):
     epsilon: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = "auto"
+    attention_impl: str = "auto"  # an AttentionImpl
 
     def _projection(self, name: str, features: int):
         return nn.Dense(features, dtype=self.dtype, precision=self.precision, name=name)
@@ -196,7 +196,7 @@ class SD3Block(nn.Module):
     qk_norm: str | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = "auto"
+    attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
     def __call__(self, image, context, conditioning):
@@ -280,7 +280,7 @@ class SD3Transformer(nn.Module):
     qk_norm: str | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = "auto"
+    attention_impl: str = "auto"  # an AttentionImpl
 
     @property
     def features(self) -> int:

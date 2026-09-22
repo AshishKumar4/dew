@@ -65,6 +65,9 @@ class MixerContext:
     kv_shared: bool = False
     kv_store_key: str | None = None
     sliding_window: int | None = None
+    attention_chunk: int | None = None
+    """The kind's chunk: a query reads only the keys whose position shares
+    its `position // attention_chunk` (`LayerKind.chunk`)."""
     attention_bias: bool = False
     o_proj_bias: bool | None = None
     attention_scale: float | None = None
@@ -80,7 +83,7 @@ class MixerContext:
     or 'default' (Qwen3.5); `dew.nn.attention.rotary_freqs` cites both."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     force_fp32_for_softmax: bool = True
     output_gate: bool = False
     """The attention's output gate (Qwen3.5's attn_output_gate), where the

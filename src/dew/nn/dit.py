@@ -350,7 +350,7 @@ class ModulatedBlock(nn.Module):
     norm_epsilon: float = 1e-5
     use_gating: bool = True
     qk_norm: bool = False
-    attention_impl: str | None = None  # None (reference) | 'xla' | 'cudnn' | 'tpu'
+    attention_impl: str = "auto"  # an AttentionImpl
     # ssm mixer options
     ssm_state_dim: int = 64
     bidirectional_ssm: bool = True

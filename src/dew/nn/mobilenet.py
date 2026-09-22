@@ -265,7 +265,7 @@ class MobileMultiQueryAttention(nn.Module):
     padding: str = "same"
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
     def __call__(self, x):
@@ -297,7 +297,7 @@ class MobileAttention(nn.Module):
     drop_path: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
     def __call__(self, x, train: bool = False):
@@ -330,7 +330,7 @@ class MobileStage(nn.Module):
     drop_path_rate: float
     dtype: Dtype | None
     precision: PrecisionLike
-    attention_impl: str | None
+    attention_impl: str
 
     @nn.compact
     def __call__(self, x, train: bool = False):
@@ -408,7 +408,7 @@ class MobileNetV5Encoder(nn.Module):
     drop_path_rate: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
         if self.channel_multiplier <= 0 or self.stem_size < 1 or self.in_chans < 1:
