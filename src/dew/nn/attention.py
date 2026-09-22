@@ -656,17 +656,20 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
                      mask=given.get('mask'), bias=given.get('bias'), sinks=given.get('sinks'))
         return jax.lax.all_to_all(out, SEQUENCE_AXIS, 1, 2, tiled=True)
 
-    # The pipeline vmaps its stages with spmd_axis_name=stage, and a vmapped
-    # shard_map can only split the new dimension over an axis it holds
-    # manual. Outside a pipeline nothing here varies over stage.
-    stage = (STAGE_AXIS,) if STAGE_AXIS in usable else ()
+    # Every axis the context leaves automatic goes manual here, those the
+    # specs do not name included, over which the operands are replicated. A
+    # Mosaic kernel (splash) refuses to lower where any axis is still left
+    # to the partitioner, whatever its size. The pipeline also needs it: it
+    # vmaps its stages with spmd_axis_name=stage, and a vmapped shard_map
+    # can only split the new dimension over an axis it holds manual.
+    manual = {axis for axis in mesh.axis_names if axis not in mesh.manual_axes}
     # Pallas kernels state no varying-manual-axes type for their outputs, so
     # splash inside the map needs the check off, as MaxText wraps it. Every
     # operand here is split on the axes the specs name and nothing is
     # reduced, so the check has nothing to catch.
     exchanged = jax.shard_map(
         local, in_specs=(in_rows,) * 3 + tuple(spec for _, spec in extras.values()),
-        out_specs=in_rows, axis_names={*rows, *tensor, SEQUENCE_AXIS, *stage}, check_vma=False)
+        out_specs=in_rows, axis_names=manual, check_vma=False)
     return exchanged(query, key, value, *(x for x, _ in extras.values()))
 
 
