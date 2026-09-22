@@ -12,6 +12,7 @@ capabilities' resources come into being in `fit`.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import sys
@@ -28,7 +29,7 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from termcolor import colored
 
-from dew.artifacts import agree_process_phase
+from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
 from dew.nn.sharding import pipeline_microbatches
@@ -47,6 +48,7 @@ from dew.objectives.base import (
 )
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import model_flops_utilization, step_flops
+from dew.telemetry.profile import region
 from dew.telemetry.records import (
     CheckpointRequested,
     FitEnded,
@@ -687,21 +689,19 @@ class Trainer(Generic[Loss, Effects]):
         # warmup steps have run.
         profiler = None
         if profile is not None:
-            # Every rank either leaves this block owning a stopped Profiler or
-            # raises together; a rank that proceeds alone would deadlock its
-            # peers at the first collective of training.
-            error = None
-            try:
+            def own_window() -> Profiler:
                 if telemetry_profile.active_profile() is not None:
                     raise ValueError(
                         "Trainer.profile cannot schedule a window while an explicit "
                         "dew.profile capture is active; drop one or stop the outer "
                         "profiler before fitting")
                 telemetry_profile.require_profile_support()
-                profiler = telemetry_profile.profile(profile.directory)
-            except BaseException as failure:
-                error = failure
-            agree_process_phase(error, phase="profiling window setup")
+                return telemetry_profile.profile(profile.directory)
+
+            # Every rank either leaves this block owning a stopped Profiler or
+            # raises together; a rank that proceeds alone would deadlock its
+            # peers at the first collective of training.
+            profiler = agreed("profiling window setup", own_window)
         outer = telemetry_profile.active_profile()
         # One boundary lookup at setup: the prefetch worker and the step
         # scopes share whichever profiler owns the capture.
@@ -774,14 +774,12 @@ class Trainer(Generic[Loss, Effects]):
                                                profiler=tracer)
                 source = None  # Lifetime transferred to the prefetch worker.
 
-            error = None
-            try:
+            def announce() -> None:
                 if process_zero:
                     print(f"Training from step {current} to {steps} on "
                           f"{dict(mesh.shape)} ({jax.process_count()} process(es))")
-            except BaseException as failure:
-                error = failure
-            agree_process_phase(error, phase="training announcement")
+
+            agreed("training announcement", announce)
             while current < steps:
                 assert train is not None
                 # The window's capture opens before this iteration's first
@@ -790,15 +788,14 @@ class Trainer(Generic[Loss, Effects]):
                 if (profiler is not None and profile is not None
                         and not tracing and traced == 0
                         and seen >= profile.warmup):
-                    error = None
-                    try:
+                    def start_capture() -> None:
+                        nonlocal tracing
+                        assert profiler is not None
                         profiler.start()
-                    except BaseException as failure:
-                        error = failure
-                    else:
                         tracing = True
+
                     try:
-                        agree_process_phase(error, phase="profiling window start")
+                        agreed("profiling window start", start_capture)
                     except BaseException as primary:
                         # A peer failed while this capture did start: closing it
                         # here keeps a live trace from outliving the aborted run.
@@ -811,19 +808,10 @@ class Trainer(Generic[Loss, Effects]):
                         raise
                 capturing = tracer is not None and tracer.running
                 step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=current)
-                              if capturing else None)
-                if step_scope is not None:
-                    step_scope.__enter__()
-                try:
-                    annotation = None
-                    if capturing:
-                        annotation = jax.profiler.TraceAnnotation("input.wait")
-                        annotation.__enter__()
-                    try:
+                              if capturing else contextlib.nullcontext())
+                with step_scope:
+                    with region("input.wait"):
                         batch = next(train)
-                    finally:
-                        if annotation is not None:
-                            annotation.__exit__(None, None, None)
                     if self.rollout is not None:
                         # Host-side and untraceable: sampling, scoring, advantages.
                         # The key folds the step key once more, keeping the
@@ -837,28 +825,14 @@ class Trainer(Generic[Loss, Effects]):
                         rollout_seconds += time.perf_counter() - began
                     shapes = batch_shapes(batch)
                     if shapes not in compiled:
-                        annotation = None
-                        if capturing:
-                            annotation = jax.profiler.TraceAnnotation("compile")
-                            annotation.__enter__()
-                        try:
+                        with region("compile"):
                             compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
-                        finally:
-                            if annotation is not None:
-                                annotation.__exit__(None, None, None)
                         if len(compiled) == 1:
                             last_log_time = time.time()
                     train_step, measured_flops = compiled[shapes]
 
-                    annotation = None
-                    if capturing:
-                        annotation = jax.profiler.TraceAnnotation("train.step")
-                        annotation.__enter__()
-                    try:
+                    with region("train.step"):
                         state, loss, aux, finite, accepted = train_step(state, batch)
-                    finally:
-                        if annotation is not None:
-                            annotation.__exit__(None, None, None)
                     position = train.source_state
                     current += 1
                     seen += 1
@@ -876,51 +850,36 @@ class Trainer(Generic[Loss, Effects]):
                         interval_loss, _, worst_bad_run = book
                         self._check_finite(worst_bad_run, current)
                         book = (interval_loss, book[1], jnp.zeros((), jnp.int32))
-                        error = None
-                        annotation = None
-                        if capturing:
-                            annotation = jax.profiler.TraceAnnotation("log")
-                            annotation.__enter__()
-                        try:
-                            try:
-                                if process_zero:
-                                    # The interval's numbers need the loss on the host, so
-                                    # this is where the loop waits on the device.
-                                    loss.block_until_ready()
-                                    now = time.time()
-                                    scalars = {"train/loss": float(loss),
-                                               **{f"train/{k}": float(v) for k, v in aux.items()},
-                                               **self._throughput(now - last_log_time, steps_since_log,
-                                                                  interval_samples, interval_flops)}
-                                    scalars["train/accepted"] = float(accepted)
-                                    if state.scale is not None:
-                                        scalars["train/loss_scale"] = float(state.scale.scale)
-                                    if self.rollout is not None:
-                                        scalars["train/rollout_seconds"] = rollout_seconds
-                                    print(f"step {current}: loss {scalars['train/loss']:.4f}")
-                                    if self.tracker is not None:
-                                        self.tracker.log(scalars, current)
-                                    last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
-                                    interval_samples, interval_flops = 0, 0.0
+                        def report_interval() -> None:
+                            nonlocal last_log_time, steps_since_log, rollout_seconds
+                            nonlocal interval_samples, interval_flops
+                            if process_zero:
+                                # The interval's numbers need the loss on the host, so
+                                # this is where the loop waits on the device.
+                                loss.block_until_ready()
+                                now = time.time()
+                                scalars = {"train/loss": float(loss),
+                                           **{f"train/{k}": float(v) for k, v in aux.items()},
+                                           **self._throughput(now - last_log_time, steps_since_log,
+                                                              interval_samples, interval_flops)}
+                                scalars["train/accepted"] = float(accepted)
+                                if state.scale is not None:
+                                    scalars["train/loss_scale"] = float(state.scale.scale)
+                                if self.rollout is not None:
+                                    scalars["train/rollout_seconds"] = rollout_seconds
+                                print(f"step {current}: loss {scalars['train/loss']:.4f}")
+                                if self.tracker is not None:
+                                    self.tracker.log(scalars, current)
+                                last_log_time, steps_since_log, rollout_seconds = now, 0, 0.0
+                                interval_samples, interval_flops = 0, 0.0
 
-                            except BaseException as failure:
-                                error = failure
-                            agree_process_phase(error, phase="training reporting")
-                        finally:
-                            if annotation is not None:
-                                annotation.__exit__(None, None, None)
+                        with region("log"):
+                            agreed("training reporting", report_interval)
 
                     if eval_every and current % eval_every == 0 and current < steps:
                         paused = time.perf_counter()
-                        annotation = None
-                        if capturing:
-                            annotation = jax.profiler.TraceAnnotation("evaluate")
-                            annotation.__enter__()
-                        try:
+                        with region("evaluate"):
                             self._evaluate(state, shardings, dataset, metrics, preview, mesh)
-                        finally:
-                            if annotation is not None:
-                                annotation.__exit__(None, None, None)
                         other += time.perf_counter() - paused
 
                     # On its own clock, not the logging one, so that a cadence
@@ -941,9 +900,6 @@ class Trainer(Generic[Loss, Effects]):
                         checkpoints.save_local(current, state, position)
                         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), current)
                         other += time.perf_counter() - paused
-                finally:
-                    if step_scope is not None:
-                        step_scope.__exit__(None, None, None)
                 # The step row is complete once its scope exits; closing the
                 # window here keeps the last iteration inside the capture.
                 if tracing and profile is not None:
@@ -1020,17 +976,16 @@ class Trainer(Generic[Loss, Effects]):
                 if error is None:
                     error = failure
             if error is None:
-                try:
+                def report_goodput() -> None:
                     if process_zero:
                         scalars = goodput(time.perf_counter() - started, first_step, other)
                         print(f"Goodput: first step after {scalars.get('goodput/time_to_first_step_s', 0.0):.2f} s, "
                               f"{scalars['goodput/step_fraction']:.1%} of the wall time in steps")
                         if self.tracker is not None:
                             self.tracker.log(scalars, current)
-                except BaseException as failure:
-                    error = failure
+
                 try:
-                    agree_process_phase(error, phase="goodput reporting")
+                    agreed("goodput reporting", report_goodput)
                 except BaseException as failure:
                     error = failure
             try:
@@ -1045,13 +1000,16 @@ class Trainer(Generic[Loss, Effects]):
         return state
 
     def _report(self, value: Record, step: int) -> None:
-        error = None
-        if jax.process_index() == 0 and self.tracker is not None:
-            try:
+        """Hand one record to the tracker on rank zero, then agree with the pool.
+
+        The record's type names the phase, so a rank that failed to report is
+        heard about at the report the pool was making, not at the next
+        collective."""
+        def send() -> None:
+            if jax.process_index() == 0 and self.tracker is not None:
                 self.tracker.artifact(value, step)
-            except BaseException as failure:
-                error = failure
-        agree_process_phase(error, phase=type(value).__name__)
+
+        agreed(type(value).__name__, send)
 
     # ------------------------------------------------------------------
     # Validation
@@ -1081,21 +1039,21 @@ class Trainer(Generic[Loss, Effects]):
             preview=preview, mesh=mesh))
 
     def _report_evaluation(self, advanced: Evaluation) -> None:
-        error = None
-        if jax.process_index() == 0:
-            try:
-                print(f"Evaluation {advanced.split} at step {advanced.step}: "
-                      f"{advanced.coordinated_batches} coordinated batches, {advanced.records} records, "
-                      f"uneven_shards={advanced.uneven_shards}, event_key={advanced.event_key}: {advanced.scores}")
-                if self.tracker is not None:
-                    for artifact in advanced.previews:
-                        self.tracker.artifact(artifact, advanced.step)
-                    scalars = advanced.scalars
-                    if scalars:
-                        self.tracker.log(scalars, advanced.step)
-            except BaseException as failure:
-                error = failure
-        agree_process_phase(error, phase="evaluation reporting")
+        """Print one evaluation on rank zero and log its previews and scores."""
+        def report() -> None:
+            if jax.process_index() != 0:
+                return
+            print(f"Evaluation {advanced.split} at step {advanced.step}: "
+                  f"{advanced.coordinated_batches} coordinated batches, {advanced.records} records, "
+                  f"uneven_shards={advanced.uneven_shards}, event_key={advanced.event_key}: {advanced.scores}")
+            if self.tracker is not None:
+                for artifact in advanced.previews:
+                    self.tracker.artifact(artifact, advanced.step)
+                scalars = advanced.scalars
+                if scalars:
+                    self.tracker.log(scalars, advanced.step)
+
+        agreed("evaluation reporting", report)
 
 
     # ------------------------------------------------------------------
@@ -1109,8 +1067,7 @@ class Trainer(Generic[Loss, Effects]):
         The core Profiler drains the backend and exports the native reports
         on `stop`. The loss's block only orders the primary's failure ahead
         of the profiler's own drain."""
-        error = None
-        try:
+        def stop() -> None:
             try:
                 if loss is not None:
                     loss.block_until_ready()
@@ -1122,17 +1079,14 @@ class Trainer(Generic[Loss, Effects]):
                     if primary is None:
                         raise
                     primary.add_note(f"Profiler stop failed: {failure!r}")
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="profile stop")
-        self._report(ProfileWindowRecord(profile.directory, traced), step)
-        error = None
-        try:
+
+        def announce() -> None:
             if jax.process_index() == 0:
                 print(f"Wrote profile for {traced} steps to {profile.directory}")
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="profile announcement")
+
+        agreed("profile stop", stop)
+        self._report(ProfileWindowRecord(profile.directory, traced), step)
+        agreed("profile announcement", announce)
 
     def _check_finite(self, worst_bad_run, step: int):
         """Raise RuntimeError once the loss has been non-finite for BAD_LOSS_STEPS steps.

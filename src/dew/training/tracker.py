@@ -87,6 +87,15 @@ def _gif(clip: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
+def _spread(value: Representations) -> np.ndarray:
+    """The per-dimension spread of a batch of representations.
+
+    It goes to zero when the encoder stops telling its inputs apart, which
+    is the collapse a run watches this number for.
+    """
+    return np.std(_home(value.features).astype(np.float32), axis=0)
+
+
 type Payload = Mapping[str, object]
 """One W&B log call: the metric names a renderer writes under and the wandb
 values it built for them. wandb is an optional import, so the values are
@@ -132,11 +141,7 @@ def _(value: TextSamples) -> Payload:
 def _(value: Representations) -> Payload:
     import wandb
 
-    # The per-dimension spread across the batch, the collapse view of a
-    # representation. It goes to zero when the encoder stops telling inputs
-    # apart.
-    spread = np.std(_home(value.features).astype(np.float32), axis=0)
-    return {"val/representation_std": wandb.Histogram(spread.tolist())}
+    return {"val/representation_std": wandb.Histogram(_spread(value).tolist())}
 
 
 class _OwnedTracker:
@@ -330,28 +335,26 @@ def _write_preview(value: Reported, prefix: Path) -> list[Path]:
     raise TypeError(f'LocalTracker has no renderer for {type(value).__name__}')
 
 
+def _write_frames(frames, encode, suffix: str, captions, prefix: Path) -> list[Path]:
+    """Write one file per frame, and the captions beside them as JSON."""
+    paths = []
+    for index, frame in enumerate(frames):
+        path = prefix.with_name(f'{prefix.name}-{index}{suffix}')
+        path.write_bytes(encode(frame))
+        paths.append(path)
+    written = prefix.with_suffix('.json')
+    written.write_text(json.dumps(list(captions)))
+    return [*paths, written]
+
+
 @_write_preview.register
 def _(value: ImageGrid, prefix: Path) -> list[Path]:
-    paths = []
-    for index, image in enumerate(_uint8(value.images)):
-        path = prefix.with_name(f'{prefix.name}-{index}.png')
-        path.write_bytes(_png(image))
-        paths.append(path)
-    captions = prefix.with_suffix('.json')
-    captions.write_text(json.dumps(list(value.captions)))
-    return [*paths, captions]
+    return _write_frames(_uint8(value.images), _png, '.png', value.captions, prefix)
 
 
 @_write_preview.register
 def _(value: VideoGrid, prefix: Path) -> list[Path]:
-    paths = []
-    for index, clip in enumerate(_uint8(value.videos)):
-        path = prefix.with_name(f'{prefix.name}-{index}.gif')
-        path.write_bytes(_gif(clip))
-        paths.append(path)
-    captions = prefix.with_suffix('.json')
-    captions.write_text(json.dumps(list(value.captions)))
-    return [*paths, captions]
+    return _write_frames(_uint8(value.videos), _gif, '.gif', value.captions, prefix)
 
 
 @_write_preview.register
@@ -526,28 +529,32 @@ def _summarize(value: Reported) -> Summary:
     raise TypeError(f'TensorBoardTracker has no renderer for {type(value).__name__}')
 
 
+def _frames_summary(frames, encode, shown, captions):
+    """A summary holding one image value per frame, and the captions as text.
+
+    `shown` picks the frame whose height, width and channels describe the
+    encoded bytes, which for a clip is its first frame.
+    """
+    from tensorboard.compat.proto.summary_pb2 import Summary
+
+    pictures = [_picture(f'val/samples/{index}', encode(frame), shown(frame))
+                for index, frame in enumerate(frames)]
+    return Summary(value=[*pictures,
+                          _text('val/samples/captions', json.dumps(list(captions)))])
+
+
 # A registered renderer cannot annotate its return: singledispatch resolves a
 # registration's annotations, and the proto module is imported where it is
 # used rather than above.
 @_summarize.register
 def _(value: ImageGrid):
-    from tensorboard.compat.proto.summary_pb2 import Summary
-
-    images = [_picture(f'val/samples/{index}', _png(image), image)
-              for index, image in enumerate(_uint8(value.images))]
-    return Summary(value=[*images,
-                          _text('val/samples/captions', json.dumps(list(value.captions)))])
+    return _frames_summary(_uint8(value.images), _png, lambda image: image, value.captions)
 
 
 @_summarize.register
 def _(value: VideoGrid):
-    from tensorboard.compat.proto.summary_pb2 import Summary
-
     # TensorBoard has no video summary; its image plugin animates a GIF.
-    clips = [_picture(f'val/samples/{index}', _gif(clip), clip[0])
-             for index, clip in enumerate(_uint8(value.videos))]
-    return Summary(value=[*clips,
-                          _text('val/samples/captions', json.dumps(list(value.captions)))])
+    return _frames_summary(_uint8(value.videos), _gif, lambda clip: clip[0], value.captions)
 
 
 @_summarize.register
@@ -563,8 +570,7 @@ def _(value: TextSamples):
 def _(value: Representations):
     from tensorboard.compat.proto.summary_pb2 import HistogramProto, Summary
 
-    # The per-dimension spread across the batch, as WandbTracker draws it.
-    spread = np.std(_home(value.features).astype(np.float32), axis=0).astype(np.float64)
+    spread = _spread(value).astype(np.float64)
     counts, edges = np.histogram(spread, bins=30)
     return Summary(value=[Summary.Value(tag='val/representation_std', histo=HistogramProto(
         min=spread.min(), max=spread.max(), num=spread.size, sum=spread.sum(),
