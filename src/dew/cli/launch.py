@@ -151,9 +151,11 @@ class Launch:
         return ("ssh", "-tt", "-o", "BatchMode=yes", host, script)
 
     def srun_argv(self) -> tuple[str, ...]:
-        exports = ",".join(["ALL", *self.env])
+        """srun's argv. The `--env` variables travel in its environment,
+        which --export=ALL hands to every task: Slurm reads --export itself
+        as a comma-separated list, and would cut a value at its commas."""
         argv = ["srun", f"--ntasks-per-node={self.processes_per_host}",
-                "--kill-on-bad-exit=1", f"--export={exports}"]
+                "--kill-on-bad-exit=1", "--export=ALL"]
         if self.devices_per_process is not None:
             argv.append(f"--gpus-per-task={self.devices_per_process}")
         if self.cwd is not None:
@@ -164,9 +166,10 @@ class Launch:
         if self.slurm:
             argv = self.srun_argv()
             if self.dry_run:
-                emit(shlex.join(argv))
+                emit(" ".join([*(f"{name}={shlex.quote(value)}"
+                                 for name, value in self.extra_env().items()), shlex.join(argv)]))
                 return 0
-            os.execvp(argv[0], argv)
+            os.execvpe(argv[0], argv, {**os.environ, **self.extra_env()})
         processes = self.pool()
         if self.dry_run:
             for process in processes:
