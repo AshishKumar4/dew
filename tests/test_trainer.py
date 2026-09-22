@@ -955,12 +955,13 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     w, ema = host(state)
     np.testing.assert_allclose(w, .8, rtol=1e-6)
     np.testing.assert_allclose(ema, .9, rtol=1e-6)
-    before = state
+    # the step consumes the state
+    counted, advanced, scaled = int(state.step), int(state.microstep), float(state.scale.scale)
     state, _, _, finite, accepted = step(state, bad)
     assert bool(finite) and not bool(accepted)
-    assert int(state.step) == int(before.step) + 1
-    assert int(state.microstep) == int(before.microstep)
-    assert float(state.scale.scale) == float(before.scale.scale) / 2
+    assert int(state.step) == counted + 1
+    assert int(state.microstep) == advanced
+    assert float(state.scale.scale) == scaled / 2
     np.testing.assert_array_equal(state.params["params"]["w"], w)
     np.testing.assert_array_equal(state.ema["params"]["w"], ema)
     state, *_ = step(state, good)

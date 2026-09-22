@@ -86,33 +86,41 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     initial = train.initial_state()
     data = batches()
     run = train.compile(initial, data[0])
+    # the step consumes the state
+    start, opt_state, key = (jax.tree.map(np.asarray, initial.params),
+                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(initial.key))
     prefix, *_ = run(initial, data[0])
+    # the step consumes the state
+    prefix_scale = float(prefix.scale.scale)
+    prefix_params = jax.tree.map(np.asarray, prefix.params)
+    prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
     rejected, _, _, finite, accepted = run(prefix, data[1])
     assert bool(finite) and not bool(accepted)
     assert int(rejected.step) == 2 and int(rejected.microstep) == 1
-    assert float(rejected.scale.scale) == float(prefix.scale.scale) / 2
-    for before, after in zip(jax.tree.leaves(prefix.params), jax.tree.leaves(rejected.params), strict=True):
+    assert float(rejected.scale.scale) == prefix_scale / 2
+    for before, after in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(rejected.params), strict=True):
         np.testing.assert_array_equal(before, after)
-    for before, after in zip(jax.tree.leaves(prefix.accumulation), jax.tree.leaves(rejected.accumulation), strict=True):
+    for before, after in zip(jax.tree.leaves(prefix_accumulation),
+                             jax.tree.leaves(rejected.accumulation), strict=True):
         np.testing.assert_array_equal(before, after)
     final, _, _, _, accepted = run(rejected, data[2])
     assert bool(accepted) and int(final.updates) == 1
     assert float(final.params["stats"]["seen"]) == 2
-    assert float(initial.params["stats"]["seen"]) == 0
+    assert float(start["stats"]["seen"]) == 0
 
     def combined(w):
         stats = []
         for attempt, seen in [(0, 0.), (2, 1.)]:
             variables = {"params": {"w": w}, "stats": {"seen": jnp.array(seen)}}
             from dew.objectives import Step
-            info = Step(jnp.asarray(int(seen)), jax.random.fold_in(initial.key, attempt), variables)
+            info = Step(jnp.asarray(int(seen)), jax.random.fold_in(key, attempt), variables)
             value, _ = train.objective.loss(variables, data[attempt], info)
             stats.append(value)
         pooled = jax.tree.map(lambda a, b: a + b, *stats)
         return train.objective.reduce_loss(pooled)[0]
-    gradient = jax.grad(combined)(initial.params["params"]["w"])
-    update, expected_opt = train.optimizer.update({"w": gradient}, initial.opt_state, initial.params["params"])
-    expected = optax.apply_updates(initial.params["params"], update)
+    gradient = jax.grad(combined)(start["params"]["w"])
+    update, expected_opt = train.optimizer.update({"w": gradient}, opt_state, start["params"])
+    expected = optax.apply_updates(start["params"], update)
     np.testing.assert_allclose(final.params["params"]["w"], expected["w"], rtol=1e-6, atol=1e-7)
     for want, got in zip(jax.tree.leaves(expected_opt), jax.tree.leaves(final.opt_state), strict=True):
         np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
@@ -167,13 +175,15 @@ def test_activity_uses_all_loss_terms(composite, aux_active, updates):
     data["mask"] = jnp.zeros_like(data["mask"])
     data["active"] = jnp.asarray(aux_active)
     run = train.compile(initial, data)
+    # the step consumes the state
+    start, opt_state = jax.tree.map(np.asarray, (initial.params, initial.opt_state))
     state, *_ = run(initial, data)
     state, *_ = run(state, data)
     assert int(state.microstep) == 2
     assert int(state.updates) == updates
     if not updates:
-        np.testing.assert_array_equal(state.params["params"]["w"], initial.params["params"]["w"])
-        for a, b in zip(jax.tree.leaves(initial.opt_state), jax.tree.leaves(state.opt_state), strict=True):
+        np.testing.assert_array_equal(state.params["params"]["w"], start["params"]["w"])
+        for a, b in zip(jax.tree.leaves(opt_state), jax.tree.leaves(state.opt_state), strict=True):
             np.testing.assert_array_equal(a, b)
 
 
@@ -207,28 +217,31 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
         data.append({"text": jnp.asarray(rng.integers(0, 16, size=(rows, 11)), jnp.int32),
                      "text_roles": jnp.asarray(roles)})
     run = train.compile(initial, data[0])
+    # the step consumes the state
+    start, opt_state, key = (jax.tree.map(np.asarray, initial.params),
+                             jax.tree.map(np.asarray, initial.opt_state), np.asarray(initial.key))
     partial, *_ = run(initial, data[0])
-    for before, after in zip(jax.tree.leaves(initial.params), jax.tree.leaves(partial.params), strict=True):
+    for before, after in zip(jax.tree.leaves(start), jax.tree.leaves(partial.params), strict=True):
         np.testing.assert_array_equal(before, after)
     actual, actual_loss, _, _, accepted = run(partial, data[1])
     assert bool(accepted) and int(actual.updates) == 1
     combined = jax.tree.map(lambda a, b: jnp.concatenate((a, b)), *data)
-    info = Step(jnp.array(0), jax.random.fold_in(initial.key, 0), initial.params)
+    info = Step(jnp.array(0), jax.random.fold_in(key, 0), start)
     (expected_loss, aux), gradient = jax.value_and_grad(
-        lambda p: scalar_loss(objective, {**initial.params, "params": p}, combined, info),
-        has_aux=True)(initial.params["params"])
-    updates, _ = optimizer.update(gradient, initial.opt_state, initial.params["params"], qk_stats=aux.qk_stats)
-    expected = optax.apply_updates(initial.params["params"], updates)
+        lambda p: scalar_loss(objective, {**start, "params": p}, combined, info),
+        has_aux=True)(start["params"])
+    updates, _ = optimizer.update(gradient, opt_state, start["params"], qk_stats=aux.qk_stats)
+    expected = optax.apply_updates(start["params"], updates)
     np.testing.assert_allclose(actual_loss, expected_loss, rtol=1e-6, atol=2e-6)
     for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(actual.params["params"]), strict=True):
         np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
-    expected_moe = objective.apply_effects(initial.params, aux.effects)["moe"]
+    expected_moe = objective.apply_effects(start, aux.effects)["moe"]
     for want, got in zip(jax.tree.leaves(expected_moe), jax.tree.leaves(actual.params["moe"]), strict=True):
         np.testing.assert_array_equal(got, want)
 
     # An independent role-mask equation catches a shared bug in both batching paths.
     if auxiliary is None:
-        scores = objective.token_scores(initial.params, combined["text"], depths=True)
+        scores = objective.token_scores(start, combined["text"], depths=True)
         roles = combined["text_roles"] == int(Role.ASSISTANT)
         numerator = jnp.sum(scores.losses * roles[:, 1:])
         for depth, (losses, _) in enumerate(scores.depths, 1):
@@ -249,9 +262,10 @@ def test_replay_preserves_half_precision_cotangents_and_integer_support():
     initial = train.initial_state()
     data = batches()[0]
     step = train.compile(initial, data)
+    # the step consumes the state
+    w = np.asarray(initial.params["params"]["w"])
     state, *_ = step(initial, data)
     state, *_ = step(state, data)
-    w = initial.params["params"]["w"]
     expected = w - .1 * (2 * (w - 1) + .2 * (w + 3))
     # Original fp16 statistic pullbacks round their coefficients to fp16.
     np.testing.assert_allclose(state.params["params"]["w"], expected, rtol=0, atol=5e-5)
@@ -266,6 +280,8 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     step = train.compile(initial, data[0])
     prefix, *_ = step(initial, data[0])
     checkpoints.save_local(1, prefix, b"1")
+    # the step consumes the state
+    prefix_params = jax.tree.map(np.asarray, prefix.params)
     final, *_ = step(prefix, data[1])
     final, *_ = step(final, data[2])
     checkpoints.wait()
@@ -280,6 +296,6 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     template = {"params": jax.tree.map(
         lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=x.sharding), restored.params)}
     selected, _ = checkpoints.restore(template, 1)
-    for want, got in zip(jax.tree.leaves(prefix.params), jax.tree.leaves(selected["params"]), strict=True):
+    for want, got in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(selected["params"]), strict=True):
         np.testing.assert_array_equal(got, want)
 
