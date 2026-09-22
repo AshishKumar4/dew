@@ -3,18 +3,20 @@
 A `ChatMessages` source reads conversations from a parquet file, a JSONL
 file or a Hub dataset id, and renders each with the tokenizer's chat
 template. Every token gets the role of the message that wrote it, so
-`LMObjective` with `loss_role=Role.ASSISTANT`
-trains on assistant tokens only. Packing is the token pipeline's plan over
-the whole corpus (`PackedWindows`) with `text_roles` as one more per-token
-field, so a window carries `text`, `text_roles`, `text_segment_ids`,
-`text_positions` and the identical `text_roles_segment_ids`,
-`text_roles_positions`, all aligned, and the training stream's position is
-a global window count that resumes on any process count.
+`LMObjective` with `loss_role=Role.ASSISTANT` trains on assistant tokens
+only.
+
+Packing is the token pipeline's plan over the whole corpus
+(`PackedWindows`) with `text_roles` as one more per-token field. A window
+carries `text`, `text_roles`, `text_segment_ids`, `text_positions` and the
+identical `text_roles_segment_ids`, `text_roles_positions`, all aligned. The
+training stream's position is a global window count that resumes on any
+process count.
 
 Conversations are structured. A `Message` carries what the Hugging Face
-chat-template contract reads: a role, content that is a string, a list of
-typed parts, or nothing, an assistant's `tool_calls`, a tool response's
-`tool_call_id` and `name`, and any further keys the template wants
+chat-template contract reads: a role; content that is a string, a list of
+typed parts, or nothing; an assistant's `tool_calls`; a tool response's
+`tool_call_id` and `name`; and any further keys the template wants
 (`reasoning_content`, `thinking`) untouched. A `Conversation` adds the
 `tools` schemas the template renders into its system block. The stored
 messages retain typed content. Text-tokenizer rendering joins all-text parts
@@ -103,12 +105,13 @@ def _mapping(raw: object, name: str, where: str) -> Mapping[str, object]:
 
 
 def _records(raw: object, name: str, where: str) -> list[Mapping[str, object]]:
-    """A list of objects, or a JSON string holding one: parquet carries
-    structured columns as JSON text when their schema varies across rows.
+    """`raw` as a list of objects, parsing it first when it is JSON text.
 
-    Every array this file reads is an array of objects, messages, content
-    parts, tool calls and tool schemas alike, so the entries are narrowed
-    here and the readers below take a record rather than an unknown."""
+    Parquet carries a structured column as JSON text when its schema varies
+    across rows. Every array this file reads is an array of objects, messages,
+    content parts, tool calls and tool schemas alike, so the entries are
+    narrowed here and the readers below take a record rather than an unknown.
+    """
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
@@ -148,9 +151,9 @@ class ToolCall:
     """One function call an assistant message asks for.
 
     `arguments` is the parsed object. A source may hold it as a JSON string,
-    since parquet cannot carry a struct whose fields differ per call, and
-    the Hugging Face contract hands templates a mapping; the string parses
-    here and a string that is not a JSON object fails. `id` links the call
+    since parquet cannot carry a struct whose fields differ per call, while
+    the Hugging Face contract hands templates a mapping. The string parses
+    here, and a string that is not a JSON object fails. `id` links the call
     to the `tool_call_id` of its response where the template uses ids.
     `type` is the contract's `"function"`. A source may write the call flat
     (`{name, arguments}`) or nested under `function`; both read the same.
@@ -218,14 +221,14 @@ RESERVED = ("role", "content", "tool_calls", "tool_call_id", "name")
 class Message:
     """One turn, in the shape the chat template reads.
 
-    `content` is the text, the typed parts, or None when the turn is only
-    its tool calls; None reaches the template as None, the wire form tool
-    loops send. `tool_calls` belong to assistant turns and `tool_call_id` to
-    tool responses; `name` is the function a response answers, or a
-    participant's name on other roles. `extra` holds every further key
-    verbatim, so `reasoning_content` or `thinking` reach the template that
-    reads them. A value of None on an optional key reads as absent, which is
-    how parquet spells a field a row does not have.
+    `content` is the text, the typed parts, or None when the turn is only its
+    tool calls. None reaches the template as None, the wire form tool loops
+    send. `tool_calls` belong to assistant turns and `tool_call_id` to tool
+    responses; `name` is the function a response answers, or a participant's
+    name on other roles. `extra` holds every further key verbatim, so
+    `reasoning_content` or `thinking` reach the template that reads them. A
+    value of None on an optional key reads as absent, which is how parquet
+    spells a field a row does not have.
     """
 
     role: Role
@@ -267,7 +270,9 @@ class Message:
 
     def as_template(self) -> Mapping[str, object]:
         """The structured HF message, retaining content parts and metadata.
-        Conversation.text_rows adapts these fields for text tokenizers."""
+
+        `Conversation.text_rows` adapts these fields for text tokenizers.
+        """
         if isinstance(self.content, tuple):
             content: object = [part.as_template() for part in self.content]
         else:
@@ -298,8 +303,10 @@ class Conversation:
     @classmethod
     def parse(cls, messages: object, tools: object = None,
               where: str = "conversation") -> Conversation:
-        """One row's messages and tool schemas, as a parquet column holds
-        them: a list, or the JSON text a column of varying schema carries."""
+        """One row's messages and tool schemas, as a parquet column holds them.
+
+        Each is a list, or the JSON text a column of varying schema carries.
+        """
         if not isinstance(messages, (str, list)):
             raise ValueError(
                 f"{where}: messages are a list of turns or the JSON text of one, "
@@ -344,14 +351,15 @@ class Conversation:
 
 def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[str, object]],
                generation_prompt: bool, source: str) -> list[int]:
-    """`rows`, the messages' template dicts, through the chat template to
-    token ids. A template that refuses the messages, or reads a key they
-    lack, fails here with the source and the template's own message.
+    """Renders `rows`, the messages' template dicts, to token ids.
 
-    `rows` carries no annotation: transformers declares the conversation
-    as string-valued dicts while its contract reads lists under
-    `tool_calls` and `content`, so the honest type has no spelling the
-    checker accepts."""
+    A template that refuses the messages, or reads a key they lack, fails
+    here with the source and the template's own message.
+
+    `rows` carries no annotation. Transformers declares the conversation as
+    string-valued dicts while its contract reads lists under `tool_calls` and
+    `content`, so the honest type has no spelling the checker accepts.
+    """
     try:
         rendered = tokenizer.apply_chat_template(
             rows, tools=[dict(tool) for tool in tools] or None, tokenize=True,
@@ -374,7 +382,7 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
 
 def render_prompt(tokenizer: PreTrainedTokenizerBase, conversation: Conversation,
                   source: str) -> list[int]:
-    """Tokenize a text conversation with the next assistant header.
+    """Tokenizes a text conversation with the next assistant header.
 
     SFT and prompt sampling use the same message conversion and tool schemas.
     All-text parts concatenate in order; nontext parts require a processor.
@@ -397,19 +405,21 @@ def render_conversation(tokenizer: PreTrainedTokenizerBase, conversation: Conver
                         source: str) -> tuple[np.ndarray, np.ndarray]:
     """Token ids and per-token roles for one conversation.
 
-    Message k's span comes from prefix rendering. An assistant turn is
-    exact: `messages[:k]` with the generation prompt against `messages[:k+1]`
-    without it, and both must be prefixes of the whole render, so the
-    completion the loss counts is the completion the model will see. A
-    template that renders the turn differently once later messages follow
-    it, or whose generation prompt is not the turn's header, fails here
-    with the message index rather than mis-masking it. Every other turn
-    spans from where the previous turn's render ended to where its own
-    render stops agreeing with the whole, which is what a template needs
-    when it re-segments a run of tool responses into one block; a turn that
-    renders to no tokens, or rewrites an earlier turn's tokens, fails. What
-    a template emits before any message, a tools block for one, has no
-    message of its own and counts as the first message's span.
+    Message k's span comes from prefix rendering. An assistant turn is exact:
+    `messages[:k]` with the generation prompt against `messages[:k+1]`
+    without it, and both must be prefixes of the whole render. The completion
+    the loss counts is then the completion the model will see. A template
+    that renders the turn differently once later messages follow it, or whose
+    generation prompt is not the turn's header, fails here with the message
+    index rather than mis-masking it.
+
+    Every other turn spans from where the previous turn's render ended to
+    where its own render stops agreeing with the whole. That is what a
+    template needs when it re-segments a run of tool responses into one
+    block. A turn that renders to no tokens, or rewrites an earlier turn's
+    tokens, fails. What a template emits before any message, a tools block
+    for one, has no message of its own and counts as the first message's
+    span.
 
     `source` names the tokenizer and the row for those refusals. The arrays
     are int32 ids and int8 roles.
@@ -467,9 +477,9 @@ def load_tokenizer(path: str) -> PreTrainedTokenizerBase:
 
     The render map runs inside grain workers, which unpickle only the path,
     so each worker loads its own copy on its first record. The lock
-    serializes that first import: transformers swaps in its lazy module
-    object while it initializes, and two threads importing it together can
-    catch it half built. The prompt source shares this cache.
+    serializes that first import, because transformers swaps in its lazy
+    module object while it initializes and two threads importing it together
+    can catch it half built. The prompt source shares this cache.
     """
     with _tokenizer_lock:
         from transformers import AutoTokenizer
@@ -533,8 +543,8 @@ def _hub_conversations(path: str, split: str, options: HFOptions, column: str) -
 
     `options` is the value the `hf` provider forwards, so the cache, the
     config name, a revision and a token are the library's own arguments. The
-    load names one split and asks for a table, so a directory of splits and a
-    streamed split are refused here rather than indexed into; the import is
+    load names one split and asks for a table, so a directory of splits or a
+    streamed split is refused here rather than indexed into. The import is
     the load's own, which has already raised the missing-extra message.
     """
     loaded = options.load(path, split, streaming=False)
@@ -550,19 +560,19 @@ def _hub_conversations(path: str, split: str, options: HFOptions, column: str) -
 
 
 class ConversationSource:
-    """Random access over the conversations at `path`, with their tool
-    schemas beside them where the rows carry any.
+    """Reads the conversations at `path` by index, with their tool schemas
+    beside them where the rows carry any.
 
-    Three things hold conversations and one iterator reads all three: a
-    parquet file, a `.jsonl` file, and a Hub dataset id resolved through
-    `HFOptions`. A suffix decides which, so `chat.jsonl` is lines,
-    `chat.parquet` is a table, an existing file without either suffix is a
-    table too, and anything else is a repo id at `split`.
+    Three things hold conversations and one reader takes all three: a parquet
+    file, a `.jsonl` file, and a Hub dataset id resolved through `HFOptions`.
+    The suffix decides which. `chat.jsonl` is lines, `chat.parquet` is a
+    table, an existing file without either suffix is a table too, and
+    anything else is a repo id at `split`.
 
     One record is one conversation, a list of messages in the verl layout,
-    and its tool schemas, a list or a JSON string. The rows are read once;
-    they come back as plain dicts, which pickle across to grain workers.
-    Other columns are not read.
+    and its tool schemas, a list or a JSON string. The rows are read once and
+    come back as plain dicts, which pickle across to grain workers. Other
+    columns are not read.
     """
 
     def __init__(self, path: str, *, column: str = "messages", split: str = "train",
@@ -584,10 +594,8 @@ class ConversationSource:
         self._tools = tools
 
     def __repr__(self) -> str:
-        # A saved data position names its source, so a resumed run needs
-        # what the rows came from here, not an address in this process: the
-        # file or repo id, and for a repo the split and the load's own
-        # arguments, which decide which rows those are.
+        # The description a saved position compares against (`describe`). A
+        # repo id names which rows only with its split and load arguments.
         return (f"{self.__class__.__name__}(path={self.path!r}, column={self.column!r}, "
                 f"split={self.split!r}, options={self.options!r})")
 
@@ -603,7 +611,8 @@ class ConversationSource:
 
 
 class RenderConversation:
-    """Source rows into rendered ids and per-token roles, for `map_with_index`.
+    """Turns source rows into rendered ids and per-token roles, for
+    `map_with_index`.
 
     Holds only the tokenizer path, so grain workers unpickle the name and
     load their own copy. Failures name the tokenizer and the row.
@@ -639,20 +648,23 @@ def _lengths(source: ConversationSource, tokenizer: str) -> list[int]:
 @datasets("chat_messages")
 @dataclasses.dataclass(frozen=True)
 class ChatMessages(DatasetSpec):
-    """Conversations rendered with the tokenizer's chat template, packed.
+    """Renders conversations with the tokenizer's chat template and packs them.
 
     `path` names the conversations: a parquet file, a `.jsonl` file, or a Hub
     dataset id read at `split` through `options`, which is the same value the
     `hf` provider forwards to `datasets.load_dataset`. Whichever it is, the
     rows carry lists of messages under `column` (or `prompt`, which is what
     the verl layout calls it) and their tool schemas under `tools` where they
-    have any; `tokenizer` is the hub name or local path whose chat template
-    renders them. Each conversation (in chunks, when it outgrows the window)
-    is one element the packing plan adds to the first window with room, and
-    every window carries `text_roles` beside the ids, so the loss can count
-    one role's targets. The plan is over the whole corpus in row order, ahead
-    of the shard, as `PackedTokens` plans its documents, so `records` is the
-    windows of a pass exactly and a saved position is a global window count.
+    have any. `tokenizer` is the hub name or local path whose chat template
+    renders them.
+
+    Each conversation, in chunks when it outgrows the window, is one element
+    the packing plan adds to the first window with room. Every window carries
+    `text_roles` beside the ids, so the loss can count one role's targets.
+    The plan runs over the whole corpus in row order, ahead of the shard, as
+    `PackedTokens` plans its documents, so `records` is the windows of a pass
+    exactly and a saved position is a global window count.
+
     `val_path` is a second source of the same three kinds, read at
     `val_split` and scored as one pass; None trains without validation.
     """

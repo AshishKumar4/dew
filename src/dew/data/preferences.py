@@ -1,8 +1,8 @@
 """Preference pairs for DPO: chosen and rejected rows with their masks.
 
 A `PreferencePairs` source reads a parquet file or in-memory JSON rows of
-`chosen` and `rejected` token-id lists with `chosen_mask` and
-`rejected_mask` marking the completion tokens, and stacks each batch in
+`chosen` and `rejected` token-id lists, with `chosen_mask` and
+`rejected_mask` marking the completion tokens. Each batch stacks them in
 TRL's layout: chosen rows over rejected rows, padded to the longest row,
 with `completion_mask` alongside the ids. A mask must run as long as its
 ids; anything else fails naming the row.
@@ -57,13 +57,14 @@ def _mask(values: object, name: str, length: int, where: str) -> list[int]:
 
 
 class PreferenceSource:
-    """Random access over validated pair rows, stacked on read.
+    """Reads validated pair rows by index, stacking each on read.
 
     Rows come back as `[2, seq_len]` pairs, chosen at index 0, padded with
-    `pad_id` and 0. A row longer than the window fails with its lengths: a
-    pair cannot be chunked without cutting a completion, and silent cuts
-    train the wrong preference. The repr names the origin file for grain's
-    checkpoint matching, or the record count for in-memory rows.
+    `pad_id` and 0. A row longer than the window fails with its lengths,
+    because a pair cannot be chunked without cutting a completion and a
+    silent cut trains the wrong preference. The repr names the origin file,
+    or the record count for in-memory rows, which is what a saved position
+    compares against (`describe`).
     """
 
     def __init__(self, rows: Sequence[Mapping[str, object]], origin: str, pad_id: int,
@@ -103,8 +104,11 @@ class PreferenceSource:
 
     @classmethod
     def from_parquet(cls, path: str, pad_id: int, seq_len: int) -> PreferenceSource:
-        """The file's rows: `chosen` and `rejected` are required, the masks
-        default to all-completion when absent. Rows longer than `seq_len` fail."""
+        """The parquet file's rows.
+
+        `chosen` and `rejected` are required; the masks default to
+        all-completion when absent. Rows longer than `seq_len` fail.
+        """
         try:
             import pyarrow.parquet as parquet
         except ImportError as exc:
@@ -150,9 +154,9 @@ class PreferenceSource:
 @datasets("preference_pairs")
 @dataclasses.dataclass(frozen=True)
 class PreferencePairs(DatasetSpec):
-    """Chosen and rejected completions as fixed-width pairs.
+    """Reads chosen and rejected completions as fixed-width pairs.
 
-    `path` is a parquet file; `records` is JSON rows for tests and small
+    `path` is a parquet file and `records` is JSON rows for tests and small
     sweeps; exactly one of the two is set. Each batch holds `input_ids` and
     `completion_mask` as `[B, 2, seq_len]` pairs, chosen at index 0. A row
     longer than `seq_len` fails. `val_path` is a second parquet file scored

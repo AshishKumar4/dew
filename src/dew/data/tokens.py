@@ -1,20 +1,21 @@
-"""Token datasets over a tokenized corpus directory: the `train.bin`,
-`val.bin` and `meta.json` that `tools/tokenize_text.py` writes, or the same
-splits as ArrayRecord shards or parquet (`dew.data.sources.text`).
+"""Reads token datasets off a tokenized corpus directory.
 
-`TokenWindows` reads fixed `seq_len + 1` windows off the token stream;
+The corpus is the `train.bin`, `val.bin` and `meta.json` that
+`tools/tokenize_text.py` writes, or the same splits as ArrayRecord shards or
+parquet (`dew.data.sources.text`).
+
+`TokenWindows` reads fixed `seq_len + 1` windows off the token stream.
 `PackedTokens` packs whole documents into windows of that size and carries
 the segment ids and positions the backbone's mask needs. Train shuffles from
-`seed`, reshuffled per epoch, and runs forever; val reads `val.bin` once, in
+`seed`, reshuffles per epoch and runs forever; val reads `val.bin` once, in
 file order, in whole batches, so every validation pass scores the same
 windows. Both shard by JAX process.
 
-Both resume from a global record count, because both put the sharding last.
-`TokenWindows` reads windows off the stream at a fixed stride; `PackedTokens`
-plans its packing over the whole corpus in file order and reads windows off
-that plan. A step is then the same windows at any process count, and the
-position a checkpoint holds is a place in one order rather than one
-process's offset into its shard.
+Both put the sharding last, so both resume from a global record count.
+`TokenWindows` reads windows off the stream at a fixed stride, and
+`PackedTokens` plans its packing over the whole corpus in file order. A step
+is then the same windows at any process count, and a saved position is a
+place in one order rather than one process's offset into its shard.
 """
 
 from __future__ import annotations
@@ -42,6 +43,12 @@ from .dataset import (
 
 
 class _BoundedIterator(Forwarding):
+    """Yields the first `batches` batches of `source` and closes `source`.
+
+    `Forwarding.close` reaches the source, so stopping early still releases
+    the grain workers the source owns.
+    """
+
     def __init__(self, source: Iterator[Batch], batches: int):
         self._source: Iterator[Batch] | None = source
         self._iterator: Iterator[Batch] = itertools.islice(source, batches)
@@ -61,7 +68,11 @@ class _BoundedIterator(Forwarding):
 
 
 def bounded(stream: Callable[[], Iterator[Batch]], batches: int | None) -> Callable[[], Iterator[Batch]]:
-    """Limit validation batches while preserving owned source shutdown."""
+    """`stream` stopped after `batches` batches, or `stream` itself when `batches` is None.
+
+    The wrapper forwards close to the source, so a caller that stops early
+    still releases the grain workers the stream owns.
+    """
     if batches is None:
         return stream
     if batches < 0:
@@ -74,12 +85,16 @@ def bounded(stream: Callable[[], Iterator[Batch]], batches: int | None) -> Calla
 @datasets("token_windows")
 @dataclasses.dataclass(frozen=True)
 class TokenWindows(DatasetSpec):
-    """Fixed windows of `seq_len + 1` ids, each starting `seq_len` after the
-    last, so record i's last token is record i + 1's first and the model sees
-    every transition once. A batch is `{"text": int32 [batch, seq_len + 1]}`.
-    `val_batches` bounds a validation pass; None scores the whole split. The
-    training stream's saved position is a global window count, so a run
-    resumes on any process count the global batch divides over."""
+    """Reads fixed windows of `seq_len + 1` ids off the token stream.
+
+    Each window starts `seq_len` ids after the last, so record i's last token
+    is record i + 1's first and the model sees every transition once. A batch
+    is `{"text": int32 [batch, seq_len + 1]}`. `val_batches` bounds a
+    validation pass; None scores the whole split.
+
+    The training stream's saved position is a global window count, so a run
+    resumes on any process count the global batch divides over.
+    """
 
     path: str | None = None
     seq_len: int = 256
@@ -130,19 +145,18 @@ def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np
 
     Grain's packer holds `bins` open windows, adds each record to the first
     with room, and emits all of them when a record fits in none
-    (`grain/_src/python/dataset/transformations/packing.py:341-355`). Over
-    the lengths alone that is a plan rather than a pass: which window every
-    chunk belongs to, without reading a token. The plan is what lets the
-    packing run ahead of the shard, over the whole corpus in file order, so
-    a window holds the same chunks at any process count and the loader can
-    shard windows the way it shards any other record.
+    (`grain/_src/python/dataset/transformations/packing.py:341-355`). Run
+    over the lengths alone it is a plan rather than a pass: which window
+    every chunk belongs to, without reading a token. That plan is what lets
+    the packing run ahead of the shard, so a window holds the same chunks at
+    any process count.
 
     Returns the chunk indices grouped by window, in the order the packer
     added them, and where each window starts in that grouping. A window the
-    packer never added anything to is dropped: it would be a batch row of
-    pure padding, which trains on nothing. Only the last set of bins can
-    hold one, because a record goes to the first window with room and an
-    empty window has room for anything.
+    packer never added anything to is dropped, since it would be a batch row
+    of pure padding. Only the last set of bins can hold one, because a record
+    goes to the first window with room and an empty window has room for
+    anything.
     """
     if bins < 1:
         raise ValueError(f"a packer fills at least one window at a time, got {bins}")
@@ -175,10 +189,10 @@ def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np
 
 
 class DocumentChunks(pygrain.MapDataset[Batch]):
-    """Documents cut into consecutive chunks of at most `chunk_len` tokens.
+    """Cuts documents into consecutive chunks of at most `chunk_len` tokens.
 
     A window holds nothing longer than itself, so a document that outgrows
-    the window is cut first; each chunk becomes its own segment in the packed
+    the window is cut first. Each chunk becomes its own segment in the packed
     window, which keeps attention inside the chunk and RoPE running from the
     chunk's own 0.
 
@@ -221,28 +235,25 @@ class DocumentChunks(pygrain.MapDataset[Batch]):
 
 
 class PackedWindows(pygrain.MapDataset[Batch]):
-    """Documents packed into windows of `window` tokens, by one plan over the
+    """Packs documents into windows of `window` tokens, by one plan over the
     whole corpus.
 
     Every window carries, beside each per-token field, `<field>_segment_ids`
     (which chunk of the window each token came from, counted from 1, and 0
     for the padding at the end) and `<field>_positions` (the token's place
-    inside its chunk), the two arrays a block-diagonal mask and per-document
-    RoPE read; grain's packer writes the same pair per packed feature
+    inside its chunk). A block-diagonal mask and per-document RoPE read that
+    pair, which is what grain's packer writes per packed feature
     (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`).
     Chunks are cut the same way in every field, so one pair describes them
     all and the arrays are shared rather than copied per field.
 
-    A window is random access, which is the point: `first_fit` plans the
-    packing from the document lengths, in file order, ahead of any sharding,
-    so window w holds the same chunks in every process of every process
-    count and the training stream can shuffle, shard and count windows the
-    way it does the records of any other source. Packing behind the shard,
-    as this loader did before, made a window a fact about one process's own
-    documents and its saved position a shard offset.
+    A window is read by index. `first_fit` plans the packing from the
+    document lengths alone, in file order, before any sharding. Window w
+    therefore holds the same chunks at every process count, and the training
+    stream shuffles, shards and counts windows as it does any other record.
 
     `documents` is any dataset of per-token fields whose lengths are
-    `lengths`, and `described` names it the way a saved position needs
+    `lengths`. `described` names it the way a saved position needs
     (`describe`), since which chunks share a window is part of the order the
     position counts into.
     """
@@ -301,23 +312,23 @@ class PackedWindows(pygrain.MapDataset[Batch]):
 @datasets("packed_tokens")
 @dataclasses.dataclass(frozen=True)
 class PackedTokens(DatasetSpec):
-    """Whole documents packed into `seq_len + 1` windows.
+    """Packs whole documents into `seq_len + 1` windows.
 
     Documents come from `TokenDocumentSource`, which cuts the token stream at
     the eos ids the tokenize tool writes between files (`--pack`). Each
-    document (in chunks, when it outgrows the window) is one element the
-    packer adds to the first window with room, and every window carries
+    document, in chunks when it outgrows the window, is one element the
+    packer adds to the first window with room. Every window carries
     `text_segment_ids` (which document each token is from, 0 for padding) and
     `text_positions` (the token's position inside its document), so the model
     can stop attention and the loss at document boundaries.
 
-    The packing is planned over the whole corpus in file order, ahead of the
-    shard (`PackedWindows`), so a window is a fact about the corpus rather
-    than about one process's documents: the training stream shuffles and
-    shards windows the way it does any other record, and its saved position
-    is a global window count that resumes on any process count. Which
-    documents share a window is then the same in every run over that corpus,
-    and the seed decides the order the windows come in.
+    `PackedWindows` plans the packing over the whole corpus in file order,
+    ahead of the shard, so a window is a fact about the corpus rather than
+    about one process's documents. The training stream shuffles and shards
+    windows as it does any other record, and its saved position is a global
+    window count that resumes on any process count. Which documents share a
+    window is the same in every run over that corpus; the seed decides only
+    the order the windows come in.
 
     `records` counts the windows a pass over the split holds, exactly, so
     `steps_per_epoch` is that pass. `val_batches` bounds a validation pass;

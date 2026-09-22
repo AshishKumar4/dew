@@ -1,14 +1,13 @@
 """Image datasets: TFDS, Hugging Face hub and arrayrecord shards, one transform.
 
-Every image dataset resizes, augments and captions its records the same way;
-what differs is where the records come from and how one is read, which is
+Every image dataset resizes, augments and captions its records the same way.
+What differs is where the records come from and how one is read, which is
 the three hooks a subclass fills in. Records leave as
 `{"image": uint8 [size, size, 3], "caption": str}`, plus `"label"` when the
-source carries a class index, and `load(tokenize=)` is where a run's own
+source carries a class index. `load(tokenize=)` is where a run's own
 condition reads the captions: the dataset carries the text, the encoder
-decides what tokens it becomes. cv2, tensorflow_datasets
-and HF datasets are imported on use, so `import dew.data` costs none of
-them.
+decides what tokens it becomes. cv2, tensorflow_datasets and HF datasets are
+imported on use, so `import dew.data` costs none of them.
 """
 
 from __future__ import annotations
@@ -44,8 +43,12 @@ from .tokens import bounded
 Augmentation = Literal["none", "flip_only", "flip_jitter"]
 
 
-def unpack_dict_of_byte_arrays(packed_data):
-    """Unpacks a dictionary of byte arrays from a packed binary format."""
+def unpack_dict_of_byte_arrays(packed_data: bytes) -> dict[str, bytes]:
+    """The `str -> bytes` entries of one packed arrayrecord record.
+
+    Each entry is a uint32 key length, the utf-8 key, a uint32 value length
+    and the value, in that order. `pack_dict_of_byte_arrays` writes it.
+    """
     unpacked_dict = {}
     offset = 0
     while offset < len(packed_data):
@@ -61,8 +64,8 @@ def unpack_dict_of_byte_arrays(packed_data):
     return unpacked_dict
 
 def pack_dict_of_byte_arrays(unpacked: dict) -> bytes:
-    """The inverse of unpack_dict_of_byte_arrays: `str -> bytes` entries,
-    length-prefixed, in dict order."""
+    """`unpacked`'s entries length-prefixed in dict order, the layout
+    `unpack_dict_of_byte_arrays` reads."""
     packed = bytearray()
     for key, byte_array in unpacked.items():
         encoded = key.encode('utf-8')
@@ -124,7 +127,7 @@ def resize_image(image: np.ndarray, size: int) -> np.ndarray:
 
 @dataclasses.dataclass(frozen=True)
 class Augment:
-    """The augmentations one mode applies: flip for flip_only, both for
+    """Says which augmentations a mode applies: flip for flip_only, both for
     flip_jitter. 'none' maps to no Augment at all."""
 
     flip: bool
@@ -132,7 +135,7 @@ class Augment:
 
 
 def image_augmentations(mode: Augmentation) -> Augment | None:
-    """The augmentations for one mode: flip_only (DiT style), flip_jitter,
+    """The augmentations `mode` names: flip_only (DiT style), flip_jitter,
     or none (deterministic evaluation and debugging)."""
     if mode == 'none':
         return None
@@ -157,12 +160,12 @@ def _gray(pixels: np.ndarray) -> np.ndarray:
 
 def augment_image(augment: Augment | None, image: np.ndarray,
                   rng: np.random.Generator) -> np.ndarray:
-    """Flip and colour-jitter `image`, seeded by the record's own rng.
+    """Flips and colour-jitters `image`, seeded by the record's own rng.
 
-    Every draw comes from grain's per-record rng (Philox keyed by the record
-    index), so a record's augmentation is the same however many workers,
-    threads or processes produced its batch. uint8 pixels go through float32
-    and are rounded and clipped once at the end.
+    Every draw comes from grain's per-record rng, a Philox keyed by the
+    record index, so a record's augmentation is the same however many
+    workers, threads or processes produced its batch. uint8 pixels go through
+    float32 and are rounded and clipped once at the end.
     """
     if augment is None:
         return image
@@ -223,9 +226,8 @@ def record_caption(element) -> str:
 def _fields(element: Batch | bytes, name: str) -> Batch:
     """A record's fields, or the refusal that this source holds bytes.
 
-    The three hooks a spec fills in belong together: a spec whose `source`
-    reads a table of features reads them by name here, and one whose source
-    is arrayrecord bytes unpacks them itself.
+    A spec whose `source` reads a table of features reads them by name here;
+    one whose source is arrayrecord bytes unpacks them itself.
     """
     if isinstance(element, bytes):
         raise TypeError(
@@ -235,7 +237,7 @@ def _fields(element: Batch | bytes, name: str) -> Batch:
 
 
 class ImageTransform(pygrain.RandomMapTransform):
-    """Resize, augment and caption one record, seeded by the record's own rng."""
+    """Resizes, augments and captions one record, seeded by the record's own rng."""
 
     def __init__(self, spec: ImageDataset):
         self.spec = spec
@@ -255,15 +257,15 @@ class ImageTransform(pygrain.RandomMapTransform):
 
 @dataclasses.dataclass(frozen=True)
 class ImageDataset(DatasetSpec):
-    """Captioned images through grain, resized to `image_size`.
+    """Reads captioned images through grain, resized to `image_size`.
 
-    Validation comes from one of two places. `val_split` names a split of
-    the dataset's own, which is opened as a second source and scored in
-    record order, `val_batches` batches of it or all of it when that is
-    None. Without one, `val_batches` batches of records are held out of the
-    head of the training source, in canonical order, so FID and CLIP are
-    still never measured on records the model trained on; None or 0 holds
-    nothing out and validates nothing.
+    Validation comes from one of two places. `val_split` names a split of the
+    dataset's own, which is opened as a second source and scored in record
+    order, `val_batches` batches of it or all of it when that is None.
+    Without one, `val_batches` batches of records are held out of the head of
+    the training source, in canonical order, so FID and CLIP are never
+    measured on records the model trained on. None or 0 holds nothing out and
+    validates nothing.
 
     `count` takes that many records from the head of the source. A source
     that reports no length needs it set.
@@ -276,27 +278,29 @@ class ImageDataset(DatasetSpec):
     count: int | None = None
 
     def source(self, split: str | None = None) -> Records:
-        """Random access over the records (`__getitem__`, and `__len__` unless
+        """Opens the records by index (`__getitem__`, and `__len__` unless
         `count` says how many there are).
 
         `split` names a split other than the one this spec reads, which is
-        how `val_split` opens a second source; a dataset whose records are
+        how `val_split` opens a second source. A dataset whose records are
         one pile refuses it.
         """
         raise NotImplementedError
 
     def record(self, element: Batch | bytes,
                rng: np.random.Generator) -> tuple[np.ndarray | bytes, str, int | None]:
-        """One record as `(image, caption, class index or None)`; the image is
-        RGB uint8, or the encoded bytes for the transform to decode at the size
-        it needs."""
+        """One record as `(image, caption, class index or None)`.
+
+        The image is RGB uint8, or the encoded bytes for the transform to
+        decode at the size it needs.
+        """
         raise NotImplementedError
 
     def records(self, source: Records) -> int:
         """The records the run uses, from the head of the source.
 
-        A source that cannot count itself is `Counted`'s other case: the
-        spec's own `count` is then the whole record of how many there are.
+        A source that cannot count itself is `Counted`'s other case, where
+        the spec's own `count` is the whole record of how many there are.
         """
         name = type(self).__name__
         if self.count is None:
@@ -336,7 +340,8 @@ class ImageDataset(DatasetSpec):
 @datasets("oxford_flowers102")
 @dataclasses.dataclass(frozen=True)
 class OxfordFlowers(ImageDataset):
-    """Prepared Oxford Flowers ArrayRecords, captioned from their class names.
+    """Reads prepared Oxford Flowers ArrayRecords, captioned from their class
+    names.
 
     Preparation runs separately. Reading uses TFDS metadata and NumPy image
     decoding through its read-only builder, without TensorFlow or dataset
@@ -381,10 +386,10 @@ class OxfordFlowers(ImageDataset):
 @datasets("hf_images")
 @dataclasses.dataclass(frozen=True)
 class HFImages(ImageDataset):
-    """A Hugging Face hub dataset of images with a 'caption' or 'text' column,
-    read through grain's random access.
+    """Reads a Hugging Face hub dataset of images by index, captioned from its
+    'caption' or 'text' column.
 
-    `name` is the repo id and `split` the split to read; `options` is
+    `name` is the repo id and `split` the split to read. `options` is
     everything else `datasets.load_dataset` takes, the same value the `hf`
     provider holds, so a dataset behind a config name, a revision, its own
     `data_files` or a token is read here too.
@@ -410,13 +415,18 @@ class HFImages(ImageDataset):
 @datasets("array_record_images")
 @dataclasses.dataclass(frozen=True)
 class ArrayRecordImages(ImageDataset):
-    """Image and caption pairs in arrayrecord shards under `path/<shard>/`,
-    each record a packed dict. Two layouts: 'jpg'/'txt' entries (encoded,
-    decoded on read) and the `prepare_images.py` layout 'image'/'shape'/
-    'caption' (uint8 HxWx3 already at training size, shape two little-endian
-    int32s, 'label' optional). `path` is the bucket mount or directory the
-    shards live under; an empty `shards` reads every arrayrecord file in
-    `path` itself, which is the layout prepare_images.py writes."""
+    """Reads image and caption pairs from arrayrecord shards under
+    `path/<shard>/`, each record a packed dict.
+
+    Two layouts are read. 'jpg'/'txt' entries hold an encoded image, decoded
+    on read. The `prepare_images.py` layout holds 'image'/'shape'/'caption',
+    where the image is uint8 HxWx3 already at training size, the shape is two
+    little-endian int32s, and 'label' is optional.
+
+    `path` is the bucket mount or directory the shards live under. An empty
+    `shards` reads every arrayrecord file in `path` itself, which is the
+    layout prepare_images.py writes.
+    """
 
     path: str | None = None
     shards: tuple[str, ...] = ()

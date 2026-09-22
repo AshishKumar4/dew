@@ -35,17 +35,17 @@ _DEFAULT_DTYPE = np.dtype("<u2")
 
 @runtime_checkable
 class TokenSource(Protocol):
-    """A tokenized corpus as one stream of ids.
+    """Reads a tokenized corpus as one stream of ids.
 
     `len` is the tokens it holds and `source[start:stop]` is that span of
-    them. Both record readers below cut their records out of this and
-    nothing else: a fixed window is a strided span, and a document is the
-    span between two eos ids.
+    them. Both record readers below cut their records out of this and nothing
+    else: a fixed window is a strided span, and a document is the span
+    between two eos ids.
 
     `eos_id` is the id that closes a document, which only the packed reader
-    needs and a corpus written without boundaries does not have. A saved
-    position names the order it counts into, so a source also describes
-    itself by what it reads rather than by its address in this process.
+    needs and a corpus written without boundaries does not have. A source
+    also describes itself by what it reads rather than by its address, which
+    is what a saved position compares against (`describe`).
     """
 
     @property
@@ -80,11 +80,11 @@ def _dtype(meta: Mapping[str, object]) -> np.dtype:
 
 
 class TokenBytes:
-    """A flat `.bin` of token ids, memmapped.
+    """Reads a flat `.bin` of token ids through a memmap.
 
-    The dtype comes from the sibling `meta.json` when present (the tokenize
-    tool records it there), else uint16. The file is never loaded into
-    memory: a worker reads only the span it is asked for.
+    The dtype comes from the sibling `meta.json` when present, where the
+    tokenize tool records it, and is uint16 otherwise. The file is never
+    loaded into memory: a worker reads only the span it is asked for.
     """
 
     def __init__(self, path: str, eos_id: int | None = None):
@@ -117,13 +117,13 @@ class TokenBytes:
 
 
 class _Sharded:
-    """Token arrays read as one stream, in the order they are stored.
+    """Reads token arrays as one stream, in the order they are stored.
 
-    A corpus of records or rows is the concatenation of them, so where a
-    span falls is a binary search over their lengths, read once at
-    construction. A span that crosses a boundary reads both pieces and joins
-    them; one that does not reads one. Only the pieces a record covers are
-    read, so a corpus is no more in memory than the memmap is.
+    A corpus of records or rows is the concatenation of them, so where a span
+    falls is a binary search over their lengths, read once at construction. A
+    span that crosses a boundary reads both pieces and joins them; one that
+    does not reads one. Only the pieces a record covers are read, so a corpus
+    is no more in memory than the memmap is.
     """
 
     def __init__(self, lengths: Sequence[int], dtype: np.dtype):
@@ -156,7 +156,7 @@ class _Sharded:
 
 
 class TokenRecords(_Sharded):
-    """Token arrays in ArrayRecord shards, read as one stream.
+    """Reads token arrays in ArrayRecord shards as one stream.
 
     Each record holds one array of ids, as its raw bytes or under `field` of
     the packed dict `dew.data.images.pack_dict_of_byte_arrays` writes. The
@@ -210,11 +210,11 @@ def _array_records(paths: Sequence[str]):
 
 
 class TokenColumn(_Sharded):
-    """One column of token ids in parquet files, read as one stream.
+    """Reads one column of token ids in parquet files as one stream.
 
     The column holds a list of integers per row, which is what a tokenized
     dataset written with `to_parquet` holds. The rows are the corpus in file
-    order; `column` names which column to read, and a file that holds one
+    order. `column` names which column to read, and a file that holds one
     column needs no name.
     """
 
@@ -264,9 +264,9 @@ def token_corpus(path: str | None, name: str, *, field: str | None = None
 
     A split's files are the ones named for it, and their suffix says which
     store they are in: `train.bin`, `train*.array_record*` shards, or
-    `train*.parquet`. Reading train in val's place would score the
-    validation pass on the windows the model trains on, so a directory
-    holding one without the other is refused rather than halved.
+    `train*.parquet`. Reading train in val's place would score the validation
+    pass on the windows the model trains on, so a directory holding one
+    without the other is refused rather than halved.
     """
     if not path:
         raise ValueError(
@@ -300,7 +300,7 @@ def _split(root: Path, split: str, name: str, field: str | None) -> TokenSource:
 
 
 class TokenWindowSource:
-    """Fixed `seq_len + 1` windows over a token corpus, by index.
+    """Reads fixed `seq_len + 1` windows over a token corpus, by index.
 
     Record i is `tokens[i * seq_len : i * seq_len + seq_len + 1]`, so the
     last token of one window is the first of the next and the model sees
@@ -319,9 +319,7 @@ class TokenWindowSource:
             )
 
     def __repr__(self) -> str:
-        # A saved data position names the order it counts into by naming its
-        # source, and a resume refuses a description it cannot match, so this
-        # describes the corpus, not an address in this process.
+        # The description a saved position compares against (`describe`).
         return f"TokenWindowSource(tokens={self.tokens!r}, seq_len={self.seq_len})"
 
     def __len__(self) -> int:
@@ -337,7 +335,7 @@ class TokenWindowSource:
 
 
 class TokenDocumentSource:
-    """One document per record over a token corpus, by index.
+    """Reads one document per record over a token corpus, by index.
 
     A document is the span from after the previous `eos_id` through its own,
     so the eos tokens are the record separators. The tail after the last eos
@@ -348,7 +346,7 @@ class TokenDocumentSource:
 
     `eos_id` is the corpus's own unless one is given; without it the stream
     has no boundaries to find. Finding them reads the corpus once at
-    construction; after that a worker touches only the span it is asked for.
+    construction, after which a worker touches only the span it is asked for.
     """
 
     def __init__(self, tokens: TokenSource, eos_id: int | None = None):
@@ -370,9 +368,8 @@ class TokenDocumentSource:
         self.lengths = self._ends - self._starts
 
     def __repr__(self) -> str:
-        # A saved data position names the order it counts into, and the packed
-        # loader's order is planned over these documents, so this describes the
-        # corpus rather than an address in the process that wrote the position.
+        # The description a saved position compares against (`describe`); the
+        # packed loader plans its order over these documents.
         return f"TokenDocumentSource(tokens={self.tokens!r}, eos_id={self.eos_id})"
 
     def __len__(self) -> int:

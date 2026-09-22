@@ -1,17 +1,17 @@
 """The value a run trains on, and the grain plumbing every dataset shares.
 
 A `DatasetSpec` is a frozen dataclass behind `@datasets(name)` that says what
-a dataset is and how it is read; `load(batch=)` turns it into a `Dataset`,
+a dataset is and how it is read. `load(batch=)` turns it into a `Dataset`,
 the value a recipe hands the trainer. Everything here is what the image,
 video and token specs have in common: the per-process batch, the shuffled
-training stream, the ordered validation pass and the slice that keeps the two
-disjoint.
+training stream, the ordered validation pass, and the slice that keeps the
+two disjoint.
 
 A training stream's position is one global record count rather than a shard
-offset, so a run saved on one process count resumes on another;
-`GlobalStream` here and `dew.position` are that contract. A weighted
-`mixture` of corpora and a `Ramp` of the batch are both cut out of that one
-order, so neither adds anything to what a checkpoint holds.
+offset, so a run saved on one process count resumes on another. `GlobalStream`
+here and `dew.position` are that contract. A weighted `mixture` of corpora
+and a `Ramp` of the batch are cut out of that one order, so neither adds
+anything to what a checkpoint holds.
 """
 
 from __future__ import annotations
@@ -33,9 +33,8 @@ from absl import flags
 
 from dew import position
 
-# `Batch` is declared once, in dew.objectives.base, and read from here by
-# the whole data layer, which imported it from this module before the
-# second declaration was removed.
+# `Batch` lives in dew.objectives.base. The data layer imports it from here
+# so a dataset module needs one import for the value and its shape.
 from dew.objectives.base import Batch
 
 if TYPE_CHECKING:
@@ -57,23 +56,21 @@ type GrainDataset = pygrain.MapDataset[Batch] | pygrain.IterDataset[Batch]
 """A grain pipeline a caller built: read by index, or read as it comes.
 `Dataset.from_grain` takes either, and which of the two it is decides what a
 saved position can be. Its elements are one example's fields, the shape
-`Batch` names, because grain stacks them into a batch of those same
-fields."""
+`Batch` names, since grain stacks them into a batch of those fields."""
 
 @runtime_checkable
 class Records(Protocol):
-    """A source the loaders read by index.
+    """Answers records by index, which is how the loaders read a source.
 
     A record is one example's fields, the shape `Batch` names, or the packed
-    bytes an arrayrecord holds, which the spec's own transform unpacks
-    before the fields exist. A grain dataset answers None where its padding
-    covers an index, and grain's reader skips those rather than batching
-    them.
+    bytes an arrayrecord holds, which the spec's own transform unpacks before
+    the fields exist. A grain dataset answers None where its padding covers
+    an index, and grain's reader skips those rather than batching them.
 
     Grain's own `RandomAccessDataSource` says the same two methods with the
-    record as a type parameter, which is invariant, so a source declared
-    through it cannot be handed to a loader that named a different record.
-    This one names what the loaders actually read.
+    record as a type parameter. That parameter is invariant, so a source
+    declared through it cannot be handed to a loader that named a different
+    record. This one names what the loaders actually read.
     """
 
     def __len__(self) -> int: ...
@@ -83,8 +80,8 @@ class Records(Protocol):
 
 type Indexed = Records | Sequence[Batch]
 """Records read by index: a source that answers grain's two methods, or a
-plain sequence of them, which is what a spec that lists its records in
-memory (the video specs list their clips) hands over."""
+plain sequence of them. A spec that lists its records in memory hands over
+the sequence, the way the video specs list their clips."""
 
 
 def json_argument[Options: DataclassInstance](
@@ -128,24 +125,25 @@ class Stoppable(Protocol):
 
 @runtime_checkable
 class Budgeted(Protocol):
-    """A stream that says how long stopping may take. Separate from
-    `Stoppable` because a stream can report a budget without taking a stop
-    request, and the wrapper forwards each on its own."""
+    """Says how long stopping this stream may take.
+
+    Separate from `Stoppable` because a stream can report a budget without
+    taking a stop request. The wrapper forwards each on its own.
+    """
 
     @property
     def stop_seconds(self) -> float | None: ...
 
 
 class Forwarding:
-    """A stream wrapper whose stop signal, stop budget and close are its
-    source's. Subclasses keep the source at `_source` and override `close`
-    for their own cleanup around `super().close()`."""
+    """Forwards a stream wrapper's stop signal, stop budget and close to its
+    source. Subclasses keep the source at `_source` and override `close` for
+    their own cleanup around `super().close()`."""
 
     def _forwarded(self) -> Iterator[Batch] | None:
         """The wrapped source, or None before a subclass sets one.
 
-        This is the boundary between the wrapper and whatever it wraps: a
-        subclass declares `_source` with its own stream type, narrower than
+        A subclass declares `_source` with its own stream type, narrower than
         anything this base could state, and a wrapper may be constructed
         before it has a source. One lookup lives here so the three hooks
         below can ask the Stoppable and Closeable protocols instead.
@@ -171,19 +169,18 @@ class Forwarding:
 
 @dataclasses.dataclass(frozen=True)
 class Loading:
-    """How fast records are read: grain's worker processes, the threads each
-    of them reads with, and the two buffers held ahead of the step.
+    """Says how fast records are read, in grain's four throughput knobs.
 
-    None of the four changes which records a run sees or what is in them, so
-    a host tuning them for its disk leaves the batches identical. The shuffle
+    None of the four changes which records a run sees or what is in them. A
+    host tuning them for its disk leaves the batches identical. The shuffle
     seed is not one of them; it decides the order records arrive in and keys
     the per-record rng that augments and captions them.
 
-    Each counts something of its own: `workers` is processes, `threads` is
-    the record reads one worker keeps in flight, `read_buffer` is the records
-    one worker reads ahead, and `worker_buffer` is the batches one worker
-    holds ready for the process that trains. Only the last counts batches,
-    because a worker stacks the records it read and hands whole batches back.
+    Each counts something of its own. `workers` is processes, `threads` is
+    the record reads one worker keeps in flight, and `read_buffer` is the
+    records one worker reads ahead. `worker_buffer` alone counts batches, the
+    batches one worker holds ready for the process that trains, because a
+    worker stacks the records it read and hands whole batches back.
     """
 
     workers: int = 32
@@ -193,15 +190,18 @@ class Loading:
 
     @property
     def stop_seconds(self) -> float:
-        """Grain joins its worker processes one at a time, ~0.5 s each idle
-        and up to a batch's work each busy."""
+        """How long a stop of this many workers is allowed to take.
+
+        Grain joins its worker processes one at a time, ~0.5 s each idle and
+        up to a batch's work each busy.
+        """
         return 2.0 + 1.0 * self.workers
 
 
 @dataclasses.dataclass(frozen=True)
 class Stage:
-    """One step of a batch ramp: the global batch a step reads while the run
-    is in this stage, and the record the stage starts at."""
+    """Holds one step of a batch ramp: the global batch a step reads while
+    the run is in this stage, and the record the stage starts at."""
 
     batch: int
     records: int
@@ -209,26 +209,24 @@ class Stage:
 
 @dataclasses.dataclass(frozen=True)
 class Ramp:
-    """A global batch that grows over the run's first records.
+    """Grows the global batch over the run's first records.
 
-    MaxText's batch ramp-up (`configs/base.yml:755-765`,
-    `utils/rampup_batch.py:53-101`): a run starts at `start`, adds
-    `increment` once the records read since the last increment reach
-    `samples` divided by the number of increments, and stops at the batch
-    the dataset was loaded with. That difference has to be a whole number of
-    increments, MaxText's own requirement (`utils/rampup_batch.py:38-50`).
+    A run starts at `start` and adds `increment` once the records read since
+    the last increment reach `samples` divided by the number of increments.
+    It stops at the batch the dataset was loaded with, and that difference
+    has to be a whole number of increments (MaxText's `configs/base.yml:755-765`,
+    `utils/rampup_batch.py:38-50,53-101`).
 
-    MaxText counts a batch per device; dew counts the global batch
-    everywhere, so `start` and `increment` are records a step, and
-    `per_device_batch_size_start` times the device count is what `start`
-    means here.
+    MaxText counts a batch per device and dew counts the global batch
+    everywhere, so `start` and `increment` are records a step:
+    `per_device_batch_size_start` times the device count is `start` here.
 
-    The stage a run is in is a function of the records it has read, and that
-    count is what a checkpoint already holds as the data position, so a
-    resumed run continues the ramp with nothing else saved. A stage lasts
-    `ceil(samples / increments / batch)` steps, computed as one integer
-    ratio rather than MaxText's two floating-point divisions, so the
-    boundaries are exact.
+    The stage a run is in is a function of the records it has read, which a
+    checkpoint already holds as the data position, so a resumed run continues
+    the ramp with nothing else saved. A stage lasts
+    `ceil(samples / increments / batch)` steps, computed as one integer ratio
+    rather than MaxText's two floating-point divisions, so the boundaries are
+    exact.
     """
 
     start: int
@@ -239,7 +237,7 @@ class Ramp:
         """Every stage of the ramp up to `final`, the run's own global batch.
 
         Each stage's batch has to split over the processes, since a step is
-        read in per-process shares; the mesh has its own divisor, which the
+        read in per-process shares. The mesh has its own divisor, which the
         trainer checks against the shardings before the run starts.
         """
         if min(self.start, self.increment, self.samples) < 1:
@@ -284,33 +282,33 @@ class Ramp:
 
 @dataclasses.dataclass(frozen=True)
 class Dataset:
-    """Batches for a run.
+    """Opens the batches a run trains and validates on.
 
-    `train()` opens an endless shuffled stream; `val()` opens one pass over
+    `train()` opens an endless shuffled stream. `val()` opens one pass over
     the held-out records in a fixed order that ends by itself, and is None
-    when nothing is held out. `batch` is the global batch, `records` the
+    when nothing is held out. `batch` is the global batch and `records` the
     training records behind it, so `steps_per_epoch` is one pass over them.
-    `ramp` is set by `ramped` when the run grows its batch over its first
-    records, and `batch` is then the batch the ramp ends at.
+    `ramped` sets `ramp` when the run grows its batch over its first records,
+    and `batch` is then the batch the ramp ends at.
 
     Each factory call returns a fresh iterator owned by its caller. Close it
-    after use when it exposes close; never close the shared dataset/backing
-    store. A source's optional request_stop is a separate thread-safe signal,
-    not permission to call final close concurrently with iteration.
+    after use when it exposes close; never close the shared dataset or
+    backing store. A source's optional request_stop is a separate thread-safe
+    signal, not permission to call final close concurrently with iteration.
 
     Image and video fields are uint8 in [0, 255], text is the tokenized
     `{"input_ids", "attention_mask"}` dict under "text", and a token window
     is int32 ids under "text".
 
     Whether a run can checkpoint its position depends on the iterator.
-    Grain-backed iterators carry `get_state` and `set_state` and a
-    fetch-as-you-go stream carries neither; `tokenized` forwards the pair.
-    A run over a stream without them trains with `checkpoint_every=None` and
-    is refused otherwise. A `train_stream` position is global and resumes on
-    any process count, whether it reads one corpus or a weighted mixture of
-    them; a stream that batches its own records reports whatever position it
-    has, and `dew.checkpoints` refuses a process count that did not write
-    one of those.
+    Grain-backed iterators carry `get_state` and `set_state`, a
+    fetch-as-you-go stream carries neither, and `tokenized` forwards the
+    pair. A run over a stream without them trains with
+    `checkpoint_every=None` and is refused otherwise. A `train_stream`
+    position is global and resumes on any process count, over one corpus or a
+    weighted mixture. A stream that batches its own records reports whatever
+    position it has, and `dew.checkpoints` refuses a process count that did
+    not write one of those.
     """
 
     train: Callable[[], Iterator[Batch]]
@@ -324,27 +322,27 @@ class Dataset:
                    validation: GrainDataset | None = None,
                    records: int | None = None,
                    loading: Loading = Loading()) -> Dataset:
-        """A run over grain datasets a caller built themselves.
+        """Builds a run over grain datasets a caller built themselves.
 
-        The order, the shuffle and what a record becomes are the caller's;
-        what this adds is what every spec's `load` adds, through the same
-        helpers: the per-process batch, whole batches only, and the state
-        pair a checkpoint saves.
+        The order, the shuffle and what a record becomes are the caller's.
+        This adds what every spec's `load` adds, through the same helpers:
+        the per-process batch, whole batches only, and the state pair a
+        checkpoint saves.
 
-        A `MapDataset` is read by index, so it gets the training stream
-        every spec gets: endlessly repeated, cut into this process's share,
-        and saved as one global record count that resumes on any process
-        count. An `IterDataset` is read as it comes, so it is batched where
-        it is and reports grain's own iterator state, which `dew.checkpoints`
-        will only restore into the process count that wrote it.
+        A `MapDataset` is read by index, so it gets the training stream every
+        spec gets: endlessly repeated, cut into this process's share, and
+        saved as one global record count. An `IterDataset` is read as it
+        comes, so it is batched where it is and reports grain's own iterator
+        state, which `dew.checkpoints` only restores into the process count
+        that wrote it.
 
         `records` is the records of one pass, which `steps_per_epoch`
-        divides; it defaults to a MapDataset's own length, and a caller who
-        repeated their dataset before handing it over should give the length
-        of one pass instead. A grain pipeline has no description of its own,
-        so the saved position names the pipeline's type and length rather
-        than the corpus under it: swapping the corpus under one pipeline is
-        the caller's to keep straight.
+        divides. It defaults to a MapDataset's own length, so a caller who
+        repeated their dataset before handing it over gives the length of one
+        pass instead. A grain pipeline has no description of its own, so the
+        saved position names the pipeline's type and length rather than the
+        corpus under it. Swapping the corpus under one pipeline is the
+        caller's to keep straight.
         """
         rows = local_batch(batch)
         mapped = train if isinstance(train, pygrain.MapDataset) else None
@@ -378,8 +376,11 @@ class Dataset:
         return self.ramp.steps_for(self.records, self.batch)
 
     def epoch_steps(self, epochs: int = 1) -> int:
-        """Steps in `epochs` passes over the records. A stream without a
-        record count has no epoch, so a run over it gives its length in steps."""
+        """The steps `epochs` passes over the records take.
+
+        A stream without a record count has no epoch, so a run over it gives
+        its length in steps instead.
+        """
         if self.steps_per_epoch is None:
             raise ValueError(
                 "epochs need a dataset with a record count; this one streams "
@@ -389,18 +390,18 @@ class Dataset:
 
 @dataclasses.dataclass(frozen=True)
 class DatasetSpec(ABC):
-    """What a dataset is and how it is read; a frozen dataclass per kind.
+    """Says what a dataset is and how it is read, one frozen dataclass per kind.
 
     `seed` and `loading` belong to every kind, so they are declared once
-    here: the seed decides the record order and keys the per-record rng, and
+    here. The seed decides the record order and keys the per-record rng;
     `loading` is how fast the records are read, which changes no record and
     no order. Both are keyword-only, so a kind can still declare a field of
     its own without a default.
 
     `load` takes `tokenize` on every kind, so a caller holding a
     `DatasetSpec` can load any of them. A dataset that captions its records
-    hands it the captions and writes back what it returns; the captions are
-    the dataset's own product, and the run's condition decides which encoder
+    hands it the captions and writes back what it returns. The captions are
+    the dataset's own product; the run's condition decides which encoder
     reads them and at which context length. A dataset that carries no
     captions has nothing for a reader to read and says so (`uncaptioned`).
     """
@@ -413,10 +414,10 @@ class DatasetSpec(ABC):
         """The dataset's batches, `batch` records a step across every process."""
 
     def uncaptioned(self, tokenize: Tokenize | None) -> None:
-        """Refuse a caption reader handed to a dataset that writes no captions.
+        """Refuses a caption reader handed to a dataset that writes no captions.
 
-        The parameter is on every `load` so one caller can load any spec;
-        silently dropping it would train a conditional run on nothing and
+        The parameter is on every `load` so one caller can load any spec.
+        Silently dropping it would train a conditional run on nothing and
         report no reason.
         """
         if tokenize is not None:
@@ -458,13 +459,12 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
     out of them.
 
     `tokenize` takes the batch's captions and returns the batch fields a
-    run's conditions want, so an encoder's context length is the encoder's
-    business and `--text.encoder char_table` and `--text.encoder clip_text`
+    run's conditions want. An encoder's context length is then the encoder's
+    business, and `--text.encoder char_table` and `--text.encoder clip_text`
     read the same dataset. It runs here, on the host, once per batch and
-    outside the grain workers, so no encoder's weights are pickled into
-    them.
+    outside the grain workers, so no encoder's weights are pickled into them.
 
-    The captions never survive the stage. They are strings and a device
+    The captions never survive the stage, since they are strings and a device
     takes numbers. Pass None for an unconditional run, or a reader that hands
     the words back to keep them.
     """
@@ -494,10 +494,10 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
                 self._source = None
 
     class CheckpointableTokenizing(Tokenizing):
-        """The same stage over a stream that can report and restore its
-        position, forwarding both. The methods are explicit because the
-        protocol reads attributes statically, where a forwarding `__getattr__`
-        would only satisfy `hasattr`."""
+        """Runs the same stage over a stream that reports and restores its
+        position, forwarding both. The methods are written out because the
+        protocol reads attributes statically, where a forwarding
+        `__getattr__` would only satisfy `hasattr`."""
 
         def get_state(self) -> Position:
             source = self._source
@@ -523,10 +523,10 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
 def local_batch(batch: int) -> int:
     """The share of a global batch each JAX process reads for itself.
 
-    Every process batches its own shard and the run reports `batch` as the
-    global batch, so a remainder would train on fewer records a step than
-    the run reports, and a batch below the process count would leave some
-    process with no records.
+    Every process batches its own shard while the run reports `batch` as the
+    global batch. A remainder would train on fewer records a step than the
+    run reports, and a batch below the process count would leave some process
+    with no records.
     """
     processes = jax.process_count()
     if batch % processes:
@@ -536,7 +536,7 @@ def local_batch(batch: int) -> int:
 
 
 class SourceSlice:
-    """Random-access view over `source[start:stop]`.
+    """Reads `source[start:stop]` by index.
 
     Gives the train and validation loaders disjoint index ranges while the
     shuffle, the epochs and the sharding stay grain's. Attributes stay plain
@@ -549,12 +549,10 @@ class SourceSlice:
         self.length = stop - start
 
     def __repr__(self) -> str:
-        # A saved position names the order it counts into, and the order is
-        # named by the source; a resumed run needs a description that survives
-        # the process that wrote it. The wrapped source is named by type: an
-        # arrayrecord source's own repr is its address, and asking a hub source
-        # for its length would download the table. Which half of the split this
-        # is, and how long, is what the record order depends on.
+        # The description a saved position compares against (`describe`).
+        # The wrapped source is named by type rather than by its own repr,
+        # which for an arrayrecord source is this process's address and for a
+        # hub source would download the table to answer a length.
         return (f"SourceSlice({type(self.source).__name__}, "
                 f"start={self.start}, length={self.length})")
 
@@ -589,12 +587,12 @@ def hold_out(source: Indexed, records: int, held_out: int,
 def describe(source: Indexed | GrainDataset) -> str:
     """`source`'s own description, or its type when it has none.
 
-    A saved position names the order it counts into, and the order is named
-    by the source, so a resumed run compares two descriptions and needs one
-    that survives the process that wrote it (`dew/data/sources/text.py`
-    writes such a repr). A source without its own is named by type: the
-    default repr is this process's address for the object, and two addresses
-    would refuse every resume.
+    A saved position names the order it counts into, and the source names
+    that order. A resumed run compares two descriptions, so it needs one that
+    survives the process that wrote it (`dew/data/sources/text.py` writes
+    such a repr). A source without its own is named by type, since the
+    default repr is this process's address and two addresses would refuse
+    every resume.
     """
     described = type(source).__repr__ is not object.__repr__
     return repr(source) if described else type(source).__name__
@@ -602,11 +600,11 @@ def describe(source: Indexed | GrainDataset) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class Corpus:
-    """One corpus of a weighted mixture: what it is called, what it reads and
-    how much of a step it fills.
+    """Names one corpus of a weighted mixture, what it reads and how much of
+    a step it fills.
 
     `weight` is a share of the step and not a record count, so the mixture
-    holds the proportions whatever the corpora's lengths are: a small corpus
+    holds its proportions whatever the corpora's lengths are. A small corpus
     comes round again while a large one is still on its first pass.
     """
 
@@ -639,34 +637,31 @@ def _shares(corpora: Sequence[Corpus]) -> tuple[float, ...]:
 def mixture(corpora: Sequence[Corpus], seed: int | None) -> pygrain.MapDataset[Batch]:
     """`corpora` read together at their weights, as one order over records.
 
-    Grain's own proportional interleave decides which corpus record k comes
-    from: the one whose share of the first k + 1 records is short by one, so
-    every prefix of the order (every global batch) holds each corpus's share
-    to within one record, and nothing is drawn at random
+    `MapDataset.mix` decides which corpus record k comes from: the one whose
+    share of the first k + 1 records is short by one. Every prefix of the
+    order, and so every global batch, holds each corpus's share to within one
+    record, and nothing is drawn at random
     (`grain/_src/python/dataset/transformations/mix.py:314-347`). Weights
     reach grain as ratios and it scales them to integers against the
     smallest, so a share is exact to a hundredth of the smallest one
     (`mix.py:305-311`).
 
-    With `seed`, every corpus is reshuffled per epoch and repeated before
-    the mixing, which is grain's own instruction for keeping a mixture's
-    proportions under a shuffle and what MaxText's pipeline does
-    (`input_pipeline/grain_data_processing.py:110-112,169-184`): the mixture
-    is then endless and each corpus cycles its own records at its own rate.
-    Without a seed the corpora are read in their own order and the mixture
-    stops before any of them would come round again, grain's own length rule
-    (`mix.py:52-68`), which is the pass a validation split wants.
+    With `seed`, every corpus is reshuffled per epoch and repeated before the
+    mixing, so the mixture is endless and each corpus cycles its own records
+    at its own rate. That is grain's own instruction for keeping a mixture's
+    proportions under a shuffle, and what MaxText's pipeline does
+    (`input_pipeline/grain_data_processing.py:110-112,169-184`). Without a
+    seed the corpora are read in their own order and the mixture stops before
+    any of them would come round again (grain's own length rule,
+    `mix.py:52-68`), which is the pass a validation split wants.
 
-    Mixing here, ahead of the shard, is what keeps a mixture's position one
-    global record count: which corpus record k is from, and where it sits in
-    that corpus, are functions of k. The shares hold over the global batch.
-    One process's rows of it are every nth record of the interleave, so two
-    corpora at equal weights, which alternate, put only the first on one of
-    two processes and only the second on the other; the step's gradient is
-    the same sum either way. MaxText mixes iterators after the
-    shard and keeps a state per corpus per host, which lets it change the
-    mixture on resume (`grain_data_processing.py:208-212`); dew refuses a
-    changed order instead, as it already does for a changed corpus.
+    The mixing happens before the shard, so a mixture's position is one
+    global record count: which corpus record k comes from is a function of k.
+    The shares hold over the global batch, not over one process's rows. Two
+    corpora at equal weights alternate, so of two processes one reads only
+    the first and the other only the second; the step's gradient is the same
+    sum either way. A resume onto a changed mixture is refused, as a resume
+    onto a changed corpus is.
     """
     shares = _shares(corpora)
 
@@ -681,24 +676,27 @@ def mixed_records(corpora: Sequence[Corpus]) -> int:
     """One pass over a mixture: the records in which every corpus of it has
     been read at least once.
 
-    A mixture has no pass of its own, since a corpus that fills a tenth of a
-    step comes round ten times while one that fills the rest is read once, so
-    the pass is the longest of the corpora's own. That is `len(source)` for
-    one corpus and the records of both for two equal corpora at equal
-    weights, which is what `steps_per_epoch` counts everywhere else.
+    A mixture has no pass of its own: a corpus filling a tenth of a step
+    comes round ten times while one filling the rest is read once. The pass
+    is the longest of the corpora's own, which is `len(source)` for one
+    corpus and the records of both for two equal corpora at equal weights.
+    That is the count `steps_per_epoch` divides everywhere else.
     """
     return max(math.ceil(len(corpus.source) / share)
                for corpus, share in zip(corpora, _shares(corpora), strict=True))
 
 
 class _WorkerBatches[Record](pygrain.MapDataset[Record]):
-    """`parent` re-indexed so that grain's per-worker stride slice (index i
-    goes to worker i % W) hands each worker whole, contiguous batches:
-    index `q*W*B + p*W + w` is record `p` of batch `b = q*W + w`. Worker w
-    then batches inside its own process and the round-robin interleave in the
-    training process restores batch order 0, 1, 2, ... The length is padded
-    to whole rounds of one batch per worker; an index past the parent's last
-    whole batch is None, which grain's reader skips.
+    """`parent` re-indexed so each grain worker reads whole, contiguous batches.
+
+    Grain gives worker i every index where i == index % W. Index
+    `q*W*B + p*W + w` is record p of batch `q*W + w`, so worker w batches
+    inside its own process. The training process interleaves the workers
+    round-robin, which restores batch order 0, 1, 2, ...
+
+    The length is padded to whole rounds of one batch per worker. An index
+    past the parent's last whole batch answers None, which grain's reader
+    skips.
     """
 
     _MUTATES_ELEMENT_SPEC = False
@@ -731,17 +729,17 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, batch: int,
                      ) -> pygrain.DatasetIterator[Batch]:
     """This process's share of `records`, in batches of `batch` records.
 
-    The slice is `offset + process_index :: process_count`, so global batch k
-    is the same records at every process count, and an offset is a slice
+    The slice is `offset + process_index :: process_count`. Global batch k is
+    then the same records at every process count, and an offset is a slice
     bound rather than a replay.
 
     Reads are records: the threads behind `to_iter_dataset` each fetch one,
-    so no read waits on a whole batch (grain's `ElasticIterator` batches
-    ahead of its read and is an order of magnitude slower on a slow source).
-    The batch is stacked inside the worker so each transfer to this process
-    is a whole batch; `_WorkerBatches` permutes the slice so a worker's share
-    is whole batches, and the permutation depends only on the batch and the
-    worker count, so neither count changes which records a batch holds.
+    so no read waits on a whole batch. Grain's `ElasticIterator` batches
+    ahead of its read and is an order of magnitude slower on a slow source.
+    The batch is stacked inside the worker, so each transfer to this process
+    is a whole batch. `_WorkerBatches` permutes the slice to make a worker's
+    share whole batches, and that permutation depends only on the batch and
+    worker counts, so neither changes which records a batch holds.
     """
     mine = records[offset + jax.process_index()::jax.process_count()]
     if loading.workers:
@@ -761,9 +759,8 @@ def _per_process(source: GrainDataset, *, rows: int, loading: Loading,
 
     A `MapDataset` is read by index, which is what `_batches` needs to cut a
     process's slice and to start that slice at a record offset. An
-    `IterDataset` has neither, so it is batched where it is and what it
-    yields is whatever the caller's own pipeline ordered and sharded; an
-    offset into one would have to replay it, which is not a resume.
+    `IterDataset` has neither, so it is batched where it is and yields
+    whatever the caller's own pipeline ordered and sharded.
     """
     if isinstance(source, pygrain.MapDataset):
         return _batches(source, batch=rows, loading=loading, offset=offset)
@@ -779,8 +776,8 @@ def rows_of(batch: Mapping[str, object]) -> int:
 
     A batch may carry a field that is one value for the whole step rather
     than one per record, and that field says nothing about how many records
-    there are. Any mapping of fields answers, so the trainer's own batch
-    type reaches this as it is.
+    there are. Any mapping of fields answers, so the trainer's own batch type
+    reaches this as it is.
     """
     for leaf in jax.tree.leaves(batch):
         shape = np.shape(leaf)
@@ -790,21 +787,20 @@ def rows_of(batch: Mapping[str, object]) -> int:
 
 
 class GlobalStream:
-    """A training stream whose saved position is one global record count.
+    """Reads a training stream whose saved position is one global record count.
 
     The stream is a shuffled order over the whole corpus, endlessly, and the
-    step is cut out of it here: global batch k is records
+    step is cut out of it here. Global batch k is records
     [k * batch, (k + 1) * batch) of that order, and process p of n reads
     every nth of them starting at p. The position is then how many records
-    the run has consumed -- one number, the same on every process, naming no
-    shard -- so the position two processes wrote is where one process or four
-    resume, on the same records in the same steps.
+    the run has consumed: one number, the same on every process, naming no
+    shard. What two processes wrote is where one process or four resume, on
+    the same records in the same steps.
 
     `open(offset)` starts the per-process read at a record offset, which is
-    what a restore does instead of replaying: an offset is a slice bound, so
-    a resume reads nothing it has already read. It is called on the first
-    batch and again after `set_state`, so a stream that is restored before it
-    is read starts no worker twice.
+    what a restore does instead of replaying, since an offset is a slice
+    bound. It is called on the first batch and again after `set_state`, so a
+    stream restored before it is read starts no worker twice.
 
     The offset alone would resume that many records into whatever order the
     run now has, so `order` rides with it and a restore that disagrees is
@@ -855,18 +851,18 @@ class GlobalStream:
 
 @runtime_checkable
 class Resumable(Checkpointable, Protocol):
-    """A stream that is read and can be put back where it stopped, which is
-    what a batch ramp wraps."""
+    """Reads batches and can be put back where it stopped, which is what a
+    batch ramp wraps."""
 
     def __next__(self) -> Batch: ...
 
 
 def _global(state: Position) -> bytes:
-    """A global position's own bytes, or the refusal that this is not one.
+    """`state`'s own bytes, or the refusal that it is no global position.
 
     A ramp cuts its step out of a global record order, so it reads the
-    source's position; grain's own state counts one process's shard and has
-    no global count in it.
+    source's position. Grain's own state counts one process's shard and holds
+    no global count.
     """
     if not isinstance(state, bytes):
         raise TypeError(
@@ -876,18 +872,19 @@ def _global(state: Position) -> bytes:
 
 
 class RampedStream(Forwarding):
-    """A training stream whose step grows over the run's first records.
+    """Grows a training stream's step over the run's first records.
 
     Wraps a stream whose position is a global record count, a `GlobalStream`
     or `tokenized` over one, and decides only how many of its records a step
-    reads. MaxText reads a whole final-size batch and cuts the current one
-    out of a rolling buffer (`common/data_loader.py:122-176`), so the records
-    a step reads are the records the run would have read without the ramp,
-    in the same order, and a stage change neither skips a record nor reads
-    one twice. What is left in the buffer has not been trained on and is not
-    in the position, which is the source's with its count replaced by the
-    records handed out; a restore hands the source that count, so it reopens
-    its read there.
+    reads. Reads run a whole final-size batch ahead and each step is cut out
+    of a rolling buffer, as MaxText's do (`common/data_loader.py:122-176`).
+    A step therefore reads the records the run would have read without the
+    ramp, in the same order, and a stage change neither skips a record nor
+    reads one twice.
+
+    What is left in the buffer has not been trained on and is not in the
+    position, which is the source's count replaced by the records handed out.
+    A restore hands the source that count, so it reopens its read there.
     """
 
     def __init__(self, source: Resumable, stages: Sequence[Stage]):
@@ -905,7 +902,7 @@ class RampedStream(Forwarding):
     def stages(self) -> tuple[Stage, ...]:
         """The batch this stream reads at each stage, and where each begins.
 
-        The trainer reads them off the stream it opened: a compiled step per
+        The trainer reads them off the stream it opened. A compiled step per
         stage is the whole set of shapes a ramped run runs, and the mesh has
         to divide every one of them.
         """
@@ -932,7 +929,7 @@ class RampedStream(Forwarding):
         return position.encode(dataclasses.replace(place, records=self._records))
 
     def set_state(self, state: bytes) -> None:
-        self._source.set_state(state)  # Refuses a shard offset and another order.
+        self._source.set_state(state)
         self._held = None
         self._records = position.read(state).records
         stage = self._stage()
@@ -949,15 +946,15 @@ class RampedStream(Forwarding):
 
 
 def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
-    """`data` with the training batch growing to `data.batch` over `ramp`.
+    """`dataset` with the training batch growing to `dataset.batch` over `ramp`.
 
-    A validation pass keeps the whole batch: a score over a growing number
-    of records is a score of a different thing each time.
+    A validation pass keeps the whole batch, since a score over a growing
+    number of records is a score of a different thing each time.
 
-    Only a stream whose position is a global record count can ramp, because
-    the ramp cuts that order into other steps and the count it saves has to
-    be the records it handed over. A stream that batches its own records
-    reports a shard offset and is refused, by name.
+    Only a stream whose position is a global record count can ramp. The ramp
+    cuts that order into other steps, and the count it saves has to be the
+    records it handed over. A stream that batches its own records reports a
+    shard offset and is refused, by name.
     """
     stages = ramp.stages(dataset.batch)  # An impossible schedule fails here, not mid-run.
 
@@ -985,13 +982,13 @@ def train_stream(source: Records, operations: Sequence[pygrain.Transformation], 
     `batch` is this process's share of a step, so the global batch behind it
     is that share times the process count. The order is the corpus reshuffled
     from `seed` every epoch, endlessly, and `_batches` cuts this process's
-    share off it, so global batch k is the same records at every process
-    count and a `GlobalStream` position is a record count rather than a shard
-    offset.
+    share off it. Global batch k is then the same records at every process
+    count, and a `GlobalStream` position is a record count rather than a
+    shard offset.
 
-    `operations` run behind the order and ahead of the slice, so they run
-    inside the workers, a record's rng is keyed by its place in the endless
-    stream, and what a record becomes depends on neither count either.
+    `operations` run behind the order and ahead of the slice. They therefore
+    run inside the workers, a record's rng is keyed by its place in the
+    endless stream, and what a record becomes depends on neither count.
     """
     order = f"{describe(source)}, {len(source)} records reshuffled from seed {seed}"
 
@@ -1013,8 +1010,8 @@ def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transfo
 
     The order is `mixture(corpora, seed)` and everything after it is
     `train_stream`'s: the same per-process slice, the same batch behind the
-    reads, and the same position, which is why a mixture's place in its
-    corpora is one record count and resumes on any process count. The
+    reads, and the same position. A mixture's place in its corpora is
+    therefore one record count and resumes on any process count. The
     `operations` sit above the mixture, so a record's rng is keyed by its
     place in the mixed stream rather than in the corpus it came from.
     """
@@ -1039,17 +1036,17 @@ def validation_pass(source: Records, transformations: Sequence[pygrain.Transform
                     loading: Loading) -> Callable[[], Iterator[Batch]]:
     """One pass over `source` in record order, in batches of `batch`.
 
-    Grain's DataLoader gives each worker its own slice of the split and lets
-    it fill a whole batch out of that, so which records a batch holds moves
-    with worker_count. `_batches` hands a worker the records of one batch
-    instead, so the split is cut into the same batches at every count.
+    Grain's DataLoader gives each worker its own slice of the split to fill a
+    whole batch out of, so which records a batch holds moves with
+    worker_count. `_batches` hands a worker the records of one batch instead,
+    so the split is cut into the same batches at every count.
 
     Sharding is grain's slice convention, so process p of n reads records
-    p, p + n, ... of the split. The transforms are applied before that slice.
-    Grain keys a record's rng by its index in the dataset the random map sits
-    on, so applied after the slice, record k takes its key from its position
-    in the slice and the same seed augments and captions it differently on
-    one host than on a pod. A pass is whole batches only, because a part-full
+    p, p + n, ... of the split. The transforms are applied before that slice
+    because grain keys a record's rng by its index in the dataset the random
+    map sits on. Applied after the slice, record k would take its key from
+    its place in the slice, and one seed would augment it differently on one
+    host than on a pod. A pass is whole batches only, because a part-full
     batch cannot be sharded over a device mesh.
     """
     def stream():
