@@ -46,7 +46,7 @@ A test is worth keeping only if it would fail on a plausible bug in the thing it
 - Assert the invariant. A stream that should end must end (exactly ceil(N/batch) batches, then stop). Records that should be distinct must be distinct. Splits that should be disjoint must be disjoint. Metrics that should reach the tracker must reach it when the stream ends. State the property and let it fail.
 - Multiprocess and multi-device paths are tested with real processes and real meshes: loading.workers above zero with workers actually running, iterator state through a restart, jax.distributed across spawned processes, loss parity between one process and many at the same seed. A single-process simulation of a mesh is necessary and not sufficient.
 - Investigate warnings at their source. Fix our misuse or the dependency defect; record an unresolved upstream warning with its cause. Do not add a filter or exemption to make a failing check pass.
-- Notebook outputs never enter git: run `python tools/strip_notebooks.py` before committing a tutorial.
+- Tutorials are committed executed, top to bottom, with small outputs.
 - For each supported architecture, exercise a real forward/backward update and its claimed placement.
 
 ## Writing
