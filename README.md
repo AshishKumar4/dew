@@ -14,7 +14,9 @@ Model training with JAX and Flax
 [Documentation](docs/index.md) · [Installation](#installation) · [Examples](examples/) · [API reference](docs/reference/core-api.md)
 </div>
 
-Dew is a framework for training language models, image and video diffusion models, and JEPA encoders in JAX. It provides Flax Linen models and training objectives, with a shared trainer for optimization, device sharding, evaluation, and checkpoints.
+Dew is a framework for training language models, image and video diffusion models, and JEPA encoders in JAX. It provides builtin definitions for common models and training objectives, with a shared trainer for optimization, device sharding, evaluation, and checkpoints.
+
+This framework was built as a fork of my previous pure diffusion focused framework I have been building and refining throughout the years, with which I was able to train stable diffusion like text-to-image models from scratch on 400M+ text-image pairs on 128 TPU v4 chips [Flaxdiff](https://github.com/AshishKumar4/FlaxDiff)
 
 Use the supplied architectures, load a supported Hugging Face checkpoint, or train your own Flax model. Model variables and training state remain JAX PyTrees; optimizers are Optax transformations, data loading uses Grain, and checkpoints use Orbax.
 
