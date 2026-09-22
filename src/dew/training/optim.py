@@ -7,12 +7,13 @@ the recipes call it. The Trainer forms the normalized effective-window
 gradient before calling this solver.
 
 The 'muon' entry is the production parameter-group split the labs converged
-on (docs/research/frontier-training.md:183): AdamW on the embeddings, the
-head, the router and the norms, Muon on the matrices. `optax.contrib.muon`
-owns the masked composition (it partitions with `optax.masked` per
-group, optax/contrib/_muon.py:694), so what Dew supplies is the parameter
-spec that says which group a parameter belongs to and which of its axes are
-the matrix.
+on (docs/research/frontier-training.md:183). AdamW takes the embeddings, the
+head, the router and the norms; Muon takes the matrices.
+
+`optax.contrib.muon` owns the masked composition, partitioning with
+`optax.masked` per group (optax/contrib/_muon.py:694). What Dew supplies is
+the parameter spec: which group a parameter belongs to, and which of its
+axes are the matrix.
 """
 
 from __future__ import annotations
@@ -31,31 +32,32 @@ if TYPE_CHECKING:
     from dew.config import OptimConfig
 
 # Attention stores its projections either as one matrix over the flattened
-# head space or as a dimension per head, so the head dimensions count as one
-# side of the matrix and both layouts get the same orthogonalized update.
+# head space or as a dimension per head. The head dimensions count as one
+# side of the matrix, so both layouts get the same orthogonalized update.
 HEAD_AXES = frozenset({'heads', 'head_dim', 'kv'})
 
 # An expert dimension stacks whole matrices, one per expert, so it is a batch
-# axis: it names neither side, and optax orthogonalizes each expert on its
+# axis. It names neither side, and optax orthogonalizes each expert on its
 # own (optax/contrib/_muon.py:56-74).
 BATCH_AXES = frozenset({'exp'})
 
 # A parameter that maps into or out of a discrete index is a lookup, so AdamW
 # keeps the embeddings, the head and the router
 # (docs/research/frontier-training.md:183). An expert dimension is one of
-# these when it is the output, where it counts the experts a router scores,
-# and a batch axis when it leads, where it stacks one matrix per expert.
+# these when it is the output, counting the experts a router scores, and a
+# batch axis when it leads, stacking one matrix per expert.
 SELECTION_AXES = frozenset({'vocab', 'output'})
 
 
 def _matrix_sides(path: jax.tree_util.KeyPath, axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """The contracted axes and the output axes of a declared parameter.
+    """Split a declared parameter's axes into a contracted and an output side.
 
     A dimension continues the side before it when the declaration leaves it
-    unnamed, as the spatial dimensions of a patch embedding are, or when it
-    and its predecessor are both head dimensions. What is left has to be two
-    sides, one contracted and one output, as MaxText's per-name
-    table produces for its own trees (maxtext utils/muon_utils.py:100-175).
+    unnamed, as the spatial dimensions of a patch embedding are. It also
+    continues that side when it and its predecessor are both head
+    dimensions. What is left has to be two sides, one contracted and one
+    output, as MaxText's per-name table produces for its own trees
+    (maxtext utils/muon_utils.py:100-175).
     """
     sides: list[list[int]] = []
     for dimension, name in enumerate(axes):
@@ -78,19 +80,20 @@ def _matrix_sides(path: jax.tree_util.KeyPath, axes: LogicalAxes) -> tuple[tuple
 
 
 def muon_weight_dimension_numbers(params):
-    """A `MuonDimensionNumbers` per parameter, None where AdamW steps in.
+    """Build a `MuonDimensionNumbers` per parameter, None where AdamW steps in.
 
     Which group a parameter lands in is read off the logical axes its module
-    declares (`dew.nn.sharding`), the table the sharding derivation reads,
-    so one declaration answers both questions. A parameter of rank
-    below two, a bias, and a parameter that maps into or out of a discrete
-    index, the vocabulary, the model's output space or the expert a router
-    picks, go to AdamW, which is the split four labs cross-confirmed.
-    Everything else is a matrix and goes to Muon.
+    declares (`dew.nn.sharding`), the same table the sharding derivation
+    reads, so one declaration answers both questions.
+
+    AdamW takes a parameter of rank below two, a bias, and a parameter that
+    maps into or out of a discrete index: the vocabulary, the model's output
+    space, or the expert a router picks. That is the split four labs
+    cross-confirmed. Everything else is a matrix and goes to Muon.
 
     An undeclared matrix of rank two takes Linen's kernel convention,
     contracting axis 0 into axis 1. An undeclared parameter of higher rank
-    raises. Its matrix axes are what this spec cannot guess, and
+    raises, because its matrix axes are what this spec cannot guess, and
     orthogonalizing the wrong pair would show up as a worse loss curve.
 
     Optax reads one spec tree shaped like the parameters and treats a None
@@ -116,7 +119,7 @@ def muon_weight_dimension_numbers(params):
 
 
 def _muon_groups(learning_rate, **opts):
-    """Muon over the matrices and AdamW over everything else, one schedule."""
+    """Run Muon over the matrices and AdamW over the rest, on one schedule."""
     return optax.contrib.muon(
         learning_rate,
         muon_weight_dimension_numbers=muon_weight_dimension_numbers,
@@ -130,14 +133,14 @@ projections. Anything else keeps its update untouched."""
 
 
 def _dict_names(path: jax.tree_util.KeyPath) -> tuple[str, ...]:
-    """The dict keys along `path`, dropping the sequence indices a stacked
+    """List the dict keys along `path`, dropping the sequence indices a stacked
     view never produces on a parameter tree."""
     return tuple(entry.key for entry in path
                  if isinstance(entry, jax.tree_util.DictKey))
 
 
 def _sown(node, name: str):
-    """The array a sowed collection holds under `name`, past its one-tuple."""
+    """Read the array a sowed collection holds under `name`, past its one-tuple."""
     value = node.get(name) if isinstance(node, Mapping) else None
     if value is None:
         return None
@@ -145,7 +148,7 @@ def _sown(node, name: str):
 
 
 def _clip_scale(s_max: jax.Array, tau: float) -> jax.Array:
-    """Per-head rescale: `min(1, tau / s)` past the threshold, 1.0 elsewhere.
+    """Compute each head's rescale: `min(1, tau / s)` past `tau`, else 1.0.
 
     A head whose every logit is non-positive clips nothing: MaxText's
     formula reads `minimum(1, tau / (s + 1e-6))`, which goes negative there
@@ -154,8 +157,9 @@ def _clip_scale(s_max: jax.Array, tau: float) -> jax.Array:
 
 
 def _query_widths(params) -> dict[tuple[str, ...], int]:
-    """Each module's query projection width, read off static shapes: what a
-    key projection's head count is measured against."""
+    """Read each module's query-projection width off the static shapes.
+
+    A key projection's head count is measured against it."""
     widths = {}
     for path, leaf in jax.tree_util.tree_leaves_with_path(params):
         names = _dict_names(path)
@@ -167,8 +171,10 @@ def _query_widths(params) -> dict[tuple[str, ...], int]:
 
 def _rescaled_update(update: jax.Array, param: jax.Array, gamma: jax.Array,
                      split: int) -> jax.Array:
-    """The update whose application rescales the stepped weights by `gamma`:
-    `(gamma - 1) * param + gamma * update`, over `split` heads."""
+    """Rescale one update so that applying it rescales the weights by `gamma`.
+
+    That update is `(gamma - 1) * param + gamma * update`, taken over
+    `split` heads."""
     width = param.shape[-1] // split
     shape = (*param.shape[:-1], split, width)
     gamma = jnp.asarray(gamma, update.dtype)
@@ -177,14 +183,22 @@ def _rescaled_update(update: jax.Array, param: jax.Array, gamma: jax.Array,
 
 
 def _mla_query_gamma(scale: jax.Array, nope: jax.Array, width: int) -> jax.Array:
-    """`[heads, width]`: `sqrt` on the nope slice, full on the rope slice.
-    The comparison keeps the sowed width dynamic; only the shape is static."""
+    """Build the per-head rescale for a latent query projection.
+
+    Returns `[heads, width]`. The no-positional-embedding slice takes
+    `sqrt(scale)`, because query and key each carry half the clip; the rotary
+    slice takes the full `scale`, since no key rescales with it. `nope` stays
+    a traced value, so only the shape is static."""
     is_nope = jnp.arange(width)[None, :] < nope
     return jnp.where(is_nope, jnp.sqrt(scale)[:, None], scale[:, None])
 
 
 def _mla_key_gamma(scale: jax.Array, nope: jax.Array, width: int) -> jax.Array:
-    """`[heads, width]`: `sqrt` on the nope slice, 1.0 on the values."""
+    """Build the per-head rescale for a latent key and value projection.
+
+    Returns `[heads, width]`. The no-positional-embedding slice takes
+    `sqrt(scale)`, half the clip; the value slice keeps 1.0, since no logit
+    passes through it."""
     is_nope = jnp.arange(width)[None, :] < nope
     return jnp.where(is_nope, jnp.sqrt(scale)[:, None],
                      jnp.ones((), scale.dtype))
@@ -193,15 +207,16 @@ def _mla_key_gamma(scale: jax.Array, nope: jax.Array, width: int) -> jax.Array:
 def _clip_leaf(qk_stats, tau: float, qdims: dict[tuple[str, ...], int],
                path: jax.tree_util.KeyPath, update: jax.Array,
                param: jax.Array) -> jax.Array:
-    """`update` rescaled the way the post-update weights rescale.
+    """Fold QK-Clip's post-step weight rescale into one leaf's update.
 
-    The clip fires on the weights after the step: `gamma * (W + update)`.
-    Written as an update, `(gamma - 1) * W + gamma * update`, so the chain
-    runs it after Muon and the applied tree lands on the same weights
-    MaxText's post-step rescale writes. Leaves outside `QK_PROJECTIONS`
-    keep their update; a named leaf whose layer sowed no maxima raises
-    naming the layer, since stepping it unclipped would train a different
-    model than the maxima describe.
+    The clip acts on the weights after the step, `gamma * (W + update)`.
+    Written as an update that is `(gamma - 1) * W + gamma * update`, so the
+    optimizer chain can apply it after Muon and land on the same weights
+    MaxText's post-step rescale writes.
+
+    Leaves outside `QK_PROJECTIONS` keep their update. A named leaf whose
+    layer sowed no maxima raises naming the layer, since stepping it
+    unclipped would train a different model than the maxima describe.
 
     Queries rescale per head over the whole projection, the gate half of an
     output-gated projection with its query head, and the latent query's rope
@@ -255,8 +270,9 @@ def _clip_leaf(qk_stats, tau: float, qdims: dict[tuple[str, ...], int],
     return (scoped - 1) * param + scoped * update
 
 def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:
-    """QK-Clip after the update: heads past `tau` rescale their query and
-    key projections, Kimi K2's MuonClip (arXiv 2507.20534).
+    """Rescale the query and key projections of every head past `tau`.
+
+    This is Kimi K2's MuonClip (arXiv 2507.20534), applied after the update.
 
     The per-head maxima arrive as `qk_stats`, the `qk` collection the model
     sowed, which the trainer forwards from the loss's `Aux`. Without them
@@ -281,7 +297,7 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
 
 
 def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
-    """Muon over the matrices, AdamW over the rest, and the QK-Clip after."""
+    """Chain `_muon_groups` with the QK-Clip that follows the update."""
     return optax.chain(
         _muon_groups(learning_rate, **opts),
         scale_by_qk_clip(qk_clip_threshold))
@@ -297,8 +313,10 @@ OPTIMIZER_MAP = {
 
 
 def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransformation:
-    """The solver, with its schedule and clipping; `steps` is the run's length,
-    which a cosine schedule decays over unless the config names its own."""
+    """Build the solver a config describes, with its schedule and clipping.
+
+    `steps` is the run's length, which a cosine schedule decays over unless
+    the config names its own."""
     learning_rate = config.learning_rate
     if config.learning_rate_schedule == 'cosine':
         decay_steps = (steps if config.learning_rate_decay_steps is None

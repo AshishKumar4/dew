@@ -3,11 +3,12 @@
 A `Tracker` is the one capability the trainer logs through. `WandbTracker`
 sends each artifact to a W&B run, `LocalTracker` writes journals, preview
 files and optional plots in a directory, `MLflowTracker` opens an MLflow run
-and `TensorBoardTracker` writes an event file; each renders artifact types
-with a `functools.singledispatch` function, so a new artifact type registers
-a renderer, and MLflow uploads the files the local renderers write.
-`Trackers` fans one report out to several sinks. A backend is imported when
-the first value is logged into it.
+and `TensorBoardTracker` writes an event file.
+
+Each renders artifact types with a `functools.singledispatch` function, so a
+new artifact type registers a renderer, and MLflow uploads the files the
+local renderers write. `Trackers` fans one report out to several sinks. A
+backend is imported when the first value is logged into it.
 """
 
 from __future__ import annotations
@@ -221,11 +222,11 @@ class WandbTracker(_OwnedTracker):
 
 
 class LocalTracker(_OwnedTracker):
-    """Synchronous reports in a tracking directory: JSONL journals, preview files
-    and optional plots.
+    """Writes synchronous reports in a tracking directory.
 
-    Nonfinite metrics are journaled as the strings NaN, +Inf and -Inf. Plotting
-    runs only on plot() or close and reads the journal rather than retaining
+    Those are JSONL journals, preview files and optional plots. Nonfinite
+    metrics are journaled as the strings NaN, +Inf and -Inf. Plotting runs
+    only on plot() or close and reads the journal rather than retaining
     history.
     """
 
@@ -380,8 +381,8 @@ class MLflowTracker(_OwnedTracker):
 
     Scalars are the run's metrics and a preview is uploaded as the files the
     local renderers write. A record becomes a JSON artifact rather than a
-    parameter, because MLflow refuses a second value for a parameter and a
-    run reports several records under one type.
+    parameter: MLflow refuses a second value for a parameter, and a run
+    reports several records under one type.
     """
 
     def __init__(self, experiment: str, name: str | None = None, *, uri: str | None = None):

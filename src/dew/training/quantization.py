@@ -1,32 +1,38 @@
 """Quantized training through Qwix, applied to the model before it trains.
 
 Qwix (google/qwix, Apache 2.0) expresses quantization as rules over module
-paths and applies them without editing the model: one call wraps the module
-and the matmuls in the wrapped methods' extent run quantized. Dew's version
-of that call is `apply_quantization`: a caller builds its model from the registry as
-always, then wraps it before the objective ever sees it. A run names the
-value as `--trainer.quantization`, and `RunConfig.train` wraps through
-`quantize` the objective it was handed, before anything initialises it.
+paths and applies them without editing the model. One call wraps the module,
+and the matmuls in the wrapped methods' extent run quantized.
+
+Dew's version of that call is `apply_quantization`. A caller builds its model
+from the registry as always, then wraps it before the objective ever sees it.
+A run that names `--trainer.quantization` instead hands `RunConfig.train` the
+objective, and `quantize` wraps the model it holds before anything
+initialises it.
 
 What trains is fake-quantized. The parameter tree keeps fp32 master weights
 with the same structure, so the checkpoint layout, the sharding derivation,
-the Muon parameter split and Hugging Face loading are unchanged: the
+the Muon parameter split and Hugging Face loading are unchanged. The
 quantization lives in the forward and backward matmuls, with a
-straight-through estimator on the backward pass. The vocabulary head stays
-fp32 with the rest of Dew's fp32 zones: its einsum lives in the objective's
-chunked cross entropy, outside any model method Qwix wraps.
+straight-through estimator on the backward pass.
+
+The vocabulary head stays fp32 with the rest of Dew's fp32 zones. Its einsum
+lives in the objective's chunked cross entropy, outside any model method
+Qwix wraps.
 
 The value mirrors MaxText's knob set (configs/base.yml:128-167) where Qwix
-has an equivalent: `dtype` is its `quantization` for the dynamic-range
-forms, `patterns` is its `quant_cfg_path` written inline as the regexes
-Qwix matches, and the backward fields are Qwix's finer-grained version of
-the same idea. Three of its knobs have no equivalent and are refused with
-the reason: static activation scaling (`fp8_full`) needs a calibration pass
-Dew has no seam for, `nanoo_fp8` is AMD-only kernels, and KV-cache
-quantization has no reader here since the cache holds the compute dtype.
+has an equivalent. `dtype` is its `quantization` for the dynamic-range forms
+and `patterns` its `quant_cfg_path`, written inline as the regexes Qwix
+matches; the backward fields are Qwix's finer-grained version of the same
+idea.
 
-Qwix is not a dependency. The import sits inside `apply_quantization`, and without the
-package the call raises naming it, the way the tokamax branch of
+Three of its knobs have no equivalent and are refused with the reason.
+Static activation scaling (`fp8_full`) needs a calibration pass Dew has no
+seam for, `nanoo_fp8` is AMD-only kernels, and KV-cache quantization has no
+reader here since the cache holds the compute dtype.
+
+Qwix is not a dependency. The import sits inside `apply_quantization`, and
+without the package the call raises naming it, the way the tokamax branch of
 `dew.nn.moe` behaves.
 """
 import dataclasses
@@ -59,8 +65,7 @@ METHODS = ("__call__", "hidden_states", "mtp_hidden_states")
 
 @dataclasses.dataclass(frozen=True)
 class Quantization:
-    """How a run quantizes its trunk matmuls with Qwix's quantized-training
-    provider."""
+    """Says how a run quantizes its trunk matmuls, for Qwix's provider."""
 
     dtype: QuantizedDtype = "int8"
     """The dtype weights and activations quantize to, in the forward pass."""
@@ -126,12 +131,12 @@ class Quantization:
 
 
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
-    """`dtype` as the JAX dtype Qwix quantizes to."""
+    """Return `dtype` as the JAX dtype Qwix quantizes to."""
     return jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
 
 
 def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
-    """`model` with its trunk matmuls training in `spec`'s dtype.
+    """Wrap `model` so its trunk matmuls train in `spec`'s dtype.
 
     The returned module is a copy of the same class with the entry methods
     it defines of `METHODS` wrapped, so everything the registry, the
@@ -161,8 +166,9 @@ def apply_quantization(model: nn.Module, spec: Quantization) -> nn.Module:
 
 @runtime_checkable
 class ModelObjective(Protocol):
-    """An objective that trains one module, which is the shape `quantize`
-    can wrap: the module is its `model`, and every trace it runs reads it
+    """Trains one module, which is the shape `quantize` can wrap.
+
+    The module is the objective's `model`, and every trace it runs reads it
     there."""
 
     model: nn.Module

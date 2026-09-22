@@ -90,17 +90,17 @@ def check_bank_pool(nbytes: int, mesh) -> None:
 
 
 def resident(placement, sites, accelerator):
-    """The frozen collection's placement beside the accelerator, from the
-    specs the layout gave it: a stack's layers in bank memory, the rest in
-    device memory, each leaf the shard the layout named; and the leaves a
-    scanned run holds in every row placed as that run's bank, with the
-    layer axis in front (`banked`).
+    """Return where the frozen collection sits beside the accelerator.
+
+    A stack's layers go to bank memory and the rest to device memory, each
+    leaf on the shard the layout named. The leaves a scanned run holds in
+    every row are placed as that run's bank, layer axis in front (`banked`).
 
     Only a scanned stack is placed in bank memory: its scan fetches one row
     per iteration, so the device holds one layer of the bank at a time. A
-    plain loop's fetches have no order between them, the scheduler hoists
-    them all to the front, and the whole stack lands on the device, which
-    is the memory the layout was asked to avoid; it is refused by name."""
+    plain loop's fetches have no order between them, so the scheduler hoists
+    them all to the front and the whole stack lands on the device. That is
+    the memory the layout was asked to avoid, so it is refused by name."""
     unscanned = [".".join(site.namespace) or "<root>" for site in sites if not site.scanned]
     if unscanned:
         raise ValueError(
@@ -118,20 +118,24 @@ def resident(placement, sites, accelerator):
 
 
 def banked(tree, sites, stack, release=None):
-    """`tree`, a frozen collection keyed per layer, with every leaf that all
-    rows of a scanned run hold moved under the run's bank name as
-    `stack(rows, path)`: arrays stack into one bank, shapes into one shape,
-    shardings into the bank's, `path` the bank leaf's keys from the root so
-    a caller can place the bank as it makes it. A leaf only some rows hold
-    stays per layer, as does every run of one, and `run_stack` stacks those
-    with the moving rows at each snapshot.
+    """Replace a scanned run's per-layer rows with one stacked bank.
 
-    So a frozen bank exists once, as the bank the scan reads, from the
-    moment it is placed: not as its rows in pinned memory and a stacked
-    copy beside them, which for a stack that fills the host is the second
-    copy that does not fit. `release(namespace, index, keys, bank)` is told
-    each row leaf the bank replaced and the bank itself, so the tree the rows
-    came from can hold the bank where the row was and let the row go.
+    `tree` is a frozen collection keyed per layer. Every leaf that all rows
+    of a run hold moves under the run's bank name, stacked by
+    `stack(rows, path)`. Arrays stack into one bank, shapes into one shape,
+    shardings into the bank's. A leaf only some rows hold stays per layer, as
+    does every run of one, and `run_stack` stacks those with the moving rows
+    at each snapshot.
+
+    `stack` is called with the rows and `path`, the bank leaf's keys from the
+    root, so a caller can place each bank as it makes it. A frozen bank then
+    exists once, from the moment it is placed, rather than as its rows in
+    pinned memory and a stacked copy beside them, which for a stack that
+    fills the host is the second copy that does not fit.
+
+    `release(namespace, index, keys, bank)` is told each row leaf the bank
+    replaced, and the bank itself. The tree the rows came from can then hold
+    the bank where the row was and let the row go.
     """
     tree = dict(tree)
     for site in sites:
@@ -177,7 +181,7 @@ def banked(tree, sites, stack, release=None):
 
 
 def _without_banks(variables, sites):
-    """`variables` without the banks a scanned run stores under its name."""
+    """Return `variables` without the banks a scanned run stores under its name."""
     banks = {(*site.namespace, name) for site in sites
              for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True)
              if count > 1}
@@ -195,7 +199,7 @@ def _without_banks(variables, sites):
 
 
 def _drop(tree, keys):
-    """`tree` without the leaf at `keys`, and without the nodes that emptied."""
+    """Delete the leaf at `keys` from `tree`, and any node that emptied with it."""
     node, parents = tree, []
     for key in keys[:-1]:
         parents.append((node, key))
@@ -212,6 +216,7 @@ def _drop(tree, keys):
 
 
 def _bank_shardings(placed, accelerator, count):
+    """Place one bank in bank memory, layer axis in front when it stacks rows."""
     return jax.tree.map(
         lambda s: NamedSharding(accelerator, P(None, *s.spec) if count > 1 else s.spec,
                                 memory_kind=BANK_MEMORY), placed)
@@ -235,7 +240,7 @@ def _replaced(tree, namespace, subtrees):
 
 
 def _logical(tree, sites):
-    """Every declared stack's banks back under their stored `layers_N` paths."""
+    """Put every declared stack's banks back under their stored `layers_N` paths."""
     for site in sites:
         local = in_namespace(tree, site.namespace)
         if local:
@@ -244,7 +249,7 @@ def _logical(tree, sites):
 
 
 def _selected(tree, paths):
-    """The leaves at `paths`, which are the canonical trainable ones."""
+    """Pick out the leaves at `paths`, which are the canonical trainable ones."""
     selected: dict = {}
     for path in paths:
         node, target = tree, selected
@@ -256,7 +261,7 @@ def _selected(tree, paths):
 
 @functools.partial(jax.jit, static_argnames=("sites", "paths", "layout"))
 def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
-    """One accelerator computation: the pullback, the unstack and the selection.
+    """Run the pullback, the unstack and the selection as one computation.
 
     `back` crosses this boundary as its own pytree, so the residuals are
     arguments rather than captured constants. It returns one cotangent per
@@ -273,7 +278,12 @@ def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
 
 
 class HostExecution:
-    """Own snapshot placement and attempt-local tapes, not another TrainState."""
+    """Runs one objective evaluation and its pullback on the accelerator.
+
+    The CPU owns the state. This class places a snapshot of it on the
+    accelerator, runs the loss there, and hands back a pullback. It keeps no
+    state of its own between attempts.
+    """
     def __init__(self, objective, layout, accelerator, cpu):
         self.objective, self.layout = objective, layout
         self.accelerator, self.cpu = accelerator, cpu
@@ -369,6 +379,14 @@ class HostExecution:
         return transfer(tree, jax.tree.map(placement, tree))
 
     def realize(self, variables, batch, step):
+        """Evaluate the objective on the accelerator, over a snapshot of the state.
+
+        The moving leaves are the vjp's primal; every frozen leaf, row or
+        bank enters as a value. The forward then keeps nothing for a
+        cotangent no optimizer reads. The statistics and the report come home
+        to the CPU, while the pullback stays here and runs on the accelerator
+        when it is called.
+        """
         with jax.set_mesh(self.cpu):
             store = self.snapshot(variables)
             # A frozen leaf, row or bank, is the state's own array: those the
