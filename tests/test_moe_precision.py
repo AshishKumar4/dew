@@ -27,9 +27,10 @@ MESH_LAYOUTS = tuple(pytest.param(expert, fsdp, marks=pytest.mark.mesh)
                      for expert, fsdp in ((2, 4), (4, 2), (8, 1)))
 LAYOUTS = (pytest.param(1, 1, id='1-1'), *MESH_LAYOUTS)
 TOLERANCE = 3e-5
-# Every grouped matmul JAX differentiates on its own, each held to the
-# contract on whatever device runs the suite; 'auto' resolves to one of them.
-IMPLEMENTATIONS = ('xla', 'tiled')
+# Every grouped matmul Dew differentiates, each held to the contract in
+# reverse mode on whatever device runs the suite; off a GPU 'pallas' runs its
+# kernels in the Pallas interpreter. Forward mode is 'xla''s alone.
+IMPLEMENTATIONS = ('xla', 'pallas')
 
 
 def rounded(value, dtype=ml_dtypes.bfloat16) -> np.ndarray:
@@ -127,9 +128,8 @@ def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, 
     (jnp.float32, jnp.float32, jnp.float32), (jnp.float64, jnp.float64, jnp.float64)])
 @pytest.mark.parametrize('expert,fsdp', LAYOUTS)
 @pytest.mark.parametrize('rows', [True, False], ids=['rows', 'columns'])
-@pytest.mark.parametrize('implementation', IMPLEMENTATIONS)
 def test_a_projection_differentiates_the_same_law_in_every_direction(
-        compute, input_dtype, master, expert, fsdp, rows, implementation):
+        compute, input_dtype, master, expert, fsdp, rows):
     """JVP, VJP, forward-over-reverse and reverse-over-forward against the
     tangent law `dx @ Q(kernel) + Q(x) @ dkernel` in float64."""
     rng = np.random.default_rng(943)
@@ -149,7 +149,7 @@ def test_a_projection_differentiates_the_same_law_in_every_direction(
 
     def evaluate(x, kernel, dx, dkernel, cotangent, sizes):
         def fn(x, kernel):
-            return jnp.asarray(expert_projection(x, kernel, sizes, compute, implementation, None))
+            return jnp.asarray(expert_projection(x, kernel, sizes, compute, 'xla', None))
 
         def scalar(x, kernel):
             return jnp.sum(fn(x, kernel).astype(jnp.float64) * cotangent)
@@ -175,8 +175,7 @@ def test_a_projection_differentiates_the_same_law_in_every_direction(
 
 
 @pytest.mark.usefixtures('x64')
-@pytest.mark.parametrize('implementation', IMPLEMENTATIONS)
-def test_a_tangent_keeps_the_residue_of_a_wider_operand(implementation):
+def test_a_tangent_keeps_the_residue_of_a_wider_operand():
     """A 2^-30 that only fp64 holds survives the projection's derivatives in
     every mode: implicit promotion, explicit fp64 compute, and both mixed
     orders under bf16 compute. The residue is representable, so these are
@@ -187,7 +186,7 @@ def test_a_tangent_keeps_the_residue_of_a_wider_operand(implementation):
     sizes = jnp.asarray([2], jnp.int32)
 
     def inferred(x, kernel):
-        return jnp.asarray(expert_projection(x, kernel, sizes, None, implementation, None))
+        return jnp.asarray(expert_projection(x, kernel, sizes, None, 'xla', None))
 
     y, tangent = jax.jit(lambda x, kernel: jax.jvp(
         inferred, (x, kernel), (jnp.zeros_like(x), jnp.ones_like(kernel))))(x, kernel)
@@ -201,7 +200,7 @@ def test_a_tangent_keeps_the_residue_of_a_wider_operand(implementation):
     sizes = jnp.asarray([1], jnp.int32)
 
     def explicit(x, kernel):
-        return jnp.asarray(expert_projection(x, kernel, sizes, jnp.float64, implementation, None))
+        return jnp.asarray(expert_projection(x, kernel, sizes, jnp.float64, 'xla', None))
 
     y, tangent = jax.jit(lambda x, kernel: jax.jvp(
         explicit, (x, kernel), (jnp.ones_like(x), jnp.zeros_like(kernel))))(x, kernel)
@@ -215,7 +214,7 @@ def test_a_tangent_keeps_the_residue_of_a_wider_operand(implementation):
 
     def scalar(x, kernel):
         return jnp.asarray(expert_projection(
-            x, kernel, sizes, jnp.bfloat16, implementation, None)).astype(jnp.float64).sum()
+            x, kernel, sizes, jnp.bfloat16, 'xla', None)).astype(jnp.float64).sum()
 
     def mixed(x, kernel, direction):
         forward_reverse = jax.jvp(jax.grad(scalar, (0, 1)), (x, kernel),
