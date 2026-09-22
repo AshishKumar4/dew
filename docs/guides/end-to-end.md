@@ -65,6 +65,21 @@ JAX_PLATFORMS=cpu python examples/sft_gemma4.py --smoke --out /tmp/gemma4-smoke
 
 The script passes `--dataset` to `ChatMessages` unchanged. `ChatMessages` resolves a Hub id through `HFOptions`, the same value the `hf` provider forwards, and renders each conversation with the checkpoint's chat template. `--rows N` takes the first N conversations, as the split slice `train[:N]` that `datasets` understands. The smoke run writes its canned conversations as JSONL and fine-tunes the committed tiny Gemma 4 for two steps.
 
+## GRPO with verifiable rewards
+
+[`examples/train_rlvr.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_rlvr.py) trains Qwen2.5-0.5B-Instruct with GRPO on generated programming tasks. Each prompt asks for a Python program that reads two integers from stdin and prints a stated function of them. A completion's reward is the fraction of three hidden test cases its program passes. The programs run in a `SandboxFleet` of processes with a wall clock, a CPU-time limit and a memory cap. Rollouts come from a rollout server one update ahead of the trainer, and the GRPO objective's importance cap corrects for that one update of staleness. [Post-training](../concepts/post_training.md#asynchronous-rlvr) describes the pieces.
+
+```bash
+python examples/train_rlvr.py --backend native --steps 40 --out runs/rlvr-native
+python examples/train_rlvr.py --backend vllm --vllm /path/to/vllm-env/bin/vllm --steps 40 --out runs/rlvr-vllm
+```
+
+```bash
+JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --out /tmp/rlvr-smoke
+```
+
+`--backend native` samples from Dew's own `Server` in the training process and pushes weights to it in place. `--backend vllm` exports the checkpoint, starts a vLLM server on it with `VLLM_SERVER_DEV_MODE=1`, samples from it by token ids, and pushes weights by writing safetensors and asking vLLM to reload them. vLLM can live in its own environment; `--vllm` names its executable. `--vllm-memory` is vLLM's share of the GPU, and `XLA_PYTHON_CLIENT_MEM_FRACTION` should leave it that much. The run prints one line per update and writes `rewards.json` with each update's reward, policy version and lag. The smoke run trains the committed tiny Qwen2 for two updates on the native backend, which checks the wiring and not the learning.
+
 ## Scoring and serving a finished run
 
 [`examples/evaluate_and_serve.py`](https://github.com/AshishKumar4/dew/blob/main/examples/evaluate_and_serve.py) loads a run with `dew.pipeline` and writes one JSON report. The report holds:
