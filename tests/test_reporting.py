@@ -135,8 +135,14 @@ def test_local_scalar_sink_does_not_enable_preview_computation(tmp_path, preview
 
     with LocalTracker(tmp_path) as sink:
         trainer = Trainer(Display(), optax.sgd(.01), key=jax.random.key(0), tracker=sink)
-        trainer.fit(Dataset(batches, lambda: iter([next(batches())]), None, 8),
-                    steps=2, eval_every=1, preview=preview)
+        data = Dataset(batches, lambda: iter([next(batches())]), None, 8)
+        if preview:
+            trainer.fit(data, steps=2, eval_every=1, preview=True)
+        else:
+            # With preview off and no metric, the scheduled pass has no
+            # consumer and is refused before anything is generated.
+            with pytest.raises(ValueError, match="nothing consumes"):
+                trainer.fit(data, steps=2, eval_every=1, preview=False)
     assert generated == ([1, 2] if preview else [])
     assert len(list(tmp_path.glob('*.png'))) == (2 if preview else 0)
 
