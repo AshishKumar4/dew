@@ -1,26 +1,28 @@
 # Plan and run on Cloud TPUs
 
-A Cloud TPU slice contains accelerator devices attached to one or more worker VMs. For a multi-worker training job, every worker runs the same program and joins the same JAX process pool. Dew's `dew-tpu` command wraps `gcloud`, SSH, and rsync to create a slice, install the environment on its workers, and launch a recipe on all of them.
+> An AI assistant maintains this document. It is presented as-is.
 
-The resource commands below include `--dry-run` and print command previews. They create no cloud resources and make no worker connections. A successful preview does not verify cloud permissions, capacity, networking, TPU execution, or distributed training.
+A Cloud TPU slice is a set of accelerator devices attached to one or more worker VMs. In a multi-worker training job, every worker runs the same program, and all of them join one JAX process pool. Dew's `dew-tpu` command wraps `gcloud`, SSH, and rsync. It creates a slice, installs the environment on each worker, and starts a recipe on all of them.
+
+Every resource command on this page carries `--dry-run`, which prints the commands `dew-tpu` would run. A dry run creates no cloud resources and connects to no workers. A dry run that succeeds does not check your cloud permissions, capacity, networking, TPU execution, or distributed training.
 
 ## Prerequisites and costs
 
-First complete a [local recipe run](recipes.md) and read [distributed training](concepts/distributed.md). Have the following ready before removing a resource command's `--dry-run` flag:
+First do a [local recipe run](recipes.md) and read [distributed training](concepts/distributed.md). Before you remove `--dry-run` from a resource command, have the following ready:
 
-- A Google Cloud project with billing enabled, the Cloud TPU API enabled, and quota for the requested accelerator type in a supported zone. Capacity can still be unavailable when quota exists.
-- An authenticated Google Cloud CLI and permissions to create/delete TPUs, use the worker service account, and access data or checkpoint buckets. Diagnose permission errors against the project's IAM policy and grant only the required permissions.
-- SSH access to workers and the local `ssh` and `rsync` programs. Source setup and training run from a Git checkout. The current sync command uses the Google Compute Engine SSH key and disables SSH host-key checking; assess that policy before using it on a sensitive network.
-- Worker network access to the package repositories used by setup, and passwordless sudo for its package and system-limit changes. A private-network deployment needs its own routing and access configuration; this command does not design that network.
-- Dataset files, compatible model/tokenizer files if needed, and a checkpoint location available to every process. Syncing the checkout does not guarantee that ignored datasets or model weights reach the workers.
+- A Google Cloud project with billing enabled, the Cloud TPU API enabled, and quota for the accelerator type you want in a zone that offers it. Even with quota, capacity can be unavailable.
+- An authenticated Google Cloud CLI, and permission to create and delete TPUs, to use the worker service account, and to reach your data or checkpoint buckets. If you get permission errors, check them against the project's IAM policy and grant only what the job needs.
+- SSH access to the workers, and `ssh` and `rsync` on your machine. Setup from source and training both run from a Git checkout. The sync step uses the Google Compute Engine SSH key and turns off SSH host-key checking. Decide whether that is acceptable before you use it on a sensitive network.
+- Network access from the workers to the package repositories setup installs from, and passwordless sudo for its package installs and system-limit changes. A private-network deployment needs its own routing and access setup; `dew-tpu` does not configure the network for you.
+- Your dataset files, any model or tokenizer files you need, and a checkpoint location that every process can reach. Sync skips everything that `.gitignore` excludes, so ignored datasets and model weights do not reach the workers that way.
 
-Review [Cloud TPU pricing](https://cloud.google.com/tpu/pricing), regional quota, and runtime availability for your project. Budget for accelerator time, worker/storage resources, bucket operations, and data transfer. Stopping a process or closing the log viewer does not stop billing. Spot TPUs can be preempted; the current overflow/resume defect means this guide cannot promise exact recovery after an interrupted run. See [checkpoints](guides/checkpoints.md) before choosing spot capacity.
+Read [Cloud TPU pricing](https://cloud.google.com/tpu/pricing), and check regional quota and runtime availability for your project. Budget for accelerator time, worker and storage resources, bucket operations, and data transfer. Billing continues after you stop a process or close the log viewer. Spot TPUs can be preempted. Resuming after a preemption needs a checkpoint on storage that every process can reach and a data iterator that saves its position; read [checkpoints](guides/checkpoints.md) before you choose spot capacity.
 
-Install Dew using the [installation guide](installation.md). `dew-tpu --help` and `dew-tpu create --help` inspect the local command interface without contacting Google Cloud.
+Install Dew by following the [installation guide](installation.md). `dew-tpu --help` and `dew-tpu create --help` show the command's options without contacting Google Cloud.
 
 ## Configure a preview
 
-Use a separate configuration directory while learning so you do not overwrite existing deployment defaults:
+While you are learning, use a separate configuration directory so you do not overwrite your real deployment defaults:
 
 ```bash
 export DEW_CONFIG_DIR="$(mktemp -d)"
@@ -29,7 +31,7 @@ dew-tpu init --project dew-training --zones us-central2-b,europe-west4-a \
     --gcs-bucket '' --data-disk '' --python-version 3.12 --dry-run
 ```
 
-`dew-training`, `you`, and `dew-16` in this guide are example names. Replace the project and SSH user with your own values before deployment. `init --dry-run` only prints the TOML; it does not save those defaults. To use the previews below with these example values, save this file as `$DEW_CONFIG_DIR/tpu.toml`:
+`dew-training`, `you`, and `dew-16` are example names. Replace the project and the SSH user with your own before you deploy anything. `init --dry-run` prints the TOML and does not save it. To use the previews below with these example values, save this file as `$DEW_CONFIG_DIR/tpu.toml`:
 
 ```toml
 project = "dew-training"
@@ -42,11 +44,11 @@ data_disk = ""
 python_version = "3.12"
 ```
 
-For a real configuration, `dew-tpu init` without `--dry-run` writes the file locally; omitted flags prompt when the terminal is interactive. Without `DEW_CONFIG_DIR`, the default location is `~/.config/dew/tpu.toml` (or the XDG config directory).
+For a real configuration, run `dew-tpu init` without `--dry-run` and it writes the file for you. In an interactive terminal it asks for any flag you left out. Without `DEW_CONFIG_DIR`, the file lives at `~/.config/dew/tpu.toml`, or under `$XDG_CONFIG_HOME/dew/` when that variable is set.
 
-`zones` defines a search order for locating an existing TPU. Creation uses the explicit `--zone`, or the first configured zone. Do not read the list as automatic capacity retry. Dew caches resolved zones in `zones.json`.
+`zones` is the order in which `dew-tpu` searches for an existing TPU. Creation uses `--zone` if you give it, and otherwise the first zone in the list. It does not retry in the next zone when one has no capacity. Dew caches the zone it finds for each TPU in `zones.json`.
 
-Dry runs have local side effects: creation can update the zone cache, and setup writes its rendered shell script into the configuration directory. They do not create cloud resources. The separate directory keeps these preview files away from your normal configuration.
+Dry runs do write local files. Creation can update the zone cache, and setup writes its generated shell script into the configuration directory. The separate directory keeps these files out of your normal configuration. No cloud resources are created.
 
 ## Preview creation and setup
 
@@ -56,39 +58,39 @@ dew-tpu setup dew-16 --zone us-central2-b --type v5e-16 \
     --from-source --dry-run
 ```
 
-Run source setup from the Dew Git checkout. Dew translates `v5e-16` to the API name `v5litepod-16` and predicts two workers for the preview. `runtime_version="auto"` selects a runtime from Dew's generation table. That table is a default, not a live availability check; verify the runtime against the current [Cloud TPU software versions](https://cloud.google.com/tpu/docs/runtimes) before creating the slice. `--version` on `create` overrides the TPU runtime. `--version` on `setup` instead selects the Dew package release.
+Run setup from source inside the Dew Git checkout. Dew turns `v5e-16` into the API name `v5litepod-16`, and the preview assumes two workers. `runtime_version="auto"` picks a runtime from a table in Dew, one entry per TPU generation. That table is a default and does not check what Google offers today. Compare its choice with the current [Cloud TPU software versions](https://cloud.google.com/tpu/docs/runtimes) before you create the slice. `--version` means two different things: on `create` it sets the TPU runtime, and on `setup` it picks the Dew package release.
 
-A real create waits for the TPU's READY state. `--spot` requests interruptible capacity; `--queued` uses the queued-resources API. An optional `--disk NAME` attaches a persistent disk and mounts it at `/mnt/persist`. Confirm disk location, permissions, and data ownership before attaching it.
+A real `create` waits until the TPU reports READY. `--spot` asks for capacity that can be preempted, and `--queued` goes through the queued-resources API. `--disk NAME` attaches a persistent disk and mounts it at `/mnt/persist`. Check the disk's location, permissions, and data ownership before you attach it.
 
-Setup syncs the checkout for `--from-source`, installs uv, creates `~/dew-venv`, installs `jax[tpu]` and Dew, writes `~/.dew-env`, adjusts file limits, and optionally mounts the configured bucket at `~/gcs_mount`. It also installs system packages using sudo. With no source flag, setup installs the selected package release. Repeating setup can resolve newer packages; pinning Dew does not pin JAX or the whole environment. Archive the resolved package versions with the run.
+With `--from-source`, setup first syncs the checkout. It then installs uv, creates `~/dew-venv`, installs `jax[tpu]` and Dew, writes `~/.dew-env`, raises the open-file limits, and mounts the configured bucket at `~/gcs_mount` if you set one. It also installs system packages with sudo. Without a source flag, setup installs the Dew release you chose. Running setup again can pick up newer packages, and pinning Dew does not pin JAX or anything else in the environment. Save the resolved package versions with your run.
 
-A real setup finishes by asking each worker for `jax.device_count()` and `jax.local_device_count()`. It compares the global count with the requested slice size. A two-worker v5e-16 preview predicts 16 global devices and 8 local devices per worker; those numbers are not observations of a deployed slice.
+A real setup ends by asking each worker for `jax.device_count()` and `jax.local_device_count()`, and it compares the global count with the slice size you asked for. For a two-worker v5e-16, the preview expects 16 global devices and 8 local devices per worker. These are expected values, not counts from a deployed slice.
 
 ## Verify the deployed slice before training
 
-After an authorized real setup, inspect every worker's report. READY means the resource exists, not that your training program can complete a collective operation. A global device count check also does not test checkpoint access, input throughput, or the model's sharding layout.
+After a real setup, read the report from every worker. READY means the resource exists. It does not mean your training program can finish a collective operation. The device-count check does not test checkpoint access, input throughput, or your model's sharding layout either.
 
-Preview an all-worker command with:
+To preview a command on all workers:
 
 ```bash
 dew-tpu run dew-16 --zone us-central2-b --dry-run -- \
     python -c 'import jax; print(jax.process_index(), jax.process_count(), jax.device_count(), jax.local_device_count())'
 ```
 
-`run` starts one SSH command per worker and prefixes each worker's output. It sources `~/.dew-env`. Your program must still initialize distributed JAX before creating device arrays; the training recipes perform that setup. The plain `python -c` command above only inspects what JAX sees in that process and is not a distributed-training test.
+`run` starts one SSH command per worker, sources `~/.dew-env` first, and prefixes each line of output with its worker. Your program still has to initialize distributed JAX before it creates device arrays; the training recipes do that for you. The `python -c` command above only shows what JAX sees in that one process. It does not test distributed training.
 
-For deployment acceptance, run a short recipe with the intended mesh and global batch size, confirm every process joins, observe finite updates, and verify that every process can access the data and checkpoint location. Then exercise the documented restore path with a separate short run. This page's previews provide none of that hardware evidence.
+Before you trust a deployment, run a short recipe with the mesh and global batch size you plan to use. Check that every process joins, that updates are finite, and that every process can read the data and write to the checkpoint location. Then restore from that checkpoint in a second short run. None of the previews on this page do any of that on real hardware.
 
 ## Supply data and preview a training launch
 
-The [recipe walkthrough](recipes.md) creates `/tmp/dew-first-recipe/tokens`. Copy that directory explicitly:
+The [recipe walkthrough](recipes.md) creates `/tmp/dew-first-recipe/tokens`. Copy that directory to the workers yourself:
 
 ```bash
 dew-tpu copy dew-16 /tmp/dew-first-recipe/tokens '~/dew-tokens' \
     --zone us-central2-b --dry-run
 ```
 
-`copy` targets every worker by default. For this example SSH user, the remote data path is `/home/you/dew-tokens`; change it if your worker home differs. Return to the Dew checkout, then preview a short launch:
+`copy` sends to every worker unless you pass `--worker`. For the example SSH user, the data lands at `/home/you/dew-tokens`; change that path if your home directory on the workers is different. Go back to the Dew checkout and preview a short launch:
 
 ```bash
 dew-tpu train dew-16 --zone us-central2-b --job byte-demo --dry-run -- \
@@ -103,9 +105,9 @@ dew-tpu train dew-16 --zone us-central2-b --job byte-demo --dry-run -- \
     --trainer.name byte-demo --sample-tokens 0
 ```
 
-The tiny shape is for launch inspection, not a TPU performance recommendation. `train` syncs the checkout and launches the recipe detached on every worker, adding `--trainer.multi-host True`. It then follows worker 0's log. The example's worker-local checkpoint path is not a durable shared-storage design for a multi-host run. Before a real run, choose a checkpoint store accessible to all processes, configure its credentials, and test it. A local directory with the same spelling on two workers is not necessarily the same storage.
+The tiny model is there so you can inspect the launch. It is not a TPU performance setting. `train` syncs the checkout, adds `--trainer.multi-host True`, and starts the recipe in the background on every worker. It then follows worker 0's log. In this example each worker writes checkpoints to its own local disk, which is not durable shared storage for a multi-host run. Before a real run, pick a checkpoint store that every process can reach, set up its credentials, and test it. The same local path on two workers is usually two different disks.
 
-Ctrl-C stops the log follower, not the detached training job. The logs live under `~/dew-runs/<job>/worker-<index>.log`. Preview later inspection with:
+Ctrl-C stops following the log. The training job keeps running. The logs are in `~/dew-runs/<job>/worker-<index>.log` on each worker. To preview the commands for checking on it later:
 
 ```bash
 dew-tpu logs dew-16 byte-demo --zone us-central2-b --worker all --dry-run
@@ -113,19 +115,19 @@ dew-tpu status dew-16 --zone us-central2-b --dry-run
 dew-tpu describe dew-16 --zone us-central2-b --dry-run
 ```
 
-`--follow` follows a log; `--worker N` selects a worker. Read failures from every worker. A successful launch command does not establish that its detached training process completed.
+`logs` reads worker 0 unless you pass `--worker N` or `--worker all`, and `--follow` keeps printing new lines. Read the logs from every worker when something fails. A launch command that succeeds only means the job started, not that it finished.
 
 ## End the allocation deliberately
 
-List or describe resources before deleting them, and preserve outputs you need. Preview deletion with:
+List or describe your resources before you delete them, and save any outputs you need. To preview deletion:
 
 ```bash
 dew-tpu delete dew-16 --zone us-central2-b --dry-run
 ```
 
-During real deletion, Dew checks whether a queued resource owns the TPU and deletes that resource when needed. A dry run cannot discover the live ownership state, so its printed deletion path may differ. Verify deletion in your project afterward, including disks and buckets that have their own lifetimes and charges.
+A real `delete` checks whether a queued resource owns the TPU, and if so deletes the queued resource. A dry run cannot look up that ownership, so the deletion command it prints can differ from the real one. Afterward, check your project to confirm the deletion, including disks and buckets, which have their own lifetimes and charges.
 
-`reset` kills processes holding accelerator devices on every worker. It is a forceful recovery operation, not normal job shutdown; it can kill another user's work on a shared slice and lose unsaved state. `stop` retains the TPU's name and disks. Neither command is a substitute for checking the remaining billable resources.
+`reset` kills every process that holds the accelerator devices on every worker. Use it to recover a stuck slice, not to stop a job normally. On a shared slice it can kill someone else's work, and anything unsaved is lost. `stop` keeps the TPU's name and disks. After either command, check what you are still being billed for.
 
 ## Other commands and older scripts
 
@@ -138,4 +140,4 @@ During real deletion, Dew checks whether a queued resource owns the TPU and dele
 | `spawn BASE N -- CMD` | Create, set up, and launch on N independent TPUs. Each adds cost. |
 | `start NAME` / `stop NAME` | Change a TPU's running state without deleting its name and disks. |
 
-Use each command's `--help` before passing destructive options. For users of the old FlaxDiff `tpu_tool.sh`, `execute` becomes `run`, the hand-copied reset script becomes `reset`, and log inspection replaces the tmux sweep dashboard. Dew does not clear `/tmp`, install the old framework pin list, or rewrite a project's DNS configuration. Use your normal secret-management process for credentials; copying a private key into every worker is not part of this setup.
+Read each command's `--help` before you pass an option that deletes or kills something. If you used the old FlaxDiff `tpu_tool.sh`, `run` does what `execute` did, `reset` does what the hand-copied reset script did, and `logs` takes the place of the tmux sweep dashboard. Dew does not clear `/tmp`, does not install the old framework's pinned package list, and does not rewrite the project's DNS configuration. Handle credentials with your usual secret-management process; this setup never copies a private key onto the workers.
