@@ -229,7 +229,7 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
                 process.argv, cwd=cwd if local else None,
                 env={**os.environ, **process.env} if local else None,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, start_new_session=True)
+                text=True, encoding="utf-8", errors="replace", start_new_session=True)
             running.append(child)
             assert child.stdout is not None, "stdout=PIPE always opens the stream"
             relay = threading.Thread(target=_relay, args=(process.rank, child.stdout, sys.stdout, lock),
