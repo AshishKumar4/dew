@@ -1,5 +1,7 @@
 # The language-model head
 
+> An AI assistant maintains this document. It is presented as-is.
+
 ## Result
 
 Scoring the vocabulary in four chunks instead of one takes the small causal
@@ -9,15 +11,14 @@ transformer's step from 82.977 ms to 82.017 ms and its peak allocation from
 they do not describe the kernel that ships; the isolation table below prices
 that difference at 17.48 ms of head work, which the step row does not show,
 and the step has not been re-measured at the shipped commit. The loss is
-unchanged and `train/token_accuracy` keeps both its value and its key,
-computed from a running argmax across the chunks rather than a pass over the
+unchanged. `train/token_accuracy` keeps both its value and its key; it now
+comes from a running argmax across the chunks instead of a pass over the
 whole logits tensor. The accuracy costs nothing measurable: 49.71 ms of head
 work with it and 49.71 ms without.
 
-The time saving is small because the head's three matmuls are the floor and
-chunking does not remove them. What chunking removes is the traffic around
-them. The full-vocabulary path held an 8,192 by 50,304 float32 logits tensor,
-1.57 GiB, and its softmax gradient at the same time; the chunked path holds
+The time saving is small because chunking does not remove the head's three
+matmuls, and they set the floor. Chunking removes the traffic around them.
+The full-vocabulary path held an 8,192 by 50,304 float32 logits tensor, 1.57 GiB, and its softmax gradient at the same time; the chunked path holds
 four 0.39 GiB tiles and one gradient tile.
 
 ## Fixed point
@@ -27,9 +28,17 @@ The step table and the head table were measured at commit `d19b242` of
 vocabulary tile in `jax.checkpoint`; the kernel that ships keeps the tiles
 (`3d184ef`), which is the "tiles kept" row of the isolation table, so the
 step row above is the remat kernel's and the one for the shipped kernel is
-missing. Re-measuring it is the two `tools/benchmark_step.py` commands under
-Reproduction, run at the merge commit of this branch; the card was held by
-another run for the whole of this pass.
+missing. To re-measure it, run the two `tools/benchmark_step.py` commands under
+Reproduction at the merge commit of this branch. I could not do it in this
+pass because another run held the card the whole time.
+
+Correction, 2026-09-22: the kernel in `src/dew/objectives/lm/chunked.py` does
+not keep the tiles. Its backward recomputes each `[token_tile,
+vocab_tile]` block of logits behind a custom VJP adapted from Tokamax
+(`src/dew/objectives/lm/chunked.py:9-20`), so none of the rows in this note
+measures the current kernel. `tools/benchmark_lm_head.py` times it as the
+`bounded` variant (`tools/benchmark_lm_head.py:6-21`). The default is still
+four chunks (`head_chunks: int = 4`, `src/dew/objectives/lm/objective.py:438`).
 
 One NVIDIA GeForce RTX 4080, 16 GiB, driver 595.84. Python 3.12.13, JAX and
 jaxlib 0.11.1, Flax 0.12.9, Optax 0.2.8. Every run started with
@@ -50,8 +59,8 @@ The GFLOP column moves without any arithmetic changing. Chunking replaces one
 cuBLAS custom call with four dots the compiler can count, so
 `cost_analysis()` sees 2.069 TFLOP where it saw 1.320 TFLOP. The analytic
 figure for this model is 3.406 TFLOP either way
-([benchmark-parity.md](benchmark-parity.md)). It is more evidence that the
-logged utilization is a compiler-visibility number, not a hardware one.
+([benchmark-parity.md](benchmark-parity.md)). So the logged utilization
+measures what the compiler can see, and says little about the hardware.
 
 ## The head in isolation
 
@@ -68,8 +77,8 @@ process reports the first row's peak for every later one.
 | 8 chunks, tiles kept | 18.56 | 50.82 | 2.020 |
 | 4 chunks, tiles recomputed (`jax.checkpoint`) | 18.12 | 67.19 | 1.834 |
 
-Read three things off it. The accuracy term is free, so the frozen metric did
-not have to move to validation. Eight chunks are slower than four by 1.11 ms
+The table shows three things. The accuracy term is free, so the frozen metric
+did not have to move to validation. Eight chunks are slower than four by 1.11 ms
 and save 0.14 GiB, so four ship. Recomputing the tiles in the backward pass
 costs 17.48 ms, which is a fourth pass of the head matmul, and saves 0.32
 GiB; on one card that is the wrong trade, so the tiles are stored. MaxText
@@ -89,7 +98,7 @@ constraints.
 
 Three checks, from tightest to loosest.
 
-**The head's own loss, same inputs.** Bitwise identical: relative difference
+The head's own loss on the same inputs is bitwise identical: relative difference
 0.00e+00 between the full pass and 4 chunks at 8,192 tokens. Gradients agree
 to 2.54e-05 on the head matrix, inside the 1e-4 the contribution rules ask
 for. The state gradient agrees to 4.48e-03, which is one bfloat16 unit in the
@@ -97,20 +106,20 @@ last place: it is a bf16 tensor on both sides, and the same comparison in
 float32 gives 9.12e-08. Parameter gradients through the real backbone are held
 to 1e-4 by `tests/test_chunked_cross_entropy.py`.
 
-**One training step.** Same seed, same fixed batch, small preset: step 0's
-loss differs by 5.06e-07 relative, inside 1e-5.
+One training step with the same seed, the same fixed batch and the small
+preset: step 0's loss differs by 5.06e-07 relative, inside 1e-5.
 
-**Twenty training steps.** The trajectories drift to 2.87e-04 by step 18. That
-is not the chunking. The control is main against itself with only the matmul
+Over twenty training steps the trajectories drift to 2.87e-04 by step 18. The
+chunking does not cause it. The control is main against itself with only the matmul
 precision changed, `precision=None` (which is TF32 on this executable) against
 `precision='highest'`: the same code diverges by 1.42e-04 over the same twenty
 steps from the same seed. Adam divides by a running gradient magnitude, so a
 last-bit difference in one step becomes a visibly different parameter in the
 next, and any reformulation that changes a matmul's shape changes those last
 bits. Run under `precision='highest'` on both sides, branch against main still
-drifts, to 2.22e-04. So twenty-step agreement at 1e-5 is below this
-hardware's reproducibility floor, and the statement is the first two
-checks plus this control, not a tolerance the machine cannot hold.
+drifts, to 2.22e-04. Twenty-step agreement at 1e-5 is below this hardware's
+reproducibility floor, so the claim rests on the first two checks and this
+control, and not on a tolerance the machine cannot hold.
 
 | comparison | step 0 | worst over 20 steps |
 |---|---:|---:|
@@ -156,9 +165,9 @@ and writes every step's loss and token accuracy.
 
 The head's three matmuls are 40.5 ms of the 82.0 ms step at the measured 49.5
 TFLOP/s TF32 ceiling for this shape, and chunking cannot remove them. Two
-things could. A bfloat16 head would run them at the 103.1 TFLOP/s bf16 ceiling,
+changes could make the step faster. A bfloat16 head would run them at the 103.1 TFLOP/s bf16 ceiling,
 which is the largest single number left on this model, and it changes the
 loss, so it needs a convergence decision rather than a tolerance
 ([benchmark-parity.md](benchmark-parity.md) records 27.8% for the PyTorch
-equivalent). cuDNN attention is worth 8.8% on this preset and is a
-configuration default, not new code.
+equivalent). cuDNN attention is worth 8.8% on this preset, and it needs a
+configuration default rather than new code.
