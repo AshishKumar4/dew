@@ -15,6 +15,7 @@ from collections.abc import Sequence
 import tyro
 
 from dew.cli.gcloud import emit
+from dew.cli.launch import Launch
 
 CONFIG = (
     tyro.conf.FlagCreatePairsOff,
@@ -44,7 +45,7 @@ class Export:
         return 0
 
 
-COMMANDS = {"export": Export}
+COMMANDS = {"export": Export, "launch": Launch}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
