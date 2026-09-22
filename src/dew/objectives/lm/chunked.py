@@ -1,9 +1,9 @@
 """Cross entropy that never holds the whole logits tensor.
 
-The forward walks the vocabulary in `chunks` tiles, keeping four float32
-numbers per token rather than a row of `vocab`. It is exact: logsumexp over a
-concatenation is `logaddexp` of the parts', the target logit lives in exactly
-one chunk, and a strict comparison over chunks taken in vocabulary order keeps
+The forward walks the vocabulary in `chunks` tiles, keeping two float32
+numbers per token, four with the argmax, rather than a row of `vocab`. It is
+exact: logsumexp over a concatenation is `logaddexp` of the parts', the target
+logit lives in exactly one chunk, and a strict comparison over chunks taken in vocabulary order keeps
 the lowest index among equals, which is `jnp.argmax`'s rule on the whole row.
 
 The backward recomputes each `[token_tile, vocab_tile]` block of logits from
@@ -25,6 +25,8 @@ from typing import Callable
 import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
+
+from dew.nn.precision import bf16_operand_precision, head_product, rounds_to_bf16
 
 
 def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ...]:
@@ -53,35 +55,55 @@ def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ..
     return bounds
 
 
+def _operand_dtype(hidden, precision: PrecisionLike):
+    """The dtype the head multiplies in: bf16 for bf16 states at the default
+    precision, fp32 otherwise."""
+    return jnp.bfloat16 if rounds_to_bf16(hidden.dtype, precision) else jnp.float32
+
+
+def _capped(logits, softcap):
+    if softcap is None:
+        return logits
+    cap = jnp.asarray(softcap, jnp.float32)
+    return cap * jnp.tanh(logits / cap)
+
+
 def head_logits(hidden, head_weight, *, softcap: float | None,
                 precision: PrecisionLike, vocab_major: bool = False) -> jax.Array:
-    """`hidden @ head_weight` as the model's forward scores it: fp32 states
+    """`hidden @ head_weight` as the model's forward scores it: the states
     against the `[features, vocab]` head (`[vocab, features]` with
-    `vocab_major`) in its stored dtype, accumulated in fp32, softcapped when
-    the backbone caps; `[..., vocab]`."""
-    logits = jnp.einsum('...d,vd->...v' if vocab_major else '...d,dv->...v',
-                        hidden.astype(jnp.float32), head_weight,
-                        precision=precision, preferred_element_type=jnp.float32)
-    if softcap is not None:
-        cap = jnp.asarray(softcap, jnp.float32)
-        logits = cap * jnp.tanh(logits / cap)
-    return logits
+    `vocab_major`), accumulated in fp32, softcapped when the backbone caps;
+    `[..., vocab]` fp32.
+
+    The states' dtype is the compute dtype. bf16 states multiply the head
+    rounded to bf16 on every backend, backward included, and fp32 states the
+    head as stored (`dew.nn.precision.head_product`)."""
+    return _capped(head_product('...d,vd->...v' if vocab_major else '...d,dv->...v',
+                                hidden, head_weight, precision), softcap)
+
+
+def _tile_logits(states, matrix, precision: PrecisionLike):
+    """Uncapped `[tokens, features] @ [columns, features].T` in fp32, over
+    operands already in the dtype the head multiplies in."""
+    return jnp.einsum('td,vd->tv', states, matrix.astype(states.dtype),
+                      precision=precision, preferred_element_type=jnp.float32)
 
 
 def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
-                 softcap: float | None, precision: PrecisionLike):
-    """One tile's logsumexp, target logit, best logit and its column."""
-    logits = head_logits(hidden, head_chunk, softcap=softcap, precision=precision,
-                         vocab_major=True)
+                 softcap: float | None, precision: PrecisionLike, predict: bool):
+    """One tile's logsumexp, target logit and, when `predict`, best logit and
+    its column."""
+    logits = _capped(_tile_logits(hidden, head_chunk, precision), softcap)
 
     inside = (targets >= start) & (targets < stop)
     column = jnp.clip(targets - start, 0, stop - start - 1)
     picked = jnp.take_along_axis(logits, column[:, None], axis=-1)[:, 0]
-    return (jax.nn.logsumexp(logits, axis=-1),
-            jnp.where(inside, picked, 0.0),
-            jnp.max(logits, axis=-1),
-            # A vocabulary column is int32 whatever the run's default integer
-            # width; argmax widens to int64 under x64.
+    terms = (jax.nn.logsumexp(logits, axis=-1), jnp.where(inside, picked, 0.0))
+    if not predict:
+        return terms
+    # A vocabulary column is int32 whatever the run's default integer width;
+    # argmax widens to int64 under x64.
+    return (*terms, jnp.max(logits, axis=-1),
             jnp.argmax(logits, axis=-1).astype(jnp.int32) + start)
 
 
@@ -99,60 +121,63 @@ def _over_tiles(carry, count: int, width: int, body: Callable):
 
 
 def _forward(hidden, table, targets, chunks: int, token_tile: int,
-             softcap, precision: PrecisionLike):
-    """Losses, top-1 columns and log partitions, a token tile at a time."""
+             softcap, precision: PrecisionLike, predict: bool):
+    """Losses, top-1 columns (None unless `predict`) and log partitions, a
+    token tile at a time."""
     features = table.shape[1]
     flat = hidden.reshape(-1, features)
     labels = targets.reshape(-1)
     bounds = vocabulary_chunks(table.shape[0], chunks)
     width = bounds[0][1]
+    operands = _operand_dtype(hidden, precision)
 
     def tokens(start, outputs, size):
-        states = jax.lax.dynamic_slice_in_dim(flat, start, size).astype(jnp.float32)
+        states = jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands)
         picked_targets = jax.lax.dynamic_slice_in_dim(labels, start, size)
 
         def columns(first, carry, count):
-            total, target_logit, best, predicted = carry
-            chunk_lse, picked, chunk_best, chunk_column = _chunk_terms(
+            terms = _chunk_terms(
                 states, jax.lax.dynamic_slice_in_dim(table, first, count),
-                picked_targets, first, first + count, softcap, precision)
-            total = jnp.logaddexp(total, chunk_lse)
-            target_logit = target_logit + picked
-            better = chunk_best > best
-            best = jnp.where(better, chunk_best, best)
-            predicted = jnp.where(better, chunk_column, predicted)
-            return total, target_logit, best, predicted
+                picked_targets, first, first + count, softcap, precision, predict)
+            total = jnp.logaddexp(carry[0], terms[0])
+            target_logit = carry[1] + terms[1]
+            if not predict:
+                return total, target_logit
+            better = terms[2] > carry[2]
+            return (total, target_logit, jnp.where(better, terms[2], carry[2]),
+                    jnp.where(better, terms[3], carry[3]))
 
-        total, target_logit, _, predicted = _over_tiles(
-            (jnp.full((size,), -jnp.inf, jnp.float32), jnp.zeros((size,), jnp.float32),
-             jnp.full((size,), -jnp.inf, jnp.float32), jnp.zeros((size,), jnp.int32)),
-            table.shape[0], width, columns)
-        values = (total - target_logit, predicted, total)
+        initial = (jnp.full((size,), -jnp.inf, jnp.float32), jnp.zeros((size,), jnp.float32))
+        if predict:
+            initial += (jnp.full((size,), -jnp.inf, jnp.float32), jnp.zeros((size,), jnp.int32))
+        total, target_logit, *best = _over_tiles(initial, table.shape[0], width, columns)
+        values = (total - target_logit, total, *best[1:])
         return tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                      for out, value in zip(outputs, values, strict=True))
 
     count = labels.shape[0]
-    outputs = _over_tiles((jnp.zeros((count,), jnp.float32),
-                           jnp.zeros((count,), jnp.int32),
-                           jnp.zeros((count,), jnp.float32)),
-                          count, token_tile, tokens)
-    return tuple(value.reshape(targets.shape) for value in outputs)
+    outputs = (jnp.zeros((count,), jnp.float32), jnp.zeros((count,), jnp.float32))
+    if predict:
+        outputs += (jnp.zeros((count,), jnp.int32),)
+    losses, log_z, *predicted = (value.reshape(targets.shape) for value in
+                                 _over_tiles(outputs, count, token_tile, tokens))
+    return losses, predicted[0] if predict else None, log_z
 
 
 def _bounded_head_impl(hidden, table, targets, chunks: int, tile: tuple[int, int],
-                       softcap, precision: PrecisionLike):
+                       softcap, precision: PrecisionLike, predict: bool):
     """Run `_forward` behind a backward that recomputes its logits."""
-    return _forward(hidden, table, targets, chunks, tile[0], softcap, precision)
+    return _forward(hidden, table, targets, chunks, tile[0], softcap, precision, predict)
 
 
-def _bounded_head_fwd(hidden, table, targets, chunks, tile, softcap, precision):
-    outputs = _forward(hidden, table, targets, chunks, tile[0], softcap, precision)
+def _bounded_head_fwd(hidden, table, targets, chunks, tile, softcap, precision, predict):
+    outputs = _forward(hidden, table, targets, chunks, tile[0], softcap, precision, predict)
     # The residuals are the inputs and one float32 per token. Everything the
     # backward needs beyond them is a recomputed tile.
     return outputs, (hidden, table, targets, outputs[2], softcap)
 
 
-def _bounded_head_bwd(chunks, tile, precision, residuals, cotangents):
+def _bounded_head_bwd(chunks, tile, precision, predict, residuals, cotangents):
     """Pull the cotangents back through logits recomputed one tile at a time.
 
     The outer loop walks vocabulary tiles carrying `(d_states, d_table,
@@ -161,8 +186,13 @@ def _bounded_head_bwd(chunks, tile, precision, residuals, cotangents):
     `(d_states, d_matrix, d_cap)`, where `d_matrix` accumulates one
     vocabulary tile's head gradient in fp32 before it is stored.
     """
-    del chunks  # The backward tiles by column, not by the forward's chunks.
+    del chunks, predict  # The backward tiles by column, and argmax has no gradient.
     hidden, table, targets, log_z, softcap = residuals
+    # The operands hold the forward's values, widened to fp32 so the logits'
+    # cotangent is not rounded here: the bf16 algorithm rounds it inside the
+    # product on a backend that has one, as the full pass's backward does.
+    operands = _operand_dtype(hidden, precision)
+    precision = bf16_operand_precision(hidden.dtype, precision)
     loss_cotangent, _, partition_cotangent = cotangents
     token_tile, vocab_tile = tile
     features = table.shape[1]
@@ -175,20 +205,18 @@ def _bounded_head_bwd(chunks, tile, precision, residuals, cotangents):
     def columns(first, gradients, width):
         d_states, d_table, d_cap = gradients
         matrix = jax.lax.dynamic_slice_in_dim(
-            table, first, width, axis=0).astype(jnp.float32)
+            table, first, width, axis=0).astype(operands).astype(jnp.float32)
 
         def tokens(start, carry, size):
             d_states, d_matrix, d_cap = carry
-            states = jax.lax.dynamic_slice_in_dim(flat, start, size).astype(jnp.float32)
+            states = jax.lax.dynamic_slice_in_dim(
+                flat, start, size).astype(operands).astype(jnp.float32)
             token_z = jax.lax.dynamic_slice_in_dim(partitions, start, size)
             token_loss = jax.lax.dynamic_slice_in_dim(d_loss, start, size)
             token_partition = jax.lax.dynamic_slice_in_dim(d_partition, start, size)
 
-            def project(states, matrix, cap):
-                return head_logits(states, matrix, softcap=cap, precision=precision,
-                                   vocab_major=True)
-
-            logits, pullback = jax.vjp(project, states, matrix, softcap)
+            logits, cap_pullback = jax.vjp(
+                _capped, _tile_logits(states, matrix, precision), softcap)
             # log Z is the whole row's, so a tile's share of the softmax needs
             # no renormalisation, and a target outside the tile one-hots to
             # zero rather than to a wrapped column.
@@ -198,7 +226,11 @@ def _bounded_head_bwd(chunks, tile, precision, residuals, cotangents):
                 dtype=jnp.float32)
             d_logits = ((token_loss + token_partition)[:, None] * probabilities
                         - token_loss[:, None] * selected)
-            states_tile, matrix_tile, cap_tile = pullback(d_logits)
+            d_raw, cap_tile = cap_pullback(d_logits)
+            states_tile = jnp.einsum('tv,vd->td', d_raw, matrix, precision=precision,
+                                     preferred_element_type=jnp.float32)
+            matrix_tile = jnp.einsum('tv,td->vd', d_raw, states, precision=precision,
+                                     preferred_element_type=jnp.float32)
             prior = jax.lax.dynamic_slice_in_dim(d_states, start, size)
             d_states = jax.lax.dynamic_update_slice_in_dim(
                 d_states, prior + states_tile, start, axis=0)
@@ -225,7 +257,7 @@ def _bounded_head_bwd(chunks, tile, precision, residuals, cotangents):
 
 # `jax.custom_vjp` is generic in its return type, and a `functools.partial`
 # decorator loses that binding, so it is built by hand.
-_bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(3, 4, 6))
+_bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(3, 4, 6, 7))
 _bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
 
 
@@ -233,15 +265,17 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                           softcap: float | None = None,
                           precision: PrecisionLike = None,
                           tile: tuple[int, int] = (1024, 8192),
-                          vocab_major: bool = False):
+                          vocab_major: bool = False,
+                          predict: bool = True):
     """Per-token cross entropy of `hidden @ head_weight`, its top-1 column
     and its log partition.
 
     `hidden` is `[..., features]` states in any compute dtype, `head_weight`
     the `[features, vocab]` head in its stored dtype (each tile upcasts its
     own slice; the products are accumulated in fp32), `targets` the `[...]`
-    int32 ids. Returns the per-token losses, the argmax prediction and the
-    row's logsumexp (log Z, which PaLM's z-loss squares), all shaped like
+    int32 ids. Returns the per-token losses, the argmax prediction (None
+    when `predict` is False, which skips the argmax: 0.75 ms of a TPU v6e
+    lm-dense step at batch 8) and the row's logsumexp (log Z, which PaLM's z-loss squares), all shaped like
     `targets`, each of the two float32 outputs carrying its own gradient. The
     caller owns the weighting and the mean, and with them the padding id.
 
@@ -251,6 +285,10 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     transposed here first, and what the backward keeps is that transposed
     array, a vocabulary-sized copy of a tied table (`head_table` on the
     backbone hands out the stored orientation).
+
+    The states' dtype is the compute dtype: bf16 states multiply the head
+    rounded to bf16 and accumulate in fp32, forward and backward
+    (`head_logits`); fp32 states multiply it as stored.
 
     `softcap` is the backbone's `final_logit_softcap`. It is elementwise, so
     capping a tile and capping the row agree. `tile` is a `(tokens, columns)`
@@ -273,4 +311,4 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     # held vocabulary-major so a column tile is a row slice.
     cap = None if softcap is None else jnp.asarray(softcap, jnp.float32)
     table = head_weight if vocab_major else head_weight.T
-    return _bounded_head(hidden, table, targets, chunks, tile, cap, precision)
+    return _bounded_head(hidden, table, targets, chunks, tile, cap, precision, predict)

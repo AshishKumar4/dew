@@ -80,6 +80,9 @@ class LMRunConfig(RunConfig):
     whose mla mixer names the indexer's heads and no top-k; `sparse`
     trains the whole model on its top-k with the KL beside the cross
     entropy. Unset trains no indexer term."""
+    token_accuracy: bool = False
+    """Report the argmax accuracy beside the loss; unset skips the argmax
+    over every logit it costs."""
     block_prompt_tokens: int = 256
     """Clean prompt prefix in a block-diffusion token row."""
     block_canvas_size: int | None = None

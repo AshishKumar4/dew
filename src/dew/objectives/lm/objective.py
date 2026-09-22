@@ -416,7 +416,8 @@ class Scores(NamedTuple):
     `losses`, `weights` and `log_z` are `[B, seq_len]`: the next-token cross
     entropy, 1 where the target counts, and the log partition of each
     prediction's distribution (what PaLM's z-loss squares). `correct` is 1
-    where the argmax was the target. `hidden` is the `[B, seq_len, D]` final
+    where the argmax was the target, None unless the objective reports
+    `token_accuracy`. `hidden` is the `[B, seq_len, D]` final
     states the head scored, `layers` the states of the layers `token_scores`
     was asked for, in that order. `routing` is what the routers sowed,
     `depths` the prediction depths' (losses, weights) pairs, `qk` the
@@ -427,7 +428,7 @@ class Scores(NamedTuple):
     losses: jax.Array
     weights: jax.Array
     log_z: jax.Array
-    correct: jax.Array
+    correct: jax.Array | None
     hidden: jax.Array
     layers: tuple[jax.Array, ...]
     routing: dict | None
@@ -471,6 +472,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         qk_stats: bool = False,
         indexer: IndexerTraining | None = None,
         trainable: PathFilter | None = None,
+        token_accuracy: bool = False,
     ):
         """Build a next-token objective over `model` for `seq_len`-token rows.
 
@@ -544,7 +546,11 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         tree is kept under `frozen`, the split the warm-up uses for the
         indexer, so `init` returns it and a checkpoint stores it. An
         adapter's own filter (`dew.lora.LoRA.trainable`) goes here. None
-        trains every leaf."""
+        trains every leaf.
+
+        `token_accuracy` reports the fraction of counted targets the argmax
+        predicts. The argmax is a pass over every logit, 0.75 ms of a TPU v6e
+        lm-dense step at batch 8, so unset skips it and reports no accuracy."""
         decoder = _decoder(model)
         if decoder is not None and decoder.causal is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")
@@ -564,6 +570,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.z_loss = z_loss
         self.router_z_loss = router_z_loss
         self.qk_stats = qk_stats
+        self.token_accuracy = token_accuracy
         self.indexer = indexer
         if indexer is not None and trainable is not None:
             raise ValueError("the indexer's phase decides what trains, so trainable is not taken with it")
@@ -700,10 +707,10 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         losses, predicted, log_z = chunked_cross_entropy(
             hidden, head, targets, self.head_chunks,
             softcap=self.model.final_logit_softcap,
-            precision=self.model.precision)
+            precision=self.model.precision, predict=self.token_accuracy)
         valid = prepared.token_fields.get("attention_mask")
         weights = self._row_weights(prepared, targets, segment_ids, roles, losses.dtype)
-        correct = (predicted == targets).astype(losses.dtype)
+        correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
         if depths:
             # Depth d's state at p scores the target d further out, so its
@@ -726,7 +733,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 depth_losses, _, _ = chunked_cross_entropy(
                     state, head, targets[:, depth:], self.head_chunks,
                     softcap=self.model.final_logit_softcap,
-                    precision=self.model.precision)
+                    precision=self.model.precision, predict=False)
                 depth_scores.append((depth_losses, self._depth_weights(
                     targets, segment_ids, valid, roles, losses.dtype, depth)))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
@@ -955,8 +962,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         mass = jax.lax.stop_gradient(jnp.sum(weights))
         prediction = Mean(jnp.sum(losses * weights), mass)
         ce, _ = mean_loss(prediction)
-        reported = {"ce": ce, "perplexity": jnp.exp(ce),
-                    "token_accuracy": jnp.sum(correct * weights) / jnp.where(mass > 0, mass, 1)}
+        reported = {"ce": ce, "perplexity": jnp.exp(ce)}
+        if correct is not None:
+            reported["token_accuracy"] = jnp.sum(correct * weights) / jnp.where(mass > 0, mass, 1)
         if self.z_loss:
             # PaLM's auxiliary over the same counted targets as the cross
             # entropy, so one Mean carries both.

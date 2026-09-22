@@ -331,7 +331,7 @@ class GRPOObjective(LMObjective):
         losses, _, _ = chunked_cross_entropy(
             hidden, head, aligned[:, 1:], self.head_chunks,
             softcap=self.model.final_logit_softcap,
-            precision=self.model.precision)
+            precision=self.model.precision, predict=False)
         losses, valid = _unpadded(losses, padding)
         return TokenScores(losses=losses, weights=valid.astype(losses.dtype))
 

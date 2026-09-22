@@ -34,8 +34,12 @@ CHUNKS = [1, 2, 4, 8]
 
 
 def reference(hidden, head, targets, softcap=None):
-    """The full-vocabulary path: one big logits tensor, optax's cross entropy."""
-    logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head)
+    """The full-vocabulary path: one big logits tensor, optax's cross entropy.
+    bf16 states are bf16 compute, which multiplies the head rounded to bf16."""
+    if hidden.dtype == jnp.bfloat16:
+        head = head.astype(jnp.bfloat16).astype(jnp.float32)
+    logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head,
+                        precision=jax.lax.Precision.HIGHEST)
     if softcap is not None:
         cap = jnp.asarray(softcap, jnp.float32)
         logits = cap * jnp.tanh(logits / cap)
@@ -135,9 +139,9 @@ def mutating_chunk_terms(monkeypatch, mutate):
     """
     original = chunked._chunk_terms
 
-    def mutated(hidden, head_chunk, targets, start, stop, softcap, precision):
+    def mutated(hidden, head_chunk, targets, start, stop, softcap, precision, predict):
         terms = original(hidden, head_chunk, targets, start, stop, softcap,
-                         precision)
+                         precision, predict)
         return mutate(terms, start, stop)
 
     monkeypatch.setattr(chunked, "_chunk_terms", mutated)
