@@ -255,3 +255,54 @@ def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving(
         assert server.submit([4, 5], 3, seed=3).result(timeout=120).prompt == (4, 5)
     finally:
         server.close()
+
+
+def test_a_push_that_never_takes_raises_after_one_redraw():
+    class Stuck(Recording):
+        def load(self, variables, version):
+            self.loads.append(version)
+
+    server = Stuck()
+    rollout, stream, params, _ = rollout_over(server, max_lag=1, ahead=1)
+    first, second = next(stream), next(stream)
+    rollout(State(params, 0), first, jax.random.key(1))
+    with pytest.raises(RuntimeError, match="did not take"):
+        rollout(State(params, 3), second, jax.random.key(2))
+    assert len(server.loads) == 2
+
+
+def test_a_stale_batch_is_redrawn_without_waiting_on_its_failed_draws():
+    class FailingOld(Recording):
+        def submit(self, prompt, max_new_tokens, *, seed):
+            if self.version == 0 and len(self.submitted) >= 4:
+                self.submitted.append((tuple(prompt), self.version))
+                future = Future()
+                future.set_exception(RuntimeError("engine lost this draw"))
+                return future
+            return super().submit(prompt, max_new_tokens, seed=seed)
+
+    server = FailingOld()
+    rollout, stream, params, records = rollout_over(server, max_lag=1, ahead=1)
+    first, second = next(stream), next(stream)
+    rollout(State(params, 0), first, jax.random.key(1))
+    out = rollout(State(params, 3), second, jax.random.key(2))
+    assert records[-1].redrawn == 1
+    np.testing.assert_array_equal(out[POLICY_VERSION_KEY], np.full(4, 3, np.int32))
+
+
+def test_each_row_carries_the_version_its_draw_reports():
+    class Stamping(Recording):
+        """Draws report the version of the weights that actually served them."""
+
+        def submit(self, prompt, max_new_tokens, *, seed):
+            future = super().submit(prompt, max_new_tokens, seed=seed)
+            draw = future.result()
+            stamped = Future()
+            stamped.set_result(Draw(draw.prompt, draw.tokens, draw.behavior_log_probs, draw.raw_log_probs,
+                                    draw.terminated, len(self.submitted) % 2))
+            return stamped
+
+    rollout, stream, params, records = rollout_over(Stamping(), max_lag=1, ahead=1)
+    out = rollout(State(params, 1), next(stream), jax.random.key(1))
+    np.testing.assert_array_equal(out[POLICY_VERSION_KEY], [1, 0, 1, 0])
+    assert records[-1].version == 0 and records[-1].lag == 1
