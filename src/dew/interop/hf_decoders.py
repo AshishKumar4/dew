@@ -173,6 +173,7 @@ class KindFields(TypedDict, total=False):
     differently. A mixer record dispatches on its own `kind`."""
 
     window: int | None
+    chunk: int | None
     num_kv_heads: int | None
     rope_theta: float | None
     rope_scaling: Ramp | None
@@ -1777,6 +1778,13 @@ def _flatten(tree: Mapping[str, object], prefix: str = '') -> Variables:
 def _export_config(model) -> Mapping[str, object]:
     """Write a CausalTransformer's fields back into HF vocabulary."""
     family = _family_for_model(model)
+    chunked = sorted(name for name, kind in (model.kinds or {}).items() if kind.chunk is not None)
+    if chunked:
+        # Llama 4 chunks through its own mixer's attention_chunk_size; no HF
+        # decoder config carries a chunk on a plain attention kind.
+        raise ValueError(
+            f"kinds {chunked} attend by chunk, which no HF decoder config of a "
+            f"plain attention layer carries")
     sandwich = bool(model.sandwich_norms)
     config: dict[str, object] = {
         'model_type': family.export_model_type,
