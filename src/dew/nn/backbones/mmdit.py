@@ -332,7 +332,74 @@ class HierarchicalMMDiT(nn.Module):
     attention_impl: str | None = None
     remat: bool = False
 
+    def stage_blocks(self, stage: int, prefix: str) -> list:
+        """Build one stage's MMDiT blocks, at that stage's width and heads."""
+        return [
+            remat_block(MMDiTBlock, self.remat)(
+                features=self.emb_features[stage],
+                num_heads=self.num_heads[stage],
+                mlp_ratio=self.mlp_ratio,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype,
+                precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax,
+                norm_epsilon=self.norm_epsilon,
+                qk_norm=self.qk_norm,
+                attention_impl=self.attention_impl,
+                name=f"{prefix}_block_stage{stage}_{i}"
+            ) for i in range(self.num_layers[stage])
+        ]
+
+    def encoder_path(self, num_stages: int):
+        """Build the encoder, fine to coarse: each stage's blocks and its merger.
+
+        Sets `encoder_blocks`, one list per stage, and `patch_mergers`, one
+        between each pair of stages.
+        """
+        self.encoder_blocks = [self.stage_blocks(s, "encoder") for s in range(num_stages)]
+        self.patch_mergers = [
+            PatchMerging(
+                out_features=self.emb_features[s + 1],
+                dtype=self.dtype,
+                precision=self.precision,
+                norm_epsilon=self.norm_epsilon,
+                name=f"patch_merger_{s}"
+            ) for s in range(num_stages - 1)
+        ]
+
+    def decoder_path(self, num_stages: int):
+        """Build the decoder, coarse to fine, for stages N-2 down to 0.
+
+        Sets `patch_expanders`, the `fusion_layers` that take an expanded
+        stage beside its skip, and `decoder_blocks`. All three are indexed
+        by decoder step, not by stage.
+        """
+        decoder_stages = list(range(num_stages - 2, -1, -1))
+        self.patch_expanders = [
+            PatchExpanding(
+                out_features=self.emb_features[s],
+                dtype=self.dtype,
+                precision=self.precision,
+                norm_epsilon=self.norm_epsilon,
+                name=f"patch_expander_{s}"
+            ) for s in decoder_stages
+        ]
+        self.fusion_layers = [
+            nn.Sequential([
+                LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype),
+                nn.Dense(features=self.emb_features[s], dtype=self.dtype,
+                         precision=self.precision),
+            ], name=f"fusion_{s}") for s in decoder_stages
+        ]
+        self.decoder_blocks = [self.stage_blocks(s, "decoder") for s in decoder_stages]
+
     def setup(self):
+        """Build the patch embedding, the two paths of stages, and the head.
+
+        `cond_projs` and `txt_embeds` carry the conditioning and the text
+        into each stage's own width. `encoder_path` and `decoder_path` set
+        the blocks and the resampling layers between them.
+        """
         assert len(self.emb_features) == len(self.num_layers) == len(self.num_heads), \
             "Feature dimensions, layers, and heads must have the same number of stages"
         num_stages = len(self.emb_features)
@@ -363,54 +430,8 @@ class HierarchicalMMDiT(nn.Module):
             for i in range(num_stages)
         ]
 
-        def stage_blocks(stage, prefix):
-            return [
-                remat_block(MMDiTBlock, self.remat)(
-                    features=self.emb_features[stage],
-                    num_heads=self.num_heads[stage],
-                    mlp_ratio=self.mlp_ratio,
-                    dropout_rate=self.dropout_rate,
-                    dtype=self.dtype,
-                    precision=self.precision,
-                    force_fp32_for_softmax=self.force_fp32_for_softmax,
-                    norm_epsilon=self.norm_epsilon,
-                    qk_norm=self.qk_norm,
-                    attention_impl=self.attention_impl,
-                    name=f"{prefix}_block_stage{stage}_{i}"
-                ) for i in range(self.num_layers[stage])
-            ]
-
-        # --- Encoder path (fine to coarse) ---
-        self.encoder_blocks = [stage_blocks(s, "encoder") for s in range(num_stages)]
-        self.patch_mergers = [
-            PatchMerging(
-                out_features=self.emb_features[s + 1],
-                dtype=self.dtype,
-                precision=self.precision,
-                norm_epsilon=self.norm_epsilon,
-                name=f"patch_merger_{s}"
-            ) for s in range(num_stages - 1)
-        ]
-
-        # --- Decoder path (coarse to fine), ordered for stages N-2, ..., 0 ---
-        decoder_stages = list(range(num_stages - 2, -1, -1))
-        self.patch_expanders = [
-            PatchExpanding(
-                out_features=self.emb_features[s],
-                dtype=self.dtype,
-                precision=self.precision,
-                norm_epsilon=self.norm_epsilon,
-                name=f"patch_expander_{s}"
-            ) for s in decoder_stages
-        ]
-        self.fusion_layers = [
-            nn.Sequential([
-                LayerNorm(epsilon=self.norm_epsilon, dtype=self.dtype),
-                nn.Dense(features=self.emb_features[s], dtype=self.dtype,
-                         precision=self.precision),
-            ], name=f"fusion_{s}") for s in decoder_stages
-        ]
-        self.decoder_blocks = [stage_blocks(s, "decoder") for s in decoder_stages]
+        self.encoder_path(num_stages)
+        self.decoder_path(num_stages)
 
         self.output = PatchSequenceOutput(
             patch_size=self.base_patch_size,

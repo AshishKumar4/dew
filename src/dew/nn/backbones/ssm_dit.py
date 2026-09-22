@@ -54,6 +54,40 @@ class HybridSSMAttentionDiT(nn.Module):
     bidirectional_ssm: bool = True
     use_2d_fusion: bool = False  # 2D state fusion in SSM blocks (see SpatialFusionConv)
 
+    def block(self, index: int, block_type: str) -> ModulatedBlock:
+        """Build layer `index`'s block, an SSM mixer or an attention one.
+
+        The two share the width, the MLP ratio and the norms. They differ
+        in the mixer they name, the fields only that mixer reads, the remat
+        policy, and the name a checkpoint stores them under.
+        """
+        shared = dict(
+            features=self.emb_features,
+            num_heads=self.num_heads,
+            mlp_ratio=self.mlp_ratio,
+            dropout_rate=self.dropout_rate,
+            dtype=self.dtype,
+            precision=self.precision,
+            norm_epsilon=self.norm_epsilon,
+        )
+        if block_type == 'ssm':
+            return remat_block(ModulatedBlock, self.remat, policy=None)(
+                mixer='ssm',
+                ssm_state_dim=self.ssm_state_dim,
+                bidirectional_ssm=self.bidirectional_ssm,
+                use_2d_fusion=self.use_2d_fusion,
+                scan_order=self.scan_order,
+                name=f"ssm_block_{index}",
+                **shared,
+            )
+        return remat_block(ModulatedBlock, self.remat)(
+            mixer='attention',
+            force_fp32_for_softmax=self.force_fp32_for_softmax,
+            qk_norm=self.qk_norm,
+            attention_impl=self.attention_impl,
+            name=f"dit_block_{index}",
+            **shared,
+        )
 
     def setup(self):
         if self.block_pattern is not None and self.ssm_attention_ratio != DEFAULT_SSM_RATIO:
@@ -75,40 +109,8 @@ class HybridSSMAttentionDiT(nn.Module):
         )
         pattern = build_block_pattern(
             self.num_layers, self.ssm_attention_ratio, self.block_pattern)
-        blocks = []
-        for i, block_type in enumerate(pattern):
-            if block_type == 'ssm':
-                blocks.append(remat_block(ModulatedBlock, self.remat, policy=None)(
-                    features=self.emb_features,
-                    num_heads=self.num_heads,
-                    mixer='ssm',
-                    mlp_ratio=self.mlp_ratio,
-                    dropout_rate=self.dropout_rate,
-                    dtype=self.dtype,
-                    precision=self.precision,
-                    norm_epsilon=self.norm_epsilon,
-                    ssm_state_dim=self.ssm_state_dim,
-                    bidirectional_ssm=self.bidirectional_ssm,
-                    use_2d_fusion=self.use_2d_fusion,
-                    scan_order=self.scan_order,
-                    name=f"ssm_block_{i}"
-                ))
-            else:  # 'attn'
-                blocks.append(remat_block(ModulatedBlock, self.remat)(
-                    features=self.emb_features,
-                    num_heads=self.num_heads,
-                    mixer='attention',
-                    mlp_ratio=self.mlp_ratio,
-                    dropout_rate=self.dropout_rate,
-                    dtype=self.dtype,
-                    precision=self.precision,
-                    force_fp32_for_softmax=self.force_fp32_for_softmax,
-                    norm_epsilon=self.norm_epsilon,
-                    qk_norm=self.qk_norm,
-                    attention_impl=self.attention_impl,
-                    name=f"dit_block_{i}"
-                ))
-        self.blocks = blocks
+        self.blocks = [self.block(index, block_type)
+                       for index, block_type in enumerate(pattern)]
 
         self.output = PatchSequenceOutput(
             patch_size=self.patch_size,
