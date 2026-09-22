@@ -10,6 +10,7 @@ whose data axis crosses the two is hybrid sharding; the losses it trains to
 have to be the reference's.
 """
 
+import dataclasses
 import json
 import os
 import socket
@@ -18,7 +19,11 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
+
+from dew.training import MeshSpec
+from dew.training.distributed import hybrid_devices
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -58,14 +63,70 @@ def reference(tmp_path_factory) -> dict:
     return train(tmp_path_factory.mktemp("reference"), {"fsdp": 8}, processes=1)
 
 
-def test_hybrid_sharding_keeps_fsdp_inside_a_host_and_trains_like_fsdp(tmp_path, reference):
-    """fsdp=4 with replicas=2 over two processes: every fsdp group sits on
-    one process, the data axis crosses them, and the losses are plain fsdp's
-    over all eight devices."""
-    pool = train(tmp_path, {"fsdp": 4, "replicas": 2}, processes=2)
-    assert pool["processes"] == 2 and pool["mesh"]["data"] == 2
-    assert pool["fsdp_groups"] == [[0], [1]]
+def test_hybrid_sharding_groups_hosts_into_replicas_and_trains_like_fsdp(tmp_path, reference):
+    """Four processes of two devices, fsdp=2 over replicas=2: each replica is
+    two processes and fsdp crosses the pair, where `jax.make_mesh` would put
+    every fsdp group on one process. The losses are plain fsdp's over all
+    eight devices."""
+    pool = train(tmp_path, {"fsdp": 2, "replicas": 2}, processes=4)
+    assert pool["processes"] == 4 and pool["mesh"]["data"] == 4
+    assert pool["fsdp_groups"] == [[0, 1], [0, 1], [2, 3], [2, 3]]
     assert max(abs(a - b) for a, b in zip(pool["losses"], reference["losses"], strict=True)) < TOLERANCE
+
+
+@dataclasses.dataclass(frozen=True)
+class StandIn:
+    """What `hybrid_devices` reads of a device, for a topology this machine
+    does not have."""
+
+    id: int
+    process_index: int
+    slice_index: int
+    platform: str = "cpu"
+    device_kind: str = "cpu"
+
+
+def standins(slices: int, processes: int, per_process: int) -> list[StandIn]:
+    """Devices numbered process-major, `processes` hosts to each slice."""
+    return [StandIn(slice_ * processes * per_process + process * per_process + local,
+                    slice_ * processes + process, slice_)
+            for slice_ in range(slices) for process in range(processes)
+            for local in range(per_process)]
+
+
+def groups(array: np.ndarray, attribute: str, axis: int) -> list[list[int]]:
+    """Along `axis` of a (data, expert, fsdp, tensor, sequence, stage)
+    device array, the distinct `attribute` values of every group."""
+    moved = np.moveaxis(array, axis, -1)
+    return [sorted({getattr(device, attribute) for device in group})
+            for group in moved.reshape(-1, moved.shape[-1])]
+
+
+def test_replicas_over_processes_split_fsdp_across_the_hosts_of_one_replica():
+    """Four hosts of two devices on one slice, fsdp=2 over replicas=2: fsdp
+    pairs hosts 0-1 and 2-3, and the data axis's outer half crosses the
+    replicas."""
+    array = hybrid_devices(MeshSpec(fsdp=2, replicas=2), (4, 1, 2, 1, 1, 1), standins(1, 4, 2))
+    assert groups(array, "process_index", 2) == [[0, 1], [0, 1], [2, 3], [2, 3]]
+    assert [sorted({d.process_index for d in array[i].flat}) for i in range(4)] == [
+        [0, 1], [0, 1], [2, 3], [2, 3]]
+
+
+def test_replicas_over_slices_keep_every_axis_but_data_inside_a_slice():
+    """Two slices of two hosts: fsdp=4 over replicas=2 keeps each fsdp group
+    in one slice across its two hosts, and only the data axis crosses the
+    slices, whose devices report a slice each."""
+    array = hybrid_devices(MeshSpec(fsdp=4, replicas=2), (2, 1, 4, 1, 1, 1), standins(2, 2, 2))
+    assert groups(array, "slice_index", 2) == [[0], [1]]
+    assert groups(array, "process_index", 2) == [[0, 1], [2, 3]]
+    assert groups(array, "slice_index", 0) == [[0, 1]] * 4
+
+
+def test_replicas_the_granules_cannot_hold_are_refused():
+    with pytest.raises(ValueError, match="replicas 3 must divide both the 4 granules"):
+        hybrid_devices(MeshSpec(fsdp=2, replicas=3), (4, 1, 2, 1, 1, 1), standins(1, 4, 2))
+    with pytest.raises(ValueError, match="fsdp 1 does not divide over them"):
+        hybrid_devices(MeshSpec(replicas=2), (8, 1, 1, 1, 1, 1), standins(1, 4, 2))
 
 
 def test_context_parallelism_trains_like_whole_sequences_across_hosts(tmp_path, reference):
