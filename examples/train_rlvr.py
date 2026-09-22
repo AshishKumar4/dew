@@ -2,6 +2,7 @@
 
     python examples/train_rlvr.py --backend native --steps 40 --out runs/rlvr-native
     python examples/train_rlvr.py --backend vllm --steps 40 --out runs/rlvr-vllm
+    python examples/train_rlvr.py --backend sglang --steps 40 --out runs/rlvr-sglang
 
 Every prompt asks for a Python program that reads two integers from stdin
 and prints a stated function of them. A completion's reward is the fraction
@@ -13,17 +14,19 @@ memory cap; that process has your user's filesystem and network.
 
 Rollouts run on a rollout server while the trainer updates. `--backend
 native` serves them from Dew's own continuous-batching `Server` in this
-process, with weights pushed in place. `--backend vllm` starts a vLLM
-OpenAI-compatible server on an export of the same checkpoint, samples from
-it by token ids, and pushes weights by writing safetensors and asking vLLM to
-reload them (its development endpoints, `VLLM_SERVER_DEV_MODE=1`); `--vllm`
-names the executable, which may live in its own environment. The rollout
-draws one batch ahead of the update, so each batch is at most one update
-stale; the GRPO objective's importance cap corrects for it.
+process, with weights pushed in place. `--backend vllm` and `--backend
+sglang` start that engine's OpenAI-compatible server on an export of the
+same checkpoint, sample from it by token ids, and push weights by writing
+safetensors and asking the engine to reload them (vLLM's development
+endpoints, `VLLM_SERVER_DEV_MODE=1`; SGLang's `/update_weights_from_disk`).
+`--vllm` and `--sglang` name the executables, which may live in their own
+environments. The rollout draws one batch ahead of the update, so each
+batch is at most one update stale; the GRPO objective's importance cap
+corrects for it.
 
 The run prints one line per update and writes `rewards.json` to `--out`
-with the per-update reward, policy version and lag, and the mean reward of
-the first and last `--window` updates.
+with the per-update reward, policy version and lag, the mean reward of the
+first and last `--window` updates, and the seconds each weight push took.
 
     JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --out /tmp/rlvr-smoke
 """
@@ -50,10 +53,10 @@ from dew.data.prompts import Prompts
 from dew.inference import (
     NativeRolloutServer,
     OpenAICompletion,
+    OpenAIRolloutServer,
     SafetensorsReload,
     Server,
     TextGeneration,
-    VLLMRolloutServer,
 )
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop import load_pretrained
@@ -113,7 +116,7 @@ def records(count: int, seed: int) -> tuple[str, ...]:
 class Config:
     model: str = "Qwen/Qwen2.5-0.5B-Instruct"
     backend: str = "native"
-    """native: Dew's own server in this process; vllm: a vLLM server this run starts."""
+    """native: Dew's own server in this process; vllm or sglang: that engine's server, started by this run."""
     out: Path = Path("runs/rlvr")
     steps: int = 40
     prompts: int = 8
@@ -130,32 +133,50 @@ class Config:
     """process: limited local processes; container: network-less Docker containers of --image."""
     image: str = "python:3.12-slim"
     vllm: str = "vllm"
+    sglang: str = "sglang"
     port: int = 8011
     vllm_memory: float = 0.12
-    """vLLM's --gpu-memory-utilization; the trainer takes the rest."""
+    """vLLM's --gpu-memory-utilization, a fraction of the whole GPU; the trainer takes the rest."""
+    sglang_memory: float = 0.8
+    """SGLang's --mem-fraction-static, a fraction of the memory the trainer left free."""
     seed: int = 0
     smoke: bool = False
     """Two updates of the committed tiny Qwen2 on CPU, native backend."""
 
 
-def launch_vllm(config: Config, directory: Path) -> subprocess.Popen:
-    """Start vLLM on the exported checkpoint and wait until it answers."""
-    with open(config.out / "vllm.log", "w") as log:
+def engine_command(config: Config, directory: Path) -> tuple[list[str], dict[str, str]]:
+    """The command line and extra environment that serve `directory` on `config.backend`."""
+    width = str(config.prompt_tokens + config.new_tokens)
+    if config.backend == "vllm":
+        return ([config.vllm, "serve", str(directory), "--served-model-name", "policy", "--port", str(config.port),
+                 "--gpu-memory-utilization", str(config.vllm_memory), "--dtype", "bfloat16",
+                 "--max-model-len", width, "--generation-config", "vllm",
+                 "--enable-prefix-caching", "--seed", str(config.seed)],
+                {"VLLM_SERVER_DEV_MODE": "1"})
+    # Request fields set every sampling control; `--sampling-defaults openai`
+    # keeps the checkpoint's generation_config from supplying any it leaves out.
+    return ([config.sglang, "serve", "--model-path", str(directory), "--served-model-name", "policy",
+             "--port", str(config.port), "--mem-fraction-static", str(config.sglang_memory), "--dtype", "bfloat16",
+             "--context-length", width, "--sampling-defaults", "openai", "--random-seed", str(config.seed)], {})
+
+
+def launch_engine(config: Config, directory: Path) -> subprocess.Popen:
+    """Start the remote engine on the exported checkpoint and wait until it answers."""
+    command, extra = engine_command(config, directory)
+    with open(config.out / f"{config.backend}.log", "w") as log:
         process = subprocess.Popen(
-            [config.vllm, "serve", str(directory), "--served-model-name", "policy", "--port", str(config.port),
-             "--gpu-memory-utilization", str(config.vllm_memory), "--dtype", "bfloat16",
-             "--max-model-len", str(config.prompt_tokens + config.new_tokens), "--generation-config", "vllm",
-             "--enable-prefix-caching", "--seed", str(config.seed)],
-            # vLLM runs build tools (ninja) from its own environment's bin directory.
-            env={**os.environ, "VLLM_SERVER_DEV_MODE": "1",
-                 "PATH": os.pathsep.join((str(Path(shutil.which(config.vllm) or config.vllm).parent),
+            command,
+            # Engines run build tools (ninja) from their own environment's bin directory.
+            env={**os.environ, **extra,
+                 "PATH": os.pathsep.join((str(Path(shutil.which(command[0]) or command[0]).parent),
                                           os.environ.get("PATH", "")))},
             stdout=log, stderr=subprocess.STDOUT)
     deadline = time.monotonic() + 900
     unanswered: httpx.HTTPError | None = None
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError(f"vLLM exited with {process.returncode}; see {config.out / 'vllm.log'}")
+            raise RuntimeError(f"{config.backend} exited with {process.returncode}; "
+                               f"see {config.out / f'{config.backend}.log'}")
         try:
             if httpx.get(f"http://127.0.0.1:{config.port}/health", timeout=2).status_code == 200:
                 return process
@@ -163,7 +184,7 @@ def launch_vllm(config: Config, directory: Path) -> subprocess.Popen:
             unanswered = error
         time.sleep(2)
     process.kill()
-    raise TimeoutError("vLLM did not come up within fifteen minutes") from unanswered
+    raise TimeoutError(f"{config.backend} did not come up within fifteen minutes") from unanswered
 
 
 def main(config: Config) -> dict:
@@ -185,28 +206,35 @@ def main(config: Config) -> dict:
 
     objective = GRPOObjective(source.model, width - 1, pretrained=source.variables,
                               behavior_importance_cap=2.0, epsilon_high=0.28)
+    pushes: list[float] = []
     if config.backend == "native":
         served = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating)
                               else jnp.asarray(leaf), source.variables)
         engine = Server.from_task(TextGeneration(source.model, served, source.processor, sampling=sampling),
                                   slots=config.prompts * config.groups, capacity=width)
         server = NativeRolloutServer(engine)
-        vllm = None
-    elif config.backend == "vllm":
+        remote = None
+    elif config.backend in ("vllm", "sglang"):
         import openai
 
         directory = config.out / "served"
         root = f"http://127.0.0.1:{config.port}"
-        weights = SafetensorsReload(source, directory, root)
-        weights.write(source.variables)
-        vllm = launch_vllm(config, directory)
+        reload = SafetensorsReload(source, directory, root, config.backend)
+        reload.write(source.variables)
+        remote = launch_engine(config, directory)
+
+        def push(variables) -> None:
+            began = time.perf_counter()
+            reload(variables)
+            pushes.append(time.perf_counter() - began)
+
         # A seeded request is safe to resend, so the SDK's retries cover a
         # keep-alive connection the server closed between requests.
         completion = OpenAICompletion("policy", openai.OpenAI(base_url=f"{root}/v1", api_key="none", max_retries=3,
-                                                              timeout=600), provider="vllm")
-        server = VLLMRolloutServer(completion, sampling, weights, workers=config.prompts * config.groups * 2)
+                                                              timeout=600), provider=config.backend)
+        server = OpenAIRolloutServer(completion, sampling, push, workers=config.prompts * config.groups * 2)
     else:
-        raise ValueError(f"backend is native or vllm, got {config.backend!r}")
+        raise ValueError(f"backend is native, vllm or sglang, got {config.backend!r}")
 
     history: list[RolloutRecord] = []
 
@@ -237,9 +265,9 @@ def main(config: Config) -> dict:
         server.close()
         rollout.close()
         fleet.close()
-        if vllm is not None:
-            vllm.terminate()
-            vllm.wait(timeout=60)
+        if remote is not None:
+            remote.terminate()
+            remote.wait(timeout=60)
     rewards = [record.reward for record in history]
     window = min(config.window, len(rewards) // 2 or 1)
     summary = {
@@ -247,11 +275,12 @@ def main(config: Config) -> dict:
         "seconds": time.perf_counter() - began, "device": jax.devices()[0].device_kind,
         "first_reward": sum(rewards[:window]) / window, "last_reward": sum(rewards[-window:]) / window,
         "max_lag": max(record.lag for record in history), "redrawn": sum(record.redrawn for record in history),
-        "history": [asdict(record) for record in history],
+        "push_seconds": pushes, "history": [asdict(record) for record in history],
     }
     (config.out / "rewards.json").write_text(json.dumps(summary, indent=1))
     print(f"{config.backend}: reward {summary['first_reward']:.3f} over the first {window} updates, "
-          f"{summary['last_reward']:.3f} over the last {window}; largest lag {summary['max_lag']}")
+          f"{summary['last_reward']:.3f} over the last {window}; largest lag {summary['max_lag']}"
+          + (f"; median weight push {sorted(pushes)[len(pushes) // 2]:.2f}s over {len(pushes)}" if pushes else ""))
     return summary
 
 
