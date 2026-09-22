@@ -55,6 +55,7 @@ from flax.linen.module import Interceptor
 
 from dew.interop.pretrained import WeightLayout
 from dew.interop.safetensors_io import read_file, write_file
+from dew.nn.backbones.causal_transformer import group_layers
 from dew.objectives.base import Path, PathFilter, Variables, merge as overlay, select
 
 PEFT_CONFIG = "adapter_config.json"
@@ -94,6 +95,27 @@ class LoRA:
         """The adapter's own leaves: the `PathFilter` a partial run trains."""
         return path[-1] in FACTORS and path[:-1] in self.targets
 
+    def target_at(self, path: Path) -> Target | None:
+        """The target a module path names, seen through the stack that runs
+        it: a scanned run's module `layers_3_7` stands for layers 3 through
+        7, whose targets must agree, since the run's kernels share one
+        stacked factor pair."""
+        if path in self.targets:
+            return self.targets[path]
+        for depth, name in enumerate(path):
+            layers = group_layers(name)
+            if layers is None or len(layers) == 1:
+                continue
+            found = {self.targets.get((*path[:depth], f"layers_{index}", *path[depth + 1:]))
+                     for index in layers}
+            if found == {None}:
+                return None
+            if len(found) != 1:
+                raise ValueError(f"{'/'.join(path)} runs layers whose adapter targets differ: "
+                                 f"a scanned run stacks one factor pair over all of them")
+            return found.pop()
+        return None
+
     def adapt(self, model: nn.Module, root: Path = ("params",)) -> nn.Module:
         """`model` computing the adapter branch in every target module.
 
@@ -131,7 +153,7 @@ class LoRA:
     def _branch(self, root: Path):
         def branch(next_fun, args, kwargs, context):
             module = context.module
-            target = self.targets.get(root + module.path) if context.method_name == "__call__" else None
+            target = self.target_at(root + module.path) if context.method_name == "__call__" else None
             if target is None:
                 return next_fun(*args, **kwargs)
             if type(module) not in (nn.Dense, nn.DenseGeneral):

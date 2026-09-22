@@ -185,6 +185,19 @@ def group_name(first: int, count: int) -> str:
     return f'layers_{first}_{first + count - 1}'
 
 
+def group_layers(name: str) -> range | None:
+    """The layers a stack module name runs: `layers_3_7` as range(3, 8),
+    `layers_3` as range(3, 4), anything else as None. The inverse of
+    `group_name`, for a reader keyed by single layers that meets the run."""
+    if not name.startswith("layers_"):
+        return None
+    parts = name[len("layers_"):].split("_")
+    if not all(part.isdigit() for part in parts) or len(parts) > 2:
+        return None
+    first, last = int(parts[0]), int(parts[-1])
+    return range(first, last + 1)
+
+
 INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
 

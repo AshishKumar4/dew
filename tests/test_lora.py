@@ -580,3 +580,30 @@ def test_an_objective_that_selects_its_own_leaves_refuses_a_config_adapter():
 
     with pytest.raises(ValueError, match="Modelless keeps no `model`"):
         config.train(Modelless(), data, name="run")
+
+
+def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
+    """A scanned stack runs its like layers as one module, `layers_0_1`; the
+    adapter's targets are named per layer, so the branch resolves the run to
+    its layers and every layer's factors carry gradient. Before this, a
+    stack cloned to `scan_layers=True` after adapting silently trained only
+    the layers that ran alone."""
+    adapter, variables = lora.fresh(decoder.model, decoder.variables, decoder.layouts, rank=2, alpha=4.0,
+                                    modules=("q_proj",), key=jax.random.key(1))
+    scanned = adapter.adapt(decoder.model.clone(scan_layers=True))
+    tokens = jnp.asarray(reference["input_ids"])
+    plain = adapter.adapt(decoder.model).apply(variables, tokens)
+    np.testing.assert_allclose(np.asarray(scanned.apply(variables, tokens)), np.asarray(plain), rtol=1e-5, atol=1e-5)
+
+    def loss(params):
+        return jnp.mean(scanned.apply({**variables, "params": params}, tokens) ** 2)
+
+    grads = jax.grad(loss)(variables["params"])
+    for layer in ("layers_0", "layers_1"):
+        factors = grads[layer]["self_attn"]["q_proj"]
+        assert float(jnp.abs(factors["lora_B"]).max()) > 0, layer
+    assert adapter.target_at(("params", "layers_0_1", "self_attn", "q_proj")) == adapter.targets[("params", "layers_0", "self_attn", "q_proj")]
+    assert adapter.target_at(("params", "layers_0_1", "mlp", "up_proj")) is None
+    uneven = lora.LoRA({**adapter.targets, ("params", "layers_1", "self_attn", "q_proj"): lora.Target(3, 4.0)})
+    with pytest.raises(ValueError, match="targets differ"):
+        uneven.target_at(("params", "layers_0_1", "self_attn", "q_proj"))
