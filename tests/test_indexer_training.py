@@ -19,7 +19,8 @@ import optax
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.mla import INDEXER, indexer_kl, top_k_keys
+from dew.nn.mla import INDEXER, indexer_kl
+from dew.nn.sparse_selection import top_k_keys
 from dew.objectives.base import FROZEN, Step, scalar_loss
 from dew.objectives.lm import IndexerTraining, LMObjective
 from dew.training import Layout, MeshSpec, Trainer

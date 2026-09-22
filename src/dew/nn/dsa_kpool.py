@@ -55,20 +55,7 @@ from .inputs import AttentionMetadata, PredictionPhase
 from .mixers import MixerBase, MixerContext, mixers
 from .mla import INDEXER, open_expanded_cache
 from .sharding import logical_axes
-
-
-def selection_mask(indices, total: int):
-    """`[B, S, N]` token indices, -1 for none, as the `[B, S, total]` bool mask
-    the attention takes (`build_attention_mask_from_topk`,
-    modeling_glm5_next.py:1218-1256): a key is visible to a query iff one of
-    the query's indices names it, so out-of-range entries drop out."""
-    batch, length, _ = indices.shape
-    # A negative index would wrap around in jnp; sending it past the end
-    # lets the scatter drop it, as it drops any index at or past `total`.
-    slots = jnp.where(indices >= 0, indices, total)
-    return jnp.zeros((batch, length, total), jnp.bool_).at[
-        jnp.arange(batch)[:, None, None], jnp.arange(length)[None, :, None], slots
-    ].set(True, mode='drop')
+from .sparse_selection import selection_mask
 
 
 def _first_valid(valid, total: int):

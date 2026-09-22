@@ -48,8 +48,9 @@ from dew.nn.attention import (
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers import MixerBase, MixerContext, mixers
-from dew.nn.mla import YarnScaling, top_k_keys, yarn_inv_freq
+from dew.nn.mla import YarnScaling, yarn_inv_freq
 from dew.nn.sharding import logical_axes
+from dew.nn.sparse_selection import top_k_keys
 
 COMPRESSORS = ('csa', 'hca')
 
