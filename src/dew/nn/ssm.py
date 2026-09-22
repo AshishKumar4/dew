@@ -43,7 +43,6 @@ class S5Layer(nn.Module):
     dt_min: float = 0.001
     dt_max: float = 0.1
     dtype: Dtype | None = None
-    precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, u):
@@ -176,7 +175,6 @@ class BidirectionalS5Layer(nn.Module):
             dt_min=self.dt_min,
             dt_max=self.dt_max,
             dtype=self.dtype,
-            precision=self.precision,
             name="s5_forward"
         )(u)
 
@@ -187,7 +185,6 @@ class BidirectionalS5Layer(nn.Module):
             dt_min=self.dt_min,
             dt_max=self.dt_max,
             dtype=self.dtype,
-            precision=self.precision,
             name="s5_backward"
         )(u_rev)
         y_bwd = jnp.flip(y_bwd_rev, axis=1)

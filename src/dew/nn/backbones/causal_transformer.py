@@ -654,8 +654,7 @@ class DecoderBlock(nn.Module):
                     "residual is the stream stack: no output norms, layer scalar, parallel "
                     "branch, altup, laurel or per-layer inputs")
             site = functools.partial(HyperConnection, spec=self.hyper_connections,
-                                     emb_features=self.emb_features, norm_eps=self.norm_eps,
-                                     dtype=self.dtype)
+                                     emb_features=self.emb_features, norm_eps=self.norm_eps)
             self.attn_hc = site(name='attn_hc')
             self.ffn_hc = site(name='ffn_hc')
         self.dropout = nn.Dropout(rate=self.dropout_rate)

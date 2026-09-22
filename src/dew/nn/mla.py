@@ -511,7 +511,6 @@ class MultiHeadLatentAttention(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str | None = None
-    force_fp32_for_softmax: bool = True
 
     def setup(self):
         if self.qk_rope_head_dim % 2:
@@ -920,5 +919,4 @@ class MLAMixer(MixerBase):
             kv_store_key=ctx.kv_store_key,
             dtype=ctx.dtype,
             precision=ctx.precision,
-            attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax)
+            attention_impl=ctx.attention_impl)

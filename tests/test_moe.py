@@ -35,7 +35,7 @@ from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, GatedMLP, Mixture
-from dew.nn.moe import ExpertMLP, Router, SparseMLP, calculate_load_balance_updates
+from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -369,7 +369,8 @@ def test_the_load_balance_update_pushes_against_the_busy_experts():
     four experts, three tokens on expert 0 and one on expert 1 averages one
     per expert, so expert 0 loses bias, expert 1 holds and the idle two gain."""
     indices = jnp.asarray([[[0, 0], [0, 1]]])
-    update = calculate_load_balance_updates(indices, num_experts=4, rate=0.001)
+    counts = jnp.sum(jax.nn.one_hot(indices.ravel(), 4, dtype=jnp.int32), axis=0)
+    update = load_balance_update(counts, rate=0.001)
 
     assert update.dtype == jnp.float32
     np.testing.assert_array_equal(
@@ -401,7 +402,8 @@ def balanced_run(steps=40, rate=0.01, direction=1.0):
     start = load(variables)
     for _ in range(steps):
         _, indices = router.apply(variables, tokens)
-        update = calculate_load_balance_updates(indices, EXPERTS, rate) * direction
+        counts = jnp.sum(jax.nn.one_hot(indices.ravel(), EXPERTS, dtype=jnp.int32), axis=0)
+        update = load_balance_update(counts, rate) * direction
         variables = {**variables, "moe": {
             "e_score_correction_bias":
                 variables["moe"]["e_score_correction_bias"] + update}}

@@ -1312,9 +1312,11 @@ class Stage:
     A stage with no attention is `None` instead. Every field is a
     `TransformerBlock` setting. The head width is the stage's channel count
     divided by `heads`, which the unet knows and a config does not, so there
-    is no `dim_head` field. `dew.registry.from_record` builds one from a
-    record at the build boundary, so a stage arrives as `{"heads": 8}` from
-    a command line and a misspelled field raises there.
+    is no `dim_head` field. `use_linear_attention` selects the projection
+    kind, a dense layer or a 1x1 convolution; it is not linear attention.
+    `dew.registry.from_record` builds one from a record at the build
+    boundary, so a stage arrives as `{"heads": 8}` from a command line and a
+    misspelled field raises there.
 
     `precision` of None means the model's. `dew.registry.with_precision`
     writes the model's dtype into every stage.
@@ -1352,9 +1354,13 @@ def stage_attention(stage: Stage, channels: int, attention_impl: str | None,
 
 
 class TransformerBlock(nn.Module):
-    """A `BasicTransformerBlock` behind an optional projection into and out of
-    `heads * dim_head`, dense (`use_linear_attention`) or a 1x1 convolution.
-    Without the projection the block runs at the input width."""
+    """Run a `BasicTransformerBlock`, optionally at its own head width.
+
+    `use_projection` puts a projection into and out of `heads * dim_head`
+    around the block; without it the block runs at the input width.
+    `use_linear_attention` picks what that projection is, a dense layer or
+    a 1x1 convolution. It does not select linear attention.
+    """
     heads: int = 4
     dim_head: int = 32
     use_linear_attention: bool = True
