@@ -4,9 +4,11 @@ import os
 # files on a GPU.
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 # Enough simulated devices to exercise a 4x2 data/fsdp mesh. Must be set before
-# jax initialises its backend.
+# jax initialises its backend. A test marked `mesh` needs this many devices;
+# a run with fewer, such as one GPU, reports it as skipped with both counts.
+MESH_DEVICES = 8
 os.environ["XLA_FLAGS"] = (
-    os.environ.get("XLA_FLAGS", "") + " --xla_force_host_platform_device_count=8"
+    os.environ.get("XLA_FLAGS", "") + f" --xla_force_host_platform_device_count={MESH_DEVICES}"
 ).strip()
 if os.environ["JAX_PLATFORMS"] == "cuda":
     # Exact state and gradient checks require repeatable CUDA reductions.
@@ -30,6 +32,12 @@ if not os.environ.get("DEW_TEST_NO_CACHE"):
     _cache = default_compilation_cache_dir()
     if _cache:
         enable_compilation_cache(_cache)
+
+
+def pytest_runtest_setup(item):
+    if item.get_closest_marker("mesh") and jax.device_count() < MESH_DEVICES:
+        pytest.skip(f"needs a {MESH_DEVICES}-device mesh; this run has "
+                    f"{jax.device_count()} {jax.default_backend()} device(s)")
 
 
 @pytest.fixture
