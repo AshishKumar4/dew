@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping, Sequence
 
+from dew.records import JSON
+
 from .dataset import Dataset, DatasetSpec, Records, local_batch, train_stream, validation_pass
 from .tokens import bounded
 
@@ -42,17 +44,18 @@ def parquet_rows(path: str, fields: Sequence[str],
     return table.to_pylist()
 
 
-def json_records(records: Sequence[str]) -> list[Mapping[str, object]]:
-    """Each string of `records` parsed as one JSON object, refused by index."""
-    rows: list[Mapping[str, object]] = []
+def json_records(records: Sequence[str]) -> list[JSON]:
+    """Each string of `records` parsed as one JSON value, refused by index.
+
+    A row's shape is the reader's to check; each source names the fields it
+    wants and refuses a row that is not an object with them.
+    """
+    rows: list[JSON] = []
     for index, record in enumerate(records):
         try:
-            row = json.loads(record)
+            rows.append(json.loads(record))
         except json.JSONDecodeError as exc:
             raise ValueError(f"record {index} is not JSON: {exc}") from exc
-        if not isinstance(row, dict):
-            raise ValueError(f"record {index} is not a JSON object: {type(row).__name__}")
-        rows.append(row)
     return rows
 
 
