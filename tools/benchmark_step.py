@@ -558,10 +558,10 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
             model, prompt_length=prompt, canvas_size=width, num_canvases=count)
     elif case.media is not None:
         family, tower, projector, token = media_values(case)
+        # The decoder carries the attention kernel; the wrapper reads none.
         model = MultimodalTransformer(
             built("causal_transformer", case.config), tower, projector, family, token,
-            dtype=resolve_dtype(case.dtype),
-            attention_impl=None if attention_impl == 'reference' else attention_impl)
+            dtype=resolve_dtype(case.dtype))
         objective = lm_objective(case, model)
     elif case.is_lm:
         objective = lm_objective(case, built(case.architecture, case.config))
