@@ -11,8 +11,6 @@ never separates a pair; the loss reads them in TRL's stacked order.
 
 from __future__ import annotations
 
-import dataclasses
-
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
@@ -108,10 +106,6 @@ class DPOObjective(LMObjective):
             "rewards/rejected": pair_rejected.mean(),
             "accuracy": accuracy,
         })
-
-    def preview(self, params, batch, step, *, scored=None):
-        """Draw policy text; this objective's EMA holds the frozen reference."""
-        return super().preview(params, batch, dataclasses.replace(step, ema=None), scored=scored)
 
     def evaluate(self, params, batch, step):
         """Score the chosen responses' perplexity under the policy.

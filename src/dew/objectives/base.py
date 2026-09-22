@@ -401,3 +401,18 @@ class Metric(Protocol[S]):
     def finalize(self, accumulated: S, /) -> float:
         """The completed pass's scalar."""
         ...
+
+
+def merge_totals(accumulated: tuple[float, float],
+                 contribution: tuple[float, float]) -> tuple[float, float]:
+    """Add one batch's (total, count) pair into a metric's accumulator.
+
+    Every metric whose statistic is a sum over a count merges this way, so
+    a pass over batches of different sizes still weighs by the count.
+    """
+    return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+
+
+def mean_of_totals(accumulated: tuple[float, float]) -> float:
+    """Divide a metric's summed total by its summed count."""
+    return accumulated[0] / accumulated[1]

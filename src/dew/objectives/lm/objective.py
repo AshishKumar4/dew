@@ -37,7 +37,7 @@ import numpy as np
 import optax
 from flax import linen as nn, struct
 
-from dew.artifacts import TextSamples, TokenScores, agree_process_phase, collective_host
+from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor
@@ -66,6 +66,7 @@ from dew.objectives.base import (
     freeze,
     mean_loss,
     merge,
+    merge_totals,
     thaw,
 )
 from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
@@ -211,25 +212,39 @@ def _is_indexer(path: tuple[str, ...]) -> bool:
     return INDEXER in path
 
 
+def _sown_nodes(tree, *markers: str) -> list[Mapping]:
+    """Find every node of a sown collection that holds all of `markers`.
+
+    A sown collection nests by module path, so what a layer sowed is the
+    branch that names the keys it sowed under. The search stops at such a
+    branch rather than descending into the arrays below it, and walks the
+    children it does descend into in sorted key order.
+    """
+    found: list[Mapping] = []
+
+    def visit(node) -> None:
+        if not isinstance(node, Mapping):
+            return
+        if all(marker in node for marker in markers):
+            found.append(node)
+            return
+        for key in sorted(node):
+            visit(node[key])
+
+    visit(tree)
+    return found
+
+
 def _indexer_kls(sown: Variables) -> list[jax.Array]:
     """Collect every attention layer's sown per-query indexer KL.
 
     Each is `[B, S]`, and they come back in the tree's key order.
     """
-    found: list[jax.Array] = []
-
-    def visit(node) -> None:
-        if not isinstance(node, Mapping):
-            return
-        if "kl" in node:
-            (kl,) = node["kl"]
-            found.append(kl)
-            return
-        for key in sorted(node):
-            visit(node[key])
-
-    visit(sown)
-    return found
+    kls: list[jax.Array] = []
+    for node in _sown_nodes(sown, "kl"):
+        (kl,) = node["kl"]
+        kls.append(kl)
+    return kls
 
 
 def _leaf_paths(tree: Variables) -> set[tuple[str, ...]]:
@@ -282,6 +297,19 @@ def _shift_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
     """Shift each row left by its count, wrapping padding to the right."""
     indices = (jnp.arange(values.shape[1])[None, :] + shifts[:, None]) % values.shape[1]
     return jnp.take_along_axis(values, indices, axis=1)
+
+
+def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Undo a left alignment on scored rows, and mark the slots that scored.
+
+    `values` were scored over rows whose real tokens had been moved down to
+    position zero by `padding` places. They come back to the columns they
+    were scored for, beside a mask that is true where the row held a real
+    token rather than padding.
+    """
+    restored = _shift_rows(values, -padding)
+    valid = jnp.arange(restored.shape[1])[None, :] >= padding[:, None]
+    return restored, valid
 
 
 def _packing(batch):
@@ -354,18 +382,9 @@ def balance(moe: Variables, routing: Variables, rate: float
 def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
     """Collect every router's sown (scores, indices), in the tree's key order."""
     found: list[tuple[jax.Array, jax.Array]] = []
-
-    def visit(node) -> None:
-        if not isinstance(node, Mapping):
-            return
-        if "scores" in node and "indices" in node:
-            (scores,), (indices,) = node["scores"], node["indices"]
-            found.append((scores, indices))
-            return
-        for key in sorted(node):
-            visit(node[key])
-
-    visit(routing)
+    for node in _sown_nodes(routing, "scores", "indices"):
+        (scores,), (indices,) = node["scores"], node["indices"]
+        found.append((scores, indices))
     return found
 
 
@@ -375,19 +394,9 @@ def _global_qk_max(qk) -> jax.Array | None:
     None when no layer sowed one.
     """
     found: list[jax.Array] = []
-
-    def visit(node) -> None:
-        if not isinstance(node, Mapping):
-            return
-        if "max_logits" in node:
-            logged = node["max_logits"]
-            found.append(jnp.max(
-                logged[0] if isinstance(logged, (tuple, list)) else logged))
-            return
-        for value in node.values():
-            visit(value)
-
-    visit(qk)
+    for node in _sown_nodes(qk, "max_logits"):
+        logged = node["max_logits"]
+        found.append(jnp.max(logged[0] if isinstance(logged, (tuple, list)) else logged))
     return jnp.max(jnp.stack(found)) if found else None
 
 
@@ -646,17 +655,12 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
         tokens = prepared.tokens
         inputs, targets = self._rows(tokens)
-        # Only a packed batch names these, and only a model that packs takes
-        # them. An unpacked run calls the model without them.
         packing = prepared.slice_tokens(stop=-1).kwargs()
         if positions is not None and "positions" in packing:
             raise ValueError("positions must come from either ModelInputs or the packing column")
         if segment_ids is not None and "segment_ids" in packing:
             raise ValueError("segment_ids must come from either ModelInputs or the packing column")
-        if positions is not None:
-            packing["positions"] = positions[:, :-1]
-        if segment_ids is not None:
-            packing["segment_ids"] = segment_ids[:, :-1]
+        packing.update(_packing_of(segment_ids, positions))
         params = thaw(params)
         collections = ((["router"] if routing else []) + (["qk"] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []))
@@ -759,9 +763,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             raise ValueError("left_padding must have one count per token row")
         aligned = prepared.align_left(padding)
         losses = self.token_scores(params, aligned).losses
-        restored = -_shift_rows(losses, -padding)
-        return jnp.where(jnp.arange(restored.shape[1])[None, :] >= padding[:, None],
-                         restored, 0.0)
+        restored, valid = _unpadded(losses, padding)
+        return jnp.where(valid, -restored, 0.0)
 
     def _target_weights(self, targets, segment_ids, dtype, depth: int = 0):
         """Mark with 1 every target that counts.
@@ -1001,25 +1004,27 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         return TokenScores(losses=losses, weights=weights)
 
     def preview(self, params, batch, step: Step, *, scored=None):
-        """Sample the configured prompt once, then decode only on process zero."""
-        error = None
-        settings = prepared = prompt = generated = None
-        try:
-            settings = self.samples
-            if settings is not None:
-                prepared = (self.policy(params if step.ema is None else step.ema, settings.sampling),
-                            self._prompt, settings.max_new_tokens)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="LM preview setup")
-        error = None
-        try:
-            if prepared is not None:
-                policy, prompt, max_new_tokens = prepared
-                generated = policy(prompt, max_new_tokens, key=step.key).host().tokens
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="LM preview generation")
+        """Sample the configured prompt once, then decode only on process zero.
+
+        An objective whose EMA holds a frozen reference draws from the live
+        policy instead, which is what `_ema_is_reference` says.
+        """
+        settings = self.samples
+
+        def setup():
+            if settings is None:
+                return None
+            weights = params if step.ema is None or self._ema_is_reference else step.ema
+            return (self.policy(weights, settings.sampling), self._prompt, settings.max_new_tokens)
+
+        def generate():
+            if prepared is None:
+                return None, None
+            policy, prompt, max_new_tokens = prepared
+            return policy(prompt, max_new_tokens, key=step.key).host().tokens, prompt
+
+        prepared = agreed("LM preview setup", setup)
+        generated, prompt = agreed("LM preview generation", generate)
         generated, prompt = collective_host((generated, prompt), phase="LM preview")
         if settings is None or jax.process_index() != 0:
             return None
@@ -1059,7 +1064,7 @@ class Perplexity:
 
     def merge(self, accumulated: tuple[float, float],
               contribution: tuple[float, float]) -> tuple[float, float]:
-        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+        return merge_totals(accumulated, contribution)
 
     def finalize(self, accumulated: tuple[float, float]) -> float:
         total, count = accumulated

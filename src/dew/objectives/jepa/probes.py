@@ -20,6 +20,7 @@ import optax
 
 from dew.artifacts import Representations
 from dew.eval.common import metric_device
+from dew.objectives.base import mean_of_totals, merge_totals
 from dew.registry import metrics
 
 type ProbeParams = dict[str, jax.Array]
@@ -98,19 +99,19 @@ class LinearProbe:
     name = "batch_linear_probe_accuracy"
     reads = Representations
 
-    def __call__(self, representations: Representations, batch) -> tuple[float, int]:
+    def __call__(self, representations: Representations, batch) -> tuple[float, float]:
         with metric_device():
             return float(linear_probe_accuracy(
                 representations.features, representations.labels, self.num_classes,
                 steps=self.steps, learning_rate=self.learning_rate,
                 weight_decay=self.weight_decay)), 1
 
-    def merge(self, accumulated: tuple[float, int],
-              contribution: tuple[float, int]) -> tuple[float, int]:
-        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+    def merge(self, accumulated: tuple[float, float],
+              contribution: tuple[float, float]) -> tuple[float, float]:
+        return merge_totals(accumulated, contribution)
 
-    def finalize(self, accumulated: tuple[float, int]) -> float:
-        return accumulated[0] / accumulated[1]
+    def finalize(self, accumulated: tuple[float, float]) -> float:
+        return mean_of_totals(accumulated)
 
 
 @dataclass(frozen=True)
@@ -122,17 +123,17 @@ class KnnProbe:
     name = "batch_knn_probe_accuracy"
     reads = Representations
 
-    def __call__(self, representations: Representations, batch) -> tuple[float, int]:
+    def __call__(self, representations: Representations, batch) -> tuple[float, float]:
         with metric_device():
             return float(knn_probe_accuracy(representations.features, representations.labels,
                                            self.num_classes, k=self.k)), 1
 
-    def merge(self, accumulated: tuple[float, int],
-              contribution: tuple[float, int]) -> tuple[float, int]:
-        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
+    def merge(self, accumulated: tuple[float, float],
+              contribution: tuple[float, float]) -> tuple[float, float]:
+        return merge_totals(accumulated, contribution)
 
-    def finalize(self, accumulated: tuple[float, int]) -> float:
-        return accumulated[0] / accumulated[1]
+    def finalize(self, accumulated: tuple[float, float]) -> float:
+        return mean_of_totals(accumulated)
 
 
 @metrics("linear_probe")
