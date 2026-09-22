@@ -13,12 +13,8 @@ import numpy as np
 
 from dew.lora import LoRA, Target
 from dew.nn.attention import scaled_dot_product_attention
-from dew.nn.mla import (
-    MultiHeadLatentAttention,
-    selection_mask,
-    sparse_latent_attention,
-    top_k_selection,
-)
+from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
 
 HEADS, RANK, NOPE, ROPE, VALUE = 4, 24, 16, 8, 12
 
@@ -59,13 +55,13 @@ def test_the_selection_attends_as_the_masked_expanded_reference():
     size of 5 splits 23 queries unevenly, so padding rides the last block."""
     length, top_k = 23, 6
     q_nope, q_rot, latent, rot, key_weight, value_weight, scores = pieces(length)
-    indices, chosen = causal_selection(scores, top_k)
-    mask = selection_mask(indices, chosen, length)
+    indices = causal_selection(scores, top_k)
+    mask = selection_mask(indices, length)
     scale = 1 / np.sqrt(NOPE + ROPE)
     cotangent = jax.random.normal(jax.random.key(9), (2, length, HEADS, VALUE))
 
     def sparse(*args):
-        return jnp.sum(sparse_latent_attention(*args, indices, chosen, scale=scale, block=5) * cotangent)
+        return jnp.sum(sparse_latent_attention(*args, indices, scale=scale, block=5) * cotangent)
 
     def dense(*args):
         return jnp.sum(expanded_reference(*args, mask) * cotangent)
@@ -81,10 +77,10 @@ def test_packed_documents_select_inside_their_own_document():
     length, top_k = 19, 4
     q_nope, q_rot, latent, rot, key_weight, value_weight, scores = pieces(length, seed=1)
     segments = jnp.asarray(np.repeat([[1, 2, 3, 0]], [6, 7, 4, 2], axis=1).repeat(2, 0))
-    indices, chosen = causal_selection(scores, top_k, segments)
-    mask = selection_mask(indices, chosen, length)
+    indices = causal_selection(scores, top_k, segments)
+    mask = selection_mask(indices, length)
     actual = sparse_latent_attention(q_nope, q_rot, latent, rot, key_weight, value_weight,
-                                     indices, chosen, scale=1 / np.sqrt(NOPE + ROPE))
+                                     indices, scale=1 / np.sqrt(NOPE + ROPE))
     expected = expanded_reference(q_nope, q_rot, latent, rot, key_weight, value_weight, mask)
     real = np.asarray(segments) != 0
     np.testing.assert_allclose(np.asarray(actual)[real], np.asarray(expected)[real], atol=2e-6)
@@ -131,15 +127,15 @@ def test_memory_follows_the_selection_not_the_sequence():
     from the compiled executables."""
     length, top_k = 2048, 64
     q_nope, q_rot, latent, rot, key_weight, value_weight, scores = pieces(length, batch=1)
-    indices, chosen = causal_selection(scores, top_k)
+    indices = causal_selection(scores, top_k)
     args = (q_nope, q_rot, latent, rot, key_weight, value_weight)
-    mask = selection_mask(indices, chosen, length)
+    mask = selection_mask(indices, length)
 
     def temporaries(fn, *inputs):
         return jax.jit(fn).lower(*inputs).compile().memory_analysis().temp_size_in_bytes
 
     dense = temporaries(expanded_reference, *args, mask)
     selected = temporaries(lambda *a: sparse_latent_attention(
-        *a, scale=1.0), *args, indices, chosen)
+        *a, scale=1.0), *args, indices)
     assert dense >= HEADS * length * length * 4
     assert selected * 8 < dense

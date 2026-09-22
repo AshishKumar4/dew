@@ -51,6 +51,7 @@ from dew.nn.attention import (
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.sharding import logical_axes
+from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
 
 
 @dataclasses.dataclass(frozen=True)
@@ -404,105 +405,6 @@ class SparseIndexer(nn.Module):
         return top_k_selection(scores, keep, self.top_k)
 
 
-def top_k_selection(scores, keep, top_k: int):
-    """The `top_k` highest-scoring keys of each query among those `keep`
-    allows: indices `[B, S, K]` and whether each is allowed, `[B, S, K]`,
-    with `K = min(top_k, T)`.
-
-    Exactly `top_k` keys where at least that many are allowed, and every
-    allowed key where fewer are, so a sequence the top-k covers attends as
-    the dense mixer does; the slots past the allowed ones carry False.
-    Equal scores choose the lower key index, because `jax.lax.top_k` is
-    stable; torch's `topk` promises no tie order, so a selection a tie
-    decides may differ from the reference's. `keep` is the `[B, S, T]`
-    attention mask (a leading axis of one broadcasts), and a key it forbids
-    is never selected whatever the tie rule.
-    """
-    batch, length, total = scores.shape
-    keep = jnp.broadcast_to(keep, (batch, length, total))
-    ranked = jnp.where(keep, scores, jnp.finfo(jnp.float32).min)
-    chosen = jax.lax.top_k(ranked, min(top_k, total), is_stable=True)[1]
-    return chosen, jnp.take_along_axis(keep, chosen, axis=-1)
-
-
-def selection_mask(indices, chosen, total: int):
-    """The `[B, S, T]` mask of a selection: True at each chosen, allowed key."""
-    batch, length, _ = indices.shape
-    return jnp.zeros((batch, length, total), jnp.bool_).at[
-        jnp.arange(batch)[:, None, None],
-        jnp.arange(length)[None, :, None], indices].set(chosen)
-
-
-def top_k_keys(scores, keep, top_k: int):
-    """`top_k_selection` as the `[B, S, T]` mask the dense kernels read."""
-    return selection_mask(*top_k_selection(scores, keep, top_k), scores.shape[-1])
-
-
-SPARSE_QUERY_BLOCK = 128
-"""Queries `sparse_latent_attention` attends at once. A block holds its
-queries' selected latents, `[B, block, K, kv_lora_rank + rope]`, so this
-bounds the gather at 151M values per batch row for V3.2's K of 2048."""
-
-
-def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, value_weight,
-                            indices, chosen, *, scale: float, precision=None,
-                            block: int = SPARSE_QUERY_BLOCK):
-    """Attend each query over the `K` keys it selected, in the latent space.
-
-    DeepSeek sparse attention's execution (arXiv 2512.02556, section 2.1;
-    FlashMLA's sparse decoding kernel): the keys are never expanded per
-    head. The nope query absorbs the key half of `kv_b_proj`, so a logit is
-    the absorbed query against the key's latent plus the rope query against
-    its shared rope head, and the probabilities weight the selected latents
-    before the value half expands the result. It is the same softmax over
-    the same keys as the dense attention under the selection mask, in
-    `O(S * K)` rather than `O(S * T)`.
-
-    `query_nope` `[B, S, H, n]` and `query_rot` `[B, S, H, p]` are the
-    rotated, pre-scaled query halves; `latent` `[B, T, r]` and `rot`
-    `[B, T, p]` the normed latent and the rotated rope head; `key_weight`
-    `[r, H, n]` and `value_weight` `[r, H, v]` the two halves of
-    `kv_b_proj`, which carries no bias in any reference. `indices`
-    and `chosen` are `top_k_selection`'s. `scale` is the kernel's
-    `1 / sqrt(n + p)`. Returns `[B, S, H, v]`.
-
-    Queries run in blocks of `block` under `jax.checkpoint`, so neither the
-    forward nor the backward pass holds more than one block's gathered
-    latents. A query whose selection allows no key (padding) averages its
-    selected slots where the dense kernel averages every key; both are
-    outputs nothing reads.
-    """
-    batch, length, heads, _ = query_nope.shape
-    absorbed = jnp.einsum('bshn,rhn->bshr', query_nope, key_weight.astype(query_nope.dtype),
-                          precision=precision)
-    blocks = -(-length // block)
-
-    def blocked(x):
-        x = jnp.pad(x, [(0, 0), (0, blocks * block - length)] + [(0, 0)] * (x.ndim - 2))
-        return jnp.moveaxis(x.reshape(batch, blocks, block, *x.shape[2:]), 1, 0)
-
-    def gathered(table, where):
-        return jax.vmap(lambda rows, at: rows[at])(table, where)
-
-    @jax.checkpoint
-    def attend(pieces):
-        q_latent, q_rot, at, allowed = pieces
-        keys, rots = gathered(latent, at), gathered(rot, at)
-        logits = (jnp.einsum('bqhr,bqkr->bqhk', q_latent, keys, precision=precision,
-                             preferred_element_type=jnp.float32)
-                  + jnp.einsum('bqhp,bqkp->bqhk', q_rot, rots, precision=precision,
-                               preferred_element_type=jnp.float32)) * scale
-        logits = jnp.where(allowed[:, :, None, :], logits, jnp.finfo(jnp.float32).min)
-        weights = jax.nn.softmax(logits, axis=-1).astype(keys.dtype)
-        return jnp.einsum('bqhk,bqkr->bqhr', weights, keys, precision=precision)
-
-    context = jax.lax.map(attend, tuple(blocked(x) for x in (
-        absorbed, query_rot, indices, chosen)))
-    context = jnp.moveaxis(context, 0, 1).reshape(batch, blocks * block, heads, -1)[:, :length]
-    return jnp.einsum('bshr,rhv->bshv', context, value_weight.astype(context.dtype),
-                      precision=precision)
-
-
 @logical_axes({
     ("q_a_proj",): ("embed", "qlora"),
     ("q_b_proj",): ("qlora", "attention"),
@@ -679,9 +581,10 @@ class MultiHeadLatentAttention(nn.Module):
                     f"layer shares the index selection under {self.kv_store_key!r} "
                     "but no earlier selecting layer stashed one; the model has to "
                     "pass one kv_store dict down its layer stack")
-            indices, chosen = kv_store[self.kv_store_key]
+            indices = kv_store[self.kv_store_key]
             keep = jnp.broadcast_to(keep, (*indices.shape[:2], keep.shape[-1]))
-            return indices, chosen & jnp.take_along_axis(keep, indices, axis=-1)
+            allowed = jnp.take_along_axis(keep, jnp.maximum(indices, 0), axis=-1)
+            return jnp.where(allowed & (indices >= 0), indices, -1)
         selected = self.indexer.select(index_scores, keep)
         if kv_store is not None and self.kv_store_key is not None:
             kv_store[self.kv_store_key] = selected
@@ -795,7 +698,7 @@ class MultiHeadLatentAttention(nn.Module):
                 keep = causal_attention_mask(
                     positions, key.shape[1],
                     key_valid=self.get_variable("cache", "cache_valid"))[:, 0]
-                mask = selection_mask(*self._select(index_scores, keep, kv_store),
+                mask = selection_mask(self._select(index_scores, keep, kv_store),
                                       key.shape[1])[:, None]
             else:
                 positions, append = open_latent_cache(
@@ -850,7 +753,7 @@ class MultiHeadLatentAttention(nn.Module):
                     if self._attends_sparsely(selection, length):
                         return self._sparse_attention(
                             q_pass, q_rot, latent, rot, selection, index_scores)
-                    keep = selection_mask(*selection, length)
+                    keep = selection_mask(selection, length)
                     mask, causal = keep[:, None], False
                 if (index_scores is not None and not self.is_initializing()
                         and self.is_mutable_collection(INDEXER_COLLECTION)):
@@ -899,7 +802,7 @@ class MultiHeadLatentAttention(nn.Module):
         absorbed path feeds kv_b_proj the identity, where a dropout draw
         would be one mask for every token rather than one per token.
         """
-        return (selection[0].shape[-1] < total and not self._qk_open()
+        return (selection.shape[-1] < total and not self._qk_open()
                 and not self.stochastic_input("kv_b_proj"))
 
     def stochastic_input(self, name: str) -> bool:
@@ -942,12 +845,12 @@ class MultiHeadLatentAttention(nn.Module):
         if (index_scores is not None and not self.is_initializing()
                 and self.is_mutable_collection(INDEXER_COLLECTION)):
             key, _ = self._expand(latent, rot)
-            self._sow_indexer_kl(index_scores, selection_mask(*selection, latent.shape[1]),
+            self._sow_indexer_kl(index_scores, selection_mask(selection, latent.shape[1]),
                                  self._scaled_query(q_pass, q_rot), key)
         attention = sparse_latent_attention(
             q_pass * scale if scale != 1.0 else q_pass,
             q_rot * scale if scale != 1.0 else q_rot,
-            latent, rot, key_weight, value_weight, *selection,
+            latent, rot, key_weight, value_weight, selection,
             scale=1.0 / math.sqrt(nope + self.qk_rope_head_dim), precision=self.precision)
         return self._output(attention)
 
