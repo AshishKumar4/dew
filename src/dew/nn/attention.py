@@ -725,6 +725,22 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     return checkpoint_name(out, 'attention_output')
 
 
+def precision_names(precision: PrecisionLike) -> frozenset[str]:
+    """The names a `PrecisionLike` spells, upper case and unordered.
+
+    flax's alias is four shapes at once: None, a string, a
+    `jax.lax.Precision`, or a pair of either for the two operands. A fused
+    path has to refuse HIGH and HIGHEST whichever shape the caller wrote, so
+    this reads the union rather than asking each member what it is: the enum
+    carries the name, a string is the name, and the pair is both operands'.
+    """
+    if precision is None:
+        return frozenset()
+    written = (precision,) if isinstance(precision, str | jax.lax.Precision) else precision
+    return frozenset((one.name if isinstance(one, jax.lax.Precision) else one).upper()
+                     for one in written if one is not None)
+
+
 def attention_kernel(query, key, value, dtype=None, precision=None,
                      force_fp32_for_softmax=True, implementation=None,
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
@@ -777,10 +793,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             dropout_rng=None, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
 
-    requested = {str(getattr(p, 'name', p)).upper()
-                 for p in (precision if isinstance(precision, (tuple, list)) else (precision,))
-                 if p is not None}
-    if requested & {'HIGH', 'HIGHEST'}:
+    if precision_names(precision) & {'HIGH', 'HIGHEST'}:
         raise ValueError(
             f"attention implementation '{implementation}' cannot honor "
             f"precision={precision}: fused attention accumulates the logits and "
