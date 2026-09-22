@@ -17,6 +17,7 @@ import jax
 from jax.experimental import multihost_utils
 
 from dew.artifacts import broadcast_from_process_zero
+from dew.cli.launch import PROCESS_COUNT, PROCESS_ID
 from dew.telemetry.devices import apply_xla_flags
 from dew.telemetry.instrumentation import enable_compilation_cache
 
@@ -37,11 +38,13 @@ def prepare_process(wandb: Wandb | None = None,
     wandb opens a run.
 
     jax.distributed.initialize() finds the coordinator from the environment on
-    TPU pods and Slurm/GKE clusters. On a machine with no cluster environment
-    it raises a ValueError naming the missing coordinator address, the
-    single-host signature. Every other failure propagates, since a pod run
-    would otherwise continue on one host. multi_host=True requires the pool,
-    multi_host=False never asks for it.
+    TPU pods and Slurm/GKE/Open MPI clusters. `dew launch` leaves the process
+    count and rank in DEW_PROCESS_COUNT and DEW_PROCESS_ID, which jax has no
+    variable for, and those are passed to it. On a machine with no cluster
+    environment it raises a ValueError naming the missing coordinator
+    address, the single-host signature. Every other failure propagates,
+    since a pod run would otherwise continue on one host. multi_host=True
+    requires the pool, multi_host=False never asks for it.
 
     xla_flags reaches XLA through the environment, which XLA reads when it
     opens a backend. So this call has to come before the first JAX call in
@@ -69,7 +72,11 @@ def prepare_process(wandb: Wandb | None = None,
 
     if multi_host is not False:
         try:
-            jax.distributed.initialize()
+            if PROCESS_COUNT in os.environ:
+                jax.distributed.initialize(num_processes=int(os.environ[PROCESS_COUNT]),
+                                           process_id=int(os.environ[PROCESS_ID]))
+            else:
+                jax.distributed.initialize()
         except ValueError as e:
             if multi_host or "coordinator_address" not in str(e):
                 raise
