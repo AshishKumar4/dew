@@ -122,6 +122,18 @@ def test_replicas_over_slices_keep_every_axis_but_data_inside_a_slice():
     assert groups(array, "slice_index", 0) == [[0, 1]] * 4
 
 
+def test_gpu_hosts_are_the_granules_however_many_processes_each_runs():
+    """Two GPU hosts of four one-device processes, which XLA gives a slice
+    index per host: the granules are the two hosts, so fsdp=4 over two
+    replicas holds each host's four processes, and four replicas are more
+    than the hosts."""
+    hosts = [StandIn(index, index, index // 4) for index in range(8)]
+    array = hybrid_devices(MeshSpec(fsdp=4, replicas=2), (2, 1, 4, 1, 1, 1), hosts)
+    assert groups(array, "slice_index", 2) == [[0], [1]]
+    with pytest.raises(ValueError, match="the 2 granules"):
+        hybrid_devices(MeshSpec(fsdp=2, replicas=4), (4, 1, 2, 1, 1, 1), hosts)
+
+
 def test_replicas_the_granules_cannot_hold_are_refused():
     with pytest.raises(ValueError, match="replicas 3 must divide both the 4 granules"):
         hybrid_devices(MeshSpec(fsdp=2, replicas=3), (4, 1, 2, 1, 1, 1), standins(1, 4, 2))

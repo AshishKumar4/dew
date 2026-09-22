@@ -68,7 +68,9 @@ mesh = MeshSpec(fsdp=8, replicas=2)
 trainer = Trainer(objective, optimizer, key=key, mesh=mesh)
 ```
 
-`replicas` counts groups of granules. A granule is a TPU slice on a multislice run and a process everywhere else, which on GPU clusters is usually one node. `build_mesh` then builds the mesh with JAX's `mesh_utils.create_hybrid_device_mesh`, the same call MaxText uses for multislice runs. The data axis spans the groups. The expert, tensor, sequence and stage axes stay inside one granule. When a group holds more than one granule, fsdp is the only axis that crosses between them. `replicas` must divide both the granule count and the data axis, and fsdp must divide over the granules of one group. `build_mesh` raises with the numbers when they do not fit.
+`replicas` counts groups of granules. A granule is whatever the devices' `slice_index` groups: a TPU slice on a multislice run, and on several GPU hosts a host or an NVLink domain, however many processes each host runs, because XLA numbers GPU slices per host boot or NVLink fabric. Where every device shares one slice, as in a CPU pool or on the hosts of one TPU slice, the process is the granule. `build_mesh` then builds the mesh with JAX's `mesh_utils.create_hybrid_device_mesh`, the same call MaxText uses for multislice runs. The data axis spans the groups. The expert, tensor, sequence and stage axes stay inside one granule. When a group holds more than one granule, fsdp is the only axis that crosses between them. `replicas` must divide both the granule count and the data axis, and fsdp must divide over the granules of one group. `build_mesh` raises with the numbers when they do not fit.
+
+On GPU hosts whose device ids run host by host, `jax.make_mesh` already puts the data axis outermost, so for one granule per replica `replicas` states the layout rather than changing it. It changes the mesh when a replica spans several granules, when the slices do not follow the device order, and on a multislice TPU run.
 
 With `replicas=1`, `jax.make_mesh` places the devices, which is what a single node or a single TPU slice wants.
 

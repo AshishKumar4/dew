@@ -138,9 +138,10 @@ class MeshSpec:
     parallelism: every other axis, fsdp included, stays inside one group,
     so the parameter gathers and gradient reduce-scatters run over the fast
     links and only the gradient all-reduce between replicas crosses the
-    slow one. A group is a whole number of granules, which are TPU slices
-    on a multislice run and processes (hosts) anywhere else. 1 lets
-    `jax.make_mesh` place every device."""
+    slow one. A group is a whole number of granules: whatever the devices'
+    slice_index groups (a TPU slice, and on multi-host GPU a host or an
+    NVLink domain), or the process where every device shares one slice.
+    1 lets `jax.make_mesh` place every device."""
 
     def __post_init__(self):
         if self.stage < 1:
@@ -222,10 +223,15 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
 def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.ndarray:
     """The device array of a mesh whose data axis spans `spec.replicas` host groups.
 
-    A granule, the unit the slow network joins, is the TPU slice where the
-    devices span more than one and the process otherwise: GPU and CPU
-    devices report slice 0, and so does every host of one TPU slice, whose
-    hosts `replicas` then groups.
+    A granule is the unit the slow network joins: whatever the devices'
+    `slice_index` groups where they report more than one, and the process
+    where they all share one. A multislice TPU run reports one slice index
+    per TPU slice. XLA numbers GPU slices per host boot or per NVLink fabric
+    (`BuildGlobalTopology`, xla/pjrt/distributed/topology_util.cc), so on
+    several GPU hosts a granule is a host or an NVLink domain however many
+    processes each runs. CPU pools, the hosts of one TPU slice, and
+    several processes on one machine share slice 0, and there the process
+    is the granule.
     """
     by_process = len({device.slice_index for device in devices}) == 1
     granules = len({device.process_index if by_process else device.slice_index
