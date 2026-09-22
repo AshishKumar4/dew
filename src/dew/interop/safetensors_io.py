@@ -198,15 +198,19 @@ def layer_bytes(directory) -> int:
     memory, and the pool that memory comes from is sized by a process
     limit that must be set before the JAX backend starts. This reads only
     the headers of the shards `directory` holds, so a launcher can size the
-    limit before importing anything that starts a backend. Layers are the
-    tensors named under `layers.<n>.`, as Hugging Face layouts name them.
+    limit before importing anything that starts a backend. The weights are
+    `model.safetensors` or the shards its index names, in `directory` and
+    in each component directory of a pipeline; layers are the tensors named
+    under `layers.<n>.`, as Hugging Face layouts name them.
     """
     directory = Path(directory)
-    index = directory / "model.safetensors.index.json"
-    if index.is_file():
-        shards = sorted({directory / name for name in json.loads(index.read_text())["weight_map"].values()})
-    else:
-        shards = [directory / "model.safetensors"]
+    shards: list[Path] = []
+    for root in (directory, *sorted(child for child in directory.iterdir() if child.is_dir())):
+        index = root / "model.safetensors.index.json"
+        if index.is_file():
+            shards.extend(sorted({root / name for name in json.loads(index.read_text())["weight_map"].values()}))
+        elif (root / "model.safetensors").is_file():
+            shards.append(root / "model.safetensors")
     total = 0
     for shard in shards:
         for name, entry in _header(os.fspath(shard)).items():

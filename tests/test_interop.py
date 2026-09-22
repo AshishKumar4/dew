@@ -545,3 +545,22 @@ def test_layer_bytes_reads_the_headers_of_a_checkpoint():
     expected = sum(tensor.nbytes for name, tensor in tensors.items() if re.search(r"\.layers\.\d+\.", name))
     assert expected > 0
     assert layer_bytes(directory) == expected
+
+
+def test_layer_bytes_covers_a_pipeline_component_and_its_index(tmp_path):
+    """A pipeline keeps its decoder in a component directory whose shards an
+    index names; the count follows the index and ignores files that are not
+    the component's weights."""
+    from dew.interop.safetensors_io import layer_bytes, write_file
+    component = tmp_path / "transformer"
+    component.mkdir()
+    layer = np.ones((4, 8), np.float32)
+    write_file({"model.layers.0.mlp.kernel": layer, "model.embed.weight": np.ones((3, 8), np.float32)},
+               component / "model-00001-of-00002.safetensors", {})
+    write_file({"model.layers.1.mlp.kernel": layer}, component / "model-00002-of-00002.safetensors", {})
+    write_file({"model.layers.9.mlp.kernel": layer}, component / "stray.safetensors", {})
+    (component / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+        "model.layers.0.mlp.kernel": "model-00001-of-00002.safetensors",
+        "model.embed.weight": "model-00001-of-00002.safetensors",
+        "model.layers.1.mlp.kernel": "model-00002-of-00002.safetensors"}}))
+    assert layer_bytes(tmp_path) == 2 * layer.nbytes
