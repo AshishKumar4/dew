@@ -666,25 +666,13 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             hidden, head, targets, self.head_chunks,
             softcap=self.model.final_logit_softcap,
             precision=self.model.precision)
-        packed_segments = segment_ids if segment_ids is not None else prepared.token_fields.get("segment_ids")
-        weights = self._target_weights(targets, packed_segments, losses.dtype)
         valid = prepared.token_fields.get("attention_mask")
-        if valid is not None:
-            weights = weights * (valid[:, :-1] & valid[:, 1:]).astype(weights.dtype)
-        if roles is not None:
-            if roles.shape != tokens.shape:
-                raise ValueError(
-                    f"text_roles has shape {tuple(roles.shape)} for "
-                    f"{tuple(tokens.shape)} ids; the roles align with the input "
-                    "tokens, one per token")
-            if self.loss_role is not None:
-                weights = weights * (roles[:, 1:] == int(self.loss_role))
+        weights = self._row_weights(prepared, targets, segment_ids, roles, losses.dtype)
         correct = (predicted == targets).astype(losses.dtype)
         depth_scores = []
         if depths:
             # Depth d's state at p scores the target d further out, so its
-            # targets are the shifted row's from d on, with the same weight
-            # rule between the state's document and the target's.
+            # targets are the shifted row's from d on.
             states = self.model.apply(
                 params, gathered['prediction_inputs']['states'] if stream_depth else hidden,
                 inputs, train=train, rngs=rngs,
@@ -704,18 +692,50 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                     state, head, targets[:, depth:], self.head_chunks,
                     softcap=self.model.final_logit_softcap,
                     precision=self.model.precision)
-                depth_weights = self._target_weights(
-                    targets[:, depth:], segment_ids, losses.dtype, depth)
-                if valid is not None:
-                    span = tokens.shape[1] - depth - 1
-                    admitted = jnp.ones((tokens.shape[0], span), dtype=bool)
-                    for offset in range(depth + 2):
-                        admitted = admitted & valid[:, offset:offset + span]
-                    depth_weights = depth_weights * admitted.astype(depth_weights.dtype)
-                if roles is not None and self.loss_role is not None:
-                    depth_weights = depth_weights * (roles[:, depth + 1:] == int(self.loss_role))
-                depth_scores.append((depth_losses, depth_weights))
+                depth_scores.append((depth_losses, self._depth_weights(
+                    targets, segment_ids, valid, roles, losses.dtype, depth)))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
+
+    def _row_weights(self, prepared, targets, segment_ids, roles, dtype):
+        """Weight the targets the row itself scores.
+
+        A packed batch's own `segment_ids` column serves when the caller
+        names none, a supplied validity mask drops the transitions across
+        padding, and `loss_role` keeps one role's targets alone.
+        """
+        packed_segments = segment_ids if segment_ids is not None else prepared.token_fields.get("segment_ids")
+        weights = self._target_weights(targets, packed_segments, dtype)
+        valid = prepared.token_fields.get("attention_mask")
+        if valid is not None:
+            weights = weights * (valid[:, :-1] & valid[:, 1:]).astype(weights.dtype)
+        if roles is not None:
+            if roles.shape != prepared.tokens.shape:
+                raise ValueError(
+                    f"text_roles has shape {tuple(roles.shape)} for "
+                    f"{tuple(prepared.tokens.shape)} ids; the roles align with the input "
+                    "tokens, one per token")
+            if self.loss_role is not None:
+                weights = weights * (roles[:, 1:] == int(self.loss_role))
+        return weights
+
+    def _depth_weights(self, targets, segment_ids, valid, roles, dtype, depth: int):
+        """Weight the targets one prediction depth scores.
+
+        Depth d's state at p scores the target d further out, so the same
+        document rule applies between the state's document and the
+        target's. A padded row admits the target only when every position
+        from the state to it is real.
+        """
+        weights = self._target_weights(targets[:, depth:], segment_ids, dtype, depth)
+        if valid is not None:
+            span = targets.shape[1] - depth
+            admitted = jnp.ones((targets.shape[0], span), dtype=bool)
+            for offset in range(depth + 2):
+                admitted = admitted & valid[:, offset:offset + span]
+            weights = weights * admitted.astype(weights.dtype)
+        if roles is not None and self.loss_role is not None:
+            weights = weights * (roles[:, depth + 1:] == int(self.loss_role))
+        return weights
 
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
                        packing: dict[str, jax.Array | Mapping[str, jax.Array]],
@@ -925,37 +945,55 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             prediction = Mean(prediction.total + self.indexer.weight * total, mass)
         statistics: Mean | LMStatistics = prediction
         if alpha is not None:
-            if not routing:
-                raise ValueError("aux_loss_alpha requires a model with a mixture")
-            routers = _router_scores(routing)
-            sequence = tuple(Mean(jnp.sum(sequence_router_losses(s, i, alpha)),
-                                  jnp.asarray(s.shape[0], jnp.promote_types(s.dtype, jnp.float32)))
-                             for s, i in routers) if self.seq_aux else ()
-            global_routers = () if self.seq_aux else tuple(router_moments(s, i) for s, i in routers)
-            statistics = LMStatistics(prediction, sequence, global_routers)
-            combined, _ = self.reduce_loss(statistics)
-            prediction_loss, _ = mean_loss(prediction)
-            reported["aux_loss"] = combined - prediction_loss
+            statistics, reported["aux_loss"] = self._router_statistics(prediction, routing, alpha)
         effects = None
         if rate is not None:
-            if "moe" not in params or routing is None:
-                raise ValueError("balance_rate requires a mixture with bias=True")
-            ran = {name: bias for name, bias in params["moe"].items()
-                   if self.mtp_weight is not None or not name.startswith("mtp_")}
-            counts = router_counts(ran, routing)
-            shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
-            if not shares:
-                raise ValueError(
-                    "balance_rate requires routers that keep a balancing bias, "
-                    "and these select by their hash table alone")
-            reported.update({"moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
-                             "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))})
-            effects = counts
+            effects, load = self._router_load(params, routing)
+            reported.update(load)
         if self.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
         return statistics, Aux(reported, qk_stats=qk, effects=effects), scores
+
+    def _router_statistics(self, prediction: Mean, routing, alpha: float
+                           ) -> tuple[LMStatistics, jax.Array]:
+        """Add the balance loss's own statistics beside the prediction's.
+
+        Each router term normalises by its own count, not by the counted
+        tokens, so the terms travel as separate statistics and only
+        `reduce_loss` adds them up. The reported number is what they add.
+        """
+        if not routing:
+            raise ValueError("aux_loss_alpha requires a model with a mixture")
+        routers = _router_scores(routing)
+        sequence = tuple(Mean(jnp.sum(sequence_router_losses(s, i, alpha)),
+                              jnp.asarray(s.shape[0], jnp.promote_types(s.dtype, jnp.float32)))
+                         for s, i in routers) if self.seq_aux else ()
+        global_routers = () if self.seq_aux else tuple(router_moments(s, i) for s, i in routers)
+        statistics = LMStatistics(prediction, sequence, global_routers)
+        combined, _ = self.reduce_loss(statistics)
+        prediction_loss, _ = mean_loss(prediction)
+        return statistics, combined - prediction_loss
+
+    def _router_load(self, params: Variables, routing) -> tuple[Variables, dict[str, jax.Array]]:
+        """Count what each balanced router selected, and report how evenly.
+
+        The counts are the effect the optimizer applies once per commit;
+        the report is each router's busiest and idlest share of the batch.
+        """
+        if "moe" not in params or routing is None:
+            raise ValueError("balance_rate requires a mixture with bias=True")
+        ran = {name: bias for name, bias in params["moe"].items()
+               if self.mtp_weight is not None or not name.startswith("mtp_")}
+        counts = router_counts(ran, routing)
+        shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
+        if not shares:
+            raise ValueError(
+                "balance_rate requires routers that keep a balancing bias, "
+                "and these select by their hash table alone")
+        return counts, {"moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
+                        "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))}
 
     def reduce_loss(self, stats: Mean | LMStatistics) -> tuple[jax.Array, jax.Array]:
         if isinstance(stats, Mean):

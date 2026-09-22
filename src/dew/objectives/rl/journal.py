@@ -33,6 +33,27 @@ def policy_digest(variables: Variables) -> str:
     return digest.hexdigest()
 
 
+def _cohort(connection: sqlite3.Connection, cohort: str, signature: str, binding: str) -> str:
+    """Create the journal's tables and settle which binding this cohort has.
+
+    A cohort already recorded has to present the same signature, and the
+    binding it was recorded under is the one the run adopts.
+    """
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    connection.execute("CREATE TABLE IF NOT EXISTS cohorts (id TEXT PRIMARY KEY, signature TEXT, binding TEXT)")
+    connection.execute("CREATE TABLE IF NOT EXISTS turns (cohort TEXT, sample INTEGER, episode TEXT, pending TEXT, snapshot BLOB, PRIMARY KEY(cohort, sample))")
+    with connection:
+        row = connection.execute("SELECT signature, binding FROM cohorts WHERE id=?", (cohort,)).fetchone()
+        if row is None:
+            connection.execute("INSERT INTO cohorts VALUES (?, ?, ?)", (cohort, signature, binding))
+        elif row[0] != signature:
+            raise ValueError("journal recovery requires the same policy, tasks, topology and sampling controls")
+        else:
+            binding = row[1]
+    return binding
+
+
 @dataclass(frozen=True)
 class SavedTurn:
     """One committed turn: the episode so far, any pending action, the snapshot."""
@@ -118,19 +139,7 @@ class EpisodeJournal:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             connection = sqlite3.connect(path)
             try:
-                connection.execute("PRAGMA journal_mode=WAL")
-                connection.execute("PRAGMA synchronous=FULL")
-                connection.execute("CREATE TABLE IF NOT EXISTS cohorts (id TEXT PRIMARY KEY, signature TEXT, binding TEXT)")
-                connection.execute("CREATE TABLE IF NOT EXISTS turns (cohort TEXT, sample INTEGER, episode TEXT, pending TEXT, snapshot BLOB, PRIMARY KEY(cohort, sample))")
-                with connection:
-                    row = connection.execute("SELECT signature, binding FROM cohorts WHERE id=?", (cohort,)).fetchone()
-                    if row is None:
-                        connection.execute("INSERT INTO cohorts VALUES (?, ?, ?)", (cohort, signature, binding))
-                    elif row[0] != signature:
-                        raise ValueError("journal recovery requires the same policy, tasks, topology and sampling controls")
-                    else:
-                        binding = row[1]
-                yield JournalRun(connection, cohort, binding)
+                yield JournalRun(connection, cohort, _cohort(connection, cohort, signature, binding))
             finally:
                 connection.close()
                 fcntl.flock(lock, fcntl.LOCK_UN)

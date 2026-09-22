@@ -353,6 +353,61 @@ class FlowRollout:
         rows = np.asarray(sorted(owned), np.int64)
         return (rows[:, None] * self.groups + np.arange(self.groups)).reshape(-1)
 
+    def _expanded(self, batch: Batch) -> tuple[Batch, slice | np.ndarray, int]:
+        """Repeat every source row into its group of samples.
+
+        Returns the expanded batch, the rows this process owns within it,
+        and the source row count each leaf has to agree with.
+        """
+        source = _source(self.objective.inputs, batch)
+        count = source.shape[0]
+        owned = self._owned_rows(source)
+
+        def repeat(leaf):
+            value = jnp.asarray(leaf)
+            if value.ndim == 0:
+                return value
+            if value.shape[0] != count:
+                raise ValueError("all flow source rows must share one batch dimension")
+            return jnp.repeat(value, self.groups, axis=0)
+
+        return jax.tree.map(repeat, batch), owned, count
+
+    def _transitions(self, trajectory: FlowTrajectory, context: Batch, rewards: np.ndarray,
+                     owned: slice | np.ndarray) -> Batch:
+        """Cut the trajectory into this rank's training rows.
+
+        Rewards are centred within their prompt's group, only the first
+        `train_steps` transitions train, and a row whose group gave it no
+        advantage is masked out of the loss.
+        """
+        grouped = rewards.reshape(-1, self.groups)
+        centered = grouped - grouped.mean(axis=1, keepdims=True)
+        # The author code uses float64 population statistics. The shared
+        # JAX group estimator fixes float32 and ddof=1, which changes this loss.
+        deviation = grouped.std(axis=1, keepdims=True)
+        advantages = (centered / (deviation + 1e-4)).astype(np.float32).reshape(-1)
+        if not np.isfinite(advantages).all():
+            raise ValueError("flow group advantages must remain finite")
+        selected = self.steps - 1 if self.train_steps is None else self.train_steps
+        local_advantages = advantages[owned]
+        shape = (local_advantages.shape[0], selected)
+        prepared = {condition.field: jax.tree.map(lambda leaf: np.asarray(leaf)[owned],
+                                                 context[condition.field])
+                    for condition in self.objective.inputs.conditions.values()}
+        prepared.update({
+            "latents": np.asarray(trajectory.states)[owned, :selected],
+            "next_latents": np.asarray(trajectory.states)[owned, 1:selected + 1],
+            "timesteps": np.broadcast_to(trajectory.times[:selected], shape),
+            "next_timesteps": np.broadcast_to(trajectory.times[1:selected + 1], shape),
+            OLD_LOG_PROBS_KEY: np.asarray(trajectory.log_probs)[owned, :selected],
+            "transition_mask": (np.asarray(trajectory.stochastic)[owned, :selected]
+                                & (local_advantages[:, None] != 0)),
+            ADVANTAGES_KEY: local_advantages,
+            REWARDS_KEY: rewards[owned],
+        })
+        return prepared
+
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
         """Collect one batch of trajectories and return this rank's training rows.
 
@@ -367,19 +422,7 @@ class FlowRollout:
         owned = slice(None)
         count = 0
         try:
-            source = _source(self.objective.inputs, batch)
-            count = source.shape[0]
-            owned = self._owned_rows(source)
-
-            def repeat(leaf):
-                value = jnp.asarray(leaf)
-                if value.ndim == 0:
-                    return value
-                if value.shape[0] != count:
-                    raise ValueError("all flow source rows must share one batch dimension")
-                return jnp.repeat(value, self.groups, axis=0)
-
-            expanded = jax.tree.map(repeat, batch)
+            expanded, owned, count = self._expanded(batch)
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="flow rollout setup")
@@ -409,31 +452,7 @@ class FlowRollout:
         error = None
         prepared = None
         try:
-            grouped = rewards.reshape(-1, self.groups)
-            centered = grouped - grouped.mean(axis=1, keepdims=True)
-            # The author code uses float64 population statistics. The shared
-            # JAX group estimator fixes float32 and ddof=1, which changes this loss.
-            deviation = grouped.std(axis=1, keepdims=True)
-            advantages = (centered / (deviation + 1e-4)).astype(np.float32).reshape(-1)
-            if not np.isfinite(advantages).all():
-                raise ValueError("flow group advantages must remain finite")
-            selected = self.steps - 1 if self.train_steps is None else self.train_steps
-            local_advantages = advantages[owned]
-            shape = (local_advantages.shape[0], selected)
-            prepared = {condition.field: jax.tree.map(lambda leaf: np.asarray(leaf)[owned],
-                                                     context[condition.field])
-                        for condition in self.objective.inputs.conditions.values()}
-            prepared.update({
-                "latents": np.asarray(trajectory.states)[owned, :selected],
-                "next_latents": np.asarray(trajectory.states)[owned, 1:selected + 1],
-                "timesteps": np.broadcast_to(trajectory.times[:selected], shape),
-                "next_timesteps": np.broadcast_to(trajectory.times[1:selected + 1], shape),
-                OLD_LOG_PROBS_KEY: np.asarray(trajectory.log_probs)[owned, :selected],
-                "transition_mask": (np.asarray(trajectory.stochastic)[owned, :selected]
-                                    & (local_advantages[:, None] != 0)),
-                ADVANTAGES_KEY: local_advantages,
-                REWARDS_KEY: rewards[owned],
-            })
+            prepared = self._transitions(trajectory, context, rewards, owned)
         except BaseException as failure:
             error = failure
         agree_process_phase(error, phase="flow rollout batching")

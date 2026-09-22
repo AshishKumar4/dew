@@ -86,6 +86,44 @@ class _ProcessEnvironment:
         for stream in (self.stdin, self.stdout, self.stderr):
             os.set_blocking(stream.fileno(), False)
 
+    def _decoded(self) -> JSON:
+        """Take the first complete line out of the read buffer as JSON."""
+        line, _, rest = self.output.partition(b"\n")
+        self.output = rest
+        try:
+            return json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError("sandbox returned malformed JSON") from error
+
+    def _pump(self, ready: selectors.BaseSelector, event: selectors.SelectorKey, request: bytes,
+              sent: int, diagnostic: bytearray) -> int:
+        """Write the pending request to one ready stream, or read a chunk from it.
+
+        Returns how much of the request has been written. A stream with
+        nothing left is unregistered, so the selector itself reports when
+        the worker can no longer answer.
+        """
+        descriptor = event.fd
+        if event.data == "stdin":
+            try:
+                sent += os.write(descriptor, request[sent:])
+            except BrokenPipeError:
+                ready.unregister(self.stdin)
+            else:
+                if sent == len(request):
+                    ready.unregister(self.stdin)
+            return sent
+        chunk = os.read(descriptor, 65536)
+        if not chunk:
+            ready.unregister(event.fileobj)
+        elif event.data == "stdout":
+            self.output.extend(chunk)
+        else:
+            diagnostic.extend(chunk)
+        if len(self.output) + len(diagnostic) > self.limits.message_bytes:
+            raise ValueError("sandbox response exceeds message_bytes")
+        return sent
+
     def _request(self, operation: str, payload: Mapping[str, object]) -> JSON:
         """Send one request and return the worker's decoded reply.
 
@@ -109,32 +147,9 @@ class _ProcessEnvironment:
                 if remaining <= 0:
                     raise TimeoutError("sandbox exceeded wall_seconds")
                 if sent == len(request) and b"\n" in self.output:
-                    line, _, rest = self.output.partition(b"\n")
-                    self.output = rest
-                    try:
-                        return json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                        raise ValueError("sandbox returned malformed JSON") from error
+                    return self._decoded()
                 for event, _ in ready.select(min(remaining, .1)):
-                    descriptor = event.fd
-                    if event.data == "stdin":
-                        try:
-                            sent += os.write(descriptor, request[sent:])
-                        except BrokenPipeError:
-                            ready.unregister(self.stdin)
-                        else:
-                            if sent == len(request):
-                                ready.unregister(self.stdin)
-                        continue
-                    chunk = os.read(descriptor, 65536)
-                    if not chunk:
-                        ready.unregister(event.fileobj)
-                    elif event.data == "stdout":
-                        self.output.extend(chunk)
-                    else:
-                        diagnostic.extend(chunk)
-                    if len(self.output) + len(diagnostic) > self.limits.message_bytes:
-                        raise ValueError("sandbox response exceeds message_bytes")
+                    sent = self._pump(ready, event, request, sent, diagnostic)
                 if self.process.poll() is not None and not ready.get_map():
                     raise ChildProcessError(
                         f"sandbox exited with code {self.process.returncode}: "
