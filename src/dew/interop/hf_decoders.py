@@ -109,7 +109,7 @@ def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
 
 
-def _fixed_fields(model: object, fixed: Mapping[str, object], message: str) -> None:
+def _fixed_fields(model: CausalTransformer, fixed: Mapping[str, object], message: str) -> None:
     """Refuse `model` wherever it disagrees with a value its family fixes.
 
     `message` is formatted with the expected value, so each family's refusal
@@ -120,7 +120,7 @@ def _fixed_fields(model: object, fixed: Mapping[str, object], message: str) -> N
             _refuse(name, message.format(expected))
 
 
-def _fixed_mixture(mixture: object, defaults: object, represented: Collection[str],
+def _fixed_mixture(mixture: Mixture, defaults: Mixture, represented: Collection[str],
                    detail: str) -> None:
     """Refuse a mixture field outside `represented` that leaves its family's default.
 

@@ -293,7 +293,8 @@ def _saved_run(directory: str, dtype: str | None) -> tuple[Mapping[str, object],
     return record, _saved_model(record, dtype), _saved_processor(record)
 
 
-def _freeze_variables(task: object, variables: Variables) -> None:
+def _freeze_variables(task: TextGeneration | BlockGeneration | MaskedGeneration,
+                      variables: Variables) -> None:
     """Freeze `variables` onto `task`, whose own `__post_init__` cannot assign.
 
     A frozen dataclass refuses attribute assignment, so the field is written

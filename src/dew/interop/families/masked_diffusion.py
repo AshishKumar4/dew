@@ -25,17 +25,16 @@ from dew.interop.hf_decoders import (
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
-def _mask_token(hf_config: Mapping[str, object], used: set[str]) -> object:
+def _mask_token(hf_config: Mapping[str, object], used: set[str]) -> int:
     """Return the mask id a masked-diffusion release reserves, under either spelling.
 
-    The releases write it as `mask_token_id` or as `mask_id`. The caller
-    narrows the value itself, since each family names the field it read.
+    The releases write it as `mask_token_id` or as `mask_id`.
     """
     mask = hf_config.get('mask_token_id', hf_config.get('mask_id'))
     if mask is None:
         _refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
     used.update(('mask_token_id', 'mask_id'))
-    return mask
+    return records.integer(mask, 'mask_token_id/mask_id')
 
 
 def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -62,7 +61,7 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
             used.add(key)
     mask = _mask_token(hf_config, used)
     _llada_refusals(hf_config, used, std)
-    config.update(causal=False, mask_token_id=records.integer(mask, 'mask_token_id'))
+    config.update(causal=False, mask_token_id=mask)
     return config
 
 
@@ -211,7 +210,7 @@ def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     used.add('use_mrope')
     config = _qwen2_config(hf_config, used)
     mask = _mask_token(hf_config, used)
-    config.update(causal=False, mask_token_id=records.integer(mask, 'mask_token_id/mask_id'))
+    config.update(causal=False, mask_token_id=mask)
     return config
 
 
