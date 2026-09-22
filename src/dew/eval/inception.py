@@ -10,16 +10,6 @@ from flax.linen.module import merge_param
 from jax import lax
 from jax.nn import initializers
 
-from . import utils
-
-# The FID feature extractor's weights, the jax-fid pickle mirrored on the Hub
-# with a pinned revision and digest. The bytes are byte-identical to the
-# jax-fid file.
-FID_WEIGHTS_REPO = 'hayden-donnelly/inception-v3-fid'
-FID_WEIGHTS_FILE = 'inception_v3_fid.pickle'
-FID_WEIGHTS_REVISION = 'ccb3ff416ff491ae7fd964c5e7c01d12ab7c48bf'
-FID_WEIGHTS_DIGEST = '4e030efa5bccac3222d975f658d1884f9e00fab24f2812082884539220b90d77'
-
 PRNGKey = Any
 Array = Any
 Shape = tuple[int]
@@ -32,35 +22,25 @@ class InceptionV3(nn.Module):
     Reference: https://arxiv.org/abs/1512.00567
     Ported mostly from: https://github.com/pytorch/vision/blob/master/torchvision/models/inception.py
 
+    The trained weights are a variables tree like any other Flax module's:
+    `dew.interop.inception_fid` converts the published jax-fid checkpoint into
+    one, and `apply` takes it.
+
     Attributes:
         include_head (bool): If True, include classifier head.
         num_classes (int): Number of classes.
-        pretrained (bool): If True, use pretrained weights.
         transform_input (bool): If True, preprocesses the input according to the method with which it
                                 was trained on ImageNet.
         aux_logits (bool): If True, add an auxiliary branch that can improve training.
+        channel_divisor (int): Every channel width is divided by this.
         dtype (str): Data type.
     """
     include_head: bool=False
     num_classes: int=1000
-    pretrained: bool=False
     transform_input: bool=False
     aux_logits: bool=False
-    ckpt_repo: str=FID_WEIGHTS_REPO
-    ckpt_file: str=FID_WEIGHTS_FILE
-    ckpt_revision: str=FID_WEIGHTS_REVISION
-    ckpt_digest: str=FID_WEIGHTS_DIGEST
+    channel_divisor: int=1
     dtype: str='float32'
-
-    def setup(self):
-        if self.pretrained:
-            path = utils.fetch(self.ckpt_repo, self.ckpt_file,
-                               self.ckpt_revision, self.ckpt_digest)
-            self.params_dict = utils.load_arrays(path)
-            self.num_classes_ = 1000
-        else:
-            self.params_dict = None
-            self.num_classes_ = self.num_classes
 
     @nn.compact
     def __call__(self, x, train=True, rng=jax.random.PRNGKey(0)):
@@ -74,71 +54,68 @@ class InceptionV3(nn.Module):
         x = BasicConv2d(out_channels=32,
                         kernel_size=(3, 3),
                         strides=(2, 2),
-                        params_dict=utils.get(self.params_dict, 'Conv2d_1a_3x3'),
+                        channel_divisor=self.channel_divisor,
                         dtype=self.dtype)(x, train)
         x = BasicConv2d(out_channels=32,
                         kernel_size=(3, 3),
-                        params_dict=utils.get(self.params_dict, 'Conv2d_2a_3x3'),
+                        channel_divisor=self.channel_divisor,
                         dtype=self.dtype)(x, train)
         x = BasicConv2d(out_channels=64,
                         kernel_size=(3, 3),
                         padding=((1, 1), (1, 1)),
-                        params_dict=utils.get(self.params_dict, 'Conv2d_2b_3x3'),
+                        channel_divisor=self.channel_divisor,
                         dtype=self.dtype)(x, train)
         x = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2))
         x = BasicConv2d(out_channels=80,
                         kernel_size=(1, 1),
-                        params_dict=utils.get(self.params_dict, 'Conv2d_3b_1x1'),
+                        channel_divisor=self.channel_divisor,
                         dtype=self.dtype)(x, train)
         x = BasicConv2d(out_channels=192,
                         kernel_size=(3, 3),
-                        params_dict=utils.get(self.params_dict, 'Conv2d_4a_3x3'),
+                        channel_divisor=self.channel_divisor,
                         dtype=self.dtype)(x, train)
         x = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2))
         x = InceptionA(pool_features=32,
-                       params_dict=utils.get(self.params_dict, 'Mixed_5b'),
+                       channel_divisor=self.channel_divisor,
                        dtype=self.dtype)(x, train)
         x = InceptionA(pool_features=64,
-                       params_dict=utils.get(self.params_dict, 'Mixed_5c'),
+                       channel_divisor=self.channel_divisor,
                        dtype=self.dtype)(x, train)
         x = InceptionA(pool_features=64,
-                       params_dict=utils.get(self.params_dict, 'Mixed_5d'),
+                       channel_divisor=self.channel_divisor,
                        dtype=self.dtype)(x, train)
-        x = InceptionB(params_dict=utils.get(self.params_dict, 'Mixed_6a'),
-                       dtype=self.dtype)(x, train)
+        x = InceptionB(channel_divisor=self.channel_divisor, dtype=self.dtype)(x, train)
         x = InceptionC(channels_7x7=128,
-                       params_dict=utils.get(self.params_dict, 'Mixed_6b'),
+                       channel_divisor=self.channel_divisor,
                        dtype=self.dtype)(x, train)
         x = InceptionC(channels_7x7=160,
-                       params_dict=utils.get(self.params_dict, 'Mixed_6c'),
+                       channel_divisor=self.channel_divisor,
                        dtype=self.dtype)(x, train)
         x = InceptionC(channels_7x7=160,
-                       params_dict=utils.get(self.params_dict, 'Mixed_6d'),
+                       channel_divisor=self.channel_divisor,
                        dtype=self.dtype)(x, train)
         x = InceptionC(channels_7x7=192,
-                       params_dict=utils.get(self.params_dict, 'Mixed_6e'),
+                       channel_divisor=self.channel_divisor,
                        dtype=self.dtype)(x, train)
         aux = None
         if self.aux_logits and train:
-            aux = InceptionAux(num_classes=self.num_classes_,
-                               params_dict=utils.get(self.params_dict, 'AuxLogits'),
+            aux = InceptionAux(num_classes=self.num_classes,
+                               channel_divisor=self.channel_divisor,
                                dtype=self.dtype)(x, train)
-        x = InceptionD(params_dict=utils.get(self.params_dict, 'Mixed_7a'),
-                       dtype=self.dtype)(x, train)
-        x = InceptionE(avg_pool, params_dict=utils.get(self.params_dict, 'Mixed_7b'),
+        x = InceptionD(channel_divisor=self.channel_divisor, dtype=self.dtype)(x, train)
+        x = InceptionE(avg_pool, channel_divisor=self.channel_divisor,
                        dtype=self.dtype)(x, train)
         # Following the implementation by @mseitzer, we use max pooling instead
         # of average pooling here.
         # See: https://github.com/mseitzer/pytorch-fid/blob/master/src/pytorch_fid/inception.py#L320
-        x = InceptionE(nn.max_pool, params_dict=utils.get(self.params_dict, 'Mixed_7c'),
+        x = InceptionE(nn.max_pool, channel_divisor=self.channel_divisor,
                        dtype=self.dtype)(x, train)
         x = jnp.mean(x, axis=(1, 2), keepdims=True)
         if not self.include_head:
             return x
         x = nn.Dropout(rate=0.5)(x, deterministic=not train, rng=rng)
         x = jnp.reshape(x, (x.shape[0], -1))
-        x = Dense(features=self.num_classes_,
-                  params_dict=utils.get(self.params_dict, 'fc'),
+        x = Dense(features=self.num_classes,
                   dtype=self.dtype)(x)
         if self.aux_logits:
             return x, aux
@@ -157,15 +134,13 @@ class Dense(nn.Module):
     features: int
     kernel_init: nn.initializers.Initializer=nn.initializers.lecun_normal()
     bias_init: nn.initializers.Initializer=nn.initializers.zeros
-    params_dict: dict | None=None
     dtype: str='float32'
 
     @nn.compact
     def __call__(self, x):
-        params = self.params_dict
         return nn.Dense(features=self.features,
-                     kernel_init=self.kernel_init if params is None else lambda *_ : jnp.array(params['kernel']),
-                     bias_init=self.bias_init if params is None else lambda *_ : jnp.array(params['bias']))(x)
+                        kernel_init=self.kernel_init,
+                        bias_init=self.bias_init)(x)
 
 
 class BasicConv2d(nn.Module):
@@ -176,84 +151,76 @@ class BasicConv2d(nn.Module):
     use_bias: bool=False
     kernel_init: nn.initializers.Initializer=nn.initializers.lecun_normal()
     bias_init: nn.initializers.Initializer=nn.initializers.zeros
-    params_dict: dict | None=None
+    channel_divisor: int=1
     dtype: str='float32'
 
     @nn.compact
     def __call__(self, x, train=True):
-        params = self.params_dict
-        x = nn.Conv(features=self.out_channels,
+        # Every width in the network reaches a convolution through here, so
+        # the divisor is applied once, at the only place a filter count is
+        # declared. The norm below takes its shape from the input.
+        x = nn.Conv(features=max(self.out_channels // self.channel_divisor, 1),
                     kernel_size=self.kernel_size,
                     strides=self.strides,
                     padding=self.padding,
                     use_bias=self.use_bias,
-                    kernel_init=self.kernel_init if params is None else lambda *_ : jnp.array(params['conv']['kernel']),
-                    bias_init=self.bias_init if params is None else lambda *_ : jnp.array(params['conv']['bias']),
+                    kernel_init=self.kernel_init,
+                    bias_init=self.bias_init,
                     dtype=self.dtype)(x)
-        if params is None:
-            x = BatchNorm(epsilon=0.001,
-                          momentum=0.1,
-                          use_running_average=not train,
-                          dtype=self.dtype)(x)
-        else:
-            x = BatchNorm(epsilon=0.001,
-                          momentum=0.1,
-                          bias_init=lambda *_ : jnp.array(params['bn']['bias']),
-                          scale_init=lambda *_ : jnp.array(params['bn']['scale']),
-                          mean_init=lambda *_ : jnp.array(params['bn']['mean']),
-                          var_init=lambda *_ : jnp.array(params['bn']['var']),
-                          use_running_average=not train,
-                          dtype=self.dtype)(x)
+        x = BatchNorm(epsilon=0.001,
+                      momentum=0.1,
+                      use_running_average=not train,
+                      dtype=self.dtype)(x)
         return jax.nn.relu(x)
 
 
 class InceptionA(nn.Module):
     pool_features: int
-    params_dict: dict | None=None
+    channel_divisor: int=1
     dtype: str='float32'
 
     @nn.compact
     def __call__(self, x, train=True):
         branch1x1 = BasicConv2d(out_channels=64,
                                 kernel_size=(1, 1),
-                                params_dict=utils.get(self.params_dict, 'branch1x1'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(x, train)
         branch5x5 = BasicConv2d(out_channels=48,
                                 kernel_size=(1, 1),
-                                params_dict=utils.get(self.params_dict, 'branch5x5_1'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(x, train)
         branch5x5 = BasicConv2d(out_channels=64,
                                 kernel_size=(5, 5),
                                 padding=((2, 2), (2, 2)),
-                                params_dict=utils.get(self.params_dict, 'branch5x5_2'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(branch5x5, train)
 
         branch3x3dbl = BasicConv2d(out_channels=64,
                                    kernel_size=(1, 1),
-                                   params_dict=utils.get(self.params_dict, 'branch3x3dbl_1'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(x, train)
         branch3x3dbl = BasicConv2d(out_channels=96,
                                    kernel_size=(3, 3),
                                    padding=((1, 1), (1, 1)),
-                                   params_dict=utils.get(self.params_dict, 'branch3x3dbl_2'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(branch3x3dbl, train)
         branch3x3dbl = BasicConv2d(out_channels=96,
                                    kernel_size=(3, 3),
                                    padding=((1, 1), (1, 1)),
-                                   params_dict=utils.get(self.params_dict, 'branch3x3dbl_3'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(branch3x3dbl, train)
 
         branch_pool = avg_pool(x, window_shape=(3, 3), strides=(1, 1), padding=((1, 1), (1, 1)))
         branch_pool = BasicConv2d(out_channels=self.pool_features,
                                   kernel_size=(1, 1),
-                                  params_dict=utils.get(self.params_dict, 'branch_pool'),
+                                  channel_divisor=self.channel_divisor,
                                   dtype=self.dtype)(branch_pool, train)
 
         return jnp.concatenate((branch1x1, branch5x5, branch3x3dbl, branch_pool), axis=-1)
 
 
 class InceptionB(nn.Module):
-    params_dict: dict | None=None
+    channel_divisor: int=1
     dtype: str='float32'
 
     @nn.compact
@@ -261,22 +228,22 @@ class InceptionB(nn.Module):
         branch3x3 = BasicConv2d(out_channels=384,
                                 kernel_size=(3, 3),
                                 strides=(2, 2),
-                                params_dict=utils.get(self.params_dict, 'branch3x3'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(x, train)
 
         branch3x3dbl = BasicConv2d(out_channels=64,
                                    kernel_size=(1, 1),
-                                   params_dict=utils.get(self.params_dict, 'branch3x3dbl_1'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(x, train)
         branch3x3dbl = BasicConv2d(out_channels=96,
                                    kernel_size=(3, 3),
                                    padding=((1, 1), (1, 1)),
-                                   params_dict=utils.get(self.params_dict, 'branch3x3dbl_2'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(branch3x3dbl, train)
         branch3x3dbl = BasicConv2d(out_channels=96,
                                    kernel_size=(3, 3),
                                    strides=(2, 2),
-                                   params_dict=utils.get(self.params_dict, 'branch3x3dbl_3'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(branch3x3dbl, train)
 
         branch_pool = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2))
@@ -286,99 +253,103 @@ class InceptionB(nn.Module):
 
 class InceptionC(nn.Module):
     channels_7x7: int
-    params_dict: dict | None=None
+    channel_divisor: int=1
     dtype: str='float32'
 
     @nn.compact
     def __call__(self, x, train=True):
         branch1x1 = BasicConv2d(out_channels=192,
                                 kernel_size=(1, 1),
-                                params_dict=utils.get(self.params_dict, 'branch1x1'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(x, train)
 
         branch7x7 = BasicConv2d(out_channels=self.channels_7x7,
                                 kernel_size=(1, 1),
-                                params_dict=utils.get(self.params_dict, 'branch7x7_1'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(x, train)
         branch7x7 = BasicConv2d(out_channels=self.channels_7x7,
                                 kernel_size=(1, 7),
                                 padding=((0, 0), (3, 3)),
-                                params_dict=utils.get(self.params_dict, 'branch7x7_2'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(branch7x7, train)
         branch7x7 = BasicConv2d(out_channels=192,
                                 kernel_size=(7, 1),
                                 padding=((3, 3), (0, 0)),
-                                params_dict=utils.get(self.params_dict, 'branch7x7_3'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(branch7x7, train)
 
         branch7x7dbl = BasicConv2d(out_channels=self.channels_7x7,
                                    kernel_size=(1, 1),
-                                   params_dict=utils.get(self.params_dict, 'branch7x7dbl_1'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(x, train)
         branch7x7dbl = BasicConv2d(out_channels=self.channels_7x7,
                                    kernel_size=(7, 1),
                                    padding=((3, 3), (0, 0)),
-                                   params_dict=utils.get(self.params_dict, 'branch7x7dbl_2'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(branch7x7dbl, train)
         branch7x7dbl = BasicConv2d(out_channels=self.channels_7x7,
                                    kernel_size=(1, 7),
                                    padding=((0, 0), (3, 3)),
-                                   params_dict=utils.get(self.params_dict, 'branch7x7dbl_3'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(branch7x7dbl, train)
         branch7x7dbl = BasicConv2d(out_channels=self.channels_7x7,
                                    kernel_size=(7, 1),
                                    padding=((3, 3), (0, 0)),
-                                   params_dict=utils.get(self.params_dict, 'branch7x7dbl_4'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(branch7x7dbl, train)
-        branch7x7dbl = BasicConv2d(out_channels=self.channels_7x7,
+        # The last of the seven-by-seven pair widens to 192, as torchvision and
+        # the published weights do. This declared it as channels_7x7 while the
+        # initializers handed back stored arrays, so the network ran 192 wide
+        # and only said otherwise.
+        branch7x7dbl = BasicConv2d(out_channels=192,
                                    kernel_size=(1, 7),
                                    padding=((0, 0), (3, 3)),
-                                   params_dict=utils.get(self.params_dict, 'branch7x7dbl_5'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(branch7x7dbl, train)
 
         branch_pool = avg_pool(x, window_shape=(3, 3), strides=(1, 1), padding=((1, 1), (1, 1)))
         branch_pool = BasicConv2d(out_channels=192,
                                   kernel_size=(1, 1),
-                                  params_dict=utils.get(self.params_dict, 'branch_pool'),
+                                  channel_divisor=self.channel_divisor,
                                   dtype=self.dtype)(branch_pool, train)
 
         return jnp.concatenate((branch1x1, branch7x7, branch7x7dbl, branch_pool), axis=-1)
 
 
 class InceptionD(nn.Module):
-    params_dict: dict | None=None
+    channel_divisor: int=1
     dtype: str='float32'
 
     @nn.compact
     def __call__(self, x, train=True):
         branch3x3 = BasicConv2d(out_channels=192,
                                 kernel_size=(1, 1),
-                                params_dict=utils.get(self.params_dict, 'branch3x3_1'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(x, train)
         branch3x3 = BasicConv2d(out_channels=320,
                                 kernel_size=(3, 3),
                                 strides=(2, 2),
-                                params_dict=utils.get(self.params_dict, 'branch3x3_2'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(branch3x3, train)
 
         branch7x7x3 = BasicConv2d(out_channels=192,
                                   kernel_size=(1, 1),
-                                  params_dict=utils.get(self.params_dict, 'branch7x7x3_1'),
+                                  channel_divisor=self.channel_divisor,
                                   dtype=self.dtype)(x, train)
         branch7x7x3 = BasicConv2d(out_channels=192,
                                   kernel_size=(1, 7),
                                   padding=((0, 0), (3, 3)),
-                                  params_dict=utils.get(self.params_dict, 'branch7x7x3_2'),
+                                  channel_divisor=self.channel_divisor,
                                   dtype=self.dtype)(branch7x7x3, train)
         branch7x7x3 = BasicConv2d(out_channels=192,
                                   kernel_size=(7, 1),
                                   padding=((3, 3), (0, 0)),
-                                  params_dict=utils.get(self.params_dict, 'branch7x7x3_3'),
+                                  channel_divisor=self.channel_divisor,
                                   dtype=self.dtype)(branch7x7x3, train)
         branch7x7x3 = BasicConv2d(out_channels=192,
                                   kernel_size=(3, 3),
                                   strides=(2, 2),
-                                  params_dict=utils.get(self.params_dict, 'branch7x7x3_4'),
+                                  channel_divisor=self.channel_divisor,
                                   dtype=self.dtype)(branch7x7x3, train)
 
         branch_pool = nn.max_pool(x, window_shape=(3, 3), strides=(2, 2))
@@ -388,57 +359,57 @@ class InceptionD(nn.Module):
 
 class InceptionE(nn.Module):
     pooling: Callable
-    params_dict: dict | None=None
+    channel_divisor: int=1
     dtype: str='float32'
 
     @nn.compact
     def __call__(self, x, train=True):
         branch1x1 = BasicConv2d(out_channels=320,
                                 kernel_size=(1, 1),
-                                params_dict=utils.get(self.params_dict, 'branch1x1'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(x, train)
 
         branch3x3 = BasicConv2d(out_channels=384,
                                 kernel_size=(1, 1),
-                                params_dict=utils.get(self.params_dict, 'branch3x3_1'),
+                                channel_divisor=self.channel_divisor,
                                 dtype=self.dtype)(x, train)
         branch3x3_a = BasicConv2d(out_channels=384,
                                   kernel_size=(1, 3),
                                   padding=((0, 0), (1, 1)),
-                                  params_dict=utils.get(self.params_dict, 'branch3x3_2a'),
+                                  channel_divisor=self.channel_divisor,
                                   dtype=self.dtype)(branch3x3, train)
         branch3x3_b = BasicConv2d(out_channels=384,
                                   kernel_size=(3, 1),
                                   padding=((1, 1), (0, 0)),
-                                  params_dict=utils.get(self.params_dict, 'branch3x3_2b'),
+                                  channel_divisor=self.channel_divisor,
                                   dtype=self.dtype)(branch3x3, train)
         branch3x3 = jnp.concatenate((branch3x3_a, branch3x3_b), axis=-1)
 
         branch3x3dbl = BasicConv2d(out_channels=448,
                                    kernel_size=(1, 1),
-                                   params_dict=utils.get(self.params_dict, 'branch3x3dbl_1'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(x, train)
         branch3x3dbl = BasicConv2d(out_channels=384,
                                    kernel_size=(3, 3),
                                    padding=((1, 1), (1, 1)),
-                                   params_dict=utils.get(self.params_dict, 'branch3x3dbl_2'),
+                                   channel_divisor=self.channel_divisor,
                                    dtype=self.dtype)(branch3x3dbl, train)
         branch3x3dbl_a = BasicConv2d(out_channels=384,
                                      kernel_size=(1, 3),
                                      padding=((0, 0), (1, 1)),
-                                     params_dict=utils.get(self.params_dict, 'branch3x3dbl_3a'),
+                                     channel_divisor=self.channel_divisor,
                                      dtype=self.dtype)(branch3x3dbl, train)
         branch3x3dbl_b = BasicConv2d(out_channels=384,
                                      kernel_size=(3, 1),
                                      padding=((1, 1), (0, 0)),
-                                     params_dict=utils.get(self.params_dict, 'branch3x3dbl_3b'),
+                                     channel_divisor=self.channel_divisor,
                                      dtype=self.dtype)(branch3x3dbl, train)
         branch3x3dbl = jnp.concatenate((branch3x3dbl_a, branch3x3dbl_b), axis=-1)
 
         branch_pool = self.pooling(x, window_shape=(3, 3), strides=(1, 1), padding=((1, 1), (1, 1)))
         branch_pool = BasicConv2d(out_channels=192,
                                   kernel_size=(1, 1),
-                                  params_dict=utils.get(self.params_dict, 'branch_pool'),
+                                  channel_divisor=self.channel_divisor,
                                   dtype=self.dtype)(branch_pool, train)
 
         return jnp.concatenate((branch1x1, branch3x3, branch3x3dbl, branch_pool), axis=-1)
@@ -448,7 +419,7 @@ class InceptionAux(nn.Module):
     num_classes: int
     kernel_init: nn.initializers.Initializer=nn.initializers.lecun_normal()
     bias_init: nn.initializers.Initializer=nn.initializers.zeros
-    params_dict: dict | None=None
+    channel_divisor: int=1
     dtype: str='float32'
 
     @nn.compact
@@ -456,16 +427,15 @@ class InceptionAux(nn.Module):
         x = avg_pool(x, window_shape=(5, 5), strides=(3, 3))
         x = BasicConv2d(out_channels=128,
                         kernel_size=(1, 1),
-                        params_dict=utils.get(self.params_dict, 'conv0'),
+                        channel_divisor=self.channel_divisor,
                         dtype=self.dtype)(x, train)
         x = BasicConv2d(out_channels=768,
                         kernel_size=(5, 5),
-                        params_dict=utils.get(self.params_dict, 'conv1'),
+                        channel_divisor=self.channel_divisor,
                         dtype=self.dtype)(x, train)
         x = jnp.mean(x, axis=(1, 2))
         x = jnp.reshape(x, (x.shape[0], -1))
         return Dense(features=self.num_classes,
-                  params_dict=utils.get(self.params_dict, 'fc'),
                   dtype=self.dtype)(x)
 
 def _absolute_dims(rank, dims):
