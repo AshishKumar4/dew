@@ -17,8 +17,8 @@
 `gmm` is `[m, k] x [g, k, n] -> [m, n]` over rows sorted by group (with
 `trans_rhs`, `[g, n, k]`), and `tgmm` the kernel gradient, `[m, k] x [m, n]
 -> [g, k, n]`. They are the body of `jax/_src/lax/pallas_lowerings/gpu/
-ragged_dot.py` in the jax-v0.11.1 source tree (tag 2d666224; license header
-above), which the 0.11.1 wheel does not ship: `DEFAULT_BLOCK_M` through
+ragged_dot.py` in the jax-v0.11.2 source tree (tag jax-v0.11.2, 32544801;
+license header above), which no jax wheel ships: `DEFAULT_BLOCK_M` through
 `_hyperparam_selection_rule`, with one line changed and marked `# Dew:`
 (tgmm's output cast). The file's `ragged_dot_general`
 adapter is left out: Dew calls the kernels itself, through
@@ -288,7 +288,8 @@ def gmm(
   with api.named_scope("pallas_triton_ragged_dot"):
     out = pl.pallas_call(
       partial(
-        _gpu_ragged_dot_kernel, size=size, block=block_sizes, **other_kws
+        _gpu_ragged_dot_kernel, size=size, block=block_sizes,
+        **other_kws  # pyrefly: ignore[bad-argument-type]
       ),
       out_shape=out_shape,
       grid=grid,
@@ -416,7 +417,7 @@ def tgmm(
   with api.named_scope("tgmm_ragged_dot"):
     out = pl.pallas_call(
       partial(_tgmm_ragged_dot_kernel, size=size, block=block_sizes,
-              **dtype_spec),
+              **dtype_spec),  # pyrefly: ignore[bad-argument-type]
       out_shape=out_shape,
       grid=grid,
       in_specs=in_specs,
@@ -442,22 +443,6 @@ def _hyperparam_selection_rule(dtype: lax.DType):
     tile_k, tile_n = tile_m // 2, tile_m
   return dict(block_m=tile_m, block_k=tile_k, block_n=tile_n)
 
-
 def block_sizes(dtype) -> dict[str, int]:
   """The tile the vendored rule picks for operands of `dtype`."""
   return _hyperparam_selection_rule(np.dtype(dtype))
-
-
-# jax/_src/pallas/triton/gpu_info.py lists the RTX 4090 and the L4 at compute
-# capability 8.9 and not the RTX 4080, so a Triton pallas_call on that card
-# raises "No supported GPU devices found". `registry` is that module's own
-# extension point.
-_ADA = ("NVIDIA GeForce RTX 4080", "NVIDIA GeForce RTX 4080 SUPER")
-
-
-def register_devices() -> None:
-  from jax._src.pallas.triton import gpu_info
-  for kind in _ADA:
-    if gpu_info.gpu_version_from_device_kind(kind) is None and kind not in gpu_info.registry:
-      gpu_info.registry[kind] = partial(
-          gpu_info.GpuInfo, gpu_version=None, arch_name="8.9", compute_capability=89)

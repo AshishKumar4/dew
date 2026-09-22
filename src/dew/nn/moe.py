@@ -28,6 +28,8 @@ shards.
 import dataclasses
 import functools
 import importlib
+import math
+import warnings
 from collections.abc import Callable
 
 import jax
@@ -37,6 +39,7 @@ from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
+from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
 from .blocks import normal_kernel
@@ -51,7 +54,7 @@ from .sharding import EXPERT_AXIS, logical_axes
 # where a sigmoid saturates.
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
-# 'auto' resolves per backend through GROUPED_MATMUL_BY_BACKEND below.
+# 'auto' resolves per hardware generation through GROUPED_MATMUL_BY_GENERATION.
 GROUPED_MATMULS = ('auto', 'xla', 'pallas', 'tokamax')
 EXPERT_DISPATCHES = ('global', 'exchange')
 
@@ -313,30 +316,48 @@ class Router(nn.Module):
         return jnp.repeat(kept > 0, per_group, axis=-1)
 
 
-# The grouped matmul 'auto' runs, per backend: the measured winner at
-# lm-moe's shape (8192 rows, 768 -> 2048, 8 experts, bf16); the numbers are in
-# docs/performance.md. On a GPU that is JAX's own Pallas/Triton kernels
-# (`dew.nn.kernels.ragged_dot`), where XLA lowers ragged_dot to a product over
-# every expert. On a TPU it is XLA's ragged_dot, within 5% of the best kernel
-# measured on a v6e.
-GROUPED_MATMUL_BY_BACKEND = {'gpu': 'pallas', 'tpu': 'xla'}
+# The grouped matmul 'auto' runs, per hardware generation (`device_generation`):
+# the measured winner at lm-moe's shape (8192 rows, 768 -> 2048, 8 experts,
+# bf16), numbers in docs/performance.md. On sm89 (L4, RTX 4080) that is
+# JAX's own Pallas/Triton kernels, where XLA runs ragged_dot as a product over
+# every expert; on a TPU v6e it is XLA's ragged_dot, within 5% of the best
+# kernel measured there. Every generation not listed is unmeasured and runs
+# 'xla'.
+GROUPED_MATMUL_BY_GENERATION = {'sm89': 'pallas', 'v6e': 'xla'}
 
-# tokamax's own dispatch tries its Mosaic kernel first: on TPU that is the v1
-# kernel, 13x slower than XLA on a v6e, and on an Ada or Ampere card a Mosaic
-# GPU config that exceeds shared memory and raises. The kernel is named.
-TOKAMAX_KERNEL_BY_BACKEND = {'gpu': 'triton', 'tpu': 'mosaic_tpu_v2'}
+# The kernel 'tokamax' names, per generation. tokamax's own dispatch tries its
+# Mosaic kernel first: on a TPU that is the v1 kernel, 13x slower than XLA on
+# a v6e, and on sm89 a Mosaic GPU config that exceeds shared memory and
+# raises. Unmeasured generations run tokamax's 'xla'.
+TOKAMAX_KERNEL_BY_GENERATION = {'sm89': 'triton', 'v6e': 'mosaic_tpu_v2'}
+
+# `device_kind` of the TPU generations Dew names.
+TPU_GENERATIONS = {'TPU v4': 'v4', 'TPU v5 lite': 'v5e', 'TPU v5': 'v5p', 'TPU v5p': 'v5p',
+                   'TPU v6 lite': 'v6e'}
+
+
+def device_generation() -> str:
+    """The default device's hardware generation, as the kernel tables key it:
+    'sm89' for a GPU of compute capability 8.9, 'v6e' for a TPU v6e, and the
+    backend's name for anything else."""
+    device = jax.devices()[0]
+    if device.platform == 'gpu' and getattr(device, 'compute_capability', None):
+        return 'sm' + device.compute_capability.replace('.', '')
+    if device.platform == 'tpu':
+        return TPU_GENERATIONS.get(device.device_kind, device.device_kind)
+    return device.platform
 
 
 def resolve_grouped_matmul(implementation: str) -> str:
-    """The grouped matmul `implementation` names on the default backend:
-    itself, or the backend's measured one for 'auto'."""
+    """The grouped matmul `implementation` names on the default device:
+    itself, or its generation's measured one for 'auto'."""
     if implementation not in GROUPED_MATMULS:
         raise ValueError(
             f"implementation must be one of {list(GROUPED_MATMULS)}, got "
             f"{implementation!r}")
     if implementation != 'auto':
         return implementation
-    return GROUPED_MATMUL_BY_BACKEND.get(jax.default_backend(), 'xla')
+    return GROUPED_MATMUL_BY_GENERATION.get(device_generation(), 'xla')
 
 
 def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
@@ -350,18 +371,19 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     between them, the seam `dew.nn.attention.scaled_dot_product_attention`
     has:
 
-    - 'auto': the backend's measured one, `GROUPED_MATMUL_BY_BACKEND`, and
-      'xla' on a backend the table does not name.
+    - 'auto': the hardware generation's measured one,
+      `GROUPED_MATMUL_BY_GENERATION`, and 'xla' on an unmeasured one.
     - 'xla': `jax.lax.ragged_dot`. On a GPU XLA lowers it to a product over
       every expert.
     - 'pallas': JAX's own Pallas/Triton `gmm` kernel, vendored in
       `dew.nn.kernels.ragged_dot`, where `pallas_runs` says it computes the
-      product asked for, and 'xla' elsewhere. On a CPU the kernel runs in
+      product asked for and no mesh axis splits the call, and 'xla'
+      elsewhere. On a CPU the kernel runs in
       the Pallas interpreter, which is how the CPU suite checks it; on any
       other backend 'pallas' is 'xla'.
     - 'tokamax': `tokamax.ragged_dot`, the same call against tokamax's own
-      kernels (`maxtext layers/moe.py:1633`), the kernel named per backend
-      by `TOKAMAX_KERNEL_BY_BACKEND` and XLA elsewhere.
+      kernels (`maxtext layers/moe.py:1633`), the kernel named per
+      generation by `TOKAMAX_KERNEL_BY_GENERATION` and XLA elsewhere.
 
     This is the raw kernel call. 'pallas' has no differentiation rule here;
     `expert_projection` adds the precision contract routed experts train
@@ -375,8 +397,9 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
         return tokamax.ragged_dot(
             tokens, kernel, group_sizes, precision=precision,
             preferred_element_type=preferred_element_type,
-            implementation=TOKAMAX_KERNEL_BY_BACKEND.get(jax.default_backend(), 'xla'))
-    if implementation == 'pallas' and pallas_runs(tokens.dtype, kernel.dtype, precision):
+            implementation=TOKAMAX_KERNEL_BY_GENERATION.get(device_generation(), 'xla'))
+    if (implementation == 'pallas' and pallas_runs(tokens.dtype, kernel.dtype, precision)
+            and _row_axes(tokens.shape[0]) == ()):
         return _gmm(tokens, kernel, group_sizes,
                     preferred_element_type or jnp.result_type(tokens, kernel))
     return jax.lax.ragged_dot(
@@ -392,11 +415,19 @@ def pallas_runs(lhs: Dtype, rhs: Dtype, precision: PrecisionLike) -> bool:
     fp32, which is what any precision asks for. With fp32 operands it is
     TF32 on a GPU, which only the default precision asks for (explicitly or
     through `jax_default_matmul_precision`), and float64 they do not run.
-    The kernels see local arrays, so a mesh that splits anything outside a
-    `shard_map` is XLA's to partition. They are Triton kernels: a GPU runs
-    them and a CPU interprets them.
+    They are Triton kernels: a GPU of compute capability 8.0 or later runs
+    them (JAX 0.11.2 deprecates the backend; see `TRITON_DEPRECATION`), and
+    a CPU interprets them. Under
+    `jax_enable_x64` their group offsets widen to int64 against int32 block
+    indices (the vendored cumsum), so an x64 run is 'xla''s.
     """
-    if jax.default_backend() not in ('gpu', 'cpu'):
+    if jax.config.jax_enable_x64:
+        return False
+    backend = jax.default_backend()
+    if backend == 'gpu':
+        if tuple(int(part) for part in jax.devices()[0].compute_capability.split('.')) < (8, 0):
+            return False
+    elif backend != 'cpu':
         return False
     compute = jnp.promote_types(lhs, rhs)
     if compute not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
@@ -406,15 +437,50 @@ def pallas_runs(lhs: Dtype, rhs: Dtype, precision: PrecisionLike) -> bool:
             jax.config.jax_default_matmul_precision)
         if asked - {'DEFAULT', 'BFLOAT16', 'FASTEST', 'TENSORFLOAT32'}:
             return False
+    return True
+
+
+def _row_axes(rows: int) -> tuple[str, ...] | None:
+    """The mesh axes a `shard_map` splits the sorted rows over for the
+    kernels, which see local arrays: every axis not already manual with more
+    than one device. None when the rows do not divide among them."""
     mesh = jax.sharding.get_abstract_mesh()
-    return all(mesh.shape[name] == 1 for name in mesh.axis_names
-               if name not in mesh.manual_axes)
+    axes = tuple(name for name in mesh.axis_names
+                 if name not in mesh.manual_axes and mesh.shape[name] > 1)
+    count = math.prod(mesh.shape[name] for name in axes)
+    return axes if rows % count == 0 else None
+
+
+# jax 0.11.2 deprecates the Pallas Triton backend: every Triton pallas_call
+# warns, at lowering, that it will be removed in favour of Mosaic GPU. The
+# grouped matmul keeps these kernels on purpose. The Mosaic GPU grouped
+# matmul JAX ships (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma, which
+# sm_80 and sm_89 do not have (it fails to compile on an RTX 4080), and
+# tokamax's sm80 Mosaic config exceeds an Ada card's shared memory and has no
+# backward. The warning is Dew's to carry until a Mosaic GPU grouped matmul
+# replaces these kernels on sm_90 and later; it is filtered by its exact
+# text once Dew first uses the kernels (`_filter_triton_deprecation`).
+TRITON_DEPRECATION = (r"The Pallas Triton backend is deprecated and will be removed in"
+                      r" a future JAX version\.")
+
+
+@functools.cache
+def _filter_triton_deprecation() -> None:
+    """Ignore `TRITON_DEPRECATION`, once the grouped matmul first uses the
+    kernels: only that message, only as a DeprecationWarning.
+
+    JAX raises it when a pallas_call is lowered, which is when the jit
+    around the whole step compiles, after Dew's call has returned and with no
+    Dew frame on the stack. A filter scoped to the call site cannot see it,
+    so this one lasts for the process, and a process that never runs the
+    kernels never installs it."""
+    warnings.filterwarnings('ignore', message=TRITON_DEPRECATION, category=DeprecationWarning)
 
 
 def _gmm(tokens, kernel, group_sizes, out_dtype, *, trans_rhs: bool = False):
     from .kernels import ragged_dot
-    ragged_dot.register_devices()
     compute = jnp.promote_types(tokens.dtype, kernel.dtype)
+    _filter_triton_deprecation()
     return ragged_dot.gmm(
         tokens.astype(compute), kernel.astype(compute), group_sizes.astype(jnp.int32),
         **ragged_dot.block_sizes(compute), trans_rhs=trans_rhs,
@@ -424,8 +490,8 @@ def _gmm(tokens, kernel, group_sizes, out_dtype, *, trans_rhs: bool = False):
 
 def _tgmm(tokens, cotangent, group_sizes, out_dtype):
     from .kernels import ragged_dot
-    ragged_dot.register_devices()
     compute = jnp.promote_types(tokens.dtype, cotangent.dtype)
+    _filter_triton_deprecation()
     return ragged_dot.tgmm(
         tokens.astype(compute), cotangent.astype(compute), group_sizes.astype(jnp.int32),
         **ragged_dot.block_sizes(compute), interpret=jax.default_backend() != 'gpu',
@@ -466,14 +532,20 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     transposed kernel and whose kernel gradient is `tgmm`. Its compute
     dtype's rounding makes the backward exact products summed in fp32 when
     the compute dtype is 16-bit. Where `pallas_runs` says the kernels would
-    change the product, 'pallas' is 'xla'. Measured against NumPy float64
+    change the product, 'pallas' is 'xla'. Under a mesh, 'pallas' splits the
+    sorted rows over every axis that is not already manual
+    (`_sharded_pallas_projection`), so the kernels see local arrays. Measured against NumPy float64
     sums of the rounded operands and three Adam steps of the global path on
     every expert/fsdp layout in tests/test_moe_precision.py.
     """
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    if (resolve_grouped_matmul(implementation) == 'pallas'
-            and pallas_runs(compute, compute, precision)):
-        return _pallas_projection(x, kernel, group_sizes, dtype)
+    axes = _row_axes(x.shape[0])
+    # The kernels accumulate in fp32, so a float64 operand, whose gradient
+    # the contract sums in float64, is 'xla''s.
+    wide = jnp.dtype(jnp.float64) in (jnp.dtype(x.dtype), jnp.dtype(kernel.dtype))
+    if (resolve_grouped_matmul(implementation) == 'pallas' and not wide
+            and pallas_runs(compute, compute, precision) and axes is not None):
+        return _sharded_pallas_projection(x, kernel, group_sizes, compute, axes)
     if implementation == 'pallas':
         implementation = 'xla'
     return _projection(x, kernel, group_sizes, dtype, implementation, precision)
@@ -491,38 +563,91 @@ def _projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     return accumulated.astype(x.dtype)
 
 
-@_projection.defjvp
 def _projection_jvp(dtype: Dtype | None, implementation: str, precision: PrecisionLike,
                     primals: tuple[jax.Array, jax.Array, jax.Array],
                     tangents: tuple[jax.Array, jax.Array, jax.Array]
                     ) -> tuple[jax.Array, jax.Array]:
     x, kernel, group_sizes = primals
     dx, dkernel, _ = tangents
-    # The tangents keep their dtypes to this point whatever produced them, so
-    # an activation's bf16 cotangent is not fused into a wider expression.
-    dx, dkernel = jax.lax.optimization_barrier((dx, dkernel))
     output = jnp.asarray(_projection(x, kernel, group_sizes, dtype, implementation, precision))
     work = jnp.result_type(output.dtype, x.dtype, kernel.dtype, jnp.float32)
-    inputs = jnp.asarray(rounded_operand(x, output.dtype))
-    matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
-    input_term = jax.lax.ragged_dot(
-        dx.astype(work), matrix.astype(work), group_sizes, precision=precision,
-        preferred_element_type=work)
-    kernel_term = jax.lax.ragged_dot(
-        inputs.astype(work), dkernel.astype(work), group_sizes, precision=precision,
-        preferred_element_type=work)
-    tangent = jax.lax.optimization_barrier((input_term + kernel_term).astype(output.dtype))
+    # A symbolic zero tangent contributes no term. Only the others pass the
+    # barrier: jax 0.11.2 cannot transpose one that holds a constant zero.
+    live = [(name, tangent) for name, tangent in (('x', dx), ('kernel', dkernel))
+            if not isinstance(tangent, SymbolicZero)]
+    if not live:
+        return output, SymbolicZero(jax.typeof(output))
+    # The tangents keep their dtypes to this point whatever produced them, so
+    # an activation's bf16 cotangent is not fused into a wider expression.
+    held = dict(zip((name for name, _ in live),
+                    jax.lax.optimization_barrier(tuple(tangent for _, tangent in live)),
+                    strict=True))
+    terms = []
+    if 'x' in held:
+        matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
+        terms.append(jax.lax.ragged_dot(
+            held['x'].astype(work), matrix.astype(work), group_sizes, precision=precision,
+            preferred_element_type=work))
+    if 'kernel' in held:
+        inputs = jnp.asarray(rounded_operand(x, output.dtype))
+        terms.append(jax.lax.ragged_dot(
+            inputs.astype(work), held['kernel'].astype(work), group_sizes, precision=precision,
+            preferred_element_type=work))
+    tangent = jax.lax.optimization_barrier(sum(terms[1:], terms[0]).astype(output.dtype))
     return output, tangent
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+_projection.defjvp(_projection_jvp, symbolic_zeros=True)
+
+
+def _sharded_pallas_projection(x, kernel, group_sizes, compute: Dtype,
+                               axes: tuple[str, ...]) -> jax.Array:
+    """`_pallas_projection` with the sorted rows split over `axes`.
+
+    Each shard multiplies its contiguous block of rows, with the group sizes
+    cut to that block, against the whole kernel. The kernel enters at least
+    fp32, replicated, so shard_map's transpose sums the per-shard kernel
+    gradients in fp32 and the master dtype rounds once, after the sum.
+    """
+    if not axes:
+        return _pallas_projection(x, kernel, group_sizes, compute,
+                                  (_varying_axes(x), _varying_axes(kernel)))
+    work = kernel.astype(jnp.promote_types(kernel.dtype, jnp.float32))
+    rows = x.shape[0] // math.prod(jax.sharding.get_abstract_mesh().shape[name] for name in axes)
+
+    def local(x, kernel, group_sizes):
+        start = jax.lax.axis_index(axes).astype(jnp.int32) * rows
+        ends = jnp.cumsum(group_sizes, dtype=jnp.int32)
+        sizes = jnp.clip(jnp.minimum(ends, start + rows) - jnp.maximum(ends - group_sizes, start), 0)
+        return _pallas_projection(x, kernel, sizes.astype(group_sizes.dtype), compute,
+                                  (_varying_axes(x), _varying_axes(kernel)))
+
+    spread, whole = P(axes), P()
+    mesh = jax.sharding.get_abstract_mesh()
+    explicit = {name for name, kind in zip(mesh.axis_names, mesh.axis_types, strict=True)
+                if kind == jax.sharding.AxisType.Explicit}
+    if explicit:
+        # shard_map takes explicit-axis operands only as its specs place
+        # them; automatic axes it places itself.
+        x = jax.sharding.reshard(x, P(tuple(name for name in axes if name in explicit)))
+        work, group_sizes = jax.sharding.reshard((work, group_sizes), whole)
+    # Pallas outputs carry no varying-axes type, so the check is off. Its
+    # transpose then sums the replicated kernel's per-shard cotangents.
+    return jax.shard_map(local, in_specs=(spread, whole, whole), out_specs=spread,
+                         axis_names=set(axes), check_vma=False)(x, work, group_sizes)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
 def _pallas_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
-                       dtype: Dtype | None) -> jax.Array:
-    """`expert_projection` on the Pallas kernels, first-order reverse mode."""
-    return _pallas_projection_fwd(x, kernel, group_sizes, dtype)[0]
+                       dtype: Dtype | None,
+                       varying: tuple[tuple[str, ...], tuple[str, ...]]) -> jax.Array:
+    """`expert_projection` on the Pallas kernels, first-order reverse mode.
+    `varying` is the manual mesh axes `x` and `kernel` vary over."""
+    return _pallas_projection_fwd(x, kernel, group_sizes, dtype, varying)[0]
 
 
-def _pallas_projection_fwd(x, kernel, group_sizes, dtype):
+def _pallas_projection_fwd(x, kernel, group_sizes, dtype, varying):
+    del varying
     inputs, matrix = promote_dtype(x, kernel, dtype=dtype)
     output = _gmm(inputs, matrix, group_sizes, jnp.promote_types(inputs.dtype, jnp.float32))
     # The residuals are the rounded operands, the values the forward
@@ -532,7 +657,7 @@ def _pallas_projection_fwd(x, kernel, group_sizes, dtype):
     return output.astype(inputs.dtype), residuals
 
 
-def _pallas_projection_bwd(dtype, residuals, cotangent):
+def _pallas_projection_bwd(dtype, varying, residuals, cotangent):
     del dtype
     inputs, matrix, group_sizes, x_like, kernel_like = residuals
     work = jnp.result_type(inputs.dtype, x_like.dtype, kernel_like.dtype, jnp.float32)
@@ -542,8 +667,21 @@ def _pallas_projection_bwd(dtype, residuals, cotangent):
     cotangent = cotangent.astype(inputs.dtype)
     d_inputs = _gmm(cotangent, matrix, group_sizes, work, trans_rhs=True)
     d_matrix = _tgmm(inputs, cotangent, group_sizes, work)
-    return (d_inputs.astype(x_like.dtype), d_matrix.astype(kernel_like.dtype),
+    # A Pallas output carries no manual-axis type, and inside a shard_map a
+    # cotangent has to vary over the axes its primal varies over.
+    x_axes, kernel_axes = varying
+    return (_varying(d_inputs.astype(x_like.dtype), x_axes),
+            _varying(d_matrix.astype(kernel_like.dtype), kernel_axes),
             np.zeros(group_sizes.shape, jax.dtypes.float0))
+
+
+def _varying(value: jax.Array, axes: tuple[str, ...]) -> jax.Array:
+    return jax.lax.pcast(value, axes, to='varying') if axes else value
+
+
+def _varying_axes(value: jax.Array) -> tuple[str, ...]:
+    return tuple(sorted(jax.typeof(value).mat.varying))
+
 
 
 _pallas_projection.defvjp(_pallas_projection_fwd, _pallas_projection_bwd)

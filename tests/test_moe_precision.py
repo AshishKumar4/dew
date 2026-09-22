@@ -27,11 +27,6 @@ MESH_LAYOUTS = tuple(pytest.param(expert, fsdp, marks=pytest.mark.mesh)
                      for expert, fsdp in ((2, 4), (4, 2), (8, 1)))
 LAYOUTS = (pytest.param(1, 1, id='1-1'), *MESH_LAYOUTS)
 TOLERANCE = 3e-5
-# Every grouped matmul Dew differentiates, each held to the contract in
-# reverse mode on whatever device runs the suite; on a CPU 'pallas' runs its
-# kernels in the Pallas interpreter, and on a TPU it is 'xla'. Forward mode
-# is 'xla''s alone.
-IMPLEMENTATIONS = ('xla', 'pallas')
 
 
 def rounded(value, dtype=ml_dtypes.bfloat16) -> np.ndarray:
@@ -91,9 +86,26 @@ def cases():
     ('input-gradient-round-once', jnp.float32, jnp.bfloat16)])
 @pytest.mark.parametrize('expert,fsdp', LAYOUTS)
 @pytest.mark.parametrize('rows', [True, False], ids=['rows', 'columns'])
-@pytest.mark.parametrize('implementation', IMPLEMENTATIONS)
-def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows,
-                                                     implementation):
+def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows):
+    rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows, 'xla')
+
+
+@pytest.mark.parametrize('case,master,input_dtype', [
+    ('random', jnp.float32, jnp.bfloat16), ('random', jnp.float32, jnp.float32),
+    ('forward-round-once', jnp.float32, jnp.bfloat16),
+    ('input-gradient-round-once', jnp.float32, jnp.bfloat16)])
+@pytest.mark.parametrize('expert,fsdp', LAYOUTS)
+@pytest.mark.parametrize('rows', [True, False], ids=['rows', 'columns'])
+def test_the_pallas_kernels_round_whole_contractions_once(case, master, input_dtype, expert,
+                                                        fsdp, rows):
+    """The same contract on the Pallas kernels, which a mesh runs on each
+    shard's rows. Without x64: under it 'pallas' is 'xla'. With fp32
+    compute at the suite's HIGHEST default it is 'xla' too, which this also
+    holds to the contract."""
+    rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows, 'pallas')
+
+
+def rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows, implementation):
     """Forward, kernel cotangent and input cotangent against float64 sums of
     the bf16 operands, with the kernel split on either of its dimensions and
     the gradient returned placed or replicated."""
@@ -282,10 +294,11 @@ def test_the_exact_gelu_rounds_once_in_every_differentiation_mode(dtype):
         np.testing.assert_allclose(np.asarray(a, np.float64), b, atol=TOLERANCE, rtol=TOLERANCE)
 
 
-def placed_experts(mesh, activation, skewed, scale_inputs, limit):
+def placed_experts(mesh, activation, skewed, scale_inputs, limit, implementation='xla'):
     rng = np.random.default_rng(341)
     model = ExpertMLP(8, 16, 8, dtype=jnp.bfloat16, activation=activation,
-                      scale_inputs=scale_inputs, swiglu_limit=limit)
+                      scale_inputs=scale_inputs, swiglu_limit=limit,
+                      implementation=implementation)
     x = jnp.asarray(rounded(rng.normal(size=(24, 8))), jnp.bfloat16)
     weights = jnp.asarray(rng.uniform(.1, .9, size=(24, 2)), jnp.float32)
     choices = (np.tile([0, 1], (24, 1)) if skewed
@@ -303,14 +316,17 @@ def placed_experts(mesh, activation, skewed, scale_inputs, limit):
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
 @pytest.mark.parametrize('skewed,scale_inputs,limit', [(False, False, None), (True, True, .7)])
 @pytest.mark.parametrize('expert,fsdp', MESH_LAYOUTS)
+@pytest.mark.parametrize('implementation', ['xla', 'pallas'])
 def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, scale_inputs, limit,
-                                                          expert, fsdp):
+                                                          expert, fsdp, implementation):
     """Three Adam steps of a bf16 routed layer: outputs, gradients, parameters
     and moments agree between global and exchange dispatch. Observed maxima
-    1.5e-8 random and 6e-8 skewed."""
+    1.5e-8 random and 6e-8 skewed. On 'pallas' the global dispatch runs the
+    kernels on every device's share of the rows, and the exchange dispatch
+    on every expert shard's rows split again over the fsdp axis."""
     mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
     model, parameters, specs, tokens, x, weights, choices = placed_experts(
-        mesh, activation, skewed, scale_inputs, limit)
+        mesh, activation, skewed, scale_inputs, limit, implementation)
     optimizer = optax.adam(1e-3)
     state = optimizer.init(parameters)
     state_specs = jax.tree.map(
