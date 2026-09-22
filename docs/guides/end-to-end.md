@@ -72,13 +72,14 @@ The script passes `--dataset` to `ChatMessages` unchanged. `ChatMessages` resolv
 ```bash
 python examples/train_rlvr.py --backend native --steps 40 --out runs/rlvr-native
 python examples/train_rlvr.py --backend vllm --vllm /path/to/vllm-env/bin/vllm --steps 40 --out runs/rlvr-vllm
+python examples/train_rlvr.py --backend sglang --sglang /path/to/sglang-env/bin/sglang --steps 40 --out runs/rlvr-sglang
 ```
 
 ```bash
 JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --out /tmp/rlvr-smoke
 ```
 
-`--backend native` samples from Dew's own `Server` in the training process and pushes weights to it in place. `--backend vllm` exports the checkpoint, starts a vLLM server on it with `VLLM_SERVER_DEV_MODE=1`, samples from it by token ids, and pushes weights by writing safetensors and asking vLLM to reload them. vLLM can live in its own environment; `--vllm` names its executable. `--vllm-memory` is vLLM's share of the GPU, and `XLA_PYTHON_CLIENT_MEM_FRACTION` should leave it that much; on a 40 GB A100 the run fits at 0.12 for vLLM and 0.82 for JAX. The run prints one line per update and writes `rewards.json` with each update's reward, policy version and lag. The smoke run trains the committed tiny Qwen2 for two updates on the native backend. It checks that the pieces connect; learning needs the full run.
+`--backend native` samples from Dew's own `Server` in the training process and pushes weights to it in place. `--backend vllm` exports the checkpoint, starts a vLLM server on it with `VLLM_SERVER_DEV_MODE=1`, samples from it by token ids, and pushes weights by writing safetensors and asking vLLM to reload them. vLLM can live in its own environment; `--vllm` names its executable. `--vllm-memory` is vLLM's share of the GPU, and `XLA_PYTHON_CLIENT_MEM_FRACTION` should leave it that much; on a 40 GB A100 the run fits at 0.12 for vLLM and 0.82 for JAX. `--backend sglang` does the same with an SGLang server (`sglang serve`), pushing weights through its `/update_weights_from_disk`; `--sglang` names its executable. `--sglang-memory` is SGLang's `--mem-fraction-static`, which SGLang takes as a fraction of the memory free when it starts, after JAX has taken its share; on a 40 GB A100 the run fits at 0.75 for JAX and 0.8 for SGLang. The run prints one line per update and writes `rewards.json` with each update's reward, policy version and lag, and, on vLLM and SGLang, the seconds each weight push took. The smoke run trains the committed tiny Qwen2 for two updates on the native backend. It checks that the pieces connect; learning needs the full run.
 
 ## Scoring and serving a finished run
 
