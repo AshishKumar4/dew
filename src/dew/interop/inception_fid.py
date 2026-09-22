@@ -16,16 +16,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.interop.safetensors_io import (
-    SEPARATOR,
-    _flatten,
-    _unflatten,
-    read_file,
-    write_file,
-)
+from dew.interop.safetensors_io import SEPARATOR, _flatten, _unflatten, read_file, write_file
 from dew.nn.text_encoders import ParamTree
-
-type Variables = dict[str, ParamTree]
+from dew.objectives.base import Variables
 
 # The FID feature extractor's weights, the jax-fid pickle mirrored on the Hub
 # with a pinned revision and digest. The bytes are byte-identical to the
@@ -163,7 +156,7 @@ def _upstream(path: tuple[str, ...]) -> tuple[str, ...]:
                 f"{SEPARATOR.join(path)}: {block} builds more convolutions than the "
                 f"{len(order)} branches jax-fid named for it")
         names.append(order[index])
-    leaf = _LEAVES.get(tuple(rest))
+    leaf = _LEAVES.get((rest[0], rest[1])) if len(rest) == 2 else None
     if leaf is None:
         raise ValueError(
             f"{SEPARATOR.join(path)}: jax-fid stored no {SEPARATOR.join(rest)}")
