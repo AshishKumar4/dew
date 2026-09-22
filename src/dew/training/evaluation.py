@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -24,6 +25,8 @@ from dew.data.dataset import Closeable
 from dew.objectives.base import Batch, Effects, Loss, Metric, Objective, Step, Variables
 
 from .distributed import build_mesh, shard_batch
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -242,6 +245,15 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
                     error = failure
             if primary is None:
                 agree_process_phase(error, phase="iterator cleanup")
+    elif batches is not None and root:
+        # Zero batches out of a split that holds them reads as an empty
+        # dataset. Nothing read it: with no metric and no preview there is
+        # nobody to hand a batch to, so the pass never opened the iterator.
+        _log.warning(
+            "evaluation %s at step %d scored nothing: no metrics were configured and preview "
+            "is off, so no consumer asked for a batch and the validation iterator was never "
+            "opened. Name a metric in val_metrics, or turn the pass off with eval_every=None.",
+            split, event_step)
     elapsed = time.perf_counter() - started
     scores, elapsed = broadcast_from_process_zero((scores, elapsed))
     return Evaluation(event_step, split, scores, scored, records, uneven, event_words, elapsed, previews)
