@@ -38,9 +38,6 @@ from .dataset import (
     Tokenize,
     describe,
     local_batch,
-    mixed_records,
-    mixed_stream,
-    mixture,
     train_stream,
     validation_pass,
 )
@@ -362,16 +359,16 @@ class PackedTokens(DatasetSpec):
     in a window and let documents further apart in the file share one."""
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
+        from .providers import corpora_dataset, name_ordered
         from .sources.text import TokenDocumentSource, same_tokenizer, token_corpus
 
         self.uncaptioned(tokenize)
-        weighted = ({} if self.path is None else {self.path: 1.0} if isinstance(self.path, str)
-                    else {path: self.path[path] for path in sorted(self.path)})
-        if not weighted or not all(weighted):
+        weighted = name_ordered(self.path)
+        if not weighted:
             raise ValueError("PackedTokens needs path= set to the directory "
                              "tools/tokenize_text.py wrote, or several with weights")
         same_tokenizer(list(weighted))
-        rows, window = local_batch(batch), self.seq_len + 1
+        window = self.seq_len + 1
 
         # One source per split, and one plan over it. Finding the boundaries
         # reads the whole file, so rebuilding either per epoch would read a
@@ -381,25 +378,10 @@ class PackedTokens(DatasetSpec):
             return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
                                  self.packing_bins, describe(source))
 
-        splits = {path: token_corpus(path, "PackedTokens", field=self.field)
-                  for path in weighted}
-        train = [Corpus(path, packed(corpus), weight)
-                 for (path, weight), (corpus, _) in zip(weighted.items(), splits.values(),
-                                                        strict=True)]
-        held = [Corpus(path, packed(held_out), weight)
-                for (path, weight), (_, held_out) in zip(weighted.items(), splits.values(),
-                                                         strict=True)]
-        if len(train) == 1:
-            stream = train_stream(train[0].source, [], batch=rows, seed=self.seed,
-                                  loading=self.loading)
-            validation, records = held[0].source, len(train[0].source)
-        else:
-            stream = mixed_stream(train, [], batch=rows, seed=self.seed, loading=self.loading)
-            validation, records = mixture(held, None), mixed_records(train)
-        return Dataset(
-            train=stream,
-            val=bounded(validation_pass(validation, [], batch=rows, seed=self.seed,
-                                        loading=self.loading), self.val_batches),
-            records=records,
-            batch=batch,
-        )
+        train, held = [], []
+        for path, weight in weighted.items():
+            corpus, held_out = token_corpus(path, "PackedTokens", field=self.field)
+            train.append(Corpus(path, packed(corpus), weight))
+            held.append(Corpus(path, packed(held_out), weight))
+        return corpora_dataset(train, held, [], batch=batch, seed=self.seed,
+                               loading=self.loading, val_batches=self.val_batches)
