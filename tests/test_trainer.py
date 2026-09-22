@@ -215,10 +215,11 @@ def test_the_ema_lags_the_parameters_at_the_configured_decay():
     trainer = make_trainer()
     state = trainer.initial_state()
     batch = next(Counting())
+    starts = [np.asarray(leaf) for leaf in jax.tree.leaves(state.params)]  # the step consumes `state`
     new_state, *_ = trainer.compile(state, batch)(state, batch)
-    for start, end, ema in zip(jax.tree.leaves(state.params), jax.tree.leaves(new_state.params),
+    for start, end, ema in zip(starts, jax.tree.leaves(new_state.params),
                                jax.tree.leaves(new_state.ema), strict=True):
-        np.testing.assert_allclose(ema, .5 * np.asarray(start) + .5 * np.asarray(end), rtol=1e-6)
+        np.testing.assert_allclose(ema, .5 * start + .5 * np.asarray(end), rtol=1e-6)
     assert int(new_state.step) == int(new_state.updates) == 1
 
 
@@ -361,6 +362,42 @@ def test_place_builds_the_state_through_the_overridable_method():
 
     assert int(state.updates) == 7, "place bypassed the overridden state construction"
     assert int(trainer.initial_state().updates) == 7 and position is None
+
+
+def test_the_compiled_step_consumes_the_state_it_is_given():
+    """`new = step(old, batch)` runs the update in place: the old state's
+    buffers move into the new one, so peak memory holds one copy of the
+    parameters and optimizer state. Reading the old state afterwards is
+    the caller's error, and JAX names it."""
+    trainer = make_trainer()
+    state, _, _ = trainer.place()
+    batch = next(Counting())
+    step = trainer.compile(state, batch)
+    stale = jax.tree.leaves(state.params)[0]
+    advanced, loss, _, finite, _ = step(state, batch)
+    assert bool(finite) and int(advanced.step) == 1
+    assert stale.is_deleted()
+    again, _, _, _, _ = step(advanced, batch)
+    assert int(again.step) == 2
+
+
+def test_a_placed_state_holds_every_buffer_once():
+    """Donation moves each buffer of the state exactly once, so no two leaves
+    may share one; the EMA in particular starts equal to the parameters but
+    not as them."""
+    _, objective, _ = held_lm_trainer()
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    # Both ways a state comes into being: built eagerly, and placed on the
+    # mesh through one compiled initializer.
+    for state in (trainer.initial_state(), trainer.place()[0]):
+        assert state.ema is not None
+        pointers: dict[int, list[str]] = {}
+        for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
+            for shard in leaf.addressable_shards:
+                pointers.setdefault(shard.data.unsafe_buffer_pointer(), []).append(jax.tree_util.keystr(path))
+        shared = [paths for paths in pointers.values() if len(paths) > 1]
+        assert not shared, shared
 
 
 def test_place_asks_the_objective_for_its_held_variables_once():

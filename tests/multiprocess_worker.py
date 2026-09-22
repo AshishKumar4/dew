@@ -1583,8 +1583,9 @@ def mixed_validity_step(trainer, batch: dict, out: Path | None = None) -> dict:
     state, _, _ = trainer.place()
     placed = shard_batch(trainer.device_mesh, batch)
     compiled = trainer.compile(state, placed)
+    before = params_dict(state.params)  # the step consumes `state`
     updated, loss, _, _, _ = compiled(state, placed)
-    before, after = params_dict(state.params), params_dict(updated.params)
+    after = params_dict(updated.params)
     update = {name: after[name] - before[name] for name in after}
     if out is not None:
         np.savez(out.with_suffix(".npz"), **after)
