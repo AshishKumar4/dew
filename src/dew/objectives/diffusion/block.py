@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import optax
 from flax import struct
 
+from dew.artifacts import TokenScores
 from dew.inputs import Field, InputSpec
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
@@ -242,6 +243,29 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, params: Variables, batch: Batch, step: Step):
+        canvas_losses, target_mask, encoder_losses, encoder_target_mask = self._token_losses(
+            params, batch, step.key, train=True)
+        canvas_stats, encoder_stats = _row_mean(canvas_losses, target_mask), _row_mean(encoder_losses, encoder_target_mask)
+        support = self.decoder_loss_weight * target_mask.sum() + self.encoder_loss_weight * encoder_target_mask.sum()
+        stats = BlockSFTStatistics(canvas_stats, encoder_stats, support)
+        return stats, Aux(metrics={"canvas_ce": mean_loss(canvas_stats)[0],
+                                  "encoder_ce": mean_loss(encoder_stats)[0]})
+
+    def evaluate(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
+        """The denoiser's cross entropy on every canvas target of the batch.
+
+        One noise level and one canvas per row are drawn from the pass's key,
+        as training draws them, with dropout off and the averaged weights
+        when the run keeps them, so `perplexity` over a validation pass is
+        exp of the denoising loss per target."""
+        params = params if step.ema is None else step.ema
+        canvas_losses, target_mask, _, _ = self._token_losses(params, batch, step.key, train=False)
+        return TokenScores(losses=canvas_losses, weights=target_mask.astype(canvas_losses.dtype))
+
+    def _token_losses(self, params: Variables, batch: Batch, key: jax.Array, *, train: bool
+                      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Per-token cross entropies of the denoiser over the response and of the
+        encoder over the full row, each with the mask of the targets it counts."""
         params = thaw(params)
         value = batch["text"]
         prepared = value if isinstance(value, ModelInputs) else ModelInputs(jnp.asarray(value))
@@ -266,7 +290,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         if text_slots is not None:
             # Zero-weight targets still reach embeddings and integer-label CE.
             response = jnp.where(text_slots[:, self.prompt_length:], response, 0)
-        time_key, corruption_key, canvas_key, sc_key = jax.random.split(step.key, 4)
+        time_key, corruption_key, canvas_key, sc_key = jax.random.split(key, 4)
         time = jax.random.uniform(time_key, (tokens.shape[0], 1),
                                   minval=self.safety_epsilon, maxval=1 - self.safety_epsilon)
         keep_key, noise_key = jax.random.split(corruption_key)
@@ -290,7 +314,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         encoder_states, mutated = model.apply(
             {**params, "cache": cache}, tokens, **encoder_kwargs,
             attention_pairwise_mask=encoder_mask, attention_key_positions=encoder_keys,
-            method=model.encode, train=True, states=True, mutable=["cache"], rngs=None,
+            method=model.encode, train=train, states=True, mutable=["cache"], rngs=None,
             capture_intermediates=False)
         cache = mutated["cache"]
         if self.stop_gradient_from_denoiser_to_encoder:
@@ -298,7 +322,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         def denoise(sc_logits):
             predicted = model.apply(
                 {**params, "cache": cache}, noisy, self_conditioning_logits=sc_logits,
-                train=True, positions=positions[:, self.prompt_length:],
+                train=train, positions=positions[:, self.prompt_length:],
                 attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
                 states=True)
             if not isinstance(predicted, jax.Array):
@@ -334,11 +358,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         encoder_losses, _, _ = chunked_cross_entropy(
             encoder_states, head, shifted, self.head_chunks, softcap=softcap, precision=precision,
             vocab_major=vocab_major)
-        canvas_stats, encoder_stats = _row_mean(canvas_losses, target_mask), _row_mean(encoder_losses, encoder_target_mask)
-        support = self.decoder_loss_weight * target_mask.sum() + self.encoder_loss_weight * encoder_target_mask.sum()
-        stats = BlockSFTStatistics(canvas_stats, encoder_stats, support)
-        return stats, Aux(metrics={"canvas_ce": mean_loss(canvas_stats)[0],
-                                  "encoder_ce": mean_loss(encoder_stats)[0]})
+        return canvas_losses, target_mask, encoder_losses, encoder_target_mask
 
     def reduce_loss(self, stats: BlockSFTStatistics):
         canvas, _ = mean_loss(stats.canvas)

@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.artifacts import TextSamples, agree_process_phase, collective_host
+from dew.artifacts import TextSamples, TokenScores, agree_process_phase, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables
@@ -108,23 +108,7 @@ class MaskedDiffusionObjective(Objective[Mean]):
         return pretrained
 
     def loss(self, params, batch, step: Step):
-        tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
-        if tokens.shape[-1] != self.seq_len:
-            raise ValueError(
-                f"the objective was built for {self.seq_len}-token rows, got {tokens.shape[-1]}")
-        time_key, mask_key, dropout_key = jax.random.split(step.key, 3)
-        t = self.process.sample_t(time_key, tokens.shape[0])
-        masked, is_masked = self.process.corrupt(mask_key, tokens, t)
-
-        hidden = self.model.apply(params, masked, train=True, rngs={"dropout": dropout_key},
-                                  method=type(self.model).hidden_states)
-        head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
-        losses, predicted, _ = chunked_cross_entropy(
-            hidden, head, tokens, self.head_chunks,
-            softcap=self.model.final_logit_softcap, precision=self.model.precision)
-
-        counted = is_masked.astype(losses.dtype)
-        weights = counted * self.process.weight(t)[:, None]
+        tokens, losses, weights, counted, predicted = self._token_losses(params, batch, step.key, train=True)
         nelbo = Mean(jnp.sum(losses * weights), jnp.asarray(tokens.size, jnp.float32))
         correct = (predicted == tokens).astype(losses.dtype)
         return nelbo, Aux(metrics={
@@ -132,16 +116,43 @@ class MaskedDiffusionObjective(Objective[Mean]):
             "masked_fraction": jnp.mean(counted),
         })
 
+    def evaluate(self, params, batch, step: Step) -> TokenScores:
+        """The negative ELBO of every token in the batch.
+
+        One noise level and one masking are drawn from the pass's key, as
+        training draws them, with dropout off and the averaged weights when
+        the run keeps them. Every token counts and carries its weighted masked
+        cross entropy, zero where it was left visible, so `perplexity` over a
+        validation pass is exp of the ELBO bound per token, the number MDLM
+        reports."""
+        params = params if step.ema is None else step.ema
+        _, losses, weights, _, _ = self._token_losses(params, batch, step.key, train=False)
+        return TokenScores(losses=losses * weights, weights=jnp.ones_like(losses))
+
+    def _token_losses(self, params, batch, key, *, train: bool):
+        """The rows, their per-token cross entropies under one corruption, the
+        time weight of each masked token, the mask itself, and the argmax."""
+        tokens = jnp.asarray(batch[TEXT_KEY], jnp.int32)
+        if tokens.shape[-1] != self.seq_len:
+            raise ValueError(
+                f"the objective was built for {self.seq_len}-token rows, got {tokens.shape[-1]}")
+        time_key, mask_key, dropout_key = jax.random.split(key, 3)
+        t = self.process.sample_t(time_key, tokens.shape[0])
+        masked, is_masked = self.process.corrupt(mask_key, tokens, t)
+
+        hidden = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
+                                  method=type(self.model).hidden_states)
+        head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
+        losses, predicted, _ = chunked_cross_entropy(
+            hidden, head, tokens, self.head_chunks,
+            softcap=self.model.final_logit_softcap, precision=self.model.precision)
+        counted = is_masked.astype(losses.dtype)
+        return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted
+
     def _sample_impl(self, params, key, *, count: int):
         denoise = self.process.denoiser(self.model, params)
         x_T = self.process.noise(key, (count, self.seq_len))
         return sample(denoise, x_T, self.steps, solver=self.sampler, key=key)
-
-    def evaluate(self, params, batch, step: Step) -> TextSamples:
-        """Generate a batch-sized token population for custom text metrics."""
-        params = params if step.ema is None else step.ema
-        tokens = self._sample(params, step.key, count=batch[TEXT_KEY].shape[0])
-        return TextSamples(tokens=tokens)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Generate the configured display count, then decode on process zero."""
