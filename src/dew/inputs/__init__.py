@@ -22,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import registry
+from dew.nn.inputs import local_rows
 from dew.nn.vision import PIXEL_VALUES_KEY
 from dew.objectives.base import Variables
 
@@ -31,6 +32,17 @@ from .encoders import CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
     """uint8 pixels in [0, 255] as float32 in [-1, 1]."""
     return (jnp.asarray(pixels, jnp.float32) - 127.5) / 127.5
+
+
+def host_rows[Record](record: Record, rows: int | None) -> Record:
+    """`record`'s first `rows` real rows, every leaf read back as a host array.
+
+    A generation or an image keeps the placement its task ran with, so on a
+    mesh each leaf is a global array whose rows split over the batch axes.
+    This is the way back: the rows this process owns, without the padding a
+    row plan added to fill the devices.
+    """
+    return jax.tree.map(lambda leaf: local_rows(leaf)[:rows], record)
 
 
 def pixel_field(height: int, width: int, channels: int = 3) -> Field:
@@ -132,4 +144,4 @@ class InputSpec:
 from .diffusion import DiffusionConditioner
 
 __all__ = ["CLIPText", "CharTable", "Condition", "ConditionEncoder", "DiffusionConditioner", "Field",
-           "InputSpec", "T5Text", "pixel_field", "rebuild", "unit_range"]
+           "InputSpec", "T5Text", "host_rows", "pixel_field", "rebuild", "unit_range"]

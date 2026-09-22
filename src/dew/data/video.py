@@ -26,6 +26,7 @@ from .dataset import (
     Dataset,
     DatasetSpec,
     Tokenize,
+    checked_count,
     hold_out,
     local_batch,
     tokenized,
@@ -102,9 +103,8 @@ class VideoDataset(DatasetSpec):
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         source = self.source()
         name = type(self).__name__
-        records = len(source) if self.count is None else self.count
-        if records > len(source):
-            raise ValueError(f"count {self.count} is more than the {len(source)} records of {name}")
+        records = (len(source) if self.count is None
+                   else checked_count(self.count, len(source), name))
         train, validation = hold_out(source, records, (self.val_batches or 0) * batch, name)
         return Dataset(
             train=tokenized(train_stream(train, [AudioVideoTransform(self)], batch=local_batch(batch), seed=self.seed, loading=self.loading), tokenize),
