@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
-from dew.data import ChatMessages, Checkpointable, Loading, Prompts
+from dew.data import ChatMessages, Checkpointable, HFOptions, Loading, Prompts
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
 
 TOKENIZERS = Path(__file__).resolve().parent / "fixtures" / "tokenizers"
@@ -455,6 +455,76 @@ def test_rows_without_a_tools_column_render_plain(tmp_path, tools_tokenizer):
 
     np.testing.assert_array_equal(batch["text"][0][:len(ids)], ids)
     np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
+
+
+def test_jsonl_rows_pack_the_way_the_same_rows_do_in_parquet(tmp_path, tools_tokenizer):
+    """A `.jsonl` path is the third reader: one JSON object per line, the
+    form a chat corpus is published in, under the same `messages` column and
+    with the same tools beside it."""
+    messages = parquet_conversation()
+    path = tmp_path / "chat.jsonl"
+    path.write_text("".join(
+        json.dumps({"messages": messages, "tools": [WEATHER]}) + "\n" for _ in range(2)))
+    ids, roles = render(tools_tokenizer, messages, [WEATHER])
+
+    data = ChatMessages(tokenizer=str(TOOLS_TOKENIZER), path=str(path), val_path=str(path),
+                        seq_len=1023, packing_bins=1, loading=Loading(workers=0)).load(batch=1)
+
+    assert data.val is not None
+    batch = next(iter(data.val()))
+    np.testing.assert_array_equal(batch["text"][0][:len(ids)], ids)
+    np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
+    # Two conversations, one window: the second starts where the first ends.
+    np.testing.assert_array_equal(batch["text"][0][len(ids):2 * len(ids)], ids)
+    np.testing.assert_array_equal(batch["text_segment_ids"][0][len(ids):2 * len(ids)], 2)
+
+
+def test_a_hub_dataset_id_reads_through_load_dataset(monkeypatch, tools_tokenizer):
+    """A path that is no file is a repo id, and `HFOptions` resolves it:
+    `datasets.load_dataset` is called with the id, the split and the
+    library's own arguments, and its rows pack like any others."""
+    import datasets as hf_datasets
+
+    messages = parquet_conversation()
+    asked = {}
+
+    class Split:
+        """What `load_dataset` hands back: named columns and a row count."""
+
+        column_names = ["messages", "tools", "id"]
+        num_rows = 1
+
+        def __getitem__(self, column):
+            return {"messages": [messages], "tools": [[WEATHER]], "id": ["row-0"]}[column]
+
+    def load_dataset(path, **arguments):
+        asked.update(path=path, **arguments)
+        return Split()
+
+    monkeypatch.setattr(hf_datasets, "load_dataset", load_dataset)
+    ids, roles = render(tools_tokenizer, messages, [WEATHER])
+
+    data = ChatMessages(tokenizer=str(TOOLS_TOKENIZER), path="allenai/tulu-3-sft-mixture",
+                        val_path="allenai/tulu-3-sft-mixture", val_split="test",
+                        options=HFOptions(config="default", revision="abc123"),
+                        seq_len=1023, packing_bins=1, loading=Loading(workers=0)).load(batch=1)
+
+    assert data.val is not None
+    batch = next(iter(data.val()))
+    np.testing.assert_array_equal(batch["text"][0][:len(ids)], ids)
+    np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
+    assert asked["path"] == "allenai/tulu-3-sft-mixture" and asked["split"] == "test"
+    assert asked["name"] == "default" and asked["revision"] == "abc123"
+    assert asked["streaming"] is False
+
+
+def test_a_source_that_holds_no_conversation_column_says_what_it_holds(tmp_path):
+    from dew.data.chat import ConversationSource
+
+    path = tmp_path / "chat.jsonl"
+    path.write_text(json.dumps({"conversation": [], "tools": None}) + "\n")
+    with pytest.raises(ValueError, match="no 'messages' or 'prompt' column"):
+        ConversationSource(str(path))
 
 
 # --- refusals ------------------------------------------------------------------
