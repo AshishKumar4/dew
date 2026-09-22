@@ -41,17 +41,17 @@ dew launch --hosts node0 node1 --processes-per-host 8 --devices-per-process 1 --
 
 ## Launch under Slurm
 
-Inside an allocation, `--slurm` hands the launch to `srun`, and JAX reads the rank from Slurm:
+Inside an allocation, `--slurm` hands the launch to `srun`, and JAX reads the rank from Slurm. Under Slurm, JAX gives each task the one GPU at its `SLURM_LOCALID`, so run one task per GPU:
 
 ```bash
 #!/bin/bash
 #SBATCH --nodes=2
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=8
 #SBATCH --gpus-per-node=8
-dew launch --slurm -- python recipes/lm/train.py --trainer.multi-host True
+dew launch --slurm --processes-per-host 8 -- /opt/dew/.venv/bin/python recipes/lm/train.py --trainer.multi-host True
 ```
 
-This runs `srun --ntasks-per-node=1 --kill-on-bad-exit=1 --export=ALL python ...`. Plain `srun python train.py` works as well. The launcher only adds the failure policy and the same flags as the ssh path.
+This runs `srun --ntasks-per-node=8 --kill-on-bad-exit=1 --export=ALL ...`, with the `--env` variables in srun's environment. One task per node would see a single GPU, because JAX still picks the GPU at local rank 0 for it. The launcher refuses `--devices-per-process` under `--slurm` for the same reason. Plain `srun` with the same task layout works as well; the launcher adds the failure policy.
 
 ## Lay the mesh out for the network
 

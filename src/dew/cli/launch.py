@@ -76,7 +76,8 @@ class Launch:
     devices_per_process: Count = None
     """Accelerators each process takes, counted from 0 on its host in rank
     order, through JAX_LOCAL_DEVICE_IDS. Unset leaves every process every
-    local device, which is right for one process per host."""
+    local device, which is right for one process per host. Not for
+    `--slurm`, where jax assigns one GPU per task itself."""
     port: int = 43217
     """The coordinator's port on process 0's host."""
     coordinator: Address = None
@@ -90,7 +91,9 @@ class Launch:
     then exist on every host at the same path."""
     slurm: bool = False
     """Launch with srun inside a Slurm allocation: `processes_per_host`
-    tasks on every allocated node, ranks from Slurm's variables."""
+    tasks on every allocated node, ranks from Slurm's variables. jax gives
+    each task the one GPU at its SLURM_LOCALID, so `processes_per_host` is
+    the GPUs a node has."""
     dry_run: bool = False
     """Print the commands that would run, then exit."""
 
@@ -110,6 +113,11 @@ class Launch:
                     f"([A-Za-z_][A-Za-z0-9_]*), got {variable!r}")
         if self.slurm and (self.hosts != ("localhost",) or self.coordinator is not None):
             raise ValueError("--slurm takes its hosts and coordinator from the allocation")
+        if self.slurm and self.devices_per_process is not None:
+            raise ValueError(
+                "--slurm runs one task per GPU: jax's Slurm detection gives each task "
+                "the GPU at its SLURM_LOCALID. Set --processes-per-host to the GPUs a "
+                "node has and leave --devices-per-process unset.")
 
     def extra_env(self) -> dict[str, str]:
         return dict(variable.split("=", 1) for variable in self.env)
@@ -156,8 +164,6 @@ class Launch:
         as a comma-separated list, and would cut a value at its commas."""
         argv = ["srun", f"--ntasks-per-node={self.processes_per_host}",
                 "--kill-on-bad-exit=1", "--export=ALL"]
-        if self.devices_per_process is not None:
-            argv.append(f"--gpus-per-task={self.devices_per_process}")
         if self.cwd is not None:
             argv.append(f"--chdir={self.cwd}")
         return (*argv, *self.command)
