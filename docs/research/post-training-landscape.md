@@ -1,12 +1,27 @@
 # Post-training landscape
 
+> An AI assistant maintains this document. It is presented as-is.
+
 Research date: 2026-09-06. Dew revision: `65fd2f4`.
 
 This note covers methods, rollout systems, agent environments, model reports, and data contracts. It makes fit recommendations. It does not select an implementation or change an API.
 
 Dew's baseline comes from the source files cited below. The starting documents were `docs/design/post-training.md:17-149`, `docs/concepts/post_training.md:5-116`, `README.md:69-77`, and `CONTRIBUTING.md:5-19`. Some statements in the design document exceed the current implementation. Those differences are recorded below. The older survey in `docs/research/frontier-training.md:20-32,203` describes an earlier Dew and is not the baseline for this note.
 
-Paper citations name a version and section. Repository snapshots are listed under Sources. Live documentation and model cards were read on the research date. A report's result is evidence about that report's experiment. It is not a guarantee for Dew. “Not disclosed” means the inspected primary sources do not supply the detail. “Nothing” means there is no corresponding capability in the inspected Dew paths.
+Paper citations name a version and section. Repository snapshots are listed under Sources. Live documentation and model cards were read on the research date. A report's result is evidence about that report's experiment. It is not a guarantee for Dew. "Not disclosed" means the inspected primary sources do not supply the detail. "Nothing" means there is no corresponding capability in the inspected Dew paths.
+
+## Correction, 2026-09-22
+
+The "What Dew has today" and "The gap" columns describe `65fd2f4`. Dew has grown several of the missing pieces since then. Checked against the current source:
+
+- Chat data is structured. A `Message` keeps typed content parts, an assistant's `tool_calls`, and a tool response's `tool_call_id` and `name`; a `Conversation` carries the `tools` schemas; `Role` has a `DEVELOPER` value for Harmony (`src/dew/data/chat.py:16-22,65-72,217-267`).
+- Generation records the behaviour policy's log probabilities beside the raw model's, `SampledRollout` masks prompt padding from the prompt lengths, and the reward sees each completion only up to its length (`src/dew/objectives/rl/rollout.py:23-31,79-94,125-129`). The sampling-provenance and padding rows describe the older source.
+- `GRPOObjective` takes a `behavior_importance_cap` that applies verl's detached token TIS correction from the recorded behaviour and raw log probabilities (`src/dew/objectives/rl/grpo.py:49-60`; `behavior_importance_weights`, `src/dew/rl/surrogate.py:210`).
+- A critic path exists: `PPOObjective`, `ValueHead` and `PPORollout` (`src/dew/objectives/rl/ppo.py:41,84,173`), with `clipped_value_loss_terms` in `src/dew/rl/surrogate.py:227`.
+- Multi-turn episodes exist: `Episode`, `Transition`, the `Environment` and `RecoverableEnvironment` protocols and `EpisodeRollout` (`src/dew/objectives/rl/episodes.py:133-250`), a `SubprocessEnvironment` sandbox (`src/dew/objectives/rl/sandbox.py:190`), an `EpisodeJournal` (`src/dew/objectives/rl/journal.py:114`), and verl row conversion both ways (`to_verl` and `from_verl`, `src/dew/objectives/rl/verl.py:73,128`).
+- `SampledRollout` still offers only the `group` and `rloo` estimators (`src/dew/objectives/rl/rollout.py:57-65`).
+
+I have not re-checked every row against these additions.
 
 ## Dew today
 
@@ -93,7 +108,7 @@ A model action can contain reasoning, visible text, tool-call names, and tool ar
 | mini-swe-agent trajectories | [Output format v1.1 in mini-swe-agent v2][mini-output] stores `messages`, `info`, configuration, exit status, and submission. Tool-call models use tool messages and call IDs. | `src/dew/data/chat.py:50-64` strips fields beyond role/content. | Direct ingestion loses tool calls, reasoning fields, and run metadata. | Preserve native messages and capture the token stream at the model boundary. A terminal exit record is metadata, not an assistant action. |
 | Terminal-Bench task execution | [Terminal-Bench][tbench] and [Harbor task documentation][harbor-tasks]. Harbor tasks separate instruction, environment, solution, and verifier. A verifier writes numeric reward output. | Nothing. | No task reset, task-version tracking, verifier artifact collection, or hidden-solution separation. | Host task adapter and sandbox lifecycle in `Rollout`. Keep benchmark evaluation splits separate from training tasks. |
 | E2B execution | [E2B lifecycle][e2b] supports isolated Linux VMs, timeouts, pause/resume, and termination. | Nothing. | Need task reset, lease/timeout tracking, returned command status, and checkpoint association. | Optional sandbox backend used by a host rollout producer. No E2B resource was created in this research. |
-| Daytona execution | [Daytona persistence][daytona] distinguishes filesystem stop/start from VM memory pause/resume. Container and GPU sandbox persistence differ. | Nothing. | A generic “snapshot” flag cannot specify these different recovery guarantees. | Host backend with explicit reset and restoration capabilities. Do not assume every sandbox class preserves running processes. |
+| Daytona execution | [Daytona persistence][daytona] distinguishes filesystem stop/start from VM memory pause/resume. Container and GPU sandbox persistence differ. | Nothing. | A generic "snapshot" flag cannot specify these different recovery guarantees. | Host backend with explicit reset and restoration capabilities. Do not assume every sandbox class preserves running processes. |
 | Modal execution | [Modal Sandboxes][modal] exposes create, exec, timeout, exit status, and termination. [Filesystem snapshots][modal-snapshots] preserve files across sandbox instances. | Nothing. | Need environment identity, cleanup, command/output capture, and a declared recovery level. | Optional host backend. Filesystem restoration alone must not be advertised as resuming a running tool process. |
 | Plain Docker execution | [Docker security documentation][docker] describes namespace/cgroup isolation and daemon privileges. [SWE-Gym][swe-gym] publishes task images. | Nothing. | Need restricted mounts, resource/network policy, image digests, and trusted verification outside the agent's control. A container is not a separate kernel. | Local host backend for appropriate tasks. Giving generated code the trainer's credentials or Docker socket does not fit an isolated training environment. |
 
@@ -103,7 +118,7 @@ The agent executor needs a serving endpoint with the model's tool and thinking f
 
 ## Infrastructure comparison
 
-These rows describe the inspected implementation and documentation, not every possible deployment. “Checkpoint resume” does not imply live worker replacement. CUDA IPC and NCCL paths are implementation-specific GPU transports. A JAX caller cannot obtain them merely by returning NumPy arrays. [Tunix][tunix-rollout], [SkyRL weight transfer][skyrl-sync], [NeMo generation][nemo-generation].
+These rows describe the inspected implementation and documentation, not every possible deployment. "Checkpoint resume" does not imply live worker replacement. CUDA IPC and NCCL paths are implementation-specific GPU transports. A JAX caller cannot obtain them merely by returning NumPy arrays. [Tunix][tunix-rollout], [SkyRL weight transfer][skyrl-sync], [NeMo generation][nemo-generation].
 
 | What it is | Who ships it (source) | What Dew has today | The gap | The fit |
 | --- | --- | --- | --- | --- |
@@ -282,7 +297,7 @@ The infrastructure repository revisions were obtained with `git ls-remote <offic
 [swe-gym]: https://github.com/SWE-Gym/SWE-Gym
 [swe-gym-data]: https://huggingface.co/datasets/SWE-Gym/SWE-Gym
 
-## What dew needs
+## What Dew needs
 
 1. Exact sampling and scoring semantics. Preserve sampled tokens and behavior log-probabilities. Resolve padding, EOS, reward truncation, and generation/scorer agreement before scaling the current sampler. Evidence: `src/dew/objectives/rl/rollout.py:100-153`, `src/dew/sampling/text.py:16-48`, [V3.2 §3.1][ds32], [TRL][trl-grpo]. Fit: `Rollout`, generation, and the objective's per-token scoring seam.
 2. A lossless episode/transition record with an array training view. Preserve tool calls/results, roles/channels, per-call context, action masks, group identity, and compaction lineage. Evidence: `src/dew/data/chat.py:50-84`, [rLLM][rllm], [SkyRL-Agent][skyagent]. Fit: data transforms and `Rollout`; only the compiled view crosses `Objective.loss`.
@@ -305,7 +320,7 @@ Remote generation, tools, sandbox lifecycle, and judge RPCs do not fit inside `j
 1. Which first acceptance workload matters most: single-turn math/code RLVR, repository-editing agents, or long-running multi-agent tasks? The choice sets the first environment and credit-assignment contract.
 2. Must the first distributed release train on TPU while sampling on GPUs, or must training and rollout both run on each target device family?
 3. Is cloud sandbox execution acceptable in the eventual product, or must all task execution remain local or self-hosted? What network access and credential policy should agent environments have?
-4. Does “inside any agent executor” include unchanged third-party CLI agents behind a model gateway, or can the integration require an instrumented Python agent API?
+4. Does "inside any agent executor" include unchanged third-party CLI agents behind a model gateway, or can the integration require an instrumented Python agent API?
 5. Which trade-off is acceptable for long-running work: an immutable policy per episode, or mixed-policy episodes with recorded token probabilities and correction? Must partial episodes survive trainer and environment preemption?
 6. Which retention and safety evaluations must remain above a fixed threshold while task reward improves? What maximum task time, output budget, and judge cost should recipes optimize for?
 7. Is exact reproduction of a named proprietary model's recipe an acceptance criterion when its maker has not published the algorithm? Muse Spark 1.3 and Qwen3.8 currently provide incomplete post-training evidence.
