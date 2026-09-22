@@ -1238,7 +1238,9 @@ def test_builtin_previews_coordinate_nested_setup_generation_and_transfer_failur
                 case = f"{kind}-{phase}-{source}"
                 local, remote = reports[source][case], reports[1 - source][case]
                 assert local["closed"] and remote["closed"]
-                assert remote["type"] == "RuntimeError"
+                # The peer learns of the failure at the phase agreement and
+                # raises a RuntimeError naming the failing rank.
+                assert remote["runtime"]
                 assert f"rank {source}" in remote["error"]
                 if phase == "setup":
                     assert local["type"] == "AttributeError"
