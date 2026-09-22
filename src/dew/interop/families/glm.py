@@ -65,7 +65,7 @@ def _glm5_refusals(hf_config: Mapping[str, object], used: set[str], layers: int)
 
 
 def _glm5_linear_fields(hf_config: Mapping[str, object],
-                        types: tuple[str, ...]) -> dict[str, object]:
+                        types: tuple[str, ...]) -> Mapping[str, object]:
     """Read the KDA mixer's fields, from `linear_attn_config` or the top level.
 
     The nested object wins wherever it states a field. Its `kda_layers` and
