@@ -283,6 +283,16 @@ class Profiler:
                 exc.add_note(f"Profile cleanup/report failure: {error}")
 
 
+def region(name: str) -> AbstractContextManager[None]:
+    """A named span in the active capture, or a no-op when nothing captures.
+
+    The site does not need to know whether a profiler is running or which
+    one; `with region("input.wait"):` reads the same either way.
+    """
+    active = active_profile()
+    return nullcontext() if active is None else active.region(name)
+
+
 def profile(directory: str | os.PathLike[str] | None = None, *,
             options: jax.profiler.ProfileOptions | None = None) -> Profiler:
     """Configure native profiling; capture starts only on enter or start()."""
