@@ -22,7 +22,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
 from .precision import precision_names
-from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_exchange, sequence_shards
+from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
 """Names which kernel an attention call runs.
@@ -565,15 +565,61 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
                                 sliding_window, mask, bias, sinks):
     """Run `kernel` over a sequence the mesh's sequence axis splits.
 
-    `sequence_exchange` in context picks the collective: 'all_to_all' runs
-    `exchanged_heads_attention`, 'all_gather' runs
-    `gathered_keys_attention`. Both are exact; they differ in what every
-    shard holds and what crosses the interconnect.
+    Two exchanges are exact for every call they take, and they differ in
+    what crosses the interconnect. `exchanged_heads_attention` (Ulysses)
+    takes a call whose query heads divide by tensor times sequence and whose
+    query and key lengths both divide by the shard count, and runs where
+    `all_to_all_moves_less` says it moves fewer bytes. Every other call runs
+    `gathered_keys_attention`, which takes any head count and any key
+    length: joint and cross attention over an odd length, a head count the
+    split does not divide, and grouped-query calls with no mask.
     """
-    run = (exchanged_heads_attention if sequence_exchange() == 'all_to_all'
+    mesh = jax.sharding.get_abstract_mesh()
+    tensor = (mesh.shape[TENSOR_AXIS]
+              if TENSOR_AXIS in mesh.axis_names and TENSOR_AXIS not in mesh.manual_axes else 1)
+    heads, kv_heads = query.shape[-2], key.shape[-2]
+    reordered = causal or sliding_window is not None or mask is not None
+    exchangeable = (heads % (tensor * shards) == 0
+                    and query.shape[-3] % shards == 0 and key.shape[-3] % shards == 0)
+    run = (exchanged_heads_attention
+           if exchangeable and all_to_all_moves_less(heads, kv_heads, tensor, shards,
+                                                     reordered=reordered)
            else gathered_keys_attention)
     return run(kernel, query, key, value, shards, causal=causal,
                sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks)
+
+
+def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int, *,
+                          reordered: bool) -> bool:
+    """Whether Ulysses sends fewer bytes per device than gathering the keys.
+
+    Counted per device, per batch row, in units of S * D * (n - 1) / n for
+    a sequence of S rows, head width D and n = `shards`, over one tensor
+    shard's heads: H = heads / tensor, K = the key heads it holds.
+
+    The all-to-all sends (n - 1) / n of four local blocks of S / n rows:
+    the query and the output at H heads, the key and the value at K', the
+    key heads repeated out to lcm(kv_heads, tensor * n) over tensor. That
+    is 2 (H + K') / n.
+
+    The gather receives the (n - 1) / n of the whole keys and values it
+    does not hold, 2 K. A causal, windowed or masked call also stripes its
+    S / n query rows and unstripes its output rows, and that reorder moves
+    (n - 1) / n of both, 2 H / n. So the gather sends 2 K, plus 2 H / n
+    when reordered.
+
+    At H = 32, K = 8, n = 2 with one tensor shard, in units of S * D the
+    all-to-all sends 20 either way, the gather 8 unmasked and 24 causal:
+    grouped-query attention with no mask gathers, causal attention
+    exchanges. The gather wins ties, as the path that takes every shape.
+    Mask and bias blocks are left out; both paths carry them.
+    """
+    local_heads = heads // tensor
+    repeated = math.lcm(kv_heads, tensor * shards) // tensor
+    # Key heads the tensor axis cannot split stay whole on every shard.
+    gathered = kv_heads // tensor if kv_heads % tensor == 0 else kv_heads
+    exchanged = 2 * (local_heads + repeated) / shards
+    return exchanged < 2 * gathered + (2 * local_heads / shards if reordered else 0)
 
 
 def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
@@ -616,12 +662,13 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
             rows = (*rows, axis)
     tensor = (TENSOR_AXIS,) if TENSOR_AXIS in usable else ()
     split = shards * math.prod(mesh.shape[axis] for axis in tensor)
-    if heads % split:
+    if heads % split or query.shape[1] % shards or key.shape[1] % shards:
         raise ValueError(
             f"the all-to-all sequence exchange splits the {heads} query heads "
-            f"{split} ways (tensor times sequence), which does not divide them. "
-            "MeshSpec(sequence_exchange='all_gather') gathers the keys and values "
-            "instead and takes any head count.")
+            f"{split} ways (tensor times sequence) and the query and key lengths "
+            f"({query.shape[1]}, {key.shape[1]}) {shards} ways, and one of them does "
+            "not divide. `gathered_keys_attention` takes any head count and key "
+            "length; `sequence_parallel_attention` picks it for such a call.")
     kv_heads = math.lcm(key.shape[-2], split)
     key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
 

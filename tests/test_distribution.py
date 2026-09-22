@@ -68,13 +68,10 @@ def test_hybrid_sharding_keeps_fsdp_inside_a_host_and_trains_like_fsdp(tmp_path,
     assert max(abs(a - b) for a, b in zip(pool["losses"], reference["losses"], strict=True)) < TOLERANCE
 
 
-@pytest.mark.parametrize("exchange", ["all_to_all", "all_gather"])
-def test_context_parallelism_trains_like_whole_sequences_across_hosts(tmp_path, reference, exchange):
+def test_context_parallelism_trains_like_whole_sequences_across_hosts(tmp_path, reference):
     """A packed batch with its sequence split two ways inside each host and
-    the replicas across the hosts trains to the reference's losses under
-    either exchange."""
-    pool = train(tmp_path, {"fsdp": 2, "sequence": 2, "replicas": 2,
-                            "sequence_exchange": exchange}, processes=2)
+    the replicas across the hosts trains to the reference's losses."""
+    pool = train(tmp_path, {"fsdp": 2, "sequence": 2, "replicas": 2}, processes=2)
     assert pool["fsdp_groups"] == [[0], [0], [1], [1]]
     assert max(abs(a - b) for a, b in zip(pool["losses"], reference["losses"], strict=True)) < TOLERANCE
 

@@ -76,10 +76,12 @@ Hybrid sharding keeps a full copy of the parameters and optimizer state on every
 
 ## Split long sequences
 
-`MeshSpec(sequence=N)` splits the token positions of every sequence over N devices, and attention exchanges data between them. `MeshSpec.sequence_exchange` picks the exchange:
+`MeshSpec(sequence=N)` splits the token positions of every sequence over N devices, and each attention call exchanges data between them in one of two ways. Both give the same result as one device.
 
-- `'all_to_all'` is the default and follows DeepSpeed Ulysses. Each device trades its slice of the positions for a slice of the attention heads, attends the whole sequence for those heads and trades back. No device ever holds a whole key or value tensor. Causal masks, sliding windows, packed-document masks and the TPU splash kernel work as they do on one device. The query heads must divide by `tensor` times `sequence`. Grouped key and value heads are repeated only as far as the split needs.
-- `'all_gather'` keeps the queries split and gathers the whole keys and values on every device. It takes any head count. It costs every device the full key and value tensors of each layer, and it reorders causal queries so every device gets the same work, which needs the sequence length to divide by twice `sequence`.
+- The all-to-all follows DeepSpeed Ulysses. Each device trades its slice of the positions for a slice of the attention heads, attends the whole sequence for those heads and trades back. No device ever holds a whole key or value tensor. Causal masks, sliding windows, packed-document masks and the TPU splash kernel work as they do on one device. Grouped key and value heads are repeated only as far as the split needs.
+- The gather keeps the queries split and gathers the whole keys and values on every device. It takes any head count and any key length. A causal or masked call reorders its queries so every device gets the same work, which needs the sequence length to divide by twice `sequence`.
+
+A call runs the all-to-all when three things hold: its query heads divide by `tensor` times `sequence`, its query and key lengths both divide by `sequence`, and it moves fewer bytes. Counted per device in units of sequence length times head width times (N-1)/N, with H query heads and K key heads per tensor shard, the all-to-all sends 2(H + K')/N, where K' is K repeated as far as the split needs. The gather sends 2K, plus 2H/N when it reorders a causal or masked call. At H=32, K=8, N=2 that is 20 against 8 without a mask and 24 with one, so causal attention exchanges heads and unmasked grouped-query attention gathers. Joint text-and-image attention over an odd length, cross attention to a 77-token context, and head counts the split does not divide all take the gather. `dew.nn.attention.all_to_all_moves_less` holds the rule.
 
 Keep the sequence axis inside a node. Both exchanges run once per attention layer in the forward and the backward pass. `replicas` keeps it inside a granule for you.
 
@@ -96,14 +98,14 @@ JAX_PLATFORMS=cpu dew launch --processes-per-host 2 \
 
 `/tmp/pool.json` records the losses and, for every fsdp group, the processes its devices sit on. Hybrid sharding shows `"fsdp_groups": [[0], [1]]`. Run the worker again as one process with `--env XLA_FLAGS=--xla_force_host_platform_device_count=8` and `--mesh '{"fsdp": 8}'`. The two runs print the same losses to within 1e-6.
 
-`tests/test_distribution.py` runs this comparison for hybrid sharding and for both sequence exchanges across two processes, and checks that a failing process stops the pool.
+`tests/test_distribution.py` runs this comparison for hybrid sharding and for a split sequence across processes, and checks that a failing process stops the pool.
 
 ## What has and has not been run
 
 These checks passed:
 
-- two real processes of four CPU devices each, launched by `dew launch`, for `MeshSpec(fsdp=4, replicas=2)` and `MeshSpec(fsdp=2, sequence=2, replicas=2)` with both exchanges, each matching one process of plain fsdp over eight devices;
-- both exchanges against whole-sequence attention, forward and backward, on the simulated eight-device mesh, including heads split over tensor and sequence at once, four sequence shards over two key heads, packed masks, biases, sinks and the pipeline's stage axis.
+- two real processes of four CPU devices each, launched by `dew launch`, for `MeshSpec(fsdp=4, replicas=2)` and `MeshSpec(fsdp=2, sequence=2, replicas=2)`, each matching one process of plain fsdp over eight devices;
+- both exchanges against whole-sequence attention, forward and backward, on the simulated eight-device mesh, with the compiled trainer step showing which exchange each mesh ran, including heads split over tensor and sequence at once, four sequence shards over two key heads, packed masks, biases, sinks and the pipeline's stage axis.
 - on one TPU v6e chip, `tools/qualify_sequence_exchange.py` ran the all-to-all exchange's `shard_map` around the Mosaic splash kernel, forward and backward, in fp32 and bf16. Its output and gradients equal whole-sequence splash exactly. One chip has one sequence shard, so this proves the lowering, not the exchange across chips.
 
 Dew has not been run on two physical nodes or on more than one accelerator at once. Throughput and memory numbers for hybrid sharding and the sequence exchanges need at least one host with eight accelerators (a TPU v5e-8 or v6e-8 slice, or eight GPUs on NVLink) for the sequence axis, and two such hosts, or a two-slice TPU run, for `replicas`. Network failures, NCCL or DCN collective tuning, shared checkpoint storage across nodes and cluster preemption are untested. A first multi-node run should compare its losses with a single-node run of the same global batch for a few hundred steps before it trains for real.
