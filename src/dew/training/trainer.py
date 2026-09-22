@@ -617,6 +617,16 @@ class Trainer(Generic[Loss, Effects]):
         Previews are generated only when `preview=True` and a tracker receives
         them; scalar reporting never triggers preview work.
         """
+        if eval_every and not metrics and not (preview and self.tracker is not None):
+            # A validation pass hands its batches to metrics and to the
+            # preview; scheduled with neither, it would open nothing and
+            # report nothing, so the contradiction is refused here.
+            raise ValueError(
+                f"eval_every={eval_every} schedules a validation pass that nothing consumes: "
+                + ("preview=True needs a tracker to receive the samples; "
+                   if preview else "")
+                + "pass metrics to score it, preview=True with a tracker to sample from it, "
+                "or leave eval_every unset")
         preview = preview and self.tracker is not None
         started = time.perf_counter()
         profile, checkpoints = self.profile, self.checkpoints
