@@ -314,7 +314,7 @@ class Mixture:
     expert_features: int | None = None
     shared_features: int = 0
     shared_gate: bool = False
-    implementation: str = 'xla'
+    implementation: str = 'auto'
     dispatch: str = 'global'
     hash_layers: tuple[int, ...] | None = None
     latent_features: int | None = None

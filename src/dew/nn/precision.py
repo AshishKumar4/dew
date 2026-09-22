@@ -17,6 +17,8 @@ reaches every product of its backward. jax's own xla attention sets this
 preset for exactly this reason (jax-ml/jax#24047).
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
@@ -81,3 +83,17 @@ def scaled(x: jax.Array, factor: float) -> jax.Array:
     if factor == 1.0:
         return x
     return (x.astype(jnp.promote_types(x.dtype, jnp.float32)) * factor).astype(x.dtype)
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
+def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
+    """The value `x` takes in `dtype`, held in `x`'s own dtype, with a
+    straight-through tangent: the rounding is the forward's, and a gradient
+    through it keeps its dtype and is never rounded a second time."""
+    return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
+
+
+@rounded_operand.defjvp
+def _rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array],
+                         tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
+    return jnp.asarray(rounded_operand(primals[0], dtype)), tangents[0]
+
