@@ -541,9 +541,9 @@ same init). On this card, at these sizes, fp8 gives no speedup to adopt.
 
 ## Kernel choices per backend, 2026-09-22
 
-Each choice below is made in one place per kernel and keyed by backend. The measurements are one process per row, jax 0.11.1, bf16 compute: a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, and the local RTX 4080 for the kernel-level rows. Step rows are `tools/benchmark_step.py` cases, 30 timed steps after 5 warmup; lm-moe is 321.8M parameters, 8 experts top-2, lm-dense 359.8M, both at sequence 1024. Batch is 4 (moe) and 1 (dense) on the L4, 8 and 8 on the v6e. "before" is main at c1f7e2dd.
+Each choice below is made in one place per kernel and keyed by hardware generation (`dew.nn.moe.device_generation`: `sm89`, `v6e`); a generation without a measurement here runs the XLA path. The measurements are one process per row, jax 0.11.1, bf16 compute: a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, and the local RTX 4080 for the kernel-level rows. Step rows are `tools/benchmark_step.py` cases, 30 timed steps after 5 warmup; lm-moe is 321.8M parameters, 8 experts top-2, lm-dense 359.8M, both at sequence 1024. Batch is 4 (moe) and 1 (dense) on the L4, 8 and 8 on the v6e. "before" is main at c1f7e2dd.
 
-### The MoE grouped matmul: `GROUPED_MATMUL_BY_BACKEND`
+### The MoE grouped matmul: `GROUPED_MATMUL_BY_GENERATION`
 
 | device | path | ms/step | p50 ms | peak GiB |
 |---|---|---|---|---|
@@ -556,7 +556,9 @@ Each choice below is made in one place per kernel and keyed by backend. The meas
 
 `expert_projection` alone, 8192 rows, 768 to 2048, 8 experts, forward plus backward: XLA 26.21 ms and Pallas 3.38 ms on the L4; XLA 14.84 ms and Pallas 1.86 ms on the RTX 4080. Errors against a float64 oracle of the rounded operands are the same or lower for Pallas (kernel gradient 4.2e-6 against 6.8e-6 relative). The L4 step is 2.82x faster; JAX's stock Pallas lowering with an out-sharding fix measured 1.97x on the same step, because its tangents run in fp32 and Dew's backward multiplies the bf16 cotangent.
 
-Rejected: a pure-JAX loop of dense per-tile products. On the RTX 4080 it was 2.2x faster than XLA for the projection alone (6.67 ms), but it doubled the step's temporaries (4.22 GiB against 2.17 at batch 1), and on the v6e it was 2.2x slower than XLA (1.71 ms against 0.79). On TPU, tokamax's `mosaic_tpu_v2` is within 1% of XLA on the step; tokamax's default dispatch picks its v1 kernel there, 13x slower, so Dew names the kernel.
+Rejected: a pure-JAX loop of dense per-tile products. On the RTX 4080 it was 2.2x faster than XLA for the projection alone (6.67 ms), but it doubled the step's temporaries (4.22 GiB against 2.17 at batch 1), and on the v6e it was 2.2x slower than XLA (1.71 ms against 0.79). The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them, and called through a custom VJP. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They stay the sm80 to sm89 path: JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, and tokamax's sm80 Mosaic config exceeds Ada's shared memory. Dew filters that one message once the kernels are used. A Mosaic GPU grouped matmul for sm90 and later waits for Hopper hardware to measure it on. Under a mesh the kernels run inside `shard_map` on each device's share of the sorted rows; that path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
+
+On TPU, tokamax's `mosaic_tpu_v2` is within 1% of XLA on the step; tokamax's default dispatch picks its v1 kernel there, 13x slower, so Dew names the kernel.
 
 ### bf16 Adam state: `OptimConfig.state_dtype`
 
