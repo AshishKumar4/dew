@@ -240,3 +240,18 @@ def test_the_native_server_serves_loaded_weights_at_its_own_precision():
     for leaf, expected in zip(jax.tree.leaves(backend.variables), jax.tree.leaves(trained), strict=True):
         assert leaf.dtype == jnp.bfloat16
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(expected.astype(jnp.bfloat16)))
+
+
+def test_a_refused_request_raises_at_submit_and_the_native_server_keeps_serving():
+    target = objective()
+    params = target.init(jax.random.key(0))
+    server = NativeRolloutServer(Server.from_task(TextGeneration(target.model, params, None, sampling=SAMPLING),
+                                                  slots=2, capacity=64))
+    try:
+        running = server.submit([1, 2, 3], 40, seed=1)
+        with pytest.raises(ValueError, match="max_seq_len"):
+            server.submit(list(range(1, 11)) * 6, 10, seed=2)
+        assert len(running.result(timeout=120).tokens) >= 1
+        assert server.submit([4, 5], 3, seed=3).result(timeout=120).prompt == (4, 5)
+    finally:
+        server.close()
