@@ -1,7 +1,7 @@
-"""DeepSeek decoders: V2, V3, V3.2, V4, and the Kimi releases of the same block.
+"""Translate the DeepSeek decoders: V2, V3, V3.2, V4 and the Kimi releases.
 
-V2 and V3 differ in how the MoE sizes itself and whether the router carries
-a bias; V3.2 adds the sparse indexer over the same MLA block. V4 is its own
+V2 and V3 differ in how the MoE sizes itself and whether the router carries a
+bias. V3.2 adds the sparse indexer over the same MLA block. V4 is its own
 layout: three attention kinds, each naming its compressor and its pooling
 rate, mHC's residual streams, and hash-routed first layers. Kimi K2 is V3's
 computation under its own provenance, and Kimi K2.5 the same decoder nested
@@ -36,7 +36,7 @@ from dew.interop.hf_decoders import (
 
 def _deepseek_rope(hf_config: Mapping[str, object], used: set
                    ) -> tuple[float, Ramp | None]:
-    """(rope_theta, yarn record) from either rope spelling.
+    """Return (rope_theta, yarn record) from either rope spelling.
 
     Both released DeepSeek configs spell it with `rope_scaling` of
     `type: yarn`; transformers prefers `rope_scaling` when both are
@@ -71,7 +71,7 @@ def _deepseek_rope(hf_config: Mapping[str, object], used: set
 
 def _deepseek_mixture(hf_config: Mapping[str, object], layers: int,
                       used: set) -> MixtureFields:
-    """The mixture record out of a DeepSeek V3 MoE config.
+    """Read a DeepSeek V3 MoE config into the mixture record.
 
     The reference selects on the biased sigmoid scores inside the best
     groups, each scored by its two best experts, and renormalises.
@@ -103,7 +103,7 @@ def _deepseek_mixture(hf_config: Mapping[str, object], layers: int,
 
 def _deepseek_v2_mixture(hf_config: Mapping[str, object], layers: int,
                          used: set) -> MixtureFields:
-    """The mixture record out of a DeepSeek V2 MoE config.
+    """Read a DeepSeek V2 MoE config into the mixture record.
 
     `DeepseekV2TopkRouter` softmaxes the logits, selects greedily or inside
     the best groups scored by their best expert, and never renormalises. It
@@ -138,7 +138,7 @@ def _deepseek_v2_mixture(hf_config: Mapping[str, object], layers: int,
 
 def _deepseek_layout(hf_config: Mapping[str, object], layers: int,
                      used: set, *, sparse_layers: tuple[int, ...] | None = None) -> MixtureFields:
-    """The expert counts, widths and sparse layers every DeepSeek MoE shares.
+    """Read the expert counts, widths and sparse layers every DeepSeek MoE shares.
 
     The first `first_k_dense_replace` layers stay dense and the rest route.
     Transformers builds every layer past the dense ones as MoE whatever
@@ -201,6 +201,14 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
                      sparse: bool = False,
                      mixture: Callable[[Mapping[str, object], int, set], MixtureFields]
                      = _deepseek_mixture) -> DecoderFields:
+    """Read a DeepSeek V2, V3 or V3.2 config into `CausalTransformer` fields.
+
+    `sparse` picks the V3.2 block, whose every layer is
+    deepseek_sparse_attention and whose `index` holds the lightning indexer's
+    geometry. `mixture` is the family's own MoE reader. The function builds
+    three things from the config: `layer_types`, one entry per layer; the MLA
+    `mixer` record; and the routed `mixture`.
+    """
     rope_theta, yarn = _deepseek_rope(hf_config, used)
     config = _base_config(hf_config, used, rope=_Ropes(rope_theta))
     layer_types = records.strings(config.get('layer_types'), 'layer_types')
@@ -320,7 +328,9 @@ _KIMI_K25_TEXT_ENCODER = ('add_cross_attention', 'cross_attention_hidden_size',
 
 
 def _kimi_k25_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """moonshotai/Kimi-K2.5: a vision wrapper whose decoder is Kimi K2's.
+    """Read a Kimi K2.5 config into `CausalTransformer` fields.
+
+    moonshotai/Kimi-K2.5 is a vision wrapper whose decoder is Kimi K2's.
 
     Kimi_K25Model is a vision tower, a language model built from
     text_config and a projector (modeling_kimi_k25.py:590-592), and
@@ -379,7 +389,7 @@ def _kimi_k25_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
 
 
 def _kimi_k25_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """A Kimi K2.5 checkpoint's tensor names onto the text decoder's leaves.
+    """Return the text decoder's path for one Kimi K2.5 tensor name.
 
     The release nests the decoder under `language_model.model.*` with its
     head at `language_model.lm_head.weight`
@@ -431,12 +441,14 @@ def _string_sequence(value: object, field: str) -> tuple[str, ...]:
 
 def _v4_layer_types(hf_config: Mapping[str, object], layers: int,
                     used: set[str]) -> tuple[str, ...]:
-    """Every layer's attention kind, as DeepseekV4Config.__post_init__
-    resolves it (configuration_deepseek_v4.py:255-267): an explicit
-    `layer_types`, else the legacy `compress_ratios` read through the rate
-    table, else the V4-Pro default of two heavily compressed layers and an
-    interleave. Either list is truncated to the layer count, which is how
-    the released config's trailing entry for its prediction depth is dropped.
+    """Return every layer's attention kind.
+
+    `DeepseekV4Config.__post_init__` resolves them in this order
+    (configuration_deepseek_v4.py:255-267): an explicit `layer_types`, else the
+    legacy `compress_ratios` read through the rate table, else the V4-Pro
+    default of two heavily compressed layers and an interleave. Either list is
+    truncated to the layer count, which drops the released config's trailing
+    entry for its prediction depth.
     """
     used.update(('layer_types', 'compress_ratios'))
     types = hf_config.get('layer_types')
@@ -467,10 +479,13 @@ def _v4_layer_types(hf_config: Mapping[str, object], layers: int,
 
 def _v4_mlp_kinds(hf_config: Mapping[str, object], layers: int,
                   used: set[str]) -> tuple[str, ...]:
-    """Every layer's feed-forward kind, as DeepseekV4Config.__post_init__
-    resolves it (configuration_deepseek_v4.py:269-273): an explicit
-    `mlp_layer_types`, else the first `num_hash_layers` layers routing by
-    the hash table and the rest by the biased top-k."""
+    """Return every layer's feed-forward kind.
+
+    `DeepseekV4Config.__post_init__` resolves them in this order
+    (configuration_deepseek_v4.py:269-273): an explicit `mlp_layer_types`, else
+    the first `num_hash_layers` layers routing by the hash table and the rest
+    by the biased top-k.
+    """
     used.update(('mlp_layer_types', 'num_hash_layers'))
     types = hf_config.get('mlp_layer_types')
     if types is None:
@@ -489,8 +504,10 @@ def _v4_mlp_kinds(hf_config: Mapping[str, object], layers: int,
 
 def _v4_rope_width(hf_config: Mapping[str, object], used: set[str],
                    head_dim: int) -> tuple[int, float]:
-    """(rotated width, fraction) of each head, `int(head_dim *
-    partial_rotary_factor)` (configuration_deepseek_v4.py:284-292).
+    """Return each head's (rotated width, fraction).
+
+    The width is `int(head_dim * partial_rotary_factor)`
+    (configuration_deepseek_v4.py:284-292).
 
     The legacy `qk_rope_head_dim` names that width and folds into the
     fraction; a config carrying both (the spelling transformers writes
@@ -520,8 +537,9 @@ def _v4_rope_width(hf_config: Mapping[str, object], used: set[str],
 
 def _v4_rope_entries(hf_config: Mapping[str, object], used: set[str],
                      partial: float) -> tuple[Mapping[str, object], Mapping[str, object]]:
-    """The `main` and `compress` rope entries, as the config resolves them
-    (configuration_deepseek_v4.py:301-321).
+    """Return the `main` and `compress` rope entries the config resolves to.
+
+    `DeepseekV4Config` resolves them at configuration_deepseek_v4.py:301-321.
 
     A config that nests both states them. Any other spelling is one flat
     ramp that rides the compressed layers alone, over `compress_rope_theta`,
@@ -555,7 +573,7 @@ def _v4_rope_entries(hf_config: Mapping[str, object], used: set[str],
 
 def _v4_rope(entry: Mapping[str, object], field: str, head_dim: int, width: int,
              max_pos: int) -> tuple[float, Ramp | None]:
-    """One V4 rope entry as (base, YaRN record or None).
+    """Read one V4 rope entry into (base, YaRN record or None).
 
     The entry's own `partial_rotary_factor` sizes its table, and so the
     slice the layers on it rotate (modeling_deepseek_v4.py:131-134); one
@@ -592,10 +610,11 @@ def _v4_rope(entry: Mapping[str, object], field: str, head_dim: int, width: int,
 
 def _v4_compress_rates(hf_config: Mapping[str, object], layer_types: tuple[str, ...],
                        used: set[str]) -> dict[str, int]:
-    """How many tokens each compressed kind pools into one entry, as
-    DeepseekV4Config.__post_init__ resolves them
-    (configuration_deepseek_v4.py:246-252): the `compress_rates` dict over
-    the class defaults, with the legacy per-kind scalars folded in.
+    """Return how many tokens each compressed kind pools into one entry.
+
+    `DeepseekV4Config.__post_init__` resolves them from the `compress_rates`
+    dict over the class defaults, with the legacy per-kind scalars folded in
+    (configuration_deepseek_v4.py:246-252).
     """
     used.update(('compress_rates', 'compress_rate_csa', 'compress_rate_hca'))
     rates: dict[str, object] = dict(_V4_RATES)
@@ -626,7 +645,7 @@ def _v4_compress_rates(hf_config: Mapping[str, object], layer_types: tuple[str, 
 
 def _v4_mixture(hf_config: Mapping[str, object], layers: int,
                 mlp_kinds: tuple[str, ...], used: set[str]) -> MixtureFields:
-    """The mixture every V4 layer routes to.
+    """Read the mixture every V4 layer routes to.
 
     The router scores the logits with the config's activation, selects on
     those scores plus its balancing bias and renormalises what it selected
@@ -677,19 +696,20 @@ def _v4_mixture(hf_config: Mapping[str, object], layers: int,
 
 
 def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """DeepSeek-V4-Flash and V4-Pro.
+    """Read a DeepSeek-V4-Flash or V4-Pro config into `CausalTransformer` fields.
 
-    Every layer is mHC's stack of residual streams around one attention
-    over a sliding window, with a low-rank query normed per head, one
-    key/value head read as both, per-head sinks and a grouped low-rank
-    output projection; the two compressed kinds extend those keys with
-    their compressor's pooled entries, the sparse one selecting them with
-    its lightning indexer (modeling_deepseek_v4.py:746-864). Every layer's
-    feed-forward routes, and the first ones route by a frozen
-    token-to-expert table rather than the biased top-k (:1045-1073). The
-    rope is two entries: the sliding layers rotate at `rope_theta`, the
-    compressed ones at `compress_rope_theta` under the ramp they share with
-    their compressor (:768, :803-806).
+    Every layer is mHC's stack of residual streams around one attention over a
+    sliding window, with a low-rank query normed per head, one key/value head
+    read as both, per-head sinks and a grouped low-rank output projection. The
+    two compressed kinds extend those keys with their compressor's pooled
+    entries, the sparse one selecting them with its lightning indexer
+    (modeling_deepseek_v4.py:746-864).
+
+    Every layer's feed-forward routes, and the first ones route by a frozen
+    token-to-expert table rather than the biased top-k (:1045-1073). The rope
+    is two entries: the sliding layers rotate at `rope_theta`, the compressed
+    ones at `compress_rope_theta` under the ramp they share with their
+    compressor (:768, :803-806).
     """
     layers = _record_int(hf_config, 'num_hidden_layers')
     heads = _record_int(hf_config, 'num_attention_heads')
@@ -780,7 +800,7 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
 def _v4_attention_kinds(hf_config: Mapping[str, object], used: set[str],
                         layer_types: tuple[str, ...], mixer: Mapping[str, object],
                         window: int, compress: tuple[float, Ramp | None]) -> dict[str, KindFields]:
-    """Each attention kind's own record.
+    """Build each attention kind's own record.
 
     Every V4 layer attends its window; a compressed one rotates at the
     compress base and hands its compressor and rate to the mixer, the sparse
@@ -807,9 +827,11 @@ def _v4_attention_kinds(hf_config: Mapping[str, object], used: set[str],
 
 
 def _v4_streams(hf_config: Mapping[str, object]) -> HyperConnectionsFields:
-    """The residual streams every V4 layer reads and writes, which it collapses
-    through a learned head of its own (DeepseekV4HyperHead,
-    modeling_deepseek_v4.py:946-962)."""
+    """Return the residual streams every V4 layer reads and writes.
+
+    A layer collapses them through a learned head of its own
+    (DeepseekV4HyperHead, modeling_deepseek_v4.py:946-962).
+    """
     return {
         'hc_mult': _record_int(hf_config, 'hc_mult', 4),
         'hc_eps': _record_float(hf_config, 'hc_eps', 1e-6),
@@ -864,7 +886,7 @@ _DEEPSEEK_V4_TRUNK = {
 
 
 def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """A DeepSeek V4 checkpoint's tensor names onto the decoder's leaves.
+    """Return the decoder's path for one DeepSeek V4 tensor name.
 
     The release names the block's halves `attn` and `ffn`, its projections
     `wq_a`/`wq_b`/`wkv`/`wgate`/`wo_a`/`wo_b`, its query latent norm
@@ -912,7 +934,7 @@ def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
 
 
 def _deepseek_v4_prepare(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """The grouped output projection and the hash table as the tree holds them.
+    """Reshape the grouped output projection and the hash table as the tree holds them.
 
     `DeepseekV4GroupedLinear` stores one block per head group in a matrix of
     `[groups * o_lora_rank, heads * head_dim / groups]` and reads it as

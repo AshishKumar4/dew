@@ -1,4 +1,4 @@
-"""Image metrics behind `dew.registry.metrics`: `metrics["fid"]()`,
+"""Score image metrics behind `dew.registry.metrics`: `metrics["fid"]()`,
 `metrics["clip_score"]()`, `metrics.psnr()`, `metrics.ssim()`, `metrics.clip()`,
 each a factory returning a `Metric` the trainer scores an `ImageGrid` with.
 

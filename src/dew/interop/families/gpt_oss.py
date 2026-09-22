@@ -1,4 +1,4 @@
-"""GPT OSS: the sliding/full alternation with clamped SwiGLU experts.
+"""Translate GPT OSS, the sliding/full alternation with clamped SwiGLU experts.
 
 The family's own dial is the `swigluoai` mlp value, which is what the export
 vocabulary maps back to the reference's `silu`.

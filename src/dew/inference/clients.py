@@ -1,4 +1,4 @@
-"""Bound-model adapters over the official Ollama and OpenAI Python clients.
+"""Adapt the official Ollama and OpenAI Python clients to a bound model.
 
 The convenience call returns associated text/usage records. Chat and stream
 methods return the SDK's native responses, retaining tools, media, structured
@@ -45,9 +45,11 @@ class _HTTPResponse(Protocol):
 
 
 class _RawResponse[T](Protocol):
-    """What the SDK's public `with_raw_response` returns: the parsed model and
-    its HTTP response. `T` is the parsed model the caller relies on; a caller
-    that narrows the body itself takes it as `object`."""
+    """Describes what the SDK's public `with_raw_response` returns.
+
+    It holds the parsed model and its HTTP response. `T` is the parsed model
+    the caller relies on; a caller that narrows the body itself takes `object`.
+    """
 
     @property
     def http_response(self) -> _HTTPResponse: ...
@@ -57,7 +59,7 @@ class _RawResponse[T](Protocol):
 
 @dataclass(frozen=True)
 class Usage:
-    """Reported aggregate usage; None means the backend did not report it."""
+    """Holds the reported aggregate usage. None means the backend did not report it."""
 
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
@@ -66,7 +68,7 @@ class Usage:
 
 @dataclass(frozen=True)
 class Completion:
-    """Choices in prompt-major order, with the original SDK responses retained.
+    """Holds the choices in prompt-major order, with the SDK responses retained.
 
     Per-choice counts stay None when only aggregate usage was reported.
     finish_reasons retain the backend's values, including an absent reason.
@@ -80,7 +82,10 @@ class Completion:
 
 
 def _invoke[T](call: Callable[..., T], fields: Mapping[str, object]) -> T:
-    """Forward SDK-owned options without maintaining a second parameter schema."""
+    """Call `call` with `fields` as keyword arguments.
+
+    The SDK owns the request schema, so nothing here validates the names.
+    """
     return call(**fields)
 
 
@@ -131,7 +136,7 @@ def _bound(options: Mapping[str, object], fixed: Mapping[str, object]) -> Mappin
 
 @lru_cache(maxsize=2)
 def _ollama_request_names(kind: Literal["generate", "chat"]) -> frozenset[str]:
-    """The request fields the SDK's public method accepts, read from its signature."""
+    """Return the request fields the SDK's public method accepts, from its signature."""
     from ollama import Client
     return frozenset(inspect.signature(getattr(Client, kind)).parameters) - {"self"}
 
@@ -168,7 +173,10 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
 
 def _ollama_body(model: str, kind: Literal["generate", "chat"],
                  fields: Mapping[str, object]) -> Mapping[str, object]:
-    """Keyword arguments for the SDK method; it owns image, message and tool serialization."""
+    """Build the keyword arguments for the SDK method.
+
+    The SDK owns image, message and tool serialization.
+    """
     body = _bound(fields, {"model": model})
     unknown = body.keys() - _ollama_request_names(kind)
     if unknown:

@@ -1,8 +1,8 @@
-"""DiffusionGemma assembly for the shared pretrained-model loader.
+"""Assemble a DiffusionGemma for the shared pretrained-model loader.
 
-Checkpoint text aliases collapse to one Flax subtree; vision and projection
-weights retain their separate subtrees. This module opens no checkpoint or
-processor and introduces no family-specific public loading entry point.
+Checkpoint text aliases collapse into one Flax subtree; vision and projection
+weights keep their own. This module opens no checkpoint or processor and adds
+no family-specific public loading entry point.
 """
 
 from __future__ import annotations
@@ -82,10 +82,11 @@ def translate_weights(
     *,
     param_dtype: str = "float32",
 ) -> Variables:
-    """Map shared aliases and media weights with independent parameter storage.
+    """Map a DiffusionGemma checkpoint's tensors into its variables tree.
 
-    Each component casts parameters at its binding site; frozen state remains
-    native FP32. No completed FP32 variables tree is narrowed afterward.
+    Text weights route through the shared decoder map, vision and projection
+    weights through their own. Each component casts its own leaves to
+    `param_dtype` as it binds them, so no full FP32 tree is built and narrowed.
     """
     text: dict[str, np.ndarray] = {}
     vision: dict[str, np.ndarray] = {}
@@ -120,7 +121,11 @@ def translate_weights(
 
 
 def generation_process(config: Mapping[str, object], generation: Mapping[str, object]) -> BlockProcess:
-    """Published inference defaults overridden by generation_config.json."""
+    """Build the block-diffusion process the published generation config describes.
+
+    Each field falls back to the reference's own default when
+    `generation_config.json` omits it.
+    """
     sampler = generation.get("sampler_config")
     if sampler is None:
         budget = 0.1
@@ -142,15 +147,14 @@ def generation_process(config: Mapping[str, object], generation: Mapping[str, ob
 
 
 def scalar_placement(text: CausalTransformer, variables: Variables) -> CausalTransformer:
-    """`text` under the layer-scalar policy the tree being written actually keeps.
+    """Return `text` with its layer-scalar policy set to the one `variables` keeps.
 
     Google makes the per-layer skip scale a parameter and Transformers calls
-    the same tensor a buffer, so a source declares which of the two it is and
-    the export reads the collection that policy names. `BlockDiffusionObjective`
-    trains the scalar, which moves every one of them into `params`, so the tree
-    a finished SFT hands back disagrees with the source it was loaded from.
-    The tree is what is being written, so the tree decides: exporting a run
-    and saving the source it trained both come through here and agree.
+    the same tensor a buffer, so a source declares which it is and the export
+    reads the collection that policy names. `BlockDiffusionObjective` trains
+    the scalar, which moves every one into `params`, so a finished SFT's tree
+    disagrees with the source it loaded. The tree being written decides, so an
+    exported run and a saved source agree.
     """
     if text.layer_scalar is None:
         return text
@@ -162,7 +166,11 @@ def scalar_placement(text: CausalTransformer, variables: Variables) -> CausalTra
 
 
 def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, object]) -> dict[str, np.ndarray]:
-    """Write canonical decoder tensors under the scalar policy the tree keeps."""
+    """Return the checkpoint tensors for a DiffusionGemma, keyed by source name.
+
+    The decoder half goes through `export_decoder_weights` and is renamed under
+    the reference's `model.decoder.` and `model.encoder.` prefixes.
+    """
     from dew.interop.hf_decoders import _flatten, export_decoder_weights
     from dew.nn.vision import _GEMMA4_VISION_TENSORS
 

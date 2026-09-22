@@ -1,4 +1,4 @@
-"""DeepSeek's block-scaled FP8 weights, read and written.
+"""Read and write DeepSeek's block-scaled FP8 weights.
 
 A quantized linear's `weight` is float8_e4m3fn [out, in] and its partner
 `weight_scale_inv` is float32 [ceil(out / 128), ceil(in / 128)], one scale
@@ -59,7 +59,7 @@ AMAX_FLOOR = 1e-4
 
 
 def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
-    """The block and whether the scales are ue8m0, from an fp8 `quantization_config`.
+    """Return the block size and whether the scales are ue8m0, from `quantization`.
 
     DeepSeek's format or refused: e4m3 in a square block, the scales float32
     (V3) or `scale_fmt` ue8m0 (V3.2). A per-tensor or rectangular scale, or
@@ -79,7 +79,10 @@ def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
 
 def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
                           block: int = BLOCK) -> np.ndarray:
-    """float32(weight[i, j]) * scale_inv[i // block, j // block], for a weight in any float dtype."""
+    """Return float32(weight[i, j]) * scale_inv[i // block, j // block].
+
+    `weight` may be in any float dtype.
+    """
     if weight.ndim != 2 or scale_inv.ndim != 2:
         raise ValueError(
             f"block-scaled dequantization takes a [rows, cols] weight and its "
@@ -101,13 +104,18 @@ def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
 
 
 def fp8_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """Names after decoding; scale metadata is not a model tensor."""
+    """Return the tensor names that survive decoding.
+
+    A `_scale_inv` partner is metadata, not a model tensor, so it is dropped.
+    """
     return tuple(name for name in tensors if not name.endswith(SCALE_SUFFIX))
 
 
 def read_fp8_tensor(tensors: Mapping[str, np.ndarray], name: str, *, block: int) -> np.ndarray:
-    """One original tensor for alias validation, decoding paired weights in
-    FP32 on demand. Unscaled values keep their original precision and dtype.
+    """Return one tensor in its original values, decoding it in FP32 if it is scaled.
+
+    Only the requested tensor is decoded, so alias validation never builds an
+    FP32 copy of the checkpoint. An unscaled value keeps its stored dtype.
     """
     value = tensors[name]
     scale = tensors.get(name + SCALE_SUFFIX)
@@ -116,10 +124,11 @@ def read_fp8_tensor(tensors: Mapping[str, np.ndarray], name: str, *, block: int)
 
 def dequantize_checkpoint(tensors: Mapping[str, np.ndarray], block: int, *,
                           param_dtype: str = "float32") -> dict[str, np.ndarray]:
-    """Apply and drop each scale partner, retaining each completed weight in
-    param_dtype. Block multiplication remains FP32; conversion happens before
-    the result enters the output dictionary, never on a whole decoded model.
-    A scale without its weight is refused. Unscaled tensors are unchanged.
+    """Apply each scale to its weight, drop the scale, and cast to `param_dtype`.
+
+    The block multiply stays FP32 and each weight is cast as it is written, so
+    no whole decoded model is held in FP32. A scale whose weight is absent is
+    refused. Unscaled tensors pass through unchanged.
     """
     from dew.nn.text_encoders import checkpoint_array
 
@@ -137,9 +146,9 @@ def dequantize_checkpoint(tensors: Mapping[str, np.ndarray], block: int, *,
 
 
 def scaled_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """The names in `tensors` with a `<name>_scale_inv` partner, in order.
+    """Return the names in `tensors` that have a `<name>_scale_inv` partner, in order.
 
-    Taken before `dequantize_checkpoint` consumes the partners; afterwards
+    Take these before `dequantize_checkpoint` consumes the partners; afterwards
     nothing says which tensors arrived quantized.
     """
     return tuple(name[:-len(SCALE_SUFFIX)] for name in tensors
@@ -148,7 +157,7 @@ def scaled_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
 
 def quantize_fp8_blocks(weight: ArrayLike, block: int = BLOCK, *,
                         ue8m0: bool = False) -> tuple[np.ndarray, np.ndarray]:
-    """`weight` as float8_e4m3fn blocks and the float32 scales that invert them.
+    """Cast `weight` to float8_e4m3fn blocks and the float32 scales that invert them.
 
     The inverse of `dequantize_fp8_blocks`: a [rows, cols] weight in any float
     dtype, on any device (widened to a host float32 copy exactly first),
@@ -190,7 +199,7 @@ def quantize_fp8_blocks(weight: ArrayLike, block: int = BLOCK, *,
 
 def pack_fp8(tensors: Mapping[str, np.ndarray], names: Iterable[str], block: int, *,
              ue8m0: bool) -> dict[str, np.ndarray]:
-    """`tensors` with each of `names` written back as fp8 blocks and scales.
+    """Return `tensors` with each of `names` written back as fp8 blocks and scales.
 
     `dequantize_checkpoint` run backwards, for the names a source shipped
     quantized (`scaled_names`) in the format its own config declares

@@ -1,4 +1,4 @@
-"""Gemma decoders: gemma, gemma2, gemma3_text, gemma3n_text, gemma4_text.
+"""Translate the Gemma decoders: gemma, gemma2, gemma3_text, gemma3n_text, gemma4_text.
 
 Each release keeps the previous block and adds one thing: Gemma 2 the
 sandwich norms and the two softcaps, Gemma 3 the q/k norms and the
@@ -53,7 +53,7 @@ def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
 
 
 def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, float | None]:
-    """(rope_theta, rope_local_theta, partial_rotary_factor) for gemma4.
+    """Return (rope_theta, rope_local_theta, partial_rotary_factor) for gemma4.
 
     The full layers may rotate a fraction of their head dims (proportional
     partial rotary); the sliding layers rotate all of theirs. Anything but
@@ -98,10 +98,13 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
 
 
 def _gemma_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Gemma 1: (1 + w) norms scaled in fp32, sqrt(d)-scaled embeddings, a
+    """Read a Gemma 1 config into `CausalTransformer` fields.
+
+    Gemma 1 has (1 + w) norms scaled in fp32, sqrt(d)-scaled embeddings, a
     tied head, and no norms beyond the two pre-norms (modeling_gemma.py:77,
     :374). Its released config names hidden_act 'gelu', which the reference
-    computes as the erf gelu (modeling_gemma.py:93, ACT2FN['gelu'])."""
+    computes as the erf gelu (modeling_gemma.py:93, ACT2FN['gelu']).
+    """
     config = _base_config(hf_config, used, scale_after_cast=False, tie_embeddings=True)
     config.update(scale_offset=True, embedding_scale=True)
     return config
@@ -109,11 +112,12 @@ def _gemma_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
 
 def _gemma_softcaps(hf_config: Mapping[str, object], used: set[str],
                     config: DecoderFields) -> None:
-    """query_pre_attn_scalar, the two softcaps and the sandwich norms of
-    Gemma 2 and 3. Gemma 3 reads attn_logit_softcapping into its attention
-    without passing it on (modeling_gemma3.py:334, :370-379), so there it
-    changes nothing. Gemma 2 applies it (modeling_gemma2.py:282) and its
-    entry maps it below."""
+    """Add the query scalar, the softcaps and the sandwich norms of Gemma 2 and 3.
+
+    Gemma 3 reads attn_logit_softcapping into its attention without passing it
+    on (modeling_gemma3.py:334, :370-379), so there it changes nothing. Gemma 2
+    applies it (modeling_gemma2.py:282) and its entry maps it below.
+    """
     config.update(scale_offset=True, embedding_scale=True, sandwich_norms=True)
     used.update(('query_pre_attn_scalar', 'final_logit_softcapping',
                  'attn_logit_softcapping'))
@@ -126,9 +130,12 @@ def _gemma_softcaps(hf_config: Mapping[str, object], used: set[str],
 
 
 def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Gemma 2: Gemma 3's block without the q/k norms, alternating sliding
-    and full layers at one rope base, and the tanh softcap on the attention
-    logits (configuration_gemma2.py:95-98, modeling_gemma2.py:203-206)."""
+    """Read a Gemma 2 config into `CausalTransformer` fields.
+
+    Gemma 2 is Gemma 3's block without the q/k norms. It alternates sliding and
+    full layers at one rope base and softcaps the attention logits with tanh
+    (configuration_gemma2.py:95-98, modeling_gemma2.py:203-206).
+    """
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     layer_types = _specified_layer_types(hf_config, used, tuple(
         'sliding_attention' if (index + 1) % 2 else 'full_attention'
@@ -150,9 +157,12 @@ def _gemma3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
 
 
 def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Gemma 3n (E2B, E4B): AltUp's stack of residual copies, the LAuReL
-    block, gaussian top-k sparsity on the first layers, one feed-forward
-    width per layer, per-layer inputs and KV sharing over the last layers."""
+    """Read a Gemma 3n config into `CausalTransformer` fields.
+
+    Gemma 3n (E2B, E4B) adds AltUp's stack of residual copies, the LAuReL
+    block, gaussian top-k sparsity on the first layers, one feed-forward width
+    per layer, per-layer inputs and KV sharing over the last layers.
+    """
     if hf_config.get('layer_types') is not None:
         layer_types = _specified_layer_types(hf_config, used)
     else:
@@ -216,8 +226,9 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
 
 
 def _gemma3n_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The AltUp and LAuReL leaves beside a Gemma 4 style layer.
+    """Return the variables-tree path for one Gemma 3n tensor name.
 
+    Gemma 3n adds the AltUp and LAuReL leaves beside a Gemma 4 style layer.
     The copies' projections are indexed modules (altup_projections.{i}), which
     land as altup_projections_{i} the way the layers do; the coefficient maps
     are Linears, so they transpose like any kernel.
@@ -354,7 +365,11 @@ def _gemma3_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
-    """Canonical Gemma4TextConfig from the native computation, never a source template."""
+    """Return the Gemma4TextConfig fields that describe `model`'s computation.
+
+    Every field is read off the model, never copied from the config a source
+    shipped, so an exported model and a trained one write the same file.
+    """
     fixed = {'qk_norm': True, 'v_norm': True, 'sandwich_norms': True, 'pre_norms': True,
              'embedding_scale': True, 'attention_scale': 1.0, 'scale_offset': False,
              'scale_after_cast': False, 'qk_norm_scope': 'head', 'causal': True}
@@ -434,7 +449,12 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
 
 def _gemma4_export_weights(model: CausalTransformer, variables: Mapping[str, object],
                            config: Mapping[str, object]) -> dict[str, np.ndarray]:
-    """One canonical text inverse shared by standalone Gemma4 and DiffGemma."""
+    """Return the Gemma 4 checkpoint tensors for `model` and `variables`.
+
+    This is the one text inverse standalone Gemma 4 and DiffusionGemma share.
+    `flat` holds the flattened params and `fixed` the constants, so a leaf is
+    read from the collection `model.layer_scalar` names.
+    """
     mode = model.layer_scalar
     if mode not in ('frozen', 'trainable'):
         raise ValueError('Gemma4 tensor export requires an explicit layer_scalar mode')
@@ -504,7 +524,7 @@ def _gemma2_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def _gemma4_prepare(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """The routed branch's fused experts into dew's stacked `[E, in, out]` kernels.
+    """Split the routed branch's fused experts into dew's stacked `[E, in, out]` kernels.
 
     `Gemma4TextExperts` holds `gate_up_proj` as `[E, 2 * expert, hidden]` with
     the gate in the first rows and `down_proj` as `[E, hidden, expert]`, each

@@ -1,4 +1,4 @@
-"""Hugging Face decoder checkpoints into CausalTransformer trees, and back.
+"""Read Hugging Face decoder checkpoints into CausalTransformer trees, and back.
 
 translate_config and translate_weights are the map: a decoder config dict into
 CausalTransformer kwargs, and HF-named tensors into a dew params tree. The
@@ -8,29 +8,16 @@ defaults to FP32, independently of compute dtype, so dew.interop.load_pretrained
 builds a model whose variables a forward pass takes straight away, and
 save_pretrained_decoder writes one back out in the HF layout.
 
-Each family is one DecoderFamily entry in _FAMILY_ENTRIES, keyed by its
+Each family is one `DecoderFamily` entry in `_FAMILY_ENTRIES`, keyed by its
 model_type: the config translation, the tensor path rule and the export
-vocabulary. Entries cover llama (Llama 2, 3 and 3.1's rope_scaling),
-mistral, mixtral, qwen2, qwen3, qwen3_moe, gemma, gemma2, gemma3_text,
-gemma3n_text, gemma4_text (the dense sizes and the routed 26B-A4B), olmo3
-(one rotary table per layer kind, the released YaRN on the full-attention
-layers alone), qwen3_5_text
-(the hybrid of gated delta net layers and gated full-attention layers, whose
-linear_attn layers land on the gated_delta_net mixer kind), gpt_oss, llama4_text,
-glm4_moe, deepseek_v2, deepseek_v2_lite, kimi_k2, deepseek_v3, deepseek_v32
-and deepseek_v4 (mHC's residual streams over its sliding, compressed sparse
-and heavily compressed attention kinds, with hash-routed first layers),
-llada and Dream (bidirectional masked-diffusion decoders with a mask token,
-Dream on the qwen2 tensor layout, LLaDA on OLMo-style names remapped onto it)
-and diffusion_gemma_text (DiffusionGemma's text weights on the Gemma 4 map in
-decoder mode; the block-diffusion sampler is not landed here).
+vocabulary. `_FAMILY_ENTRIES` at the bottom of this file is the list of
+covered families; read it rather than a copy of it here.
+
 A multimodal wrapper config raises a ValueError naming its model_type.
-DeepSeek loads
-through the MLA mixer with DeepSeek's MoE sizing, and its released
-checkpoints carry `num_nextn_predict_layers: 1` with no `mtp.*` weights, so
-translation builds the base model the weights describe. A config field that
-changes what the model computes and has no dew counterpart raises a
-ValueError naming it.
+DeepSeek's released checkpoints carry `num_nextn_predict_layers: 1` with no
+`mtp.*` weights, so translation builds the base model the weights describe. A
+config field that changes what the model computes and has no dew counterpart
+raises a ValueError naming it.
 """
 
 import dataclasses
@@ -104,6 +91,9 @@ _LINEAR_FIELDS = ('linear_num_key_heads', 'linear_num_value_heads',
                   'linear_key_head_dim', 'linear_value_head_dim',
                   'linear_conv_kernel_dim')
 
+# These fields have no effect on an eval-time forward pass: metadata, token
+# ids, or runtime knobs of the reference implementation (Gemma 3 ships
+# cache_implementation 'hybrid', which describes transformers' KV cache).
 _IGNORED_FIELDS = {
     'architectures', 'attention_dropout', 'attn_implementation', 'auto_map',
     'bos_token_id', 'cache_implementation', 'chunk_size_feed_forward', 'dtype', 'eos_token_id',
@@ -114,22 +104,18 @@ _IGNORED_FIELDS = {
     'torch_dtype', 'transformers_version',
 }
 
-# The fields above have no effect on an eval-time forward pass: metadata,
-# token ids, or runtime knobs of the reference implementation (Gemma 3 ships
-# cache_implementation 'hybrid', which describes transformers' KV cache).
-
 
 def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
 
 
 def _kind_name(record: Mapping[str, object], section: str) -> str:
-    """The registry name of one nested value record."""
+    """Return the registry name of one nested value record."""
     return records.text(records.record(record[section], section)['kind'], f"{section} kind")
 
 
 class Llama3Ramp(TypedDict):
-    """Llama 3.1's frequency ramp, under the reference's own field names.
+    """Describes Llama 3.1's frequency ramp, under the reference's own field names.
     `dew.nn.attention.RopeScaling` is built from these keys."""
 
     rope_type: Literal['llama3']
@@ -140,7 +126,7 @@ class Llama3Ramp(TypedDict):
 
 
 class YarnRamp(TypedDict):
-    """A YaRN frequency table, under the reference's own field names.
+    """Describes a YaRN frequency table, under the reference's own field names.
     `dew.nn.mla.YarnScaling` is built from these keys."""
 
     rope_type: Literal['yarn']
@@ -160,7 +146,7 @@ type Ramp = Llama3Ramp | YarnRamp
 
 
 class KindFields(TypedDict, total=False):
-    """One `LayerKind` as a record: what the layers of one kind do
+    """Describes one `LayerKind`: what the layers of one kind do
     differently. A mixer record dispatches on its own `kind`."""
 
     window: int | None
@@ -173,7 +159,7 @@ class KindFields(TypedDict, total=False):
 
 
 class MixtureFields(TypedDict, total=False):
-    """One `Mixture` as a record: the experts some layers route to, and how
+    """Describes one `Mixture`: the experts some layers route to, and how
     the router chooses."""
 
     experts: int
@@ -198,7 +184,7 @@ class MixtureFields(TypedDict, total=False):
 
 
 class AltUpFields(TypedDict, total=False):
-    """One `AltUp` as a record: Gemma 3n's stack of residual copies."""
+    """Describes one `AltUp`: Gemma 3n's stack of residual copies."""
 
     num_inputs: int
     active_idx: int
@@ -207,7 +193,7 @@ class AltUpFields(TypedDict, total=False):
 
 
 class HyperConnectionsFields(TypedDict, total=False):
-    """One `HyperConnections` as a record: how many residual streams a layer
+    """Describes one `HyperConnections`: how many residual streams a layer
     reads and writes, and how they collapse."""
 
     hc_mult: int
@@ -217,7 +203,7 @@ class HyperConnectionsFields(TypedDict, total=False):
 
 
 class DecoderFields(TypedDict, total=False):
-    """Every field of `CausalTransformer` a translated config can name.
+    """Names every field of `CausalTransformer` a translated config can set.
 
     The keys are the dataclass's own init fields, which
     `tests/test_hf_decoders.py` pins, so a field renamed there is a failing
@@ -294,8 +280,10 @@ class DecoderFields(TypedDict, total=False):
 
 
 class AudioFields(TypedDict):
-    """The audio half of a wrapper record; a family without an audio tower
-    carries all four as None."""
+    """Describes the audio half of a wrapper record.
+
+    A family without an audio tower carries all four as None.
+    """
 
     audio: Mapping[str, object] | None
     audio_projector: Mapping[str, object] | None
@@ -304,7 +292,7 @@ class AudioFields(TypedDict):
 
 
 class WrapperFields(AudioFields):
-    """A multimodal wrapper as a record: its decoder, its tower, its
+    """Describes a multimodal wrapper: its decoder, its tower, its
     projector, and where each modality's tokens sit."""
 
     model_type: str
@@ -317,7 +305,7 @@ class WrapperFields(AudioFields):
 
 
 def _kinds_of(config: DecoderFields) -> dict[str, KindFields]:
-    """The kind records of a translated config, which `_base_config` always
+    """Return the kind records of a translated config, which `_base_config` always
     sets, for a family that adds its own to them."""
     kinds = config.get('kinds')
     if kinds is None:
@@ -336,7 +324,7 @@ _RAMP_FIELDS = {'llama3': 'rope_scaling', 'yarn': 'yarn'}
 
 @dataclass(frozen=True)
 class _Rope:
-    """One rope entry as read: its base and, for a scaled entry, the ramp
+    """Holds one rope entry as read: its base and, for a scaled entry, the ramp
     record under the reference's names. `theta` is None where the entry
     names no base of its own, and a ramp record carries the `rope_type`
     that says which ramp it is."""
@@ -347,7 +335,7 @@ class _Rope:
 
 def _rope_entry(entry: Mapping[str, object] | None, field: str,
                 yarn_max_pos: int | None = None) -> _Rope:
-    """One rope_parameters entry, if it names a base or a ramp.
+    """Read one rope_parameters entry, if it names a base or a ramp.
 
     Plain rope ('default' or 'none') and Llama 3.1's 'llama3' map; any other
     variant changes what the model computes, so it refuses with the field
@@ -401,8 +389,11 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
 
 
 def _rope_theta(entry: Mapping[str, object] | None, field: str) -> float | None:
-    """One plain rope base frequency; a llama3 entry refuses where only plain
-    rope has a place (the DeepSeek and Gemma 4 readers)."""
+    """Read one plain rope base frequency.
+
+    A llama3 entry refuses where only plain rope has a place: the DeepSeek and
+    Gemma 4 readers.
+    """
     rope = _rope_entry(entry, field)
     if rope.scaling is not None:
         _refuse(f"{field} (rope_type 'llama3')",
@@ -412,7 +403,7 @@ def _rope_theta(entry: Mapping[str, object] | None, field: str) -> float | None:
 
 @dataclass(frozen=True)
 class _Ropes:
-    """What the shared rope readers hand a family: the model's base and
+    """Holds what the shared rope readers hand a family: the model's base and
     ramp, and the sliding kind's own where a config states one.
     `full_only` marks a nested config whose sliding entry names no ramp
     while the full one does, so the ramp is the full kind's alone."""
@@ -425,7 +416,7 @@ class _Ropes:
 
 
 def _at_base(scaling: Ramp | None, theta: float) -> Ramp | None:
-    """A ramp record at the base the layers it rides on rotate at.
+    """Return a ramp record at the base the layers it rides on rotate at.
 
     A YaRN record repeats that base (the mixer's `YarnScaling.rope_theta`),
     and a released config states it once beside `rope_scaling` rather than
@@ -439,7 +430,7 @@ def _at_base(scaling: Ramp | None, theta: float) -> Ramp | None:
 
 def _rope(hf_config: Mapping[str, object], used: set,
           yarn_max_pos: int | None = None) -> _Ropes:
-    """The rope of any of the three HF spellings.
+    """Read the rope of any of the three HF spellings.
 
     Flat rope_theta with rope_scaling beside it, gemma3 text configs with
     rope_local_base_freq, and nested per-layer-type rope_parameters all read
@@ -494,7 +485,7 @@ def _specified_layer_types(hf_config: Mapping[str, object], used: set[str],
 def _kinds(layer_types: tuple[str, ...], window: int | None,
            local_theta: float | None, full_theta: float | None,
            full_head_dim: int | None) -> dict[str, KindFields]:
-    """What each named kind of the pattern does, as records.
+    """Return what each named kind of the pattern does, as records.
 
     A family states its window and its local rope base for the sliding
     layers and its own head dim for the global ones; the pattern names
@@ -527,7 +518,7 @@ _YARN_FIELDS = frozenset({
 
 def _yarn_record(entry: Mapping[str, object], field: str, theta: float,
                  max_pos: int) -> YarnRamp:
-    """The mixer's yarn record out of a YaRN rope entry.
+    """Read a YaRN rope entry into the mixer's yarn record.
 
     Keeps the reference's names; the mixer's YarnScaling is built from these
     keys. An explicit `attention_factor` rides along (the reference scales
@@ -566,9 +557,11 @@ def _yarn_record(entry: Mapping[str, object], field: str, theta: float,
 
 
 def _mlp_features(hf_config: Mapping[str, object]) -> int | tuple[int, ...]:
-    """One width, or Gemma 3n's list of one per layer. configuration_gemma3n.py
-    expands an int to a list, so a config it wrote carries the list. A list
-    of one value is that value."""
+    """Return one feed-forward width, or Gemma 3n's list of one per layer.
+
+    configuration_gemma3n.py expands an int to a list, so a config it wrote
+    carries the list. A list of one repeated value is that value.
+    """
     stated = hf_config['intermediate_size']
     if isinstance(stated, (list, tuple)):
         widths = records.integers(stated, 'intermediate_size')
@@ -581,7 +574,7 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
                  rope: _Ropes | None = None,
                  qk_norm: bool = False, scale_after_cast: bool = True,
                  tie_embeddings: bool = False) -> DecoderFields:
-    """The shared projection geometry and decoder fields.
+    """Read the projection geometry and decoder fields every family shares.
 
     A ramp both kinds share is the model's; a ramp the full layers alone
     carry (OLMo 3's spelling) lands on the full kind, because a kind's None
@@ -670,7 +663,7 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
 
 def _softmax_mixture(hf_config: Mapping[str, object], used: set[str],
                      **fields: Unpack[MixtureFields]) -> MixtureFields:
-    """The Mixtral-style mixture: a softmax over the experts, the top k, and
+    """Build the Mixtral-style mixture: a softmax over the experts, the top k, and
     the renormalisation the family's `norm_topk_prob` says (Mixtral always
     renormalises, modeling_mixtral.py:109; Qwen3-MoE reads the field,
     modeling_qwen3_moe.py:263-264). The router's aux loss coefficient and
@@ -733,7 +726,7 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
 
 
 def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
-    """The wrapper's text_config translated as the decoder it is."""
+    """Translate the wrapper's text_config as the decoder it is."""
     text = hf_config.get("text_config")
     if not isinstance(text, Mapping):
         _refuse("text_config",
@@ -752,7 +745,7 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
 
 
 def _wrapper_image_id(hf_config: Mapping[str, object], used: set, *names: str) -> int:
-    """The image token id under either of its spellings."""
+    """Return the image token id under either of its spellings."""
     for name in names:
         if hf_config.get(name) is not None:
             used.add(name)
@@ -768,7 +761,7 @@ _NO_AUDIO: AudioFields = {"audio": None, "audio_projector": None,
 
 
 def _wrapper_tokens(hf_config: Mapping[str, object], used: set) -> None:
-    """The wrapper-level keys every multimodal repo carries, marked read."""
+    """Mark the wrapper-level keys every multimodal repo carries as read."""
     used.update(("architectures", "tie_word_embeddings", "torch_dtype",
                  "transformers_version", "initializer_range", "boi_token_id",
                  "boi_token_index", "eoi_token_id", "eoi_token_index",
@@ -776,19 +769,17 @@ def _wrapper_tokens(hf_config: Mapping[str, object], used: set) -> None:
 
 
 def _record_int(record: Mapping[str, object], field: str, default: int | None = None) -> int:
-    """An int field out of a record by name; a None default makes it required."""
+    """Read an int field out of a record by name. A None default makes it required."""
     return records.integer(record[field] if default is None else record.get(field, default), field)
 
 
 def _record_float(record: Mapping[str, object], field: str, default: float | None = None) -> float:
-    """A real field out of a record by name; a None default makes it required."""
+    """Read a real field out of a record by name. A None default makes it required."""
     return records.number(record[field] if default is None else record.get(field, default), field)
 
 
 def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
-
-
-    """A Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
+    """Read a Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
     text = _wrapper_text(hf_config, used)
     tower = vision_nn.translate_siglip_vision_config(hf_config)
     used.add("vision_config")
@@ -811,7 +802,7 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 
 
 def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
-    """A Llama 4 wrapper: MetaCLIP-style tower, shuffle adapter, outer map."""
+    """Read a Llama 4 wrapper: MetaCLIP-style tower, shuffle adapter, outer map."""
     text = _wrapper_text(hf_config, used)
     tower = vision_nn.translate_llama4_vision_config(hf_config)
     used.add("vision_config")
@@ -838,7 +829,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 
 
 def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) -> AudioFields:
-    """The optional audio tower, its embedder and placeholder id for a Gemma wrapper.
+    """Read the optional audio tower, its embedder and placeholder id for a Gemma wrapper.
 
     Gemma 4 projects encoded frames through the same norm-and-project
     embedder as its images, at the encoder's output width; the processor
@@ -872,7 +863,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
 
 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
-    """A Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
+    """Read a Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
     text = _wrapper_text(hf_config, used)
     tower = vision_nn.translate_gemma4_vision_config(hf_config)
     used.add("vision_config")
@@ -898,7 +889,7 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 
 
 def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
-    """A Qwen 3.5 wrapper: NaViT-style tower, merger, decoder."""
+    """Read a Qwen 3.5 wrapper: NaViT-style tower, merger, decoder."""
     if hf_config.get('language_model_only', False) is not False:
         _refuse('language_model_only', 'the multimodal wrapper requires its vision component')
     used.add('language_model_only')
@@ -925,7 +916,7 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 
 
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
-    """A Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
+    """Read a Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
     text = _wrapper_text(hf_config, used)
     tower = vision_nn.translate_gemma3n_vision_config(hf_config)
     projector = vision_nn.translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
@@ -943,7 +934,7 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
-    """A multimodal wrapper into its decoder, tower and projector records.
+    """Translate a multimodal wrapper into its decoder, tower and projector records.
 
     gemma3, llama4, gemma4, qwen3_5 and gemma3n bundles translate. Records
     retain the decoder, tower, projector, image token ID and token count, and
@@ -994,7 +985,7 @@ def _wrapper_tower_variables(
 def _wrapper_projector_weights(
     kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
 ) -> Variables:
-    """Projector tensors by projector kind, preserving the requested storage."""
+    """Return the projector tensors for one projector kind, in the requested storage."""
     if kind == "gemma":
         return vision_nn.translate_gemma_projector_weights(hf_tensors, param_dtype=param_dtype)
     if kind == "llama4":
@@ -1087,7 +1078,7 @@ def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], con
 
 
 def _tied_names(family: "DecoderFamily", config, names: Collection[str]) -> tuple[str, str]:
-    """The family's tied head and embedding, as this source spells them.
+    """Return the family's tied head and embedding, as this source spells them.
 
     A release need not name the embedding the way the family does: DeepSeek
     V4 ships `embed.weight` where an export of it writes
@@ -1108,7 +1099,7 @@ def _tied_names(family: "DecoderFamily", config, names: Collection[str]) -> tupl
 
 def _denoiser_sources(names: Collection[str], read: Callable[[str], np.ndarray], *,
                       text_only: bool):
-    """Shared text names, preferring the encoder exactly as the weight map does.
+    """Return the shared text names, preferring the encoder as the weight map does.
     Alias-only inspection of a complete source leaves media validation to its
     own mapper; the text-only translator still refuses every unknown prefix.
     """
@@ -1143,10 +1134,12 @@ def _denoiser_sources(names: Collection[str], read: Callable[[str], np.ndarray],
 
 def validate_source_aliases(names: Collection[str], read: Callable[[str], np.ndarray],
                             config: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
-    """Check original values before a codec retains narrowed weights. read
-    decodes only the requested tensor in FP32; no FP32 mapping is built.
-    Verified relationships let a narrowed quantized weight and an unquantized
-    copy share storage rather than subsequently disagree due to rounding.
+    """Return the pairs of source tensor names that hold equal values.
+
+    `read` decodes one tensor at a time in FP32, so no whole-checkpoint FP32
+    copy is built. The pairs are checked before any narrowing cast, so a
+    quantized weight and its unquantized copy can share one leaf instead of
+    rounding to different values.
     """
     if config.get("model_type") == "diffusion_gemma":
         from dew.interop.diffusion_gemma import text_config
@@ -1170,7 +1163,7 @@ def translate_wrapper_weights(
     *,
     param_dtype: str = "float32",
 ) -> Variables:
-    """Wrapper weights into language, tower, projector and audio trees.
+    """Map wrapper weights into language, tower, projector and audio trees.
 
     One leading `model.` comes off every name first, which is the released
     nesting; what stays routes by prefix. The language half rides the text
@@ -1276,7 +1269,7 @@ def _norm_names(sandwich: bool) -> dict[str, str]:
 
 
 def _dew_path(hf_name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """One HF tensor name into its path in a CausalTransformer's variables.
+    """Map one HF tensor name to its path in a CausalTransformer's variables.
 
     The first name is the collection: `params` for a weight, `moe` for
     DeepSeek's balancing bias. That bias is router state a training step
@@ -1294,7 +1287,7 @@ def _dew_path(hf_name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
 
 
 def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """The params-tree path of a split HF tensor name, or None for the tied head."""
+    """Return the params-tree path of a split HF tensor name, or None for the tied head."""
     hf_name = '.'.join(parts)
     if parts == ['model', 'norm', 'weight']:
         return ('norm', 'scale')
@@ -1399,7 +1392,7 @@ def _param_path(parts: list[str], config: Mapping[str, object]) -> tuple[str, ..
 
 
 def _v4_attention_leaf(tail: list[str]) -> tuple[str, ...] | None:
-    """DeepSeek V4's own leaf under `self_attn`, or None for another family's.
+    """Return DeepSeek V4's own leaf under `self_attn`, or None for another family's.
 
     The reference nests a compressor under the layer, an indexer under a
     compressor and a scorer under the indexer, each holding projections and
@@ -1420,7 +1413,7 @@ def _v4_attention_leaf(tail: list[str]) -> tuple[str, ...] | None:
 
 
 def _stack_experts(params: ParamTree) -> None:
-    """Per-expert `experts/K/projection` dicts into stacked `[E, ...]` leaves.
+    """Stack per-expert `experts/K/projection` dicts into `[E, ...]` leaves.
 
     A checkpoint names one tensor per expert while the tree keeps one leaf
     per projection stacked on an expert dimension, so after the flat map
@@ -1468,7 +1461,7 @@ def translate_weights(
     *,
     param_dtype: str = "float32",
 ) -> Variables:
-    """HF tensors into a CausalTransformer tree; parameters default to FP32.
+    """Map HF tensors into a CausalTransformer tree. Parameters default to FP32.
 
     Linear weights arrive as [out, in] and nn.Dense keeps [in, out], so every
     `.kernel` is transposed; norm `.weight` becomes `.scale`; Gemma's
@@ -1529,7 +1522,7 @@ def translate_denoiser_weights(
     *,
     param_dtype: str = "float32",
 ) -> Variables:
-    """A DiffusionGemma text checkpoint into the shared tree plus self-conditioning.
+    """Map a DiffusionGemma text checkpoint into the shared tree plus self-conditioning.
 
     The encoder (`model.encoder.language_model.*`) and the decoder
     (`model.decoder.*`) share every text weight they have in common, so both
@@ -1554,7 +1547,7 @@ def translate_denoiser_weights(
 
 
 def _read_shard(path: Path) -> dict[str, np.ndarray]:
-    """Every tensor of one safetensors file, memory mapped in its stored
+    """Read every tensor of one safetensors file, memory mapped in its stored
     dtype. The translator chooses each bound leaf's storage precision;
     packed payloads such as MXFP4 stay bytes for their dequantizer."""
     tensors, _ = read_file(path)
@@ -1562,7 +1555,7 @@ def _read_shard(path: Path) -> dict[str, np.ndarray]:
 
 
 def _load_shards(directory: Path) -> dict[str, np.ndarray]:
-    """Every tensor of a checkpoint directory, mapped in its stored dtype."""
+    """Read every tensor of a checkpoint directory, mapped in its stored dtype."""
     shards = sorted(directory.glob("*.safetensors"))
     if not shards:
         raise FileNotFoundError(f"no *.safetensors under {directory}")
@@ -1742,7 +1735,7 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
 
 
 def _flatten(tree: Mapping[str, object], prefix: str = '') -> Variables:
-    """A params tree as '.'-joined names, leaves untouched.
+    """Flatten a params tree to '.'-joined names, leaves untouched.
 
     Untouched matters because the shape check flattens a jax.eval_shape template,
     whose leaves carry a shape but no data to convert.
@@ -1758,7 +1751,7 @@ def _flatten(tree: Mapping[str, object], prefix: str = '') -> Variables:
 
 
 def _export_config(model) -> Mapping[str, object]:
-    """A CausalTransformer's fields back into HF vocabulary."""
+    """Write a CausalTransformer's fields back into HF vocabulary."""
     family = _family_for_model(model)
     sandwich = bool(model.sandwich_norms)
     config: dict[str, object] = {
@@ -1857,7 +1850,7 @@ def _export_config(model) -> Mapping[str, object]:
 
 
 def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
-    """One flattened dew param path into its HF tensor name, or None.
+    """Map one flattened dew param path to its HF tensor name, or None.
 
     None is the tied lm_head, whose embedding copy is written instead.
     """
@@ -1888,7 +1881,7 @@ def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
 
 @dataclass(frozen=True)
 class DecoderFamily:
-    """One family's config, tensor paths and export vocabulary.
+    """Holds one family's config, tensor paths and export vocabulary.
 
     A dew config carries no provenance tag, so `matches` reads the fields
     the backbone would be built from and names the family whose reference
@@ -1922,7 +1915,7 @@ class DecoderFamily:
 
 
 def _kind_mixers(fields: DecoderFields) -> list[MixerBase]:
-    """The mixer value of every kind a config names, records built."""
+    """Return the mixer value of every kind a config names, records built."""
     found = []
     for kind in (fields.get('kinds') or {}).values():
         mixer = kind.mixer if isinstance(kind, LayerKind) else kind.get('mixer')
@@ -2183,7 +2176,7 @@ _FAMILY_ENTRIES = (
 _FAMILIES = {name: family for family in _FAMILY_ENTRIES for name in family.model_types}
 
 def _backbone_defaults() -> DecoderFields:
-    """What the backbone takes for a field a config leaves unset, so a partial
+    """Return what the backbone takes for a field a config leaves unset, so a partial
     config (a layer's worth of tensors in a test) selects its family the way
     the built model would."""
     found = {}

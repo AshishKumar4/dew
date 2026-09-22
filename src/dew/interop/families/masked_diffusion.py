@@ -1,4 +1,4 @@
-"""The bidirectional decoders: LLaDA, Dream and DiffusionGemma's text half.
+"""Translate the bidirectional decoders: LLaDA, Dream and DiffusionGemma's text half.
 
 Each is a causal family's block with the mask replaced: full attention in
 place of the causal mask, and a mask token the sampler denoises to. Dream
@@ -26,17 +26,18 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """LLaDA-8B: a Llama-shaped decoder with full attention and a mask token.
+    """Read a LLaDA-8B config into `CausalTransformer` fields.
 
     GSAI-ML/LLaDA-8B-Base (model_type 'llada', architectures ['LLaDAModelLM'])
-    computes a Llama block (RMSNorm pre-norms, rotate-half rope, SwiGLU) with
-    no causal mask anywhere (modeling_llada.py, LLaDAModel bidirectional bias,
-    LLaDALlamaBlock is_causal=False) and trains masked diffusion on the id in
-    mask_token_id. The checkpoint names its tensors OLMo-style
+    computes a Llama block: RMSNorm pre-norms, rotate-half rope, SwiGLU. It
+    carries no causal mask anywhere (modeling_llada.py, LLaDAModel
+    bidirectional bias, LLaDALlamaBlock is_causal=False) and trains masked
+    diffusion on the id in mask_token_id.
+
+    The checkpoint names its tensors OLMo-style
     (model.transformer.blocks.N.{attn_norm,q_proj,k_proj,v_proj,attn_out,
-    ff_norm,ff_proj,up_proj,ff_out}, wte, ln_f, ff_out for the head), so the
-    weight path renames them onto the llama layout and the shared map reads
-    them from there.
+    ff_norm,ff_proj,up_proj,ff_out}, wte, ln_f, ff_out for the head), so
+    `_llada_path` renames them onto the llama layout the shared map reads.
     """
     std = _llada_geometry(hf_config)
     layers = records.integer(std['num_hidden_layers'], 'num_hidden_layers/n_layers')
@@ -67,9 +68,11 @@ _LLADA_READ = ('hidden_size', 'd_model', 'num_hidden_layers', 'n_layers', 'num_l
 
 
 def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
-    """LLaDA's own config spellings (d_model, n_layers, n_heads, n_kv_heads,
-    mlp_hidden_size, embedding_size, max_sequence_length) under the standard
-    names `_base_config` reads, each alias beside the spelling it stands in for.
+    """Rewrite LLaDA's own config spellings under the standard names `_base_config` reads.
+
+    The aliases are d_model, n_layers, n_heads, n_kv_heads, mlp_hidden_size,
+    embedding_size and max_sequence_length. Each is read beside the standard
+    spelling it stands in for.
     """
     hidden = hf_config.get('hidden_size', hf_config.get('d_model'))
     layers = hf_config.get('num_hidden_layers', hf_config.get('n_layers',
@@ -110,13 +113,13 @@ def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
 
 def _llada_refusals(hf_config: Mapping[str, object], used: set[str],
                     std: Mapping[str, object]) -> None:
-    """The release's own flags, against the one computation this entry builds.
+    """Check the release's own config flags against the computation this entry builds.
 
     Dropout, init and kernel flags describe training or the kernel, not the
-    eval forward, and read as used where the release leaves them; anything
-    that would change the eval computation refuses. `std` is the geometry
-    already read, so the two checks that compare against it (the biases and
-    the activation) read the resolved value rather than an alias.
+    eval forward, so they are marked read and left alone. A flag that would
+    change the eval computation refuses. `std` is the geometry already read, so
+    the two checks against it (the biases and the activation) see the resolved
+    value rather than an alias.
     """
     layers = records.integer(std['num_hidden_layers'], 'num_hidden_layers/n_layers')
     if std['attention_bias']:
@@ -183,15 +186,15 @@ def _llada_refusals(hf_config: Mapping[str, object], used: set[str],
 
 
 def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Dream-v0: a Qwen2-shaped decoder with full attention and a mask token.
+    """Read a Dream-v0 config into `CausalTransformer` fields.
 
-    Dream-org/Dream-v0-Base-7B (model_type 'Dream', architectures ['DreamModel'])
-    is a 28-layer Qwen2.5-7B geometry (3584 wide, 28 heads, 4 kv heads) whose
-    attention hard-codes is_causal=False over biased q/k/v and a bias-free
-    o_proj (modeling_dream.py, DreamAttention/DreamSdpaAttention) and whose
-    MLP is bias-free SwiGLU. Tensor names are the qwen2 layout, so the shared
-    map reads them with no new table. use_mrope=False is the only Dream-only
-    flag and changes nothing at that value.
+    Dream-org/Dream-v0-Base-7B (model_type 'Dream', architectures
+    ['DreamModel']) is a 28-layer Qwen2.5-7B geometry: 3584 wide, 28 heads, 4
+    kv heads. Its attention hard-codes is_causal=False over biased q/k/v and a
+    bias-free o_proj (modeling_dream.py, DreamAttention/DreamSdpaAttention),
+    and its MLP is bias-free SwiGLU. Tensor names are the qwen2 layout, so the
+    shared map reads them with no new table. use_mrope=False is the only
+    Dream-only flag and changes nothing at that value.
     """
     if hf_config.get('use_mrope'):
         _refuse('use_mrope=True', 'the backbone rotates plain positions')
@@ -206,20 +209,21 @@ def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
 
 
 def _diffusion_gemma_text_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """DiffusionGemma's text weights: the Gemma 4 block in decoder mode.
+    """Read a DiffusionGemma text config into `CausalTransformer` fields.
 
     google/diffusiongemma-26B-A4B-it (model_type 'diffusion_gemma_text') is the
-    Gemma 4 text geometry with canvas denoising around it: a causal encoder
-    over the prompt filling a KV cache, then a bidirectional decoder over the
-    canvas attending to that cache, with a self-conditioning MLP folding the
-    previous step's logits into the input embeddings
+    Gemma 4 text geometry with canvas denoising around it. A causal encoder
+    over the prompt fills a KV cache, a bidirectional decoder over the canvas
+    attends to that cache, and a self-conditioning MLP folds the previous
+    step's logits into the input embeddings
     (TF/models/diffusion_gemma/modeling_diffusion_gemma.py:281, :383, :790-823,
-    :1326-1440). The tree is the same either way (causal changes the mask, not
-    the parameters), so this entry translates the weights onto the Gemma 4 map
-    with no new table and marks the record decoder-mode (causal=False). The
-    encoder cache, the canvas positions and the self-conditioning loop need a
-    block-diffusion Process and objective that are not landed here; the report
-    names them.
+    :1326-1440).
+
+    The parameter tree is the same either way, since `causal` changes the mask
+    and not the parameters. So this entry maps the weights onto the Gemma 4
+    table and marks the record decoder-mode (causal=False). The encoder cache,
+    the canvas positions and the self-conditioning loop need a block-diffusion
+    Process and objective, which live outside this module.
     """
     # The reference builds no v_proj on full layers whatever the config says
     # (modeling_diffusion_gemma.py, DiffusionGemmaEncoderTextAttention: v_proj
@@ -267,11 +271,11 @@ _LLADA_TRUNK_NAMES = {
 
 
 def _llada_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """LLaDA's OLMo-style names onto the shared llama-layout map.
+    """Return the variables-tree path for one LLaDA tensor name.
 
-    The computation matches (pre-norm RMS, rotate-half rope, SwiGLU, untied
-    head), only the names differ, so each name is respelled and _dew_path does
-    the rest. No second table.
+    The computation matches the llama block (pre-norm RMS, rotate-half rope,
+    SwiGLU, untied head) and only the names differ, so each name is respelled
+    and `_dew_path` does the rest. There is no second table.
     """
     renamed = _LLADA_TRUNK_NAMES.get(name)
     if renamed is None:
@@ -286,12 +290,12 @@ def _llada_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
 
 
 def _llada_export_path(name: str, config: Mapping[str, object]) -> str | None:
-    """One dew leaf back into LLaDA's own tensor name, `_llada_path` inverted.
+    """Return LLaDA's own tensor name for one dew leaf, inverting `_llada_path`.
 
     The llama spelling is what the shared map produced, not what the release
-    stores, so writing it under a config that declares model_type llada
-    would leave a checkpoint neither `modeling_llada.py` nor `_llada_path`
-    reads back. None stays None: the tied head's copy is the embedding.
+    stores. Writing it under a config that declares model_type llada would
+    leave a checkpoint neither `modeling_llada.py` nor `_llada_path` reads
+    back. None stays None: the tied head's copy is the embedding.
     """
     llama = _hf_name(name, config)
     if llama is None:

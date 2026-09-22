@@ -1,4 +1,4 @@
-"""Host-local image metric sufficient statistics."""
+"""Accumulate host-local sufficient statistics for the image metrics."""
 
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -22,12 +22,12 @@ def metric_device():
 
 
 def frames(artifact: ImageGrid | VideoGrid) -> jax.Array:
-    """Pixels in [-1, 1], with videos retaining their frame axis."""
+    """Return pixels in [-1, 1], with videos keeping their frame axis."""
     return artifact.videos if isinstance(artifact, VideoGrid) else artifact.images
 
 
 def paired(artifact: ImageGrid | VideoGrid, batch: Batch, field: str):
-    """Generated and reference pixels aligned over the complete batch."""
+    """Align generated and reference pixels over the complete batch."""
     from dew.inputs import unit_range
 
     samples = frames(artifact)
@@ -42,7 +42,7 @@ def paired(artifact: ImageGrid | VideoGrid, batch: Batch, field: str):
 
 @dataclass(frozen=True, eq=False)
 class ImageMetric:
-    """Per-image (per-frame for video) means over the consumed pass."""
+    """Averages one image metric per image, or per frame for video, over a pass."""
 
     name: str
     measure: Callable[[ImageGrid | VideoGrid, Batch], ArrayLike]

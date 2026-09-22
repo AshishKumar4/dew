@@ -1,17 +1,9 @@
-"""A trained run out to the layout its family publishes.
+"""Write a trained run to the Hugging Face layout its model family publishes.
 
-`Pretrained.save` writes a loaded source back to the directory it came from,
-and `save_pretrained_decoder` writes a decoder whose config it derives; both
-start from something that was already published. A run trained from scratch
-starts from `run.json` and a checkpoint, and had no way out: its weights
-could be read back only by Dew, through the run directory that describes
-them.
-
-`export_run` is that way out. It loads the run the way `dew.pipeline` loads
-it and hands the model it rebuilt to the writer its family already has, so
-an exported run and an exported source leave the same files behind. The
-run's tokenizer name travels with the weights, which is what makes the
-export a directory a reader can load without the run beside it.
+`export_run` loads the run's `run.json` and checkpoint, rebuilds the model,
+and hands it to that family's own writer. An exported run and an exported
+source therefore leave the same files behind. The run's tokenizer name is
+written beside the weights, so the export loads without the run directory.
 """
 
 from __future__ import annotations
@@ -20,7 +12,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 DECODER_FAMILIES = "a decoder of a registered family (CausalTransformer) or a DiffusionGemma"
-"""What a run's model has to be for a published layout to exist for it."""
+"""Names the model kinds that have a published layout to export to."""
 
 
 def export_run(run_dir: str, destination: str | Path, *, ema: bool = True,
@@ -48,11 +40,10 @@ def export_run(run_dir: str, destination: str | Path, *, ema: bool = True,
 
 
 def _export_model(model, variables, destination: Path, record: Mapping[str, object]) -> None:
-    """One rebuilt model through the writer of the family it belongs to.
+    """Write `model` and `variables` to `destination` through its family's writer.
 
-    The family is decided before anything is read out of the record, so a
-    run whose model has no layout is refused for that and not for a field
-    its own kind never writes.
+    The family is chosen before any field is read out of `record`. A model with
+    no published layout is therefore refused by type, not by a missing field.
     """
     from dew.interop.hf_decoders import save_export_assets, save_pretrained_decoder
     from dew.nn.backbones.causal_transformer import CausalTransformer

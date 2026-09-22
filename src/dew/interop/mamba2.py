@@ -1,4 +1,4 @@
-"""A Hugging Face `Mamba2ForCausalLM` checkpoint as a `CausalTransformer`.
+"""Read a Hugging Face `Mamba2ForCausalLM` checkpoint as a `CausalTransformer`.
 
 `config_from_hf` reads `Mamba2Config`'s fields (configuration_mamba2.py)
 into the backbone's: the SSD geometry onto the `mamba2` mixer value, the
@@ -9,12 +9,8 @@ variables tree, and `translate` walks a whole state dict through it,
 transposing the linear kernels as `dew.interop.hf_decoders.translate_weights`
 does.
 
-This module stands beside `hf_decoders` rather than inside it: wiring it
-into that module's `_FAMILY_ENTRIES` is a `DecoderFamily(('mamba2',),
-config_from_hf, matches=<any kind mixer is a Mamba2Mixer>, 'mamba2',
-'Mamba2ForCausalLM', lambda model: {}, weight_path=weight_path,
-preserve_source_layout=True, tied_head_names=('lm_head.weight',
-'backbone.embeddings.weight'))` entry.
+`hf_decoders._FAMILY_ENTRIES` registers this module as the `mamba2` family.
+The entry lives there rather than here so that one table names every family.
 """
 
 from __future__ import annotations
@@ -39,7 +35,7 @@ _MIXER_LINEARS = ("in_proj", "out_proj")
 
 
 def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None) -> DecoderFields:
-    """`Mamba2Config` fields as `CausalTransformer` kwargs.
+    """Read `Mamba2Config` fields into `CausalTransformer` kwargs.
 
     `used` collects the config keys read, the set `hf_decoders.translate_config`
     checks the rest against. The attention geometry the backbone validates
@@ -107,8 +103,10 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
 
 
 def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """One `Mamba2ForCausalLM` tensor name as its path in the variables
-    tree, or None for the tied head's copy. An unknown name raises."""
+    """Return the variables-tree path for one `Mamba2ForCausalLM` tensor name.
+
+    The tied head's copy comes back as None. An unknown name raises.
+    """
     parts = name.split(".")
     if parts == ["backbone", "embeddings", "weight"]:
         return ("params", "embed_tokens", "embedding")
@@ -135,9 +133,11 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
 
 
 def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
-    """The inverse of `weight_path`: one flattened dew parameter path as its
-    `Mamba2ForCausalLM` tensor name, or None for the tied head, whose
-    embedding copy is written instead."""
+    """Return the `Mamba2ForCausalLM` tensor name for one flattened dew parameter path.
+
+    The inverse of `weight_path`. The tied head comes back as None, since its
+    embedding copy is written instead.
+    """
     parts = dew_name.split(".")
     if parts == ["embed_tokens", "embedding"]:
         return "backbone.embeddings.weight"
@@ -164,13 +164,13 @@ def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
 
 def translate(state_dict: Mapping[str, np.ndarray], config: Mapping[str, object], *,
               param_dtype: str = "float32") -> Variables:
-    """A `Mamba2ForCausalLM` state dict as the variables of the
-    `CausalTransformer` `config` (the dict `config_from_hf` returns) builds.
+    """Map a `Mamba2ForCausalLM` state dict into a `CausalTransformer`'s variables.
 
-    Linear weights arrive `[out, in]` and `nn.Dense` keeps `[in, out]`, so
-    every kernel is transposed; the conv taps keep the checkpoint's
-    `[D, 1, K]`. A tied checkpoint's `lm_head.weight` is checked against the
-    embedding and dropped.
+    `config` is the dict `config_from_hf` returns, which decides the model the
+    variables belong to. Linear weights arrive `[out, in]` and `nn.Dense` keeps
+    `[in, out]`, so every kernel is transposed; the conv taps keep the
+    checkpoint's `[D, 1, K]`. A tied checkpoint's `lm_head.weight` is checked
+    against the embedding and dropped.
     """
     variables: dict[str, dict[str, object]] = {}
     for name, tensor in state_dict.items():

@@ -1,4 +1,4 @@
-"""Names for the things a run is made of.
+"""Name the things a run is made of.
 
 One Registry per kind, including model components such as mixers, towers and
 projectors. A registry is a decorator, a mapping and
@@ -73,7 +73,7 @@ NO_RECORD: Mapping[str, object] = types.MappingProxyType({})
 
 
 class Registry(Mapping[str, T], Generic[T, Built]):
-    """Names for one kind of thing: a decorator, a mapping and an attribute view."""
+    """Names one kind of thing: a decorator, a mapping and an attribute view."""
 
     def __init__(self, kind: str, *, record: Literal["name", "kind"] = "name"):
         self.kind = kind
@@ -85,7 +85,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
         self._members: dict[str, Any] = {}
 
     def __call__(self, name: str, /) -> Callable[[M], M]:
-        """`@models("simple_dit")` on the class it names."""
+        """Register the class it names, as `@models("simple_dit")`."""
         if type(name) is not str or not name:
             raise TypeError(f"a {self.kind} name is a non-empty string, not {name!r}")
 
@@ -109,7 +109,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
             ) from None
 
     def __getattr__(self, attr: str) -> T:
-        """`models.SimpleDiT`: the member whose class name is `attr`."""
+        """Return the member whose class name is `attr`, as `models.SimpleDiT`."""
         if attr.startswith("_"):
             raise AttributeError(attr)
         for member in self._members.values():
@@ -129,7 +129,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
         return f"Registry({self.kind!r}, {sorted(self._members)})"
 
     def name_of(self, member: Named) -> str:
-        """The name a member was registered under. The table is scanned by
+        """Return the name a member was registered under. The table is scanned by
         identity, so this takes a member of any registry, whatever it makes."""
         for name, held in self._members.items():
             if held is member:
@@ -156,7 +156,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
 
     def _declared_fields(self, name: str, member: Callable[..., Built],
                          fields: Mapping[str, object]) -> Mapping[str, object]:
-        """`fields` as the member declares them, or an error naming what it
+        """Return `fields` as the member declares them, or raise naming what it
         has no field for. A member that is not a dataclass takes them as given."""
         if not (isinstance(member, type) and dataclasses.is_dataclass(member)):
             return fields
@@ -172,7 +172,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
 
     @property
     def union(self) -> type[Built] | types.UnionType:
-        """`Union[...]` of the members, for a tyro subcommand over the table."""
+        """Return `Union[...]` of the members, for a tyro subcommand over the table."""
         members = list(self._members.values())
         if not members:
             raise ValueError(f"the {self.kind} registry is empty")
@@ -180,7 +180,7 @@ class Registry(Mapping[str, T], Generic[T, Built]):
 
 
 class Named(Protocol):
-    """The name a registry member carries of its own.
+    """Declares the name a registry member carries of its own.
 
     A member is a class or a function -- the decorator takes both -- and each
     declares `__name__`, which is what the attribute view matches on and what
@@ -198,7 +198,7 @@ def _describe(member: Named) -> str:
 
 
 def _declared_type(member: type, field: str) -> Annotation:
-    """Resolve one field without evaluating unrelated dependency annotations."""
+    """Resolve one field's annotation, without evaluating unrelated ones."""
     for owner in member.__mro__:
         annotations = get_annotations(owner, format=Format.FORWARDREF)
         if field not in annotations:
@@ -215,14 +215,14 @@ def _declared_type(member: type, field: str) -> Annotation:
 
 
 def _value_type(annotation: Annotation) -> type | None:
-    """A dataclass type behind an Optional, but not a multi-member union."""
+    """Return a dataclass type behind an Optional, but not a multi-member union."""
     annotation = _unwrapped(annotation)
     return (annotation if isinstance(annotation, type) and dataclasses.is_dataclass(annotation)
             else None)
 
 
 def resolve_alias(annotation: Annotation) -> Annotation:
-    """A PEP 695 alias looked through to the type it declares. `get_origin`
+    """Look a PEP 695 alias through to the type it declares. `get_origin`
     and `get_args` see nothing through one, so every reader goes through here
     before asking an annotation what it is."""
     while isinstance(annotation, typing.TypeAliasType):
@@ -231,7 +231,7 @@ def resolve_alias(annotation: Annotation) -> Annotation:
 
 
 def _unwrapped(annotation: Annotation) -> Annotation:
-    """`annotation` with an Optional looked through; a union of several
+    """Return `annotation` with an Optional looked through. A union of several
     members says nothing about its entries and answers None."""
     annotation = resolve_alias(annotation)
     if typing.get_origin(annotation) not in (Union, types.UnionType):
@@ -241,7 +241,7 @@ def _unwrapped(annotation: Annotation) -> Annotation:
 
 
 def entry_types(annotation: Annotation, count: int) -> list[Annotation]:
-    """The annotation of each of the `count` entries of an annotated
+    """Return the annotation of each of the `count` entries of an annotated
     container: a fixed tuple's per-position types, otherwise its one element
     type repeated (a mapping's value type, a sequence's element). None is an
     unannotated entry, which takes its value as given."""
@@ -256,7 +256,7 @@ def entry_types(annotation: Annotation, count: int) -> list[Annotation]:
 
 
 def wants_tuple(annotation: Annotation) -> bool:
-    """Whether the annotation declares an immutable sequence. A record's
+    """Return whether the annotation declares an immutable sequence. A record's
     list is rebuilt as a tuple so the frozen value stays hashable; `list`
     and `MutableSequence` keep their list."""
     annotation = _unwrapped(annotation)
@@ -265,7 +265,7 @@ def wants_tuple(annotation: Annotation) -> bool:
 
 
 def from_record[ValueT](annotation: type[ValueT], value: Configured) -> ValueT:
-    """`value` as the class `annotation` names, built from a record or already one.
+    """Return `value` as the class `annotation` names, from a record or already one.
 
     The class is the witness: what comes back is an instance of it or a
     `ValueError` naming what the record built instead, so a caller reads a
@@ -281,7 +281,7 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured) -> ValueT:
 
 
 def _rebuilt(annotation: Annotation, value: object) -> Configured:
-    """`value` as its annotation asks for it: a record becomes the value it
+    """Return `value` as its annotation asks for it: a record becomes the value it
     describes, and anything already built is left alone.
 
     Containers are walked, so a mapping of records and a tuple of records
@@ -317,7 +317,7 @@ def _rebuilt(annotation: Annotation, value: object) -> Configured:
 
 
 def configured(value: object) -> Configured:
-    """One value a record carried, handed back as a field holds it.
+    """Return one value a record carried, as a field holds it.
 
     Nothing is converted here: this is the one place that says what a field
     can carry at all, so a value no member could take is refused where the
@@ -338,7 +338,7 @@ _DTYPES: dict[DtypeName, DTypeLike] = {
 
 
 def resolve_dtype(value: object) -> DTypeLike | None:
-    """A dtype as a module field: a jnp dtype, one of its names, or None.
+    """Resolve a dtype for a module field: a jnp dtype, one of its names, or None.
 
     Every field named `dtype` is read here, wherever it arrives from, so a
     dtype passes through and a name becomes the dtype it names. Anything
@@ -358,7 +358,7 @@ def resolve_dtype(value: object) -> DTypeLike | None:
 
 
 def dtype_name(value: DTypeLike | None) -> DtypeName | None:
-    """The name `resolve_dtype` accepts for a dtype, for a logged config."""
+    """Return the name `resolve_dtype` accepts for a dtype, for a logged config."""
     if value is None:
         return None
     for name, dtype in _DTYPES.items():
@@ -375,7 +375,7 @@ _PRECISION_FLAGS = {"dtype": "--model.dtype", "attention_impl": "--model.attenti
 
 
 class PrecisionFields(TypedDict, total=False):
-    """What a run's precision settings write into a model config.
+    """Names what a run's precision settings write into a model config.
 
     Only the keys the named member declares are written, so the bag is
     partial by construction; `attention_configs` is the UNets' per-stage
@@ -394,7 +394,7 @@ class PrecisionFields(TypedDict, total=False):
 def precision_fields(name: str, config: Mapping[str, object], *,
                      dtype: str, attention_impl: str, param_dtype: str | None = None,
                      matmul_precision: str | None = None) -> PrecisionFields:
-    """The run's compute dtype and attention kernel as the fields a model takes.
+    """Return the run's compute dtype and attention kernel as the fields a model takes.
 
     `with_precision` is the same settings merged into the config they belong
     to; this is them on their own, for a caller holding a typed field bag.
@@ -407,9 +407,8 @@ def precision_fields(name: str, config: Mapping[str, object], *,
     stored and `matmul_precision` what every matmul asks XLA for. Those two
     reach the model only where it declares the field (`param_dtype`,
     `precision`), so a model that declares neither takes neither and a run
-    that names neither writes neither. Unset, parameters stay float32 and
-    the model keeps its own precision, which is what every run did before
-    the fields existed.
+    that names neither writes neither. Unset, parameters stay float32 and the
+    model keeps its own precision.
 
     The UNets keep per-stage attention settings in `attention_configs`,
     which do not inherit the model dtype and default `force_fp32_for_softmax`
@@ -461,7 +460,7 @@ def precision_fields(name: str, config: Mapping[str, object], *,
 def with_precision(name: str, config: Mapping[str, object], *,
                    dtype: str, attention_impl: str, param_dtype: str | None = None,
                    matmul_precision: str | None = None) -> Mapping[str, object]:
-    """A model config with the run's compute dtype and attention kernel in it."""
+    """Return a model config with the run's compute dtype and attention kernel in it."""
     return {**config, **precision_fields(
         name, config, dtype=dtype, attention_impl=attention_impl,
         param_dtype=param_dtype, matmul_precision=matmul_precision)}

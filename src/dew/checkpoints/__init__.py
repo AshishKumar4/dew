@@ -1,4 +1,4 @@
-"""A run's checkpoints: the train state and the data position, through orbax.
+"""Save and restore a run's train state and data position through orbax.
 
 A checkpoint holds `step`, `params`, `opt_state`, `ema`, `key` and, when the
 data iterator can report one, `position`. Metrics, the loss scale and epoch
@@ -61,12 +61,12 @@ step directories, and `dew.io.publish` ships with a step."""
 
 
 def is_uri(path: str) -> bool:
-    """Whether a path names a `<scheme>://` location, such as a gs:// bucket."""
+    """Return whether a path names a `<scheme>://` location, such as a gs:// bucket."""
     return '://' in path
 
 
 def location(directory: str) -> epath.Path:
-    """Where a run's files go: a bucket URI as given, a local path absolute.
+    """Return where a run's files go: a bucket URI as given, a local path absolute.
 
     `epath` reads and writes both, but `Path.resolve` turns `gs://bucket/run`
     into a local `gs:/bucket/run`, so the absolute step is for a path with no
@@ -85,7 +85,7 @@ def _loss(metrics):
 
 
 def gather_positions(saved: bytes) -> dict:
-    """Every process's iterator position as one table, the checkpoint's `position`.
+    """Gather every process's iterator position into the checkpoint's `position` table.
 
     'rows' is a uint8 [process_count, longest] array with one row per
     process, 'lengths' the unpadded length of each. A process reports the
@@ -104,13 +104,13 @@ def gather_positions(saved: bytes) -> dict:
 
 
 def _row(table: dict, index: int) -> bytes:
-    """One row of a `gather_positions` table, without its padding."""
+    """Return one row of a `gather_positions` table, without its padding."""
     row = np.asarray(table['rows'][index], np.uint8)
     return row[:int(table['lengths'][index])].tobytes()
 
 
 def read_position(table: dict, where: str) -> bytes:
-    """The position this run resumes from, out of a saved table.
+    """Read the position this run resumes from, out of a saved table.
 
     A row is this process's own when the counts match. When they differ the
     saved position has to be a global one, a record count over an order that
@@ -147,7 +147,7 @@ def read_position(table: dict, where: str) -> bytes:
 
 
 def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
-    """Where each array leaf of `tree` sits, by path, as the string of its
+    """Return where each array leaf of `tree` sits, by path, as the string of its
     sharding; a local checkpoint restores onto this placement and no other."""
     leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
     return {jax.tree_util.keystr(path): str(leaf.sharding)
@@ -156,7 +156,7 @@ def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
 
 
 class Checkpoints:
-    """The checkpoints of one run, in one directory.
+    """Holds the checkpoints of one run, in one directory.
 
     Constructing one opens nothing; the orbax managers are created on first
     use. The directory keeps the latest `keep` steps, so a resume has
@@ -207,7 +207,7 @@ class Checkpoints:
 
     @property
     def local_path(self) -> str:
-        """This process's own local directory."""
+        """Return this process's own local directory."""
         if self.local_directory is None:
             raise ValueError("this run keeps no local checkpoints")
         return str(epath.Path(self.local_directory) / f"process{jax.process_index()}")
@@ -238,7 +238,7 @@ class Checkpoints:
         return self._local_manager
 
     def _local_latest(self) -> int | None:
-        """The local step every process holds, or None.
+        """Return the local step every process holds, or None.
 
         Each process keeps one local step, its newest; a resume can read a
         local step only if every process has it, so the processes agree
@@ -255,7 +255,7 @@ class Checkpoints:
 
     @property
     def latest(self) -> int | None:
-        """The newest step a resume can read, local or persistent."""
+        """Return the newest step a resume can read, local or persistent."""
         persistent = self._open().latest_step()
         local = self._local_latest()
         if persistent is None or local is None:
@@ -264,14 +264,14 @@ class Checkpoints:
 
     @property
     def best(self) -> int | None:
-        """The step with the lowest reported loss, or None when no save carried one."""
+        """Return the step with the lowest reported loss, or None when no save carried one."""
         return self._open().best_step()
 
     def path(self, step: int) -> str:
         return str(epath.Path(self.directory) / str(step))
 
     def source(self, step: int) -> str:
-        """The directory `restore` reads `step` from: this process's local one
+        """Return the directory `restore` reads `step` from: this process's local one
         when the step is the local one every process holds, else the
         persistent one."""
         return self.local_path if step == self._local_latest() else self.directory
@@ -330,9 +330,13 @@ class Checkpoints:
         if saved is not None:
             state_tree['position'] = gather_positions(saved)
         return state_tree
+
     def stored(self, step: int | None = None) -> Variables:
-        """What the checkpoint at `step` (the latest by default) holds, as
-        shape/dtype trees per state field; an unset field is None."""
+        """Return what the checkpoint at `step` holds, without reading its values.
+
+        `step` defaults to the latest. Each state field comes back as a
+        shape/dtype tree, and an unset field as None.
+        """
         if step is None:
             step = self.latest
             if step is None:
@@ -344,7 +348,7 @@ class Checkpoints:
                 for name, value in dict(metadata).items()}
 
     def accumulation_template(self, step: int):
-        """The persisted pending-array shapes, without reading their values."""
+        """Return the persisted pending-array shapes, without reading their values."""
         from dew.training.state import Accumulation
         checkpointer = self._open_local() if step == self._local_latest() else self._open()
         metadata = checkpointer.item_metadata(step)
@@ -368,7 +372,7 @@ class Checkpoints:
                 step: int | None = None) -> tuple[Variables, bytes | None]: ...
 
     def restore(self, template=None, step: int | None = None):
-        """The state at `step` (the latest by default) and this process's data position.
+        """Restore the state at `step` and this process's data position.
 
         `template` is a pytree of `jax.ShapeDtypeStruct` naming the state
         leaves to restore; a leaf's sharding, when set, is where the array is

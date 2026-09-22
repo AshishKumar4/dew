@@ -1,6 +1,6 @@
-"""Qwen decoders: qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_next.
+"""Translate the Qwen decoders: qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_next.
 
-Qwen2 is the llama block with biased q/k/v; Qwen3 adds the head norms and
+Qwen2 is the llama block with biased q/k/v. Qwen3 adds the head norms, and
 qwen3_moe the routed feed-forward on every decoder_sparse_step-th layer.
 Qwen3.5 and Qwen3-Next are the hybrid: gated delta net layers between gated
 full-attention ones, a partial rotary, and the shared-embedding prediction
@@ -42,23 +42,23 @@ def _qwen_layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[
 
 
 def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
-    """(rope_theta, partial_rotary_factor) for qwen3_5_text.
+    """Return (rope_theta, partial_rotary_factor) for a qwen3_5_text config.
 
     The family's rope is one flat entry carrying the mRoPE layout beside the
     base and the fraction. Only plain rope maps; a scaled type or a scaling
-    field refuses. The fraction is the entry's, else the config's own, else
-    the class default of 0.25 (configuration_qwen3_5.py:111 sets it as a
-    kwarg and modeling_rope_utils.py:755-757 lets the entry's value win),
-    and the reference reads it as a rope of int(head_dim * factor) dims
-    (modeling_qwen3_5.py:117-124), which is the 'default' convention of
+    field refuses. The fraction is the entry's, else the config's own, else the
+    class default of 0.25 (configuration_qwen3_5.py:111 sets it as a kwarg and
+    modeling_rope_utils.py:755-757 lets the entry's value win). The reference
+    reads it as a rope of int(head_dim * factor) dims
+    (modeling_qwen3_5.py:117-124), the 'default' convention of
     `dew.nn.attention.rotary_freqs`.
 
     mrope_section and mrope_interleaved describe how the three grids of an
-    image share the rotated pairs; with one position per token every grid
-    has the same angles and the interleave reads the same value from each
+    image share the rotated pairs. With one position per token every grid has
+    the same angles and the interleave reads the same value from each
     (modeling_qwen3_5.py:129-164), so text-only input is this partial rope
-    exactly (difference 0.0 against the reference cos/sin). Wrapper loading
-    retains the three-axis layout on its attention mixer for visual inputs.
+    exactly. Wrapper loading keeps the three-axis layout on its attention mixer
+    for visual inputs.
     """
     entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
@@ -92,9 +92,12 @@ def _qwen3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
 
 
 def _sparse_step_layers(hf_config: Mapping[str, object], layers: int, used: set[str]) -> tuple[int, ...]:
-    """The layers a Qwen MoE routes: every decoder_sparse_step-th counting
-    from one, minus mlp_only_layers (modeling_qwen3_moe.py:309-313,
-    modeling_qwen3_next.py:813-818)."""
+    """Return the layer indices a Qwen MoE routes.
+
+    Those are every decoder_sparse_step-th layer counting from one, minus
+    mlp_only_layers (modeling_qwen3_moe.py:309-313,
+    modeling_qwen3_next.py:813-818).
+    """
     used.update(('decoder_sparse_step', 'mlp_only_layers'))
     step = records.integer(hf_config.get('decoder_sparse_step', 1), 'decoder_sparse_step')
     if step < 1:
@@ -105,14 +108,18 @@ def _sparse_step_layers(hf_config: Mapping[str, object], layers: int, used: set[
 
 
 def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """The Qwen3 block with a routed feed-forward on the layers
+    """Read a qwen3_moe config into `CausalTransformer` fields.
+
+    The Qwen3 block gets a routed feed-forward on the layers
     decoder_sparse_step and mlp_only_layers pick; the others stay dense at
     intermediate_size. The routed experts are moe_intermediate_size wide.
-    Its window rule is not Qwen3's. With use_sliding_window every layer is
+
+    Its window rule is not Qwen3's: with use_sliding_window every layer is
     windowed and max_window_layers is never read
     (configuration_qwen3_moe.py:115, modeling_qwen3_moe.py:149). The expert
-    count is `num_experts`, with `num_local_experts` its alias
-    (attribute_map), the name transformers 5.16.1 writes it back under."""
+    count is `num_experts`, with `num_local_experts` its alias (attribute_map),
+    the name transformers 5.16.1 writes it back under.
+    """
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
     windowed = (hf_config.get('use_sliding_window', False)
@@ -137,10 +144,12 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
 
 def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
                         mixer: Mapping[str, object]) -> DecoderFields:
-    """The hybrid Qwen decoder qwen3_5_text and qwen3_next share: gated
-    delta net layers on the kind's record, gated full attention with a
-    'default'-convention partial rope, and (1 + w) norms. `mixer` is the
-    family's own fields of the delta net record beside the config's geometry.
+    """Read the hybrid Qwen block qwen3_5_text and qwen3_next share.
+
+    The block is gated delta net layers on the kind's record, gated full
+    attention with a 'default'-convention partial rope, and (1 + w) norms.
+    `mixer` adds the family's own fields to the delta net record, beside the
+    geometry read from the config.
     """
     interval = records.integer(hf_config.get('full_attention_interval', 4), 'full_attention_interval')
     layer_types = _specified_layer_types(hf_config, used, tuple(
@@ -209,13 +218,16 @@ def _qwen35_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
 
 
 def _qwen3_next_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Qwen3-Next: the Qwen3.5 hybrid block with its delta net's input
-    projections fused (modeling_qwen3_next.py:540-586) and a routed
-    feed-forward, softmax top-k over the experts beside a sigmoid-gated
-    shared expert (Qwen3NextTopKRouter and Qwen3NextSparseMoeBlock,
-    modeling_qwen3_next.py:758-798), on the layers decoder_sparse_step
-    selects minus mlp_only_layers (modeling_qwen3_next.py:813-818); the
-    others stay dense at intermediate_size.
+    """Read a qwen3_next config into `CausalTransformer` fields.
+
+    It is the Qwen3.5 hybrid block with its delta net's input projections
+    fused (modeling_qwen3_next.py:540-586). Its routed feed-forward takes a
+    softmax top-k over the experts beside a sigmoid-gated shared expert
+    (Qwen3NextTopKRouter and Qwen3NextSparseMoeBlock,
+    modeling_qwen3_next.py:758-798). Routing covers the layers
+    decoder_sparse_step selects minus mlp_only_layers
+    (modeling_qwen3_next.py:813-818); the others stay dense at
+    intermediate_size.
     """
     config = _qwen_hybrid_config(hf_config, used, mixer={'fused_in_proj': True})
     # The release spells its rope flat: rope_theta beside a null rope_scaling.
@@ -242,9 +254,10 @@ def _qwen3_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
 
 
 def _qwen35_moe_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """The hybrid Qwen decoder with routed SwiGLU and a sigmoid-gated shared expert.
+    """Read a qwen3_5_moe config into `CausalTransformer` fields.
 
-    Qwen3_5MoeTopKRouter always renormalizes selected softmax probabilities;
+    It is the hybrid Qwen block with routed SwiGLU and a sigmoid-gated shared
+    expert. Qwen3_5MoeTopKRouter always renormalizes selected softmax probabilities;
     SparseMoeBlock gates the shared expert independently (Transformers
     modeling_qwen3_5_moe.py:763-801). The checkpoint has no dense MLP width.
     """
@@ -281,7 +294,11 @@ _QWEN_MTP_FIELDS = {
 
 def _qwen_mtp_path(name: str, config: Mapping[str, object],
                    block_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None]) -> tuple[str, ...]:
-    """vLLM qwen3_5_mtp.py's shared-embedding single prediction layer."""
+    """Return the variables-tree path for one Qwen MTP tensor name.
+
+    The names are vLLM qwen3_5_mtp.py's, for the shared-embedding single
+    prediction layer. `block_path` maps the layer's own block tensors.
+    """
     if config.get("num_nextn_predict_layers", 0) != 1:
         raise ValueError("mtp tensors require one configured Qwen prediction layer")
     tail = name.removeprefix("mtp.")

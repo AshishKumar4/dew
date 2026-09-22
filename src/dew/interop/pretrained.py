@@ -1,4 +1,11 @@
-"""Load native models and their host processors from a Hugging Face source."""
+"""Load native models and their host processors from a Hugging Face source.
+
+`load_pretrained` is the front door: it reads a source directory or repo,
+translates its config and weights through `dew.interop.hf_decoders`, and
+returns a `Pretrained` holding the model, its variables and its processor.
+`Pretrained` also carries the source's own decoding controls and the layouts
+that write every tensor back, so `Pretrained.save` restores what it read.
+"""
 
 from __future__ import annotations
 
@@ -53,7 +60,7 @@ from dew.sampling.text import Sampling
 
 
 class ProcessorCall(TypedDict, total=False):
-    """Every keyword dew hands a host processor beside `images`.
+    """Names every keyword dew hands a host processor beside `images`.
 
     A source processor takes far more than these; these are the ones dew
     passes, so the bag names them rather than standing for any keyword at
@@ -70,7 +77,7 @@ class ProcessorCall(TypedDict, total=False):
 
 
 class HostProcessor(Protocol):
-    """The HF processor operations kept outside compiled model computation."""
+    """Declares the HF processor operations kept outside compiled model computation."""
 
     def __call__(self, *, images: Media | None = None,
                  **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]: ...
@@ -84,7 +91,7 @@ class HostProcessor(Protocol):
 def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | None, *,
                    kernel: int, table_size: int, patch_size: int
                    ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Each modality's patch frames, their coordinates and their pooled
+    """Return each modality's patch frames, their coordinates and their pooled
     lengths, by the placeholder id that stands in the prompt for them.
 
     The source flattens its video and frame axes, not its prompt rows
@@ -131,7 +138,7 @@ def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | 
 
 
 def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"]]:
-    """The id and the side to pad text rows with, at the boundary a host
+    """Return the id and the side to pad text rows with, at the boundary a host
     processor draws: it delegates text to the tokenizer it wraps, a tokenizer
     is its own, and either may state neither field, so both names are read off
     the object here and narrowed once for the rows.
@@ -147,7 +154,7 @@ def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"
 
 @dataclass(frozen=True)
 class Processor:
-    """Host text/image preprocessing followed by numeric layout normalization.
+    """Runs host text and image preprocessing, then normalizes the numeric layout.
 
     The checkpoint processor owns resizing, normalization and special-token
     expansion. Dew organizes its outputs into row-aligned arrays; it does
@@ -283,6 +290,18 @@ class Processor:
 
     def _images(self, values: Mapping[str, object], tokens: np.ndarray
                 ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+        """Row-align the processor's image and video features to their placeholders.
+
+        It runs in two halves. The first reads the processor's output into
+        `chunks`, one feature block per image, with `lengths` its placeholder
+        count, `shape` the padded block shape and `capacity` the slots one
+        image occupies; `grid` and `patch_positions` carry the per-family
+        extras. The second copies each chunk into `padded` at its row and image
+        slot and writes `indices`, the slot each placeholder token reads.
+
+        The three branches are the three source layouts: Qwen's packed patch
+        runs, a per-patch position stream, and a fixed tokens-per-image grid.
+        """
         image_id = self.record.get("image_token_id", self.config.get("image_token_id"))
         if type(image_id) is not int:
             raise ValueError("image_token_id must be an integer")
@@ -455,7 +474,7 @@ class Processor:
 
 
     def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
-        """Views of packed image/video patches in text order, one item per frame.
+        """Return views of packed image/video patches in text order, one item per frame.
 
         Qwen3.5 get_rope_index repeats video grids by their temporal count and
         resets each frame's temporal coordinate to zero. The processor places
@@ -517,7 +536,7 @@ class Processor:
 
     def _image_rotary_positions(self, tokens: np.ndarray, valid: np.ndarray,
                                 groups: jax.Array, grids: jax.Array) -> jax.Array:
-        """Qwen3.5's get_rope_index on host-normalized image grids.
+        """Compute Qwen3.5's get_rope_index on host-normalized image grids.
 
         Text advances one coordinate per token. An image occupies its merged
         temporal/height/width grid, and following text starts after its longest
@@ -568,7 +587,7 @@ class Processor:
 
 @dataclass(frozen=True)
 class WeightLayout:
-    """An existing source tensor's location and reversible storage layout.
+    """Holds an existing source tensor's location and reversible storage layout.
 
     `expert_index` is the expert a per-expert source tensor holds. The
     loader stacks those tensors onto an expert dimension
@@ -626,7 +645,7 @@ class WeightLayout:
         return value if self.dtype is None else value.astype(self.dtype)
 
     def restore(self, tensor: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
-        """The leaf of `shape` whose export is `tensor`.
+        """Return the leaf of `shape` whose export is `tensor`.
 
         The inverse of `export` for a layout that binds one whole leaf; a
         tensor assembled from several leaves has no single leaf to restore.
@@ -641,7 +660,7 @@ class WeightLayout:
 
 
 def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
-    """A per-expert leaf path as the stacked leaf the loaded tree holds.
+    """Map a per-expert leaf path to the stacked leaf the loaded tree holds.
 
     A checkpoint that names one tensor per expert maps through the family
     to `experts/K/projection/kernel`, a path `hf_decoders._stack_experts`
@@ -657,7 +676,7 @@ def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]
 
 def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
                   expert_index: int | None) -> int:
-    """How many axes a bound leaf carries ahead of its stored matrix.
+    """Return how many axes a bound leaf carries ahead of its stored matrix.
 
     A kernel stores `[in, out]` where its source stores `[out, in]`, and a
     grouped projection's leaf keeps one such matrix per group: DeepSeek
@@ -681,7 +700,7 @@ def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
 def _language_layout(name: str, text_name: str, tensor: np.ndarray,
                      config, model_type: str, variables: Mapping[str, object],
                      component: str | None = None) -> WeightLayout | None:
-    """The text family's existing leaf map plus its inverse storage operations."""
+    """Return the text family's leaf map plus its inverse storage operations."""
     family = decoders._FAMILIES[model_type]
     # A family whose checkpoint packs its experts as `[E, out, in]`
     # (`_gemma4_prepare` swaps them into dew's `[E, in, out]`) writes them
@@ -734,7 +753,11 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
 
 
 def _wrapper_layouts(tensors, record, variables):
-    """Retain source names while borrowing the loader's internal leaf paths."""
+    """Return one `WeightLayout` per wrapper source tensor.
+
+    Each layout keeps the source's own tensor name and points at the leaf path
+    the loader built, so an export writes the names the source shipped.
+    """
     from dew.nn import vision
 
     tower_kind = record["tower"]["kind"]
@@ -806,7 +829,7 @@ def _wrapper_layouts(tensors, record, variables):
 
 @dataclass(frozen=True)
 class _SourceQuantization:
-    """A source format the loader undoes and `Pretrained.save` restores.
+    """Describes a source format the loader undoes and `Pretrained.save` restores.
 
     `names` reads which tensors arrived quantized off the raw checkpoint,
     before dequantize replaces them with dense weights in requested storage;
@@ -823,7 +846,7 @@ class _SourceQuantization:
 
 
 def _source_quantization(config: Mapping[str, object], *, param_dtype: str = "float32") -> _SourceQuantization | None:
-    """The format a config's `quantization_config` declares, or None for a dense source."""
+    """Return the format a config's `quantization_config` declares, or None."""
     quantization = config.get("quantization_config")
     if quantization is None:
         return None
@@ -877,7 +900,7 @@ def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tupl
 
 @dataclass(frozen=True)
 class Pretrained:
-    """A native model, explicit variables and its checkpoint's host processor.
+    """Holds a native model, explicit variables and its checkpoint's host processor.
 
     `model_config` is the record the model was built from, in Dew's own
     vocabulary with the run's compute dtype and attention kernel, so a caller
@@ -904,7 +927,7 @@ class Pretrained:
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
-        """Source module name to the layout of its weight: `model.<module>`
+        """Map each source module name to the layout of its weight: `model.<module>`
         for a decoder, `unet.<module>` for a pipeline component.
 
         These are the names a published adapter file writes, so this is what
@@ -914,7 +937,7 @@ class Pretrained:
                 for layout in self.weight_layouts if layout.name.endswith(".weight")}
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration | MaskedGeneration:
-        """Native MDLM for masked models, source decoding controls for causal models.
+        """Build the text generation task this source describes.
 
         Masked generation refines a full response with Unmask, not the source
         family's custom generation recipe. AR sampling overrides are refused.
@@ -952,7 +975,7 @@ class Pretrained:
                               n=rows, logits=logits, stopping=stopping, strategy=strategy)
 
     def block_generation(self) -> BlockGeneration:
-        """The DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
+        """Build the DiffusionGemma as a canvas task, defaulting to the source's sampler config."""
         from dew.interop import diffusion_gemma
         if not isinstance(self.model, DiffusionGemma):
             raise TypeError("block generation needs a DiffusionGemma source")
@@ -965,7 +988,7 @@ class Pretrained:
                                n=_return_sequences(self.config, self.generation_config))
 
     def text_to_image(self) -> TextToImage:
-        """The latent diffusion source as an image task with its published policy."""
+        """Build the latent diffusion source as an image task with its published policy."""
         if self.process is None or self.inputs is None or self.schedule is None:
             raise TypeError("text_to_image needs a latent diffusion source")
         if self.task is None:
@@ -1020,9 +1043,6 @@ class Pretrained:
                                     generation_config=generation_config)
 
 
-
-
-
 def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:
     collections: dict[str, dict[str, ParamTree]] = {}
     for component, variables in parts.items():
@@ -1074,7 +1094,7 @@ def _generation_limit(config: Mapping[str, object], generation_config: Mapping[s
 
 
 def _return_sequences(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int:
-    """The source's continuations per prompt; one when it declares none."""
+    """Return the source's continuations per prompt. One when it declares none."""
     value = _generation_value(config, generation_config, "num_return_sequences")
     if value is None:
         return 1
@@ -1094,7 +1114,7 @@ def _probability_control(config: Mapping[str, object], generation_config: Mappin
 
 @dataclass(frozen=True)
 class _Control:
-    """One source control's consumer, activation rule and unsupported case."""
+    """Describes one source control's consumer, activation rule and unsupported case."""
 
     owner: Literal["policy", "task", "metadata", "inapplicable", "transform",
                    "criterion", "strategy", "capacity", "unsupported"]
@@ -1253,7 +1273,7 @@ def _neutral(value: JSON, neutral: tuple[JSON, ...]) -> bool:
 
 def _active(config: Mapping[str, object], generation_config: Mapping[str, object],
             name: str, *, masked: bool = False) -> JSON:
-    """The control's value when it is active, None when it changes nothing."""
+    """Return the control's value when it is active, None when it changes nothing."""
     value = _generation_value(config, generation_config, name)
     rule = _CONTROLS.get(name)
     neutral = () if rule is None else rule.neutral
@@ -1263,7 +1283,11 @@ def _active(config: Mapping[str, object], generation_config: Mapping[str, object
 
 
 def _audit_masked(config: Mapping[str, object], generation_config: Mapping[str, object]) -> None:
-    """Native MDLM has no AR policy chain or KV cache, but shares task controls."""
+    """Refuse the active source controls a masked model cannot honour.
+
+    Native MDLM has no AR policy chain and no KV cache, so only the controls a
+    task owns are left standing.
+    """
     refused = []
     for name in sorted(_CONTROLS.keys() | generation_config.keys()):
         rule = _CONTROLS.get(name)
@@ -1309,7 +1333,7 @@ def _audit(config: Mapping[str, object], generation_config: Mapping[str, object]
 
 
 def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | None:
-    """The decoder a source built, or None for a model that is not one.
+    """Return the decoder a source built, or None for a model that is not one.
 
     `CausalTransformer` declares what native decoding reads off a model, and
     `MultimodalTransformer` forwards those four fields to the decoder it
@@ -1320,7 +1344,7 @@ def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | No
 
 def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str, object],
                     model: nn.Module) -> None:
-    """A declared cache length is real, and has to fit the model's own."""
+    """Return the declared cache length, checked against the model's own."""
     value = _generation_value(config, generation_config, "max_cache_len")
     if value is None:
         return
@@ -1334,7 +1358,7 @@ def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str
 
 def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object],
                      do_sample: bool) -> Sampling:
-    """The policy tail a source declares, whatever else it also declares."""
+    """Return the policy tail a source declares, whatever else it also declares."""
     temperature = _generation_value(config, generation_config, "temperature", Sampling.temperature)
     if temperature is None:
         temperature = Sampling.temperature
@@ -1416,7 +1440,7 @@ def _as_strings(value: object) -> tuple[str, ...]:
 def _source_transforms(config: Mapping[str, object], generation_config: Mapping[str, object],
                        sampling: Sampling, do_sample: bool,
                        searching: bool) -> tuple[decoding.LogitsTransform, ...]:
-    """The source's whole transform chain, in `_get_logits_processor`'s order.
+    """Build the source's whole transform chain, in `_get_logits_processor`'s order.
 
     This is the complete chain the task runs, so the policy's own tail is
     built here rather than appended afterwards and every warper lands where
@@ -1495,7 +1519,7 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
 def _source_stopping(config: Mapping[str, object], generation_config: Mapping[str, object],
                      processor: Processor | None, vocab_size: int | None
                      ) -> tuple[decoding.Stopping, ...]:
-    """The source's active criteria beyond the policy's EOS ids."""
+    """Return the source's active criteria beyond the policy's EOS ids."""
     value = _active(config, generation_config, "stop_strings")
     if value is None:
         return ()
@@ -1508,7 +1532,7 @@ def _source_stopping(config: Mapping[str, object], generation_config: Mapping[st
 
 def _source_strategy(config: Mapping[str, object], generation_config: Mapping[str, object],
                      model: nn.Module, do_sample: bool, rows: int) -> Strategy | None:
-    """The device loop a source's config names, or None for plain sampling."""
+    """Return the device loop a source's config names, or None for plain sampling."""
     read = functools.partial(_active, config, generation_config)
     beams = read("num_beams")
     speculating = read("use_mtp") is not None or _mtp_mode(read("speculation_type"))
@@ -1563,7 +1587,7 @@ def _source_decoding(config: Mapping[str, object], generation_config: Mapping[st
                      override: Sampling | None
                      ) -> tuple[Sampling, tuple[decoding.LogitsTransform, ...] | None,
                                 tuple[decoding.Stopping, ...], Strategy | None]:
-    """The policy, chain, criteria and strategy a loaded source decodes with.
+    """Return the policy, chain, criteria and strategy a loaded source decodes with.
 
     An explicit policy replaces the first two, so they are not built and the
     controls behind them are not judged: a watermark the caller just replaced
@@ -1586,7 +1610,7 @@ def _source_decoding(config: Mapping[str, object], generation_config: Mapping[st
 
 
 class _Call(NamedTuple):
-    """One pinned pipeline's own `__call__` policy, read from Diffusers
+    """Holds one pinned pipeline's own `__call__` policy, read from Diffusers
     0.34.0: the family it belongs to, the steps and guidance scale it
     defaults to, whether that scale guides two branches or is the value the
     model embeds, and the text sequence budget it pads its T5 tower to."""
@@ -1620,7 +1644,7 @@ _PIPELINE_POLICY: Mapping[str, _Call] = MappingProxyType({
 
 
 def _call_policy(index: Mapping[str, object], denoiser: _Denoiser) -> _Call:
-    """The call policy this file's own pipeline carries.
+    """Return the call policy this file's own pipeline carries.
 
     A directory that declares no pipeline - a bare component tree - takes its
     family's reference pipeline. A directory that declares one Dew does not
@@ -1644,7 +1668,7 @@ def _call_policy(index: Mapping[str, object], denoiser: _Denoiser) -> _Call:
 
 @dataclass(frozen=True)
 class SourceTask:
-    """A published pipeline's own call policy.
+    """Holds a published pipeline's own call policy.
 
     `steps` and `guidance` are the defaults its `__call__` signature carries,
     and `grid` prepares the sampling grid the way that pipeline prepares it,
@@ -1660,7 +1684,7 @@ class SourceTask:
 
 @dataclass(frozen=True)
 class _Denoiser:
-    """What one architecture contributes to a diffusion source.
+    """Holds what one architecture contributes to a diffusion source.
 
     Model construction and conditioning conventions use metadata only.
     The weight reader is invoked only by a complete source load; a restored
@@ -1688,7 +1712,7 @@ class _Denoiser:
 
 def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtype: str,
                            attention_impl: str, param_dtype: str = "float32") -> Pretrained:
-    """A published latent diffusion directory as native modules and variables.
+    """Read a published latent diffusion directory into native modules and variables.
 
     Two denoiser families ship this layout: a UNet reading one or two CLIP
     towers through cross attention, and an MM-DiT transformer reading them
@@ -1791,7 +1815,7 @@ def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16
 
 
 def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """The published UNet: cross attention over one or two CLIP towers, whose
+    """Build the published UNet: cross attention over one or two CLIP towers, whose
     pooled text conditioning is the one its added time features ask for."""
     from dew.interop import diffusion
     from dew.nn.backbones.unet_condition import UNet2DCondition
@@ -1819,7 +1843,7 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
 
 
 def _transformer_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """The published transformer this directory holds, by the class it names."""
+    """Build the published transformer this directory holds, by the class it names."""
     config = _component_config(directory, "transformer")
     published = config.get("_class_name")
     if published == "SD3Transformer2DModel":
@@ -1831,7 +1855,7 @@ def _transformer_denoiser(directory: Path, *, dtype: str | None, attention_impl:
 
 
 def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """SD3's MM-DiT: both CLIP towers and the T5 tower read jointly, with the
+    """Build SD3's MM-DiT: both CLIP towers and the T5 tower read jointly, with the
     stored position buffer in its own frozen collection."""
     from dew.interop import diffusion
     from dew.nn.backbones.sd3 import SD3Transformer
@@ -1857,7 +1881,7 @@ def _sd3_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
 
 
 def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attention_impl: str) -> _Denoiser:
-    """Flux's transformer: one CLIP tower for the pooled vector, the T5 tower
+    """Build Flux's transformer: one CLIP tower for the pooled vector, the T5 tower
     for the sequence, and a latent its pipeline packs in 2x2 patches.
 
     The class declares no sample size; its pipeline's `default_sample_size`
@@ -1888,21 +1912,21 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attentio
 
 
 def _component_config(directory: Path, name: str) -> dict:
-    """One published component's own config file."""
+    """Read one published component's own config file."""
     file = "scheduler_config.json" if name == "scheduler" else "config.json"
     with open(directory / name / file) as handle:
         return json.load(handle)
 
 
 def _present(index: Mapping[str, object], name: str) -> bool:
-    """Whether the index declares a component rather than declaring it absent."""
+    """Return whether the index declares a component rather than declaring it absent."""
     entry = index.get(name)
     return isinstance(entry, list) and entry[0] is not None
 
 
 def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32"
                    ) -> tuple[StableDiffusionVAE, Variables, tuple[WeightLayout, ...], dict]:
-    """The published autoencoder, its parameters and their source layouts."""
+    """Build the published autoencoder, its parameters and their source layouts."""
     from dew.interop import diffusion
     from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
     from dew.nn.autoencoders.vae import _vae_path
@@ -1925,7 +1949,7 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32"
 
 def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtype: str = "float32",
                  params: Variables | None = None):
-    """The published CLIP text towers, their tokenizers, their parameters and
+    """Build the published CLIP text towers, their tokenizers, their parameters and
     the layouts those parameters came from."""
     from transformers import CLIPTokenizer
 
@@ -1950,7 +1974,7 @@ def _clip_towers(directory: Path, names: tuple[str, ...], compute, *, param_dtyp
 
 def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dtype: str = "float32",
               params: Variables | None = None):
-    """The published T5 encoder as the conditioner's segment, with its
+    """Build the published T5 encoder as the conditioner's segment, with its
     parameters, their layouts and its config.
 
     `component` is where the family keeps it: an SD3 directory's third text
@@ -1976,7 +2000,7 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
 
 
 def _unconditional(composition: str, index: Mapping[str, object]) -> dict:
-    """The empty-prompt row a file's own pipeline guides against: the XL
+    """Return the empty-prompt row a file's own pipeline guides against: the XL
     pipelines zero it where their index says so, and the SD3 pipeline encodes
     it with its towers, having no such control."""
     zero = composition == "clip_pooled" and bool(index.get("force_zeros_for_empty_prompt", True))
@@ -1984,7 +2008,7 @@ def _unconditional(composition: str, index: Mapping[str, object]) -> dict:
 
 
 def _image_safety(directory: Path, compute, *, param_dtype: str = "float32"):
-    """The safety head a file declares: the finish, its parameters, their
+    """Build the safety head a file declares: the finish, its parameters, their
     layouts and the two configs it ships."""
     from dew.inputs.diffusion import CLIPImageTransform, CLIPSafetyHead, ImageSafety
     from dew.interop import diffusion
@@ -2028,7 +2052,7 @@ def _safety_path(name: str):
 
 def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperFields,
                          max_seq_len: int | None) -> decoders.DecoderFields:
-    """The decoder fields a wrapper's text_config states, with the corrections
+    """Read the decoder fields a wrapper's text_config states, with the corrections
     its own family makes to them.
 
     Gemma 3 projects its logits without the causal-LM class's final tanh cap
@@ -2069,7 +2093,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
 
 def _wrapper_model(config: Mapping[str, object], record: decoders.WrapperFields,
                    language_model: CausalTransformer, *, dtype: str) -> MultimodalTransformer:
-    """The wrapper its record describes: the decoder above, the towers and
+    """Build the wrapper its record describes: the decoder above, the towers and
     projectors it names, and the placeholder ids its prompts carry."""
     family = records.text(config["model_type"], "model_type")
     text_config = records.record(config["text_config"], "text_config")
@@ -2092,7 +2116,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoders.WrapperFields,
 
 def _source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
                       model: nn.Module) -> Processor | None:
-    """The host preprocessing a source ships, or None where it ships none.
+    """Build the host preprocessing a source ships, or None where it ships none.
 
     Only a model with towers reads images or audio, and only through the
     processor its repo ships; a text decoder takes its tokenizer whatever

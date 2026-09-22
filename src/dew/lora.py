@@ -1,4 +1,4 @@
-"""Low-rank adapters (LoRA, arXiv 2106.09685) over a variables tree.
+"""Adapt a variables tree with low-rank deltas (LoRA, arXiv 2106.09685).
 
 An adapter is a set of rank-`r` deltas on the kernels of Dense modules.
 Beside a target kernel `W`, `[in..., out...]`, the tree holds `lora_A`,
@@ -80,7 +80,7 @@ INIT_B = nn.initializers.zeros
 
 @dataclass(frozen=True)
 class Target:
-    """One adapted kernel's rank and alpha."""
+    """Holds one adapted kernel's rank and alpha."""
 
     rank: int
     alpha: float
@@ -88,7 +88,7 @@ class Target:
 
 @dataclass(frozen=True)
 class LoRA:
-    """Which kernels carry a low-rank delta, and how the delta scales."""
+    """Says which kernels carry a low-rank delta, and how the delta scales."""
 
     targets: Mapping[Path, Target]
     rslora: bool = False
@@ -106,11 +106,11 @@ class LoRA:
         return target.alpha / (math.sqrt(target.rank) if self.rslora else target.rank)
 
     def trainable(self, path: Path) -> bool:
-        """The adapter's own leaves: the `PathFilter` a partial run trains."""
+        """Return the adapter's own leaves: the `PathFilter` a partial run trains."""
         return path[-1] in FACTORS and path[:-1] in self.targets
 
     def target_at(self, path: Path) -> Target | None:
-        """The target a module path names, seen through the stack that runs
+        """Return the target a module path names, seen through the stack that runs
         it: a scanned run's module `layers_3_7` stands for layers 3 through
         7, whose targets must agree, since the run's kernels share one
         stacked factor pair."""
@@ -131,7 +131,7 @@ class LoRA:
         return None
 
     def adapt(self, model: nn.Module, root: Path = ("params",)) -> nn.Module:
-        """`model` computing the adapter branch in every target module.
+        """Return `model` computing the adapter branch in every target module.
 
         The result is an instance of a subclass of `model`'s class with the
         same fields and methods, so it builds, checks and generates as the
@@ -201,7 +201,7 @@ class LoRA:
         return branch
 
     def merge(self, variables: Variables) -> Variables:
-        """`variables` with every delta added into its kernel and the factors removed.
+        """Return `variables` with every delta added into its kernel and the factors removed.
 
         The sum runs in at least fp32 at full precision and lands in the
         kernel's dtype, PEFT's `merge_and_unload`.
@@ -220,7 +220,7 @@ class LoRA:
     def fresh(cls, model: nn.Module, variables: Variables, layouts: Mapping[str, WeightLayout], *,
               rank: int, modules: Sequence[str], key: jax.Array, alpha: float | None = None,
               rslora: bool = False, dropout: float = 0.0) -> tuple[LoRA, Variables]:
-        """A new adapter on the projections `modules` name, and `variables` with its factors.
+        """Build a new adapter on the projections `modules` name, and add its factors.
 
         `modules` are PEFT's `target_modules`: a projection matches when its
         name relative to the model (`model.layers.0.self_attn.q_proj`, or `to_q`
@@ -244,7 +244,7 @@ class LoRA:
     @classmethod
     def load(cls, model: nn.Module, variables: Variables, layouts: Mapping[str, WeightLayout],
              path: str | FilePath) -> tuple[LoRA, Variables]:
-        """An adapter for `model` and `variables` with the factors in place.
+        """Load an adapter for `model` and `variables` with the factors in place.
 
         `layouts` are the bindings a file's module names resolve through:
         `Pretrained.layouts` for a loaded source, an empty mapping for a model
@@ -332,7 +332,7 @@ def _insert(tree: dict, path: Path, value) -> None:
 
 @dataclass(frozen=True)
 class _Factors:
-    """The source-layout bindings of one target's factors.
+    """Holds the source-layout bindings of one target's factors.
 
     `a` stores `[r, in]` and `b` `[out, r]`, PEFT's `lora_A.weight` and
     `lora_B.weight`, as transposed views of the tree's `[in..., r]` and
@@ -347,12 +347,12 @@ class _Factors:
     b: WeightLayout
 
     def shapes(self, rank: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """The tree's `lora_A` and `lora_B` shapes at `rank`."""
+        """Return the tree's `lora_A` and `lora_B` shapes at `rank`."""
         return (*self.kernel_shape[:self.contracted], rank), (rank, *self.kernel_shape[self.contracted:])
 
 
 def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -> _Factors:
-    """The factor layouts of the kernel `layout` binds in `variables`."""
+    """Return the factor layouts of the kernel `layout` binds in `variables`."""
     if layout.paths[0][-1] != "kernel":
         raise ValueError(f"{name} is not a projection weight, so it takes no low-rank delta")
     if len(layout.paths) != 1 or layout.concatenate is not None or layout.expert_index is not None:
@@ -385,7 +385,7 @@ def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -
 
 def bound_layouts(model: nn.Module, variables: Variables,
                   layouts: Mapping[str, WeightLayout]) -> Mapping[str, WeightLayout]:
-    """The projections an adapter can bind on `model`, by the name a file uses.
+    """Return the projections an adapter can bind on `model`, by the name a file uses.
 
     A loaded source publishes `Pretrained.layouts`, the bindings its export
     runs backwards, and those names are the ones PEFT and Diffusers write.
@@ -412,7 +412,7 @@ def bound_layouts(model: nn.Module, variables: Variables,
 
 
 def _kernels(node: Mapping, path: Path) -> Iterator[tuple[Path, np.ndarray | jax.Array]]:
-    """Every `kernel` leaf under `node`, with the module path that holds it."""
+    """Yield every `kernel` leaf under `node`, with the module path that holds it."""
     for name, child in node.items():
         if not isinstance(child, Mapping):
             continue
@@ -423,14 +423,14 @@ def _kernels(node: Mapping, path: Path) -> Iterator[tuple[Path, np.ndarray | jax
 
 
 def _kernel_layout(module: Path, kernel: np.ndarray | jax.Array) -> WeightLayout:
-    """One `[in, out]` kernel as the `[out, in]` weight a PEFT file names."""
+    """Return one `[in, out]` kernel as the `[out, in]` weight a PEFT file names."""
     inner, out = kernel.shape
     return WeightLayout(f"{'.'.join(module)}.weight", (("params", *module, "kernel"),),
                         (out, inner), (1, 0))
 
 
 def _components(layouts: Mapping[str, WeightLayout]) -> frozenset[str]:
-    """The named components these layouts bind.
+    """Return the named components these layouts bind.
 
     A pipeline source names each weight under the component that holds it,
     `unet/down_blocks...`; a decoder and a registry-built model name theirs
@@ -442,7 +442,7 @@ def _components(layouts: Mapping[str, WeightLayout]) -> frozenset[str]:
 
 
 def _component(components: frozenset[str], module: str) -> tuple[str, str]:
-    """`(component, the name relative to it)` for one module of a file."""
+    """Split one module name of a file into (component, name relative to it)."""
     component, _, relative = module.partition(".")
     return (component, relative) if component in components else ("", module)
 
@@ -457,7 +457,7 @@ _REFUSED_FLAGS = ("fan_in_fan_out", "use_dora", "lora_bias", "modules_to_save",
 
 @dataclass(frozen=True)
 class _Config:
-    """The fields of a PEFT `LoraConfig` an adapter's numerics depend on."""
+    """Holds the fields of a PEFT `LoraConfig` an adapter's numerics depend on."""
 
     rank: int
     alpha: float
@@ -495,15 +495,17 @@ class _Config:
 
 
 def _pattern(patterns: Mapping[str, object], relative: str) -> str:
-    """PEFT's `get_pattern_key`: the first pattern that names this module,
+    """Return PEFT's `get_pattern_key`: the first pattern that names this module,
     else the name itself, which no pattern table holds."""
     return next((key for key in patterns if re.match(rf"(.*\.)?({key})$", relative)), relative)
 
 
 class PeftConfig(TypedDict):
-    """`adapter_config.json` as PEFT writes and reads it: the defaults every
-    target takes, the per-module exceptions, and the flags whose values dew
-    fixes because its adapters are built one way."""
+    """Describes `adapter_config.json` as PEFT writes and reads it.
+
+    It carries the defaults every target takes, the per-module exceptions, and
+    the flags dew fixes because its adapters are built one way.
+    """
 
     peft_type: str
     r: int
@@ -520,8 +522,10 @@ class PeftConfig(TypedDict):
 
 
 def _config(lora: LoRA, named: Mapping[str, Target]) -> PeftConfig:
-    """The PEFT config of `named` targets, keyed by the relative module name;
-    the commonest rank and alpha are the defaults, the rest the patterns."""
+    """Build the PEFT config of `named` targets, keyed by the relative module name.
+
+    The commonest rank and alpha become the defaults and the rest the patterns.
+    """
     ranks = [target.rank for target in named.values()]
     alphas = [target.alpha for target in named.values()]
     rank = max(set(ranks), key=ranks.count)
@@ -549,7 +553,7 @@ def _config(lora: LoRA, named: Mapping[str, Target]) -> PeftConfig:
 
 @dataclass(frozen=True)
 class _Entry:
-    """One adapted source module as a file names it, with its component's config."""
+    """Holds one adapted source module as a file names it, with its component's config."""
 
     module: str
     a: np.ndarray
@@ -559,7 +563,7 @@ class _Entry:
 
 def _entries(components: frozenset[str], tensors: Mapping[str, np.ndarray],
              configs: Mapping[str, _Config], prefix: str) -> list[_Entry]:
-    """Every module's factor pair; `configs` is keyed by component."""
+    """Return every module's factor pair. `configs` is keyed by component."""
     factors: dict[str, dict[str, np.ndarray]] = {}
     for key, tensor in tensors.items():
         module, _, factor = key.removeprefix(prefix).rpartition(".lora_")
@@ -581,7 +585,7 @@ def _entries(components: frozenset[str], tensors: Mapping[str, np.ndarray],
 
 def _place(layouts: Mapping[str, WeightLayout], variables: Variables,
            entries: Sequence[_Entry]) -> tuple[LoRA, Variables]:
-    """The adapter the entries describe, with its factors restored into the model's tree."""
+    """Build the adapter the entries describe, its factors restored into the model's tree."""
     components = _components(layouts)
     settings = {(entry.config.rslora, entry.config.dropout) for entry in entries}
     if len(settings) != 1:
@@ -618,7 +622,7 @@ def _place(layouts: Mapping[str, WeightLayout], variables: Variables,
 
 def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
                        where: str) -> dict[str, _Config]:
-    """Per-component PEFT configs from the header, or what Diffusers derives
+    """Read per-component PEFT configs from the header, or what Diffusers derives
     without one (utils.peft_utils.get_peft_kwargs): every module's rank from
     its tensors, and one alpha for the component, the rank of its first
     module in file order."""
@@ -640,7 +644,7 @@ def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
 
 
 def _named(layouts: Mapping[str, WeightLayout], wanted: Sequence[str]) -> dict[str, WeightLayout]:
-    """The projections PEFT's `target_modules` selects: a name relative to
+    """Return the projections PEFT's `target_modules` selects: a name relative to
     the model that is an entry, or ends in `.` and an entry."""
     components = _components(layouts)
     matched: dict[str, WeightLayout] = {}
@@ -659,7 +663,7 @@ def _named(layouts: Mapping[str, WeightLayout], wanted: Sequence[str]) -> dict[s
 
 @runtime_checkable
 class _Adapted(Protocol):
-    """A module class `adapt` already wrapped.
+    """Marks a module class `adapt` already wrapped.
 
     The wrapper subclass declares the interceptor its `apply` and `init` run
     under, which is the whole record that a class was adapted: a second
@@ -671,7 +675,7 @@ class _Adapted(Protocol):
 
 @runtime_checkable
 class Adaptable(Protocol):
-    """An objective an adapter attaches to.
+    """Declares an objective an adapter attaches to.
 
     It trains one module, which is its `model`, and it takes the filter that
     says which of that module's leaves the optimizer moves. `LMObjective`

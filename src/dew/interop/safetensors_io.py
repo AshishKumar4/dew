@@ -1,4 +1,4 @@
-"""safetensors for Flax parameter trees.
+"""Read and write Flax parameter trees as safetensors files.
 
 A parameter tree is nested dicts, a safetensors file is a flat table of named
 tensors. The two meet at the '/'-joined path, the same naming the Hugging Face
@@ -52,7 +52,11 @@ _STORED_DTYPES = {
 
 
 def _safetensors():
-    """The reader and NumPy writer share one lazy optional-package boundary."""
+    """Import safetensors and return its reader and NumPy writer modules.
+
+    The import is lazy and in one place, so the reader and the writer raise the
+    same install message when the optional package is missing.
+    """
     try:
         import safetensors
         from safetensors import numpy as safetensors_numpy
@@ -107,7 +111,7 @@ def _leaf_name(path) -> str:
 
 
 def _host_array(leaf) -> np.ndarray:
-    """Host copy of a leaf. safetensors writes raw bytes, so it must be dense."""
+    """Return a host copy of `leaf`, dense because safetensors writes raw bytes."""
     array = np.asarray(leaf)
     return array if array.flags.c_contiguous else np.ascontiguousarray(array)
 
@@ -147,7 +151,7 @@ def load_params(path) -> ParamTree:
 
 
 def _tensor_offsets(path: str, header: object) -> dict[str, int]:
-    """Each tensor's byte offset from the start of the data region.
+    """Return each tensor's byte offset from the start of the data region.
 
     safe_open already validated the container, so a malformed entry here is a
     file whose header the official parser accepted and then disagreed with;
@@ -222,7 +226,7 @@ def layer_bytes(directory) -> int:
 
 
 def read_file(path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
-    """A file's flat tensor table, names as stored, and its header metadata.
+    """Return a file's flat tensor table, names as stored, and its header metadata.
 
     One read-only memory map backs every array, so the tensors stay file
     backed after the reader closes and arrive in their stored dtype -

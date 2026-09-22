@@ -37,7 +37,7 @@ def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None
              dtype: str | None = None, param_dtype: str | None = None,
              ema: bool = True, step: int | None = None,
              revision: str | None = None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
-    """The inference task for `source`, its weights placed once.
+    """Load the inference task for `source`, its weights placed once.
 
     `source` is a run directory, or a source checkpoint directory or Hub
     repository. `mesh` places the weights on that mesh under `layout` (the
@@ -127,8 +127,11 @@ def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
 
 
 def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) -> Variables:
-    """`variables` on the mesh `mesh` describes, sharded the way the trainer
-    shards a train state's parameters under `layout`."""
+    """Place `variables` on the mesh `mesh` describes.
+
+    The sharding is the one the trainer gives a train state's parameters under
+    `layout`.
+    """
     from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
 
     device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
@@ -138,10 +141,8 @@ def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) ->
     return jax.device_put(variables, shardings)
 
 
-
-
 class RunTokenizer(Protocol):
-    """What a run's tokenizer offers: `dew.data.ByteTokenizer` and `HFTokenizer` do."""
+    """Declares what a run's tokenizer offers, as `ByteTokenizer` and `HFTokenizer` do."""
 
 
     def encode(self, text: str) -> list[int]: ...
@@ -151,7 +152,10 @@ class RunTokenizer(Protocol):
 
 @dataclass(frozen=True)
 class RunProcessor:
-    """A run's tokenizer as a task's host processor: left-padded prompt rows in, one string per row out."""
+    """Adapts a run's tokenizer to a task's host processor.
+
+    Left-padded prompt rows go in and one string per row comes out.
+    """
 
     tokenizer: RunTokenizer
 

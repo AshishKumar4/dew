@@ -1,7 +1,7 @@
-"""Checkpoint-file translation for native latent diffusion models.
+"""Translate published latent diffusion checkpoints into native model values.
 
-Source configurations and safetensors are data. No external model or scheduler
-implementation is imported by this module.
+Source configurations and safetensors are read as data. No external model or
+scheduler implementation is imported by this module.
 """
 from __future__ import annotations
 
@@ -46,8 +46,11 @@ def _insert(tree: TensorTree, path: tuple[str, ...], value: np.ndarray) -> None:
 
 def _source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...], str],
                   path: tuple[str, ...], name: str) -> None:
-    """Check tied source values before a requested storage cast can round
-    different values to the same BF16 leaf. Only names are retained here."""
+    """Record `name` as the owner of `path`, and raise if another name differs there.
+
+    The check runs on the source values, before the storage cast, because two
+    different values can round to the same BF16 leaf.
+    """
     previous = owners.setdefault(path, name)
     if previous != name and not np.array_equal(tensors[previous], tensors[name]):
         raise ValueError(f"Two different source tensors {previous!r} and {name!r} map to {path}")
@@ -75,7 +78,11 @@ class UNetFields(TypedDict):
 
 def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
                 attention_impl="auto") -> UNetFields:
-    """Interpret source geometry and reject operation-changing unsupported controls."""
+    """Read a Diffusers UNet config into the fields `UNet2DCondition` takes.
+
+    A control whose active value this UNet cannot compute raises rather than
+    being dropped, so a checkpoint cannot load as a model it does not describe.
+    """
     raw_widths = config["block_out_channels"]
     if not isinstance(raw_widths, (tuple, list)) or not raw_widths:
         raise ValueError("block_out_channels must be a nonempty sequence")
@@ -150,6 +157,13 @@ def unet_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "floa
 
 
 def _unet_path(name: str, rank: int) -> tuple[str, ...]:
+    """Return the `UNet2DCondition` parameter path for a Diffusers UNet tensor.
+
+    `parts` holds the dotted name segments still to read and shrinks as each
+    one is consumed; `path` holds the native path built so far; `leaf` is the
+    trailing `weight` or `bias`. `rank` picks `scale` over `kernel` for a
+    one-dimensional weight. An unknown name raises with that name.
+    """
     parts = name.split(".")
     leaf = parts.pop()
     if leaf not in ("weight", "bias"):
@@ -219,7 +233,12 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
 
 def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondition, *,
                            param_dtype: str = "float32") -> tuple[TensorTree, tuple[WeightLayout, ...]]:
-    """Native parameters and reversible layouts, cast before layout conversion."""
+    """Map UNet tensors into a parameter tree and the layouts that invert it.
+
+    Each leaf is cast to `param_dtype` before its transpose. Attention kernels
+    are also reshaped to per-head axes, which is why this does not go through
+    `record_layouts`.
+    """
     from dew.interop.pretrained import WeightLayout
     parameters: TensorTree = {}
     layouts = []
@@ -268,11 +287,11 @@ class SD3Fields(TypedDict):
 
 def sd3_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
                attention_impl="auto") -> SD3Fields:
-    """A published `SD3Transformer2DModel` config as native model fields.
+    """Read a published `SD3Transformer2DModel` config into native model fields.
 
-    Every geometry control the source declares is read; a control whose
-    active meaning this model does not carry is refused rather than dropped,
-    so a checkpoint that means something else cannot load as if it did not.
+    Every geometry control the source declares is read. A control whose active
+    meaning this model does not carry is refused rather than dropped, so a
+    checkpoint that means something else cannot load as if it did not.
     """
     from dew.interop.pretrained import resolve_dtype
 
@@ -328,8 +347,12 @@ def _dit_leaf(leaf: str) -> str:
 
 def _dit_attention(block: tuple[str, ...], attention: str, inner: list[str], leaf: str,
                    name: str, *, joint: bool) -> tuple[str, ...]:
-    """One attention tensor: a projection, the output projection a joint
-    attention holds, or a per-head norm's scale."""
+    """Return the path of one attention tensor inside `block`.
+
+    The tensor is a projection, the output projection a joint attention holds,
+    or a per-head norm's scale. `inner` is the name's segments below the
+    attention.
+    """
     if joint and inner == ["to_out", "0"]:
         return (*block, attention, "to_out_0", _dit_leaf(leaf))
     if len(inner) == 1 and inner[0] in (_JOINT_ATTENTION if joint else _SINGLE_ATTENTION):
@@ -343,8 +366,12 @@ def _dit_attention(block: tuple[str, ...], attention: str, inner: list[str], lea
 
 def _dit_block(block: tuple[str, ...], rest: list[str], leaf: str, name: str, *,
                attentions: tuple[str, ...]) -> tuple[str, ...]:
-    """A joint block's tensor: either stream's modulation, one of its
-    attentions, or either stream's feed-forward."""
+    """Return the path of one tensor inside a joint block.
+
+    The tensor is either stream's modulation, one of the block's attentions,
+    or either stream's feed-forward. `rest` is the name's segments below the
+    block.
+    """
     if rest in (["norm1", "linear"], ["norm1_context", "linear"]):
         return (*block, rest[0], "linear", _dit_leaf(leaf))
     if len(rest) > 1 and rest[0] in attentions:
@@ -358,11 +385,11 @@ def _dit_block(block: tuple[str, ...], rest: list[str], leaf: str, name: str, *,
 
 
 def _sd3_path(name: str) -> tuple[str, ...] | None:
-    """One published SD3 tensor name as its path in `SD3Transformer`.
+    """Return the `SD3Transformer` path for a published SD3 tensor name.
 
-    The position buffer is not a parameter and comes back as None; every
-    other declared tensor maps, and an unknown name raises with that name so
-    a checkpoint carrying something else cannot load silently.
+    The position buffer is not a parameter and comes back as None. Every other
+    declared tensor maps, and an unknown name raises with that name so a
+    checkpoint carrying something else cannot load silently.
     """
     if name == "pos_embed.pos_embed":
         return None
@@ -394,7 +421,7 @@ class FluxFields(TypedDict):
 
 def flux_fields(config: Mapping[str, object], *, dtype: DTypeLike | None = "float32",
                 attention_impl="auto") -> FluxFields:
-    """A published `FluxTransformer2DModel` config as native model fields.
+    """Read a published `FluxTransformer2DModel` config into native model fields.
 
     Every geometry control the source declares is read, including whether it
     embeds its distilled guidance, which changes what the model takes as an
@@ -441,7 +468,7 @@ _FLUX_EMBEDDERS = {
 
 
 def _flux_path(name: str) -> tuple[str, ...]:
-    """One published Flux tensor name as its path in `FluxTransformer`.
+    """Return the `FluxTransformer` path for a published Flux tensor name.
 
     A single-stream block's fused output projection is `proj_out` in the
     source, inside its own block; here it is `proj_fused`, since the model's
@@ -472,14 +499,17 @@ def _flux_path(name: str) -> tuple[str, ...]:
 
 def translate_flux_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
                            ) -> tuple[TensorTree, tuple[WeightLayout, ...]]:
-    """Native parameters and reversible layouts. Rotary tables are computed
-    from input ids, so Flux stores no positional buffer."""
+    """Map Flux tensors into a parameter tree and the layouts that invert it.
+
+    Rotary tables are computed from input ids, so Flux stores no positional
+    buffer and there is nothing to place outside `params`.
+    """
     return record_layouts("transformer", tensors, _flux_path, ("params",), param_dtype=param_dtype)
 
 
 def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
                           ) -> tuple[TensorTree, TensorTree, tuple[WeightLayout, ...]]:
-    """Native parameters, frozen buffers and reversible source layouts.
+    """Map SD3 tensors into a parameter tree, its buffers and the inverting layouts.
 
     The source's position embedding is a persistent sin/cos-initialized
     buffer, so its stored values land in the `buffers` collection: an
@@ -532,10 +562,12 @@ def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
 def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
                    path_of: Callable[[str], tuple[str, ...] | None], prefix: tuple[str, ...], *,
                    param_dtype: str = "float32") -> tuple[TensorTree, tuple[WeightLayout, ...]]:
-    """Bind component parameters in the requested precision before layout copies.
+    """Map a component's tensors into a parameter tree and the layouts that invert it.
 
-    Frozen encoders and autoencoders still contain parameters. Callers with
-    actual buffers or scoring state keep those on their explicit FP32 path.
+    `path_of` gives each tensor's tree path, or None to skip it. Kernels are
+    transposed and the transpose is recorded in the layout, so `WeightLayout.export`
+    writes the tensor back unchanged. Each leaf is cast to `param_dtype` before
+    the transpose; buffers and scoring state are the caller's to keep in FP32.
     """
     from dew.interop.pretrained import WeightLayout
     parameters: TensorTree = {}
@@ -557,7 +589,7 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray],
 
 
 def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray]) -> TensorTree:
-    """Canonical tensor names to the declared Flax checkpoint's storage tree.
+    """Map canonical tensor names into the storage tree a Flax checkpoint declares.
 
     This translates files only; no foreign model implementation is imported.
     """
@@ -595,7 +627,11 @@ def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray])
 
 
 def write_flax_component(directory: Path, component: str, tensors: Mapping[str, np.ndarray]) -> None:
-    """Retain a source Flax model's declared weight format beside native safetensors."""
+    """Write `tensors` as the msgpack file a Flax component of `component` ships.
+
+    A source that declares a Flax class keeps that format beside the
+    safetensors, so a reader of either one finds what it expects.
+    """
     from flax.serialization import to_bytes
     filename = "diffusion_flax_model.msgpack" if component in ("unet", "vae") else "flax_model.msgpack"
     (directory / component / filename).write_bytes(to_bytes(flax_component_parameters(component, tensors)))

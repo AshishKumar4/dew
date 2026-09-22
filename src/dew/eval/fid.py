@@ -1,4 +1,4 @@
-"""FID between two populations of images.
+"""Measure FID between two populations of images.
 
 `fid(generated, reference)` scores two image sets against each other, and the
 registered `fid` metric pools the same features, statistics and distance over
@@ -32,13 +32,13 @@ FEATURES = "FID InceptionV3 pool3, bilinear 299x299, [-1, 1]"
 
 
 def _features(weights: str | None) -> str:
-    """What a distance was measured with, for the line every one is logged
+    """Names what a distance was measured with, for the line every one is logged
     with: two FID values are comparable only when this string matches."""
     return FEATURES if weights is None else f"{FEATURES}, weights {weights}"
 
 
 def _extractor(weights: str | None):
-    """The feature extractor and the variables to apply it with.
+    """Build the feature extractor and the variables to apply it with.
 
     The module is an ordinary Flax module, so its parameters are an ordinary
     variables tree in safetensors: the file named, or the converted copy of the
@@ -60,8 +60,8 @@ def _extractor(weights: str | None):
 
 @functools.cache
 def _get_inception(weights: str | None = None):
-    """The pool3 feature extractor and its variables, loaded once per
-    process and per weights. The FID InceptionV3 is about 90 MB of weights,
+    """Load the pool3 feature extractor and its variables, once per process
+    and per weights. The FID InceptionV3 is about 90 MB of weights,
     and every metric built from this module shares the copy."""
     _log.info("loading InceptionV3 FID weights from %s (cached for reuse)",
               "the hub" if weights is None else weights)
@@ -69,7 +69,7 @@ def _get_inception(weights: str | None = None):
 
 
 def _sqrtm(product):
-    """`sqrtm` without its singularity warning. A singular product is the
+    """Take `sqrtm` without its singularity warning. A singular product is the
     case the finiteness check in `frechet_distance` handles."""
     from scipy import linalg
 
@@ -79,7 +79,7 @@ def _sqrtm(product):
 
 
 def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
-    """Frechet distance between two multivariate gaussians.
+    """Return the Frechet distance between two multivariate gaussians.
 
     Runs once per consumed validation pass on the host through scipy. The
     matrix square root of the covariance product has no JAX equivalent.
@@ -105,7 +105,7 @@ def frechet_distance(mu_a, sigma_a, mu_b, sigma_b, eps=1e-6) -> float:
 
 @dataclass
 class GaussianStats:
-    """A population's count, float64 mean and centered sum of outer products."""
+    """Holds a population's count, float64 mean and centered sum of outer products."""
 
     count: int
     mean: NDArray[np.float64]
@@ -155,7 +155,7 @@ class FIDStats:
 
 @functools.cache
 def _get_activations(weights: str | None = None):
-    """The jitted pool3 feature extractor, built on first use.
+    """Return the jitted pool3 feature extractor, built on first use.
 
     Building it loads the ~90MB weights, so it happens here, on first use.
     Constructing the metric opens nothing.
@@ -177,7 +177,7 @@ def _get_activations(weights: str | None = None):
 
 def _pooled_stats(batches: Iterable[ArrayLike], *, population: str,
                   weights: str | None = None) -> GaussianStats:
-    """Pool3 statistics over batches of pixels in [-1, 1], pooled as they come.
+    """Pool pool3 statistics over batches of pixels in [-1, 1], as they come.
 
     The extractor is asked for inside the loop, so the weights load with the
     first batch and an image set that is refused costs no download.
@@ -194,7 +194,7 @@ def _pooled_stats(batches: Iterable[ArrayLike], *, population: str,
 
 def _unit_range_batches(images: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike], *,
                         population: str, batch_size: int) -> Iterator[jax.Array]:
-    """A uint8 [N, H, W, 3] array, or an iterable of them, as [-1, 1] batches
+    """Yield [-1, 1] batches from a uint8 [N, H, W, 3] array or an iterable of them.
     of at most `batch_size` rows."""
     blocks = [images] if isinstance(images, np.ndarray | jax.Array) else images
     for block in blocks:
@@ -207,7 +207,7 @@ def _unit_range_batches(images: NDArray[np.uint8] | jax.Array | Iterable[ArrayLi
 
 
 def _pooled_distance(stats: FIDStats, weights: str | None = None) -> float:
-    """The distance between two pooled populations, logged with the counts and
+    """Return the distance between two pooled populations, logged with the counts and
     the features it holds for."""
     generated, real = stats.generated, stats.real
     if generated.count < 2 or real.count < 2:
@@ -224,7 +224,7 @@ def _pooled_distance(stats: FIDStats, weights: str | None = None) -> float:
 def fid(generated: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
         reference: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
         *, batch_size: int = 64, weights: str | Path | None = None) -> float:
-    """FID between two sets of uint8 [N, H, W, 3] images.
+    """Measure FID between two sets of uint8 [N, H, W, 3] images.
 
     Each side is one array or an iterable of arrays, so a directory of samples
     can stream past in blocks of `batch_size` rows instead of being held at
@@ -255,7 +255,7 @@ def fid(generated: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
 @metrics("fid")
 @dataclass(frozen=True)
 class FID:
-    """Pooled-population FID with O(D²) pass state and one final distance.
+    """Scores FID over a pass, pooling statistics and taking one final distance.
 
     The call gathers the sampled grid and the batch's reference field. The
     features, the statistics and the distance are the ones `fid` runs, so a
