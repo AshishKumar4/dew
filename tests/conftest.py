@@ -41,6 +41,18 @@ def pytest_runtest_setup(item):
 
 
 @pytest.fixture
+def without_deterministic_ops(monkeypatch):
+    """The cuda lane runs the whole suite under --xla_gpu_deterministic_ops,
+    which Dew refuses cudnn attention under (openxla/xla#46500). XLA read the
+    variable when it opened the backend, so taking the flag back out of the
+    environment leaves this executable's reductions as they are and lets a
+    test reach the cudnn path it is about."""
+    kept = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
+            if not flag.startswith("--xla_gpu_deterministic_ops")]
+    monkeypatch.setenv("XLA_FLAGS", " ".join(kept))
+
+
+@pytest.fixture
 def rng():
     return jax.random.PRNGKey(0)
 

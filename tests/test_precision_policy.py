@@ -29,7 +29,8 @@ def qkv(dtype=jnp.bfloat16):
 @pytest.mark.parametrize("implementation", ['auto', 'xla', 'cudnn', 'tpu'])
 @pytest.mark.parametrize("precision", [jax.lax.Precision.HIGH, jax.lax.Precision.HIGHEST,
                                        'high', ('highest', 'highest')])
-def test_fused_attention_rejects_precision_it_cannot_honor(implementation, precision):
+def test_fused_attention_rejects_precision_it_cannot_honor(implementation, precision,
+                                                           without_deterministic_ops):
     """jax.nn.dot_product_attention takes no precision argument at all: it
     accumulates the logits in fp32 whatever it is handed, so asking for HIGH
     raises."""
@@ -39,7 +40,7 @@ def test_fused_attention_rejects_precision_it_cannot_honor(implementation, preci
 
 
 @pytest.mark.parametrize("implementation", ['auto', 'xla', 'cudnn', 'tpu'])
-def test_fused_attention_rejects_bf16_softmax(implementation):
+def test_fused_attention_rejects_bf16_softmax(implementation, without_deterministic_ops):
     with pytest.raises(ValueError, match="force_fp32_for_softmax"):
         scaled_dot_product_attention(*qkv(), force_fp32_for_softmax=False,
                                      implementation=implementation)
@@ -56,14 +57,14 @@ def test_fused_attention_default_precision_matches_the_attention_equation(precis
     assert jnp.max(jnp.abs(actual - expected)) < 1e-5
 
 
-def test_cudnn_rejects_float32_inputs():
+def test_cudnn_rejects_float32_inputs(without_deterministic_ops):
     """cuDNN's fused kernel has no fp32 path; casting behind the caller's back
     would make --model.dtype float32 a lie."""
     with pytest.raises(ValueError, match="bfloat16"):
         scaled_dot_product_attention(*qkv(jnp.float32), implementation='cudnn')
 
 
-def test_cudnn_rejects_a_head_dimension_it_cannot_honor():
+def test_cudnn_rejects_a_head_dimension_it_cannot_honor(without_deterministic_ops):
     narrow = (jnp.ones((1, 4, 2, 4), jnp.bfloat16),) * 3
     with pytest.raises(ValueError, match="multiple of 8"):
         scaled_dot_product_attention(*narrow, implementation="cudnn")

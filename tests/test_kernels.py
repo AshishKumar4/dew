@@ -36,18 +36,6 @@ def qkv(shape, seed=0):
     return tuple(jax.random.normal(key, shape, jnp.bfloat16) for key in keys)
 
 
-@pytest.fixture
-def without_deterministic_ops(monkeypatch):
-    """The cuda lane runs the whole suite under --xla_gpu_deterministic_ops,
-    which Dew refuses cudnn attention under (openxla/xla#46500). XLA read the
-    variable when it opened the backend, so taking the flag back out of the
-    environment leaves this executable's reductions as they are and lets a
-    kernel test ask for the kernel it measures."""
-    kept = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-            if not flag.startswith("--xla_gpu_deterministic_ops")]
-    monkeypatch.setenv("XLA_FLAGS", " ".join(kept))
-
-
 def value_and_grads(implementation, query, key, value, **kwargs):
     def loss(q, k, v):
         out = scaled_dot_product_attention(q, k, v, implementation=implementation, **kwargs)
