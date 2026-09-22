@@ -102,7 +102,7 @@ class DiffusionGemma(nn.Module):
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         # decoder shares text's scope; it is another reader, not another bank.
-        return tuple(DecoderBank(("text", *site.namespace), site.view)
+        return tuple(DecoderBank(("text", *site.namespace), site.view, site.scanned)
                      for site in self.text.bank_sites)
 
     @property

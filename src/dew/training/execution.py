@@ -53,7 +53,20 @@ def _in_stack(path: tuple[str, ...], sites) -> bool:
 def resident(placement, sites, accelerator):
     """The frozen collection's placement beside the accelerator, from the
     specs the layout gave it: a stack's layers in bank memory, the rest in
-    device memory, each leaf the shard the layout named."""
+    device memory, each leaf the shard the layout named.
+
+    Only a scanned stack is placed in bank memory: its scan fetches one row
+    per iteration, so the device holds one layer of the bank at a time. A
+    plain loop's fetches have no order between them, the scheduler hoists
+    them all to the front, and the whole stack lands on the device, which
+    is the memory the layout was asked to avoid; it is refused by name."""
+    unscanned = [".".join(site.namespace) or "<root>" for site in sites if not site.scanned]
+    if unscanned:
+        raise ValueError(
+            "a host layout streams a scanned stack; the decoder at "
+            f"{', '.join(unscanned)} runs a plain loop (scan_layers=False), whose layer "
+            "fetches the compiler hoists together, so set scan_layers=True (and bank_layers "
+            "to bound a run) on it")
     def leaf(path, sharding):
         keys = tuple(entry.key for entry in path)
         kind = BANK_MEMORY if _in_stack(keys, sites) else None

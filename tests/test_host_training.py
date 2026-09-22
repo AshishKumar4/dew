@@ -417,25 +417,23 @@ def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
         np.testing.assert_array_equal(value, initial[name], err_msg=name)
 
 
-def test_an_unscanned_decoder_trains_through_singleton_banks():
-    """A plain loop declares one bank per layer and streams them the same way."""
+def test_an_unscanned_decoder_is_refused_by_a_host_layout():
+    """A plain loop declares one bank per layer, but nothing sequences their
+    fetches: the compiler hoists every layer's copy to the front and the
+    whole stack lands on the device (the 26B on an A100 asked for 49 GiB in
+    one allocation). The layout says so by name instead of streaming nothing."""
     model = multimodal(scan_layers=False)
     (site,) = model.bank_sites
-    assert site.namespace == ("language_model",)
-    assert site.view.groups == ((0, 1), (1, 1))
+    assert (site.namespace, site.view.groups, site.scanned) == (("language_model",), ((0, 1), (1, 1)), False)
     batch = media_batch()
     held = model.init(jax.random.key(0), batch["text"].tokens,
                       image_indices=batch["text"].token_fields["image_indices"],
                       conditioning=batch["text"].conditioning)
-
-    def objective():
-        return LMObjective(model, 8, head_chunks=1, pretrained=held,
-                           trainable=lambda path: path[1] == "language_model")
-
-    resident = updated(objective(), batch, DEVICE)
-    host = updated(objective(), batch, HOST)
-    close(host, resident)
-    assert sorted(host.params["params"]["language_model"]) == ["embed_tokens", "layers_0", "layers_1", "norm"]
+    objective = LMObjective(model, 8, head_chunks=1, pretrained=held,
+                            trainable=lambda path: path[1] == "language_model")
+    with pytest.raises(ValueError, match="language_model runs a plain loop"):
+        updated(objective, batch, HOST)
+    assert multimodal(scan_layers=True).bank_sites[0].scanned
 
 
 @pytest.mark.parametrize("detached", [False, True])
@@ -493,17 +491,16 @@ def _named_leaves(tree):
     return [(jax.tree_util.keystr(path), leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(tree)]
 
 
-@pytest.mark.parametrize("scan", [False, True], ids=["per-layer", "scanned"])
-def test_frozen_leaves_stay_resident_and_snapshots_alias_them(scan):
+def test_frozen_leaves_stay_resident_and_snapshots_alias_them():
     """A frozen leaf is placed once, beside the accelerator, and is the same
-    buffer after every step; the snapshot of a per-layer bank is the leaf
-    itself and a scanned run's frozen bank is built once and kept."""
+    buffer after every step; a scanned run's frozen bank is built once and
+    kept, while its moving leaves are snapshotted afresh."""
     from dew.training.execution import BANK_MEMORY, HostExecution
 
     def trainable(path):
         return path[-2:] == ("q_proj", "kernel")
 
-    objective = LMObjective(decoder(scan_layers=scan), 8, head_chunks=1, trainable=trainable)
+    objective = LMObjective(decoder(scan_layers=True), 8, head_chunks=1, trainable=trainable)
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
     state, placement, _ = trainer.place()
     frozen = state.params[FROZEN]
@@ -513,12 +510,9 @@ def test_frozen_leaves_stay_resident_and_snapshots_alias_them(scan):
     execution = HostExecution(objective, HOST, trainer.device_mesh, trainer.state_mesh)
     with jax.set_mesh(trainer.state_mesh):
         first, second = execution.snapshot(state.params), execution.snapshot(state.params)
-    if not scan:
-        assert first["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"] is frozen["layers_1"]["mlp"]["gate_proj"]["kernel"]
-    else:
-        bank = next(name for name in first["params"] if name.startswith("layers_0_"))
-        assert first["params"][bank]["mlp"]["gate_proj"]["kernel"] is second["params"][bank]["mlp"]["gate_proj"]["kernel"]
-        assert first["params"][bank]["self_attn"]["q_proj"]["kernel"] is not second["params"][bank]["self_attn"]["q_proj"]["kernel"]
+    bank = next(name for name in first["params"] if name.startswith("layers_0_"))
+    assert first["params"][bank]["mlp"]["gate_proj"]["kernel"] is second["params"][bank]["mlp"]["gate_proj"]["kernel"]
+    assert first["params"][bank]["self_attn"]["q_proj"]["kernel"] is not second["params"][bank]["self_attn"]["q_proj"]["kernel"]
     before = _pointers(frozen)
     step = trainer.compile(state, tokens())
     for _ in range(2):

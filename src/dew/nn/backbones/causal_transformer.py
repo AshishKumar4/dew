@@ -1231,6 +1231,12 @@ class DecoderBank:
     """
     namespace: tuple[str, ...]
     view: StackView
+    scanned: bool = True
+    """Whether the stack runs its banks under `scan`, which is what sequences
+    a host-resident bank's fetches one row at a time. A plain loop declares
+    the same banks, but nothing orders their fetches, so the compiler hoists
+    every layer's copy to the front and the whole stack lands on the device
+    at once; a host layout refuses it (`dew.training.execution.resident`)."""
 
 
 def _on_stage_axis(leaf):
@@ -1668,10 +1674,11 @@ class CausalTransformer(nn.Module):
 
         `groups` already says which is which. A scanned stack declares its
         runs and a plain loop declares singletons, and `run_stack` fetches a
-        run of one the same way it fetches a longer one.
+        run of one the same way it fetches a longer one; `scanned` says
+        whether those fetches are sequenced, which a host layout requires.
         """
         bound = self if self.scope is not None else self.bind({})
-        return (DecoderBank((), StackView(bound.groups)),)
+        return (DecoderBank((), StackView(bound.groups), scanned=self.scan_layers),)
 
     def setup(self):
         types = self.per_layer_types
