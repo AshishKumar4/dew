@@ -28,8 +28,9 @@ MESH_LAYOUTS = tuple(pytest.param(expert, fsdp, marks=pytest.mark.mesh)
 LAYOUTS = (pytest.param(1, 1, id='1-1'), *MESH_LAYOUTS)
 TOLERANCE = 3e-5
 # Every grouped matmul Dew differentiates, each held to the contract in
-# reverse mode on whatever device runs the suite; off a GPU 'pallas' runs its
-# kernels in the Pallas interpreter. Forward mode is 'xla''s alone.
+# reverse mode on whatever device runs the suite; on a CPU 'pallas' runs its
+# kernels in the Pallas interpreter, and on a TPU it is 'xla'. Forward mode
+# is 'xla''s alone.
 IMPLEMENTATIONS = ('xla', 'pallas')
 
 

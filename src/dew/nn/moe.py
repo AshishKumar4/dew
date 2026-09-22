@@ -356,8 +356,9 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
       every expert.
     - 'pallas': JAX's own Pallas/Triton `gmm` kernel, vendored in
       `dew.nn.kernels.ragged_dot`, where `pallas_runs` says it computes the
-      product asked for, and 'xla' elsewhere. Off a GPU the kernel runs in
-      the Pallas interpreter.
+      product asked for, and 'xla' elsewhere. On a CPU the kernel runs in
+      the Pallas interpreter, which is how the CPU suite checks it; on any
+      other backend 'pallas' is 'xla'.
     - 'tokamax': `tokamax.ragged_dot`, the same call against tokamax's own
       kernels (`maxtext layers/moe.py:1633`), the kernel named per backend
       by `TOKAMAX_KERNEL_BY_BACKEND` and XLA elsewhere.
@@ -392,8 +393,11 @@ def pallas_runs(lhs: Dtype, rhs: Dtype, precision: PrecisionLike) -> bool:
     TF32 on a GPU, which only the default precision asks for (explicitly or
     through `jax_default_matmul_precision`), and float64 they do not run.
     The kernels see local arrays, so a mesh that splits anything outside a
-    `shard_map` is XLA's to partition.
+    `shard_map` is XLA's to partition. They are Triton kernels: a GPU runs
+    them and a CPU interprets them.
     """
+    if jax.default_backend() not in ('gpu', 'cpu'):
+        return False
     compute = jnp.promote_types(lhs, rhs)
     if compute not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
         if compute != jnp.dtype(jnp.float32):
