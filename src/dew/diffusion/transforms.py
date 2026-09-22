@@ -235,6 +235,9 @@ class SourceLimitedPrediction(PredictionTransform):
             level = expand(jnp.clip(level, 1.0, maximum), x_0)
             return jnp.clip(x_0, -level, level) / level
         if self.clip is None:
+            # Unreachable: `__init__` refuses both limits unset, and the
+            # thresholding branch above has returned. It narrows the declared
+            # `float | None` for the checker.
             raise ValueError("a limited prediction needs a clip range or a thresholding ratio")
         return jnp.clip(x_0, -self.clip, self.clip)
 
