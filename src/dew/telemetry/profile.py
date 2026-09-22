@@ -14,6 +14,7 @@ import shlex
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from importlib.metadata import version
 from pathlib import Path
 from types import TracebackType
@@ -146,6 +147,17 @@ class Profiler:
     @property
     def directory(self) -> Path | None:
         return self._directory
+
+    def region(self, name: str) -> AbstractContextManager[None]:
+        """A named span in the trace while this profiler is capturing.
+
+        Wrap the work whose device and host time should show under `name`.
+        Outside a capture the span is a no-op, so the same code runs
+        unprofiled without a branch at every site.
+        """
+        if not self.running:
+            return nullcontext()
+        return jax.profiler.TraceAnnotation(name)
 
     @property
     def running(self) -> bool:
