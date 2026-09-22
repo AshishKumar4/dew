@@ -65,6 +65,34 @@ class SampledRollout:
         if self.sample not in ("group", "rloo"):
             raise ValueError("the advantage families are 'group' and 'rloo'")
 
+    def _prepared(self, batch, key: jax.Array):
+        """Validate one prompt batch and build the inputs generation reads.
+
+        Returns the prompt ids, their lengths, the decoded source, truth
+        and info strings the reward is called with, and the `ModelInputs`
+        the policy is given.
+        """
+        key = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
+        if key.shape != ():
+            raise ValueError("key must be a single JAX PRNG key")
+        prompts = local_rows(batch[PROMPT_KEY])
+        prompt_lengths = local_rows(batch[LENGTH_KEY])
+        sources, truths, infos = (_texts(local_rows(batch[name]))
+                                  for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
+        rows, width = prompts.shape
+        if width + self.max_new_tokens != self.objective.seq_len + 1:
+            raise ValueError("size the objective one below the prompt width plus max_new_tokens")
+        if (prompt_lengths.shape != (rows,) or not np.issubdtype(prompt_lengths.dtype, np.integer)
+                or np.any(prompt_lengths < 1) or np.any(prompt_lengths > width)):
+            raise ValueError("prompt_length must contain one valid integer length per row")
+        # The lengths are already here on the host, so a batch of whole
+        # prompts states its validity by carrying none.
+        padded = bool(np.any(prompt_lengths < width))
+        inputs = ModelInputs(jnp.asarray(prompts), {
+            "attention_mask": jnp.arange(width)[None, :] >= width - jnp.asarray(prompt_lengths)[:, None]
+        } if padded else {})
+        return prompts, prompt_lengths, sources, truths, infos, inputs
+
     def __call__(self, state, batch, key: jax.Array) -> dict[str, np.ndarray]:
         """Draw `groups` completions per prompt and pack them as GRPO rows.
 
@@ -76,26 +104,7 @@ class SampledRollout:
         prepared = None
         error = None
         try:
-            key = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
-            if key.shape != ():
-                raise ValueError("key must be a single JAX PRNG key")
-            prompts = local_rows(batch[PROMPT_KEY])
-            prompt_lengths = local_rows(batch[LENGTH_KEY])
-            sources, truths, infos = (_texts(local_rows(batch[name]))
-                                      for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
-            rows, width = prompts.shape
-            if width + self.max_new_tokens != self.objective.seq_len + 1:
-                raise ValueError("size the objective one below the prompt width plus max_new_tokens")
-            if (prompt_lengths.shape != (rows,) or not np.issubdtype(prompt_lengths.dtype, np.integer)
-                    or np.any(prompt_lengths < 1) or np.any(prompt_lengths > width)):
-                raise ValueError("prompt_length must contain one valid integer length per row")
-            # The lengths are already here on the host, so a batch of whole
-            # prompts states its validity by carrying none.
-            padded = bool(np.any(prompt_lengths < width))
-            inputs = ModelInputs(jnp.asarray(prompts), {
-                "attention_mask": jnp.arange(width)[None, :] >= width - jnp.asarray(prompt_lengths)[:, None]
-            } if padded else {})
-            prepared = prompts, prompt_lengths, sources, truths, infos, inputs
+            prepared = self._prepared(batch, key)
         except BaseException as failure:
             error = failure
         if mesh_of(state.params) is not None:

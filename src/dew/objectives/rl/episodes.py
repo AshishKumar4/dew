@@ -475,6 +475,69 @@ class EpisodeRollout:
                       tuple(float(value) for value in behavior[:count]),
                       bool(ended[row]), policy_step, self.sampling, _binding_id=binding_id)
 
+    def _slots(self, tasks, state: TrainState, key: jax.Array, rank: int) -> list[_Session]:
+        """Build one session per task and group, each with its own identity.
+
+        The identity is drawn from the cohort key and the sample's global
+        index, so a rank's slots are reproducible from checkpointed work.
+        """
+        slots = []
+        for index, task in enumerate(tasks):
+            for group in range(self.groups):
+                sample = (rank * tasks.size + index) * self.groups + group
+                draw = jax.random.fold_in(key, sample)
+                slots.append(_Session(EpisodeId(int(task), int(state.step), int(sample),
+                    tuple(int(value) for value in np.asarray(jax.random.key_data(draw))))))
+        return slots
+
+    def _bound_journal(self, journal_stack: ExitStack, state: TrainState, key: jax.Array, tasks,
+                       signature, processes: int, rank: int, binding: str) -> tuple[JournalRun, str]:
+        """Open this cohort's journal and agree on the binding it records under.
+
+        A journal that already holds this cohort's turns keeps its own
+        binding, so the resumed run stays the collection the stored actions
+        were drawn from.
+        """
+        journal = self.journal
+        assert journal is not None
+
+        def open_journal():
+            from .journal import policy_digest
+
+            cohort = repr((int(state.step), tuple(np.asarray(jax.random.key_data(key)).tolist())))
+            fingerprint = repr((signature.tobytes().hex(), tasks.tolist(), processes, rank,
+                                policy_digest(state.params)))
+            return journal_stack.enter_context(journal.open(cohort, fingerprint, binding))
+
+        run = agreed("episode journal open", open_journal)
+        origin = np.frombuffer(bytes.fromhex(run.binding), np.uint8)
+        if processes > 1:
+            origin = multihost_utils.broadcast_one_to_all(origin)
+        bound = origin.tobytes().hex()
+        agreed("episode journal binding", lambda: run.align(bound))
+        return run, bound
+
+    def _turns(self, slots: list[_Session], policy: EpisodeInference, key: jax.Array,
+               run: JournalRun | None, policy_step: int, binding_id: str) -> None:
+        """Run the cohort turn by turn until every rank's slots are finished.
+
+        A turn packs the contexts, agrees on whether any slot is still
+        running, generates for the whole cohort and steps the environments.
+        Every environment entered here is released before returning, and
+        the slots are verified once the loop ends.
+        """
+        with ExitStack() as stack:
+            agreed("episode reset", lambda: self._open(slots, stack, run, policy_step, binding_id))
+            for turn in range(self.max_turns):
+                inputs = agreed("episode context preparation", lambda: self._inputs(slots, turn))
+                active = any(slot.status == EpisodeStatus.RUNNING for slot in slots)
+                if not agree_process_phase(None, phase="episode availability", available=active):
+                    break
+                generation = agreed("episode generation", lambda: policy(inputs, self.max_new_tokens,
+                    key=jax.random.fold_in(key, turn), sampling=self.sampling))
+                agreed("episode tool step", lambda: self._advance(slots, generation, policy_step, binding_id, turn, run))
+            agreed("episode verification", lambda: self._verify(slots, policy_step, binding_id, run))
+
     def collect(self, state: TrainState, batch: Batch, key: jax.Array) -> tuple[Episode, ...]:
         """Collect fixed cohorts, agreeing host phases before every generation."""
         def prepare():
@@ -497,43 +560,15 @@ class EpisodeRollout:
             origin = multihost_utils.broadcast_one_to_all(origin)
         binding_id = origin.tobytes().hex()
         policy_step = int(state.updates)
-        slots = []
-        for index, task in enumerate(tasks):
-            for group in range(self.groups):
-                sample = (rank * tasks.size + index) * self.groups + group
-                draw = jax.random.fold_in(key, sample)
-                slots.append(_Session(EpisodeId(int(task), int(state.step), int(sample),
-                    tuple(int(value) for value in np.asarray(jax.random.key_data(draw))))))
+        slots = self._slots(tasks, state, key, rank)
         error = None
         try:
             with ExitStack() as journal_stack:
                 run = None
                 if self.journal is not None:
-                    journal = self.journal
-                    def open_journal():
-                        from .journal import policy_digest
-
-                        cohort = repr((int(state.step), tuple(np.asarray(jax.random.key_data(key)).tolist())))
-                        fingerprint = repr((signature.tobytes().hex(), tasks.tolist(), processes, rank,
-                                            policy_digest(state.params)))
-                        return journal_stack.enter_context(journal.open(cohort, fingerprint, binding_id))
-                    run = agreed("episode journal open", open_journal)
-                    origin = np.frombuffer(bytes.fromhex(run.binding), np.uint8)
-                    if processes > 1:
-                        origin = multihost_utils.broadcast_one_to_all(origin)
-                    binding_id = origin.tobytes().hex()
-                    agreed("episode journal binding", lambda: run.align(binding_id))
-                with ExitStack() as stack:
-                    agreed("episode reset", lambda: self._open(slots, stack, run, policy_step, binding_id))
-                    for turn in range(self.max_turns):
-                        inputs = agreed("episode context preparation", lambda: self._inputs(slots, turn))
-                        active = any(slot.status == EpisodeStatus.RUNNING for slot in slots)
-                        if not agree_process_phase(None, phase="episode availability", available=active):
-                            break
-                        generation = agreed("episode generation", lambda: policy(inputs, self.max_new_tokens,
-                            key=jax.random.fold_in(key, turn), sampling=self.sampling))
-                        agreed("episode tool step", lambda: self._advance(slots, generation, policy_step, binding_id, turn, run))
-                    agreed("episode verification", lambda: self._verify(slots, policy_step, binding_id, run))
+                    run, binding_id = self._bound_journal(
+                        journal_stack, state, key, tasks, signature, processes, rank, binding_id)
+                self._turns(slots, policy, key, run, policy_step, binding_id)
         except BaseException as failure:
             error = failure
         try:

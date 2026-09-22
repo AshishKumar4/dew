@@ -288,15 +288,15 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         canvas_losses, target_mask, _, _ = self._token_losses(params, batch, step.key, train=False)
         return TokenScores(losses=canvas_losses, weights=target_mask.astype(canvas_losses.dtype))
 
-    def _token_losses(self, params: Variables, batch: Batch, key: jax.Array, *, train: bool
-                      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        """Score both SFT passes over one batch.
+    def _row(self, batch: Batch):
+        """Read one batch's rows and the masks every later phase reads.
 
-        Returns the denoiser's per-token cross entropies over the response
-        and the encoder's over the full row, each with the mask of the
-        targets it counts.
+        Returns the `ModelInputs` it came from, the int32 `tokens`, the
+        `response` half of them, the supplied `validity` or None, the
+        `full_valid` occupancy of the whole row, the `canvas_mask` of
+        response tokens that may be targets, and `text_slots`, which is
+        None unless media placeholders have to be kept out.
         """
-        params = thaw(params)
         value = batch["text"]
         prepared = value if isinstance(value, ModelInputs) else ModelInputs(jnp.asarray(value))
         tokens = prepared.tokens
@@ -320,8 +320,16 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         if text_slots is not None:
             # Zero-weight targets still reach embeddings and integer-label CE.
             response = jnp.where(text_slots[:, self.prompt_length:], response, 0)
+        return prepared, tokens, response, validity, full_valid, canvas_mask, text_slots
+
+    def _corrupted(self, response: jax.Array, canvas_mask: jax.Array, key: jax.Array):
+        """Draw one noise level and corrupt the response at it.
+
+        Returns the corrupted tokens, the canvas each row scores, and the
+        key the self-conditioning draw still needs.
+        """
         time_key, corruption_key, canvas_key, sc_key = jax.random.split(key, 4)
-        time = jax.random.uniform(time_key, (tokens.shape[0], 1),
+        time = jax.random.uniform(time_key, (response.shape[0], 1),
                                   minval=self.safety_epsilon, maxval=1 - self.safety_epsilon)
         keep_key, noise_key = jax.random.split(corruption_key)
         keep = jax.random.bernoulli(keep_key, jnp.broadcast_to(1 - time, response.shape), mode="high")
@@ -329,6 +337,39 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         noisy = jnp.where(keep, response, noise)
         valid_canvases = canvas_mask[:, ::self.canvas_size].sum(axis=-1)
         selected = jax.random.randint(canvas_key, valid_canvases.shape, 0, jnp.maximum(valid_canvases, 1))
+        return noisy, selected, sc_key
+
+    def _encoder_targets(self, batch: Batch, tokens: jax.Array, validity, full_valid: jax.Array,
+                         text_slots) -> tuple[jax.Array, jax.Array]:
+        """Shift the row by one and weight the targets the encoder scores.
+
+        A default target needs its neighbour valid too, which is Google's
+        SequenceTargetShift; a supplied mask is taken as given, except that
+        media placeholders never become labels.
+        """
+        shifted = jnp.concatenate([tokens[:, 1:], jnp.full((tokens.shape[0], 1), self.pad_token_id, jnp.int32)], axis=-1)
+        adjacent = full_valid & jnp.concatenate([full_valid[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
+        encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), jnp.float32)
+        if encoder_target_mask.shape != tokens.shape:
+            raise ValueError("encoder_target_mask must align with the full sequence")
+        if validity is not None:
+            encoder_target_mask *= adjacent
+        if text_slots is not None:
+            encoder_target_mask *= jnp.concatenate([text_slots[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
+        return jnp.where(encoder_target_mask != 0, shifted, 0), encoder_target_mask
+
+    def _token_losses(self, params: Variables, batch: Batch, key: jax.Array, *, train: bool
+                      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """Score both SFT passes over one batch.
+
+        Returns the denoiser's per-token cross entropies over the response
+        and the encoder's over the full row, each with the mask of the
+        targets it counts.
+        """
+        params = thaw(params)
+        prepared, tokens, response, validity, full_valid, canvas_mask, text_slots = self._row(batch)
+        noisy, selected, sc_key = self._corrupted(response, canvas_mask, key)
+        fields = prepared.token_fields
         positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
             full_valid, selected, self.prompt_length, self.canvas_size,
             fields.get("positions"), fields.get("image_groups"))
@@ -375,16 +416,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         canvas_losses, _, _ = chunked_cross_entropy(
             states, head, response, self.head_chunks, softcap=softcap, precision=precision,
             vocab_major=vocab_major)
-        shifted = jnp.concatenate([tokens[:, 1:], jnp.full((tokens.shape[0], 1), self.pad_token_id, jnp.int32)], axis=-1)
-        adjacent = full_valid & jnp.concatenate([full_valid[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
-        encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), jnp.float32)
-        if encoder_target_mask.shape != tokens.shape:
-            raise ValueError("encoder_target_mask must align with the full sequence")
-        if validity is not None:
-            encoder_target_mask *= adjacent
-        if text_slots is not None:
-            encoder_target_mask *= jnp.concatenate([text_slots[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1)
-        shifted = jnp.where(encoder_target_mask != 0, shifted, 0)
+        shifted, encoder_target_mask = self._encoder_targets(batch, tokens, validity, full_valid, text_slots)
         encoder_losses, _, _ = chunked_cross_entropy(
             encoder_states, head, shifted, self.head_chunks, softcap=softcap, precision=precision,
             vocab_major=vocab_major)
