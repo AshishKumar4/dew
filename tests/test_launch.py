@@ -124,3 +124,28 @@ def test_every_repeated_env_flag_reaches_the_ranks():
         cwd=REPO_ROOT, env=ENV, capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stdout
     assert "[0] 12" in done.stdout
+def fake_srun(tmp_path: Path) -> dict:
+    """An environment whose `srun` records its arguments and the variables
+    it would hand its tasks, in place of Slurm's."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    srun = bin_dir / "srun"
+    srun.write_text("#!/bin/sh\n"
+                    f"printf '%s\\n' \"$@\" > {tmp_path}/argv\n"
+                    f"printf '%s' \"$CUDA_VISIBLE_DEVICES|$XLA_FLAGS\" > {tmp_path}/env\n")
+    srun.chmod(0o755)
+    return {**ENV, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+
+def test_srun_receives_values_with_commas_whole(tmp_path):
+    """Slurm reads --export as a comma-separated list, so a value holding a
+    comma would be cut there. The variables travel in srun's environment,
+    which --export=ALL hands to every task."""
+    done = subprocess.run(
+        [sys.executable, "-m", "dew.cli.main", "launch", "--slurm",
+         "--env", "CUDA_VISIBLE_DEVICES=0,1", "--env", "XLA_FLAGS=--a=1,--b=2",
+         "--", "python", "train.py"],
+        cwd=REPO_ROOT, env=fake_srun(tmp_path), capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    assert (tmp_path / "env").read_text() == "0,1|--a=1,--b=2"
+    assert "--export=ALL" in (tmp_path / "argv").read_text().split()
