@@ -148,6 +148,16 @@ def test_math_reward_compares_rational_answers():
     assert reward("math", "the answer is 8", "8", "") == 0.0
     assert MathReward(require_boxed=False)("math", "the answer is 8.", "8", "") == 1.0
     assert reward("math", r"\boxed{x+1}", "x+1", "") == 1.0
+    assert reward("math", r"\boxed{12,345.5}", "12345.5", "") == 1.0
+
+
+def test_math_reward_does_not_merge_a_list_into_one_number():
+    reward = MathReward()
+    assert reward("math", r"\boxed{1,2}", "12", "") == 0.0
+    assert reward("math", r"\boxed{12}", "1, 2", "") == 0.0
+    assert reward("math", r"\boxed{3,5}", "35", "") == 0.0
+    assert reward("math", r"\boxed{2 3}", "23", "") == 0.0
+    assert MathReward(require_boxed=False)("math", "the roots are 1,2", "12", "") == 0.0
 
 
 IMAGE = "python:3.12-slim"
