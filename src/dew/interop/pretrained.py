@@ -81,6 +81,55 @@ class HostProcessor(Protocol):
     def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]: ...
 
 
+def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | None, *,
+                   kernel: int, table_size: int, patch_size: int
+                   ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Each modality's patch frames, their coordinates and their pooled
+    lengths, by the placeholder id that stands in the prompt for them.
+
+    The source flattens its video and frame axes, not its prompt rows
+    (modeling_gemma4.py:2476-2488), so the two streams stay separate here and
+    the caller's placeholder runs establish row order over them. A stream
+    arrives whole: its pixels with its positions, its coordinates inside the
+    position table, and its patches in complete pooling blocks.
+    """
+    streams: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    for pixel_name, position_name, token_id, ndim in (
+        ("pixel_values", "image_position_ids", image_id, 3),
+        ("pixel_values_videos", "video_position_ids", video_id, 4),
+    ):
+        if pixel_name not in values and position_name not in values:
+            continue
+        if pixel_name not in values or position_name not in values:
+            raise ValueError(f"{pixel_name} and {position_name} arrive together")
+        if token_id is None:
+            raise ValueError(f"{pixel_name} requires an integer placeholder id")
+        if token_id in streams:
+            raise ValueError("image_token_id and video_token_id must identify separate payload streams")
+        frames, coordinates = np.asarray(values[pixel_name]), np.asarray(values[position_name])
+        if (frames.ndim != ndim or not np.issubdtype(frames.dtype, np.floating)
+                or min(frames.shape[1:]) < 1):
+            raise ValueError(f"{pixel_name} must contain floating patch frames of rank {ndim}")
+        if (coordinates.shape != (*frames.shape[:-1], 2)
+                or not np.issubdtype(coordinates.dtype, np.integer)):
+            raise ValueError(f"{position_name} must contain aligned integer patch coordinates")
+        if frames.shape[-1] != 3 * patch_size ** 2:
+            raise ValueError(f"{pixel_name} patch width disagrees with vision_config.patch_size")
+        frames = frames.reshape(-1, *frames.shape[-2:])
+        coordinates = coordinates.reshape(-1, *coordinates.shape[-2:])
+        valid_patches = (coordinates >= 0).all(axis=-1)
+        padding = (coordinates == -1).all(axis=-1)
+        if not np.all(valid_patches | padding):
+            raise ValueError(f"{position_name} uses nonnegative coordinates or paired (-1, -1) padding")
+        if np.any(coordinates >= table_size):
+            raise ValueError(f"{position_name} exceeds position_embedding_size")
+        counts = valid_patches.sum(axis=1)
+        if frames.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2):
+            raise ValueError("patch counts must divide into complete pooling blocks")
+        streams[token_id] = (frames, coordinates, counts // kernel ** 2)
+    return streams
+
+
 def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"]]:
     """The id and the side to pad text rows with, at the boundary a host
     processor draws: it delegates text to the tokenizer it wraps, a tokenizer
@@ -241,6 +290,8 @@ class Processor:
         gemma = self.config.get("model_type") == "gemma4"
         video_id = (self.config.get("video_token_id", 258884) if gemma else
                     self.config.get("video_token_id") if qwen else None)
+        if video_id is not None and type(video_id) is not int:
+            raise ValueError("video_token_id must be an integer")
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
         if pixels.ndim not in (2, 3, 4) or not np.issubdtype(pixels.dtype, np.floating):
             raise ValueError("pixel_values must contain floating image tensors or patch vectors")
@@ -273,43 +324,8 @@ class Processor:
             table_size, patch_size = vision.get("position_embedding_size"), vision.get("patch_size")
             if type(table_size) is not int or table_size < 1 or type(patch_size) is not int or patch_size < 1:
                 raise ValueError("position_embedding_size and patch_size must be positive integers")
-            streams: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-            for pixel_name, position_name, token_id, ndim in (
-                ("pixel_values", "image_position_ids", image_id, 3),
-                ("pixel_values_videos", "video_position_ids", video_id, 4),
-            ):
-                if pixel_name not in values and position_name not in values:
-                    continue
-                if pixel_name not in values or position_name not in values:
-                    raise ValueError(f"{pixel_name} and {position_name} arrive together")
-                if type(token_id) is not int:
-                    raise ValueError(f"{pixel_name} requires an integer placeholder id")
-                if token_id in streams:
-                    raise ValueError("image_token_id and video_token_id must identify separate payload streams")
-                frames, coordinates = np.asarray(values[pixel_name]), np.asarray(values[position_name])
-                if (frames.ndim != ndim or not np.issubdtype(frames.dtype, np.floating)
-                        or min(frames.shape[1:]) < 1):
-                    raise ValueError(f"{pixel_name} must contain floating patch frames of rank {ndim}")
-                if (coordinates.shape != (*frames.shape[:-1], 2)
-                        or not np.issubdtype(coordinates.dtype, np.integer)):
-                    raise ValueError(f"{position_name} must contain aligned integer patch coordinates")
-                if frames.shape[-1] != 3 * patch_size ** 2:
-                    raise ValueError(f"{pixel_name} patch width disagrees with vision_config.patch_size")
-                # The source flattens video then frame axes, not prompt rows
-                # (modeling_gemma4.py:2476-2488). Keep the two modality streams
-                # separate until their placeholder runs establish row order.
-                frames = frames.reshape(-1, *frames.shape[-2:])
-                coordinates = coordinates.reshape(-1, *coordinates.shape[-2:])
-                valid_patches = (coordinates >= 0).all(axis=-1)
-                padding = (coordinates == -1).all(axis=-1)
-                if not np.all(valid_patches | padding):
-                    raise ValueError(f"{position_name} uses nonnegative coordinates or paired (-1, -1) padding")
-                if np.any(coordinates >= table_size):
-                    raise ValueError(f"{position_name} exceeds position_embedding_size")
-                counts = valid_patches.sum(axis=1)
-                if frames.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2):
-                    raise ValueError("patch counts must divide into complete pooling blocks")
-                streams[token_id] = (frames, coordinates, counts // kernel ** 2)
+            streams = _patch_streams(values, image_id, video_id, kernel=kernel,
+                                     table_size=table_size, patch_size=patch_size)
             offsets = dict.fromkeys(streams, 0)
             chunks, patch_positions, lengths = [], [], []
             for row, blocks in enumerate(runs):
@@ -2010,6 +2026,96 @@ def _safety_path(name: str):
     return _clip_path(name.removeprefix("vision_model."))
 
 
+def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperFields,
+                         max_seq_len: int | None) -> decoders.DecoderFields:
+    """The decoder fields a wrapper's text_config states, with the corrections
+    its own family makes to them.
+
+    Gemma 3 projects its logits without the causal-LM class's final tanh cap
+    and attends its image spans both ways; Gemma 4 does the same on its
+    sliding layers when the config asks for it; Qwen3.5 splits its rotary
+    into the three mrope sections its wrapper positions rows with.
+    """
+    family = config.get("model_type")
+    text_config = records.record(config["text_config"], "text_config")
+    text_fields: decoders.DecoderFields = {**record["text"]}
+    if max_seq_len is not None:
+        text_fields["max_seq_len"] = max_seq_len
+    if family == "gemma3":
+        text_fields["final_logit_softcap"] = None
+        text_fields["mixer"] = {"kind": "attention", "bidirectional_images": True}
+    if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
+        kinds = dict(text_fields.get("kinds") or {})
+        sliding: decoders.KindFields = {
+            **kinds.get("sliding_attention", {}),
+            "mixer": {"kind": "attention", "bidirectional_images": True}}
+        kinds["sliding_attention"] = sliding
+        text_fields["kinds"] = kinds
+    if family == "qwen3_5":
+        rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
+        sections = rope.get("mrope_section", [11, 11, 10])
+        if (not isinstance(sections, (list, tuple)) or len(sections) != 3
+                or any(type(value) is not int or value < 0 for value in sections)):
+            raise ValueError("mrope_section must contain three nonnegative integer widths")
+        kinds = dict(text_fields.get("kinds") or {})
+        full: decoders.KindFields = {
+            **kinds.get("full_attention", {}),
+            "mixer": {"kind": "attention",
+                      "mrope_section": [sections[0], sections[1], sections[2]]}}
+        kinds["full_attention"] = full
+        text_fields["kinds"] = kinds
+    return text_fields
+
+
+def _wrapper_model(config: Mapping[str, object], record: decoders.WrapperFields,
+                   language_model: CausalTransformer, *, dtype: str,
+                   attention_impl: str) -> MultimodalTransformer:
+    """The wrapper its record describes: the decoder above, the towers and
+    projectors it names, and the placeholder ids its prompts carry."""
+    family = records.text(config["model_type"], "model_type")
+    text_config = records.record(config["text_config"], "text_config")
+    audio_record = record["audio"]
+    audio_projector = record["audio_projector"]
+    return MultimodalTransformer(
+        language_model, tower_from_record(record["tower"]),
+        projector_from_record(record["projector"]), family,
+        record["image_token_id"], dtype=resolve_dtype(dtype),
+        # A text_config that states a null pad id states none, and the
+        # wrapper's own field defaults to 0 for exactly that.
+        pad_token_id=records.integer(text_config.get("pad_token_id") or 0, "pad_token_id"),
+        extra_placeholder_ids=(tuple(records.integer(config.get(name, default), name) for name, default in
+            (("video_token_id", 258884), ("audio_token_id", 258881))) if family == "gemma4" else ()),
+        audio=None if audio_record is None else tower_from_record(audio_record),
+        audio_projection=(None if audio_projector is None
+                          else projector_from_record(audio_projector)),
+        audio_soft_tokens=record["audio_soft_tokens"],
+        attention_impl=attention_impl)
+
+
+def _source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
+                      model: nn.Module) -> Processor | None:
+    """The host preprocessing a source ships, or None where it ships none.
+
+    Only a model with towers reads images or audio, and only through the
+    processor its repo ships; a text decoder takes its tokenizer whatever
+    processor files sit beside it (DiffusionGemma publishes a Gemma 4
+    processor config beside a text-only model), and a tiny multimodal
+    fixture without processor files tokenizes text only.
+    """
+    processor_files = any((directory / name).exists()
+                          for name in ("processor_config.json", "preprocessor_config.json"))
+    if isinstance(model, MultimodalTransformer) and processor_files:
+        from transformers import AutoProcessor
+        options = {"backend": "pil"} if config.get("model_type") == "gemma3" else {}
+        reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
+        return Processor(reference, config, record, model.vocab_size)
+    if (directory / "tokenizer_config.json").exists():
+        from transformers import AutoTokenizer
+        return Processor(AutoTokenizer.from_pretrained(str(directory), local_files_only=True),
+                         config, record, model.vocab_size)
+    return None
+
+
 def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                     attention_impl: str = "auto", max_seq_len: int | None = None,
                     revision: str | None = None) -> Pretrained:
@@ -2073,35 +2179,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         # nested config; `translate_config` refuses the rest by the same
         # rule.
         record = decoders.translate_wrapper_config(config)
-        text_fields: decoders.DecoderFields = {**record["text"]}
-        if max_seq_len is not None:
-            text_fields["max_seq_len"] = max_seq_len
-        if family == "gemma3":
-            # Gemma3ForConditionalGeneration projects logits without the
-            # causal-LM class's optional final tanh cap.
-            text_fields["final_logit_softcap"] = None
-            text_fields["mixer"] = {"kind": "attention", "bidirectional_images": True}
-        if family == "gemma4" and config["text_config"].get("use_bidirectional_attention") == "vision":
-            kinds = dict(text_fields.get("kinds") or {})
-            sliding: decoders.KindFields = {
-                **kinds.get("sliding_attention", {}),
-                "mixer": {"kind": "attention", "bidirectional_images": True}}
-            kinds["sliding_attention"] = sliding
-            text_fields["kinds"] = kinds
-        if family == "qwen3_5":
-            rope = config["text_config"].get("rope_parameters") or {}
-            sections = rope.get("mrope_section", [11, 11, 10])
-            if (not isinstance(sections, (list, tuple)) or len(sections) != 3
-                    or any(type(value) is not int or value < 0 for value in sections)):
-                raise ValueError("mrope_section must contain three nonnegative integer widths")
-            kinds = dict(text_fields.get("kinds") or {})
-            full: decoders.KindFields = {
-                **kinds.get("full_attention", {}),
-                "mixer": {"kind": "attention",
-                          "mrope_section": [sections[0], sections[1], sections[2]]}}
-            kinds["full_attention"] = full
-            text_fields["kinds"] = kinds
-
+        text_fields = _wrapper_text_fields(config, record, max_seq_len)
         text: decoders.DecoderFields = {**text_fields, **precision_fields(
             "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)}
         wrapper: decoders.WrapperFields = {**record, "text": text}
@@ -2109,20 +2187,8 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         language_model = models.build("causal_transformer", wrapper["text"])
         if not isinstance(language_model, CausalTransformer):
             raise TypeError("causal_transformer registry entry must build CausalTransformer")
-        audio_record = record["audio"]
-        audio_projector = record["audio_projector"]
-        model = MultimodalTransformer(
-            language_model, tower_from_record(record["tower"]),
-            projector_from_record(record["projector"]), family,
-            record["image_token_id"], dtype=resolve_dtype(dtype),
-            pad_token_id=config["text_config"].get("pad_token_id", 0),
-            extra_placeholder_ids=(tuple(config.get(name, default) for name, default in
-                (("video_token_id", 258884), ("audio_token_id", 258881))) if family == "gemma4" else ()),
-            audio=None if audio_record is None else tower_from_record(audio_record),
-            audio_projection=(None if audio_projector is None
-                              else projector_from_record(audio_projector)),
-            audio_soft_tokens=record["audio_soft_tokens"],
-            attention_impl=attention_impl)
+        model = _wrapper_model(config, record, language_model,
+                               dtype=dtype, attention_impl=attention_impl)
         variables = _native_variables(decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype))
         layouts, retained = _wrapper_layouts(tensors, record, variables)
     else:
@@ -2149,23 +2215,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
                 else:
                     bindings.append(layout)
             layouts = tuple(bindings)
-    processor = None
-    processor_files = any((directory / name).exists()
-                          for name in ("processor_config.json", "preprocessor_config.json"))
-    if isinstance(model, MultimodalTransformer) and processor_files:
-        # Only a model with towers reads images or audio, and only through
-        # the processor its repo ships; a text decoder takes its tokenizer
-        # whatever processor files sit beside it (DiffusionGemma publishes a
-        # Gemma 4 processor config beside a text-only model), and a tiny
-        # multimodal fixture without processor files tokenizes text only.
-        from transformers import AutoProcessor
-        options = {"backend": "pil"} if family == "gemma3" else {}
-        reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
-        processor = Processor(reference, config, record, model.vocab_size)
-    elif (directory / "tokenizer_config.json").exists():
-        from transformers import AutoTokenizer
-        reference = AutoTokenizer.from_pretrained(str(directory), local_files_only=True)
-        processor = Processor(reference, config, record, model.vocab_size)
+    processor = _source_processor(directory, config, record, model)
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
     error = None
