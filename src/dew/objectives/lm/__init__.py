@@ -5,10 +5,9 @@ from .objective import (
                         LMObjective,
                         Perplexity,
                         Samples,
-                        balance,
                         perplexity,
                         prompt_batch,
 )
 
 __all__ = ["TEXT_KEY", "IndexerTraining", "LMObjective", "LMRunConfig", "Perplexity", "Samples",
-           "balance", "perplexity", "prompt_batch"]
+           "perplexity", "prompt_batch"]

@@ -36,10 +36,8 @@ from .rollout import (
     BEHAVIOR_LOG_PROBS_KEY,
     IDS_KEY,
     OLD_LOG_PROBS_KEY,
-    RESPONSE_LENGTH_KEY,
     RESPONSE_MASK_KEY,
     REWARDS_KEY,
-    TERMINATED_KEY,
 )
 
 if TYPE_CHECKING:
@@ -606,9 +604,7 @@ class EpisodeRollout:
         mask = np.zeros((rows, response), np.float32)
         raw = np.zeros_like(mask)
         behavior = np.zeros_like(mask)
-        lengths = np.zeros(rows, np.int32)
         prompt_lengths = np.ones(rows, np.int32)
-        terminated = np.zeros(rows, bool)
         for index, episode in enumerate(episodes):
             for turn_index, transition in enumerate(episode.transitions):
                 action = transition.action
@@ -621,15 +617,10 @@ class EpisodeRollout:
                 mask[row, :count] = 1
                 raw[row, :count] = action.raw_log_probs
                 behavior[row, :count] = action.behavior_log_probs
-                lengths[row], prompt_lengths[row] = count, size
-                terminated[row] = action.terminated
+                prompt_lengths[row] = size
         return {
             IDS_KEY: ids, RESPONSE_MASK_KEY: mask, OLD_LOG_PROBS_KEY: raw,
-            BEHAVIOR_LOG_PROBS_KEY: behavior, RESPONSE_LENGTH_KEY: lengths,
-            LENGTH_KEY: prompt_lengths, TERMINATED_KEY: terminated,
+            BEHAVIOR_LOG_PROBS_KEY: behavior, LENGTH_KEY: prompt_lengths,
             REWARDS_KEY: np.repeat(np.asarray(rewards, np.float32), self.max_turns),
-
-            "episode_status": np.repeat(np.asarray([episode.status for episode in episodes], np.int32), self.max_turns),
             "task_id": np.repeat(np.asarray([episode.identity.task for episode in episodes], np.int32), self.max_turns),
-            "policy_step": np.full(rows, policy_step, np.int32),
         }

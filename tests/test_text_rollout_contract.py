@@ -127,14 +127,14 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
     rollout = SampledRollout(objective, reward, groups=2, max_new_tokens=4,
                              sampling=Sampling(temperature=0, eos_id=eos, pad_id=12))
     result = rollout(SimpleNamespace(params=params), batch, jax.random.key(1))
-    np.testing.assert_array_equal(result["response_length"][:2], [1, 1])
-    np.testing.assert_array_equal(result["terminated"][:2], [True, True])
     np.testing.assert_array_equal(result["response_mask"][:2], [[1, 0, 0, 0]] * 2)
     np.testing.assert_array_equal(result["input_ids"][:2, 4:], [[eos, 12, 12, 12]] * 2)
     np.testing.assert_array_equal(result["behavior_log_probs"], np.zeros((4, 4)))
     assert seen[:2] == [("a", "", "1", "")] * 2
     for row, (_, text, _, _) in enumerate(seen):
-        count = int(result["response_length"][row]) - int(result["terminated"][row])
+        # The mask counts EOS as an action; the reward text stops before it.
+        drawn = int(result["response_mask"][row].sum())
+        count = drawn - int(result["input_ids"][row, 4 + drawn - 1] == eos)
         assert text == " ".join(str(token) for token in result["input_ids"][row, 4:4 + count])
     assert np.all(result["old_log_probs"][:2, 1:] == 0)
     assert np.all(result["old_log_probs"][:2, 0] < 0)

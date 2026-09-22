@@ -22,8 +22,6 @@ type Reward = Callable[[str, str, str, str], float]
 
 IDS_KEY = "input_ids"
 RESPONSE_MASK_KEY = "response_mask"
-RESPONSE_LENGTH_KEY = "response_length"
-TERMINATED_KEY = "terminated"
 OLD_LOG_PROBS_KEY = "old_log_probs"
 """Raw model-policy log-probabilities recorded before the training update.
 
@@ -132,8 +130,6 @@ class SampledRollout:
         return {
             IDS_KEY: full.reshape(-1, full.shape[-1]),
             RESPONSE_MASK_KEY: mask.reshape(-1, self.max_new_tokens).astype(np.float32),
-            RESPONSE_LENGTH_KEY: lengths.reshape(-1),
-            TERMINATED_KEY: terminated.reshape(-1),
             OLD_LOG_PROBS_KEY: raw.reshape(-1, self.max_new_tokens),
             BEHAVIOR_LOG_PROBS_KEY: behavior.reshape(-1, self.max_new_tokens),
             ADVANTAGES_KEY: np.broadcast_to(advantages[:, None],

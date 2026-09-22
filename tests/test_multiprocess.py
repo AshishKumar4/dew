@@ -995,19 +995,17 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
         assert report["step"] == 1
     expected = single["single"]
     pooled = {name: reports[0][name] + reports[1][name]
-              for name in ("input_ids", "response_length", "terminated",
-                           "response_mask", "old_log_probs", "behavior_log_probs")}
+              for name in ("input_ids", "response_mask", "old_log_probs", "behavior_log_probs")}
     assert pooled["input_ids"] == expected["input_ids"]
-    assert pooled["response_length"] == expected["response_length"]
-    assert pooled["terminated"] == expected["terminated"]
     assert pooled["response_mask"] == expected["response_mask"]
     np.testing.assert_allclose(pooled["old_log_probs"], expected["old_log_probs"],
                                rtol=1e-5, atol=1e-6)
     np.testing.assert_allclose(pooled["behavior_log_probs"], expected["behavior_log_probs"],
                                rtol=1e-5, atol=1e-6)
     # The ranks stop at different steps and hold different prompt lengths.
-    assert len(set(pooled["response_length"])) > 1
-    assert reports[0]["response_length"] != reports[1]["response_length"]
+    drawn = [sum(row) for row in pooled["response_mask"]]
+    assert len(set(drawn)) > 1
+    assert reports[0]["response_mask"] != reports[1]["response_mask"]
     assert sorted(set(reports[0]["prompt_lengths"])) != sorted(set(reports[1]["prompt_lengths"]))
     # Stochastic draws: each rank's rows are drawn with their global row keys,
     # so the pool reproduces the single process token for token.

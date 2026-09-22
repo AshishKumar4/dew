@@ -1321,8 +1321,6 @@ def mode_rollout(args) -> dict:
         "prompt_lengths": local["prompt_length"].tolist(),
         "invalid_errors": invalid_errors,
         "input_ids": np.asarray(rolled["input_ids"]).tolist(),
-        "response_length": np.asarray(rolled["response_length"]).tolist(),
-        "terminated": np.asarray(rolled["terminated"]).tolist(),
         "response_mask": np.asarray(rolled["response_mask"]).tolist(),
         "old_log_probs": np.asarray(rolled["old_log_probs"]).tolist(),
         "behavior_log_probs": np.asarray(rolled["behavior_log_probs"]).tolist(),
