@@ -59,7 +59,7 @@ This writes `train.bin`, `val.bin` and `meta.json`. The binary files hold token 
 
 ## Loss, precision, and evaluation
 
-The vocabulary loss runs in float32. `head_chunks` sets how many vocabulary slices the loss scores; the default is four. Chunking can lower peak memory, but it adds work, and the backend compiler may rewrite it. How much memory it saves depends on the vocabulary size, sequence length, batch size and the compiled executable. There is no fixed saving.
+The vocabulary loss runs in float32. Under bf16 compute the head multiplies the bf16 states by the head rounded to bf16 and sums in float32, backward included; fp32 compute multiplies the head as stored. The step reports `ce` and `perplexity`. `token_accuracy=True` on `LMObjective`, `--token-accuracy` on the recipe, adds the argmax accuracy, which costs a pass over every logit: 0.77 ms of the head's 8.0 ms on a TPU v6e. `head_chunks` sets how many vocabulary slices the loss scores; the default is four. Chunking can lower peak memory, but it adds work, and the backend compiler may rewrite it. How much memory it saves depends on the vocabulary size, sequence length, batch size and the compiled executable. There is no fixed saving.
 
 `LMObjective` keeps an EMA copy by default. Use `state.params` for the live variables and `state.averaged` when you want the moving-average copy. Evaluation reads the averaged variables when the objective keeps them. With `ema_decay=None` there is no copy: `state.ema` is `None`, `state.averaged` raises, and previews and evaluation read the live variables. A checkpoint written with one of these settings does not restore into the other.
 

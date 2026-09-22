@@ -538,3 +538,46 @@ device. At these sizes the converts cost more than the gemms save, and
 nothing raises an error. The losses go down (2.44 bf16 against 2.68 fp8 at
 width 256, 0.009 against 0.011 at width 1024, each after 14 steps from the
 same init). On this card, at these sizes, fp8 gives no speedup to adopt.
+
+## Kernel choices per backend, 2026-09-22
+
+Each choice below is made in one place per kernel and keyed by backend. The measurements are one process per row, jax 0.11.1, bf16 compute: a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, and the local RTX 4080 for the kernel-level rows. Step rows are `tools/benchmark_step.py` cases, 30 timed steps after 5 warmup; lm-moe is 321.8M parameters, 8 experts top-2, lm-dense 359.8M, both at sequence 1024. Batch is 4 (moe) and 1 (dense) on the L4, 8 and 8 on the v6e. "before" is main at c1f7e2dd.
+
+### The MoE grouped matmul: `GROUPED_MATMUL_BY_BACKEND`
+
+| device | path | ms/step | p50 ms | peak GiB |
+|---|---|---|---|---|
+| L4 | lm-moe before (xla) | 601.55 | 610.84 | 12.46 |
+| L4 | lm-moe after, `auto` = pallas | 213.14 | 216.45 | 8.15 |
+| L4 | lm-moe after, xla | 598.54 | 609.07 | 12.46 |
+| v6e | lm-moe before (xla) | 76.04 | 76.43 | 5.05 |
+| v6e | lm-moe after, `auto` = xla | 74.68 | 75.25 | 5.05 |
+| v6e | lm-moe after, tokamax (`mosaic_tpu_v2`) | 75.40 | 76.04 | 5.05 |
+
+`expert_projection` alone, 8192 rows, 768 to 2048, 8 experts, forward plus backward: XLA 26.21 ms and Pallas 3.38 ms on the L4; XLA 14.84 ms and Pallas 1.86 ms on the RTX 4080. Errors against a float64 oracle of the rounded operands are the same or lower for Pallas (kernel gradient 4.2e-6 against 6.8e-6 relative). The L4 step is 2.82x faster; JAX's stock Pallas lowering with an out-sharding fix measured 1.97x on the same step, because its tangents run in fp32 and Dew's backward multiplies the bf16 cotangent.
+
+Rejected: a pure-JAX loop of dense per-tile products. On the RTX 4080 it was 2.2x faster than XLA for the projection alone (6.67 ms), but it doubled the step's temporaries (4.22 GiB against 2.17 at batch 1), and on the v6e it was 2.2x slower than XLA (1.71 ms against 0.79). On TPU, tokamax's `mosaic_tpu_v2` is within 1% of XLA on the step; tokamax's default dispatch picks its v1 kernel there, 13x slower, so Dew names the kernel.
+
+### bf16 Adam state: `OptimConfig.state_dtype`
+
+| device | measurement | fp32 state | bf16 state, hash rounding | bf16 state, threefry rounding |
+|---|---|---|---|---|
+| L4 | one AdamW update, lm-dense tree | 49.10 ms | 37.20 ms | 51.54 ms |
+| v6e | one AdamW update, lm-dense tree | 11.45 ms | 8.89 ms | 20.07 ms |
+| L4 | lm-dense step | 132.43 ms, 7.31 GiB | 120.09 ms, 5.86 GiB | |
+| L4 | lm-moe step | 213.14 ms, 8.15 GiB | 208.52 ms, 6.92 GiB | |
+| v6e | lm-dense step | 123.85 ms, 5.77 GiB | 124.94 ms, 4.50 GiB | |
+| v6e | lm-moe step | 74.68 ms, 5.05 GiB | 71.96 ms, 3.87 GiB | |
+
+The rounding noise is a counter hash of the step, the leaf and the element index. threefry noise (`jax.random.bits`) makes the update slower than fp32 state on both devices. The saving is memory everywhere; on the v6e lm-dense step it costs 0.9% instead of saving time, so the option stays off by default.
+
+### The vocabulary head: `head_logits`
+
+Forward plus backward of the chunked head alone, 8 x 1024 tokens, 1024 features, vocabulary 50304:
+
+| device | before (fp32 operands) | bf16 operands, with argmax | bf16 operands, no argmax | fused linear cross entropy (Pallas port of Liger) |
+|---|---|---|---|---|
+| L4 | 206.16 ms | 134.02 ms | 133.91 ms | 142.63 ms |
+| v6e | 8.04 ms | 8.03 ms | 7.26 ms | not run |
+
+On the v6e the fp32 operands already multiplied in one bf16 pass, so only skipping the argmax moves the head. On the L4 the argmax fuses into the head's own kernels. The lm-dense step on the L4 went from 142.21 ms to 132.43 ms with the head change. Rejected: the fused Pallas kernel, 6% slower than the chunked head on the L4, and tokamax's `mosaic_tpu` head, 2.24x slower on the v6e (kernel catalog, 2026-09-22).
