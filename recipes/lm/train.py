@@ -44,7 +44,8 @@ class LmRunConfig(LMRunConfig):
     Everything else a decoder run records is `dew.objectives.lm.LMRunConfig`,
     which a script that trains on some other layout of the same ids uses as
     it stands. What this adds is the one thing the recipe itself requires:
-    `--data.path` is a directory `tools/tokenize_text.py` wrote.
+    `--data.path` is a directory `tools/tokenize_text.py` wrote, or with
+    data:packed-tokens several with their weights (`--data.path a 0.7 b 0.3`).
     """
 
     data: TokenSpec = field(default_factory=TokenWindows)
@@ -59,16 +60,35 @@ class LmRunConfig(LMRunConfig):
             raise ValueError("block_diffusion requires data:token-windows, not packed documents")
 
 
-def token_directory(path: str | None) -> Path:
-    """The directory tools/tokenize_text.py wrote, which --data.path names."""
+def token_directories(path: str | Mapping[str, float] | None) -> list[Path]:
+    """The directories tools/tokenize_text.py wrote, which --data.path names:
+    one, or each corpus of a weighted mixture."""
     if not path:
         raise ValueError("--data.path is the token directory tools/tokenize_text.py wrote")
-    directory = Path(path)
-    if not (directory / "meta.json").is_file():
-        raise FileNotFoundError(
-            f"{directory / 'meta.json'} is missing: --data.path is the token directory "
-            "that tools/tokenize_text.py wrote, not a dataset name")
-    return directory
+    directories = [Path(path)] if isinstance(path, str) else [Path(name) for name in sorted(path)]
+    for directory in directories:
+        if not (directory / "meta.json").is_file():
+            raise FileNotFoundError(
+                f"{directory / 'meta.json'} is missing: --data.path is the token directory "
+                "that tools/tokenize_text.py wrote, not a dataset name")
+    return directories
+
+
+def token_meta(path: str | Mapping[str, float] | None) -> dict:
+    """The tokenizer and vocabulary the token files were written with.
+
+    A mixture's corpora feed one embedding table, so they have to record
+    the same tokenizer and vocabulary; `train_tokens` is their sum.
+    """
+    metas = [json.loads((directory / "meta.json").read_text())
+             for directory in token_directories(path)]
+    recorded = {(meta["tokenizer"], int(meta["vocab_size"])) for meta in metas}
+    if len(recorded) > 1:
+        raise ValueError(
+            f"the corpora of --data.path feed one embedding table, and record "
+            f"different (tokenizer, vocab_size): {sorted(recorded)}")
+    counts = [meta.get("train_tokens") for meta in metas]
+    return {**metas[0], "train_tokens": None if None in counts else sum(counts)}
 
 
 def context_length(config: LmRunConfig, samples: Samples | None) -> int:
@@ -225,9 +245,7 @@ def main(config: LmRunConfig) -> TrainState:
                     config.trainer.xla_flags, config.trainer.compilation_cache_dir,
                     layout=config.trainer.layout)
 
-    tokens = token_directory(config.data.path)
-    # The tokenizer and vocabulary the token files were written with.
-    meta = json.loads((tokens / "meta.json").read_text())
+    meta = token_meta(config.data.path)
     if config.tokenizer != meta['tokenizer']:
         # Decoding with a different tokenizer than the ids were written with
         # produces text that says nothing about the model.
@@ -261,7 +279,8 @@ def main(config: LmRunConfig) -> TrainState:
         resolved["max_seq_len"] = model.max_seq_len
     config = replace(config, model=replace(config.model, config=resolved))
     name = config.trainer.name or (
-        f"{config.objective}-{tokens.name}/seq-{config.data.seq_len}/"
+        f"{config.objective}-{'+'.join(d.name for d in token_directories(config.data.path))}/"
+        f"seq-{config.data.seq_len}/"
         f"lr-{config.optim.learning_rate}/"
         f"date-{run_timestamp()}")
     summary = {"model": fields, "arguments": run_summary(config, fields),
