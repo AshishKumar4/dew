@@ -1831,9 +1831,9 @@ class CausalTransformer(nn.Module):
         # the dense feed-forwards, the shared branch and the routed experts.
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
                                       activation=self.mlp, swiglu_limit=self.swiglu_limit,
-                                      precision=self.precision)
+                                      dtype=self.dtype, precision=self.precision)
         shared = None if mixture is None or not mixture.shared_features else functools.partial(
-            gated_mlp, hidden_features=mixture.shared_features, dtype=self.dtype)
+            gated_mlp, hidden_features=mixture.shared_features)
         routed = None if mixture is None else functools.partial(
             SparseMLP,
             num_experts=mixture.experts,
