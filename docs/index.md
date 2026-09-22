@@ -1,16 +1,18 @@
 # Train models with Dew
 
-Dew provides Python interfaces for training Flax Linen models with JAX. An `Objective` defines initialization, a loss function, and optional evaluation. `Trainer` runs optimization and manages device sharding and checkpoints when configured.
+> An AI assistant maintains this document. It is presented as-is.
 
-These pages assume Python and basic machine learning: batches, loss functions, gradients, and train/validation splits. You can start without experience running JAX on multiple devices. Pages that require Flax or sharding knowledge state that prerequisite.
+Dew is a Python library for training Flax Linen models with JAX. You write an `Objective` that sets up the model's variables, computes a loss, and optionally evaluates. `Trainer` runs the optimization. It also places the model on your devices and writes checkpoints if you ask it to.
+
+I assume you know Python and the basics of machine learning: batches, loss functions, gradients, and train/validation splits. You do not need to have run JAX on more than one device. A page that needs Flax or sharding knowledge says so at the top.
 
 ## Start here
 
-1. [Install Dew](installation.md) in a virtual environment and check which JAX devices are available.
-2. [Run a small training example](getting-started.md) without downloading data or weights.
-3. [Write a custom objective](concepts/objectives.md) and adapt the model and data to your experiment.
+1. [Install Dew](installation.md) in a virtual environment and check which JAX devices it can see.
+2. [Run a small training example](getting-started.md). It downloads no data and no weights.
+3. [Write a custom objective](concepts/objectives.md) and change the model and data for your own experiment.
 
-The first example teaches the full sequence: create batches, initialize a Flax model, compute a loss, optimize it, and inspect the returned variables. It uses a linear regression problem so you can check the result directly.
+The first example goes through the whole sequence once: make a batch, initialize a Flax model, compute a loss, optimize it, and look at the trained variables. It fits a straight line, so you can check the answer yourself.
 
 ## Follow a task
 
@@ -28,12 +30,12 @@ The first example teaches the full sequence: create batches, initialize a Flax m
 
 ## Understand the interfaces
 
-[Objectives and state](concepts/objectives.md) explains what the loss receives and returns. [Data](concepts/data.md) explains how dataset specifications produce iterators. [Distributed training](concepts/distributed.md) explains meshes and parameter placement after you have run a single-device example.
+[Objectives and state](concepts/objectives.md) explains what the loss function receives and what it returns. [Data](concepts/data.md) explains how a dataset specification turns into iterators. [Distributed training](concepts/distributed.md) explains meshes and parameter placement; read it after you have run something on one device.
 
-Use the [core API reference](reference/core-api.md) for the signatures and defaults of the documented interfaces. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names the configurations whose whole workflow runs, and the piece each unfinished one is missing.
+The [core API reference](reference/core-api.md) lists the signatures and defaults of the documented interfaces. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names the model configurations whose whole workflow runs, and for each unfinished one, the piece it is missing.
 
 ## Project status
 
-Dew is pre-1.0 research software. Checkpoint and API compatibility can change. Current verification includes CPU, local process-pool, and single-GPU work; multi-host GPU and TPU deployment requires separate validation. Known training and evaluation limitations appear beside the affected workflow.
+Dew is research software and has not reached 1.0. Checkpoint formats and the API can change between versions. I have tested it on CPU, on a local pool of processes, and on a single GPU. Multi-host GPU and TPU deployments need their own testing. Each guide lists the known training and evaluation limitations next to the workflow they affect.
 
-[References](references.md) links to JAX, Flax, and the model and method papers. Internal design history and research notes remain in the repository for contributors; they are not prerequisites for using Dew.
+[References](references.md) links to JAX, Flax, and the papers behind the models and methods. The repository also holds design history and research notes for contributors. You do not need to read them to use Dew.
