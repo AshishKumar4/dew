@@ -306,12 +306,110 @@ def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
         scale_by_qk_clip(qk_clip_threshold))
 
 
+def _mix(h: jax.Array) -> jax.Array:
+    """murmur3's 32-bit finaliser: every input bit reaches every output bit."""
+    h = h ^ (h >> 16)
+    h = h * jnp.uint32(0x85EBCA6B)
+    h = h ^ (h >> 13)
+    h = h * jnp.uint32(0xC2B2AE35)
+    return h ^ (h >> 16)
+
+
+def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
+    """`x` rounded to bf16 up or down with the probability of its distance to
+    each, from a hash of `seed` and each element's flat index.
+
+    Adding 16 uniform bits below the kept mantissa and truncating rounds up
+    exactly when the discarded bits plus the noise carry, which is the
+    discarded fraction's probability. The noise is a counter-based hash, so a
+    step's rounding is a pure function of the seed and the position: no key
+    is split or carried, and nothing is read from memory. jax.random.bits
+    (threefry) made the whole update 1.46x slower than fp32 state on a TPU
+    v6e; this costs a few integer ops per element. NaN stays NaN.
+    """
+    x = x.astype(jnp.float32)
+    index = jax.lax.iota(jnp.uint32, x.size).reshape(x.shape)
+    noise = _mix(index * jnp.uint32(0x9E3779B1) + seed.astype(jnp.uint32)) & jnp.uint32(0xFFFF)
+    bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
+    rounded = jax.lax.bitcast_convert_type((bits + noise) & jnp.uint32(0xFFFF0000), jnp.float32)
+    return jnp.where(jnp.isnan(x), x, rounded).astype(jnp.bfloat16)
+
+
+def scale_by_adam_bf16_state(b1: float = 0.9, b2: float = 0.999, eps: float = 1e-8,
+                             eps_root: float = 0.0, nesterov: bool = False
+                             ) -> optax.GradientTransformation:
+    """`optax.scale_by_adam` with both moments stored in bf16.
+
+    The moments are read into fp32, updated and used there, and written back
+    stochastically rounded (`stochastic_round_bf16`), seeded by the step
+    count, the leaf and the moment. Round to nearest would lose every
+    increment of the second moment smaller than half its bf16 spacing, which
+    at b2 = 0.999 is most of them; a stochastic rounding keeps each one in
+    expectation. The state keeps optax's `ScaleByAdamState` layout, so
+    sharding and checkpoints read it as they read fp32 state.
+    """
+    def init_fn(params):
+        zeros = lambda leaf: jnp.zeros(leaf.shape, jnp.bfloat16)  # noqa: E731
+        return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32),
+                                      mu=jax.tree.map(zeros, params),
+                                      nu=jax.tree.map(zeros, params))
+
+    def update_fn(updates, state, params=None):
+        del params
+        count = optax.safe_increment(state.count)
+        step = _mix(count.astype(jnp.uint32) * jnp.uint32(0x27D4EB2F))
+        leaves, structure = jax.tree.flatten(updates)
+        mus, nus, steps = [], [], []
+        for leaf, (g, mu, nu) in enumerate(zip(
+                leaves, structure.flatten_up_to(state.mu), structure.flatten_up_to(state.nu),
+                strict=True)):
+            g = g.astype(jnp.float32)
+            mu = b1 * mu.astype(jnp.float32) + (1 - b1) * g
+            nu = b2 * nu.astype(jnp.float32) + (1 - b2) * jnp.square(g)
+            if nesterov:
+                mu_hat = (b1 * mu / (1 - b1 ** optax.safe_increment(count))
+                          + (1 - b1) * g / (1 - b1 ** count))
+            else:
+                mu_hat = mu / (1 - b1 ** count)
+            nu_hat = nu / (1 - b2 ** count)
+            steps.append((mu_hat / (jnp.sqrt(nu_hat + eps_root) + eps)).astype(leaves[leaf].dtype))
+            salt = _mix(step + jnp.uint32(2 * leaf + 1) * jnp.uint32(0x165667B1))
+            mus.append(stochastic_round_bf16(mu, salt))
+            nus.append(stochastic_round_bf16(nu, _mix(salt + jnp.uint32(0x9E3779B9))))
+        return structure.unflatten(steps), optax.ScaleByAdamState(
+            count=count, mu=structure.unflatten(mus), nu=structure.unflatten(nus))
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _adam_bf16_state(learning_rate, b1: float = 0.9, b2: float = 0.999, eps: float = 1e-8,
+                     eps_root: float = 0.0, *, nesterov: bool = False):
+    """`optax.adam` over `scale_by_adam_bf16_state`."""
+    return optax.chain(scale_by_adam_bf16_state(b1, b2, eps, eps_root, nesterov),
+                       optax.scale_by_learning_rate(learning_rate))
+
+
+def _adamw_bf16_state(learning_rate, b1: float = 0.9, b2: float = 0.999, eps: float = 1e-8,
+                      eps_root: float = 0.0, weight_decay: float = 1e-4, mask=None, *,
+                      nesterov: bool = False):
+    """`optax.adamw` over `scale_by_adam_bf16_state`, optax's defaults kept."""
+    return optax.chain(scale_by_adam_bf16_state(b1, b2, eps, eps_root, nesterov),
+                       optax.add_decayed_weights(weight_decay, mask),
+                       optax.scale_by_learning_rate(learning_rate))
+
+
 OPTIMIZER_MAP = {
     'adam': optax.adam,
     'adamw': optax.adamw,
     'lamb': optax.lamb,
     'muon': _muon_groups,
     'muonclip': _muonclip_groups,
+}
+
+# The optimizers `OptimConfig.state_dtype='bfloat16'` builds.
+BF16_STATE_OPTIMIZER_MAP = {
+    'adam': _adam_bf16_state,
+    'adamw': _adamw_bf16_state,
 }
 
 
@@ -553,6 +651,12 @@ def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransforma
             solvers[group.name] = OPTIMIZER_MAP[config.optimizer](
                 _scaled(learning_rate, group.learning_rate_multiplier), **group_opts)
         solver = optax.multi_transform(solvers, param_labels(config.param_groups))
+    if config.state_dtype == 'bfloat16':
+        if config.optimizer not in BF16_STATE_OPTIMIZER_MAP:
+            raise ValueError(
+                f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
+                f"{sorted(BF16_STATE_OPTIMIZER_MAP)} have; {config.optimizer!r} does not")
+        solver = BF16_STATE_OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
     else:
         solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
 

@@ -630,3 +630,51 @@ def test_a_power_schedules_tail_is_one_record_that_ends_where_it_says():
     np.testing.assert_allclose(tailed.schedule(10)(8), (law.schedule(10)(6) + 0.01) / 2, rtol=1e-5)
     early = Power(peak=1.0, warmup_steps=2, a=0.5, b=-0.5, tail=PowerTail(start=6, steps=8))
     np.testing.assert_allclose(early.schedule(10)(8), 0.0, atol=1e-7)
+# --- bf16 optimizer state ---------------------------------------------------
+
+def bf16_state_adamw(**kwargs):
+    return build_optimizer(OptimConfig(optimizer='adamw', learning_rate=LR, weight_decay=0.1,
+                                       state_dtype='bfloat16', **kwargs), steps=10)
+
+
+def test_bf16_state_takes_optax_adamw_steps_from_the_fp32_moments():
+    """The update is computed from the fp32 moments before they are rounded,
+    so the first two steps are optax's AdamW to fp32 rounding while the state
+    it keeps is bf16."""
+    params = decoder_params()
+    grads = jax.tree.map(lambda p: jax.random.normal(jax.random.key(1), p.shape) * 1e-2, params)
+    reference, solver = optax.adamw(LR, weight_decay=0.1), bf16_state_adamw()
+    expected_state, state = reference.init(params), solver.init(params)
+    for _ in range(2):
+        expected, expected_state = reference.update(grads, expected_state, params)
+        update, state = solver.update(grads, state, params)
+        for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(update), strict=True):
+            np.testing.assert_allclose(have, want, rtol=1e-2, atol=1e-7)
+    assert {leaf.dtype for leaf in jax.tree.leaves((state[0].mu, state[0].nu))} == {jnp.dtype(jnp.bfloat16)}
+
+
+def test_bf16_state_keeps_the_second_moments_small_increments():
+    """At b2 = 0.999 an increment of the second moment is under half a bf16
+    spacing, which round to nearest drops every step: nu started at 1 would
+    never decay. The stochastic rounding keeps each increment in expectation,
+    so the mean over many entries follows the fp32 moment."""
+    params = {'w': jnp.zeros((8192,), jnp.float32)}
+    grads = {'w': jnp.full((8192,), 1e-3, jnp.float32)}
+    reference, solver = optax.scale_by_adam(), bf16_state_adamw()
+    expected = reference.init(params)
+    expected = expected._replace(nu={'w': jnp.ones(8192, jnp.float32)})
+    state = solver.init(params)
+    state = (state[0]._replace(nu={'w': jnp.ones(8192, jnp.bfloat16)}), *state[1:])
+    reference_update, solver_update = jax.jit(reference.update), jax.jit(solver.update)
+    for _ in range(1000):
+        _, expected = reference_update(grads, expected, params)
+        _, state = solver_update(grads, state, params)
+    want = float(expected.nu['w'][0])
+    have = float(jnp.mean(state[0].nu['w'].astype(jnp.float32)))
+    assert want < 0.4
+    assert have == pytest.approx(want, rel=1e-2)
+
+
+def test_bf16_state_is_refused_where_there_is_no_adam_moment():
+    with pytest.raises(ValueError, match="state_dtype"):
+        build_optimizer(OptimConfig(optimizer='lamb', state_dtype='bfloat16'), steps=10)
