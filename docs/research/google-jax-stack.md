@@ -1,5 +1,7 @@
 # The JAX training stack Google publishes, and what Dew should take from it
 
+> An AI assistant maintains this document. It is presented as-is.
+
 Research note, 2026-09-02.
 
 ## How this was done, and how to read it
@@ -30,11 +32,27 @@ The Dew seams referred to throughout:
 | post-training interop | `dew.interop`, safetensors |
 | telemetry | `dew.telemetry` |
 
+## Correction, 2026-09-22
+
+The Dew side of this note describes the source on 2026-09-02, and several of the ranked items in section 12 have since landed. Checked against the current source:
+
+- Item 1 and item 8: a `Layout` maps the logical axes the modules declare onto mesh axes (`src/dew/training/distributed.py:299-302`), with a `tolerance` of 0.02 for unsharded parameters (`src/dew/training/distributed.py:338`). The mesh has six named axes, all `AxisType.Auto` (`src/dew/nn/sharding.py:43-48`; `src/dew/training/distributed.py:201`). The two-axis `(data, fsdp)` mesh and the shape-inferred `parameter_spec` this note describes are gone.
+- Item 2: token windows carry `<field>_segment_ids` for packed documents (`src/dew/data/tokens.py:254`).
+- Item 3: `OPTIMIZER_MAP` has `muon` and `muonclip` entries built on `optax.contrib.muon` (`src/dew/training/optim.py:13,306-312`). Schedule-free AdamW is not in the map.
+- Item 4: the LM head scores the vocabulary in chunks (`src/dew/objectives/lm/chunked.py`; see [lm-head.md](lm-head.md)).
+- Item 5: the decoder takes a named remat policy from MaxText's list, including host-offloading ones (`REMAT_POLICIES`, `src/dew/nn/backbones/causal_transformer.py:485-498`).
+- Item 7: Dew has an MoE whose grouped matmul runs `jax.lax.ragged_dot` or, optionally, `tokamax.ragged_dot` (`src/dew/nn/moe.py:49,311-312`). TPU attention runs JAX's Pallas Splash kernel, not tokamax's (`src/dew/nn/attention.py:35-38`).
+- Item 10: the trainer computes goodput numbers (`goodput`, `src/dew/training/trainer.py:164`).
+- `pyproject.toml:10` requires Python 3.12 or newer, so the Python 3.11 argument against Kauldron in section 2 no longer holds.
+- `src/dew/training/objective_trainer.py` and `src/dew/data/dataloaders.py` no longer exist, so the seams and line citations that name them point at code that has moved.
+
+I have not re-checked items 6 and 9 or the other Dew line citations.
+
 ---
 
 ## 1. MaxText
 
-**What it is.** Google's reference LLM training codebase in JAX, <https://github.com/AI-Hypercomputer/maxtext>. Apache 2.0. Very active: the clone's last commit is 2026-09-01. It is not a library you import; it is a configured program, and `src/maxtext/configs/base.yml` is 1432 lines of it. Read it as the answer key for "how does a lab actually configure a training run".
+Google's reference LLM training codebase in JAX, <https://github.com/AI-Hypercomputer/maxtext>. Apache 2.0. Very active: the clone's last commit is 2026-09-01. It is not a library you import; it is a configured program, and `src/maxtext/configs/base.yml` is 1432 lines of it. Read it as the answer key for "how does a lab actually configure a training run".
 
 ### Sharding: named axes, logical rules, two parallelism vectors
 
@@ -58,7 +76,7 @@ Three axes beyond the usual list are worth naming:
 
 The mesh is built by `create_device_mesh` (`utils/maxtext_utils.py:2169-2248`): fill the `-1`s with `fill_unspecified_mesh_axes`, then `mesh_utils.create_hybrid_device_mesh(ici_parallelism, dcn_parallelism, devices)` for multiple slices, or `mesh_utils.create_device_mesh(ici_parallelism, devices)` for one. Around that sit sub-slice selection, split physical axes, ring-reshaped custom meshes, a v6e-specific optimisation, and an elastic device list from `elastic_utils.live_devices`.
 
-**The part worth copying is the indirection.** Arrays carry logical names, and the config maps each logical name to an ordered list of physical axes; the first axis that exists in the mesh wins. The table is 109 lines, `base.yml:550-658`. Five of them show the shape:
+The part worth copying is the indirection. Arrays carry logical names, and the config maps each logical name to an ordered list of physical axes; the first axis that exists in the mesh wins. The table is 109 lines, `base.yml:550-658`. Five of them show the shape:
 
 ```
 ['activation_batch_attn', ['data', 'fsdp', 'fsdp_transpose', 'expert']],
@@ -70,9 +88,9 @@ The mesh is built by `create_device_mesh` (`utils/maxtext_utils.py:2169-2248`): 
 
 The model says "this axis is `heads`". The config decides whether `heads` is sharded over `tensor` today. One model definition then serves data, FSDP, tensor, context, expert and pipeline parallelism with no edits. `override_logical_axis_rules` chooses merge or replace (`base.yml:25`), and evaluation gets its own `logical_axis_rules_for_eval` (`:670`).
 
-One guardrail is worth stealing on its own: `sharding_tolerance: 0.02`, described as "the allowed percentage of non-sharded parameters" (`base.yml:672-673`). The run fails if too much of the model ended up replicated.
+One guardrail is worth copying on its own: `sharding_tolerance: 0.02`, described as "the allowed percentage of non-sharded parameters" (`base.yml:672-673`). The run fails if too much of the model ended up replicated.
 
-One more flag deserves a mention because Dew has made the same choice implicitly: `shard_mode: "auto"`, "can be either auto or explicit" (`base.yml:547`). Auto means GSPMD infers the collectives from the annotations, explicit means JAX's explicit axis types make them visible in the type. Dew builds its mesh with `axis_types=(AxisType.Auto, AxisType.Auto)` (`src/dew/training/distributed.py:38`) and says why in the docstring, that GSPMD should infer the collectives rather than Dew writing them by hand (`:27-28`). That is the right default, and it is worth knowing that the reference codebase treats it as a switch rather than a law, with `custom_mesh_and_rule` to swap the mesh and rules wholesale (`base.yml:548`).
+One more flag matters because Dew has made the same choice implicitly: `shard_mode: "auto"`, "can be either auto or explicit" (`base.yml:547`). Auto means GSPMD infers the collectives from the annotations, explicit means JAX's explicit axis types make them visible in the type. Dew builds its mesh with `axis_types=(AxisType.Auto, AxisType.Auto)` (`src/dew/training/distributed.py:38`) and says why in the docstring, that GSPMD should infer the collectives rather than Dew writing them by hand (`:27-28`). That is the right default, and it is worth knowing that the reference codebase treats it as a switch, not a fixed rule, with `custom_mesh_and_rule` to swap the mesh and rules wholesale (`base.yml:548`).
 
 ### Rematerialisation
 
@@ -99,7 +117,7 @@ Token routing has its own kernels: SparseCore paths for ragged gather and ragged
 
 ### Checkpointing
 
-This is where Dew and MaxText overlap most, so the gaps are sharp.
+This is where Dew and MaxText overlap most, so the gaps are easy to see.
 
 | Feature | MaxText | Dew today |
 | --- | --- | --- |
@@ -160,11 +178,11 @@ The order of work: name logical axes in the model modules, add a rules table fro
 
 ## 2. Kauldron
 
-**What it is.** DeepMind's research trainer, <https://github.com/google-research/kauldron>. Apache 2.0. On PyPI as `kauldron` 1.4.4, and it requires Python 3.12 or newer. The clone's last commit is 2026-09-02, and the message ("Skip test_overview_dashboard in Copybara export") shows this is an export of an internal repository rather than a repository developed on GitHub.
+DeepMind's research trainer, <https://github.com/google-research/kauldron>. Apache 2.0. On PyPI as `kauldron` 1.4.4, and it requires Python 3.12 or newer. The clone's last commit is 2026-09-02, and the message ("Skip test_overview_dashboard in Copybara export") shows this is an export of an internal repository rather than a repository developed on GitHub.
 
 It is a real dependency, not only a design reference, and the proof is not the PyPI page: the `gemma` library depends on `kauldron>=1.4.4` (`gemma/pyproject.toml:45`) and uses it in its public model protocol (`gemma/gm/nn/_transformer_like.py:28,48`).
 
-**The trainer is one flat dataclass.** `kauldron/train/trainer_lib.py:109` declares `class Trainer(config_util.BaseConfig)` and every part of a training run is a field on it (`:169-249`):
+The trainer is one flat dataclass. `kauldron/train/trainer_lib.py:109` declares `class Trainer(config_util.BaseConfig)` and every part of a training run is a field on it (`:169-249`):
 
 | Field group | Fields |
 | --- | --- |
@@ -184,7 +202,7 @@ It is a real dependency, not only a design reference, and the proof is not the P
 
 Two fields deserve attention because Dew has no equivalent. `init_transform: checkpoints.InitTransform` is a declared hook for "where do the initial weights come from", which is how a fine-tune differs from a pretrain without a different trainer. And `evals` is a mapping of named evaluators, so a run can carry several evaluation suites with different data and different cadence, rather than one validation loop.
 
-**konfig** is the configuration system. You write a Python function that builds the object graph using the real classes, and every field is addressable from the command line. `kauldron/konfig/README.md:1-30` shows the pattern: `get_config(args: ConfigArgs)` returns a `kd.train.Trainer()` with fields assigned, and command-line overrides use paths like `--cfg.__args__.arg1=value`. The point is that the config is the constructor call, so there is no second schema to keep in sync with the code. Dew uses tyro over dataclasses, which achieves the same goal for flat configs and less for nested object graphs.
+konfig is the configuration system. You write a Python function that builds the object graph using the real classes, and every field is addressable from the command line. `kauldron/konfig/README.md:1-30` shows the pattern: `get_config(args: ConfigArgs)` returns a `kd.train.Trainer()` with fields assigned, and command-line overrides use paths like `--cfg.__args__.arg1=value`. The point is that the config is the constructor call, so there is no second schema to keep in sync with the code. Dew uses tyro over dataclasses, which achieves the same goal for flat configs and less for nested object graphs.
 
 ### What Dew should do about it
 
@@ -199,11 +217,11 @@ Borrow two specific things. The first is the flat, fully substitutable trainer: 
 
 ## 3. The gemma library
 
-**What it is.** The official JAX library for running and fine-tuning Gemma, <https://github.com/google-deepmind/gemma>. Apache 2.0. PyPI `gemma` 4.0.1, and the clone declares 4.1.0 in `gemma/__init__.py`. Last commit 2026-08-04 in my clone. It implements Gemma 2, 3, 3n and 4, plus research variants T5Gemma and Diffusion Gemma.
+The official JAX library for running and fine-tuning Gemma, <https://github.com/google-deepmind/gemma>. Apache 2.0. PyPI `gemma` 4.0.1, and the clone declares 4.1.0 in `gemma/__init__.py`. Last commit 2026-08-04 in my clone. It implements Gemma 2, 3, 3n and 4, plus research variants T5Gemma and Diffusion Gemma.
 
-**Linen, with no NNX at all.** Searching the whole repository for `nnx` returns zero files; 45 files import `flax.linen`. The `gm` namespace is not an NNX rewrite, it is a new-generation API surface over the same Linen models, organised as `gm.nn`, `gm.text`, `gm.ckpts`, `gm.data`, `gm.losses`, `gm.evals`, `gm.math`, `gm.tools` and `gm.sharding`.
+The library is Linen, with no NNX at all. Searching the whole repository for `nnx` returns zero files; 45 files import `flax.linen`. The `gm` namespace is not an NNX rewrite, it is a new-generation API surface over the same Linen models, organised as `gm.nn`, `gm.text`, `gm.ckpts`, `gm.data`, `gm.losses`, `gm.evals`, `gm.math`, `gm.tools` and `gm.sharding`.
 
-**The sampler contract is a Protocol, and that is the interesting part.** `gemma/gm/nn/_transformer_like.py:79-158` defines:
+The sampler contract is a Protocol. `gemma/gm/nn/_transformer_like.py:79-158` defines:
 
 ```python
 class TransformerLike(Protocol):
@@ -223,9 +241,9 @@ class TransformerLike(Protocol):
 
 The KV cache is a per-layer structure with left-aligned slices and an end index, and GQA is a reshaped einsum. There are no fused or Pallas kernels in the sampler path.
 
-**Checkpoints are Orbax, not safetensors.** `gemma/gm/ckpts/_checkpoint.py` uses `ocp.StandardCheckpointer` with `save_concurrent_gb` and `restore_concurrent_gb` (`:207,245`), reading canonical paths from a `CheckpointPath` string enum pointing at `gs://gemma-data/checkpoints/...` (`gm/ckpts/_paths.py:20-49`). There is no Hugging Face safetensors loader. The loader auto-detects four on-disk layouts (nested, flat, stacked, Kauldron). Several comments wait on a feature Orbax does not have yet: "Once orbax supports partial restore, we would not need to ..." (`_checkpoint.py:410,597,608`).
+Checkpoints are Orbax, not safetensors. `gemma/gm/ckpts/_checkpoint.py` uses `ocp.StandardCheckpointer` with `save_concurrent_gb` and `restore_concurrent_gb` (`:207,245`), reading canonical paths from a `CheckpointPath` string enum pointing at `gs://gemma-data/checkpoints/...` (`gm/ckpts/_paths.py:20-49`). There is no Hugging Face safetensors loader. The loader auto-detects four on-disk layouts (nested, flat, stacked, Kauldron). Several comments wait on a feature Orbax does not have yet: "Once orbax supports partial restore, we would not need to ..." (`_checkpoint.py:410,597,608`).
 
-**Fine-tuning is Kauldron.** The library's own dependency list includes `kauldron>=1.4.4` (`pyproject.toml:45`), and fine-tuning runs through `kd.train.Trainer` with LoRA, QAT, DPO and NPO losses provided by `gemma.peft` and `gm.losses`. `gemma/peft` does module surgery with Linen interceptors, which is a Linen-native way to add LoRA or int4 without editing the model.
+Fine-tuning runs on Kauldron. The library's own dependency list includes `kauldron>=1.4.4` (`pyproject.toml:45`), and fine-tuning runs through `kd.train.Trainer` with LoRA, QAT, DPO and NPO losses provided by `gemma.peft` and `gm.losses`. `gemma/peft` does module surgery with Linen interceptors, which is a Linen-native way to add LoRA or int4 without editing the model.
 
 Also in the dependency list, and worth a look for Dew: `hackable-diffusion @ git+https://github.com/google/hackable_diffusion.git` (`pyproject.toml:41`). That repository exists, is Apache 2.0, has 160 stars and was pushed 2026-08-18.
 
@@ -245,17 +263,17 @@ The second thing to take is the checkpoint layout normaliser. gemma detects four
 
 ## 4. Tunix
 
-**What it is.** Google's post-training library for JAX, <https://github.com/google/tunix>. Apache 2.0. Last commit 2026-09-01, so it is active. PyPI has `tunix` at version 0.0.0, a placeholder, so installation is from GitHub. The README calls the project "in early development".
+Google's post-training library for JAX, <https://github.com/google/tunix>. Apache 2.0. Last commit 2026-09-01, so it is active. PyPI has `tunix` at version 0.0.0, a placeholder, so installation is from GitHub. The README calls the project "in early development".
 
-**What it covers.** SFT, DPO, PPO, GRPO and Dr.GRPO with citations in the README (`README.md:42-57`), knowledge distillation, and agentic RL with multi-turn agent and environment interaction, tool use and async rollout, released 2025-12 (`:67`). Rollout is served by vLLM or SGLang-JAX on TPU (`:74-76`). Gemma 4 support landed 2026-04 (`:65`), and the models use splash attention and a GMM MoE kernel (`:66`). The package tree is `sft`, `dpo`, `rl` (with `grpo`, `ppo`, `agentic`, `rollout`, `inference`, `rl_cluster.py`, `rl_learner.py`, `reward_manager.py`, `reshard.py`), `distillation`, `generate`, `models`, `perf`, `processors`, `diffusion` and `cli`.
+It covers SFT, DPO, PPO, GRPO and Dr.GRPO with citations in the README (`README.md:42-57`), knowledge distillation, and agentic RL with multi-turn agent and environment interaction, tool use and async rollout, released 2025-12 (`:67`). Rollout is served by vLLM or SGLang-JAX on TPU (`:74-76`). Gemma 4 support landed 2026-04 (`:65`), and the models use splash attention and a GMM MoE kernel (`:66`). The package tree is `sft`, `dpo`, `rl` (with `grpo`, `ppo`, `agentic`, `rollout`, `inference`, `rl_cluster.py`, `rl_learner.py`, `reward_manager.py`, `reshard.py`), `distillation`, `generate`, `models`, `perf`, `processors`, `diffusion` and `cli`.
 
-**The model interface is NNX, and that is the blocker.** `PeftTrainer.__init__` takes `model: nnx.Module` (`tunix/sft/peft_trainer.py:347-349`), the gradient accumulator is itself an `nnx.Module` (`:201`), and the train step signature is `Concatenate[nnx.Module, P]` (`:463`). Across `tunix/`, 63 files use `flax.nnx` and 1 uses `flax.linen`.
+The model interface is NNX, and that is what blocks Dew. `PeftTrainer.__init__` takes `model: nnx.Module` (`tunix/sft/peft_trainer.py:347-349`), the gradient accumulator is itself an `nnx.Module` (`:201`), and the train step signature is `Concatenate[nnx.Module, P]` (`:463`). Across `tunix/`, 63 files use `flax.nnx` and 1 uses `flax.linen`.
 
 So a Dew `CausalTransformer`, which is Linen, cannot be passed to a Tunix trainer as it stands. There is a bridge, and Tunix uses it for its own Gemma port: `module_from_linen_variables` (`tunix/models/gemma/model.py:755`, used at `:881`) builds an NNX module from a Linen variable dict. That is the shape of the work: convert the param tree, not the module.
 
 Tunix also ships its own model zoo with `safetensors_loader.py`, `safetensors_saver.py`, `naming.py`, `registry.py` and `automodel.py`, including `create_model_from_safe_tensors` and `create_gemma_model_with_nnx_conversion` (`tunix/models/automodel.py:148,329`). Models present: gemma, gemma3, gemma4, llama3, qwen2, qwen3.
 
-**Against verl.** verl (`volcengine/verl`) is the widely used RLHF and RL post-training framework, and it is PyTorch. For Dew the comparison is short: verl would mean leaving JAX for the post-training stage, moving weights across frameworks, and maintaining two model definitions. Tunix keeps everything in JAX and on TPU, at the cost of an NNX boundary and a library that has not shipped a real PyPI release. Neither is a dependency Dew should take today.
+Compared with verl: verl (`volcengine/verl`) is the widely used RLHF and RL post-training framework, and it is PyTorch. For Dew the comparison is short: verl would mean leaving JAX for the post-training stage, moving weights across frameworks, and maintaining two model definitions. Tunix keeps everything in JAX and on TPU, at the cost of an NNX boundary and a library that has not shipped a real PyPI release. Neither is a dependency Dew should take today.
 
 ### What Dew should do about it
 
@@ -271,9 +289,9 @@ If Dew wants deeper integration later, the cheapest path is a `dew.interop` func
 
 ## 5. tokamax
 
-**What it is.** A library of accelerator kernels written in Pallas, at <https://github.com/openxla/tokamax>. Note the org: `openxla/tokamax`, not `google/tokamax`, and the copyright header reads "DeepMind Technologies Limited" (`tokamax/__init__.py:1`). Apache 2.0 (`LICENSE`). Version 0.0.13 on PyPI. The clone's last commit is 2026-09-02. The version number is honest: a young library with a stable-looking front door.
+A library of accelerator kernels written in Pallas, at <https://github.com/openxla/tokamax>. Note the org: `openxla/tokamax`, not `google/tokamax`, and the copyright header reads "DeepMind Technologies Limited" (`tokamax/__init__.py:1`). Apache 2.0 (`LICENSE`). Version 0.0.13 on PyPI. The clone's last commit is 2026-09-02. The version number fits: it is a young library, though its public API looks stable.
 
-**The front door.** Everything public is a plain JAX function with an `implementation` argument, exported from the top level (`tokamax/__init__.py:29-40`):
+Everything public is a plain JAX function with an `implementation` argument, exported from the top level (`tokamax/__init__.py:29-40`):
 
 | Function | What it is | Backends in the source |
 | --- | --- | --- |
@@ -295,7 +313,7 @@ Three design choices are worth taking regardless of the dependency question:
 2. Autotuning results are values. `tokamax.autotune(f, *args)` returns an `AutotuningResult` that is also a context manager, with `dumps()` and `loads()` (`docs/basic_usage.md:47-69`). The docs state plainly that autotuning is non-deterministic and that different configs change numerics, so pinning a serialized result is how numerics stay stable across sessions (`:75-79`).
 3. Benchmarking helpers measure accelerator time, not Python time, with a CUPTI path on GPU (`docs/basic_usage.md:106-125`). The docs call out timing around `block_until_ready` as the thing that does not work, which is what `tools/benchmark_step.py` in Dew currently does.
 
-**Adoption evidence.** MaxText vendors a copy of the tokamax splash attention kernel at `src/maxtext/kernels/tokamax_splash_attention/splash_attention_kernel.py` and exposes `use_tokamax_splash` (`base.yml:1350`), `use_splash_scheduler` (`:1192`), `use_tokamax_gmm` (`:286`) and a GMM v2 switch (`:287`). The two projects are converging: tokamax is where MaxText's kernels are heading.
+Adoption evidence: MaxText vendors a copy of the tokamax splash attention kernel at `src/maxtext/kernels/tokamax_splash_attention/splash_attention_kernel.py` and exposes `use_tokamax_splash` (`base.yml:1350`), `use_splash_scheduler` (`:1192`), `use_tokamax_gmm` (`:286`) and a GMM v2 switch (`:287`). The two projects are converging: tokamax is where MaxText's kernels are heading.
 
 ### Does it run on an RTX 4080 (Ada, sm_89)?
 
@@ -327,7 +345,7 @@ Dew's `implementation` argument already routes `xla` and `cudnn` to `jax.nn.dot_
 
 ## 6. Orbax
 
-**What it is.** The JAX checkpointing library, <https://github.com/google/orbax>. Apache 2.0. `orbax-checkpoint` is at 0.12.4 on PyPI, which is what Dew has. The clone's last commit is 2026-09-02.
+The JAX checkpointing library, <https://github.com/google/orbax>. Apache 2.0. `orbax-checkpoint` is at 0.12.4 on PyPI, which is what Dew has. The clone's last commit is 2026-09-02.
 
 Dew already uses more of Orbax than most projects do: a `CheckpointManager` with `enable_async_checkpointing=True`, an `AnyPreservationPolicy` combining `LatestN` with `BestN(get_metric_fn=_epoch_loss)`, sharded restore through `ocp.ArrayRestoreArgs(sharding=...)`, and a deliberate choice to hand sharded arrays straight to Orbax rather than gathering them on the host (`src/dew/training/trainer.py:162-171,285-347`). So this section is about the parts Dew has not reached. There are four.
 
@@ -383,9 +401,9 @@ Not worth doing now: emergency and multi-tier checkpointing assume many slices, 
 
 ## 7. Grain
 
-**What it is.** Google's data pipeline library for JAX, <https://github.com/google/grain>. Apache 2.0. PyPI 0.2.18, which is what Dew has; the clone declares 0.2.19 (`pyproject.toml:7`). Last commit 2026-08-31. It does not require JAX to run (`README.md:31`).
+Google's data pipeline library for JAX, <https://github.com/google/grain>. Apache 2.0. PyPI 0.2.18, which is what Dew has; the clone declares 0.2.19 (`pyproject.toml:7`). Last commit 2026-08-31. It does not require JAX to run (`README.md:31`).
 
-**Two APIs, and neither is deprecated.** I looked for a deprecation of `grain.python` and there is none. `docs/api_choice.md:7-16` states the choice:
+Grain has two APIs, and neither is deprecated. I looked for a deprecation of `grain.python` and there is none. `docs/api_choice.md:7-16` states the choice:
 
 > If you need to do one of the following: mix multiple data sources, pack variable length elements, split dataset elements and globally shuffle the splits, then you should use `Dataset`, otherwise use simpler `DataLoader`.
 
@@ -401,9 +419,9 @@ Two of the three reasons to move are things Dew's LM path needs.
 | Elastic iterators across a changing host count | `ElasticIterDatasetIterator` with `get_shard_states()`, saved as `shard_state_<idx>.json` (`checkpoint/elastic_checkpoint.py`) | none |
 | Sharding by process | `ShardByJaxProcess` sets `shard_index=process_index`, `shard_count=process_count` (`core/sharding.py:57-66`) | used already (`dew/data/dataloaders.py:190`) |
 
-**Packing, concretely.** `FirstFitPackIterDataset` takes `length_struct={"x": 4}` and `num_packing_bins`, adds each element to the first bin with room, and emits all bins when an element does not fit (`transformations/packing.py:341-392`). The packer writes two extra features per packed feature, `f"{k}_segment_ids"` and `f"{k}_positions"`, both int32 (`transformations/packing_packed_batch.py:116-117`). Those are exactly the arrays an attention mask needs to stop attention crossing a document boundary, and a RoPE call needs to restart positions per document. The alternative strategy, `ConcatThenSplitIterDataset`, has an explicit `BOSHandling` enum (`transformations/packing_concat_then_split.py:72`). The docstring states the tradeoff: packing avoids splitting sequences by padding instead, and more bins means less padding but risks epoch leakage, where examples from two epochs land in one bin (`packing.py:344-347`).
+`FirstFitPackIterDataset` takes `length_struct={"x": 4}` and `num_packing_bins`, adds each element to the first bin with room, and emits all bins when an element does not fit (`transformations/packing.py:341-392`). The packer writes two extra features per packed feature, `f"{k}_segment_ids"` and `f"{k}_positions"`, both int32 (`transformations/packing_packed_batch.py:116-117`). Those are exactly the arrays an attention mask needs to stop attention crossing a document boundary, and a RoPE call needs to restart positions per document. The alternative strategy, `ConcatThenSplitIterDataset`, has an explicit `BOSHandling` enum (`transformations/packing_concat_then_split.py:72`). The docstring states the tradeoff: packing avoids splitting sequences by padding instead, and more bins means less padding but risks epoch leakage, where examples from two epochs land in one bin (`packing.py:344-347`).
 
-**Performance knobs, with defaults.** `ReadOptions(num_threads=16, prefetch_buffer_size=500)` per process, and `MultiprocessingOptions(num_workers=0, per_worker_buffer_size=1, enable_profiling=False)` (`options.py:50-51,102-104`). Threads multiply: 8 threads and 10 workers is 80 readers (`options.py:33-35`). Grain warns when `prefetch_buffer_size < num_threads`, because that caps effective parallelism, and says the warning may become an error (`options.py:72-82`). Both read fields now accept an `AutotuneParameter` in place of an int (`options.py:50-51`). Dew passes one `Loading(workers=32, threads=64, read_buffer=128, worker_buffer=2)` per dataset spec (`dew/data/dataset.py`), so the tuning surface is wired; the defaults are just not documented on Dew's side.
+`ReadOptions(num_threads=16, prefetch_buffer_size=500)` per process, and `MultiprocessingOptions(num_workers=0, per_worker_buffer_size=1, enable_profiling=False)` (`options.py:50-51,102-104`). Threads multiply: 8 threads and 10 workers is 80 readers (`options.py:33-35`). Grain warns when `prefetch_buffer_size < num_threads`, because that caps effective parallelism, and says the warning may become an error (`options.py:72-82`). Both read fields now accept an `AutotuneParameter` in place of an int (`options.py:50-51`). Dew passes one `Loading(workers=32, threads=64, read_buffer=128, worker_buffer=2)` per dataset spec (`dew/data/dataset.py`), so the tuning surface is wired; the defaults are just not documented on Dew's side.
 
 ### What Dew should do about it
 
@@ -418,7 +436,7 @@ The second change is to stop hand-rolling iterator checkpointing and register Gr
 
 ## 8. Optax
 
-**What it is.** The JAX optimizer library, <https://github.com/google-deepmind/optax>. Apache 2.0. PyPI 0.2.8, dated 2026-03-20; the clone declares `0.2.9.dev` (`optax/__init__.py:319`) and carries 2026 commits. Dew already depends on it.
+The JAX optimizer library, <https://github.com/google-deepmind/optax>. Apache 2.0. PyPI 0.2.8, dated 2026-03-20; the clone declares `0.2.9.dev` (`optax/__init__.py:319`) and carries 2026 commits. Dew already depends on it.
 
 Dew's `build_optimizer` offers `adam`, `adamw` and `lamb`, a warmup-cosine schedule, weight decay folded into the optimizer kwargs, `clip_by_global_norm`, and `MultiSteps` for gradient accumulation (`src/dew/training/optim.py:14-41`). Everything in `optax.contrib` is a plain `GradientTransformation`, so anything below drops into `OPTIMIZER_MAP` without touching the surrounding wiring.
 
@@ -428,7 +446,7 @@ Dew's `build_optimizer` offers `adam`, `adamw` and `lamb`, a warmup-cosine sched
 
 The practical detail is that the top-level `muon()` partitions parameters by `ndim == 2`. Matrices go through `scale_by_muon`, everything else goes through `optax.adamw`. Adopting Muon needs no restructuring of Dew's parameter tree, only a `weight_dimension_numbers` spec for arrays whose matrix axes are not `(0, 1)`.
 
-**MuonClip is not in Optax.** A repository-wide search for `muon_clip` or `MuonClip` returns nothing. The mechanism exists elsewhere and belongs elsewhere: it is QK-Clip, a per-head rescale of the query and key projections when the observed maximum attention logit exceeds a threshold. MaxText implements it at the attention seam as `use_qk_clip` with `qk_clip_threshold: 100.0` (section 1).
+MuonClip is not in Optax. A repository-wide search for `muon_clip` or `MuonClip` returns nothing. The mechanism exists elsewhere and belongs elsewhere: it is QK-Clip, a per-head rescale of the query and key projections when the observed maximum attention logit exceeds a threshold. MaxText implements it at the attention seam as `use_qk_clip` with `qk_clip_threshold: 100.0` (section 1).
 
 ### Schedule-free
 
@@ -449,7 +467,7 @@ Two consequences for Dew. There is no learning-rate decay, so it pairs with warm
 | `split_real_and_imaginary` | complex parameters (`contrib/_complex_valued.py:87`) | later |
 | `sophia`, `sam`, `dog`, `dowg`, `dadapt_adamw`, `prodigy`, `momo`, `madgrad`, `cocob`, `adopt`, `acprop`, `dpsgd`, `reduce_on_plateau` | research optimizers and wrappers | skip today |
 
-**On sharded optimizer state.** Optax provides no wrap-to-shard helper. What it provides is a tested guarantee: `contrib/_sharding_test.py:54-75` and `_src/sharding_test.py:71-121` verify that every optimizer's state carries the input `NamedSharding` through `init` and `update` under an explicit mesh. For Dew that is the right news, because Dew derives optimizer-state sharding from parameter shapes already: `parameter_spec` is applied to every leaf of the train state, and the docstring says why, that moments and EMA copies have the same shapes as the parameters they track (`src/dew/training/distributed.py:44-52`).
+Optax provides no wrap-to-shard helper. What it provides is a tested guarantee: `contrib/_sharding_test.py:54-75` and `_src/sharding_test.py:71-121` verify that every optimizer's state carries the input `NamedSharding` through `init` and `update` under an explicit mesh. For Dew that is the right news, because Dew derives optimizer-state sharding from parameter shapes already: `parameter_spec` is applied to every leaf of the train state, and the docstring says why, that moments and EMA copies have the same shapes as the parameters they track (`src/dew/training/distributed.py:44-52`).
 
 ### What Dew should do about it
 
@@ -464,9 +482,9 @@ Add two entries to `OPTIMIZER_MAP`: `optax.contrib.muon` and `optax.contrib.sche
 
 ## 9. Qwix, and FP8 on GPU
 
-**What it is.** Google's JAX quantization library, <https://github.com/google/qwix>. Apache 2.0. PyPI 0.1.8, despite the README still saying "Qwix doesn't provide a PyPI package yet" (`README.md:38-40`); tokamax depends on `qwix>=0.1.2` (`tokamax/pyproject.toml:27`), so the package is real and in use. Last commit 2026-08-31.
+Google's JAX quantization library, <https://github.com/google/qwix>. Apache 2.0. PyPI 0.1.8, despite the README still saying "Qwix doesn't provide a PyPI package yet" (`README.md:38-40`); tokamax depends on `qwix>=0.1.2` (`tokamax/pyproject.toml:27`), so the package is real and in use. Last commit 2026-08-31.
 
-**What it covers** (`README.md:7-36`):
+What it covers (`README.md:7-36`):
 
 | Dimension | Options |
 | --- | --- |
@@ -477,7 +495,7 @@ Add two entries to `OPTIMIZER_MAP`: `optax.contrib.muon` and `optax.contrib.sche
 | Granularity | per-channel and sub-channel for `dot_general` and `einsum`, per-channel for `conv_general_dilated` |
 | Integration | "any Flax Linen or NNX models via a single function call" |
 
-**The API is the reason to care.** Quantization is expressed as regex rules over module paths and applied without editing the model (`README.md:74-101`):
+The API is the main reason to use it. Quantization is expressed as regex rules over module paths and applied without editing the model (`README.md:74-101`):
 
 ```python
 rules = [qwix.QuantizationRule(module_path='.*', weight_qtype='int8', act_qtype='int8')]
@@ -486,7 +504,7 @@ ptq_model = qwix.quantize_model(model, qwix.PtqProvider(rules))
 
 The parameter tree then holds `QArray(qvalue=int8[...], scale=float32[...])` values wrapped in `WithAux`, visible under `jax.eval_shape(ptq_model.init, ...)` (`README.md:103-131`). Weight quantization is a separate call, `qwix.quantize_params`, because Linen modules are pure functions (`README.md:133-140`). The exported providers are `PtqProvider`, `QtProvider`, `LoraProvider`, `BoxedParamProvider`, `OdmlQatProvider` and `OdmlConversionProvider` (`qwix/__init__.py:28-37`). The README makes a point of shipping no preset recipes: schemas are combinations of rules.
 
-**Quantized training is real, not only fake-quant.** `QtProvider` is "Quantization provider for Quantized Training (QT)" and overrides `dot_general` (`qwix/_src/providers/qt.py:66-84`). Its rule type adds the backward pass explicitly (`qt.py:32-54`):
+Qwix supports quantized training, not only fake quantization. `QtProvider` is "Quantization provider for Quantized Training (QT)" and overrides `dot_general` (`qwix/_src/providers/qt.py:66-84`). Its rule type adds the backward pass explicitly (`qt.py:32-54`):
 
 | Field | Meaning |
 | --- | --- |
@@ -530,9 +548,9 @@ Two things not to do. Do not write a quantization branch into Dew's modules; tha
 
 ## 10. The scaling book, "How to Scale Your Model"
 
-**What it is.** A book by Jacob Austin, Sholto Douglas, Roy Frostig, Anselm Levskaya, Charlie Chen, Sharad Vikram, Federico Lebron, Peter Choy, Vinay Ramasesh, Albert Webson and Reiner Pope, published by Google DeepMind on 2025-02-04 at <https://jax-ml.github.io/scaling-book/>. Twelve chapters. Chapter 12, on NVIDIA GPUs, is dated 2025-08-18. Not a library: it is the arithmetic that decides which parallelism to use.
+A book by Jacob Austin, Sholto Douglas, Roy Frostig, Anselm Levskaya, Charlie Chen, Sharad Vikram, Federico Lebron, Peter Choy, Vinay Ramasesh, Albert Webson and Reiner Pope, published by Google DeepMind on 2025-02-04 at <https://jax-ml.github.io/scaling-book/>. Twelve chapters. Chapter 12, on NVIDIA GPUs, is dated 2025-08-18. Not a library: it is the arithmetic that decides which parallelism to use.
 
-**Why Dew needs it.** Dew's mesh has two axes and one rule: shard the largest evenly divisible axis over `fsdp`, replicate below 65536 elements (`src/dew/training/distributed.py:44-58`). Nothing in Dew's docs tells a user when that rule stops working. This book gives the thresholds.
+Dew's mesh has two axes and one rule: shard the largest evenly divisible axis over `fsdp`, replicate below 65536 elements (`src/dew/training/distributed.py:44-58`). Nothing in Dew's docs tells a user when that rule stops working. This book gives the thresholds.
 
 ### The chip numbers
 
@@ -580,7 +598,7 @@ Let `C` be per-chip FLOPs/s, `W` the relevant bidirectional bandwidth, `B` the t
 Two more facts belong in Dew's docs because they constrain model shape, not just sharding:
 
 - Weight matrices are padded to at least 128 in both dimensions, 256 on TPU v6e (ch. 2, "Key Takeaways"). Head dimension and `d_ff` should be multiples of those.
-- VMEM bandwidth is about 22 times HBM bandwidth, so an operation that fits in VMEM needs an arithmetic intensity of 10 to 20 rather than 240 (ch. 2). That is the whole argument for fused kernels.
+- VMEM bandwidth is about 22 times HBM bandwidth, so an operation that fits in VMEM needs an arithmetic intensity of 10 to 20 rather than 240 (ch. 2). That is the argument for fused kernels.
 
 ### What Dew should do about it
 
@@ -614,7 +632,7 @@ Model coverage, from `src/maxdiffusion/configs/`: Stable Diffusion 1.4, 1.5, 2.1
 
 Both moved. Levanter's README carries a notice: "Levanter has been merged into Marin as of November 2025. All active development now happens in the Marin monorepo at `lib/levanter/`", with `pip install levanter` still working (`levanter/README.md:1-12`). Haliax says the same: "Development has moved into https://github.com/marin-community/marin monorepo" (`haliax/README.md:1-3`). Both are Apache 2.0. My Levanter clone's last commit is 2025-11-07, the merger notice itself; Haliax's is 2026-09-01, a README pointer.
 
-Haliax is the interesting half: "a JAX library for building neural networks with named tensors", explicitly in the tradition of Tensor Considered Harmful, where "named tensors improve the legibility and compositionality of tensor programs by using named axes instead of positional indices" (`haliax/README.md:23-25`).
+Haliax is the more relevant of the two: "a JAX library for building neural networks with named tensors", explicitly in the tradition of Tensor Considered Harmful, where "named tensors improve the legibility and compositionality of tensor programs by using named axes instead of positional indices" (`haliax/README.md:23-25`).
 
 This is the same idea as MaxText's logical axis rules, taken further. MaxText keeps positional arrays and annotates them; Haliax makes the named axis the primitive, so an axis cannot be sharded by the wrong name because there is no position to confuse. For Dew the practical read is that the named-axis idea has two published forms, a light one (annotate and map, MaxText and MaxDiffusion, works with Linen today) and a heavy one (named tensors throughout, Haliax, a rewrite). The light one is the one to take.
 
@@ -670,34 +688,34 @@ While reading gemma's dependencies I found `hackable-diffusion @ git+https://git
 
 Ordered by expected value at scale, not by effort. Each line says why it matters with the evidence behind it.
 
-**1. Logical axis rules instead of shape inference.** [borrow] Seam: `dew.training.distributed` plus annotations in `dew.nn`.
+1. Logical axis rules instead of shape inference. [borrow] Seam: `dew.training.distributed` plus annotations in `dew.nn`.
 Evidence: MaxText expresses twelve physical axes through a 109-line rules table (`base.yml:549-658`), and MaxDiffusion applies the identical pattern to DiTs and UNets with four axes (`base_flux_dev.yml:151-178`). Dew's `parameter_spec` can only ever produce FSDP, so by section 10's arithmetic Dew is capped near a per-device batch of 850 tokens on v5p, where FSDP plus tensor parallelism reaches about 100. This one change is the precondition for tensor, context and expert parallelism, and therefore for training anything Dew cannot already train.
 
-**2. Sequence packing with segment ids.** [adopt] Seam: data source in `dew.data`.
+2. Sequence packing with segment ids. [adopt] Seam: data source in `dew.data`.
 Evidence: `grain.experimental.FirstFitPackIterDataset` emits `_segment_ids` and `_positions` per feature (`packing_packed_batch.py:116-117`), which is what a block-diagonal mask and per-document RoPE need. Dew's `TokenWindowSource` chops a concatenated stream at fixed stride (`dew/data/sources/text.py:24-63`), so today every training window that straddles a document boundary trains attention across unrelated text with no marker. Grain's own guidance is that packing is one of exactly three reasons to use the `Dataset` API (`docs/api_choice.md:10-16`).
 
-**3. `optax.contrib.muon`.** [adopt] Seam: `dew.training.optim.OPTIMIZER_MAP`.
+3. `optax.contrib.muon`. [adopt] Seam: `dew.training.optim.OPTIMIZER_MAP`.
 Evidence: one dictionary entry, because `muon()` already partitions by `ndim == 2` and routes non-matrices to adamw internally (`optax/contrib/_muon.py`), so Dew's parameter tree needs no restructuring. It is the cheapest item on this list per unit of frontier parity.
 
-**4. Vocabulary tiling for the LM head.** [borrow] Seam: the LM objective.
+4. Vocabulary tiling for the LM head. [borrow] Seam: the LM objective.
 Evidence: MaxText's `num_vocab_tiling` chunks the cross-entropy along batch-sequence and is "highly recommended for models with large vocabularies (e.g. Gemma)", with `vocab_tiling_ag_once` to gather the head once for the backward (`base.yml:720-729`). tokamax ships the fused form as `linear_softmax_cross_entropy_loss`. For a 256k-vocabulary decoder the logits are the largest single activation in the step, so this is the highest memory saving available for the least architectural risk.
 
-**5. A named remat policy with host offload.** [borrow] Seam: `dew.training.objective_trainer`.
+5. A named remat policy with host offload. [borrow] Seam: `dew.training.objective_trainer`.
 Evidence: MaxText offers eleven named policies plus a `custom` mode where each of about twenty tensors takes `remat`, `device` or `offload` (`base.yml:373-403`), and pins `decoder_layer_input` to `device` because it is the remat restart point. All-or-nothing checkpointing forces a choice between speed and fitting; the named middle ground is what makes large models trainable on a given HBM budget.
 
-**6. Replica-parallel checkpoint writes, and the iterator as a separate checkpointable.** [adopt] Seam: checkpointer in `dew.training.trainer`.
+6. Replica-parallel checkpoint writes, and the iterator as a separate checkpointable. [adopt] Seam: checkpointer in `dew.training.trainer`.
 Evidence: `use_replica_parallel` with its size and replica caps (`orbax .../v1/_src/context/options.py:342-349,405-408`) divides write bytes by the replica count, and Dew's default mesh always has replicas when `fsdp_size < device_count`. Separately, making the data iterator its own checkpointable removes the variable-length-pytree-leaf workaround at `trainer.py:285-288` and lets Grain's own `CheckpointHandler` do the work (`grain checkpoint/handler.py:33`).
 
-**7. tokamax as the TPU kernel path, and `ragged_dot` for MoE.** [adopt, optional extra] Seam: `dew.nn.attention`, future `dew.nn.moe`.
+7. tokamax as the TPU kernel path, and `ragged_dot` for MoE. [adopt, optional extra] Seam: `dew.nn.attention`, future `dew.nn.moe`.
 Evidence: Dew's `tpu` implementation imports `jax.experimental.pallas.ops.tpu.flash_attention` (`dew/nn/attention.py:177-182`), while MaxText has moved to a vendored tokamax splash kernel and exposes `use_tokamax_splash` and `use_tokamax_gmm` (`base.yml:286,1350`). tokamax's signature is a superset of the one Dew already calls, and it supports all eighteen MoE tile configs against six for megablox and JAX ragged dot (`base.yml:261-262`). My own test (appendix A) shows the fast paths do not reach consumer Ada, so this is a TPU and H100-and-newer item, which is exactly where it matters.
 
-**8. `sharding_tolerance` as a startup assertion.** [borrow] Seam: `dew.training.distributed`.
+8. `sharding_tolerance` as a startup assertion. [borrow] Seam: `dew.training.distributed`.
 Evidence: MaxText fails a run when more than 2 percent of parameters are unsharded (`base.yml:672-673`). Dew's `parameter_spec` silently returns `P()` when no axis divides evenly by `fsdp_size` (`distributed.py:56-58`), so a model whose dimensions do not match the device count trains at full replication and reports nothing. This is a dozen lines that turn a silent memory blow-up into an error, which is why it ranks above larger items.
 
-**9. The scaling rules written into Dew's docs.** [borrow] Seam: `docs/concepts/`.
+9. The scaling rules written into Dew's docs. [borrow] Seam: `docs/concepts/`.
 Evidence: the thresholds in section 10, notably per-device batch above `2550/M_X` for FSDP, `Y < F/2550` for tensor parallelism, `X_opt = sqrt((B/F)(M_X/M_Y)N)` for the split, and about 73,000 tokens per pod before DCN binds. A framework that cannot tell a user which mesh to pick makes the user guess, and the arithmetic is public.
 
-**10. Goodput accounting.** [borrow] Seam: `dew.telemetry`.
+10. Goodput accounting. [borrow] Seam: `dew.telemetry`.
 Evidence: MaxText treats it as a first-class metric with five flags and a 30 second upload interval (`base.yml:1078-1084`). Dew measures step time, which answers "how fast is a step" and not "what fraction of the last day was training". Every item on this list about checkpointing and elasticity is justified by a goodput number, so the measurement should come before the mitigation.
 
 Two honourable mentions, both cheap and both narrow. `optax.contrib.schedule_free_adamw` is one map entry plus an eval-params path, and it removes the decay schedule as a tuning axis. Qwix int8 PTQ is two calls and touches no model code (`qwix.quantize_model`, `qwix.quantize_params`), which gives Dew a serving story before it needs a training-precision story.
