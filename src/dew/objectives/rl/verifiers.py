@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 from dataclasses import dataclass
 from fractions import Fraction
 
@@ -53,12 +52,12 @@ class CodeReward:
     up to trailing whitespace. A completion without a code block scores
     zero, as do timeouts, crashes and oversized output. `all_or_nothing`
     scores one only when every case passes. `interpreter` is the argv the
-    program file is appended to; the default is this Python, isolated from
-    the environment, site-packages and user site.
+    program file is appended to; None takes the fleet runner's `python`, so
+    a container runs the image's interpreter and a process runs this one.
     """
 
     fleet: SandboxFleet
-    interpreter: tuple[str, ...] = (sys.executable, "-I", "-S")
+    interpreter: tuple[str, ...] | None = None
     language: str = "python"
     filename: str = "main.py"
     all_or_nothing: bool = False
@@ -68,7 +67,8 @@ class CodeReward:
         source = code_block(completion, self.language)
         if source is None:
             return 0.0
-        outcomes = self.fleet.run(Program({self.filename: source}, (*self.interpreter, self.filename), stdin)
+        interpreter = self.fleet.runner.python if self.interpreter is None else self.interpreter
+        outcomes = self.fleet.run(Program({self.filename: source}, (*interpreter, self.filename), stdin)
                                   for stdin, _ in cases)
         passed = sum(outputs_match(outcome, expected) for outcome, (_, expected) in zip(outcomes, cases, strict=True))
         if self.all_or_nothing:

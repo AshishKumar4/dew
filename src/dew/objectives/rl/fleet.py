@@ -28,6 +28,7 @@ import os
 import selectors
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -85,7 +86,13 @@ class Outcome:
 
 
 class Runner(Protocol):
-    """Run one program to its end under `limits`; raise only when it cannot start."""
+    """Run one program to its end under `limits`; raise only when it cannot start.
+
+    `python` is the argv that runs a Python file where this runner runs programs.
+    """
+
+    @property
+    def python(self) -> tuple[str, ...]: ...
 
     def __call__(self, program: Program, limits: SandboxLimits) -> Outcome: ...
 
@@ -186,8 +193,11 @@ class ProcessRunner:
 
     The whole process group is killed at the wall deadline, on excess
     output, and after a normal exit, so no child it forked outlives it
-    unless it left the group on purpose.
+    unless it left the group on purpose. `python` is this interpreter,
+    isolated from the environment, site-packages and user site.
     """
+
+    python: tuple[str, ...] = (sys.executable, "-I", "-S")
 
     def __call__(self, program: Program, limits: SandboxLimits) -> Outcome:
         with tempfile.TemporaryDirectory(prefix="dew-fleet-") as directory:
@@ -224,6 +234,8 @@ class ContainerRunner:
     cpus: float = 1.0
     pids: int = 64
     user: str = "65534:65534"
+    python: tuple[str, ...] = ("python", "-I", "-S")
+    """The image's own interpreter; the host's path does not exist inside it."""
 
     def command(self, program: Program, limits: SandboxLimits, directory: str, name: str, cidfile: str) -> list[str]:
         """The runtime argv that runs `program` from `directory` in a container called `name`.
