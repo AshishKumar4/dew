@@ -175,11 +175,15 @@ class DiscreteProcess:
 class DiscreteDenoiser:
     """`(x_t, t) -> (argmax fill, log-probabilities)` for `model` under `params`.
 
-    The model's own logits at an unmasked position are irrelevant. The
-    position keeps its token (MDLM's carry-over parameterization).
-    The mask token itself carries no mass. It marks corruption, so the
-    categorical a reveal draws from never offers it, however the model
-    scores it.
+    `t` goes unread here: the masked model is conditioned on the corruption
+    it sees rather than on the time, and `Unmask.step` reads the time from
+    the process instead. It stays in the signature because `sample` calls
+    every denoiser as `(x_t, t)`.
+
+    The model's own logits at an unmasked position are irrelevant, since the
+    position keeps its token (MDLM's carry-over parameterization). The mask
+    token itself carries no mass: it marks corruption, so the categorical a
+    reveal draws from never offers it, however the model scores it.
     """
 
     process: DiscreteProcess

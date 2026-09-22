@@ -760,14 +760,11 @@ def _per_process(source: GrainDataset, *, rows: int, loading: Loading,
     A `MapDataset` is read by index, which is what `_batches` needs to cut a
     process's slice and to start that slice at a record offset. An
     `IterDataset` has neither, so it is batched where it is and yields
-    whatever the caller's own pipeline ordered and sharded.
+    whatever the caller's own pipeline ordered and sharded. Only the indexed
+    branch is opened at an offset, since only it has a position to resume.
     """
     if isinstance(source, pygrain.MapDataset):
         return _batches(source, batch=rows, loading=loading, offset=offset)
-    if offset:
-        raise ValueError(
-            "a streamed grain dataset cannot start at a record offset; it is "
-            "read as it comes, so its position is grain's own iterator state")
     return iter(source.batch(rows, drop_remainder=True))
 
 
