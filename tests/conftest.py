@@ -33,6 +33,14 @@ if not os.environ.get("DEW_TEST_NO_CACHE"):
     if _cache:
         enable_compilation_cache(_cache)
 
+# XLA parses XLA_FLAGS once, at the first compile, not when the backend
+# opens. A test that edits the variable, such as `without_deterministic_ops`
+# or the apply_xla_flags tests, would otherwise hand its flags to the whole
+# run whenever it happens to run first: the cuda lane then loses
+# --xla_gpu_deterministic_ops and its bitwise checks see two compilations of
+# one forward disagree. Compiling here fixes the flags set above.
+jax.jit(lambda x: x + 1)(0).block_until_ready()
+
 
 def pytest_runtest_setup(item):
     if item.get_closest_marker("mesh") and jax.device_count() < MESH_DEVICES:
@@ -44,7 +52,7 @@ def pytest_runtest_setup(item):
 def without_deterministic_ops(monkeypatch):
     """The cuda lane runs the whole suite under --xla_gpu_deterministic_ops,
     which Dew refuses cudnn attention under (openxla/xla#46500). XLA read the
-    variable when it opened the backend, so taking the flag back out of the
+    variable at the compile above, so taking the flag back out of the
     environment leaves this executable's reductions as they are and lets a
     test reach the cudnn path it is about."""
     kept = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
