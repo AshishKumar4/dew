@@ -1,12 +1,14 @@
 # Contributing
 
+> An AI assistant maintains this document. It is presented as-is.
+
 Dew is small on purpose. Every line has to earn its place. These rules apply to people and to agents alike, and a review checks each one.
 
 ## Design
 
 - Compose before you write. Look for the primitive first: `jax.nn.dot_product_attention` (grouped-query heads, causal and windowed masks, the fused kernels), `flax.linen` (norms, embeddings, attention with its decode cache, `scan`, `remat`), `optax` (losses, schedules, transforms), `orbax` (checkpoints and retention), `grain` (sources, sharding, batching, packing), and Google's own JAX code (MaxText, tokamax, the gemma library) for anything they already do well. A reimplementation needs a reason a reader can check: a measured inefficiency, a missing feature, or a parameter layout we must match. Write that reason where the code is.
 - One path. A capability has one implementation, one config field, one registry entry. No fallbacks, flags or compatibility layers without a demonstrated need.
-- The seams are the contract. Models are plain Flax modules that know nothing about training. Objectives own parameters, loss and validation. The trainer owns the mesh, the compiled step, EMA, checkpoints and logging. Data sources produce records; transforms are Grain transforms. A new architecture is a module and a registry entry; a new modality is an objective. If a change needs to cross these lines, the design is wrong, not the lines.
+- The seams are the contract. Models are plain Flax modules that know nothing about training. Objectives own parameters, loss and validation. The trainer owns the mesh, the compiled step, EMA, checkpoints and logging. Data sources produce records; transforms are Grain transforms. A new architecture is a module and a registry entry; a new modality is an objective. If a change needs to cross these lines, change the design so that it does not.
 - Prefer deep modules: a small interface over real complexity. Delete an abstraction if inlining it makes the code clearer.
 - Frozen at 1.0: parameter tree names and shapes, the checkpoint layout, wandb metric keys, the Objective methods, and the Hugging Face parameter layout of `CausalTransformer`. Dew is unpublished, so until 1.0 these change outright, with no converter and no compatibility path; from 1.0 on, a change to any of them is a migration, with a converter and a test that loads the old form.
 
@@ -14,20 +16,20 @@ Dew is small on purpose. Every line has to earn its place. These rules apply to 
 
 Anything that implements a published architecture, schedule, sampler or loss is a port, and a port is correct only when it reproduces the reference.
 
-- Identical design, not an equivalent one. The same parameter layout, the same operation order where numerics depend on it (norm placement, RoPE convention, softcapping, attention scaling, the dtype each step runs in), the same defaults. A rearrangement is allowed only with a test that shows it agrees with the reference to the stated tolerance.
+- Match the reference design exactly: the same parameter layout, the same operation order where numerics depend on it (norm placement, RoPE convention, softcapping, attention scaling, the dtype each step runs in), and the same defaults. A rearrangement is allowed only with a test that shows it agrees with the reference to the stated tolerance.
 - A parity test ships with the port. It loads the same weights into Dew and into the reference (the transformers implementation for model families, the authors' code for a paper, the equation for a schedule), runs the same inputs at fp32, and asserts the outputs agree: identical argmax and a stated maximum absolute difference for logits, a stated tolerance for everything else. The tolerance and the largest observed difference are written in the test.
-- Fixtures are reproducible. The script that generates reference outputs is committed under `tools/`, the fixtures it produced are small and committed under `tests/fixtures/`, and a network-marked test regenerates them against the real checkpoint when it is available. A fixture nobody can regenerate is not evidence.
+- Fixtures are reproducible. The script that generates reference outputs is committed under `tools/`, the fixtures it produced are small and committed under `tests/fixtures/`, and a network-marked test regenerates them against the real checkpoint when it is available. A fixture that nobody can regenerate does not count as evidence.
 - Configuration round-trips. A reference `config.json` translates into Dew's fields and back without loss; the translation is tested on the real configs of the smallest checkpoint of each family.
 
 ## Code
 
 - Keep the smallest correct implementation. Remove dead parameters and unreachable branches. Keep a helper when it owns a coherent operation or hides meaningful complexity, even with one caller.
-- Fix causes, not symptoms. No suppressed warnings, no special-cased inputs, no zero-filled fallbacks.
-- Types are narrow and true. No `Any`, no casts to make a checker quiet. `dew` ships `py.typed`, so a caller's checker reads these annotations: a wrong one is a bug with a wide blast radius. The gate is `uvx pyright@1.1.406 src/dew` from the repository root, where `pyproject.toml` names the environment. A worktree has no `.venv` of its own, so pyright there resolves nothing and invents hundreds of errors in files that are clean; from a worktree, pass the interpreter instead: `uvx pyright@1.1.406 --pythonpath ../../.venv/bin/python src/dew`. Where the untrue type belongs to a dependency without `py.typed`, narrow it with a stub under `stubs/`, the one `stubPath` `pyproject.toml` names, and say which signature the stub declares. CI runs the same command and fails on an error.
+- Fix the cause. Do not suppress warnings, special-case inputs or fill in zeros as a fallback.
+- Types are narrow and true. No `Any`, and no casts to quiet a checker. `dew` ships `py.typed`, so a caller's checker reads these annotations, and a wrong one misleads every caller. The gate is `uvx pyright@1.1.406 src/dew` from the repository root, where `pyproject.toml` names the environment. A worktree has no `.venv` of its own, so pyright run there resolves no imports and reports hundreds of errors in clean files. From a worktree, pass the interpreter instead: `uvx pyright@1.1.406 --pythonpath ../../.venv/bin/python src/dew`. When the untrue type belongs to a dependency without `py.typed`, narrow it with a stub under `stubs/` (the `stubPath` that `pyproject.toml` names) and say which signature the stub declares. CI runs pyright on Python 3.12 with `--pythonpath` set to its own interpreter, and fails on an error.
 - The venv installs dew editable, so `import dew` from the repository root reads `src/`. A worktree is not the root: run its tests through pytest, whose `pythonpath` puts the worktree's `src/` first, and its scripts with `PYTHONPATH=src`, or they read the main checkout's source and report on the wrong tree.
 - Comments say why, never what or what changed. Docstrings describe the code as it is.
-- One lint gate, run from the repository root: `uvx ruff@0.14.3 check src/dew tools/lint_slop.py examples && python tools/lint_slop.py && uvx pyright@1.1.406 src/dew`. Ruff's configuration lives in `pyproject.toml`, where every ignore carries the one-line reason it exists; `tools/lint_slop.py` is this repository's own checker for what ruff and a type checker cannot state; its module docstring names every rule, the roots each one runs over and the analysis boundaries it does not cross. A rule that is wrong for a real reason is an ignore in `pyproject.toml` with that reason next to it, never a `# noqa` in `src/`; the one exception is an import kept for the registry entry it makes, which carries `# noqa: F401  (registers the kind)`.
-- Performance is measured, not assumed. A change that claims to be faster ships with the number, the command that produced it and the hardware it ran on. Defaults are the fast ones.
+- One lint gate, run from the repository root: `uvx ruff@0.14.3 check src/dew tools/lint_slop.py examples && python tools/lint_slop.py && uvx pyright@1.1.406 src/dew`. Ruff's configuration lives in `pyproject.toml`, where every ignore carries the one-line reason it exists. `tools/lint_slop.py` is this repository's own checker for what ruff and a type checker cannot state. Its module docstring names every rule, the roots each rule runs over and the analysis boundaries it does not cross. A rule that is wrong for a real reason becomes an ignore in `pyproject.toml` with that reason next to it, never a `# noqa` in `src/`. The one exception is an import kept for the registry entry it makes, which carries `# noqa: F401  (registers the kind)`.
+- Measure performance claims. A change that claims to be faster ships with the number, the command that produced it and the hardware it ran on. Defaults are the fast ones.
 - Performance never costs anything else. An optimization is accepted only if the loss, gradients and outputs match the code it replaces to fp32 tolerance, nothing observable is removed, and no reduced-precision path, clipping or approximation is introduced. A test that would fail if a term were dropped ships with it.
 
 ## Tests
@@ -40,8 +42,8 @@ A test is worth keeping only if it would fail on a plausible bug in the thing it
 - One behaviour per test, named for the behaviour. A test that would need its name changed when the implementation changes is testing the implementation.
 - Keep tests deterministic with fixed seeds. Run backend-independent logic on CPU and device-specific kernels, precision, and memory behavior on the relevant GPU or TPU. Use small cases for logic; use representative device-sized cases for kernel checks. Keep timing in benchmarks and network access behind its marker.
 - No silent skips. `importorskip` only for an optional dependency, never for the code under test; a test that skips because a module broke is a broken test.
-- Be adversarial. Test the order that breaks things, not the order that works: build a loader after a device exists, resume a run mid-epoch, kill a worker, restore a checkpoint into a different mesh, feed a corpus too small for one batch, feed a split with no boundary. Three bugs shipped because every test used the safe order.
-- Assert the invariant, not the observation. A stream that should end must end (exactly ceil(N/batch) batches, then stop). Records that should be distinct must be distinct. Splits that should be disjoint must be disjoint. Metrics that should reach the tracker must reach it when the stream ends. State the property and let it fail.
+- Be adversarial. Test the orders that break things: build a loader after a device exists, resume a run mid-epoch, kill a worker, restore a checkpoint into a different mesh, feed a corpus too small for one batch, feed a split with no boundary. A test suite that only uses the safe order lets these bugs through.
+- Assert the invariant. A stream that should end must end (exactly ceil(N/batch) batches, then stop). Records that should be distinct must be distinct. Splits that should be disjoint must be disjoint. Metrics that should reach the tracker must reach it when the stream ends. State the property and let it fail.
 - Multiprocess and multi-device paths are tested with real processes and real meshes: loading.workers above zero with workers actually running, iterator state through a restart, jax.distributed across spawned processes, loss parity between one process and many at the same seed. A single-process simulation of a mesh is necessary and not sufficient.
 - Investigate warnings at their source. Fix our misuse or the dependency defect; record an unresolved upstream warning with its cause. Do not add a filter or exemption to make a failing check pass.
 - Notebook outputs never enter git: run `python tools/strip_notebooks.py` before committing a tutorial.
@@ -51,19 +53,19 @@ A test is worth keeping only if it would fail on a plausible bug in the thing it
 
 Plain sentences, short, in the register of someone explaining their own work to a colleague. Tables for comparisons. The README and docs describe what the code does today; a claim without code behind it is a bug.
 
-These constructions are banned, in prose, docstrings, comments and commit messages. They are the patterns machine-written text falls into, and they make a document sound like nobody wrote it.
+These constructions are banned in prose, docstrings, comments and commit messages. Machine-written text falls into them, and they make a document sound like nobody wrote it.
 
-- **Colon reveals.** A noun phrase, a colon, then a dramatic lowercase reveal: "Measured, not adopted: where the room is", "What it costs, stated: a run cannot", "One design, three parts:". Write the plain sentence. Colons are for lists, labels and quotes.
-- **Binary contrasts.** "This is not X, it is Y", "The question is not X but Y", "not just X but Y". State Y.
-- **Throat-clearing and faux insight.** "Here's the thing", "Let me be clear", "What most people get wrong", "the part everyone misses", "the uncomfortable truth is".
-- **Importance puffery.** "marks a pivotal moment", "plays a vital role", "underscores", "highlights", "showcases", "stands as a testament". State the fact.
-- **Trailing -ing clauses that pretend to explain.** "..., highlighting the team's commitment", "..., reflecting a broader shift". Say the consequence or cut it.
-- **Negative listing and dramatic fragmentation.** "Not a wrapper. Not a framework. A library." / "That's it. That's the whole thing."
-- **Fake-profound endings and recaps.** A closing metaphor or aphorism, or a paragraph that restates the section. End on the last concrete point.
-- **Weasel attribution.** "experts agree", "studies show", "widely regarded as". Name the source or cut the claim.
-- **Words that sell.** robust, seamless, leverage, utilize, delve, comprehensive, cutting-edge, elevate, harness, streamline, empower, paramount, intricate, transformative, ever-evolving.
-- **Em dashes.** None. Commas, periods and parentheses cover every case.
-- **Formatting decoration.** No emoji in headings, no bold mid-sentence for emphasis, no bullet list where two sentences read better, no heading over a two-sentence section.
+- Colon reveals: a noun phrase, a colon, then a dramatic lowercase reveal, as in "Measured, not adopted: where the room is", "What it costs, stated: a run cannot", "One design, three parts:". Write the plain sentence. Colons are for lists, labels and quotes.
+- Binary contrasts: "This is not X, it is Y", "The question is not X but Y", "not just X but Y". State Y.
+- Throat-clearing and faux insight: "Here's the thing", "Let me be clear", "What most people get wrong", "the part everyone misses", "the uncomfortable truth is".
+- Importance puffery: "marks a pivotal moment", "plays a vital role", "underscores", "highlights", "showcases", "stands as a testament". State the fact.
+- Trailing -ing clauses that pretend to explain: "..., highlighting the team's commitment", "..., reflecting a broader shift". Say the consequence or cut it.
+- Negative listing and dramatic fragments: "Not a wrapper. Not a framework. A library." or "That's it. That's the whole thing."
+- Fake-profound endings and recaps: a closing metaphor or aphorism, or a paragraph that restates the section. End on the last concrete point.
+- Weasel attribution: "experts agree", "studies show", "widely regarded as". Name the source or cut the claim.
+- Words that sell: robust, seamless, leverage, utilize, delve, comprehensive, cutting-edge, elevate, harness, streamline, empower, paramount, intricate, transformative, ever-evolving.
+- Em dashes: do not use them. Commas, periods and parentheses cover every case.
+- Formatting decoration: no emoji in headings, no bold mid-sentence for emphasis, no bullet list where two sentences read better, and no heading over a two-sentence section.
 
 ## User documentation
 
@@ -73,9 +75,8 @@ These constructions are banned, in prose, docstrings, comments and commit messag
 - Identify download and hardware requirements. Do not claim that an unexercised runtime path works.
 - Test observable runtime behavior. Do not add assertions about prose, source spelling, documentation structure, or generated API-index snapshots.
 
-
 ## Before a merge
 
 1. The suite passes on CPU (`JAX_PLATFORMS=cpu pytest -m "not network" -q`) and the touched files pass on a GPU.
 2. Every new number in docs has its reproduction command, and every port has its parity test.
-3. An independent review has read the code, not the description of it.
+3. An independent reviewer has read the code itself.
