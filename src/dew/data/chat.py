@@ -532,9 +532,17 @@ def _hub_conversations(path: str, split: str, options: HFOptions, column: str) -
     """One Hub split, through `datasets.load_dataset` on the library's terms.
 
     `options` is the value the `hf` provider forwards, so the cache, the
-    config name, a revision and a token are the library's own arguments.
+    config name, a revision and a token are the library's own arguments. The
+    load names one split and asks for a table, so a directory of splits and a
+    streamed split are refused here rather than indexed into; the import is
+    the load's own, which has already raised the missing-extra message.
     """
     loaded = options.load(path, split, streaming=False)
+    from datasets import Dataset as ArrowDataset
+    if not isinstance(loaded, ArrowDataset):
+        raise TypeError(
+            f"{path!r} split {split!r} loaded as {type(loaded).__name__}; conversations are "
+            f"read off one Arrow-backed split, so name one split of the dataset")
     names = list(loaded.column_names)
     held = _conversation_column(names, column, f"{path} split {split!r}")
     return (list(loaded[held]),

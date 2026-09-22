@@ -486,20 +486,13 @@ def test_a_hub_dataset_id_reads_through_load_dataset(monkeypatch, tools_tokenize
     import datasets as hf_datasets
 
     messages = parquet_conversation()
+    split = hf_datasets.Dataset.from_dict(
+        {"messages": [messages], "tools": [json.dumps([WEATHER])], "id": ["row-0"]})
     asked = {}
-
-    class Split:
-        """What `load_dataset` hands back: named columns and a row count."""
-
-        column_names = ["messages", "tools", "id"]
-        num_rows = 1
-
-        def __getitem__(self, column):
-            return {"messages": [messages], "tools": [[WEATHER]], "id": ["row-0"]}[column]
 
     def load_dataset(path, **arguments):
         asked.update(path=path, **arguments)
-        return Split()
+        return split
 
     monkeypatch.setattr(hf_datasets, "load_dataset", load_dataset)
     ids, roles = render(tools_tokenizer, messages, [WEATHER])
