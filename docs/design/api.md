@@ -1,7 +1,10 @@
 # The API: one registry, one objective, one trainer
 
-This page records the original API design and its implementation history. The statistics-first C01/C02 cutover supersedes its scalar-loss, MultiSteps, mutable-router and checkpoint-field examples; use the [current core API](../reference/core-api.md) and [objective guide](../concepts/objectives.md) for executable contracts.
-Design record, 2026-09-03. The historical examples and ticket states below describe their cited revisions. Current executable interfaces live in the linked objective and core API guides.
+> An AI assistant maintains this document. It is presented as-is.
+
+This page records the original API design and how it was built. The statistics-first C01/C02 cutover replaced its scalar-loss, MultiSteps, mutable-router and checkpoint-field examples. For contracts you can run, read the [current core API](../reference/core-api.md) and the [objective guide](../concepts/objectives.md).
+
+Design record, 2026-09-03. The code blocks are design sketches, not runnable code. The examples and ticket states below describe the revisions they cite.
 
 ## 0. The decisions
 
@@ -48,7 +51,7 @@ The seams named in `CONTRIBUTING.md:9` are crossed in these places, all confirme
 5. An unknown name or field raises.
 6. A schedule is a value, a sampler is a solver step, a preset is a `Process`.
 
-Every surface below follows all six. That is where consistency comes from, and a reviewer can check a new module against the list.
+Every surface below follows all six rules, and a reviewer can check a new module against the list.
 
 ## 3. The surfaces
 
@@ -376,7 +379,7 @@ Waves 1, 4 and 5 are mechanical and go to workhorse agents with a lead review of
 
 ## 8. How to build against this design
 
-- A new model is a module, `@models(name)` and `@logical_axes({...})`. Nothing else.
+- A new model is a module with `@models(name)` and `@logical_axes({...})`, and needs nothing else.
 - A new modality is an `Objective`. It may add a preset registry and a discrete or continuous process; it never touches the trainer.
 - A new sampler is a `Solver` with a `step`. It states which schedules it integrates.
 - A new metric is a function `(artifact, batch) -> value` behind `@metrics(name)`.
@@ -429,14 +432,14 @@ Status: `open`, `done` with the commit, or `held` with the reason. Type: `fix`, 
 
 Measured on the tree that landed: 53 constructors take more than eight fields, `CausalTransformer` takes 42, and five of `Router`'s routing options, each already pinned against transformers, could not be named from a config at all. Both of those are worth fixing, and only one of them is fixed by grouping.
 
-The rule, and it is narrow on purpose:
+The rule is deliberately narrow:
 
-1. Condense what is redundant. That is a field another field derives, the same dial declared a second time under a second name, the same dials declared again on a second base, and a sentinel value standing in for a feature being off when the rest of that feature's fields mean nothing without it.
+1. Condense what is redundant: a field another field derives, the same dial declared a second time under a second name, the same dials declared again on a second base, and a sentinel value standing in for a feature being off when the rest of that feature's fields mean nothing without it.
 2. Cohesion is not a reason. Dials that one model family happens to set together stay separate dials, because the next run wants three of them and not the fourth. A family's convention is not a type.
 3. A feature that is off by default becomes `Value | None` only in the sentinel case above, where its other fields depend on it. Then nothing is taken away: every dial is still set by name, inside the value.
 4. Every value stays a dict. `dew.registry.from_record` builds a declared value from a record at the build boundary, so `mixture={"experts": 8}` from the command line and `mixture=Mixture(experts=8)` from code agree, mappings and tuples of values are walked, and a run record round-trips without a second serialiser.
 
-What stays flat, and this is most of it: every independent dial. `qk_norm`, `v_norm`, `attention_bias`, `attention_scale`, `sandwich_norms`, `scale_offset`, `scale_after_cast`, `norm_eps`, `embedding_scale`, `final_logit_softcap` and `tie_embeddings` are each settable on their own and each mean something on their own, so they are each a field. Grouping them would read tidier and would cost a user the ability to vary one.
+Every independent dial stays flat, and that is most of the fields. `qk_norm`, `v_norm`, `attention_bias`, `attention_scale`, `sandwich_norms`, `scale_offset`, `scale_after_cast`, `norm_eps`, `embedding_scale`, `final_logit_softcap` and `tie_embeddings` can each be set on its own and each means something on its own, so each is a field. Grouping them would read tidier, but a user would lose the ability to vary one.
 
 | condensed | why it is redundant |
 |---|---|
@@ -452,7 +455,7 @@ Not condensed, on the second reading: `norm_eps` with the three norm-placement s
 
 ## 11. Where the built surface differs from this design
 
-Verified against the tree, not remembered. Nothing here is a compromise of a decision in section 0; each is a name or a shape that moved while being built.
+I checked this table against the tree at the time. None of these rows gives up a decision from section 0. Each is a name or a shape that changed during the build.
 
 | Drafted | Built | Why |
 | --- | --- | --- |
@@ -464,4 +467,6 @@ Verified against the tree, not remembered. Nothing here is a compromise of a dec
 |`objectives` registry (3.1)|built, with `diffusion`, `masked_diffusion`, `jepa` and `lm` registered|As drafted. Recorded here because the design's example code predates the registry existing.|
 |`Trainer(step=...)` escape hatch (decision 11, T34)|built as `step: Callable[[Objective, GradientTransformation], StepFn] | None`|As drafted. It replaces the compiled body only; a rollout is host-side and effectful, so it is not this seam. `docs/design/post-training.md` section 4 states that boundary.|
 
-What section 10 added later, and what the second reading of it narrowed, is in section 10 itself. The ticket table in section 9 records the state at the time of the review and is not maintained against `main`; the suite and `tests/test_api_surface.py` are.
+Section 10 itself records what it added later and what the second reading narrowed. The ticket table in section 9 records the state at the time of the review and is not maintained against `main`; the suite and `tests/test_api_surface.py` are.
+
+Correction (2026-09-22): three rows of the table above have moved on. The `metrics` registry is now `Registry[Callable[..., Metric], Metric]` (`src/dew/registry.py:479`). `Condition.unconditional` is `str | float | Mapping[str, object]` (`src/dew/inputs/__init__.py:63`). The `objectives` registry also holds `block_diffusion`, `dpo`, `grpo`, `ppo`, `flow_grpo` and `distillation`. `tests/test_api_surface.py` was deleted in `93a8ee10` (2026-09-06), so only the suite checks the surface now. The other rows still hold: `RunConfig.save` and `RunConfig.load` (`src/dew/config/__init__.py:475-488`), `TextToImage.from_run` and `.from_pretrained` (`src/dew/sampling/pipelines.py:156`, `:182`), `dew.io.publish(directory, name, *, tracker)` (`src/dew/io.py:20`), and `Trainer(step=...)` (`src/dew/training/trainer.py:200`).
