@@ -70,9 +70,9 @@ def test_the_sampling_budget_decides_the_context_the_model_is_built_for():
 def test_a_dataset_that_is_not_a_token_directory_says_so(tmp_path):
     recipe = load_recipe()
     with pytest.raises(FileNotFoundError, match="meta.json"):
-        recipe.token_directory(str(tmp_path))
+        recipe.token_directories(str(tmp_path))
     with pytest.raises(ValueError, match="--data.path"):
-        recipe.token_directory(None)
+        recipe.token_directories(None)
 
 
 def test_a_tokenizer_that_does_not_match_the_token_files_is_rejected(tmp_path):
@@ -128,6 +128,41 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     expected = trained("the ", seed=11).host()
     np.testing.assert_array_equal(actual.tokens, expected.tokens)
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
+
+
+def test_the_recipe_trains_on_weighted_corpora(tmp_path):
+    """`--data.path a 0.7 b 0.3` parses to the weighted mapping and trains:
+    the vocabulary comes from the corpora's shared meta.json, and run.json
+    records the mapping so the run reloads as configured."""
+    recipe = load_recipe()
+    first = write_token_files(tmp_path / "first", 40 * SEQ, 8 * SEQ, eos_id=0)
+    second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
+    config = tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe.LmRunConfig], args=[
+        "data:packed-tokens", "--data.path", str(first), "0.7", str(second), "0.3",
+        "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--data.loading.workers", "0",
+        "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+        "--trainer.steps", "2", "--trainer.name", "mixed", "--sample-tokens", "0",
+        "--model.dtype", "float32",
+        "--model.config", '{"emb_features": 16, "num_layers": 1, "num_heads": 2}'])
+    assert config.data.path == {str(first): 0.7, str(second): 0.3}
+
+    state = recipe.main(config)
+
+    assert int(state.step) == 2
+    recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "mixed"))
+    assert recorded.data.path == config.data.path
+    assert recorded.model.config["vocab_size"] == 256
+
+
+def test_weighted_corpora_from_different_vocabularies_are_refused(tmp_path):
+    recipe = load_recipe()
+    first = write_token_files(tmp_path / "first", 40 * SEQ, 8 * SEQ, eos_id=0)
+    second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
+    meta = json.loads((second / "meta.json").read_text())
+    (second / "meta.json").write_text(json.dumps({**meta, "vocab_size": 512}))
+    with pytest.raises(ValueError, match="vocab"):
+        recipe.token_meta({str(first): 0.5, str(second): 0.5})
 
 
 def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
