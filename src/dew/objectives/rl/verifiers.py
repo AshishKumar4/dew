@@ -77,7 +77,9 @@ class CodeReward:
 
 
 _BOXED = re.compile(r"\\boxed\{")
-_NUMBER = re.compile(r"-?\d[\d,]*(?:\.\d+)?(?:/\d+)?|-?\.\d+")
+_GROUPED = r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?"
+"""A number written with thousands-group commas, the only commas read as part of one."""
+_NUMBER = re.compile(rf"{_GROUPED}|-?\d+(?:\.\d+)?(?:/\d+)?|-?\.\d+")
 
 
 def _boxed(text: str) -> str | None:
@@ -94,8 +96,14 @@ def _boxed(text: str) -> str | None:
 
 
 def _rational(text: str) -> Fraction | None:
-    """Read a decimal, integer or `a/b` answer, allowing thousands separators and `\\frac{a}{b}`."""
-    cleaned = text.strip().replace(",", "").replace("$", "").replace(" ", "")
+    """Read a decimal, integer or `a/b` answer, allowing thousands separators and `\\frac{a}{b}`.
+
+    Any other comma or inner space leaves the text unreadable as one number,
+    so a list such as `1,2` or `2 3` never collapses into `12` or `23`.
+    """
+    cleaned = text.replace("$", "").strip()
+    if re.fullmatch(_GROUPED, cleaned):
+        cleaned = cleaned.replace(",", "")
     fraction = re.fullmatch(r"-?\\[dt]?frac\{(-?\d+)\}\{(-?\d+)\}", cleaned)
     if fraction is not None:
         numerator, denominator = int(fraction[1]), int(fraction[2])
