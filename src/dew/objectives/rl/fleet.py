@@ -215,7 +215,8 @@ class ContainerRunner:
     is a small writable tmpfs. Memory is capped at `memory_bytes` with no
     swap, CPU time at `cpu_seconds` (SIGXCPU, then SIGKILL a second later), the processor share at `cpus` and the
     process count at `pids`. At the wall deadline the container is killed
-    by name, as is the client that runs it.
+    by name, as is the client that runs it. A runtime that exits without
+    creating the container (no daemon, no permission, no image) raises.
     """
 
     image: str
@@ -224,9 +225,12 @@ class ContainerRunner:
     pids: int = 64
     user: str = "65534:65534"
 
-    def command(self, program: Program, limits: SandboxLimits, directory: str, name: str) -> list[str]:
-        """The runtime argv that runs `program` from `directory` in a container called `name`."""
-        return [self.runtime, "run", "--rm", "-i", "--name", name, "--network", "none",
+    def command(self, program: Program, limits: SandboxLimits, directory: str, name: str, cidfile: str) -> list[str]:
+        """The runtime argv that runs `program` from `directory` in a container called `name`.
+
+        The runtime writes the container's id to `cidfile` once it creates one.
+        """
+        return [self.runtime, "run", "--rm", "-i", "--name", name, "--cidfile", cidfile, "--network", "none",
                 "--memory", str(limits.memory_bytes), "--memory-swap", str(limits.memory_bytes),
                 "--cpus", str(self.cpus), "--pids-limit", str(self.pids),
                 "--ulimit", f"cpu={limits.cpu_seconds}:{limits.cpu_seconds + 1}", "--ulimit", "core=0",
@@ -236,7 +240,10 @@ class ContainerRunner:
                 "--env", "PYTHONDONTWRITEBYTECODE=1", self.image, *program.command]
 
     def __call__(self, program: Program, limits: SandboxLimits) -> Outcome:
-        with tempfile.TemporaryDirectory(prefix="dew-fleet-") as directory:
+        with tempfile.TemporaryDirectory(prefix="dew-fleet-") as scratch:
+            # The job is mounted; the id file beside it is not.
+            directory, cidfile = os.path.join(scratch, "job"), os.path.join(scratch, "cid")
+            os.mkdir(directory)
             _written(program, directory)
             # The container user is not the caller, so it needs to read the files.
             os.chmod(directory, 0o755)
@@ -247,7 +254,7 @@ class ContainerRunner:
             # The pull and the container start count against the deadline, so
             # a cold image is a timeout, not an unbounded wait.
             deadline = started + limits.wall_seconds
-            process = subprocess.Popen(self.command(program, limits, directory, name),
+            process = subprocess.Popen(self.command(program, limits, directory, name, cidfile),
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, start_new_session=True)
             try:
@@ -261,6 +268,11 @@ class ContainerRunner:
                 outcome = _outcome(process, streams, stopped, started, deadline)
             finally:
                 _closed(process)
+            if stopped is None and not (os.path.exists(cidfile) and Path(cidfile).read_text().strip()):
+                # The client ended without creating a container: the runtime
+                # failed, and the program never ran to be scored.
+                raise RuntimeError(f"{self.runtime} created no container (exit {outcome.exit_code}): "
+                                   f"{outcome.stderr.strip()}")
             # `docker run` exits with 128 plus the signal that ended the
             # container's process. The CPU soft limit sits one second under
             # the hard one, so running out of CPU time is SIGXCPU; SIGKILL is
