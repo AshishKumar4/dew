@@ -1,12 +1,14 @@
 # Review of `main` at `102baa4`
 
-Review, 2026-09-03. Read first hand: `training/`, `objectives/`, `diffusion/`, `sampling/`, `inputs/`, `registry.py`, `config/`, the causal transformer and attention, the chunked cross entropy, the DiT head, the data loaders and token sources, the eval metrics, the JEPA mask and probes, the examples, the LM recipe, and the trainer and sampler tests. Four read-only audits covered the data internals, the backbones, the periphery (interop, telemetry, eval, CLI, RL) and the test suite; every finding cited from them was re-read at the named lines. Every finding below was then executed on CPU in the project venv (jax 0.11.1, flax 0.12.9, Apple M3) before it was called confirmed. The companion design is `docs/design/api.md`.
+> An AI assistant maintains this document. It is presented as-is.
+
+Review, 2026-09-03. I read these first hand: `training/`, `objectives/`, `diffusion/`, `sampling/`, `inputs/`, `registry.py`, `config/`, the causal transformer and attention, the chunked cross entropy, the DiT head, the data loaders and token sources, the eval metrics, the JEPA mask and probes, the examples, the LM recipe, and the trainer and sampler tests. Four read-only audits covered the data internals, the backbones, the periphery (interop, telemetry, eval, CLI, RL) and the test suite. I re-read every finding cited from them at the named lines. I then executed every finding below on CPU in the project venv (jax 0.11.1, flax 0.12.9, Apple M3) before calling it confirmed. The companion design is `docs/design/api.md`.
 
 ## 1. Verdict
 
-The mechanics are better than the API. The compiled step, the abstract-state sharded materialisation, cross-mesh restore, the checkpointable device prefetch, the attention kernel seam and KV cache, the chunked cross entropy, `generate` and the HF decoder translation are correct where checked. The suite (44 files) asserts values against references far more than most research code does: committed parity fixtures with their generators under `tools/`, mutation tests, and real `jax.distributed` process tests.
+The mechanics are better than the API. The compiled step, the abstract-state sharded materialisation, cross-mesh restore, the checkpointable device prefetch, the attention kernel seam and KV cache, the chunked cross entropy, `generate` and the HF decoder translation are correct where I checked them. The suite (44 files) asserts values against references more than most research code does: committed parity fixtures with their generators under `tools/`, mutation tests, and real `jax.distributed` process tests.
 
-What is wrong is ownership. The trainer is a diffusion trainer with an escape hatch, the objective is handed the W&B run, data is an anonymous dict, randomness is a class, presets are tuples, registries are strings and configs are dicts that drop keys. The design document names each crossing with its line and the surface that replaces it.
+The problem is ownership. The trainer is a diffusion trainer with an escape hatch, the objective is handed the W&B run, data is an anonymous dict, randomness is a class, presets are tuples, registries are strings and configs are dicts that drop keys. The design document names each crossing with its line and the surface that replaces it.
 
 ## 2. Findings
 
@@ -50,7 +52,7 @@ Verified correct and left alone: EDM `c_in`, `c_out`, `c_skip`, `c_noise` and `l
 
 ## 3. The fix wave
 
-Seven branches from `102baa4`, one owner each, disjoint files, the failing test committed before the fix, merged without conflicts as `3d30a35` through `b39c62a`. Every branch's covering test files were run green in its worktree before the merge, and the whole CPU suite ran once on `main` after it (section 4).
+Seven branches from `102baa4`, one owner each, disjoint files, the failing test committed before the fix, merged without conflicts as `3d30a35` through `b39c62a`. Each branch's covering test files passed in its worktree before the merge, and the whole CPU suite ran once on `main` after it (section 4).
 
 | Branch | Commits | Covering files |
 | --- | --- | --- |
@@ -62,21 +64,23 @@ Seven branches from `102baa4`, one owner each, disjoint files, the failing test 
 | `fix/data` | `7c2ddd6`, `f3ea98b`, `b52c6ec`, `e95189a` | `tests/test_data.py`, `tests/test_text_data.py` |
 | `fix/trainer` | `6b747dc`, `d35ee68`, `5bc43e7`, `9e27b67` | `tests/test_trainer.py`, `tests/test_objectives.py`, `tests/test_parallelism.py` |
 
-Two things the wave did on purpose that are worth knowing. `b21ef60` removed the `SimpleDDPMSampler` and `generate_images` aliases; nothing outside the tests used them. `8b34869` makes an old logged config with a since-removed key fail to rebuild; per decision 7 in the design there is no migration for that.
+The wave made two deliberate breaks. `b21ef60` removed the `SimpleDDPMSampler` and `generate_images` aliases; nothing outside the tests used them. `8b34869` makes an old logged config with a since-removed key fail to rebuild; per decision 7 in the design there is no migration for that.
 
 ## 4. Integration run
 
-`PYTHONPATH=src JAX_PLATFORMS=cpu .venv/bin/python -m pytest -m "not network" -q -p no:cacheprovider -x` on `main` after the merges, Apple M3, CPU: 230 passed, 1 skipped (`test_data_real.py`, needs the tfds extra), then one failure, `tests/test_config_cli.py::test_grad_accum_steps_wraps_the_optimizer_and_reaches_the_trainer`, from `prepare_process` using the Linux-only `resource.RLIMIT_OFILE` name (`training/runtime.py:43`), a macOS portability bug older than this wave that CI on Linux never sees. Fixed in `f0e623a`; `tests/test_config_cli.py` then passes (16 passed). The full run after that fix was started and stopped before it finished; the whole suite still has to run once on a Linux box, which is the first step in section 6.
+`PYTHONPATH=src JAX_PLATFORMS=cpu .venv/bin/python -m pytest -m "not network" -q -p no:cacheprovider -x` on `main` after the merges, Apple M3, CPU: 230 passed, 1 skipped (`test_data_real.py`, needs the tfds extra), then one failure. `tests/test_config_cli.py::test_grad_accum_steps_wraps_the_optimizer_and_reaches_the_trainer` failed because `prepare_process` used the Linux-only `resource.RLIMIT_OFILE` name (`training/runtime.py:43`). That macOS portability bug is older than this wave, and CI on Linux never sees it. `f0e623a` fixed it; `tests/test_config_cli.py` then passed (16 passed). I started the full run after that fix and stopped it before it finished. The whole suite still has to run once on a Linux box, which is the first step in section 6.
 
-The reproduction scripts behind section 2 are under `tools/review/*_2026_09_03.py`. Run one with `PYTHONPATH=src JAX_PLATFORMS=cpu python tools/review/<name>.py` from the repository root; each prints a `CONFIRMED` or `NOT REPRODUCED` line per finding. `diffusion_2026_09_03.py` and `trainer_2026_09_03.py` import helpers from `tests/`. They are the evidence for the held decisions (T9, T10, T19, T21, T23) and are not tests.
+The reproduction scripts behind section 2 are under `tools/review/*_2026_09_03.py`. Run one with `PYTHONPATH=src JAX_PLATFORMS=cpu python tools/review/<name>.py` from the repository root; each prints a `CONFIRMED` or `NOT REPRODUCED` line per finding. `diffusion_2026_09_03.py` and `trainer_2026_09_03.py` import helpers from `tests/`. They are the evidence for the held decisions (T9, T10, T19, T21, T23). They are not tests.
+
+Correction (2026-09-22): commit `04da7926` deleted `tools/review/`. The scripts are still in history; `git show 04da7926^:tools/review/<name>.py` prints one. They were written against the modules at `102baa4` and I have not checked whether they run on current source.
 
 ## 5. Not done
 
-No training run was made; the numerics-changing items (T21, T23) and the time embedding note (T9) wait for the lead's decision. `nn/ssm.py`, `scan_orders.py`, `uvit.py`, `unet*.py`, `video_dit.py`, the middle of `mmdit.py`, `eval/inception.py`, `online_loader.py` and `cli/tpu.py` were read by the audits, not first hand. The seam crossings in section 2 of the design are confirmed and are the design waves, not this wave.
+No training run was made; the numerics-changing items (T21, T23) and the time embedding note (T9) wait for the lead's decision. The audits read `nn/ssm.py`, `scan_orders.py`, `uvit.py`, `unet*.py`, `video_dit.py`, the middle of `mmdit.py`, `eval/inception.py`, `online_loader.py` and `cli/tpu.py`; I did not read them first hand. The seam crossings in section 2 of the design are confirmed. They belong to the design waves, not this fix wave.
 
 ## 6. How to continue
 
-1. Recreate the environment: `uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -e '.[test,metrics,interop]'`. Then run the whole suite once: `JAX_PLATFORMS=cpu .venv/bin/python -m pytest -m "not network" -q -p no:cacheprovider`. Nothing in section 3 was merged without its covering files green, but the union was not run to completion.
+1. Recreate the environment: `uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python -e '.[test,metrics,interop]'`. Then run the whole suite once: `JAX_PLATFORMS=cpu .venv/bin/python -m pytest -m "not network" -q -p no:cacheprovider`. Every branch in section 3 had its covering files passing before its merge, but nobody ran the union to completion.
 2. Decide the held items: T9, T10, T21, T23 in the design's ticket table. Each changes either documentation or the numerics of an existing preset; the reproduction scripts print the numbers the decision rests on.
 3. Start wave 1 of `docs/design/api.md` (the `Registry`); it is mechanical and touches no numerics.
 4. Delete the seven `fix/*` branches after the suite is green on Linux; their commits are in `main` through the merge commits `3d30a35` to `b39c62a`.
