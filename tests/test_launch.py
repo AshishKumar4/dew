@@ -112,3 +112,15 @@ def test_a_variable_name_the_shell_would_read_as_syntax_is_refused(variable):
         Launch(command=("python",), hosts=("node1",), env=(variable,))
     assert Launch(command=("python",), env=("XLA_FLAGS=a=b,c",)).extra_env() == {
         "XLA_FLAGS": "a=b,c"}
+
+
+def test_every_repeated_env_flag_reaches_the_ranks():
+    """`--env A=1 --env B=2` is how the guide spells two variables; a flag
+    that kept only its last value would drop the first without a word."""
+    done = subprocess.run(
+        [sys.executable, "-m", "dew.cli.main", "launch", "--env", "A=1", "--env", "B=2",
+         "--port", "1", "--", sys.executable, "-c",
+         "import os; print(os.environ['A'] + os.environ['B'])"],
+        cwd=REPO_ROOT, env=ENV, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout
+    assert "[0] 12" in done.stdout

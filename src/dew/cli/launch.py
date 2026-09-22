@@ -42,7 +42,7 @@ POLL_SECONDS = 0.2
 
 Positional = tyro.conf.Positional
 Hosts = Annotated[tuple[str, ...], tyro.conf.arg(metavar="HOST")]
-Variables = Annotated[tuple[str, ...], tyro.conf.arg(metavar="NAME=VALUE")]
+Variables = Annotated[tuple[str, ...], tyro.conf.arg(metavar="NAME=VALUE"), tyro.conf.UseAppendAction]
 Address = Annotated[str | None, tyro.conf.arg(metavar="HOST")]
 Directory = Annotated[str | None, tyro.conf.arg(metavar="DIR")]
 Count = Annotated[int | None, tyro.conf.arg(metavar="N")]
