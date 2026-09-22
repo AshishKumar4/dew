@@ -141,8 +141,28 @@ def generation_process(config: Mapping[str, object], generation: Mapping[str, ob
         confidence_threshold=_number(generation, "confidence_threshold", 0.005))
 
 
+def scalar_placement(text: CausalTransformer, variables: Variables) -> CausalTransformer:
+    """`text` under the layer-scalar policy the tree being written actually keeps.
+
+    Google makes the per-layer skip scale a parameter and Transformers calls
+    the same tensor a buffer, so a source declares which of the two it is and
+    the export reads the collection that policy names. `BlockDiffusionObjective`
+    trains the scalar, which moves every one of them into `params`, so the tree
+    a finished SFT hands back disagrees with the source it was loaded from.
+    The tree is what is being written, so the tree decides: exporting a run
+    and saving the source it trained both come through here and agree.
+    """
+    if text.layer_scalar is None:
+        return text
+    for mode, collection in (("trainable", "params"), ("frozen", "constants")):
+        held = variables.get(collection, {})
+        if any(isinstance(node, Mapping) and "layer_scalar" in node for node in held.values()):
+            return text if text.layer_scalar == mode else text.clone(layer_scalar=mode)
+    return text
+
+
 def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, object]) -> dict[str, np.ndarray]:
-    """Write canonical decoder tensors under the native model's explicit scalar policy."""
+    """Write canonical decoder tensors under the scalar policy the tree keeps."""
     from dew.interop.hf_decoders import _flatten, export_decoder_weights
     from dew.nn.vision import _GEMMA4_VISION_TENSORS
 
@@ -151,8 +171,9 @@ def export_weights(model: nn.Module, variables: Variables, config: Mapping[str, 
     params = variables["params"]
     text_variables = {collection: tree["text"] for collection, tree in variables.items()
                       if "text" in tree}
+    text = scalar_placement(model.text, text_variables)
     tensors: dict[str, np.ndarray] = {}
-    for name, tensor in export_decoder_weights(model.text, text_variables, text_config(config)).items():
+    for name, tensor in export_decoder_weights(text, text_variables, text_config(config)).items():
         target = "model.decoder." + name.removeprefix("model.") if name.startswith("model.") else name
         tensors[target] = tensor
         if name.endswith(".layer_scalar"):

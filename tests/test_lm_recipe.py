@@ -511,3 +511,41 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     prompt = [[4, 5, 6, 7]]
     np.testing.assert_array_equal(task(prompt, 4, seed=9).host().tokens,
                                   trained(prompt, 4, seed=9).host().tokens)
+
+
+def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
+    """The SFT trains the per-layer skip scale, which the source declares a
+    constant and the objective moves into `params`, so a trained tree and the
+    source it came from disagree about where that tensor lives. The tree is
+    what is being written, so `source.save(destination)` takes the trained one
+    and the model read back out of that directory computes the trained loss."""
+    import optax
+
+    from dew import Dataset, Trainer
+    from dew.interop import load_pretrained
+    from dew.objectives.base import Step, scalar_loss, thaw
+    from dew.objectives.diffusion.block import BlockDiffusionObjective
+
+    checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
+    source = load_pretrained(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
+    objective = BlockDiffusionObjective(source.model, prompt_length=4, num_canvases=2,
+                                        pretrained=source.variables)
+    rows = jax.device_count()
+    with np.load(checkpoint / "reference.npz") as arrays:
+        batch = {name: np.concatenate([arrays[source_name]] * (rows // 2))
+                 for name, source_name in (("text", "tokens"), ("canvas_mask", "canvas_mask"),
+                                           ("encoder_target_mask", "encoder_target_mask"))}
+    data = Dataset(train=lambda: iter([batch, batch]), val=None, records=rows, batch=rows)
+
+    state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(0)).fit(data, steps=1, log_every=1)
+    source.save(tmp_path / "trained", variables=thaw(state.params))
+
+    read = load_pretrained(tmp_path / "trained", dtype="float32", attention_impl="xla", max_seq_len=32)
+    restored = BlockDiffusionObjective(read.model, prompt_length=4, num_canvases=2,
+                                       pretrained=read.variables)
+    rebuilt = restored.init(jax.random.key(0))
+    for wanted, actual in zip(jax.tree.leaves(state.params), jax.tree.leaves(rebuilt), strict=True):
+        np.testing.assert_array_equal(actual, wanted)
+    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(1), ema=None)
+    np.testing.assert_array_equal(scalar_loss(restored, rebuilt, batch, step)[0],
+                                  scalar_loss(objective, state.params, batch, step)[0])
