@@ -68,11 +68,15 @@ def test_unmask_sampler_runs_on_a_loaded_model_end_to_end():
     tokens = np.asarray(out.tokens)
     assert tokens.shape == (4, 12) and tokens.dtype == np.int32
     assert bool(((tokens != 120) & (tokens >= 0) & (tokens < 128)).all())
+    # Scoring is teacher-forced: every token of the batch carries its weighted
+    # masked cross entropy and counts once, so the pass's perplexity is exp of
+    # the ELBO bound per token.
     scored = objective.evaluate(
         variables, {"text": np.zeros((7, 12), np.int32)},
         Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None))
-    assert scored.tokens.shape == (7, 12) and scored.texts == ()
-    assert bool((np.asarray(scored.tokens) != 120).all())
+    assert scored.losses.shape == (7, 12) and scored.weights.shape == (7, 12)
+    np.testing.assert_array_equal(np.asarray(scored.weights), 1.0)
+    assert bool(np.isfinite(np.asarray(scored.losses)).all()) and float(np.asarray(scored.losses).max()) > 0
 
 
 def test_the_objective_reports_the_loaded_tree_and_returns_it_from_init():

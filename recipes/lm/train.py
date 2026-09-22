@@ -18,7 +18,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import tyro
 
@@ -59,7 +59,7 @@ class LmRunConfig(LMRunConfig):
             raise ValueError("block_diffusion requires data:token-windows, not packed documents")
 
 
-def token_directory(path: Optional[str]) -> Path:
+def token_directory(path: str | None) -> Path:
     """The directory tools/tokenize_text.py wrote, which --data.path names."""
     if not path:
         raise ValueError("--data.path is the token directory tools/tokenize_text.py wrote")
@@ -71,7 +71,7 @@ def token_directory(path: Optional[str]) -> Path:
     return directory
 
 
-def context_length(config: LmRunConfig, samples: Optional[Samples]) -> int:
+def context_length(config: LmRunConfig, samples: Samples | None) -> int:
     """How far the position table and the KV cache have to reach.
 
     Generation decodes into a cache sized once at build time, so a sampling
@@ -152,7 +152,7 @@ def checkpoint_tokenizer(pretrained: str) -> str:
     return pretrained
 
 
-def build_samples(config: LmRunConfig) -> Optional[Samples]:
+def build_samples(config: LmRunConfig) -> Samples | None:
     """What the objective generates and decodes at every validation."""
     if config.sample_tokens <= 0:
         return None
@@ -267,12 +267,13 @@ def main(config: LmRunConfig) -> TrainState:
     summary = {"model": fields, "arguments": run_summary(config, fields),
                "dataset": {"path": config.data.path, "records": data.records,
                            "tokens": meta.get("train_tokens")}}
+    validation = (metrics.perplexity(),)
     if config.objective == "masked_diffusion":
         return config.train(build_masked_objective(config, model, fields, pretrained), data,
-                            name=name, summary=summary)
+                            name=name, metrics=validation, summary=summary)
     if config.objective == "block_diffusion":
         return config.train(build_block_objective(config, model, pretrained), data,
-                            name=name, summary=summary)
+                            name=name, metrics=validation, summary=summary)
     objective = LMObjective(
         model,
         config.data.seq_len,
@@ -284,7 +285,7 @@ def main(config: LmRunConfig) -> TrainState:
         indexer=config.indexer,
         qk_stats=config.optim.optimizer == "muonclip",
     )
-    return config.train(objective, data, name=name, metrics=(metrics.perplexity(),), summary=summary)
+    return config.train(objective, data, name=name, metrics=validation, summary=summary)
 
 
 if __name__ == '__main__':

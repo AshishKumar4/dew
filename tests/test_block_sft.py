@@ -112,6 +112,20 @@ def test_loss_weights_apply_after_independent_row_normalization(source):
     assert abs(float(loss) - wrong) > 1e-3
 
 
+def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(source):
+    """A validation pass scores each row's selected canvas under the same draw
+    training makes from the key, so the weights are the reference's selected
+    targets and the per-row means are its canvas losses; `perplexity` over the
+    pass is exp of the denoising loss per target."""
+    loaded, batch, step, reference = source
+    obj = objective(loaded)
+    scored = obj.evaluate(jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
+    weights = np.asarray(scored.weights)
+    np.testing.assert_array_equal(weights, reference["selected_mask"][..., 0].astype(weights.dtype))
+    row_means = (np.asarray(scored.losses) * weights).sum(-1) / weights.sum(-1)
+    np.testing.assert_allclose(row_means, reference["canvas_loss"], atol=1e-5, rtol=0)
+
+
 def dataset(batch):
     rows = next(iter(batch.values())).shape[0]
     records = [{name: value[row] for name, value in batch.items()} for row in range(rows)]
