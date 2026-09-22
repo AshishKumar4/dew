@@ -100,11 +100,11 @@ assert int(state.step) == 2
 for before, after in zip(
     jax.tree.leaves(reference), jax.tree.leaves(state.ema), strict=True
 ):
-    np.testing.assert_array_equal(before, np.asarray(after))
+    np.testing.assert_allclose(before, np.asarray(after), rtol=0, atol=1e-6)
 print("Completed", int(state.updates), "DPO updates; reference stayed fixed.")
 ```
 
-You should see two training updates and the final confirmation. This run writes no checkpoints or tracker records. For a real dataset, build both sequences with the same tokenizer and chat format, check that they share the prompt, and take the masks from known token boundaries. Do not search the string for an assistant marker and assume the character offset you find is a token boundary.
+You should see two training updates and the final confirmation. `fit` builds its state inside a compiled function, so its copy of the reference can differ from the eager `initial_state()` by float rounding (1.8e-7 at most on an L4). The tolerance of 1e-6 allows that rounding and still fails if an optimizer step moves the reference, because one Adam step at this learning rate moves weights by about 1e-3. This run writes no checkpoints or tracker records. For a real dataset, build both sequences with the same tokenizer and chat format, check that they share the prompt, and take the masks from known token boundaries. Do not search the string for an assistant marker and assume the character offset you find is a token boundary.
 
 ### Account for reference memory
 
