@@ -326,7 +326,7 @@ class Conversation:
     def rows(self) -> list[Mapping[str, object]]:
         return [message.as_template() for message in self.messages]
 
-    def text_rows(self, source: str) -> list[Mapping[str, object]]:
+    def text_rows(self, where: str) -> list[Mapping[str, object]]:
         """The text-tokenizer input, with all-text parts joined in order.
 
         The stored messages and `rows` retain their structured content.
@@ -340,22 +340,22 @@ class Conversation:
                 continue
             texts: list[str] = []
             for part in message.content:
-                where = f"{source} message {index}"
+                at = f"{where} message {index}"
                 if part.type != "text":
                     raise ValueError(
-                        f"{where}: content part {part.type!r} requires a processor; "
+                        f"{at}: content part {part.type!r} requires a processor; "
                         "text tokenizers accept only text parts")
-                texts.append(_text(part.fields.get("text"), "a text part's text", where))
+                texts.append(_text(part.fields.get("text"), "a text part's text", at))
             rows.append({**row, "content": "".join(texts)})
         return rows
 
 
 def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[str, object]],
-               generation_prompt: bool, source: str) -> list[int]:
+               generation_prompt: bool, where: str) -> list[int]:
     """Renders `rows`, the messages' template dicts, to token ids.
 
     A template that refuses the messages, or reads a key they lack, fails
-    here with the source and the template's own message.
+    here with `where` and the template's own message.
 
     `rows` carries no annotation. Transformers declares the conversation as
     string-valued dicts while its contract reads lists under `tool_calls` and
@@ -366,30 +366,30 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
             rows, tools=[dict(tool) for tool in tools] or None, tokenize=True,
             return_dict=False, add_generation_prompt=generation_prompt)
     except (TemplateError, TypeError) as exc:
-        raise ValueError(f"{source}: the chat template refused the conversation: {exc}") from exc
+        raise ValueError(f"{where}: the chat template refused the conversation: {exc}") from exc
     if not isinstance(rendered, list):
         raise ValueError(
-            f"tokenizer {source!r} answered the chat template with "
+            f"tokenizer {where!r} answered the chat template with "
             f"{type(rendered).__name__}, not token ids")
     ids: list[int] = []
     for token in rendered:
         if not isinstance(token, int):
             raise ValueError(
-                f"tokenizer {source!r} answered the chat template with a "
+                f"tokenizer {where!r} answered the chat template with a "
                 f"non-id {token!r}")
         ids.append(token)
     return ids
 
 
 def render_prompt(tokenizer: PreTrainedTokenizerBase, conversation: Conversation,
-                  source: str) -> list[int]:
+                  where: str) -> list[int]:
     """Tokenizes a text conversation with the next assistant header.
 
     SFT and prompt sampling use the same message conversion and tool schemas.
     All-text parts concatenate in order; nontext parts require a processor.
     """
-    return _token_ids(tokenizer, conversation.text_rows(source), conversation.tools,
-                      generation_prompt=True, source=source)
+    return _token_ids(tokenizer, conversation.text_rows(where), conversation.tools,
+                      generation_prompt=True, where=where)
 
 
 def _agreement(rendered: Sequence[int], full: Sequence[int]) -> int:
@@ -403,7 +403,7 @@ def _agreement(rendered: Sequence[int], full: Sequence[int]) -> int:
 
 
 def render_conversation(tokenizer: PreTrainedTokenizerBase, conversation: Conversation,
-                        source: str) -> tuple[np.ndarray, np.ndarray]:
+                        where: str) -> tuple[np.ndarray, np.ndarray]:
     """Token ids and per-token roles for one conversation.
 
     Message k's span comes from prefix rendering. An assistant turn is exact:
@@ -422,22 +422,22 @@ def render_conversation(tokenizer: PreTrainedTokenizerBase, conversation: Conver
     for one, has no message of its own and counts as the first message's
     span.
 
-    `source` names the tokenizer and the row for those refusals. The arrays
+    `where` names the tokenizer and the row for those refusals. The arrays
     are int32 ids and int8 roles.
     """
-    rows = conversation.text_rows(source)
+    rows = conversation.text_rows(where)
     tools = conversation.tools
-    full = _token_ids(tokenizer, rows, tools, generation_prompt=False, source=source)
+    full = _token_ids(tokenizer, rows, tools, generation_prompt=False, where=where)
     roles = np.zeros(len(full), np.int8)
     agreed = 0
     for position, message in enumerate(conversation.messages):
-        following = _token_ids(tokenizer, rows[:position + 1], tools, generation_prompt=False, source=source)
+        following = _token_ids(tokenizer, rows[:position + 1], tools, generation_prompt=False, where=where)
         if message.role is Role.ASSISTANT:
             start, end = _completion_span(tokenizer, rows, tools, full, following, agreed,
-                                          position, source)
+                                          position, where)
         else:
             start = agreed
-            end = _turn_end(full, following, agreed, message.role, position, source)
+            end = _turn_end(full, following, agreed, message.role, position, where)
         roles[start:end] = message.role.value
         agreed = end
     return np.asarray(full, np.int32), roles
@@ -445,7 +445,7 @@ def render_conversation(tokenizer: PreTrainedTokenizerBase, conversation: Conver
 
 def _completion_span(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[str, object]],
                      full: Sequence[int], following: Sequence[int], agreed: int,
-                     position: int, source: str) -> tuple[int, int]:
+                     position: int, where: str) -> tuple[int, int]:
     """Where assistant message `position`'s completion begins and ends in `full`.
 
     The generation prompt over the messages before it is that turn's opening
@@ -455,27 +455,27 @@ def _completion_span(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[M
     """
     if position == 0:
         raise ValueError(
-            f"{source}: the first message is an assistant turn, so its "
+            f"{where}: the first message is an assistant turn, so its "
             "opening header cannot be separated from its completion "
             "through the template; start the conversation with a system "
             "or user message")
-    prefix = _token_ids(tokenizer, rows[:position], tools, generation_prompt=True, source=source)
+    prefix = _token_ids(tokenizer, rows[:position], tools, generation_prompt=True, where=where)
     if full[:len(prefix)] != prefix or len(prefix) < agreed:
         raise ValueError(
-            f"tokenizer {source!r} does not render incrementally at message "
+            f"tokenizer {where!r} does not render incrementally at message "
             f"{position} (assistant): the generation prompt tokenizes to "
             f"{prefix[-8:]}, the conversation to "
             f"{full[max(0, len(prefix) - 8):len(prefix)]}")
     if full[:len(following)] != following:
         raise ValueError(
-            f"tokenizer {source!r} renders message {position} (assistant) "
+            f"tokenizer {where!r} renders message {position} (assistant) "
             "differently once later messages follow it, so its completion "
             "cannot be masked from the whole conversation")
     return len(prefix), len(following)
 
 
 def _turn_end(full: Sequence[int], following: Sequence[int], agreed: int, role: Role,
-              position: int, source: str) -> int:
+              position: int, where: str) -> int:
     """Where message `position`'s span ends in `full`, for a turn that is not
     an assistant's.
 
@@ -486,11 +486,11 @@ def _turn_end(full: Sequence[int], following: Sequence[int], agreed: int, role: 
     end = _agreement(following, full)
     if end < agreed:
         raise ValueError(
-            f"tokenizer {source!r} rewrites message {position - 1}'s tokens when "
+            f"tokenizer {where!r} rewrites message {position - 1}'s tokens when "
             f"message {position} ({role.name.lower()}) follows it")
     if end == agreed:
         raise ValueError(
-            f"tokenizer {source!r} renders message {position} ({role.name.lower()}) "
+            f"tokenizer {where!r} renders message {position} ({role.name.lower()}) "
             "to no tokens; the template does not read this role or content")
     return end
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import os
-import struct as st
+import struct
 from typing import Literal
 
 import grain.python as pygrain
@@ -53,12 +53,12 @@ def unpack_dict_of_byte_arrays(packed_data: bytes) -> dict[str, bytes]:
     unpacked_dict = {}
     offset = 0
     while offset < len(packed_data):
-        key_length = st.unpack_from('I', packed_data, offset)[0]
-        offset += st.calcsize('I')
+        key_length = struct.unpack_from('I', packed_data, offset)[0]
+        offset += struct.calcsize('I')
         key = packed_data[offset:offset+key_length].decode('utf-8')
         offset += key_length
-        byte_array_length = st.unpack_from('I', packed_data, offset)[0]
-        offset += st.calcsize('I')
+        byte_array_length = struct.unpack_from('I', packed_data, offset)[0]
+        offset += struct.calcsize('I')
         byte_array = packed_data[offset:offset+byte_array_length]
         offset += byte_array_length
         unpacked_dict[key] = byte_array
@@ -70,9 +70,9 @@ def pack_dict_of_byte_arrays(unpacked: dict) -> bytes:
     packed = bytearray()
     for key, byte_array in unpacked.items():
         encoded = key.encode('utf-8')
-        packed += st.pack('I', len(encoded))
+        packed += struct.pack('I', len(encoded))
         packed += encoded
-        packed += st.pack('I', len(byte_array))
+        packed += struct.pack('I', len(byte_array))
         packed += byte_array
     return bytes(packed)
 

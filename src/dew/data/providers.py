@@ -421,10 +421,10 @@ def _stream(name: str, split: str, *, options: HFOptions,
             return _iterable(options.load(name, split, streaming=True), f"{name}/{split}")
         return own
 
-    what = f"{name!r} split {split!r}" if dataset is None else "the given dataset"
+    where = f"{name!r} split {split!r}" if dataset is None else "the given dataset"
 
     def stream() -> Iterator[Batch]:
-        source = HFRows(open_split, what=what, seed=seed, rank=jax.process_index(),
+        source = HFRows(open_split, what=where, seed=seed, rank=jax.process_index(),
                         world_size=jax.process_count(),
                         shuffle_buffer=shuffle_buffer, epochs=epochs,
                         given=dataset is not None)
@@ -440,13 +440,13 @@ def _stream(name: str, split: str, *, options: HFOptions,
     return stream
 
 
-def _iterable(rows: object, what: str) -> IterableDataset:
+def _iterable(rows: object, where: str) -> IterableDataset:
     """`rows` as a streamed split, or the refusal that it is not one."""
     import datasets
 
     if isinstance(rows, datasets.IterableDataset):
         return rows
     raise TypeError(
-        f"{what} is {type(rows).__name__}; a streamed split is an IterableDataset, "
+        f"{where} is {type(rows).__name__}; a streamed split is an IterableDataset, "
         f"so name one split rather than a whole dataset, or drop streaming=True to "
         f"read it at random")
