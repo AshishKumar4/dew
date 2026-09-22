@@ -572,3 +572,65 @@ def test_place_streams_the_held_tree_and_releases_each_source():
     close(updated(LMObjective(model, 8, head_chunks=1, pretrained=jax.tree.map(np.asarray, fresh),
                               trainable=lambda path: path[-2:] == ("q_proj", "kernel")), tokens(), HOST).params,
           resident.params)
+
+
+def _resident_pages(view: np.ndarray) -> int:
+    """How many of a mapped view's whole pages this process has in memory."""
+    import mmap
+    base = view
+    while not isinstance(base, np.memmap):
+        base = base.base
+    offset = view.__array_interface__["data"][0] - base.__array_interface__["data"][0]
+    first = -(-offset // mmap.PAGESIZE) * mmap.PAGESIZE
+    last = (offset + view.nbytes) // mmap.PAGESIZE * mmap.PAGESIZE
+    resident = 0
+    with open("/proc/self/pagemap", "rb") as pagemap:
+        for page in range(first // mmap.PAGESIZE, last // mmap.PAGESIZE):
+            address = base.__array_interface__["data"][0] + page * mmap.PAGESIZE
+            pagemap.seek(address // mmap.PAGESIZE * 8)
+            resident += int.from_bytes(pagemap.read(8), "little") >> 63
+    return resident
+
+
+def test_place_lets_a_mapped_checkpoint_page_go_once_the_leaf_has_landed(tmp_path):
+    """A loader maps a checkpoint file once and hands out views into it. Placing
+    a view reads its pages in; afterwards they are given back, whether the
+    view went into a bank or was placed on its own, so the file is not a
+    second copy of the base beside the placed one. A fault maps the whole
+    page-cache folio it lands in, so a neighbour's placement can bring back
+    the part of a tensor that shares its folio: the file is dropped from the
+    cache first so it comes back through readahead in small folios, and the
+    tensors are megabytes, so what stays is a sliver."""
+    import os
+    from dew.interop.safetensors_io import read_file, write_file
+    model = decoder(vocab_size=256, emb_features=256, mlp_features=4096)
+    fresh = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+    flat = {"/".join(entry.key for entry in path): leaf
+            for path, leaf in jax.tree_util.tree_leaves_with_path(fresh["params"])}
+    write_file(flat, tmp_path / "model.safetensors", {})
+    descriptor = os.open(tmp_path / "model.safetensors", os.O_RDONLY)
+    os.fsync(descriptor)
+    os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+    os.close(descriptor)
+    stored, _ = read_file(tmp_path / "model.safetensors")
+    held = {"params": {}}
+    for name, view in stored.items():
+        node = held["params"]
+        *parents, last = name.split("/")
+        for key in parents:
+            node = node.setdefault(key, {})
+        node[last] = view
+    banked_row = stored["layers_1/mlp/gate_proj/kernel"]
+    single = stored["embed_tokens/embedding"]
+    assert banked_row.base is single.base and isinstance(banked_row.base, np.memmap)
+    pages = banked_row.nbytes // 4096
+    assert pages >= 1024
+
+    objective = LMObjective(model, 8, head_chunks=1, pretrained=held,
+                            trainable=lambda path: path[-2:] == ("q_proj", "kernel"))
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST)
+    state, _, _ = trainer.place()
+    assert _resident_pages(banked_row) < pages // 10
+    assert _resident_pages(single) < single.nbytes // 4096
+    np.testing.assert_array_equal(
+        np.asarray(state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"])[1], np.asarray(banked_row))

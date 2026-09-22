@@ -76,17 +76,18 @@ def resident(placement, sites, accelerator):
         kind = BANK_MEMORY if _in_stack(keys, sites) else None
         return NamedSharding(accelerator, sharding.spec, memory_kind=kind)
     placed = jax.tree_util.tree_map_with_path(leaf, placement)
-    return banked(placed, sites, lambda rows: NamedSharding(
+    return banked(placed, sites, lambda rows, path: NamedSharding(
         accelerator, P(None, *rows[0].spec), memory_kind=BANK_MEMORY))
 
 
 def banked(tree, sites, stack, release=None):
     """`tree`, a frozen collection keyed per layer, with every leaf that all
     rows of a scanned run hold moved under the run's bank name as
-    `stack(rows)`: arrays stack into one bank, shapes into one shape,
-    shardings into the bank's. A leaf only some rows hold stays per layer,
-    as does every run of one, and `run_stack` stacks those with the moving
-    rows at each snapshot.
+    `stack(rows, path)`: arrays stack into one bank, shapes into one shape,
+    shardings into the bank's, `path` the bank leaf's keys from the root so
+    a caller can place the bank as it makes it. A leaf only some rows hold
+    stays per layer, as does every run of one, and `run_stack` stacks those
+    with the moving rows at each snapshot.
 
     So a frozen bank exists once, as the bank the scan reads, from the
     moment it is placed: not as its rows in pinned memory and a stacked
@@ -118,12 +119,13 @@ def banked(tree, sites, stack, release=None):
             shared = set(leaves[0]).intersection(*leaves[1:])
             if not shared:
                 continue
-            bank = local.setdefault(group_name(first, count), {})
+            name = group_name(first, count)
+            bank = local.setdefault(name, {})
             for keys in sorted(shared):
                 node = bank
                 for key in keys[:-1]:
                     node = node.setdefault(key, {})
-                node[keys[-1]] = stack([held[keys] for held in leaves])
+                node[keys[-1]] = stack([held[keys] for held in leaves], (*site.namespace, name, *keys))
                 for offset, row in enumerate(rows):
                     _drop(row, keys)
                     if release is not None:

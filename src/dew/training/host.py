@@ -7,6 +7,7 @@ cross-host device_put between different device sets (dispatch.py:488-516).
 """
 from __future__ import annotations
 
+import mmap
 from collections import defaultdict
 from collections.abc import Mapping
 
@@ -98,28 +99,62 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
     if held is not None:
         index(held)
 
-    def placed(value, target):
-        if isinstance(value, jax.Array) and (isinstance(value.sharding, NamedSharding)
-                                             or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
-            return transfer(value, target)
-        # A host array, or one device's: each process cuts its own shards
-        # out of it, so a sharded placement lands sharded.
-        source = np.asarray(value)
-        return jax.make_array_from_callback(source.shape, target, lambda index: source[index])
-
     def place_dict(node, target):
         for name in list(node):
             child, wanted = node[name], target[name]
             if isinstance(child, dict):
                 place_dict(child, wanted)
                 continue
-            landed = placed(child, wanted)
+            landed = place_leaf(child, wanted)
             for holder, key in holders.get(id(child), ()):
                 holder[key] = landed
             node[name] = landed
 
     place_dict(tree, placement)
     return tree
+
+
+def place_leaf(value, target: NamedSharding) -> jax.Array:
+    """`value` in `target`, its source pages let go once the copy has landed.
+
+    A host array, or one device's: each process cuts its own shards out of
+    it, so a sharded placement lands sharded. An array already on the mesh
+    moves as it is."""
+    if isinstance(value, jax.Array) and (isinstance(value.sharding, NamedSharding)
+                                         or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
+        return transfer(value, target)
+    source = np.asarray(value)
+    landed = jax.make_array_from_callback(source.shape, target, lambda index: source[index])
+    jax.block_until_ready(landed)
+    evict(source)
+    return landed
+
+
+def evict(array: np.ndarray) -> None:
+    """Drop a memory-mapped checkpoint tensor's pages from this process.
+
+    A loader maps a checkpoint file once and hands out views into it, so
+    letting a view go frees nothing while any other view is alive: the
+    pages a placed tensor was read from stay resident, and for a base that
+    fills the host they are the second copy that does not fit. The pages
+    the view covers whole are given back to the kernel here; a boundary
+    page shared with a neighbour stays until the neighbour is placed, and a
+    later read of an evicted page faults it back from the file. An array
+    that is not such a view is left alone."""
+    root: np.ndarray = array
+    while isinstance(root.base, np.ndarray):
+        root = root.base
+    mapping = root.base
+    if not isinstance(root, np.memmap) or not isinstance(mapping, mmap.mmap) or array.nbytes == 0:
+        return
+    # The map starts at the allocation granule below the memmap's file
+    # offset; the memmap's data sits that remainder into it.
+    start = root.__array_interface__["data"][0] - root.offset % mmap.ALLOCATIONGRANULARITY
+    offset = array.__array_interface__["data"][0] - start
+    first = -(-offset // mmap.PAGESIZE) * mmap.PAGESIZE
+    last = (offset + array.nbytes) // mmap.PAGESIZE * mmap.PAGESIZE
+    if last > first:
+        mapping.madvise(mmap.MADV_DONTNEED, first, last - first)
 
 
 def transfer[TreeT](tree: TreeT, placement: Placement[TreeT] | NamedSharding) -> TreeT:
