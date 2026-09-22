@@ -35,6 +35,7 @@ from dew.nn.sharding import (
     declared_axes,
 )
 from dew.objectives.base import Batch, Variables
+from dew.telemetry.profile import region
 
 # The axes a parameter can be split over. A dimension named 'exp' takes the
 # expert axis, the widths of Megatron's split take tensor, everything else
@@ -614,54 +615,24 @@ class DevicePrefetchIterator:
                 source.set_state(saved if isinstance(source.get_state(), bytes)
                                  else json.loads(saved))
             while not self._stop.is_set():
-                # Each scope exists only while the tracer owns a capture; the
-                # unprofiled worker runs its reads untouched.
-                annotation = None
-                if self._profiler is not None and self._profiler.running:
-                    annotation = jax.profiler.TraceAnnotation("data.read")
-                    annotation.__enter__()
-                try:
+                with region("data.read"):
                     batch = next(iterator)
-                finally:
-                    if annotation is not None:
-                        annotation.__exit__(None, None, None)
                 if self._stop.is_set():
                     break
-                annotation = None
-                if self._profiler is not None and self._profiler.running:
-                    annotation = jax.profiler.TraceAnnotation("data.position")
-                    annotation.__enter__()
-                try:
+                with region("data.position"):
                     state = source.get_state() if source is not None else None
                     if source is not None and not isinstance(state, bytes):
                         state = json.dumps(state).encode()
-                finally:
-                    if annotation is not None:
-                        annotation.__exit__(None, None, None)
-                annotation = None
-                if self._profiler is not None and self._profiler.running:
-                    annotation = jax.profiler.TraceAnnotation("data.place")
-                    annotation.__enter__()
-                try:
+                with region("data.place"):
                     placed = shard_batch(mesh, batch)
-                finally:
-                    if annotation is not None:
-                        annotation.__exit__(None, None, None)
                 batch = None
-                annotation = None
-                if self._profiler is not None and self._profiler.running:
-                    annotation = jax.profiler.TraceAnnotation("data.enqueue")
-                    annotation.__enter__()
-                try:
+                with region("data.enqueue"):
                     while not self._stop.is_set():
                         try:
                             self._queue.put((placed, state), timeout=0.05)
                             break
                         except queue.Full:
                             continue
-                finally:
-                    if annotation is not None:
-                        annotation.__exit__(None, None, None)
                 placed = state = None
         except StopIteration:
             # A drained source is how a prefetch thread ends; the finally

@@ -353,7 +353,7 @@ class HostExecution:
         return store
 
     def _stack_rows(self, rows, sharding):
-        """The rows of one bank leaf stacked into the bank's placement.
+        """Stack the rows of one bank leaf into the bank's placement.
 
         The stack runs on the CPU backend whatever the rows' placement: a
         moving row is the CPU's already, and a frozen row sits in the
@@ -364,19 +364,25 @@ class HostExecution:
         """
         return transfer(jnp.stack(self.on_cpu(rows)), sharding)
 
-    def on_cpu(self, tree):
+    def _moved(self, tree, mesh):
+        """Move `tree` to `mesh`, each leaf keeping the partition spec it has.
+
+        A leaf with no named sharding is replicated, which is what a scalar
+        clock or a key crossing the boundary asks for.
+        """
         def placement(leaf):
             sharding = getattr(leaf, "sharding", None)
             spec = sharding.spec if isinstance(sharding, NamedSharding) else P()
-            return NamedSharding(self.cpu, spec)
+            return NamedSharding(mesh, spec)
         return transfer(tree, jax.tree.map(placement, tree))
 
+    def on_cpu(self, tree):
+        """Move `tree` to the CPU mesh, where the state lives."""
+        return self._moved(tree, self.cpu)
+
     def on_accelerator(self, tree):
-        def placement(leaf):
-            sharding = getattr(leaf, "sharding", None)
-            spec = sharding.spec if isinstance(sharding, NamedSharding) else P()
-            return NamedSharding(self.accelerator, spec)
-        return transfer(tree, jax.tree.map(placement, tree))
+        """Move `tree` to the accelerator mesh, where the loss runs."""
+        return self._moved(tree, self.accelerator)
 
     def realize(self, variables, batch, step):
         """Evaluate the objective on the accelerator, over a snapshot of the state.

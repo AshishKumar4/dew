@@ -17,6 +17,7 @@ from dew.artifacts import (
     Artifact,
     Artifacts,
     agree_process_phase,
+    agreed,
     broadcast_from_process_zero,
     collective_host,
 )
@@ -99,20 +100,18 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     """
     started = time.perf_counter()
     root = jax.process_index() == 0
-    configuration = None
-    error = None
-    try:
+
+    def checked() -> dict[str, object]:
         names = [metric.name for metric in metrics]
         if len(names) != len(set(names)):
             raise ValueError("evaluation metric names must be unique")
         if not split or "/" in split:
             raise ValueError("evaluation split must be a nonempty name without '/'")
-        configuration = {"validation": batches is not None, "split": split,
-                         "metrics": [[metric.name, metric.reads.__module__, metric.reads.__qualname__]
-                                     for metric in metrics]}
-    except BaseException as failure:
-        error = failure
-    agree_process_phase(error, phase="configuration")
+        return {"validation": batches is not None, "split": split,
+                "metrics": [[metric.name, metric.reads.__module__, metric.reads.__qualname__]
+                            for metric in metrics]}
+
+    configuration = agreed("configuration", checked)
     root_configuration = broadcast_from_process_zero(configuration)
     error = None if configuration == root_configuration else ValueError(
         "validation availability, split and ordered metric names/types must agree across ranks")
@@ -120,18 +119,14 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     preview_enabled = bool(broadcast_from_process_zero(root and preview))
     step_home, schedule_home = collective_host(
         (step, step if schedule_step is None else schedule_step), phase="evaluation clocks")
-    error = None
-    event_step = 0
-    context = event_data = None
-    try:
-        event_step = int(step_home)
-        event_key = jax.random.fold_in(jax.random.fold_in(key, 0x4556414C), event_step)
-        context = Step(step=jnp.asarray(schedule_home), key=event_key, ema=averaged)
-        event_data = jax.random.key_data(event_key)
-    except BaseException as failure:
-        error = failure
-    agree_process_phase(error, phase="evaluation context")
-    assert context is not None and event_data is not None
+
+    def event() -> tuple[int, Step, jax.Array]:
+        at = int(step_home)
+        event_key = jax.random.fold_in(jax.random.fold_in(key, 0x4556414C), at)
+        return (at, Step(step=jnp.asarray(schedule_home), key=event_key, ema=averaged),
+                jax.random.key_data(event_key))
+
+    event_step, context, event_data = agreed("evaluation context", event)
     event_words = tuple(int(word) for word in np.asarray(collective_host(
         event_data, phase="event identity")))
     score_key = jax.random.fold_in(context.key, 0x53434F52)
@@ -144,14 +139,15 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     uneven = False
     if batches is not None and (metrics or preview_enabled):
         try:
-            error = None
-            try:
+            def open_source() -> None:
+                # Each name is bound as it is built, so a failure part way
+                # through still leaves the cleanup below what to close.
+                nonlocal mesh, source, iterator
                 mesh = build_mesh() if mesh is None else mesh
                 source = batches()
                 iterator = iter(source)
-            except BaseException as failure:
-                error = failure
-            agree_process_phase(error, phase="iterator construction")
+
+            agreed("iterator construction", open_source)
             assert iterator is not None and mesh is not None
             while True:
                 error = None
@@ -170,49 +166,37 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
                     batch = None
                     break
                 assert batch is not None
-                error = None
-                try:
+
+                def place() -> None:
+                    nonlocal batch, records
                     batch = shard_batch(mesh, batch)
                     rows = next((leaf.shape[0] for leaf in jax.tree.leaves(batch) if leaf.ndim), None)
                     if rows is None:
                         raise ValueError("validation batch has no row-bearing array")
                     records += int(rows)
-                except BaseException as failure:
-                    error = failure
-                agree_process_phase(error, phase=f"batch placement {scored}")
+
+                agreed(f"batch placement {scored}", place)
                 produced = None
                 if metrics:
-                    error = None
-                    try:
-                        context_at = replace(context, key=jax.random.fold_in(score_key, scored))
-                        produced = objective.evaluate(variables, batch, context_at)
-                    except BaseException as failure:
-                        error = failure
-                    agree_process_phase(error, phase=f"scoring batch {scored}")
+                    produced = agreed(f"scoring batch {scored}", lambda: objective.evaluate(
+                        variables, batch, replace(context, key=jax.random.fold_in(score_key, scored))))
                     produced, home = collective_host((produced, batch), phase=f"scoring batch {scored}")
                     artifacts = _artifacts(produced)
                     for metric in metrics:
-                        error = None
-                        if root:
-                            try:
-                                contribution = metric(_pick(artifacts, metric.reads), home)
-                                summaries[metric.name] = (
-                                    metric.merge(summaries[metric.name], contribution)
-                                    if metric.name in summaries else contribution)
-                                del contribution
-                            except BaseException as failure:
-                                error = failure
-                        agree_process_phase(error, phase=f"metric {metric.name} batch {scored}")
+                        def merge() -> None:
+                            if not root:
+                                return
+                            contribution = metric(_pick(artifacts, metric.reads), home)
+                            summaries[metric.name] = (
+                                metric.merge(summaries[metric.name], contribution)
+                                if metric.name in summaries else contribution)
+
+                        agreed(f"metric {metric.name} batch {scored}", merge)
                     del home, artifacts
                 if scored == 0 and preview_enabled:
-                    error = None
-                    produced_preview = None
-                    try:
-                        context_at = replace(context, key=preview_key)
-                        produced_preview = objective.preview(variables, batch, context_at, scored=produced)
-                    except BaseException as failure:
-                        error = failure
-                    agree_process_phase(error, phase="preview generation/decoding")
+                    produced_preview = agreed(
+                        "preview generation/decoding", lambda: objective.preview(
+                            variables, batch, replace(context, key=preview_key), scored=produced))
                     produced_preview = collective_host(produced_preview, phase="preview artifacts")
                     if root:
                         previews = _artifacts(produced_preview)
@@ -223,13 +207,12 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
                     break
             if scored:
                 for metric in metrics:
-                    error = None
-                    if root:
-                        try:
-                            scores[f"{split}/{metric.name}"] = float(metric.finalize(summaries[metric.name]))
-                        except BaseException as failure:
-                            error = failure
-                    agree_process_phase(error, phase=f"finalizing metric {metric.name}")
+                    def finalize() -> None:
+                        if root:
+                            scores[f"{split}/{metric.name}"] = float(
+                                metric.finalize(summaries[metric.name]))
+
+                    agreed(f"finalizing metric {metric.name}", finalize)
         finally:
             primary = sys.exception()
             error = None
