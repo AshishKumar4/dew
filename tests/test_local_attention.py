@@ -68,7 +68,7 @@ def test_chunks_match_splash_chunked_causal_mask(implementation, length, chunk):
     np.testing.assert_allclose(np.asarray(actual), expected, atol=2e-6, rtol=0)
 
 
-@pytest.mark.parametrize("span", [{"window": 5}, {"chunk": 4}])
+@pytest.mark.parametrize("span", [{"window": 5}, {"chunk": 4}, {"window": 16}, {"chunk": 16}])
 def test_packed_documents_restart_their_windows_and_chunks(span):
     """Chunks count from each document's first token, as `chunked_overlay`
     reads packed positions; windows count rows inside the document. Padding
@@ -135,6 +135,39 @@ def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
         q, k, v, window=window, implementation="xla"))
     assert dense >= heads * length * length * 4
     assert banded * 4 < dense
+
+
+@pytest.mark.parametrize("span,length,packing", [
+    ({"window": 4096}, 256, True),
+    ({"chunk": 8192}, 1024, True),
+    ({"chunk": 8192}, 1024, False),
+    ({"chunk": 8192}, 2048, False),
+])
+def test_a_sequence_within_two_spans_costs_no_more_than_the_dense_call(span, length, packing):
+    """Banding pads to whole spans, so at or below two spans it would hold
+    more than the `[S, S]` mask it replaces: those calls take the dense mask,
+    and the compiled temporaries stay at the dense call's."""
+    heads = 4
+    query, key, value = inputs(length, heads=heads, kv_heads=heads, batch=1)
+    segments, positions = packed(length, (length // 3, length - 5))
+    segments, positions = jnp.asarray(segments)[None], jnp.asarray(positions)
+    rows = jnp.arange(length)
+    keep = rows[None, :] <= rows[:, None]
+    if packing:
+        keep = keep & (segments[0, :, None] == segments[0, None, :]) & (segments[0, :, None] != 0)
+    if "window" in span:
+        keep = keep & (rows[:, None] - rows[None, :] < span["window"])
+
+    def temporaries(fn):
+        compiled = jax.jit(fn).lower(query, key, value).compile()
+        return compiled.memory_analysis().temp_size_in_bytes
+
+    dense = temporaries(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, mask=keep[None, None], implementation="xla"))
+    local = temporaries(lambda q, k, v: local_attention(
+        q, k, v, **span, segment_ids=segments if packing else None,
+        positions=positions if packing and "chunk" in span else None, implementation="xla"))
+    assert local <= dense * 1.25
 
 
 def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes():

@@ -1122,14 +1122,17 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     `segment_ids` keeps each packed document to itself (0 is padding) and
     `valid` `[B, S]` drops the keys it marks False.
 
-    No `[S, S]` array is built. A sliding window that cudnn or splash takes
-    as a flag runs there, whose kernels skip the blocks outside it. Chunks
-    that start at row multiples fold into the batch, one causal call per
-    chunk, which every kernel takes. Everything else runs banded: the
-    queries in blocks of the span, each against its own block and the one
-    before, which holds every key a query of the block may read, under a
-    `[W, 2W]` mask per block. The xla kernel's logits are then `[S, 2W]`
-    per head where a dense mask costs `[S, S]`.
+    No `[S, S]` array is built above two spans. A sliding window that
+    cudnn or splash takes as a flag runs there, whose kernels skip the
+    blocks outside it. Chunks that start at row multiples fold into the
+    batch, one causal call per chunk, which every kernel takes. Everything
+    else runs banded: the queries in blocks of the span, each against its
+    own block and the one before, which holds every key a query of the
+    block may read, under a `[W, 2W]` mask per block. The xla kernel's
+    logits are then `[S, 2W]` per head where a dense mask costs `[S, S]`.
+    Banding pads the sequence to whole spans, so a sequence of at most two
+    spans, where `[S, S]` is no larger than `[S, 2W]`, takes the dense
+    call instead.
     """
     if (window is None) == (chunk is None):
         raise ValueError("local attention takes exactly one of window and chunk")
@@ -1151,11 +1154,28 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
             implementation, query, key, dtype=dtype, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, causal=True,
             sliding_window=window)
-        if resolved in ('cudnn', 'tpu') or length <= window:
+        if resolved in ('cudnn', 'tpu') or length <= 2 * span:
             return scaled_dot_product_attention(
                 query, key, value, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
                 causal=True, sliding_window=window, sinks=sinks, softcap=softcap)
+    if length <= 2 * span:
+        places = jnp.arange(length) if positions is None else positions
+        mask = (None if chunk is None or (positions is None and length <= chunk)
+                else chunk_mask(places, places, chunk))
+        if segment_ids is not None:
+            inside = document_mask(segment_ids)[:, None]
+            mask = inside if mask is None else mask & inside
+        if valid is not None:
+            live = jnp.asarray(valid, bool)[:, None, None, :]
+            mask = live if mask is None else mask & live
+        if mask is not None:
+            mask = combined_attention_mask(length, length, True, window, mask)
+            implementation = kernel_for_materialized_mask(implementation)
+        return scaled_dot_product_attention(
+            query, key, value, dtype=dtype, precision=precision,
+            force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
+            causal=mask is None, mask=mask, sinks=sinks, softcap=softcap)
 
     blocks = -(-length // span)
 
