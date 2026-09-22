@@ -7,6 +7,7 @@ import sys
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, replace
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -119,6 +120,37 @@ def evaluate(objective: Objective[Loss, Effects], variables: Variables,
     return Evaluation(event_step, split, scores, scored, records, uneven, event_words, elapsed, previews)
 
 
+class _Accumulators:
+    """Each metric's running accumulator over the batches scored so far.
+
+    A metric owns its accumulator type; the pass only carries one per metric
+    and hands it back to the same metric to merge and finalize.
+    """
+
+    def __init__(self) -> None:
+        self._held: dict[str, Any] = {}
+
+    def add[S](self, metric: Metric[S], contribution: S) -> None:
+        held = self._held.get(metric.name)
+        self._held[metric.name] = contribution if held is None else metric.merge(held, contribution)
+
+    def finalize[S](self, metric: Metric[S]) -> float:
+        return float(metric.finalize(self._held[metric.name]))
+
+
+@dataclass(frozen=True)
+class _Configuration:
+    """What every rank must agree on before a validation pass walks its phases."""
+    validation: bool
+    split: str
+    metrics: tuple[tuple[str, str, str], ...]
+    """Each metric's name and the module and qualified name of the artifact it reads."""
+
+    def broadcast(self) -> list[bool | str | list[list[str]]]:
+        """The record as rank zero's ranks see it, through the JSON broadcast."""
+        return [self.validation, self.split, [list(entry) for entry in self.metrics]]
+
+
 def _agree_configuration(metrics: Sequence[Metric], batches, split: str) -> None:
     """Check this rank's evaluation settings, then agree they match root's.
 
@@ -126,17 +158,18 @@ def _agree_configuration(metrics: Sequence[Metric], batches, split: str) -> None
     validation stream would walk different phases below, and hang at a
     collective one of them never reaches.
     """
-    def checked() -> dict[str, object]:
+    def checked() -> _Configuration:
         names = [metric.name for metric in metrics]
         if len(names) != len(set(names)):
             raise ValueError("evaluation metric names must be unique")
         if not split or "/" in split:
             raise ValueError("evaluation split must be a nonempty name without '/'")
-        return {"validation": batches is not None, "split": split,
-                "metrics": [[metric.name, metric.reads.__module__, metric.reads.__qualname__]
-                            for metric in metrics]}
+        return _Configuration(
+            validation=batches is not None, split=split,
+            metrics=tuple((metric.name, metric.reads.__module__, metric.reads.__qualname__)
+                          for metric in metrics))
 
-    configuration = agreed("configuration", checked)
+    configuration = agreed("configuration", checked).broadcast()
     root_configuration = broadcast_from_process_zero(configuration)
     error = None if configuration == root_configuration else ValueError(
         "validation availability, split and ordered metric names/types must agree across ranks")
@@ -181,7 +214,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     early stops the pool at the batch agreement rather than at a collective
     its peers have already left.
     """
-    summaries: dict[str, object] = {}
+    summaries = _Accumulators()
     scores: dict[str, float] = {}
     previews: tuple[Artifact, ...] = ()
     source = iterator = None
@@ -260,7 +293,7 @@ def _placed_batch(mesh: Mesh, batch: Batch, index: int) -> tuple[Batch, int]:
 
 def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, batch: Batch,
                   context: Step, index: int, *, metrics: Sequence[Metric],
-                  summaries: dict[str, object], score_key: jax.Array, root: bool):
+                  summaries: _Accumulators, score_key: jax.Array, root: bool):
     """Score one batch into `summaries`, returning what the objective produced.
 
     The report and the batch come home together, so each metric on root
@@ -275,9 +308,7 @@ def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, bat
         def merge() -> None:
             if not root:
                 return
-            contribution = metric(_pick(artifacts, metric.reads), home)
-            summaries[metric.name] = (metric.merge(summaries[metric.name], contribution)
-                                      if metric.name in summaries else contribution)
+            summaries.add(metric, metric(_pick(artifacts, metric.reads), home))
 
         agreed(f"metric {metric.name} batch {index}", merge)
     return produced
@@ -297,7 +328,7 @@ def _previewed(objective: Objective[Loss, Effects], variables: Variables, batch:
     return _artifacts(produced) if root else ()
 
 
-def _finalized(metrics: Sequence[Metric], summaries: dict[str, object], *,
+def _finalized(metrics: Sequence[Metric], summaries: _Accumulators, *,
                split: str, root: bool) -> dict[str, float]:
     """Reduce each metric's accumulator to one number, agreeing per metric.
 
@@ -308,7 +339,7 @@ def _finalized(metrics: Sequence[Metric], summaries: dict[str, object], *,
     for metric in metrics:
         def finalize() -> None:
             if root:
-                scores[f"{split}/{metric.name}"] = float(metric.finalize(summaries[metric.name]))
+                scores[f"{split}/{metric.name}"] = summaries.finalize(metric)
 
         agreed(f"finalizing metric {metric.name}", finalize)
     return scores
