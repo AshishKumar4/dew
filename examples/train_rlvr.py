@@ -48,7 +48,7 @@ from dew.inference.tasks import SHAPE_BUCKETS
 from dew.inference import (
     NativeRolloutServer,
     OpenAICompletion,
-    OpenAIRolloutServer,
+    VLLMRolloutServer,
     SafetensorsReload,
     Server,
     TextGeneration,
@@ -196,7 +196,7 @@ def main(config: Config) -> dict:
         # keep-alive connection the server closed between requests.
         completion = OpenAICompletion("policy", openai.OpenAI(base_url=f"{root}/v1", api_key="none", max_retries=3,
                                                               timeout=600), provider="vllm")
-        server = OpenAIRolloutServer(completion, sampling, weights, workers=config.prompts * config.groups * 2)
+        server = VLLMRolloutServer(completion, sampling, weights, workers=config.prompts * config.groups * 2)
     else:
         raise ValueError(f"backend is native or vllm, got {config.backend!r}")
 

@@ -10,7 +10,7 @@ oldest weights that may have produced any of its tokens.
 
 Two backends fill the interface. `NativeRolloutServer` drives Dew's
 continuous-batching `Server` on a background thread and loads weights in
-process, copying the trainer's tree onto the served device. `OpenAIRolloutServer`
+process, copying the trainer's tree onto the served device. `VLLMRolloutServer`
 posts token ids to a vLLM completions endpoint through `OpenAICompletion` and
 reloads weights from disk: `SafetensorsReload` writes the policy in its Hugging
 Face layout with `Pretrained.save` and asks the engine to reload it.
@@ -265,7 +265,7 @@ class WeightSync(Protocol):
     def __call__(self, variables: Variables) -> None: ...
 
 
-class OpenAIRolloutServer:
+class VLLMRolloutServer:
     """Serve rollouts from a vLLM OpenAI-compatible completions endpoint.
 
     Each submission is one completion request of token ids, carrying the
