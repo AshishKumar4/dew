@@ -137,8 +137,8 @@ class Launch:
         cwd = self.cwd or os.getcwd()
         assignments = " ".join(f"{name}={shlex.quote(value)}" for name, value in env.items())
         script = f"cd {shlex.quote(cwd)} && exec env {assignments} {shlex.join(self.command)}"
-        # -tt gives the remote command a terminal, so closing the connection
-        # delivers SIGHUP to it and a killed launch leaves no orphan behind.
+        # -tt gives the remote command a terminal, so closing the connection,
+        # which stopping the pool does, delivers SIGHUP to it.
         return ("ssh", "-tt", "-o", "BatchMode=yes", host, script)
 
     def srun_argv(self) -> tuple[str, ...]:
@@ -190,6 +190,18 @@ def _stop(running: Sequence[subprocess.Popen]) -> None:
             child.wait()
 
 
+class Stopped(BaseException):
+    """The launcher was told to stop by a signal; `code` is what it exits."""
+
+    def __init__(self, signum: int):
+        super().__init__(signum)
+        self.code = 128 + signum
+
+
+def _raise_stopped(signum: int, _frame: object) -> None:
+    raise Stopped(signum)
+
+
 def supervise(processes: Sequence[Process], cwd: str | None) -> int:
     """Run the pool with each line prefixed by its rank, and return the
     first failure's exit code, or 0.
@@ -197,10 +209,19 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
     A process that fails leaves its peers waiting in a collective for a
     partner that is gone, which on most backends is a hang rather than an
     error. So the first non-zero exit stops the rest.
+
+    Every rank runs in a session of its own, so no signal meant for the
+    launcher's terminal or process group reaches it. The launcher stops the
+    pool itself on SIGINT, SIGTERM (a scheduler's cancel) and SIGHUP (its
+    terminal or ssh session closing), and returns 128 plus the signal, as a
+    shell reports it. Any other exception stops the pool before it
+    propagates.
     """
     lock = threading.Lock()
     running: list[subprocess.Popen] = []
     relays = []
+    handlers = {signum: signal.signal(signum, _raise_stopped)
+                for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     try:
         for process in processes:
             local = process.host in LOCAL_HOSTS
@@ -225,10 +246,16 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
             if all(code == 0 for code in codes):
                 return 0
             time.sleep(POLL_SECONDS)
-    except KeyboardInterrupt:
+    except BaseException as error:
+        # A second signal while the pool stops would leave it half stopped.
+        for signum in handlers:
+            signal.signal(signum, signal.SIG_IGN)
         _stop(running)
-        return 130
+        if isinstance(error, Stopped):
+            return error.code
+        raise
     finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
         for relay in relays:
             relay.join(timeout=5)
-
