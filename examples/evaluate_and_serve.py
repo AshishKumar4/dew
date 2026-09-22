@@ -48,7 +48,7 @@ GREEDY = Sampling(temperature=0.0)
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 # An InceptionV3 at a sixteenth of every channel width with drawn
 # parameters: the FID path runs offline on it, and the value is its own.
-SMOKE_INCEPTION = FIXTURES / "inception/tiny/inception_v3_fid.pickle"
+SMOKE_INCEPTION = FIXTURES / "inception/tiny/inception_v3_fid.safetensors"
 
 
 @dataclass

@@ -51,7 +51,7 @@ SMOKE_CLIP = Path(__file__).resolve().parents[1] / "tests/fixtures/clip/tiny"
 # The FID extractor at a sixteenth of every channel width, drawn rather than
 # trained: the same pooled statistics and distance, on numbers of its own.
 SMOKE_INCEPTION = (Path(__file__).resolve().parents[1]
-                   / "tests/fixtures/inception/tiny/inception_v3_fid.pickle")
+                   / "tests/fixtures/inception/tiny/inception_v3_fid.safetensors")
 
 
 @dataclass
