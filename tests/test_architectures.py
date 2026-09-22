@@ -223,9 +223,8 @@ CASES = [
     Case("causal_transformer", {
         **LM, "head_dim": 8, "qk_norm": False,
         "layer_types": ("chunked_attention", "full_attention"),
-        "kinds": {"chunked_attention": {"mixer": {
-                      "kind": "llama4", "use_rope": True, "attention_chunk_size": 4,
-                      "floor_scale": 4.0}},
+        "kinds": {"chunked_attention": {"chunk": 4, "mixer": {
+                      "kind": "llama4", "use_rope": True, "floor_scale": 4.0}},
                   "full_attention": {"mixer": {"kind": "llama4", "use_rope": False,
                                                "floor_scale": 4.0}}},
         "mixture": {"experts": 8, "top_k": 1, "every": 2, "score_function": "sigmoid",

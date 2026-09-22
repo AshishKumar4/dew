@@ -3124,7 +3124,7 @@ def test_llama4_config_translates_field_by_field():
             "floor_scale": 4.0, "attn_scale": 0.1}
     assert config["kinds"] == {
         "full_attention": {"mixer": {**rule, "use_rope": False}},
-        "chunked_attention": {"mixer": {**rule, "use_rope": True, "attention_chunk_size": 4}}}
+        "chunked_attention": {"chunk": 4, "mixer": {**rule, "use_rope": True}}}
     assert config["mixture"] == {
         "experts": 4, "top_k": 2, "score_function": "sigmoid", "norm_topk_prob": False,
         "scale_inputs": True, "expert_features": 48, "shared_features": 48, "layers": (1, 3)}
@@ -3149,8 +3149,8 @@ def test_the_real_llama_4_scout_text_config_translates():
         "experts": 16, "top_k": 1, "score_function": "sigmoid", "norm_topk_prob": False,
         "scale_inputs": True, "expert_features": 8192, "shared_features": 8192, "every": 1}
     assert config["mlp_features"] == 16384 and config["vocab_size"] == 202048
-    local = config["kinds"]["chunked_attention"]["mixer"]
-    assert local["attention_chunk_size"] == 8192 and local["floor_scale"] == 8192.0
+    local = config["kinds"]["chunked_attention"]
+    assert local["chunk"] == 8192 and local["mixer"]["floor_scale"] == 8192.0
     assert config["rope_theta"] == 500000.0
     assert config["rope_scaling"] == {
         "rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
@@ -3197,6 +3197,18 @@ def test_llama4_logits_match_the_reference_implementation():
 def test_llama4_export_is_refused_by_name(tmp_path):
     model, variables = fp32_decoder(LLAMA4)
     with pytest.raises(ValueError, match="a mixer other than attention"):
+        save_pretrained_decoder(model, variables, str(tmp_path))
+
+
+def test_a_chunked_kind_no_config_carries_is_refused_on_export(tmp_path):
+    """Only Llama 4's config spells a chunk; a llama-family export of a
+    chunked attention kind would write a model that attends everything."""
+    model = CausalTransformer(
+        vocab_size=32, num_layers=2, emb_features=16, num_heads=2, max_seq_len=16,
+        layer_types=("chunked_attention", "full_attention"),
+        kinds={"chunked_attention": {"chunk": 4}})
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    with pytest.raises(ValueError, match="chunk"):
         save_pretrained_decoder(model, variables, str(tmp_path))
 
 

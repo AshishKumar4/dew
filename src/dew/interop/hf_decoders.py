@@ -1778,13 +1778,14 @@ def _flatten(tree: Mapping[str, object], prefix: str = '') -> Variables:
 def _export_config(model) -> Mapping[str, object]:
     """Write a CausalTransformer's fields back into HF vocabulary."""
     family = _family_for_model(model)
+    exported = family.export_fields(model)
     chunked = sorted(name for name, kind in (model.kinds or {}).items() if kind.chunk is not None)
-    if chunked:
-        # Llama 4 chunks through its own mixer's attention_chunk_size; no HF
-        # decoder config carries a chunk on a plain attention kind.
+    if chunked and 'attention_chunk_size' not in exported:
+        # Llama 4's attention_chunk_size is the one config field a chunk
+        # goes back out under.
         raise ValueError(
-            f"kinds {chunked} attend by chunk, which no HF decoder config of a "
-            f"plain attention layer carries")
+            f"kinds {chunked} attend by chunk, which the {family.export_model_type} "
+            f"config does not carry")
     sandwich = bool(model.sandwich_norms)
     config: dict[str, object] = {
         'model_type': family.export_model_type,
@@ -1877,7 +1878,7 @@ def _export_config(model) -> Mapping[str, object]:
         config.pop('rope_local_base_freq', None)
     elif ramped:
         config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
-    config.update(family.export_fields(model))
+    config.update(exported)
     return {key: value for key, value in config.items() if value is not None or key == 'pad_token_id'}
 
 
@@ -2039,7 +2040,7 @@ from dew.interop.families.glm import (
 )
 from dew.interop.families.gpt_oss import _gpt_oss_config, _gpt_oss_export, _gpt_oss_export_path, _gpt_oss_path
 from dew.interop.families.llama import _mistral_config, _mixtral_config, _mixtral_path
-from dew.interop.families.llama4 import _llama4_config, _llama4_path, _llama4_prepare
+from dew.interop.families.llama4 import _llama4_config, _llama4_export, _llama4_path, _llama4_prepare
 from dew.interop.families.masked_diffusion import (
     _diffusion_gemma_export,
     _diffusion_gemma_text_config,
@@ -2100,7 +2101,7 @@ _FAMILY_ENTRIES = (
                   preserve_source_layout=False),
     DecoderFamily(('llama4_text',), _llama4_config,
                   lambda fields: any(isinstance(mixer, Llama4Mixer) for mixer in _kind_mixers(fields)),
-                  'llama4_text', 'Llama4ForCausalLM', lambda model: {},
+                  'llama4_text', 'Llama4ForCausalLM', _llama4_export,
                   weight_path=_llama4_path, prepare_weights=_llama4_prepare, preserve_source_layout=True),
     DecoderFamily(('glm4_moe',), _glm4_moe_config,
                   lambda fields: (fields.get('partial_rotary_type') == 'default'

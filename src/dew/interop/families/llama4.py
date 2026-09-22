@@ -70,8 +70,8 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     chunk = hf_config.get('attention_chunk_size')
     kinds: dict[str, KindFields] = {
         'full_attention': {'mixer': {**rule, 'use_rope': False}},
-        'chunked_attention': {'mixer': {**rule, 'use_rope': True,
-                                        'attention_chunk_size': None if chunk is None else records.integer(chunk, 'attention_chunk_size')}},
+        'chunked_attention': {'chunk': None if chunk is None else records.integer(chunk, 'attention_chunk_size'),
+                              'mixer': {**rule, 'use_rope': True}},
     }
     moe_layers = hf_config.get('moe_layers')
     step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
@@ -97,6 +97,17 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         mixture=mixture,
     )
     return config
+
+
+def _llama4_export(model) -> dict[str, object]:
+    """The config field the rotated layers' chunk goes back out under: every
+    chunked kind shares Llama 4's one `attention_chunk_size`."""
+    chunks = {kind.chunk for kind in (model.kinds or {}).values() if kind.chunk is not None}
+    if len(chunks) > 1:
+        raise ValueError(
+            f"the kinds chunk at {sorted(chunks)}, and Llama 4's config carries one "
+            "attention_chunk_size")
+    return {'attention_chunk_size': chunks.pop() if chunks else None}
 
 
 def _llama4_prepare(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
