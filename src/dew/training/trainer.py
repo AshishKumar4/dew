@@ -380,7 +380,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master and FROZEN in abstract.params:
             abstract = dataclasses.replace(abstract, params={**abstract.params, FROZEN: self._banked_frozen(
                 abstract.params[FROZEN],
-                lambda rows: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
+                lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         template = jax.tree.map(
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
             abstract, shardings)
@@ -431,24 +431,36 @@ class Trainer(Generic[Loss, Effects]):
         transient is one leaf, not the tree, and one JIT could not have
         returned to the two device sets anyway.
         """
-        from dew.training.host import stream, transfer
+        from dew.training.host import evict, place_leaf, stream, transfer
         held = self.objective.held_variables()
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
             if FROZEN in state.params:
-                # A scanned run's frozen rows become its bank here, on the
-                # CPU, and the held tree holds the bank where each row was, so
-                # the row is let go and `stream` updates both trees to the
-                # placed bank as it lands: the bank is the one copy. An
+                # A scanned run's frozen rows become its bank here and the
+                # bank lands where it stays resident before the next is
+                # stacked, so the host holds one bank in transit, not the
+                # stack; the rows' pages are let go as it lands and the held
+                # tree holds the placed bank where each row was. An
                 # objective placed this way holds banks at its rows afterwards
                 # and does not seed a second trainer.
+                targets = shardings.params[FROZEN]
+
+                def stack(rows, path):
+                    target = targets
+                    for component in path:
+                        target = target[component]
+                    bank = place_leaf(jnp.stack(rows), target)
+                    for row in rows:
+                        evict(np.asarray(row))
+                    return bank
+
                 def release(namespace, index, keys, bank):
                     node = held["params"] if held is not None else None
                     for component in (*namespace, f"layers_{index}", *keys[:-1]):
                         node = node.get(component) if isinstance(node, dict) else None
                     if isinstance(node, dict) and keys[-1] in node:
                         node[keys[-1]] = bank
-                frozen = self._banked_frozen(state.params[FROZEN], jnp.stack, release)
+                frozen = self._banked_frozen(state.params[FROZEN], stack, release)
                 state = dataclasses.replace(state, params={**state.params, FROZEN: frozen})
         params = stream(state.params, shardings.params, held)
         ema = None if state.ema is None else stream(state.ema, shardings.ema)
