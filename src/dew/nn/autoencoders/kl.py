@@ -9,6 +9,22 @@ from flax.typing import Dtype
 from .vae import FlaxDecoder, FlaxEncoder
 
 
+def diagonal_gaussian(moments: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Split encoder moments on the channel axis into the posterior's mean
+    and standard deviation, the log-variance clamped to [-30, 20] as
+    diffusers' `DiagonalGaussianDistribution` clamps it."""
+    mean, log_variance = jnp.split(moments, 2, axis=-1)
+    return mean, jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+
+
+def posterior_latent(moments: jnp.ndarray, key: jax.Array | None) -> jnp.ndarray:
+    """The posterior mean when `key` is None, else one draw from it."""
+    mean, deviation = diagonal_gaussian(moments)
+    if key is None:
+        return mean
+    return mean + deviation * jax.random.normal(key, mean.shape, dtype=mean.dtype)
+
+
 class AutoencoderKL(nn.Module):
     """NHWC image/latent arrays; scaling and shifts belong to AutoEncoder.
 
@@ -46,11 +62,7 @@ class AutoencoderKL(nn.Module):
         moments = self.encoder(image)
         if self.quantize:
             moments = self.quant_conv(moments)
-        mean, log_variance = jnp.split(moments, 2, axis=-1)
-        if key is None:
-            return mean
-        deviation = jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
-        return mean + deviation * jax.random.normal(key, mean.shape, dtype=mean.dtype)
+        return posterior_latent(moments, key)
 
     def decode(self, latents):
         if self.post_quantize:
