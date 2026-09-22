@@ -702,6 +702,15 @@ def test_a_failing_metric_fails_the_validation_pass():
                                                log_every=1, eval_every=1, metrics=(Broken(),))
 
 
+def test_a_scheduled_validation_pass_with_no_consumer_is_refused():
+    """eval_every with neither metrics nor a tracked preview would open
+    nothing and report nothing; the contradiction is named before training."""
+    with pytest.raises(ValueError, match="nothing consumes"):
+        make_trainer().fit(Data(val=val_batches(1)), steps=1, log_every=1, eval_every=1)
+    with pytest.raises(ValueError, match="needs a tracker"):
+        make_trainer().fit(Data(val=val_batches(1)), steps=1, log_every=1, eval_every=1, preview=True)
+
+
 def test_a_failing_validation_loader_fails_the_pass():
     class UnreadableSplit:
         def __iter__(self):
@@ -811,7 +820,7 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
     clock = ManualClock()
     monkeypatch.setattr(trainer_module, "time", clock)
     tracker = RecordingTracker()
-    trainer = make_trainer(tmp_path, tracker=tracker)
+    trainer = make_trainer(tmp_path, objective=Features(), tracker=tracker)
     compile_step, evaluate, save = trainer.compile, trainer_module.evaluate, trainer.checkpoints.save
 
     def compile_then_time_each_step(*args):
@@ -835,7 +844,8 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
     monkeypatch.setattr(trainer_module, "evaluate", slow_evaluate)
     monkeypatch.setattr(trainer.checkpoints, "save", slow_save)
-    trainer.fit(Data(val=val_batches()), steps=4, log_every=1, eval_every=2, checkpoint_every=2)
+    trainer.fit(Data(val=val_batches()), steps=4, log_every=1, eval_every=2, checkpoint_every=2,
+                metrics=(Spread([]),))
 
     goodput = [s for _, s in tracker.scalars if "goodput/step_fraction" in s]
     assert len(goodput) == 1

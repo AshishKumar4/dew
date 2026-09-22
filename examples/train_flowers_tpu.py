@@ -113,7 +113,10 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         sampling_steps=2,
         ema_decay=0.9,
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
-        val_metrics=(),
+        # A validation pass needs a consumer; a smoke that walks the
+        # validation path names a metric that downloads nothing (fid and
+        # clip_score pull their own weights).
+        val_metrics=("psnr",),
         optim=OptimConfig(learning_rate=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), batch_size=4, steps=3,
                               log_every=1, eval_every=3, checkpoint_every=3,
