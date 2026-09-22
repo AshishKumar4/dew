@@ -634,6 +634,21 @@ def cudnn_runs(query, softcap=None) -> bool:
             and softcap is None and not deterministic_ops_requested())
 
 
+def weighted_values(equation, weights, value, *, precision=None):
+    """The probability-value product, with the probabilities in the value's dtype.
+
+    An fp32 softmax leaves fp32 probabilities, and `jnp.einsum` promotes to
+    the wider operand, so multiplying them by a bf16 value would run both
+    sides at the fp32 rate - forward and backward, since the product's
+    cotangent is then fp32 too. Rounding the probabilities first is what
+    `jax.nn.dot_product_attention` does on its own xla path
+    (`probs.astype(key.dtype)`), so the two paths multiply alike; the softmax
+    that produced them still reduced in fp32, which is where the precision
+    was needed.
+    """
+    return jnp.einsum(equation, weights.astype(value.dtype), value, precision=precision)
+
+
 def softcapped_attention(query, key, value, softcap: float, dtype=None, precision=None,
                          force_fp32_for_softmax=True, mask=None, bias=None):
     """Attend with Gemma 2's tanh softcap on the logits, in plain XLA ops.
@@ -659,7 +674,7 @@ def softcapped_attention(query, key, value, softcap: float, dtype=None, precisio
         weights = jax.nn.softmax(logits.astype(jnp.float32))
     else:
         weights = jax.nn.softmax(logits).astype(dtype)
-    return jnp.einsum('...hqk,...khd->...qhd', weights, value, precision=precision)
+    return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
 
 
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
@@ -841,8 +856,13 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                 force_fp32_for_softmax=force_fp32_for_softmax, mask=mask, bias=bias)
         return nn.dot_product_attention(
             query, key, value, bias=bias, mask=mask, dtype=dtype, broadcast_dropout=False,
-            dropout_rng=None, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
+            dropout_rng=None, precision=None,
+            force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True,
+            # flax takes the precision through these two or through
+            # `precision`, never both, and its own value product would
+            # multiply the fp32 probabilities by the bf16 value.
+            qk_attn_weights_einsum=functools.partial(jnp.einsum, precision=precision),
+            attn_weights_value_einsum=functools.partial(weighted_values, precision=precision))
 
     refuse_reference_only_arguments(
         implementation, query, dtype, precision, force_fp32_for_softmax)
