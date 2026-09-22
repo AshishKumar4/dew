@@ -26,10 +26,12 @@ carries the choice: a `ModelConfig`, the modules' `attention_impl` field and
 
 'reference' is the portable einsum and softmax, the only path that reads
 dtype, precision and force_fp32_for_softmax; 'xla' and 'cudnn' are
-`jax.nn.dot_product_attention`'s own two; 'tpu' is the pallas flash kernel;
-'auto' is cudnn where its kernel runs and xla anywhere else, resolved per
-trace. A module field spells 'reference' as None as well, which is what a
-module built in code without the field set runs.
+`jax.nn.dot_product_attention`'s own two; 'tpu' is the pallas splash kernel,
+with the older pallas flash kernel behind it for the calls splash's mask
+descriptor cannot carry; 'auto' is cudnn where its kernel runs and xla anywhere
+else, resolved per trace. A module field
+spells 'reference' as None as well, which is what a module built in code
+without the field set runs.
 """
 
 
@@ -664,7 +666,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
       inputs, a query head width that is a multiple of 8 and at most 128, no
       softcap, and no `--xla_gpu_deterministic_ops` on the run), 'xla'
       anywhere else. Resolved per trace, so a config logged as 'auto' still
-      runs on the next machine.
+      runs on the next machine. A tpu backend gets xla here until the rule
+      reads splash's own constraints.
     - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
       fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
       or softmax argument: the logits accumulate and the softmax runs in fp32
@@ -675,9 +678,18 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
       value wider than the query has no fused rewrite and raises, and so does
       an explicit 'cudnn' under `--xla_gpu_deterministic_ops`, whose backward
       pass XLA cannot execute (openxla/xla#46500).
-    - 'tpu': the pallas TPU flash kernel, with the 1/sqrt(d) scale passed
-      explicitly (the deleted EfficientAttention passed none, which inflated
-      the logits by sqrt(d) and made its checkpoints poisonous).
+    - 'tpu': the pallas splash kernel (`tpu_attention`), whose mask is a
+      block-sparse descriptor built at trace time, so a causal or windowed
+      long sequence costs its live blocks rather than its rectangle. The
+      1/sqrt(d) scale goes onto the query, in the query's dtype, because the
+      kernel has no scale argument of its own (the deleted EfficientAttention
+      passed none to a kernel that wanted one, which inflated the logits by
+      sqrt(d) and made its checkpoints poisonous). The older pallas flash
+      kernel stays behind it for the calls splash has no form for: an
+      additive bias, a mask that is a value of the trace, and a length that
+      is not a multiple of 128. Off a tpu backend the kernel runs under
+      pallas's interpreter, which computes the same numbers far more slowly;
+      'auto' never selects it there.
 
     causal restricts query i to keys 0..i, top-left aligned like jax's
     is_causal; sliding_window=w narrows that to the w most recent keys. Both
@@ -685,10 +697,13 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     `mask` instead (built by causal_attention_mask over the cache slots): a
     step's single query sits at the cache index, not at row 0. The fused
     kernels take causality and the window as flags, which saves the memory of
-    a materialized mask; the TPU kernel has no mask argument, so an explicit
-    mask rides in there as an additive bias.
+    a materialized mask; splash takes them as a descriptor, which additionally
+    saves visiting the blocks they empty, and the pallas flash kernel behind
+    it has no mask argument at all, so an explicit mask rides in there as an
+    additive bias.
     `bias` is an additive float array broadcastable to [B, H, Q, K], added to
-    the logits on every path; T5's relative position table travels in it.
+    the logits on every path; T5's relative position table travels in it, and
+    it is the one argument splash has no form for.
     `sinks` holds one learned, value-free logit per query head. The reference
     and xla paths include it in the denominator; auto chooses xla, and the
     fused cudnn and tpu kernels refuse it.
@@ -840,33 +855,236 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
             implementation='xla')
     elif implementation == 'tpu':
-        from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
-        heads = query.shape[-2]
-        key = repeat_kv_heads(key, heads)
-        value = repeat_kv_heads(value, heads)
-        # pallas wants [B, H, S, D]
-        q = jnp.moveaxis(query, -2, -3)
-        k = jnp.moveaxis(key, -2, -3)
-        v = jnp.moveaxis(value, -2, -3)
-        combined = None
-        if bias is not None:
-            combined = jnp.broadcast_to(bias.astype(q.dtype),
-                                        (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
-        if sliding_window is not None:
-            band = causal_attention_mask(
-                jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
-            mask = band if mask is None else jnp.logical_and(mask, band)
-        if mask is not None:
-            seated = jnp.broadcast_to(
-                jnp.where(mask, 0, jnp.finfo(q.dtype).min).astype(q.dtype),
-                (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
-            combined = seated if combined is None else combined + seated
-        out = jnp.moveaxis(
-            flash_attention(q, k, v, ab=combined, causal=causal,
-                            sm_scale=1.0 / math.sqrt(query.shape[-1])), -3, -2)
+        out = tpu_attention(query, key, value, bias, mask, causal, sliding_window,
+                            interpret=jax.default_backend() != 'tpu')
     else:
         raise ValueError(f"Unknown attention implementation: {implementation}")
     return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
+
+
+# Splash's tile sizes, one constant for every block the kernel names. The
+# forward kernel holds a [block_q, block_kv] fp32 logit tile, an fp32
+# [block_q, head_dim] output accumulator and the q, k and v blocks in VMEM at
+# once: at 512 that is 1 MiB of logits and a few hundred KiB of operands,
+# double-buffered by the pipeline and still far inside a core's VMEM at the
+# head widths a decoder has, while jax's own BlockSizes.get_default() of 128
+# hands the MXU a sixteenth of that tile per pass. `splash_block_sizes`
+# narrows it to a divisor of each sequence, which is what the mask blocking
+# needs; a longer sequence therefore gets 512 and a short one gets itself.
+SPLASH_BLOCK = 512
+# The kernel tiles the key axis by lanes: the compute block must be a whole
+# number of them (`{bkv_compute=} must be a multiple of {NUM_LANES=}`,
+# splash_attention_kernel.py:970-971) and the mask blocking must divide both
+# sequences (splash_attention_mask_info.py:565-571), so a length that is not
+# a multiple of this has no legal block size and never reaches splash.
+SPLASH_LANES = 128
+# What the kernel accumulates in is fp32 whatever comes in: the logits carry
+# preferred_element_type=float32 and the running max, sum and output stay
+# fp32 to the last block, which is the reference softmax. These are the two
+# input dtypes a TPU matmul takes; fp16 has no MXU path.
+SPLASH_DTYPES = (jnp.bfloat16, jnp.float32)
+# How much of an explicit boolean mask splash will carry. The array is read
+# on the host while the executable is built and its unresolved blocks are
+# stored dense inside it, so this bounds host and executable bytes, not
+# device memory that grows with the batch. 4 Mi cells is a 16-head 512x512.
+SPLASH_DENSE_MASK_CELLS = 1 << 22
+
+
+def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
+                  interpret: bool):
+    """The pallas TPU path: splash where its descriptor covers the call, the
+    older pallas flash kernel everywhere else.
+
+    Splash is the block-sparse kernel. Its mask is a descriptor built while
+    the executable is, the blocks that descriptor empties are never visited,
+    and a causal or windowed long sequence costs what its live blocks cost
+    rather than what its rectangle does. What it has no form for is a value
+    of the trace: there is no bias argument at all, and the mask has to be
+    readable on the host. Flash takes both, as one additive [B, H, Q, K]
+    array, and pays the whole rectangle for them, so it stays for exactly
+    these calls:
+
+    - an additive `bias`, which is T5's relative position table;
+    - a `mask` that is a tracer (a KV-cache decode mask over slots, a packed
+      batch's segment mask, the striped mask sequence parallelism builds), or
+      one past `SPLASH_DENSE_MASK_CELLS`, or one that differs by batch row;
+    - a query or key length that is not a multiple of `SPLASH_LANES`, which
+      leaves the mask blocking no block size that divides its sequence.
+
+    `interpret` runs splash under pallas's interpreter instead of Mosaic,
+    which is what lets the same arithmetic, forward and backward, run off a
+    TPU and what the parity tests use. It is far slower than XLA's attention,
+    so it exists for an explicit 'tpu' and never for 'auto'. The flash kernel
+    takes no such argument, so the calls that fall through to it run on a TPU
+    and nowhere else.
+    """
+    q_len, kv_len = query.shape[-3], key.shape[-3]
+    descriptor = None
+    if bias is None and not (q_len % SPLASH_LANES or kv_len % SPLASH_LANES):
+        descriptor = splash_mask_descriptor(
+            q_len, kv_len, query.shape[-2], causal, sliding_window, mask)
+    if descriptor is not None:
+        return splash_attention(query, key, value, descriptor, interpret=interpret)
+    return pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window)
+
+
+def splash_attention(query, key, value, descriptor, *, interpret: bool):
+    """The splash kernel over [B, S, H, D] arrays under `descriptor`.
+
+    The kernel takes one example at a time, as [H, S, D] with the head width
+    minor, so the batch rides in on a vmap and the seam is two transposes.
+    It applies no scale of its own, unlike the flash kernel's `sm_scale`, so
+    the 1/sqrt(d) goes onto the query in the query's own dtype: that is where
+    flax's reference path puts it (`query / jnp.sqrt(depth)` in
+    dot_product_attention_weights), which is what makes the two agree exactly
+    in fp32 rather than to a rounding of the scale. Grouped key heads stay
+    grouped, because splash reads q_heads % kv_heads itself, so this path
+    never materializes the repeated keys the flash path needs.
+    """
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+
+    kernel = splash_attention_kernel.make_splash_mha(
+        descriptor, block_sizes=splash_block_sizes(query.shape[-3], key.shape[-3]),
+        head_shards=1, q_seq_shards=1, interpret=interpret)
+    scale = jnp.asarray(1.0 / math.sqrt(query.shape[-1]), query.dtype)
+    attended = jax.vmap(kernel)(jnp.moveaxis(query, -2, -3) * scale,
+                                jnp.moveaxis(key, -2, -3), jnp.moveaxis(value, -2, -3))
+    if isinstance(attended, tuple):
+        # make_splash_mha(save_residuals=True) returns the logsumexp beside
+        # the output, and this builds a kernel without it, so the pair is a
+        # kernel someone else built. Narrowed rather than asserted, because a
+        # cast is evidence nobody produced.
+        raise ValueError("splash returned residuals this path has no consumer for")
+    return jnp.moveaxis(attended, -3, -2)
+
+
+def splash_block_sizes(q_len: int, kv_len: int):
+    """`SPLASH_BLOCK` narrowed to a divisor of each sequence, forward and
+    backward.
+
+    The greatest common divisor satisfies both of the kernel's stated rules
+    at once: it divides its sequence, which the mask blocking requires, and
+    it stays a multiple of `SPLASH_LANES`, which the key compute block
+    requires, because the constant and the admitted lengths are both
+    multiples of it. The backward blocks are filled in because a kernel built
+    without them raises "Need to specify backward blocks." from inside its
+    own vjp, which a training run would meet at its first gradient rather
+    than at trace time.
+    """
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+
+    block_q, block_kv = math.gcd(SPLASH_BLOCK, q_len), math.gcd(SPLASH_BLOCK, kv_len)
+    return splash_attention_kernel.BlockSizes(
+        block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv,
+        block_q_dkv=block_q, block_kv_dkv=block_kv, block_kv_dkv_compute=block_kv,
+        block_q_dq=block_q, block_kv_dq=block_kv)
+
+
+def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
+                           sliding_window: int | None, mask):
+    """Splash's mask for one call, or None when the call's mask is not one
+    splash describes.
+
+    The structural part is a function of the two indices, not an array:
+    CausalMask and LocalMask carry the comparison the kernel evaluates per
+    block, so the blocks they empty are dropped from the grid and nothing
+    proportional to Q*K is stored. Dew's window is causal already
+    (`causal_attention_mask` keeps k <= q before it narrows to the w most
+    recent keys, which is what the xla path spells `local_window_size=(w-1,
+    0)`), so a window replaces the causal flag here instead of sitting beside
+    it. An explicit boolean mask has no such form: it is ANDed in as dense
+    blocks, which is why only a concrete, small one is taken.
+    """
+    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+
+    shape = (q_len, kv_len)
+    if sliding_window is not None:
+        structural = splash_attention_mask.LocalMask(shape, (sliding_window - 1, 0), 0)
+    elif causal:
+        structural = splash_attention_mask.CausalMask(shape)
+    else:
+        structural = splash_attention_mask.FullMask(shape)
+    if mask is None:
+        return splash_attention_mask.MultiHeadMask([structural] * heads)
+    per_head = splash_dense_mask(mask, q_len, kv_len, heads)
+    if per_head is None:
+        return None
+    dense = [splash_attention_mask.NumpyMask(rows) for rows in per_head]
+    if isinstance(structural, splash_attention_mask.FullMask):
+        return splash_attention_mask.MultiHeadMask(dense)
+    return splash_attention_mask.MultiHeadMask(
+        [splash_attention_mask.LogicalAnd(structural, head) for head in dense])
+
+
+def splash_dense_mask(mask, q_len: int, kv_len: int, heads: int):
+    """An explicit mask as one host [Q, K] boolean array per query head, or
+    None when splash cannot carry it.
+
+    Three things put a mask out of reach. It is a value of the trace: the
+    descriptor is built while the executable is, so a mask that exists only
+    as a tracer cannot be read, and a decode mask over cache slots and a
+    packed batch's segment mask are both that. It has a batch axis wider than
+    one: splash indexes its mask by head and by position and has no batch
+    axis at all. Or it is large: the blocks the descriptor cannot resolve to
+    all-on or all-off are stored dense inside the executable, so past
+    `SPLASH_DENSE_MASK_CELLS` the additive-bias path is the cheaper one.
+
+    numpy and the tracer type are imported here rather than at the module:
+    this is the one place the mask leaves the trace, and splash's NumpyMask
+    is a host array.
+    """
+    import numpy as np
+    from jax.core import Tracer
+
+    if isinstance(mask, Tracer):
+        return None
+    dense = np.asarray(mask, bool)
+    while dense.ndim > 3 and dense.shape[0] == 1:
+        dense = dense[0]
+    if dense.ndim == 2:
+        dense = dense[None]
+    if dense.ndim != 3 or dense.shape[-2:] != (q_len, kv_len):
+        return None
+    if dense.shape[0] not in (1, heads) or dense.size > SPLASH_DENSE_MASK_CELLS:
+        return None
+    return [dense[head % dense.shape[0]] for head in range(heads)]
+
+
+def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window):
+    """The pallas TPU flash kernel, with every mask as an additive bias.
+
+    The kernel has no mask argument, so a window and an explicit mask become
+    one [B, H, Q, K] float array of zeros and the dtype's minimum, added to
+    the logits; only causality is a flag it takes. That array is the whole
+    rectangle, which is what splash exists to avoid, so this path runs for
+    the calls `tpu_attention` names and not for the others. The 1/sqrt(d)
+    scale is the kernel's own `sm_scale` here.
+    """
+    from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+
+    heads = query.shape[-2]
+    key = repeat_kv_heads(key, heads)
+    value = repeat_kv_heads(value, heads)
+    # pallas wants [B, H, S, D]
+    q = jnp.moveaxis(query, -2, -3)
+    k = jnp.moveaxis(key, -2, -3)
+    v = jnp.moveaxis(value, -2, -3)
+    combined = None
+    if bias is not None:
+        combined = jnp.broadcast_to(bias.astype(q.dtype),
+                                    (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
+    if sliding_window is not None:
+        band = causal_attention_mask(
+            jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
+        mask = band if mask is None else jnp.logical_and(mask, band)
+    if mask is not None:
+        seated = jnp.broadcast_to(
+            jnp.where(mask, 0, jnp.finfo(q.dtype).min).astype(q.dtype),
+            (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
+        combined = seated if combined is None else combined + seated
+    return jnp.moveaxis(
+        flash_attention(q, k, v, ab=combined, causal=causal,
+                        sm_scale=1.0 / math.sqrt(query.shape[-1])), -3, -2)
 
 
 @logical_axes({
