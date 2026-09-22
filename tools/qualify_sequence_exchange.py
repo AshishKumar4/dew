@@ -9,8 +9,11 @@ axis has one shard, so the all-to-alls move nothing; the lowering is what one
 chip can prove. With a chip count the heads divide, the sequence axis takes
 every chip and the exchange is real.
 
-Prints one JSON line per case: the largest output and gradient differences,
-and the median step time of the exchange and of whole-sequence splash.
+Prints one JSON line per case: the largest output and gradient differences
+against XLA's attention and against whole-sequence splash, and the median
+backward time of the exchange and of whole-sequence splash. Run it at the
+default matmul precision: splash's Mosaic matmul does not compile fp32
+operands under JAX_DEFAULT_MATMUL_PRECISION=highest on jax 0.11.1.
 """
 
 import functools
@@ -64,7 +67,9 @@ def case(batch: int, seq: int, heads: int, kv_heads: int, head_dim: int, dtype) 
     reference = functools.partial(whole, xla)
     want = jax.jit(reference)(query, key, value)
     want_grads = jax.jit(jax.grad(loss(reference), argnums=(0, 1, 2)))(query, key, value)
-    splash_backward = jax.jit(jax.grad(loss(functools.partial(whole, splash)), argnums=(0, 1, 2)))
+    plain = functools.partial(whole, splash)
+    splash_backward = jax.jit(jax.grad(loss(plain), argnums=(0, 1, 2)))
+    plain_grads = splash_backward(query, key, value)
 
     def gap(a, b):
         return float(jnp.max(jnp.abs(a.astype(jnp.float32) - b.astype(jnp.float32))))
@@ -75,6 +80,9 @@ def case(batch: int, seq: int, heads: int, kv_heads: int, head_dim: int, dtype) 
         "shape": [batch, seq, heads, kv_heads, head_dim],
         "output_gap": gap(out, want),
         "gradient_gap": max(gap(a, b) for a, b in zip(grads, want_grads, strict=True)),
+        "gap_to_whole_splash": gap(out, jax.jit(plain)(query, key, value)),
+        "gradient_gap_to_whole_splash": max(
+            gap(a, b) for a, b in zip(grads, plain_grads, strict=True)),
         "gradient_scale": max(float(jnp.max(jnp.abs(g.astype(jnp.float32)))) for g in want_grads),
         "exchange_backward_s": exchange_time,
         "splash_backward_s": timed(splash_backward, query, key, value),
