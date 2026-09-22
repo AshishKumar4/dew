@@ -846,7 +846,7 @@ with LocalTracker("runs/lm-report", plots=True) as tracker:
     print(result.scores)
 ```
 
-This run reports perplexity around 1.002 and saves the training-loss curve, scalar journal, and generated text under `runs/lm-report`. Plots render when the tracker closes, rather than on every training step. Use `plots=False` for scalar/artifact recording only, or call `tracker.plot()` explicitly. [`examples/evaluate_and_serve.py`](examples/evaluate_and_serve.py) scores a finished run the same way and adds an lm-eval-harness suite, image metrics, and a served-model comparison.
+This run reports perplexity around 1.002 and saves the training-loss curve, scalar journal, and generated text under `runs/lm-report`. The tracker renders plots once, when it closes. Use `plots=False` to record only scalars and artifacts, or call `tracker.plot()` yourself. [`examples/evaluate_and_serve.py`](examples/evaluate_and_serve.py) scores a finished run the same way and adds an lm-eval-harness suite, image metrics, and a served-model comparison.
 
 `Trackers` sends the same reports to several backends, and you switch a backend by changing its constructor. Install `dew-ml[wandb]`, `dew-ml[mlflow]` or `dew-ml[tensorboard]` for the backend you want:
 
@@ -1143,9 +1143,8 @@ EOF
 ollama create dew-decoder -f Modelfile
 ```
 
-`num_gpu 0` keeps the runner on the CPU, and `TEMPLATE "{{ .Prompt }}"` passes
-the prompt through unchanged, which is what makes the served draw comparable to
-the local one.
+`num_gpu 0` keeps the runner on the CPU. `TEMPLATE "{{ .Prompt }}"` passes
+the prompt through unchanged, so the served draw is comparable to the local one.
 
 `OllamaCompletion` and `OpenAICompletion` wrap the vendors' own SDK clients,
 which you construct and own. Pass a `Sampling` to request the same sampling
@@ -1193,7 +1192,7 @@ accept them.
 
 `MeshSpec` describes the device topology; `Layout` maps model dimensions onto it. For example, `MeshSpec(fsdp=4)` splits eligible parameters and optimizer state over four devices. The remaining devices form the data-parallel axis. Use the same `Trainer` interface on one device or a mesh.
 
-The mesh also supports expert, tensor, sequence, and stage axes. Sequence-parallel attention exchanges the keys and values that local queries need. The GPipe stage axis partitions the execution view; parameters and optimizer state stay replicated across stages, so a stage split saves activation memory rather than parameter memory.
+The mesh also supports expert, tensor, sequence, and stage axes. Sequence-parallel attention exchanges the keys and values that local queries need. The stage axis runs a GPipe schedule: each stage computes its own layers on its own devices. The stored parameters and optimizer state stay replicated across stages, so a stage split saves activation memory and does not save parameter memory.
 
 Models use configurable compute dtypes and hardware-dependent attention kernels: cuDNN on compatible NVIDIA GPU shapes, a Pallas TPU path, and XLA implementations for other configurations. Qwix supplies optional int8/fp8 computation, and MuonClip adds per-head QK clipping to Muon. Quantized weight loading is separate from quantized training.
 
