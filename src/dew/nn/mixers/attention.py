@@ -454,9 +454,9 @@ class CausalSelfAttention(nn.Module):
             key_places = (jnp.arange(key.shape[-3]) if decode else positions)
             if attention_metadata is not None and attention_metadata.key_positions is not None:
                 key_places = attention_metadata.key_positions
-            mask = jnp.logical_and(
-                combined_attention_mask(S, key.shape[-3], causal, window, mask),
-                chunk_mask(positions, key_places, self.attention_chunk))
+            chunked = chunk_mask(positions, key_places, self.attention_chunk)
+            base = combined_attention_mask(S, key.shape[-3], causal, window, mask)
+            mask = chunked if base is None else base & chunked
             causal, window = False, None
             implementation = masked
         # The per-head maxima the QK-Clip reads. Computed only when a caller
