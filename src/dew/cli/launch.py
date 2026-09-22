@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from collections.abc import Sequence
 from typing import Annotated, TextIO
 
@@ -216,7 +217,7 @@ class Stopped(BaseException):
         self.code = 128 + signum
 
 
-def _raise_stopped(signum: int, _frame: object) -> None:
+def _raise_stopped(signum: int, _frame: types.FrameType | None) -> None:
     raise Stopped(signum)
 
 
@@ -275,7 +276,7 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
             return error.code
         raise
     finally:
-        for signum, handler in handlers.items():
-            signal.signal(signum, handler)
+        for signum, previous in handlers.items():
+            signal.signal(signum, previous)
         for relay in relays:
             relay.join(timeout=5)
