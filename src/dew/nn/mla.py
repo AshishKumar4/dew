@@ -894,9 +894,20 @@ class MultiHeadLatentAttention(nn.Module):
         kernel would read keys the selection drops. A selection as wide as
         the sequence is every allowed key, which the dense kernel under the
         allowed mask computes. An open `qk` collection reads the dense
-        logits for its maxima, so it keeps the masked kernel.
+        logits for its maxima, so it keeps the masked kernel, and so does a
+        call whose `kv_b_proj` input is drawn on (`stochastic_input`): the
+        absorbed path feeds kv_b_proj the identity, where a dropout draw
+        would be one mask for every token rather than one per token.
         """
-        return selection[0].shape[-1] < total and not self._qk_open()
+        return (selection[0].shape[-1] < total and not self._qk_open()
+                and not self.stochastic_input("kv_b_proj"))
+
+    def stochastic_input(self, name: str) -> bool:
+        """Whether this call draws randomness on the input of the submodule
+        `name`. The layer draws none; a method interceptor that does, as
+        `dew.lora`'s dropout does on its targets, answers for itself."""
+        del name
+        return False
 
     def _scaled_query(self, q_pass, q_rot):
         """The whole query with YaRN's mscale on it, as every kernel reads it."""
@@ -917,10 +928,11 @@ class MultiHeadLatentAttention(nn.Module):
         """Attend the selection in the latent space (`sparse_latent_attention`).
 
         `kv_b_proj` applied to the identity is its matrix as the layer
-        computes it, dtype policy and any interceptor's branch (a LoRA
-        adapter, a quantization rule) included, so the absorbed weights are
-        the ones the expanded path multiplies by. The indexer's objective,
-        when open, still reads the expanded keys over the selection mask.
+        computes it, dtype policy and any deterministic interceptor's branch
+        (a LoRA adapter without dropout in this call, a quantization rule)
+        included, so the absorbed weights are the ones the expanded path
+        multiplies by. The indexer's objective, when open, still reads the
+        expanded keys over the selection mask.
         """
         heads, nope = self.num_heads, self.qk_nope_head_dim
         matrix = self.kv_b_proj(jnp.eye(self.kv_lora_rank, dtype=latent.dtype)).reshape(

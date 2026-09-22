@@ -167,6 +167,14 @@ class LoRA:
     def _branch(self, root: Path):
         def branch(next_fun, args, kwargs, context):
             module = context.module
+            if context.method_name == "stochastic_input":
+                # A layer asks whether its submodule's input is drawn on this
+                # call (`MultiHeadLatentAttention.stochastic_input`): the
+                # branch's dropout is, on a target under a dropout stream.
+                name = args[0] if args else kwargs["name"]
+                return next_fun(*args, **kwargs) or bool(
+                    self.dropout and module.has_rng("dropout")
+                    and self.target_at(root + module.path + (name,)) is not None)
             target = self.target_at(root + module.path) if context.method_name == "__call__" else None
             if target is None:
                 return next_fun(*args, **kwargs)

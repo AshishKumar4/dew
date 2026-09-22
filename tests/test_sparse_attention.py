@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.lora import LoRA, Target
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.mla import (
     MultiHeadLatentAttention,
@@ -101,6 +102,27 @@ def test_the_layer_runs_the_selection_and_matches_its_masked_kernel():
     sparse = layer.apply(variables, hidden)
     dense, _ = layer.apply(variables, hidden, mutable=["qk"])
     np.testing.assert_allclose(np.asarray(sparse), np.asarray(dense), atol=2e-5, rtol=0)
+
+
+def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
+    """LoRA dropout on kv_b_proj draws a mask per token and latent dimension.
+    The absorbed path applies kv_b_proj to the identity, where the same draw
+    would be one mask for every token, so such a training call runs the
+    masked kernel: it matches the same call with `qk` open, rng for rng."""
+    layer = MultiHeadLatentAttention(
+        emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
+        qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
+        index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
+    adapter = LoRA({("params", "kv_b_proj"): Target(rank=4, alpha=8.0)}, dropout=0.5)
+    adapted = adapter.adapt(layer)
+    hidden = jax.random.normal(jax.random.key(2), (2, 21, 32))
+    variables = adapted.init(jax.random.key(3), hidden)
+    factor = variables["params"]["kv_b_proj"]["lora_B"]
+    variables["params"]["kv_b_proj"]["lora_B"] = jax.random.normal(jax.random.key(4), factor.shape)
+    rngs = {"dropout": jax.random.key(5)}
+    trained = adapted.apply(variables, hidden, rngs=rngs)
+    masked, _ = adapted.apply(variables, hidden, rngs=rngs, mutable=["qk"])
+    np.testing.assert_allclose(np.asarray(trained), np.asarray(masked), atol=2e-5, rtol=0)
 
 
 def test_memory_follows_the_selection_not_the_sequence():
