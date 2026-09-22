@@ -154,14 +154,21 @@ def test_the_converted_extractor_reproduces_the_features_it_gave_as_a_pickle():
     handing every convolution and norm an initializer that returned the stored
     array. It is an ordinary Flax module now, applied to an ordinary variables
     tree read from safetensors, and `reference_features.npy` is what the old
-    path gave for this fixture: the same arrays reach the same operations, so
-    the features are equal to the bit, not merely close."""
+    path gave for this fixture: the same arrays reach the same operations.
+
+    The two are equal to the bit when the reductions behind them are split the
+    same way, which is how this was checked when the extractor changed. XLA's
+    CPU backend splits by its thread pool, and the thread pool is the machine's
+    rather than the code's: the same weights on the same pixels move by 6e-08
+    between one host and another, so what is asserted here is a tolerance a
+    changed network could not sit inside.
+    """
     from dew.eval.fid import _get_activations
 
     images = np.random.default_rng(0).uniform(-1, 1, (4, 299, 299, 3)).astype(np.float32)
     features = np.asarray(_get_activations(str(INCEPTION_TINY))(images))
     reference = np.load(INCEPTION_TINY.parent / "reference_features.npy")
-    np.testing.assert_array_equal(features, reference)
+    np.testing.assert_allclose(features, reference, rtol=1e-5, atol=1e-7)
 
 
 @pytest.mark.network
