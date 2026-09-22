@@ -268,6 +268,21 @@ _STORES = (".bin", ".array_record", ".parquet")
 """What a tokenized corpus is held in, named by the suffix of its files."""
 
 
+def same_tokenizer(paths: list[str]) -> None:
+    """Refuse tokenized directories whose ids come from different tokenizers.
+
+    A mixture reads one vocabulary, so every corpus's `meta.json` has to
+    record the same tokenizer and eos id; a directory without the record
+    says nothing and is not refused.
+    """
+    recorded = {path: (meta.get("tokenizer"), meta.get("eos_id"))
+                for path in paths for meta in (_meta(Path(path)),) if meta}
+    if len(set(recorded.values())) > 1:
+        raise ValueError(
+            f"a mixture reads one vocabulary, and these corpora record different "
+            f"(tokenizer, eos_id): {recorded}")
+
+
 def token_corpus(path: str | None, name: str, *, field: str | None = None
                  ) -> tuple[TokenSource, TokenSource]:
     """The `(train, val)` corpora of a tokenized directory, both required.

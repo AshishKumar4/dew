@@ -410,6 +410,71 @@ def test_a_packed_pass_covers_every_document_once_at_every_process_count(monkeyp
         assert sorted(row for shard in shards for row in shard) == sorted(whole)
 
 
+def weighted_packed(tmp_path, weights, **overrides):
+    """Two corpora told apart by their values: 1..40 in the first, 101..124
+    in the second, each document one value repeated three times."""
+    first = document_dir(tmp_path / "first", [[index + 1] * 3 for index in range(40)])
+    second = document_dir(tmp_path / "second", [[index + 101] * 3 for index in range(24)])
+    spec = PackedTokens(path={first: weights[0], second: weights[1]}, seq_len=8,
+                        val_batches=None, packing_bins=2, loading=READ, **overrides)
+    return spec, first, second
+
+
+def corpus_of(window: tuple[int, ...]) -> int:
+    values = {value for value in window if value}
+    corpora = {0 if value < 100 else 1 for value in values}
+    assert len(corpora) == 1, f"window {window} mixes corpora"
+    return corpora.pop()
+
+
+def test_weighted_packed_corpora_fill_every_step_at_their_shares(tmp_path):
+    """MaxText's weighted `grain_train_files`, over packed windows: every
+    window is one corpus's documents, and every prefix of the stream holds
+    each corpus's share of its windows to within one, the contract grain's
+    `MapDataset.mix` keeps. At 3:1 a batch of four is three and one."""
+    spec, _, _ = weighted_packed(tmp_path, (3.0, 1.0))
+    rows = [row for batch in packed_rows(spec.load(batch=4).train(), 12) for row in batch]
+    drawn = [corpus_of(row) for row in rows]
+    for prefix in range(1, len(drawn) + 1):
+        assert abs(drawn[:prefix].count(1) - prefix / 4) <= 1
+    assert all(drawn[step * 4:step * 4 + 4].count(1) == 1 for step in range(12))
+
+
+def test_weighted_packed_corpora_resume_on_another_process_count(monkeypatch, tmp_path):
+    spec, _, _ = weighted_packed(tmp_path, (1.0, 1.0))
+    open_stream = lambda: spec.load(batch=4).train()  # noqa: E731  one line, read once
+    whole = pooled(monkeypatch, open_stream, 1, 6, rows=windows_of)
+
+    as_processes(monkeypatch, 2, 0)
+    stopped = open_stream()
+    packed_rows(stopped, 2)
+    state = stopped.get_state()
+    for processes in (1, 4):
+        assert pooled(monkeypatch, open_stream, processes, 4, state,
+                      rows=windows_of) == whole[2:]
+
+
+def test_a_weighted_packed_pass_counts_and_scores_every_corpus(tmp_path):
+    """The pass is the windows in which every corpus has been read once, and
+    the validation pass reads each held-out window at most once."""
+    spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    loaded = spec.load(batch=2)
+    alone = [PackedTokens(path=path, seq_len=8, val_batches=None, packing_bins=2,
+                          loading=READ).load(batch=2).records for path in (first, second)]
+    assert loaded.records == 2 * max(alone)
+    scored = [row for batch in loaded.val() for row in windows_of([batch])[0]]
+    assert len(scored) == len(set(scored))
+    assert {corpus_of(row) for row in scored} == {0, 1}
+
+
+def test_corpora_from_different_tokenizers_are_not_mixed(tmp_path):
+    spec, _, second = weighted_packed(tmp_path, (1.0, 1.0))
+    meta = json.loads((Path(second) / "meta.json").read_text())
+    (Path(second) / "meta.json").write_text(json.dumps({**meta, "tokenizer": "gpt2"}))
+    with pytest.raises(ValueError, match="one vocabulary"):
+        spec.load(batch=4)
+
+
 # --------------------------------------------------------------------------
 # The batch ramp: MaxText's schedule
 # --------------------------------------------------------------------------
