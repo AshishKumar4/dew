@@ -15,7 +15,13 @@ import numpy as np
 import pytest
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import translate_config, translate_wrapper_config
+from dew.interop.hf_decoders import (
+    _FAMILIES,
+    _flatten,
+    _wrapper_sources,
+    translate_config,
+    translate_wrapper_config,
+)
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -48,6 +54,40 @@ def test_source_geometry_is_configurable_without_allocating_released_weights():
     assert moe_model.num_layers == 92
     assert moe_model.mixture.experts == 512 and moe_model.mixture.top_k == 10
     assert moe_model.mixture.shared_gate
+
+
+def released_tree(fields) -> set[tuple[str, ...]]:
+    """Every leaf path of the released geometry, traced without allocating it."""
+    model = models.build("causal_transformer", **fields)
+    shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
+    return {tuple(name.split(".")) for name in _flatten(dict(shapes))}
+
+
+@pytest.mark.parametrize("kind", ["dense", "moe"])
+def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(kind):
+    """The pinned weight indexes name 866 language tensors of the 27B and
+    1609 of the 2.4T-A95B, MTP layers included. Each maps onto the tree the
+    released config builds, and together they cover it: a tensor the
+    families cannot place, or a leaf no checkpoint tensor fills, fails here
+    before 55 GB or 4.8 TB of weights would be read."""
+    source = ROOT / "qwen38-source" / kind
+    config = json.loads((source / "config.json").read_text())
+    names = json.loads((source / "model.safetensors.index.json").read_text())["weight_map"]
+    if kind == "dense":
+        record = translate_wrapper_config(config)
+        fields, family = record["text"], _FAMILIES[config["text_config"]["model_type"]]
+        names = _wrapper_sources(names, lambda name: None, record)[0]["language_model"]
+    else:
+        fields, family = translate_config(config), _FAMILIES[config["model_type"]]
+    # Placeholder arrays carry only the ranks the family's fused-expert split reads.
+    prepared = family.prepare_weights({
+        name: np.zeros((1, 2, 1) if name.endswith((".gate_up_proj", ".down_proj"))
+                       and ".experts." in name else (1,)) for name in names})
+    paths = [family.weight_path(name, fields) for name in prepared]
+    assert None not in paths
+    assert len(set(paths)) == len(paths)
+    assert set(paths) == released_tree(fields)
+    assert any(path[1] == "mtp_0" for path in paths)
 
 
 def test_source_processor_and_forward_match_reference(source):
