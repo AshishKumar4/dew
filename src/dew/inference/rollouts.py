@@ -1,4 +1,4 @@
-"""Rollout servers: one submission interface over Dew's own server and an OpenAI-compatible engine.
+"""Rollout servers: one submission interface over Dew's own server and OpenAI-compatible engines.
 
 A `RolloutServer` takes one prompt of token ids at a time and resolves a
 future `Draw` with the sampled ids, their likelihoods and the policy version
@@ -10,10 +10,14 @@ oldest weights that may have produced any of its tokens.
 
 Two backends fill the interface. `NativeRolloutServer` drives Dew's
 continuous-batching `Server` on a background thread and loads weights in
-process, copying the trainer's tree onto the served device. `VLLMRolloutServer`
-posts token ids to a vLLM completions endpoint through `OpenAICompletion` and
-reloads weights from disk: `SafetensorsReload` writes the policy in its Hugging
-Face layout with `Pretrained.save` and asks the engine to reload it.
+process, copying the trainer's tree onto the served device.
+`OpenAIRolloutServer` posts token ids to a vLLM or SGLang completions
+endpoint through `OpenAICompletion` and reloads weights from disk:
+`SafetensorsReload` writes the policy in its Hugging Face layout with
+`Pretrained.save` and asks the engine to reload it. The request, the
+response and the draw are the same for both engines; they differ in the
+field that returns sampled ids, the distribution their log-probabilities
+describe, and the reload calls.
 
 A remote engine reports one log-probability per token, of the distribution it
 was configured to report, in its own numerics. The draw records it as the
@@ -32,7 +36,7 @@ from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -228,22 +232,36 @@ class SafetensorsReload:
     files, which is the directory the engine was launched on. Files are
     staged beside `directory` and moved in with `os.replace`, so the engine
     never reads a half-written file. `base_url` is the engine's root, not
-    its `/v1` API.
+    its `/v1` API. Any reload call answering other than 200 fails the push.
 
-    The vLLM reload is its development endpoint (`VLLM_SERVER_DEV_MODE=1`):
-    `POST /collective_rpc {"method": "reload_weights"}`, which reloads from
-    the served directory, then `POST /reset_prefix_cache?reset_running_requests=true`.
-    That reset preempts running requests and recomputes them, so no cached
-    prefix outlives the weights that computed it; without the flag vLLM
-    answers 200 and skips the reset whenever a request holds KV blocks. A
-    reset vLLM still cannot make answers non-200 and fails the push.
+    vLLM (`engine="vllm"`) reloads through its development endpoints
+    (`VLLM_SERVER_DEV_MODE=1`): `POST /collective_rpc {"method":
+    "reload_weights"}`, which reloads from the served directory, then `POST
+    /reset_prefix_cache?reset_running_requests=true`. That reset preempts
+    running requests and recomputes them, so no cached prefix outlives the
+    weights that computed it; without the flag vLLM answers 200 and skips the
+    reset whenever a request holds KV blocks.
+
+    SGLang (`engine="sglang"`) reloads with one call, `POST
+    /update_weights_from_disk {"model_path": directory, "flush_cache": true}`.
+    SGLang admits it only once every in-flight request has finished, holds
+    new requests until it returns, and flushes the radix cache before
+    answering, so in-flight draws finish wholly on the old weights and no
+    prefix computed by them survives. A load that fails answers 400; SGLang's
+    rollback re-reads the same directory, so the engine then serves whatever
+    that directory holds.
     """
 
     source: Pretrained
     directory: Path
     base_url: str
+    engine: Literal["vllm", "sglang"]
     dtype: str = "bfloat16"
     timeout: float = 600.0
+
+    def __post_init__(self) -> None:
+        if self.engine not in ("vllm", "sglang"):
+            raise ValueError("engine must be vllm or sglang")
 
     def write(self, variables: Variables) -> None:
         """Write `variables` into `directory`, file by file atomically."""
@@ -261,7 +279,13 @@ class SafetensorsReload:
 
         self.write(variables)
         root = self.base_url.rstrip("/")
-        for path, body in (("/collective_rpc", {"method": "reload_weights"}), ("/reset_prefix_cache?reset_running_requests=true", None)):
+        if self.engine == "vllm":
+            calls = (("/collective_rpc", {"method": "reload_weights"}),
+                     ("/reset_prefix_cache?reset_running_requests=true", None))
+        else:
+            calls = (("/update_weights_from_disk", {"model_path": str(Path(self.directory).resolve()),
+                                                    "flush_cache": True, "abort_all_requests": False}),)
+        for path, body in calls:
             response = httpx.post(root + path, json=body, timeout=self.timeout)
             if response.status_code != 200:
                 raise RuntimeError(f"{path.split('?')[0]} answered {response.status_code}: {response.text}")
@@ -271,36 +295,55 @@ class WeightSync(Protocol):
     def __call__(self, variables: Variables) -> None: ...
 
 
-class VLLMRolloutServer:
-    """Serve rollouts from a vLLM OpenAI-compatible completions endpoint.
+# The request field that makes each engine return the sampled ids themselves.
+_RETURN_IDS = {"vllm": {"return_tokens_as_token_ids": True}, "sglang": {"return_token_ids": True}}
+
+
+class OpenAIRolloutServer:
+    """Serve rollouts from a vLLM or SGLang OpenAI-compatible completions endpoint.
 
     Each submission is one completion request of token ids, carrying the
-    `Sampling` policy as vLLM request controls, a seed, one reported
-    log-probability per sampled token and the ids themselves
-    (`return_tokens_as_token_ids`). `workers` requests are in flight at once;
-    the engine batches them.
+    `Sampling` policy as engine request controls, a seed, one reported
+    log-probability per sampled token and the ids themselves. `workers`
+    requests are in flight at once; the engine batches them. The engine is
+    `completion.provider`.
 
-    vLLM reports raw model log-probabilities unless it runs with
-    `--logprobs-mode processed_logprobs`. Those are the behavior likelihoods
-    only when the sampling applies no transform (temperature one, no top-k,
-    top-p or min-p), so a transforming policy needs `processed_logprobs=True`
-    to say the engine was started that way.
+    The reported log-probabilities are the behavior likelihoods only for
+    some policies. vLLM reports raw model log-probabilities unless it runs
+    with `--logprobs-mode processed_logprobs`, so a transforming policy
+    (temperature other than one, top-k, top-p or min-p) needs
+    `processed_logprobs=True` to say the engine was started that way. SGLang
+    reports the temperature-scaled distribution before its top-k, top-p and
+    min-p filters, and has no mode that reports the filtered one, so it
+    serves any temperature but no filter. Its `SGLANG_RETURN_ORIGINAL_LOGPROB`
+    switches the report to raw log-probabilities and must stay unset.
+
+    SGLang honors a request's seed only under `--enable-deterministic-inference`;
+    otherwise draws are unseeded.
     """
 
     def __init__(self, completion: OpenAICompletion, sampling: Sampling, weights: WeightSync, *,
                  version: int = 0, workers: int = 64, processed_logprobs: bool = False):
-        if completion.provider != "vllm":
-            raise ValueError("token rollouts need provider='vllm': ids, seeds and EOS controls are vLLM request fields")
-        if sampling.transforms() and not processed_logprobs:
+        engine = completion.provider
+        if engine not in _RETURN_IDS:
+            raise ValueError("token rollouts need provider='vllm' or 'sglang': ids, seeds and EOS controls "
+                             "are engine request fields")
+        if sampling.temperature == 0:
+            raise ValueError("a rollout samples; greedy decoding gives every group member the same draw")
+        if engine == "vllm" and sampling.transforms() and not processed_logprobs:
             raise ValueError(
                 "vLLM reports raw log-probabilities by default, which are not the behavior likelihoods "
                 "of a transforming Sampling; start it with --logprobs-mode processed_logprobs and pass "
                 "processed_logprobs=True, or sample at temperature one without filters")
-        if sampling.temperature == 0:
-            raise ValueError("a rollout samples; greedy decoding gives every group member the same draw")
+        if engine == "sglang" and processed_logprobs:
+            raise ValueError("processed_logprobs names a vLLM mode; SGLang has none")
+        if engine == "sglang" and replace(sampling, temperature=1.0).transforms():
+            raise ValueError("SGLang reports log-probabilities before top-k, top-p and min-p, which are not "
+                             "the behavior likelihoods of a filtering Sampling; sample without filters")
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive number of concurrent requests")
         self._completion = completion
+        self._return_ids = _RETURN_IDS[engine]
         self._sampling = sampling
         self._weights = weights
         self._version = version
@@ -320,10 +363,10 @@ class VLLMRolloutServer:
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
         # The pad id shapes Dew's packed rows; it is not a request field.
         completion = self._completion([list(prompt)], budget, seed=seed, sampling=replace(self._sampling, pad_id=0),
-                                      logprobs=0, extra_body={"return_tokens_as_token_ids": True})
+                                      logprobs=0, extra_body=self._return_ids)
         tokens, probabilities = completion.tokens[0], completion.log_probs[0]
         if tokens is None or probabilities is None:
-            raise ValueError("the engine reported no sampled token ids; is it vLLM?")
+            raise ValueError(f"the engine reported no sampled token ids; is it {self._completion.provider}?")
         stops = self._sampling.stops
         terminated = bool(tokens) and tokens[-1] in stops
         reason = completion.finish_reasons[0]
