@@ -1,5 +1,7 @@
 # Domain sweep for Dew
 
+> An AI assistant maintains this document. It is presented as-is.
+
 Measured 2026-09-02, 17:55 to 20:40 UTC. 348 stem and TLD combinations were checked. Every
 registration fact comes from the registry's own RDAP or port-43 WHOIS server, chosen from the IANA
 bootstrap file or the IANA root zone database. No aggregator and no registrar search box was used to
@@ -13,14 +15,14 @@ sweep was running, and were still unregistered when it ended. Second, a dozen ex
 
 ## Headline findings
 
-1. `dew.tools` and `dew.software` **dropped during this sweep and are unregistered as of
-   2026-09-02 20:39 UTC**. Both were held by the same registrant through Namecheap, both registered
+1. `dew.tools` and `dew.software` dropped during this sweep and are unregistered as of
+   2026-09-02 20:39 UTC. Both were held by the same registrant through Namecheap, both registered
    2025-06-17, both expired 2026-06-17, both entered `pendingDelete` at 2026-08-28 20:34 UTC. The
    predicted purge was 2026-09-02 20:34 UTC. A watcher polling the registry RDAP endpoint once a
-   minute observed `dew.tools` flip from HTTP 200 to 404 at **20:34:03 UTC** and `dew.software` at
-   **20:34:49 UTC**, matching the prediction to the minute. Both were still 404 five minutes later,
-   so no drop-catcher had taken them at the last check. This is the moment to act, and it will not
-   last.
+   minute observed `dew.tools` flip from HTTP 200 to 404 at 20:34:03 UTC and `dew.software` at
+   20:34:49 UTC, matching the prediction to the minute. Both were still 404 five minutes later,
+   so no drop-catcher had taken them at the last check. A drop-catcher can take them at any
+   time, so the owner has to act now.
 2. `dew.ml`, the one exact "dew plus ml" address, is buyable, and it is expensive every year rather
    than once. The Mali registry quotes 250,000 F CFA a year. Gandi resells it at 569.39 USD for the
    first year and 598.45 USD a year after that.
@@ -186,7 +188,7 @@ at the last observation. The predicted instant and the observed instant agree to
 
 ### Why he cannot just race a registration form
 
-This is the part that decides whether `dew.tools` is realistic. Purged Identity Digital names do not
+DropZone decides whether `dew.tools` is realistic. Purged Identity Digital names do not
 go straight into open registration. They go to DropZone first. From Identity Digital's RSEP request
 2023-002 filed with ICANN: "Dropzone is a discrete EPP server system, separated from the main
 registry instance that will manage, on a daily basis, the synchronized release of expiring domain
@@ -245,7 +247,7 @@ The parent word is crowded. These are live sites found in this sweep, not guesse
 | dewlab.org | "DEW Lab, Teachers College" |
 | dew.academy | "dew involvement GmbH" |
 
-Two of these are software products literally branded "Dew", one of them in AI. That is an argument
+Two of these are software products branded "Dew", one of them in AI. That is an argument
 for a TLD that carries the category, such as `.tools` or `.software`, over one that does not.
 
 ## Aftermarket prices found
@@ -338,13 +340,13 @@ the registry itself where it publishes them.
 | .ai | Anguilla (UK overseas territory) | yes | 82.7 | 82.7 | 2 to 10 | yes | Open to anyone worldwide. Gandi: '.ai domains are open to everyone.' Registration period 2 to 10 years |
 | .ml | Mali | yes | not published | premium only | 1 to unknown | no | Open to anyone. 101domain: 'There are no special requirements to register a .ML domain, which means anyone in the world can buy it.' Gandi: '.ml domains are open to everyone.' (Sou |
 
-Reading this table. Only eight of these are both usable and under the 40 USD renewal cutoff: `.in`,
+Only eight of these are both usable and under the 40 USD renewal cutoff: `.in`,
 `.us`, `.me`, `.cc`, `.tv`, `.la`, `.am` and `.ws`. Of those, `dew.tv` is a reserved string, and
 `dew.in`, `dew.us`, `dew.cc` and `dew.la` are already registered, `dew.me` is registry premium with
-no published price, and `dew.am` and `dew.ws` are open. Two corrections to common belief came out of
-this: `.ax` is open to everyone rather than restricted to an Aland connection, and Estonia's
+no published price, and `dew.am` and `dew.ws` are open. The sweep also corrected two common beliefs:
+`.ax` is open to everyone rather than restricted to an Aland connection, and Estonia's
 historical local-contact rule for `.ee` is gone. Both are still priced far above the cutoff. `.so` is
-the one ccTLD here the owner genuinely cannot use, because the registry requires a bona fide
+the one ccTLD here the owner cannot use, because the registry requires a bona fide
 connection to Somalia, which also settles `dew.so` and its 5,990 USD asking price.
 
 ## Method
