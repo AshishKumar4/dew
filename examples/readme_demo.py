@@ -6,10 +6,10 @@ Run from an installed Dew checkout, without downloads:
 Use a new output directory for each invocation. The generated data demonstrates
 mechanics, not language ability, preference quality, or useful image generation.
 """
-from dataclasses import dataclass
-from pathlib import Path
 import itertools
 import json
+from dataclasses import dataclass
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp

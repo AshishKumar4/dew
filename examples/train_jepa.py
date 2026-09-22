@@ -29,7 +29,8 @@ class Config:
     steps: int | None = None
     """Run length in steps; unset trains for `epochs` passes over the data."""
     learning_rate: float = 1e-3
-    model: dict = field(default_factory=lambda: dict(emb_features=384, num_layers=12, num_heads=6))
+    model: dict = field(default_factory=lambda: {
+        "emb_features": 384, "num_layers": 12, "num_heads": 6})
     out: Path = Path("runs/ijepa-flowers")
 
 

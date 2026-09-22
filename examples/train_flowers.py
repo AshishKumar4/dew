@@ -16,8 +16,8 @@ from PIL import Image
 from dew import Checkpoints, Field, InputSpec, Trainer, sample
 from dew.data import Loading, OxfordFlowers
 from dew.diffusion.presets import EDM
-from dew.objectives.diffusion import DiffusionObjective
 from dew.nn.backbones import SimpleDiT
+from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling import Heun
 
 

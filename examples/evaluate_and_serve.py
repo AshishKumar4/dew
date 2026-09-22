@@ -102,8 +102,8 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
     (tokens / "meta.json").write_text(json.dumps(
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8"}))
 
-    fields = dict(emb_features=16, num_layers=1, num_heads=2, head_dim=8, mlp_features=32,
-                  vocab_size=256, max_seq_len=48)
+    fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
+              "mlp_features": 32, "vocab_size": 256, "max_seq_len": 48}
     run = LMRunConfig(
         model=ModelConfig("causal_transformer", fields, dtype="float32",
                           attention_impl="reference"),

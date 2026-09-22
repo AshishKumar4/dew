@@ -41,7 +41,7 @@ jobs:
     - name: Lint
       run: |
         pip install uv
-        uvx ruff@0.14.3 check src/dew tools/lint_slop.py
+        uvx ruff@0.14.3 check src/dew tools/lint_slop.py examples
         python tools/lint_slop.py
     - name: Type check the Python 3.12 compatibility floor
       if: matrix.python-version == '3.12'

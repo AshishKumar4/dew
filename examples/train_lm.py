@@ -13,9 +13,9 @@ import optax
 import tyro
 
 from dew.data import ByteTokenizer, Loading, TokenWindows
+from dew.inference import RunProcessor
 from dew.objectives.lm import LMObjective, Samples
 from dew.registry import models
-from dew.inference import RunProcessor
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Trainer
 
@@ -29,7 +29,8 @@ class Config:
     steps: int | None = None
     """Run length in steps; unset trains for `epochs` passes over the data."""
     learning_rate: float = 1e-3
-    model: dict = field(default_factory=lambda: dict(emb_features=384, num_layers=6, num_heads=6))
+    model: dict = field(default_factory=lambda: {
+        "emb_features": 384, "num_layers": 6, "num_heads": 6})
     prompt: str = "ROMEO:"
     sample_tokens: int = 300
     out: Path = Path("runs/shakespeare")
