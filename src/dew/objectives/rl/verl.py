@@ -15,7 +15,15 @@ from typing import TypedDict
 from dew.records import JSON
 
 from .episodes import Episode
-from .records import episode_from_record, episode_record, integer, object_record, real, sequence
+from .records import (
+    EpisodeFields,
+    episode_from_record,
+    episode_record,
+    integer,
+    object_record,
+    real,
+    sequence,
+)
 
 
 class VerlRow(TypedDict):
@@ -37,7 +45,7 @@ class VerlRow(TypedDict):
     extra_fields: Mapping[str, Mapping[str, object]]
 
 
-def _call_row(episode: Episode, header: Mapping[str, JSON], index: int) -> VerlRow:
+def _call_row(episode: Episode, header: EpisodeFields, index: int) -> VerlRow:
     """Render one of an episode's model calls as an AgentLoopOutput row.
 
     An episode with no turn still exports one row, so its header and its
@@ -68,9 +76,7 @@ def to_verl(episodes: Sequence[Episode]) -> list[VerlRow]:
     for episode in episodes:
         header = episode_record(episode)
         header.pop("transitions")
-        turns = episode.transitions
-        for index in range(max(1, len(turns))):
-            rows.append(_call_row(episode, header, index))
+        rows.extend(_call_row(episode, header, index) for index in range(max(1, len(episode.transitions))))
     return rows
 
 
