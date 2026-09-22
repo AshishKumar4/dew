@@ -52,7 +52,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
-from flax.core import unfreeze
 from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.typing import ArrayLike
@@ -450,12 +449,14 @@ class Server:
         policy version on a request takes the version it was submitted under.
         Not thread-safe against `step`: the caller serializes the two.
         """
-        # Frozen or plain mappings hold the same variables; compare them as plain ones.
-        incoming, served = unfreeze(variables), unfreeze(self.variables)
-        if jax.tree.structure(incoming) != jax.tree.structure(served):
+        # A frozen and a plain mapping flatten to different tree structures but
+        # the same leaf paths, so the paths are what must match.
+        incoming, _ = jax.tree_util.tree_flatten_with_path(variables)
+        served, structure = jax.tree_util.tree_flatten_with_path(self.variables)
+        if [path for path, _ in incoming] != [path for path, _ in served]:
             raise ValueError("reloaded variables must have the served tree structure")
         leaves = []
-        for new, old in zip(jax.tree.leaves(incoming), jax.tree.leaves(served), strict=True):
+        for (_, new), (_, old) in zip(incoming, served, strict=True):
             kind, served_kind = jnp.result_type(new), jnp.result_type(old)
             if np.shape(new) != np.shape(old) or (kind != served_kind and not (
                     jnp.issubdtype(kind, jnp.floating) and jnp.issubdtype(served_kind, jnp.floating))):
@@ -466,7 +467,7 @@ class Server:
             # owns its buffer whatever the caller donates next.
             placement = old.sharding if isinstance(old, jax.Array) else None
             leaves.append(jnp.array(jax.device_put(new, placement), dtype=served_kind, copy=True))
-        self.variables = jax.tree.unflatten(jax.tree.structure(self.variables), leaves)
+        self.variables = jax.tree.unflatten(structure, leaves)
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
                key: jax.Array | None = None, seed: int | None = None) -> Ticket:
