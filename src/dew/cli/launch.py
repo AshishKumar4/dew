@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import re
 import shlex
 import signal
 import socket
@@ -34,6 +35,8 @@ import tyro
 from dew.cli.gcloud import emit
 from dew.pool import COORDINATOR, LOCAL_DEVICES, PROCESS_COUNT, PROCESS_ID
 
+VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+"""What an `--env` name may be: it lands unquoted in the remote shell line."""
 LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 POLL_SECONDS = 0.2
 
@@ -65,7 +68,8 @@ class Launch:
     hosts: Hosts = ("localhost",)
     """The machines, process 0's first. localhost runs here without ssh;
     every other name is reached with `ssh -o BatchMode=yes`, so keys must
-    already be in place."""
+    already be in place. The remote shell reads no login profile, so give
+    the program as an absolute path, or its PATH through `--env`."""
     processes_per_host: int = 1
     """Processes each host runs. One per host is the usual layout; one per
     GPU needs `devices_per_process` so each takes its own devices."""
@@ -99,8 +103,11 @@ class Launch:
             raise ValueError(
                 f"devices_per_process must be positive, got {self.devices_per_process}")
         for variable in self.env:
-            if "=" not in variable:
-                raise ValueError(f"--env takes NAME=VALUE, got {variable!r}")
+            name = variable.split("=", 1)[0]
+            if "=" not in variable or not VARIABLE_NAME.fullmatch(name):
+                raise ValueError(
+                    f"--env takes NAME=VALUE with a shell variable name "
+                    f"([A-Za-z_][A-Za-z0-9_]*), got {variable!r}")
         if self.slurm and (self.hosts != ("localhost",) or self.coordinator is not None):
             raise ValueError("--slurm takes its hosts and coordinator from the allocation")
 
@@ -131,7 +138,9 @@ class Launch:
 
     def remote_argv(self, host: str, env: dict[str, str]) -> tuple[str, ...]:
         """The argv that starts the command on `host`: the command itself
-        here, a login shell over ssh anywhere else."""
+        here, and anywhere else the user's shell over ssh, which is not a
+        login shell, so profile setup such as a virtualenv does not run and
+        the command's interpreter is best given as an absolute path."""
         if host in LOCAL_HOSTS:
             return self.command
         cwd = self.cwd or os.getcwd()

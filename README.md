@@ -1269,13 +1269,13 @@ if __name__ == "__main__":
     main()
 ```
 
-Launch it from the first host. `dew launch` starts one process on each host over ssh and gives each its coordinator, process count and rank:
+Launch it from the first host. `dew launch` starts one process on each host over ssh and gives each its coordinator, process count and rank. The remote shell reads no login profile, so name the interpreter by its absolute path:
 
 ```bash
 dew launch --hosts 10.0.0.1 10.0.0.2 \
     --env DEW_TOKEN_DIR=/shared/tokens --env DEW_CHECKPOINT_DIR=/shared/runs/lm \
     --env CUDA_VISIBLE_DEVICES=0,1 --env JAX_PLATFORMS=cuda \
-    -- python train_multihost.py
+    -- /opt/dew/.venv/bin/python train_multihost.py
 ```
 
 `batch=16` is global, so each process reads eight rows. To rehearse the launch on one machine, run `dew launch --processes-per-host 2 --env JAX_PLATFORMS=cpu --env XLA_FLAGS=--xla_force_host_platform_device_count=2 --env DEW_STEPS=20 ...` with local directories: two processes of two simulated devices fill the same `MeshSpec(fsdp=4)`, and each prints `20 updates`.

@@ -100,3 +100,15 @@ def test_a_rank_killed_by_a_signal_exits_the_launch_128_plus_it():
     launch = launcher("--port", "1", "--", sys.executable, "-c", program)
     launch.communicate(timeout=60)
     assert launch.returncode == 137
+
+
+@pytest.mark.parametrize("variable", ["A B=1", "X;touch y=1", "1X=1", "=1"])
+def test_a_variable_name_the_shell_would_read_as_syntax_is_refused(variable):
+    """A name is spliced unquoted into the remote shell line, so one that is
+    not an identifier would run as something other than an assignment."""
+    from dew.cli.launch import Launch
+
+    with pytest.raises(ValueError, match="variable name"):
+        Launch(command=("python",), hosts=("node1",), env=(variable,))
+    assert Launch(command=("python",), env=("XLA_FLAGS=a=b,c",)).extra_env() == {
+        "XLA_FLAGS": "a=b,c"}
