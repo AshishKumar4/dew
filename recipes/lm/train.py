@@ -22,10 +22,9 @@ from typing import TYPE_CHECKING, Optional
 
 import tyro
 
-from dew.config import ModelConfig, OptimConfig, RunConfig
+from dew.config import ModelConfig
 from dew.data import PackedTokens, TokenWindows, tokenizer_for
-from dew.objectives.lm import IndexerTraining, LMObjective, Samples
-from dew.sampling import Sampling
+from dew.objectives.lm import LMObjective, LMRunConfig, Samples
 from dew.registry import datasets, metrics, models
 from dew.training import TrainState, prepare_process, run_timestamp
 
@@ -39,67 +38,25 @@ else:
 
 
 @dataclass(frozen=True)
-class LmRunConfig(RunConfig):
-    """A run, plus the language model's own knobs."""
+class LmRunConfig(LMRunConfig):
+    """The shipped LM run, narrowed to the token files this recipe reads.
 
-    model: ModelConfig = field(
-        default_factory=lambda: ModelConfig("causal_transformer"))
+    Everything else a decoder run records is `dew.objectives.lm.LMRunConfig`,
+    which a script that trains on some other layout of the same ids uses as
+    it stands. What this adds is the one thing the recipe itself requires:
+    `--data.path` is a directory `tools/tokenize_text.py` wrote.
+    """
+
     data: TokenSpec = field(default_factory=TokenWindows)
-    optim: OptimConfig = field(
-        default_factory=lambda: OptimConfig(
-            learning_rate=6e-4, learning_rate_peak=6e-4, learning_rate_end=6e-5,
-            weight_decay=0.1, clip_grads=1.0))
-    tokenizer: str = "byte"
-    """What the token files were written with: 'byte', or an HF tokenizer name."""
-    ema_decay: float | None = 0.999
-    """None disables EMA; 1.0 retains a frozen copy."""
-    sample_prompt: str = ""
-    """Prompt the validation samples continue; empty continues a newline."""
-    sample_tokens: int = 128
-    """Tokens generated per validation sample; 0 logs no text."""
-    sampling: Sampling = field(default_factory=lambda: Sampling(temperature=0.8, top_k=40))
-    """The preview policy, recorded with the run for inference."""
-    pretrained: Optional[str] = None
-    """Hugging Face decoder to continue training: a hub repo id or a local
-    directory in that layout. The checkpoint decides the architecture, so
-    --model.config may then carry max_seq_len alone."""
-    balance_rate: Optional[float] = None
-    """How far a sparse run moves each router's balancing bias against its
-    load every step (DeepSeek's aux-loss-free balancing). Needs a mixture
-    with bias=True; unset leaves the bias where it is."""
-    mtp_weight: Optional[float] = None
-    """DeepSeek's lambda on the multi-token-prediction term. Needs a model
-    with num_nextn_predict_layers above zero; unset leaves the term out."""
-    indexer: Optional[IndexerTraining] = None
-    """DeepSeek-V3.2's lightning-indexer phase: `indexer:indexer-training
-    --indexer.phase warmup` freezes everything but the indexer of a model
-    whose mla mixer names the indexer's heads and no top-k; `sparse`
-    trains the whole model on its top-k with the KL beside the cross
-    entropy. Unset trains no indexer term."""
-    objective: str = "lm"
-    """Loss convention: lm, masked_diffusion (MDLM), or block_diffusion
-    (the official DiffusionGemma fine-tuning objective)."""
-    block_prompt_tokens: int = 256
-    """Clean prompt prefix in a block-diffusion token row."""
-    block_canvas_size: int | None = None
-    """Training canvas width; None uses the checkpoint canvas length."""
 
     def __post_init__(self):
+        super().__post_init__()
         if not isinstance(self.data, (TokenWindows, PackedTokens)):
             raise ValueError(
                 "the language model recipe trains on token files: "
                 "data:token-windows or data:packed-tokens")
-        if self.objective not in ("lm", "masked_diffusion", "block_diffusion"):
-            raise ValueError(
-                f"--objective {self.objective!r} is not lm, masked_diffusion or block_diffusion")
-        if self.objective == "block_diffusion":
-            if not isinstance(self.data, TokenWindows):
-                raise ValueError("block_diffusion requires data:token-windows, not packed documents")
-            if self.pretrained is None:
-                raise ValueError("block_diffusion fine-tuning requires --pretrained")
-            if (self.balance_rate is not None or self.mtp_weight is not None
-                    or self.trainer.quantization is not None):
-                raise ValueError("block_diffusion has no balancing, MTP or quantized-training term")
+        if self.objective == "block_diffusion" and not isinstance(self.data, TokenWindows):
+            raise ValueError("block_diffusion requires data:token-windows, not packed documents")
 
 
 def token_directory(path: Optional[str]) -> Path:

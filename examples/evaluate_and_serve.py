@@ -26,7 +26,7 @@ rest of the run is unaffected.
 """
 
 import json
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -35,28 +35,16 @@ import numpy as np
 import tyro
 
 import dew
-from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import Loading, TokenWindows
 from dew.eval import clip_score, fid
 from dew.inference import TextGeneration, TextToImage
-from dew.objectives.lm import LMObjective
+from dew.objectives.lm import LMObjective, LMRunConfig
 from dew.registry import metrics
 from dew.sampling import Sampling
 from dew.training import evaluate
 
 GREEDY = Sampling(temperature=0.0)
-
-
-@dataclass(frozen=True)
-class LMRun(RunConfig):
-    """The record a byte-level LM run publishes, as `dew.pipeline` reads it."""
-
-    objective: str = "lm"
-    model: ModelConfig = field(default_factory=lambda: ModelConfig("causal_transformer"))
-    data: TokenWindows = field(default_factory=TokenWindows)
-    tokenizer: str = "byte"
-    sample_tokens: int = 16
-    sampling: Sampling = field(default_factory=lambda: Sampling(temperature=0.8, top_k=40))
 
 
 @dataclass
@@ -109,7 +97,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
 
     fields = dict(emb_features=16, num_layers=1, num_heads=2, head_dim=8, mlp_features=32,
                   vocab_size=256, max_seq_len=48)
-    run = LMRun(
+    run = LMRunConfig(
         model=ModelConfig("causal_transformer", fields, dtype="float32",
                           attention_impl="reference"),
         data=TokenWindows(path=str(tokens), seq_len=32,

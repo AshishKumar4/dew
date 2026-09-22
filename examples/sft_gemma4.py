@@ -21,19 +21,18 @@ provider hands back raw rows with no chat template behind them.
 
 import json
 import shutil
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
 import tyro
 
-from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import ChatMessages, HFOptions, Loading, tokenizer_for
 from dew.data.chat import Role
 from dew.interop import export_run, load_pretrained
-from dew.objectives.lm import LMObjective, Samples
+from dew.objectives.lm import LMObjective, LMRunConfig, Samples
 from dew.registry import metrics
-from dew.sampling import Sampling
 from dew.training import MeshSpec, TrainState, prepare_process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -51,26 +50,6 @@ SMOKE_CONVERSATIONS = [
     [{"role": "user", "content": f"t{first} t{first + 2}"},
      {"role": "assistant", "content": f"t{first + 4} t{first + 6}"}]
     for first in range(5, 45, 5)]
-
-
-@dataclass(frozen=True)
-class ChatSFTRun(RunConfig):
-    """The run record a chat SFT publishes.
-
-    `RunConfig` holds the model, the data, the optimizer and the trainer;
-    what a saved decoder needs beside them is the tokenizer its ids came
-    from and the preview policy, which is what `dew.pipeline` and
-    `dew.interop.export_run` read back out of `run.json`. The LM recipe's
-    own config declares the same three and trains on token files, so a chat
-    spec needs this one.
-    """
-
-    objective: str = "lm"
-    model: ModelConfig = field(default_factory=lambda: ModelConfig("causal_transformer"))
-    data: ChatMessages = field(default_factory=lambda: ChatMessages(tokenizer="byte"))
-    tokenizer: str = "byte"
-    sample_tokens: int = 16
-    sampling: Sampling = field(default_factory=lambda: Sampling(temperature=0.8, top_k=40))
 
 
 @dataclass
@@ -134,10 +113,10 @@ def smoke_tokenizer(out: Path) -> str:
     return str(directory)
 
 
-def run_config(config: Config, tokenizer: str, parquet: Path) -> ChatSFTRun:
+def run_config(config: Config, tokenizer: str, parquet: Path) -> LMRunConfig:
     """Everything the run is, before the checkpoint decides the architecture."""
     smoke = config.smoke
-    return ChatSFTRun(
+    return LMRunConfig(
         model=ModelConfig("causal_transformer", {}, dtype="float32" if smoke else "bfloat16",
                           attention_impl="xla" if smoke else "auto"),
         data=ChatMessages(tokenizer=tokenizer, path=str(parquet), val_path=str(parquet),
