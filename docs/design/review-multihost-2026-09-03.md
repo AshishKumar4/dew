@@ -1,15 +1,29 @@
 # Review of the September waves: multi-host and test adequacy
 
+> An AI assistant maintains this document. It is presented as-is.
+
 Companion to `review-api-2026-09-03.md`, which read the same commit for ownership and API and fixed what it found in `3d30a35` through `b39c62a`. This review ran the recipes on real process pools and the tests under mutation. One finding overlaps: validation exceptions, fixed in `6b747dc` there and item 4 below.
 
 Five reviewers, one per area, read main at 102baa4 in throwaway worktrees and
 ran what they needed: real two-process pools over a loopback coordinator,
 mutations against the suite, and the recipes as shipped. Every item here has a
-reproduction or a traced code path. The scout-tier leads that did not survive
-expert review are not listed.
+reproduction or a traced code path. Leads from the first scouting pass that
+did not hold up under expert review are not listed.
 
-The owner's bar for this review: no inaccurate or half-baked implementations,
-and nothing that falls apart on a multi-device, multi-host run.
+The owner set the bar for this review: no inaccurate or half-finished
+implementations, and nothing that falls apart on a multi-device, multi-host
+run.
+
+Correction (2026-09-22): the items below describe `102baa4`. I spot-checked a
+few against current source. Checkpoints now gather one iterator position per
+process and refuse a process-count change the position cannot survive
+(`src/dew/checkpoints/__init__.py:87-146`, pod item 1). A `gs://` directory
+goes to storage as given instead of through `resolve`
+(`src/dew/checkpoints/__init__.py:63-76`, pod item 2). The CLIP metric runs
+the vendored towers and no longer imports `FlaxCLIPModel`
+(`src/dew/eval/images.py:1-11`, single-host item 1). `7817b05f` deleted
+`tools/run_notebooks.py` (single-host item 8). I did not re-check the other
+items.
 
 ## What holds
 
@@ -31,7 +45,7 @@ tokens and an identical CE on both processes.
 
 ## What breaks first on a pod, in order
 
-Each of these was reproduced.
+The reviewers reproduced each of these.
 
 1. Resume on a pool fails every time. `trainer.save` stores one
    `dataset_state` blob; orbax writes numpy leaves from process 0 only; every
@@ -137,7 +151,7 @@ links it for its figures.
 
 ## Test gaps that let plausible bugs through
 
-Each survived the whole suite as a mutation.
+Each of these mutations passed the whole suite.
 
 - Accumulating the MoE expert combine in bf16 instead of fp32.
 - Deleting `WEIGHT_SUM_EPSILON` (the all-zero top-k case has no test).
