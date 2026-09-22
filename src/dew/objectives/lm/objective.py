@@ -367,18 +367,6 @@ def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
     return (bias.astype(dtype) + correction).astype(bias.dtype)
 
 
-def balance(moe: Variables, routing: Variables, rate: float
-            ) -> tuple[Variables, dict[str, jax.Array]]:
-    """Bias replacements and load telemetry from one routed batch."""
-    counts = router_counts(moe, routing)
-    shares = [count / jnp.sum(count) for count in jax.tree.leaves(counts)]
-    balanced = jax.tree.map(lambda bias, count: _updated_bias(bias, count, rate),
-                            _balanced_biases(moe), counts)
-    return merge(moe, balanced), {
-        "moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
-        "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))}
-
-
 def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
     """Collect every router's sown (scores, indices), in the tree's key order."""
     found: list[tuple[jax.Array, jax.Array]] = []
