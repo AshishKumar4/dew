@@ -38,43 +38,34 @@ def _features(weights: str | None) -> str:
 
 
 def _extractor(weights: str | None):
-    """The feature extractor, from the published checkpoint or a file.
+    """The feature extractor and the variables to apply it with.
 
-    A local file is read by the same loader the download feeds: a pickle of
-    numpy arrays in the layout the published FID checkpoint uses, which the
-    module takes as the parameters of every convolution and norm it builds.
+    The module is an ordinary Flax module, so its parameters are an ordinary
+    variables tree in safetensors: the file named, or the converted copy of the
+    published checkpoint that `dew.interop.inception_fid` keeps in the Hub
+    cache. Its header says which width to build the extractor at, since a Flax
+    parameter has to be the shape its module declares.
     """
+    from dew.interop.inception_fid import cached_weights, channel_divisor, load
+
     from .inception import InceptionV3
-    if weights is None:
-        return InceptionV3(pretrained=True)
 
-    class LocalInceptionV3(InceptionV3):
-        """InceptionV3 whose parameters come from a file instead of the Hub.
-
-        `setup` is the download in the base class, and the only thing it
-        does is hand the module the parameter dict every convolution and
-        norm below reads its own arrays out of."""
-
-        ckpt_path: str = ""
-
-        def setup(self):
-            from . import utils
-            self.params_dict = utils.load_arrays(self.ckpt_path)
-            self.num_classes_ = self.num_classes
-
-    return LocalInceptionV3(ckpt_path=weights)
+    path = cached_weights() if weights is None else weights
+    # The file is read as memory maps. They land on the device here, once, so
+    # the jitted extractor closes over arrays instead of compiling 90 MB of
+    # weights into every kernel as constants.
+    return (InceptionV3(channel_divisor=channel_divisor(path)),
+            jax.tree.map(jnp.asarray, load(path)))
 
 
 @functools.cache
 def _get_inception(weights: str | None = None):
-    """The pool3 feature extractor and its parameters, loaded once per
+    """The pool3 feature extractor and its variables, loaded once per
     process and per weights. The FID InceptionV3 is about 90 MB of weights,
     and every metric built from this module shares the copy."""
     _log.info("loading InceptionV3 FID weights from %s (cached for reuse)",
               "the hub" if weights is None else weights)
-    model = _extractor(weights)
-    params = model.init(jax.random.PRNGKey(0), jnp.ones((1, 299, 299, 3)))
-    return model, params
+    return _extractor(weights)
 
 
 def _sqrtm(product):
@@ -169,13 +160,13 @@ def _get_activations(weights: str | None = None):
     Building it loads the ~90MB weights, so it happens here, on first use.
     Constructing the metric opens nothing.
     """
-    model, params = _get_inception(weights)
+    model, variables = _get_inception(weights)
 
     @jax.jit
     def activations(images):
         # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048]
         resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear')
-        features = model.apply(params, resized, train=False)
+        features = model.apply(variables, resized, train=False)
         # apply returns the output alone, since no mutable collections are
         # asked for.
         assert not isinstance(features, tuple)
@@ -241,10 +232,11 @@ def fid(generated: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
     which is FID-50k only at 50,000 images a side.
 
     `weights` is the feature extractor's parameters as a file, the way
-    `clip_score(modelname=)` names a local CLIP: a pickle of numpy arrays in
-    the layout the published FID checkpoint uses. Unset downloads that
-    checkpoint. Two distances are comparable only when both were measured
-    with the same one, which is why every distance logs which it was.
+    `clip_score(modelname=)` names a local CLIP: the InceptionV3 variables tree
+    in safetensors, which `tools/convert_inception_weights.py` writes. Unset
+    downloads the published checkpoint and converts it. Two distances are
+    comparable only when both were measured with the same one, which is why
+    every distance logs which it was.
     """
     if batch_size < 1:
         raise ValueError(f"fid: a batch holds at least one image, got batch_size={batch_size}")
