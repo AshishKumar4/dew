@@ -248,11 +248,11 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
     by_process = len({device.slice_index for device in devices}) == 1
     granules = len({device.process_index if by_process else device.slice_index
                     for device in devices})
-    data = shape[0]
-    if granules % spec.replicas or data % spec.replicas:
+    data_width = shape[0]
+    if granules % spec.replicas or data_width % spec.replicas:
         raise ValueError(
             f"replicas {spec.replicas} must divide both the {granules} granules "
-            f"(slices, or processes) the devices form and the data axis of {data}")
+            f"(slices, or processes) the devices form and the data axis of {data_width}")
     per_replica = granules // spec.replicas
     if spec.fsdp % per_replica:
         raise ValueError(
