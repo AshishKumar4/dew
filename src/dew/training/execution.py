@@ -211,16 +211,26 @@ class HostExecution:
             held = all((*namespace, f"layers_{first + offset}", *keys) in frozen
                        for offset in range(len(leaves)))
             if not held:
-                # A moving row is the CPU's; a frozen row beside it is
-                # brought over so the run stacks on one backend.
-                return transfer(jnp.stack(self.on_cpu(leaves)), sharding)
+                return self._stack_rows(leaves, sharding)
             key = (namespace, first, keys, *(id(row) for row in leaves))
             bank = self._stacked.get(key)
             if bank is None:
-                bank = jax.block_until_ready(transfer(jnp.stack(leaves), sharding))
+                bank = jax.block_until_ready(self._stack_rows(leaves, sharding))
             stacked[key] = bank
             return bank
         return jax.tree_util.tree_map_with_path(leaf, spread, *rows)
+
+    def _stack_rows(self, rows, sharding):
+        """The rows of one bank leaf stacked into the bank's placement.
+
+        The stack runs on the CPU backend whatever the rows' placement: a
+        moving row is the CPU's already, and a frozen row sits in the
+        accelerator's pinned host memory, where a stack traced against the
+        state mesh cannot reach it and a stack on the accelerator would
+        materialise the whole bank in device memory, which is exactly what
+        the bank's placement avoids. One bank crosses host memory at a time.
+        """
+        return transfer(jnp.stack(self.on_cpu(rows)), sharding)
 
     def on_cpu(self, tree):
         def placement(leaf):
