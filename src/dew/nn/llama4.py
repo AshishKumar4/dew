@@ -178,7 +178,9 @@ class Llama4Attention(nn.Module):
                 mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
         implementation = self.attention_impl
         if mask is not None:
-            implementation = kernel_for_materialized_mask(implementation)
+            implementation = kernel_for_materialized_mask(
+                implementation, query, dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax)
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,

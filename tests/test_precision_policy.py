@@ -12,9 +12,14 @@ import pytest
 
 from dew import models
 from dew.diffusion.process import DenoisingCondition
-from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.attention import local_attention, scaled_dot_product_attention
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.dit import TextContext
+from dew.nn.dsa_kpool import KPoolSparseAttention
+from dew.nn.inputs import AttentionMetadata
+from dew.nn.llama4 import Llama4Attention
+from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.registry import dtype_name, resolve_dtype, with_precision
@@ -59,6 +64,65 @@ def test_auto_takes_the_reference_path_for_arithmetic_only_it_performs(arguments
     auto = scaled_dot_product_attention(query, key, value, implementation="auto", **arguments)
     reference = scaled_dot_product_attention(query, key, value, implementation="reference",
                                              **arguments)
+    assert jnp.array_equal(auto, reference)
+
+
+PACKED = jnp.asarray([[1] * 6 + [2] * 7 + [0] * 3, [1] * 16])
+LAYERS = {
+    "window": lambda **policy: CausalTransformer(
+        vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
+        max_seq_len=32, layer_types=("sliding", "full_attention"),
+        kinds={"sliding": {"window": 4}}, **policy),
+    "packed": lambda **policy: CausalTransformer(
+        vocab_size=64, num_layers=1, emb_features=32, num_heads=4, num_kv_heads=2,
+        max_seq_len=32, **policy),
+    "llama4_chunk": lambda **policy: Llama4Attention(
+        emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32,
+        attention_chunk_size=4, **policy),
+    "llama4_global": lambda **policy: Llama4Attention(
+        emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32,
+        use_rope=False, **policy),
+    "mla": lambda **policy: MultiHeadLatentAttention(
+        emb_features=32, num_heads=4, max_seq_len=32, q_lora_rank=16, kv_lora_rank=8,
+        qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8, **policy),
+    "kpool": lambda **policy: KPoolSparseAttention(
+        emb_features=32, num_heads=4, max_seq_len=32, q_lora_rank=8, kv_lora_rank=8,
+        qk_nope_head_dim=8, v_head_dim=8, index_n_heads=2, index_head_dim=8, index_topk=4,
+        index_kpool=2, **policy),
+}
+
+
+@pytest.mark.parametrize("arguments", [
+    {"precision": "highest"},
+    {"force_fp32_for_softmax": False},
+])
+@pytest.mark.parametrize("layer", sorted(LAYERS))
+def test_auto_under_a_window_or_packing_takes_the_reference_path(layer, arguments):
+    """A window, a chunk, packed documents or a sparse selection build a
+    mask, which sends 'auto' to xla rather than cuDNN; the call still
+    resolves to the reference path first when only that path computes what
+    it asks for, and matches naming that path."""
+    if layer == "mla" and "precision" not in arguments:
+        pytest.skip("latent attention always runs its softmax in fp32")
+    if layer in ("window", "packed"):
+        x = jax.random.randint(jax.random.key(0), (2, 16), 0, 64)
+    else:
+        x = jax.random.normal(jax.random.key(0), (2, 16, 32))
+    call = {} if layer == "window" else {"segment_ids": PACKED}
+    if layer == "kpool":
+        call = {"attention_metadata": AttentionMetadata(valid=PACKED != 0)}
+    variables = LAYERS[layer](**arguments).init(jax.random.key(1), x, **call)
+    auto = LAYERS[layer](attention_impl="auto", **arguments).apply(variables, x, **call)
+    reference = LAYERS[layer](attention_impl="reference", **arguments).apply(variables, x, **call)
+    assert jnp.array_equal(auto, reference)
+
+
+@pytest.mark.parametrize("span", [{"window": 4}, {"chunk": 4}])
+def test_local_attention_resolves_auto_before_the_mask(span):
+    query, key, value = jax.random.normal(jax.random.key(1), (3, 2, 64, 4, 8))
+    packed = {"segment_ids": jnp.ones((2, 64), jnp.int32), "precision": "highest"}
+    auto = local_attention(query, key, value, **span, **packed, implementation="auto")
+    reference = local_attention(query, key, value, **span, **packed, implementation="reference")
     assert jnp.array_equal(auto, reference)
 
 
