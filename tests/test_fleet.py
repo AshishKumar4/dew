@@ -187,6 +187,33 @@ def test_a_container_has_no_network_a_read_only_root_and_a_deadline():
     with SandboxFleet(runner, limits=SandboxLimits(wall_seconds=4, cpu_seconds=30), workers=1) as fleet:
         slept = fleet.run([Program({"main.py": "import time\ntime.sleep(60)"}, ("python", "main.py"))])[0]
     assert slept.verdict is Verdict.TIMEOUT
-    leftover = subprocess.run(["docker", "ps", "--filter", "name=dew-fleet-", "-q"],
+    leftover = subprocess.run(["docker", "ps", "-a", "--filter", "name=dew-fleet-", "-q"],
                               capture_output=True, text=True, check=True).stdout.strip()
     assert leftover == "", "a timed-out container is still running"
+
+
+def test_a_runtime_that_cannot_start_the_container_raises():
+    # `false` stands in for a runtime whose daemon is gone: it exits 1 and creates nothing.
+    with SandboxFleet(ContainerRunner(IMAGE, runtime="false"), workers=1) as fleet:
+        with pytest.raises(RuntimeError, match="created no container"):
+            fleet.run([Program({"main.py": "print(5)"}, ("python", "main.py"))])
+
+
+@pytest.mark.skipif(not _image_present(), reason=f"needs a Docker daemon with {IMAGE} pulled")
+def test_code_reward_runs_the_containers_own_interpreter():
+    with SandboxFleet(ContainerRunner(IMAGE), limits=SandboxLimits(wall_seconds=30), workers=2) as fleet:
+        right = "```python\na, b = map(int, input().split())\nprint(a + b)\n```"
+        assert CodeReward(fleet)("code", right, CASES, "") == 1.0
+
+
+@pytest.mark.skipif(not _image_present(), reason=f"needs a Docker daemon with {IMAGE} pulled")
+def test_a_deadline_during_container_start_leaves_no_container():
+    program = Program({"main.py": "import time\ntime.sleep(60)"}, ("python", "main.py"))
+    with SandboxFleet(ContainerRunner(IMAGE), limits=SandboxLimits(wall_seconds=.4), workers=4) as fleet:
+        outcomes = fleet.run([program] * 8)
+    assert all(outcome.verdict is Verdict.TIMEOUT for outcome in outcomes)
+    time.sleep(3)
+    leftover = subprocess.run(["docker", "ps", "-a", "--filter", "name=dew-fleet-", "-q"],
+                              capture_output=True, text=True, check=True).stdout.split()
+    subprocess.run(["docker", "rm", "--force", *leftover], capture_output=True, check=False)
+    assert leftover == [], f"{len(leftover)} containers outlived their deadline"
