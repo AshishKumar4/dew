@@ -509,6 +509,12 @@ def expert_dispatch[Parameters](
                        out_specs=P(EXPERT_AXIS))
     def local(tokens: jax.Array, indices: jax.Array, parameters: Parameters,
               input_weights: jax.Array | None) -> jax.Array:
+        """Run one expert shard's share of the exchange, inside shard_map.
+
+        Every shard sorts its own rows by expert, cuts them into buckets of
+        `capacity` per destination, and runs `rounds` exchanges. `rounds` is
+        the mesh-wide maximum, so every shard runs the same number.
+        """
         slots, per_shard = indices.size, num_experts // shards
         order = jnp.argsort(indices.ravel())
         experts = indices.ravel()[order]
@@ -523,6 +529,12 @@ def expert_dispatch[Parameters](
 
         @jax.checkpoint
         def exchange_round(iteration: jax.Array) -> tuple[jax.Array, jax.Array]:
+            """Send one bucket to each shard, project it there, bring it back.
+
+            Returns the returned rows and the local address each one belongs
+            at. Padding addresses land past the end, so the caller's
+            scatter drops them.
+            """
             offsets = iteration * capacity + lanes
             valid = offsets[None, :] < sizes[:, None]
             addresses = starts[:, None] + offsets
@@ -544,6 +556,11 @@ def expert_dispatch[Parameters](
             return returned, jnp.where(valid, addresses, slots)
 
         def step(out: jax.Array, iteration: jax.Array) -> tuple[jax.Array, None]:
+            """Scan one round into the output rows; the carry is those rows.
+
+            The scan always runs `shards` iterations so its length is
+            static, and the rounds past `rounds` keep the carry unchanged.
+            """
             def active(out: jax.Array) -> jax.Array:
                 returned, addresses = exchange_round(iteration)
                 return out.at[addresses].set(returned, mode='drop')

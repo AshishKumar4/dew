@@ -576,29 +576,14 @@ def translate_vae_weights(torch_tensors: ParamTree) -> dict:
 FLAX_REVISIONS = ("bf16", "flax")
 
 
-def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) -> dict:
-    """Read a pretrained AutoencoderKL's config and params, local or from the Hub.
+def _flax_layout(modelname: str, revision: str, params, errors: list) -> dict | None:
+    """Read the SD1-era flax msgpack, or None when the repo ships none.
 
-    Two weight layouts reach the same tree. The SD1-era repos ship flax
-    `diffusion_flax_model.msgpack`, sometimes under a `vae` subfolder on a
-    `flax`/`bf16` revision. Every 16-channel VAE (SD3.5, Flux) ships torch
-    `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
-    reads. Supplied `params` are authoritative: only the configuration and
-    the repository's file metadata are read then, never weight bytes.
-
-    `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
-    the torch path then reads the repo's default branch. Any other revision
-    is a pin: the torch path reads only that revision, and raises
-    FileNotFoundError when the repo has no weights at it.
+    The four candidates are the revision the caller named and the `flax`
+    branch, each with and without the `vae` subfolder. Every miss is
+    appended to `errors`, so the caller can raise the last one.
     """
     from flax.serialization import msgpack_restore
-
-    if os.path.isdir(modelname):
-        directory = Path(modelname)
-        with open(directory / "config.json") as handle:
-            config = json.load(handle)
-        return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
-
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
@@ -608,7 +593,6 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
         (revision, None),
         (None, None),
     ]
-    last_error = None
     for candidate_revision, subfolder in candidates:
         try:
             config_path = hf_hub_download(modelname, "config.json",
@@ -626,25 +610,68 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
             with open(weights_path, "rb") as f:
                 return {"config": config, "params": msgpack_restore(f.read())}
         except (EntryNotFoundError, RevisionNotFoundError) as e:
-            last_error = e
+            errors.append(e)
+    return None
+
+
+def _torch_layout(modelname: str, revision: str, params, errors: list) -> dict | None:
+    """Read the torch safetensors and translate them, or None when absent.
+
+    A revision outside `FLAX_REVISIONS` is a pin, so only that revision is
+    tried; otherwise the repo's default branch is. Every miss is appended
+    to `errors`.
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
     pinned = revision not in FLAX_REVISIONS
-    torch_candidates = ([(revision, "vae"), (revision, None)]
-                        if pinned else [(None, "vae"), (None, None)])
-    for candidate_revision, subfolder in torch_candidates:
+    candidates = ([(revision, "vae"), (revision, None)]
+                  if pinned else [(None, "vae"), (None, None)])
+    for candidate_revision, subfolder in candidates:
         try:
             config_path = hf_hub_download(modelname, "config.json",
                                           revision=candidate_revision, subfolder=subfolder)
             hf_hub_download(modelname, "diffusion_pytorch_model.safetensors",
                             revision=candidate_revision, subfolder=subfolder, dry_run=params is not None)
         except (EntryNotFoundError, RevisionNotFoundError) as e:
-            last_error = e
+            errors.append(e)
             continue
         directory = Path(config_path).parent
         with open(config_path) as handle:
             config = json.load(handle)
         return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
+    return None
 
+
+def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) -> dict:
+    """Read a pretrained AutoencoderKL's config and params, local or from the Hub.
+
+    Two weight layouts reach the same tree. The SD1-era repos ship flax
+    `diffusion_flax_model.msgpack`, sometimes under a `vae` subfolder on a
+    `flax`/`bf16` revision. Every 16-channel VAE (SD3.5, Flux) ships torch
+    `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
+    reads. Supplied `params` are authoritative: only the configuration and
+    the repository's file metadata are read then, never weight bytes.
+
+    `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
+    the torch path then reads the repo's default branch. Any other revision
+    is a pin: the torch path reads only that revision, and raises
+    FileNotFoundError when the repo has no weights at it.
+    """
+    if os.path.isdir(modelname):
+        directory = Path(modelname)
+        with open(directory / "config.json") as handle:
+            config = json.load(handle)
+        return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
+
+    errors: list[Exception] = []
+    loaded = _flax_layout(modelname, revision, params, errors)
+    if loaded is None:
+        loaded = _torch_layout(modelname, revision, params, errors)
+    if loaded is not None:
+        return loaded
+    last_error = errors[-1] if errors else None
+    pinned = revision not in FLAX_REVISIONS
     raise FileNotFoundError(
         f"no VAE weights in {modelname}"
         + (f" at revision {revision!r}" if pinned else "")
