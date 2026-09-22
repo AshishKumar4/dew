@@ -66,6 +66,21 @@ def _observation(value: object) -> Observation:
     return Observation(tuple(ids), state, detail)
 
 
+def launch(command: tuple[str, ...], limits: SandboxLimits, directory: str) -> subprocess.Popen[bytes]:
+    """Start `command` in `directory` under `limits`, in its own session, with piped streams.
+
+    The launcher applies RLIMIT_CPU, RLIMIT_AS and no core dumps, installs the
+    parent-death signal, then execs the command with a minimal environment.
+    """
+    launcher = str(Path(__file__).with_name("_sandbox_exec.py"))
+    return subprocess.Popen(
+        [sys.executable, "-I", launcher, str(limits.cpu_seconds), str(limits.memory_bytes),
+         str(os.getpid()), *command], cwd=directory,
+        env={"PATH": os.defpath, "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1"},
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True)
+
+
 class _ProcessEnvironment:
     """Drive one sandboxed worker process over a line-delimited JSON protocol."""
 
@@ -74,13 +89,7 @@ class _ProcessEnvironment:
         self.identity, self.limits = identity, limits
         self.deadline = time.monotonic() + limits.wall_seconds
         self.output = bytearray()
-        launcher = str(Path(__file__).with_name("_sandbox_exec.py"))
-        self.process = subprocess.Popen(
-            [sys.executable, "-I", launcher, str(limits.cpu_seconds), str(limits.memory_bytes),
-             str(os.getpid()), *command], cwd=directory,
-            env={"PATH": os.defpath, "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1"},
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True)
+        self.process = launch(command, limits, directory)
         assert self.process.stdin is not None and self.process.stdout is not None and self.process.stderr is not None
         self.stdin, self.stdout, self.stderr = self.process.stdin, self.process.stdout, self.process.stderr
         for stream in (self.stdin, self.stdout, self.stderr):
