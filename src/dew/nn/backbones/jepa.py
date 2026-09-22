@@ -47,7 +47,7 @@ class TokenStack(nn.Module):
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
         pattern = build_block_pattern(
@@ -98,7 +98,7 @@ class FactorizedTokenStack(nn.Module):
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
 
     def setup(self):
         def stack(name, num_layers, ratio):
@@ -149,7 +149,7 @@ class JepaEncoder(nn.Module):
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
 
@@ -201,7 +201,7 @@ class JepaVideoEncoder(nn.Module):
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
 
@@ -257,7 +257,7 @@ class JepaPredictor(nn.Module):
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     scan_order: str = 'raster'
     factorized: bool = False     # space-time blocks, for video
 

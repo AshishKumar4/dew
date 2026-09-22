@@ -26,24 +26,40 @@ def qkv(dtype=jnp.bfloat16):
     return (jnp.ones(BF16_QKV, dtype),) * 3
 
 
-@pytest.mark.parametrize("implementation", ['auto', 'xla', 'cudnn', 'tpu'])
+@pytest.mark.parametrize("implementation", ['xla', 'cudnn', 'tpu'])
 @pytest.mark.parametrize("precision", [jax.lax.Precision.HIGH, jax.lax.Precision.HIGHEST,
                                        'high', ('highest', 'highest')])
 def test_fused_attention_rejects_precision_it_cannot_honor(implementation, precision,
                                                            without_deterministic_ops):
     """jax.nn.dot_product_attention takes no precision argument at all: it
-    accumulates the logits in fp32 whatever it is handed, so asking for HIGH
-    raises."""
+    accumulates the logits in fp32 whatever it is handed, so asking a fused
+    kernel by name for HIGH raises."""
     with pytest.raises(ValueError, match="precision"):
         scaled_dot_product_attention(*qkv(), precision=precision,
                                      implementation=implementation)
 
 
-@pytest.mark.parametrize("implementation", ['auto', 'xla', 'cudnn', 'tpu'])
+@pytest.mark.parametrize("implementation", ['xla', 'cudnn', 'tpu'])
 def test_fused_attention_rejects_bf16_softmax(implementation, without_deterministic_ops):
     with pytest.raises(ValueError, match="force_fp32_for_softmax"):
         scaled_dot_product_attention(*qkv(), force_fp32_for_softmax=False,
                                      implementation=implementation)
+
+
+@pytest.mark.parametrize("arguments", [
+    {"precision": jax.lax.Precision.HIGHEST},
+    {"force_fp32_for_softmax": False},
+    {"dtype": jnp.float32},
+])
+def test_auto_takes_the_reference_path_for_arithmetic_only_it_performs(arguments):
+    """'auto' resolves a call that asks for a matmul precision, a softmax
+    dtype or a compute dtype no fused kernel honours to the reference path,
+    and computes exactly what naming that path computes."""
+    query, key, value = jax.random.normal(jax.random.key(1), (3, *BF16_QKV), jnp.bfloat16)
+    auto = scaled_dot_product_attention(query, key, value, implementation="auto", **arguments)
+    reference = scaled_dot_product_attention(query, key, value, implementation="reference",
+                                             **arguments)
+    assert jnp.array_equal(auto, reference)
 
 
 @pytest.mark.parametrize("precision", [None, jax.lax.Precision.DEFAULT, "default"])

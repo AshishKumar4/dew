@@ -276,7 +276,7 @@ class DecoderFields(TypedDict, total=False):
     dtype: Dtype | None
     precision: PrecisionLike
     force_fp32_for_softmax: bool
-    attention_impl: str | None
+    attention_impl: str
     mixture: MixtureFields | None
     use_double_wide_mlp: bool
     causal: bool

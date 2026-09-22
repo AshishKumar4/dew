@@ -261,7 +261,7 @@ class KPoolSparseAttention(nn.Module):
     attention_bias: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     force_fp32_for_softmax: bool = True
 
     def setup(self):
@@ -425,6 +425,7 @@ class KPoolSparseAttentionMixer(MixerBase):
             "v_norm": ctx.v_norm,
             "k_eq_v": ctx.k_eq_v,
             "sliding_window": ctx.sliding_window,
+            "attention_chunk": ctx.attention_chunk,
             "attention_scale": ctx.attention_scale,
             "partial_rotary_factor": ctx.partial_rotary_factor,
             "kv_shared": ctx.kv_shared,

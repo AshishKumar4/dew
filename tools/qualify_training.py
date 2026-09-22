@@ -113,7 +113,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
     initial_loss = float(objective.reduce_loss(stats)[0])
     if mode == "baseline":
         parity = LMObjective(
-            source.model.clone(dtype=jnp.float32, attention_impl=None),
+            source.model.clone(dtype=jnp.float32, attention_impl='reference'),
             SEQUENCE,
             ema_decay=None,
         )
@@ -165,7 +165,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
         run / "export", dtype="float32", attention_impl="reference"
     )
     ids = jnp.asarray(probe["text"][:, :-1])
-    expected = source.model.clone(dtype=jnp.float32, attention_impl=None).apply(
+    expected = source.model.clone(dtype=jnp.float32, attention_impl='reference').apply(
         state.params, ids
     )
     actual = reloaded.model.apply(reloaded.variables, ids)

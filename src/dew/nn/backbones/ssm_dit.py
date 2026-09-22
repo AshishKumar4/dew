@@ -46,7 +46,7 @@ class HybridSSMAttentionDiT(nn.Module):
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
-    attention_impl: str | None = None
+    attention_impl: str = "auto"  # an AttentionImpl
     remat: bool = False
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
     block_pattern: Sequence[str] | None = None  # e.g., ['ssm','ssm','ssm','attn']

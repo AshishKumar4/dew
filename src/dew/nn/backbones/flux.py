@@ -103,7 +103,7 @@ class _FluxAttention(nn.Module):
     head_dim: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = "auto"
+    attention_impl: str = "auto"  # an AttentionImpl
 
     def _heads(self, x):
         return x.reshape(x.shape[0], x.shape[1], self.heads, self.head_dim)
@@ -151,7 +151,7 @@ class FluxBlock(nn.Module):
     head_dim: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = "auto"
+    attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
     def __call__(self, image, context, conditioning, cos, sin):
@@ -190,7 +190,7 @@ class FluxSingleBlock(nn.Module):
     mlp_ratio: float = 4.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = "auto"
+    attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
     def __call__(self, x, conditioning, cos, sin):
@@ -246,7 +246,7 @@ class FluxTransformer(nn.Module):
     axes_dims_rope: Sequence[int] = (16, 56, 56)
     dtype: Dtype | None = None
     precision: PrecisionLike = None
-    attention_impl: str | None = "auto"
+    attention_impl: str = "auto"  # an AttentionImpl
 
     @property
     def features(self) -> int:

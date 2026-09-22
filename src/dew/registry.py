@@ -404,9 +404,9 @@ def precision_fields(name: str, config: Mapping[str, object], *,
     `with_precision` is the same settings merged into the config they belong
     to; this is them on their own, for a caller holding a typed field bag.
 
-    `attention_impl` is an `AttentionImpl` and travels as it is written: the
-    kernel reads 'reference' as the reference path, so nothing here rewrites
-    the name a run recorded into the None a module field also accepts.
+    `attention_impl` is an `AttentionImpl` and travels as it is written; the
+    kernel resolves 'auto' against each call, so the name a run recorded is
+    the name the model holds.
 
     `dtype` is the compute dtype; `param_dtype` is where the parameters are
     stored and `matmul_precision` what every matmul asks XLA for. Those two

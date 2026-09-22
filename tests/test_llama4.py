@@ -15,8 +15,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from dew.nn.attention import chunk_mask
 from dew.nn.backbones.causal_transformer import GatedMLP
-from dew.nn.llama4 import Llama4Attention, chunk_mask, temperature_scale
+from dew.nn.llama4 import Llama4Attention, temperature_scale
 from dew.nn.moe import SparseMLP
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "llama4"
