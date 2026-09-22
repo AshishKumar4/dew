@@ -85,9 +85,12 @@ def load_rows(sources: Sequence[str]) -> Dataset:
 
 @lru_cache(maxsize=1)
 def _user_agent() -> str:
-    """The user agent HF `datasets` advertises, resolved on the first fetch so
-    importing this module needs no `datasets`. It is the agent the library's
-    own url-fetching example sends."""
+    """The user agent HF `datasets` advertises, which its own url-fetching
+    example sends.
+
+    Resolved on the first fetch, so importing this module needs no
+    `datasets`.
+    """
     try:
         from datasets.utils.file_utils import get_datasets_user_agent
     except ImportError as exc:
@@ -120,7 +123,7 @@ def fetch_bytes(url: str, timeout: float, retries: int) -> bytes | None:
 
 
 def decode_pixels(blob: bytes) -> np.ndarray | None:
-    """`data` as the array PIL decodes it to, or None when it is no image.
+    """`blob` as the array PIL decodes it to, or None when it is no image.
 
     The bytes are whatever the open internet returned. PIL reports a bad
     file as OSError, SyntaxError, ValueError, its own DecompressionBombError
@@ -165,7 +168,7 @@ def prepare_image(pixels: np.ndarray, size: int, min_size: int) -> np.ndarray | 
 
 @dataclasses.dataclass(frozen=True)
 class Fetch:
-    """How a worker turns one url into a sample."""
+    """Says how a worker turns one url into a sample."""
 
     size: int
     min_size: int
@@ -175,7 +178,7 @@ class Fetch:
 
 def fetch_one(url: str, caption: str, sink: queue.Queue | multiprocessing.queues.Queue,
               fetch: Fetch, stop: multiprocessing.synchronize.Event | None = None) -> None:
-    """Queue the sample for `url`, or the url itself when it yields nothing."""
+    """Queues the sample for `url`, or the url itself when it yields nothing."""
     if stop is not None and stop.is_set():
         return
     blob = fetch_bytes(url, fetch.timeout, fetch.retries)
@@ -191,8 +194,8 @@ def fetch_one(url: str, caption: str, sink: queue.Queue | multiprocessing.queues
 
 
 def columns(shard: Mapping[str, Sequence[str]]) -> tuple[Sequence[str], Sequence[str]]:
-    """The url and caption columns of a shard of rows, by whichever of the
-    known names it uses."""
+    """The url and caption columns of `shard`, under whichever of the known
+    names it uses."""
     urls = next((shard[name] for name in URL_COLUMNS if name in shard), None)
     captions = next((shard[name] for name in CAPTION_COLUMNS if name in shard), None)
     if urls is None or captions is None:
@@ -219,7 +222,7 @@ def _init_worker(sink: multiprocessing.queues.Queue,
 
 
 def _fetch_shard(shard: Mapping[str, Sequence[str]], fetch: Fetch, threads: int) -> None:
-    """Fetch every row of one shard onto this worker's queue."""
+    """Fetches every row of one shard onto this worker's queue."""
     if _worker_sink is None:
         raise RuntimeError("the fetch pool's worker was started without a queue")
     urls, captions = columns(shard)
@@ -233,8 +236,8 @@ def _fetch_shard(shard: Mapping[str, Sequence[str]], fetch: Fetch, threads: int)
 def fetch_rows(rows: Dataset, sink: multiprocessing.queues.Queue, *, workers: int,
                threads: int, fetch: Fetch, stop: multiprocessing.synchronize.Event,
                shutdown: threading.Event, finish: Callable[[BaseException | None], None]) -> None:
-    """Walk `rows` forever, `workers` processes fetching a shard each with
-    `threads` threads, and reshuffle between passes.
+    """Walks `rows` forever, `workers` processes fetching a shard each with
+    `threads` threads, reshuffling between passes.
 
     Every row belongs to one shard. The bounds split len(rows) evenly, so a
     row past an even split is the last shard's tail.
@@ -269,17 +272,19 @@ def fetch_rows(rows: Dataset, sink: multiprocessing.queues.Queue, *, workers: in
 
 
 class ImageStream:
-    """Endless batches of fetched images, `{"image": uint8 [batch, size, size, 3],
-    "caption": [batch] str}`.
+    """Yields endless batches of fetched images,
+    `{"image": uint8 [batch, size, size, 3], "caption": [batch] str}`.
 
-    A batch is `batch` samples the fetchers really produced, and a quiet queue
-    is no batch. While production runs the stream keeps waiting. When it
-    finishes, iteration ends or raises its exception after queued samples.
-    The fetcher retains its pool until iteration-owning close, so cancellation
-    cannot destroy a writer halfway through an active queue receive.
-    `dropped` counts the urls the workers threw away. The
-    fetchers run at most `prefetch` batches ahead. The stream reports no
-    position, so a run over it does not checkpoint.
+    A batch is `batch` samples the fetchers really produced, and a quiet
+    queue is no batch. While production runs the stream keeps waiting. When
+    it finishes, iteration ends or raises its exception after queued samples.
+    The fetcher retains its pool until iteration-owning close, so
+    cancellation cannot destroy a writer halfway through an active queue
+    receive.
+
+    `dropped` counts the urls the workers threw away, and the fetchers run at
+    most `prefetch` batches ahead. The stream reports no position, so a run
+    over it does not checkpoint.
     """
 
     def __init__(self, rows: Dataset, *, batch: int, size: int, min_size: int,
@@ -348,11 +353,11 @@ class ImageStream:
         self._done.set()
 
     def request_stop(self) -> None:
-        """Signal cancellation; safe alongside next and final close."""
+        """Signals cancellation; safe alongside next and final close."""
         self._stop.set()
 
     def close(self) -> None:
-        """Finalize on the iteration-owning thread, after next has returned."""
+        """Finalizes on the iteration-owning thread, after next has returned."""
         self.request_stop()
         if self._closed:
             return
@@ -371,8 +376,10 @@ class ImageStream:
         self._closed = True
 
     def _check_fetcher(self) -> None:
-        """Raise when there is nothing left to wait for. A live fetcher is
-        only slow."""
+        """Raises when there is nothing left to wait for.
+
+        A live fetcher is only slow, so it earns one line on stdout instead.
+        """
         if not self._done.is_set():
             if not self._waiting_logged:
                 self._waiting_logged = True

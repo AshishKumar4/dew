@@ -7,9 +7,9 @@ turns it into a `Dataset` of batch iterators:
     steps = epochs * data.steps_per_epoch
 
 Importing this package registers every dataset and costs none of the heavy
-dependencies: cv2, tensorflow_datasets, HF `datasets`, the
-AV readers and `transformers` are imported by a spec on use, so a host that
-only needs the token loaders never pays for the image stack, and vice versa.
+dependencies. cv2, tensorflow_datasets, HF `datasets`, the AV readers and
+`transformers` are imported by a spec on use, so a host that only needs the
+token loaders never pays for the image stack, and vice versa.
 """
 
 from .chat import ChatMessages, Role

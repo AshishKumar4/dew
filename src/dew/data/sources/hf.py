@@ -51,12 +51,12 @@ def _hf_datasets():
 
 @dataclasses.dataclass(frozen=True)
 class HFOptions:
-    """`datasets.load_dataset`'s arguments, as one value with their own types.
+    """Holds `datasets.load_dataset`'s arguments as one value of their own types.
 
     Both hf routes call `load`, so the Arrow source and the streamed source
     cannot drift apart in what they forward. The fields are the library's,
     named as the library names them apart from `config`, which is
-    `load_dataset`'s `name`: dew already uses `name` for which dataset this
+    `load_dataset`'s `name`; dew already uses `name` for which dataset this
     is.
     """
 
@@ -80,9 +80,9 @@ class HFOptions:
     def load(self, path: str, split: str, *, streaming: bool):
         """The split at `path`, through `datasets.load_dataset`.
 
-        This is where a hub dataset is downloaded and an Arrow cache written,
-        by the library, on its own terms; a streamed split reads as it goes
-        instead. Dew adds nothing to either.
+        This is where the library downloads a hub dataset and writes an Arrow
+        cache, on its own terms. A streamed split reads as it goes instead.
+        Dew adds nothing to either.
         """
         datasets = _hf_datasets()
         return datasets.load_dataset(
@@ -111,22 +111,25 @@ table and the lock left behind."""
 
 @runtime_checkable
 class ArrayInterface(Protocol):
-    """A value numpy reads without being told how: `datasets` decodes an
-    image column into a PIL image, and a PIL image describes its buffer
-    here. Strings, numbers and lists describe none and travel as they are."""
+    """Describes a buffer numpy reads without being told how.
+
+    `datasets` decodes an image column into a PIL image, and a PIL image
+    describes its buffer here. Strings, numbers and lists describe none and
+    travel as they are.
+    """
 
     @property
     def __array_interface__(self) -> Mapping[str, object]: ...
 
 
 class HFDatasetSource:
-    """Random access over a Hugging Face `datasets.Dataset`.
+    """Reads a Hugging Face `datasets.Dataset` by index.
 
-    Either hand over a loaded dataset or name a hub dataset and split, which
-    `load_dataset` resolves on the first record. The table never travels in
-    the source's pickle. A named dataset reloads from its name and split
-    inside the worker, and a dataset handed over in memory is written out
-    once and reopened from there, the way TokenFileSource reopens its memmap.
+    Either hand over a loaded dataset or name a hub dataset and split;
+    `load_dataset` resolves the name on the first record. The table never
+    travels in the source's pickle. A named dataset reloads from its name
+    inside the worker. A dataset handed over in memory is written out once
+    and reopened from there, the way `TokenBytes` reopens its memmap.
     """
 
     def __init__(self, name: str | None = None, split: str = "train", dataset=None,
@@ -148,9 +151,9 @@ class HFDatasetSource:
         self._lock = threading.Lock()
 
     def __repr__(self) -> str:
-        # A saved data position names the order it counts into by naming its
-        # source, and a resume refuses a description it cannot match, so this
-        # names the dataset, not an address, and without touching the table.
+        # The description a saved position compares against (`describe`).
+        # It names the dataset rather than an address, without touching the
+        # table.
         return (f"HFDatasetSource(name={self.name!r}, split={self.split!r}, "
                 f"options={self.options!r}, cache={self._cache_path!r})")
 
@@ -161,8 +164,8 @@ class HFDatasetSource:
         that both find no table would start two loads of it. The load happens
         under the lock and the fast path only reads the attribute.
 
-        Random access is the whole promise of this source, so whatever the
-        library hands back has to be one table: a directory of splits and a
+        Reading by index is the whole promise of this source, so whatever the
+        library hands back has to be one table. A directory of splits and a
         streamed split are both refused here rather than indexed into.
         """
         held = self._dataset

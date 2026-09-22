@@ -13,17 +13,18 @@ from .dataset import Dataset, DatasetSpec, Loading, Tokenize, local_batch, token
 
 @dataclasses.dataclass(frozen=True)
 class OnlineImages(DatasetSpec):
-    """Images fetched by url as they are read, an endless stream.
+    """Fetches images by url as they are read, an endless stream.
 
     `sources` name hub datasets or `gs://` directories saved with
-    `save_to_disk`; their rows carry a url and a caption. The rows are
-    concatenated, shuffled once, and sharded by JAX process; each process
-    then walks its shard forever, reshuffling between passes, so nothing is
-    held out and the stream cannot resume mid-epoch. A url that yields no
-    image, or an image that is not RGB, under `min_image_size` on its
-    shorter side, more than 2.4 times as long as wide or a single flat
-    colour, is dropped and counted. Needs the streaming extra (HF
-    `datasets`).
+    `save_to_disk`, whose rows carry a url and a caption. The rows are
+    concatenated, shuffled once and sharded by JAX process. Each process then
+    walks its shard forever, reshuffling between passes, so nothing is held
+    out and the stream cannot resume mid-epoch.
+
+    A row is dropped and counted when its url yields no image, or when the
+    image is not RGB, under `min_image_size` on its shorter side, more than
+    2.4 times as long as wide, or a single flat colour. Needs the streaming
+    extra (HF `datasets`).
     """
 
     sources: tuple[str, ...] = ()
@@ -31,11 +32,11 @@ class OnlineImages(DatasetSpec):
     min_image_size: int = 128
     loading: Loading = dataclasses.field(
         default=Loading(workers=16, threads=512, worker_buffer=20), kw_only=True)
-    """The fetch pool is this spec's own, not a grain reader: `workers` and
-    `threads` are the fetch pool's, `read_buffer` does not reach this path at
-    all, and `worker_buffer` is how many batches the fetchers run ahead. The
-    grain default would read 32 processes of 64 threads two batches ahead of
-    a step, which is the wrong shape for a pool waiting on urls."""
+    """How the fetch pool runs, which is this spec's own and not a grain
+    reader. `workers` and `threads` are the pool's, `worker_buffer` is how
+    many batches the fetchers run ahead, and `read_buffer` does not reach
+    this path. The grain default is shaped for file reads rather than for a
+    pool waiting on urls."""
     timeout: int = 15
     retries: int = 3
 
@@ -62,7 +63,10 @@ class OnlineImages(DatasetSpec):
 @datasets("combined_online")
 @dataclasses.dataclass(frozen=True)
 class CombinedOnline(OnlineImages):
-    """The dew-datasets-regional bucket's url datasets, the liked sets several times over."""
+    """Reads every url dataset in the dew-datasets-regional bucket.
+
+    The liked sets are listed several times over, which weights them up.
+    """
 
     sources: tuple[str, ...] = (
         "gs://dew-datasets-regional/datasets/laion-aesthetics-12m+mscoco-2017",

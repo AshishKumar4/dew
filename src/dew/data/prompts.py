@@ -1,16 +1,18 @@
 """Prompts for online RL: fixed-width rows with their reward context.
 
 A `Prompts` source reads a parquet file or in-memory JSON rows in the verl
-layout and encodes each into a left-padded `prompt` of `max_prompt_len` ids
-plus `prompt_length`, and the reward columns `data_source`, `ground_truth`
-and `extra_info` as fixed-width UTF-8 byte arrays, so every leaf survives
-the device transfer. A row's prompt is messages rendered with the tokenizer's
-chat template and generation prompt, a string encoded on its own, or token
-ids used as they are. Chat messages use the SFT parser and carry optional
-top-level `tools` schemas into the template. Text parts join in order;
-nontext parts require a processor and are refused before truncation.
-Prompts longer than the window keep their tail; the three reward columns
-default to the empty string when the row lacks them.
+layout. Each row becomes a left-padded `prompt` of `max_prompt_len` ids with
+its `prompt_length`, and the reward columns `data_source`, `ground_truth`
+and `extra_info` as fixed-width UTF-8 byte arrays, so every leaf survives the
+device transfer.
+
+A row's prompt is messages rendered with the tokenizer's chat template and
+generation prompt, a string encoded on its own, or token ids used as they
+are. Chat messages use the SFT parser and carry optional top-level `tools`
+schemas into the template. Text parts join in order; nontext parts require a
+processor and are refused before truncation. Prompts longer than the window
+keep their tail, and the three reward columns default to the empty string
+when the row lacks them.
 """
 
 from __future__ import annotations
@@ -58,8 +60,11 @@ class _Row:
 
 
 def _text(value: object) -> str:
-    """One reward column as a string: missing is empty, a string is itself,
-    and anything else travels as JSON, which is refused where it is not."""
+    """One reward column as a string.
+
+    Missing is empty and a string is itself. Anything else travels as JSON,
+    and a value that is not JSON is refused.
+    """
     if value is None:
         return ""
     if isinstance(value, str):
@@ -72,11 +77,11 @@ def _text(value: object) -> str:
 
 
 def _prompt_ids(tokenizer: str, prompt: object, tools: object, origin: str) -> list[int]:
-    """Encode a prompt, retaining structured messages until text rendering.
+    """Encodes a prompt, retaining structured messages until text rendering.
 
     A row's prompt is a string, a list of token ids, or the messages of a
-    conversation; a list of anything else is read as messages, which is
-    where a part that is not one is named. Tools belong to messages only.
+    conversation. A list of anything else is read as messages, which is where
+    a part that is not one is named. Tools belong to messages only.
     """
     if tools is not None and not isinstance(tools, (str, list)):
         raise ValueError(
@@ -105,8 +110,11 @@ def _prompt_ids(tokenizer: str, prompt: object, tools: object, origin: str) -> l
 
 
 def _utf8(text: str, width: int) -> np.ndarray:
-    """The string as int32 UTF-8 bytes in a zero-padded row of the scanned
-    width, which fits every row by construction."""
+    """`text` as int32 UTF-8 bytes, zero-padded to `width`.
+
+    `width` is the longest reward string the source scanned, so every row
+    fits without truncation.
+    """
     raw = np.frombuffer(text.encode("utf-8"), dtype=np.uint8).astype(np.int32)
     out = np.zeros(width, np.int32)
     out[:len(raw)] = raw
@@ -114,13 +122,13 @@ def _utf8(text: str, width: int) -> np.ndarray:
 
 
 class PromptSource:
-    """Random access over normalized prompt rows, encoded on read.
+    """Reads normalized prompt rows by index, encoding each on read.
 
-    Rows come back encoded: the prompt left-padded to the window, the reward
-    columns as UTF-8 bytes of the scanned width, so workers unpickle rows and
-    the tokenizer path and render their own copies. The repr names the origin
-    file for grain's checkpoint matching, or the record count for in-memory
-    rows.
+    A row comes back as the prompt left-padded to the window and the reward
+    columns as UTF-8 bytes of the scanned width. Workers unpickle the rows
+    and the tokenizer path and render their own copies. The repr names the
+    origin file, or the record count for in-memory rows, which is what a
+    saved position compares against (`describe`).
     """
 
     def __init__(self, rows: Sequence[Mapping[str, object]], origin: str,
@@ -161,8 +169,10 @@ class PromptSource:
     @classmethod
     def from_parquet(cls, path: str, tokenizer: str, max_prompt_len: int,
                      pad_id: int) -> PromptSource:
-        """The file's rows: `prompt` is required, the reward columns ride
-        along when present."""
+        """The parquet file's rows.
+
+        `prompt` is required; the reward columns ride along when present.
+        """
         try:
             import pyarrow.parquet as parquet
         except ImportError as exc:
@@ -213,15 +223,17 @@ class PromptSource:
 @datasets("prompts")
 @dataclasses.dataclass(frozen=True)
 class Prompts(DatasetSpec):
-    """Prompts with their reward context, in fixed-width batches.
+    """Reads prompts with their reward context, in fixed-width batches.
 
-    `path` is a parquet file in the verl layout; `records` is JSON rows for
-    tests and small sweeps; exactly one of the two is set. Each batch holds
-    `prompt` left-padded to `max_prompt_len` with `pad_id`, `prompt_length`,
-    and the reward columns as UTF-8 bytes. An optional `tools` column holds
-    schemas as a list or JSON string for chat prompts; schemas are rendered
-    into prompt tokens and never copied into the device batch. `val_path` is
-    a second parquet file scored as one pass; None trains without validation.
+    `path` is a parquet file in the verl layout and `records` is JSON rows
+    for tests and small sweeps; exactly one of the two is set. Each batch
+    holds `prompt` left-padded to `max_prompt_len` with `pad_id`,
+    `prompt_length`, and the reward columns as UTF-8 bytes.
+
+    An optional `tools` column holds schemas as a list or JSON string for
+    chat prompts. Schemas are rendered into prompt tokens and never copied
+    into the device batch. `val_path` is a second parquet file scored as one
+    pass; None trains without validation.
     """
 
     tokenizer: str

@@ -1,11 +1,11 @@
 """Audio-video datasets: a directory tree of clips, one random clip per record.
 
-A record is a video file and a caption; the transform reads `frames` frames
+A record is a video file and a caption. The transform reads `frames` frames
 from a random offset with the audio around them, resizes the frames and
 featurises the audio for the audio model. Records leave as
 `{"video": uint8 [frames, size, size, 3], "caption": str, "audio": {...}}`,
 where the audio dict holds the audio model's own feature keys next to
-`full_audio`, the padded waveform cut into one row per frame;
+`full_audio`, the padded waveform cut into one row per frame.
 `load(tokenize=)` is where a run's condition reads the captions. The AV
 reader and the audio processor are imported on use.
 """
@@ -47,7 +47,7 @@ def video_paths(root: str, extensions: tuple[str, ...]) -> list[str]:
 
 
 class AudioVideoTransform(pygrain.RandomMapTransform):
-    """One clip per record, with its frames, their audio, and the record's caption."""
+    """Reads one clip per record: its frames, their audio, and its caption."""
 
     def __init__(self, spec: VideoDataset):
         self.spec = spec
@@ -79,7 +79,7 @@ class AudioVideoTransform(pygrain.RandomMapTransform):
 
 @dataclasses.dataclass(frozen=True)
 class VideoDataset(DatasetSpec):
-    """Clips of `frames` frames at `frame_size`, with their audio, through grain.
+    """Reads clips of `frames` frames at `frame_size`, with their audio.
 
     `val_batches` batches of records are held out of the head of the source,
     in canonical order, as the validation split; None or 0 holds nothing out.
@@ -118,9 +118,11 @@ class VideoDataset(DatasetSpec):
 @datasets("voxceleb2")
 @dataclasses.dataclass(frozen=True)
 class VoxCeleb2(VideoDataset):
-    """A VoxCeleb2 tree, `<path>/<split>/<identity>/<clip>/<utterance>.mp4`,
-    scanned recursively so extra nesting is tolerated. The caption is
-    `prompt_template` with `{identity}` replaced by the speaker directory."""
+    """Reads a VoxCeleb2 tree, `<path>/<split>/<identity>/<clip>/<utterance>.mp4`.
+
+    The scan is recursive, so extra nesting is tolerated. The caption is
+    `prompt_template` with `{identity}` replaced by the speaker directory.
+    """
 
     path: str | None = None
     split: str = "train"
@@ -152,7 +154,7 @@ class VoxCeleb2(VideoDataset):
 @datasets("local_videos")
 @dataclasses.dataclass(frozen=True)
 class LocalVideos(VideoDataset):
-    """Every video file under `path`, captioned with `caption`."""
+    """Reads every video file under `path`, captioned with `caption`."""
 
     path: str | None = None
     extensions: tuple[str, ...] = (".mp4", ".avi", ".mov", ".webm")

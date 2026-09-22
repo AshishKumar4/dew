@@ -17,12 +17,12 @@ if TYPE_CHECKING:
 
 @runtime_checkable
 class TokenArray(Protocol):
-    """Ids held as an array rather than a list.
+    """Holds ids as an array rather than as a list.
 
-    numpy's and jax's arrays both hand their ids over through `tolist`, and
-    a decode takes either beside a plain sequence, because a sampler returns
-    a row of a device array and a caller writes a list. A row has a length;
-    the scalars `ArrayLike` also covers hand over a single id and have none.
+    numpy's and jax's arrays both hand their ids over through `tolist`, and a
+    decode takes either beside a plain sequence, because a sampler returns a
+    row of a device array while a caller writes a list. A row has a length;
+    the scalars `ArrayLike` also covers are one id and have none.
     """
 
     def __len__(self) -> int: ...
@@ -31,12 +31,11 @@ class TokenArray(Protocol):
 
 
 class ByteTokenizer:
-    """Vocabulary 256, one id per utf-8 byte of the text.
+    """Encodes text as one id per utf-8 byte, over a vocabulary of 256.
 
     It trains nothing and downloads nothing, which makes it the default for
-    small corpora and for tests; its decode is the inverse of its encode on
-    any unicode input, so a generated sequence rounds back to text byte for
-    byte.
+    small corpora and for tests. Its decode inverts its encode on any unicode
+    input, so a generated sequence rounds back to text byte for byte.
     """
 
     def __init__(self):
@@ -50,7 +49,7 @@ class ByteTokenizer:
         values = ids.tolist() if isinstance(ids, TokenArray) else ids
         if not isinstance(values, Sequence):
             raise TypeError("decode takes a row of token ids, not one id")
-        return bytes(int(i) for i in values).decode("utf-8", errors="replace")
+        return bytes(int(token) for token in values).decode("utf-8", errors="replace")
 
     def __repr__(self):
         return self.__class__.__name__ + "()"
@@ -94,11 +93,11 @@ class HFTokenizer:
         return self.tokenizer.decode(ids.tolist() if isinstance(ids, TokenArray) else ids)
 
     def save_pretrained(self, directory) -> None:
-        """Write this tokenizer's own files into an export directory.
+        """Writes this tokenizer's own files into an export directory.
 
-        What makes an exported checkpoint loadable by anything that reads the
-        HF layout: the tokenizer writes tokenizer.json, tokenizer_config.json
-        and its vocabulary itself, so the export copies no bytes by hand.
+        The tokenizer writes tokenizer.json, tokenizer_config.json and its
+        vocabulary itself, so the export copies no bytes by hand and the
+        result loads in anything that reads the HF layout.
         """
         self.tokenizer.save_pretrained(str(directory))
 
@@ -107,13 +106,13 @@ class HFTokenizer:
 
 
 def tokenizer_for(name: str, *, local_files_only: bool = False):
-    """The tokenizer a name asks for: `byte` for Dew's own utf-8 vocabulary,
-    any other name for the HF tokenizer of that repo or local directory.
+    """Builds the tokenizer `name` asks for.
 
-    The one place a tokenizer name is resolved, so a training run and an
-    export of what it trained read the same name the same way. An export
-    passes local_files_only, since writing a checkpoint out is no reason to
-    reach the hub for a tokenizer the host does not already have.
+    `byte` is dew's own utf-8 vocabulary; any other name is the HF tokenizer
+    of that repo or local directory. Resolving names here alone keeps a
+    training run and an export of what it trained reading one name one way.
+    An export passes `local_files_only`, since writing a checkpoint out is no
+    reason to reach the hub.
     """
     if name == "byte":
         return ByteTokenizer()

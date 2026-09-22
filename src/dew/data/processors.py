@@ -1,26 +1,31 @@
-"""Host-side tokenizers and feature extractors, turning raw text and audio
-into the arrays a batch carries. They run inside grain's workers, so the
-device only sees ready tensors. `transformers` is imported on construction,
-not on import."""
+"""Turns raw text and audio into the arrays a batch carries.
+
+These run inside grain's workers, so the device only ever sees ready tensors.
+`transformers` is imported on construction, not on import.
+"""
 
 from typing import Protocol, runtime_checkable
 
 
 @runtime_checkable
 class Sampled(Protocol):
-    """A feature extractor that states the rate it expects its audio at.
+    """States the sampling rate a feature extractor expects its audio at.
 
-    Whisper's and wav2vec2's do; one that states none is read at the 16 kHz
-    every released speech model here is trained on.
+    Whisper's and wav2vec2's extractors do. One that states none is read at
+    16 kHz, the rate every released speech model here is trained on.
     """
 
     sampling_rate: int
 
 
 class AutoTextTokenizer:
-    """The CLIP tokenizer, padded and truncated to the model's context."""
+    """Tokenizes captions, padded and truncated to the text model's context.
 
-    def __init__(self, tensor_type="pt", modelname="openai/clip-vit-large-patch14"):
+    `tensor_type` is what the tokenizer returns its arrays as; "np" is what
+    every caller here asks for, since nothing downstream reads torch.
+    """
+
+    def __init__(self, tensor_type="np", modelname="openai/clip-vit-large-patch14"):
         from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(modelname)
         self.tensor_type = tensor_type
@@ -39,12 +44,13 @@ class AutoTextTokenizer:
 
 
 class AutoAudioProcessor:
-    """Turn raw audio waveforms into model inputs, for any HF audio model.
+    """Turns raw waveforms into the inputs of any HF audio model.
 
     Whatever keys the model's feature extractor emits (`input_values` for
-    wav2vec2/HuBERT, `input_features` for Whisper/AST, ...) are passed
-    through unchanged, so switching audio models needs no change here.
+    wav2vec2/HuBERT, `input_features` for Whisper/AST, ...) pass through
+    unchanged, so switching audio models needs no change here.
     """
+
     def __init__(self, tensor_type="np", modelname="facebook/wav2vec2-base-960h",
                  sampling_rate=None):
         from transformers import AutoFeatureExtractor

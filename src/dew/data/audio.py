@@ -14,11 +14,12 @@ import numpy as np
 
 
 class AudioProcessor:
-    """Construct a Gemma audio feature extractor without downloading any files.
+    """Turns mono waveforms into the features a Gemma audio encoder reads.
 
-    ``config`` is the feature-extractor record (preprocessor_config.json),
-    while ``model_type`` identifies the encoder family. Waveforms are mono
-    float samples at the supplied sampling rate. This boundary never resamples.
+    ``config`` is the feature-extractor record (preprocessor_config.json) and
+    ``model_type`` names the encoder family, so the extractor is built without
+    downloading any files. Waveforms arrive at the sampling rate the extractor
+    states; this boundary never resamples.
     """
 
     def __init__(self, model_type: str, config: Mapping[str, object] | None = None):
@@ -39,6 +40,13 @@ class AudioProcessor:
     def __call__(self, waveforms: np.ndarray | Sequence[np.ndarray] | Sequence[float], *,
                  sampling_rate: int, max_length: int | None = 480000,
                  truncation: bool = True, pad_to_multiple_of: int | None = 128) -> dict[str, np.ndarray]:
+        """The float32 `input_features` and boolean `input_features_mask` of `waveforms`.
+
+        One waveform or a batch of them; every row is padded to the longest.
+        `max_length` is 30 seconds at 16 kHz, the window Gemma's extractor is
+        configured for, and `pad_to_multiple_of` keeps the frame count a
+        multiple of the encoder's stack of 128.
+        """
         if sampling_rate != self.sampling_rate:
             raise ValueError(f"audio sampling_rate must be {self.sampling_rate}, got {sampling_rate}")
         if len(waveforms) == 0:
