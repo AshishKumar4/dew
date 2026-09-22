@@ -2068,8 +2068,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
 
 
 def _wrapper_model(config: Mapping[str, object], record: decoders.WrapperFields,
-                   language_model: CausalTransformer, *, dtype: str,
-                   attention_impl: str) -> MultimodalTransformer:
+                   language_model: CausalTransformer, *, dtype: str) -> MultimodalTransformer:
     """The wrapper its record describes: the decoder above, the towers and
     projectors it names, and the placeholder ids its prompts carry."""
     family = records.text(config["model_type"], "model_type")
@@ -2088,8 +2087,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoders.WrapperFields,
         audio=None if audio_record is None else tower_from_record(audio_record),
         audio_projection=(None if audio_projector is None
                           else projector_from_record(audio_projector)),
-        audio_soft_tokens=record["audio_soft_tokens"],
-        attention_impl=attention_impl)
+        audio_soft_tokens=record["audio_soft_tokens"])
 
 
 def _source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
@@ -2187,8 +2185,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         language_model = models.build("causal_transformer", wrapper["text"])
         if not isinstance(language_model, CausalTransformer):
             raise TypeError("causal_transformer registry entry must build CausalTransformer")
-        model = _wrapper_model(config, record, language_model,
-                               dtype=dtype, attention_impl=attention_impl)
+        model = _wrapper_model(config, record, language_model, dtype=dtype)
         variables = _native_variables(decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype))
         layouts, retained = _wrapper_layouts(tensors, record, variables)
     else:

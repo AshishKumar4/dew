@@ -61,32 +61,35 @@ class HybridSSMAttentionDiT(nn.Module):
         in the mixer they name, the fields only that mixer reads, the remat
         policy, and the name a checkpoint stores them under.
         """
-        shared = dict(
-            features=self.emb_features,
-            num_heads=self.num_heads,
-            mlp_ratio=self.mlp_ratio,
-            dropout_rate=self.dropout_rate,
-            dtype=self.dtype,
-            precision=self.precision,
-            norm_epsilon=self.norm_epsilon,
-        )
+        def build(block_cls, policy: str | None, **fields) -> ModulatedBlock:
+            return remat_block(block_cls, self.remat, policy=policy)(
+                features=self.emb_features,
+                num_heads=self.num_heads,
+                mlp_ratio=self.mlp_ratio,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype,
+                precision=self.precision,
+                norm_epsilon=self.norm_epsilon,
+                **fields,
+            )
+
         if block_type == 'ssm':
-            return remat_block(ModulatedBlock, self.remat, policy=None)(
+            return build(
+                ModulatedBlock, None,
                 mixer='ssm',
                 ssm_state_dim=self.ssm_state_dim,
                 bidirectional_ssm=self.bidirectional_ssm,
                 use_2d_fusion=self.use_2d_fusion,
                 scan_order=self.scan_order,
                 name=f"ssm_block_{index}",
-                **shared,
             )
-        return remat_block(ModulatedBlock, self.remat)(
+        return build(
+            ModulatedBlock, 'dots',
             mixer='attention',
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             qk_norm=self.qk_norm,
             attention_impl=self.attention_impl,
             name=f"dit_block_{index}",
-            **shared,
         )
 
     def setup(self):

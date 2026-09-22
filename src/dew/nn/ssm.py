@@ -164,7 +164,6 @@ class BidirectionalS5Layer(nn.Module):
     dt_min: float = 0.001
     dt_max: float = 0.1
     dtype: Dtype | None = None
-    precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, u):
@@ -191,12 +190,7 @@ class BidirectionalS5Layer(nn.Module):
 
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
 
-        return nn.Dense(
-            features=self.features,
-            dtype=self.dtype,
-            precision=self.precision,
-            name="out_proj"
-        )(y_cat)
+        return nn.Dense(features=self.features, dtype=self.dtype, name="out_proj")(y_cat)
 
 
 class SpatialFusionConv(nn.Module):

@@ -383,13 +383,7 @@ class ModulatedBlock(nn.Module):
             )
         else:
             ssm_cls = BidirectionalS5Layer if self.bidirectional_ssm else S5Layer
-            self.ssm = ssm_cls(
-                features=self.features,
-                state_dim=self.ssm_state_dim,
-                dtype=self.dtype,
-                precision=self.precision,
-                name="ssm",
-            )
+            self.ssm = ssm_cls(features=self.features, state_dim=self.ssm_state_dim, dtype=self.dtype, name="ssm")
             if self.use_2d_fusion:
                 assert self.scan_order in SCAN_ORDERS, f"Unknown scan_order {self.scan_order}"
                 self.spatial_fusion = SpatialFusionConv(
