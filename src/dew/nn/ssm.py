@@ -1,6 +1,8 @@
-"""
-S5 state-space layers (diagonal SSM with associative_scan, HiPPO init) and the
-Spatial-Mamba style 2D state fusion conv, the SSM mixer of `ModulatedBlock`.
+"""Mix tokens with S5 state-space layers and a 2D state fusion convolution.
+
+The S5 layer is a diagonal SSM run by `associative_scan` under a HiPPO
+init. The fusion convolution is Spatial-Mamba's, and the two together are
+the SSM mixer of `ModulatedBlock`.
 """
 
 
@@ -27,9 +29,14 @@ def hippo_a_imag_init(key, shape, dtype=jnp.float32):
 
 
 class S5Layer(nn.Module):
-    """S5 layer with diagonal complex state matrix.
-        x_k = A * x_{k-1} + B * u_k
-        y_k = Re(C * x_k) + D * u_k
+    """Run a diagonal complex state-space recurrence over `[B, S, F]` inputs.
+
+        x_k = A x_{k-1} + B u_k
+        y_k = Re(C x_k) + D u_k
+
+    `A` is `state_dim` complex poles, stored as the log of the negative
+    real part so the recurrence cannot grow. `dt` discretizes them per
+    pole, and the scan runs in fp32 whatever dtype the input carries.
     """
     features: int
     state_dim: int = 64
@@ -40,6 +47,13 @@ class S5Layer(nn.Module):
 
     @nn.compact
     def __call__(self, u):
+        """Scan `u` `[B, S, F]` through the discretized poles into `[B, S, F]`.
+
+        The parameters are the poles `log_A_real`/`A_imag`, the input map
+        `B_re`/`B_im`, the output map `C_re`/`C_im`, the skip `D` and the
+        per-pole step `log_dt`. The scan's carry is `(A_bar, Bu)`, the
+        running pole product and the running state.
+        """
         # The input u has shape [B, S, F].
         B, S, F = u.shape
         assert self.features == F, f"S5Layer built for {self.features} features, got {F}"

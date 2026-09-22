@@ -3,13 +3,15 @@
 `Gemma3nTextModel` (modeling_gemma3n.py) carries `altup_num_inputs` copies of
 the residual stream. The embeddings are the first; each other copy is the
 embeddings through its own projection, rescaled to the embeddings' RMS
-magnitude. Every layer predicts all copies from the active one
-(`Gemma3nTextAltUp.predict`), runs the transformer block on the active
-prediction, corrects every copy by the block's innovation
-(`Gemma3nTextAltUp.correct`) and adds the per-layer input's contribution to
-the copies past the first. After the last layer the copies past the first
-are projected back and rescaled to the first's magnitude, and the mean of
-all of them is what the final norm reads.
+magnitude.
+
+Every layer predicts all copies from the active one
+(`Gemma3nTextAltUp.predict`), runs the transformer block on that prediction,
+and corrects every copy by the block's innovation
+(`Gemma3nTextAltUp.correct`). It then adds the per-layer input's
+contribution to the copies past the first. After the last layer those
+copies are projected back and rescaled to the first's magnitude, and their
+mean is what the final norm reads.
 
 `Gemma3nTextLaurelBlock` is the learned augmented residual: a rank-`laurel_rank`
 map of the block's normed input, normed and added back, which the block

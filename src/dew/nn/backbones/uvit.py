@@ -1,5 +1,9 @@
-"""The two U-shaped token transformers: UViT, whose blocks take the time and
-the text as tokens, and the U-DiT, whose blocks are adaLN-Zero modulated."""
+"""Denoise patches with the two U-shaped token transformers.
+
+UViT takes the time and the text as tokens beside the patches. The U-DiT
+takes them as adaLN-Zero modulation instead. Both skip each first-half
+block's output into its mirror in the second half.
+"""
 
 from functools import partial
 from typing import Callable, Literal
@@ -28,14 +32,18 @@ from ..sharding import logical_axes
 @models("uvit")
 @logical_axes({}, heuristic=(("text_proj",), ("up_dense_*",), ("pos_encoding",), ("final_*conv*",)))
 class UViT(nn.Module):
-    """U-ViT (Bao et al. 2023): the time embedding and the text are tokens
-    beside the patches, the blocks are plain transformer blocks, and the
-    first half's outputs skip into the second half through a dense layer
-    over the concatenation. Position is a learned table over the raster
-    index, sized for a 512 pixel image.
+    """Denoise patches as U-ViT does (Bao et al. 2023).
+
+    The time embedding and the text are tokens beside the patches, the
+    blocks are plain transformer blocks, and each first-half output skips
+    into the second half through a dense layer over the concatenation.
+    Position is a learned table over the raster index, sized for a 512
+    pixel image.
 
     `add_residualblock_output` refines the unpatchified prediction with two
-    convolutions over it and the input image.
+    convolutions over it and the input image. `use_projection`,
+    `use_self_and_cross`, `norm_inputs` and `explicitly_add_residual` are
+    `TransformerBlock`'s own settings, passed to every block.
     """
     output_channels: int = 3
     patch_size: int = 16

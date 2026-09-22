@@ -1,30 +1,27 @@
-"""The CLIP towers and the T5 encoder as linen modules, and their Hugging
-Face weights.
+"""Encode text with the CLIP towers and the T5 encoder as linen modules.
 
 transformers 5 ships no Flax classes, so the towers are vendored the way
-`dew/nn/autoencoders/vae.py` vendors the Stable Diffusion VAE, in the
-reference layout, with each weight read from the checkpoint's safetensors
-under its reference tensor name.
+`dew/nn/autoencoders/vae.py` vendors the Stable Diffusion VAE: the reference
+layout, each weight read from the checkpoint's safetensors under its
+reference tensor name.
 
-The CLIP port is `openai/clip-vit-large-patch14`: the text tower, which is the
-part a diffusion model conditions on, and the vision tower with the two
-projection heads, which the metrics score generated images with. The
-operation order follows transformers 5.16.1 `models/clip/modeling_clip.py`.
-For the text tower, token and position embeddings added, twelve pre-norm
+The CLIP port is `openai/clip-vit-large-patch14`, following transformers
+5.16.1 `models/clip/modeling_clip.py`. The text tower is what a diffusion
+model conditions on: token and position embeddings added, twelve pre-norm
 layers of causal attention and a quick-GELU MLP, a final layer norm, and the
-pooled row taken where `CLIPTextModel.forward` takes it. For the vision tower,
-a patch convolution with the class token in front and position embeddings
-added, a layer norm, the same layers without the causal mask, and the class
-row through a final layer norm where `CLIPVisionModel.forward` pools it.
+pooled row `CLIPTextModel.forward` takes. The vision tower is what the
+metrics score images with: a patch convolution with the class token in front
+and position embeddings added, a layer norm, the same layers without the
+causal mask, and the class row through a final layer norm.
 `CLIP.get_text_features` and `get_image_features` are those pooled rows
-through `text_projection` and `visual_projection`, as in `CLIPModel`.
-Attention runs on dew's own kernel path, which divides the query by
-sqrt(head_dim) before the logits where the reference scales the logits after;
-`tests/test_text_encoders.py` states what that rearrangement costs against the
-reference.
+through `text_projection` and `visual_projection`.
 
-Weights come from the checkpoint's safetensors through `dew.interop`, mapped by
-name, so neither torch nor a Flax class from transformers is needed. The
+Attention runs on dew's own kernel path, which divides the query by
+sqrt(head_dim) before the logits where the reference scales the logits
+after. `tests/test_text_encoders.py` states what that rearrangement costs.
+
+Weights come from the checkpoint's safetensors through `dew.interop`, mapped
+by name, so neither torch nor a Flax class from transformers is needed. The
 tokenizer is transformers' `AutoTokenizer`, and the metrics preprocess with
 its PIL image processor.
 """

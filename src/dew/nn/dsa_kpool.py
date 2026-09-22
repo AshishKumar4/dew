@@ -9,14 +9,14 @@ The reference is transformers 5.16.1 models/glm5_next/modeling_glm5_next.py
 `qk_nope_head_dim` latents alone, scaled by that width, and positions enter
 only through causality.
 
-The indexer scores pools of `index_kpool` consecutive keys instead of
-single keys: a pool's key is a softmax average of its members' indexer keys
-under learned gate scores plus a per-slot term, the budget is
-`index_topk // index_kpool` pools, a selected pool admits all of its tokens,
-and the incomplete pool at the causal frontier (the tail) rides along when
-`index_kpool_always_select_tail` is set, so every query sees its most recent
-keys. Pools count from a row's first real key, which makes a left-padded row
-pool like the same tokens unpadded. The selection is integer indices under
+The indexer scores pools of `index_kpool` consecutive keys, not single keys.
+A pool's key is a softmax average of its members' indexer keys, weighted by
+learned gate scores plus a per-slot term. Each query picks
+`index_topk // index_kpool` pools and attends every token in them. With
+`index_kpool_always_select_tail`, the incomplete pool at the causal frontier
+rides along, so a query always sees its most recent keys. Pools count from a
+row's first real key, which makes a left-padded row pool like the same
+tokens unpadded. The selection is integer indices under
 `torch.no_grad` in the reference, so it is detached here as well: the main
 loss reaches none of the indexer's weights.
 

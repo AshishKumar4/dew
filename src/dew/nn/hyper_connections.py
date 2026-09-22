@@ -4,9 +4,8 @@ GLM-5.3-Flash and DeepSeek V4 carry the residual through the decoder as a
 stack of `hc_mult` streams, `[B, S, H, D]`, instead of one vector. Each
 sublayer reads one collapse of the streams and writes back into every one
 of them through a mixing the streams themselves choose (mHC, Xie et al.
-2026, section 2.2 eq. 8). Both references compute the same thing, module
-for module (`Glm5NextTextHyperConnection`, modeling_glm5_next.py:219-295;
-`DeepseekV4HyperConnection`, modeling_deepseek_v4.py:867-943):
+2026, section 2.2 eq. 8). GLM-5.3-Flash and DeepSeek V4 compute this
+identically. The steps are:
 
     flat  = rmsnorm(streams.reshape(B, S, H*D))          # no weight, fp32
     mixes = flat @ fn^T                                  # [(2 + H) * H]
@@ -17,11 +16,13 @@ for module (`Glm5NextTextHyperConnection`, modeling_glm5_next.py:219-295;
     collapsed = sum_h pre[h] streams[h]                  # the sublayer's input
     streams'  = post[:, None] * sublayer(collapsed)[None, :] + comb^T @ streams
 
+References: `Glm5NextTextHyperConnection` (modeling_glm5_next.py:219-295)
+and `DeepseekV4HyperConnection` (modeling_deepseek_v4.py:867-943).
+
 `comb` is projected toward the doubly stochastic matrices by Sinkhorn-Knopp:
 a column normalisation first, then `iters - 1` rounds of row and column
 normalisation, each with `eps` in the denominator, in fp32. It is applied
-transposed, `streams'[k] = sum_j comb[j, k] streams[j]`, which the reference
-spells `matmul(comb.transpose(-1, -2), residual)`; Sinkhorn leaves the
+transposed, `streams'[k] = sum_j comb[j, k] streams[j]`. Sinkhorn leaves the
 matrix asymmetric, so the direction is part of the math.
 
 The two references differ only in how the streams collapse at the end:
@@ -46,6 +47,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype
 
+from .attention import unweighted_rmsnorm
 from .sharding import logical_axes
 
 HEADS = ('mean', 'weighted')
@@ -53,9 +55,12 @@ HEADS = ('mean', 'weighted')
 
 @dataclasses.dataclass(frozen=True)
 class HyperConnections:
-    """The record a model names on `hyper_connections`, by the references'
-    config fields: the stream count, the Sinkhorn floor and iteration
-    count, and which head collapses the streams before the final norm."""
+    """Holds the stream count, the Sinkhorn floor and iterations, and the head.
+
+    A model names this on `hyper_connections`. The field names are the
+    references' own config fields. `head` picks what collapses the streams
+    before the final norm.
+    """
 
     hc_mult: int = 4
     hc_eps: float = 1e-6
@@ -73,20 +78,16 @@ class HyperConnections:
 
 
 def expand_streams(x, hc_mult: int):
-    """The embeddings copied into every stream: `[B, S, D]` -> `[B, S, H, D]`
-    (modeling_glm5_next.py:1477, modeling_deepseek_v4.py:1310)."""
+    """Copy the embeddings into every stream: `[B, S, D]` -> `[B, S, H, D]`."""
     return jnp.broadcast_to(x[:, :, None, :], (*x.shape[:2], hc_mult, x.shape[-1]))
 
 
-def _unweighted_rmsnorm(flat, eps: float):
-    """`x * rsqrt(mean(x^2) + eps)` with no weight, in fp32
-    (`Glm5NextTextUnweightedRMSNorm`, modeling_glm5_next.py:210-216)."""
-    return flat * jax.lax.rsqrt(jnp.mean(jnp.square(flat), axis=-1, keepdims=True) + eps)
-
-
 def sinkhorn(comb, iters: int, eps: float):
-    """`iters` alternating normalisations of `[..., H, H]`, the column one
-    first, each with `eps` in its denominator (modeling_glm5_next.py:287-290)."""
+    """Normalise `[..., H, H]` alternately `iters` times, the columns first.
+
+    Each division carries `eps` in its denominator
+    (modeling_glm5_next.py:287-290).
+    """
     comb = comb / (jnp.sum(comb, axis=-2, keepdims=True) + eps)
     for _ in range(iters - 1):
         comb = comb / (jnp.sum(comb, axis=-1, keepdims=True) + eps)
@@ -95,8 +96,11 @@ def sinkhorn(comb, iters: int, eps: float):
 
 
 def mix_streams(post, comb, output, streams):
-    """The sublayer's output written into every stream over the mixed residual:
-    `post[k] output + sum_j comb[j, k] streams[j]` (modeling_glm5_next.py:1316-1318)."""
+    """Write the sublayer's output into every stream over the mixed residual.
+
+    Stream k becomes `post[k] output + sum_j comb[j, k] streams[j]`
+    (modeling_glm5_next.py:1316-1318).
+    """
     dtype = streams.dtype
     mixed = jnp.einsum('bsjk,bsjd->bskd', comb.astype(dtype), streams)
     return post.astype(dtype)[..., None] * output[..., None, :] + mixed
@@ -104,11 +108,11 @@ def mix_streams(post, comb, output, streams):
 
 @logical_axes({}, heuristic=(("attn_hc",), ("ffn_hc",), ("hc_head",)))
 class HyperConnection(nn.Module):
-    """One site's mHC mapping: `(post, comb, collapsed)` of the streams.
+    """Map the streams to one site's `(post, comb, collapsed)`.
 
     `post` `[B, S, H]` and `comb` `[B, S, H, H]` are fp32, as the reference
-    computes them, for `mix_streams`; `collapsed` `[B, S, D]` is in the
-    streams' dtype and is what the sublayer's norm reads.
+    computes them, and go to `mix_streams`. `collapsed` `[B, S, D]` is in
+    the streams' dtype and is what the sublayer's norm reads.
     """
 
     spec: HyperConnections
@@ -123,8 +127,9 @@ class HyperConnection(nn.Module):
         fn = self.param('fn', nn.initializers.normal(0.02), (mix, hc * self.emb_features), jnp.float32)
         base = self.param('base', nn.initializers.zeros, (mix,), jnp.float32)
         scale = self.param('scale', nn.initializers.ones, (3,), jnp.float32)
-        flat = _unweighted_rmsnorm(streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(jnp.float32),
-                                   self.norm_eps)
+        flat = unweighted_rmsnorm(
+            streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(jnp.float32),
+            self.norm_eps)
         mixes = flat @ fn.T
         pre = nn.sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + self.spec.hc_eps
         post = 2 * nn.sigmoid(mixes[..., hc:2 * hc] * scale[1] + base[hc:2 * hc])
@@ -136,9 +141,11 @@ class HyperConnection(nn.Module):
 
 
 class HyperHead(nn.Module):
-    """DeepSeek V4's learned collapse of the streams before the final norm
-    (modeling_deepseek_v4.py:958-962): `pre` of the mHC mapping alone, with
-    its own `hc_fn` `[H, H D]`, `hc_base` `[H]` and `hc_scale` `[1]`."""
+    """Collapse the streams as DeepSeek V4 learns to, before the final norm.
+
+    This is `pre` of the mHC mapping alone, with its own `hc_fn` `[H, H D]`,
+    `hc_base` `[H]` and `hc_scale` `[1]` (modeling_deepseek_v4.py:958-962).
+    """
 
     spec: HyperConnections
     emb_features: int
@@ -150,15 +157,19 @@ class HyperHead(nn.Module):
         fn = self.param('hc_fn', nn.initializers.normal(0.02), (hc, hc * self.emb_features), jnp.float32)
         base = self.param('hc_base', nn.initializers.zeros, (hc,), jnp.float32)
         scale = self.param('hc_scale', nn.initializers.ones, (1,), jnp.float32)
-        flat = _unweighted_rmsnorm(streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(jnp.float32),
-                                   self.norm_eps)
+        flat = unweighted_rmsnorm(
+            streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(jnp.float32),
+            self.norm_eps)
         pre = nn.sigmoid(flat @ fn.T * scale + base) + self.spec.hc_eps
         return jnp.sum(pre[..., None] * streams.astype(jnp.float32), axis=2).astype(streams.dtype)
 
 
 def collapse_streams(streams, head: HyperHead | None):
-    """The streams as the one vector the final norm reads: their mean without
-    a head (modeling_glm5_next.py:301-302) or the weighted head's collapse."""
+    """Collapse the streams to the one vector the final norm reads.
+
+    Without a head that is their mean (modeling_glm5_next.py:301-302), and
+    with one it is the head's weighted sum.
+    """
     if head is None:
         return jnp.mean(streams, axis=2)
     return head(streams)

@@ -379,13 +379,14 @@ def _backward(x_c, b_c, c_c, a_c, entered, dy, dfinal, platform: str):
 
 
 def _ssd_scan(x_c, b_c, c_c, a_c, state, platform: str) -> tuple[jax.Array, jax.Array]:
-    """The chunked SSD scan on the Pallas kernel, operands laid out as
-    `chunk_ssd` chunks them and all in fp32: `x_c` `[NC, B, C, H, P]` already
-    scaled by `dt`, `b_c` and `c_c` `[NC, B, C, H, N]` with the groups already
-    expanded, `a_c` `[NC, B, H, C]` the per-step `A dt`, `state` `[B, H, P, N]`
-    entering the sequence. `platform` is 'gpu' or 'tpu', the backend to build
-    the kernel for. Returns the output in `x_c`'s layout and the final state,
-    which is what `xla_chunk_scan` returns for the same operands.
+    """Run the chunked SSD scan on the Pallas kernel for `platform`.
+
+    Operands arrive in `chunk_ssd`'s layout, all fp32: `x_c`
+    `[NC, B, C, H, P]` already scaled by `dt`, `b_c` and `c_c`
+    `[NC, B, C, H, N]` with the groups expanded, `a_c` `[NC, B, H, C]` the
+    per-step `A dt`, `state` `[B, H, P, N]` entering the sequence. Returns
+    the output in `x_c`'s layout and the final state, the same pair
+    `xla_chunk_scan` returns.
     """
     y, final = _forward(x_c, b_c, c_c, a_c, state, platform, keep_entered=False)
     return y, final

@@ -43,6 +43,7 @@ from dew.nn.attention import (
     _write_cache,
     apply_rotary,
     causal_attention_mask,
+    document_mask,
     max_attention_logits,
     rotary_freqs,
     scaled_dot_product_attention,
@@ -730,9 +731,7 @@ class MultiHeadLatentAttention(nn.Module):
                 rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :]
             key, value = self._expand(latent, rot)
             if segment_ids is not None:
-                segment_ids = jnp.asarray(segment_ids)
-                inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])
-                          & (segment_ids[:, :, None] != 0))[:, None]
+                inside = document_mask(segment_ids)[:, None]
                 mask = inside
                 if causal:
                     mask = jnp.logical_and(

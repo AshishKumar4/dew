@@ -7,6 +7,15 @@ from dew.nn.text_encoders import CLIPTowerOutput, CLIPVisionTransformer
 
 
 class CLIPSafetyHead(nn.Module):
+    """Flag an image whose CLIP embedding passes any concept's threshold.
+
+    The stored weights are the thresholds, one per concept: a concept fires
+    when the cosine similarity of the projected image exceeds its own. A
+    special concept firing raises every other threshold's margin by 0.01,
+    which is the published head's own arithmetic, rounded to three decimals
+    at each step.
+    """
+
     vision_model: CLIPVisionTransformer
     projection_dim: int
     concepts: int = 17
@@ -21,6 +30,7 @@ class CLIPSafetyHead(nn.Module):
         self.special_care_embeds_weights = self.param("special_care_embeds_weights", nn.initializers.ones, (self.special_concepts,))
 
     def features(self, pixels):
+        """Project the vision tower's pooled output into the concept space."""
         output = self.vision_model(pixels)
         assert isinstance(output, CLIPTowerOutput)
         return self.visual_projection(output.pooler_output)
@@ -28,7 +38,9 @@ class CLIPSafetyHead(nn.Module):
     def __call__(self, pixels):
         images = self.features(pixels)
         images = images / jnp.maximum(jnp.linalg.norm(images, axis=-1, keepdims=True), 1e-12)
+
         def scores(concepts, threshold):
+            """Cosine similarity to each concept, less that concept's threshold."""
             concepts = concepts / jnp.maximum(jnp.linalg.norm(concepts, axis=-1, keepdims=True), 1e-12)
             return images @ concepts.T - threshold
         special = jnp.round(scores(self.special_care_embeds, self.special_care_embeds_weights), 3)

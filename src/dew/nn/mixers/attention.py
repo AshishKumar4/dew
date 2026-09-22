@@ -22,6 +22,7 @@ from dew.nn.attention import (
     RopeScaling,
     apply_rotary,
     causal_attention_mask,
+    document_mask,
     max_attention_logits,
     open_kv_cache,
     rotary_freqs,
@@ -31,6 +32,21 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, mla_rope_freqs
 from dew.nn.sharding import logical_axes
+
+
+def kernel_for_materialized_mask(implementation: str | None) -> str | None:
+    """Send a call that built an explicit mask to the xla kernel.
+
+    cuDNN has no mask argument: causality and the window are flags, and jax
+    hands the kernel a bool mask as an additive bias of -2**41 in the
+    compute dtype instead (`combine_bias_and_mask` in
+    jax/_src/cudnn/fused_attention_stablehlo.py). That also makes
+    `check_is_flash_attention` refuse an odd length while training. The xla
+    kernel masks by exclusion, on every backend and with the same fp32
+    softmax. It costs 83.6 ms and 5.80 GiB a step where the fixed window on
+    cuDNN costs 75.8 ms and 4.99 GiB (docs/concepts/language_models.md).
+    """
+    return 'xla' if implementation in ('auto', 'cudnn') else implementation
 
 
 @logical_axes({
@@ -374,36 +390,19 @@ class CausalSelfAttention(nn.Module):
             # make the mask block-diagonal, padding (segment 0) sees nothing,
             # and causality (with the layer's window) travels in the same mask
             # and not as the kernels' flag.
-            segment_ids = jnp.asarray(segment_ids)
-            inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])
-                      & (segment_ids[:, :, None] != 0))[:, None]
+            inside = document_mask(segment_ids)[:, None]
             mask = inside
             if causal:
                 mask = jnp.logical_and(
                     inside, causal_attention_mask(jnp.arange(S), S, self.sliding_window))
             causal, window = False, None
-            if implementation in ('auto', 'cudnn'):
-                # cuDNN has no mask argument: causality and the window are
-                # flags, and jax hands the kernel a bool mask as an additive
-                # bias of -2**41 in the compute dtype instead
-                # (combine_bias_and_mask in
-                # jax/_src/cudnn/fused_attention_stablehlo.py), which also
-                # makes check_is_flash_attention refuse an odd length while
-                # training. The xla kernel masks by exclusion, on every
-                # backend and with the same fp32 softmax. It costs 83.6 ms
-                # and 5.80 GiB a step where the fixed window on cuDNN costs
-                # 75.8 ms and 4.99 GiB, measured in
-                # docs/concepts/language_models.md.
-                implementation = 'xla'
+            implementation = kernel_for_materialized_mask(implementation)
         if prefix is None and self._restricts_visibility(attention_metadata, decode):
             mask = self._metadata_mask(attention_metadata, positions, B, S, key.shape[-3], decode)
             if segment_ids is not None and not decode:
-                inside = ((segment_ids[:, :, None] == segment_ids[:, None, :])
-                          & (segment_ids[:, :, None] != 0))
-                mask = mask & inside[:, None]
+                mask = mask & document_mask(segment_ids)[:, None]
             causal, window = False, None
-            if implementation in ("auto", "cudnn"):
-                implementation = "xla"
+            implementation = kernel_for_materialized_mask(implementation)
         if attention_metadata is not None and attention_metadata.pairwise_mask is not None:
             pairwise = jnp.asarray(attention_metadata.pairwise_mask)
             if pairwise.shape != (B, S, key.shape[-3]) or pairwise.dtype != jnp.bool_:
@@ -418,8 +417,7 @@ class CausalSelfAttention(nn.Module):
                     distance = query_positions[:, :, None] - key_positions[:, None, :]
                     mask = mask & (jnp.abs(distance) < self.sliding_window)[:, None]
             causal, window = False, None
-            if implementation in ("auto", "cudnn"):
-                implementation = "xla"
+            implementation = kernel_for_materialized_mask(implementation)
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.

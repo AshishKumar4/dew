@@ -175,18 +175,11 @@ class CumulativeGroupNorm(nn.Module):
 
 
 def _every_nth_frame(z, stride: int):
-    """`z[:, ::stride]` as an explicit frame gather.
+    """Keep every `stride`-th frame, as a gather rather than a strided slice.
 
-    A strided slice anywhere on the value chain of a dot operand aborts the
-    XLA GPU compiler. Propagating a dot's tiling through a slice rewrites a
-    fragment's element count only where `slice_limit - slice_start` differs
-    from the operand's dimension, which a full-range strided slice never
-    does, so the operand's dim order keeps the sliced count for a dimension
-    that is `stride` times longer and the next dim-altering op walks off the
-    end of the fragment list: `triton_tiling_propagation.cc:698 Check failed:
-    src_fragment_it != src_fragments_order.end()` under xla::gpu::GemmFusion,
-    jaxlib 0.11.1. A gather is not fused into a GEMM operand, so it ends the
-    propagation rather than corrupting it.
+    A strided slice feeding a dot crashes XLA's GPU tiling pass
+    (`triton_tiling_propagation.cc:698`, jaxlib 0.11.1). A gather is not
+    fused into a GEMM operand, so it stops the propagation instead.
     """
     return z if stride == 1 else z[:, jnp.arange(-(-z.shape[1] // stride)) * stride]
 
@@ -243,6 +236,11 @@ class AudioSubsample(nn.Module):
 
 
 def _block_context(x, chunk: int, left: int, right: int):
+    """Gather each chunk's keys with `left` before it and `right` after it.
+
+    Returns `[B, blocks, left + chunk + right, ...]`. The padding makes
+    every block whole, so the trailing block reads zeros past the end.
+    """
     x = jnp.pad(x, ((0, 0), (left, right + chunk - 1)) + ((0, 0),) * (x.ndim - 2))
     length = chunk + left + right
     blocks = (x.shape[1] - length) // chunk + 1
@@ -251,12 +249,14 @@ def _block_context(x, chunk: int, left: int, right: int):
 
 
 def _queries(x, chunk: int):
+    """Split the frames into whole chunks: `[B, blocks, chunk, ...]`."""
     blocks = -(-x.shape[1] // chunk)
     x = jnp.pad(x, ((0, 0), (0, blocks * chunk - x.shape[1])) + ((0, 0),) * (x.ndim - 2))
     return x.reshape(x.shape[0], blocks, chunk, *x.shape[2:])
 
 
 def _position_signal(width: int, positions, dtype):
+    """Embed each relative position as `width` sinusoids, sines then cosines."""
     half = width // 2
     inv = jnp.exp(jnp.arange(half, dtype=jnp.float32) * (-math.log(10000.0) / max(half - 1, 1)))
     angles = positions.astype(jnp.float32)[:, None] * inv[None, :]
@@ -264,6 +264,15 @@ def _position_signal(width: int, positions, dtype):
 
 
 def _relative_logits(query, key, positional, precision: PrecisionLike = None):
+    """Add content and relative-position logits: `[B, H, blocks, chunk, context]`.
+
+    The content term is the usual query-key product per block. The relative
+    term is the query against `positional`, one row per relative offset,
+    then shifted so row i reads the offsets its own position spans. The
+    shift is the pad-and-reshape trick of the reference (Shaw et al. 2018):
+    padding each row by one and reading the flat result back as
+    `chunk * context` moves every row one step left of the one above it.
+    """
     batch, blocks, chunk, heads, dim = query.shape
     context = key.shape[2]
     q = query.transpose(0, 3, 1, 2, 4)

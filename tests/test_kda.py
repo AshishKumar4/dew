@@ -143,9 +143,9 @@ def test_the_chunked_rule_matches_the_oracle_across_chunks_with_a_carried_state(
     q, k, v, g, beta, state = operands
     wanted, wanted_state = oracle_chunk(q, k, v, g, beta, state, chunk_size=4)
     ql, kl = jnp.asarray(q, jnp.float32), jnp.asarray(k, jnp.float32)
-    from dew.nn.kda import kda_l2norm
+    from dew.nn.linear import l2norm
 
-    out, final = chunk_kimi_delta_rule(kda_l2norm(ql), kda_l2norm(kl), *as_f32(v, g, beta, state), chunk_size=4)
+    out, final = chunk_kimi_delta_rule(l2norm(ql), l2norm(kl), *as_f32(v, g, beta, state), chunk_size=4)
 
     assert scaled(out, wanted) < BOUND
     assert scaled(final, wanted_state) < BOUND
@@ -154,9 +154,9 @@ def test_the_chunked_rule_matches_the_oracle_across_chunks_with_a_carried_state(
 def test_the_recurrent_rule_matches_the_oracle_and_the_chunked_rule(operands):
     q, k, v, g, beta, state = operands
     wanted, wanted_state = oracle_recurrent(q, k, v, g, beta, state)
-    from dew.nn.kda import kda_l2norm
+    from dew.nn.linear import l2norm
 
-    ql, kl = kda_l2norm(jnp.asarray(q, jnp.float32)), kda_l2norm(jnp.asarray(k, jnp.float32))
+    ql, kl = l2norm(jnp.asarray(q, jnp.float32)), l2norm(jnp.asarray(k, jnp.float32))
     out, final = recurrent_kimi_delta_rule(ql, kl, *as_f32(v, g, beta, state))
     chunked, chunked_state = chunk_kimi_delta_rule(ql, kl, *as_f32(v, g, beta, state), chunk_size=4)
 
