@@ -1,19 +1,38 @@
 # Dew at scale: the plan
 
+> An AI assistant maintains this document. It is presented as-is.
+
 Design note, 2026-09-02. Author: the MasterPlan agent. Companion document:
-`docs/design/post-training.md`, which is the detailed spec for SFT, preference
-and RL objectives. This document is the frame that spec sits in.
+`docs/design/post-training.md`, the detailed spec for SFT, preference and RL
+objectives. This document is the frame that spec sits in.
+
+Correction (2026-09-22): several parts of this plan were built differently or
+not built. I checked the following against current source. There is no
+`PolicyGradientObjective`, `Env`, `ReplayBuffer`, `ProbeSpec`, `dew.recipes`
+package, or `dew/telemetry/keys.py`, `goodput.py` or `probes.py` under `src/`.
+`Objective` has no `rollout` method; a rollout is a capability handed to the
+`Trainer` (`src/dew/training/trainer.py:112-121`, `:201`), as
+`post-training.md` section 4 decided. The `Tracker` protocol lives in
+`src/dew/training/tracker.py:44-48` with three methods, `log`, `artifact` and
+`close`. Goodput is computed in `src/dew/training/trainer.py:164`. Chained
+post-training runs are `Recipe` and `Stage` in `recipes/chain.py`, which run
+every stage in one process and write no `recipe.json` manifest. The `dew`
+console script has one command, `export` (`src/dew/cli/main.py:47`); there is
+no `dew recipe`. `dew.rl` has `advantage.py` and `surrogate.py`, and nothing
+outside `dew.rl` and `dew.objectives.rl` imports it. `src/dew/nn/moe.py` has
+`Router` and `ExpertMLP`. The post-training user guide is
+`docs/concepts/post_training.md`; the design spec stays in `docs/design/`.
 
 ## What this is, and how to read it
 
-This is the plan for taking Dew from a framework that trains research-sized
-models on one card to one that trains real models at real scale, with
+This is the plan for taking Dew from training research-sized models on one card
+to training full-size models across many devices and hosts, with
 post-training and reinforcement learning, on one design. It covers the package
-map and the seams, what gets lifted from Google's JAX code and what gets
-written, the telemetry design, the scale waves with their acceptance runs, the
-RL framework, the Recipe layer, the sequencing, and the risks.
+map and the seams, what Dew lifts from Google's JAX code and what it writes, the
+telemetry design, the scale waves with their acceptance runs, the RL framework,
+the Recipe layer, the sequencing, and the risks.
 
-It is a plan, not code. Nothing here is implemented by this document.
+It is a plan. This document implements nothing.
 
 Citation convention:
 
@@ -29,10 +48,10 @@ Citation convention:
 Line numbers into the clones are exact for those commits and will drift. The
 commit is given so a reader can check.
 
-Three rules were applied throughout, from `CONTRIBUTING.md:7-11`. A capability
-has one implementation. A reimplementation needs a reason a reader can check. A
-new abstraction survives only if inlining it makes the code worse, and this
-document states that test for every one it proposes.
+The plan applies three rules from `CONTRIBUTING.md:7-11` throughout. A
+capability has one implementation. A reimplementation needs a reason a reader
+can check. A new abstraction survives only if inlining it makes the code worse,
+and this document states that test for every abstraction it proposes.
 
 ## 0. The ten decisions this plan makes
 
@@ -79,7 +98,7 @@ dew/
 recipes/         lm/train.py, diffusion/train.py, jepa/train.py: the run entrypoints
 ```
 
-Two placements need a word.
+Two placements need a note.
 
 `dew.rl` holds primitives, `dew.objectives.rl` holds the objectives that use
 them. The split is the same one the repository already draws between
@@ -198,9 +217,9 @@ framework in it. Two candidates pass that bar: the load-balance bias update
 (`maxtext layers/moe.py:238-261`, plain jax) and the masked reductions in
 `tunix rl/algo_core.py:117-165`. Everything else in the table is either a
 dependency or a pattern, because the source code is bound to NNX modules, to a
-config object with forty fields, or to a loop Dew already owns. The valuable
-part of MaxText is its configuration surface and its arithmetic, and both
-transfer as design.
+config object with forty fields, or to a loop Dew already owns. What Dew takes
+from MaxText is its configuration surface and its arithmetic, and both transfer
+as design.
 
 ## 3. Telemetry
 
@@ -293,7 +312,7 @@ step time. Section 4.3's acceptance run states that fraction for gradient norms.
 | --- | --- | --- |
 | Step FLOPs | parse the optimized HLO and sum dots, convolutions and known custom calls (`wave/adopt-small:src/dew/telemetry/instrumentation.py:338` `hlo_flops`) | `compiled_flops`, which reads `cost_analysis()`, is deleted. It undercounts convolutions by 22.5x and varies between identical recompiles (`docs/research/benchmark-parity.md:93-102`) |
 | Peak FLOPs per device | the table at `src/dew/telemetry/instrumentation.py:10-24` | unchanged, with the caveat from `docs/research/benchmark-parity.md:123-125` written next to it: the spec number is not a sustained ceiling, and small shapes reach 49 to 93 TFLOP/s on this card |
-| MFU | FLOPs per step over step time over peak, one SPMD partition (`src/dew/telemetry/instrumentation.py:53-66`) | unchanged arithmetic, honest numerator |
+| MFU | FLOPs per step over step time over peak, one SPMD partition (`src/dew/telemetry/instrumentation.py:53-66`) | unchanged arithmetic, correct numerator |
 | Goodput | an accumulator over the five event kinds patterned from `maxtext common/goodput.py:31-36`, with badput attributed to its cause | new, fresh code, no GCP dependency |
 | Profiler window | `jax.profiler.start_trace` once per run after a warmup (`trainer.py:456-467,530-538`) | becomes a `ProfileSpec` with start step and length, and the window can be requested again on demand; kernel time, not wall time, is what the trace is read for (`docs/research/google-jax-stack.md:296`) |
 | Data throughput | Grain's own read options and a wait timer inside `DevicePrefetchIterator` (`src/dew/training/distributed.py:78-126`) | new: `data/queue_wait_ms` is the number that says whether the pipeline is the bottleneck, which no current metric answers |
@@ -427,7 +446,7 @@ three commands that reproduce the chain.
 Contents: `build_mesh` grows `sequence` and `tensor` axes; the rules table
 grows the entries that map `sequence` and `heads`, `mlp`, `vocab` onto them;
 `BATCH_SPEC` grows the sequence dimension (`src/dew/training/distributed.py:16`).
-Nothing else changes. The whole point of the rules table is that an axis is a
+Nothing else changes. The rules table exists so that adding an axis is a
 configuration change (`docs/research/google-jax-stack.md:71`).
 
 Acceptance run: on the simulated eight-device CPU mesh, the same 50 steps of the
@@ -959,8 +978,8 @@ ports), 4.15 (world models).
 
 Task-level work, where a reference exists and the acceptance test is
 mechanical: 4.3, 4.4, 4.6, 4.8, 4.9, 4.13, and every documentation and notebook
-item in section 8. Task-level waves still get a review; the level is about who
-writes, not about whether anyone checks.
+item in section 8. Task-level waves still get a review; the level decides who
+writes the code, and every wave gets checked.
 
 ## 10. Risks and unknowns
 
@@ -977,7 +996,7 @@ row is deferred without one.
 | 10.6 | The data pipeline may not survive the move to two hosts. `ShardByJaxProcess` and `jax.make_array_from_process_local_data` are multi-controller idioms (`docs/research/google-jax-stack.md:634`) | 4.6 asserts that the union of records seen by the two workers over 200 steps is the expected disjoint cover, from the iterator state, not from a log line |
 | 10.7 | Dreamer v4's shortcut forcing objective is not specified in this plan | A reading pass over arXiv 2509.24527 producing a specification with equations, then a small reproduction: train the world model on one small video dataset and compare open-loop prediction error against a diffusion-forcing baseline on the same data. Only then does it become a wave |
 | 10.8 | Muon may not transfer to Dew's parameter layouts. The labs' recipes assume a particular matrix-axis convention (`docs/research/frontier-training.md:183`) | 4.9's equal-token comparison, plus the dimension-numbers coverage test. If Muon loses at 0.4B, it stays an option and AdamW stays the default |
-| 10.9 | The probe step may change the largest trainable configuration through captured activations | 4.3 measures peak HBM with and without capture at the largest configuration that fits on the 4080. If capture changes it, the probe step runs on a smaller batch, which is honest because it measures statistics, not throughput |
+| 10.9 | The probe step may change the largest trainable configuration through captured activations | 4.3 measures peak HBM with and without capture at the largest configuration that fits on the 4080. If capture changes it, the probe step runs on a smaller batch, which is acceptable because it measures statistics, not throughput |
 | 10.10 | Adding checkpointables changes a frozen layout | 4.11 ships the converter and a test that loads a checkpoint written by today's code, as `CONTRIBUTING.md:11` requires. Without that test the wave does not land |
 | 10.11 | The one-way import rule for `dew.rl` may quietly break | The import-direction test in 5.1, in the suite from the first RL commit |
 | 10.12 | Two documents may drift on the shared seams | `rollout`, the batch key names and the stage handoff are written identically here and in `docs/design/post-training.md`, and each names the other. A grep for `rollout(` across both documents is the check |
