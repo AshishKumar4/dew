@@ -320,16 +320,14 @@ class Trainer(Generic[Loss, Effects]):
         CPU-owned state the frozen collection is the exception: it sits where
         the realization reads it (`execution.resident`) for the whole run."""
         mesh = self.state_mesh
-        placed = self.layout.shardings(mesh, dataclasses.replace(state, accumulation=None))
+        params = dict(state.params)
+        frozen = params.pop(FROZEN, None) if self.host_master else None
+        placed = self.layout.shardings(mesh, dataclasses.replace(state, params=params, accumulation=None))
         placed = dataclasses.replace(placed, **{
             field: jax.tree.map(lambda s: s.with_memory_kind("pinned_host"), getattr(placed, field))
             for field in (() if self.host_master else self.layout.host)})
-        if self.host_master and FROZEN in placed.params:
-            from dew.inference.banks import bank_sites
-            from dew.training.execution import resident
-            sites = bank_sites(self.objective) if self.objective.bank_sites else ()
-            placed = dataclasses.replace(placed, params={
-                **placed.params, FROZEN: resident(placed.params[FROZEN], sites, self.device_mesh)})
+        if frozen is not None:
+            placed = dataclasses.replace(placed, params={**placed.params, FROZEN: self._frozen_shardings(state, frozen)})
         accumulation = state.accumulation
         if accumulation is None:
             return placed
@@ -379,6 +377,10 @@ class Trainer(Generic[Loss, Effects]):
             return state, shardings, None
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings = self.shardings(abstract)
+        if self.host_master and FROZEN in abstract.params:
+            abstract = dataclasses.replace(abstract, params={**abstract.params, FROZEN: self._banked_frozen(
+                abstract.params[FROZEN],
+                lambda rows: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         template = jax.tree.map(
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
             abstract, shardings)
@@ -387,6 +389,36 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         print(f"Resumed from step {resume} in {checkpoints.source(resume)}")
         return state, shardings, position
+
+    def _frozen_shardings(self, state: TrainState, frozen):
+        """Where the frozen collection sits for a CPU-owned run.
+
+        Before placement the layout names each row's shards and `resident`
+        moves the stack's rows to bank memory, a scanned run's shared rows
+        as one bank. Once placed, the collection holds those banks, whose
+        leading layer axis the layout's rules do not name, and its arrays
+        say where they sit.
+        """
+        leaves = jax.tree.leaves(frozen)
+        if leaves and all(isinstance(leaf, jax.Array) for leaf in leaves):
+            return jax.tree.map(lambda leaf: leaf.sharding, frozen)
+        from dew.training.execution import resident
+        rows = self.layout.shardings(
+            self.state_mesh, dataclasses.replace(state, params={FROZEN: frozen}, accumulation=None))
+        return resident(rows.params[FROZEN], self.bank_sites, self.device_mesh)
+
+    @functools.cached_property
+    def bank_sites(self):
+        """The objective's declared layer stacks, which a host layout streams as banks."""
+        from dew.inference.banks import bank_sites
+        return bank_sites(self.objective) if self.objective.bank_sites else ()
+
+    def _banked_frozen(self, tree, stack, release=None):
+        """`tree`, a frozen collection, with each scanned run's shared leaves as
+        one bank (`execution.banked`): the shape a placement and a checkpoint
+        template take, and the arrays the state holds."""
+        from dew.training.execution import banked
+        return banked(tree, self.bank_sites, stack, release)
 
     def _placed_host(self, initializer, key, shardings: Placement[TrainState]) -> TrainState:
         """A fresh CPU-owned state, its leaves streamed into place one at a time.
@@ -403,6 +435,21 @@ class Trainer(Generic[Loss, Effects]):
         held = self.objective.held_variables()
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
+            if FROZEN in state.params:
+                # A scanned run's frozen rows become its bank here, on the
+                # CPU, and the held tree holds the bank where each row was, so
+                # the row is let go and `stream` updates both trees to the
+                # placed bank as it lands: the bank is the one copy. An
+                # objective placed this way holds banks at its rows afterwards
+                # and does not seed a second trainer.
+                def release(namespace, index, keys, bank):
+                    node = held["params"] if held is not None else None
+                    for component in (*namespace, f"layers_{index}", *keys[:-1]):
+                        node = node.get(component) if isinstance(node, dict) else None
+                    if isinstance(node, dict) and keys[-1] in node:
+                        node[keys[-1]] = bank
+                frozen = self._banked_frozen(state.params[FROZEN], jnp.stack, release)
+                state = dataclasses.replace(state, params={**state.params, FROZEN: frozen})
         params = stream(state.params, shardings.params, held)
         ema = None if state.ema is None else stream(state.ema, shardings.ema)
         rest = dataclasses.replace(state, params=None, ema=None)

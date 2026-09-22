@@ -328,13 +328,15 @@ def test_banked_training_preserves_each_layers_dropout_rng_lineage():
         np.testing.assert_array_equal(np.asarray(a) == 0, np.asarray(b) == 0)
 
 
-def test_a_store_holding_both_a_bank_and_its_layers_is_refused():
-    """Which of the two a run would read is not decided by guessing."""
+def test_a_store_holding_a_leaf_in_both_a_bank_and_its_layers_is_refused():
+    """A bank beside its rows is read when the two hold different leaves (a
+    host layout keeps what every row froze as the bank); the same leaf in
+    both is not decided by guessing."""
     _, scanned, variables, tokens = pair(num_layers=4)
     _, on_host = stores(scanned, variables)
     mixed = {"params": {**on_host["params"],
                         "layers_0": variables["params"]["layers_0"]}}
-    with pytest.raises(ValueError, match="never a mixture"):
+    with pytest.raises(ValueError, match="a leaf is read from one"):
         scanned.apply(mixed, tokens)
 
 

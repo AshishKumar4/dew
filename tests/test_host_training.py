@@ -1,4 +1,6 @@
 """Host-owned full-tree transactions: coupling, replay, restart and placement."""
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -8,9 +10,9 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
 
 from dew.checkpoints import Checkpoints
-from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture, group_layers
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Aux, EMASpec, Mean, Objective
+from dew.objectives.base import FROZEN, Aux, EMASpec, Mean, Objective, merge
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
@@ -36,8 +38,31 @@ def equal(left, right):
 
 
 def close(left, right, bound=STREAMED_BOUND):
+    """`left`, a CPU-owned state, agrees with `right`, a device one, leaf by
+    leaf; the frozen collection is compared per layer, the host's banks
+    (`execution.banked`) read row by row."""
+    if isinstance(left, dict) and FROZEN in left:
+        left = {**left, FROZEN: unbanked(left[FROZEN])}
+    elif FROZEN in getattr(left, "params", {}):
+        left = dataclasses.replace(left, params={**left.params, FROZEN: unbanked(left.params[FROZEN])})
     for path, a, b in _leaves(left, right):
         np.testing.assert_allclose(a, b, atol=bound, rtol=0, err_msg=path)
+
+
+def unbanked(tree):
+    """A frozen collection with every run's bank spread back over its
+    layers, `layers_3_7` as `layers_3` through `layers_7`."""
+    spread = {}
+    for name, value in tree.items():
+        layers = group_layers(name) if isinstance(value, dict) else None
+        if layers is None or len(layers) == 1:
+            held = unbanked(value) if isinstance(value, dict) and layers is None else value
+            spread[name] = merge(spread.get(name, {}), held) if isinstance(held, dict) else held
+            continue
+        for offset, index in enumerate(layers):
+            row = jax.tree.map(lambda leaf, offset=offset: np.asarray(leaf)[offset], value)
+            spread[f"layers_{index}"] = merge(spread.get(f"layers_{index}", {}), row)
+    return spread
 
 
 class Coupled(Objective):
@@ -336,7 +361,10 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
     for name, value in frozen_leaves(host).items():
         np.testing.assert_array_equal(value, initial[name], err_msg=name)
     assert sorted(host.params["params"]) == ["embed_tokens", "layers_0", "norm"]
-    assert "layers_0" in host.params[FROZEN] and "layers_1" in host.params[FROZEN]
+    # The leaf both rows froze is the run's bank; the leaves only layer 1
+    # froze stay its own.
+    assert sorted(host.params[FROZEN]) == ["layers_0_1", "layers_1"]
+    assert host.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"].shape[0] == 2
     assert jax.tree.structure(_moments(host.opt_state).mu) == jax.tree.structure(host.params["params"])
 
     # The EMA tracks the moving collection only, and banked execution reads
@@ -532,8 +560,15 @@ def test_place_streams_the_held_tree_and_releases_each_source():
     state, _, _ = trainer.place()
     for path, leaf in _named_leaves(held["params"]):
         assert isinstance(leaf, jax.Array), path
-    assert state.params[FROZEN]["layers_1"]["mlp"]["gate_proj"]["kernel"] is held["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"]
+    # A leaf every row froze lives once, as the run's bank; the held tree
+    # holds that bank where each row was, so no row copy stays beside it.
+    bank = state.params[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"]
+    assert held["params"]["layers_1"]["mlp"]["gate_proj"]["kernel"] is bank
+    assert held["params"]["layers_0"]["mlp"]["gate_proj"]["kernel"] is bank
     assert state.params["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"] is held["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
-    resident = updated(LMObjective(model, 8, head_chunks=1, pretrained=held,
+    fresh = jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32)))
+    resident = updated(LMObjective(model, 8, head_chunks=1, pretrained=fresh,
                                    trainable=lambda path: path[-2:] == ("q_proj", "kernel")), tokens(), DEVICE)
-    close(updated(objective, tokens(), HOST).params, resident.params)
+    close(updated(LMObjective(model, 8, head_chunks=1, pretrained=jax.tree.map(np.asarray, fresh),
+                              trainable=lambda path: path[-2:] == ("q_proj", "kernel")), tokens(), HOST).params,
+          resident.params)

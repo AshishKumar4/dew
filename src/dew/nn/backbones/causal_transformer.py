@@ -185,6 +185,16 @@ def group_name(first: int, count: int) -> str:
     return f'layers_{first}_{first + count - 1}'
 
 
+def _merged(bank: Mapping, rows: Mapping) -> dict:
+    """`bank` with every leaf `rows` holds added beside its own."""
+    merged = dict(bank)
+    for key, value in rows.items():
+        held = merged.get(key)
+        merged[key] = (_merged(held, value) if isinstance(held, Mapping) and isinstance(value, Mapping)
+                       else value)
+    return merged
+
+
 def group_layers(name: str) -> range | None:
     """The layers a stack module name runs: `layers_3_7` as range(3, 8),
     `layers_3` as range(3, 4), anything else as None. The inverse of
@@ -1182,7 +1192,10 @@ class StackView:
                 runs = [_stack_leaves(*[tree.pop(layer) for layer in stage]) if count > 1
                         else tree.pop(stage[0]) for stage in names]
                 if self.stages == 1:
-                    tree[name] = runs[0]
+                    # A bank already stored under the run's name holds the
+                    # leaves its rows lack (`banked_collections`); the rows
+                    # stack into it.
+                    tree[name] = _merged(tree[name], runs[0]) if name in tree else runs[0]
                 else:
                     stages[name] = jax.tree.map(_on_stage_axis, _stack_leaves(*runs))
             if stages:
@@ -2316,24 +2329,48 @@ class CausalTransformer(nn.Module):
         holds the name of each run of more than one layer, `layers_0_15`. A
         run of one is the same tree either way, so it says nothing about
         which of the two a store is and neither form has to be converted for
-        it. A collection holding a run's bank and that run's layers, or some
-        of the banks and not the others, is refused: which of the two the run
-        would read is not a question this answers by guessing.
+        it. A collection may hold a run's bank beside that run's layers when
+        the two hold different leaves: a host layout keeps the leaves every
+        row froze as the bank and the rest per layer, and `StackView.stack`
+        stacks the rows into the bank. Such a collection is not banked, since
+        its rows still stack. A bank and a row holding the same leaf, or some
+        of the banks and not the others with no rows, is refused: which of
+        the two the run would read is not a question this answers by
+        guessing.
         """
-        banks = {group_name(first, count) for first, count in self.groups if count > 1}
-        inside = {f'layers_{index}' for first, count in self.groups if count > 1
-                  for index in range(first, first + count)}
+        runs = {group_name(first, count): [f'layers_{index}' for index in range(first, first + count)]
+                for first, count in self.groups if count > 1}
         banked = []
         for collection, tree in self.variables.items():
             names = set(tree)
-            if not names & banks:
+            if not names & set(runs):
                 continue
-            if not banks <= names or names & inside:
+            mixed = False
+            for bank, layers in runs.items():
+                rows = [tree[layer] for layer in layers if layer in tree]
+                if bank not in tree:
+                    if rows:
+                        mixed = True
+                    continue
+                if not rows:
+                    continue
+                mixed = True
+                shared = {tuple(entry.key for entry in path)
+                          for path, _ in jax.tree_util.tree_leaves_with_path(tree[bank])}
+                for layer, row in zip(layers, rows, strict=False):
+                    overlap = shared & {tuple(entry.key for entry in path)
+                                        for path, _ in jax.tree_util.tree_leaves_with_path(row)}
+                    if overlap:
+                        raise ValueError(
+                            f"collection {collection!r} holds {'/'.join(overlap.pop())} both in "
+                            f"the bank {bank} and in its layer {layer}; a leaf is read from one")
+            if mixed:
+                continue
+            if not set(runs) <= names:
                 raise ValueError(
-                    f"collection {collection!r} holds the banks {sorted(names & banks)} "
-                    f"of the runs {sorted(banks)} and the layers "
-                    f"{sorted(names & inside)}; a store holds every run's bank or "
-                    f"every layer's own subtree, never a mixture")
+                    f"collection {collection!r} holds the banks {sorted(names & set(runs))} "
+                    f"of the runs {sorted(runs)} and not the others; a store holds every "
+                    f"run's bank or every layer's own subtree")
             banked.append(collection)
         return tuple(banked)
 
@@ -2372,9 +2409,10 @@ class CausalTransformer(nn.Module):
 
         A store holding one subtree per layer answers with layer 0's; one
         holding banks answers with the first row of the first bank's, the
-        layer axis dropped. Nothing is read, fetched or sliced: this is what
-        an abstract run of one layer needs and no more, and a bank's first
-        row is a shape, not a copy.
+        layer axis dropped; one holding both (`banked_collections`) answers
+        with layer 0's leaves completed by the bank's. Nothing is read,
+        fetched or sliced: this is what an abstract run of one layer needs
+        and no more, and a bank's first row is a shape, not a copy.
         """
         banked = self.banked_collections()
         first = StackView(self.groups).bank_names()[0]
@@ -2388,9 +2426,14 @@ class CausalTransformer(nn.Module):
             if collection in banked:
                 variables[collection] = jax.tree.map(
                     functools.partial(shapes, drop=stacked), tree[first])
-            elif 'layers_0' in tree:
-                variables[collection] = jax.tree.map(
-                    functools.partial(shapes, drop=False), tree['layers_0'])
+                continue
+            held = {}
+            if stacked and first in tree:
+                held = jax.tree.map(functools.partial(shapes, drop=True), tree[first])
+            if 'layers_0' in tree:
+                held = _merged(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
+            if held:
+                variables[collection] = held
         return variables
 
     def stage_layers(self, stages: int) -> int:

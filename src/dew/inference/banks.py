@@ -307,9 +307,11 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
 
 
 def entry_tree(variables: Variables, sites: Sequence[DecoderBank]) -> Variables:
-    """The leaf complement of declared decoder layers, including nested media."""
+    """The leaf complement of declared decoder layers and their runs' banks,
+    including nested media."""
     layers = {(*site.namespace, f"layers_{index}") for site in sites
               for first, count in site.view.groups for index in range(first, first + count)}
+    layers.update((*site.namespace, name) for site in sites for name in site.view.bank_names())
 
     def outside(tree: Mapping, path: tuple[str, ...]) -> dict:
         collected = {}
