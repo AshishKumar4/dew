@@ -1,6 +1,8 @@
 # Training language models
 
-This guide assumes the [first training run](../getting-started.md) and basic next-token prediction. You do not need a pretrained model to run the example. It uses a four-token synthetic vocabulary so you can inspect the entire input and output.
+> An AI assistant maintains this document. It is presented as-is.
+
+This page assumes you have done the [first training run](../getting-started.md) and know how next-token prediction works. You do not need a pretrained model to run the first example. It uses a synthetic vocabulary of four tokens, so you can look at every input and output.
 
 ## Train a small decoder
 
@@ -35,17 +37,17 @@ print("Generated token IDs:", np.asarray(result.tokens).tolist())
 np.testing.assert_array_equal(np.asarray(result.tokens[:, :2]), np.asarray(prompt))
 ```
 
-`LMObjective` reads token rows of shape `(B, S + 1)`. It feeds the first `S` tokens to the model and scores predictions against the next `S` tokens. Here each row has nine tokens, so `seq_len=8`. Token IDs must be integers inside the model's vocabulary.
+`LMObjective` reads token rows of shape `(B, S + 1)`. It feeds the first `S` tokens to the model and scores the predictions against the next `S` tokens. Each row here has nine tokens, so `seq_len=8`. Token IDs must be integers inside the model's vocabulary.
 
-The model's causal attention prevents a position from reading later tokens. Its hidden width is 16, with two attention heads and a feed-forward width of 32. The example uses float32 and XLA attention on CPU. These dimensions are for teaching, not model-quality or throughput comparisons.
+Causal attention stops a position from reading later tokens. The model has a hidden width of 16, two attention heads and a feed-forward width of 32. The example uses float32 and XLA attention so it also runs on CPU. These sizes are for learning the API. Do not use them to compare model quality or throughput.
 
-The training loss should decrease as the decoder learns the repeating pattern. `result.tokens` contains the prompt followed by six token IDs. `Sampling(temperature=0.0)` chooses the highest-scoring token at each step; its behavior log-probability is zero. The key remains an explicit argument. Outputs may differ with library versions and initialization.
+The training loss should go down as the decoder learns the repeating pattern. `result.tokens` holds the prompt followed by six generated token IDs. `Sampling(temperature=0.0)` picks the highest-scoring token at each step, so the behavior log-probability of each pick is zero. You still pass the key explicitly. The exact output can change with the library version and the initialization.
 
 ## Tokenize real text
 
-For real text, choose a tokenizer and use its vocabulary consistently for data preparation, model construction, decoding, and checkpoint loading. `ByteTokenizer` represents UTF-8 bytes with a vocabulary of 256. A Hugging Face tokenizer uses the selected model's vocabulary and chat template and may download files on first use.
+For real text, pick one tokenizer and use its vocabulary everywhere: data preparation, model construction, decoding and checkpoint loading. `ByteTokenizer` treats UTF-8 bytes as tokens, with a vocabulary of 256. A Hugging Face tokenizer uses the chosen model's vocabulary and chat template, and may download files the first time you use it.
 
-From a repository checkout, prepare your own corpus and create token files:
+From a repository checkout, prepare your own corpus and write token files:
 
 ```bash
 mkdir -p data
@@ -53,25 +55,25 @@ printf 'A small corpus for a tokenizer demonstration.\n' > data/corpus.txt
 python tools/tokenize_text.py --input data/corpus.txt --out data/corpus-byte --tokenizer byte --val-fraction 0.1
 ```
 
-This command writes `train.bin`, `val.bin`, and `meta.json`. The binary arrays store token IDs; metadata describes their dtype, counts, and tokenizer. This tiny corpus demonstrates preparation only. Use enough text to supply your requested windows, batches, and held-out split before training.
+This writes `train.bin`, `val.bin` and `meta.json`. The binary files hold token IDs. The metadata records their dtype, counts and tokenizer. This tiny corpus only shows the preparation step. Before training, use enough text to fill the windows, batches and held-out split you ask for.
 
-`TokenWindows(path, seq_len).load(batch=...)` reads fixed-width windows. `PackedTokens` combines documents and adds `text_segment_ids` and `text_positions`. The objective excludes padded targets and document-boundary transitions. Packing can change which attention implementation is usable because the model needs a segment mask.
+`TokenWindows(path, seq_len).load(batch=...)` reads fixed-width windows. `PackedTokens` packs documents together and adds `text_segment_ids` and `text_positions`. The objective skips padded targets and the transitions between documents. Packing can change which attention implementations you can use, because the model then needs a segment mask.
 
 ## Loss, precision, and evaluation
 
-The vocabulary loss runs in float32. `head_chunks` controls how many vocabulary slices it scores, with a default of four. Chunking can reduce peak memory but adds work and can be transformed by the backend compiler. The saved memory depends on vocabulary size, sequence length, batch size, and executable; it is not a universal fixed reduction.
+The vocabulary loss runs in float32. `head_chunks` sets how many vocabulary slices the loss scores; the default is four. Chunking can lower peak memory, but it adds work, and the backend compiler may rewrite it. How much memory it saves depends on the vocabulary size, sequence length, batch size and the compiled executable. There is no fixed saving.
 
-`LMObjective` enables EMA by default. Use `state.params` for live variables and `state.averaged` when you deliberately want the moving-average copy. Evaluation reads averaged variables when the objective keeps them. `ema_decay=None` keeps no copy: `state.ema` is None, `state.averaged` raises, previews and evaluation read the live variables, and a checkpoint written with one configuration will not restore into the other.
+`LMObjective` keeps an EMA copy by default. Use `state.params` for the live variables and `state.averaged` when you want the moving-average copy. Evaluation reads the averaged variables when the objective keeps them. With `ema_decay=None` there is no copy: `state.ema` is `None`, `state.averaged` raises, and previews and evaluation read the live variables. A checkpoint written with one of these settings does not restore into the other.
 
-To measure validation perplexity, provide a validation iterator and set `eval_every`, as shown in [evaluation and tracking](../guides/evaluation.md). With a tracker, `Samples` configures one generated preview per event, separate from complete-batch teacher-forced scoring.
+To measure validation perplexity, pass a validation iterator and set `eval_every`, as shown in [evaluation and tracking](../guides/evaluation.md). With a tracker, `Samples` sets up one generated preview per event. That preview is separate from teacher-forced scoring of the complete batch.
 
-Accumulation weights CE and MTP by the main supported-target mass, including target-role masks at each MTP depth. Sequence-router losses normalize by rows; global router losses pool selected-slot counts and score sums before their product. Routing bias stays fixed during the window and commits from its aggregate counts. A zero-CE window with active router auxiliary can still update. Combined-batch equivalence assumes identical stochastic realizations and the declared mutable-state semantics.
+With gradient accumulation, Dew weights the cross-entropy and multi-token-prediction (MTP) losses by the mass of supported main targets, including the target-role masks at each MTP depth. Sequence-level router losses normalize by rows. Global router losses first add up the selected-slot counts and the score sums, then take their product. The routing bias stays fixed during an accumulation window and is updated from the window's total counts. A window with zero cross-entropy can still update when a router auxiliary loss is active. Accumulated and combined batches match only when their random draws are the same and mutable state follows its declared rules.
 
 ## Generate from a checkpoint
 
-`load_pretrained` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle: the native Flax model, its explicit variables tree, the checkpoint's own processor or tokenizer, the source config and the generation defaults. `dew.pipeline(source)` is the front door over the same loader: it answers with a `TextGeneration` (or a `BlockGeneration` for DiffusionGemma) whose weights are placed once, on the current device mesh, and whose sampling policy and budget come from the checkpoint. [Inference](inference.md) describes placement, `seed`, `host()` and `text`, and the workflows from a trained objective, a run directory and a published checkpoint.
+`load_pretrained` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle. The bundle holds the native Flax model, its variables tree, the checkpoint's own processor or tokenizer, the source config and the generation defaults. `dew.pipeline(source)` is the simpler entry point over the same loader. It returns a `TextGeneration` (or a `BlockGeneration` for DiffusionGemma) with its weights placed once on the current device mesh, and with the sampling policy and budget taken from the checkpoint. [Inference](inference.md) covers placement, `seed`, `host()` and `text`, and the workflows that start from a trained objective, a run directory and a published checkpoint.
 
-The real prompt plus continuation must fit `model.max_seq_len`; input padding consumes no capacity. `Sampling` carries temperature, top-k, top-p, min-p, EOS and the output padding id; the source's `generation_config.json` fills it for a loaded checkpoint, and `text_generation(sampling=...)` overrides it. Generation prepares inputs on the host and runs prefill and decode in one compiled call with one padded input shape and per-row cache cursors; different valid lengths at the same padded shape reuse the executable.
+The real prompt plus the continuation must fit in `model.max_seq_len`. Input padding takes up no room. `Sampling` holds temperature, top-k, top-p, min-p, EOS and the output padding id. For a loaded checkpoint, the source's `generation_config.json` fills it in, and `text_generation(sampling=...)` overrides it. Generation prepares the inputs on the host, then runs prefill and decode in one compiled call with one padded input shape and a cache cursor per row. Inputs with different valid lengths but the same padded shape reuse the executable.
 
 ```python
 import dew
@@ -80,8 +82,11 @@ task = dew.pipeline("tests/fixtures/hf/gemma3-native-tiny", dtype="float32")
 print(task("token7 token9", 3, seed=1).text[0])
 ```
 
-`LMObjective.policy(params)` returns the same task already bound to a training tree, which is what `SampledRollout` draws with. To hand the weights to another runtime, export them and point Ollama or vLLM at the directory; the [README](https://github.com/AshishKumar4/dew/blob/main/README.md#exporting-a-decoder-and-serving-it) walks that through to the client call.
-This example runs offline on the tiny Gemma 3 fixture that the wrapper tests use. A Hub name such as `"Qwen/Qwen3-0.6B"` works the same way with the `interop` extra and a download; a real checkpoint needs enough host and device memory for its weights and cache.
+This example runs offline on the tiny Gemma 3 fixture the wrapper tests use. A Hub name such as `"Qwen/Qwen3-0.6B"` works the same way with the `interop` extra installed and a download. A real checkpoint needs enough host and device memory for its weights and cache.
+
+`LMObjective.policy(params)` returns the same kind of task, already bound to a training tree. `SampledRollout` samples with it. To run the weights in another runtime, export them and point Ollama or vLLM at the directory. The [README](https://github.com/AshishKumar4/dew/blob/main/README.md#exporting-a-decoder-and-serving-it) goes through this up to the client call.
+
+The next example loads the same fixture with its processor and gives it images:
 
 ```python
 import jax
@@ -101,9 +106,11 @@ for text in task(inputs, 3, seed=1).text:
     print(text)
 ```
 
-The rows have different image counts, so the processor left-pads the shorter one; `inputs.token_fields["attention_mask"]` is the sole validity source and the padded slots consume no cache. A batch with nothing to pad carries no `attention_mask` at all, which is how a host says every slot is real. The model then keeps causality as a kernel flag and attention runs fused, where an all-true mask would cost it that (`docs/performance.md`). Read the field with `token_fields.get("attention_mask")` if your code has to handle both. On a pool the omission is agreed before anything is assembled, since padding is a property of a process's own rows: a generation request materializes the field wherever any process carries it and keeps the omission where none does, and a training batch placed by `shard_batch` carries it on every process. Text-only prompts skip the `images` argument, and Gemma 3n and Gemma 4 take `audio=[waveform, ...]`, one waveform per audio placeholder in reading order.
+The two rows have different numbers of images, so the processor left-pads the shorter one. `inputs.token_fields["attention_mask"]` is the only record of which slots are valid, and padded slots take up no cache. A batch with nothing to pad has no `attention_mask` at all. That is how the host says every slot is real. Without a mask, the model passes causality to the kernel as a flag and attention runs fused; an all-true mask would prevent that (see `docs/performance.md`). If your code has to handle both cases, read the field with `token_fields.get("attention_mask")`.
 
-To continue training, hand the loaded variables to the objective and feed `{"text": inputs}` batches to the trainer; `bundle.save(directory, variables=state.params)` writes the trained weights back under the source tensor names with the processor, so the directory loads again here and in Transformers.
+Padding belongs to each process's own rows, so on a process pool the processes agree about a missing mask before anything is assembled. A generation request creates the field on every process if any process has it, and leaves it out if none does. A training batch placed by `shard_batch` has it on every process. For text-only prompts, leave out the `images` argument. Gemma 3n and Gemma 4 take `audio=[waveform, ...]`, one waveform per audio placeholder in reading order.
+
+To keep training, hand the loaded variables to the objective and feed the trainer `{"text": inputs}` batches. `bundle.save(directory, variables=state.params)` writes the trained weights back under the source tensor names, together with the processor, so the directory loads again both here and in Transformers.
 
 ```python
 import optax
@@ -122,13 +129,13 @@ state = trainer.fit(data, steps=1, log_every=1)
 bundle.save("gemma3-tiny-step1", variables=state.params)
 ```
 
-The base fixture is not an instruction-tuned chat assistant. Use the checkpoint's documented chat template when loading an instruction-tuned model. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which decoder families load, train, generate and export.
+The base fixture is not an instruction-tuned chat model. When you load an instruction-tuned model, use the chat template its checkpoint documents. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) says which decoder families load, train, generate and export.
 
 ## Diffusion language models and media inputs
 
-LLaDA and Dream use bidirectional masked-token prediction. They require a mask token ID and a masked-diffusion objective; replacing an autoregressive loss without changing the attention and corruption process is not sufficient.
+LLaDA and Dream predict masked tokens with bidirectional attention. They need a mask token ID and a masked-diffusion objective. Swapping out the autoregressive loss is not enough; the attention and the corruption process have to change too.
 
-`load_pretrained(...).text_generation()`, `dew.pipeline(source_or_run)`, and `MaskedDiffusionObjective.pipeline(state)` return `MaskedGeneration` for these models. This is Dew's native MDLM algorithm (`DiscreteProcess` with `Unmask`), **not** a reproduction of LLaDA's or Dream's source-specific remasking and block-generation recipes.
+For these models, `load_pretrained(...).text_generation()`, `dew.pipeline(source_or_run)` and `MaskedDiffusionObjective.pipeline(state)` return `MaskedGeneration`. It runs Dew's native MDLM algorithm (`DiscreteProcess` with `Unmask`). It does not reproduce the source-specific remasking and block-generation recipes of LLaDA or Dream.
 
 ```python
 from dew.interop import load_pretrained
@@ -139,17 +146,17 @@ result = task([[1, 2, 3]], 8, seed=7, steps=16, n=2)
 print(result.host().tokens)
 ```
 
-The tiny fixtures demonstrate mechanics, not language quality. Released sources with a tokenizer also accept text and provide `result.text`. This path is text-only: media payloads and media token fields are rejected. Numeric requests use `ModelInputs`; attention validity, logical `[B, S]` positions, rotary coordinates and segment IDs travel through the masked model. The prompt stays fixed even when it contains a literal mask ID. All requested response positions refine together under bidirectional attention; mask IDs are excluded from generated categorical draws.
+The tiny fixtures show the mechanics, not language quality. Released sources that ship a tokenizer also accept text and provide `result.text`. This path handles text only and rejects media payloads and media token fields. Numeric requests use `ModelInputs`. Attention validity, logical `[B, S]` positions, rotary coordinates and segment IDs pass through the masked model. The prompt stays fixed, even if it contains a literal mask ID. All requested response positions are refined together under bidirectional attention, and mask IDs are never drawn as generated tokens.
 
-The default is 64 model evaluations, including the final clean prediction. A call can override `steps`. `n` continuations are prompt-major, and continuation zero is unchanged when more continuations are requested. EOS is applied after full-span refinement: lengths include its first occurrence, and the tail is padded. This is not autoregressive early stopping. A zero-token request preserves the prompt and reports zero refinements. `CanvasGeneration` reports lengths, EOS flags and refinement counts without fabricated autoregressive log-probabilities. AR sampling, beam and logits controls are not accepted on this path.
+The default is 64 model evaluations, including the final clean prediction. A call can override `steps`. The `n` continuations are grouped by prompt, and continuation zero does not change when you ask for more. EOS is applied after the whole span is refined: lengths include the first EOS, and the rest is padded. This is not autoregressive early stopping. A request for zero tokens keeps the prompt and reports zero refinements. `CanvasGeneration` reports lengths, EOS flags and refinement counts, and has no autoregressive log-probabilities. This path does not accept autoregressive sampling, beam or logits controls.
 
-Active source generation controls that native MDLM cannot honor are rejected by name. Neutral values and shared budget, continuation-count, EOS and padding metadata remain accepted. MDLM does not use a KV cache: `use_cache=False` is compatible; requesting a cache is not.
+If the source turns on a generation control that native MDLM cannot follow, Dew rejects it by name. Neutral values are accepted, as are the shared budget, continuation count, EOS and padding metadata. MDLM does not use a KV cache, so `use_cache=False` is accepted and asking for a cache is not.
 
-Saved masked recipe runs preserve compute/storage precision and select live or EMA weights through the ordinary `dew.pipeline` options. Their run record reconstructs native MDLM with its default `Unmask` sampler and 64 steps; it does not serialize custom programmatic objective steps or sampler choices. Plain `Checkpoints` stores weights/state, not those task settings: callers must retain and reapply custom task configuration. The existing recipe also saves no EOS policy. Source checkpoints honor their EOS metadata; programmatic objective tasks can be configured with `dataclasses.replace(task, eos_token_ids=(...))`. No additional recipe inference fields are implied.
+Saved masked-diffusion recipe runs keep their compute and storage precision, and you pick live or EMA weights through the usual `dew.pipeline` options. The run record rebuilds native MDLM with its default `Unmask` sampler and 64 steps. It does not save custom objective steps or sampler choices you set in code. Plain `Checkpoints` saves weights and training state, not these task settings, so you must keep your custom task configuration and apply it again yourself. The recipe does not save an EOS policy either. Source checkpoints follow their own EOS metadata. For a task built from an objective in code, set EOS with `dataclasses.replace(task, eos_token_ids=(...))`. The recipe saves no other inference fields.
 
-DiffusionGemma uses uniform-vocabulary corruption, a causal prompt encoder, a bidirectional canvas, and self-conditioning. Load the complete model through the same `load_pretrained` interface as other published models. Its `BlockProcess` generation policy refines full canvases, commits clean tokens to the shared text cache, and returns `CanvasGeneration`: response lengths including EOS, termination flags and per-row refinement counts, without autoregressive likelihood fields.
+DiffusionGemma uses uniform-vocabulary corruption, a causal prompt encoder, a bidirectional canvas and self-conditioning. Load the complete model through the same `load_pretrained` interface as other published models. Its `BlockProcess` generation policy refines whole canvases and commits clean tokens to the shared text cache. It returns `CanvasGeneration` with response lengths (including EOS), termination flags and per-row refinement counts, and no autoregressive likelihood fields.
 
-From a repository checkout, this CPU example loads the complete tiny reference checkpoint, tokenizes, generates, decodes, saves and reloads it. Its 64-token synthetic vocabulary tests the workflow, not language quality. The released model ID is `google/diffusiongemma-26B-A4B-it`; loading that ID downloads large weights and requires sufficient host/device memory.
+From a repository checkout, the next example loads the complete tiny reference checkpoint, then tokenizes, generates, decodes, saves and reloads it. It runs on CPU. Its synthetic vocabulary has 64 tokens, so it tests the workflow, not language quality. The released model ID is `google/diffusiongemma-26B-A4B-it`. Loading it downloads large weights and needs enough host and device memory.
 
 ```python
 from tempfile import TemporaryDirectory
@@ -164,7 +171,7 @@ assert bundle.processor is not None
 inputs = bundle.processor(["<bos> t5 t7 t9 t11"])
 task = bundle.block_generation()
 generated = task(inputs, 7, key=jax.random.key(11))
-print(task.decode(generated, inputs.tokens.shape[1]))
+print(task.decode(generated))
 with TemporaryDirectory() as checkpoint:
     bundle.save(checkpoint)
     restored = load_pretrained(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=32)
@@ -172,13 +179,13 @@ with TemporaryDirectory() as checkpoint:
     np.testing.assert_array_equal(replay.tokens, generated.tokens)
 ```
 
-The final canvas is refined at its full width, then the returned response is clipped to `max_new_tokens`. The prefix plus rounded-up canvas capacity must fit `max_seq_len`. Generation defaults come from `generation_config.json`; pass a `BlockProcess` as `process=` to override them. Media are prepared through the checkpoint processor and run only during prompt prefill, not once per refinement. The [training-contract note](../research/inference.md#diffusiongemma-training-contract-and-open-prerequisites) separates the available official fine-tuning recipe from the still-undisclosed original sampler-distillation/RL objective.
+The last canvas is refined at full width, and the returned response is then cut to `max_new_tokens`. The prefix plus the canvas capacity, rounded up to whole canvases, must fit in `max_seq_len`. Generation defaults come from `generation_config.json`. To override them, pass a `BlockProcess` as `process=`. Media go through the checkpoint's processor and run only during prompt prefill, not on every refinement. The [training-contract note](../research/inference.md#diffusiongemma-training-contract-and-open-prerequisites) separates the official fine-tuning recipe, which is public, from the original sampler-distillation and RL objective, which Google has not published.
 
 ### Fine-tune with the official block loss
 
-`BlockDiffusionObjective` ports Google's public post-release SFT adapter. It samples a valid response canvas, corrupts the entire response with uniform-vocabulary noise, performs detached-first-pass self-conditioning, and combines independently row-normalized canvas and encoder losses. The default time safety margin is 1e-4 and self-conditioning probability is 0.5. This is not the undisclosed original sampler-distillation/RL objective.
+`BlockDiffusionObjective` ports Google's public SFT adapter, released after the model. It samples a valid response canvas, corrupts the whole response with uniform-vocabulary noise, and runs self-conditioning with a detached first pass. It then combines the canvas loss and the encoder loss, each normalized per row on its own. The default time safety margin is 1e-4 and the self-conditioning probability is 0.5. This is not the unpublished original sampler-distillation and RL objective.
 
-The following CPU example takes a real optimizer step on the tiny official-reference model. It deliberately uses a synthetic vocabulary and unequal target support. The objective prepares trainable layer scalars; the checkpoint's ordinary HF view keeps those same tensors frozen. Pass the objective's native model value when exporting the trained variables.
+The next example takes one real optimizer step on the tiny official reference model, on CPU. It uses a synthetic vocabulary and unequal target support on purpose. The objective makes the per-layer scalars trainable, while the checkpoint's ordinary HF view keeps those same tensors frozen. So when you export the trained variables, pass the objective's native model.
 
 ```python
 from dataclasses import replace
@@ -207,7 +214,7 @@ with TemporaryDirectory() as checkpoint:
 print("Optimizer updates:", int(block_state.updates))
 ```
 
-The same objective is available in `recipes/lm/train.py`, not a second recipe. It uses complete token-window rows: `data.seq_len + 1` must equal `block_prompt_tokens` plus whole training canvases. `block_canvas_size` defaults to the checkpoint's canvas length. Packed documents are rejected because they have different context boundaries. Block SFT logs `canvas_ce` and `encoder_ce`; it does not report autoregressive perplexity or use the AR preview settings. Generate text through the shared pretrained interface when needed.
+The same objective is available in `recipes/lm/train.py`; there is no separate recipe for it. It trains on complete token-window rows, and `data.seq_len + 1` must equal `block_prompt_tokens` plus a whole number of training canvases. `block_canvas_size` defaults to the checkpoint's canvas length. Packed documents are rejected, because their context boundaries differ. Block SFT logs `canvas_ce` and `encoder_ce`. It does not report autoregressive perplexity or use the autoregressive preview settings. To generate text, use the shared pretrained interface.
 
 ```bash
 python recipes/lm/train.py data:token-windows --data.path data/diffusion-token-windows \
@@ -217,12 +224,30 @@ python recipes/lm/train.py data:token-windows --data.path data/diffusion-token-w
     --sample-tokens 0 --ema-decay None --optim.learning-rate 0.00015
 ```
 
-Those token files must use the checkpoint tokenizer and arrange the intended clean prompt prefix and response canvases. Trainer checkpoints preserve optimizer and iterator state; `Pretrained.save` instead writes a complete source-format inference checkpoint.
+The token files must use the checkpoint's tokenizer and lay out the clean prompt prefix and the response canvases you intend. Trainer checkpoints keep the optimizer and iterator state. `Pretrained.save` writes a complete inference checkpoint in the source format instead.
 
-A multimodal checkpoint loads as a `MultimodalTransformer`: the text decoder, the vision tower and projector, and for Gemma 3n and Gemma 4 the audio tower and its embedder, under the variable names `language_model`, `tower`, `projector`, `audio_tower` and `audio_projector`. The checkpoint's processor owns resizing, normalization, patching and placeholder expansion; Dew's `Processor` runs it and lays its outputs out row by row. `ModelInputs.tokens` is `[B, S]`; `token_fields` holds `attention_mask`, `positions`, `image_indices` and `image_groups` (the soft feature and the image behind each slot, -1 for text), `audio_indices` for audio slots and, for Qwen 3.5, the three-axis `rotary_positions`; `conditioning` holds the media, padded to the row with the most images or clips: `pixel_values` as `[B, images, ...]` in the processor's own layout, `image_position_ids` (Gemma 4) or `image_grid_thw` (Qwen 3.5) beside it, and `input_features` with `input_features_mask` as `[B, clips, frames, mel]`. The processor checks token ids, placeholder counts and media shapes on the host; the compiled model is pure. The same `ModelInputs` feeds `model.apply`, the objective and `generate`; media are evaluated at prefill and decode steps read the cache.
+### Multimodal checkpoints
 
-Per family, the processor emits what the reference expects. Gemma 3 gives one fixed-resolution image per placeholder block. Llama 4 tiles each image into local tiles and a global tile with separator tokens, normalizing pixels in bfloat16 as its original implementation does; the loader widens them to float32 exactly. Gemma 4 emits padded patch streams with 2D patch positions and expands video placeholders that the decoder maps to the pad embedding. Qwen 3.5 packs channel-then-time patches with a per-image grid, and the loader derives the spatial rotary coordinates the reference's `get_rope_index` computes. Gemma 3n uses the MobileNet-v5 encoder, embeds its hard vision and audio vocabulary ranges through the multimodal embedders, and keeps placeholder ids for its per-layer inputs while masking the hard ranges, on training and decode steps alike. Audio clips carry a mask that is True for valid frames; Gemma 4 inserts one placeholder per encoded frame, Gemma 3n a fixed `audio_soft_tokens_per_image` per clip with the embedder's padding token in the remaining slots.
+A multimodal checkpoint loads as a `MultimodalTransformer`. It holds the text decoder, the vision tower and projector, and for Gemma 3n and Gemma 4 also the audio tower and its embedder. Their variable names are `language_model`, `tower`, `projector`, `audio_tower` and `audio_projector`. The checkpoint's processor does resizing, normalization, patching and placeholder expansion. Dew's `Processor` runs it and lays out its outputs row by row.
 
-`bundle.save` writes trained variables under the source tensor names, including Gemma 4's frozen standardization and clipping buffers, which live in the `constants` collection and stay bitwise through training. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names each wrapper's media.
+`ModelInputs` has three parts:
 
-Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gemma4Audio`, registered as towers `gemma3n_audio` and `gemma4_audio`. `audio_config` reads the checkpoint's `audio_config` record and rejects unknown computational fields; `audio_weights` converts the tower's own tensors, keeping Gemma 4's checkpointed clipping bounds in a frozen `constants` collection. An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)` with the mask subsampled to the encoder's frame rate. `dew.data.audio.AudioProcessor` builds the checkpoint's feature extractor from its `preprocessor_config.json` record and converts 16 kHz mono waveforms into those two arrays without resampling. Gemma 3n projects audio through `Gemma3nProjectorModule.soft_embeddings`, without the vision-only scaling; Gemma 4 reuses `Gemma4ProjectorModule` with its input width taken from `output_proj_dims`.
+- `tokens` is `[B, S]`.
+- `token_fields` holds `attention_mask`, `positions`, `image_indices` and `image_groups` (the soft feature and the image behind each slot, -1 for text), `audio_indices` for audio slots, and for Qwen 3.5 the three-axis `rotary_positions`.
+- `conditioning` holds the media, padded to the row with the most images or clips. `pixel_values` is `[B, images, ...]` in the processor's own layout, with `image_position_ids` (Gemma 4) or `image_grid_thw` (Qwen 3.5) beside it. `input_features` and `input_features_mask` are `[B, clips, frames, mel]`.
+
+The processor checks token ids, placeholder counts and media shapes on the host, and the compiled model does no checking. The same `ModelInputs` goes to `model.apply`, the objective and `generate`. Media are evaluated at prefill, and decode steps read the cache.
+
+Each family's processor emits what its reference implementation expects:
+
+- Gemma 3 gives one fixed-resolution image per placeholder block.
+- Llama 4 splits each image into local tiles and a global tile with separator tokens. It normalizes pixels in bfloat16, as the original implementation does, and the loader widens them to float32 exactly.
+- Gemma 4 emits padded patch streams with 2D patch positions. It expands video placeholders, which the decoder maps to the pad embedding.
+- Qwen 3.5 packs patches channel first, then time, with a grid per image. The loader derives the spatial rotary coordinates that the reference's `get_rope_index` computes.
+- Gemma 3n uses the MobileNet-v5 encoder. It embeds its hard vision and audio vocabulary ranges through the multimodal embedders and keeps placeholder ids for its per-layer inputs while masking the hard ranges, on both training and decode steps.
+
+Audio clips carry a mask that is True for valid frames. Gemma 4 inserts one placeholder per encoded frame. Gemma 3n inserts a fixed `audio_soft_tokens_per_image` per clip and fills the remaining slots with the embedder's padding token.
+
+`bundle.save` writes trained variables under the source tensor names. This includes Gemma 4's frozen standardization and clipping buffers, which live in the `constants` collection and stay bit-for-bit unchanged through training. The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) lists the media each wrapper takes.
+
+The Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gemma4Audio`, registered as the towers `gemma3n_audio` and `gemma4_audio`. `audio_config` reads the checkpoint's `audio_config` record and rejects unknown computational fields. `audio_weights` converts the tower's own tensors and keeps Gemma 4's checkpointed clipping bounds in a frozen `constants` collection. An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames. It returns `AudioEncoding(features, mask)`, with the mask subsampled to the encoder's frame rate. `dew.data.audio.AudioProcessor` builds the checkpoint's feature extractor from its `preprocessor_config.json` record and turns 16 kHz mono waveforms into those two arrays. It does not resample. Gemma 3n projects audio through `Gemma3nProjectorModule.soft_embeddings`, without the scaling used for vision. Gemma 4 reuses `Gemma4ProjectorModule`, with its input width taken from `output_proj_dims`.
