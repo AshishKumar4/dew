@@ -65,6 +65,7 @@ def _text_features(tower, ids):
     first position that equals the eos id.
     """
     hidden = tower.token_embedding(ids) + tower.position_embedding(jnp.arange(ids.shape[1]))
+    penultimate = hidden  # the state before the last layer; the embedding when there is none
     for layer in tower.layers:
         penultimate = hidden
         hidden = layer(hidden)

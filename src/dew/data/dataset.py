@@ -143,10 +143,11 @@ class Forwarding:
     def _forwarded(self) -> Iterator[Batch] | None:
         """The wrapped source, or None before a subclass sets one.
 
-        A subclass declares `_source` with its own stream type, narrower than
-        anything this base could state, and a wrapper may be constructed
-        before it has a source. One lookup lives here so the three hooks
-        below can ask the Stoppable and Closeable protocols instead.
+        This lookup is the boundary between the wrapper and whatever it
+        wraps. A subclass declares `_source` with its own stream type,
+        narrower than anything this base could state, and a wrapper may be
+        constructed before it has a source. The three hooks below ask the
+        Stoppable and Closeable protocols of what it returns.
         """
         return getattr(self, "_source", None)
 
