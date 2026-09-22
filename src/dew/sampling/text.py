@@ -32,7 +32,6 @@ from jax.experimental import checkify, multihost_utils
 from jax.typing import ArrayLike
 
 from dew.artifacts import agreed
-from dew.inputs import host_rows
 from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.inputs import (
     ArrayT,
@@ -224,8 +223,9 @@ class Generation(Generic[ArrayT]):
         return self.tokens.shape[1] - self.behavior_log_probs.shape[1]
 
     def host(self) -> Generation[np.ndarray]:
-        """This process's real rows as host arrays."""
-        return host_rows(self, self.rows)
+        """This process's real rows as host arrays, without the padding a
+        row plan added to fill the devices."""
+        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:

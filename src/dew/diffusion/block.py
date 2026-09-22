@@ -23,7 +23,6 @@ from flax import struct
 from jax.experimental import multihost_utils
 
 from dew.artifacts import agreed
-from dew.inputs import host_rows
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import (
     ArrayT,
@@ -67,8 +66,9 @@ class CanvasGeneration(Generic[ArrayT]):
         pytree_node=False, default=None)
 
     def host(self) -> CanvasGeneration[np.ndarray]:
-        """This process's real rows as host arrays."""
-        return host_rows(self, self.rows)
+        """This process's real rows as host arrays, without the padding a
+        row plan added to fill the devices."""
+        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:
