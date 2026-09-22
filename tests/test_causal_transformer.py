@@ -18,6 +18,7 @@ import pytest
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
+from dew.objectives.lm.chunked import head_logits
 from dew.registry import models, with_precision
 
 VOCAB = 37
@@ -216,11 +217,8 @@ def test_hidden_states_times_head_weight_are_the_logits(rng, config):
 
     hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
     head = model.apply(params, params['params'], method=CausalTransformer.head_weight)
-    logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head,
-                        precision=model.precision)
-    if model.final_logit_softcap is not None:
-        cap = jnp.asarray(model.final_logit_softcap, jnp.float32)
-        logits = cap * jnp.tanh(logits / cap)
+    logits = head_logits(hidden, head, softcap=model.final_logit_softcap,
+                         precision=model.precision)
 
     assert hidden.shape == (ids.shape[0], SEQ, model.emb_features)
     stored = params['params']['embed_tokens']['embedding'].dtype
@@ -874,21 +872,26 @@ def test_the_qk_norm_reads_the_model_norm_eps(rng):
     assert not jnp.allclose(q_small, q_large, rtol=1e-2)
 
 
-def test_the_tied_head_multiplies_in_fp32_under_bf16_compute(rng):
-    """The head reads the fp32 embedding table and the fp32 states: casting
-    both to bf16 before the einsum, then up, is a different number, and the
-    loss the optimizer sees is the fp32 one."""
+def test_the_tied_head_multiplies_bf16_into_fp32_under_bf16_compute(rng):
+    """Under bf16 compute the head multiplies the bf16 states by the table
+    rounded to bf16 and accumulates in fp32: the products are exact, so the
+    logits are the fp32 sum of the rounded operands, not the fp32 table's
+    product and not a product rounded to bf16 at the end."""
     model = tiny(dtype=jnp.bfloat16)
     ids = tokens(rng)
     params = model.init(rng, ids)
     logits = model.apply(params, ids)
     hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
     table = params["params"]["embed_tokens"]["embedding"]
-    fp32 = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32), table.astype(jnp.float32))
-    bf16 = jnp.einsum("...d,vd->...v", hidden.astype(jnp.bfloat16),
-                      table.astype(jnp.bfloat16)).astype(jnp.float32)
-    np.testing.assert_allclose(np.asarray(logits), np.asarray(fp32), atol=1e-6)
-    assert not np.allclose(np.asarray(logits), np.asarray(bf16), atol=1e-6)
+    exact = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32),
+                       table.astype(jnp.bfloat16).astype(jnp.float32),
+                       precision=jax.lax.Precision.HIGHEST)
+    fp32 = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32), table,
+                      precision=jax.lax.Precision.HIGHEST)
+    rounded = exact.astype(jnp.bfloat16).astype(jnp.float32)
+    np.testing.assert_allclose(np.asarray(logits), np.asarray(exact), atol=1e-6)
+    assert not np.allclose(np.asarray(logits), np.asarray(fp32), atol=1e-6)
+    assert not np.allclose(np.asarray(logits), np.asarray(rounded), atol=1e-6)
 
 
 def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):

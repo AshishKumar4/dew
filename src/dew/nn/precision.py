@@ -97,3 +97,46 @@ def _rounded_operand_jvp(dtype: Dtype, primals: tuple[jax.Array],
                          tangents: tuple[jax.Array]) -> tuple[jax.Array, jax.Array]:
     return jnp.asarray(rounded_operand(primals[0], dtype)), tangents[0]
 
+
+def rounds_to_bf16(dtype: Dtype | None, precision: PrecisionLike = None) -> bool:
+    """Whether an fp32-result product under this compute dtype and precision
+    multiplies bf16 operands (`bf16_operand_precision`)."""
+    return bf16_operand_precision(dtype, precision) is jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+
+
+def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
+    """A flax layer's `dot_general` for a vocabulary head under compute
+    `dtype`: an fp32 result whose operands are the compute dtype's values.
+
+    Under bf16 compute the head is rounded to bf16 before the product, on
+    every backend (the CPU backend ignores the dot algorithm and would
+    otherwise multiply the stored fp32 head), and the product runs the
+    bf16 algorithm in both directions. The rounding is straight-through,
+    so the head's gradient keeps the master dtype. `dtype` is the model's
+    compute dtype, not the layer's: the layer promotes the states to fp32.
+    """
+    resolved = bf16_operand_precision(dtype, precision)
+    rounds = rounds_to_bf16(dtype, precision)
+
+    def dot_general(lhs, rhs, dimension_numbers, precision=None,
+                    preferred_element_type=None):
+        del precision, preferred_element_type  # this head's policy, not the layer's
+        if rounds:
+            rhs = rounded_operand(rhs, jnp.bfloat16)
+        return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=resolved,
+                                   preferred_element_type=jnp.float32)
+
+    return dot_general
+
+
+def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
+                 precision: PrecisionLike = None) -> jax.Array:
+    """`jnp.einsum(subscripts, hidden, head)` as a vocabulary head computes
+    it: fp32 states against the head as stored, or, under bf16 compute (the
+    states' dtype), both rounded to bf16 as `head_dot_general` does, with
+    fp32 accumulation and an fp32 result."""
+    resolved = bf16_operand_precision(hidden.dtype, precision)
+    if rounds_to_bf16(hidden.dtype, precision):
+        head = rounded_operand(head, jnp.bfloat16)
+    return jnp.einsum(subscripts, hidden.astype(jnp.float32), head,
+                      precision=resolved, preferred_element_type=jnp.float32)

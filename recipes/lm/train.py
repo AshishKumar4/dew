@@ -320,6 +320,7 @@ def main(config: LmRunConfig) -> TrainState:
         mtp_weight=config.mtp_weight,
         indexer=config.indexer,
         qk_stats=config.optim.optimizer == "muonclip",
+        token_accuracy=config.token_accuracy,
     )
     return config.train(objective, data, name=name, metrics=validation, summary=summary)
 

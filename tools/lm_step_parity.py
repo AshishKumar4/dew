@@ -49,7 +49,7 @@ def run(config: dict[str, int], batch: int, seq: int, steps: int,
     if precision is not None:
         fields["precision"] = precision
     model = models.build("causal_transformer", **fields)
-    trainer = Trainer(LMObjective(model, seq), optax.adam(1e-4),
+    trainer = Trainer(LMObjective(model, seq, token_accuracy=True), optax.adam(1e-4),
                       key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
                       checkpoints=None, tracker=None)
     abstract = jax.eval_shape(trainer.initial_state)

@@ -415,11 +415,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             target_mask &= text_slots[:, self.prompt_length:]
         canvas_losses, _, _ = chunked_cross_entropy(
             states, head, response, self.head_chunks, softcap=softcap, precision=precision,
-            vocab_major=vocab_major)
+            vocab_major=vocab_major, predict=False)
         shifted, encoder_target_mask = self._encoder_targets(batch, tokens, validity, full_valid, text_slots)
         encoder_losses, _, _ = chunked_cross_entropy(
             encoder_states, head, shifted, self.head_chunks, softcap=softcap, precision=precision,
-            vocab_major=vocab_major)
+            vocab_major=vocab_major, predict=False)
         return canvas_losses, target_mask, encoder_losses, encoder_target_mask
 
     def reduce_loss(self, stats: BlockSFTStatistics):

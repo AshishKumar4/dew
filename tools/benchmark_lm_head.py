@@ -86,7 +86,7 @@ def baseline(states, table, targets, variant: Variant):
 def bounded(states, table, targets, variant: Variant):
     losses, predicted, log_z = chunked_cross_entropy(
         states, table.T, targets, variant.chunks, softcap=variant.softcap,
-        tile=variant.tile
+        tile=variant.tile, predict=variant.accuracy
     )
     return finish(losses, predicted, log_z, targets, variant)
 

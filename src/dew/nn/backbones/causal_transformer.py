@@ -59,6 +59,7 @@ from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, Situ, SparseMLP, gated_product
 from ..precision import scaled
+from ..precision import head_dot_general, head_product
 from ..rope import RopeScaling, YarnScaling
 from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
 
@@ -2209,6 +2210,7 @@ class CausalTransformer(nn.Module):
                 features=self.vocab_size, use_bias=False, dtype=jnp.float32,
                 precision=self.precision, name='lm_head',
                 **normal_kernel(self.initializer_range))
+                dot_general=head_dot_general(self.dtype, self.precision), name='lm_head')
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None,
@@ -2257,15 +2259,14 @@ class CausalTransformer(nn.Module):
 
     def _logits(self, x):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
-        # fp32 head, as in the DiT output projection: the loss is computed in
-        # fp32. The table is contracted in its stored dtype with fp32
-        # accumulation: a bf16 product is exact in fp32, so the scores are
-        # the upcast table's up to summation order, and no fp32 copy of the
-        # vocabulary-sized table is materialised or saved for the backward.
+        # An fp32 result, as in the DiT output projection: the loss is
+        # computed in fp32. Under bf16 compute both operands are multiplied
+        # in bf16 and accumulated in fp32, backward included, the arithmetic
+        # of the chunked loss's `head_logits` (`dew.nn.precision`); the
+        # head's gradient keeps the master dtype.
         if self.tie_embeddings:
-            logits = jnp.einsum(
-                '...d,vd->...v', x.astype(jnp.float32), self.embed_tokens.embedding,
-                precision=self.precision, preferred_element_type=jnp.float32)
+            logits = head_product('...d,vd->...v', x, self.embed_tokens.embedding,
+                                  self.precision)
         else:
             logits = self.lm_head(x)
         logits = logits.astype(jnp.float32)
