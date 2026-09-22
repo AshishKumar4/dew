@@ -1,3 +1,5 @@
+"""Rectified flow schedules: the linear path and its resolution shift."""
+
 import math
 
 import jax
@@ -48,10 +50,8 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler):
         return jnp.ones_like(jnp.asarray(t, jnp.float32))
 
     def model_time(self, t):
-        # The flow models were trained on the shifted time times 1000, so that
-        # is what a trained one reads. SimpleDiT's embedder is EDM's random
-        # Fourier features (blocks.FourierEmbedding), which take an input of
-        # order one and need nothing in the DiT sinusoidal range; the factor
-        # is there because changing it changes what every trained flow model
-        # is conditioned on.
+        # Trained flow checkpoints are conditioned on the shifted time times
+        # 1000. The factor is part of the training convention, not of the
+        # embedder: SimpleDiT's Fourier embedding takes an input of order one
+        # either way.
         return self.shift_timesteps(jnp.asarray(t, jnp.float32)) * 1000

@@ -1,3 +1,5 @@
+"""The tabulated variance-preserving schedule every beta table shares."""
+
 import jax
 import jax.numpy as jnp
 import numpy as np

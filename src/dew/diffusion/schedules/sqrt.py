@@ -1,3 +1,5 @@
+"""The square-root schedule of Diffusion-LM."""
+
 import jax.numpy as jnp
 
 from .continuous import ContinuousNoiseScheduler

@@ -1,9 +1,9 @@
 """Named conventions, as the dataclasses a run's `run.json` stores.
 
-A preset is a frozen dataclass of the numbers that define a convention;
+A preset is a frozen dataclass of the numbers that define a convention, and
 calling it builds the `Process`. Both training and inference build from the
 same preset, so a model is always sampled with the convention it was trained
-with, and a record that holds the preset's fields rebuilds it exactly.
+with. A record that holds the preset's fields rebuilds it exactly.
 """
 
 from __future__ import annotations
@@ -96,9 +96,12 @@ class Karras:
 @presets("cosine")
 @dataclass(frozen=True)
 class Cosine:
-    """The cosine beta table with v-prediction. The table's P2 weight at its
-    defaults (k = 1, gamma = 1) is 1 / (1 + SNR), which makes the v loss an
-    unweighted x_0 loss; `p2_loss_weight_gamma` changes that."""
+    """The cosine beta table with v-prediction.
+
+    The table's P2 weight at its defaults (k = 1, gamma = 1) is 1 / (1 + SNR),
+    which makes the v loss an unweighted x_0 loss. `p2_loss_weight_gamma`
+    changes that.
+    """
 
     timesteps: int = 1000
     beta_end: float = 1.0

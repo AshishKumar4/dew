@@ -24,7 +24,13 @@ from dew.diffusion.schedules import NoiseScheduler, expand
 
 
 class PredictionTransform:
-    """The identity parameterization: the model outputs x_0's target space."""
+    """What the model predicts, and how x_0 and epsilon are read back out.
+
+    The base supplies the x_0 target and the identity output transform. A
+    subclass gives `backward_diffusion`, without which the parameterization
+    is incomplete.
+    """
+
     normalize_input: bool = False
 
     def __init__(self, *, normalize_input: bool = False):
@@ -36,8 +42,8 @@ class PredictionTransform:
 
     def forward_diffusion(self, x_0, epsilon,
                           rates) -> tuple[jax.Array, ArrayLike, jax.Array]:
-        """`(x_t, c_in, target)`: the noised sample, the model input scale and
-        what the model should output for it."""
+        """`(x_t, c_in, target)`: the noised sample, the model input scale,
+        and what the model should output for it."""
         signal_rate, noise_rate = rates
         x_t = signal_rate * x_0 + noise_rate * epsilon
         return x_t, self.get_input_scale(rates), self.get_target(x_0, epsilon, rates)
@@ -58,8 +64,8 @@ class PredictionTransform:
     def target_error_scale(self, snr) -> ArrayLike:
         """||target error||^2 / ||x_0 error||^2 at the given SNR.
 
-        Loss weights (min-SNR-gamma and friends) are defined on the x_0 loss;
-        dividing by this converts them into the space the model is trained in.
+        min-SNR-gamma and the other loss weights are defined on the x_0 loss.
+        Dividing by this converts them into the space the model trains in.
         """
         return 1.0
 
@@ -104,8 +110,10 @@ class VPredictionTransform(PredictionTransform):
 
 
 class FlowMatchPredictionTransform(PredictionTransform):
-    """Rectified flow velocity: the model predicts u = epsilon - x_0, the
-    constant velocity of the linear path, so both endpoints are one step away.
+    """The model predicts the rectified flow velocity u = epsilon - x_0.
+
+    That is the constant velocity of the linear path, so both endpoints are
+    one step away.
     """
 
     def backward_diffusion(self, x_t, preds, rates):
@@ -121,12 +129,14 @@ class FlowMatchPredictionTransform(PredictionTransform):
 
 
 class KarrasPredictionTransform(PredictionTransform):
-    """The EDM preconditioning (Karras et al. 2022, Table 1): the model sees
-    c_in x_t and its raw output F is read as x_0 = c_skip x_t + c_out F. Every
-    denominator is at least sigma_data, so none needs a guard.
+    """The EDM preconditioning of Karras et al. 2022, Table 1.
+
+    The model sees c_in x_t and its raw output F is read as
+    x_0 = c_skip x_t + c_out F. Every denominator is at least sigma_data, so
+    none needs a guard.
 
     `velocity` is Diffusers 0.34.0's EDM `prediction_type="v_prediction"`,
-    whose `precondition_outputs` negates c_out: the model's output is the
+    whose `precondition_outputs` negates c_out, so the model's output is the
     velocity of the preconditioned path rather than its endpoint offset.
     """
 
@@ -155,13 +165,15 @@ class KarrasPredictionTransform(PredictionTransform):
 
 
 class ConsistencyBoundary(PredictionTransform):
-    """The boundary parameterization of a latent consistency model (Luo et
-    al. 2023, arXiv 2310.04378), as Diffusers' `LCMScheduler` reads it: the
-    model predicts x_0 in `inner`'s space, and the consistency function is
-    f = c_skip x_t + c_out x_0 with c_skip = sigma_data^2 / (s^2 +
+    """The boundary parameterization of a latent consistency model, as
+    Diffusers' `LCMScheduler` reads it (Luo et al. 2023, arXiv 2310.04378).
+
+    The model predicts x_0 in `inner`'s space, and the consistency function
+    is f = c_skip x_t + c_out x_0, with c_skip = sigma_data^2 / (s^2 +
     sigma_data^2) and c_out = s / sqrt(s^2 + sigma_data^2) at the scaled time
-    s = `timestep_scaling` t, so f is x_t itself at t = 0. `x_0` and
-    `epsilon` are read out of f."""
+    s = `timestep_scaling` t. f is therefore x_t itself at t = 0, and `x_0`
+    and `epsilon` are read out of f.
+    """
 
     def __init__(self, inner: PredictionTransform, timestep_scaling: float = 10.0,
                  sigma_data: float = 0.5) -> None:
@@ -186,19 +198,19 @@ class ConsistencyBoundary(PredictionTransform):
 
 
 class SourceLimitedPrediction(PredictionTransform):
-    """A published scheduler's limit on x_0, in the conversion order its
-    `step` applies it.
+    """Limits x_0 the way a published scheduler's `step` does.
 
-    `inner` reads x_0 out of the model's output; then dynamic thresholding
-    (Saharia et al. 2022: clamp each sample to its own `ratio` quantile of
-    |x_0|, never below 1 and never above `maximum`, and divide by it) or a
-    plain clamp to `clip` limits it. Thresholding wins where a source
-    declares both, the way its `step` tests them.
+    `inner` reads x_0 out of the model's output, and then either dynamic
+    thresholding or a plain clamp to `clip` limits it. Thresholding is
+    Saharia et al. 2022: clamp each sample to its own `ratio` quantile of
+    |x_0|, never below 1 and never above `maximum`, then divide by it.
+    Thresholding wins where a source declares both, the way its `step` tests
+    them.
 
     `recompute_epsilon` is whether the source re-derives epsilon from the
     limited x_0. DDPM's posterior, DEIS and the noise-prediction DPM-Solver
-    algorithms do, so their update carries the limit; DDIM keeps the model's
-    own output as its epsilon and only its x_0 term is limited.
+    algorithms do, so their update carries the limit. DDIM keeps the model's
+    own output as its epsilon, and only its x_0 term is limited.
 
     The limit is not linear in the model's output, so it belongs to the
     conversion a guided walk runs once on the combined output rather than to
@@ -248,6 +260,8 @@ class SourceLimitedPrediction(PredictionTransform):
 
 
 class Weighting(Protocol):
+    """Weights a per-example loss, given the schedule and what it predicts."""
+
     def __call__(self, schedule: NoiseScheduler, prediction: PredictionTransform,
                  t) -> jax.Array:
         """Per-example loss weight at `t`, shaped like `t`."""
@@ -256,7 +270,7 @@ class Weighting(Protocol):
 
 @dataclass(frozen=True)
 class ScheduleWeighting:
-    """The schedule's own weight."""
+    """Weights the loss with the schedule's own weight."""
 
     def __call__(self, schedule, prediction, t):
         return schedule.weight(t)
@@ -264,9 +278,11 @@ class ScheduleWeighting:
 
 @dataclass(frozen=True)
 class MinSNR:
-    """min-SNR-gamma (Hang et al. 2023). min(SNR, gamma) on the x_0 loss,
-    converted into the space the model is trained in. It is used in place of
-    the schedule's own weight."""
+    """Weights the loss with min-SNR-gamma (Hang et al. 2023).
+
+    min(SNR, gamma) on the x_0 loss, converted into the space the model
+    trains in. It replaces the schedule's own weight.
+    """
 
     gamma: float
 

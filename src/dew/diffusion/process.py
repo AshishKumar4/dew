@@ -1,4 +1,4 @@
-"""One convention a model is trained and sampled with."""
+"""Holds the one convention a model is trained and sampled with."""
 
 from __future__ import annotations
 
@@ -16,10 +16,12 @@ from dew.objectives.base import Variables
 
 @struct.dataclass
 class DenoisingCondition:
-    """Text conditioning as the published families read it: the token states,
-    a pooled vector, the size and crop ids the XL towers add, and the
-    distilled guidance value a guidance-embedded transformer takes as a model
-    input rather than as two guided branches."""
+    """Carries text conditioning as the published families read it.
+
+    The fields are the token states, a pooled vector, the size and crop ids
+    the XL towers add, and the distilled guidance value a guidance-embedded
+    transformer takes as a model input rather than as two guided branches.
+    """
 
     context: jax.Array
     pooled: jax.Array | None = None
@@ -30,9 +32,9 @@ class DenoisingCondition:
         """This conditioning with `given`'s own model inputs.
 
         A distilled guidance value belongs to the row rather than to its
-        caption: dropping the caption or guiding against an unconditional one
-        changes what the model reads about the text, not the scale the
-        checkpoint was distilled to walk at. The two seams that pair a
+        caption. Dropping the caption, or guiding against an unconditional
+        one, changes what the model reads about the text and not the scale
+        the checkpoint was distilled to walk at. The two seams that pair a
         conditional record with an unconditional one align them here first,
         so both keep each row's own scalar.
         """
@@ -48,7 +50,7 @@ def aligned_conditions(conditions: Mapping[str, Conditioning],
                        unconditional: Mapping[str, Conditioning]) -> dict[str, Conditioning]:
     """`unconditional` with each row's own model inputs taken from `conditions`.
 
-    A keyword names a conditioning record on both sides or on neither: the
+    A keyword names a conditioning record on both sides or on neither, so the
     spatial keywords an inpainting source adds are arrays and pass through. A
     keyword that is a record on one side only is a caller pairing two
     different conditionings, and raises rather than aligning nothing.
@@ -67,11 +69,12 @@ def aligned_conditions(conditions: Mapping[str, Conditioning],
 
 @dataclass(frozen=True)
 class Process:
-    """A schedule, what the model predicts on it, and how the loss is weighted.
+    """Pairs a schedule with what the model predicts on it and how the loss is
+    weighted.
 
-    `sampling` is the schedule inference integrates when it is not the training
-    one (EDM trains on log-normal sigmas and samples on the Karras grid); None
-    means the same schedule.
+    `sampling` is the schedule inference integrates when it is not the
+    training one, as EDM trains on log-normal sigmas and samples on the
+    Karras grid. None means the same schedule.
     """
 
     schedule: NoiseScheduler
@@ -87,16 +90,18 @@ class Process:
         return self.weighting(self.schedule, self.prediction, t)
 
     def times(self, steps: int) -> jax.Array:
-        """The descending time grid of `steps` points a sampler walks, from
-        T to 0. A tabulated schedule cannot take more steps than it has
-        entries, so `steps` is capped at T there."""
+        """The descending time grid of `steps` points a sampler walks, from T to 0.
+
+        A tabulated schedule cannot take more steps than it has entries, so
+        `steps` is capped at T there.
+        """
         schedule = self.sampler_schedule
         if schedule.T > 1:
             steps = min(steps, int(schedule.T))
         return jnp.linspace(schedule.T, 0.0, steps, dtype=jnp.float32)
 
     def noise(self, key, shape) -> jax.Array:
-        """Draw the sampling schedule's Gaussian prior for the requested shape.
+        """Draws the sampling schedule's Gaussian prior at `shape`.
 
         Its default scale is the unit-data marginal at T; a schedule may
         declare a different prior normalization.
@@ -117,16 +122,15 @@ class Process:
 
 @dataclass(frozen=True)
 class Denoiser:
-    """A model, its parameters and its conditions as one denoising function.
+    """Denoises with one model, its parameters and its conditions.
 
     A call is the model's raw output at `(x_t, t)` followed by the process's
     conversion of it into `(x_0, epsilon)`. The two are separate because a
-    source's conversion is not always linear in the output: dynamic
-    thresholding and sample clipping limit x_0, and a consistency boundary
-    reads a function of it, so combining two raw outputs after conversion is
-    not combining them before it. Guidance therefore reads `raw_both`,
-    combines the raw outputs and converts once, the order a source pipeline
-    runs its scheduler in.
+    conversion is not always linear in the output: dynamic thresholding and
+    sample clipping limit x_0, and a consistency boundary reads a function of
+    it, so combining two raw outputs after conversion is not combining them
+    before it. Guidance therefore reads `raw_both`, combines the raw outputs
+    and converts once, the order a source pipeline runs its scheduler in.
     """
 
     process: Process

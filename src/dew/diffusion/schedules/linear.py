@@ -1,3 +1,5 @@
+"""The linear beta table of Ho et al. 2020."""
+
 import numpy as np
 
 from .discrete import DiscreteNoiseScheduler
