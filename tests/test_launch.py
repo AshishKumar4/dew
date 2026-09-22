@@ -75,3 +75,19 @@ def test_a_signalled_launch_stops_its_pool_and_reports_the_signal(tmp_path, sign
     while any(alive(pid) for pid in ranks) and time.monotonic() < deadline:
         time.sleep(0.1)
     assert not any(alive(pid) for pid in ranks)
+
+
+def test_a_rank_printing_bytes_that_are_not_utf8_still_finishes():
+    """One undecodable byte, then more output than a pipe holds: the relay
+    keeps reading, so the rank never blocks on a full pipe, and the byte
+    arrives as a replacement character."""
+    program = ("import sys\n"
+               "sys.stdout.buffer.write(b'\\xff\\xfe\\n')\n"
+               "sys.stdout.buffer.write(b'x' * 300_000 + b'\\n')\n")
+    launch = launcher("--port", "1", "--", sys.executable, "-c", program)
+    try:
+        output, _ = launch.communicate(timeout=60)
+    finally:
+        launch.kill()
+    assert launch.returncode == 0
+    assert "[0] \ufffd\ufffd" in output.decode()
