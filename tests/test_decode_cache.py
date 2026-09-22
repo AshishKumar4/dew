@@ -55,7 +55,7 @@ def test_mixer_prefill_and_resume_follow_each_rows_real_tokens(kind):
     if kind == "recurrent":
         module = GatedDeltaNet(emb_features=16, num_k_heads=2, num_v_heads=2,
                                head_k_dim=4, head_v_dim=4, conv_kernel=4,
-                               max_seq_len=8, dtype=jnp.float32)
+                               dtype=jnp.float32)
     else:
         sparse = dict(index_topk=3, index_n_heads=2, index_head_dim=8) if kind == "sparse" else {}
         module = MultiHeadLatentAttention(
