@@ -549,3 +549,26 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(1), ema=None)
     np.testing.assert_array_equal(scalar_loss(restored, rebuilt, batch, step)[0],
                                   scalar_loss(objective, state.params, batch, step)[0])
+
+
+def test_the_shipped_lm_run_config_round_trips_through_its_record():
+    """`LMRunConfig` is what `TextGeneration.from_run` and `export_run` read
+    back: the tokenizer the ids came from, the preview budget and the
+    sampling policy survive `run.json` as the values they went in as. The
+    recipe's own class is that one narrowed to token files, so a chat spec
+    is a record the base takes and the recipe refuses."""
+    from dew.data import ChatMessages
+    from dew.objectives.lm import LMRunConfig
+
+    chat = ChatMessages(tokenizer="byte", path="chat.parquet", seq_len=16)
+    config = LMRunConfig(data=chat, tokenizer="gpt2", sample_tokens=8, ema_decay=None,
+                         sampling=Sampling(temperature=0.5, top_k=7))
+
+    record = config.to_dict()
+
+    assert record["tokenizer"] == "gpt2" and record["sample_tokens"] == 8
+    assert record["ema_decay"] is None and record["objective"] == "lm"
+    assert record["sampling"]["temperature"] == 0.5 and record["sampling"]["top_k"] == 7
+    assert LMRunConfig.from_dict(record) == config
+    with pytest.raises(ValueError, match="trains on token files"):
+        load_recipe().LmRunConfig(data=chat)
