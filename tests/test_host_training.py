@@ -115,10 +115,13 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
         state, _, _ = trainer.place()
         step = trainer.compile(state, data[0])
         prefix, *_ = step(state, data[0])
+        # the step consumes the state
+        prefix_params = jax.tree.map(np.asarray, prefix.params)
+        prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
         rejected, _, _, _, accepted = step(prefix, data[1])
         assert not bool(accepted)
-        equal(prefix.params, rejected.params)
-        equal(prefix.accumulation, rejected.accumulation)
+        equal(prefix_params, rejected.params)
+        equal(prefix_accumulation, rejected.accumulation)
         state, *_ = step(rejected, data[2])
         assert int(state.updates) == 1
         assert float(state.params["stats"]["seen"]) == 2
@@ -196,18 +199,23 @@ def test_nonfinite_optimizer_candidate_rolls_back_all_cpu_owned_fields():
                                     dynamic_scale=True, layout=layout)
         initial, _, _ = trainer.place()
         data = batches()[0]
+        # the step consumes the state
+        assert initial.scale is not None
+        start_params, start_ema, start_opt = jax.tree.map(
+            np.asarray, (initial.params, initial.ema, initial.opt_state))
+        start_scale, start_fin = float(initial.scale.scale), int(initial.scale.fin_steps)
         final, _, _, finite, accepted = trainer.compile(initial, data)(initial, data)
         assert bool(finite) and not bool(accepted)
-        equal(initial.params, final.params)
-        equal(initial.ema, final.ema)
-        equal(initial.opt_state, final.opt_state)
+        equal(start_params, final.params)
+        equal(start_ema, final.ema)
+        equal(start_opt, final.opt_state)
         assert int(final.microstep) == int(final.updates) == 0
         assert int(final.step) == 1
         # Preserve the existing distinction: candidate-state rejection rolls
         # back the transaction, while the scaler tracks gradient finiteness.
-        assert final.scale is not None and initial.scale is not None
-        assert float(final.scale.scale) == float(initial.scale.scale)
-        assert int(final.scale.fin_steps) == int(initial.scale.fin_steps) + 1
+        assert final.scale is not None
+        assert float(final.scale.scale) == start_scale
+        assert int(final.scale.fin_steps) == start_fin + 1
         results.append(final)
     equal(*results)
 
@@ -427,6 +435,9 @@ def test_a_nested_decoder_bank_trains_beside_frozen_media_entries():
     start, _, _ = trainer.place()
     step = trainer.compile(start, batch)
     _, loss, *_ = step(start, batch)
+    # Both losses must come from the same weights, and the step consumes the
+    # state, so place them again instead of reusing the consumed ones.
+    start, _, _ = trainer.place()
     _, changed, *_ = step(start, other)
     assert abs(float(loss) - float(changed)) > 1e-4, "the pixels do not reach the loss"
 
