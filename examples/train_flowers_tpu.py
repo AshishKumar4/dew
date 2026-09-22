@@ -66,8 +66,8 @@ class Config:
     score_fid: bool = True
     """FID's Inception weights are a Hub download and the repo ships no tiny
     stand-in, so an offline run turns the number off rather than reaching out."""
-    model: dict = field(default_factory=lambda: dict(
-        patch_size=2, emb_features=1024, num_layers=24, num_heads=16))
+    model: dict = field(default_factory=lambda: {
+        "patch_size": 2, "emb_features": 1024, "num_layers": 24, "num_heads": 16})
     smoke: bool = False
     """Train the synthetic fixture on one device for a few steps instead."""
 
@@ -98,8 +98,8 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
     """The same run at the size a laptop finishes: one device, tiny everything."""
     synthetic_records(out / "data", count=16, size=16)
     return DiffusionRunConfig(
-        model=ModelConfig("simple_dit", dict(patch_size=4, emb_features=32, num_layers=1,
-                                             num_heads=2), dtype="float32"),
+        model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 32,
+                                        "num_layers": 1, "num_heads": 2}, dtype="float32"),
         data=ArrayRecordImages(path=str(out / "data"), image_size=16, augmentation="none",
                                val_batches=1, loading=Loading(workers=0, threads=1,
                                                               read_buffer=2, worker_buffer=1)),

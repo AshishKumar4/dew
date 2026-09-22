@@ -32,7 +32,8 @@ class Config:
     """Run length in steps; unset trains for `epochs` passes over the data."""
     learning_rate: float = 2e-4
     fsdp: int = 1
-    model: dict = field(default_factory=lambda: dict(patch_size=4, emb_features=512, num_layers=12, num_heads=8))
+    model: dict = field(default_factory=lambda: {
+        "patch_size": 4, "emb_features": 512, "num_layers": 12, "num_heads": 8})
     prompts: tuple[str, ...] = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
     out: Path = Path("runs/flowers")
 

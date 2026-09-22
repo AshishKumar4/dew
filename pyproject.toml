@@ -145,9 +145,10 @@ split-on-trailing-comma = false
 [tool.ruff.lint.per-file-ignores]
 # The suite prints its own diagnostics and calls library predicates positionally.
 "tests/**" = ["T20", "FBT003"]
-# Reference generators and recipes are scripts; stdout is their interface.
+# Reference generators, recipes and examples are scripts; stdout is their interface.
 "tools/**" = ["T20"]
 "recipes/**" = ["T20"]
+"examples/**" = ["T20"]
 # The progress line the README documents ("step N: loss ..."), the device count
 # and the resume banner are the trainer's user-facing output, not logging.
 "src/dew/training/trainer.py" = ["T201"]

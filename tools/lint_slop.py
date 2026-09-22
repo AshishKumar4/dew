@@ -10,10 +10,10 @@ Python's version of each is below. No dependency, one output format,
 Scope is per rule, because the rules are not all about the same thing:
 
 - `src/dew` is the published contract, so every rule runs there.
-- `tests`, `tools` and `recipes` are scripts and proofs. Their names and
-  annotations are local, so the contract rules (SLOP001, SLOP002, SLOP004,
-  SLOP005) do not run there. A swallowed exception, a narration comment and an
-  unsplittable function are defects anywhere, so those do.
+- `tests`, `tools`, `recipes` and `examples` are scripts and proofs. Their
+  names and annotations are local, so the contract rules (SLOP001, SLOP002,
+  SLOP004, SLOP005) do not run there. A swallowed exception, a narration
+  comment and an unsplittable function are defects anywhere, so those do.
 - SLOP008 is about the suite only.
 
 Enforcement is staged. `ENFORCED` names the rules the tree is at zero for, and
@@ -566,7 +566,7 @@ def collect(roots: Sequence[str]) -> Iterator[Module]:
 
 
 def main() -> int:
-    roots = sys.argv[1:] or ["src/dew", "tests", "tools", "recipes"]
+    roots = sys.argv[1:] or ["src/dew", "tests", "tools", "recipes", "examples"]
     counts: dict[str, int] = {}
     files: dict[str, set[str]] = {}
     for module in collect(roots):
