@@ -139,14 +139,14 @@ class BlockProcess:
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive and finite")
 
-    def temperature(self, cur_step: jax.typing.ArrayLike) -> jax.Array:
-        return self.t_min + (self.t_max - self.t_min) * jnp.asarray(cur_step) / self.max_steps
+    def temperature(self, remaining: jax.typing.ArrayLike) -> jax.Array:
+        return self.t_min + (self.t_max - self.t_min) * jnp.asarray(remaining) / self.max_steps
 
     def noise(self, key: jax.Array, shape: Sequence[int]) -> jax.Array:
         return jax.random.randint(key, shape, 0, self.vocab_size, jnp.int32)
 
-    def temper(self, logits: jax.typing.ArrayLike, cur_step: jax.typing.ArrayLike) -> jax.Array:
-        return jnp.asarray(logits, jnp.float32) / self.temperature(cur_step)
+    def temper(self, logits: jax.typing.ArrayLike, remaining: jax.typing.ArrayLike) -> jax.Array:
+        return jnp.asarray(logits, jnp.float32) / self.temperature(remaining)
 
     def accept(self, current: jax.typing.ArrayLike, denoised: jax.typing.ArrayLike,
                logits: jax.typing.ArrayLike) -> tuple[jax.Array, jax.Array]:

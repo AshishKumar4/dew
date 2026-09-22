@@ -23,14 +23,14 @@ from jax.typing import ArrayLike
 from dew.diffusion.schedules import NoiseScheduler, expand
 
 
-def from_clean(x_t, preds, rates) -> tuple[jax.Array, jax.Array]:
+def from_clean(x_t, prediction, rates) -> tuple[jax.Array, jax.Array]:
     """`(x_0, epsilon)` where the prediction is already x_0 itself.
 
     epsilon is what is left of `x_t` once the clean part is taken out of it,
     which is the reading every x_0-space parameterization shares.
     """
     signal_rate, noise_rate = rates
-    return preds, (x_t - preds * signal_rate) / noise_rate
+    return prediction, (x_t - prediction * signal_rate) / noise_rate
 
 
 class PredictionTransform:
@@ -46,9 +46,9 @@ class PredictionTransform:
     def __init__(self, *, normalize_input: bool = False):
         self.normalize_input = normalize_input
 
-    def pred_transform(self, x_t, preds, rates, t) -> jax.Array:
+    def pred_transform(self, x_t, prediction, rates, t) -> jax.Array:
         """The model's raw output at `(x_t, t)` as a prediction in target space."""
-        return preds
+        return prediction
 
     def forward_diffusion(self, x_0, epsilon,
                           rates) -> tuple[jax.Array, ArrayLike, jax.Array]:
@@ -58,7 +58,7 @@ class PredictionTransform:
         x_t = signal_rate * x_0 + noise_rate * epsilon
         return x_t, self.get_input_scale(rates), self.get_target(x_0, epsilon, rates)
 
-    def backward_diffusion(self, x_t, preds, rates) -> tuple[jax.Array, jax.Array]:
+    def backward_diffusion(self, x_t, prediction, rates) -> tuple[jax.Array, jax.Array]:
         """`(x_0, epsilon)` read out of a prediction in target space."""
         raise NotImplementedError
 
@@ -81,9 +81,9 @@ class PredictionTransform:
 
 
 class EpsilonPredictionTransform(PredictionTransform):
-    def backward_diffusion(self, x_t, preds, rates):
+    def backward_diffusion(self, x_t, prediction, rates):
         signal_rates, noise_rates = rates
-        return (x_t - preds * noise_rates) / signal_rates, preds
+        return (x_t - prediction * noise_rates) / signal_rates, prediction
 
     def get_target(self, x_0, epsilon, rates):
         return epsilon
@@ -93,20 +93,20 @@ class EpsilonPredictionTransform(PredictionTransform):
 
 
 class DirectPredictionTransform(PredictionTransform):
-    def backward_diffusion(self, x_t, preds, rates):
-        return from_clean(x_t, preds, rates)
+    def backward_diffusion(self, x_t, prediction, rates):
+        return from_clean(x_t, prediction, rates)
 
 
 class VPredictionTransform(PredictionTransform):
     """v = alpha eps - sigma x_0, normalized by the total variance."""
 
-    def backward_diffusion(self, x_t, preds, rates):
+    def backward_diffusion(self, x_t, prediction, rates):
         signal_rate, noise_rate = rates
         variance = signal_rate ** 2 + noise_rate ** 2
-        v = preds * jnp.sqrt(variance)
+        v = prediction * jnp.sqrt(variance)
         x_0 = signal_rate * x_t - noise_rate * v
-        eps_0 = signal_rate * v + noise_rate * x_t
-        return x_0 / variance, eps_0 / variance
+        epsilon = signal_rate * v + noise_rate * x_t
+        return x_0 / variance, epsilon / variance
 
     def get_target(self, x_0, epsilon, rates):
         signal_rate, noise_rate = rates
@@ -125,9 +125,9 @@ class FlowMatchPredictionTransform(PredictionTransform):
     one step away.
     """
 
-    def backward_diffusion(self, x_t, preds, rates):
+    def backward_diffusion(self, x_t, prediction, rates):
         signal_rate, noise_rate = rates
-        return x_t - noise_rate * preds, x_t + signal_rate * preds
+        return x_t - noise_rate * prediction, x_t + signal_rate * prediction
 
     def get_target(self, x_0, epsilon, rates):
         return epsilon - x_0
@@ -153,14 +153,14 @@ class KarrasPredictionTransform(PredictionTransform):
         self.sigma_data = sigma_data
         self.velocity = velocity
 
-    def backward_diffusion(self, x_t, preds, rates):
-        return from_clean(x_t, preds, rates)
+    def backward_diffusion(self, x_t, prediction, rates):
+        return from_clean(x_t, prediction, rates)
 
-    def pred_transform(self, x_t, preds, rates, t):
+    def pred_transform(self, x_t, prediction, rates, t):
         _, sigma = rates
         c_out = sigma * self.sigma_data / jnp.sqrt(self.sigma_data ** 2 + sigma ** 2)
         c_skip = self.sigma_data ** 2 / (self.sigma_data ** 2 + sigma ** 2)
-        return (-c_out if self.velocity else c_out) * preds + c_skip * x_t
+        return (-c_out if self.velocity else c_out) * prediction + c_skip * x_t
 
     def get_input_scale(self, rates):
         _, sigma = rates
@@ -189,16 +189,16 @@ class ConsistencyBoundary(PredictionTransform):
         self.timestep_scaling = timestep_scaling
         self.sigma_data = sigma_data
 
-    def pred_transform(self, x_t, preds, rates, t):
-        preds = self.inner.pred_transform(x_t, preds, rates, t)
-        x_0, _ = self.inner.backward_diffusion(x_t, preds, rates)
+    def pred_transform(self, x_t, prediction, rates, t):
+        prediction = self.inner.pred_transform(x_t, prediction, rates, t)
+        x_0, _ = self.inner.backward_diffusion(x_t, prediction, rates)
         scaled = expand(jnp.asarray(t, jnp.float32) * self.timestep_scaling, x_t)
         c_skip = self.sigma_data ** 2 / (scaled ** 2 + self.sigma_data ** 2)
         c_out = scaled / (scaled ** 2 + self.sigma_data ** 2) ** 0.5
         return c_out * x_0 + c_skip * x_t
 
-    def backward_diffusion(self, x_t, preds, rates):
-        return from_clean(x_t, preds, rates)
+    def backward_diffusion(self, x_t, prediction, rates):
+        return from_clean(x_t, prediction, rates)
 
     def get_input_scale(self, rates):
         return self.inner.get_input_scale(rates)
@@ -248,11 +248,11 @@ class SourceLimitedPrediction(PredictionTransform):
             raise ValueError("a limited prediction needs a clip range or a thresholding ratio")
         return jnp.clip(x_0, -self.clip, self.clip)
 
-    def pred_transform(self, x_t, preds, rates, t):
-        return self.inner.pred_transform(x_t, preds, rates, t)
+    def pred_transform(self, x_t, prediction, rates, t):
+        return self.inner.pred_transform(x_t, prediction, rates, t)
 
-    def backward_diffusion(self, x_t, preds, rates):
-        x_0, epsilon = self.inner.backward_diffusion(x_t, preds, rates)
+    def backward_diffusion(self, x_t, prediction, rates):
+        x_0, epsilon = self.inner.backward_diffusion(x_t, prediction, rates)
         limited = self._limit(x_0)
         if not self.recompute_epsilon:
             return limited, epsilon

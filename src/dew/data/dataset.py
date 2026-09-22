@@ -807,7 +807,7 @@ class GlobalStream:
     shard. What two processes wrote is where one process or four resume, on
     the same records in the same steps.
 
-    `open(offset)` starts the per-process read at a record offset, which is
+    `open_at(offset)` starts the per-process read at a record offset, which is
     what a restore does instead of replaying, since an offset is a slice
     bound. It is called on the first batch and again after `set_state`, so a
     stream restored before it is read starts no worker twice.
@@ -818,9 +818,9 @@ class GlobalStream:
     read.
     """
 
-    def __init__(self, open: Callable[[int], pygrain.DatasetIterator[Batch]],
+    def __init__(self, open_at: Callable[[int], pygrain.DatasetIterator[Batch]],
                  batch: int, order: str, stop_seconds: float):
-        self._open = open
+        self._open = open_at
         self._batch = batch
         self._order = order
         self._records = 0
@@ -867,7 +867,7 @@ class Resumable(Checkpointable, Protocol):
     def __next__(self) -> Batch: ...
 
 
-def _global(state: Position) -> bytes:
+def _global_position(state: Position) -> bytes:
     """`state`'s own bytes, or the refusal that it is no global position.
 
     A ramp cuts its step out of a global record order, so it reads the
@@ -935,7 +935,7 @@ class RampedStream(Forwarding):
         return step
 
     def get_state(self) -> bytes:
-        place = position.read(_global(self._source.get_state()))
+        place = position.read(_global_position(self._source.get_state()))
         return position.encode(dataclasses.replace(place, records=self._records))
 
     def set_state(self, state: bytes) -> None:

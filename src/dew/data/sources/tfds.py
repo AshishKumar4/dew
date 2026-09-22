@@ -143,7 +143,7 @@ def read_only_builder(directory: epath.Path, *, builder: str | None,
     return reader
 
 
-def shards(builder, split: str, directory: epath.Path) -> None:
+def check_shards(builder, split: str, directory: epath.Path) -> None:
     """Raise unless every prepared shard the split reads is present.
 
     A plain name that is not a prepared split is named here, where the
@@ -186,7 +186,7 @@ def prepared_source(path: str, split: str, *, builder: str | None = None,
     """
     directory = prepared(path, builder=builder, config=config, version=version)
     reader = read_only_builder(directory, builder=builder, config=config, version=version)
-    shards(reader, split, directory)
+    check_shards(reader, split, directory)
     return Prepared(reader.as_data_source(split, decoders=decoders),
                     str(directory), split)
 

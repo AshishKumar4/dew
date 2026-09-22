@@ -215,6 +215,19 @@ def continuations(start: StepState, n: int,
         continuation_keys(start.keys, n)))
 
 
+class _Emitted(NamedTuple):
+    """The rows a speculative loop has written so far, by response position.
+
+    `valid` marks the slots a row actually emitted, so a block that kept two
+    tokens writes two columns and the rest of the block writes none.
+    """
+
+    tokens: jax.Array
+    valid: jax.Array
+    behavior_log_probs: jax.Array
+    raw_log_probs: jax.Array
+
+
 @struct.dataclass
 class Sample:
     """Draw every row independently, one token per step.
@@ -351,7 +364,7 @@ def _beam_continue(state: DecoderState, beams: StepState, ops: DecodeOps, parent
     return state, beams.commit(selected, real), selected
 
 
-def _completed(done: Completed, search: Beam, top, open_, position: int, *,
+def _completed(done: Completed, search: Beam, top, extending, position: int, *,
                best, hit, ended, tokens, raw) -> Completed:
     """The `width` best completed hypotheses, after this step's arrivals.
 
@@ -363,7 +376,7 @@ def _completed(done: Completed, search: Beam, top, open_, position: int, *,
     prompts, width, keep = done.score.shape[0], search.width, search.keep
     normalized = best / jnp.power(position + 1.0, search.length_penalty)
     blocked = jnp.all(done.flag, axis=-1, keepdims=True) & (search.early_stopping is True)
-    normalized = normalized + (blocked | ~open_).astype(jnp.float32) * DEAD
+    normalized = normalized + (blocked | ~extending).astype(jnp.float32) * DEAD
     normalized = normalized + (~(hit & top)).astype(jnp.float32) * DEAD
     merged = jnp.concatenate([done.score, normalized], axis=1)
     order = lax.top_k(merged, width)[1]
@@ -399,9 +412,9 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
     top = (jnp.arange(keep) < width)[None, :]
 
     def step(carry, position):
-        state, beams, live, drawn, scored, open_, done = carry
+        state, beams, live, drawn, scored, extending, done = carry
         best, index, chosen, vocab = _beam_candidates(state, beams, transform, live, real,
-                                                      open_, prompts, width, keep)
+                                                      extending, prompts, width, keep)
         parent, token = index // vocab, (index % vocab).astype(jnp.int32)
 
         branch = _beam_rows(parent, prompts, width)
@@ -421,7 +434,7 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         state, beams, selected = _beam_continue(state, beams, ops, parent, token, forward,
                                                 real, prompts, width)
 
-        done = _completed(done, search, top, open_, position,
+        done = _completed(done, search, top, extending, position,
                           best=best, hit=hit, ended=ended, tokens=grown, raw=traced)
 
         live = _pick(alive, forward)
@@ -429,19 +442,19 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         # budget where the penalty rewards length; otherwise from here.
         reach = float(budget) if never and penalty > 0 else (position + 1.0)
         worst = jnp.where(done.flag, jnp.min(done.score, axis=1, keepdims=True), DEAD)
-        open_ = open_ & jnp.any(live[:, :1] / jnp.power(reach, penalty) > worst,
+        extending = extending & jnp.any(live[:, :1] / jnp.power(reach, penalty) > worst,
                                 axis=-1, keepdims=True)
         state = ops.advance(state, selected, real)
         drawn = _pick(grown, forward).reshape(prompts * width, budget)
         scored = _pick(traced, forward).reshape(prompts * width, budget)
-        return (state, beams, live, drawn, scored, open_, done), None
+        return (state, beams, live, drawn, scored, extending, done), None
 
     initial = _beam_start(state, start, ops, prompts, width, budget)
     (_, _, _, _, _, _, done), _ = lax.scan(step, initial, jnp.arange(budget))
     return _beam_draws(done, start, prompts, n, budget)
 
 
-def _beam_candidates(state: DecoderState, beams: StepState, transform, live, real, open_,
+def _beam_candidates(state: DecoderState, beams: StepState, transform, live, real, extending,
                      prompts: int, width: int, keep: int):
     """The best `keep` continuations of the live beams, over all of them.
 
@@ -451,7 +464,7 @@ def _beam_candidates(state: DecoderState, beams: StepState, transform, live, rea
     and worth extending has to hold a distribution; one that is not is
     refused rather than searched.
     """
-    genuine = real.reshape(prompts, width) & (live > DEAD / 2) & open_
+    genuine = real.reshape(prompts, width) & (live > DEAD / 2) & extending
     checkify.check(jnp.all(wellformed(state.logits.astype(jnp.float32)).reshape(
         prompts, width) | ~genuine),
         "the model produced a live beam without a distribution to score")
@@ -602,7 +615,7 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
     """
     propose = ops.propose
     assert propose is not None
-    gamma, rows = plan.block, step.rows
+    block_size, rows = plan.block, step.rows
 
     def asked(at):
         """Rows genuinely drawing at slot `at`, not walking past the budget."""
@@ -615,7 +628,7 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
     states = [opening, opening.commit(candidates[0], active)]
     hidden, drafting, live, ending = state.hidden, state, opening.active, []
     sure = jnp.ones(rows, bool)
-    for depth in range(1, gamma):
+    for depth in range(1, block_size):
         ending.append(stopping(states[depth], candidates[depth - 1]))
         live = live & ~ending[depth - 1] & asked(depth)
         states[depth] = dataclasses.replace(states[depth], active=live)
@@ -633,11 +646,11 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
         states.append(states[depth].commit(token, active))
     # Every candidate gets the real criterion, the last one included: a
     # block accepted whole must not draw its bonus behind a stop.
-    ending.append(stopping(states[gamma], candidates[gamma - 1]))
+    ending.append(stopping(states[block_size], candidates[block_size - 1]))
     return _Drafted(drafting, candidates, scores, states, offered, ending)
 
 
-def _accepted(gamma: int, keys: jax.Array, targets: list[jax.Array], drafted: _Drafted,
+def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafted: _Drafted,
               step: StepState, active: jax.Array, budget: int) -> tuple[jax.Array, jax.Array]:
     """How many candidates the block keeps, and the token it ends on.
 
@@ -652,11 +665,11 @@ def _accepted(gamma: int, keys: jax.Array, targets: list[jax.Array], drafted: _D
                                            drafted.offered, drafted.ending)
     rows = active.shape[0]
     accepted = []
-    for at in range(1, gamma):
+    for at in range(1, block_size):
         chosen = candidates[at][:, None]
         ratio = (jnp.take_along_axis(jax.nn.log_softmax(targets[at]), chosen, -1)[:, 0]
                  - jnp.take_along_axis(jax.nn.log_softmax(drafts[at]), chosen, -1)[:, 0])
-        uniform = jax.vmap(jax.random.uniform)(keys[:, gamma + at])
+        uniform = jax.vmap(jax.random.uniform)(keys[:, block_size + at])
         accepted.append((jnp.log(uniform) <= ratio) & offered[at])
     available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
     matched = (1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1), axis=1)
@@ -664,18 +677,18 @@ def _accepted(gamma: int, keys: jax.Array, targets: list[jax.Array], drafted: _D
     turned_down = matched < available
     target = jnp.take_along_axis(jnp.stack(targets, axis=1), matched[:, None, None], axis=1)[:, 0]
     draft = jnp.take_along_axis(jnp.stack(drafts, axis=1),
-                                jnp.minimum(matched, gamma - 1)[:, None, None], axis=1)[:, 0]
+                                jnp.minimum(matched, block_size - 1)[:, None, None], axis=1)[:, 0]
     residual = jnp.maximum(jax.nn.softmax(target) - jax.nn.softmax(draft), 0.0)
     weight = jnp.sum(residual, axis=-1, keepdims=True)
     rest = jnp.log(residual / jnp.where(weight > 0, weight, 1.0))
     stopped = jnp.any(jnp.stack(ending, axis=1)
-                      & (jnp.arange(gamma)[None, :] < matched[:, None]), axis=1)
-    replacement = select(keys[:, 2 * gamma], jnp.where(turned_down[:, None], rest, target),
+                      & (jnp.arange(block_size)[None, :] < matched[:, None]), axis=1)
+    replacement = select(keys[:, 2 * block_size], jnp.where(turned_down[:, None], rest, target),
                          active & ~stopped & (step.step + matched < budget))
     return matched, replacement
 
 
-def _emission(gamma: int, slots: jax.Array, matched: jax.Array, replacement: jax.Array,
+def _emission(block_size: int, slots: jax.Array, matched: jax.Array, replacement: jax.Array,
               proposed: jax.Array, targets: list[jax.Array], raw: list[jax.Array],
               rows: int) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's tokens and the two log probabilities recorded for each.
@@ -690,14 +703,14 @@ def _emission(gamma: int, slots: jax.Array, matched: jax.Array, replacement: jax
                         replacement[:, None])
     behavior = jnp.stack([jnp.take_along_axis(jax.nn.log_softmax(targets[at]),
                                               emitted[:, at:at + 1], -1)[:, 0]
-                          for at in range(gamma + 1)], axis=1)
+                          for at in range(block_size + 1)], axis=1)
     original = jnp.stack([jnp.take_along_axis(jax.nn.log_softmax(raw[at]),
                                               emitted[:, at:at + 1], -1)[:, 0]
-                          for at in range(gamma + 1)], axis=1)
+                          for at in range(block_size + 1)], axis=1)
     return emitted, behavior, original
 
 
-def _emitted_count(gamma: int, step: StepState, emitted: jax.Array, active: jax.Array,
+def _emitted_count(block_size: int, step: StepState, emitted: jax.Array, active: jax.Array,
                    terminated: jax.Array, budget: int, stopping,
                    matched: jax.Array) -> tuple[jax.Array, jax.Array]:
     """How many of the block's slots each row keeps, and which rows ended.
@@ -708,7 +721,7 @@ def _emitted_count(gamma: int, step: StepState, emitted: jax.Array, active: jax.
     """
     count = jnp.minimum(matched + 1, budget - step.step)
     walked, hits = step, []
-    for at in range(gamma + 1):
+    for at in range(block_size + 1):
         walked = walked.commit(emitted[:, at], active & (at < count))
         hits.append(stopping(walked, emitted[:, at]) & active & (at < count))
     firing = jnp.stack(hits, axis=1)
@@ -718,7 +731,7 @@ def _emitted_count(gamma: int, step: StepState, emitted: jax.Array, active: jax.
     return count, terminated | (anywhere & (count == jnp.argmax(firing, axis=1) + 1))
 
 
-def _recorded(gamma: int, step: StepState, emitted: jax.Array, behavior: jax.Array,
+def _recorded(block_size: int, step: StepState, emitted: jax.Array, behavior: jax.Array,
               original: jax.Array, count: jax.Array, slots: jax.Array, index: jax.Array,
               active: jax.Array, terminated: jax.Array, budget: int, out):
     """The kept slots, the `StepState` they leave, and the output rows.
@@ -729,16 +742,16 @@ def _recorded(gamma: int, step: StepState, emitted: jax.Array, behavior: jax.Arr
     """
     keep = slots < count[:, None]
     committed = step
-    for at in range(gamma + 1):
+    for at in range(block_size + 1):
         committed = committed.commit(emitted[:, at], keep[:, at])
     committed = dataclasses.replace(
         committed, active=active & ~terminated & (step.step + count < budget))
     landing = jnp.where(keep, step.step[:, None] + slots, budget)
-    return keep, committed, (
-        out[0].at[index, landing].set(emitted, mode="drop"),
-        out[1].at[index, landing].set(True, mode="drop"),
-        out[2].at[index, landing].set(behavior, mode="drop"),
-        out[3].at[index, landing].set(original, mode="drop"))
+    return keep, committed, _Emitted(
+        out.tokens.at[index, landing].set(emitted, mode="drop"),
+        out.valid.at[index, landing].set(True, mode="drop"),
+        out.behavior_log_probs.at[index, landing].set(behavior, mode="drop"),
+        out.raw_log_probs.at[index, landing].set(original, mode="drop"))
 
 
 def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget: int,
@@ -750,13 +763,13 @@ def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget
     replayed into it, because a recurrent mixer's state is a running summary
     no cursor can rewind, and the prediction cache is rebuilt the same way.
     """
-    verify, gamma = ops.verify, plan.block
+    verify, block_size = ops.verify, plan.block
     assert verify is not None
     state, step, terminated, out = carry
     active, saved, rows = step.active, state.cache, step.rows
     base = _coordinates(state, step, slots)
     keys = jax.vmap(lambda key, count: jax.random.split(
-        jax.random.fold_in(key, count), 2 * gamma + 1))(step.keys, step.step)
+        jax.random.fold_in(key, count), 2 * block_size + 1))(step.keys, step.step)
 
     drafted = _drafted(plan, ops, state, step, keys, base, active, budget,
                        transform, stopping)
@@ -764,23 +777,23 @@ def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget
     proposed = jnp.stack(candidates, axis=1)
     drafting, verified, _ = verify(
         drafted.state, proposed,
-        jnp.stack([active & (step.step + at < budget) for at in range(gamma)], axis=1))
+        jnp.stack([active & (step.step + at < budget) for at in range(block_size)], axis=1))
     assert state.hidden is not None
     raw = [state.logits.astype(jnp.float32)] + [verified[:, at].astype(jnp.float32)
-                                                for at in range(gamma)]
+                                                for at in range(block_size)]
     targets = [drafted.scores[0]] + [transform(states[at], raw[at])
-                                     for at in range(1, gamma + 1)]
+                                     for at in range(1, block_size + 1)]
 
-    matched, replacement = _accepted(gamma, keys, targets, drafted, step, active, budget)
+    matched, replacement = _accepted(block_size, keys, targets, drafted, step, active, budget)
 
-    emitted, behavior, original = _emission(gamma, slots, matched, replacement, proposed,
+    emitted, behavior, original = _emission(block_size, slots, matched, replacement, proposed,
                                             targets, raw, rows)
-    count, terminated = _emitted_count(gamma, step, emitted, active, terminated, budget,
+    count, terminated = _emitted_count(block_size, step, emitted, active, terminated, budget,
                                        stopping, matched)
     checkify.check(
-        jnp.all(jnp.stack([wellformed(raw[at]) | ~(at < count) for at in range(gamma + 1)])),
+        jnp.all(jnp.stack([wellformed(raw[at]) | ~(at < count) for at in range(block_size + 1)])),
         "the model produced an emitted position without a distribution to score")
-    keep, committed, out = _recorded(gamma, step, emitted, behavior, original, count,
+    keep, committed, out = _recorded(block_size, step, emitted, behavior, original, count,
                                      slots, index, active, terminated, budget, out)
 
     following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
@@ -809,15 +822,15 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
 
     The carry is the draft and target model states, the `StepState` the
     accepted tokens leave behind, the tokens and their two log probabilities,
-    and the rows still running. One block drafts `gamma` tokens, scores them
+    and the rows still running. One block drafts `block_size` candidates, scores them
     and the one after them in a single target call, accepts the longest
     prefix the acceptance test allows, and emits the bonus or corrected token
     after it.
     """
-    gamma, rows = plan.block, start.rows
+    block_size, rows = plan.block, start.rows
     propose, verify = ops.propose, ops.verify
     assert propose is not None and verify is not None
-    slots = jnp.arange(gamma + 1)[None, :]
+    slots = jnp.arange(block_size + 1)[None, :]
     index = jnp.arange(rows)[:, None]
 
     def outer(carry, _):
@@ -829,9 +842,10 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                                             slots, index),
                         lambda held: (held, None), carry)
 
-    empty = (jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
-             jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32))
+    empty = _Emitted(jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
+                     jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32))
     (_, _, terminated, out), _ = lax.scan(
         outer, (state, start, jnp.zeros(rows, bool), empty), None, length=-(-budget // 2))
-    return Draws(out[0], out[1], jnp.where(out[1], out[2], 0.0), jnp.where(out[1], out[3], 0.0),
-                 terminated)
+    return Draws(out.tokens, out.valid,
+                 jnp.where(out.valid, out.behavior_log_probs, 0.0),
+                 jnp.where(out.valid, out.raw_log_probs, 0.0), terminated)

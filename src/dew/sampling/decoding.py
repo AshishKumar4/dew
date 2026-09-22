@@ -357,8 +357,8 @@ class TopH:
     """Entropy-budget filtering, as `TopHLogitsWarper`.
 
     Tokens enter in probability order while the cumulative entropy of the
-    truncated head stays within `h` times its total entropy, and the best
-    token always enters. `n` is the head the reference fixes at 100.
+    truncated head stays within `fraction` of its total entropy, and the best
+    token always enters. `candidates` is the head the reference fixes at 100.
 
     The two entropies are computed the way the reference computes them, and
     they are not the same expression. The budget is
@@ -370,20 +370,20 @@ class TopH:
     token the reference drops.
     """
 
-    h: float = struct.field(pytree_node=False, default=1.0)
-    n: int = struct.field(pytree_node=False, default=100)
+    fraction: float = struct.field(pytree_node=False, default=1.0)
+    candidates: int = struct.field(pytree_node=False, default=100)
 
     def __post_init__(self) -> None:
-        if _unit("top_h", self.h) <= 0:
+        if _unit("top_h", self.fraction) <= 0:
             raise ValueError("top_h must be finite and above zero up to one")
-        _size("top_h candidates", self.n)
+        _size("top_h candidates", self.candidates)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        head, index = lax.top_k(logits, min(self.n, logits.shape[-1]))
+        head, index = lax.top_k(logits, min(self.candidates, logits.shape[-1]))
         normalized = head - jax.scipy.special.logsumexp(head, axis=-1, keepdims=True)
         probabilities = jax.nn.softmax(normalized)
         budget = -jnp.sum(jnp.maximum(normalized, jnp.finfo(head.dtype).min) * probabilities,
-                          axis=-1, keepdims=True) * self.h
+                          axis=-1, keepdims=True) * self.fraction
         selected = jnp.cumsum(-probabilities * jnp.log(probabilities), axis=-1) <= budget
         selected = selected.at[:, 0].set(True)
         rows = jnp.arange(logits.shape[0])[:, None]
@@ -560,14 +560,14 @@ class SequenceBias:
     bias: jax.Array
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        tokens, history = state.history()
+        tokens, lengths = state.history()
         width = self.sequences.shape[1]
         prefix = self.sequences[:, :-1]
         needed = self.lengths - 1
         held = jnp.arange(width - 1)[None, :] >= (width - 1 - needed[:, None])
-        suffix = _suffix(tokens, history, width - 1)
+        suffix = _suffix(tokens, lengths, width - 1)
         matched = jnp.all((suffix[:, None, :] == prefix[None, :, :]) | ~held[None, :, :], axis=-1)
-        matched = matched & (self.lengths[None, :] <= history[:, None])
+        matched = matched & (self.lengths[None, :] <= lengths[:, None])
         added = jnp.where(matched, self.bias[None, :], 0.0)
         rows = jnp.arange(logits.shape[0])[:, None]
         last = jnp.broadcast_to(self.sequences[None, :, -1], added.shape)
@@ -1066,16 +1066,16 @@ def as_pytree(value: LogitsTransform) -> LogitsTransform:
 
 
 def components(values: LogitsTransform | Sequence[LogitsTransform],
-               kind: str) -> tuple[LogitsTransform, ...]:
+               where: str) -> tuple[LogitsTransform, ...]:
     """`values` as a tuple of pytrees `jax.jit` accepts as data.
 
-    Takes one transform or criterion or a sequence of either. `kind` names
+    Takes one transform or criterion or a sequence of either. `where` names
     the argument in the refusal a non-callable earns.
     """
     if callable(values):
         return (as_pytree(values),)
     if not isinstance(values, (tuple, list)):
-        raise TypeError(f"{kind} must be a callable or a sequence of callables")
+        raise TypeError(f"{where} must be a callable or a sequence of callables")
     return tuple(as_pytree(value) for value in values)
 
 

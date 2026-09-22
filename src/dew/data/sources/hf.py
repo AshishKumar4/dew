@@ -184,15 +184,15 @@ class HFDatasetSource:
             # is one split's table.
             held = datasets.load_from_disk(self._cache_path)
             table = held[self.split] if isinstance(held, datasets.DatasetDict) else held
-            what = f"the saved dataset at {self._cache_path!r}"
+            where = f"the saved dataset at {self._cache_path!r}"
         elif self.name is None:
             raise ValueError("an HF source needs a dataset name or a cache path")
         else:
             table = self.options.load(self.name, self.split, streaming=False)
-            what = f"{self.name!r} split {self.split!r}"
+            where = f"{self.name!r} split {self.split!r}"
         if not isinstance(table, datasets.Dataset):
             raise TypeError(
-                f"{what} loaded as {type(table).__name__}; a random-access source "
+                f"{where} loaded as {type(table).__name__}; a random-access source "
                 f"is one Arrow-backed split, so name one split, or read it with "
                 f"streaming=True")
         return table
