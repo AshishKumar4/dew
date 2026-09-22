@@ -1,8 +1,10 @@
 # Review of the external critique
 
-The supplied critique reviewed `f144a9c1ee543334fcb15832ae910fad2ab7a885`. This response checks the relevant contracts against local source at `65fd2f4d7470fe6b6dd168b15977e965810ec1f3`, before the documentation restructuring and isolated repairs in `e5ee70d`.
+> An AI assistant maintains this document. It is presented as-is.
 
-The reproduction environment used JAX 0.11.1, Flax 0.12.9, and Optax 0.2.8 on CPU. It ran real Dew paths with small arrays and local Orbax storage. These checks do not qualify GPU or TPU deployment.
+The critique reviewed `f144a9c1ee543334fcb15832ae910fad2ab7a885`. This response checks its findings against local source at `65fd2f4d7470fe6b6dd168b15977e965810ec1f3`, before the documentation restructuring and isolated repairs in `e5ee70d`.
+
+The reproductions used JAX 0.11.1, Flax 0.12.9, and Optax 0.2.8 on CPU. They ran real Dew paths with small arrays and local Orbax storage. They say nothing about GPU or TPU deployment.
 
 ## Findings and dispositions
 
@@ -10,7 +12,7 @@ The reproduction environment used JAX 0.11.1, Flax 0.12.9, and Optax 0.2.8 on CP
 |---|---|---|---|
 | D01: overflow and checkpoint clocks | Agree, high severity | With accumulation 1 and 2, four attempted batches save directory 4 with serialized step 3 and consumed position 4. A same-target resume consumes another batch and raises `StepAlreadyExistsError`. Loss scale resets from 32768 to 65536. A finite forward loss with an infinite derivative returns a true finite-loss flag while the update is rejected. | Define attempted-work, accepted-microstep, and optimizer-update clocks; checkpoint loss-scaler state; use deliberate clocks for keys, schedules, termination, and checkpoint names. |
 | D02: masked-token accumulation | Agree, high severity | Real `LMObjective` and `Trainer.compile`, valid-target counts 1 and 9: two accumulated microbatches leave the tested vocabulary head at `[0, 0]`; one concatenated batch updates it to approximately `[-0.04, 0.04]`. | Preserve loss sums and normalization weights across the effective batch. Define auxiliary-loss normalization separately. |
-| D03: evaluation RNG and previews | Agree, with metric scope distinction | Three diffusion evaluation batches produce 12 rows but only four distinct images; repeated evaluation is reproducible. Three LM evaluation batches generate identical fixed-prompt previews while the tracker displays one. | Separate preview cadence from scoring, derive distinct reproducible batch keys, and define pass-level generative metrics. Perplexity's sum/count reduction is a different path and should be retained. |
+| D03: evaluation RNG and previews | Agree, with metric scope distinction | Three diffusion evaluation batches produce 12 rows but only four distinct images; repeated evaluation is reproducible. Three LM evaluation batches generate identical fixed-prompt previews while the tracker displays one. | Separate preview cadence from scoring, derive distinct reproducible batch keys, and define pass-level generative metrics. Keep perplexity's sum/count reduction; it is a different path. |
 | D04: prefetch lifetime | Agree, medium severity | Three abandoned real CPU prefetch iterators remain alive after GC, each with a live producer and full queue. `fit` does not close them in a general finally block. | Add explicit ownership and cancellation-aware producer/consumer operations; close and join on normal completion, zero-step runs, and failures. Verify accelerator buffer release separately. |
 | D05: device timeline window | Agree; repaired in `e5ee70d` | Nested intervals `[0,10]` and `[2,3]` originally report 10 ms busy in a 3 ms window, or 333.33%. | The repair uses the latest end from the interval union. Regression cases cover nested, overlapping, and disjoint intervals. Multi-device output is documented as any-device busy time, not average capacity utilization. |
 | D06: CI failure before tests | Agree; local repair verified, remote rerun still required | Authenticated run `34013943262`, job `101434397317`, fails Flake8 on `tools/benchmark_step.py:494` (`compiled`). Pyright and pytest are skipped; report annotation then raises `FileNotFoundError`. | Removed unnecessary deletion of the closure's captured variable. Annotation now reports missing test output without hiding the earlier failed step; artifact upload requires a report. Local lint and annotation smoke cases pass. |
@@ -24,13 +26,13 @@ Commit `e5ee70d` restores the decorator to `LMObjective`. A regression construct
 
 ## Architecture assessment
 
-The objective/trainer separation, explicit non-parameter updates, reference fixtures, and real process-pool tests should remain. They provide useful contracts but did not detect the integration failures above.
+Keep the objective/trainer separation, the explicit non-parameter updates, the reference fixtures, and the real process-pool tests. They define useful contracts, but they did not catch the integration failures above.
 
-Decoder assembly has received a later refactor, so the old line counts are not current evidence. Its remaining configuration combinations still need a validity and ownership review. Moving flags into a dataclass is not sufficient evidence that the abstraction improved.
+Decoder assembly was refactored after the critique, so its old line counts are not current evidence. Its remaining configuration combinations still need a review of which ones are valid and who owns them. Moving flags into a dataclass does not by itself show that the abstraction improved.
 
-Registry lookup, annotation-driven reconstruction, and direct Python construction provide different type guarantees. Documentation now distinguishes dynamic construction from typed class constructors. The language objective also requires decoder-specific hidden-state and vocabulary-head methods; it is not compatible with every Linen module.
+Registry lookup, annotation-driven reconstruction, and direct Python construction give different type guarantees. The documentation now tells dynamic construction apart from typed class constructors. The language objective also needs decoder-specific hidden-state and vocabulary-head methods, so it does not work with every Linen module.
 
-The base objective can omit EMA, but `LMObjective` currently enables an EMA copy by default. DPO/GRPO use a frozen reference through the EMA state. Memory and evaluation policy should be explicit in the next API design. Optional-dependency and lower-bound compatibility claims also require a separate package audit.
+The base objective can omit EMA, but `LMObjective` enables an EMA copy by default. DPO and GRPO use a frozen reference through the EMA state. The next API design should make the memory and evaluation policy explicit. Optional-dependency and lower-bound compatibility claims need a separate package audit.
 
 ## Repair acceptance criteria
 
@@ -41,10 +43,12 @@ The base objective can omit EMA, but `LMObjective` currently enables an EMA copy
 - D05/D06: run the timeline regressions, benchmark smoke path, lint, and both absent/present report annotation paths; verify a new CI run separately.
 - D07: offline examples execute from the documented setup with no fixtures or variables supplied by tests, and their promised files and metrics are observed.
 
-Do not add model families or performance claims as substitutes for these repairs. The state and normalization decisions need an integrated design before source changes because they affect objectives, optimizer accumulation, checkpoint layout, and rollout reproducibility.
+Do not add model families or performance claims in place of these repairs. The state and normalization decisions need an integrated design before any source change, because they affect objectives, optimizer accumulation, checkpoint layout, and rollout reproducibility.
 
 ## Reproduction artifacts
 
-The independent review left small diagnostic scripts under `/home/mrwhite0racle/.cache/dew/`: `critique_contracts.py`, `critique_checkpoint_readback.py`, `critique_evaluation.py`, `critique_lm_preview.py`, and `critique_timeline_registry.py`. Run them with the project environment, `JAX_PLATFORMS=cpu`, and `PYTHONPATH` pointing to the checkout's `src`. These local paths are repair aids, not user documentation prerequisites or permanent regression coverage.
+The review left small diagnostic scripts under `/home/mrwhite0racle/.cache/dew/`: `critique_contracts.py`, `critique_checkpoint_readback.py`, `critique_evaluation.py`, `critique_lm_preview.py`, and `critique_timeline_registry.py`. Run them with the project environment, `JAX_PLATFORMS=cpu`, and `PYTHONPATH` pointing to the checkout's `src`. They are aids for the repairs. Users do not need them, and they are not permanent regression tests.
 
-The CI evidence is available at [run 34013943262](https://github.com/AshishKumar4/dew/actions/runs/34013943262). The critique's older pinned run and modeled reproductions remain historical evidence; they are not substitutes for the current checks summarized here.
+The CI evidence is [run 34013943262](https://github.com/AshishKumar4/dew/actions/runs/34013943262). The critique's older pinned run and modeled reproductions stay as historical evidence; the current checks above replace them.
+
+Correction (2026-09-22): source changes for D01 to D04 have landed since this review. `TrainState` keeps three clocks (`step` for attempts, `microstep` for accepted microbatches, `updates` for committed updates) and checkpoints the dynamic loss scaler and the partial accumulation window (`src/dew/training/state.py:39-61`). The accumulation window keeps sums: a gradient, a loss mass, and the objective's statistics (`src/dew/training/state.py:15-35`). Evaluation derives a separate key per scored batch (`src/dew/training/evaluation.py:107-108`, `:304`), and `fit` closes the training source in a `finally` block (`src/dew/training/trainer.py:844-856`). I checked these by reading the source, not by rerunning the scripts above. `LMObjective` still defaults to `ema_decay=0.999` (`src/dew/objectives/lm/objective.py:436`).
