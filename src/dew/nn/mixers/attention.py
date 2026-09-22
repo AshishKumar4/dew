@@ -378,6 +378,9 @@ class CausalSelfAttention(nn.Module):
             return self._output(attention, gate, B, S)
         causal, mask = self.causal, None
         implementation = self.attention_impl
+        masked = kernel_for_materialized_mask(
+            implementation, query, dtype=self.dtype, precision=self.precision,
+            force_fp32_for_softmax=self.force_fp32_for_softmax)
         window = None if decode else self.sliding_window
         if prefix is not None:
             # Every canvas query reads the same retained encoder keys and all
@@ -422,13 +425,13 @@ class CausalSelfAttention(nn.Module):
                 mask = jnp.logical_and(
                     inside, causal_attention_mask(jnp.arange(S), S, self.sliding_window))
             causal, window = False, None
-            implementation = kernel_for_materialized_mask(implementation)
+            implementation = masked
         if prefix is None and self._restricts_visibility(attention_metadata, decode):
             mask = self._metadata_mask(attention_metadata, positions, B, S, key.shape[-3], decode)
             if segment_ids is not None and not decode:
                 mask = mask & document_mask(segment_ids)[:, None]
             causal, window = False, None
-            implementation = kernel_for_materialized_mask(implementation)
+            implementation = masked
         if attention_metadata is not None and attention_metadata.pairwise_mask is not None:
             pairwise = jnp.asarray(attention_metadata.pairwise_mask)
             if pairwise.shape != (B, S, key.shape[-3]) or pairwise.dtype != jnp.bool_:
@@ -443,7 +446,7 @@ class CausalSelfAttention(nn.Module):
                     distance = query_positions[:, :, None] - key_positions[:, None, :]
                     mask = mask & (jnp.abs(distance) < self.sliding_window)[:, None]
             causal, window = False, None
-            implementation = kernel_for_materialized_mask(implementation)
+            implementation = masked
         if self.attention_chunk is not None:
             # The decode and diagnostic paths: the chunk joins the mask the
             # branch above built, keys placed at their cache slots while
@@ -455,7 +458,7 @@ class CausalSelfAttention(nn.Module):
                 combined_attention_mask(S, key.shape[-3], causal, window, mask),
                 chunk_mask(positions, key_places, self.attention_chunk))
             causal, window = False, None
-            implementation = kernel_for_materialized_mask(implementation)
+            implementation = masked
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.

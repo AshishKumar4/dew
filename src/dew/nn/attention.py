@@ -1072,7 +1072,8 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     return 'xla'
 
 
-def kernel_for_materialized_mask(implementation: str) -> str:
+def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, precision=None,
+                                 force_fp32_for_softmax=True) -> str:
     """Send a call that built an explicit mask to the xla kernel.
 
     cuDNN has no mask argument: causality and the window are flags, and jax
@@ -1083,7 +1084,13 @@ def kernel_for_materialized_mask(implementation: str) -> str:
     kernel masks by exclusion, on every backend and with the same fp32
     softmax. It costs 83.6 ms and 5.80 GiB a step where the fixed window on
     cuDNN costs 75.8 ms and 4.99 GiB (docs/concepts/language_models.md).
+
+    'auto' first takes the reference path for arithmetic only it performs
+    (`reference_only`), as `resolve_implementation` does.
     """
+    if implementation == 'auto' and reference_only(query, dtype, precision,
+                                                   force_fp32_for_softmax):
+        return 'reference'
     return 'xla' if implementation in ('auto', 'cudnn') else implementation
 
 
@@ -1148,6 +1155,9 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
+    masked = kernel_for_materialized_mask(
+        implementation, query, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax)
     flags_only = segment_ids is None and valid is None
     if window is not None and flags_only:
         resolved = resolve_implementation(
@@ -1171,7 +1181,7 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
             mask = live if mask is None else mask & live
         if mask is not None:
             mask = combined_attention_mask(length, length, True, window, mask)
-            implementation = kernel_for_materialized_mask(implementation)
+            implementation = masked
         return scaled_dot_product_attention(
             query, key, value, dtype=dtype, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
@@ -1196,7 +1206,7 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
             if valid is not None:
                 keep = keep & row_blocks(jnp.asarray(valid, bool))[..., None, :]
             mask = keep.reshape(batch * blocks, 1, span, span)
-            implementation = kernel_for_materialized_mask(implementation)
+            implementation = masked
         out = kernel(*(folded(_blocks(x, span, blocks), span) for x in (query, key, value)),
                      implementation=implementation, causal=True, mask=mask)
     else:
@@ -1219,7 +1229,7 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         out = kernel(folded(_blocks(query, span, blocks), span),
                      folded(_banded(_blocks(key, span, blocks)), 2 * span),
                      folded(_banded(_blocks(value, span, blocks)), 2 * span),
-                     implementation=kernel_for_materialized_mask(implementation),
+                     implementation=masked,
                      mask=keep.reshape(batch * blocks, 1, span, 2 * span))
     out = out.reshape(batch, blocks * span, *out.shape[2:])[:, :length]
     return checkpoint_name(out, 'attention_output')

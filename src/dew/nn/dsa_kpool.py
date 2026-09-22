@@ -47,6 +47,7 @@ from .attention import (
     LayerNorm,
     RMSNorm,
     causal_attention_mask,
+    kernel_for_materialized_mask,
     max_attention_logits,
     scaled_dot_product_attention,
 )
@@ -368,11 +369,11 @@ class KPoolSparseAttention(nn.Module):
                 indices = self.indexer.select_indices(x, q_resid, packed, visible)
         else:
             visible = causal_attention_mask(jnp.arange(length), length, key_valid=row_valid)[:, 0]
-            if implementation in ('auto', 'cudnn'):
-                # cudnn reads a bool mask as an additive bias and refuses one
-                # at an odd length while training (dew.nn.mla says why); the
-                # selection is always a mask, so training runs xla.
-                implementation = 'xla'
+            # The selection is always a mask, so training takes the kernel
+            # a materialized mask runs on.
+            implementation = kernel_for_materialized_mask(
+                implementation, query, dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax)
             indices = self.indexer.select_indices(x, q_resid, packed, visible)
         selected = selection_mask(indices, key.shape[1])
         # An invalid query selects nothing (modeling_glm5_next.py:875).

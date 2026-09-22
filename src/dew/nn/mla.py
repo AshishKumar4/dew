@@ -861,13 +861,14 @@ class MultiHeadLatentAttention(nn.Module):
             mask = queries_valid if mask is None else mask & queries_valid
             if not decode:
                 mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
+        query = self._scaled_query(q_pass, q_rot)
         if mask is not None and not decode:
             # Packed documents, row validity and the indexer's selection all
             # materialize a mask on the training path, so they take the xla
             # kernel, the way the standard mixer's own masks do. Decoding
             # runs no backward pass, so its cache mask keeps the fused path.
-            implementation = kernel_for_materialized_mask(implementation)
-        query = self._scaled_query(q_pass, q_rot)
+            implementation = kernel_for_materialized_mask(
+                implementation, query, dtype=self.dtype, precision=self.precision)
         if objective is not None:
             self._sow_indexer_kl(*objective, query, key)
         # The per-head maxima the QK-Clip reads, with the nope width the
