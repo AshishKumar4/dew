@@ -112,9 +112,11 @@ def stored(cache):
 def test_a_slot_is_reused_over_the_same_cache():
     """The cache is one allocation for the server's life: the step donates
     it, so its key and value buffers are updated in place, and a row that
-    finishes gives its slot to the next request."""
+    finishes gives its slot to the next request. The capacity is wider
+    than the prompt bucket, so a reused slot keeps its former occupant's
+    keys past the new prompt, hidden by the validity the admission wrote."""
     bound = task()
-    server = Server.from_task(bound, slots=2, capacity=64, admission=1)
+    server = Server.from_task(bound, slots=2, capacity=128, admission=1)
     before = stored(server.cache)
     assert len(before) == 2
     shapes = [leaf.shape for leaf in jax.tree.leaves(server.cache)]
@@ -134,13 +136,19 @@ def test_a_slot_is_reused_over_the_same_cache():
     third = server.submit("98", 3, seed=2)
     server.run()
     assert third.result().text == bound("98", 3, seed=2).text
+    fourth = server.submit("1234567", 40, seed=3)
+    server.run()
+    assert fourth.result().text == bound("1234567", 40, seed=3).text
+    fifth = server.submit("5", 40, seed=4)
+    server.run()
+    assert fifth.result().text == bound("5", 40, seed=4).text
     assert stored(server.cache) == before
     assert [leaf.shape for leaf in jax.tree.leaves(server.cache)] == shapes
 
 
 def test_more_requests_than_slots_queue_and_all_complete():
     bound = task()
-    server = Server.from_task(bound, slots=2, capacity=64, admission=2)
+    server = Server.from_task(bound, slots=2, capacity=128, admission=2)
     prompts = PROMPTS * 2
     budgets = BUDGETS * 2
     tickets = [server.submit(prompt, budget, seed=index)

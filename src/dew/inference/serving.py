@@ -40,6 +40,7 @@ the host one step after it happens, and its slot is refilled the step after.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import time
 from collections import deque
@@ -151,27 +152,55 @@ def _opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capaci
                  jnp.zeros((slots, *keys.shape), keys.dtype))
 
 
+def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array) -> jax.Array:
+    """`incoming`'s rows written into `resident` at `rows`.
+
+    A cache leaf from a prefill over a cache of the prompt's width is
+    narrower than the resident leaf on its slot axis, the one axis whose
+    size the model's `max_seq_len` sets; it lands in the first slots of
+    its rows. Every other leaf is the same shape row for row. A row past
+    the last slot is dropped.
+    """
+    narrow = [axis for axis in range(1, incoming.ndim) if incoming.shape[axis] != resident.shape[axis]]
+    if not narrow:
+        return resident.at[rows].set(incoming, mode="drop")
+    axis, = narrow
+    window = tuple(slice(None) if index != axis else slice(0, incoming.shape[axis])
+                   for index in range(1, incoming.ndim))
+    return resident.at[(rows, *window)].set(incoming, mode="drop")
+
+
 def _admitted(model: nn.Module, params: Variables, pad_id: int, state: Slots, admission: Admission) -> Slots:
     """`state` with the admitted prompts prefilled into their slots.
 
     The prompts run as their own forward over a fresh cache of their row
-    count, and every leaf of the result is scattered on the batch axis into
-    the resident state; an unused admission row points past the last slot
+    count and their bucket width, so the prefill's attention reads the
+    prompt's keys and not the resident capacity: over a 1024-slot cache an
+    admission of eight 512-wide prompts took a third of a served batch's
+    wall through the decode-mode attention's [rows x heads, width,
+    capacity] f32 scores. Every leaf of the result is scattered into the
+    resident state; a resident row's slots past the prompt keep a former
+    occupant's keys, which the cache's validity hides, since the validity
+    is written whole. An unused admission row points past the last slot
     and the scatter drops it.
     """
-    ops = _operations(model, params, pad_id, prediction_depths(model))
-    fresh, real = _prefill(model, params, admission.prompts, ops)
+    width = admission.prompts.tokens.shape[1]
+    narrow = _sized(model, width)
+    ops = _operations(narrow, params, pad_id, prediction_depths(narrow))
+    fresh, real = _prefill(narrow, params, admission.prompts, ops)
     rows = admission.slots
     capacity = state.tokens.shape[1] // 2
-    width = admission.prompts.tokens.shape[1]
     valid = admission.prompts.token_fields.get("attention_mask")
     valid = jnp.ones(admission.prompts.tokens.shape, bool) if valid is None else valid.astype(bool)
     padding = ((0, 0), (capacity - width, capacity))
 
     def place(resident, incoming):
-        return resident.at[rows].set(incoming, mode="drop")
+        return _placed(resident, incoming, rows)
 
-    return Slots(jax.tree.map(place, state.decoder, fresh),
+    cache = jax.tree.map(lambda leaf: leaf.at[rows].set(jnp.zeros_like(leaf[:1]), mode="drop")
+                         if leaf.dtype == bool else leaf, state.decoder.cache)
+    decoder = dataclasses.replace(state.decoder, cache=cache)
+    return Slots(jax.tree.map(place, decoder, fresh),
                  place(state.tokens, jnp.pad(admission.prompts.tokens, padding)),
                  place(state.valid, jnp.pad(valid, padding)),
                  place(state.step, jnp.zeros_like(admission.slots)),
