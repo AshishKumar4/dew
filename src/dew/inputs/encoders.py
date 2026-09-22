@@ -264,6 +264,12 @@ class CharTable(ConditionEncoder[str, TextContext]):
                         tokens: int = 8, features: int = 16, vocab: int = 130,
                         seed: int = 0, param_dtype: str = "float32",
                         params: Variables | None = None):
+        """The table `seed` draws, or the one `params` already holds.
+
+        There is nothing to load, so `checkpoint` goes unread here. It is on
+        the signature because `rebuild` hands every encoder the name its
+        `to_json` wrote, and this one writes the fixed `"char_table"`.
+        """
         compute = resolve_dtype(dtype)
         storage = resolve_dtype(param_dtype)
         if params is None:

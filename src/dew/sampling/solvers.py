@@ -61,6 +61,14 @@ class Solver(Protocol[StateT]):
         a solver whose source draws one correlated path over the whole
         trajectory keeps that path's state, and every other solver ignores it
         and draws from the per-step key `step` is handed.
+
+        Every argument is on every solver because this is the surface
+        `sample` calls. `x` sizes the carried history (`LMS`, `MultiStepDPM`,
+        `DEIS`, `UniPC` and the DPM-Solvers), `times` and `process` check the
+        grid's endpoints and count its steps (`DDPM`, `Consistency`,
+        `DPMSolverSDE`, `DEIS`, `UniPC` and the DPM-Solvers), and `key` seeds
+        the Brownian tree of `DPMSolverSDE` alone. A one-step solver reads
+        none of them and answers `()`.
         """
         ...
 

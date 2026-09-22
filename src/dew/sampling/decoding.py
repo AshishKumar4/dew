@@ -211,6 +211,10 @@ class Greedy:
                          point, logits)
 
 
+# `as_pytree` binds each of these to its scalar and hands the result over as a
+# `LogitsTransform`, which is called `(state, logits)`. None of the three reads
+# the step state; they take it because the chain calls every transform the same
+# way.
 def _temperature(value: float, state: StepState, logits: jax.Array) -> jax.Array:
     return logits / value
 
