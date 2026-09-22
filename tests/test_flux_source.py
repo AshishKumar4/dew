@@ -286,7 +286,11 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     rows = jax.device_count()
     pixels = np.tile(np.arange(height * width * 3, dtype=np.uint8).reshape(1, height, width, 3),
                      (rows, 1, 1, 1))
-    batch = {"image": pixels, **loaded.inputs.tokenize(pipeline_record["prompts"] * (rows // 2))}
+    # One row per device, the recorded prompts in turn: a device count that
+    # is odd, one GPU included, still gets a prompt for every image.
+    prompts = pipeline_record["prompts"]
+    batch = {"image": pixels,
+             **loaded.inputs.tokenize([prompts[row % len(prompts)] for row in range(rows)])}
     checkpoints = Checkpoints(str(tmp_path / "run"))
     trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3),
                       checkpoints=checkpoints)
