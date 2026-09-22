@@ -1,10 +1,12 @@
 # Resuming training
 
-A training checkpoint holds variables, optimizer state, attempted/accepted/update clocks, the root key, EMA when configured, scaler history, and the actual partial accumulation window. Exact data continuation also needs the iterator position. Resume with the same model, optimizer, accumulation length, and scaler configuration.
+> An AI assistant maintains this document. It is presented as-is.
+
+A training checkpoint holds the model variables, the optimizer state, three step counters (attempted batches, accepted microbatches and optimizer updates), the root key, the EMA copy when you configure one, the loss scaler's history, and any half-filled gradient accumulation window. To continue the data sequence exactly, the checkpoint also needs the data iterator's position. When you resume, use the same model, optimizer, accumulation length and scaler configuration you trained with.
 
 ## Save and restore a small run
 
-The complete example below trains for five steps, restores the state, and continues to step ten. Its custom iterator records a batch index as bytes. It uses a temporary directory so repeated runs do not overwrite another experiment.
+The example below trains for five steps, restores the state, and continues to step ten. Its iterator records its batch index as bytes, so the checkpoint can store the data position. It writes into a temporary directory so that repeated runs do not overwrite another experiment.
 
 ```python
 import tempfile
@@ -76,24 +78,30 @@ with tempfile.TemporaryDirectory(prefix="dew-checkpoint-") as directory:
     print("Restored step 5 and data position 5; continued to step 10.")
 ```
 
-`steps` is a final target, not an additional step count. The second `fit(..., steps=10)` starts at step five and performs five more steps. `place()` returns the restored `TrainState`, its placement description, and the recorded iterator position. Prefetch may read ahead, but the position saved for this ordinary run corresponds to the last batch the loop consumed.
+`steps` is the step count to finish at, not a number of steps to add. The second `fit(..., steps=10)` starts at step five and runs five more steps. `place()` returns three things: the restored `TrainState`, its placement, and the saved iterator position. Prefetching may read batches ahead of the loop, but in this run the saved position is the last batch the loop consumed.
 
-The script verifies checkpoint directories and continuation before the temporary directory is removed. To retain a run, replace the temporary-directory context with a dedicated persistent path and keep that path for later calls. Never reuse an unrelated experiment directory.
+The script checks the checkpoint directory and the continued run before the temporary directory is deleted. To keep a run, replace the temporary directory with a persistent path of its own and pass that path on later calls. Do not reuse the directory of an unrelated experiment.
 
 ## What a checkpoint does not save
 
-`Checkpoints` does not create `run.json`. Recipes using `RunConfig.save` or `RunConfig.train` write the run configuration separately. Saving model state alone does not preserve the source code, package versions, tokenizer files, dataset revision, or all external service state. Record those in your experiment metadata.
+`Checkpoints` does not write `run.json`. Recipes that use `RunConfig.save` or `RunConfig.train` write the run configuration separately. A checkpoint also does not save your source code, package versions, tokenizer files, dataset revision, or the state of any external service. Record those in your experiment metadata.
 
-A plain Python generator generally has no restorable position. To continue the data sequence, use a checkpointable built-in source or implement both iterator-state methods. Reconstructing an iterator from the beginning may replay records even when model weights restore correctly.
+A plain Python generator usually cannot report its position. To continue the data sequence, use a built-in source that supports checkpointing, or give your iterator both `get_state` and `set_state` as the example does. If you rebuild an iterator from the start instead, it may replay records even though the model weights restore correctly.
 
 ## Change placement deliberately
 
-Persistent checkpoints can restore into a compatible placement through the trainer's restore template. A saved iterator position can change the process count when it is a global record count, which every record dataset built on `train_stream` reports; a position that is one process's own shard offset, as custom iterators report, requires the count that wrote it, and restore rejects a different count naming both. Position-free checkpoints can change process count when the tensor layout is compatible. Local emergency checkpoints contain each process's available shards and impose additional placement restrictions. See [resume from a data position](../concepts/data.md#resume-from-a-data-position).
+A persistent checkpoint can restore into a different, compatible placement through the trainer's restore template. Whether the process count can change depends on the saved iterator position:
 
-Use [distributed training](../concepts/distributed.md) for topology requirements and [the TPU guide](../tpu.md) for remote setup. A local save/restore test does not prove cross-host recovery or remote storage behavior.
+- A global record count can be read at any process count. Every record dataset built on `train_stream` saves this kind of position.
+- One process's own shard offset, which custom iterators like the one above report, can only be read at the process count that wrote it. Restore refuses a different count and names both counts.
+- A checkpoint without a position can change the process count when the tensor layout is compatible.
+
+Local emergency checkpoints hold only the shards each process had, so they restrict placement further. See [resume from a data position](../concepts/data.md#resume-from-a-data-position).
+
+See [distributed training](../concepts/distributed.md) for topology requirements and [the TPU guide](../tpu.md) for remote setup. A local save and restore test does not show that cross-host recovery or remote storage work.
 
 ## Current limits
 
-Scaled-gradient rejection consumes an attempt but preserves previously accepted accumulation records, optimizer state, EMA and mutable contributions. Restore keeps the scaler's finite streak and scale, including a partially filled window. The trainer rejects a changed accumulation length. Resuming at the saved attempted-work target performs no new data, evaluation, compilation, or save work.
+When the loss scaler rejects a step's gradients, the attempt still counts. The accumulation records, optimizer state, EMA and mutable contributions accepted before it stay as they were. Restoring keeps the scaler's streak of finite steps and its scale, including a partially filled window. The trainer refuses to resume with a different accumulation length. If the checkpoint already reached the target step, resuming reads no data and does no evaluation, compilation or saving.
 
-Deterministic CPU regressions cover partial and rejected-attempt checkpoints, including composite replay. They do not establish GPU/TPU cross-host recovery or replay of external rollout side effects. Record software and data versions with the run; the per-fit nonfinite-loss abort counter is not checkpointed. Older training checkpoints lack the required clocks and accumulation fields and cannot resume through this interface. Parameter-only loading remains available.
+Deterministic CPU tests cover checkpoints taken in the middle of a window and after rejected attempts, including composite replay. They do not cover cross-host recovery on GPU or TPU, or replaying the side effects of external rollouts. The per-fit counter that stops a run after repeated non-finite losses is not checkpointed. A training checkpoint without the step counters and accumulation fields cannot resume through this interface, but you can still load its parameters alone.
