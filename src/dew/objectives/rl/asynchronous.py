@@ -43,14 +43,22 @@ from dataclasses import dataclass, field
 import jax
 import numpy as np
 
-from dew.data.dataset import Batch, Checkpointable, Dataset, Forwarding, Position
-from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
+from dew.data.dataset import Batch, Dataset, tapped
+from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inference.rollouts import Draw, RolloutServer
 from dew.nn.inputs import local_rows
 from dew.training.state import TrainState
 
 from .grpo import GRPOObjective
-from .rollout import IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY, Reward, _texts, grouped_rows
+from .rollout import (
+    IDS_KEY,
+    OLD_LOG_PROBS_KEY,
+    RESPONSE_MASK_KEY,
+    Reward,
+    check_rollout,
+    grouped_rows,
+    prompt_rows,
+)
 
 POLICY_VERSION_KEY = "policy_version"
 """Per row, the policy version the row's draw was submitted under."""
@@ -88,46 +96,6 @@ class _Entry:
     draws: list[list[Future[Scored]]] = field(default_factory=list)
 
 
-class _Lookahead(Forwarding):
-    """The prompt stream, registering every batch it yields with the rollout."""
-
-    def __init__(self, source: Iterator[Batch], rollout: AsyncRollout):
-        self._source: Iterator[Batch] | None = source
-        self._rollout = rollout
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> Batch:
-        if self._source is None:
-            raise StopIteration
-        batch = next(self._source)
-        self._rollout._register(batch)
-        return batch
-
-    def close(self) -> None:
-        try:
-            super().close()
-        finally:
-            self._source = None
-
-
-class _CheckpointableLookahead(_Lookahead):
-    """The same stream over a source that reports and restores its position."""
-
-    def get_state(self) -> Position:
-        source = self._source
-        if not isinstance(source, Checkpointable):
-            raise RuntimeError("the prompt stream is closed")
-        return source.get_state()
-
-    def set_state(self, state: Position) -> None:
-        source = self._source
-        if not isinstance(source, Checkpointable):
-            raise RuntimeError("the prompt stream is closed")
-        source.set_state(state)
-
-
 class AsyncRollout:
     """Draw `groups` completions per prompt on a `RolloutServer`, `ahead` batches early.
 
@@ -143,12 +111,7 @@ class AsyncRollout:
                  decode: Callable[[Sequence[int]], str], groups: int = 4, max_new_tokens: int = 32,
                  max_lag: int = 1, ahead: int = 1, sync_every: int = 1, sample: str = "group",
                  scorers: int = 16, log: Callable[[RolloutRecord], None] | None = None):
-        if type(groups) is not int or groups < 2:
-            raise ValueError(f"groups is {groups}: an advantage needs at least two completions")
-        if type(max_new_tokens) is not int or max_new_tokens < 1:
-            raise ValueError("a rollout generates at least one token")
-        if sample not in ("group", "rloo"):
-            raise ValueError("the advantage families are 'group' and 'rloo'")
+        check_rollout(groups, max_new_tokens, sample)
         for name, value, least in (("ahead", ahead, 0), ("sync_every", sync_every, 1), ("max_lag", max_lag, 0)):
             if type(value) is not int or value < least:
                 raise ValueError(f"{name} must be an integer of at least {least}")
@@ -171,13 +134,12 @@ class AsyncRollout:
 
     def prompts(self, dataset: Dataset) -> Dataset:
         """`dataset` with a training stream that registers each batch ahead of the step."""
+        opened = tapped(dataset.train, self._register)
+
         def train() -> Iterator[Batch]:
             with self._lock:
                 self._registered.clear()
-            source = iter(dataset.train())
-            if isinstance(source, Checkpointable):
-                return _CheckpointableLookahead(source, self)
-            return _Lookahead(source, self)
+            return opened()
 
         return dataclasses.replace(dataset, train=train)
 
@@ -186,15 +148,7 @@ class AsyncRollout:
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
     def _register(self, batch: Batch) -> None:
-        prompts = np.asarray(batch[PROMPT_KEY])
-        lengths = np.asarray(batch[LENGTH_KEY])
-        rows, width = prompts.shape
-        if width + self.max_new_tokens != self.objective.seq_len + 1:
-            raise ValueError("size the objective one below the prompt width plus max_new_tokens")
-        if (lengths.shape != (rows,) or not np.issubdtype(lengths.dtype, np.integer)
-                or np.any(lengths < 1) or np.any(lengths > width)):
-            raise ValueError("prompt_length must contain one valid integer length per row")
-        sources, truths, infos = (_texts(np.asarray(batch[name])) for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
+        prompts, lengths, sources, truths, infos = prompt_rows(batch, self.objective.seq_len, self.max_new_tokens)
         with self._lock:
             self._registered.append(_Entry(self._serial, prompts, lengths, sources, truths, infos))
             self._serial += 1

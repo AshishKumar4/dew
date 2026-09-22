@@ -24,6 +24,7 @@ policy it has.
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import threading
@@ -71,8 +72,18 @@ class Draw:
         if len(self.behavior_log_probs) != len(self.tokens) or (
                 self.raw_log_probs is not None and len(self.raw_log_probs) != len(self.tokens)):
             raise ValueError("every drawn token needs its likelihoods")
+        for probabilities in (self.behavior_log_probs, self.raw_log_probs or ()):
+            if not all(math.isfinite(value) for value in probabilities):
+                raise ValueError("drawn likelihoods must be finite")
         if self.terminated and not self.tokens:
             raise ValueError("a terminated draw ends on its EOS token")
+
+    def check_stops(self, stops: tuple[int, ...]) -> Draw:
+        """This draw, refused unless it ends on EOS exactly when it terminated and holds no earlier EOS."""
+        if self.terminated != bool(self.tokens and self.tokens[-1] in stops) or any(
+                token in stops for token in self.tokens[:-1]):
+            raise ValueError("the draw's termination disagrees with its EOS tokens")
+        return self
 
 
 class RolloutServer(Protocol):
@@ -93,11 +104,6 @@ class RolloutServer(Protocol):
     def load(self, variables: Variables, version: int) -> None: ...
 
     def close(self) -> None: ...
-
-
-def _stops(sampling: Sampling) -> tuple[int, ...]:
-    eos = sampling.eos_id
-    return () if eos is None else (eos,) if isinstance(eos, int) else tuple(eos)
 
 
 def _prompt(prompt: Sequence[int]) -> tuple[int, ...]:
@@ -168,7 +174,7 @@ class NativeRolloutServer:
                 if failure is not None:
                     future.set_exception(failure)
                 else:
-                    future.set_result(_native_draw(ids, done.result(), version))
+                    future.set_result(_native_draw(ids, done.result(), version).check_stops(self.sampling.stops))
 
             ticket.add_done_callback(resolve)
             self._lock.notify()
@@ -318,12 +324,12 @@ class VLLMRolloutServer:
         tokens, probabilities = completion.tokens[0], completion.log_probs[0]
         if tokens is None or probabilities is None:
             raise ValueError("the engine reported no sampled token ids; is it vLLM?")
-        stops = _stops(self._sampling)
+        stops = self._sampling.stops
         terminated = bool(tokens) and tokens[-1] in stops
         reason = completion.finish_reasons[0]
         if reason != ("stop" if terminated else "length") or (not terminated and len(tokens) != budget):
             raise ValueError(f"finish reason {reason!r} disagrees with {len(tokens)} drawn ids ending {tokens[-1:]}")
-        return Draw(prompt, tokens, probabilities, None, terminated, version)
+        return Draw(prompt, tokens, probabilities, None, terminated, version).check_stops(stops)
 
     def load(self, variables: Variables, version: int) -> None:
         self._weights(variables)
