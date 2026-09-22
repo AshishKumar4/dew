@@ -199,6 +199,22 @@ def draw(state: StepState, logits: jax.Array,
     return token, behavior, selected
 
 
+def continuations(start: StepState, n: int,
+                  run: Callable[[StepState], Draws]) -> Draws:
+    """`run` over `n` continuations of every prompt, in prompt order.
+
+    One continuation is the request itself, with the prompt's own keys, so
+    `n=1` and continuation zero of a larger request are the same draw. The
+    rest run as a mapped loop over fresh keys rather than as a wider batch,
+    which keeps decode memory and every collective the size of one request.
+    """
+    if n == 1:
+        return run(start)
+    return prompt_major(lax.map(
+        lambda keys: run(dataclasses.replace(start, keys=keys)),
+        continuation_keys(start.keys, n)))
+
+
 @struct.dataclass
 class Sample:
     """Draw every row independently, one token per step.
@@ -213,12 +229,8 @@ class Sample:
                  transform: Callable[[StepState, jax.Array], jax.Array],
                  stopping: Callable[[StepState, jax.Array], jax.Array],
                  budget: int, n: int) -> Draws:
-        if n == 1:
-            return _sample_rows(state, start, ops, transform, stopping, budget)
-        return prompt_major(lax.map(
-            lambda keys: _sample_rows(state, dataclasses.replace(start, keys=keys), ops, transform,
-                                      stopping, budget),
-            continuation_keys(start.keys, n)))
+        return continuations(start, n, lambda drawn: _sample_rows(
+            state, drawn, ops, transform, stopping, budget))
 
 
 def _sample_rows(state: DecoderState, start: StepState, ops: DecodeOps,
@@ -479,12 +491,8 @@ class Speculative:
                              "this model declares none; load a checkpoint with MTP weights or "
                              "choose another strategy")
         assert ops.propose is not None and ops.verify is not None
-        if n == 1:
-            return _speculate(state, start, ops, transform, stopping, budget, self)
-        return prompt_major(lax.map(
-            lambda keys: _speculate(state, dataclasses.replace(start, keys=keys), ops, transform,
-                                    stopping, budget, self),
-            continuation_keys(start.keys, n)))
+        return continuations(start, n, lambda drawn: _speculate(
+            state, drawn, ops, transform, stopping, budget, self))
 
 
 def _coordinates(state: DecoderState, step: StepState, slots: jax.Array) -> jax.Array:

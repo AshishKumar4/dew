@@ -23,6 +23,16 @@ from jax.typing import ArrayLike
 from dew.diffusion.schedules import NoiseScheduler, expand
 
 
+def from_clean(x_t, preds, rates) -> tuple[jax.Array, jax.Array]:
+    """`(x_0, epsilon)` where the prediction is already x_0 itself.
+
+    epsilon is what is left of `x_t` once the clean part is taken out of it,
+    which is the reading every x_0-space parameterization shares.
+    """
+    signal_rate, noise_rate = rates
+    return preds, (x_t - preds * signal_rate) / noise_rate
+
+
 class PredictionTransform:
     """What the model predicts, and how x_0 and epsilon are read back out.
 
@@ -84,8 +94,7 @@ class EpsilonPredictionTransform(PredictionTransform):
 
 class DirectPredictionTransform(PredictionTransform):
     def backward_diffusion(self, x_t, preds, rates):
-        signal_rate, noise_rate = rates
-        return preds, (x_t - preds * signal_rate) / noise_rate
+        return from_clean(x_t, preds, rates)
 
 
 class VPredictionTransform(PredictionTransform):
@@ -145,8 +154,7 @@ class KarrasPredictionTransform(PredictionTransform):
         self.velocity = velocity
 
     def backward_diffusion(self, x_t, preds, rates):
-        signal_rate, noise_rate = rates
-        return preds, (x_t - preds * signal_rate) / noise_rate
+        return from_clean(x_t, preds, rates)
 
     def pred_transform(self, x_t, preds, rates, t):
         _, sigma = rates
@@ -190,8 +198,7 @@ class ConsistencyBoundary(PredictionTransform):
         return c_out * x_0 + c_skip * x_t
 
     def backward_diffusion(self, x_t, preds, rates):
-        signal_rate, noise_rate = rates
-        return preds, (x_t - preds * signal_rate) / noise_rate
+        return from_clean(x_t, preds, rates)
 
     def get_input_scale(self, rates):
         return self.inner.get_input_scale(rates)

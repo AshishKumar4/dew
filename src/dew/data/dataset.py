@@ -585,6 +585,15 @@ def hold_out(source: Indexed, records: int, held_out: int,
             SourceSlice(source, 0, held_out))
 
 
+def checked_count(count: int, length: int, name: str) -> int:
+    """`count` records off the head of `name`'s `length`, refused when there
+    are fewer of them than that."""
+    if count > length:
+        raise ValueError(
+            f"count {count} is more than the {length} records of {name}")
+    return count
+
+
 def describe(source: Indexed | GrainDataset) -> str:
     """`source`'s own description, or its type when it has none.
 
@@ -990,15 +999,11 @@ def train_stream(source: Records, operations: Sequence[pygrain.Transformation], 
     """
     order = f"{describe(source)}, {len(source)} records reshuffled from seed {seed}"
 
-    def open(offset: int) -> pygrain.DatasetIterator[Batch]:
-        records = pygrain.MapDataset.source(source).seed(seed)
-        records = records.shuffle(seed).repeat(None).apply(list(operations))
-        return _batches(records, batch=batch, loading=loading, offset=offset)
+    def records() -> pygrain.MapDataset[Batch]:
+        reshuffled = pygrain.MapDataset.source(source).seed(seed)
+        return reshuffled.shuffle(seed).repeat(None).apply(list(operations))
 
-    def stream() -> GlobalStream:
-        return GlobalStream(open, batch * jax.process_count(), order, loading.stop_seconds)
-
-    return stream
+    return _global_stream(records, order, batch=batch, loading=loading)
 
 
 def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transformation], *,
@@ -1019,12 +1024,25 @@ def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transfo
         f"{len(corpus.source)} records"
         for corpus, share in zip(corpora, shares, strict=True)))
 
-    def open(offset: int) -> pygrain.DatasetIterator[Batch]:
-        records = mixture(corpora, seed).seed(seed).apply(list(operations))
-        return _batches(records, batch=batch, loading=loading, offset=offset)
+    def records() -> pygrain.MapDataset[Batch]:
+        return mixture(corpora, seed).seed(seed).apply(list(operations))
+
+    return _global_stream(records, order, batch=batch, loading=loading)
+
+
+def _global_stream(records: Callable[[], pygrain.MapDataset[Batch]], order: str, *,
+                   batch: int, loading: Loading) -> Callable[[], GlobalStream]:
+    """A `GlobalStream` factory over the endless order `records` builds.
+
+    Each reader gets its own pipeline, opened at whatever record offset a
+    restore hands it, and `order` is the description a saved position is
+    compared against.
+    """
+    def open_at(offset: int) -> pygrain.DatasetIterator[Batch]:
+        return _batches(records(), batch=batch, loading=loading, offset=offset)
 
     def stream() -> GlobalStream:
-        return GlobalStream(open, batch * jax.process_count(), order, loading.stop_seconds)
+        return GlobalStream(open_at, batch * jax.process_count(), order, loading.stop_seconds)
 
     return stream
 

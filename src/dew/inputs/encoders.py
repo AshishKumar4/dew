@@ -102,21 +102,20 @@ def rebuild(name: str, fields: Mapping[str, object], *,
     return encoders[name].from_pretrained(checkpoint, **rest, params=params)
 
 
-@encoders("clip_text")
 @dataclass(frozen=True, eq=False)
-class CLIPText(ConditionEncoder[str, TextContext]):
-    """The CLIP text tower, vendored in `dew.nn.text_encoders`, with the
-    checkpoint's tokenizer.
+class _TextTower(ConditionEncoder[str, TextContext]):
+    """A pretrained text tower with the checkpoint's own tokenizer.
 
-    `tokenize` pads every prompt to the checkpoint's context length and
-    returns the ids with the attention mask. `encode` returns the last hidden
-    state with that mask as a `TextContext`, so a model can pool over the
-    real tokens only.
+    `tokenize` pads every prompt to `context` tokens and returns the ids with
+    the attention mask. `encode` returns the tower's last hidden state with
+    that mask as a `TextContext`, so a model can pool over the real tokens
+    only. A subclass names its own transformer, says how long a prompt it
+    pads to, and reads the state out of whatever its `apply` returns.
     """
 
     checkpoint: str
     parameter_collections: ClassVar[tuple[str, ...] | None] = ("params", FROZEN)
-    transformer: CLIPTextTransformer
+    transformer: CLIPTextTransformer | T5EncoderTransformer
     params: Variables
     tokenizer: PreTrainedTokenizerBase
     dtype: Dtype | None = None
@@ -125,6 +124,53 @@ class CLIPText(ConditionEncoder[str, TextContext]):
     """The checkpoint's git revision, recorded so a rebuild reads the same
     weights and the same tokenizer."""
     param_dtype: str = "float32"
+
+    @property
+    def context(self) -> int:
+        """How many tokens a prompt is padded to."""
+        raise NotImplementedError
+
+    def states(self, answer: object) -> jnp.ndarray:
+        """The tower's last hidden state, out of what `apply` handed back."""
+        raise NotImplementedError
+
+    @property
+    def recorded(self) -> dict:
+        """The fields this tower records beyond the ones every tower has."""
+        return {}
+
+    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
+        tokens = self.tokenizer(list(texts), padding="max_length", max_length=self.context,
+                                truncation=True, return_tensors="np")
+        return {"input_ids": np.asarray(tokens["input_ids"], np.int32),
+                "attention_mask": np.asarray(tokens["attention_mask"], np.int32)}
+
+    def encode(self, params, tokens) -> TextContext:
+        mask = jnp.asarray(tokens["attention_mask"])
+        answer = self.transformer.apply(params, jnp.asarray(tokens["input_ids"]), mask)
+        return TextContext(hidden=self.states(answer), mask=mask)
+
+    def captions(self, tokens) -> tuple[str, ...]:
+        return tuple(self.tokenizer.batch_decode(
+            np.asarray(tokens["input_ids"]), skip_special_tokens=True))
+
+    def to_json(self) -> dict:
+        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.dtype),
+                "param_dtype": self.param_dtype, **self.recorded,
+                **({} if self.revision is None else {"revision": self.revision})}
+
+
+@encoders("clip_text")
+@dataclass(frozen=True, eq=False)
+class CLIPText(_TextTower):
+    """The CLIP text tower, vendored in `dew.nn.text_encoders`, with the
+    checkpoint's tokenizer.
+
+    Prompts are padded to the checkpoint's own context length, which the
+    tokenizer reports.
+    """
+
+    transformer: CLIPTextTransformer
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = DEFAULT_MODEL, *, dtype=None,
@@ -139,55 +185,30 @@ class CLIPText(ConditionEncoder[str, TextContext]):
                    tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
                    dtype=dtype, param_dtype=param_dtype, revision=revision)
 
-    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
-        tokens = self.tokenizer(list(texts), padding="max_length",
-                                max_length=self.tokenizer.model_max_length,
-                                truncation=True, return_tensors="np")
-        return {"input_ids": np.asarray(tokens["input_ids"], np.int32),
-                "attention_mask": np.asarray(tokens["attention_mask"], np.int32)}
+    @property
+    def context(self) -> int:
+        return self.tokenizer.model_max_length
 
-    def encode(self, params, tokens) -> TextContext:
-        mask = jnp.asarray(tokens["attention_mask"])
-        hidden = self.transformer.apply(params, jnp.asarray(tokens["input_ids"]), mask)
+    def states(self, answer):
         # The tower returns its own output type; apply's mutable-collections
         # pair would mean collections were asked for, and none were.
-        assert isinstance(hidden, CLIPTowerOutput)
-        return TextContext(hidden=hidden.last_hidden_state, mask=mask)
-
-    def captions(self, tokens) -> tuple[str, ...]:
-        return tuple(self.tokenizer.batch_decode(
-            np.asarray(tokens["input_ids"]), skip_special_tokens=True))
-
-    def to_json(self) -> dict:
-        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.dtype),
-                "param_dtype": self.param_dtype,
-                **({} if self.revision is None else {"revision": self.revision})}
+        assert isinstance(answer, CLIPTowerOutput)
+        return answer.last_hidden_state
 
 
 @encoders("t5")
 @dataclass(frozen=True, eq=False)
-class T5Text(ConditionEncoder[str, TextContext]):
+class T5Text(_TextTower):
     """The T5 encoder tower, vendored in `dew.nn.text_encoders`, with the
     checkpoint's tokenizer.
 
     It is the text half of an SD3.5/Flux-class run, whose MMDiT conditions on
-    T5-XXL's last hidden states. `tokenize` pads every prompt to `max_length`
-    and returns the ids with the attention mask. `encode` returns the last
-    hidden state with that mask as a `TextContext`.
+    T5-XXL's last hidden states. Prompts are padded to `max_length`, which
+    the run's record carries.
     """
 
-    checkpoint: str
-    parameter_collections: ClassVar[tuple[str, ...] | None] = ("params", FROZEN)
     transformer: T5EncoderTransformer
-    params: Variables
-    tokenizer: PreTrainedTokenizerBase
     max_length: int = 256
-    dtype: Dtype | None = None
-
-    revision: str | None = None
-    """The checkpoint's git revision, recorded so a rebuild reads the same
-    weights and the same tokenizer."""
-    param_dtype: str = "float32"
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = DEFAULT_T5_MODEL, *, dtype=None,
@@ -203,29 +224,19 @@ class T5Text(ConditionEncoder[str, TextContext]):
                    tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
                    max_length=max_length, dtype=dtype, param_dtype=param_dtype, revision=revision)
 
-    def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
-        tokens = self.tokenizer(list(texts), padding="max_length", max_length=self.max_length,
-                                truncation=True, return_tensors="np")
-        return {"input_ids": np.asarray(tokens["input_ids"], np.int32),
-                "attention_mask": np.asarray(tokens["attention_mask"], np.int32)}
+    @property
+    def context(self) -> int:
+        return self.max_length
 
-    def encode(self, params, tokens) -> TextContext:
-        mask = jnp.asarray(tokens["attention_mask"])
-        hidden = self.transformer.apply(params, jnp.asarray(tokens["input_ids"]), mask)
+    @property
+    def recorded(self) -> dict:
+        return {"max_length": self.max_length}
+
+    def states(self, answer):
         # The tower returns one array; a tuple would mean apply() returned
         # mutable collections, and none were asked for.
-        assert not isinstance(hidden, tuple)
-        return TextContext(hidden=hidden, mask=mask)
-
-    def captions(self, tokens) -> tuple[str, ...]:
-        return tuple(self.tokenizer.batch_decode(
-            np.asarray(tokens["input_ids"]), skip_special_tokens=True))
-
-    def to_json(self) -> dict:
-        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.dtype),
-                "param_dtype": self.param_dtype,
-                "max_length": self.max_length,
-                **({} if self.revision is None else {"revision": self.revision})}
+        assert not isinstance(answer, tuple)
+        return answer
 
 
 @encoders("char_table")

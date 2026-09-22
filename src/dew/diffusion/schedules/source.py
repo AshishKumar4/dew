@@ -548,6 +548,20 @@ class SourceSchedule:
         base = np.sqrt((1 - alphas) / alphas, dtype=np.float32)
         return base, np.log(base, dtype=np.float32)
 
+    def _transformed_grid(self, steps: int, log_base: np.ndarray, low: float,
+                          high: float) -> tuple[np.ndarray, np.ndarray]:
+        """The class's own sigma grid over `[low, high]`, and the model times
+        its log-linear inverse recovers for those sigmas.
+
+        A Karras grid rounds those times where the source rounds them.
+        """
+        policy = self.policy
+        sigmas = _transformed_sigmas(policy.transform, low, high, steps, policy.rho)
+        times = _sigma_to_time(sigmas, log_base)
+        if policy.transform == "karras" and policy.karras_round:
+            times = times.round()
+        return sigmas, times
+
     def _lambda_grid(self, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
         """The paired sigma and model-time tables of a log-SNR class, with the
         terminal sigma its `final_sigmas_type` appends. Model times end as
@@ -560,12 +574,10 @@ class SourceSchedule:
         if policy.transform == "none":
             sigmas = np.interp(times, np.arange(len(base)), base)
         else:
-            low = float(base[0]) if policy.sigma_min is None else policy.sigma_min
-            high = float(base[-1]) if policy.sigma_max is None else policy.sigma_max
-            sigmas = _transformed_sigmas(policy.transform, low, high, steps, policy.rho)
-            times = _sigma_to_time(sigmas, log_base)
-            if policy.transform == "karras" and policy.karras_round:
-                times = times.round()
+            sigmas, times = self._transformed_grid(
+                steps, log_base,
+                float(base[0]) if policy.sigma_min is None else policy.sigma_min,
+                float(base[-1]) if policy.sigma_max is None else policy.sigma_max)
         if policy.terminal == "zero":
             terminal = 0.0
         elif policy.grid_terminal and policy.transform != "none":
@@ -585,12 +597,10 @@ class SourceSchedule:
                               rounded=False)
         sigmas = np.interp(times, np.arange(len(base)), base)
         if policy.transform != "none":
-            low = float(sigmas[-1]) if policy.sigma_min is None else policy.sigma_min
-            high = float(sigmas[0]) if policy.sigma_max is None else policy.sigma_max
-            sigmas = _transformed_sigmas(policy.transform, low, high, steps, policy.rho)
-            times = _sigma_to_time(sigmas, log_base)
-            if policy.transform == "karras" and policy.karras_round:
-                times = times.round()
+            sigmas, times = self._transformed_grid(
+                steps, log_base,
+                float(sigmas[-1]) if policy.sigma_min is None else policy.sigma_min,
+                float(sigmas[0]) if policy.sigma_max is None else policy.sigma_max)
         terminal = float(base[0]) if policy.terminal == "sigma_min" else 0.0
         prior = float(np.max(sigmas))
         if policy.spacing == "leading":

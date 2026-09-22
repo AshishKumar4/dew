@@ -20,7 +20,7 @@ from flax import struct
 from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
-from dew.diffusion.schedules import FlowMatchingScheduler
+from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.registry import samplers
 
@@ -85,35 +85,41 @@ class GaussianTransition:
                          jnp.where(variance == 0, deterministic, jnp.nan))
 
 
-def flow_transition(x: ArrayLike, velocity: ArrayLike, t: ArrayLike,
-                    t_next: ArrayLike, *, noise_level: float = 0.7) -> GaussianTransition:
-    """Euler-Maruyama from physical flow time t to t_next, with 0 <= t_next <= t <= 1.
-
-    x and velocity are [batch, ...]; times are scalars or [batch]. All density
-    arithmetic is float32. Variance is sigma(t)^2 * (t - t_next), including
-    the elapsed time. Invalid times produce non-finite transitions. At zero
-    noise or zero elapsed time the result is deterministic.
-    """
+def checked_noise_level(noise_level: float) -> float:
+    """`noise_level` itself, refusing a rate that is not finite and non-negative."""
     if not math.isfinite(noise_level) or noise_level < 0:
         raise ValueError("noise_level must be finite and non-negative")
+    return noise_level
+
+
+def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
+                    sigma_next: ArrayLike, *, noise_level: float = 0.7) -> GaussianTransition:
+    """Euler-Maruyama over the physical noise rate, with 0 <= sigma_next <= sigma <= 1.
+
+    A rectified flow's noise rate is its own physical time, which is what
+    `FlowSDE` reads off the schedule and hands over here. x and velocity are
+    [batch, ...]; rates are scalars or [batch]. All density arithmetic is
+    float32. Variance is sigma^2 times the elapsed rate. Invalid rates
+    produce non-finite transitions. At zero noise or zero elapsed rate the
+    result is deterministic.
+    """
+    checked_noise_level(noise_level)
     x = jnp.asarray(x, jnp.float32)
     velocity = jnp.asarray(velocity, jnp.float32)
     if x.ndim < 2 or velocity.shape != x.shape:
         raise ValueError("x and velocity must share a [batch, ...] sample shape")
-    t = jnp.broadcast_to(jnp.asarray(t, jnp.float32), (x.shape[0],))
-    t_next = jnp.broadcast_to(jnp.asarray(t_next, jnp.float32), t.shape)
-    dt = t_next - t
-    valid = (t_next >= 0) & (t <= 1) & (dt <= 0)
-    denominator = jnp.where(dt == 0, 1, 1 - jnp.where(t == 1, t_next, t))
-    # sigma(t)^2 / (2t) has this finite limit at t=0.
+    sigma = jnp.broadcast_to(jnp.asarray(sigma, jnp.float32), (x.shape[0],))
+    sigma_next = jnp.broadcast_to(jnp.asarray(sigma_next, jnp.float32), sigma.shape)
+    dt = sigma_next - sigma
+    valid = (sigma_next >= 0) & (sigma <= 1) & (dt <= 0)
+    denominator = jnp.where(dt == 0, 1, 1 - jnp.where(sigma == 1, sigma_next, sigma))
+    # The diffusion coefficient squared over twice the rate has this finite
+    # limit at sigma = 0.
     correction = noise_level**2 / (2 * denominator)
-    def expand(rate: jax.Array) -> jax.Array:
-        return rate.reshape((x.shape[0],) + (1,) * (x.ndim - 1))
-
-    mean = x * expand(1 + correction * dt) + velocity * expand(
-        (1 + correction * (1 - t)) * dt)
-    variance = noise_level**2 * t / denominator * -dt
-    return GaussianTransition(jnp.where(expand(valid), mean, jnp.nan),
+    mean = x * expand(1 + correction * dt, x) + velocity * expand(
+        (1 + correction * (1 - sigma)) * dt, x)
+    variance = noise_level**2 * sigma / denominator * -dt
+    return GaussianTransition(jnp.where(expand(valid, x), mean, jnp.nan),
                               jnp.where(valid, variance, jnp.nan))
 
 
@@ -130,8 +136,7 @@ class FlowSDE:
     noise_level: float = 0.7
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.noise_level) or self.noise_level < 0:
-            raise ValueError("noise_level must be finite and non-negative")
+        checked_noise_level(self.noise_level)
 
     def validate(self, process: Process) -> None:
         schedule = process.sampler_schedule

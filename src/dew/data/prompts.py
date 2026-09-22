@@ -26,8 +26,8 @@ import numpy as np
 from dew.registry import datasets
 
 from .chat import Conversation, load_tokenizer, render_prompt
-from .dataset import Batch, Dataset, DatasetSpec, Tokenize, local_batch, train_stream, validation_pass
-from .tokens import bounded
+from .dataset import Batch, Dataset, DatasetSpec, Tokenize
+from .rows import json_records, parquet_names, parquet_rows, row_dataset
 
 PROMPT_KEY = "prompt"
 """Batch key the prompts pipeline left-pads `[B, max_prompt_len]` ids under."""
@@ -173,28 +173,17 @@ class PromptSource:
 
         `prompt` is required; the reward columns ride along when present.
         """
-        try:
-            import pyarrow.parquet as parquet
-        except ImportError as exc:
-            raise ImportError(
-                "reading prompt parquet needs pyarrow: pip install pyarrow") from exc
-        names = [field.name for field in parquet.read_schema(path)]
+        names = parquet_names(path, "prompt")
         if "prompt" not in names:
             raise ValueError(
                 f"{path}: the prompt column is required, the file has {names}")
-        table = parquet.read_table(path, columns=[name for name in FIELDS if name in names])
-        return cls(table.to_pylist(), path, tokenizer, max_prompt_len, pad_id)
+        return cls(parquet_rows(path, FIELDS, names), path, tokenizer, max_prompt_len, pad_id)
 
     @classmethod
     def from_records(cls, records: tuple[str, ...], tokenizer: str,
                      max_prompt_len: int, pad_id: int) -> PromptSource:
         """In-memory rows as JSON, for tests and small sweeps."""
-        rows = []
-        for index, record in enumerate(records):
-            try:
-                rows.append(json.loads(record))
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"record {index} is not JSON: {exc}") from exc
+        rows = json_records(records)
         return cls(rows, f"{len(rows)} in-memory records", tokenizer,
                    max_prompt_len, pad_id)
 
@@ -246,28 +235,10 @@ class Prompts(DatasetSpec):
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         self.uncaptioned(tokenize)
-        if (self.path is None) == (not self.records):
-            raise ValueError(
-                "Prompts reads one source: --data.path names a parquet file, "
-                "or records holds JSON rows")
-        if self.path is not None:
-            source = PromptSource.from_parquet(
-                self.path, self.tokenizer, self.max_prompt_len, self.pad_id)
-        else:
-            source = PromptSource.from_records(
-                self.records, self.tokenizer, self.max_prompt_len, self.pad_id)
-        per_process = local_batch(batch)
-        validation = None
-        if self.val_path is not None:
-            val_source = PromptSource.from_parquet(
-                self.val_path, self.tokenizer, self.max_prompt_len, self.pad_id)
-            validation = bounded(validation_pass(
-                val_source, [], batch=per_process, seed=self.seed,
-                loading=self.loading), self.val_batches)
-        return Dataset(
-            train=train_stream(source, [], batch=per_process, seed=self.seed,
-                               loading=self.loading),
-            val=validation,
-            records=len(source),
-            batch=batch,
-        )
+        return row_dataset(
+            self, batch=batch, path=self.path, records=self.records,
+            val_path=self.val_path, val_batches=self.val_batches,
+            from_parquet=lambda path: PromptSource.from_parquet(
+                path, self.tokenizer, self.max_prompt_len, self.pad_id),
+            from_records=lambda records: PromptSource.from_records(
+                tuple(records), self.tokenizer, self.max_prompt_len, self.pad_id))

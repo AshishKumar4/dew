@@ -31,6 +31,8 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.experimental import checkify, multihost_utils
 from jax.typing import ArrayLike
 
+from dew.artifacts import agreed
+from dew.inputs import host_rows
 from dew.nn.backbones.causal_transformer import gather_cache_rows
 from dew.nn.inputs import (
     ArrayT,
@@ -223,7 +225,7 @@ class Generation(Generic[ArrayT]):
 
     def host(self) -> Generation[np.ndarray]:
         """This process's real rows as host arrays."""
-        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+        return host_rows(self, self.rows)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:
@@ -255,8 +257,8 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     if ops.depths:
         drafting = model.apply(params, batch, method="init_mtp_cache", mutable=["cache"])[1]["cache"]
         cache = unflatten_dict({**flatten_dict(dict(cache)), **flatten_dict(dict(drafting))})
-    exposed = _exposes_states(model)
-    selective = _scores_one_slot(model)
+    exposed = isinstance(model, Exposing)
+    selective = isinstance(model, Selective)
     # An unpadded prompt carries no validity field, and its last real token is
     # the last slot.
     valid = inputs.token_fields.get("attention_mask")
@@ -312,16 +314,6 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     return state, last >= 0
 
 
-def _exposes_states(model: nn.Module) -> bool:
-    """Whether the model is `Exposing`: hidden states come back with the logits."""
-    return isinstance(model, Exposing)
-
-
-def _scores_one_slot(model: nn.Module) -> bool:
-    """Whether the model is `Selective`: one position per row is scored."""
-    return isinstance(model, Selective)
-
-
 def prediction_depths(model: nn.Module) -> int:
     """How many multi-token prediction depths the model declares; none unless it is `Predicting`."""
     return model.num_nextn_predict_layers if isinstance(model, Predicting) else 0
@@ -333,7 +325,7 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
     Parameters stay unmapped: every operation reads the same tree, and only
     the cache moves with the rows.
     """
-    exposed = _exposes_states(model)
+    exposed = isinstance(model, Exposing)
 
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array
             ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
@@ -666,19 +658,12 @@ def generate(model: nn.Module, params: Variables,
     """
     mesh = mesh_of(params)
     processes = jax.process_count() if mesh is not None else 1
-    error = None
-    request = None
-    try:
-        request = _request(model, params, inputs, max_new_tokens, key, seed, sampling, n,
-                           logits, stopping, strategy, pooled=processes > 1)
-    except BaseException as failure:
-        error = failure
-    if processes > 1:
-        from dew.artifacts import agree_process_phase
-        agree_process_phase(error, phase="generation input validation")
-    elif error is not None:
-        raise error
-    assert request is not None
+
+    def resolve():
+        return _request(model, params, inputs, max_new_tokens, key, seed, sampling, n,
+                        logits, stopping, strategy, pooled=processes > 1)
+
+    request = (agreed("generation input validation", resolve) if processes > 1 else resolve())
     prepared, random_key, components, controls = request
     if processes > 1:
         # Whether this process's own prompts needed padding is rank-local, and

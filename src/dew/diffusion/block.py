@@ -22,7 +22,8 @@ import numpy as np
 from flax import struct
 from jax.experimental import multihost_utils
 
-from dew.artifacts import agree_process_phase
+from dew.artifacts import agreed
+from dew.inputs import host_rows
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import (
     ArrayT,
@@ -67,7 +68,7 @@ class CanvasGeneration(Generic[ArrayT]):
 
     def host(self) -> CanvasGeneration[np.ndarray]:
         """This process's real rows as host arrays."""
-        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+        return host_rows(self, self.rows)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:
@@ -237,18 +238,14 @@ class BlockProcess:
         prompt, in prompt order. Continuation zero refines with the request's
         own key, so it is what a single continuation draws.
         """
-        prepared = None
-        error = None
-        request = None
-        try:
+        def resolve() -> tuple[jax.Array, ModelInputs]:
             request = request_key(key, seed)
             canonical = ModelInputs.from_value(inputs)
             prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
             _validated(model, self, prepared, max_new_tokens, eos_token_ids, pad_token_id, n)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="canvas generation setup")
-        assert prepared is not None and request is not None
+            return request, prepared
+
+        request, prepared = agreed("canvas generation setup", resolve)
         if jax.process_count() > 1:
             controls = (max_new_tokens, n, self, eos_token_ids, pad_token_id, model)
             # A process whose own rows needed no padding carries no validity,

@@ -17,9 +17,9 @@ from flax.core import freeze
 from jax.experimental import multihost_utils
 from jax.typing import ArrayLike
 
-from dew.artifacts import agree_process_phase
+from dew.artifacts import agreed
 from dew.diffusion.process import Process
-from dew.inputs import InputSpec
+from dew.inputs import InputSpec, host_rows
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import ArrayT, RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import FROZEN, Variables
@@ -72,7 +72,7 @@ class Images(Generic[ArrayT]):
     latents: ArrayT | None = None
 
     def host(self) -> Images[np.ndarray]:
-        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+        return host_rows(self, self.rows)
 
 
 @dataclass(frozen=True, eq=False)
@@ -233,9 +233,8 @@ class TextToImage:
         encode_key samples a VAE posterior; None uses its mean.
         """
         mesh = mesh_of(self.params)
-        prepared = None
-        error = None
-        try:
+
+        def resolve():
             rows = [prompts] if isinstance(prompts, str) else list(prompts)
             if not rows or not all(isinstance(prompt, (str, Mapping)) for prompt in rows):
                 raise ValueError("prompts must be a non-empty sequence of strings or conditioning records")
@@ -270,8 +269,9 @@ class TextToImage:
                 raise ValueError("noise is for noising a clean image; initial is already noisy")
             if mask is not None and image is None:
                 raise ValueError("a mask requires its image pixels")
-            if encode_key is not None:
-                encode_key = request_key(encode_key, None)
+            posterior = encode_key
+            if posterior is not None:
+                posterior = request_key(posterior, None)
             samples = {}
             if image is not None:
                 pixels = _image_rows(image, len(rows), self.inputs.sample.shape, "image")
@@ -284,17 +284,14 @@ class TextToImage:
                 samples["mask"] = (value >= (128 if value.dtype == np.uint8 else 0.5)).astype(np.float32)
             controls = (plan.rows, count, selected, shape,
                         tuple(np.asarray(jax.random.key_data(request))),
-                        None if encode_key is None else tuple(np.asarray(jax.random.key_data(encode_key))))
+                        None if posterior is None else tuple(np.asarray(jax.random.key_data(posterior))))
             signature = generation_signature((tokens, null_tokens, samples), controls)
-            prepared = plan, process, request, tokens, null_tokens, shape, count, selected, samples, signature
-        except Exception as failure:
-            error = failure
-        if mesh is not None:
-            agree_process_phase(error, phase="image input preparation")
-        elif error is not None:
-            raise error
-        assert prepared is not None
-        plan, process, request, tokens, null_tokens, shape, count, selected, samples, signature = prepared
+            return (plan, process, request, tokens, null_tokens, shape, count, selected,
+                    samples, posterior, signature)
+
+        prepared = (agreed("image input preparation", resolve) if mesh is not None else resolve())
+        (plan, process, request, tokens, null_tokens, shape, count, selected,
+         samples, encode_key, signature) = prepared
         if plan.processes > 1:
             multihost_utils.assert_equal(signature, "image input shapes and sampling must agree across processes")
         annotation = None
@@ -344,9 +341,8 @@ class TextToImage:
         guidance scale, or a `CFG` with its interval, or None for the plain
         conditional prediction; omitted, it is the task's default."""
         mesh = mesh_of(self.params)
-        settings = None
-        error = None
-        try:
+
+        def resolve():
             chosen = self.guidance if guidance is _Default.GUIDANCE else guidance
             if isinstance(chosen, (int, float)) and not isinstance(chosen, bool):
                 chosen = CFG(float(chosen))
@@ -388,14 +384,9 @@ class TextToImage:
                         None if prepared is None else prepared.rows)
             arrays = None if prepared is None else (prepared.noise, prepared.conditions, prepared.unconditional)
             signature = generation_signature(arrays, controls)
-            settings = prepared, request, count, process, times, solver, chosen, signature
-        except Exception as failure:
-            error = failure
-        if mesh is not None:
-            agree_process_phase(error, phase="image sampling setup")
-        elif error is not None:
-            raise error
-        assert settings is not None
+            return prepared, request, count, process, times, solver, chosen, signature
+
+        settings = (agreed("image sampling setup", resolve) if mesh is not None else resolve())
         prepared, request, count, process, times, solver, chosen, signature = settings
         if mesh is not None and jax.process_count() > 1:
             multihost_utils.assert_equal(signature, "image execution controls must agree across processes")

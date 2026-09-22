@@ -79,7 +79,29 @@ def _dtype(meta: Mapping[str, object]) -> np.dtype:
     return np.dtype(str(meta.get("dtype", _DEFAULT_DTYPE)))
 
 
-class TokenBytes:
+class _Reopened:
+    """A source whose open handle is dropped from its pickle and reopened.
+
+    Neither a memmap nor an arrayrecord reader survives grain's round trip
+    to a worker, and the rest of the state says how to open one. `handle`
+    names the attribute holding it and `open_handle` opens it again.
+    """
+
+    handle: str
+
+    def open_handle(self):
+        """The handle this source reads through, opened afresh."""
+        raise NotImplementedError
+
+    def __getstate__(self):
+        return {**self.__dict__, self.handle: None}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        setattr(self, self.handle, self.open_handle())
+
+
+class TokenBytes(_Reopened):
     """Reads a flat `.bin` of token ids through a memmap.
 
     The dtype comes from the sibling `meta.json` when present, where the
@@ -87,13 +109,18 @@ class TokenBytes:
     loaded into memory: a worker reads only the span it is asked for.
     """
 
+    handle = "_tokens"
+
     def __init__(self, path: str, eos_id: int | None = None):
         self.path = str(path)
         meta = _meta(Path(self.path).parent)
         self.dtype = _dtype(meta)
         self.vocab_size = _recorded(meta, "vocab_size")
         self.eos_id = eos_id if eos_id is not None else _recorded(meta, "eos_id")
-        self._tokens = np.memmap(self.path, dtype=self.dtype, mode="r")
+        self._tokens = self.open_handle()
+
+    def open_handle(self) -> np.memmap:
+        return np.memmap(self.path, dtype=self.dtype, mode="r")
 
     def __repr__(self) -> str:
         return f"TokenBytes(path={self.path!r})"
@@ -103,17 +130,6 @@ class TokenBytes:
 
     def __getitem__(self, span: slice) -> np.ndarray:
         return np.asarray(self._tokens[span])
-
-    def __getstate__(self):
-        # The memmap does not survive grain's pickle round trip to workers;
-        # the path and dtype are enough to reopen it there.
-        state = dict(self.__dict__)
-        state["_tokens"] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._tokens = np.memmap(self.path, dtype=self.dtype, mode="r")
 
 
 class _Sharded:
@@ -155,7 +171,7 @@ class _Sharded:
         return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
 
 
-class TokenRecords(_Sharded):
+class TokenRecords(_Reopened, _Sharded):
     """Reads token arrays in ArrayRecord shards as one stream.
 
     Each record holds one array of ids, as its raw bytes or under `field` of
@@ -164,6 +180,8 @@ class TokenRecords(_Sharded):
     document per record and one that wrote fixed blocks read back the same.
     """
 
+    handle = "_records"
+
     def __init__(self, paths: Sequence[str], *, field: str | None = None,
                  dtype: np.dtype = _DEFAULT_DTYPE, eos_id: int | None = None):
         if not paths:
@@ -171,7 +189,7 @@ class TokenRecords(_Sharded):
         self.paths = [str(path) for path in paths]
         self.field = field
         self.eos_id = None if eos_id is None else int(eos_id)
-        self._records = _array_records(self.paths)
+        self._records = self.open_handle()
         super().__init__([len(self._ids(index, np.dtype(dtype)))
                           for index in range(len(self._records))], np.dtype(dtype))
 
@@ -187,19 +205,11 @@ class TokenRecords(_Sharded):
     def piece(self, index: int) -> np.ndarray:
         return self._ids(index, self.dtype)
 
+    def open_handle(self):
+        return _array_records(self.paths)
+
     def __repr__(self) -> str:
         return f"TokenRecords(paths={self.paths!r}, field={self.field!r})"
-
-    def __getstate__(self):
-        # The arrayrecord reader holds open files, which do not survive
-        # grain's pickle; the paths reopen it in the worker.
-        state = dict(self.__dict__)
-        state["_records"] = None
-        return state
-
-    def __setstate__(self, state):
-        self.__dict__.update(state)
-        self._records = _array_records(self.paths)
 
 
 def _array_records(paths: Sequence[str]):

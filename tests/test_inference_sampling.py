@@ -471,7 +471,9 @@ def test_prefill_scores_the_sampled_position_and_no_other(roomy, monkeypatch):
     np.testing.assert_array_equal(picked, every[jnp.arange(2), slots])
     np.testing.assert_array_equal(states, whole_states)
     gathered = roomy(prompt, 8, seed=0)
-    monkeypatch.setattr(text, "_scores_one_slot", lambda model: False)
+    # Nothing satisfies this stand-in, so the prefill takes the path that
+    # scores every prompt position.
+    monkeypatch.setattr(text, "Selective", type("NotSelective", (), {}))
     scored_everywhere = roomy(prompt, 8, seed=0)
     np.testing.assert_array_equal(gathered.tokens, scored_everywhere.tokens)
     np.testing.assert_array_equal(gathered.raw_log_probs, scored_everywhere.raw_log_probs)

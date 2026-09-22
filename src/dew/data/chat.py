@@ -51,6 +51,7 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
+from .rows import parquet_names, parquet_rows
 from .sources.hf import HFOptions, HubOptions
 from .tokens import PackedWindows, bounded
 
@@ -502,18 +503,10 @@ def _conversation_column(names: Sequence[str], column: str, where: str) -> str:
 
 def _parquet_conversations(path: str, column: str) -> tuple[list, list]:
     """One parquet file, with only the two columns this reads taken off it."""
-    try:
-        import pyarrow.parquet as parquet
-    except ImportError as exc:
-        raise ImportError(
-            "reading chat parquet needs pyarrow: pip install pyarrow") from exc
-    names = [field.name for field in parquet.read_schema(path)]
+    names = parquet_names(path, "chat")
     held = _conversation_column(names, column, path)
-    columns = [held, "tools"] if "tools" in names else [held]
-    table = parquet.read_table(path, columns=columns)
-    return (table.column(held).to_pylist(),
-            table.column("tools").to_pylist() if "tools" in columns
-            else [None] * table.num_rows)
+    rows = parquet_rows(path, [held, "tools"], names)
+    return ([row[held] for row in rows], [row.get("tools") for row in rows])
 
 
 def _jsonl_conversations(path: str, column: str) -> tuple[list, list]:
@@ -610,6 +603,17 @@ class ConversationSource:
         return {"messages": self._conversations[index], "tools": self._tools[index]}
 
 
+def _rendered(tokenizer: PreTrainedTokenizerBase, record: Batch,
+              where: str) -> tuple[np.ndarray, np.ndarray]:
+    """One source row's token ids and per-token roles.
+
+    The row is parsed and rendered in one place, so the length pass and the
+    render map read a conversation the same way.
+    """
+    return render_conversation(
+        tokenizer, Conversation.parse(record["messages"], record["tools"], where), where)
+
+
 class RenderConversation:
     """Turns source rows into rendered ids and per-token roles, for
     `map_with_index`.
@@ -623,9 +627,7 @@ class RenderConversation:
 
     def __call__(self, index: int, record: Batch) -> Batch:
         where = f"{self.tokenizer} row {index}"
-        ids, roles = render_conversation(
-            load_tokenizer(self.tokenizer),
-            Conversation.parse(record["messages"], record["tools"], where), where)
+        ids, roles = _rendered(load_tokenizer(self.tokenizer), record, where)
         return {"text": ids, ROLES_KEY: roles}
 
 
@@ -637,12 +639,8 @@ def _lengths(source: ConversationSource, tokenizer: str) -> list[int]:
     fails the run here with its index.
     """
     load = load_tokenizer(tokenizer)
-    lengths = []
-    for index, record in enumerate(source):
-        where = f"{source.path} row {index}"
-        conversation = Conversation.parse(record["messages"], record["tools"], where)
-        lengths.append(len(render_conversation(load, conversation, where)[0]))
-    return lengths
+    return [len(_rendered(load, record, f"{source.path} row {index}")[0])
+            for index, record in enumerate(source)]
 
 
 @datasets("chat_messages")

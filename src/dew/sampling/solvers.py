@@ -104,6 +104,21 @@ def _sigma_integrator(name: str, process: Process) -> GeneralizedNoiseScheduler:
     return schedule
 
 
+def _euler_step(x, denoised, source, target):
+    """One Euler step of the probability-flow ODE, in sigma.
+
+    Returns `(x at the target level, the derivative, the x_0 coefficient,
+    the interval)`. A second-order method re-evaluates the derivative at the
+    end of this step and needs the coefficient and the interval it was taken
+    over.
+    """
+    (alpha_t, sigma_t), (alpha_s, sigma_s) = source, target
+    dt = sigma_s - sigma_t
+    x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / dt
+    derivative = (x - x_0_coeff * denoised) / sigma_t
+    return x + derivative * dt, derivative, x_0_coeff, dt
+
+
 def _ancestral(sigma_t, sigma_s):
     """k-diffusion's `get_ancestral_step` at eta 1: `(sigma_down, sigma_up)`,
     the level a deterministic step goes down to and the fresh noise that
@@ -208,11 +223,8 @@ class Euler:
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        (alpha_t, sigma_t), (alpha_s, sigma_s) = _rates(process, t, t_next, x)
-        dt = sigma_s - sigma_t
-        x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / dt
-        dx = (x - x_0_coeff * denoised) / sigma_t
-        return x + dx * dt, state
+        stepped, _, _, _ = _euler_step(x, denoised, *_rates(process, t, t_next, x))
+        return stepped, state
 
 
 @samplers("euler_ancestral")
@@ -251,11 +263,9 @@ class Heun:
         return ()
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        (alpha_t, sigma_t), (alpha_s, sigma_s) = _rates(process, t, t_next, x)
-        dt = sigma_s - sigma_t
-        x_0_coeff = (alpha_t * sigma_s - alpha_s * sigma_t) / dt
-        dx_0 = (x - x_0_coeff * denoised) / sigma_t
-        x_euler = x + dx_0 * dt
+        source, target = _rates(process, t, t_next, x)
+        sigma_s = target[1]
+        x_euler, dx_0, x_0_coeff, dt = _euler_step(x, denoised, source, target)
 
         denoised_next, _ = denoise(x_euler, t_next)
         # When sigma reaches 0 there is no derivative there, so the step is

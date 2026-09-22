@@ -188,7 +188,31 @@ def first_fit(sizes: np.ndarray, window: int, bins: int) -> tuple[np.ndarray, np
     return np.argsort(plan, kind="stable"), starts
 
 
-class DocumentChunks(pygrain.MapDataset[Batch]):
+class _WrappingDataset(pygrain.MapDataset[Batch]):
+    """A dataset read by index, whose index wraps into its own length.
+
+    grain's slice is the sharding and windowing API (`ds[shard::count]`), and
+    an index past the end wraps, so `repeat` is a length change. Both are
+    answered here and a subclass reads one record through `record`.
+    """
+
+    def record(self, index: int) -> Batch:
+        """The record at `index`, which is inside this dataset's length."""
+        raise NotImplementedError
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
+
+    @overload
+    def __getitem__(self, index: int) -> Batch: ...
+
+    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch]:
+        if isinstance(index, slice):
+            return self.slice(index)
+        return self.record(index % len(self))
+
+
+class DocumentChunks(_WrappingDataset):
     """Cuts documents into consecutive chunks of at most `chunk_len` tokens.
 
     A window holds nothing longer than itself, so a document that outgrows
@@ -213,18 +237,7 @@ class DocumentChunks(pygrain.MapDataset[Batch]):
     def __len__(self) -> int:
         return len(self._document)
 
-    @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
-
-    @overload
-    def __getitem__(self, index: int) -> Batch: ...
-
-    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch]:
-        # grain's slice is the sharding and windowing API (ds[shard::count]),
-        # and an index past the end wraps, so `repeat` is a length change.
-        if isinstance(index, slice):
-            return self.slice(index)
-        index = index % len(self)
+    def record(self, index: int) -> Batch:
         document = self._parent[int(self._document[index])]
         if document is None:
             raise ValueError(f"document {index} of the packed corpus is missing")
@@ -234,7 +247,7 @@ class DocumentChunks(pygrain.MapDataset[Batch]):
         return {key: value[start:start + self._chunk_len] for key, value in document.items()}
 
 
-class PackedWindows(pygrain.MapDataset[Batch]):
+class PackedWindows(_WrappingDataset):
     """Packs documents into windows of `window` tokens, by one plan over the
     whole corpus.
 
@@ -274,18 +287,7 @@ class PackedWindows(pygrain.MapDataset[Batch]):
     def __len__(self) -> int:
         return len(self._starts) - 1
 
-    @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
-
-    @overload
-    def __getitem__(self, index: int) -> Batch: ...
-
-    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch]:
-        # grain's slice is the sharding and windowing API (ds[shard::count]),
-        # and an index past the end wraps, so `repeat` is a length change.
-        if isinstance(index, slice):
-            return self.slice(index)
-        index = index % len(self)
+    def record(self, index: int) -> Batch:
         chunks = []
         for position in self._order[self._starts[index]:self._starts[index + 1]]:
             chunk = self._parent[int(position)]

@@ -27,7 +27,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.artifacts import agree_process_phase
+from dew.artifacts import agreed
 from dew.diffusion.block import CanvasGeneration
 from dew.diffusion.process import Conditioning
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -142,18 +142,16 @@ class DiscreteProcess:
         the completed response and does not stop bidirectional refinement
         early.
         """
-        prepared = request = None
-        error = None
         solver = Unmask() if sampler is None else sampler
-        try:
+
+        def resolve() -> tuple[jax.Array, ModelInputs]:
             request = request_key(key, seed)
             canonical = ModelInputs.from_value(inputs)
             prepared = jax.tree.map(lambda leaf: local_rows(leaf, host=False), canonical)
             _validate_request(model, self, prepared, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
-        except BaseException as failure:
-            error = failure
-        agree_process_phase(error, phase="masked generation setup")
-        assert prepared is not None and request is not None
+            return request, prepared
+
+        request, prepared = agreed("masked generation setup", resolve)
         if jax.process_count() > 1:
             from jax.experimental import multihost_utils
             controls = (max_new_tokens, steps, n, self, solver, eos_token_ids, pad_token_id, model)

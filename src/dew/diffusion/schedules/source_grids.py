@@ -117,7 +117,21 @@ class StageSigmaGrid(SigmaGrid):
         return self.T - jnp.interp(jnp.asarray(sigma), self.stages, self.stage_positions)
 
 
-class FlowGrid(_PairedGrid, NoiseScheduler):
+class _UniformGrid(_PairedGrid, NoiseScheduler):
+    """A paired grid whose source trains at uniform times and weights nothing.
+
+    The flow and normalized-VP grids differ only in what their sigmas mean
+    as rates; the draw and the loss weight are the same for both.
+    """
+
+    def sample_t(self, key, n: int):
+        return jax.random.uniform(key, (n,), minval=0, maxval=self.T)
+
+    def weight(self, t):
+        return jnp.ones_like(jnp.asarray(t, jnp.float32))
+
+
+class FlowGrid(_UniformGrid):
     """A rectified-flow grid: alpha is 1 - sigma, not a normalized VP pair.
 
     The source's forward process is x_t = (1 - sigma) x_0 + sigma eps, so
@@ -130,14 +144,8 @@ class FlowGrid(_PairedGrid, NoiseScheduler):
         sigma = self.sigmas(t)
         return 1.0 - sigma, sigma
 
-    def sample_t(self, key, n: int):
-        return jax.random.uniform(key, (n,), minval=0, maxval=self.T)
 
-    def weight(self, t):
-        return jnp.ones_like(jnp.asarray(t, jnp.float32))
-
-
-class VPGrid(_PairedGrid, NoiseScheduler):
+class VPGrid(_UniformGrid):
     """The same paired coordinates in normalized VP latent space."""
 
     def rates(self, t):
@@ -146,12 +154,6 @@ class VPGrid(_PairedGrid, NoiseScheduler):
         # stiff cosine-grid VJPs beyond the float32 source-parity bound.
         alpha = 1 / jax.lax.optimization_barrier(jnp.sqrt(1 + sigma ** 2))
         return alpha, sigma * alpha
-
-    def sample_t(self, key, n: int):
-        return jax.random.uniform(key, (n,), minval=0, maxval=self.T)
-
-    def weight(self, t):
-        return jnp.ones_like(jnp.asarray(t, jnp.float32))
 
 
 __all__ = ["FlowGrid", "SigmaGrid", "StageSigmaGrid", "TabulatedVP", "VPGrid"]

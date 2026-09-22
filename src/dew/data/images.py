@@ -30,6 +30,7 @@ from .dataset import (
     DatasetSpec,
     Records,
     Tokenize,
+    checked_count,
     hold_out,
     local_batch,
     tokenized,
@@ -309,9 +310,8 @@ class ImageDataset(DatasetSpec):
                     f"{name} reports no length, so it needs count= set to the "
                     "records it holds")
             return len(source)
-        if isinstance(source, Counted) and self.count > len(source):
-            raise ValueError(
-                f"count {self.count} is more than the {len(source)} records of {name}")
+        if isinstance(source, Counted):
+            return checked_count(self.count, len(source), name)
         return self.count
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
