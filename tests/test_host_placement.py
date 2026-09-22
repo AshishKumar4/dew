@@ -34,7 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from test_trainer import BATCH, Counting, Regression, val_batches
+from test_trainer import BATCH, Counting, Features, Regression, Spread, val_batches
 
 from dew.data import Dataset
 from dew.inference.banks import CheckpointBanks, HeldBanks, host_banked
@@ -51,10 +51,13 @@ BANKS = Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",))
 
 def fit(layout, directory, steps):
     checkpoints = Checkpoints(str(directory), keep=3)
-    trainer = Trainer(Regression(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
+    # A validation pass needs a consumer, so the objective that scores
+    # features stands in for the plain regression and a metric reads them.
+    trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
                       checkpoints=checkpoints)
     data = Dataset(train=Counting, val=val_batches(), records=None, batch=BATCH)
-    state = trainer.fit(data, steps=steps, log_every=1, eval_every=2, checkpoint_every=2)
+    state = trainer.fit(data, steps=steps, log_every=1, eval_every=2, checkpoint_every=2,
+                        metrics=(Spread([]),))
     checkpoints.wait()
     return state
 
