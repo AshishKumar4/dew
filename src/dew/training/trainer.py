@@ -293,7 +293,10 @@ class Trainer(Generic[Loss, Effects]):
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             params=params,
             opt_state=self.optimizer.init(params["params"]),
-            ema=None if ema is None else select(params, ema.select),
+            # The average starts equal to the parameters but as its own
+            # buffers: the step donates the state, and a buffer can be
+            # donated once.
+            ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
             key=run_key,
         )
 
@@ -532,8 +535,14 @@ class Trainer(Generic[Loss, Effects]):
     def compile(self, state: TrainState, batch: Batch) -> CompiledStep:
         """Compile a transaction over state and one already-produced global batch.
 
-        Retained records and asynchronous checkpoints can own old array leaves.
-        The call therefore does not donate input state or batch buffers.
+        The step consumes the state it is given: the returned state takes
+        over its buffers, so the update runs in place and peak memory holds
+        one copy of the parameters and optimizer state, not two. Keep no
+        reference to a state after stepping it; `new = step(old, batch)` is
+        the whole contract. A checkpoint saved before the step is safe:
+        orbax copies every array to the host before `save` returns, as long
+        as `Checkpoints` names no prioritized keys and no concurrent
+        transfer limit. The batch is not donated; the loader owns it.
         """
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
@@ -557,7 +566,8 @@ class Trainer(Generic[Loss, Effects]):
                         jnp.isfinite(loss), advanced.microstep > current.microstep)
 
             jitted = jax.jit(step, in_shardings=(shardings, batch_shardings(mesh, batch)),
-                             out_shardings=(shardings, replicated, replicated, replicated, replicated))
+                             out_shardings=(shardings, replicated, replicated, replicated, replicated),
+                             donate_argnums=0)
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
             self.flops_per_step = step_flops(jitted, prepared, batch)
