@@ -25,6 +25,19 @@ from dew.interop.hf_decoders import (
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
+def _mask_token(hf_config: Mapping[str, object], used: set[str]) -> object:
+    """Return the mask id a masked-diffusion release reserves, under either spelling.
+
+    The releases write it as `mask_token_id` or as `mask_id`. The caller
+    narrows the value itself, since each family names the field it read.
+    """
+    mask = hf_config.get('mask_token_id', hf_config.get('mask_id'))
+    if mask is None:
+        _refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
+    used.update(('mask_token_id', 'mask_id'))
+    return mask
+
+
 def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read a LLaDA-8B config into `CausalTransformer` fields.
 
@@ -47,10 +60,7 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     for key in _LLADA_READ:
         if key in hf_config:
             used.add(key)
-    mask = hf_config.get('mask_token_id', hf_config.get('mask_id'))
-    if mask is None:
-        _refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
-    used.update(('mask_token_id', 'mask_id'))
+    mask = _mask_token(hf_config, used)
     _llada_refusals(hf_config, used, std)
     config.update(causal=False, mask_token_id=records.integer(mask, 'mask_token_id'))
     return config
@@ -200,10 +210,7 @@ def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
         _refuse('use_mrope=True', 'the backbone rotates plain positions')
     used.add('use_mrope')
     config = _qwen2_config(hf_config, used)
-    mask = hf_config.get('mask_token_id', hf_config.get('mask_id'))
-    if mask is None:
-        _refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
-    used.update(('mask_token_id', 'mask_id'))
+    mask = _mask_token(hf_config, used)
     config.update(causal=False, mask_token_id=records.integer(mask, 'mask_token_id/mask_id'))
     return config
 
@@ -313,11 +320,11 @@ def _llada_export_path(name: str, config: Mapping[str, object]) -> str | None:
     raise ValueError(f"unknown parameter path {name!r}")
 
 
-def _llada_export(model: CausalTransformer) -> Mapping[str, object]:
-    return {'mask_token_id': model.mask_token_id}
+def _mask_token_export(model: CausalTransformer) -> Mapping[str, object]:
+    """Return the config field a masked-diffusion export writes: its mask id.
 
-
-def _dream_export(model: CausalTransformer) -> Mapping[str, object]:
+    LLaDA and Dream both declare the reserved id and nothing else of their own.
+    """
     return {'mask_token_id': model.mask_token_id}
 
 

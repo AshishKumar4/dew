@@ -24,6 +24,8 @@ from dew.interop.hf_decoders import (
     _base_config,
     _check_tree,
     _dew_path,
+    _fixed_fields,
+    _fixed_mixture,
     _flatten,
     _hf_name,
     _record_float,
@@ -170,9 +172,7 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         'altup': None, 'laurel_rank': None, 'per_layer_input_dim': None,
         'activation_sparsity_pattern': None, 'final_logit_softcap': None,
     }
-    for name, expected in fixed.items():
-        if getattr(model, name) != expected:
-            _refuse(name, f'GLM5 requires {expected!r}')
+    _fixed_fields(model, fixed, 'GLM5 requires {0!r}')
     hc = model.hyper_connections
     if hc is None or hc.head != 'mean':
         _refuse('hyper_connections', 'GLM5 contracts mHC streams by their unweighted mean')
@@ -226,9 +226,8 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
                        'groups_per_token', 'expert_features', 'shared_features', 'norm_topk_prob',
                        'implementation', 'dispatch'}
         defaults = Mixture(experts=mixture.experts, score_function='sigmoid', bias=True)
-        for entry in dataclasses.fields(mixture):
-            if entry.name not in represented and getattr(mixture, entry.name) != getattr(defaults, entry.name):
-                _refuse(f'mixture.{entry.name}', 'GLM5 uses biased grouped sigmoid routing with top-two group scores')
+        _fixed_mixture(mixture, defaults, represented,
+                       'GLM5 uses biased grouped sigmoid routing with top-two group scores')
         width = mixture.expert_features or model.hidden_features
         if mixture.shared_features < width or mixture.shared_features % width:
             _refuse('mixture.shared_features', 'GLM5 needs an integral positive count of shared expert widths')

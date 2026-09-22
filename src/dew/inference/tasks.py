@@ -36,7 +36,7 @@ from dew.records import integer, record as named_fields, text as named
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
 from dew.sampling.text import Bounded, Criteria, Generation, Sampling, Transforms, generate
-from dew.telemetry.profile import active_profile
+from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
     from dew.config import ModelConfig
@@ -109,22 +109,25 @@ def _prepared(processor: Processor | None, request: Request, *, images: Media | 
 def _task_inputs(processor: Processor | None, request: Request, *, images: Media | None,
                  collective: bool, max_new_tokens: int | None, default_tokens: int | None,
                  max_length: int | None, key: jax.Array | None, seed: int | None) -> tuple[ModelInputs, int, jax.Array]:
-    inputs = None
-    budget = None
-    random_key = None
-    error = None
-    try:
+    def prepared() -> tuple[ModelInputs, int, jax.Array]:
+        """Tokenize the request, size its budget and draw its key."""
         random_key = request_key(key, seed)
         inputs = _prepared(processor, request, images=images)
-        budget = _budget(max_new_tokens, default_tokens, max_length, inputs.tokens.shape[1])
+        return inputs, _budget(max_new_tokens, default_tokens, max_length,
+                               inputs.tokens.shape[1]), random_key
+
+    held = None
+    error = None
+    try:
+        held = prepared()
     except Exception as failure:
         error = failure
     if collective:
         agree_process_phase(error, phase="inference task input preparation")
     elif error is not None:
         raise error
-    assert inputs is not None and budget is not None and random_key is not None
-    return inputs, budget, random_key
+    assert held is not None
+    return held
 
 
 def _decoded(processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int) -> tuple[str, ...]:
@@ -284,6 +287,35 @@ def _saved_budget(record: Mapping[str, object]) -> int | None:
     return budget
 
 
+def _saved_run(directory: str, dtype: str | None) -> tuple[Mapping[str, object], ModelConfig, Processor]:
+    """Read a run's record, its model config at `dtype`, and its host processor."""
+    record = run_record(directory)
+    return record, _saved_model(record, dtype), _saved_processor(record)
+
+
+def _freeze_variables(task: object, variables: Variables) -> None:
+    """Freeze `variables` onto `task`, whose own `__post_init__` cannot assign.
+
+    A frozen dataclass refuses attribute assignment, so the field is written
+    through `object.__setattr__`.
+    """
+    object.__setattr__(task, "variables", freeze(dict(variables)))
+
+
+def _canvas_text(processor: Processor | None, generation: CanvasGeneration,
+                 trace: str) -> tuple[str, ...]:
+    """Decode a canvas generation's rows past their prompt, traced under `trace`.
+
+    A generation with no prompt width names no boundary to decode from, so it
+    is refused rather than decoded from the start of the canvas.
+    """
+    with region(trace):
+        if generation.prompt_width is None:
+            raise ValueError("this generation has no prompt width")
+        rows = generation.host()
+        return _decoded(processor, rows.tokens, rows.lengths, generation.prompt_width)
+
+
 def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Sampling:
     """Return the policy the run drew its previews under, or the basic one."""
     controls = record.get("sampling")
@@ -353,7 +385,7 @@ class TextGeneration:
     strategy: Strategy | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "variables", freeze(dict(self.variables)))
+        _freeze_variables(self, self.variables)
 
     def bind(self, variables: Variables) -> TextGeneration:
         """Return the same task over other weights, such as a policy snapshot."""
@@ -381,10 +413,8 @@ class TextGeneration:
         from dew.registry import objectives
         from dew.sampling.pipelines import restore_variables
 
-        record = run_record(directory)
+        record, model_config, processor = _saved_run(directory, dtype)
         kind = named(record["objective"], "objective")
-        model_config = _saved_model(record, dtype)
-        processor = _saved_processor(record)
         budget = _saved_budget(record)
         objective_type = objectives[kind]
         variables = restore_variables(directory, ema=ema and not objective_type._ema_is_reference,
@@ -430,11 +460,7 @@ class TextGeneration:
                  sampling: Sampling | None = None, images: Media | None = None,
                  logits: Transforms | None = None, stopping: Criteria | None = None,
                  strategy: Strategy | None = None) -> Generation:
-        annotation = None
-        if active_profile() is not None:
-            annotation = jax.profiler.TraceAnnotation("inference.text")
-            annotation.__enter__()
-        try:
+        with region("inference.text"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images,
                                           collective=mesh_of(self.variables) is not None,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
@@ -450,22 +476,12 @@ class TextGeneration:
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
             return replace(_requested(generated, budget, padding), decoder=decoder)
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
 
     def decode(self, generation: Generation) -> tuple[str, ...]:
         """Return each row's valid continuation as text, empty without a processor."""
-        annotation = None
-        if active_profile() is not None:
-            annotation = jax.profiler.TraceAnnotation("inference.text.decode")
-            annotation.__enter__()
-        try:
+        with region("inference.text.decode"):
             rows = generation.host()
             return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
 
 
 
@@ -492,7 +508,7 @@ class BlockGeneration:
     n: int = 1
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "variables", freeze(dict(self.variables)))
+        _freeze_variables(self, self.variables)
 
     def bind(self, variables: Variables) -> BlockGeneration:
         """Return the same task over other weights."""
@@ -513,9 +529,7 @@ class BlockGeneration:
         from dew.interop import diffusion_gemma
         from dew.sampling.pipelines import restore_variables
 
-        record = run_record(directory)
-        model_config = _saved_model(record, dtype)
-        processor = _saved_processor(record)
+        record, model_config, processor = _saved_run(directory, dtype)
         canvas = model_config.config["max_seq_len"]
         if not isinstance(canvas, int):
             raise ValueError(
@@ -554,11 +568,7 @@ class BlockGeneration:
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
                  process: BlockProcess | None = None, images: Media | None = None) -> CanvasGeneration:
-        annotation = None
-        if active_profile() is not None:
-            annotation = jax.profiler.TraceAnnotation("inference.block")
-            annotation.__enter__()
-        try:
+        with region("inference.block"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key, seed=seed)
@@ -568,24 +578,10 @@ class BlockGeneration:
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
             return replace(generated, decoder=decoder)
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
         """Return each row's valid continuation as text, empty without a processor."""
-        annotation = None
-        if active_profile() is not None:
-            annotation = jax.profiler.TraceAnnotation("inference.block.decode")
-            annotation.__enter__()
-        try:
-            if generation.prompt_width is None:
-                raise ValueError("this generation has no prompt width")
-            rows = generation.host()
-            return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
+        return _canvas_text(self.processor, generation, "inference.block.decode")
 
 
 
@@ -611,7 +607,7 @@ class MaskedGeneration:
     n: int = 1
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "variables", freeze(dict(self.variables)))
+        _freeze_variables(self, self.variables)
 
     def bind(self, variables: Variables) -> MaskedGeneration:
         """Return the same native MDLM task over another weight snapshot."""
@@ -631,9 +627,7 @@ class MaskedGeneration:
         from dew.diffusion.discrete import MDLM
         from dew.sampling.pipelines import restore_variables
 
-        record = run_record(directory)
-        model_config = _saved_model(record, dtype)
-        processor = _saved_processor(record)
+        record, model_config, processor = _saved_run(directory, dtype)
         budget = _saved_budget(record)
         model = model_config.build()
         if not isinstance(model, CausalTransformer) or model.causal or type(model.mask_token_id) is not int:
@@ -669,11 +663,7 @@ class MaskedGeneration:
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: jax.Array | None = None, seed: int | None = None, n: int | None = None,
                  steps: int | None = None, images: Media | None = None) -> CanvasGeneration:
-        annotation = None
-        if active_profile() is not None:
-            annotation = jax.profiler.TraceAnnotation("inference.masked")
-            annotation.__enter__()
-        try:
+        with region("inference.masked"):
             inputs, budget, random_key = _task_inputs(self.processor, request, images=images, collective=True,
                 max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                 max_length=self.max_length, key=key, seed=seed)
@@ -683,23 +673,9 @@ class MaskedGeneration:
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
             decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
             return replace(generated, decoder=decoder)
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
         """Return each row's valid response as text, empty without a processor."""
-        annotation = None
-        if active_profile() is not None:
-            annotation = jax.profiler.TraceAnnotation("inference.masked.decode")
-            annotation.__enter__()
-        try:
-            if generation.prompt_width is None:
-                raise ValueError("this generation has no prompt width")
-            rows = generation.host()
-            return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
+        return _canvas_text(self.processor, generation, "inference.masked.decode")
 
 

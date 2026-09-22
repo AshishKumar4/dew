@@ -25,7 +25,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew import records
-from dew.artifacts import agree_process_phase
+from dew.artifacts import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
@@ -1397,16 +1397,10 @@ def _as_float(name: str, value: object) -> float:
     return float(value)
 
 
-def _as_int(name: str, value: object) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be an integer")
-    return value
-
-
 def _as_decay(value: object) -> tuple[int, float]:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise ValueError("exponential_decay_length_penalty must be (start_index, factor)")
-    return (_as_int("exponential_decay_length_penalty start", value[0]),
+    return (records.integer(value[0], "exponential_decay_length_penalty start"),
             _as_float("exponential_decay_length_penalty factor", value[1]))
 
 
@@ -1460,17 +1454,17 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
     if (value := read("repetition_penalty")) is not None:
         transforms.append(decoding.RepetitionPenalty(_as_float("repetition_penalty", value)))
     if (value := read("no_repeat_ngram_size")) is not None:
-        transforms.append(decoding.NoRepeatNGram(_as_int("no_repeat_ngram_size", value)))
+        transforms.append(decoding.NoRepeatNGram(records.integer(value, "no_repeat_ngram_size")))
     if (value := read("encoder_no_repeat_ngram_size")) is not None:
-        transforms.append(decoding.PromptNoRepeatNGram(_as_int("encoder_no_repeat_ngram_size", value)))
+        transforms.append(decoding.PromptNoRepeatNGram(records.integer(value, "encoder_no_repeat_ngram_size")))
     if (value := read("bad_words_ids")) is not None:
         transforms.append(decoding.bad_words(_as_words(value), sampling.eos_id))
     if (value := read("min_length")) is not None and eos.size:
-        transforms.append(decoding.MinLength(_as_int("min_length", value), eos))
+        transforms.append(decoding.MinLength(records.integer(value, "min_length"), eos))
     if (value := read("min_new_tokens")) is not None and eos.size:
-        transforms.append(decoding.MinNewTokens(_as_int("min_new_tokens", value), eos))
+        transforms.append(decoding.MinNewTokens(records.integer(value, "min_new_tokens"), eos))
     if (value := read("forced_bos_token_id")) is not None:
-        transforms.append(decoding.ForcedBOS(_as_int("forced_bos_token_id", value)))
+        transforms.append(decoding.ForcedBOS(records.integer(value, "forced_bos_token_id")))
     if (value := read("forced_eos_token_id")) is not None:
         # The reference forces at the effective end of the request, and a call
         # may set its own budget, so the control stays request relative.
@@ -1543,7 +1537,7 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
             raise ValueError("stochastic beam search is refused: a selected beam's marginal "
                              "probability is not the per-step candidate probability, so no honest "
                              "behaviour likelihood exists")
-        width = _as_int("num_beams", beams)
+        width = records.integer(beams, "num_beams")
         if rows > width:
             raise ValueError(f"num_return_sequences {rows} exceeds num_beams {width}")
         early = _generation_value(config, generation_config, "early_stopping")
@@ -1564,7 +1558,7 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
                          "checkpoint carries no prediction-depth weights")
     length = read("num_assistant_tokens")
     threshold = read("assistant_confidence_threshold")
-    drafted = Speculative.block - 1 if length is None else _as_int("num_assistant_tokens", length)
+    drafted = Speculative.block - 1 if length is None else records.integer(length, "num_assistant_tokens")
     if drafted < 1:
         raise ValueError("num_assistant_tokens must draft at least one token")
     # The block includes the target draw the proposer chains from.
@@ -2239,14 +2233,15 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     processor = _source_processor(directory, config, record, model)
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
-    error = None
-    try:
-        # Loading for training/export does not opt into the source sampler.
-        # Active policy support is checked when the caller creates its task.
+    def policy_read() -> None:
+        """Refuse a generation_config.json that is not an object.
+
+        Loading for training or export does not opt into the source sampler;
+        active policy support is checked when the caller creates its task.
+        """
         if not isinstance(generation_config, dict):
             raise ValueError("generation_config.json must contain an object")
-    except BaseException as failure:
-        error = failure
-    agree_process_phase(error, phase="pretrained generation policy")
+
+    agreed("pretrained generation policy", policy_read)
     return Pretrained(model, variables, processor, config, directory, built, generation_config,
                       layouts, retained, export_adapter, quantized_tensors=quantized_tensors)

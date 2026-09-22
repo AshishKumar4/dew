@@ -35,6 +35,12 @@ C = TypeVar('C', bound=RunConfig)
 
 
 class Search(Protocol):
+    """Chooses the next point of a space, given the trials already finished.
+
+    `seed` is read by the samplers that draw at random, `random_search` and
+    `optuna_search`; `grid_search` walks the product in order and ignores it.
+    """
+
     def __call__(self, space: Space, finished: Sequence[TrialFinished], seed: int) -> Point: ...
 
 
@@ -64,7 +70,11 @@ def random_search(space: Space, finished: Sequence[TrialFinished], seed: int) ->
 
 
 def grid_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:
-    """Return the next point of the space's cartesian product, in order."""
+    """Return the next point of the space's cartesian product, in order.
+
+    `seed` is the `Search` protocol's, and this walk draws nothing, so it goes
+    unread here.
+    """
     points = list(itertools.product(*space.values()))
     if len(finished) >= len(points):
         raise ValueError(f'the grid holds {len(points)} points and trial '

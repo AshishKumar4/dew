@@ -36,7 +36,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import position
 from dew.objectives.base import Variables
-from dew.telemetry.profile import active_profile
+from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
     import optax
@@ -289,17 +289,9 @@ class Checkpoints:
         A write that fails surfaces from `wait`, which is deliberately
         unguarded: a checkpoint that did not land is data loss.
         """
-        annotation = None
-        active = active_profile()
-        if active is not None and active.running:
-            annotation = jax.profiler.TraceAnnotation("checkpoint.submit")
-            annotation.__enter__()
-        try:
+        with region("checkpoint.submit"):
             self._open().save(step, args=ocp.args.PyTreeSave(self._item(state, saved)),
                               metrics=metrics, force=True)
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
 
     def save_local(self, step: int, state: TrainState, saved: bytes | None) -> None:
         """Write `state` under `step` to this process's local directory,
@@ -311,18 +303,10 @@ class Checkpoints:
         if saved is not None:
             state_tree['position'] = jax.tree.map(
                 lambda leaf: jax.device_put(leaf, state.step.sharding), state_tree['position'])
-        annotation = None
-        active = active_profile()
-        if active is not None and active.running:
-            annotation = jax.profiler.TraceAnnotation("checkpoint.submit_local")
-            annotation.__enter__()
-        try:
+        with region("checkpoint.submit_local"):
             self._open_local().save(
                 step, args=ocp.args.PyTreeSave(state_tree), force=True,
                 custom_metadata={'processes': jax.process_count(), 'placement': written})
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
 
     @staticmethod
     def _item(state: TrainState, saved: bytes | None) -> dict[str, StateLeaf]:
@@ -479,12 +463,7 @@ class Checkpoints:
 
     def _check_placement(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
         """Refuse a local step written for another placement of the state."""
-        annotation = None
-        active = active_profile()
-        if active is not None and active.running:
-            annotation = jax.profiler.TraceAnnotation("checkpoint.validate")
-            annotation.__enter__()
-        try:
+        with region("checkpoint.validate"):
             written = self._open_local().metadata(step).custom_metadata or {}
             wanted = placement(state_tree)
             moved = [path for path in wanted if written.get('placement', {}).get(path) != wanted[path]]
@@ -504,9 +483,6 @@ class Checkpoints:
                 f"layout and process count it was written with. Resume with those, or "
                 f"delete {self.local_directory} to resume from the persistent checkpoint "
                 f"at step {self._open().latest_step()} in {self.directory}.")
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)
 
     def wait(self) -> None:
         """Block until pending async writes have landed on disk.
@@ -514,12 +490,7 @@ class Checkpoints:
         Saving is async so it stays off the training loop's critical path;
         anything that reads a checkpoint back has to call this first.
         """
-        annotation = None
-        active = active_profile()
-        if active is not None and active.running:
-            annotation = jax.profiler.TraceAnnotation("checkpoint.wait")
-            annotation.__enter__()
-        try:
+        with region("checkpoint.wait"):
             error = None
             for checkpointer in (self._manager, self._local_manager):
                 if checkpointer is not None:
@@ -532,6 +503,3 @@ class Checkpoints:
                             error.add_note(f"Checkpoint wait also failed: {failure!r}")
             if error is not None:
                 raise error
-        finally:
-            if annotation is not None:
-                annotation.__exit__(None, None, None)

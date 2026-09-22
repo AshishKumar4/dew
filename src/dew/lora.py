@@ -237,8 +237,8 @@ class LoRA:
             factors = _factors(name, bound[name], variables, rank)
             shape_a, shape_b = factors.shapes(rank)
             targets[factors.module] = Target(rank, scaling)
-            _insert(leaves, (*factors.module, "lora_A"), INIT_A(factor_key, shape_a, jnp.float32))
-            _insert(leaves, (*factors.module, "lora_B"), INIT_B(factor_key, shape_b, jnp.float32))
+            _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, jnp.float32),
+                            INIT_B(factor_key, shape_b, jnp.float32))
         return cls(targets, rslora, dropout, bound), overlay(variables, leaves)
 
     @classmethod
@@ -349,6 +349,12 @@ class _Factors:
     def shapes(self, rank: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Return the tree's `lora_A` and `lora_B` shapes at `rank`."""
         return (*self.kernel_shape[:self.contracted], rank), (rank, *self.kernel_shape[self.contracted:])
+
+
+def _insert_factors(leaves: dict, module: Path, a, b) -> None:
+    """Write one target's two factor leaves into `leaves`, under `FACTORS`."""
+    for name, value in zip(FACTORS, (a, b), strict=True):
+        _insert(leaves, (*module, name), value)
 
 
 def _factors(name: str, layout: WeightLayout, variables: Variables, rank: int) -> _Factors:
@@ -503,8 +509,10 @@ def _pattern(patterns: Mapping[str, object], relative: str) -> str:
 class PeftConfig(TypedDict):
     """Describes `adapter_config.json` as PEFT writes and reads it.
 
-    It carries the defaults every target takes, the per-module exceptions, and
-    the flags dew fixes because its adapters are built one way.
+    It carries the defaults every target takes and the per-module exceptions.
+    `fan_in_fan_out`, `bias`, `init_lora_weights` and `inference_mode` are
+    fixed because dew builds its adapters one way. Nothing here reads those
+    four back; they are written so a PEFT reader finds the keys it expects.
     """
 
     peft_type: str
@@ -615,8 +623,8 @@ def _place(layouts: Mapping[str, WeightLayout], variables: Variables,
         shape_a, shape_b = factors.shapes(rank)
         targets[factors.module] = Target(rank, entry.config.alpha_of(relative))
         bound[entry.module] = layout
-        _insert(leaves, (*factors.module, "lora_A"), factors.a.restore(entry.a, shape_a))
-        _insert(leaves, (*factors.module, "lora_B"), factors.b.restore(entry.b, shape_b))
+        _insert_factors(leaves, factors.module, factors.a.restore(entry.a, shape_a),
+                        factors.b.restore(entry.b, shape_b))
     return LoRA(targets, rslora, dropout, bound), overlay(variables, leaves)
 
 
