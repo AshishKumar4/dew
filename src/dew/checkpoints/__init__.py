@@ -155,6 +155,66 @@ def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
             if isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)) and leaf.sharding is not None}
 
 
+def _check_template(template, metadata, stored) -> None:
+    """Refuse a train-state template the checkpoint at hand cannot fill.
+
+    A mapping template names the leaves it wants and is checked by the
+    restore itself. A whole train state has to find every required field, and
+    its scaler and EMA have to be present or absent together with the
+    checkpoint's.
+    """
+    if template is None or isinstance(template, Mapping):
+        return
+    missing = set(STATE_LEAVES).difference(stored)
+    if missing:
+        raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
+    if (metadata["scale"] is None) != (template.scale is None):
+        raise ValueError("checkpoint dynamic-scaler configuration differs from this run")
+    if (metadata["ema"] is None) != (template.ema is None):
+        raise ValueError("checkpoint EMA configuration differs from this run")
+
+
+def _position_leaves(state_tree: dict, restore_args: dict, metadata, *,
+                     from_local: bool) -> None:
+    """Add the data position to the leaves and the args a typed restore reads.
+
+    The table's shape follows the process count and the iterator's position,
+    so it comes from the checkpoint's own metadata rather than the template. A
+    local checkpoint holds it as a device array, replicated like the step.
+    """
+    target = next(iter(jax.tree.leaves(state_tree)), None)
+    target_sharding = getattr(target, "sharding", None)
+    position_sharding = (
+        jax.sharding.NamedSharding(target_sharding.mesh, jax.sharding.PartitionSpec())
+        if isinstance(target_sharding, jax.sharding.NamedSharding) else
+        jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
+    state_tree["position"] = jax.tree.map(
+        lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),
+        dict(metadata['position']))
+    restore_args['position'] = jax.tree.map(
+        lambda leaf: (ocp.ArrayRestoreArgs(sharding=position_sharding,
+                                           global_shape=leaf.shape)
+                      if from_local else ocp.RestoreArgs()),
+        state_tree['position'])
+
+
+def _filled(template, restored: dict, step: int):
+    """Return `restored` as the train state `template` describes, or as it stands.
+
+    A whole train state is refused where the serialized step or accumulation
+    window disagrees with the directory it came from, since both are part of
+    the resume contract.
+    """
+    if template is None or isinstance(template, Mapping):
+        return restored
+    if int(restored["step"]) != step:
+        raise ValueError("checkpoint directory and serialized attempted step disagree")
+    if (not isinstance(template.window_size, jax.ShapeDtypeStruct)
+            and int(restored["window_size"]) != int(template.window_size)):
+        raise ValueError("checkpoint accumulation window_size differs from this run")
+    return template.replace(**restored)
+
+
 class Checkpoints:
     """Holds the checkpoints of one run, in one directory.
 
@@ -386,14 +446,7 @@ class Checkpoints:
                 f"persistent checkpoint at {self.path(step)}")
         metadata = checkpointer.item_metadata(step)
         stored = metadata.keys()
-        if template is not None and not isinstance(template, Mapping):
-            missing = set(STATE_LEAVES).difference(stored)
-            if missing:
-                raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
-            if (metadata["scale"] is None) != (template.scale is None):
-                raise ValueError("checkpoint dynamic-scaler configuration differs from this run")
-            if (metadata["ema"] is None) != (template.ema is None):
-                raise ValueError("checkpoint EMA configuration differs from this run")
+        _check_template(template, metadata, stored)
         if template is None:
             # Typed as host arrays, so orbax reads no sharding file and warns
             # about none. A local checkpoint knows device arrays only, so its
@@ -415,26 +468,7 @@ class Checkpoints:
                     sharding=leaf.sharding if isinstance(leaf, jax.ShapeDtypeStruct) else None),
                 state_tree)
             if 'position' in stored and not isinstance(template, Mapping):
-                # A mapping names the leaves it wants and nothing else; a
-                # resume takes the whole state, the data position included.
-                # The table's shape depends on the process count and the
-                # iterator's position, so it comes from the checkpoint's own
-                # metadata, not from the template. A local checkpoint
-                # holds it as a device array, replicated like the step.
-                target = next(iter(jax.tree.leaves(state_tree)), None)
-                target_sharding = getattr(target, "sharding", None)
-                position_sharding = (
-                    jax.sharding.NamedSharding(target_sharding.mesh, jax.sharding.PartitionSpec())
-                    if isinstance(target_sharding, jax.sharding.NamedSharding) else
-                    jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
-                state_tree["position"] = jax.tree.map(
-                    lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),
-                    dict(metadata['position']))
-                restore_args['position'] = jax.tree.map(
-                    lambda leaf: (ocp.ArrayRestoreArgs(sharding=position_sharding,
-                                                       global_shape=leaf.shape)
-                                  if from_local else ocp.RestoreArgs()),
-                    state_tree['position'])
+                _position_leaves(state_tree, restore_args, metadata, from_local=from_local)
             try:
                 # partial_restore: a key the checkpoint holds and the template
                 # does not is skipped instead of refused.
@@ -452,13 +486,7 @@ class Checkpoints:
         restored = dict(restored)
         table = restored.pop('position', None)
         saved = None if table is None else read_position(table, where)
-        if template is not None and not isinstance(template, Mapping):
-            if int(restored["step"]) != step:
-                raise ValueError("checkpoint directory and serialized attempted step disagree")
-            if (not isinstance(template.window_size, jax.ShapeDtypeStruct)
-                    and int(restored["window_size"]) != int(template.window_size)):
-                raise ValueError("checkpoint accumulation window_size differs from this run")
-            restored = template.replace(**restored)
+        restored = _filled(template, restored, step)
         return restored, saved
 
     def _check_placement(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:

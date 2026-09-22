@@ -40,22 +40,12 @@ from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
 from dew.nn.kda import KimiDeltaAttentionMixer
 
 
-def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a GLM-5.3-Flash text config into `CausalTransformer` fields.
+def _glm5_refusals(hf_config: Mapping[str, object], used: set[str], layers: int) -> None:
+    """Refuse a GLM-5.3-Flash config field the reference does not carry.
 
-    The block is NoPE pooled MLA, KDA and mHC
-    (modeling_glm5_next.py:1259-1329). The reader builds four things from the
-    config: `types`, one attention kind per layer; `linear`, the KDA mixer's
-    fields; `sparse`, the k-pool mixer's; and `mixture`, the routed layers'
-    geometry. Every field the reference fixes is checked and refused rather
-    than dropped.
+    Each field the reference fixes is checked against its one value, and the
+    indexer schedule against the one selection mode this loader builds.
     """
-    layers = _record_int(hf_config, 'num_hidden_layers')
-    types = _specified_layer_types(hf_config, used, tuple(
-        'deepseek_sparse_attention' if i % 4 == 3 else 'linear_attention' for i in range(layers)))
-    types = tuple('full_attention' if kind == 'deepseek_sparse_attention' else kind for kind in types)
-    if len(types) != layers or set(types) - {'linear_attention', 'full_attention'}:
-        _refuse('layer_types', 'one linear_attention or deepseek_sparse_attention entry per layer')
     for name, expected in (('mhc', True), ('mla_use_nope', True), ('index_kpool_compress', True),
                            ('moe_router_dtype', 'float32'), ('hidden_act', 'silu'),
                            ('qk_rope_head_dim', 0), ('head_dim', 0)):
@@ -72,6 +62,16 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     used.add('attention_dropout')
     if 'shared' in _glm_indexer_types(hf_config, layers, used):
         _refuse('indexer_types', 'shared k-pool index selections are not implemented')
+
+
+def _glm5_linear_fields(hf_config: Mapping[str, object],
+                        types: tuple[str, ...]) -> dict[str, object]:
+    """Read the KDA mixer's fields, from `linear_attn_config` or the top level.
+
+    The nested object wins wherever it states a field. Its `kda_layers` and
+    `full_attn_layers` are checked against `types` rather than read, since the
+    layer kinds are resolved before this runs.
+    """
     nested = hf_config.get('linear_attn_config')
     raw = {} if nested is None else nested
     if not isinstance(raw, Mapping):
@@ -93,20 +93,16 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
             if not isinstance(indices, (list, tuple)) or list(indices) != [
                     i for i, value in enumerate(types) if value == kind]:
                 _refuse(f'linear_attn_config.{name}', 'disagrees with layer_types')
-    sparse_fields = ('q_lora_rank', 'kv_lora_rank', 'qk_nope_head_dim', 'v_head_dim',
-                     'index_n_heads', 'index_head_dim', 'index_topk', 'index_kpool')
-    sparse = {name: _record_int(hf_config, name) for name in sparse_fields}
-    if sparse['index_kpool'] < 1 or sparse['index_topk'] % sparse['index_kpool']:
-        _refuse('index_topk / index_kpool', 'the budget must contain whole positive-sized pools')
-    config = _base_config({**hf_config, 'layer_types': types, 'head_dim': sparse['qk_nope_head_dim'],
-                          'num_key_value_heads': hf_config['num_attention_heads']},
-                          used, rope=_Ropes(10000.0))
-    kinds: dict[str, KindFields] = {}
-    if 'linear_attention' in types:
-        kinds['linear_attention'] = {'mixer': {'kind': 'kimi_delta_attention', **linear}}
-    if 'full_attention' in types:
-        kinds['full_attention'] = {'mixer': {'kind': 'kpool_sparse_attention', **sparse,
-            'index_kpool_always_select_tail': hf_config.get('index_kpool_always_select_tail', True)}}
+    return linear
+
+
+def _glm5_mixture(hf_config: Mapping[str, object], used: set[str],
+                  layers: int) -> tuple[MixtureFields | None, tuple[int, ...]]:
+    """Read the routed layers and their mixture, or (None, ()) for a dense stack.
+
+    `routed` is the layers `mlp_layer_types` marks sparse, which the caller
+    reads again to place the prediction depth.
+    """
     # GLM reads the explicit schedule, not DeepSeek's dense-prefix rule
     # (modeling_glm5_next.py:1270-1272; configuration_glm5_next.py:160-163).
     schedule = hf_config.get('mlp_layer_types')
@@ -135,6 +131,42 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
                      'moe_intermediate_size', 'first_k_dense_replace', 'moe_layer_freq',
                      'mlp_layer_types', 'aux_loss_alpha', 'seq_aux'))
     used.update(('scoring_func', 'topk_method', 'norm_topk_prob'))
+    return mixture, routed
+
+
+def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    """Read a GLM-5.3-Flash text config into `CausalTransformer` fields.
+
+    The block is NoPE pooled MLA, KDA and mHC
+    (modeling_glm5_next.py:1259-1329). The reader builds four things from the
+    config: `types`, one attention kind per layer; `linear`, the KDA mixer's
+    fields; `sparse`, the k-pool mixer's; and `mixture`, the routed layers'
+    geometry. Every field the reference fixes is checked and refused rather
+    than dropped.
+    """
+    layers = _record_int(hf_config, 'num_hidden_layers')
+    types = _specified_layer_types(hf_config, used, tuple(
+        'deepseek_sparse_attention' if i % 4 == 3 else 'linear_attention' for i in range(layers)))
+    types = tuple('full_attention' if kind == 'deepseek_sparse_attention' else kind for kind in types)
+    if len(types) != layers or set(types) - {'linear_attention', 'full_attention'}:
+        _refuse('layer_types', 'one linear_attention or deepseek_sparse_attention entry per layer')
+    _glm5_refusals(hf_config, used, layers)
+    linear = _glm5_linear_fields(hf_config, types)
+    sparse_fields = ('q_lora_rank', 'kv_lora_rank', 'qk_nope_head_dim', 'v_head_dim',
+                     'index_n_heads', 'index_head_dim', 'index_topk', 'index_kpool')
+    sparse = {name: _record_int(hf_config, name) for name in sparse_fields}
+    if sparse['index_kpool'] < 1 or sparse['index_topk'] % sparse['index_kpool']:
+        _refuse('index_topk / index_kpool', 'the budget must contain whole positive-sized pools')
+    config = _base_config({**hf_config, 'layer_types': types, 'head_dim': sparse['qk_nope_head_dim'],
+                          'num_key_value_heads': hf_config['num_attention_heads']},
+                          used, rope=_Ropes(10000.0))
+    kinds: dict[str, KindFields] = {}
+    if 'linear_attention' in types:
+        kinds['linear_attention'] = {'mixer': {'kind': 'kimi_delta_attention', **linear}}
+    if 'full_attention' in types:
+        kinds['full_attention'] = {'mixer': {'kind': 'kpool_sparse_attention', **sparse,
+            'index_kpool_always_select_tail': hf_config.get('index_kpool_always_select_tail', True)}}
+    mixture, routed = _glm5_mixture(hf_config, used, layers)
     hc_fields = ('hc_mult', 'hc_eps', 'hc_sinkhorn_iters')
     config.update(kinds=kinds, mixture=mixture,
                   hyper_connections={'hc_mult': _record_int(hf_config, 'hc_mult'),
