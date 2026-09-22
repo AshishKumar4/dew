@@ -32,6 +32,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import Dtype, PrecisionLike
@@ -40,6 +41,7 @@ from jax.sharding import PartitionSpec as P
 
 from .blocks import normal_kernel
 from .precision import rounded_operand
+from .precision import precision_names, rounded_operand
 from .sharding import EXPERT_AXIS, logical_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
@@ -50,7 +52,7 @@ from .sharding import EXPERT_AXIS, logical_axes
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
 # 'auto' resolves per backend through GROUPED_MATMUL_BY_BACKEND below.
-GROUPED_MATMULS = ('auto', 'xla', 'tiled', 'tokamax')
+GROUPED_MATMULS = ('auto', 'xla', 'pallas', 'tokamax')
 EXPERT_DISPATCHES = ('global', 'exchange')
 
 # DeepSeek divides the selected weights by their sum plus this, so a token
@@ -312,19 +314,17 @@ class Router(nn.Module):
 
 
 # The grouped matmul 'auto' runs, per backend: the measured winner at
-# lm-moe's shape (8192 rows, 768 -> 2048, 8 experts, bf16). The numbers are
-# in docs/performance.md.
-GROUPED_MATMUL_BY_BACKEND = {'gpu': 'tiled', 'tpu': 'xla'}
+# lm-moe's shape (8192 rows, 768 -> 2048, 8 experts, bf16); the numbers are in
+# docs/performance.md. On a GPU that is JAX's own Pallas/Triton kernels
+# (`dew.nn.kernels.ragged_dot`), where XLA lowers ragged_dot to a product over
+# every expert. On a TPU it is XLA's ragged_dot, within 5% of the best kernel
+# measured on a v6e.
+GROUPED_MATMUL_BY_BACKEND = {'gpu': 'pallas', 'tpu': 'xla'}
 
 # tokamax's own dispatch tries its Mosaic kernel first: on TPU that is the v1
 # kernel, 13x slower than XLA on a v6e, and on an Ada or Ampere card a Mosaic
 # GPU config that exceeds shared memory and raises. The kernel is named.
 TOKAMAX_KERNEL_BY_BACKEND = {'gpu': 'triton', 'tpu': 'mosaic_tpu_v2'}
-
-# Rows per tile of the 'tiled' grouped matmul. Each expert's rows are padded
-# to whole tiles, so the loop multiplies at most one tile of padding per
-# expert beyond the routed rows.
-TILE_ROWS = 512
 
 
 def resolve_grouped_matmul(implementation: str) -> str:
@@ -337,55 +337,6 @@ def resolve_grouped_matmul(implementation: str) -> str:
     if implementation != 'auto':
         return implementation
     return GROUPED_MATMUL_BY_BACKEND.get(jax.default_backend(), 'xla')
-
-
-def _tiled_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
-                  precision: PrecisionLike, preferred_element_type: Dtype | None,
-                  tile: int) -> jax.Array:
-    """The grouped matmul as a loop of dense `[tile, in] @ [in, out]` products.
-
-    Each expert's rows are gathered into whole zero-padded tiles, so a tile
-    belongs to one expert and the loop multiplies it by that expert's matrix;
-    a second gather puts the rows back in order. The shapes are static: the
-    tile count is the bound `ceil(rows / tile) + experts`, and a tile past
-    the routed rows multiplies zeros. Both gathers transpose to scatter-adds
-    and the loop to a loop, so the product differentiates in both
-    directions. Rows past `sum(group_sizes)` come out zero, as ragged_dot's
-    do.
-    """
-    rows = tokens.shape[0]
-    experts, _, features = kernel.shape
-    tile = max(1, min(tile, rows))
-    tiles = -(-rows // tile) + experts
-    sizes = group_sizes.astype(jnp.int32)
-    per_expert = (sizes + tile - 1) // tile
-    tile_ends = jnp.cumsum(per_expert)
-    tile_starts = tile_ends - per_expert
-    row_ends = jnp.cumsum(sizes)
-    row_starts = row_ends - sizes
-    # Each tile's expert, and the row of that expert each tile slot reads.
-    index = jnp.arange(tiles)
-    owner = jnp.minimum(jnp.searchsorted(tile_ends, index, side='right'), experts - 1)
-    offset = (index - tile_starts[owner])[:, None] * tile + jnp.arange(tile)[None, :]
-    # An out-of-range source reads the fill value: the zero padding.
-    source = jnp.where((offset >= 0) & (offset < sizes[owner][:, None]),
-                       row_starts[owner][:, None] + offset, rows)
-    padded = tokens.at[source].get(mode='fill', fill_value=0)
-
-    def product(operands):
-        block, expert = operands
-        return jax.lax.dot_general(
-            block, jax.lax.dynamic_index_in_dim(kernel, expert, keepdims=False),
-            (((1,), (0,)), ((), ())), precision=precision,
-            preferred_element_type=preferred_element_type)
-
-    products = jax.lax.map(product, (padded, owner)).reshape(tiles * tile, features)
-    # Row r of expert e sits in slot tile_starts[e] * tile + r - row_starts[e].
-    row = jnp.arange(rows)
-    expert = jnp.minimum(jnp.searchsorted(row_ends, row, side='right'), experts - 1)
-    slot = jnp.where(row < row_ends[-1],
-                     tile_starts[expert] * tile + row - row_starts[expert], tiles * tile)
-    return products.at[slot].get(mode='fill', fill_value=0)
 
 
 def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
@@ -401,16 +352,19 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
 
     - 'auto': the backend's measured one, `GROUPED_MATMUL_BY_BACKEND`, and
       'xla' on a backend the table does not name.
-    - 'xla': `jax.lax.ragged_dot`, which lowers on every backend. On a GPU
-      it lowers to a dense product over every expert.
-    - 'tiled': `_tiled_matmul`, a loop of dense per-tile products in JAX.
+    - 'xla': `jax.lax.ragged_dot`. On a GPU XLA lowers it to a product over
+      every expert.
+    - 'pallas': JAX's own Pallas/Triton `gmm` kernel, vendored in
+      `dew.nn.kernels.ragged_dot`, where `pallas_runs` says it computes the
+      product asked for, and 'xla' elsewhere. Off a GPU the kernel runs in
+      the Pallas interpreter.
     - 'tokamax': `tokamax.ragged_dot`, the same call against tokamax's own
       kernels (`maxtext layers/moe.py:1633`), the kernel named per backend
       by `TOKAMAX_KERNEL_BY_BACKEND` and XLA elsewhere.
 
-    This is the raw kernel call and JAX's own differentiation rules.
+    This is the raw kernel call. 'pallas' has no differentiation rule here;
     `expert_projection` adds the precision contract routed experts train
-    under.
+    under, and the gradients of every implementation.
     """
     implementation = resolve_grouped_matmul(implementation)
     if implementation == 'tokamax':
@@ -421,12 +375,57 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
             tokens, kernel, group_sizes, precision=precision,
             preferred_element_type=preferred_element_type,
             implementation=TOKAMAX_KERNEL_BY_BACKEND.get(jax.default_backend(), 'xla'))
-    if implementation == 'tiled':
-        return _tiled_matmul(tokens, kernel, group_sizes, precision=precision,
-                             preferred_element_type=preferred_element_type, tile=TILE_ROWS)
+    if implementation == 'pallas' and pallas_runs(tokens.dtype, kernel.dtype, precision):
+        return _gmm(tokens, kernel, group_sizes,
+                    preferred_element_type or jnp.result_type(tokens, kernel))
     return jax.lax.ragged_dot(
         tokens, kernel, group_sizes, precision=precision,
         preferred_element_type=preferred_element_type)
+
+
+def pallas_runs(lhs: Dtype, rhs: Dtype, precision: PrecisionLike) -> bool:
+    """Whether the Pallas kernels compute the product asked for, at trace time.
+
+    They multiply in the operands' promoted dtype, accumulate in fp32 and
+    ignore `precision`. With 16-bit operands that is exact products summed in
+    fp32, which is what any precision asks for. With fp32 operands it is
+    TF32 on a GPU, which only the default precision asks for (explicitly or
+    through `jax_default_matmul_precision`), and float64 they do not run.
+    The kernels see local arrays, so a mesh that splits anything outside a
+    `shard_map` is XLA's to partition.
+    """
+    compute = jnp.promote_types(lhs, rhs)
+    if compute not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
+        if compute != jnp.dtype(jnp.float32):
+            return False
+        asked = precision_names(precision) or precision_names(
+            jax.config.jax_default_matmul_precision)
+        if asked - {'DEFAULT', 'BFLOAT16', 'FASTEST', 'TENSORFLOAT32'}:
+            return False
+    mesh = jax.sharding.get_abstract_mesh()
+    return all(mesh.shape[name] == 1 for name in mesh.axis_names
+               if name not in mesh.manual_axes)
+
+
+def _gmm(tokens, kernel, group_sizes, out_dtype, *, trans_rhs: bool = False):
+    from .kernels import ragged_dot
+    ragged_dot.register_devices()
+    compute = jnp.promote_types(tokens.dtype, kernel.dtype)
+    return ragged_dot.gmm(
+        tokens.astype(compute), kernel.astype(compute), group_sizes.astype(jnp.int32),
+        **ragged_dot.block_sizes(compute), trans_rhs=trans_rhs,
+        interpret=jax.default_backend() != 'gpu', compute_dtype=compute,
+        out_dtype=jnp.dtype(out_dtype))
+
+
+def _tgmm(tokens, cotangent, group_sizes, out_dtype):
+    from .kernels import ragged_dot
+    ragged_dot.register_devices()
+    compute = jnp.promote_types(tokens.dtype, cotangent.dtype)
+    return ragged_dot.tgmm(
+        tokens.astype(compute), cotangent.astype(compute), group_sizes.astype(jnp.int32),
+        **ragged_dot.block_sizes(compute), interpret=jax.default_backend() != 'gpu',
+        compute_dtype=compute, out_dtype=jnp.dtype(out_dtype))
 
 
 def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
@@ -441,7 +440,6 @@ def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> 
     return values.at[expert_ids].get(mode='fill', fill_value=0).astype(dtype)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
 def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
                       precision: PrecisionLike) -> jax.Array:
@@ -453,20 +451,35 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     tangent is `dx @ Q(kernel) + Q(x) @ dkernel` with `Q` the rounded operand
     values and the tangents in their own dtypes: a kernel gradient keeps the
     master dtype, an input gradient its input's, and both accumulate over
-    the widest of the compute, input and kernel dtypes. The contract holds
-    in both differentiation directions and does not depend on placement.
+    the widest of the compute, input and kernel dtypes. The contract does
+    not depend on placement.
 
-    The tangent contractions run on the same grouped matmul as the forward
-    where JAX can transpose it ('xla', 'tiled'), and on `jax.lax.ragged_dot`
-    under 'tokamax', whose own rules stop at reverse mode. Their operands
-    are in the work dtype, not the compute dtype, even where the values are
-    exact in bf16: forward-over-reverse differentiates a tangent
-    contraction again, and a bf16 dot there would round the master-dtype
-    kernel tangent. Measured against NumPy float64 sums of the rounded
-    operands and three Adam steps of the global path on every expert/fsdp
-    layout in tests/test_moe_precision.py; with fp32 operands the forward
-    pass is the call it wraps.
+    'xla' and 'tokamax' hold it in every differentiation mode: the forward
+    runs on the chosen kernel and the tangent contractions on
+    `jax.lax.ragged_dot`, whose transposes JAX defines. 'pallas' holds it in
+    first-order reverse mode, the way MaxText wires megablox: a custom VJP
+    whose forward is `gmm`, whose input gradient is `gmm` against the
+    transposed kernel and whose kernel gradient is `tgmm`. Its compute
+    dtype's rounding makes the backward exact products summed in fp32 when
+    the compute dtype is 16-bit. Where `pallas_runs` says the kernels would
+    change the product, 'pallas' is 'xla'. Measured against NumPy float64
+    sums of the rounded operands and three Adam steps of the global path on
+    every expert/fsdp layout in tests/test_moe_precision.py.
     """
+    compute = canonicalize_dtype(x, kernel, dtype=dtype)
+    if (resolve_grouped_matmul(implementation) == 'pallas'
+            and pallas_runs(compute, compute, precision)):
+        return _pallas_projection(x, kernel, group_sizes, dtype)
+    if implementation == 'pallas':
+        implementation = 'xla'
+    return _projection(x, kernel, group_sizes, dtype, implementation, precision)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
+def _projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
+                dtype: Dtype | None, implementation: str,
+                precision: PrecisionLike) -> jax.Array:
+    """`expert_projection` in every differentiation mode."""
     x, kernel = promote_dtype(x, kernel, dtype=dtype)
     accumulated = grouped_matmul(
         x, kernel, group_sizes, implementation=implementation, precision=precision,
@@ -474,31 +487,62 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     return accumulated.astype(x.dtype)
 
 
-@expert_projection.defjvp
-def _expert_projection_jvp(dtype: Dtype | None, implementation: str,
-                           precision: PrecisionLike,
-                           primals: tuple[jax.Array, jax.Array, jax.Array],
-                           tangents: tuple[jax.Array, jax.Array, jax.Array]
-                           ) -> tuple[jax.Array, jax.Array]:
+@_projection.defjvp
+def _projection_jvp(dtype: Dtype | None, implementation: str, precision: PrecisionLike,
+                    primals: tuple[jax.Array, jax.Array, jax.Array],
+                    tangents: tuple[jax.Array, jax.Array, jax.Array]
+                    ) -> tuple[jax.Array, jax.Array]:
     x, kernel, group_sizes = primals
     dx, dkernel, _ = tangents
     # The tangents keep their dtypes to this point whatever produced them, so
     # an activation's bf16 cotangent is not fused into a wider expression.
     dx, dkernel = jax.lax.optimization_barrier((dx, dkernel))
-    output = jnp.asarray(expert_projection(x, kernel, group_sizes, dtype, implementation, precision))
+    output = jnp.asarray(_projection(x, kernel, group_sizes, dtype, implementation, precision))
     work = jnp.result_type(output.dtype, x.dtype, kernel.dtype, jnp.float32)
     inputs = jnp.asarray(rounded_operand(x, output.dtype))
     matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
-    tangents_on = resolve_grouped_matmul(implementation)
-    tangents_on = 'xla' if tangents_on == 'tokamax' else tangents_on
-    input_term = grouped_matmul(
-        dx.astype(work), matrix.astype(work), group_sizes, implementation=tangents_on,
-        precision=precision, preferred_element_type=work)
-    kernel_term = grouped_matmul(
-        inputs.astype(work), dkernel.astype(work), group_sizes, implementation=tangents_on,
-        precision=precision, preferred_element_type=work)
+    input_term = jax.lax.ragged_dot(
+        dx.astype(work), matrix.astype(work), group_sizes, precision=precision,
+        preferred_element_type=work)
+    kernel_term = jax.lax.ragged_dot(
+        inputs.astype(work), dkernel.astype(work), group_sizes, precision=precision,
+        preferred_element_type=work)
     tangent = jax.lax.optimization_barrier((input_term + kernel_term).astype(output.dtype))
     return output, tangent
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def _pallas_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
+                       dtype: Dtype | None) -> jax.Array:
+    """`expert_projection` on the Pallas kernels, first-order reverse mode."""
+    return _pallas_projection_fwd(x, kernel, group_sizes, dtype)[0]
+
+
+def _pallas_projection_fwd(x, kernel, group_sizes, dtype):
+    inputs, matrix = promote_dtype(x, kernel, dtype=dtype)
+    output = _gmm(inputs, matrix, group_sizes, jnp.promote_types(inputs.dtype, jnp.float32))
+    # The residuals are the rounded operands, the values the forward
+    # multiplied; the dtypes of the originals are what the gradients take.
+    residuals = (inputs, matrix, group_sizes, jnp.zeros((0,), x.dtype),
+                 jnp.zeros((0,), kernel.dtype))
+    return output.astype(inputs.dtype), residuals
+
+
+def _pallas_projection_bwd(dtype, residuals, cotangent):
+    del dtype
+    inputs, matrix, group_sizes, x_like, kernel_like = residuals
+    work = jnp.result_type(inputs.dtype, x_like.dtype, kernel_like.dtype, jnp.float32)
+    # The cotangent is in the compute dtype, so with 16-bit compute both
+    # products multiply values exact in it and sum in fp32: the work-dtype
+    # contraction of the contract, without widening the operands.
+    cotangent = cotangent.astype(inputs.dtype)
+    d_inputs = _gmm(cotangent, matrix, group_sizes, work, trans_rhs=True)
+    d_matrix = _tgmm(inputs, cotangent, group_sizes, work)
+    return (d_inputs.astype(x_like.dtype), d_matrix.astype(kernel_like.dtype),
+            np.zeros(group_sizes.shape, jax.dtypes.float0))
+
+
+_pallas_projection.defvjp(_pallas_projection_fwd, _pallas_projection_bwd)
 
 
 @jax.custom_jvp
