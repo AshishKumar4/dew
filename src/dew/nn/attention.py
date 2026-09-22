@@ -1182,7 +1182,8 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
             live = jnp.asarray(valid, bool)[:, None, None, :]
             mask = live if mask is None else mask & live
         if mask is not None:
-            mask = combined_attention_mask(length, length, True, window, mask)
+            mask = combined_attention_mask(length, length, causal=True,
+                                           sliding_window=window, mask=mask)
             implementation = masked
         return scaled_dot_product_attention(
             query, key, value, dtype=dtype, precision=precision,

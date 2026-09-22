@@ -24,6 +24,7 @@ from dew.interop.hf_decoders import (
     _rope,
 )
 from dew.nn import llama4 as llama4_nn
+from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -99,7 +100,7 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     return config
 
 
-def _llama4_export(model) -> dict[str, object]:
+def _llama4_export(model: CausalTransformer) -> Mapping[str, object]:
     """The config field the rotated layers' chunk goes back out under: every
     chunked kind shares Llama 4's one `attention_chunk_size`."""
     chunks = {kind.chunk for kind in (model.kinds or {}).values() if kind.chunk is not None}

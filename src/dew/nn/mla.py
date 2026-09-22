@@ -657,7 +657,7 @@ class MultiHeadLatentAttention(nn.Module):
                  attention_metadata: AttentionMetadata | None = None):
         causal, mask, objective = self.causal, None, None
         implementation = self.attention_impl
-        batch, length, _ = x.shape
+        _, length, _ = x.shape
         valid = None if attention_metadata is None else attention_metadata.valid
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             raise ValueError("MLA does not implement multi-axis rotary positions")
