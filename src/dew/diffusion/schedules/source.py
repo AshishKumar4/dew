@@ -2,19 +2,22 @@
 
 One class of a published `scheduler_config.json` is interpreted once, here,
 into the native process, solver and time grid that reproduce its
-`set_timesteps` and `step`. Each pinned Diffusers 0.34.0 class declares its own
-constructor controls with its own defaults and builds its grid its own way, so
-`_SOURCES` names, per class, exactly the keys that class reads and the grid
-family it belongs to; a key another class declares is not read here, the way
-the source ignores it. Whatever a class does declare and this file does not
-reconstruct is refused rather than dropped.
+`set_timesteps` and `step`.
+
+Each pinned Diffusers 0.34.0 class declares its own constructor controls with
+its own defaults and builds its grid its own way. `_SOURCES` therefore names,
+per class, exactly the keys that class reads and the grid family it belongs
+to. A key another class declares is not read here, the way the source ignores
+it, and whatever a class does declare and this file does not reconstruct is
+refused rather than dropped.
 
 The five families are the shapes those `set_timesteps` take:
 
 - `tabulated`: DDIM, PNDM, DDPM, LCM and TCD step between integer indices of
   the training beta table, so the schedule is that table and the grid is the
-  indices. DDIM and PNDM transfer over a fixed training stride whatever their
-  evaluation spacing; DDPM, LCM and TCD step to the grid's own next point.
+  indices. DDIM and PNDM transfer over a fixed training stride whatever
+  their evaluation spacing. DDPM, LCM and TCD step to the grid's own next
+  point.
 - `lambda`: DPM-Solver multistep and singlestep, DEIS and UniPC integrate in
   log-SNR over paired sigma and model-time tables, normalized so that
   alpha^2 + sigma^2 is 1, and truncate their model times to integers.
@@ -23,8 +26,8 @@ The five families are the shapes those `set_timesteps` take:
   1 / sqrt(sigma^2 + 1).
 - `stage`: KDPM2, KDPM2 ancestral and DPMSolverSDE evaluate the model twice
   per interval. Their grids carry the interpolated stage rows the source
-  places between grid points, so the solver's own second evaluation reads the
-  source's sigma and model time there while the outer walk still visits one
+  places between grid points. The solver's second evaluation reads the
+  source's sigma and model time there, while the outer walk still visits one
   point per interval.
 - `edm`: EDMDPMSolverMultistep is EDM's own convention, sigma_min to sigma_max
   at rho with c_noise = log(sigma) / 4 and a signed c_out. It has no beta
@@ -106,9 +109,12 @@ _TRANSFORM_CONTROLS: tuple[tuple[Transform, str], ...] = (
 
 
 class Control(Protocol):
-    """One class's reading of a control by name: the value the file states,
-    the class's own declared default when the file omits it, and `absent` when
-    this class declares no such control at all."""
+    """Reads one class's control by name.
+
+    The answer is the value the file states, the class's own declared default
+    when the file omits it, or `absent` when this class declares no such
+    control at all.
+    """
 
     def __call__(self, key: str, absent: JSON = None) -> JSON: ...
 
@@ -129,11 +135,11 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
     """The class's beta table, rescaled for zero terminal SNR when it asks.
 
     Every control arrives already resolved against the class's own declared
-    default, so a file that omits one gets that class's value and a file that
-    carries a control the class does not declare does not reach the table.
-    `schedules` are the `beta_schedule` tables the class implements: all of
-    them accept the three common ones, DDPM adds GeoDiff's sigmoid and Heun
-    the exponential alpha-bar.
+    default. A file that omits one gets that class's value, and a control the
+    class does not declare never reaches the table. `schedules` are the
+    `beta_schedule` tables the class implements: all of them accept the three
+    common ones, DDPM adds GeoDiff's sigmoid and Heun the exponential
+    alpha-bar.
     """
     length = records.integer(count, "num_train_timesteps")
     if length < 1:
@@ -208,9 +214,12 @@ _NO_SAMPLE = ("epsilon", "v_prediction")
 
 @dataclass(frozen=True)
 class _Class:
-    """One pinned scheduler class: its grid family, the constructor controls it
-    declares with that class's own defaults, the `beta_schedule` tables it
-    accepts and the `prediction_type` values its own `step` converts."""
+    """Describes one pinned scheduler class.
+
+    The fields are its grid family, the constructor controls it declares with
+    that class's own defaults, the `beta_schedule` tables it accepts, and the
+    `prediction_type` values its own `step` converts.
+    """
 
     family: Family
     fields: Mapping[str, JSON]
@@ -293,12 +302,12 @@ _KARRAS_ROUNDS = ("DPMSolverSinglestep", "DEISMultistep", "UniPCMultistep",
 
 @dataclass(frozen=True)
 class _Flow:
-    """A rectified-flow file's shift controls and the shift they name.
+    """Holds a rectified-flow file's shift controls and the shift they name.
 
-    `shift` alone is the static form; with `dynamic` the shift follows the
+    `shift` alone is the static form. With `dynamic` the shift follows the
     latent's token count through the source pipeline's `calculate_shift`,
-    which returns mu itself, and `terminal` stretches the result to end where
-    the file says.
+    which returns mu itself. `terminal` stretches the result to end where the
+    file says.
     """
 
     shift: float
@@ -311,8 +320,11 @@ class _Flow:
     kind: str
 
     def mu(self, tokens: int) -> float:
-        """The source pipeline's `calculate_shift`: mu interpolated linearly
-        in the token count, not exponentiated."""
+        """The source pipeline's `calculate_shift`.
+
+        mu is interpolated linearly in the token count and is not
+        exponentiated here.
+        """
         slope = (self.max_shift - self.base_shift) / (self.max_tokens - self.base_tokens)
         return tokens * slope + self.base_shift - slope * self.base_tokens
 
@@ -320,7 +332,7 @@ class _Flow:
         """The sigmas after this file's shift.
 
         The static and the dynamic forms are the same map with a different
-        base: shift s / (1 + (shift - 1) s) is base / (base + 1/s - 1) at
+        base. shift s / (1 + (shift - 1) s) is base / (base + 1/s - 1) at
         base = shift, and the dynamic base is exp(mu) or mu itself.
         """
         if not self.dynamic:
@@ -374,12 +386,12 @@ class _Policy:
 
 def _spaced_times(spacing: str, *, train_steps: int, steps: int, offset: int, last: int,
                   extra: int, rounded: bool) -> np.ndarray:
-    """A source `set_timesteps` evaluation grid: Table 2 of Lin et al. 2023 in
-    the three forms the pinned classes write it.
+    """A source `set_timesteps` evaluation grid, Table 2 of Lin et al. 2023.
 
+    The three spacings are the three forms the pinned classes write it in.
     `extra` is the additional point the log-SNR classes lay out and drop,
-    `last` the end of the table left after lambda clipping, and `rounded`
-    whether the class rounds its linspace before using it.
+    `last` is the end of the table left after lambda clipping, and `rounded`
+    is whether the class rounds its linspace before using it.
     """
     if spacing == "linspace":
         times = np.linspace(0, last - 1, steps + extra, dtype=np.float64)
@@ -500,9 +512,9 @@ class SourceSchedule:
         """The process the checkpoint was trained under.
 
         Every class but the EDM one tabulates a VP beta table and trains on
-        it. EDM's convention has no beta table and no VP law, so its training
-        process is EDM's own log-normal sigma draw over the same
-        preconditioning the sampler reads.
+        it. EDM's convention has no beta table and no VP law. Its training
+        process is EDM's own log-normal sigma draw, over the preconditioning
+        the sampler reads.
         """
         if self.policy.family == "flow":
             return Process(FlowMatchingScheduler(), self.prediction)
@@ -523,12 +535,12 @@ class SourceSchedule:
         near-zero terminal alpha the zero-SNR classes substitute.
 
         The source accumulates this product in double and keeps the result in
-        float32, which is what `torch.cumprod` of a float32 table does; the
-        ratio and its logarithm are then float32. Both halves matter: a
+        float32, which is what `torch.cumprod` of a float32 table does, so
+        the ratio and its logarithm are float32 too. Both halves matter. A
         float32 accumulation moves the cosine table's last alpha, about
-        2.4e-9, by a part in a million and its sigma by 8e-3, and a float64
-        ratio moves a model time recovered by log-linear search across the
-        integer boundary it is truncated at.
+        2.4e-9, by a part in a million and its sigma by 8e-3. A float64 ratio
+        moves a model time recovered by log-linear search across the integer
+        boundary it is truncated at.
         """
         alphas = np.cumprod(1 - self.betas, dtype=np.float64).astype(np.float32)
         if self.policy.zero_snr_tail:
@@ -592,7 +604,7 @@ class SourceSchedule:
         form the geometric mean of the start and k-diffusion's `sigma_down`,
         and DPMSolverSDE the midpoint in -log(sigma), which is that same
         geometric mean. Every stage model time is the source's log-linear
-        inverse of the stage sigma in the training table; the interval that
+        inverse of the stage sigma in the training table. The interval that
         lands on zero has no stage evaluation and carries zero.
         """
         policy = self.policy
@@ -621,14 +633,14 @@ class SourceSchedule:
         """Refuse a grid whose first model time appears again in it.
 
         The source finds the step it starts at by matching that time against
-        the whole list of times it will evaluate and takes the second match
-        when the time repeats, which shifts its walk by one and runs off the
-        end of its sigma table. A list that repeats its first time therefore
-        has no source trajectory to reproduce; the Karras grid of a cosine
-        table at a small step count is the case that reaches it, because the
-        largest sigmas of that table all recover the same index. Repeats after
-        the first entry are left alone: the two-evaluation classes and PNDM's
-        warmup place them on purpose and count from where they started.
+        the whole list of times it will evaluate. A repeated first time makes
+        it take the second match, which shifts its walk by one and runs off
+        the end of its sigma table, so such a list has no source trajectory
+        to reproduce. The Karras grid of a cosine table at a small step count
+        is the case that reaches it, because the largest sigmas of that table
+        all recover the same index. Repeats after the first entry are left
+        alone: the two-evaluation classes and PNDM's warmup place them on
+        purpose and count from where they started.
         """
         if len(times) > 1 and float(np.sum(times == times[0])) > 1:
             raise ValueError(
@@ -641,10 +653,10 @@ class SourceSchedule:
         """`FlowMatchEulerDiscreteScheduler.set_timesteps` in its own order.
 
         `origin` is where the sigmas start, which is a pipeline fact rather
-        than a config one: SD3 lets the scheduler lay them out between its own
-        sigma extremes, and Flux hands it `linspace(1, 1/N, N)`. Then comes the
-        file's shift, then whichever sigma conversion it asks for, then the
-        appended zero.
+        than a config one. SD3 lets the scheduler lay them out between its own
+        sigma extremes, and Flux hands it `linspace(1, 1/N, N)`. Then comes
+        the file's shift, then whichever sigma conversion it asks for, then
+        the appended zero.
         """
         policy = self.policy
         count = policy.train_steps
@@ -667,9 +679,11 @@ class SourceSchedule:
         return np.append(sigmas, 0.0), np.asarray(sigmas, np.float64) * count, 1.0
 
     def _edm_grid(self, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
-        """EDM's own grid: rho spacing or an exponential one between sigma_min
-        and sigma_max, with c_noise = log(sigma) / 4 as the model time and the
-        prior of unit data at sigma_max."""
+        """EDM's own grid, rho or exponential spacing between the sigma extremes.
+
+        The model time is c_noise = log(sigma) / 4 and the prior is unit data
+        at sigma_max.
+        """
         policy = self.policy
         low = 0.002 if policy.sigma_min is None else policy.sigma_min
         high = 80.0 if policy.sigma_max is None else policy.sigma_max
@@ -684,8 +698,8 @@ class SourceSchedule:
         """The process and the explicit descending grid a `steps` walk takes.
 
         `tokens` is the latent token count a resolution-dependent flow shift
-        reads, and `origin` where a flow file's sigmas start; both are the
-        calling pipeline's, bound through the task's grid callable.
+        reads, and `origin` is where a flow file's sigmas start. Both belong
+        to the calling pipeline, bound through the task's grid callable.
         """
         held = self._grids.get((steps, tokens, origin))
         if held is None:
@@ -751,9 +765,11 @@ class SourceSchedule:
 
 def _algorithm(kind: str, family: str, declared: Mapping[str, JSON],
                value: Control) -> Algorithm:
-    """The algorithm this class integrates with, after its own coercions: each
-    pinned class rewrites a few foreign names to its own before refusing the
-    rest, and the EDM class refuses the two non-++ ones outright."""
+    """The algorithm this class integrates with, after its own coercions.
+
+    Each pinned class rewrites a few foreign names to its own before refusing
+    the rest, and the EDM class refuses the two non-++ ones outright.
+    """
     if "algorithm_type" not in declared:
         return "dpmsolver++"
     algorithm = str(value("algorithm_type"))
@@ -912,7 +928,7 @@ def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
     """The native solver this class and its controls name, built once.
 
     A solver is a frozen value, so the file's class and controls resolve into
-    one here and `SourceSchedule.solver()` hands that same value out; nothing
+    one here and `SourceSchedule.solver()` hands that same value out. Nothing
     downstream re-reads a control to rebuild it.
     """
     if kind == "DDIM":

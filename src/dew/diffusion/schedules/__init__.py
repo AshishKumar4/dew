@@ -1,3 +1,5 @@
+"""The noise schedules, one module per family."""
+
 from .common import GeneralizedNoiseScheduler, NoiseScheduler, expand
 from .continuous import ContinuousNoiseScheduler
 from .cosine import (

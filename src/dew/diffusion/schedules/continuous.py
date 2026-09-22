@@ -1,3 +1,5 @@
+"""The continuous-time base every fractional-time schedule shares."""
+
 import jax
 
 from .common import NoiseScheduler

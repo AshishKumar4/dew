@@ -1,9 +1,10 @@
 """Entropy-bounded block generation for a shared-weight diffusion language model.
 
-DiffusionGemma Technical Report (2608.00146), Algorithm 1: initialize a uniform
-canvas, refine it with tempered self-conditioning, stop stable/confident rows,
-and commit the final argmax canvas through the causal encoder. The compiled
-loops keep fixed bounds and mask finished rows, including their step counts.
+Algorithm 1 of the DiffusionGemma Technical Report (2608.00146): initialize a
+uniform canvas, refine it with tempered self-conditioning, stop stable and
+confident rows, and commit the final argmax canvas through the causal
+encoder. The compiled loops keep fixed bounds and mask finished rows,
+including their step counts.
 """
 
 from __future__ import annotations
@@ -40,16 +41,19 @@ from dew.objectives.base import Variables
 
 @struct.dataclass
 class CanvasGeneration(Generic[ArrayT]):
-    """Prompt plus padded response, with no autoregressive likelihood claim.
+    """Carries a prompt plus its padded response, with no autoregressive
+    likelihood claim.
 
     ``lengths`` counts response tokens including the first EOS, not prompt
-    tokens. ``decoder_steps`` counts useful refinements per row across canvases.
-    ``terminated`` distinguishes EOS from the requested token limit. A request
-    for ``n`` continuations per prompt gives every array ``[B * n, ...]``
-    rows, each prompt's continuations together and in prompt order. Arrays
-    keep the placement the task ran with; ``host()`` reads this process's
-    ``rows`` real rows back, and ``text`` decodes them through the bound
-    processor.
+    tokens. ``decoder_steps`` counts useful refinements per row across
+    canvases. ``terminated`` distinguishes EOS from the requested token
+    limit. A request for ``n`` continuations per prompt gives every array
+    ``[B * n, ...]`` rows, each prompt's continuations together and in prompt
+    order.
+
+    Arrays keep the placement the task ran with. ``host()`` reads this
+    process's ``rows`` real rows back, and ``text`` decodes them through the
+    bound processor.
     """
 
     tokens: ArrayT
@@ -78,7 +82,12 @@ class CanvasGeneration(Generic[ArrayT]):
 
 @struct.dataclass
 class CanvasState:
-    """The refinement state; previous logits reset between canvases."""
+    """What one canvas carries between refinement steps.
+
+    `logits` are the previous step's, which self-conditioning reads; a new
+    canvas starts at zeros. `stable_steps` counts consecutive identical
+    argmax canvases, and `finished` marks the rows a stop test ended.
+    """
 
     canvas: jax.Array
     logits: jax.Array
@@ -95,11 +104,13 @@ def _entropy(logits: jax.Array) -> jax.Array:
 
 @dataclass(frozen=True)
 class BlockProcess:
-    """Uniform-vocabulary diffusion with the published entropy-bound sampler.
+    """Runs uniform-vocabulary diffusion with the published entropy-bound
+    sampler.
 
-    The temperature uses steps remaining, N through 1, rather than a second
-    independently configured time grid. Stability counts previous identical
-    argmax canvases; threshold one needs two matching predictions.
+    The temperature reads the steps remaining, N through 1, rather than a
+    second independently configured time grid. Stability counts previous
+    identical argmax canvases, so threshold one needs two matching
+    predictions.
     """
 
     canvas_length: int
@@ -138,7 +149,7 @@ class BlockProcess:
 
     def accept(self, current: jax.typing.ArrayLike, denoised: jax.typing.ArrayLike,
                logits: jax.typing.ArrayLike) -> tuple[jax.Array, jax.Array]:
-        """Accept the lowest-entropy prefix whose cumulative excess fits the bound."""
+        """Accepts the lowest-entropy tokens whose cumulative entropy fits the bound."""
         entropy = _entropy(jnp.asarray(logits))
         order = jnp.argsort(entropy, axis=-1, stable=True)
         ranked = jnp.take_along_axis(entropy, order, axis=-1)
@@ -154,7 +165,7 @@ class BlockProcess:
     @partial(jax.jit, static_argnames=("self", "model", "batch"))
     def refine(self, model: DiffusionGemma, variables: Variables, cache: Variables,
                key: jax.Array, batch: int, finished: jax.Array) -> CanvasState:
-        """Refine one canvas without updating its prefix cache."""
+        """Refines one canvas without updating its prefix cache."""
         shape = (batch, self.canvas_length)
         initial = CanvasState(
             canvas=self.noise(jax.random.fold_in(key, 0), shape),
@@ -208,20 +219,23 @@ class BlockProcess:
                  inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
                  max_new_tokens: int, *, key: jax.Array | None = None, seed: int | None = None,
                  n: int = 1, eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
-        """Run prefill, refinement and clean-token commits as one device computation.
+        """Runs prefill, refinement and clean-token commits as one device
+        computation.
 
-        The last canvas is fully refined even when only part is requested;
-        output is cropped to the token limit. Finished rows are padded after
-        their first EOS. No host-side decisions depend on generated tokens.
-        Weights keep their placement; on a mesh, rows split over its batch
-        axes and the result keeps that sharding. The canvas sampler draws
-        one batch-wide key per refinement, so a row's draw depends on the
-        rows placed with it.
+        The last canvas is fully refined even when only part is requested,
+        and the output is cropped to the token limit. Finished rows are
+        padded after their first EOS. No host-side decision depends on a
+        generated token.
+
+        Weights keep their placement. On a mesh, rows split over its batch
+        axes and the result keeps that sharding. The canvas sampler draws one
+        batch-wide key per refinement, so a row's draw depends on the rows
+        placed with it.
 
         ``n`` continuations of each prompt share its prefill and refine
         independently from it. They leave as ``n`` consecutive rows per
-        prompt, in prompt order. Continuation zero refines with the
-        request's own key, so it is what a single continuation draws.
+        prompt, in prompt order. Continuation zero refines with the request's
+        own key, so it is what a single continuation draws.
         """
         prepared = None
         error = None
@@ -254,7 +268,11 @@ class BlockProcess:
 
 @dataclass(frozen=True)
 class CanvasPlan:
-    """Static controls of one canvas request; every field enters the compiled step."""
+    """Holds the static controls of one canvas request.
+
+    Every field enters the compiled step, so a change to any of them is a
+    recompilation.
+    """
 
     process: BlockProcess
     eos_token_ids: tuple[int, ...]
@@ -269,10 +287,11 @@ class CanvasPlan:
 
 @struct.dataclass
 class CanvasDecodeState:
-    """Committed output and prefix cache between complete canvas refinements.
+    """Carries the committed output and prefix cache between canvas refinements.
 
-    index counts refined canvases even after individual rows finish. It is
-    the random-key fold and commit position, independent of emitted lengths.
+    `index` counts refined canvases even after individual rows finish. It is
+    the random-key fold and the commit position, independent of the emitted
+    lengths.
     """
 
     cache: Variables
@@ -282,7 +301,7 @@ class CanvasDecodeState:
 
 def _validated(model: DiffusionGemma, process: BlockProcess, inputs: ModelInputs, max_new_tokens: int,
                eos_token_ids: tuple[int, ...], pad_token_id: int, n: int) -> None:
-    """Host checks before the compiled loop."""
+    """Raises for whatever a rank can get wrong before the compiled loop."""
     if type(max_new_tokens) is not int or max_new_tokens < 0:
         raise ValueError("max_new_tokens must be a nonnegative integer")
     if type(n) is not int or n < 1:

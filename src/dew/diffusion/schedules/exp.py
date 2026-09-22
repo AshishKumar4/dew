@@ -1,3 +1,5 @@
+"""The exponential beta table."""
+
 import numpy as np
 
 from .discrete import DiscreteNoiseScheduler

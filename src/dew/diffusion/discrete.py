@@ -46,11 +46,15 @@ from dew.objectives.base import Variables
 from dew.registry import presets, samplers
 
 MDLM_STEPS = 64
+"""Reverse steps `generate` takes by default, the count MDLM samples with."""
 
 
 class MaskingSchedule(ABC):
-    """alpha(t) in (0, 1]: the fraction of tokens left unmasked at t, with
-    alpha(0) = 1."""
+    """Says how fast tokens are masked along t.
+
+    `alpha(t)` in (0, 1] is the fraction of tokens left unmasked at t, with
+    alpha(0) = 1.
+    """
 
     @abstractmethod
     def alpha(self, t) -> jax.Array: ...
@@ -62,8 +66,11 @@ class MaskingSchedule(ABC):
 
 @dataclass(frozen=True)
 class LogLinear(MaskingSchedule):
-    """MDLM's log-linear schedule: alpha(t) = 1 - (1 - eps) t, so the masking
-    rate -log alpha is linear in log space and the NELBO weight is 1 / t."""
+    """MDLM's log-linear schedule, alpha(t) = 1 - (1 - eps) t.
+
+    The masking rate -log alpha is then linear in log space and the NELBO
+    weight is 1 / t.
+    """
 
     eps: float = 1e-3
 
@@ -76,16 +83,19 @@ class LogLinear(MaskingSchedule):
 
 @dataclass(frozen=True)
 class DiscreteProcess:
-    """The masking process over a vocabulary whose mask token is `mask_id`."""
+    """Masks tokens of a vocabulary whose mask token is `mask_id`."""
 
     schedule: MaskingSchedule
     mask_id: int
     T = 1.0
+    """The fully masked end of the time domain, as a Gaussian process names it."""
 
     def sample_t(self, key, n: int) -> jax.Array:
-        """`n` times stratified over [0, 1), MDLM's antithetic draw. One
-        uniform offset is shared by the batch, so the weights 1 / t of one
-        batch cover the trajectory."""
+        """`n` times stratified over [0, 1), MDLM's antithetic draw.
+
+        One uniform offset is shared by the batch, so the weights 1 / t of
+        one batch cover the trajectory.
+        """
         offset = jax.random.uniform(key, (), minval=0.0, maxval=1.0)
         return (jnp.arange(n, dtype=jnp.float32) + offset) / n
 
@@ -96,9 +106,11 @@ class DiscreteProcess:
         return jnp.where(is_masked, self.mask_id, tokens), is_masked
 
     def weight(self, t) -> jax.Array:
-        """The NELBO weight -alpha'(t) / (1 - alpha(t)) on the masked cross
-        entropy, and exactly zero at t = 0. Nothing is masked there, so no
-        token contributes, and the quotient itself is undefined."""
+        """The NELBO weight -alpha'(t) / (1 - alpha(t)) on the masked cross entropy.
+
+        It is exactly zero at t = 0, where nothing is masked, no token
+        contributes, and the quotient itself is undefined.
+        """
         t = jnp.asarray(t, jnp.float32)
         return jnp.where(t > 0, -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t)), 0.0)
 
@@ -106,8 +118,10 @@ class DiscreteProcess:
         return jnp.linspace(self.T, 0.0, steps, dtype=jnp.float32)
 
     def noise(self, key, shape) -> jax.Array:
-        """x_T: every position masked. `key` is unused, the fully masked state
-        is one point."""
+        """x_T, with every position masked.
+
+        `key` goes unread: the fully masked state is one point, not a draw.
+        """
         return jnp.full(shape, self.mask_id, jnp.int32)
 
     def denoiser(self, model: nn.Module, params: Variables,
@@ -122,10 +136,11 @@ class DiscreteProcess:
                  max_new_tokens: int, *, key: jax.Array | None = None, seed: int | None = None,
                  n: int = 1, steps: int = MDLM_STEPS, sampler: Unmask | None = None,
                  eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
-        """Native MDLM over one full response span, not source-specific remasking.
+        """Runs native MDLM over one full response span.
 
-        Prompt tokens are immutable, including literal mask IDs. EOS trims the
-        completed response; it does not stop bidirectional refinement early.
+        Prompt tokens are immutable, including literal mask ids. EOS trims
+        the completed response and does not stop bidirectional refinement
+        early.
         """
         prepared = request = None
         error = None
@@ -192,10 +207,12 @@ class DiscreteDenoiser:
 @samplers("unmask")
 @dataclass(frozen=True)
 class Unmask:
-    """MDLM's reverse step from t to s < t: each masked position is revealed
-    with probability (alpha(s) - alpha(t)) / (1 - alpha(t)), with a token drawn
-    from the model's categorical; the rest stay masked. Integrates a
-    `DiscreteProcess`."""
+    """Integrates a `DiscreteProcess` with MDLM's reverse step from t to s < t.
+
+    Each masked position is revealed with probability
+    (alpha(s) - alpha(t)) / (1 - alpha(t)), taking a token drawn from the
+    model's categorical. The rest stay masked.
+    """
 
     def init(self, x, times, process, *, key) -> tuple:
         return ()
@@ -218,7 +235,7 @@ class Unmask:
 @presets("mdlm")
 @dataclass(frozen=True)
 class MDLM:
-    """Sahoo et al. 2024 with the log-linear schedule."""
+    """Builds the process of Sahoo et al. 2024, on the log-linear schedule."""
 
     mask_id: int
     eps: float = 1e-3
@@ -257,6 +274,14 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
 
 
 def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[ModelInputs, jax.Array]:
+    """`inputs` extended by `width` masked slots, and which slots may change.
+
+    Every per-token field is continued past the prompt's last real token: a
+    logical position counts on from it, a rotary coordinate counts on from
+    the largest on each axis, the attention mask marks the response valid for
+    rows that hold a prompt, and a segment id repeats. A field with no rule
+    here is filled with -1.
+    """
     batch, prompt = inputs.tokens.shape
     valid = jnp.asarray(inputs.token_fields.get("attention_mask", jnp.ones((batch, prompt), bool)), bool)
     active = valid.any(axis=1)
@@ -290,6 +315,12 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys: jax.Array,
               process: DiscreteProcess, sampler: Unmask, budget: int, steps: int, n: int,
               eos_ids: tuple[int, ...], pad_id: int) -> CanvasGeneration:
+    """The compiled body: one masked walk per row, `n` continuations each.
+
+    Each row is sampled on its own so the response span is the only mutable
+    part of it. A continuation keeps the tokens up to its first EOS, pads the
+    rest, and reports the steps it took.
+    """
     from dew.sampling.sample import sample
 
     batch, prompt = inputs.tokens.shape

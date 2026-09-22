@@ -1,3 +1,5 @@
+"""Karras schedules: the rho sigma grid and the EDM training draw."""
+
 import jax
 import jax.numpy as jnp
 

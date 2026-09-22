@@ -1,3 +1,6 @@
+"""Cosine schedules: the DDPM beta table, and its variance-exploding and
+continuous forms."""
+
 import math
 
 import jax.numpy as jnp
