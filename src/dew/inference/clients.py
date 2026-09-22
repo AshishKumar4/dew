@@ -297,8 +297,10 @@ class OllamaCompletion:
 def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None, tuple[float, ...] | None]:
     """Read one choice's reported sampled ids and log-probabilities, if any.
 
-    Ids are read only from vLLM's `token_id:<n>` rendering of the tokens;
-    text tokens are not reverse-mapped through a vocabulary.
+    Ids come from the choice's `token_ids` list when the engine returns one
+    (SGLang's `return_token_ids`), else from vLLM's `token_id:<n>` rendering
+    of the logprob tokens; text tokens are not reverse-mapped through a
+    vocabulary.
     """
     logprobs = entry.get("logprobs")
     if logprobs is None:
@@ -312,6 +314,12 @@ def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None,
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each reported token log-probability must be a number")
         probabilities.append(float(value))
+    listed = entry.get("token_ids")
+    if listed is not None:
+        if not isinstance(listed, list) or len(listed) != len(values) or any(
+                type(token) is not int or token < 0 for token in listed):
+            raise ValueError("choice token_ids must be nonnegative ids aligned with its token_logprobs")
+        return tuple(listed), tuple(probabilities)
     ids: list[int] = []
     for token in rendered:
         if not isinstance(token, str) or not token.startswith("token_id:"):
@@ -394,23 +402,24 @@ def _openai_fields(model: str, prompts: str | Sequence[str] | TokenRows, budget:
 
 @dataclass(frozen=True)
 class OpenAICompletion:
-    """Bind an OpenAI client, including one configured for vLLM's base_url.
+    """Bind an OpenAI client, including one configured for a vLLM or SGLang base_url.
 
     Native SDK request options pass through to completion/chat resources.
-    vLLM-only controls such as top_k/min_p/stop_token_ids belong explicitly in
-    extra_body. SDK responses and streaming chunks retain backend logprobs,
-    token IDs/extensions, tool calls and structured output fields unchanged.
-    Completion prompts are text or token-id rows; a row of ids reaches the
-    engine as ids, with no detokenize/retokenize round trip.
+    Engine-only controls such as top_k/min_p/stop_token_ids, which vLLM and
+    SGLang both accept, belong explicitly in extra_body. SDK responses and
+    streaming chunks retain backend logprobs, token IDs/extensions, tool calls
+    and structured output fields unchanged. Completion prompts are text or
+    token-id rows; a row of ids reaches the engine as ids, with no
+    detokenize/retokenize round trip.
     """
 
     model: str
     client: OpenAI | AsyncOpenAI
-    provider: Literal["openai", "vllm"] = "openai"
+    provider: Literal["openai", "vllm", "sglang"] = "openai"
 
     def __post_init__(self) -> None:
-        if self.provider not in ("openai", "vllm"):
-            raise ValueError("provider must be openai or vllm")
+        if self.provider not in ("openai", "vllm", "sglang"):
+            raise ValueError("provider must be openai, vllm or sglang")
 
     def _parameters(self, supplied: Mapping[str, object]) -> Mapping[str, object]:
         fields = dict(supplied)
@@ -422,7 +431,7 @@ class OpenAICompletion:
         if sampling.pad_id != 0:
             raise ValueError("remote text completion does not implement padded token rows")
         if self.provider == "openai" and (sampling.top_k is not None or sampling.min_p != 0 or sampling.eos_id is not None):
-            raise ValueError("top-k, min-p and EOS-token controls require provider='vllm'")
+            raise ValueError("top-k, min-p and EOS-token controls require provider='vllm' or 'sglang'")
         native: dict[str, object] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
                                      "frequency_penalty": 0.0, "presence_penalty": 0.0}
         controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
@@ -431,7 +440,7 @@ class OpenAICompletion:
             controls["stop_token_ids"] = list(sampling.eos_id) if isinstance(sampling.eos_id, tuple) else [sampling.eos_id]
         extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
         if self.provider == "openai" and controls.keys() & extra.keys():
-            raise ValueError("top-k, min-p, repetition and EOS-token controls in extra_body require provider='vllm'")
+            raise ValueError("top-k, min-p, repetition and EOS-token controls in extra_body require provider='vllm' or 'sglang'")
         # The SDK writes extra_body over the named parameters, so the policy
         # is checked against both namespaces of the final request body.
         policy = {**native, **controls}
@@ -441,7 +450,7 @@ class OpenAICompletion:
         if conflicts:
             raise ValueError(f"parameters conflict with Sampling: {conflicts}")
         fields.update(native)
-        if self.provider == "vllm":
+        if self.provider != "openai":
             fields["extra_body"] = {**extra, **controls}
         return fields
 
