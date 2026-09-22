@@ -1,5 +1,9 @@
-"""Attention: the one kernel path, the KV cache, and the blocks the UNets
-use, the latter ported from diffusers' attention_flax.py."""
+"""Attend over queries, keys and values, cache them, and block them up.
+
+One kernel path serves every attention module here. The KV cache and the
+UNet transformer blocks sit beside it; the blocks come from diffusers'
+attention_flax.py.
+"""
 
 import dataclasses
 import functools
@@ -20,18 +24,19 @@ from .attention_sinks import attention_with_sinks
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
-"""Which kernel an attention call runs, named once for every layer that
-carries the choice: a `ModelConfig`, the modules' `attention_impl` field and
-`scaled_dot_product_attention`'s `implementation`.
+"""Names which kernel an attention call runs.
 
-'reference' is the portable einsum and softmax, the only path that reads
-dtype, precision and force_fp32_for_softmax; 'xla' and 'cudnn' are
-`jax.nn.dot_product_attention`'s own two; 'tpu' is the pallas splash kernel,
+Every layer that carries the choice spells it the same way: a `ModelConfig`
+field, a module's `attention_impl`, and `scaled_dot_product_attention`'s
+`implementation`.
+
+'reference' is the portable einsum and softmax, and the only path that reads
+dtype, precision and force_fp32_for_softmax. 'xla' and 'cudnn' are
+`jax.nn.dot_product_attention`'s own two. 'tpu' is the pallas splash kernel,
 with the older pallas flash kernel behind it for the calls splash's mask
-descriptor cannot carry; 'auto' is cudnn where its kernel runs, 'tpu' where
-splash's does, and xla anywhere else, resolved per trace. A module field
-spells 'reference' as None as well, which is what a module built in code
-without the field set runs.
+descriptor cannot carry. 'auto' resolves per trace to cudnn where its kernel
+runs, tpu where splash's does, and xla anywhere else. A module field spells
+'reference' as None, which is what a module built without the field set runs.
 """
 
 
@@ -75,11 +80,13 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
 def combined_attention_mask(query_length: int, key_length: int, causal: bool,
                             sliding_window: int | None,
                             mask: jax.Array | None) -> jax.Array | None:
-    """`mask` with the structural positions folded in: a causal flag keeps
-    keys at or before each query's row, a window narrows that to the most
-    recent keys, both read off the row index the way the fused kernels take
-    them as flags. Unset stays unset, so a caller that distinguishes no mask
-    from an all-true one keeps doing so."""
+    """Fold causality and a sliding window into `mask`.
+
+    A causal flag keeps the keys at or before each query's row; a window
+    narrows that to the most recent keys. Both read the row index, the way
+    the fused kernels take them as flags. Unset stays unset, so a caller
+    that distinguishes no mask from an all-true one keeps doing so.
+    """
     if causal or sliding_window is not None:
         structural = causal_attention_mask(
             jnp.arange(query_length), key_length, sliding_window)
@@ -91,14 +98,15 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
                          sliding_window: int | None = None,
                          mask: jax.Array | None = None,
                          bias: jax.Array | None = None) -> jax.Array:
-    """Per query head, the largest pre-softmax logit: `[batch, heads]`, fp32.
+    """Return the largest pre-softmax logit per query head: `[batch, heads]`, fp32.
 
-    The logits are the scaled dot products the kernels softmax, masked
-    positions reading -inf so causality and packing never trip the maximum.
-    Grouped key heads repeat out to the query heads first, the same grouping
-    the kernels run. A logit softcap and attention sinks stay out: the clip
-    that reads this bounds the raw query-key growth, and a softcapped model
-    bounds it already."""
+    The logits are the scaled dot products the kernels softmax. Masked
+    positions read -inf, so causality and packing never trip the maximum.
+    Grouped key heads repeat out to the query heads first, the grouping the
+    kernels run. A logit softcap and attention sinks stay out: the clip that
+    reads this bounds the raw query-key growth, and a softcapped model bounds
+    it already.
+    """
     heads = query.shape[-2]
     key = repeat_kv_heads(key, heads)
     scale = 1.0 / math.sqrt(query.shape[-1])
@@ -115,30 +123,22 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
 
 
 def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
-    """`normalize` rematerialized, so the residual stream crosses into the
-    backward pass in the dtype the caller holds it in.
+    """Wrap a norm body in `jax.checkpoint` so nothing fp32 is retained.
 
-    Every norm here reduces over the width in fp32, which is what keeps a
-    bf16 run stable. Differentiated as written, that upcast is also what the
-    backward pass keeps: the fp32 copy of the norm's input and the fp32
-    normalized activations are both residuals, so a bf16 stream is saved at
-    fp32 twice per norm. On a SimpleDiT step (patch 4, emb 256, 8 layers, 4
-    heads, bf16, 128px, batch 64) that was 36 fp32 [64, 1024, 256] tensors,
-    2.35 GiB, against 48 bf16 ones for the stream itself; under this it is
-    one, the fp32 output head's own promoted input.
+    The norms reduce in fp32 for bf16 stability. Differentiated as written,
+    the backward pass would keep two fp32 copies of the activations per
+    norm. Recomputing them keeps only the bf16 input. On one SimpleDiT step
+    this saved 2.35 GiB.
 
-    The checkpoint saves nothing, so what the backward pass holds is the
-    arguments: the norm's input, its weight and its bias. It recomputes the
-    reductions rather than naming them, which keeps the recomputed block's
-    residuals a matter for the policy that recomputes it
-    (`causal_transformer.RESIDUALS`) and not for the norms underneath.
+    The policy saves nothing, so the backward pass holds the arguments: the
+    input, the weight and the bias. Recomputing the reductions rather than
+    naming them leaves the residuals to the policy that recomputes this
+    block (`causal_transformer.RESIDUALS`).
 
-    The wrapped function takes arrays first and its static arguments last, so
-    a caller reads its own parameters out of the variable tree and hands them
-    over as plain arrays: the checkpoint stays a jax transform over a pure
-    function, with no flax lifting between it and the module. The forward
-    values are the same ones in the same order, so a checkpoint and a
-    converged run are untouched; only the buffer assignment moves.
+    The wrapped function takes arrays first and static arguments last. A
+    caller passes its parameters as plain arrays, so no flax lifting sits
+    between the checkpoint and the module. The forward values are unchanged;
+    only the buffer assignment moves.
     """
     return jax.checkpoint(normalize, policy=jax.checkpoint_policies.nothing_saveable,
                           static_argnums=static_argnums)
@@ -146,9 +146,11 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
 
 @functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5))
 def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool):
-    """`RMSNorm`'s body: the root-mean-square normalization in fp32 and the
-    learned weight applied on whichever side of the cast the family puts it.
-    `scale` of None is the weightless norm."""
+    """Normalize `x` by its root mean square in fp32, then apply `scale`.
+
+    The families differ on which side of the cast the weight goes, which
+    `scale_after_cast` picks. `scale` of None is the weightless norm.
+    """
     y = x.astype(jnp.float32)
     y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + epsilon)
     if scale is None:
@@ -163,11 +165,13 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4))
 def layer_normalized(x, scale, bias, epsilon: float, dtype):
-    """`LayerNorm`'s body, op for op as flax computes it: E[x] and E[x^2] over
-    the width in fp32, the variance from the pair and clipped at zero, the
-    learned weight folded into the inverse deviation before it meets the
-    centered activations. `scale` and `bias` of None are the affine-free
-    norm."""
+    """Normalize `x` over its last axis, op for op as flax computes it.
+
+    E[x] and E[x^2] are reduced in fp32 and the variance comes from the
+    pair, clipped at zero. The weight folds into the inverse deviation
+    before it meets the centered activations. `scale` and `bias` of None
+    are the affine-free norm.
+    """
     y = x.astype(jnp.float32)
     row_mean = jnp.mean(y, axis=-1)
     variance = jnp.maximum(0.0, jnp.mean(jax.lax.square(y), axis=-1) - jax.lax.square(row_mean))
@@ -182,20 +186,20 @@ def layer_normalized(x, scale, bias, epsilon: float, dtype):
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm normalized in fp32, with Gemma's (1 + w) scale behind a flag.
+    """Normalize the last axis by its root mean square, reducing in fp32.
 
-    scale_offset also flips the initializer to zeros, so the identity is the
-    starting point either way and a Gemma checkpoint's stored weights land
-    unchanged.
+    `scale_offset` stores the weight as Gemma does, (1 + w), and flips the
+    initializer to zeros. The identity is the starting point either way, so
+    a Gemma checkpoint's stored weights land unchanged.
 
     The families differ in where the scale meets the activation dtype. Gemma
-    multiplies in fp32 and casts the product (modeling_gemma3.py:147-150);
-    Llama and Qwen3 cast the normalized activations first and multiply by
-    the scale in that dtype (modeling_qwen3.py:61-64), which
-    scale_after_cast reproduces. The two agree at fp32 and differ under bf16.
+    multiplies in fp32 and casts the product (modeling_gemma3.py:147-150).
+    Llama and Qwen3 cast first and multiply in that dtype
+    (modeling_qwen3.py:61-64), which `scale_after_cast` reproduces. The two
+    agree at fp32 and differ under bf16.
 
-    The fp32 reduction runs under `normalized_in_fp32`, so what the backward
-    pass keeps is this call's input in its own dtype, not an fp32 copy.
+    The reduction runs under `normalized_in_fp32`, so the backward pass
+    keeps this call's input in its own dtype, not an fp32 copy.
     """
     epsilon: float = 1e-5
     scale_offset: bool = False
@@ -215,20 +219,17 @@ class RMSNorm(nn.Module):
 
 
 class LayerNorm(nn.Module):
-    """flax's `nn.LayerNorm` over the last axis, keeping the residual stream
-    in the dtype the caller holds it in.
+    """Normalize the last axis as flax's `nn.LayerNorm` does, op for op.
 
-    Same parameter tree, same names, same fp32 arithmetic, so a checkpoint
-    written by either loads into the other and the forward values match bit
-    for bit. What differs is what the backward pass keeps: flax's version
-    leaves it the fp32 copy of the input and the fp32 centered activations,
-    and this one, through `normalized_in_fp32`, leaves it the input as it
-    arrived.
+    The parameter tree, the names and the fp32 arithmetic are flax's, so a
+    checkpoint written by either loads into the other and the forward values
+    match bit for bit. What differs is the backward pass: flax keeps an fp32
+    copy of the input and the fp32 centered activations, and this keeps the
+    input as it arrived, through `normalized_in_fp32`.
 
     The fields are the subset the tree sets. A norm over other axes, under a
-    mask, across a pmapped axis or on the slower exact variance is flax's to
-    serve, and a caller that needs one takes `nn.LayerNorm` and its fp32
-    residual with it.
+    mask, across a pmapped axis, or on the slower exact variance is flax's
+    to serve.
     """
     epsilon: float = 1e-6
     use_scale: bool = True
@@ -249,17 +250,18 @@ class LayerNorm(nn.Module):
 
 @dataclasses.dataclass(frozen=True)
 class RopeScaling:
-    """Llama 3.1's frequency ramp, under the reference's own names.
+    """Scales rotary frequencies by Llama 3.1's ramp, under the reference's names.
 
     `_compute_llama3_parameters` (transformers modeling_rope_utils.py:580)
-    divides the inverse frequencies whose wavelength exceeds
-    original_max_position_embeddings / low_freq_factor by `factor`, leaves
-    those below original_max_position_embeddings / high_freq_factor alone,
-    and interpolates linearly in between on
+    divides a frequency by `factor` when its wavelength exceeds
+    original_max_position_embeddings / low_freq_factor, and leaves it alone
+    below original_max_position_embeddings / high_freq_factor. In between it
+    interpolates linearly on
     (original_max_position_embeddings / wavelength - low_freq_factor)
-    / (high_freq_factor - low_freq_factor). `rope_type` is the record's
-    discriminator, and only 'llama3' is this ramp; YaRN is a mixer kind's
-    own value.
+    / (high_freq_factor - low_freq_factor).
+
+    `rope_type` is the record's discriminator and only 'llama3' is this
+    ramp; YaRN is a mixer kind's own value.
     """
 
     factor: float
@@ -284,7 +286,7 @@ class RopeScaling:
                 f"context, got {self.original_max_position_embeddings}")
 
     def apply(self, inv_freq):
-        """The scaled inverse frequencies, the reference's arithmetic in fp32."""
+        """Return the scaled inverse frequencies, the reference's arithmetic in fp32."""
         old_context_len = float(self.original_max_position_embeddings)
         wavelen = 2 * math.pi / inv_freq
         divided = jnp.where(wavelen > old_context_len / self.low_freq_factor,
@@ -300,33 +302,32 @@ class RopeScaling:
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
                  partial_rotary_type: str = 'proportional',
                  rope_scaling: RopeScaling | None = None):
-    """cos/sin of the rotary angles at absolute `positions`: [P, pairs].
+    """Return cos and sin of the rotary angles at absolute `positions`: [P, pairs].
 
-    `positions` may be [P] (one sequence) or [B, P] (a packed batch whose
-    documents each restart at 0); the angle axes line up with the trailing
-    [B, S] either way. Computed in fp32 so a token gets the same rotation
-    whether it arrives in a prefill or comes back as a single decode step.
+    `positions` may be [P] for one sequence, or [B, P] for a packed batch
+    whose documents each restart at 0; the angle axes line up with the
+    trailing [B, S] either way. The angles are computed in fp32, so a token
+    rotates the same in a prefill and in a single decode step.
 
-    rot_dim narrows the rotation to the first rot_dim dimensions, and
-    `partial_rotary_type` names which of the two published conventions
-    that is, because they rotate different angles:
+    `rot_dim` narrows the rotation to the first rot_dim dimensions.
+    `partial_rotary_type` names which published convention that is, because
+    the two rotate different angles:
 
     - 'proportional' (Gemma 4, modeling_rope_utils.py
       `_compute_proportional_rope_parameters`): the exponents run over the
       full head_dim, `theta ** (2i / head_dim)` for the rot_dim // 2 rotated
-      pairs, and the rest keep frequency zero (cosine one, sine zero, so the
-      rotation is the identity there). The output is head_dim // 2 wide.
+      pairs. The rest keep frequency zero, where the rotation is the
+      identity. The output is head_dim // 2 wide.
     - 'default' (Qwen3.5, modeling_qwen3_5.py:117-124
-      `Qwen3_5TextRotaryEmbedding.compute_default_rope_parameters`): the
-      rope is a rot_dim-dimensional one, `theta ** (2i / rot_dim)`, and the
-      output is rot_dim // 2 wide; `apply_rotary` passes the trailing
-      dimensions through untouched, the reference's `q_rot, q_pass` split
-      (modeling_qwen3_5.py:581-591).
+      `Qwen3_5TextRotaryEmbedding.compute_default_rope_parameters`): the rope
+      is rot_dim-dimensional, `theta ** (2i / rot_dim)`, and the output is
+      rot_dim // 2 wide. `apply_rotary` passes the trailing dimensions
+      through, the reference's `q_rot, q_pass` split.
 
     With rot_dim None both are the full rotation and the type is moot.
-    `rope_scaling` is Llama 3.1's ramp over the base frequencies, applied
-    before a proportional rope pads its zero-frequency tail, as the reference
-    does (`dim = head_dim * partial_rotary_factor`).
+    `rope_scaling` is Llama 3.1's ramp over the base frequencies. It applies
+    before a proportional rope pads its zero-frequency tail, as the
+    reference's `dim = head_dim * partial_rotary_factor` does.
     """
     if partial_rotary_type not in ('proportional', 'default'):
         raise ValueError(
@@ -439,25 +440,19 @@ def _pad_rows(x, rows: int):
 
 
 def widen_value_heads(query, value):
-    """`value` with its head axis zero-padded to the query's width, which is
-    what the fused kernels take.
+    """Zero-pad `value`'s head axis out to the query's width.
 
     `jax.nn.dot_product_attention` checks the value against the key's whole
-    shape (`_check_shape_and_dtype` in jax/_src/nn/functions.py), so a value
-    narrower than the query is refused before any kernel sees it, and
-    DeepSeek's latent attention is exactly that shape: `v_head_dim` is 128
-    where the queries carry `qk_nope_head_dim + qk_rope_head_dim`, 192, in
-    every released V2/V3 config. The attention's second product is a separate
-    sum per value column, so a zero column produces a zero output column and
-    leaves the real ones untouched; the caller crops them off, and the
-    arithmetic on the kept columns is the fused kernel's own. transformers
-    5.16.1 hands FlashAttention the same padding
-    (integrations/flash_attention.py:63, `pad(value, [0, head_dim -
-    v_head_dim])`, cropped again after the call).
+    shape, so a value narrower than the query is refused before any kernel
+    sees it. DeepSeek's latent attention is that shape: `v_head_dim` is 128
+    against a 192-wide query in every released V2/V3 config. The second
+    product is a separate sum per value column, so a zero column gives a
+    zero output column and the caller crops it off. transformers 5.16.1
+    pads FlashAttention the same way (integrations/flash_attention.py:63).
 
-    A value *wider* than the query has no such rewrite: padding the query and
-    the key instead would move the kernel's own 1/sqrt(d) scale off the
-    query's width, so it raises and names the reference path.
+    A value wider than the query has no such rewrite. Padding the query and
+    the key instead would move the kernel's 1/sqrt(d) scale off the query's
+    width, so this raises and names the reference path.
     """
     width, v_width = query.shape[-1], value.shape[-1]
     if v_width > width:
@@ -470,17 +465,15 @@ def widen_value_heads(query, value):
 
 
 def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
-    """jax's cudnn flash attention over any sequence length.
+    """Run jax's cudnn flash attention over any sequence length.
 
-    cudnn's kernel has no backward pass for an odd query or key length (jax
-    raises NotImplementedError from inside the gradient, so a run found out at
-    its first training step), and 77 CLIP text tokens are odd, as is every
-    concatenated text-plus-image sequence. One zero row of padding makes the
-    length even: a padded query row's output is sliced off, so nothing reads
-    it, and a padded key is hidden by the kernel's own padding mask
-    (key_value_seq_lengths), so every real query attends to exactly the keys
-    it had. The arithmetic on the real rows is the fused kernel's, in fp32
-    like the xla path's; tests/test_kernels.py pins the equality.
+    cudnn's kernel has no backward pass for an odd query or key length; jax
+    raises NotImplementedError from inside the gradient. 77 CLIP text tokens
+    are odd, as is every concatenated text-plus-image sequence. One zero row
+    of padding makes the length even. A padded query row's output is sliced
+    off and a padded key is hidden by the kernel's own padding mask
+    (key_value_seq_lengths), so every real query attends to the keys it had.
+    tests/test_kernels.py pins the equality with the xla path.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     q_pad, kv_pad = q_len % 2, kv_len % 2
@@ -506,18 +499,17 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
 
 
 def stripe(x, shards: int, axis: int = 1):
-    """`x` with `axis` in the striped order of load-balanced context
-    parallelism: the axis is cut into 2 * shards chunks and shard i holds
-    chunks i and 2 * shards - 1 - i, so under a causal mask every shard's
-    queries see the same number of (query, key) pairs. For two shards,
-    [0, 1, 2, 3, 4, 5, 6, 7] becomes [0, 1, 6, 7, 2, 3, 4, 5], the order
-    MaxText's reorder_sequence writes (src/maxtext/utils/maxtext_utils.py).
+    """Reorder `axis` so every shard holds equal causal work.
 
-    Written as a reshape, two slices, a flip and a stack, not as a gather
-    with the permutation: GSPMD lowers these to
-    collective-permutes of the chunks that change shard, half of the rows,
-    and a gather along a split axis to an all-gather of the whole array on
-    every device (measured in tests/test_sequence_parallel.py).
+    The axis is cut into 2 * shards chunks; shard i takes chunks i and
+    2 * shards - 1 - i. For two shards, [0..7] becomes [0, 1, 6, 7, 2, 3,
+    4, 5], which is MaxText's `reorder_sequence` order.
+
+    A reshape, two slices, a flip and a stack, not a gather with the
+    permutation: GSPMD lowers these to collective-permutes of the chunks
+    that change shard, half the rows. It lowers a gather along a split axis
+    to an all-gather of the whole array on every device
+    (tests/test_sequence_parallel.py measures both).
     """
     axis %= x.ndim
     length = x.shape[axis]
@@ -545,21 +537,20 @@ def unstripe(x, shards: int, axis: int = 1):
 
 def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causal,
                                 sliding_window, mask, bias):
-    """`kernel` over queries split along the sequence axis of the mesh in
-    context, with the keys and values gathered whole once.
+    """Run `kernel` with the queries split along the mesh's sequence axis.
 
-    The batch rows of every activation stay split over the mesh's other
-    axes but tensor and stage, which hold a width and a pipeline stage and
-    never a row; the heads are left to GSPMD, so a width the rules put on
-    the tensor axis stays there. A
-    causal call, a windowed one and a masked one reorder the queries with
-    `stripe` so each shard holds equal causal work, carry the queries'
-    positions into the mask (`causal_attention_mask` reads positions, so the
-    mask and the rotary angles the caller already applied stay exact under
-    the reorder) and put the output back in sequence order with
-    `unstripe`. A call with no mask at all has equal work on every row and
-    keeps its order. Under the reorder the kernels see an explicit mask, not
-    their causal flag: a striped row's position is in the mask, not its index.
+    The keys and values are gathered whole once. Batch rows stay split over
+    every other mesh axis but tensor and stage, which hold a width and a
+    pipeline stage and never a row. The heads are left to GSPMD, so a width
+    the rules put on the tensor axis stays there.
+
+    A causal, windowed or masked call reorders the queries with `stripe` so
+    each shard holds equal causal work, and puts the output back with
+    `unstripe`. The queries' positions travel in the mask, which keeps the
+    mask and the caller's rotary angles exact under the reorder. Under the
+    reorder the kernels see that mask and not their causal flag, because a
+    striped row's position is no longer its index. A call with no mask has
+    equal work on every row and keeps its order.
     """
     mesh = jax.sharding.get_abstract_mesh()
     rows = tuple(axis for axis in mesh.axis_names
@@ -589,25 +580,28 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
         mask = structural if mask is None else jnp.logical_and(mask, structural)
     out = kernel(query, key, value, causal=False, sliding_window=None, mask=mask, bias=bias)
     return constrain(unstripe(constrain(out, split), shards), split)
+
+
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
 CUDNN_MAX_HEAD_DIM = 128
 
 
 def cudnn_runs(query, softcap=None) -> bool:
-    """Whether cudnn's fused kernel takes this query: a gpu backend, one of its
-    two dtypes, a head dimension it tiles, and no logit softcap, which no
-    fused kernel applies. 'auto' asks this; an explicit 'cudnn' refuses by
-    name instead.
+    """Report whether cudnn's fused kernel takes this query.
 
-    A run under `--xla_gpu_deterministic_ops` is excluded as well, because
-    XLA's cudnn attention backward path crashes at execution time when one
-    executable holds two structurally identical backward calls under that
-    flag, which every multi-layer model has (openxla/xla#46500).
+    It needs a gpu backend, one of cudnn's two dtypes, a head dimension it
+    tiles, and no logit softcap, which no fused kernel applies. Only 'auto'
+    asks this; an explicit 'cudnn' refuses by name instead.
 
-    The query's head width is the one every fused kernel runs at, values
-    included: a narrower value (DeepSeek's latent attention) is padded to it
-    by `widen_value_heads`, so this predicate reads the query alone and holds
-    for the whole call."""
+    A run under `--xla_gpu_deterministic_ops` is excluded as well. Under
+    that flag XLA's cudnn attention backward path crashes at execution time
+    when one executable holds two structurally identical backward calls,
+    which every multi-layer model has (openxla/xla#46500).
+
+    Every fused kernel runs at the query's head width, values included:
+    `widen_value_heads` pads a narrower value up to it. So this reads the
+    query alone and holds for the whole call.
+    """
     head_dim = query.shape[-1]
     return (jax.default_backend() == 'gpu' and query.dtype in CUDNN_DTYPES
             and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM
@@ -616,14 +610,14 @@ def cudnn_runs(query, softcap=None) -> bool:
 
 def softcapped_attention(query, key, value, softcap: float, dtype=None, precision=None,
                          force_fp32_for_softmax=True, mask=None, bias=None):
-    """Attention with Gemma 2's tanh softcap on the logits, in plain XLA ops.
+    """Attend with Gemma 2's tanh softcap on the logits, in plain XLA ops.
 
     The reference scales the logits, squashes them into (-softcap, softcap)
-    as `softcap * tanh(logits / softcap)`, adds the mask and takes the softmax
-    in fp32 (modeling_gemma2.py:192-208). No fused kernel has that tanh, so
-    this is flax's reference attention with the cap between the scaling and
-    the mask; heads arrive already repeated and the mask already structural,
-    as the reference path prepares them.
+    as `softcap * tanh(logits / softcap)`, adds the mask and takes the
+    softmax in fp32 (modeling_gemma2.py:192-208). No fused kernel has that
+    tanh, so this is flax's reference attention with the cap between the
+    scaling and the mask. Heads arrive repeated and the mask structural, as
+    the reference path prepares them.
     """
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     dtype = query.dtype
@@ -646,86 +640,37 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation=None,
                                  causal=False, sliding_window=None, mask=None, bias=None,
                                  sinks=None, softcap=None):
-    """The one attention kernel path for every attention module.
+    """Attend over [B, S, H, D] queries, keys and values.
 
-    Inputs are [B, S, H, D]. Keys and values may carry fewer heads than the
-    query (grouped-query attention); the paths that cannot group heads
-    themselves get them repeated out. The value's head width may be narrower
-    than the query's, which is DeepSeek's latent attention (`v_head_dim`
-    against `qk_nope_head_dim + qk_rope_head_dim`): the reference path takes
-    it as it is, and a fused path pads the value to the query's width and
-    crops its own columns back out (`widen_value_heads`), so the selection
-    below reads the query's width for either shape. The param trees of the
-    callers never change with the implementation, so checkpoints are
-    interchangeable across hardware:
+    Picks the kernel `implementation` names and returns [B, S, H, Dv]. The
+    parameter tree never changes with the kernel, so checkpoints move
+    between backends. `AttentionImpl` lists the paths; `attention_kernel`
+    dispatches to them and raises for the arguments each one cannot honour.
 
-    - 'reference', which a module field also spells None: flax reference
-      attention (einsum + softmax), the portable default and the only path
-      that reads dtype, precision and force_fp32_for_softmax.
-    - 'auto': 'cudnn' where its kernel runs (a gpu backend, bf16 or fp16
-      inputs, a query head width that is a multiple of 8 and at most 128, no
-      softcap, and no `--xla_gpu_deterministic_ops` on the run), then 'tpu'
-      where splash's does (`tpu_runs`: a tpu backend, bf16 or fp32 inputs,
-      query and key lengths that are multiples of 128, no bias, no mesh
-      splitting the sequence, and a mask splash can describe), 'xla' anywhere
-      else. Resolved per trace, so a config logged as 'auto' still runs on
-      the next machine.
-    - 'xla' / 'cudnn': jax.nn.dot_product_attention, which dispatches to the
-      fused cudnn flash kernel on supported GPUs. It takes no dtype, precision
-      or softmax argument: the logits accumulate and the softmax runs in fp32
-      whatever the inputs are. A dtype other than the inputs' own raises a
-      ValueError, and so do a HIGH or HIGHEST precision and
-      force_fp32_for_softmax=False. cudnn takes any sequence length
-      (`cudnn_attention` pads an odd one), and only bf16 or fp16 inputs. A
-      value wider than the query has no fused rewrite and raises, and so does
-      an explicit 'cudnn' under `--xla_gpu_deterministic_ops`, whose backward
-      pass XLA cannot execute (openxla/xla#46500).
-    - 'tpu': the pallas splash kernel (`tpu_attention`), whose mask is a
-      block-sparse descriptor built at trace time, so a causal or windowed
-      long sequence costs its live blocks rather than its rectangle. The
-      1/sqrt(d) scale goes onto the query, in the query's dtype, because the
-      kernel has no scale argument of its own (the deleted EfficientAttention
-      passed none to a kernel that wanted one, which inflated the logits by
-      sqrt(d) and made its checkpoints poisonous). The older pallas flash
-      kernel stays behind it for the calls splash has no form for: an
-      additive bias, a mask that is a value of the trace, and a length that
-      is not a multiple of 128. Off a tpu backend the kernel runs under
-      pallas's interpreter, which computes the same numbers far more slowly;
-      'auto' never selects it there.
+    Keys and values may carry fewer heads than the query, which is
+    grouped-query attention; the paths that cannot group heads themselves
+    get them repeated out. The value's head width may be narrower than the
+    query's, which is DeepSeek's latent attention. The reference path takes
+    that as it is and a fused path pads and crops it (`widen_value_heads`),
+    so the kernel selection reads the query's width either way.
 
-    causal restricts query i to keys 0..i, top-left aligned like jax's
-    is_causal; sliding_window=w narrows that to the w most recent keys. Both
-    are structural, over the row index, so decoding against a KV cache passes
-    `mask` instead (built by causal_attention_mask over the cache slots): a
-    step's single query sits at the cache index, not at row 0. The fused
-    kernels take causality and the window as flags, which saves the memory of
-    a materialized mask; splash takes them as a descriptor, which additionally
-    saves visiting the blocks they empty, and the pallas flash kernel behind
-    it has no mask argument at all, so an explicit mask rides in there as an
-    additive bias.
-    `bias` is an additive float array broadcastable to [B, H, Q, K], added to
-    the logits on every path; T5's relative position table travels in it, and
-    it is the one argument splash has no form for.
-    `sinks` holds one learned, value-free logit per query head. The reference
-    and xla paths include it in the denominator; auto chooses xla, and the
-    fused cudnn and tpu kernels refuse it.
+    `causal` restricts query i to keys 0..i, top-left aligned like jax's
+    is_causal, and `sliding_window=w` narrows that to the w most recent
+    keys. Both read the row index, so decoding against a KV cache passes
+    `mask` instead: a step's single query sits at the cache index, not at
+    row 0. `bias` is an additive float array broadcastable to [B, H, Q, K];
+    T5's relative position table travels in it. `sinks` holds one learned,
+    value-free logit per query head, which the reference and xla paths put
+    in the denominator. `softcap` is Gemma 2's tanh on the scaled logits,
+    which only `softcapped_attention` applies.
 
-    Under a mesh in context whose sequence axis is above one, the call runs
-    through `sequence_parallel_attention`: the queries split over that axis,
-    the keys and values are gathered whole, and a causal or masked call
-    balances its work across the shards.
+    Under a mesh whose sequence axis is above one, the call runs through
+    `sequence_parallel_attention`.
 
-    `softcap` is Gemma 2's tanh on the scaled logits before the mask and the
-    softmax. No fused kernel applies it, so a softcapped call runs
-    `softcapped_attention` under both the reference and the xla
-    implementation, honouring dtype, precision and force_fp32_for_softmax the
-    way the reference path does; 'auto' resolves it to xla, and cudnn or tpu
-    raise a ValueError that names the implementation.
-
-    Whichever path ran, the result leaves here as the checkpoint name
-    'attention_output', which is what lets a remat policy save it instead of
-    replaying the kernel in the backward pass (`remat_block` in dit.py). The
-    name is inert outside jax.checkpoint.
+    The result leaves here under the checkpoint name 'attention_output', so
+    a remat policy can save it instead of replaying the kernel in the
+    backward pass (`remat_block` in dit.py). The name is inert outside
+    jax.checkpoint.
     """
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
@@ -758,11 +703,84 @@ def precision_names(precision: PrecisionLike) -> frozenset[str]:
                      for one in written if one is not None)
 
 
+def refuse_reference_only_arguments(implementation, query, dtype, precision,
+                                    force_fp32_for_softmax):
+    """Raise for the arguments only the reference path reads.
+
+    A fused kernel accumulates the logits and runs the softmax in fp32 in
+    the inputs' own dtype, whatever the caller asked for. Each message names
+    the implementation and the reference path, so a caller can pick one.
+    """
+    if precision_names(precision) & {'HIGH', 'HIGHEST'}:
+        raise ValueError(
+            f"attention implementation '{implementation}' cannot honor "
+            f"precision={precision}: fused attention accumulates the logits and "
+            "runs the softmax in fp32 regardless. Leave precision at DEFAULT, or "
+            "use the reference implementation (attention_impl 'reference').")
+    if not force_fp32_for_softmax:
+        raise ValueError(
+            f"attention implementation '{implementation}' cannot honor "
+            "force_fp32_for_softmax=False: fused attention runs the softmax in "
+            "fp32 regardless. Leave it True, or use the reference implementation "
+            "(attention_impl 'reference').")
+    if dtype is not None and jnp.dtype(dtype) != query.dtype:
+        raise ValueError(
+            f"attention implementation '{implementation}' cannot honor "
+            f"dtype={dtype}: fused attention computes in the inputs' dtype "
+            f"({query.dtype}). Pass dtype=None or leave the inputs in that dtype, or use "
+            "the reference implementation (attention_impl 'reference').")
+
+
+def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation):
+    """Run the fused kernel `implementation` names, at the query's head width.
+
+    Every fused kernel runs one head width for the keys and the values, so a
+    narrower value rides in padded and its own columns come back out. The
+    widths a caller passes are static, so this costs no runtime branch.
+    """
+    v_head_dim = value.shape[-1]
+    if v_head_dim != query.shape[-1]:
+        value = widen_value_heads(query, value)
+
+    if implementation == 'cudnn':
+        if query.dtype not in CUDNN_DTYPES:
+            raise ValueError(
+                "cudnn attention needs bf16 or fp16 inputs, the query is "
+                f"{query.dtype}. Set dtype bfloat16, or attention_impl 'xla' to "
+                "keep this precision.")
+        head_dim = query.shape[-1]
+        if head_dim % 8 or head_dim > CUDNN_MAX_HEAD_DIM:
+            raise ValueError(
+                f"cudnn attention needs a head dimension that is a multiple of 8 "
+                f"and at most {CUDNN_MAX_HEAD_DIM}, got {head_dim}; use attention_impl "
+                "'xla' for this shape.")
+        out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window)
+    elif implementation == 'xla':
+        # A left window of l means the l+1 most recent keys on both the xla and
+        # the cudnn path, which is the window this function counts.
+        out = jax.nn.dot_product_attention(
+            query, key, value, bias=bias, mask=mask, is_causal=causal,
+            local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
+            implementation='xla')
+    elif implementation == 'tpu':
+        out = tpu_attention(query, key, value, bias, mask, causal, sliding_window,
+                            interpret=jax.default_backend() != 'tpu')
+    else:
+        raise ValueError(f"Unknown attention implementation: {implementation}")
+    return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
+
+
 def attention_kernel(query, key, value, dtype=None, precision=None,
                      force_fp32_for_softmax=True, implementation=None,
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
                      softcap=None):
-    """`scaled_dot_product_attention`'s kernel dispatch over whole sequences."""
+    """Dispatch one whole-sequence attention call to the kernel it names.
+
+    Sinks and a softcap have no fused kernel, so they run their own path.
+    'auto' resolves here, against this call's shapes and this machine's
+    backend. What is left goes to `fused_attention`, after the arguments it
+    cannot honour raise.
+    """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
     if sinks is not None:
@@ -816,69 +834,16 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             dropout_rng=None, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, deterministic=True)
 
-    if precision_names(precision) & {'HIGH', 'HIGHEST'}:
-        raise ValueError(
-            f"attention implementation '{implementation}' cannot honor "
-            f"precision={precision}: fused attention accumulates the logits and "
-            "runs the softmax in fp32 regardless. Leave precision at DEFAULT, or "
-            "use the reference implementation (attention_impl 'reference').")
-    if not force_fp32_for_softmax:
-        raise ValueError(
-            f"attention implementation '{implementation}' cannot honor "
-            "force_fp32_for_softmax=False: fused attention runs the softmax in "
-            "fp32 regardless. Leave it True, or use the reference implementation "
-            "(attention_impl 'reference').")
-    if dtype is not None and jnp.dtype(dtype) != query.dtype:
-        raise ValueError(
-            f"attention implementation '{implementation}' cannot honor "
-            f"dtype={dtype}: fused attention computes in the inputs' dtype "
-            f"({query.dtype}). Pass dtype=None or leave the inputs in that dtype, or use "
-            "the reference implementation (attention_impl 'reference').")
-
-    # Every fused kernel runs one head width for the keys and the values, so a
-    # narrower value rides in padded and its own columns come back out; the
-    # widths a caller passes are static, so this costs no runtime branch.
-    v_head_dim = value.shape[-1]
-    if v_head_dim != query.shape[-1]:
-        value = widen_value_heads(query, value)
-
-    if implementation == 'cudnn':
-        if query.dtype not in CUDNN_DTYPES:
-            raise ValueError(
-                "cudnn attention needs bf16 or fp16 inputs, the query is "
-                f"{query.dtype}. Set dtype bfloat16, or attention_impl 'xla' to "
-                "keep this precision.")
-        head_dim = query.shape[-1]
-        if head_dim % 8 or head_dim > CUDNN_MAX_HEAD_DIM:
-            raise ValueError(
-                f"cudnn attention needs a head dimension that is a multiple of 8 "
-                f"and at most {CUDNN_MAX_HEAD_DIM}, got {head_dim}; use attention_impl "
-                "'xla' for this shape.")
-        out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window)
-    elif implementation == 'xla':
-        # A left window of l means the l+1 most recent keys on both the xla and
-        # the cudnn path, which is the window this function counts.
-        out = jax.nn.dot_product_attention(
-            query, key, value, bias=bias, mask=mask, is_causal=causal,
-            local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
-            implementation='xla')
-    elif implementation == 'tpu':
-        out = tpu_attention(query, key, value, bias, mask, causal, sliding_window,
-                            interpret=jax.default_backend() != 'tpu')
-    else:
-        raise ValueError(f"Unknown attention implementation: {implementation}")
-    return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
+    refuse_reference_only_arguments(
+        implementation, query, dtype, precision, force_fp32_for_softmax)
+    return fused_attention(query, key, value, bias, mask, causal, sliding_window,
+                           implementation)
 
 
-# Splash's tile sizes, one constant for every block the kernel names. The
-# forward kernel holds a [block_q, block_kv] fp32 logit tile, an fp32
-# [block_q, head_dim] output accumulator and the q, k and v blocks in VMEM at
-# once: at 512 that is 1 MiB of logits and a few hundred KiB of operands,
-# double-buffered by the pipeline and still far inside a core's VMEM at the
-# head widths a decoder has, while jax's own BlockSizes.get_default() of 128
-# hands the MXU a sixteenth of that tile per pass. `splash_block_sizes`
-# narrows it to a divisor of each sequence, which is what the mask blocking
-# needs; a longer sequence therefore gets 512 and a short one gets itself.
+# Splash's tile size. At 512 the forward kernel holds 1 MiB of fp32 logits
+# plus its operands, which fits VMEM at decoder head widths. jax's default
+# of 128 gives the MXU a sixteenth of that per pass. `splash_block_sizes`
+# narrows this to a divisor of each sequence, as the mask blocking needs.
 SPLASH_BLOCK = 512
 # The kernel tiles the key axis by lanes: the compute block must be a whole
 # number of them (`{bkv_compute=} must be a multiple of {NUM_LANES=}`,
@@ -886,10 +851,10 @@ SPLASH_BLOCK = 512
 # sequences (splash_attention_mask_info.py:565-571), so a length that is not
 # a multiple of this has no legal block size and never reaches splash.
 SPLASH_LANES = 128
-# What the kernel accumulates in is fp32 whatever comes in: the logits carry
-# preferred_element_type=float32 and the running max, sum and output stay
-# fp32 to the last block, which is the reference softmax. These are the two
-# input dtypes a TPU matmul takes; fp16 has no MXU path.
+# The two input dtypes a TPU matmul takes; fp16 has no MXU path. The kernel
+# accumulates in fp32 whatever comes in: the logits carry
+# preferred_element_type=float32, and the running max, sum and output stay
+# fp32 to the last block, which is the reference softmax.
 SPLASH_DTYPES = (jnp.bfloat16, jnp.float32)
 # How much of an explicit boolean mask splash will carry. The array is read
 # on the host while the executable is built and its unresolved blocks are
@@ -900,33 +865,27 @@ SPLASH_DENSE_MASK_CELLS = 1 << 22
 
 def tpu_runs(query, key, softcap=None, *, causal=False, sliding_window=None,
              mask=None, bias=None) -> bool:
-    """Whether splash takes this call: a tpu backend, one of the two dtypes a
-    TPU matmul reads, sequence lengths its mask blocking can tile, a mask it
-    can describe, and neither of the two things no fused kernel does.
+    """Report whether splash takes this call.
 
-    'auto' asks this after `cudnn_runs`, and only 'auto' asks it: an explicit
-    'tpu' keeps the older pallas flash kernel for exactly the calls this
-    turns down, so what the predicate decides is whether a TPU run that asked
-    for nothing in particular gets the block-sparse kernel or XLA's.
+    It needs a tpu backend, one of the two dtypes a TPU matmul reads,
+    sequence lengths its mask blocking can tile, a mask it can describe, and
+    neither a bias nor a softcap. Only 'auto' asks this, after `cudnn_runs`;
+    an explicit 'tpu' sends the calls this turns down to the older pallas
+    flash kernel instead.
 
     The head width is not read, because splash does not constrain it. The
-    kernel pads the value width to a whole number of lanes itself and slices
-    the result back (`pl.cdiv(head_dim_v, NUM_LANES)`,
-    splash_attention_kernel.py:732 with 826 and 841), and the query and key
-    width is only the contraction dimension of a dot_general inside the
-    kernel, which Mosaic pads to a lane multiple like any other minor axis.
-    The sequence axes are the ones the kernel and its mask blocking state a
-    divisibility for, so those are the ones here.
+    kernel pads the value width to a whole number of lanes and slices the
+    result back (`pl.cdiv(head_dim_v, NUM_LANES)`,
+    splash_attention_kernel.py:732). The query and key width is only a
+    dot_general's contraction dimension inside the kernel, which Mosaic pads
+    like any other minor axis. The sequence axes are the ones the kernel and
+    its mask blocking state a divisibility for.
 
-    A mesh that splits the sequence is turned down as well. Splash states its
-    own sharding as a `shard_map` partition spec (`manual_sharding_spec`, and
-    the `head_shards`/`q_seq_shards` the descriptor is built with), while
-    Dew's sequence parallelism is GSPMD constraints around a whole-sequence
-    kernel; a pallas call with no partitioning rule would have the queries
-    gathered back to serve it, which is the split this code exists to keep.
-    A causal or masked sequence-parallel call never reaches here anyway,
-    because `sequence_parallel_attention` hands the kernel a striped mask
-    that is a value of the trace.
+    A mesh that splits the sequence is turned down as well. Splash states
+    its own sharding as a `shard_map` partition spec, while Dew's sequence
+    parallelism is GSPMD constraints around a whole-sequence kernel. A
+    pallas call with no partitioning rule would have the queries gathered
+    back to serve it, which is the split this code exists to keep.
     """
     if jax.default_backend() != 'tpu' or query.dtype not in SPLASH_DTYPES:
         return False
@@ -943,17 +902,16 @@ def tpu_runs(query, key, softcap=None, *, causal=False, sliding_window=None,
 
 def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
                   interpret: bool):
-    """The pallas TPU path: splash where its descriptor covers the call, the
-    older pallas flash kernel everywhere else.
+    """Attend on pallas: splash where its descriptor covers the call, flash
+    everywhere else.
 
     Splash is the block-sparse kernel. Its mask is a descriptor built while
     the executable is, the blocks that descriptor empties are never visited,
-    and a causal or windowed long sequence costs what its live blocks cost
-    rather than what its rectangle does. What it has no form for is a value
-    of the trace: there is no bias argument at all, and the mask has to be
-    readable on the host. Flash takes both, as one additive [B, H, Q, K]
-    array, and pays the whole rectangle for them, so it stays for exactly
-    these calls:
+    and a causal or windowed long sequence costs its live blocks rather than
+    its rectangle. What it has no form for is a value of the trace: there is
+    no bias argument at all, and the mask has to be readable on the host.
+    Flash takes both as one additive [B, H, Q, K] array and pays the whole
+    rectangle for them, so it stays for exactly these calls:
 
     - an additive `bias`, which is T5's relative position table;
     - a `mask` that is a tracer (a KV-cache decode mask over slots, a packed
@@ -980,14 +938,13 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
 
 
 def splash_attention(query, key, value, descriptor, *, interpret: bool):
-    """The splash kernel over [B, S, H, D] arrays under `descriptor`.
+    """Run the splash kernel over [B, S, H, D] arrays under `descriptor`.
 
     The kernel takes one example at a time, as [H, S, D] with the head width
     minor, so the batch rides in on a vmap and the seam is two transposes.
     It applies no scale of its own, unlike the flash kernel's `sm_scale`, so
-    the 1/sqrt(d) goes onto the query in the query's own dtype: that is where
-    flax's reference path puts it (`query / jnp.sqrt(depth)` in
-    dot_product_attention_weights), which is what makes the two agree exactly
+    the 1/sqrt(d) goes onto the query in the query's own dtype. That is
+    where flax's reference path puts it, which makes the two agree exactly
     in fp32 rather than to a rounding of the scale. Grouped key heads stay
     grouped, because splash reads q_heads % kv_heads itself, so this path
     never materializes the repeated keys the flash path needs.
@@ -1010,17 +967,15 @@ def splash_attention(query, key, value, descriptor, *, interpret: bool):
 
 
 def splash_block_sizes(q_len: int, kv_len: int):
-    """`SPLASH_BLOCK` narrowed to a divisor of each sequence, forward and
-    backward.
+    """Narrow `SPLASH_BLOCK` to a divisor of each sequence, forward and backward.
 
-    The greatest common divisor satisfies both of the kernel's stated rules
-    at once: it divides its sequence, which the mask blocking requires, and
-    it stays a multiple of `SPLASH_LANES`, which the key compute block
+    The greatest common divisor satisfies both of the kernel's rules at
+    once. It divides its sequence, which the mask blocking requires, and it
+    stays a multiple of `SPLASH_LANES`, which the key compute block
     requires, because the constant and the admitted lengths are both
-    multiples of it. The backward blocks are filled in because a kernel built
-    without them raises "Need to specify backward blocks." from inside its
-    own vjp, which a training run would meet at its first gradient rather
-    than at trace time.
+    multiples of it. The backward blocks are filled in because a kernel
+    built without them raises "Need to specify backward blocks." from inside
+    its own vjp, which a training run would meet at its first gradient.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
@@ -1033,18 +988,15 @@ def splash_block_sizes(q_len: int, kv_len: int):
 
 def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
                            sliding_window: int | None, mask):
-    """Splash's mask for one call, or None when the call's mask is not one
-    splash describes.
+    """Build splash's mask for one call, or None when splash cannot describe it.
 
-    The structural part is a function of the two indices, not an array:
+    The structural part is a function of the two indices, not an array.
     CausalMask and LocalMask carry the comparison the kernel evaluates per
-    block, so the blocks they empty are dropped from the grid and nothing
-    proportional to Q*K is stored. Dew's window is causal already
-    (`causal_attention_mask` keeps k <= q before it narrows to the w most
-    recent keys, which is what the xla path spells `local_window_size=(w-1,
-    0)`), so a window replaces the causal flag here instead of sitting beside
-    it. An explicit boolean mask has no such form: it is ANDed in as dense
-    blocks, which is why only a concrete, small one is taken.
+    block, so the blocks they empty leave the grid and nothing proportional
+    to Q*K is stored. Dew's window is causal already, so a window replaces
+    the causal flag here instead of sitting beside it. An explicit boolean
+    mask has no such form: it is ANDed in as dense blocks, so only a
+    concrete, small one is taken.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 
@@ -1068,21 +1020,19 @@ def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
 
 
 def splash_dense_mask(mask, q_len: int, kv_len: int, heads: int):
-    """An explicit mask as one host [Q, K] boolean array per query head, or
-    None when splash cannot carry it.
+    """Return an explicit mask as one host [Q, K] boolean array per query head.
 
-    Three things put a mask out of reach. It is a value of the trace: the
-    descriptor is built while the executable is, so a mask that exists only
-    as a tracer cannot be read, and a decode mask over cache slots and a
-    packed batch's segment mask are both that. It has a batch axis wider than
-    one: splash indexes its mask by head and by position and has no batch
-    axis at all. Or it is large: the blocks the descriptor cannot resolve to
-    all-on or all-off are stored dense inside the executable, so past
-    `SPLASH_DENSE_MASK_CELLS` the additive-bias path is the cheaper one.
+    Returns None when splash cannot carry it, which three things cause. The
+    mask is a value of the trace: the descriptor is built while the
+    executable is, so a tracer cannot be read, and a decode mask over cache
+    slots and a packed batch's segment mask are both tracers. Or it has a
+    batch axis wider than one: splash indexes by head and position and has
+    no batch axis. Or it is large: unresolved blocks are stored dense inside
+    the executable, so past `SPLASH_DENSE_MASK_CELLS` the additive-bias path
+    is cheaper.
 
-    numpy and the tracer type are imported here rather than at the module:
-    this is the one place the mask leaves the trace, and splash's NumpyMask
-    is a host array.
+    numpy and the tracer type are imported here because this is the one
+    place the mask leaves the trace, and splash's NumpyMask is a host array.
     """
     import numpy as np
     from jax.core import Tracer
@@ -1102,14 +1052,14 @@ def splash_dense_mask(mask, q_len: int, kv_len: int, heads: int):
 
 
 def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window):
-    """The pallas TPU flash kernel, with every mask as an additive bias.
+    """Run the pallas TPU flash kernel, with every mask as an additive bias.
 
     The kernel has no mask argument, so a window and an explicit mask become
     one [B, H, Q, K] float array of zeros and the dtype's minimum, added to
-    the logits; only causality is a flag it takes. That array is the whole
-    rectangle, which is what splash exists to avoid, so this path runs for
-    the calls `tpu_attention` names and not for the others. The 1/sqrt(d)
-    scale is the kernel's own `sm_scale` here.
+    the logits. Only causality is a flag it takes. That array is the whole
+    rectangle, which is what splash exists to avoid, so this path runs only
+    for the calls `tpu_attention` names. The 1/sqrt(d) scale is the kernel's
+    own `sm_scale` here.
     """
     from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
@@ -1145,15 +1095,15 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
     ("to_out_0",): ("heads", "head_dim", "embed"),
 })
 class NormalAttention(nn.Module):
-    """Multi-head attention over a `[B, S, C]` or `[B, H, W, C]` input.
+    """Attend over a `[B, S, C]` or `[B, H, W, C]` input with multiple heads.
 
-    causal makes it a decoder attention (query i sees keys 0..i). decode=True
-    on a call runs it against a fixed-size KV cache instead, allocated at
-    max_seq_len: the first call writes the whole prompt, later calls append one
-    token each. Neither flag touches the param tree, so a model trained without
-    either reloads into a decoding one unchanged. `freqs_cis` rotates the
-    queries and keys of a self-attention call (`rotary_freqs` gives the pair);
-    None leaves them unrotated.
+    `causal` makes it a decoder attention, where query i sees keys 0..i.
+    `decode=True` on a call runs it against a fixed-size KV cache allocated
+    at max_seq_len instead: the first call writes the whole prompt, later
+    calls append one token each. Neither flag touches the param tree, so a
+    model trained without either reloads into a decoding one unchanged.
+    `freqs_cis` rotates the queries and keys of a self-attention call;
+    `rotary_freqs` gives the pair, and None leaves them unrotated.
     """
     query_dim: int
     heads: int = 4
@@ -1230,10 +1180,14 @@ class NormalAttention(nn.Module):
         proj = self.proj_attn(hidden_states)
         return proj.reshape(orig_x_shape)
 
+
 class FlaxGEGLU(nn.Module):
-    """A linear layer into the gated linear unit of Shazeer 2020
-    (https://arxiv.org/abs/2002.05202): half the projection gates the other
-    half through GELU. The hidden width is four times `dim`."""
+    """Project to twice the hidden width, then gate one half by the other.
+
+    The gate is GELU, the gated linear unit of Shazeer 2020
+    (https://arxiv.org/abs/2002.05202). The hidden width is four times
+    `dim`.
+    """
 
     dim: int
     dtype: Dtype | None = jnp.float32
@@ -1252,9 +1206,11 @@ class FlaxGEGLU(nn.Module):
 
 @logical_axes({("net_0", "proj"): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
 class FlaxFeedForward(nn.Module):
-    """GEGLU then a linear layer back to `dim`, diffusers' `FlaxFeedForward`.
+    """Run GEGLU then a linear layer back to `dim`, as diffusers does.
+
     The checkpoint keys `net_0` and `net_2` are the indices the reference's
-    Sequential gives the two layers."""
+    Sequential gives the two layers.
+    """
 
     dim: int
     dtype: Dtype | None = jnp.float32
@@ -1275,10 +1231,12 @@ class FlaxFeedForward(nn.Module):
 
 
 class BasicTransformerBlock(nn.Module):
-    """Self-attention, cross-attention over `context`, feed-forward, each
-    pre-normed with a residual. `use_cross_only` drops the self-attention;
-    `only_pure_attention` runs the cross-attention alone with no norm and no
-    residual; the UNets' stages use it by default."""
+    """Run self-attention, cross-attention over `context`, then feed-forward.
+
+    Each is pre-normed with a residual. `use_cross_only` drops the
+    self-attention. `only_pure_attention` runs the cross-attention alone,
+    with no norm and no residual, which the UNets' stages do by default.
+    """
     query_dim: int
     heads: int = 4
     dim_head: int = 64
@@ -1324,18 +1282,17 @@ class BasicTransformerBlock(nn.Module):
 
 @dataclasses.dataclass(frozen=True)
 class Stage:
-    """One resolution stage's attention in a UNet, or `None` for a stage that
-    has none.
+    """Describes one resolution stage's attention in a UNet.
 
-    Every field is a `TransformerBlock` dial. The block's head width is the
-    stage's channel count divided by `heads`, which the unet knows and a
-    config does not, so there is no `dim_head` field. `dew.registry.from_record` builds one from a record at
-    the build boundary, so a stage still arrives as `{"heads": 8}` from a
-    command line or a run record, and a misspelled field raises there.
+    A stage with no attention is `None` instead. Every field is a
+    `TransformerBlock` setting. The head width is the stage's channel count
+    divided by `heads`, which the unet knows and a config does not, so there
+    is no `dim_head` field. `dew.registry.from_record` builds one from a
+    record at the build boundary, so a stage arrives as `{"heads": 8}` from
+    a command line and a misspelled field raises there.
 
-    `dtype` defaults to float32; `with_precision` writes the model's dtype
-    into every stage. `precision` is the one field whose None means "the
-    model's".
+    `precision` of None means the model's. `dew.registry.with_precision`
+    writes the model's dtype into every stage.
     """
 
     heads: int
@@ -1353,8 +1310,10 @@ class Stage:
 
 def stage_attention(stage: Stage, channels: int, attention_impl: str | None,
                     precision: PrecisionLike, name: str) -> "TransformerBlock":
-    """The block a UNet stage's `Stage` describes, at the stage's channel
-    count; a stage that names no precision takes the model's."""
+    """Build the block a `Stage` describes, at the stage's channel count.
+
+    A stage that names no precision takes the model's.
+    """
     return TransformerBlock(
         heads=stage.heads, dim_head=channels // stage.heads, dtype=stage.dtype,
         attention_impl=attention_impl, use_projection=stage.use_projection,

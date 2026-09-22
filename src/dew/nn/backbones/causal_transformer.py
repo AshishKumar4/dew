@@ -244,46 +244,37 @@ class Mixture:
     Qwen3-MoE's decoder_sparse_step; neither makes every layer sparse, which
     is Mixtral.
 
-    The routing options are `Router`'s: `score_function` softmax, sigmoid or
-    sqrtsoftplus, `norm_topk_prob` (the reference's name) for dividing a
-    token's selected weights by their sum, `scaling` on the routed output,
-    `groups` with `groups_per_token` for DeepSeek's node limit, `group_score`
-    for how a group is scored ('top2' is V3's, 'max' is V2's), `bias`
-    for V3's aux-loss-free balancing bias, and `scale_inputs` for Llama 4's
-    weight on the expert input in place of its output.
+    The routing fields pass straight through to `Router`; that class
+    documents each one.
 
-    `parallel` is Gemma 4's placement (`enable_moe_block`): the experts run
-    beside the dense feed-forward on the same residual and the two are
-    summed after a norm each, under `Gemma4TextRouter`, which softmaxes,
-    keeps the renormalised top k and scales each choice per expert; the
-    routing dials above belong to the replacing routers and are refused
-    with it.
+    `parallel` is Gemma 4's placement (`enable_moe_block`). The experts run
+    beside the dense feed-forward on the same residual, and the two are
+    summed after a norm each, under `Gemma4TextRouter`. That router replaces
+    the routing fields above, which are refused with it.
 
     `expert_features` is the routed experts' width, None for the model's
-    `mlp_features`; DeepSeek sizes its experts apart from its dense layers
-    (`moe_intermediate_size` beside `intermediate_size`). `shared_features`
-    is the width of the one dense gated MLP every token takes beside the
-    routed experts, 0 for none: `DeepseekV3MoE` builds its `n_shared_experts`
-    as a single MLP of `n_shared_experts * moe_intermediate_size`, so the
-    product is the whole record of them.
-    The optional shared_gate multiplies that output by a learned scalar
-    sigmoid per token, independently of routing, as Qwen3.5 MoE does.
+    `mlp_features`; DeepSeek sizes its experts apart from its dense layers.
+    `shared_features` is the width of the one dense gated MLP every token
+    takes beside the routed experts, 0 for none. `DeepseekV3MoE` builds its
+    `n_shared_experts` as a single MLP of that many times its expert width,
+    so the product is the whole record of them. `shared_gate` multiplies
+    that branch's output by a learned scalar sigmoid per token, as Qwen3.5
+    MoE does.
 
-    `implementation` is the grouped matmul the experts run on,
-    `moe.grouped_matmul`'s 'xla' or 'tokamax', the way `attention_impl`
-    names the attention kernel; it changes which kernel computes the same
-    contraction and nothing about the routing.
+    `implementation` is the grouped matmul the experts run on, one of
+    `moe.grouped_matmul`'s, the way `attention_impl` names an attention
+    kernel. It changes which kernel computes the same contraction and
+    nothing about the routing.
 
     `dispatch='exchange'` sends selected tokens to their expert shard in
-    bounded rounds on an expert mesh axis larger than one that divides the
-    expert count. The default `'global'` retains global sort/gather. Both
-    dispatches share the projection precision and differentiation contract.
+    bounded rounds, on an expert mesh axis larger than one that divides the
+    expert count. The default `'global'` sorts and gathers globally. Both
+    share the projection precision and the differentiation contract.
 
     `hash_layers` names the sparse layers that route by DeepSeek V4's fixed
-    token table instead of the scores (`DeepseekV4HashRouter`,
-    modeling_deepseek_v4.py:1045-1073, the `hash_moe` entries of
-    `mlp_layer_types`): their router holds `tid2eid` over the vocabulary in
-    place of the balancing bias, and the block hands it the token ids.
+    token table instead of the scores (`DeepseekV4HashRouter`). Their router
+    holds `tid2eid` over the vocabulary in place of the balancing bias, and
+    the block hands it the token ids.
     """
 
     experts: int
@@ -918,40 +909,38 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
               groups: Sequence[tuple[int, int]], x, *, train: bool, decode: bool,
               positions, segment_ids, kv_store, per_layer_input, attention_metadata=None,
               banked: bool = False):
-    """The layers over `x`, one run at a time as `groups` says.
+    """Run the layers over `x`, one run at a time as `groups` says.
 
-    A run of one layer is `layers[first]`, called as the plain loop calls it.
-    A longer run is one block, named for its range, under flax's scan: its
-    variables carry a leading layer axis that the view outside stacks and
-    unstacks, and each iteration reads its own slice of the per-layer inputs.
-    Building that block here needs a compact caller.
+    A run of one layer is `layers[first]`, called as the plain loop calls
+    it. A longer run is one block, named for its range, under flax's scan.
+    Its variables carry a leading layer axis that the view outside stacks
+    and unstacks, and each iteration reads its own slice of the per-layer
+    inputs.
 
-    A run's layers all share or all own their keys and values. Sharing layers
-    read the store their providers filled before the run, a constant the loop
-    closes over. Owning layers would write into it from inside the loop,
-    where a Python dict cannot follow, so they get no store; nothing reads
-    what they would have written, because a provider is always a run of one.
+    A run's layers all share or all own their keys and values. Sharing
+    layers read the store their providers filled before the run, a constant
+    the loop closes over. Owning layers would write into it from inside the
+    loop, where a Python dict cannot follow, so they get no store. Nothing
+    reads what they would have written, because a provider is always a run
+    of one.
 
-    `banked` says the store holds each run's parameters as one array already
-    (`dew.inference.banks`) rather than as the layers the view stacked. Those
-    runs, and any run the layout left in host memory, are read one layer at a
-    time, in `_prefetched_run`: the loop holds the layer it is about to
-    compute with and the one after it, the copy of the next layer is issued
-    before the current layer computes, and the parameters a layer has been
-    computed with are dropped. So at most two layers of one run are in device
-    memory, whatever the depth, and the last layer of the stack is the last
-    copy issued: nothing is fetched that nothing computes with. Staging
-    crosses the runs' boundaries, so a stack of single layers, of unequal
-    runs, or of both is pipelined the same way, and no run's fetch can be
-    hoisted above the layer before it, because it is issued inside that
-    layer's scan iteration or ordered after it by the carry it lands in.
-    Where a bank sits changes nothing here: a leaf in device memory is not
-    moved, so a resident bank and a host-resident one are read by the same
-    loop and give the same values.
-    Training uses the native Linen scan instead: map_variables stages one
-    row under remat, so backward refetches the original pinned bank rather
-    than retaining a device copy of every layer. There is no saved duplicate
-    weight bank and no training prefetch carry; inference keeps its prefetch.
+    `banked` says the store already holds each run's parameters as one array
+    (`dew.inference.banks`) rather than as the layers the view stacked.
+    Those runs, and any run the layout left in host memory, are read one
+    layer at a time in `_prefetched_run`. At most two layers of one run are
+    in device memory then, whatever the depth, and nothing is fetched that
+    nothing computes with. Staging crosses the runs' boundaries, so a stack
+    of single layers, of unequal runs, or of both is pipelined the same way.
+    No run's fetch can be hoisted above the layer before it, because it is
+    issued inside that layer's scan iteration or ordered after it by the
+    carry it lands in. A resident bank and a host-resident one are read by
+    the same loop and give the same values.
+
+    Training uses the native Linen scan instead. map_variables stages one
+    row under remat, so the backward pass refetches the original pinned bank
+    rather than retaining a device copy of every layer. That leaves training
+    no duplicate weight bank and no prefetch carry; inference keeps its
+    prefetch.
     """
     runs = [layers[first] if count == 1 else block(first, group_name(first, count))
             for first, count in groups]
@@ -990,15 +979,20 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         return x
 
     def read_only(run: DecoderBlock) -> list[str]:
-        """The collections a run reads and does not write: its parameters and
-        whatever else it was given, all of which a bank holds per layer."""
+        """List the collections a run reads and does not write.
+
+        These are its parameters and whatever else it was given, all of
+        which a bank holds per layer.
+        """
         return [name for name in run.variables
                 if not run.is_mutable_collection(name) or name not in WRITTEN]
 
     def first_of(index: int):
-        """Run `index`'s first layer's read-only variables, fetched, or None
-        past the last run: the copy nothing computes with is the one not
-        issued."""
+        """Fetch run `index`'s first layer's read-only variables.
+
+        Returns None past the last run: the copy nothing computes with is
+        the one not issued.
+        """
         if index >= len(runs):
             return None
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
@@ -1043,22 +1037,21 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
 
 
 def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, following):
-    """One run of `count` layers under `jax.lax.scan`, read one layer at a time.
+    """Run `count` layers under `jax.lax.scan`, read one layer at a time.
 
     `primed` is layer 0's read-only variables, already in device memory.
     Iteration `i` issues the copy of layer `i + 1` and then computes layer
-    `i`, so the copy has that layer's compute to overlap and the carry hands
-    its result to the iteration that reads it. The loop runs `count - 1`
-    iterations and the last layer is computed after it, out of what the carry
-    brought out; `following` stages the next run's first layer in place of
-    the copy the last layer does not need, and its result goes back to the
-    caller.
+    `i`, so the copy has that layer's compute to overlap. The loop runs
+    `count - 1` iterations and the last layer is computed after it, out of
+    what the carry brought out. `following` stages the next run's first
+    layer in place of the copy the last layer does not need, and its result
+    goes back to the caller.
 
-    The cache stays in the carry and is written in place, one layer's slice
-    per iteration, so a decode step holds one banked cache and not two. A
-    cache the layers create instead comes out per iteration, like everything
-    else they sow, stacked on a leading layer axis the way flax's own scan
-    hands them out.
+    The carry is the hidden state, the staged variables and the cache. The
+    cache is written in place, one layer's slice per iteration, so a decode
+    step holds one banked cache and not two. A cache the layers create
+    instead comes out per iteration, stacked on a leading layer axis the way
+    flax's own scan hands them out.
     """
     def body(carry, index):
         hidden, current, held = carry
@@ -1306,100 +1299,82 @@ def _whole(value, axis: int):
 class CausalTransformer(nn.Module):
     """Decoder-only transformer over token ids: [B, S] int32 -> [B, S, vocab] fp32.
 
-    The defaults are a from-scratch training recipe (multi-head attention,
-    swiglu, tied embeddings, no softcap); the fields that differ between the
-    open decoders are all here, so a Qwen3 or Gemma3 config is a field
-    mapping: num_kv_heads/head_dim for grouped-query attention,
-    attention_bias, norm_eps with scale_offset for Gemma's (1 + w) norms and
-    sandwich_norms for its second pair of them, attention_scale for its
-    query_pre_attn_scalar, embedding_scale and final_logit_softcap for the
-    rest of Gemma.
+    The defaults train a model from scratch: multi-head attention, swiglu,
+    tied embeddings, no softcap. Every field an open decoder varies is a
+    field here, so loading Qwen3 or Gemma3 is a field mapping and not a
+    subclass. The field comments below name which family sets each one.
 
-    `layer_types` is the pattern, one kind per layer, and `kinds` says what a
-    kind does: its window, and its own rope base or head dim where it has
-    one. How a checkpoint's config derives the pattern (Qwen3 makes every
-    layer past max_window_layers sliding) belongs to that translation, not
-    here: this takes the tuple.
+    `layer_types` is the pattern, one kind per layer, and `kinds` says what
+    a kind does: its window, and its own rope base or head dim. Deriving the
+    pattern from a checkpoint's config belongs to that translation, not
+    here; this takes the tuple.
 
     `mixture` turns the feed-forward of some layers into `moe.SparseMLP`,
-    routing each token to a few of its experts; a dense layer keeps the
-    leaves it always had, and None is a dense model. The LM objective's
-    balance_rate is what moves a mixture's balancing bias.
+    routing each token to a few of its experts. None is a dense model. The
+    LM objective's balance_rate is what moves a mixture's balancing bias.
 
-    causal=False turns every layer into full attention with no cache, the
-    encoder a masked diffusion language model denoises with; the parameter
-    tree is the same either way.
+    `causal=False` turns every layer into full attention with no cache,
+    which is the encoder a masked diffusion language model denoises with.
+    The parameter tree is the same either way.
 
-    per_layer_input_dim turns on Gemma 3n/4 style per-layer input embeddings:
-    an extra table of per_layer_input_vocab by layers times dim rows, read
-    per layer and added to that layer's input through its own gate. None is a
-    plain decoder and leaves the tree unchanged.
+    `per_layer_input_dim` turns on Gemma 3n/4 per-layer input embeddings: an
+    extra table, read per layer and added to that layer's input through its
+    own gate. None leaves the tree unchanged.
 
-    num_kv_shared_layers makes the trailing layers of that count reuse the
-    keys and values of the last earlier layer of their own kind instead of
-    projecting their own (Gemma 3n/4 cross-layer KV sharing). 0 is a plain
-    decoder and leaves the tree unchanged, and use_double_wide_mlp, which
-    widens the sharing layers' MLP, needs it. kv_shared_layers names the
-    sharing layers one by one instead, for a pattern that is not a trailing
-    run: GLM's IndexShare puts a sharing layer after every indexer layer
-    but the first three (modeling_glm_moe_dsa.py:313-318). Either spelling
-    resolves to the same plan: a sharing layer reads what the last earlier
-    non-sharing layer of its own kind stashed, and what a layer stashes is
-    its mixer's own, keys and values for attention and the indexer's
-    selection for MLA.
+    `num_kv_shared_layers` makes that many trailing layers reuse an earlier
+    layer's keys and values instead of projecting their own, which is Gemma
+    3n/4 cross-layer KV sharing. `use_double_wide_mlp`, which widens the
+    sharing layers' MLP, needs it. `kv_shared_layers` names the sharing
+    layers one by one instead, for a pattern that is not a trailing run:
+    GLM's IndexShare puts one after every indexer layer but the first three.
+    Either spelling resolves to the same plan. A sharing layer reads what
+    the last earlier non-sharing layer of its own kind stashed, and what a
+    layer stashes is its mixer's own: keys and values for attention, the
+    indexer's selection for MLA.
 
-    altup carries Gemma 3n's `altup_num_inputs` copies of the residual stream
-    (`dew.nn.gemma3n`): the embeddings and their projections enter the
-    layers as a stack, each block predicts the copies, runs on the active
-    one and corrects them all, and the copies come back through their own
-    projections to a mean the final norm reads. laurel_rank adds the LAuReL
-    block to every layer, activation_sparsity_pattern the gaussian top-k on
-    each layer's gate, and a tuple mlp_features gives each layer its own
-    feed-forward width. None and an int are a plain decoder. A width of 0
-    is a layer without a feed-forward, Mamba-2's block of the mixer alone.
+    `altup` carries Gemma 3n's copies of the residual stream
+    (`dew.nn.gemma3n`). The embeddings enter the layers as a stack, each
+    block predicts the copies, runs on the active one and corrects them all,
+    and the copies come back through their own projections to a mean the
+    final norm reads. `laurel_rank` adds the LAuReL block to every layer and
+    `activation_sparsity_pattern` the gaussian top-k on each layer's gate. A
+    tuple `mlp_features` gives each layer its own width; a width of 0 is a
+    layer without a feed-forward, which is Mamba-2's block of the mixer
+    alone.
 
-    partial_rotary_factor rotates that fraction of an unwindowed kind's head
-    dims and passes the rest through; a windowed kind rotates whole.
-    partial_rotary_type names which published convention the fraction
-    follows, because the two rotate different angles: 'proportional' is
-    Gemma 4's global layers (a head_dim-wide rope cut short), 'default' is
-    Qwen3.5's (a rope of the rotated width alone). The lines of each are
-    cited on `dew.nn.attention.rotary_freqs`. Interleaved mRoPE
-    (Qwen3.5's mrope_section) is the same rotation for text: with one
+    `partial_rotary_factor` rotates that fraction of an unwindowed kind's
+    head dims and passes the rest through; a windowed kind rotates whole.
+    `partial_rotary_type` names which published convention the fraction
+    follows, because the two rotate different angles:
+    `dew.nn.attention.rotary_freqs` documents both. Interleaved mRoPE
+    (Qwen3.5's mrope_section) is this same rotation for text. With one
     position per token the three grids' angles are equal and the interleave
-    reads the same value from each, so text-only input reduces exactly to
-    this partial rope (difference 0.0 against the reference's
-    apply_interleaved_mrope) and the image-grid positions are not modelled.
+    reads the same value from each, so text-only input reduces to this
+    partial rope exactly; image-grid positions are not modelled.
 
     `mixer` names the per-layer token mixer as a value from the `mixers`
-    registry, one frozen dataclass per kind carrying the reference's field
-    names (`mixer={"kind": "mla", ...}` from a config and the dataclass from
-    code agree; an unknown kind or field raises). None is today's
-    grouped-query causal attention with no config change. A non-standard kind
-    reads its own record and ignores the GQA projection geometry
-    (num_kv_heads, head_dim) the context still carries; those fields stay
-    validated, so a translation fills them with consistent values.
+    registry, one frozen dataclass per kind under the reference's own field
+    names. None is grouped-query causal attention. A non-standard kind reads
+    its own record and ignores the GQA projection geometry the context still
+    carries; those fields stay validated, so a translation fills them with
+    consistent values.
 
     `num_nextn_predict_layers` stacks that many multi-token-prediction
-    depths after the final norm, each an `MTPBlock` with the model-level
-    mixer and a dense feed-forward; 0 is a plain decoder and leaves the
-    tree unchanged. Depth d pairs the previous depth's state at position p
-    with the embedding of the token at p + d and scores what follows p + d
-    (arXiv 2412.19437, section 2.2), so each depth is one position shorter
-    than the last.
+    depths after the final norm, each an `MTPBlock`. Depth d pairs the
+    previous depth's state at position p with the embedding of the token at
+    p + d and scores what follows p + d (arXiv 2412.19437, section 2.2), so
+    each depth is one position shorter than the last.
 
-    `scan_layers` runs every run of consecutive layers that share a
-    parameter shape and a computation (same kind, same feed-forward and
-    width, the same say in keys and values) as iterations of one body under
-    flax's scan, and the layers between such runs unrolled; the grouping
-    is read off the resolved layers, never configured. A body compiles
-    once however many layers it runs, so compile time stops growing with
-    depth. The variables tree is the unscanned one leaf for leaf: `init`
-    always runs the plain loop, and the scan reads and writes its stacked
-    view of the same leaves (`StackView`), so a checkpoint or a Hugging Face
-    tree loads either way. A stage axis above one on the mesh in context
-    runs the stack as a pipeline over that axis (`_pipeline`) whether or
-    not the layers scan.
+    `scan_layers` runs each run of consecutive like layers as iterations of
+    one body under flax's scan, and the layers between such runs unrolled.
+    Layers are alike when they share a parameter shape and a computation,
+    which is read off the resolved layers and never configured. A body
+    compiles once however many layers it runs, so compile time stops growing
+    with depth. The variables tree is the unscanned one leaf for leaf:
+    `init` always runs the plain loop, and the scan reads and writes a
+    stacked view of the same leaves (`StackView`). A stage axis above one on
+    the mesh runs the stack as a pipeline over that axis (`_pipeline`),
+    whether or not the layers scan.
     """
     vocab_size: int
     emb_features: int = 512
@@ -1417,10 +1392,10 @@ class CausalTransformer(nn.Module):
     layer_types: tuple[str, ...] | None = None  # the pattern, one kind per layer
     kinds: Mapping[str, LayerKind] | None = None  # what each named kind does
     norm_eps: float = 1e-5
-    scale_offset: bool = False               # Gemma's (1 + w) RMSNorm scale
-    scale_after_cast: bool = False           # Llama and Qwen3 scale the cast activations
-    sandwich_norms: bool = False             # Gemma's norms on the sublayer outputs
-    pre_norms: bool = True                   # False with sandwich_norms: OLMo 3's post-norm block
+    scale_offset: bool = False       # RMSNorm weight is (1 + w), as Gemma stores it
+    scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
+    sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
+    pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
     qk_norm: bool = True
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
@@ -1706,8 +1681,12 @@ class CausalTransformer(nn.Module):
         bound = self if self.scope is not None else self.bind({})
         return (DecoderBank((), StackView(bound.groups), scanned=self.scan_layers),)
 
-    def setup(self):
-        types = self.per_layer_types
+    def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:
+        """Resolve every kind the pattern names, and the prediction depths'.
+
+        Raises when the pattern is not one kind per layer, or when `kinds`
+        describes a kind no layer has.
+        """
         if len(types) != self.num_layers:
             raise ValueError(
                 f"layer_types has {len(types)} entries for {self.num_layers} layers")
@@ -1717,7 +1696,14 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"kinds {unnamed} name no layer of this model, whose pattern is "
                 f"{sorted(set(types))}")
-        kinds = {layer_type: self.kind_of(layer_type) for layer_type in set(types) | prediction_kinds}
+        return {layer_type: self.kind_of(layer_type) for layer_type in set(types) | prediction_kinds}
+
+    def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
+        """Raise for a field, or a pair of fields, this model cannot build.
+
+        Each check names the field the caller set and what a model without
+        it looks like, so a translated config says which entry to fix.
+        """
         mtp_hc = self.mtp_hyper_connections
         if mtp_hc is not None:
             if self.num_nextn_predict_layers != 1:
@@ -1805,24 +1791,13 @@ class CausalTransformer(nn.Module):
                 f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
                 "model trained on plain next-token prediction")
 
-        self.embed_tokens = TokenEmbedding(
-            num_embeddings=self.vocab_size, features=self.emb_features,
-            dtype=self.dtype, name='embed_tokens')
-        if ple:
-            # The packed table every layer reads its own slice of
-            # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
-            # hidden_size_per_layer_input slice per layer.
-            self.embed_tokens_per_layer = TokenEmbedding(
-                num_embeddings=self.per_layer_vocab, features=self.num_layers * ple,
-                dtype=self.dtype, name='embed_tokens_per_layer')
-            self.per_layer_model_projection = nn.Dense(
-                self.num_layers * ple, use_bias=False,
-                dtype=self.dtype, precision=self.precision,
-                name='per_layer_model_projection')
-            self.per_layer_projection_norm = RMSNorm(
-                epsilon=self.norm_eps, scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast, dtype=self.dtype,
-                name='per_layer_projection_norm')
+    def feedforward_factories(self):
+        """Build the three feed-forward factories a layer can be given.
+
+        Returns the dense gated MLP, the routed experts, and Gemma 4's
+        parallel branch, each a partial the block calls with a name. A
+        model with no mixture has only the first.
+        """
         mixture = self.mixture
         # The shared branch is the dense feed-forward at the mixture's shared
         # width, handed to the sparse layer as a factory the way the block
@@ -1878,7 +1853,7 @@ class CausalTransformer(nn.Module):
             # The branch rides beside every sparse layer's dense feed-forward.
             routed = None
         if self.mlp == 'swigluoai':
-            if mixture is None or mixture.shared_features or len(sparse) != self.num_layers:
+            if mixture is None or mixture.shared_features or len(self.sparse_layers) != self.num_layers:
                 raise ValueError('swigluoai requires routed experts on every layer and no shared experts')
             routed = functools.partial(
                 GptOssMLP, hidden_size=self.emb_features,
@@ -1887,6 +1862,46 @@ class CausalTransformer(nn.Module):
                 implementation=mixture.implementation,
                 dispatch=mixture.dispatch,
                 dtype=self.dtype, precision=self.precision)
+        return gated_mlp, routed, parallel
+
+    def setup(self):
+        """Build the embeddings, the layers, the prediction depths and the head.
+
+        `specs` is one `LayerSpec` per layer, `block` builds a layer from
+        its index and name, `layers` holds them all, and `groups` says which
+        consecutive runs of them scan together. `mtp` holds the prediction
+        depths and `norm` the final norm, with `lm_head` beside it when the
+        embeddings are not tied.
+        """
+        types = self.per_layer_types
+        kinds = self.layer_kinds(types)
+        self.refuse_unbuildable_fields(kinds)
+        sparse = self.sparse_layers
+        hashed = self.hash_layers
+        sharing = self.kv_sharing
+        ple = self.per_layer_input_dim
+        widths = self.mlp_widths
+        sparsity = self.activation_sparsity_pattern
+
+        self.embed_tokens = TokenEmbedding(
+            num_embeddings=self.vocab_size, features=self.emb_features,
+            dtype=self.dtype, name='embed_tokens')
+        if ple:
+            # The packed table every layer reads its own slice of
+            # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
+            # hidden_size_per_layer_input slice per layer.
+            self.embed_tokens_per_layer = TokenEmbedding(
+                num_embeddings=self.per_layer_vocab, features=self.num_layers * ple,
+                dtype=self.dtype, name='embed_tokens_per_layer')
+            self.per_layer_model_projection = nn.Dense(
+                self.num_layers * ple, use_bias=False,
+                dtype=self.dtype, precision=self.precision,
+                name='per_layer_model_projection')
+            self.per_layer_projection_norm = RMSNorm(
+                epsilon=self.norm_eps, scale_offset=self.scale_offset,
+                scale_after_cast=self.scale_after_cast, dtype=self.dtype,
+                name='per_layer_projection_norm')
+        gated_mlp, routed, parallel = self.feedforward_factories()
         # None is today's attention; a kind names its own mixer on LayerKind
         # and otherwise rides the model's. Both build over the layer's
         # context.

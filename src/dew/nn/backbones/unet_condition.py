@@ -17,6 +17,12 @@ from dew.registry import models
 
 @dataclass(frozen=True)
 class UNetStage:
+    """Describes one resolution level: its width, heads and transformer depth.
+
+    `cross_attention` gives the level a spatial attention block at all;
+    `cross_only` drops the self-attention inside it.
+    """
+
     features: int
     heads: int
     depth: int = 1
@@ -25,15 +31,18 @@ class UNetStage:
 
 
 def sinusoidal_time(time, features: int, *, shift: float = 0, cosine_first: bool = True):
+    """Embed a scalar timestep as `features` sinusoids: `[B]` to `[B, features]`.
+
+    `cosine_first` puts the cosines in the leading half, as SD1/2 and SDXL
+    store them. `shift` moves the lowest frequency, the reference's
+    `freq_shift`.
+    """
     half = features // 2
     if features % 2 or half <= shift:
         raise ValueError("Time embedding width must be even and exceed twice the frequency shift")
-    # The exponent is the published models' own float32 arithmetic (the whole
-    # exponent scaled, then divided; the other order moves a sine by 1e-5 at a
-    # timestep near a thousand). Its exponential is taken on the host in
-    # float64 and rounded once: no backend's float32 `exp` is correctly rounded
-    # everywhere, and one ulp of a frequency is one ulp of a thousand-radian
-    # angle, so a device table would make the embedding depend on the backend.
+    # Scale the whole exponent before dividing, as the published models do;
+    # the other order moves a sine by 1e-5 near timestep 1000. Take exp on
+    # the host in float64 so the table does not vary with the backend.
     exponent = np.arange(half, dtype=np.float32) * np.float32(-math.log(10000.0)) / np.float32(half - shift)
     frequencies = jnp.asarray(np.exp(exponent.astype(np.float64)).astype(np.float32))
     phase = jnp.asarray(time, jnp.float32).reshape(-1, 1) * frequencies[None]
@@ -42,6 +51,8 @@ def sinusoidal_time(time, features: int, *, shift: float = 0, cosine_first: bool
 
 
 class _TimeMLP(nn.Module):
+    """Project a time embedding through two dense layers with a silu between."""
+
     features: int
     dtype: Dtype
     precision: PrecisionLike = None
@@ -53,6 +64,12 @@ class _TimeMLP(nn.Module):
 
 
 class _Attention(nn.Module):
+    """Attend over `[B, S, features]` tokens, against `context` when given.
+
+    The head width is `features // heads`. The projections carry no bias,
+    which is what the SD checkpoints hold.
+    """
+
     features: int
     heads: int
     dropout: float
@@ -75,6 +92,13 @@ class _Attention(nn.Module):
 
 
 class _Transformer(nn.Module):
+    """Run one transformer block: self-attention, cross-attention, feed-forward.
+
+    Each sublayer is pre-normed and added back as a residual. Under
+    `stage.cross_only` the first attention reads `context` too, which is
+    what the SD checkpoints with no self-attention hold.
+    """
+
     stage: UNetStage
     dropout: float
     dtype: Dtype
@@ -98,6 +122,13 @@ class _Transformer(nn.Module):
 
 
 class _SpatialAttention(nn.Module):
+    """Flatten an image to tokens, run `stage.depth` transformers, fold it back.
+
+    A group norm and a residual wrap the whole block. `linear_projection`
+    picks the projection into and out of the token width, a dense layer or a
+    1x1 convolution; SD1/2 store the convolution and SDXL the dense layer.
+    """
+
     stage: UNetStage
     linear_projection: bool
     dropout: float
@@ -134,6 +165,16 @@ class _SpatialAttention(nn.Module):
 
 
 class _Level(nn.Module):
+    """Run one resolution level of the encoder or the decoder.
+
+    Each of `blocks` steps is a residual block on the time embedding, then
+    the level's spatial attention when the stage has one. A 'up' level
+    concatenates a skip onto its input first. `resize` adds the level's
+    final convolution, strided in the encoder and preceded by a
+    nearest-neighbour upsample in the decoder. Returns the level's output
+    and every output the decoder consumes as a skip.
+    """
+
     stage: UNetStage
     blocks: int
     direction: str
@@ -180,11 +221,12 @@ class _Level(nn.Module):
 
 @models("unet_2d_condition")
 class UNet2DCondition(nn.Module):
-    """NHWC noisy latents plus text, pooled/size and optional inpaint conditions.
+    """Denoise NHWC latents on text, pooled/size and optional inpaint conditions.
 
     Stages specify spatial width, attention heads and transformer depth. The
-    encoder saves each residual output and each downsample; the decoder consumes
-    those skips in reverse order with one extra residual block per level.
+    encoder saves each residual output and each downsample; the decoder
+    consumes those skips in reverse order with one extra residual block per
+    level.
     """
     stages: tuple[UNetStage, ...]
     in_channels: int = 4

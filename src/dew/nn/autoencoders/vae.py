@@ -1,7 +1,7 @@
-"""Convolutional VAE building blocks originally ported from
-huggingface/diffusers v0.29.2 src/diffusers/models/vae_flax.py (Apache-2.0).
+"""Build the convolutional encoder and decoder of a diffusion VAE.
 
-These are independent linen modules in Dew. The loader below reads source
+The modules are independent linen ports of huggingface/diffusers v0.29.2
+src/diffusers/models/vae_flax.py (Apache-2.0). The loader below reads source
 configuration and checkpoint files; no external model implementation runs.
 """
 
@@ -21,15 +21,7 @@ from dew.nn.text_encoders import ParamTree
 
 
 class FlaxUpsample2D(nn.Module):
-    """
-    Flax implementation of 2D Upsample layer
-
-    Args:
-        in_channels (`int`):
-            Input channels
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            Parameters `dtype`
-    """
+    """Double each spatial axis by nearest-neighbour resize, then a 3x3 conv."""
 
     in_channels: int
     dtype: jnp.dtype = jnp.float32
@@ -54,15 +46,7 @@ class FlaxUpsample2D(nn.Module):
 
 
 class FlaxDownsample2D(nn.Module):
-    """
-    Flax implementation of 2D Downsample layer
-
-    Args:
-        in_channels (`int`):
-            Input channels
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            Parameters `dtype`
-    """
+    """Halve each spatial axis with a stride-2 3x3 conv, padded on the far side."""
 
     in_channels: int
     dtype: jnp.dtype = jnp.float32
@@ -83,22 +67,10 @@ class FlaxDownsample2D(nn.Module):
 
 
 class FlaxResnetBlock2D(nn.Module):
-    """
-    Flax implementation of 2D Resnet Block.
+    """Run two group-normed 3x3 convolutions and add the input back.
 
-    Args:
-        in_channels (`int`):
-            Input channels
-        out_channels (`int`):
-            Output channels
-        dropout (:obj:`float`, *optional*, defaults to 0.0):
-            Dropout rate
-        groups (:obj:`int`, *optional*, defaults to `32`):
-            The number of groups to use for group norm.
-        use_nin_shortcut (:obj:`bool`, *optional*, defaults to `None`):
-            Whether to use `nin_shortcut`. This activates a new layer inside ResNet block
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            Parameters `dtype`
+    `use_nin_shortcut` puts a 1x1 convolution on the residual; None takes it
+    whenever the block changes the channel count.
     """
 
     in_channels: int
@@ -160,19 +132,12 @@ class FlaxResnetBlock2D(nn.Module):
 
 
 class FlaxAttentionBlock(nn.Module):
-    r"""
-    Flax Convolutional based multi-head attention block for diffusion-based VAE.
+    """Attend over an image's pixels as a sequence, with a residual.
 
-    Parameters:
-        channels (:obj:`int`):
-            Input channels
-        num_head_channels (:obj:`int`, *optional*, defaults to `None`):
-            Number of attention heads
-        num_groups (:obj:`int`, *optional*, defaults to `32`):
-            The number of groups to use for group norm
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            Parameters `dtype`
-
+    `num_head_channels` is the width of one head, so the head count is
+    `channels // num_head_channels`; None is a single head. The scale is
+    split over the query and the key, as diffusers writes it, which is the
+    arithmetic the published weights were trained under.
     """
 
     channels: int
@@ -231,24 +196,10 @@ class FlaxAttentionBlock(nn.Module):
 
 
 class FlaxDownEncoderBlock2D(nn.Module):
-    r"""
-    Flax Resnet blocks-based Encoder block for diffusion-based VAE.
+    """Run `num_layers` resnets to `out_channels`, then halve the spatial axes.
 
-    Parameters:
-        in_channels (:obj:`int`):
-            Input channels
-        out_channels (:obj:`int`):
-            Output channels
-        dropout (:obj:`float`, *optional*, defaults to 0.0):
-            Dropout rate
-        num_layers (:obj:`int`, *optional*, defaults to 1):
-            Number of Resnet layer block
-        resnet_groups (:obj:`int`, *optional*, defaults to `32`):
-            The number of groups to use for the Resnet block group norm
-        add_downsample (:obj:`bool`, *optional*, defaults to `True`):
-            Whether to add downsample layer
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            Parameters `dtype`
+    Only the first resnet changes the channel count. `add_downsample` is
+    False on the last level, which keeps its resolution.
     """
 
     in_channels: int
@@ -288,24 +239,10 @@ class FlaxDownEncoderBlock2D(nn.Module):
 
 
 class FlaxUpDecoderBlock2D(nn.Module):
-    r"""
-    Flax Resnet blocks-based Decoder block for diffusion-based VAE.
+    """Run `num_layers` resnets to `out_channels`, then double the spatial axes.
 
-    Parameters:
-        in_channels (:obj:`int`):
-            Input channels
-        out_channels (:obj:`int`):
-            Output channels
-        dropout (:obj:`float`, *optional*, defaults to 0.0):
-            Dropout rate
-        num_layers (:obj:`int`, *optional*, defaults to 1):
-            Number of Resnet layer block
-        resnet_groups (:obj:`int`, *optional*, defaults to `32`):
-            The number of groups to use for the Resnet block group norm
-        add_upsample (:obj:`bool`, *optional*, defaults to `True`):
-            Whether to add upsample layer
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            Parameters `dtype`
+    Only the first resnet changes the channel count. `add_upsample` is
+    False on the last level, which keeps its resolution.
     """
 
     in_channels: int
@@ -345,22 +282,10 @@ class FlaxUpDecoderBlock2D(nn.Module):
 
 
 class FlaxUNetMidBlock2D(nn.Module):
-    r"""
-    Flax Unet Mid-Block module.
+    """Alternate attention and resnet blocks at the bottleneck resolution.
 
-    Parameters:
-        in_channels (:obj:`int`):
-            Input channels
-        dropout (:obj:`float`, *optional*, defaults to 0.0):
-            Dropout rate
-        num_layers (:obj:`int`, *optional*, defaults to 1):
-            Number of Resnet layer block
-        resnet_groups (:obj:`int`, *optional*, defaults to `32`):
-            The number of groups to use for the Resnet and Attention block group norm
-        num_attention_heads (:obj:`int`, *optional*, defaults to `1`):
-            Number of attention heads for each attention block
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            Parameters `dtype`
+    There is always a leading resnet, then `num_layers` attention/resnet
+    pairs. The channel count does not change.
     """
 
     in_channels: int
@@ -417,28 +342,11 @@ class FlaxUNetMidBlock2D(nn.Module):
 
 
 class FlaxEncoder(nn.Module):
-    r"""
-    Flax Implementation of VAE Encoder.
+    """Encode images to latent moments with a conv stack that halves each axis.
 
-    Parameters:
-        in_channels (:obj:`int`, *optional*, defaults to 3):
-            Input channels
-        out_channels (:obj:`int`, *optional*, defaults to 3):
-            Output channels
-        down_block_types (:obj:`Tuple[str]`, *optional*, defaults to `(DownEncoderBlock2D)`):
-            DownEncoder block type
-        block_out_channels (:obj:`Tuple[str]`, *optional*, defaults to `(64,)`):
-            Tuple containing the number of output channels for each block
-        layers_per_block (:obj:`int`, *optional*, defaults to `2`):
-            Number of Resnet layer for each block
-        norm_num_groups (:obj:`int`, *optional*, defaults to `32`):
-            norm num group
-        act_fn (:obj:`str`, *optional*, defaults to `silu`):
-            Activation function
-        double_z (:obj:`bool`, *optional*, defaults to `False`):
-            Whether to double the last output channels
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            Parameters `dtype`
+    `block_out_channels` gives one level per entry, each `layers_per_block`
+    resnets; the last level does not downsample. `double_z` doubles the
+    output channels so the caller can split them into mean and log-variance.
     """
 
     in_channels: int = 3
@@ -518,26 +426,10 @@ class FlaxEncoder(nn.Module):
 
 
 class FlaxDecoder(nn.Module):
-    r"""
-    Flax Implementation of VAE Decoder.
+    """Decode latents to images with a conv stack that doubles each axis.
 
-    Parameters:
-        in_channels (:obj:`int`, *optional*, defaults to 3):
-            Input channels
-        out_channels (:obj:`int`, *optional*, defaults to 3):
-            Output channels
-        up_block_types (:obj:`Tuple[str]`, *optional*, defaults to `(UpDecoderBlock2D)`):
-            UpDecoder block type
-        block_out_channels (:obj:`Tuple[str]`, *optional*, defaults to `(64,)`):
-            Tuple containing the number of output channels for each block
-        layers_per_block (:obj:`int`, *optional*, defaults to `2`):
-            Number of Resnet layer for each block
-        norm_num_groups (:obj:`int`, *optional*, defaults to `32`):
-            norm num group
-        act_fn (:obj:`str`, *optional*, defaults to `silu`):
-            Activation function
-        dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
-            parameters `dtype`
+    `block_out_channels` is read in reverse, one level per entry, each
+    `layers_per_block + 1` resnets; the last level does not upsample.
     """
 
     in_channels: int = 3
@@ -617,20 +509,18 @@ class FlaxDecoder(nn.Module):
         return self.conv_out(sample)
 
 
-
 _VAE_ATTENTION = {"to_q": "query", "to_k": "key", "to_v": "value"}
 
 
 def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
-    """One diffusers AutoencoderKL tensor name into its path in the vendored
-    tree, `{"encoder": ..., "decoder": ..., "quant_conv": ...}`.
+    """Map one diffusers AutoencoderKL tensor name to its path in this tree.
 
-    diffusers numbers its repeated children with a dot (`down_blocks.0`)
-    where linen names them with an underscore (`down_blocks_0`), calls the
-    mid-block attention's projections `to_q/to_k/to_v/to_out.0` where
-    `FlaxAttentionBlock` calls them `query/key/value/proj_attn`, and stores
-    every gain as `weight`: linen calls a norm's `scale` and a convolution's
-    or a dense's `kernel`, which the tensor's own rank tells apart.
+    Three names differ. diffusers numbers repeated children with a dot
+    (`down_blocks.0`) where linen uses an underscore (`down_blocks_0`). It
+    calls the mid-block attention's projections `to_q/to_k/to_v/to_out.0`
+    where `FlaxAttentionBlock` calls them `query/key/value/proj_attn`. It
+    stores every gain as `weight`, where linen has a norm's `scale` and a
+    convolution's or a dense's `kernel`, which `rank` tells apart.
     """
     parts = torch_name.split(".")
     leaf = "bias" if parts[-1] == "bias" else ("scale" if rank == 1 else "kernel")
@@ -659,12 +549,12 @@ def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
 
 
 def translate_vae_weights(torch_tensors: ParamTree) -> dict:
-    """diffusers AutoencoderKL tensors into the vendored modules' param tree.
+    """Convert diffusers AutoencoderKL tensors into this module's param tree.
 
     Convolution kernels transpose from torch's [out, in, kh, kw] to linen's
-    [kh, kw, in, out] and dense kernels from [out, in] to [in, out]; norms and
-    biases keep their layout. Every tensor maps: an unknown name raises rather
-    than loading half an autoencoder.
+    [kh, kw, in, out], and dense kernels from [out, in] to [in, out]; norms
+    and biases keep their layout. Every tensor maps, so an unknown name
+    raises rather than loading half an autoencoder.
     """
     params: dict = {}
     for name, tensor in torch_tensors.items():
@@ -687,20 +577,18 @@ FLAX_REVISIONS = ("bf16", "flax")
 
 
 def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) -> dict:
-    """A pretrained AutoencoderKL's config and params, from a local directory
-    or the Hub.
+    """Read a pretrained AutoencoderKL's config and params, local or from the Hub.
 
     Two weight layouts reach the same tree. The SD1-era repos ship flax
     `diffusion_flax_model.msgpack`, sometimes under a `vae` subfolder on a
     `flax`/`bf16` revision. Every 16-channel VAE (SD3.5, Flux) ships torch
     `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
-    reads, so the newer latent spaces load through the same seam.
-    Returns a dict with config and params. Supplied params are authoritative;
-    only configuration and repository file metadata are read, never weight bytes.
+    reads. Supplied `params` are authoritative: only the configuration and
+    the repository's file metadata are read then, never weight bytes.
 
     `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
-    the torch path then reads the repo's default branch. Any other revision is
-    a pin: the torch path reads only that revision and raises
+    the torch path then reads the repo's default branch. Any other revision
+    is a pin: the torch path reads only that revision, and raises
     FileNotFoundError when the repo has no weights at it.
     """
     from flax.serialization import msgpack_restore
@@ -766,7 +654,7 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
 
 
 def _read_vae_weights(directory: Path) -> dict:
-    """The params in `directory`, whichever of the two layouts it holds."""
+    """Read the params in `directory`, whichever of the two layouts it holds."""
     from flax.serialization import msgpack_restore
 
     msgpack = directory / "diffusion_flax_model.msgpack"
