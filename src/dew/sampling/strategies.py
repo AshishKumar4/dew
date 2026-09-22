@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Sequence
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -324,6 +324,62 @@ class Beam:
         return _beam_search(state, start, ops, transform, stopping, budget, n, self)
 
 
+def _pick(leaf, index):
+    """`leaf[:, index]` per prompt, over a `[prompts, count, ...]` leaf."""
+    return jnp.take_along_axis(leaf, index.reshape(index.shape + (1,) * (leaf.ndim - 2)),
+                               axis=1)
+
+
+def _beam_rows(parent, prompts: int, width: int):
+    """Cache rows of a `[prompts, count]` parent-beam index."""
+    return (parent + jnp.arange(prompts)[:, None] * width).reshape(-1)
+
+
+def _beam_continue(state: DecoderState, beams: StepState, ops: DecodeOps, parent, token,
+                   forward, real, prompts: int, width: int):
+    """The `width` beams the step carries on with, reparented onto their rows.
+
+    A branched beam decodes exactly like a separately selected prefix, so
+    the whole decode state of each parent is gathered onto the row its child
+    continues from before the child's token is committed.
+    """
+    parents = _pick(parent, forward)
+    selected = _pick(token, forward).reshape(-1)
+    state = ops.reindex(state, _beam_rows(parents, prompts, width))
+    beams = jax.tree.map(lambda leaf: jnp.take(leaf, _beam_rows(parents, prompts, width), axis=0),
+                         beams)
+    return state, beams.commit(selected, real), selected
+
+
+def _completed(done: Completed, search: Beam, top, open_, position: int, *,
+               best, hit, ended, tokens, raw) -> Completed:
+    """The `width` best completed hypotheses, after this step's arrivals.
+
+    A candidate joins the set at its length-penalized score, and only the
+    ones a criterion ended this step, in the live half of the ranking, can
+    join at all. `early_stopping` True stops recording once every slot is
+    full, and a prompt that is no longer worth extending records nothing.
+    """
+    prompts, width, keep = done.score.shape[0], search.width, search.keep
+    normalized = best / jnp.power(position + 1.0, search.length_penalty)
+    blocked = jnp.all(done.flag, axis=-1, keepdims=True) & (search.early_stopping is True)
+    normalized = normalized + (blocked | ~open_).astype(jnp.float32) * DEAD
+    normalized = normalized + (~(hit & top)).astype(jnp.float32) * DEAD
+    merged = jnp.concatenate([done.score, normalized], axis=1)
+    order = lax.top_k(merged, width)[1]
+    return Completed(
+        score=jnp.take_along_axis(merged, order, axis=1),
+        tokens=_pick(jnp.concatenate([done.tokens, tokens], axis=1), order),
+        raw=_pick(jnp.concatenate([done.raw, raw], axis=1), order),
+        flag=jnp.take_along_axis(jnp.concatenate([done.flag, hit & top], axis=1), order, axis=1),
+        length=jnp.take_along_axis(
+            jnp.concatenate([done.length,
+                             jnp.full((prompts, keep), position + 1, jnp.int32)], axis=1),
+            order, axis=1),
+        terminated=jnp.take_along_axis(
+            jnp.concatenate([done.terminated, ended & top], axis=1), order, axis=1))
+
+
 def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
                  stopping: Callable[[StepState, jax.Array], jax.Array],
@@ -342,32 +398,13 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
     real = jnp.repeat(start.active, width)
     top = (jnp.arange(keep) < width)[None, :]
 
-    def rows_of(parent):
-        """Cache rows of a `[prompts, count]` parent-beam index."""
-        return (parent + jnp.arange(prompts)[:, None] * width).reshape(-1)
-
-    def pick(leaf, index):
-        """`leaf[:, index]` per prompt, over a `[prompts, count, ...]` leaf."""
-        return jnp.take_along_axis(leaf, index.reshape(index.shape + (1,) * (leaf.ndim - 2)),
-                                   axis=1)
-
     def step(carry, position):
         state, beams, live, drawn, scored, open_, done = carry
-        genuine = real.reshape(prompts, width) & (live > DEAD / 2) & open_
-        checkify.check(jnp.all(wellformed(state.logits.astype(jnp.float32)).reshape(
-            prompts, width) | ~genuine),
-            "the model produced a live beam without a distribution to score")
-        raw = jax.nn.log_softmax(state.logits.astype(jnp.float32))
-        scores = transform(beams, raw)
-        checkify.check(jnp.all(wellformed(scores).reshape(prompts, width) | ~genuine),
-                       "the transform chain left a live beam without a distribution to search")
-        vocab = scores.shape[-1]
-        best, index = lax.top_k((scores.reshape(prompts, width, vocab)
-                                 + live[:, :, None]).reshape(prompts, width * vocab), keep)
+        best, index, chosen, vocab = _beam_candidates(state, beams, transform, live, real,
+                                                      open_, prompts, width, keep)
         parent, token = index // vocab, (index % vocab).astype(jnp.int32)
-        chosen = jnp.take_along_axis(raw.reshape(prompts, width * vocab), index, axis=1)
 
-        branch = rows_of(parent)
+        branch = _beam_rows(parent, prompts, width)
         candidates = jax.tree.map(lambda leaf: jnp.take(leaf, branch, axis=0), beams)
         flat = token.reshape(-1)
         ended = stopping(candidates.commit(flat, jnp.repeat(start.active, keep)), flat)
@@ -381,41 +418,62 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
 
         alive = best + hit.astype(jnp.float32) * DEAD
         forward = lax.top_k(alive, width)[1]
-        parents = pick(parent, forward)
-        selected = pick(token, forward).reshape(-1)
-        state = ops.reindex(state, rows_of(parents))
-        beams = jax.tree.map(lambda leaf: jnp.take(leaf, rows_of(parents), axis=0), beams)
-        beams = beams.commit(selected, real)
+        state, beams, selected = _beam_continue(state, beams, ops, parent, token, forward,
+                                                real, prompts, width)
 
-        normalized = best / jnp.power(position + 1.0, penalty)
-        blocked = jnp.all(done.flag, axis=-1, keepdims=True) & (search.early_stopping is True)
-        normalized = normalized + (blocked | ~open_).astype(jnp.float32) * DEAD
-        normalized = normalized + (~(hit & top)).astype(jnp.float32) * DEAD
-        merged = jnp.concatenate([done.score, normalized], axis=1)
-        order = lax.top_k(merged, width)[1]
-        done = Completed(
-            score=jnp.take_along_axis(merged, order, axis=1),
-            tokens=pick(jnp.concatenate([done.tokens, grown], axis=1), order),
-            raw=pick(jnp.concatenate([done.raw, traced], axis=1), order),
-            flag=jnp.take_along_axis(jnp.concatenate([done.flag, hit & top], axis=1), order, axis=1),
-            length=jnp.take_along_axis(
-                jnp.concatenate([done.length,
-                                 jnp.full((prompts, keep), position + 1, jnp.int32)], axis=1),
-                order, axis=1),
-            terminated=jnp.take_along_axis(
-                jnp.concatenate([done.terminated, ended & top], axis=1), order, axis=1))
+        done = _completed(done, search, top, open_, position,
+                          best=best, hit=hit, ended=ended, tokens=grown, raw=traced)
 
-        live = pick(alive, forward)
+        live = _pick(alive, forward)
+        # `never` estimates the best score still reachable from the whole
+        # budget where the penalty rewards length; otherwise from here.
         reach = float(budget) if never and penalty > 0 else (position + 1.0)
         worst = jnp.where(done.flag, jnp.min(done.score, axis=1, keepdims=True), DEAD)
         open_ = open_ & jnp.any(live[:, :1] / jnp.power(reach, penalty) > worst,
                                 axis=-1, keepdims=True)
         state = ops.advance(state, selected, real)
-        drawn = pick(grown, forward).reshape(prompts * width, budget)
-        scored = pick(traced, forward).reshape(prompts * width, budget)
+        drawn = _pick(grown, forward).reshape(prompts * width, budget)
+        scored = _pick(traced, forward).reshape(prompts * width, budget)
         return (state, beams, live, drawn, scored, open_, done), None
 
-    initial = (
+    initial = _beam_start(state, start, ops, prompts, width, budget)
+    (_, _, _, _, _, _, done), _ = lax.scan(step, initial, jnp.arange(budget))
+    return _beam_draws(done, start, prompts, n, budget)
+
+
+def _beam_candidates(state: DecoderState, beams: StepState, transform, live, real, open_,
+                     prompts: int, width: int, keep: int):
+    """The best `keep` continuations of the live beams, over all of them.
+
+    Returns each candidate's running score, the flat `beam * vocab` index it
+    came from, the model's own log probability of its token, and the
+    vocabulary that index is read against. A beam that is real, still scored
+    and worth extending has to hold a distribution; one that is not is
+    refused rather than searched.
+    """
+    genuine = real.reshape(prompts, width) & (live > DEAD / 2) & open_
+    checkify.check(jnp.all(wellformed(state.logits.astype(jnp.float32)).reshape(
+        prompts, width) | ~genuine),
+        "the model produced a live beam without a distribution to score")
+    raw = jax.nn.log_softmax(state.logits.astype(jnp.float32))
+    scores = transform(beams, raw)
+    checkify.check(jnp.all(wellformed(scores).reshape(prompts, width) | ~genuine),
+                   "the transform chain left a live beam without a distribution to search")
+    vocab = scores.shape[-1]
+    best, index = lax.top_k((scores.reshape(prompts, width, vocab)
+                             + live[:, :, None]).reshape(prompts, width * vocab), keep)
+    return best, index, jnp.take_along_axis(raw.reshape(prompts, width * vocab), index, axis=1), vocab
+
+
+def _beam_start(state: DecoderState, start: StepState, ops: DecodeOps, prompts: int,
+                width: int, budget: int):
+    """The carry the search scans from: `width` copies of each prompt.
+
+    Only beam zero starts alive, so the first step's continuations all come
+    from the one prefilled row and the search does not begin by scoring
+    `width` copies of the same distribution.
+    """
+    return (
         ops.reindex(state, jnp.repeat(jnp.arange(prompts), width)),
         jax.tree.map(lambda leaf: jnp.repeat(leaf, width, axis=0), start),
         jnp.broadcast_to(jnp.where(jnp.arange(width) == 0, 0.0, DEAD), (prompts, width)),
@@ -428,7 +486,15 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
                   jnp.zeros((prompts, width), bool),
                   jnp.zeros((prompts, width), jnp.int32),
                   jnp.zeros((prompts, width), bool)))
-    (_, _, _, _, _, _, done), _ = lax.scan(step, initial, jnp.arange(budget))
+
+
+def _beam_draws(done: Completed, start: StepState, prompts: int, n: int, budget: int) -> Draws:
+    """The best `n` completed hypotheses per prompt, as output rows.
+
+    A selected path is a search result rather than a draw, so its behaviour
+    log probability is zero; the raw log probabilities stay the model's own
+    for the tokens on the path.
+    """
     lengths = jnp.where(start.active[:, None], done.length, 0)[:, :n]
     valid = jnp.arange(budget)[None, None, :] < lengths[:, :, None]
     return Draws(done.tokens[:, :n].reshape(prompts * n, budget),
@@ -505,6 +571,236 @@ def _coordinates(state: DecoderState, step: StepState, slots: jax.Array) -> jax.
     return base[:, None] + slots
 
 
+class _Drafted(NamedTuple):
+    """What one drafting pass leaves for the verification that follows it.
+
+    `candidates` is the block's proposed tokens, `scores` the distribution
+    each was drawn from, and `steps` the `StepState` at each slot. `offered`
+    marks the candidates the confidence criterion still let the draft make,
+    and `ending` whether a stopping criterion fired on each of them.
+    """
+
+    state: DecoderState
+    candidates: list[jax.Array]
+    scores: list[jax.Array]
+    steps: list[StepState]
+    offered: list[jax.Array]
+    ending: list[jax.Array]
+
+
+def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepState,
+             keys: jax.Array, base: jax.Array, active: jax.Array, budget: int,
+             transform, stopping) -> _Drafted:
+    """One block's candidates: an ordinary target draw, then the draft chain.
+
+    The first candidate comes from the target's own logits, so it is always
+    accepted. Every later one chains through a prediction depth from the
+    previous candidate's hidden state and the coordinate it sits at.
+    `plan.confidence` stops offering candidates after the first the draft is
+    less sure of than that; they are still computed, at the same shapes, and
+    simply cannot be accepted.
+    """
+    propose = ops.propose
+    assert propose is not None
+    gamma, rows = plan.block, step.rows
+
+    def asked(at):
+        """Rows genuinely drawing at slot `at`, not walking past the budget."""
+        return active & (step.step + at < budget)
+
+    opening = dataclasses.replace(step, active=asked(0))
+    scores = [transform(opening, state.logits.astype(jnp.float32))]
+    candidates = [select(keys[:, 0], scores[0], opening.active)]
+    offered = [jnp.ones(rows, bool)]
+    states = [opening, opening.commit(candidates[0], active)]
+    hidden, drafting, live, ending = state.hidden, state, opening.active, []
+    sure = jnp.ones(rows, bool)
+    for depth in range(1, gamma):
+        ending.append(stopping(states[depth], candidates[depth - 1]))
+        live = live & ~ending[depth - 1] & asked(depth)
+        states[depth] = dataclasses.replace(states[depth], active=live)
+        drafting, logits, produced = propose(
+            drafting, hidden[:, None], candidates[depth - 1][:, None], None, live[:, None],
+            base[:, depth - 1][:, None], (depth - 1) % ops.depths, "draft")
+        hidden = produced[:, 0]
+        drawn = transform(states[depth], logits[:, 0].astype(jnp.float32))
+        token = select(keys[:, depth], drawn, live)
+        scores.append(drawn)
+        candidates.append(token)
+        offered.append(sure)
+        sure = sure & (jnp.exp(jnp.take_along_axis(
+            jax.nn.log_softmax(drawn), token[:, None], -1)[:, 0]) >= plan.confidence)
+        states.append(states[depth].commit(token, active))
+    # Every candidate gets the real criterion, the last one included: a
+    # block accepted whole must not draw its bonus behind a stop.
+    ending.append(stopping(states[gamma], candidates[gamma - 1]))
+    return _Drafted(drafting, candidates, scores, states, offered, ending)
+
+
+def _accepted(gamma: int, keys: jax.Array, targets: list[jax.Array], drafted: _Drafted,
+              step: StepState, active: jax.Array, budget: int) -> tuple[jax.Array, jax.Array]:
+    """How many candidates the block keeps, and the token it ends on.
+
+    A proposed `x` is accepted with probability `min(1, p(x) / q(x))` for the
+    target's post-transform `p` and the draft's own `q`, compared as a log
+    ratio. A candidate the draft never offered was not rejected, so the block
+    ends on an ordinary target draw; only a rejected offer draws from the
+    normalized positive part of `p - q`, which is the distinction algorithm 1
+    rests on.
+    """
+    candidates, drafts, offered, ending = (drafted.candidates, drafted.scores,
+                                           drafted.offered, drafted.ending)
+    rows = active.shape[0]
+    accepted = []
+    for at in range(1, gamma):
+        chosen = candidates[at][:, None]
+        ratio = (jnp.take_along_axis(jax.nn.log_softmax(targets[at]), chosen, -1)[:, 0]
+                 - jnp.take_along_axis(jax.nn.log_softmax(drafts[at]), chosen, -1)[:, 0])
+        uniform = jax.vmap(jax.random.uniform)(keys[:, gamma + at])
+        accepted.append((jnp.log(uniform) <= ratio) & offered[at])
+    available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
+    matched = (1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1), axis=1)
+               if accepted else jnp.ones(rows, jnp.int32)).astype(jnp.int32)
+    turned_down = matched < available
+    target = jnp.take_along_axis(jnp.stack(targets, axis=1), matched[:, None, None], axis=1)[:, 0]
+    draft = jnp.take_along_axis(jnp.stack(drafts, axis=1),
+                                jnp.minimum(matched, gamma - 1)[:, None, None], axis=1)[:, 0]
+    residual = jnp.maximum(jax.nn.softmax(target) - jax.nn.softmax(draft), 0.0)
+    weight = jnp.sum(residual, axis=-1, keepdims=True)
+    rest = jnp.log(residual / jnp.where(weight > 0, weight, 1.0))
+    stopped = jnp.any(jnp.stack(ending, axis=1)
+                      & (jnp.arange(gamma)[None, :] < matched[:, None]), axis=1)
+    replacement = select(keys[:, 2 * gamma], jnp.where(turned_down[:, None], rest, target),
+                         active & ~stopped & (step.step + matched < budget))
+    return matched, replacement
+
+
+def _emission(gamma: int, slots: jax.Array, matched: jax.Array, replacement: jax.Array,
+              proposed: jax.Array, targets: list[jax.Array], raw: list[jax.Array],
+              rows: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The block's tokens and the two log probabilities recorded for each.
+
+    Every emitted action, a replacement or a bonus included, records the
+    target's post-transform log probability as its behaviour and the model's
+    own as its raw value. The draft's `q` is never recorded: it is not the
+    distribution the action came from.
+    """
+    emitted = jnp.where(slots < matched[:, None],
+                        jnp.concatenate([proposed, jnp.zeros((rows, 1), jnp.int32)], axis=1),
+                        replacement[:, None])
+    behavior = jnp.stack([jnp.take_along_axis(jax.nn.log_softmax(targets[at]),
+                                              emitted[:, at:at + 1], -1)[:, 0]
+                          for at in range(gamma + 1)], axis=1)
+    original = jnp.stack([jnp.take_along_axis(jax.nn.log_softmax(raw[at]),
+                                              emitted[:, at:at + 1], -1)[:, 0]
+                          for at in range(gamma + 1)], axis=1)
+    return emitted, behavior, original
+
+
+def _emitted_count(gamma: int, step: StepState, emitted: jax.Array, active: jax.Array,
+                   terminated: jax.Array, budget: int, stopping,
+                   matched: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """How many of the block's slots each row keeps, and which rows ended.
+
+    The accepted prefix and the token after it are walked one slot at a time
+    so every criterion sees the history it would have seen in an ordinary
+    loop; the row stops at the first slot one fires on.
+    """
+    count = jnp.minimum(matched + 1, budget - step.step)
+    walked, hits = step, []
+    for at in range(gamma + 1):
+        walked = walked.commit(emitted[:, at], active & (at < count))
+        hits.append(stopping(walked, emitted[:, at]) & active & (at < count))
+    firing = jnp.stack(hits, axis=1)
+    anywhere = jnp.any(firing, axis=1)
+    count = jnp.where(anywhere, jnp.minimum(count, jnp.argmax(firing, axis=1) + 1), count)
+    count = jnp.where(active, count, 0)
+    return count, terminated | (anywhere & (count == jnp.argmax(firing, axis=1) + 1))
+
+
+def _recorded(gamma: int, step: StepState, emitted: jax.Array, behavior: jax.Array,
+              original: jax.Array, count: jax.Array, slots: jax.Array, index: jax.Array,
+              active: jax.Array, terminated: jax.Array, budget: int, out):
+    """The kept slots, the `StepState` they leave, and the output rows.
+
+    Each kept slot lands at its own response position, so a block that
+    emitted two tokens writes two columns and the rest of the block writes
+    none. A row that ran out of budget or ended stops being active.
+    """
+    keep = slots < count[:, None]
+    committed = step
+    for at in range(gamma + 1):
+        committed = committed.commit(emitted[:, at], keep[:, at])
+    committed = dataclasses.replace(
+        committed, active=active & ~terminated & (step.step + count < budget))
+    landing = jnp.where(keep, step.step[:, None] + slots, budget)
+    return keep, committed, (
+        out[0].at[index, landing].set(emitted, mode="drop"),
+        out[1].at[index, landing].set(True, mode="drop"),
+        out[2].at[index, landing].set(behavior, mode="drop"),
+        out[3].at[index, landing].set(original, mode="drop"))
+
+
+def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget: int,
+           slots: jax.Array, index: jax.Array):
+    """One speculative block: draft `plan.block` candidates, verify them,
+    accept the longest prefix the test allows, and emit what follows it.
+
+    The target cache is saved before the block and the accepted prefix is
+    replayed into it, because a recurrent mixer's state is a running summary
+    no cursor can rewind, and the prediction cache is rebuilt the same way.
+    """
+    verify, gamma = ops.verify, plan.block
+    assert verify is not None
+    state, step, terminated, out = carry
+    active, saved, rows = step.active, state.cache, step.rows
+    base = _coordinates(state, step, slots)
+    keys = jax.vmap(lambda key, count: jax.random.split(
+        jax.random.fold_in(key, count), 2 * gamma + 1))(step.keys, step.step)
+
+    drafted = _drafted(plan, ops, state, step, keys, base, active, budget,
+                       transform, stopping)
+    states, candidates = drafted.steps, drafted.candidates
+    proposed = jnp.stack(candidates, axis=1)
+    drafting, verified, _ = verify(
+        drafted.state, proposed,
+        jnp.stack([active & (step.step + at < budget) for at in range(gamma)], axis=1))
+    assert state.hidden is not None
+    raw = [state.logits.astype(jnp.float32)] + [verified[:, at].astype(jnp.float32)
+                                                for at in range(gamma)]
+    targets = [drafted.scores[0]] + [transform(states[at], raw[at])
+                                     for at in range(1, gamma + 1)]
+
+    matched, replacement = _accepted(gamma, keys, targets, drafted, step, active, budget)
+
+    emitted, behavior, original = _emission(gamma, slots, matched, replacement, proposed,
+                                            targets, raw, rows)
+    count, terminated = _emitted_count(gamma, step, emitted, active, terminated, budget,
+                                       stopping, matched)
+    checkify.check(
+        jnp.all(jnp.stack([wellformed(raw[at]) | ~(at < count) for at in range(gamma + 1)])),
+        "the model produced an emitted position without a distribution to score")
+    keep, committed, out = _recorded(gamma, step, emitted, behavior, original, count,
+                                     slots, index, active, terminated, budget, out)
+
+    following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
+    assert seen is not None and ops.embed is not None
+    last = jnp.maximum(count - 1, 0)
+    # The tails reseed hands back are every depth's predecessor at the
+    # last emitted slot, the target's own state first; a row that emitted
+    # nothing keeps what it had.
+    following, _, carried = reseed(
+        ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted),
+        keep, base, last, prior_tokens=step.total())
+    following = dataclasses.replace(
+        following,
+        logits=jnp.where((count > 0)[:, None],
+                         jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
+                         state.logits),
+        hidden=carried[0], drafts=carried[1:])
+    return (following, committed, terminated, out), None
+
+
 def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
                transform: Callable[[StepState, jax.Array], jax.Array],
                stopping: Callable[[StepState, jax.Array], jax.Array],
@@ -524,138 +820,14 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
     slots = jnp.arange(gamma + 1)[None, :]
     index = jnp.arange(rows)[:, None]
 
-    def block(carry):
-        state, step, terminated, out = carry
-        active = step.active
-        saved = state.cache
-        base = _coordinates(state, step, slots)
-        keys = jax.vmap(lambda key, count: jax.random.split(
-            jax.random.fold_in(key, count), 2 * gamma + 1))(step.keys, step.step)
-
-        def asked(at):
-            """Rows genuinely drawing at slot `at`, not walking past the budget."""
-            return active & (step.step + at < budget)
-
-        opening = dataclasses.replace(step, active=asked(0))
-        targets = [transform(opening, state.logits.astype(jnp.float32))]
-        drafts, candidates, offered = [targets[0]], [], [jnp.ones(rows, bool)]
-        candidates.append(select(keys[:, 0], targets[0], opening.active))
-        states = [opening, opening.commit(candidates[0], active)]
-        hidden, drafting, live, ending = state.hidden, state, opening.active, []
-        sure = jnp.ones(rows, bool)
-        for depth in range(1, gamma):
-            ending.append(stopping(states[depth], candidates[depth - 1]))
-            live = live & ~ending[depth - 1] & asked(depth)
-            states[depth] = dataclasses.replace(states[depth], active=live)
-            drafting, logits, produced = propose(
-                drafting, hidden[:, None], candidates[depth - 1][:, None], None, live[:, None],
-                base[:, depth - 1][:, None], (depth - 1) % ops.depths, "draft")
-            hidden = produced[:, 0]
-            scores = transform(states[depth], logits[:, 0].astype(jnp.float32))
-            token = select(keys[:, depth], scores, live)
-            drafts.append(scores)
-            candidates.append(token)
-            offered.append(sure)
-            sure = sure & (jnp.exp(jnp.take_along_axis(
-                jax.nn.log_softmax(scores), token[:, None], -1)[:, 0]) >= plan.confidence)
-            states.append(states[depth].commit(token, active))
-        # Every candidate gets the real criterion, the last one included: a
-        # block accepted whole must not draw its bonus behind a stop.
-        ending.append(stopping(states[gamma], candidates[gamma - 1]))
-
-        proposed = jnp.stack(candidates, axis=1)
-        drafting, verified, _ = verify(
-            drafting, proposed, jnp.stack([asked(at) for at in range(gamma)], axis=1))
-        assert state.hidden is not None
-        raw = [state.logits.astype(jnp.float32)] + [verified[:, at].astype(jnp.float32)
-                                                    for at in range(gamma)]
-        targets += [transform(states[at], raw[at]) for at in range(1, gamma + 1)]
-
-        accepted = []
-        for at in range(1, gamma):
-            chosen = candidates[at][:, None]
-            ratio = (jnp.take_along_axis(jax.nn.log_softmax(targets[at]), chosen, -1)[:, 0]
-                     - jnp.take_along_axis(jax.nn.log_softmax(drafts[at]), chosen, -1)[:, 0])
-            uniform = jax.vmap(jax.random.uniform)(keys[:, gamma + at])
-            accepted.append((jnp.log(uniform) <= ratio) & offered[at])
-        available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
-        matched = (1 + jnp.sum(jnp.cumprod(jnp.stack(accepted, axis=1), axis=1), axis=1)
-                   if accepted else jnp.ones(rows, jnp.int32)).astype(jnp.int32)
-
-        # A candidate the draft never offered was not rejected, so the block
-        # ends on an ordinary target draw. Only a rejected offer draws from the
-        # residual, which is the distinction algorithm 1 rests on.
-        turned_down = matched < available
-        target = jnp.take_along_axis(jnp.stack(targets, axis=1), matched[:, None, None], axis=1)[:, 0]
-        draft = jnp.take_along_axis(jnp.stack(drafts, axis=1),
-                                    jnp.minimum(matched, gamma - 1)[:, None, None], axis=1)[:, 0]
-        residual = jnp.maximum(jax.nn.softmax(target) - jax.nn.softmax(draft), 0.0)
-        weight = jnp.sum(residual, axis=-1, keepdims=True)
-        rest = jnp.log(residual / jnp.where(weight > 0, weight, 1.0))
-        stopped = jnp.any(jnp.stack(ending, axis=1)
-                          & (jnp.arange(gamma)[None, :] < matched[:, None]), axis=1)
-        replacement = select(keys[:, 2 * gamma], jnp.where(turned_down[:, None], rest, target),
-                             active & ~stopped & (step.step + matched < budget))
-
-        emitted = jnp.where(slots < matched[:, None],
-                            jnp.concatenate([proposed, jnp.zeros((rows, 1), jnp.int32)], axis=1),
-                            replacement[:, None])
-        behavior = jnp.stack([jnp.take_along_axis(jax.nn.log_softmax(targets[at]),
-                                                  emitted[:, at:at + 1], -1)[:, 0]
-                              for at in range(gamma + 1)], axis=1)
-        original = jnp.stack([jnp.take_along_axis(jax.nn.log_softmax(raw[at]),
-                                                  emitted[:, at:at + 1], -1)[:, 0]
-                              for at in range(gamma + 1)], axis=1)
-
-        count = jnp.minimum(matched + 1, budget - step.step)
-        walked, hits = step, []
-        for at in range(gamma + 1):
-            walked = walked.commit(emitted[:, at], active & (at < count))
-            hits.append(stopping(walked, emitted[:, at]) & active & (at < count))
-        firing = jnp.stack(hits, axis=1)
-        anywhere = jnp.any(firing, axis=1)
-        count = jnp.where(anywhere, jnp.minimum(count, jnp.argmax(firing, axis=1) + 1), count)
-        count = jnp.where(active, count, 0)
-        terminated = terminated | (anywhere & (count == jnp.argmax(firing, axis=1) + 1))
-        checkify.check(
-            jnp.all(jnp.stack([wellformed(raw[at]) | ~(at < count) for at in range(gamma + 1)])),
-            "the model produced an emitted position without a distribution to score")
-
-        keep = slots < count[:, None]
-        committed = step
-        for at in range(gamma + 1):
-            committed = committed.commit(emitted[:, at], keep[:, at])
-        committed = dataclasses.replace(
-            committed, active=active & ~terminated & (step.step + count < budget))
-
-        landing = jnp.where(keep, step.step[:, None] + slots, budget)
-        out = (out[0].at[index, landing].set(emitted, mode="drop"),
-               out[1].at[index, landing].set(True, mode="drop"),
-               out[2].at[index, landing].set(behavior, mode="drop"),
-               out[3].at[index, landing].set(original, mode="drop"))
-
-        following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
-        assert seen is not None and ops.embed is not None
-        last = jnp.maximum(count - 1, 0)
-        # The tails reseed hands back are every depth's predecessor at the
-        # last emitted slot, the target's own state first; a row that emitted
-        # nothing keeps what it had.
-        following, _, carried = reseed(
-            ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted),
-            keep, base, last, prior_tokens=step.total())
-        following = dataclasses.replace(
-            following,
-            logits=jnp.where((count > 0)[:, None],
-                             jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
-                             state.logits),
-            hidden=carried[0], drafts=carried[1:])
-        return (following, committed, terminated, out), None
-
     def outer(carry, _):
         # Every rank reduces the same global mask, so the pool skips the same
         # blocks. A skipped block runs no model call at all, which is where
         # the saved target forwards come from.
-        return lax.cond(jnp.any(carry[1].active), block, lambda held: (held, None), carry)
+        return lax.cond(jnp.any(carry[1].active),
+                        lambda held: _block(held, plan, ops, transform, stopping, budget,
+                                            slots, index),
+                        lambda held: (held, None), carry)
 
     empty = (jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
              jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32))

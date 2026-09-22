@@ -293,25 +293,38 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
         # held; a depth without enough history never reads it.
         state = dataclasses.replace(state, drafts=(states[rows, slot],) * (ops.depths - 1))
     if ops.depths and width > 1 and states is not None and prepared:
-        order = jnp.argsort(~real, axis=1, stable=True)[..., None]
-        lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
-        # Without supplied coordinates a token's position is its rank among
-        # the row's real tokens, which is what the cache assigns; the physical
-        # slot a padded prompt put it in is not a coordinate.
-        coordinates = (jnp.take_along_axis(logical.astype(jnp.int32), order, axis=1)
-                       if logical is not None and logical.ndim == 3 else
-                       jnp.broadcast_to(jnp.arange(width)[None, :], (batch, width))
-                       if logical is None
-                       else jnp.take_along_axis(logical.astype(jnp.int32), order[..., 0], axis=1))
-        compact = states[jnp.arange(batch)[:, None], order[..., 0]]
-        state, _, carried = strategies.reseed(
-            ops, state, (compact[:, 0],) + (None,) * (ops.depths - 1), compact[:, 1:],
-            jnp.take_along_axis(prepared[0], order, axis=1)[:, 1:],
-            jnp.arange(width - 1)[None, :] < (lengths - 1)[:, None],
-            coordinates[:, 1:], jnp.maximum(lengths - 2, 0),
-            prior_tokens=jnp.ones(batch, jnp.int32))
-        state = dataclasses.replace(state, drafts=carried[1:])
+        state = _seeded_depths(ops, state, states, prepared[0], real, logical, batch, width)
     return state, last >= 0
+
+
+def _seeded_depths(ops: DecodeOps, state: DecoderState, states: jax.Array,
+                   embeddings: jax.Array, real: jax.Array, logical: jax.Array | None,
+                   batch: int, width: int) -> DecoderState:
+    """`state` with each prediction depth's cache seeded over the prompt.
+
+    A padded prompt's real tokens are compacted to the front first, so a
+    depth reads the target's hidden state at one position with the token at
+    the next, at that token's own coordinate, which is the history a
+    checkpoint's predictor was trained behind.
+    """
+    order = jnp.argsort(~real, axis=1, stable=True)[..., None]
+    lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
+    # Without supplied coordinates a token's position is its rank among
+    # the row's real tokens, which is what the cache assigns; the physical
+    # slot a padded prompt put it in is not a coordinate.
+    coordinates = (jnp.take_along_axis(logical.astype(jnp.int32), order, axis=1)
+                   if logical is not None and logical.ndim == 3 else
+                   jnp.broadcast_to(jnp.arange(width)[None, :], (batch, width))
+                   if logical is None
+                   else jnp.take_along_axis(logical.astype(jnp.int32), order[..., 0], axis=1))
+    compact = states[jnp.arange(batch)[:, None], order[..., 0]]
+    state, _, carried = strategies.reseed(
+        ops, state, (compact[:, 0],) + (None,) * (ops.depths - 1), compact[:, 1:],
+        jnp.take_along_axis(embeddings, order, axis=1)[:, 1:],
+        jnp.arange(width - 1)[None, :] < (lengths - 1)[:, None],
+        coordinates[:, 1:], jnp.maximum(lengths - 2, 0),
+        prior_tokens=jnp.ones(batch, jnp.int32))
+    return dataclasses.replace(state, drafts=carried[1:])
 
 
 def prediction_depths(model: nn.Module) -> int:
@@ -358,7 +371,16 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
 
     if not depths or not exposed:
         return DecodeOps(advance, reindex, run)
+    return DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths)
 
+
+def _drafting(model: nn.Module, params: Variables, pad_id: int):
+    """The `(propose, embed)` pair a drafting strategy runs the depths with.
+
+    `propose` runs one prediction depth over a candidate token at an explicit
+    target position; `embed` prepares the token embeddings a replayed block
+    hands back to the depths.
+    """
     def propose(state: DecoderState, hidden: jax.Array, tokens: jax.Array | None,
                 embeds: jax.Array | None, valid: jax.Array, positions: jax.Array,
                 depth: int, prediction_phase: PredictionPhase) -> tuple[DecoderState, jax.Array, jax.Array]:
@@ -379,7 +401,7 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
         assert isinstance(prepared, jax.Array)
         return prepared
 
-    return DecodeOps(advance, reindex, run, propose, embed, depths)
+    return propose, embed
 
 
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
@@ -609,6 +631,38 @@ def _compiled(rows: jax.sharding.NamedSharding | None):
                    out_shardings=(None, rows))
 
 
+def _agreed_request(prepared: ModelInputs, processes: int, controls) -> ModelInputs:
+    """`prepared` under one validity schema, with the pool agreed on the rest.
+
+    Whether this process's own prompts needed padding is rank-local, and the
+    digest would refuse a pool that disagrees only about that, so the schema
+    is agreed first. The digest then covers all conditioning and token
+    fields, not token length alone, because different traced shapes would
+    issue mismatched collectives.
+    """
+    prepared = agreed_validity(prepared, processes, controls=controls, phase="generation input")
+    multihost_utils.assert_equal(
+        generation_signature(prepared, controls),
+        "generation input shapes, continuations, decoding components and padding "
+        "must agree across processes")
+    return prepared
+
+
+def _padded(plan: RowPlan, prepared: ModelInputs) -> ModelInputs:
+    """`prepared` filled out to the rows the devices take.
+
+    Repeated rows carry no real token, so they finish at once and emit
+    nothing. Their validity is the field an unpadded request omitted.
+    """
+    padded = plan.pad(prepared)
+    if plan.count == plan.rows:
+        return padded
+    existing = padded.token_fields.get("attention_mask")
+    valid = jnp.ones(padded.tokens.shape, bool) if existing is None else existing
+    return replace(padded, token_fields={**padded.token_fields,
+                                         "attention_mask": valid & ~plan.padding[:, None]})
+
+
 @overload
 def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
@@ -666,26 +720,9 @@ def generate(model: nn.Module, params: Variables,
     request = (agreed("generation input validation", resolve) if processes > 1 else resolve())
     prepared, random_key, components, controls = request
     if processes > 1:
-        # Whether this process's own prompts needed padding is rank-local, and
-        # the digest below would refuse a pool that disagrees only about that,
-        # so the pool agrees one validity schema first.
-        prepared = agreed_validity(prepared, processes, controls=controls, phase="generation input")
-        # Compare fixed-size hashes before creating distributed input arrays.
-        # The schema covers all conditioning and token fields, not token length
-        # alone; different traced shapes would issue mismatched collectives.
-        digest = generation_signature(prepared, controls)
-        multihost_utils.assert_equal(
-            digest, "generation input shapes, continuations, decoding components and padding "
-                    "must agree across processes")
+        prepared = _agreed_request(prepared, processes, controls)
     plan = RowPlan.over(mesh, prepared.tokens.shape[0])
-    padded = plan.pad(prepared)
-    if plan.count != plan.rows:
-        # Repeated rows carry no real token, so they finish at once and emit
-        # nothing. Their validity is the field an unpadded request omitted.
-        existing = padded.token_fields.get("attention_mask")
-        valid = jnp.ones(padded.tokens.shape, bool) if existing is None else existing
-        padded = replace(padded, token_fields={**padded.token_fields,
-                                               "attention_mask": valid & ~plan.padding[:, None]})
+    padded = _padded(plan, prepared)
     failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
                                                plan.keys(random_key), max_new_tokens, sampling.pad_id, n,
                                                *components)

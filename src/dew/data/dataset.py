@@ -469,56 +469,59 @@ def tokenized(stream: Callable[[], Iterator[Batch]],
     takes numbers. Pass None for an unconditional run, or a reader that hands
     the words back to keep them.
     """
-    class Tokenizing(Forwarding):
-        """The stream's iterator with each batch's captions tokenized."""
-
-        def __init__(self, source: Iterator[Batch]):
-            self._source: Iterator[Batch] | None = source
-
-        def __iter__(self):
-            return self
-
-        def __next__(self) -> Batch:
-            if self._source is None:
-                raise StopIteration
-            batch = dict(next(self._source))
-            captions = [str(caption) for caption in batch.pop(CAPTION)]
-            if tokenize is not None:
-                batch.update(tokenize(captions))
-            return batch
-
-        def close(self) -> None:
-            try:
-                super().close()
-            finally:
-                # request_stop must still reach a source waiting inside close.
-                self._source = None
-
-    class CheckpointableTokenizing(Tokenizing):
-        """Runs the same stage over a stream that reports and restores its
-        position, forwarding both. The methods are written out because the
-        protocol reads attributes statically, where a forwarding
-        `__getattr__` would only satisfy `hasattr`."""
-
-        def get_state(self) -> Position:
-            source = self._source
-            if not isinstance(source, Checkpointable):
-                raise RuntimeError("the tokenized iterator is closed")
-            return source.get_state()
-
-        def set_state(self, state: Position) -> None:
-            source = self._source
-            if not isinstance(source, Checkpointable):
-                raise RuntimeError("the tokenized iterator is closed")
-            source.set_state(state)
-
     def start() -> Iterator[Batch]:
         source = iter(stream())
         if isinstance(source, Checkpointable):
-            return CheckpointableTokenizing(source)
-        return Tokenizing(source)
+            return _CheckpointableTokenizing(source, tokenize)
+        return _Tokenizing(source, tokenize)
 
     return start
+
+
+class _Tokenizing(Forwarding):
+    """The stream's iterator with each batch's captions tokenized."""
+
+    def __init__(self, source: Iterator[Batch], tokenize: Tokenize | None):
+        self._source: Iterator[Batch] | None = source
+        self._tokenize = tokenize
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Batch:
+        if self._source is None:
+            raise StopIteration
+        batch = dict(next(self._source))
+        captions = [str(caption) for caption in batch.pop(CAPTION)]
+        if self._tokenize is not None:
+            batch.update(self._tokenize(captions))
+        return batch
+
+    def close(self) -> None:
+        try:
+            super().close()
+        finally:
+            # request_stop must still reach a source waiting inside close.
+            self._source = None
+
+
+class _CheckpointableTokenizing(_Tokenizing):
+    """Runs the same stage over a stream that reports and restores its
+    position, forwarding both. The methods are written out because the
+    protocol reads attributes statically, where a forwarding
+    `__getattr__` would only satisfy `hasattr`."""
+
+    def get_state(self) -> Position:
+        source = self._source
+        if not isinstance(source, Checkpointable):
+            raise RuntimeError("the tokenized iterator is closed")
+        return source.get_state()
+
+    def set_state(self, state: Position) -> None:
+        source = self._source
+        if not isinstance(source, Checkpointable):
+            raise RuntimeError("the tokenized iterator is closed")
+        source.set_state(state)
 
 
 def local_batch(batch: int) -> int:

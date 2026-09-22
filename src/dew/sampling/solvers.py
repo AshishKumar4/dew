@@ -871,33 +871,46 @@ class DPMSolverSinglestep:
             return jnp.where(from_zero, source_limit(2, m1 + weight * (m0 - m1)), stepped)
 
         def third(_):
-            h, ax, b, _, c_heun, c_2, dz = update(3)
-            m1, m2 = outputs[-2], outputs[-3]
-            from_zero = history.alphas[-3] == 0
-            r0 = jnp.where(from_zero, 1.0, (lambdas[-1] - lambdas[-3]) / h)
-            r1 = jnp.where(from_zero, 0.5, (lambdas[-2] - lambdas[-3]) / h)
-            d1_0 = (m1 - m2) / r1
-            d1_1 = (m0 - m2) / r0
-            if self.solver_type == "midpoint":
-                stepped = ax + b * m2 + c_heun * d1_1
-            else:
-                d1 = (r0 * d1_0 - r1 * d1_1) / (r0 - r1)
-                d2 = 2.0 * (d1_1 - d1_0) / (r0 - r1)
-                stepped = ax + b * m2 + c_heun * d1 + c_2 * d2
-            if self.algorithm.startswith("sde"):
-                stepped = stepped + dz
-            endpoint_clean = m0
-            if self.solver_type == "heun" and self.algorithm == "dpmsolver++":
-                # Combine D1 and D2 before taking the infinite-anchor limit.
-                # Their individually divergent leading terms cancel.
-                gap = _half_log_snr(alpha_t, jnp.where(sigma_t == 0, 1.0, sigma_t)) - lambdas[-1]
-                endpoint_clean = m0 + (gap - 1.0) * (m0 - m1) / (lambdas[-1] - lambdas[-2])
-            return jnp.where(from_zero, source_limit(3, endpoint_clean), stepped)
+            return _singlestep_third(self, update, source_limit, history, alpha_t, sigma_t)
 
         stepped = lax.switch(order - 1, [first, second, third][:self.order], None)
         terminal = sigma_t <= 0
         next_x = jnp.where(terminal, alpha_t * denoised, stepped)
         return next_x, Singlestep(history.advance(), anchor, state.orders)
+
+
+def _singlestep_third(solver: DPMSolverSinglestep, update, source_limit, history: Multistep,
+                      alpha_t, sigma_t):
+    """The third-order singlestep update from the anchor three points back.
+
+    `update` gives that anchor's coefficients and its noise term, and
+    `source_limit` the alpha=0 limit. The Heun `dpmsolver++` form combines
+    the two differences before the limit is taken, because their leading
+    terms diverge individually and cancel together.
+    """
+    lambdas, outputs = history.lambdas, history.outputs
+    m0, m1, m2 = outputs[-1], outputs[-2], outputs[-3]
+    h, ax, b, _, c_heun, c_2, dz = update(3)
+    from_zero = history.alphas[-3] == 0
+    r0 = jnp.where(from_zero, 1.0, (lambdas[-1] - lambdas[-3]) / h)
+    r1 = jnp.where(from_zero, 0.5, (lambdas[-2] - lambdas[-3]) / h)
+    d1_0 = (m1 - m2) / r1
+    d1_1 = (m0 - m2) / r0
+    if solver.solver_type == "midpoint":
+        stepped = ax + b * m2 + c_heun * d1_1
+    else:
+        d1 = (r0 * d1_0 - r1 * d1_1) / (r0 - r1)
+        d2 = 2.0 * (d1_1 - d1_0) / (r0 - r1)
+        stepped = ax + b * m2 + c_heun * d1 + c_2 * d2
+    if solver.algorithm.startswith("sde"):
+        stepped = stepped + dz
+    endpoint_clean = m0
+    if solver.solver_type == "heun" and solver.algorithm == "dpmsolver++":
+        # Combine D1 and D2 before taking the infinite-anchor limit.
+        # Their individually divergent leading terms cancel.
+        gap = _half_log_snr(alpha_t, jnp.where(sigma_t == 0, 1.0, sigma_t)) - lambdas[-1]
+        endpoint_clean = m0 + (gap - 1.0) * (m0 - m1) / (lambdas[-1] - lambdas[-2])
+    return jnp.where(from_zero, source_limit(3, endpoint_clean), stepped)
 
 
 def _deis_second(t, b, c):
@@ -1073,13 +1086,16 @@ class UniPC:
     def _b_h(self, hh):
         return hh if self.solver_type == "bh1" else jnp.expm1(hh)
 
-    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
-        (alpha_here, sigma_here), (alpha_t, sigma_t) = _rates(process, t, t_next, x)
+    def _corrected(self, x, state: UniPCState, m_here, alpha_here, sigma_here, lambda_here):
+        """`x` corrected with the UniC of the last predictor's own order.
+
+        The first step has no predictor to correct, and `disable_corrector`
+        names the step indices whose predictor output is left as it is. The
+        corrector reads the history as it stood before this point's output
+        was pushed onto it.
+        """
         history = state.history
-        m_here = denoised if self.predict_x0 else eps
-        taken, steps = history.taken, history.steps
-        lambdas = history.lambdas
-        lambda_here = _half_log_snr(alpha_here, sigma_here)
+        taken, lambdas = history.taken, history.lambdas
 
         def corrected(p: int):
             """x at this point, corrected with the p-th order UniC from the
@@ -1104,8 +1120,16 @@ class UniPC:
                           jnp.zeros((), bool))
         use_corrector = jnp.logical_and(taken > 0, jnp.logical_not(disabled))
         branch = jnp.where(use_corrector, state.last_order, 0)
-        x = lax.switch(branch, [lambda _: x] + [
+        return lax.switch(branch, [lambda _: x] + [
             (lambda p: lambda _: corrected(p))(p) for p in range(1, self.order + 1)], None)
+
+    def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
+        (alpha_here, sigma_here), (alpha_t, sigma_t) = _rates(process, t, t_next, x)
+        history = state.history
+        m_here = denoised if self.predict_x0 else eps
+        taken, steps = history.taken, history.steps
+        lambda_here = _half_log_snr(alpha_here, sigma_here)
+        x = self._corrected(x, state, m_here, alpha_here, sigma_here, lambda_here)
 
         history = history.push(m_here, alpha_here, sigma_here)
         lambdas, outputs = history.lambdas, history.outputs
