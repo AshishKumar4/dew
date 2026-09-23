@@ -56,7 +56,7 @@ def test_released_config_builds_the_published_geometry():
     assert model.mixture.latent_features == 3584 and model.mixture.latent_norm
     assert model.attention_residuals.block_size == 12
     assert model.attention_residuals.blocks(93) == 8
-    assert model.situ == Situ(4.0, 25.0) and model.mlp == "situ"
+    assert model.mlp == Situ(4.0, 25.0)
 
 
 def released_tensors() -> dict[str, tuple[str, list[int]]]:

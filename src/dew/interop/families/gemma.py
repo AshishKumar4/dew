@@ -17,7 +17,6 @@ import numpy as np
 
 from dew import records
 from dew.interop.hf_decoders import (
-    _HF_ACTIVATIONS,
     _MOE_SHARED,
     AltUpFields,
     DecoderFields,
@@ -26,6 +25,7 @@ from dew.interop.hf_decoders import (
     _fixed_fields,
     _fixed_mixture,
     _flatten,
+    _hf_activation,
     _hf_name,
     _kinds,
     _kinds_of,
@@ -357,7 +357,7 @@ def _gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
 
 def _gemma3_export(model: CausalTransformer) -> Mapping[str, object]:
     return {
-        'hidden_activation': _HF_ACTIVATIONS[model.mlp],
+        'hidden_activation': _hf_activation(model.mlp),
         'query_pre_attn_scalar': (None if model.attention_scale is None
                                  else round(1.0 / model.attention_scale ** 2)),
         'final_logit_softcapping': model.final_logit_softcap,
@@ -411,7 +411,7 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
         _refuse('kv_shared_layers', 'Gemma4 can express only a trailing run of shared-KV layers')
     mixture = model.mixture
     fields: dict[str, object] = {
-        'hidden_act': None, 'hidden_activation': _HF_ACTIVATIONS[model.mlp],
+        'hidden_act': None, 'hidden_activation': _hf_activation(model.mlp),
         'layer_types': list(types), 'intermediate_size': model.hidden_features,
         'head_dim': local.head_dim, 'num_key_value_heads': local.num_kv_heads,
         'global_head_dim': full.head_dim, 'num_global_key_value_heads': full.num_kv_heads,
