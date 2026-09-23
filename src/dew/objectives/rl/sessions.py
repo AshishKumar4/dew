@@ -337,13 +337,13 @@ def _built(sessions: Sequence[Session], width: int, truncation: str) -> list[_Ch
             for chain in _chains(session, index, width)]
 
 
-def _place(built: Sequence[_Chain], width: int) -> list[list[int]]:
+def _place(lengths: Sequence[int], width: int) -> list[list[int]]:
     """Place chains first-fit in decreasing length, a stable order: per row, its chain numbers."""
-    order = sorted(range(len(built)), key=lambda number: -len(built[number].tokens))
+    order = sorted(range(len(lengths)), key=lambda number: -lengths[number])
     fill: list[int] = []
     placed: list[list[int]] = []
     for number in order:
-        size = len(built[number].tokens)
+        size = lengths[number]
         row = next((row for row, used in enumerate(fill) if used + size <= width), None)
         if row is None:
             fill.append(0)
@@ -354,10 +354,15 @@ def _place(built: Sequence[_Chain], width: int) -> list[list[int]]:
     return placed
 
 
-def rows_needed(sessions: Sequence[Session], width: int, *, truncation: str = "mask") -> int:
-    """How many `width`-id rows `pack` fills with `sessions`' trained chains."""
+def chain_lengths(sessions: Sequence[Session], width: int, *, truncation: str) -> list[int]:
+    """The length of every chain `pack` builds from `sessions` under `truncation`."""
     check_truncation(truncation)
-    return len(_place(_built(sessions, width, truncation), width))
+    return [len(chain.tokens) for chain in _built(sessions, width, truncation)]
+
+
+def rows_needed(lengths: Sequence[int], width: int) -> int:
+    """How many `width`-id rows `pack` fills with chains of `lengths`."""
+    return len(_place(lengths, width))
 
 
 def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
@@ -371,7 +376,7 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     `session_weights` is described at `SESSION_WEIGHTS_KEY`. Chains are
     placed first-fit in decreasing length, a stable order, and `rows` pads
     the batch to a fixed count, refusing chains that need more
-    (`rows_needed` counts them). `truncation` decides whether TRUNCATED
+    (`rows_needed` over `chain_lengths` counts them). `truncation` decides whether TRUNCATED
     sessions train, as the module docstring describes.
     """
     if type(width) is not int or width < 2:
@@ -380,7 +385,7 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
         raise ValueError("rows is a positive integer, or None for as many as the chains need")
     values = advantages(sessions, estimator, truncation=truncation)
     built = _built(sessions, width, truncation)
-    placed = _place(built, width)
+    placed = _place([len(chain.tokens) for chain in built], width)
     count = len(placed) if rows is None else rows
     if len(placed) > count:
         raise ValueError(f"the chains need {len(placed)} rows of {width} ids, more than the {rows} asked for")

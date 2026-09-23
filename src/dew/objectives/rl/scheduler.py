@@ -92,6 +92,7 @@ from .sessions import (
     SessionSource,
     Status,
     Task,
+    chain_lengths,
     check_truncation,
     pack,
     rows_needed,
@@ -168,6 +169,8 @@ class _Group:
     label: str
     live: list[_Sample] = field(default_factory=list)
     done: list[Session] = field(default_factory=list)
+    lengths: list[int] = field(default_factory=list)
+    """Once complete, the lengths of the chains its sessions pack into."""
     latencies: list[float] = field(default_factory=list)
     failures: Counter[int] = field(default_factory=Counter)
     abandoned: bool = False
@@ -375,12 +378,13 @@ class RolloutScheduler:
         A session whose calls do not extend each other packs as one chain
         per call, so the rows a group needs are known only once it is done.
         """
-        alone = rows_needed(group.done, self.width, truncation=self.truncation)
+        group.lengths = chain_lengths(group.done, self.width, truncation=self.truncation)
+        alone = rows_needed(group.lengths, self.width)
         if alone > self.rows:
             raise ValueError(f"one group of task {group.task.id} needs {alone} rows of {self.width} ids, "
                              f"more than rows={self.rows}; size rows for sessions whose calls split into chains")
-        admitted = [session for complete in entry.complete for session in complete.done[:self.groups]]
-        if rows_needed([*admitted, *group.done], self.width, truncation=self.truncation) <= self.rows:
+        admitted = [length for complete in entry.complete for length in complete.lengths]
+        if rows_needed([*admitted, *group.lengths], self.width) <= self.rows:
             entry.complete.append(group)
             return
         tally.cut += 1
