@@ -129,8 +129,8 @@ def main(config: Config) -> dict:
                                rows=config.prompts * config.groups, tasks=harbor_tasks, groups=config.groups,
                                max_lag=config.max_lag, ahead=config.max_lag, truncation=config.truncation, log=log)
     draw = np.random.default_rng(config.seed)
-    data = Dataset(train=lambda: iter(lambda: {"task_id": draw.integers(0, len(tasks), config.prompts, np.int32)},
-                                      None),
+    data = Dataset(train=lambda partition: iter(
+                       lambda: {"task_id": draw.integers(0, len(tasks), config.prompts, np.int32)}, None),
                    val=None, records=len(tasks), batch=config.prompts)
     trainer = Trainer(objective, optax.adamw(config.learning_rate, b2=0.99, weight_decay=0.0),
                       key=jax.random.key(config.seed), rollout=rollout)
