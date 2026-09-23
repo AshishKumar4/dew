@@ -120,15 +120,12 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
     `dew.position` is where that promise is written down and `read_position`
     is where it is taken up. A share's own offset resumes only the readers of
     that same share, whichever processes they are, and anything else is
-    refused with the shares named. A table written before shares were
-    recorded held one per process, each process reading its own.
+    refused with the shares named.
     """
     written = len(table['lengths'])
     # Row order, not set order: bytes hash differently per interpreter, and
     # which of the refusals below a broken checkpoint gets is a diagnostic.
     rows = [_row(table, index) for index in range(written)]
-    held = ([(int(index), int(count)) for index, count in np.asarray(table['shares'])]
-            if 'shares' in table else [(process, written) for process in range(written)])
     if position.translates(rows[0]):
         if any(row != rows[0] for row in rows[1:]):
             raise ValueError(
@@ -138,6 +135,7 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
                 f"different orders and no single one of their positions is this "
                 f"run's.")
         return rows[0]
+    held = [(int(index), int(count)) for index, count in np.asarray(table['shares'])]
     mine = [row for row, written_share in zip(rows, held, strict=True)
             if written_share == (share.index, share.count)]
     if not mine:

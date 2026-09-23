@@ -150,7 +150,7 @@ def train(case: Case, source: Pretrained, ids: np.ndarray):
     entries = [{"text": rows[row]} for row in range(count)]
     stream = (pygrain.MapDataset.source(entries).repeat().to_iter_dataset()
               .batch(count, drop_remainder=True))
-    data = Dataset(train=lambda: iter(stream), val=None, records=count, batch=count)
+    data = Dataset(train=lambda partition: iter(stream), val=None, records=count, batch=count)
     state = Trainer(objective, optax.sgd(case.rate), key=jax.random.key(SEED)).fit(
         data, steps=1, log_every=1)
     return state

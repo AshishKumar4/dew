@@ -182,22 +182,30 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
     processes each runs. CPU pools, the hosts of one TPU slice, and
     several processes on one machine share slice 0, and there the process
     is the granule.
+
+    Devices on several slices with no replicas asked for put the slices on
+    the data axis where it divides, as MaxText's default DCN data
+    parallelism does, so only the gradient sum crosses the slow network;
+    otherwise the slices split fsdp.
     """
     by_process = len({_slice(device) for device in devices}) == 1
     granules = len({device.process_index if by_process else device.slice_index
                     for device in devices})
     data_width = shape[0]
-    if granules % spec.replicas or data_width % spec.replicas:
+    replicas = spec.replicas
+    if replicas == 1 and not by_process and data_width % granules == 0:
+        replicas = granules
+    if granules % replicas or data_width % replicas:
         raise ValueError(
-            f"replicas {spec.replicas} must divide both the {granules} granules "
+            f"replicas {replicas} must divide both the {granules} granules "
             f"(slices, or processes) the devices form and the data axis of {data_width}")
-    per_replica = granules // spec.replicas
+    per_replica = granules // replicas
     if spec.fsdp % per_replica:
         raise ValueError(
-            f"each of the {spec.replicas} replicas spans {per_replica} granules, "
+            f"each of the {replicas} replicas spans {per_replica} granules, "
             f"which only the fsdp axis may cross, and fsdp {spec.fsdp} does not "
             "divide over them")
-    dcn = (spec.replicas, 1, per_replica, 1, 1, 1)
+    dcn = (replicas, 1, per_replica, 1, 1, 1)
     ici = tuple(size // outer for size, outer in zip(shape, dcn, strict=True))
     return mesh_utils.create_hybrid_device_mesh(
         ici, dcn, devices, process_is_granule=by_process, allow_split_physical_axes=True)
@@ -331,7 +339,9 @@ class Layout:
     @property
     def axis_rules(self) -> LogicalAxisRules:
         """The rules as flax reads them, pairs in precedence order."""
-        return _rule_table(self.rules)
+        rules = self.rules
+        assert isinstance(rules, tuple), "__post_init__ keeps the rules as pairs"
+        return rules
 
     def shardings[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Derive a NamedSharding per leaf of `tree` from the declared axes.

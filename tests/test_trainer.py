@@ -618,16 +618,14 @@ def test_a_checkpoint_that_does_not_land_fails_the_run(tmp_path):
         trainer.fit(Data(), steps=1, log_every=1)
 
 
-def _rewrite_position(trainer, step, rows, shares=None):
+def _rewrite_position(trainer, step, rows, shares):
     """Save `step` again with `rows` as the checkpoint's position table, each
-    row read for the share `shares` names; no shares is a table written
-    before they were recorded."""
+    row read for the share `shares` names."""
     restored, _ = trainer.checkpoints.restore()
     written = [np.frombuffer(row, np.uint8) for row in rows]
     table = {"rows": np.stack(written),
-             "lengths": np.array([len(row) for row in written], np.int64)}
-    if shares is not None:
-        table["shares"] = np.array(shares, np.int64)
+             "lengths": np.array([len(row) for row in written], np.int64),
+             "shares": np.array(shares, np.int64)}
     manager = trainer.checkpoints._open()
     manager.save(step, args=ocp.args.PyTreeSave({**restored, "position": table}), force=True)
     manager.wait_until_finished()
@@ -640,7 +638,7 @@ def test_a_position_written_by_another_process_count_is_refused(tmp_path):
     trainer = make_trainer(tmp_path)
     trainer.fit(Data(), steps=1, log_every=1)
     _, saved = trainer.checkpoints.restore(share=DataPartition())
-    _rewrite_position(trainer, 2, [saved, saved])
+    _rewrite_position(trainer, 2, [saved, saved], shares=[[0, 2], [1, 2]])
 
     with pytest.raises(ValueError, match=r"shares \[\(0, 2\), \(1, 2\)\] \(index, count\), and this "
                                          r"reader reads share 0 of 1"):
@@ -673,7 +671,7 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     trainer = make_trainer(tmp_path)
     trainer.fit(Data(), steps=1, log_every=1)
     global_position = position.encode(position.Global(records=16, order="Counting"))
-    _rewrite_position(trainer, 2, [global_position, global_position])
+    _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
 
     assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position
 
@@ -685,7 +683,7 @@ def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
     trainer.fit(Data(), steps=1, log_every=1)
     _rewrite_position(trainer, 2, [
         position.encode(position.Global(records=records, order="Counting"))
-        for records in (16, 32)])
+        for records in (16, 32)], shares=[[0, 2], [1, 2]])
 
     with pytest.raises(ValueError, match="global data position that differs between the 2 processes"):
         Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())
