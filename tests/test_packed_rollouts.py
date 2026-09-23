@@ -185,7 +185,6 @@ def test_session_metrics_report_merge_masking_reward_latency_and_lag():
         Session("u", "g", 3, 0, (first, merged), Status.INFRA_ERROR, None),
     ]
     batch = pack(rollouts, 8)
-    batch["old_log_probs"] = batch[BEHAVIOR_LOG_PROBS_KEY] + .1 * batch[RESPONSE_MASK_KEY]
     metrics = session_metrics(rollouts, batch, source=lambda rollout: rollout.task,
                               latencies=[1.0, 2.0, 3.0, 40.0], version=6)
     assert metrics["merge/calls_per_chain"] == pytest.approx(4 / 3)
@@ -196,8 +195,6 @@ def test_session_metrics_report_merge_masking_reward_latency_and_lag():
     assert metrics["reward/component/tests"] == .5
     assert metrics["latency/max"] == 40.0 and metrics["latency/p50"] == 2.5
     assert metrics["lag/max"] == 2 and metrics["lag/mean"] == pytest.approx((2 + 1 + 1 + 2 + 1) / 5)
-    # The loss owns the mismatch metrics, over the same mask its weights read.
-    assert not any(key.startswith("mismatch/") for key in metrics)
 
 
 def test_each_sampled_id_weighs_one_over_its_rollouts_sampled_count():

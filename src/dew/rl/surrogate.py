@@ -335,7 +335,7 @@ def mismatch_metrics(proximal_log_probs: jax.Array, behavior_log_probs: jax.Arra
     """Trainer-versus-engine diagnostics over the trainable tokens.
 
     verl 12ebe0c `compute_offpolicy_metrics`: `kl` is the direct estimate
-    `masked_mean(log behavior - log proximal, keep)` and `k3_kl` the mean of
+    `mean(log behavior - log proximal)` and `k3_kl` the mean of
     `r - log r - 1` for `r = proximal / behavior`, the quantity prime-rl logs
     as `mismatch_kl`. `ess` is verl's `rollout_is_eff_sample_size`, one over
     the mean square of the applied weights clamped to `[0, cap]` and divided

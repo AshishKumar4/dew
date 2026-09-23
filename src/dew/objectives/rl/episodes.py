@@ -249,11 +249,11 @@ class EpisodeRollout:
     Episodes train through `sessions.pack`: a call whose context extends the
     previous call's context and actions merges into its chain, and chains
     share rows of max_prompt_tokens + max_new_tokens ids, so set the
-    objective's seq_len one below that. `rows` fixes the packed row count;
-    None reserves one row per possible call, which always fits. The terminal
-    group advantage is shared by the episode's actions; no per-turn credit
-    rule is inferred, and truncated episodes are masked. Host records and numeric rows carry the trainer's committed
-    update clock. Raw and behavior likelihoods come from actual draws.
+    objective's seq_len one below that. The batch keeps one row per possible
+    call, which always fits and keeps shapes fixed. The terminal group
+    advantage is shared by the episode's actions; no per-turn credit rule is
+    inferred, and truncated episodes are masked. Host records and numeric
+    rows carry the trainer's committed update clock. Raw and behavior likelihoods come from actual draws.
 
     The policy binds one immutable variables snapshot for the whole
     collection. It must use that binding, not a mutable serving default.
@@ -273,7 +273,6 @@ class EpisodeRollout:
     groups: int = 2
     record: EpisodeRecorder | None = None
     journal: EpisodeJournal | None = None
-    rows: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("max_prompt_tokens", "max_new_tokens", "max_turns"):
@@ -281,8 +280,6 @@ class EpisodeRollout:
                 raise ValueError(f"{name} must be a positive integer")
         if type(self.groups) is not int or self.groups < 2:
             raise ValueError("an episode group needs at least two samples")
-        if self.rows is not None and (type(self.rows) is not int or self.rows < 1):
-            raise ValueError("rows is a positive integer, or None to reserve one row per possible call")
         if self.sampling.eos_id is None:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
 
@@ -623,8 +620,8 @@ class EpisodeRollout:
                 raise ValueError("an advantage group must contain the same task")
         sessions = [session_of(episode, group=str(index // self.groups))
                     for index, episode in enumerate(episodes)]
-        rows = len(episodes) * self.max_turns if self.rows is None else self.rows
-        batch = pack(sessions, self.max_prompt_tokens + self.max_new_tokens, rows=rows)
+        batch = pack(sessions, self.max_prompt_tokens + self.max_new_tokens,
+                     rows=len(episodes) * self.max_turns)
         batch[OLD_LOG_PROBS_KEY] = sampled_values(
             batch, lambda index, number: episodes[index].transitions[number].action.raw_log_probs)
         return batch
