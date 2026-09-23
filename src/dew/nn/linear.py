@@ -81,19 +81,21 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None):
     `bias` the `[D]` per-channel bias a conv with one adds before the
     activation (Mamba-2's `use_conv_bias`).
 
-    Depthwise in lax terms: the input's channel axis is the feature axis of
-    a grouped conv with one channel per group, so the taps land as
-    [D, 1, K, 1, 1] (lhs feature, window, rhs feature), matching
-    `feature_group_count=D` on a one-in-one-out grouping.
+    The taps apply as K shifted products summed in fp32, not as a grouped
+    `conv_general_dilated`: XLA's SPMD partitioner sums that conv's filter
+    gradient over every device of the mesh, the ones that hold the same rows
+    included, so a batch split over part of the mesh (fsdp beside a tensor
+    axis the conv's input does not use) doubled the taps' gradient (jax
+    0.11.2). The products are what a depthwise conv computes anyway.
     """
-    D, K = kernel.shape
-    padded = jnp.pad(x, ((0, 0), (0, 0), (K - 1, 0)))
-    taps = kernel[:, None, :]  # [D(out), 1(in per group), K] in OIH terms
-    windows = jax.lax.conv_general_dilated(
-        padded, taps,
-        window_strides=(1,), padding='VALID',
-        dimension_numbers=('NCH', 'OIH', 'NCH'),
-        feature_group_count=D)
+    _, K = kernel.shape
+    length = x.shape[-1]
+    padded = jnp.pad(x, ((0, 0), (0, 0), (K - 1, 0))).astype(jnp.promote_types(x.dtype, jnp.float32))
+    taps = kernel.astype(padded.dtype)
+    windows = padded[..., :length] * taps[:, :1]
+    for tap in range(1, K):
+        windows = windows + padded[..., tap:tap + length] * taps[:, tap:tap + 1]
+    windows = windows.astype(x.dtype)
     if bias is not None:
         windows = windows + bias.astype(windows.dtype)[None, :, None]
     if activation:

@@ -16,10 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
-from jax.sharding import PartitionSpec as P
+from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.data import Dataset
 from dew.nn.backbones.dit import SimpleDiT
@@ -28,6 +25,9 @@ from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import batch_shardings, shard_batch
+
+# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+pytestmark = pytest.mark.mesh
 
 VOCAB = 64
 # Training batches carry seq_len + 1 columns for the one-token shift, so the
@@ -416,3 +416,28 @@ def test_a_pipeline_moves_no_microbatch_between_the_batch_shards():
              if op in ("all-gather", "all-to-all") for shape in shapes]
 
     assert not [shape for shape in moved if math.prod(shape) >= hidden], moved
+
+
+def test_the_causal_convs_taps_gradient_under_a_partly_replicated_batch():
+    """Rows split over fsdp beside a tensor axis the conv's input does not
+    use: the taps' gradient is one device's. XLA partitioned a grouped
+    conv's filter gradient by summing it over all four devices, the two
+    that hold the same rows included, which doubled it and trained the
+    Mamba-2 and gated delta net convs of a hybrid on fsdp x tensor wrong."""
+    from dew.nn.linear import causal_conv1d
+
+    rng = np.random.default_rng(0)
+    x, cotangent = (rng.normal(size=(4, 16, 8)).astype(np.float32) for _ in range(2))
+    taps = rng.normal(size=(16, 4)).astype(np.float32)
+
+    def loss(x, taps, cotangent):
+        return jnp.sum(causal_conv1d(x, taps) * cotangent)
+
+    alone = jax.grad(loss, argnums=1)(x, taps, cotangent)
+    mesh = build_mesh(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4])
+    rows = NamedSharding(mesh, P("fsdp"))
+    with jax.set_mesh(mesh):
+        split = jax.jit(jax.grad(loss, argnums=1))(
+            jax.device_put(x, rows), taps, jax.device_put(cotangent, rows))
+
+    np.testing.assert_allclose(split, alone, rtol=1e-6)
