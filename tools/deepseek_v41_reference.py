@@ -12,15 +12,14 @@ Run it in its own environment, never the project's:
     VIRTUAL_ENV=... uv pip install torch==2.10.0 numpy safetensors sympy \
         tokenizers transformers huggingface_hub tilelang==0.1.8
     PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
-        tools/deepseek_v41_reference.py [--search N | --check-kernels | --fp64 PATH | --vision]
+        tools/deepseek_v41_reference.py [--search N | --check-kernels | --vision | --fp64]
 
 `--check-kernels` compares the stand-ins with the release's tilelang kernels
 on a CUDA GPU (`check_kernels`). `--search N` ranks N seeds from `--seed` by
 what fp32 noise can reach in them (`search`); SEED is the first of 119.
-`--fp64 PATH` writes the seed's plain outputs from a run widened to fp64
-(`widened_outputs`), which `tools/deepseek_v41_numerics.py fp64` holds Dew's
-own fp64 run to. `--vision` writes the vision half beside the fixture
-(`write_vision`).
+`--vision` writes the vision half beside the fixture (`write_vision`), and
+`--fp64`, run after both, the float64 truth of everything they wrote
+(`write_truth`).
 
 It writes tests/fixtures/hf/deepseek-v41-tiny: the release's config.json
 spelling at toy width, a model.safetensors under the release's tensor names,
@@ -36,19 +35,21 @@ the tokenizer the engram hash reads, source.json and reference.npz with
     generated                  greedy ids after the prefill
     draft_ids, draft_logits,   DSpark's forward_spec at every decode step
     draft_confidence
-    selection_{rows,picks,margin,scale}
+    selection_{rows,picks,scale}
                                every top-k of the forward in call order: its
                                scored rows (NaN past a row's width), sorted
-                               picks (-1 past k), and `selection_margins`
+                               picks (-1 past k), and each row's largest
+                               finite magnitude (`selection_margins`)
     qat_*                      the same with the quantizers on: the forward,
                                loss, update (read through the plain forward),
                                cached run and top-k calls
-    qat_{window,entries,index}_{in,out,margin,flip,scale_margin}
+    qat_{window,entries,index}_{in,out}
                                every quantizer call of that forward in call
-                               order: the blocks it read and wrote and their
-                               `quantizer_margins`
+                               order: the blocks it read and wrote
 
-source.json records NOISE and what it can reach at the seed (`Record.assess`).
+source.json records NOISE and what it can reach at the seed (`Record.assess`),
+and `--fp64` writes the fixture's float64 truth, reference_f64.npz
+(`write_truth`).
 
 Where the reference departs from the release, it says so where it happens:
 the engram lookup keeps the model's dtype where the release casts to its
@@ -280,13 +281,14 @@ def draft(net, ids, main_hidden, start_pos):
     return type(net).forward_spec.__wrapped__(net, ids, main_hidden, start_pos)
 
 
-# The fp32 noise between Dew's and the reference's inputs to a rounding or a
-# selection, twice the largest that `tools/deepseek_v41_numerics.py noise`
-# measures over the fixture on CPU and on GPU: a quantizer's input over its
-# block's amax (which bounds the relative noise on its scale's quotient as
-# well), a top-k row over its largest finite magnitude. A value closer than
-# this to where its rounding or selection changes may round or select
-# differently in the two.
+# The seed rank's estimate of the fp32 noise between Dew's and the
+# reference's inputs to a rounding or a selection, twice the largest that
+# `tools/deepseek_v41_numerics.py noise` measures over the fixture on CPU and
+# an RTX 4080: a quantizer's input over its block's amax (which bounds the
+# relative noise on its scale's quotient as well), a top-k row over its
+# largest finite magnitude. A value closer than this to where its rounding
+# or selection changes may round or select differently in the two. The
+# tests do not read it; an L4 moves top-k rows by up to 1.5e-4.
 NOISE = {"window": 4.0e-6, "entries": 3.9e-6, "index": 4.1e-6, "selection": 1.2e-4}
 BLOCKS = {"window": 32, "entries": 16, "index": 32}
 E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
@@ -519,12 +521,11 @@ def run(seed: int):
     The architecture outputs (the forward, the update, the cached decode,
     greedy generation and DSpark's drafts) run with the quantizers off, and
     the `qat_*` outputs repeat the forward, the update and the cached run
-    with them on. A rounding or a selection turns fp32 noise between two
-    frameworks into a whole step wherever a value sits within that noise of
-    where it changes, so both forwards record every quantizer and top-k
-    call with its margins: a port is held to each call it makes, and a
-    difference from a recorded output is allowed only where the recorded
-    margin sits within NOISE (tests/test_deepseek_v41.py).
+    with them on. Both forwards record every quantizer and top-k call, so a
+    port is held to each call it makes (tests/test_deepseek_v41.py), and
+    their margins rank the seed: a rounding or a selection turns fp32 noise
+    between two frameworks into a whole step wherever a value sits within
+    NOISE of where it changes.
     """
     model_module, engram_module = import_reference()
     install_selection_probe()
@@ -615,21 +616,49 @@ def widened(model_module):
 
 
 def widened_outputs(seed: int) -> dict[str, np.ndarray]:
-    """The plain forward, loss, update and cached run of `run`, in fp64
-    (`widened`) over the fixture's fp32 weights, for
-    `tools/deepseek_v41_numerics.py fp64` to hold Dew's fp64 run to."""
+    """The float64 truth of the fixture (tests/reference_error.py): `run`'s
+    outputs in fp64 (`widened`) over the fixture's fp32 weights, the plain
+    and quantization-aware forward, loss, update and cached run, every
+    quantizer input and top-k row of both forwards with their outputs and
+    picks, and the vision half's outputs (`vision_outputs`). The stand-in
+    quantizers round the fp64 values, so `--fp64` counts where a rounding or
+    a pick differs from the fixture's before it writes the truth."""
     model_module, engram_module = import_reference()
-    set_quantizers(model_module, enabled=False)
+    install_selection_probe()
     args = model_args(model_module, engram_module)
     ids = torch.randint(3, args.vocab_size - 1, (2, LENGTH), generator=torch.Generator().manual_seed(seed + 1))
+    outputs: dict[str, np.ndarray] = {}
     with widened(model_module):
         net = build(model_module, engram_module, args, seed, widen=True)
-        logits, loss, gradients = trained(net, ids)
-        outputs = {"input_ids": ids.numpy().astype(np.int32), "logits": logits.numpy(),
-                   "loss": np.float64(loss.item()), "updated_logits": stepped(net, gradients, ids)}
-        with torch.no_grad():
-            outputs.update(cached(net, ids))
-    return outputs
+        gradients = {}
+        for prefix, quantized in (("qat_", True), ("", False)):
+            set_quantizers(model_module, enabled=quantized)
+            recorded = Record()
+            RECORDS[:] = [recorded]
+            logits, loss, gradients[prefix] = trained(net, ids)
+            RECORDS.clear()
+            outputs.update({name: value for name, value in recorded.arrays(prefix).items()
+                            if name.endswith(("_in", "_out", "_rows", "_picks"))})
+            outputs.update({f"{prefix}logits": logits.numpy(), f"{prefix}loss": np.float64(loss.item())})
+            with torch.no_grad():
+                outputs.update({f"{prefix}{name}": value for name, value in cached(net, ids).items()})
+        for prefix, gradient in gradients.items():
+            outputs[f"{prefix}updated_logits"] = stepped(net, gradient, ids)
+        vision = vision_outputs(model_module, engram_module, seed, widen=True)[2]
+    return {**outputs, **{name: vision[name] for name in ("vision_span", "vision_prompt_logits",
+                                                         "vision_decode_logits")}}
+
+
+def write_truth(seed: int):
+    """reference_f64.npz beside the fixture (`widened_outputs`), after a
+    count of the roundings and picks that differ from the fixture's."""
+    truth, fixture = widened_outputs(seed), np.load(FIXTURE / "reference.npz")
+    differ = {name: int(np.sum(truth[name].astype(np.float32) != fixture[name]) if name.endswith("_out")
+                        else np.sum(truth[name] != fixture[name]))
+              for name in truth if name.endswith(("_out", "_picks", "draft_ids"))}
+    print(json.dumps({"differing": differ}))
+    np.savez(FIXTURE / "reference_f64.npz", **{name: value for name, value in truth.items()
+                                               if not name.endswith(("_out", "_picks", "draft_ids"))})
 
 
 def official_kernels():
@@ -822,26 +851,21 @@ def vision_config_json(args) -> dict:
             "max_wh_ratio": args.vision_max_wh_ratio}
 
 
-def write_vision(seed: int):
-    """The vision half beside the fixture: vision.safetensors (the ViT, the
-    aligner, the span vectors and every router's image bias, under the
-    release's names), vision_config.json, and vision.npz with one image
-    prompt through Transformer.forward (model.py:1241-1272), the quantizers
-    off: its pixels, ids and token types, the span the image fills
-    (merge_image_embeddings), the prefill's logits and three teacher-forced
-    text steps after it."""
-    from safetensors.torch import save_file
-
-    model_module, engram_module = import_reference()
+def vision_outputs(model_module, engram_module, seed: int, widen: bool = False):
+    """One image prompt through Transformer.forward (model.py:1241-1272), the
+    quantizers off: the toy model with its vision half, its arguments, and its pixels, ids
+    and token types, the span the image fills (merge_image_embeddings), the
+    prefill's logits and three teacher-forced text steps after it; in fp64
+    when `widen`, inside `widened`."""
     processor = importlib.import_module("image_processor")
     set_quantizers(model_module, enabled=False)
     args = model_args(model_module, engram_module)
     for field, value in VISION.items():
         setattr(args, field, value)
-    net = build(model_module, engram_module, args, seed)
+    net = build(model_module, engram_module, args, seed, widen=widen)
     generator = torch.Generator().manual_seed(seed + 3)
     patch = args.vision_patch_size
-    pixels = torch.randn(3, GRID[0] * patch, GRID[1] * patch, generator=generator)
+    pixels = torch.randn(3, GRID[0] * patch, GRID[1] * patch, generator=generator, dtype=torch.float32)
     patches = pixels.reshape(3, GRID[0], patch, GRID[1], patch).permute(1, 3, 0, 2, 4).reshape(-1, 3, patch, patch)
     ratio = args.vision_downsample_ratio
     types = processor.image_token_types(-(-GRID[0] // ratio), -(-GRID[1] // ratio))
@@ -851,7 +875,7 @@ def write_vision(seed: int):
     token_types = torch.full(ids.shape, processor.TEXT)
     token_types[0, start:start + types.numel()] = types
     prompt = start + types.numel() + 1
-    image = processor.ImageInput(start, patches, GRID[0], GRID[1], types)
+    image = processor.ImageInput(start, patches.double() if widen else patches, GRID[0], GRID[1], types)
     with torch.no_grad():
         reset(net)
         embedded = net.embed(ids[:, :prompt])
@@ -860,15 +884,27 @@ def write_vision(seed: int):
             net, ids[:, :prompt], 0, [[image]], token_types[:, :prompt])
         steps = [forward(net, ids[:, position:position + 1], position)[1][:, 0]
                  for position in range(prompt, LENGTH)]
+    return net, args, {"pixels": pixels.numpy(), "input_ids": ids.numpy().astype(np.int32),
+                 "token_types": token_types.numpy().astype(np.int32), "decode_prompt": np.int32(prompt),
+                 "vision_span": embedded[0, start:start + types.numel()].numpy(),
+                 "vision_prompt_logits": prompt_logits.numpy(),
+                 "vision_decode_logits": torch.stack(steps, 1).numpy()}
+
+
+def write_vision(seed: int):
+    """The vision half beside the fixture: vision.safetensors (the ViT, the
+    aligner, the span vectors and every router's image bias, under the
+    release's names), vision_config.json, and vision.npz (`vision_outputs`)."""
+    from safetensors.torch import save_file
+
+    model_module, engram_module = import_reference()
+    net, args, outputs = vision_outputs(model_module, engram_module, seed)
     tensors = {name: tensor.detach().contiguous() for name, tensor in net.named_parameters()
                if name.startswith(("vision.", "aligner.", "image_")) or name.endswith(".bias_vl")}
     save_file(tensors, FIXTURE / "vision.safetensors", metadata={"format": "pt"})
     (FIXTURE / "vision_config.json").write_text(json.dumps(vision_config_json(args), indent=1) + "\n")
-    np.savez(FIXTURE / "vision.npz", pixels=pixels.numpy(), input_ids=ids.numpy().astype(np.int32),
-             token_types=token_types.numpy().astype(np.int32), decode_prompt=np.int32(prompt),
-             vision_span=embedded[0, start:start + types.numel()].numpy(),
-             vision_prompt_logits=prompt_logits.numpy(), vision_decode_logits=torch.stack(steps, 1).numpy())
-    print(f"{FIXTURE}: {len(tensors)} vision tensors, a {types.numel()}-position span")
+    np.savez(FIXTURE / "vision.npz", **outputs)
+    print(f"{FIXTURE}: {len(tensors)} vision tensors, a {len(outputs['vision_span'])}-position span")
 
 
 def write(seed: int):
@@ -887,7 +923,8 @@ def write(seed: int):
         {"bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 2, "do_sample": False}, indent=1) + "\n")
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(TOKENIZER / name, FIXTURE / name)
-    np.savez(FIXTURE / "reference.npz", **outputs)
+    np.savez(FIXTURE / "reference.npz", **{name: value for name, value in outputs.items()
+                                           if not name.endswith(("_margin", "_flip"))})
     print(json.dumps({"seed": seed, **assessment}))
     import transformers
 
@@ -907,7 +944,7 @@ def main():
     parser.add_argument("--seed", type=int, default=SEED, help="the fixture's seed, or the first searched")
     parser.add_argument("--check-kernels", action="store_true",
                         help="compare the torch stand-ins with the tilelang kernels on CUDA")
-    parser.add_argument("--fp64", type=Path, help="write the seed's plain outputs in fp64 here")
+    parser.add_argument("--fp64", action="store_true", help="write the fixture's float64 truth")
     parser.add_argument("--vision", action="store_true", help="write the vision half beside the fixture")
     options = parser.parse_args()
     torch.set_default_dtype(torch.float32)
@@ -916,8 +953,8 @@ def main():
     torch.set_num_threads(1)
     if options.check_kernels:
         check_kernels()
-    elif options.fp64 is not None:
-        np.savez(options.fp64, **widened_outputs(options.seed))
+    elif options.fp64:
+        write_truth(options.seed)
     elif options.vision:
         write_vision(options.seed)
     elif options.search:
