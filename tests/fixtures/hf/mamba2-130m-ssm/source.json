@@ -1,0 +1,10 @@
+{
+  "repo": "state-spaces/mamba2-130m",
+  "revision": "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49",
+  "files": [
+    ".gitattributes",
+    "README.md",
+    "config.json",
+    "pytorch_model.bin"
+  ]
+}
