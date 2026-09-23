@@ -190,7 +190,10 @@ def main() -> None:
                 parameter.copy_(mxfp4_decode(tensors[stem + ".weight_packed"], tensors[stem + ".weight_scale"]).to(parameter))
         again = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         assert torch.equal(again, logits), "restoring the written weights must restore the logits"
-        generated = model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=4,
+        # The wrapper carries no GenerationMixin under transformers 4.56.2;
+        # without pixels it runs the language model on its embeddings
+        # (modeling_kimi_k3.py:1145-1218), so that model generates.
+        generated = model.language_model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=4,
                                    do_sample=False, eos_token_id=None, pad_token_id=0,
                                    output_logits=True, return_dict_in_generate=True)
     grid = torch.linspace(-80, 80, 4001, dtype=torch.float32)
