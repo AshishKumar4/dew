@@ -59,8 +59,9 @@ sys.path.insert(0, str(REPO / "tools"))
 FLOOR_FACTOR = 4.0
 PERMUTATIONS = 16
 ANCHOR_LIMIT = 1e-2
-"""A reference leaf farther than this from the fp64 step is not fp32's
-rounding of it but another computation, which no floor may absorb."""
+"""A reference leaf farther than this from the fp64 step, or a floor wider
+than this, is not fp32's rounding but another computation, which no floor
+may absorb."""
 
 LAYOUTS: dict[str, dict[str, int]] = {
     "data4": {},
@@ -359,6 +360,13 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                         f"{farthest}, past fp32 rounding ({ANCHOR_LIMIT:.0e}): the two compute "
                         f"different steps, so the anchor cannot bound the layouts")
                 floors = {leaf: max(value, rounding[leaf]) for leaf, value in floors.items()}
+            widest = max(floors, key=floors.__getitem__)
+            if floors[widest] > ANCHOR_LIMIT:
+                # A floor this wide passes any layout: the reference's own
+                # steps differ by more than fp32 rounding moves a sum.
+                raise ValueError(
+                    f"the floor at {widest} is {floors[widest]:.2e}, past fp32 rounding "
+                    f"({ANCHOR_LIMIT:.0e}), so no layout of this model can be judged by it")
         except Exception as error:  # no reference judges no layout: the model's one row
             rows.append({"model": model, "layout": "reference", "processes": jax.process_count(),
                          "status": "error", "error": f"{type(error).__name__}: {error}"[:2000],
@@ -366,7 +374,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
             speak(f"[{model}] reference error {rows[-1]['error'][:300]}")
             keep(rows)
             continue
-        speak(f"[{model}] reference losses {ref_losses}, largest floor {max(floors.values()):.2e}")
+        speak(f"[{model}] reference losses {ref_losses}, largest floor {floors[widest]:.2e} at {widest}")
         for name in layouts:
             row: dict[str, Any] = {"model": model, "layout": name, "processes": jax.process_count(),
                                    "reference_losses": ref_losses}
