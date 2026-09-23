@@ -1776,12 +1776,8 @@ class CausalTransformer(nn.Module):
                 f"{sorted(set(types))}")
         return {layer_type: self.kind_of(layer_type) for layer_type in set(types) | prediction_kinds}
 
-    def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise for a field, or a pair of fields, this model cannot build.
-
-        Each check names the field the caller set and what a model without
-        it looks like, so a translated config says which entry to fix.
-        """
+    def refuse_unbuildable_mup(self, kinds: Mapping[str, "ResolvedKind"]):
+        """Raise for lm-engine's multipliers or init on a model that cannot carry them."""
         mup = (self.embedding_multiplier != 1.0 or self.residual_multiplier != 1.0
                or self.logits_scaling != 1.0 or self.initializer_range is not None)
         if mup and (self.num_nextn_predict_layers or self.hyper_connections is not None
@@ -1805,6 +1801,14 @@ class CausalTransformer(nn.Module):
                         f"which keeps its own initializers")
         elif self.depth_scaled_init:
             raise ValueError("depth_scaled_init scales initializer_range's std; set it")
+
+    def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
+        """Raise for a field, or a pair of fields, this model cannot build.
+
+        Each check names the field the caller set and what a model without
+        it looks like, so a translated config says which entry to fix.
+        """
+        self.refuse_unbuildable_mup(kinds)
         mtp_hc = self.mtp_hyper_connections
         if mtp_hc is not None:
             if self.num_nextn_predict_layers != 1:
