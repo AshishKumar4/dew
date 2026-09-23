@@ -418,6 +418,8 @@ class DecoderFields(TypedDict, total=False):
     laurel_rank: int | None
     hyper_connections: HyperConnectionsFields | None
     attention_residuals: AttentionResidualsFields | None
+    engram: Mapping[str, object] | None
+    dspark: Mapping[str, object] | None
     swiglu_limit: float | None
     activation_sparsity_pattern: tuple[float, ...] | None
     mask_token_id: int | None
