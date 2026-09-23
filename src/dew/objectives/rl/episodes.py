@@ -414,12 +414,7 @@ class EpisodeRollout:
             if slot.reward is not None:
                 continue
             if slot.status == EpisodeStatus.RUNNING:
-                # The cohort ran every turn; this slot drew on each of them.
-                assert slot.observation is not None
-                limit = turn_limit(slot.observation, len(slot.transitions), max_turns=self.max_turns,
-                                   max_prompt_tokens=self.max_prompt_tokens)
-                assert limit is not None
-                slot.status, slot.detail = limit.status, limit.detail
+                slot.status, slot.detail = EpisodeStatus.TRUNCATED, "episode turn limit reached"
             def score() -> float:
                 reward = float(self.verifier(slot.episode(policy_step, binding_id)))
                 if not math.isfinite(reward):
