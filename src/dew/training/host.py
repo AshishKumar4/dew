@@ -119,12 +119,12 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
 
 @runtime_checkable
 class HostSource(Protocol):
-    """A host leaf a placement reads one shard at a time.
+    """A host leaf a placement reads one device shard at a time.
 
-    `read` returns the values at a global index, as
-    `jax.make_array_from_callback` asks for them, so no process holds more
-    of the leaf than its own devices take. `release` gives back what the
-    reads left resident.
+    `read` returns the values at a global index. `place_leaf` reads a shard,
+    puts it on its device and lets it go before it reads the next, so the
+    host holds one device shard of the leaf at a time. `release` gives back
+    what the reads left resident.
     """
 
     @property
@@ -143,17 +143,22 @@ def place_leaf(value, target: NamedSharding) -> jax.Array:
 
     A host array or a single device's array is cut into shards by each
     process, so a sharded placement lands sharded. An array already on the
-    mesh moves as it is. A `HostSource` is read shard by shard. Memory-mapped
+    mesh moves as it is. A `HostSource` is read and placed one device shard
+    at a time. Memory-mapped
     source pages are given back to the kernel, which is what keeps a large
     checkpoint from being resident twice."""
     if isinstance(value, jax.Array) and (isinstance(value.sharding, NamedSharding)
                                          or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
         return transfer(value, target)
     if isinstance(value, HostSource):
-        landed = jax.make_array_from_callback(value.shape, target, value.read)
-        jax.block_until_ready(landed)
+        # make_array_from_callback would hold every addressable shard on
+        # the host before any transfer.
+        shards = []
+        for device, index in target.addressable_devices_indices_map(value.shape).items():
+            shard = jax.device_put(value.read(index), SingleDeviceSharding(device, memory_kind=target.memory_kind))
+            shards.append(jax.block_until_ready(shard))
         value.release()
-        return landed
+        return jax.make_array_from_single_device_arrays(value.shape, target, shards)
     source = np.asarray(value)
     landed = jax.make_array_from_callback(source.shape, target, lambda index: source[index])
     jax.block_until_ready(landed)
