@@ -13,6 +13,7 @@ pinned commit against transformers over the same file.
 """
 
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -221,6 +222,31 @@ def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     assert VOCAB - 1 in tokens.tolist()[0]
     assert pretrained.processor.decode(tokens) == ["Hello, GGUF"]
     assert pretrained.revision is None
+
+
+def test_the_files_tokenizer_loads_without_torch(tmp_path):
+    """GGUF repos ship no tokenizer files, and transformers' own GGUF route
+    to the tokenizer needs torch; the gguf extra alone loads one, in a process
+    where torch cannot import, and it tokenizes as transformers' does."""
+    import subprocess
+
+    from transformers import AutoTokenizer
+
+    rng = np.random.default_rng(0)
+    write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0, hf_tensors("llama", rng), rng)
+    expected = AutoTokenizer.from_pretrained(str(tmp_path), gguf_file="model.gguf")("Hello, GGUF").input_ids
+    script = """
+import sys
+sys.modules["torch"] = None
+import numpy as np
+from dew.interop import load_pretrained
+loaded = load_pretrained(sys.argv[1], dtype="float32", attention_impl="reference", gguf_file="model.gguf")
+print(np.asarray(loaded.processor("Hello, GGUF").tokens).tolist()[0])
+"""
+    run = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert run.returncode == 0, run.stderr[-1500:]
+    assert run.stdout.split("\n")[-2] == str(expected)
 
 
 def test_a_tensor_with_no_hf_name_is_refused(tmp_path):
