@@ -6,7 +6,10 @@ shape of every tensor (read off the 20 shard headers). kimi-linear-tiny is
 written by tools/kimi_linear_reference.py from the pinned modeling_kimi.py
 with fla-core 0.4.0's kernels in fp32 on CUDA, its gate weighing the
 released selection by the unbiased scores, as K3's revision of the file and
-vLLM do. No model weights are downloaded at test time.
+vLLM do. Its numerics.npz is the same model evaluated in float64
+(tools/kimi_float64_reference.py), which Dew and the reference are both
+measured from (tests/reference_error.py). No model weights are downloaded
+at test time.
 """
 
 import json
@@ -17,7 +20,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import FACTOR, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
+from scipy.special import log_softmax
 
 from dew.interop import load_pretrained
 from dew.interop.hf_decoders import _FAMILIES, _flatten, translate_config
@@ -35,7 +40,8 @@ TINY = ROOT / "kimi-linear-tiny"
 @pytest.fixture(scope="module")
 def source():
     loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
-    reference = np.load(TINY / "reference.npz")
+    with np.load(TINY / "reference.npz") as stored, np.load(TINY / "numerics.npz") as exact:
+        reference = {name: stored[name] for name in stored.files} | {name: exact[name] for name in exact.files}
     inputs = ModelInputs(jnp.asarray(reference["input_ids"], jnp.int32),
                          {"attention_mask": jnp.asarray(reference["attention_mask"], bool)})
     return loaded, inputs, reference
@@ -90,30 +96,28 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
 def test_forward_matches_the_reference_over_left_padding(source):
     """fp32 logits over 70 tokens (past one KDA chunk), one row left-padded
     by 9, against fla 0.4.0 on CUDA in IEEE fp32
-    (tools/kimi_linear_reference.py). The tolerance adds the two sides' fp32
-    rounding, each measured against a float64 forward of these weights with
-    the exact KDA recurrence: Dew's logits miss it by at most 1.3e-5 on CPU
-    (1.0e-5 on the 4080 at matmul precision highest) and the fixture's by
-    1.2e-5. Tolerance 3e-5; largest difference 1.5e-5 on CPU and 1.4e-5 on
-    the 4080, argmax exact."""
+    (tools/kimi_linear_reference.py): Dew's RMS distance from the float64
+    logits at most twice the reference's, and argmax exact. Observed RMS
+    from float64: Dew 1.28e-6, the reference 1.04e-6 (ratio 1.23 on CPU,
+    1.12 on an RTX 4080 and an RTX 3090)."""
     loaded, inputs, reference = source
     logits = loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
     valid = reference["attention_mask"].astype(bool)
-    np.testing.assert_allclose(np.asarray(logits)[valid], reference["logits"][valid], atol=3e-5, rtol=0)
+    assert_as_exact_as_the_reference(np.asarray(logits)[valid], reference["logits"][valid],
+                                     reference["logits_f64"][valid], "logits")
     np.testing.assert_array_equal(np.asarray(logits)[valid].argmax(-1), reference["logits"][valid].argmax(-1))
 
 
 def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
     """One all-parameter SGD step at the reference's learning rate (1e-2,
-    which moves the logits by up to 3.8): loss within 1e-5, and updated
-    logits within the sum of the two sides' distances from a float64 step,
-    which are the fp32 rounding of the gradient: 1.5e-4 for Dew on CPU,
-    1.4e-5 for Dew on the 4080 and 1.5e-4 for the fixture, the two larger
-    at the same token, where the float64 step's own code run in float32
-    misses by 8.3e-5. Tolerance 3.5e-4; largest difference 4.3e-5 on CPU and 1.5e-4
-    on the 4080. The export writes every source name back at its stored
-    shape, A_log as [1, 1, heads, 1], and reloading restores the trained
-    weights exactly."""
+    which moves the logits by up to 3.8). The loss is within 1e-5 of the
+    reference's (4.8e-7 apart), and the updated logits are held to the
+    reference's own distance from a float64 step as the forward is.
+    Observed RMS from float64: Dew 5.47e-6, the reference 4.94e-6 (ratio
+    1.11 on CPU, 0.33 on an RTX 4080, 0.53 on an RTX 3090).
+
+    The export writes every source name back at its stored shape, A_log as
+    [1, 1, heads, 1], and reloading restores the trained weights exactly."""
     loaded, inputs, reference = source
     objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1, pretrained=loaded.variables,
                             ema_decay=None, pad_id=0)
@@ -129,7 +133,8 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
         lambda weight, grad: weight - reference["learning_rate"] * grad, loaded.variables["params"], gradient)}
     valid = reference["attention_mask"].astype(bool)
     updated = loaded.model.apply(variables, inputs.tokens, **inputs.kwargs())
-    np.testing.assert_allclose(np.asarray(updated)[valid], reference["updated_logits"][valid], atol=3.5e-4, rtol=0)
+    assert_as_exact_as_the_reference(np.asarray(updated)[valid], reference["updated_logits"][valid],
+                                     reference["updated_logits_f64"][valid], "updated logits")
 
     loaded.save(tmp_path, variables=variables)
     written, shipped = load_file(str(tmp_path / "model.safetensors")), load_file(str(TINY / "model.safetensors"))
@@ -143,16 +148,23 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
 
 
 def test_greedy_generation_and_decode_steps_match_the_reference(source):
-    """Four greedy tokens from both rows: the ids are exact, and each chosen
-    token's log-probability under the cached KDA recurrence and MLA cache
-    matches the reference's cached step logits."""
+    """Four greedy tokens from both rows through the cached KDA recurrence and
+    MLA cache, held as tests/test_generate_reference.py holds greedy decoding.
+    E is the reference's largest decode logit error from the float64 logits
+    teacher-forced over the same path (5.26e-6). Every step's float64 top-2
+    margin exceeds 2 FACTOR E (smallest 0.034 against 2.1e-5), so the ids
+    must be exact, and each chosen token's log probability is within 2
+    FACTOR E of float64's (observed 1.8e-6)."""
     loaded, inputs, reference = source
+    error = float(np.max(np.abs(reference["step_logits"] - reference["step_logits_f64"])))
+    ranked = np.sort(reference["step_logits_f64"], -1)
+    assert np.min(ranked[..., -1] - ranked[..., -2]) > 2 * FACTOR * error
     generated = generate(loaded.model, loaded.variables, inputs, 4, key=jax.random.key(1),
                          sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(np.asarray(generated.tokens)[:, -4:], reference["generated"][:, -4:])
-    expected = np.asarray(jax.nn.log_softmax(jnp.asarray(reference["step_logits"]), axis=-1))
-    chosen = np.take_along_axis(expected, reference["generated"][:, -4:, None], -1)[..., 0]
-    np.testing.assert_allclose(np.asarray(generated.raw_log_probs)[:, :4], chosen, atol=1e-4, rtol=0)
+    exact = np.take_along_axis(log_softmax(reference["step_logits_f64"], -1),
+                               reference["generated"][:, -4:, None], -1)[..., 0]
+    assert np.max(np.abs(np.asarray(generated.raw_log_probs, np.float64)[:, :4] - exact)) <= 2 * FACTOR * error
 
 
 def test_group_limited_routing_is_refused():
