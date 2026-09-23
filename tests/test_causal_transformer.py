@@ -1035,3 +1035,12 @@ def test_a_multiplier_scales_bf16_states_in_fp32_opmath():
     np.testing.assert_array_equal(scaled(x, 0.22), (x.astype(jnp.float32) * 0.22).astype(jnp.bfloat16))
     assert scaled(x, 0.22).dtype == jnp.bfloat16
     assert scaled(x, 1.0) is x
+
+
+@pytest.mark.parametrize("extra", [{"laurel_rank": 8}, {"per_layer_input_dim": 4}])
+def test_mup_fields_refuse_blocks_that_do_not_carry_them(extra):
+    """LAuReL, AltUp and per-layer inputs keep their own inits and add their
+    branches unscaled, so lm-engine's multipliers cannot be asked of them."""
+    model = tiny(initializer_range=0.02, residual_multiplier=0.22, **extra)
+    with pytest.raises(ValueError, match="lm-engine's dense and routed blocks"):
+        model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))

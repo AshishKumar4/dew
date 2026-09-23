@@ -1767,12 +1767,13 @@ class CausalTransformer(nn.Module):
                or self.logits_scaling != 1.0 or self.initializer_range is not None)
         if mup and (self.num_nextn_predict_layers or self.hyper_connections is not None
                     or (self.mixture is not None and self.mixture.parallel)
-                    or self.mlp == 'swigluoai'):
+                    or self.mlp == 'swigluoai' or self.laurel_rank is not None
+                    or self.altup is not None or self.per_layer_input_dim):
             raise ValueError(
                 "embedding_multiplier, residual_multiplier, logits_scaling and "
                 "initializer_range are lm-engine's dense and routed blocks; prediction "
-                "depths, hyper-connection streams, Gemma 4's parallel experts and "
-                "gpt-oss experts do not carry them")
+                "depths, hyper-connection streams, Gemma 4's parallel experts, gpt-oss "
+                "experts, LAuReL, AltUp and per-layer inputs do not carry them")
         if self.logits_scaling <= 0 or (self.initializer_range is not None
                                         and self.initializer_range <= 0):
             raise ValueError("logits_scaling and initializer_range are positive")
