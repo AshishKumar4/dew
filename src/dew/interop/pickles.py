@@ -24,11 +24,15 @@ import os
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import ml_dtypes
 import numpy as np
 
 from dew.interop.safetensors_io import WEIGHTS_FILE, weight_files, write_file
+
+if TYPE_CHECKING:
+    import torch
 
 STEMS = ("pytorch_model",)
 """The stem of transformers' pickle checkpoint and of its index."""
@@ -96,12 +100,20 @@ def _state_dict(path: Path) -> dict[str, np.ndarray]:
         if not isinstance(name, str) or not isinstance(tensor, torch.Tensor):
             raise ValueError(f"{path} holds {name!r} as a {type(tensor).__name__}, not a tensor; "
                              "save the model's state_dict() instead")
-        kind = str(tensor.dtype).removeprefix("torch.")
-        try:
-            dtype = np.dtype(getattr(ml_dtypes, kind, kind))
-        except TypeError as error:
-            raise ValueError(f"{path} stores {name!r} as torch.{kind}, which safetensors has no tag for; "
-                             "cast it to a floating or integer dtype before saving") from error
-        flat = tensor.detach().contiguous().reshape(-1)
-        tensors[name] = flat.view(torch.uint8).numpy().view(dtype).reshape(tuple(tensor.shape))
+        tensors[name] = host_view(tensor, f"{path}'s {name!r}")
     return tensors
+
+
+def host_view(tensor: torch.Tensor, what: str) -> np.ndarray:
+    """A CPU torch tensor's bytes as a NumPy array of its dtype, bfloat16 and
+    float8 through ml_dtypes, sharing its storage where it is contiguous."""
+    import torch
+
+    kind = str(tensor.dtype).removeprefix("torch.")
+    try:
+        dtype = np.dtype(getattr(ml_dtypes, kind, kind))
+    except TypeError as error:
+        raise ValueError(f"{what} is torch.{kind}, which NumPy and safetensors have no dtype for; "
+                         "cast it to a floating or integer dtype") from error
+    flat = tensor.detach().contiguous().reshape(-1)
+    return flat.view(torch.uint8).numpy().view(dtype).reshape(tuple(tensor.shape))

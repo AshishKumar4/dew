@@ -39,6 +39,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.interop import hf_decoders as decoders
+from dew.interop.pickles import host_view
 from dew.interop.pretrained import AUTO, Pretrained, _source_processor
 from dew.nn.sharding import LogicalAxes, parameter_path
 from dew.registry import resolve_dtype
@@ -280,7 +281,6 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
             f"release, or drop fallback for a registered family whose codec Dew reads")
     try:
         import torch
-        import torchax
         from torchax.interop import JittableModule, extract_all_buffers
         from transformers import AutoModelForCausalLM
     except ImportError as error:
@@ -299,9 +299,10 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     head_name = next((name for name, value in jittable.params.items() if value is head_weight), None)
     if head_name is not None and not _plain_head(model, head_weight):
         head_name = None
-    env = torchax.default_env()
-    params = {name: np.asarray(leaf) for name, leaf in env.t2j_copy(dict(jittable.params)).items()}
-    buffers = {name: np.asarray(leaf) for name, leaf in env.t2j_copy(extract_all_buffers(model)[1]).items()}
+    # Host views of torch's storage: nothing reaches a device before the
+    # caller's placement.
+    params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
+    buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
     stored = model.state_dict()
     persistent = tuple(name for name in buffers if name in stored)
     vocab = int(head_weight.shape[0])
