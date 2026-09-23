@@ -218,3 +218,59 @@ def test_a_kind_reads_a_window_or_a_chunk_not_both():
         layer_types=("local",), kinds={"local": {"chunk": 4, "window": 4}})
     with pytest.raises(ValueError, match="window and a chunk"):
         model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+
+
+@pytest.mark.skipif(not attention.cudnn_runs(jnp.zeros((1, 8, 2, 64), jnp.bfloat16), None),
+                    reason="needs a GPU cuDNN attention runs on")
+def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn():
+    """'auto' hands the band mask of a packed, windowed bf16 call to cuDNN
+    as a bias: finite everywhere, padding rows included, and as close to a
+    float64 oracle as the xla band is."""
+    batch, length, heads, kv_heads, width, window = 1, 1024, 8, 2, 64, 256
+    lengths = [300, 200, 380]  # then 144 rows of padding, segment 0
+    segments = np.concatenate([np.repeat(np.arange(1, 4), lengths),
+                               np.zeros(length - sum(lengths), int)])[None]
+    segment_ids = jnp.asarray(segments, jnp.int32)
+    keys = jax.random.split(jax.random.key(0), 4)
+    query = jax.random.normal(keys[0], (batch, length, heads, width), jnp.bfloat16)
+    key = jax.random.normal(keys[1], (batch, length, kv_heads, width), jnp.bfloat16)
+    value = jax.random.normal(keys[2], (batch, length, kv_heads, width), jnp.bfloat16)
+    cotangent = jax.random.normal(keys[3], (batch, length, heads, width), jnp.float32)
+    real = jnp.asarray(segments[0] != 0)
+
+    def loss(implementation):
+        def run(query, key, value):
+            out = local_attention(query, key, value, window=window, segment_ids=segment_ids,
+                                  implementation=implementation)
+            return jnp.sum(out.astype(jnp.float32) * cotangent * real[None, :, None, None]), out
+        return jax.jit(jax.value_and_grad(run, argnums=(0, 1, 2), has_aux=True))
+
+    assert "__cudnn$fmha" in loss("auto").lower(query, key, value).compile().as_text()
+
+    def oracle(query, key, value):
+        q, k, v = (x.astype(jnp.float64) for x in (query, key, value))
+        k, v = (jnp.repeat(x, heads // kv_heads, axis=2) for x in (k, v))
+        logits = jnp.einsum("bqhd,bkhd->bhqk", q, k) / np.sqrt(width)
+        rows = jnp.arange(length)
+        keep = ((rows[None, :] <= rows[:, None]) & (rows[:, None] - rows[None, :] < window)
+                & (segment_ids[0][:, None] == segment_ids[0][None, :]) & real[:, None])
+        logits = jnp.where(keep[None, None], logits, -jnp.inf)
+        weights = jnp.nan_to_num(jax.nn.softmax(logits, axis=-1))
+        out = jnp.einsum("bhqk,bkhd->bqhd", weights, v)
+        return jnp.sum(out * cotangent * real[None, :, None, None]), out
+
+    with jax.enable_x64():
+        (_, want), wants = jax.value_and_grad(oracle, argnums=(0, 1, 2), has_aux=True)(
+            query, key, value)
+    (_, got), grads = loss("auto")(query, key, value)
+    (_, xla), xla_grads = loss("xla")(query, key, value)
+    assert all(bool(jnp.all(jnp.isfinite(x.astype(jnp.float32)))) for x in (got, *grads))
+
+    def error(have, reference):
+        have = np.asarray(have, np.float64)[:, np.asarray(real)] if have.ndim == 4 else have
+        reference = np.asarray(reference)[:, np.asarray(real)] if reference.ndim == 4 else reference
+        return np.max(np.abs(np.asarray(have, np.float64) - reference)) / np.max(np.abs(reference))
+
+    assert error(got, want) <= 2 * error(xla, want)
+    for have, baseline, reference in zip(grads, xla_grads, wants, strict=True):
+        assert error(have, reference) <= 2 * error(baseline, reference)

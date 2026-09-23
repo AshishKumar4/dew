@@ -99,9 +99,9 @@ LAYERS = {
 @pytest.mark.parametrize("layer", sorted(LAYERS))
 def test_auto_under_a_window_or_packing_takes_the_reference_path(layer, arguments):
     """A window, a chunk, packed documents or a sparse selection build a
-    mask, which sends 'auto' to xla rather than cuDNN; the call still
-    resolves to the reference path first when only that path computes what
-    it asks for, and matches naming that path."""
+    mask, which a fused kernel takes; the call still resolves to the
+    reference path first when only that path computes what it asks for,
+    and matches naming that path."""
     if layer == "mla" and "precision" not in arguments:
         pytest.skip("latent attention always runs its softmax in fp32")
     if layer in ("window", "packed"):
