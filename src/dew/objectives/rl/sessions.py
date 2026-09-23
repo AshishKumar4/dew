@@ -274,7 +274,7 @@ def check_truncation(truncation: str) -> None:
         raise ValueError(f"truncation must be one of {TRUNCATIONS}, got {truncation!r}")
 
 
-def trained_reward(session: Session, truncation: str = "mask") -> float | None:
+def _trained_reward(session: Session, truncation: str) -> float | None:
     """The reward `session` trains on under `truncation`, or None when it carries no loss."""
     if session.status.trainable:
         return session.reward
@@ -304,14 +304,14 @@ def advantages(sessions: Sequence[Session], estimator: str = "group", *,
     """One advantage per session from the rewards of its `(task, group)`.
 
     The baseline reads the group's trained members only, each at its
-    `trained_reward`. A masked member has no score to compare against, and
+    trained reward. A masked member has no score to compare against, and
     a group with fewer than two trained members has no baseline, so every
     member there gets zero.
     """
     check_estimator(estimator)
     check_truncation(truncation)
     members: dict[tuple[str, str], list[int]] = {}
-    rewards_of = [trained_reward(session, truncation) for session in sessions]
+    rewards_of = [_trained_reward(session, truncation) for session in sessions]
     for index, session in enumerate(sessions):
         if rewards_of[index] is not None:
             members.setdefault((session.task, session.group), []).append(index)
@@ -333,7 +333,7 @@ def advantages(sessions: Sequence[Session], estimator: str = "group", *,
 
 def _built(sessions: Sequence[Session], width: int, truncation: str) -> list[_Chain]:
     """The chains of every session that trains under `truncation`, in session order."""
-    return [chain for index, session in enumerate(sessions) if trained_reward(session, truncation) is not None
+    return [chain for index, session in enumerate(sessions) if _trained_reward(session, truncation) is not None
             for chain in _chains(session, index, width)]
 
 
@@ -461,7 +461,6 @@ def sampled_values(batch: Mapping[str, np.ndarray],
 
 
 def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray], *,
-                    source: Callable[[Session], str] | None = None,
                     latencies: Sequence[float] | None = None,
                     version: int | None = None, truncation: str = "mask") -> dict[str, float]:
     """Host-side agentic telemetry for one packed batch and the sessions behind it.
@@ -471,8 +470,8 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
     - `status/<name>`: share of sessions per status, and
       `masked/<name>`: share of all sampled ids that status masked, under
       the `truncation` policy `pack` used.
-    - `reward/mean` over trained sessions at their trained reward, `reward/<source>` per
-      `source(session)`, `reward/component/<name>` per verifier component.
+    - `reward/mean` over trained sessions at their trained reward, and
+      `reward/component/<name>` per verifier component.
     - `latency/p50`, `p90`, `p99`, `max` over `latencies`, seconds per session.
     - `lag/mean`, `lag/max`: `version` minus each trainable id's version.
 
@@ -480,7 +479,7 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
     computed where the proximal policy is known.
     """
     check_truncation(truncation)
-    rewards_of = [trained_reward(session, truncation) for session in sessions]
+    rewards_of = [_trained_reward(session, truncation) for session in sessions]
     metrics: dict[str, float] = {}
     total = max(len(sessions), 1)
     sampled = dict.fromkeys(Status, 0)
@@ -502,14 +501,10 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
               if reward is not None]
     if scored:
         metrics["reward/mean"] = float(np.mean([reward for _, reward in scored]))
-        by_source: dict[str, list[float]] = {}
         components: dict[str, list[float]] = {}
-        for session, reward in scored:
-            if source is not None:
-                by_source.setdefault(source(session), []).append(float(reward))
+        for session, _ in scored:
             for name, value in session.components.items():
                 components.setdefault(name, []).append(float(value))
-        metrics.update({f"reward/{name}": float(np.mean(values)) for name, values in by_source.items()})
         metrics.update({f"reward/component/{name}": float(np.mean(values)) for name, values in components.items()})
     if latencies:
         seconds = np.asarray(latencies, np.float64)
