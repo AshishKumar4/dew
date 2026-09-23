@@ -14,7 +14,8 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-from dew.nn.gpt_oss import GptOssMLP, dequantize_mxfp4, mxfp4_stems, pack_mxfp4, quantize_mxfp4, unpack_mxfp4
+from dew.interop.codecs import dequantize_mxfp4, mxfp4_stems, pack_mxfp4, quantize_mxfp4, unpack_mxfp4
+from dew.nn.gpt_oss import GptOssMLP
 
 FIXTURES = Path(__file__).parent / "fixtures" / "gpt_oss"
 

@@ -485,7 +485,7 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     from safetensors.numpy import load_file
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors
 
-    from dew.nn.gpt_oss import pack_mxfp4
+    from dew.interop.codecs import pack_mxfp4
 
     source = FIXTURES / "gpt-oss-tiny"
     tensors = load_file(str(source / "model.safetensors"))
@@ -574,8 +574,7 @@ def test_the_latent_norms_keep_the_reference_epsilon(name, tmp_path):
 
 @pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
 def test_codec_parameter_storage_follows_fp32_dequantization(kind):
-    from dew.interop.quantized import dequantize_checkpoint, pack_fp8
-    from dew.nn.gpt_oss import pack_mxfp4, unpack_mxfp4
+    from dew.interop.codecs import dequantize_checkpoint, pack_fp8, pack_mxfp4, unpack_mxfp4
 
     weight = (np.arange(15, dtype=np.float32).reshape(3, 5) - 7) / 11 if kind == "fp8" else (
         np.arange(2 * 64 * 48, dtype=np.float32).reshape(2, 64, 48) % 13 - 6) / 7
@@ -599,8 +598,7 @@ def test_codec_parameter_storage_follows_fp32_dequantization(kind):
 
 @pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
 def test_codec_rejects_integer_parameter_storage(kind):
-    from dew.interop.quantized import dequantize_checkpoint
-    from dew.nn.gpt_oss import pack_mxfp4, unpack_mxfp4
+    from dew.interop.codecs import dequantize_checkpoint, pack_mxfp4, unpack_mxfp4
 
     if kind == "fp8":
         packed = {"weight": np.ones((1, 1), np.float32),
@@ -617,8 +615,7 @@ def test_codec_rejects_integer_parameter_storage(kind):
 def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
     from test_interop import assert_parameter_storage
 
-    from dew.interop.quantized import pack_fp8
-    from dew.nn.gpt_oss import pack_mxfp4
+    from dew.interop.codecs import pack_fp8, pack_mxfp4
 
     fixture = FIXTURES / ("deepseek-v3-tiny" if kind == "fp8" else "gpt-oss-tiny")
     tensors = tool.source_tensors(fixture)
@@ -642,7 +639,7 @@ def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
 
 @pytest.mark.parametrize("same_values", [True, False], ids=["equal-before-rounding", "different-before-rounding"])
 def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_values):
-    from dew.interop.quantized import E4M3
+    from dew.interop.codecs import E4M3
 
     fixture = FIXTURES / "deepseek-v3-tiny"
     tensors = tool.source_tensors(fixture)
@@ -675,7 +672,7 @@ def test_public_quantized_alias_check_uses_original_fp32_values(tmp_path, same_v
 
 
 def test_public_quantized_diffusion_gemma_rejects_rounded_shared_copies(tmp_path):
-    from dew.interop.quantized import E4M3
+    from dew.interop.codecs import E4M3
 
     fixture = FIXTURES / "diffusion-gemma-workflow"
     tensors = tool.source_tensors(fixture)

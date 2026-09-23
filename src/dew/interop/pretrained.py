@@ -34,25 +34,11 @@ from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition, DiffusionConditioner, T5Segment
 from dew.interop import hf_decoders as decoders
-from dew.interop.quantized import (
-    dequantize_checkpoint,
-    fp8_format,
-    fp8_tensor_names,
-    pack_fp8,
-    pack_packed_mxfp4,
-    packed_mxfp4_format,
-    packed_mxfp4_stems,
-    packed_mxfp4_tensor_names,
-    read_fp8_tensor,
-    read_packed_mxfp4_tensor,
-    scaled_names,
-    unpack_packed_mxfp4,
-)
+from dew.interop.codecs import source_quantization
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.gpt_oss import mxfp4_stems, mxfp4_tensor_names, pack_mxfp4, read_mxfp4_tensor, unpack_mxfp4
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.text_encoders import ParamTree
@@ -880,77 +866,6 @@ def _wrapper_layouts(tensors, record, variables):
     return tuple(bindings), retained
 
 
-@dataclass(frozen=True)
-class _SourceQuantization:
-    """Describes a source format the loader undoes and `Pretrained.save` restores.
-
-    `names` reads which tensors arrived quantized off the raw checkpoint,
-    before dequantize replaces them with dense weights in requested storage;
-    `requantize` writes those names back in the format.
-    tensor_names and read expose original per-weight values for alias checks;
-    read dequantizes on demand rather than retaining an FP32 model.
-    """
-
-    names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
-    dequantize: Callable[[Mapping[str, np.ndarray]], dict[str, np.ndarray]]
-    requantize: Callable[[Mapping[str, np.ndarray], tuple[str, ...]], dict[str, np.ndarray]]
-    tensor_names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
-    read: Callable[[Mapping[str, np.ndarray], str], np.ndarray]
-
-
-def _refuse_mlx(config: Mapping[str, object]) -> None:
-    """Refuse MLX quantization by name.
-
-    mlx-lm writes its affine group quantization as `quantization` (and, in
-    older conversions, the same record as `quantization_config`) with
-    `group_size` and `bits` and no `quant_method`, over MLX's own tensor
-    names (`.scales`, `.biases`).
-    """
-    for key in ("quantization", "quantization_config"):
-        entry = config.get(key)
-        if isinstance(entry, Mapping) and "quant_method" not in entry and {"bits", "group_size"} <= entry.keys():
-            raise ValueError(
-                f"{key} {dict(entry)!r} is MLX quantization ({entry['bits']}-bit weights in groups "
-                f"of {entry['group_size']}), which Dew does not dequantize; load the unquantized "
-                "safetensors repo it was converted from (the model card's base_model)")
-
-
-def _source_quantization(config: Mapping[str, object], *, param_dtype: str = "float32") -> _SourceQuantization | None:
-    """Return the format a config's `quantization_config` declares, or None.
-
-    A wrapper may declare it on its text_config alone: KimiK3Config lifts
-    `text_config.quantization_config` onto itself (configuration_kimi_k3.py:282-283).
-    """
-    _refuse_mlx(config)
-    quantization = config.get("quantization_config")
-    text = config.get("text_config")
-    if quantization is None and isinstance(text, Mapping):
-        quantization = text.get("quantization_config")
-    if quantization is None:
-        return None
-    if not isinstance(quantization, Mapping):
-        raise ValueError(f"quantization_config must be an object, got {quantization!r}")
-    method = quantization.get("quant_method")
-    if method == "fp8":
-        block, ue8m0 = fp8_format(quantization)
-        return _SourceQuantization(
-            scaled_names, partial(dequantize_checkpoint, block=block, param_dtype=param_dtype),
-            partial(pack_fp8, block=block, ue8m0=ue8m0),
-            fp8_tensor_names, partial(read_fp8_tensor, block=block))
-    if method == "mxfp4":
-        return _SourceQuantization(
-            mxfp4_stems, partial(unpack_mxfp4, param_dtype=param_dtype), pack_mxfp4,
-            mxfp4_tensor_names, read_mxfp4_tensor)
-    if method == "compressed-tensors":
-        packed_mxfp4_format(quantization)
-        return _SourceQuantization(
-            packed_mxfp4_stems, partial(unpack_packed_mxfp4, param_dtype=param_dtype), pack_packed_mxfp4,
-            packed_mxfp4_tensor_names, read_packed_mxfp4_tensor)
-    raise ValueError(
-        f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
-        f"fp8 blocks, GPT OSS's mxfp4 and compressed-tensors' mxfp4-pack-quantized and nothing else")
-
-
 def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tuple[str, str], ...],
                              quantized: tuple[str, ...]) -> None:
     """Share only aliases verified on original values before codec narrowing.
@@ -1087,7 +1002,7 @@ class Pretrained:
         """Write trained variables back to the source layout with its tokenizer assets."""
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
-        quantization = _source_quantization(self.config)
+        quantization = source_quantization(self.config)
         if quantization is not None and not self.quantized_tensors:
             raise ValueError(
                 "this source's config declares a quantization_config and the loader recorded "
@@ -2323,12 +2238,12 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     family = config.get("model_type")
     # Before any weight downloads: a format the codec cannot read is refused
     # on the config alone.
-    _source_quantization(config)
+    source_quantization(config)
     directory = decoders._snapshot(str(name_or_dir), directory.name)
     tensors = decoders._load_shards(directory)
     if param_dtype == AUTO:
         param_dtype = _checkpoint_dtype(config, tensors)
-    quantization = _source_quantization(config, param_dtype=param_dtype)
+    quantization = source_quantization(config, param_dtype=param_dtype)
     quantized_tensors = () if quantization is None else quantization.names(tensors)
     if quantization is not None:
         aliases: tuple[tuple[str, str], ...] = ()
