@@ -12,10 +12,11 @@ tests/reference_error.py over the steps: its RMS distance from float64 at
 most twice torch's. A different decay, clip, schedule or loss normalisation
 moves every step after the first by far more than fp32 rounding does.
 
-Observed RMS distance from float64 over the eight steps, Dew on one CPU
-device / torch: loss 3.3e-07 / 4.8e-07, gradient norm 2.0e-07 / 2.2e-07.
-On an A100, where the test passes too, Dew without the decay lands at
-1.1e-02 (ratio 22,000) and Dew without the clip at 1.9e-03 (ratio 4,000).
+Observed RMS distance from float64 over the eight steps against torch's
+4.8e-07 (loss) and 2.2e-07 (gradient norm): Dew on one CPU device 3.3e-07
+and 2.0e-07, on an RTX 3090 (JAX_PLATFORMS=cuda) 4.0e-07 and 3.0e-07. On
+either, Dew without the decay lands at 1.1e-02 (ratio 22,000) and Dew
+without the clip at 1.9e-03 (ratio 4,000).
 """
 
 from pathlib import Path
