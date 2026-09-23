@@ -274,6 +274,48 @@ def packed_mxfp4_format(quantization: Mapping[str, object]) -> None:
                              f"{ {key: PACKED_MXFP4_WEIGHTS[key] for key in wrong} }")
 
 
+def quantize_packed_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
+    """[..., output, input] weights to compressed-tensors' packed codes
+    [..., output, input / 2] and E8M0 exponent bytes [..., output, input / 32].
+
+    compressed-tensors 0.17.1's own encoder, `calculate_qparams` then
+    `MXFP4PackedCompressor.compress`, computed as the library computes it,
+    in the weight's dtype, per group of 32 inputs:
+
+    - the largest magnitude rounds to a power of two on its bits
+      (`round_to_power_2` adds a quarter of the exponent step to the pattern,
+      2 ** 21 in float32, and keeps the exponent: up from a mantissa
+      fraction of 0.75, down below it);
+    - the byte is 127 + log2 of that power - 2, floor(log2 6)
+      (`generate_mx_scales`), clamped to [0, 255], so an all-zero group,
+      whose log2 is -inf, takes byte 0;
+    - the scale is 2 ** (byte - 127) in the weight's dtype. Where that
+      underflows to zero, as the smallest groups' scales do in float16,
+      the library puts the eps of a uint8 scale dtype, 1, and writes 127;
+    - each weight over the scale, plus the symmetric zero point the
+      quantization lifecycle keeps until compression, saturates at 6 and
+      rounds to the nearest E2M1 value, ties to even. The zero point makes
+      a -0.0 quotient code 0; a negative quotient that rounds to zero keeps
+      code 8.
+    """
+    groups = _float_groups(weight, "compressed-tensors MXFP4")
+    largest = np.abs(groups).max(-1)
+    mantissa = ml_dtypes.finfo(largest.dtype).nmant
+    unsigned = np.dtype(f'u{largest.dtype.itemsize}')
+    bits = largest.view(unsigned) + unsigned.type(1 << (mantissa - 2))
+    power = (bits & ~unsigned.type((1 << mantissa) - 1)).view(largest.dtype)
+    if not np.isfinite(power).all():
+        raise ValueError("compressed-tensors MXFP4 rounds a group's largest magnitude up to the "
+                         "power of two past its dtype's range, whose E8M0 byte is the reserved NaN 0xff")
+    with np.errstate(divide='ignore'):
+        exponents = np.clip(127 + np.floor(np.log2(power.astype(np.float64))) - 2, 0, 255).astype(np.uint8)
+    scales = e8m0_scales(exponents).astype(groups.dtype)
+    underflow = scales == 0
+    scales[underflow], exponents[underflow] = 1, 127
+    codes = encode_e2m1(groups / scales[..., None] + groups.dtype.type(0))
+    return codes.reshape(*groups.shape[:-2], -1), exponents
+
+
 def packed_mxfp4_stems(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
     """The `<module>.weight` names a checkpoint ships as a compressed-tensors
     MXFP4 pair, sorted. Half a pair, or a pair beside a dense weight of the
@@ -325,9 +367,10 @@ def unpack_packed_mxfp4(tensors: Mapping[str, np.ndarray], *,
 def pack_packed_mxfp4(tensors: Mapping[str, np.ndarray],
                       stems: Collection[str]) -> dict[str, np.ndarray]:
     """Replace each named `<module>.weight` `[output, input]` with the
-    compressed-tensors pair `quantize_mxfp4` encodes it to. Only the stems a
-    source shipped packed (`packed_mxfp4_stems`); a named stem the tensors no
-    longer hold is refused, since the config would still promise its codes."""
+    compressed-tensors pair `quantize_packed_mxfp4` encodes it to. Only the
+    stems a source shipped packed (`packed_mxfp4_stems`); a named stem the
+    tensors no longer hold is refused, since the config would still promise
+    its codes."""
     packed = dict(tensors)
     for stem in stems:
         if stem not in packed:
@@ -335,10 +378,8 @@ def pack_packed_mxfp4(tensors: Mapping[str, np.ndarray],
         weight = np.asarray(packed.pop(stem))
         if weight.ndim != 2:
             raise ValueError(f"{stem} packs a Linear's [output, input] weight, got {weight.shape}")
-        blocks, scales = quantize_mxfp4(weight.T[None])
         module = stem.removesuffix('.weight')
-        packed[module + PACKED_SUFFIXES[0]] = blocks[0].reshape(weight.shape[0], -1)
-        packed[module + PACKED_SUFFIXES[1]] = scales[0]
+        packed[module + PACKED_SUFFIXES[0]], packed[module + PACKED_SUFFIXES[1]] = quantize_packed_mxfp4(weight)
     return packed
 
 
