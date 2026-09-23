@@ -21,6 +21,7 @@ from typing import Literal, NamedTuple, Protocol, TypedDict, Unpack
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
@@ -2150,6 +2151,35 @@ def _source_processor(directory: Path, config: Mapping[str, object], record: Map
     return None
 
 
+AUTO = "auto"
+"""The param_dtype that stores a checkpoint's parameters in its own dtype."""
+
+
+def _checkpoint_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
+    """Return the storage dtype a checkpoint states, for param_dtype 'auto'.
+
+    transformers' dtype='auto' rule (modeling_utils.py `_get_dtype`, 5.16.1):
+    config.json's `dtype` (`torch_dtype` before 5.0), else the dtype of the
+    first floating tensor. Packed FP8 or FP4 payloads are no storage dtype,
+    so the first tensor stored in one is what a quantized checkpoint without
+    a stated dtype resolves to. A diffusers pipeline states none, so its
+    denoiser's tensors decide.
+    """
+    stated = config.get("dtype", config.get("torch_dtype"))
+    if stated is not None:
+        storage = dtype_name(resolve_dtype(records.text(stated, "dtype")))
+        if storage is None:
+            raise ValueError(f"dtype={stated!r} names no floating parameter storage")
+        return storage
+    storable = {np.dtype(np.float32): "float32", np.dtype(np.float16): "float16",
+                np.dtype(ml_dtypes.bfloat16): "bfloat16"}
+    for tensor in tensors.values():
+        if tensor.dtype in storable:
+            return storable[tensor.dtype]
+    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a float32, bfloat16 or "
+                     "float16 tensor in the checkpoint")
+
+
 def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                     attention_impl: str = "auto", max_seq_len: int | None = None,
                     revision: str | None = None) -> Pretrained:
@@ -2160,14 +2190,16 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     wrapper variables join under their existing component names. Processor
     artifacts are loaded only when the source contains them.
     dtype selects computation; param_dtype independently selects floating
-    parameter storage and defaults to FP32 masters. Frozen component weights
+    parameter storage and defaults to FP32 masters, or 'auto' stores the
+    checkpoint's own dtype (`_checkpoint_dtype`). Frozen component weights
     (text encoders and VAE) follow it too; router, clipping, positional and
     safety state retain their own FP32/integer contracts.
     """
-    storage = dtype_name(resolve_dtype(param_dtype))
-    if storage is None:
-        raise ValueError("param_dtype must select floating parameter storage")
-    param_dtype = storage
+    if param_dtype != AUTO:
+        storage = dtype_name(resolve_dtype(param_dtype))
+        if storage is None:
+            raise ValueError("param_dtype must select floating parameter storage")
+        param_dtype = storage
     directory = decoders._snapshot(str(name_or_dir), revision, weights=False)
     if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
         # A latent diffusion pipeline is a directory of components with no
@@ -2179,6 +2211,10 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         # come from that commit even if the requested branch moves.
         directory = decoders._snapshot(str(name_or_dir), directory.name, weights=tuple(
             name for name in index if _present(index, name)))
+        if param_dtype == AUTO:
+            from dew.interop import diffusion
+            denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
+            param_dtype = _checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
         return _load_diffusion_source(directory, index, dtype=dtype,
                                       attention_impl=attention_impl, param_dtype=param_dtype)
     if not (directory / "config.json").is_file():
@@ -2196,9 +2232,12 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     family = config.get("model_type")
     # Before any weight downloads: a format the codec cannot read is refused
     # on the config alone.
-    quantization = _source_quantization(config, param_dtype=param_dtype)
+    _source_quantization(config)
     directory = decoders._snapshot(str(name_or_dir), directory.name)
     tensors = decoders._load_shards(directory)
+    if param_dtype == AUTO:
+        param_dtype = _checkpoint_dtype(config, tensors)
+    quantization = _source_quantization(config, param_dtype=param_dtype)
     quantized_tensors = () if quantization is None else quantization.names(tensors)
     if quantization is not None:
         aliases: tuple[tuple[str, str], ...] = ()

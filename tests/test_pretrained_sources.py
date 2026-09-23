@@ -14,6 +14,7 @@ from fnmatch import fnmatch
 from pathlib import Path
 from types import SimpleNamespace
 
+import ml_dtypes
 import numpy as np
 import pytest
 
@@ -339,3 +340,44 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
     assert record["yarn"]["factor"] == 4.0 and record["yarn"]["original_max_position_embeddings"] == 32768
     assert np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling)) - expected.numpy())) < 1e-7
     assert yarn_attention_factor(scaling) == pytest.approx(attention_factor)
+
+
+def bf16_source(tmp_path, **stated):
+    """qwen3-tiny with its tensors stored in bfloat16 and `stated` as its dtype fields."""
+    source = tmp_path / "source"
+    shutil.copytree(FIXTURES / "qwen3-tiny", source)
+    tensors = hf_decoders._load_shards(source)
+    safetensors_numpy.save_file({name: np.asarray(value, np.float32).astype(ml_dtypes.bfloat16)
+                                 for name, value in tensors.items()}, str(source / "model.safetensors"))
+    config = {key: value for key, value in fixture_config("qwen3-tiny").items()
+              if key not in ("dtype", "torch_dtype")}
+    (source / "config.json").write_text(json.dumps({**config, **stated}))
+    return source
+
+
+def leaf_dtypes(variables):
+    import jax
+
+    return {np.dtype(leaf.dtype) for leaf in jax.tree.leaves(variables["params"])}
+
+
+@pytest.mark.parametrize("stated, stored", [
+    ({}, ml_dtypes.bfloat16),                       # the first floating tensor's
+    ({"dtype": "float16"}, np.float16),             # config.json's, which wins
+    ({"torch_dtype": "float32"}, np.float32),       # the pre-5.0 spelling
+])
+def test_param_dtype_auto_stores_the_checkpoints_dtype(tmp_path, stated, stored):
+    """transformers' dtype='auto' rule: config.json's dtype, else the
+    dtype of the first floating tensor."""
+    loaded = pretrained.load_pretrained(bf16_source(tmp_path, **stated), dtype="float32",
+                                        param_dtype="auto", attention_impl="xla")
+
+    assert leaf_dtypes(loaded.variables) == {np.dtype(stored)}
+
+
+def test_the_pipeline_places_a_source_in_its_own_dtype(tmp_path):
+    import dew
+
+    task = dew.pipeline(str(bf16_source(tmp_path)), dtype="float32", param_dtype="auto")
+
+    assert leaf_dtypes(task.variables) == {np.dtype(ml_dtypes.bfloat16)}

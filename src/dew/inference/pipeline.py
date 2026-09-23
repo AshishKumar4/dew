@@ -44,7 +44,9 @@ def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None
     trainer's default when None). Without `mesh`, data parallelism uses the
     current pool's devices. dtype selects computation. param_dtype selects
     parameter storage: None preserves a run's stored dtypes and uses FP32
-    masters for a source. ema reads a run's averaged weights; step selects
+    masters for a source, and 'auto' stores the stored dtypes either way (a
+    source's config dtype or first floating tensor, as transformers'
+    dtype='auto' reads it). ema reads a run's averaged weights; step selects
     its checkpoint and revision pins a Hub source.
 
     Loading a task also points XLA at the on-disk executable cache, so a
@@ -52,13 +54,14 @@ def pipeline(source: str, *, mesh: MeshSpec | None = None, layout: Layout | None
     """
     _persist_compilations()
     resolve_dtype(dtype)
-    resolve_dtype(param_dtype)
+    if param_dtype != "auto":
+        resolve_dtype(param_dtype)
     root = epath.Path(source)
     if (root / RUN_FILE).is_file():
         if revision is not None:
             raise ValueError("revision pins a Hub source; a run directory has checkpoints, selected by step")
-        return _from_run(root, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
-                         ema=ema, step=step)
+        return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,
+                         param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema, step=step)
     if step is not None:
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
