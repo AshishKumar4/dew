@@ -193,6 +193,15 @@ def test_a_truncated_member_completes_its_group_but_carries_no_loss():
     np.testing.assert_array_equal(batch["advantages"], 0)
 
 
+def test_a_scored_truncation_trains_on_its_reward_when_the_scheduler_says_so():
+    source = Scripted(lambda task, submission, sample, version: finished(
+        5.0, version, status=Status.TRUNCATED) if sample == 1 else finished(1.0, version))
+    rollout, data, records = scheduler(source, ahead=0, groups=2, truncation="score", estimator="mean")
+    batch = rollout(State(0), next(iter(data.train())), None)
+    assert trained(batch)[0] == [0, 1, 2, 3]
+    assert records[-1].metrics["reward/mean"] == 3.0 and "masked/truncated" not in records[-1].metrics
+
+
 def test_oversampled_stragglers_are_cancelled_once_the_group_is_full():
     source = Scripted(lambda task, submission, sample, version: None if sample == 0 else finished(
         float(sample), version))

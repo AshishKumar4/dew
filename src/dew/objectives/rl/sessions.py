@@ -18,12 +18,20 @@ not see (research memo section 6). Chains are then packed first-fit into
 `[rows, width]` with per-chain segment ids and positions, the layout
 `LMObjective.token_scores` reads for packed documents.
 
-Only sampled ids of trainable sessions carry loss mass. A session is
-trainable when its verifier scored it: `COMPLETED`, or `AGENT_ERROR` (the
-agent broke; the verifier's reward says how badly). `TRUNCATED`,
-`INFRA_ERROR` and `CANCELLED` sessions are masked, so they take no rows and
-enter no baseline: a truncation is not scored zero and an infrastructure
-failure is retried by the scheduler, never trained on.
+Only sampled ids of trained sessions carry loss mass. `COMPLETED` and
+`AGENT_ERROR` sessions (the agent broke; the verifier's reward says how
+badly) always train on their reward. `INFRA_ERROR` and `CANCELLED` sessions
+never do: they take no rows and enter no baseline, and the scheduler retries
+them. A `TRUNCATED` session follows the `truncation` policy:
+
+- `mask` (the default) drops it like an infrastructure failure. A context,
+  turn or wall-clock limit says little about the task, so agentic runs mask
+  them (DeepSWE's compact filtering, SkyRL-Agent, memo section 1.3).
+- `score` trains it on its verifier reward, as a completed session. Fits
+  single-turn RLVR where a budget-hit completion can still hold a gradable
+  answer, and keeps short-budget runs from training on nothing.
+- `zero` trains it on reward 0 whatever the verifier said, a penalty on
+  running long (SkyRL's `zero_reward_on_non_stop`).
 """
 
 from __future__ import annotations
@@ -70,6 +78,8 @@ Summed over a batch it counts sessions, so `sum(weights * terms)` over
 `sum(weights)` is the mean over sessions of each session's token mean."""
 
 FINISH_REASONS = frozenset({"stop", "tool_calls", "length", "abort"})
+TRUNCATIONS = ("mask", "score", "zero")
+"""What a `TRUNCATED` session trains on; see the module docstring."""
 ESTIMATORS = ("group", "mean", "rloo")
 """Advantage families: `group` centres on the group mean and divides by its
 deviation (GRPO), `mean` only centres (Dr.GRPO), `rloo` subtracts the mean
@@ -258,6 +268,26 @@ def _chains(session: Session, index: int, width: int) -> list[_Chain]:
     return built
 
 
+def check_truncation(truncation: str) -> None:
+    """Refuse a truncation policy `pack` does not apply."""
+    if truncation not in TRUNCATIONS:
+        raise ValueError(f"truncation must be one of {TRUNCATIONS}, got {truncation!r}")
+
+
+def trained_reward(session: Session, truncation: str = "mask") -> float | None:
+    """The reward `session` trains on under `truncation`, or None when it carries no loss."""
+    if session.status.trainable:
+        return session.reward
+    if session.status is not Status.TRUNCATED or truncation == "mask":
+        return None
+    if truncation == "zero":
+        return 0.0
+    if session.reward is None:
+        raise ValueError(f"truncation='score' trains session {session.task}/{session.group}/{session.sample} "
+                         "on its reward, and it has none")
+    return session.reward
+
+
 def check_estimator(estimator: str) -> None:
     """Refuse an advantage family `advantages` does not compute."""
     if estimator not in ESTIMATORS:
@@ -269,17 +299,21 @@ def chains(session: Session, width: int) -> tuple[tuple[int, ...], ...]:
     return tuple(tuple(chain.tokens) for chain in _chains(session, 0, width))
 
 
-def advantages(sessions: Sequence[Session], estimator: str = "group") -> np.ndarray:
+def advantages(sessions: Sequence[Session], estimator: str = "group", *,
+               truncation: str = "mask") -> np.ndarray:
     """One advantage per session from the rewards of its `(task, group)`.
 
-    The baseline reads the group's trainable members only. A masked member
-    has no score to compare against, and a group with fewer than two scored
-    members has no baseline, so every member there gets zero.
+    The baseline reads the group's trained members only, each at its
+    `trained_reward`. A masked member has no score to compare against, and
+    a group with fewer than two trained members has no baseline, so every
+    member there gets zero.
     """
     check_estimator(estimator)
+    check_truncation(truncation)
     members: dict[tuple[str, str], list[int]] = {}
+    rewards_of = [trained_reward(session, truncation) for session in sessions]
     for index, session in enumerate(sessions):
-        if session.status.trainable:
+        if rewards_of[index] is not None:
             members.setdefault((session.task, session.group), []).append(index)
     per_session = np.zeros(len(sessions), np.float32)
     by_size: dict[int, list[list[int]]] = {}
@@ -288,7 +322,7 @@ def advantages(sessions: Sequence[Session], estimator: str = "group") -> np.ndar
             by_size.setdefault(len(group), []).append(group)
     for size, groups in by_size.items():
         order = [index for group in groups for index in group]
-        rewards = jnp.asarray([sessions[index].reward for index in order], jnp.float32)
+        rewards = jnp.asarray([rewards_of[index] for index in order], jnp.float32)
         if estimator == "rloo":
             values = rloo_advantage(rewards, size)
         else:
@@ -297,25 +331,14 @@ def advantages(sessions: Sequence[Session], estimator: str = "group") -> np.ndar
     return per_session
 
 
-def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
-         estimator: str = "group") -> dict[str, np.ndarray]:
-    """Strictly merge each trainable session's calls, then pack the chains into `[rows, width]`.
+def _built(sessions: Sequence[Session], width: int, truncation: str) -> list[_Chain]:
+    """The chains of every session that trains under `truncation`, in session order."""
+    return [chain for index, session in enumerate(sessions) if trained_reward(session, truncation) is not None
+            for chain in _chains(session, index, width)]
 
-    Every array is `[rows, width]` and aligned with `input_ids`: entry t
-    describes id t. `response_mask` is 1 on sampled ids alone;
-    `behavior_log_probs`, `versions` and `call_index` are set on them;
-    `advantages` repeats the session's advantage over its chain tokens;
-    `session_weights` is described at `SESSION_WEIGHTS_KEY`. Chains are
-    placed first-fit in decreasing length, a stable order, and `rows` pads
-    the batch to a fixed count, refusing chains that need more.
-    """
-    if type(width) is not int or width < 2:
-        raise ValueError("a packed row holds at least two ids")
-    if rows is not None and (type(rows) is not int or rows < 1):
-        raise ValueError("rows is a positive integer, or None for as many as the chains need")
-    values = advantages(sessions, estimator)
-    built = [chain for index, session in enumerate(sessions) if session.status.trainable
-             for chain in _chains(session, index, width)]
+
+def _place(built: Sequence[_Chain], width: int) -> list[list[int]]:
+    """Place chains first-fit in decreasing length, a stable order: per row, its chain numbers."""
     order = sorted(range(len(built)), key=lambda number: -len(built[number].tokens))
     fill: list[int] = []
     placed: list[list[int]] = []
@@ -328,9 +351,39 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
             row = len(fill) - 1
         placed[row].append(number)
         fill[row] += size
-    count = len(fill) if rows is None else rows
-    if len(fill) > count:
-        raise ValueError(f"the chains need {len(fill)} rows of {width} ids, more than the {rows} asked for")
+    return placed
+
+
+def rows_needed(sessions: Sequence[Session], width: int, *, truncation: str = "mask") -> int:
+    """How many `width`-id rows `pack` fills with `sessions`' trained chains."""
+    check_truncation(truncation)
+    return len(_place(_built(sessions, width, truncation), width))
+
+
+def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
+         estimator: str = "group", truncation: str = "mask") -> dict[str, np.ndarray]:
+    """Strictly merge each trained session's calls, then pack the chains into `[rows, width]`.
+
+    Every array is `[rows, width]` and aligned with `input_ids`: entry t
+    describes id t. `response_mask` is 1 on sampled ids alone;
+    `behavior_log_probs`, `versions` and `call_index` are set on them;
+    `advantages` repeats the session's advantage over its chain tokens;
+    `session_weights` is described at `SESSION_WEIGHTS_KEY`. Chains are
+    placed first-fit in decreasing length, a stable order, and `rows` pads
+    the batch to a fixed count, refusing chains that need more
+    (`rows_needed` counts them). `truncation` decides whether TRUNCATED
+    sessions train, as the module docstring describes.
+    """
+    if type(width) is not int or width < 2:
+        raise ValueError("a packed row holds at least two ids")
+    if rows is not None and (type(rows) is not int or rows < 1):
+        raise ValueError("rows is a positive integer, or None for as many as the chains need")
+    values = advantages(sessions, estimator, truncation=truncation)
+    built = _built(sessions, width, truncation)
+    placed = _place(built, width)
+    count = len(placed) if rows is None else rows
+    if len(placed) > count:
+        raise ValueError(f"the chains need {len(placed)} rows of {width} ids, more than the {rows} asked for")
     count = max(count, 1)
     shape = (count, width)
     ids = np.zeros(shape, np.int32)
@@ -405,14 +458,15 @@ def sampled_values(batch: Mapping[str, np.ndarray],
 def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray], *,
                     source: Callable[[Session], str] | None = None,
                     latencies: Sequence[float] | None = None,
-                    version: int | None = None) -> dict[str, float]:
+                    version: int | None = None, truncation: str = "mask") -> dict[str, float]:
     """Host-side agentic telemetry for one packed batch and the sessions behind it.
 
     - `merge/calls_per_chain`: trainable calls over packed chains, 1.0 when
       nothing merged; `pack/fill` is the share of row slots holding ids.
     - `status/<name>`: share of sessions per status, and
-      `masked/<name>`: share of all sampled ids that status masked.
-    - `reward/mean` over scored sessions, `reward/<source>` per
+      `masked/<name>`: share of all sampled ids that status masked, under
+      the `truncation` policy `pack` used.
+    - `reward/mean` over trained sessions at their trained reward, `reward/<source>` per
       `source(session)`, `reward/component/<name>` per verifier component.
     - `latency/p50`, `p90`, `p99`, `max` over `latencies`, seconds per session.
     - `lag/mean`, `lag/max`: `version` minus each trainable id's version.
@@ -420,6 +474,8 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
     Trainer-versus-engine mismatch is the loss's own metric (`mismatch/*`),
     computed where the proximal policy is known.
     """
+    check_truncation(truncation)
+    rewards_of = [trained_reward(session, truncation) for session in sessions]
     metrics: dict[str, float] = {}
     total = max(len(sessions), 1)
     sampled = dict.fromkeys(Status, 0)
@@ -428,16 +484,17 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
     everything = max(sum(sampled.values()), 1)
     for status in Status:
         metrics[f"status/{status.value}"] = sum(session.status == status for session in sessions) / total
-        if not status.trainable:
+        if not status.trainable and not (status is Status.TRUNCATED and truncation != "mask"):
             metrics[f"masked/{status.value}"] = sampled[status] / everything
     segments = np.asarray(batch[SEGMENT_IDS_KEY])
     rows = np.arange(segments.shape[0])[:, None] * (segments.shape[1] + 1) + segments
     chain_count = np.unique(rows[segments > 0]).size
-    calls = sum(len(session.calls) for session in sessions if session.status.trainable)
+    calls = sum(len(session.calls) for session, reward in zip(sessions, rewards_of, strict=True)
+                if reward is not None)
     metrics["merge/calls_per_chain"] = calls / chain_count if chain_count else 0.0
     metrics["pack/fill"] = float(np.mean(segments > 0))
-    scored = [(session, session.reward) for session in sessions
-              if session.status.trainable and session.reward is not None]
+    scored = [(session, reward) for session, reward in zip(sessions, rewards_of, strict=True)
+              if reward is not None]
     if scored:
         metrics["reward/mean"] = float(np.mean([reward for _, reward in scored]))
         by_source: dict[str, list[float]] = {}

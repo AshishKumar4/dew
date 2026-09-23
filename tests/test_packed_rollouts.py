@@ -26,6 +26,7 @@ from dew.objectives.rl.sessions import (
     advantages,
     chains,
     pack,
+    rows_needed,
     sampled_values,
     session_metrics,
 )
@@ -153,6 +154,37 @@ def test_masked_rollouts_take_no_rows_and_no_baseline():
     np.testing.assert_allclose(advantages(rollouts, "mean"), [.5, -.5, 0, 0])
     lonely = [rollouts[0], rollouts[2]]
     assert (advantages(lonely) == 0).all()
+
+
+@pytest.mark.parametrize("truncation, expected", [
+    ("mask", [.5, -.5, 0, 0]),       # the truncation takes no row and no baseline
+    ("score", [-1, -2, 3, 0]),   # it trains on its reward 5: baseline 2
+    ("zero", [2 / 3, -1 / 3, -1 / 3, 0]),  # it trains on 0: baseline 1/3
+])
+def test_the_truncation_policy_decides_whether_a_truncation_trains_and_on_what_reward(truncation, expected):
+    call = Call((1, 2), (3,), (-.1,), "stop", 0)
+    sessions = [Session("t", "g", 0, 0, (call,), Status.COMPLETED, 1.0),
+                Session("t", "g", 1, 0, (call,), Status.AGENT_ERROR, 0.0),
+                Session("t", "g", 2, 0, (call,), Status.TRUNCATED, 5.0),
+                Session("t", "g", 3, 0, (call,), Status.INFRA_ERROR, None)]
+    np.testing.assert_allclose(advantages(sessions, "mean", truncation=truncation), expected, rtol=1e-6)
+    batch = pack(sessions, 3, estimator="mean", truncation=truncation)
+    trained = {0, 1} if truncation == "mask" else {0, 1, 2}
+    assert set(np.unique(batch[SESSION_INDEX_KEY][batch[RESPONSE_MASK_KEY] > 0])) == trained
+    assert rows_needed(sessions, 3, truncation=truncation) == batch[IDS_KEY].shape[0]
+    metrics = session_metrics(sessions, batch, truncation=truncation)
+    assert metrics["reward/mean"] == pytest.approx({"mask": .5, "score": 2.0, "zero": 1 / 3}[truncation])
+    assert ("masked/truncated" in metrics) == (truncation == "mask")
+
+
+def test_a_scored_truncation_needs_a_reward_and_an_unknown_policy_is_refused():
+    call = Call((1, 2), (3,), (-.1,), "length", 0)
+    unscored = [Session("t", "g", 0, 0, (call,), Status.TRUNCATED, None)]
+    with pytest.raises(ValueError, match="reward"):
+        pack(unscored, 3, truncation="score")
+    assert pack(unscored, 3, truncation="zero")[RESPONSE_MASK_KEY].sum() == 1
+    with pytest.raises(ValueError, match="truncation"):
+        pack(unscored, 3, truncation="drop")
 
 
 def test_rows_pad_to_a_fixed_count_and_refuse_overflow():
