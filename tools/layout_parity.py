@@ -375,12 +375,18 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
             case = dataclasses.replace(case, config={
                 **case.config, "mixture": {**case.config["mixture"], **mixture}})
         batch = bench.global_batch(case)
+        # The exchange needs an expert axis; one device computes the same
+        # layer through the global dispatch.
+        reference = case if case.config.get("mixture", {}).get("dispatch") != "exchange" else (
+            dataclasses.replace(case, config={
+                **case.config, "mixture": {**case.config["mixture"], "dispatch": "global"}}))
         try:
             ref_losses, ref_gradient, ref_compiled = agreed(
-                f"reference of {model}", lambda: trained(case, {}, batch, steps=steps, one_device=True))
-            floors, loss_floor = floor(case, batch, ref_gradient, ref_losses[0])
-            if anchor and reassociates(case):
-                rounding = exact(case, ref_gradient)
+                f"reference of {model}",
+                lambda: trained(reference, {}, batch, steps=steps, one_device=True))
+            floors, loss_floor = floor(reference, batch, ref_gradient, ref_losses[0])
+            if anchor and reassociates(reference):
+                rounding = exact(reference, ref_gradient)
                 farthest = max(rounding, key=rounding.__getitem__)
                 if rounding[farthest] > rounding_limit(dtype):
                     raise ValueError(
