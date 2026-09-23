@@ -105,8 +105,8 @@ def audit_template(name: str, end_token: str | None) -> dict:
         raise ValueError("the tokenizer names no EOS; pass --end-token")
     cases = [template_case(tokenizer, end, role, reasoning=reasoning)
              for role in ("tool", "user") for reasoning in (False, True)]
-    cases.append(template_case(tokenizer, end, "tool", reasoning=False, arguments_as_string=True))
-    cases.append(template_case(tokenizer, end, "tool", reasoning=False, compact_json=True))
+    cases += [template_case(tokenizer, end, "tool", reasoning=reasoning, **{variant: True})
+              for variant in ("arguments_as_string", "compact_json") for reasoning in (False, True)]
     return {"tokenizer": name, "end_token": tokenizer.convert_ids_to_tokens(end),
             "append_only": all(case["strict_prefix_holds"] for case in cases),
             "lenient_merge_would_corrupt": [case for case in cases
