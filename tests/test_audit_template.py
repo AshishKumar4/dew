@@ -3,7 +3,9 @@
 The tiny-tools fixture writes tool calls as `<tool_call id="...">name {json}`,
 not Qwen's Hermes JSON, and has no reasoning markup. Its histories stay
 append-only whenever the template re-renders the parsed call as it wrote it,
-so the audit must report every case but the compact-JSON one as merging.
+so the audit must report every case but the compact-JSON ones as merging.
+Each JSON variant runs with and without reasoning, since a family may split
+on one of those settings for reasons unrelated to the JSON.
 """
 
 import importlib.util
@@ -29,5 +31,6 @@ def test_a_non_hermes_template_audits_its_own_tool_call_syntax(audit):
              case["sampled_compact_json"]): case["strict_prefix_holds"] for case in report["cases"]}
     assert held == {("tool", False, False, False): True, ("tool", True, False, False): True,
                     ("user", False, False, False): True, ("user", True, False, False): True,
-                    ("tool", False, True, False): True, ("tool", False, False, True): False}
-    assert [case["sampled_compact_json"] for case in report["lenient_merge_would_corrupt"]] == [True]
+                    ("tool", False, True, False): True, ("tool", False, False, True): False,
+                    ("tool", True, True, False): True, ("tool", True, False, True): False}
+    assert [case["sampled_compact_json"] for case in report["lenient_merge_would_corrupt"]] == [True, True]
