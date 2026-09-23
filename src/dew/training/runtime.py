@@ -18,12 +18,27 @@ from jax.experimental import multihost_utils
 
 from dew.artifacts import broadcast_from_process_zero, end_pool_on_failure
 from dew.pool import PROCESS_COUNT, PROCESS_ID
-from dew.telemetry.devices import apply_xla_flags
+from dew.telemetry.devices import apply_xla_flags, xla_flag
 from dew.telemetry.instrumentation import enable_compilation_cache
 
 if TYPE_CHECKING:
     from dew.config import Wandb
     from dew.training.distributed import Layout
+
+
+EXECUTION_TIMEOUT = "30m"
+"""How long one device execution of a process pool may run before XLA ends
+its process.
+
+A rank that stalls without failing, blocked on a read or on a compile that
+waits for peers, leaves the other ranks inside a collective or a
+communicator's setup. No GPU backend times that out and no process reports it,
+so the pool would hang for ever with every process alive. XLA's execution
+watchdog ends a process whose execution runs past this, and `dew launch`,
+srun or the scheduler then stops the rest. An execution is a whole step or
+sampling loop, which can run for minutes, so the bound is generous;
+`--xla_gpu_execution_terminate_timeout` in XLA_FLAGS or `xla_flags` sets
+another."""
 
 
 def prepare_process(wandb: Wandb | None = None,
@@ -81,6 +96,10 @@ def prepare_process(wandb: Wandb | None = None,
             if multi_host or "coordinator_address" not in str(e):
                 raise
         else:
+            # XLA reads its flags when the backend opens, which the first
+            # line below does.
+            if xla_flag("xla_gpu_execution_terminate_timeout") is None:
+                apply_xla_flags(f"--xla_gpu_execution_terminate_timeout={EXECUTION_TIMEOUT}")
             print(f"Joined the JAX process pool: process {jax.process_index()} "
                   f"of {jax.process_count()}")
             # One collective while the processes are still in lockstep;
