@@ -30,6 +30,7 @@ import json
 import sys
 import warnings
 
+import jax
 import numpy as np
 import pytest
 import torch
@@ -85,6 +86,26 @@ def test_a_llama_convention_type_loads_with_one_tier2_warning(tmp_path):
     assert "transformers 5.16.1's CwmForCausalLM" in str(caught[0].message)
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
     np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="TF32 matmuls exist on a GPU alone")
+def test_the_probe_holds_its_bound_at_a_gpus_default_tf32_precision(tmp_path):
+    """The bound was measured at fp32 matmul precision. A GPU's default runs
+    fp32 matmuls in TF32, which puts 1e-2 between two correct models, so the
+    probe computes Dew's side at the highest precision whatever the caller's.
+    The load runs as a user's would, outside the suite's precision and XLA
+    flags."""
+    import os
+    import subprocess
+
+    write_tiny(tmp_path, "cwm", sliding_window=4)
+    script = ("import sys\nfrom dew.interop import load_pretrained\n"
+              "load_pretrained(sys.argv[1], dtype='float32', attention_impl='reference')")
+    env = {name: value for name, value in os.environ.items()
+           if name not in ("JAX_DEFAULT_MATMUL_PRECISION", "XLA_FLAGS")}
+    run = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-1500:]
+    assert TIER2 in run.stderr
 
 
 def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path):
