@@ -249,6 +249,8 @@ compute dtype. Non-parameter state retains its declared precision.
 | Qwen3-Next | `qwen3_next` |
 | GLM floating-point checkpoints, GLM-5.3, GLM-5.3-Flash | `glm4_moe`, `glm_moe_dsa`, `glm5_next_text` |
 | DeepSeek floating-point checkpoints | `deepseek_v2`, `deepseek_v3`, `deepseek_v32` |
+| DeepSeek-V4 | `deepseek_v4` |
+| DeepSeek-V4.1-Flash text | `deepseek_v41` |
 | Kimi K2, Kimi K2.5 text | `kimi_k2`, `kimi_k25` |
 | Kimi K3 text, MXFP4 routed experts | `kimi_k3` |
 | Kimi Linear | `kimi_linear` |
@@ -303,6 +305,7 @@ carries the processor and tokenizer files beside the weights.
 | Gemma 4 | `gemma4` | Images; videos; waveforms |
 | Qwen 3.5 | `qwen3_5` | Images and timestamped videos, with M-RoPE positions |
 | Llama 4 | `llama4` | Tiled images |
+| DeepSeek-V4.1-Flash | `deepseek_v41` | Images |
 
 The image, video and audio inputs a model accepts follow the checkpoint's
 modality configuration. `Processor.__call__` takes `text`, `images`, `audio`,
@@ -310,7 +313,9 @@ modality configuration. `Processor.__call__` takes `text`, `images`, `audio`,
 template, so the checkpoint interprets template controls such as
 `reasoning_effort` and `preserve_thinking`. The checkpoint's own processor also
 does the raw image, video and waveform preprocessing, and Dew arranges its
-outputs row by row.
+outputs row by row. DeepSeek-V4.1 ships no processor, so its caller builds
+the pixel values and image positions
+([language models](docs/concepts/language_models.md#multimodal-checkpoints)).
 
 Qwen 3.8 ships under the Qwen 3.5 model types. `Qwen/Qwen3.8-27B` loads as a
 `qwen3_5` conditional model with a dense hybrid decoder, images and videos.
