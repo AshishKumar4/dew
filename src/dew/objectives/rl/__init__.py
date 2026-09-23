@@ -40,15 +40,16 @@ from .rollout import (
                        Reward,
                        SampledRollout,
 )
+from .rollouts import Call, Rollout, RolloutSource, Status, Task, pack
 from .sandbox import SandboxLimits, SubprocessEnvironment
 from .verifiers import CodeReward, MathReward, code_block
 
 __all__ = ["ADVANTAGES_KEY", "IDS_KEY", "OLD_LOG_PROBS_KEY", "POLICY_VERSION_KEY", "PREFERENCE_IDS_KEY",
-           "PREFERENCE_MASK_KEY", "RESPONSE_MASK_KEY", "REWARDS_KEY", "Action", "AsyncRollout", "CodeReward",
+           "PREFERENCE_MASK_KEY", "RESPONSE_MASK_KEY", "REWARDS_KEY", "Action", "AsyncRollout", "Call", "CodeReward",
            "ContainerRunner", "DPOObjective", "Environment", "EnvironmentFactory",
            "Episode", "EpisodeCancelled", "EpisodeFailure", "EpisodeId", "EpisodeInference", "EpisodeJournal",
            "EpisodeRecorder", "EpisodeRollout", "EpisodeStatus", "FlowGRPOObjective", "FlowReward",
            "FlowRollout", "GRPOObjective", "MathReward", "Observation", "Outcome", "PPOObjective", "PPORollout",
-           "ProcessRunner", "Program", "RecoverableEnvironment", "Reward", "RolloutRecord", "Runner",
-           "SampledRollout", "SandboxFleet", "SandboxLimits", "SubprocessEnvironment",
-           "Transition", "ValueHead", "Verdict", "Verifier", "code_block"]
+           "ProcessRunner", "Program", "RecoverableEnvironment", "Reward", "Rollout", "RolloutRecord", "RolloutSource", "Runner",
+           "SampledRollout", "SandboxFleet", "SandboxLimits", "Status", "SubprocessEnvironment",
+           "Task", "Transition", "ValueHead", "Verdict", "Verifier", "code_block", "pack"]
