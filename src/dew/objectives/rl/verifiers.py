@@ -1,7 +1,7 @@
 """Verifiable rewards: score a completion by running it or by checking its answer.
 
 Both are `Reward` callables, `(data_source, completion, ground_truth,
-extra_info) -> float`, so they plug into `SampledRollout` and `AsyncRollout`
+extra_info) -> float`, so they plug into `SampledRollout` and `PromptSource`
 unchanged. `CodeReward` extracts the program from the completion and runs it
 against test cases in a `SandboxFleet`. `MathReward` reads the final answer
 and compares it with the reference as an exact rational number.

@@ -20,9 +20,10 @@ same checkpoint, sample from it by token ids, and push weights by writing
 safetensors and asking the engine to reload them (vLLM's development
 endpoints, `VLLM_SERVER_DEV_MODE=1`; SGLang's `/update_weights_from_disk`).
 `--vllm` and `--sglang` name the executables, which may live in their own
-environments. The rollout draws one batch ahead of the update, so each
-batch is at most one update stale; the GRPO objective's importance cap
-corrects for it.
+environments. A `RolloutScheduler` over a `PromptSource` draws one batch
+ahead of the update, so each batch is at most one update stale; the GRPO
+objective's importance cap corrects for it. A completion that runs out of
+`--new-tokens` is truncated and masked, not scored.
 
 The run prints one line per update and writes `rewards.json` to `--out`
 with the per-update reward, policy version and lag, the mean reward of the
@@ -61,14 +62,16 @@ from dew.inference import (
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop import load_pretrained
 from dew.objectives.rl import (
-    AsyncRollout,
     CodeReward,
     ContainerRunner,
     GRPOObjective,
     ProcessRunner,
-    RolloutRecord,
+    PromptSource,
+    RolloutScheduler,
     SandboxFleet,
     SandboxLimits,
+    SchedulerRecord,
+    prompt_tasks,
 )
 from dew.sampling import Sampling
 from dew.training import Trainer
@@ -248,21 +251,25 @@ def main(config: Config) -> dict:
     else:
         raise ValueError(f"backend is native, vllm or sglang, got {config.backend!r}")
 
-    history: list[RolloutRecord] = []
+    history: list[SchedulerRecord] = []
 
-    def log(record: RolloutRecord) -> None:
+    def log(record: SchedulerRecord) -> None:
         history.append(record)
         print(f"update {record.updates:3d}  reward {record.reward:.3f}  version {record.version}  "
-              f"lag {record.lag}  redrawn {record.redrawn}  waited {record.waited:.1f}s", flush=True)
+              f"lag {record.lag}  resubmitted {sum(record.resubmitted.values())}  "
+              f"truncated {record.statuses.get('truncated', 0)}  waited {record.waited:.1f}s", flush=True)
 
     limits = SandboxLimits(wall_seconds=5.0, cpu_seconds=2, memory_bytes=512 * 1024 ** 2, message_bytes=65536)
     if config.runner not in ("process", "container"):
         raise ValueError(f"runner is process or container, got {config.runner!r}")
     runner = ProcessRunner() if config.runner == "process" else ContainerRunner(config.image)
     fleet = SandboxFleet(runner, limits=limits, workers=max(os.cpu_count() or 1, 4))
-    rollout = AsyncRollout(objective, server, CodeReward(fleet), decode=words.decode, groups=config.groups,
-                           max_new_tokens=config.new_tokens, max_lag=config.max_lag, ahead=config.max_lag,
-                           log=log)
+    prompts = PromptSource(server, CodeReward(fleet), decode=words.decode, max_new_tokens=config.new_tokens,
+                           seed=config.seed)
+    # One chain per completion at most, each within the prompt and response width.
+    rollout = RolloutScheduler(objective, prompts, server, width=width, rows=config.prompts * config.groups,
+                               tasks=prompt_tasks, groups=config.groups, max_lag=config.max_lag,
+                               ahead=config.max_lag, log=log)
     data = Prompts(tokenizer=tokenizer, records=records(config.tasks, config.seed),
                    max_prompt_len=config.prompt_tokens, pad_id=sampling.pad_id, val_batches=None,
                    loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
@@ -272,10 +279,11 @@ def main(config: Config) -> dict:
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed), rollout=rollout)
     began = time.perf_counter()
     try:
-        state = trainer.fit(rollout.prompts(data), steps=config.steps, log_every=1)
+        state = trainer.fit(rollout.tasks(data), steps=config.steps, log_every=1)
     finally:
-        server.close()
         rollout.close()
+        prompts.close()
+        server.close()
         fleet.close()
         if remote is not None:
             remote.terminate()
@@ -286,8 +294,8 @@ def main(config: Config) -> dict:
         "backend": config.backend, "model": config.model, "updates": int(state.updates),
         "seconds": time.perf_counter() - began, "device": jax.devices()[0].device_kind,
         "first_reward": sum(rewards[:window]) / window, "last_reward": sum(rewards[-window:]) / window,
-        "max_lag": max(record.lag for record in history), "redrawn": sum(record.redrawn for record in history),
-        "push_seconds": pushes, "history": [asdict(record) for record in history],
+        "max_lag": max(record.lag for record in history),
+        "resubmitted": sum(sum(record.resubmitted.values()) for record in history), "push_seconds": pushes, "history": [asdict(record) for record in history],
     }
     (config.out / "rewards.json").write_text(json.dumps(summary, indent=1))
     print(f"{config.backend}: reward {summary['first_reward']:.3f} over the first {window} updates, "

@@ -7,7 +7,6 @@ and nothing under `dew` outside these two packages may read `dew.rl`.
 
 from dew.data.preferences import IDS_KEY as PREFERENCE_IDS_KEY, MASK_KEY as PREFERENCE_MASK_KEY
 
-from .asynchronous import AsyncRollout, RolloutRecord
 from .episodes import (
                        Action,
                        Environment,
@@ -46,24 +45,20 @@ from .sessions import (
                        Task,
                        pack,
 )
+from .scheduler import Publisher, RolloutScheduler, SchedulerRecord, task_ids
+from .sources import EnvironmentSource, PromptSource, Score, prompt_tasks
 from .verifiers import CodeReward, MathReward, code_block
 
 __all__ = [
                        "ADVANTAGES_KEY",
-                       "IDS_KEY",
-                       "OLD_LOG_PROBS_KEY",
-                       "PREFERENCE_IDS_KEY",
-                       "PREFERENCE_MASK_KEY",
-                       "RESPONSE_MASK_KEY",
-                       "REWARDS_KEY",
                        "Action",
-                       "AsyncRollout",
                        "Call",
                        "CodeReward",
                        "ContainerRunner",
                        "DPOObjective",
                        "Environment",
                        "EnvironmentFactory",
+                       "EnvironmentSource",
                        "Episode",
                        "EpisodeCancelled",
                        "EpisodeFailure",
@@ -77,20 +72,30 @@ __all__ = [
                        "FlowReward",
                        "FlowRollout",
                        "GRPOObjective",
+                       "IDS_KEY",
                        "MathReward",
+                       "OLD_LOG_PROBS_KEY",
                        "Observation",
                        "Outcome",
                        "PPOObjective",
                        "PPORollout",
+                       "PREFERENCE_IDS_KEY",
+                       "PREFERENCE_MASK_KEY",
                        "ProcessRunner",
                        "Program",
+                       "PromptSource",
+                       "Publisher",
+                       "RESPONSE_MASK_KEY",
+                       "REWARDS_KEY",
                        "RecoverableEnvironment",
                        "Reward",
-                       "RolloutRecord",
+                       "RolloutScheduler",
                        "Runner",
                        "SampledRollout",
                        "SandboxFleet",
                        "SandboxLimits",
+                       "SchedulerRecord",
+                       "Score",
                        "Session",
                        "SessionSource",
                        "Status",
@@ -102,5 +107,7 @@ __all__ = [
                        "Verifier",
                        "code_block",
                        "pack",
+                       "prompt_tasks",
                        "session_of",
+                       "task_ids",
 ]

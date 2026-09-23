@@ -8,20 +8,30 @@ cancellations are resubmitted and never trained; a sample that keeps failing
 abandons its group; truncations stay masked; stragglers are cut by
 over-sampling and the admit count; stale rollouts are discarded before anyone
 waits on them; a rollout spanning a weight push keeps its oldest version; a
-reopened stream cancels what the old one left in flight; and a source that
-raises stops the batch.
+reopened stream cancels what the old one left in flight; a source that
+raises stops the batch; and a real `Trainer` trains a tiny model through
+two-turn in-process environments on Dew's own server.
 """
 
 import threading
 from concurrent.futures import Future
+from contextlib import contextmanager
 
+import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 
 from dew.data import Dataset
-from dew.objectives.rl.rollouts import Call, Rollout, Status
+from dew.inference import NativeRolloutServer, TextGeneration
+from dew.inference.serving import Server
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, Observation, Score
+from dew.objectives.rl.rollouts import Call, Rollout, Status, pack
 from dew.objectives.rl.scheduler import RolloutScheduler
+from dew.sampling import Sampling
+from dew.training import Layout, Trainer
 
 EOS = 9
 WIDTH = 8
@@ -57,7 +67,7 @@ def finished(reward=1.0, *versions, status=Status.COMPLETED, components=None):
     calls, prompt = [], (1, 2)
     for version in versions or (0,):
         calls.append(Call(prompt, (3, EOS), (-.5, -.25), "stop", version))
-        prompt = prompt + (3, EOS, 4)
+        prompt = (*prompt, 3, EOS, 4)
     scored = status.trainable or status == Status.TRUNCATED
     return Rollout("source-task", "source-group", 7, 7, tuple(calls), status,
                    reward if scored else None, components or {}, "")
@@ -124,7 +134,7 @@ def test_complete_groups_are_packed_and_the_next_batch_is_submitted_ahead():
     assert indices == [0, 1, 2, 3] and weight == pytest.approx(4.0)
     # Sample rewards 0 and 1 in each group, centred per group.
     by_rollout = {int(i): float(a) for i, a in zip(batch["rollout_index"][batch["response_mask"] > 0],
-                                                   batch["advantages"][batch["response_mask"] > 0])}
+                                                   batch["advantages"][batch["response_mask"] > 0], strict=True)}
     assert by_rollout == pytest.approx({0: -.5, 1: .5, 2: -.5, 3: .5})
     np.testing.assert_allclose(batch["old_log_probs"], -0.75 * batch["response_mask"])
     record = records[-1]
@@ -307,3 +317,84 @@ def test_a_batch_that_did_not_come_through_the_stream_is_refused():
 def test_a_schedule_that_could_exceed_the_bound_is_refused(options, message):
     with pytest.raises(ValueError, match=message):
         RolloutScheduler(Objective(), Scripted(lambda *_: None), Publisher(), width=WIDTH, rows=ROWS, **options)
+
+
+VOCAB = 13
+STOP = 12
+
+
+class Tools:
+    """Two tool turns: each appends the action and one tool id, then the task completes."""
+
+    def __init__(self, task):
+        self.context, self.steps = (1, 2 + task % 3), 0
+
+    def reset(self):
+        return Observation(self.context)
+
+    def step(self, action):
+        self.steps += 1
+        if self.steps == 2:
+            return Observation((), EpisodeStatus.COMPLETED, "done")
+        self.context = action.context + action.tokens + (4,)
+        return Observation(self.context)
+
+
+def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_server():
+    width = 48
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=64, dtype="float32")
+    target = GRPOObjective(model, seq_len=width - 1, behavior_importance_cap=2.0)
+    params = target.init(jax.random.key(0))
+    sampling = Sampling(temperature=1.0, eos_id=STOP)
+    server = NativeRolloutServer(Server.from_task(TextGeneration(model, params, None, sampling=sampling),
+                                                  slots=16, capacity=64))
+
+    @contextmanager
+    def environment(identity):
+        yield Tools(identity.task)
+
+    def verifier(episode):
+        sampled = [token for turn in episode.transitions for token in turn.action.tokens if token != STOP]
+        share = sum(token == 5 for token in sampled) / max(len(sampled), 1)
+        return Score(share, {"turns": float(len(episode.transitions))})
+
+    episodes = EnvironmentSource(server, environment, verifier, max_prompt_tokens=32, max_new_tokens=16,
+                                 max_turns=3, workers=16)
+    rollouts = []
+    submit = episodes.submit
+
+    def watched(task, samples, *, version):
+        futures = submit(task, samples, version=version)
+        for future in futures:
+            future.add_done_callback(lambda done: rollouts.append(done.result()) if not done.cancelled() else None)
+        return futures
+
+    episodes.submit = watched
+    tasks = jax.device_count()
+    records = []
+    scheduler = RolloutScheduler(target, episodes, server, width=width, rows=2 * tasks, groups=2,
+                                 max_lag=2, ahead=1, sync_every=2, log=records.append)
+    stream = scheduler.tasks(Dataset(train=lambda: ({"task_id": np.arange(tasks, dtype=np.int32) + step * tasks}
+                                                    for step in range(100)), val=None, records=None, batch=tasks))
+    try:
+        trainer = Trainer(target, optax.adam(1e-2), key=jax.random.key(3), rollout=scheduler,
+                          layout=Layout(min_shard=1, tolerance=1.0))
+        state = trainer.fit(stream, steps=4, log_every=4)
+    finally:
+        scheduler.close()
+        episodes.close()
+        server.close()
+    assert int(state.updates) == 4 and [record.updates for record in records] == [0, 1, 2, 3]
+    assert all(0 <= record.lag <= 2 for record in records)
+    assert any(record.lag > 0 for record in records), "no batch was ever drawn ahead of its update"
+    assert all(record.components["turns"] >= 1 for record in records)
+    completed = [rollout for rollout in rollouts if rollout.status == Status.COMPLETED]
+    assert completed, "no session completed both tool turns"
+    # Every completed session made two calls, and the second extends the first,
+    # so the pair packs into one chain.
+    for rollout in completed:
+        assert len(rollout.calls) == 2
+        assert pack([rollout], width)["input_ids"].shape[0] == 1
+    assert server.version == 2
+    assert not all(jnp.array_equal(a, b) for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(state.params), strict=True))
