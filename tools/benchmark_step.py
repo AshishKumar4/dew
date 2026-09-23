@@ -83,7 +83,7 @@ from dew.training.distributed import DevicePrefetchIterator, data_partition
 from dew.training.runtime import prepare_process
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from trace_window import kernel_category, length, union, window_split
+from trace_window import kernel_category, length, overlap, union, window_split
 
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
 # of the model should not spend its first minute downloading a text tower, and
@@ -815,6 +815,25 @@ def device_timeline(directory: str, steps: int) -> dict[str, Any]:
     }
 
 
+# The HLO collective each NCCL kernel runs for, read off the `hlo_op` stat
+# XLA puts on the kernel: `all-to-all.3` where the partitioner made the op,
+# `all_to_all.124.1` where a shard_map's `jax.lax.all_to_all` did. NCCL runs
+# an all-to-all and a collective-permute as the same SendRecv kernel, so a
+# sequence exchange's Ulysses all-to-alls and a ring's or a Mamba-2 state's
+# shifts are told apart only here.
+HLO_COLLECTIVES = ("all-to-all", "collective-permute", "all-gather", "reduce-scatter",
+                   "all-reduce")
+
+
+def _hlo_collective(event) -> str | None:
+    """The HLO collective op an NCCL kernel event ran for, or None."""
+    for name, value in event.stats:
+        if name == "hlo_op" and isinstance(value, str):
+            spelled = value.replace("_", "-")
+            return next((op for op in HLO_COLLECTIVES if spelled.startswith(op)), None)
+    return None
+
+
 def communication(directory: str, steps: int) -> dict[str, Any]:
     """Each device's traced window split by `trace_window.window_split` into
     compute, every collective, the communication no compute kernel
@@ -824,7 +843,10 @@ def communication(directory: str, steps: int) -> dict[str, Any]:
     Only the stream lines are read, since the derived lines (`XLA Ops`,
     `XLA Modules`) repeat the same time under the program's names.
     `exposed_communication_ms_per_step` is the collective time no compute
-    kernel on the same device ran beside: what overlap did not hide.
+    kernel on the same device ran beside: what overlap did not hide. Each
+    HLO collective (`HLO_COLLECTIVES`) gets its own time and exposed time,
+    `all_to_all_ms_per_step` and `all_to_all_exposed_ms_per_step`, from the
+    op each NCCL kernel ran for.
     """
     from jax.profiler import ProfileData
 
@@ -835,17 +857,24 @@ def communication(directory: str, steps: int) -> dict[str, Any]:
         if not plane.name.startswith("/device:"):
             continue
         streams = [line for line in plane.lines if line.name.startswith("Stream")]
-        events = [(event.name, event.start_ns, event.end_ns)
-                  for line in streams or plane.lines for event in line.events]
-        if events:
-            devices.append(events)
+        kernels = [event for line in streams or plane.lines for event in line.events]
+        if kernels:
+            devices.append(([(event.name, event.start_ns, event.end_ns) for event in kernels],
+                            [_hlo_collective(event) for event in kernels]))
     if not devices:
         raise ValueError(f"the trace under {directory} holds no device kernels")
 
     totals: dict[str, float] = {}
-    for events in devices:
+    for events, ops in devices:
         figures = window_split(events)
         figures.pop("busy")  # device_timeline's, over every device
+        compute = union([(start, end) for name, start, end in events if "nccl" not in name.lower()])
+        for op in HLO_COLLECTIVES:
+            spans = union([(start, end) for (_, start, end), of in zip(events, ops, strict=True)
+                           if of == op])
+            key = op.replace("-", "_")
+            figures[key] = length(spans)
+            figures[f"{key}_exposed"] = length(spans) - overlap(spans, compute)
         for key, value in figures.items():
             totals[key] = totals.get(key, 0.0) + value
     per_step = 1e-6 / steps / len(devices)

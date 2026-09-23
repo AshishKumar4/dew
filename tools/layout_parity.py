@@ -73,8 +73,10 @@ LAYOUTS: dict[str, dict[str, int]] = {
     "replicas2_fsdp2": {"fsdp": 2, "replicas": 2},
     "data2_expert2": {"expert": 2},
     "expert2_fsdp2": {"expert": 2, "fsdp": 2},
+    "sequence2": {"sequence": 2},
     "fsdp2_sequence2": {"fsdp": 2, "sequence": 2},
     "tensor2_sequence2": {"tensor": 2, "sequence": 2},
+    "stage2_sequence2": {"stage": 2, "sequence": 2, "microbatches": 4},
     "stage2_fsdp2": {"fsdp": 2, "stage": 2, "microbatches": 4},
 }
 """Four-device layouts: every axis alone and the combinations worth running."""
@@ -93,7 +95,12 @@ def zoo() -> dict[str, Any]:
     decoder, MoE decoders with 8 and with Qwen3-30B-A3B's 128 experts, a
     Mamba-2 hybrid, a DiT and DiffusionGemma, each at widths every layout
     above divides. The last two MoE models and DiffusionGemma keep their
-    released configs' routing and layer kinds."""
+    released configs' routing and layer kinds. The layers a sequence axis
+    splits differently come too: latent attention (MLA), a window (12 rows:
+    a sequence split two ways reads it from one neighbour, four ways through
+    the exchange), Mamba-2 alone, and packed rows of three documents whose
+    boundaries fall inside the shards, in the dense decoder and in Rigel's
+    three Mamba-2 layers to one windowed layer."""
     from benchmark_step import Case
 
     dense = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8,
@@ -113,10 +120,16 @@ def zoo() -> dict[str, Any]:
               "kinds": {"sliding_attention": {"window": 8, "rope_theta": 10000.0},
                         "full_attention": {"head_dim": 32, "num_kv_heads": 1}},
               "mixture": {**released["mixture"], "experts": 8, "top_k": 2, "expert_features": 32}}
+    mamba = {"mixer": {"kind": "mamba2", "num_heads": 4, "head_dim": 16, "state_size": 8,
+                       "n_groups": 1, "chunk_size": 8}}
     hybrid = {**dense, "layer_types": ("mamba", "attention") * 2,
-              "kinds": {"mamba": {"mixer": {"kind": "mamba2", "num_heads": 4, "head_dim": 16,
-                                            "state_size": 8, "n_groups": 1, "chunk_size": 8}},
-                        "attention": {}}}
+              "kinds": {"mamba": mamba, "attention": {}}}
+    window = {**dense, "layer_types": ("sliding",) * 4, "kinds": {"sliding": {"window": 12}}}
+    mla = {**dense, "mixer": {"kind": "mla", "kv_lora_rank": 32, "qk_nope_head_dim": 16,
+                              "qk_rope_head_dim": 8, "v_head_dim": 8}}
+    mamba2 = {**dense, "layer_types": ("mamba",) * 4, "kinds": {"mamba": mamba}}
+    rigel = {**dense, "layer_types": ("mamba",) * 3 + ("sliding",),
+             "kinds": {"mamba": mamba, "sliding": {"window": 12}}}
     dit = {"patch_size": 2, "emb_features": 64, "num_layers": 4, "num_heads": 4, "mlp_ratio": 2,
            "output_channels": 4}
     lm = {"batch_size": 8, "seq_len": 32, "fsdp_min_param_size": 256}
@@ -125,6 +138,11 @@ def zoo() -> dict[str, Any]:
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
+        "window": Case("causal_transformer", window, **lm),
+        "mla": Case("causal_transformer", mla, **lm),
+        "mamba2": Case("causal_transformer", mamba2, **lm),
+        "dense_packed": Case("causal_transformer", dense, packed_documents=3, **lm),
+        "rigel_packed": Case("causal_transformer", rigel, packed_documents=3, **lm),
         "dit": Case("simple_dit", dit, batch_size=8, image_size=8, channels=4,
                     fsdp_min_param_size=256),
         "dgemma": Case("diffusion_gemma", dgemma, canvas={"prompt_length": 16, "canvas_size": 8},
