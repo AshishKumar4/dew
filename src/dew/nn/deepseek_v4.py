@@ -40,13 +40,13 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.nn.attention import (
     RMSNorm,
     _cache_positions,
-    _write_cache,
     causal_attention_mask,
     document_mask,
     rotary_freqs,
     unweighted_rmsnorm,
 )
 from dew.nn.inputs import AttentionMetadata
+from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, yarn_inv_freq
 from dew.nn.sharding import logical_axes
@@ -153,8 +153,8 @@ def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
         buffered, prior, values, indices, count = carry
         key, logits, position = inputs
         within = jnp.where(position >= 0, position % rate, -1)
-        buffered = (_write_cache(buffered[0], key[:, None], within[:, None]),
-                    _write_cache(buffered[1], logits[:, None], within[:, None]))
+        buffered = (write_cache(buffered[0], key[:, None], within[:, None]),
+                    write_cache(buffered[1], logits[:, None], within[:, None]))
         closed = (position >= 0) & ((position + 1) % rate == 0)
 
         def emit(state):
@@ -166,8 +166,8 @@ def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
             weights = jax.nn.softmax(window_gate.astype(jnp.float32), axis=1).astype(window_key.dtype)
             entry = jnp.sum(window_key * weights, axis=1)
             at = jnp.where(closed, count, -1)[:, None]
-            values = _write_cache(values, entry[:, None], at)
-            indices = _write_cache(indices[..., None], (position // rate)[:, None, None], at)[..., 0]
+            values = write_cache(values, entry[:, None], at)
+            indices = write_cache(indices[..., None], (position // rate)[:, None, None], at)[..., 0]
             if old is not None:
                 old = tuple(jnp.where(closed[:, None, None], current[..., :width], before)
                             for current, before in zip(buffered, old, strict=True))
@@ -270,7 +270,7 @@ class CompressedEntries(nn.Module):
         rotated = rotate_trailing(pooled, cos, sin)
         if write:
             buffer_kv.value, buffer_gate.value = buffered
-            entries.value = _write_cache(entries.value, rotated, emitted)
+            entries.value = write_cache(entries.value, rotated, emitted)
             if overlap_kv is not None and overlap_gate is not None and prior is not None:
                 overlap_kv.value, overlap_gate.value = prior
         return entries.value
@@ -499,7 +499,7 @@ class DeepseekV4Attention(nn.Module):
         if cache is not None and cached_key is not None:
             slots, _, allocated = cache
             if allocated:
-                cached_key.value = _write_cache(cached_key.value, keys, slots)
+                cached_key.value = write_cache(cached_key.value, keys, slots)
             keys = cached_key.value
             allowed = causal_attention_mask(
                 slots, keys.shape[1], self.sliding_window,
@@ -570,6 +570,8 @@ class DeepseekV4Mixer(MixerBase):
             raise ValueError("a deepseek_v4 layer attends a sliding window, not a chunk")
         if ctx.kv_shared:
             raise ValueError("the deepseek_v4 mixer shares no keys across layers")
+        if ctx.kv_cache != KVCache():
+            raise ValueError("the deepseek_v4 mixer keeps its own compressed cache; it takes no kv_cache layout")
         if ctx.yarn is not None and ctx.yarn.rope_theta != ctx.rope_theta:
             raise ValueError(
                 f"the yarn record's rope_theta ({ctx.yarn.rope_theta}) and the layer's "

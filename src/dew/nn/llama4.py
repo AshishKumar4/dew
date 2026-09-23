@@ -31,6 +31,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.inputs import AttentionMetadata
+from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import apply_rotary_interleave
 from dew.nn.sharding import logical_axes
@@ -220,6 +221,7 @@ class Llama4Mixer(MixerBase):
             "partial_rotary_factor": ctx.partial_rotary_factor,
             "output_gate": ctx.output_gate,
             "scale_offset": ctx.scale_offset,
+            "kv_cache": ctx.kv_cache != KVCache(),
         }
         asked = sorted(name for name, value in unsupported.items() if value)
         if asked:

@@ -21,6 +21,7 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
+from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import precision_names
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
 
@@ -430,24 +431,19 @@ def _cache_positions(module: nn.Module, batch: int, length: int, capacity: int, 
     positions = jnp.where(valid, positions, -1)
     if allocated:
         index.value = index.value + jnp.sum(valid, axis=1, dtype=jnp.int32)
-        cached_valid.value = jnp.arange(capacity)[None, :] < index.value[:, None]
+        cached_valid.value = filled_slots(index.value, capacity)
     return positions, allocated
 
 
-def _write_cache(buffer: jax.Array, values: jax.Array, positions: jax.Array) -> jax.Array:
-    """Append at per-row slots; invalid queries do not change cache storage."""
-    slots = jnp.where(positions >= 0, positions, buffer.shape[1])
-    return buffer.at[jnp.arange(buffer.shape[0])[:, None], slots].set(
-        values.astype(buffer.dtype), mode="drop")
-
-
-def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None):
+def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = KVCache()):
     """Fixed-size K/V with a cursor and cached validity for each batch row.
 
     Returns [B, S] compact slot positions and a writer. Invalid tokens have
     position -1 and do not advance the cursor. The allocation-only call leaves
     every row empty. The writer returns full cache arrays, including unused
-    slots which the caller excludes with cache_valid.
+    slots which the caller excludes with cache_valid. `layout` chooses the
+    storage behind the slots, dense or paged, full or quantized
+    (`dew.nn.kv_cache`); the slots and the cursor are the same for all.
     """
     shards = sequence_shards()
     if shards > 1:
@@ -459,19 +455,9 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None):
     batch, length, heads, head_dim = key.shape
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
-    cached_key = module.variable("cache", "cached_key", jnp.zeros,
-                                 (batch, max_seq_len, heads, head_dim), key.dtype)
-    cached_value = module.variable("cache", "cached_value", jnp.zeros,
-                                   (batch, max_seq_len, heads, head_dim), key.dtype)
+    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype)
     positions, allocated = _cache_positions(module, batch, length, max_seq_len, valid)
-
-    def append(key, value):
-        if allocated:
-            cached_key.value = _write_cache(cached_key.value, key, positions)
-            cached_value.value = _write_cache(cached_value.value, value, positions)
-        return cached_key.value, cached_value.value
-
-    return positions, append
+    return positions, Append(store, positions, allocated)
 
 
 def _pad_rows(x, rows: int):
