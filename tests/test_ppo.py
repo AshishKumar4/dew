@@ -154,8 +154,23 @@ def test_composite_objective_and_parameter_gradients_match_verl():
             assert difference < 2e-6, f"verl {name} gradient maximum difference {difference}"
 
 
-@pytest.mark.parametrize("active", [0, 1])
-def test_ppo_refuses_undefined_gae_whitening(active):
+def test_an_all_truncated_cohort_is_a_zero_mass_batch_not_a_failure():
+    """Truncations are masked, so a cohort that never finishes within budget
+    has no trainable token; it makes no update instead of ending the run."""
+    trainer, rollout = build_ppo()
+    rollout = replace(rollout, episodes=replace(rollout.episodes, max_turns=1))
+    state = trainer.initial_state()
+    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    assert batch["response_mask"].sum() == 0
+    for name in (OLD_VALUES_KEY, RETURNS_KEY, "advantages"):
+        assert batch[name].shape == batch["input_ids"].shape and not batch[name].any()
+    loss, _ = rollout.objective.loss(state.params, batch, Step(jnp.array(0), jax.random.key(1), state.averaged))
+    assert float(loss.mass) == 0
+
+
+def test_ppo_refuses_undefined_gae_whitening():
+    """One trainable action token has no whitening deviation."""
+    active = 1
     from contextlib import contextmanager
 
     from dew.objectives.rl import EpisodeStatus, Observation
