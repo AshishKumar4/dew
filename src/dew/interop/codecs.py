@@ -9,6 +9,10 @@ encodes dense weights back into those parts for `Pretrained.save`:
 - DeepSeek's block-scaled FP8 (`quant_method: fp8`; V3, V3.2 and the
   finegrained FP8 of Qwen3 and MiniMax): `<m>.weight` in float8_e4m3fn
   beside `<m>.weight_scale_inv`, one float32 scale per square block.
+- DeepSeek-V4's storage of that config, which also declares `expert_dtype`:
+  `<m>.weight` beside `<m>.scale`, an E8M0 exponent (a float32 power of two
+  in the Base releases) per block of an FP8 Linear, per 32 values of a V4.1
+  engram table's row, and per 32 inputs of an FP4 routed expert.
 - GPT OSS's MXFP4 (`quant_method: mxfp4`): `<stem>_blocks` and `<stem>_scales`.
 - compressed-tensors' `mxfp4-pack-quantized`: `<m>.weight_packed` beside
   `<m>.weight_scale`.
@@ -29,10 +33,11 @@ zeros (measured, jax 0.11 CPU, scale bytes 0 and 1).
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
-from typing import Protocol
+from typing import Literal, Protocol
 
 import jax.numpy as jnp
 import ml_dtypes
@@ -90,11 +95,11 @@ E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -
 _E2M1_BYTES = np.stack((E2M1[np.arange(256) & 15], E2M1[np.arange(256) >> 4]), axis=-1)
 """The two values each packed byte holds, low nibble first."""
 
-_CODE_DTYPES = (np.dtype(np.uint8),)
-"""Packed E2M1 pairs: U8 in GPT OSS and compressed-tensors."""
+_CODE_DTYPES = (np.dtype(np.uint8), np.dtype(np.int8))
+"""Packed E2M1 pairs: U8 in GPT OSS and compressed-tensors, I8 in DeepSeek-V4."""
 
-_EXPONENT_DTYPES = (np.dtype(np.uint8),)
-"""E8M0 exponent bytes: U8 in GPT OSS and compressed-tensors."""
+_EXPONENT_DTYPES = (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu))
+"""E8M0 exponent bytes: U8, or F8_E8M0 in DeepSeek-V4."""
 
 
 def _bytes(array: ArrayLike, dtypes: tuple[np.dtype, ...]) -> np.ndarray:
@@ -107,9 +112,9 @@ def _bytes(array: ArrayLike, dtypes: tuple[np.dtype, ...]) -> np.ndarray:
 
 
 def e8m0_scales(exponents: ArrayLike) -> np.ndarray:
-    """The float32 scale 2 ** (b - 127) of each E8M0 exponent byte b:
-    exact down to byte 0's subnormal 2 ** -127, and NaN for byte 255, as
-    float8_e8m0fnu reads."""
+    """The float32 scale 2 ** (b - 127) of each E8M0 exponent byte b,
+    uint8 or float8_e8m0fnu: exact down to byte 0's subnormal 2 ** -127,
+    and NaN for byte 255, as float8_e8m0fnu reads."""
     return _bytes(exponents, _EXPONENT_DTYPES).view(ml_dtypes.float8_e8m0fnu).astype(np.float32)
 
 
@@ -118,6 +123,7 @@ def decode_e2m1(packed: ArrayLike, exponents: ArrayLike) -> np.ndarray:
 
     Element i is E2M1[code i] * 2 ** (exponents[i // 32] - 127), a product
     float32 holds exactly, down to 2 ** -128 at byte 0; code 8 is -0.0.
+    Codes arrive as uint8 or int8, exponents as uint8 or float8_e8m0fnu.
     """
     codes, scales = _bytes(packed, _CODE_DTYPES), e8m0_scales(exponents)
     if codes.shape[:-1] != scales.shape[:-1] or codes.shape[-1] != scales.shape[-1] * (GROUP // 2):
@@ -484,9 +490,9 @@ def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
 
 def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
                           block: int = BLOCK) -> np.ndarray:
-    """Return float32(weight[i, j]) * scale_inv[i // block, j // block].
+    """Return float32(weight[i, j]) * float32(scale_inv[i // block, j // block]).
 
-    `weight` may be in any float dtype.
+    `weight` may be in any float dtype, `scale_inv` float32 or E8M0.
     """
     if weight.ndim != 2 or scale_inv.ndim != 2:
         raise ValueError(
@@ -570,6 +576,32 @@ def scaled_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
                  if name.endswith(SCALE_SUFFIX))
 
 
+def _fp8_scale_inv(amax: np.ndarray, ue8m0: bool) -> np.ndarray:
+    """`per_block_cast_to_fp8`'s scale of a block from its float32 amax."""
+    scale_inv = np.maximum(amax, np.float32(AMAX_FLOOR)) / np.float32(E4M3_MAX)
+    return np.exp2(np.ceil(np.log2(scale_inv))) if ue8m0 else scale_inv
+
+
+def _finite_matrix(weight: ArrayLike, rows: int, cols: int) -> np.ndarray:
+    """A weight's host float32 copy, refused unless it is a finite matrix;
+    its blocks are `rows` x `cols`."""
+    values = np.asarray(weight, np.float32)
+    if values.ndim != 2:
+        raise ValueError(
+            f"block-scaled quantization takes a [rows, cols] weight, got shape "
+            f"{values.shape}")
+    if type(cols) is not int or cols < 1:
+        raise ValueError(
+            f"a block covers a positive number of rows and columns, got {cols!r}")
+    if not np.isfinite(values).all():
+        raise ValueError(
+            f"a {values.shape} weight holds "
+            f"{int(np.count_nonzero(~np.isfinite(values)))} value(s) that are not "
+            f"finite; E4M3FN encodes no infinity, and one of them carries its "
+            f"whole {rows} x {cols} block's scale away with it")
+    return values
+
+
 def quantize_fp8_blocks(weight: ArrayLike, block: int = BLOCK, *,
                         ue8m0: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Cast `weight` to float8_e4m3fn blocks and the float32 scales that invert them.
@@ -604,29 +636,14 @@ def quantize_fp8_blocks(weight: ArrayLike, block: int = BLOCK, *,
     refused by name rather than written as a block of NaN. The 1e-4 floor
     keeps every scale a float32 normal.
     """
-    values = np.asarray(weight, np.float32)
-    if values.ndim != 2:
-        raise ValueError(
-            f"block-scaled quantization takes a [rows, cols] weight, got shape "
-            f"{values.shape}")
-    if type(block) is not int or block < 1:
-        raise ValueError(
-            f"a block covers a positive number of rows and columns, got {block!r}")
-    if not np.isfinite(values).all():
-        raise ValueError(
-            f"a {values.shape} weight holds "
-            f"{int(np.count_nonzero(~np.isfinite(values)))} value(s) that are not "
-            f"finite; E4M3FN encodes no infinity, and one of them carries its "
-            f"whole {block} x {block} block's scale away with it")
+    values = _finite_matrix(weight, block, block)
     rows, cols = values.shape
     row_starts, col_starts = np.arange(0, rows, block), np.arange(0, cols, block)
     # reduceat's last segment in each dimension is the partial block, over
     # just its own elements.
     amax = np.maximum.reduceat(
         np.maximum.reduceat(np.abs(values), row_starts, axis=0), col_starts, axis=1)
-    scale_inv = np.maximum(amax, np.float32(AMAX_FLOOR)) / np.float32(E4M3_MAX)
-    if ue8m0:
-        scale_inv = np.exp2(np.ceil(np.log2(scale_inv)))
+    scale_inv = _fp8_scale_inv(amax, ue8m0)
     out = np.empty(values.shape, E4M3)
     for index, start in enumerate(row_starts):
         # One reciprocal per block, as the reference takes it, repeated across
@@ -662,6 +679,245 @@ def pack_fp8(tensors: Mapping[str, np.ndarray], names: Iterable[str], block: int
 
 
 # --------------------------------------------------------------------------
+# DeepSeek-V4: quant_method fp8 beside expert_dtype, <m>.weight and <m>.scale
+# --------------------------------------------------------------------------
+
+V4_SCALE_SUFFIX = '.scale'
+"""DeepSeek-V4 scales `<m>.weight` by `<m>.scale`."""
+
+V4_SCALE_DTYPES = ('float8_e8m0fnu', 'float32')
+"""The dtypes a DeepSeek-V4 FP8 weight's `.scale` ships in: E8M0 exponents
+in V4-Flash, V4-Pro and V4.1-Flash, float32 powers of two in V4-Flash-Base
+and V4-Pro-Base. The config says neither, so the loader records which."""
+
+V4_FP4_AMAX_FLOOR = 6 * 2.0 ** -126
+"""The release's floor on an FP4 group's amax, which keeps its scale at
+least 2 ** -126 (E8M0 byte 1)."""
+
+V4Layout = Literal['blocks', 'rows', 'fp4']
+"""How a DeepSeek-V4 `.scale` covers its weight: one per block of an FP8
+Linear, one per `block` values of an engram table's row, or one per 32
+inputs of an FP4 routed expert."""
+
+_V4_EXPERT = re.compile(r'\.experts\.\d+\.w[123]\.weight$')
+"""A routed expert's projection, `layers.N.ffn.experts.E.w1` or under `mtp.N`."""
+
+_V4_ENGRAM = '.engram.embed.weight'
+"""V4.1's n-gram hash table, `layers.N.engram.embed.weight`."""
+
+
+def deepseek_v4_format(quantization: Mapping[str, object],
+                       config: Mapping[str, object]) -> tuple[int, bool]:
+    """Return the block size and whether routed experts are FP4, from a
+    DeepSeek-V4 config.
+
+    `fp8_format`'s blocks, with ue8m0 scales, the only kind an E8M0 `.scale`
+    holds. `expert_dtype` sits in quantization_config (V4.1) or beside it
+    (V4): 'fp4' ships routed experts as E2M1 pairs (inference/model.py
+    `Linear` under float4_e2m1fn_x2), 'fp8' or null as FP8 blocks like every
+    other Linear (the Base releases).
+    """
+    block, ue8m0 = fp8_format(quantization)
+    if not ue8m0:
+        raise ValueError(
+            f"quantization_config declares expert_dtype, DeepSeek-V4's `.scale` storage, with "
+            f"scale_fmt {quantization.get('scale_fmt')!r}; those scales are powers of two, which "
+            f"the release declares as scale_fmt 'ue8m0'")
+    experts = quantization.get('expert_dtype', config.get('expert_dtype'))
+    if experts not in ('fp4', 'fp8', None):
+        raise ValueError(
+            f"expert_dtype {experts!r}: DeepSeek-V4 ships routed experts as fp4 E2M1 pairs "
+            f"or as fp8 blocks and nothing else")
+    return block, experts == 'fp4'
+
+
+def deepseek_v4_layout(name: str, fp4_experts: bool) -> V4Layout:
+    """How the `.scale` beside `name` covers it, as inference/model.py builds
+    the module: an FP4 `Linear` for a routed expert under expert_dtype
+    'fp4', `ParallelEngramEmbedding` for an engram table, an FP8 `Linear`
+    otherwise."""
+    if fp4_experts and _V4_EXPERT.search(name):
+        return 'fp4'
+    return 'rows' if name.endswith(_V4_ENGRAM) else 'blocks'
+
+
+def deepseek_v4_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """The `<m>.weight` names a DeepSeek-V4 checkpoint ships beside a `<m>.scale`, in order.
+
+    A `.scale` whose weight is absent is refused: the checkpoint has lost it.
+    """
+    names = []
+    for name in tensors:
+        if name.endswith(V4_SCALE_SUFFIX):
+            weight = name.removesuffix(V4_SCALE_SUFFIX) + '.weight'
+            if weight not in tensors:
+                raise ValueError(f"{name} scales {weight}, which the checkpoint does not hold")
+            names.append(weight)
+    return tuple(names)
+
+
+def deepseek_v4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """Decoded names: every tensor but the `.scale` partners."""
+    return tuple(name for name in tensors if not name.endswith(V4_SCALE_SUFFIX))
+
+
+def deepseek_v4_scale_dtype(tensors: Mapping[str, np.ndarray]) -> str | None:
+    """The dtype a DeepSeek-V4 checkpoint stores its `.scale` tensors in, or
+    None without any. Scales in more than one dtype are refused."""
+    stored = sorted({tensors[name.removesuffix('.weight') + V4_SCALE_SUFFIX].dtype.name
+                     for name in deepseek_v4_names(tensors)})
+    if len(stored) > 1:
+        raise ValueError(f"a DeepSeek-V4 checkpoint stores its `.scale` tensors in one dtype, "
+                         f"this one in {stored}")
+    return stored[0] if stored else None
+
+
+def _check_v4(name: str, layout: V4Layout, weight: np.ndarray, scale: np.ndarray, block: int) -> None:
+    """Refuse a DeepSeek-V4 pair whose dtypes or shapes are not its layout's."""
+    partner = name.removesuffix('.weight') + V4_SCALE_SUFFIX
+    packed = weight.dtype in _CODE_DTYPES
+    if layout == 'fp4':
+        if (not packed or weight.ndim != 2 or scale.dtype != ml_dtypes.float8_e8m0fnu
+                or 2 * weight.shape[1] % GROUP
+                or scale.shape != (weight.shape[0], 2 * weight.shape[1] // GROUP)):
+            raise ValueError(
+                f"{name} is a routed expert, which expert_dtype 'fp4' ships as int8 [out, in / 2] "
+                f"E2M1 pairs beside a float8_e8m0fnu [out, in / {GROUP}] {partner}, got "
+                f"{weight.dtype} {weight.shape} and {scale.dtype} {scale.shape}")
+        return
+    if packed:
+        reason = ("the config's expert_dtype is not 'fp4'" if _V4_EXPERT.search(name)
+                  else "it is not a routed expert")
+        raise ValueError(
+            f"{name} arrives as {weight.dtype} E2M1 pairs, which DeepSeek-V4 ships for routed "
+            f"experts under expert_dtype 'fp4' alone, and {reason}")
+    if weight.dtype != E4M3 or weight.ndim != 2 or scale.dtype.name not in V4_SCALE_DTYPES:
+        raise ValueError(
+            f"{name} and {partner} are a DeepSeek-V4 FP8 weight, float8_e4m3fn beside a scale in "
+            f"one of {list(V4_SCALE_DTYPES)}, got {weight.dtype} {weight.shape} and {scale.dtype}")
+    if layout == 'rows' and (weight.shape[1] % block
+                             or scale.shape != (weight.shape[0], weight.shape[1] // block)):
+        raise ValueError(
+            f"{name} is an engram table, [rows, dim] beside a [rows, dim / {block}] {partner}, "
+            f"got {weight.shape} and {scale.shape}")
+
+
+def read_deepseek_v4_tensor(tensors: Mapping[str, np.ndarray], name: str, index: Index | None = None,
+                            *, block: int, fp4_experts: bool) -> np.ndarray:
+    """One tensor, or the region `index` names, in its original values; a
+    scaled weight decodes in FP32 from the blocks or groups the region covers.
+
+    The release's own dequantization: an FP8 Linear is float32(weight) *
+    float32(scale) per block (convert.py on `wo_a`), an engram row is
+    float32(weight) * float32(scale) per `block` values (model.py,
+    `ParallelEngramEmbedding.forward`), and an FP4 expert is
+    FP4_TABLE[code] * float32(scale) per 32 inputs with element 2i in the
+    low nibble (convert.py, `cast_e2m1fn_to_e4m3fn`). The one difference is
+    code 8, which FP4_TABLE reads as 0.0 and this reads as -0.0, so that a
+    decoded weight encodes back to the same byte.
+    """
+    value = tensors[name]
+    module = name.removesuffix('.weight')
+    scale = tensors.get(module + V4_SCALE_SUFFIX) if module != name else None
+    if scale is None:
+        return value if index is None else value[index]
+    layout = deepseek_v4_layout(name, fp4_experts)
+    _check_v4(name, layout, value, scale, block)
+    if layout == 'fp4':
+        return _read_e2m1(value, scale, index)
+    if layout == 'blocks':
+        return _read_blocks(value, scale, block, index)
+    covered, span, within = _hull(index, value.shape, (1, block))
+    rows = value[span].astype(np.float32).reshape(*scale[covered].shape, block)
+    rows *= scale[covered].astype(np.float32)[..., None]
+    return rows.reshape(rows.shape[0], rows.shape[1] * block)[within]
+
+
+def unpack_deepseek_v4(tensors: Mapping[str, np.ndarray], *, block: int, fp4_experts: bool,
+                       param_dtype: str = "float32") -> dict[str, np.ndarray]:
+    """Decode each `.scale` pair in FP32 into its weight, retained in
+    param_dtype, and drop the `.scale`. Every other tensor remains untouched."""
+    unpacked = dict(tensors)
+    for name in deepseek_v4_names(tensors):
+        unpacked[name] = checkpoint_array(
+            read_deepseek_v4_tensor(tensors, name, block=block, fp4_experts=fp4_experts), param_dtype)
+        unpacked.pop(name.removesuffix('.weight') + V4_SCALE_SUFFIX)
+    return unpacked
+
+
+def quantize_deepseek_v4_fp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
+    """[..., output, input] weights to DeepSeek-V4's int8 E2M1 pairs
+    [..., output, input / 2] and float8_e8m0fnu scales [..., output, input / 32].
+
+    The release's FP4 rule, `fp4_quant_kernel` in inference/kernel.py under
+    E8M0 scales, per group of 32 inputs: the weight rounds to the bf16 the
+    kernel reads; amax is floored at 6 * 2 ** -126; the scale is 2 **
+    ceil(log2(amax * float32(1 / 6))) on the float32 bits of that product
+    (`fast_round_scale`: the exponent, plus one if any mantissa bit is
+    set); each value over the scale saturates at 6 and rounds to the
+    nearest E2M1 value, ties to even. An all-zero group takes byte 1.
+    """
+    groups = _float_groups(weight, "DeepSeek-V4 FP4", ml_dtypes.bfloat16).astype(np.float32)
+    amax = np.maximum(np.abs(groups).max(-1), np.float32(V4_FP4_AMAX_FLOOR))
+    bits = (amax * np.float32(1 / 6)).view(np.uint32)
+    exponents = ((bits >> 23) + ((bits & 0x007fffff) != 0)).astype(np.uint8)
+    codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None])
+    return (codes.reshape(*groups.shape[:-2], groups.shape[-2] * GROUP // 2).view(np.int8),
+            exponents.view(ml_dtypes.float8_e8m0fnu))
+
+
+def quantize_fp8_rows(weight: ArrayLike, group: int) -> tuple[np.ndarray, np.ndarray]:
+    """Cast a [rows, cols] weight to float8_e4m3fn with one ue8m0 scale per
+    `group` consecutive values of a row, [rows, cols / group] float32.
+
+    `quantize_fp8_blocks`' rule with ue8m0 over 1 x `group` blocks, the
+    layout V4.1's engram tables ship in.
+    """
+    values = _finite_matrix(weight, 1, group)
+    if values.shape[1] % group:
+        raise ValueError(f"row groups of {group} take a weight whose width is a multiple of "
+                         f"{group}, got {values.shape}")
+    groups = values.reshape(values.shape[0], values.shape[1] // group, group)
+    scale_inv = _fp8_scale_inv(np.abs(groups).max(-1), ue8m0=True)
+    codes = (groups * (np.float32(1.0) / scale_inv)[..., None]).astype(E4M3)
+    return codes.reshape(values.shape), scale_inv
+
+
+def pack_deepseek_v4(tensors: Mapping[str, np.ndarray], names: Iterable[str], *, block: int,
+                     fp4_experts: bool, scale_dtype: str | None = None) -> dict[str, np.ndarray]:
+    """Return `tensors` with each of `names` written back as a DeepSeek-V4
+    weight and `.scale`, in the layout `deepseek_v4_layout` gives it.
+
+    An FP8 weight takes `quantize_fp8_blocks` or `quantize_fp8_rows` under
+    ue8m0, its scale stored in `scale_dtype`, the dtype the source stored
+    its scales in (`deepseek_v4_scale_dtype`; E8M0 when None). An FP4
+    expert takes `quantize_deepseek_v4_fp4`, whose scales are E8M0. A name
+    the caller no longer holds is refused, and so is a `.scale` already
+    among the tensors.
+    """
+    stored = np.dtype(scale_dtype or V4_SCALE_DTYPES[0])
+    if stored.name not in V4_SCALE_DTYPES:
+        raise ValueError(f"a DeepSeek-V4 FP8 `.scale` is stored in one of {list(V4_SCALE_DTYPES)}, "
+                         f"not {stored.name}")
+    out = dict(tensors)
+    for name in names:
+        if name not in out:
+            raise ValueError(f"{name} was quantized in the source and is not among the tensors to write")
+        partner = name.removesuffix('.weight') + V4_SCALE_SUFFIX
+        if partner in out:
+            raise ValueError(f"{partner} is already among the tensors to write, so quantizing "
+                             f"{name} would overwrite it")
+        layout = deepseek_v4_layout(name, fp4_experts)
+        if layout == 'fp4':
+            out[name], out[partner] = quantize_deepseek_v4_fp4(out[name])
+            continue
+        codes, scale_inv = (quantize_fp8_rows(out[name], block) if layout == 'rows'
+                            else quantize_fp8_blocks(out[name], block, ue8m0=True))
+        out[name], out[partner] = codes, scale_inv.astype(stored)
+    return out
+
+
+# --------------------------------------------------------------------------
 # Dispatch from quantization_config
 # --------------------------------------------------------------------------
 
@@ -670,6 +926,10 @@ class TensorReader(Protocol):
 
     def __call__(self, tensors: Mapping[str, np.ndarray], name: str,
                  index: Index | None = None) -> np.ndarray: ...
+
+
+def _one_scale_dtype(tensors: Mapping[str, np.ndarray]) -> None:
+    """A format whose scales have one dtype records none."""
 
 
 @dataclass(frozen=True)
@@ -681,7 +941,9 @@ class SourceQuantization:
     storage; `requantize` writes those names back in the format.
     `tensor_names` and `read` expose original values one tensor, or one
     region of one, at a time, for alias checks and streamed loads, so
-    neither holds an FP32 model.
+    neither holds an FP32 model. `scale_dtype` reads the dtype a source
+    stored its scales in where the format leaves that to the checkpoint
+    (DeepSeek-V4), for `source_quantization` to write back.
     """
 
     names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
@@ -689,6 +951,7 @@ class SourceQuantization:
     requantize: Callable[[Mapping[str, np.ndarray], tuple[str, ...]], dict[str, np.ndarray]]
     tensor_names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
     read: TensorReader
+    scale_dtype: Callable[[Mapping[str, np.ndarray]], str | None] = _one_scale_dtype
 
 
 def _refuse_mlx(config: Mapping[str, object]) -> None:
@@ -708,12 +971,15 @@ def _refuse_mlx(config: Mapping[str, object]) -> None:
                 "safetensors repo it was converted from (the model card's base_model)")
 
 
-def source_quantization(config: Mapping[str, object], *,
-                        param_dtype: str = "float32") -> SourceQuantization | None:
+def source_quantization(config: Mapping[str, object], *, param_dtype: str = "float32",
+                        scale_dtype: str | None = None) -> SourceQuantization | None:
     """Return the format a config's `quantization_config` declares, or None.
 
     A wrapper may declare it on its text_config alone: KimiK3Config lifts
     `text_config.quantization_config` onto itself (configuration_kimi_k3.py:282-283).
+    An fp8 config that declares `expert_dtype`, in quantization_config or
+    beside it, is DeepSeek-V4's `.scale` storage; `scale_dtype` is the dtype
+    the source stored those scales in, which the codec writes back.
     """
     _refuse_mlx(config)
     quantization = config.get("quantization_config")
@@ -725,6 +991,14 @@ def source_quantization(config: Mapping[str, object], *,
     if not isinstance(quantization, Mapping):
         raise ValueError(f"quantization_config must be an object, got {quantization!r}")
     method = quantization.get("quant_method")
+    if method == "fp8" and ("expert_dtype" in quantization or "expert_dtype" in config):
+        block, fp4_experts = deepseek_v4_format(quantization, config)
+        return SourceQuantization(
+            deepseek_v4_names,
+            partial(unpack_deepseek_v4, block=block, fp4_experts=fp4_experts, param_dtype=param_dtype),
+            partial(pack_deepseek_v4, block=block, fp4_experts=fp4_experts, scale_dtype=scale_dtype),
+            deepseek_v4_tensor_names, partial(read_deepseek_v4_tensor, block=block, fp4_experts=fp4_experts),
+            deepseek_v4_scale_dtype)
     if method == "fp8":
         block, ue8m0 = fp8_format(quantization)
         return SourceQuantization(
@@ -742,4 +1016,5 @@ def source_quantization(config: Mapping[str, object], *,
             packed_mxfp4_tensor_names, read_packed_mxfp4_tensor)
     raise ValueError(
         f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
-        f"fp8 blocks, GPT OSS's mxfp4 and compressed-tensors' mxfp4-pack-quantized and nothing else")
+        f"fp8 blocks and V4 `.scale` storage, GPT OSS's mxfp4 and compressed-tensors' "
+        f"mxfp4-pack-quantized and nothing else")

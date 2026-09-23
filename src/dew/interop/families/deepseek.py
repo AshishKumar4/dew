@@ -754,11 +754,10 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     # Transformers omits the prediction depth (modeling_deepseek_v4.py:1212);
     # the released inference/model.py MTPBlock executes its raw-stream
     # e_proj/h_proj composition. The router's logit output and aux
-    # coefficient are training knobs, its jitter is read nowhere, and the
-    # storage hints name what a quantized checkpoint is dequantized from.
+    # coefficient are training knobs, its jitter is read nowhere, and ep_size
+    # is a runtime parallel hint.
     used.update(('num_nextn_predict_layers', 'output_router_logits',
-                 'router_aux_loss_coef', 'router_jitter_noise',
-                 'quantization_config', 'expert_dtype', 'ep_size'))
+                 'router_aux_loss_coef', 'router_jitter_noise', 'ep_size'))
     groups = _record_int(hf_config, 'o_groups')
     mixer: dict[str, object] = {
         'kind': 'deepseek_v4',
