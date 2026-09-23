@@ -13,14 +13,15 @@ from dew.nn.gpt_oss import GptOssExperts, GptOssMLP
 from dew.training import Layout, MeshSpec, build_mesh
 
 
-@pytest.mark.mesh
+@pytest.mark.mesh(devices=4)
 def test_gpt_oss_experts_split_over_the_expert_axis_beside_fsdp():
     """Each fused expert leaf declares its own axes, so the expert mesh axis
     splits every leaf's expert dimension and fsdp one width of each, where
     the shape heuristic had split a width over fsdp alone."""
     x = jnp.zeros((1, 4, 64))
     variables = jax.eval_shape(GptOssMLP(64, 128, 8, 2).init, jax.random.key(0), x)
-    shardings = Layout(min_shard=1).shardings(build_mesh(MeshSpec(expert=2, fsdp=2)), variables)
+    shardings = Layout(min_shard=1).shardings(
+        build_mesh(MeshSpec(expert=2, fsdp=2), jax.devices()[:4]), variables)
     for name, sharding in shardings['params']['experts'].items():
         shape = variables['params']['experts'][name].shape
         assert sharding.spec[0] == 'expert', name
