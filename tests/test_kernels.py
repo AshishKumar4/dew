@@ -351,6 +351,7 @@ def test_a_gpu_older_than_sm80_multiplies_bf16_without_the_bf16_algorithm(monkey
     from dew.nn.attention import resolve_implementation
     from dew.nn.precision import bf16_operand_precision
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
+    monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu' if generation.startswith('sm') else generation)
     query = jnp.zeros((1, 16, 2, 64), jnp.bfloat16)
     assert (bf16_operand_precision(jnp.bfloat16, None)
             is jax.lax.DotAlgorithmPreset.BF16_BF16_F32) == runs
