@@ -57,7 +57,7 @@ from ..kv_cache import KVCache, is_paged
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, Situ, SparseMLP, check_gated_activation
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, Situ, SparseMLP, gated_product
 from ..precision import scaled
 from ..rope import RopeScaling, YarnScaling
 from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
@@ -367,13 +367,6 @@ class Mixture:
                 "or shared branch to set")
 
 
-def _gated_activation(activation: str, gate):
-    """The gate's nonlinearity by the mlp's name: silu, tanh-approximate gelu
-    or the erf gelu (torch's default, ACT2FN['gelu'])."""
-    if activation == 'swiglu':
-        return nn.silu(gate)
-    return nn.gelu(gate, approximate=activation == 'geglu')
-
 @logical_axes({
     ("gate_proj",): ("embed", "mlp"),
     ("up_proj",): ("embed", "mlp"),
@@ -384,7 +377,7 @@ class GatedMLP(nn.Module):
     the tanh approximation of gelu (HF's gelu_pytorch_tanh) and geglu_exact
     the erf form (HF's gelu, which Gemma's released config names). A `Situ`
     in place of the name is Kimi K3's SiTU, which transforms both halves
-    (`dew.nn.moe.Situ`).
+    (`dew.nn.moe.gated_product`).
 
     Bias-free, like the gated MLP of every open decoder this loads.
 
@@ -397,7 +390,7 @@ class GatedMLP(nn.Module):
     """
     hidden_features: int
     out_features: int
-    activation: str | Situ = 'swiglu'
+    activation: GatedActivation = 'swiglu'
     activation_sparsity: float = 0.0
     swiglu_limit: float | None = None
     init_std: float | None = None  # gate/up normal std; None: lecun normal
@@ -406,7 +399,6 @@ class GatedMLP(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        check_gated_activation(self.activation)
         if not 0 <= self.activation_sparsity < 1:
             raise ValueError(
                 f"activation_sparsity is the fraction of gate activations dropped, "
@@ -427,10 +419,7 @@ class GatedMLP(nn.Module):
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        if isinstance(self.activation, Situ):
-            return checkpoint_name(self.down_proj(self.activation(gate, up)), 'down_proj')
-        gate = _gated_activation(self.activation, gate)
-        return checkpoint_name(self.down_proj(gate * up), 'down_proj')
+        return checkpoint_name(self.down_proj(gated_product(self.activation)(gate, up)), 'down_proj')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -614,11 +603,9 @@ class DecoderBlock(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     per_layer_input_dim: int = 0
-    gate_activation: str = 'swiglu'
-    """The nonlinearity on the per-layer residual's gate, which Gemma 3n/4
-    share with the feed-forward's own gate (modeling_gemma4.py,
-    Gemma4TextDecoderLayer). `_gated_activation`'s three names; a block whose
-    feed-forward gates by another rule has no name to share and keeps silu."""
+    gate_activation: GatedActivation = 'swiglu'
+    """The per-layer residual's gated product, which Gemma 3n/4 share with the
+    feed-forward's own (modeling_gemma4.py, Gemma4TextDecoderLayer)."""
     parallel: Callable[..., nn.Module] | None = None
     """A branch summed with the feed-forward's output before its output norm,
     called with the residual and that output (Gemma 4's routed experts)."""
@@ -864,9 +851,8 @@ class DecoderBlock(nn.Module):
         Gemma4TextDecoderLayer): the layer's own gate over x, activated like
         its feed-forward, multiplied by the layer's input signal, projected
         back and normed."""
-        gated = self.per_layer_input_gate(x)
-        gated = _gated_activation(self.gate_activation, gated)
-        projected = self.per_layer_projection(gated * per_layer_input)
+        gated = gated_product(self.gate_activation)(self.per_layer_input_gate(x), per_layer_input)
+        projected = self.per_layer_projection(gated)
         return self.post_per_layer_input_norm(projected)
 
 
@@ -1487,7 +1473,7 @@ class CausalTransformer(nn.Module):
     num_heads: int = 8
     num_kv_heads: int | None = None       # None: as many as the query heads
     head_dim: int | None = None           # None: emb_features // num_heads
-    mlp: str | Situ = 'swiglu'               # 'swiglu' | 'geglu' | 'geglu_exact', or Kimi K3's Situ
+    mlp: GatedActivation = 'swiglu'          # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
     mlp_features: int | tuple[int, ...] | None = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n); 0: no feed-forward (Mamba-2)
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
@@ -2148,12 +2134,7 @@ class CausalTransformer(nn.Module):
                 scale_after_cast=self.scale_after_cast,
                 wiring=wiring,
                 per_layer_input_dim=ple or 0,
-                # The per-layer residual gates the way this model's gated
-                # feed-forward does; gpt-oss's clamped swiglu and Kimi's
-                # SiTU are not among the three names that gate shares, so
-                # they keep silu.
-                gate_activation=('swiglu' if self.mlp == 'swigluoai' or isinstance(self.mlp, Situ)
-                                 else self.mlp),
+                gate_activation=self.mlp,
                 parallel=parallel if spec.routed else None,
                 altup=self.altup,
                 laurel_rank=self.laurel_rank,

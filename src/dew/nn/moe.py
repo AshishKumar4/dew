@@ -469,11 +469,22 @@ class Situ:
         return (activated * work_up).astype(gate.dtype)
 
 
-def check_gated_activation(activation: str | Situ) -> None:
-    """Refuse an activation no gated MLP computes: silu, the tanh gelu and
-    the erf gelu on the gate by name, or SiTU over both halves."""
-    if not isinstance(activation, Situ) and activation not in ('swiglu', 'geglu', 'geglu_exact'):
+GatedActivation = str | Situ
+"""A gated MLP's activation: 'swiglu', 'geglu' or 'geglu_exact' by name, or a `Situ`."""
+
+
+def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array], jax.Array]:
+    """The product a gated MLP takes of its gate and up projections: silu
+    ('swiglu'), the tanh gelu ('geglu') or the erf gelu rounded once from
+    fp32 ('geglu_exact', `exact_gelu`) on the gate times up, or a `Situ`
+    over both halves."""
+    if isinstance(activation, Situ):
+        return activation
+    gates = {'swiglu': nn.silu, 'geglu': functools.partial(nn.gelu, approximate=True), 'geglu_exact': exact_gelu}
+    if activation not in gates:
         raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
+    activate = gates[activation]
+    return lambda gate, up: activate(gate) * up
 
 
 class ExpertLinear(nn.Module):
@@ -661,7 +672,7 @@ class ExpertMLP(nn.Module):
     num_experts: int
     hidden_features: int
     out_features: int
-    activation: str | Situ = 'swiglu'
+    activation: GatedActivation = 'swiglu'
     implementation: str = 'xla'
     dispatch: str = 'global'
     swiglu_limit: float | None = None
@@ -672,7 +683,6 @@ class ExpertMLP(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        check_gated_activation(self.activation)
         if self.swiglu_limit is not None and self.swiglu_limit <= 0:
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is "
@@ -705,15 +715,7 @@ class ExpertMLP(nn.Module):
         if self.swiglu_limit is not None:
             gate = jnp.minimum(gate, self.swiglu_limit)
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
-        if isinstance(self.activation, Situ):
-            return checkpoint_name(linear(self.activation(gate, up), kernels[2]), 'down_proj')
-        if self.activation == 'swiglu':
-            gate = nn.silu(gate)
-        elif self.activation == 'geglu':
-            gate = nn.gelu(gate, approximate=True)
-        else:
-            gate = exact_gelu(gate)
-        return checkpoint_name(linear(gate * up, kernels[2]), 'down_proj')
+        return checkpoint_name(linear(gated_product(self.activation)(gate, up), kernels[2]), 'down_proj')
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
         if self.scale_inputs:
@@ -778,7 +780,7 @@ class SparseMLP(nn.Module):
     top_k: int
     hidden_features: int
     out_features: int
-    activation: str | Situ = 'swiglu'
+    activation: GatedActivation = 'swiglu'
     implementation: str = 'xla'
     dispatch: str = 'global'
     score_function: str = 'softmax'

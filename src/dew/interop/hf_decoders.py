@@ -55,7 +55,7 @@ from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
-from dew.nn.moe import Situ
+from dew.nn.moe import GatedActivation, Situ
 from dew.nn.text_encoders import ParamTree, checkpoint_array
 from dew.objectives.base import Variables
 from dew.registry import from_record
@@ -78,7 +78,7 @@ _HF_ACTIVATIONS = {ours: theirs for theirs, ours in _ACTIVATIONS.items()}
 _HF_ACTIVATIONS['swigluoai'] = 'silu'
 
 
-def _hf_activation(activation: str | Situ) -> str:
+def _hf_activation(activation: GatedActivation) -> str:
     """The `hidden_act` a family's config names an activation by; Kimi K3's
     SiTU carries its betas in fields of its own and has no such name."""
     if isinstance(activation, Situ):
