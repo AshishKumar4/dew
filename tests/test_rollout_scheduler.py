@@ -42,6 +42,7 @@ class Objective:
     """The scheduler reads the correction setting and rescores packed rows."""
 
     behavior_importance_cap = 2.0
+    behavior_band = None
 
     def packed_log_probs(self, params, batch):
         return jnp.full(batch["input_ids"].shape, -0.75, jnp.float32) + 0 * params
