@@ -78,7 +78,12 @@ def pack_dict_of_byte_arrays(unpacked: dict) -> bytes:
 
 
 def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
-    """An encoded image as RGB uint8.
+    """An encoded image as RGB uint8, in the orientation its pixels are stored.
+
+    cv2's colour flags give three 8-bit channels for any source: grey is
+    replicated, alpha dropped rather than composited, a 16-bit sample kept to
+    its high byte. EXIF orientation is ignored, as PIL's `Image.open` ignores
+    it, on the reduced decodes too, which would otherwise apply it.
 
     With `at_least`, a JPEG is decoded at the largest 1/2, 1/4 or 1/8 DCT
     reduction that keeps both sides >= `at_least`, so the resize after it
@@ -87,7 +92,7 @@ def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
     """
     import cv2
     buffer = np.frombuffer(encoded, dtype=np.uint8)
-    flags = cv2.IMREAD_UNCHANGED
+    flags = cv2.IMREAD_COLOR
     if at_least is not None:
         shortest = min(_encoded_size(encoded))
         for factor, reduced in ((8, cv2.IMREAD_REDUCED_COLOR_8), (4, cv2.IMREAD_REDUCED_COLOR_4),
@@ -95,12 +100,10 @@ def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
             if shortest // factor >= at_least:
                 flags = reduced
                 break
-    image = cv2.imdecode(buffer, flags)
+    image = cv2.imdecode(buffer, flags | cv2.IMREAD_IGNORE_ORIENTATION)
     if image is None:
         raise ValueError(f"cv2 could not decode {len(encoded)} bytes of image")
-    if image.ndim == 2:
-        return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
-    return cv2.cvtColor(image, cv2.COLOR_BGRA2RGB if image.shape[-1] == 4 else cv2.COLOR_BGR2RGB)
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
 def _encoded_size(encoded: bytes) -> tuple[int, int]:
