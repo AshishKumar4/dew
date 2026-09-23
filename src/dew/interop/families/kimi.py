@@ -38,6 +38,7 @@ from dew import records
 from dew.interop.hf_decoders import (
     _ACTIVATIONS,
     _CODEC_FIELDS,
+    DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
     KindFields,
     MixtureFields,
@@ -209,7 +210,9 @@ def _kimi_k3_text(text: Mapping[str, object], tied: bool) -> DecoderFields:
         'head_dim': hidden // heads,
         'mlp': _situ(text) if activation == 'situ' else _ACTIVATIONS[activation],
         'mlp_features': _record_int(text, 'intermediate_size'),
-        'max_seq_len': min(_record_int(text, 'max_position_embeddings', 4096), 8192),
+        # KimiLinearConfig's own default (configuration_kimi_k3.py:55), capped
+        # at the context every family builds by default.
+        'max_seq_len': min(_record_int(text, 'max_position_embeddings', 4096), DEFAULT_MAX_SEQ_LEN),
         'layer_types': types,
         'kinds': kinds,
         # KimiRMSNorm scales after the cast (modeling_kimi_linear.py:232-236).
