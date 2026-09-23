@@ -52,10 +52,19 @@ def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.Co
     else:
         env["JAX_PLATFORMS"] = "cpu"
         placement = ["--env", f"XLA_FLAGS=--xla_force_host_platform_device_count={devices}"]
-    return subprocess.run(
+    process = subprocess.Popen(
         [sys.executable, "-m", "dew.cli.main", "launch", "--port", str(free_port()), *placement,
          *arguments],
-        cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout)
+        cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # SIGTERM, not the SIGKILL a timed-out run sends: the launcher stops
+        # its ranks, which run in sessions of their own, before it exits.
+        process.terminate()
+        stdout, stderr = process.communicate(timeout=60)
+        pytest.fail(f"the pool was still running after {timeout}s\n{stdout}{stderr}")
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
 
 def train(tmp_path: Path, mesh: dict, processes: int, devices: int = 8) -> dict:
@@ -272,6 +281,21 @@ def test_a_rank_that_raises_between_collectives_stops_the_pool():
     assert done.returncode == 1, done.stdout + done.stderr
     assert "RuntimeError: injected failure" in done.stdout
     assert time.monotonic() - started < 120, done.stdout + done.stderr
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_rank_whose_data_fails_mid_fit_stops_the_pool(tmp_path):
+    """Rank 1's loader raises on its fourth batch while rank 0 has gone on to
+    that step, whose collectives wait for rank 1 for ever on a GPU. Rank 1's
+    fit reaches its cleanup agreement alone; the pool still has to end, with
+    rank 1's error, within a bound."""
+    started = time.monotonic()
+    done = launch("--processes-per-host", "2", "--", sys.executable, str(WORKER),
+                  "--out", str(tmp_path / "failed.json"), "--mesh", json.dumps({"fsdp": 2}),
+                  "--steps", "50", "--fail-at", "3", devices=1, timeout=600)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "injected failure reading batch 3" in done.stdout, done.stdout
+    assert time.monotonic() - started < 180, done.stdout + done.stderr
 
 
 @pytest.mark.mesh(devices=2)
