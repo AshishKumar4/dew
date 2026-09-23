@@ -12,11 +12,14 @@ deepseek-ai/DeepSeek-V4-Flash and V4.1-Flash), transcribed to NumPy from the
 formats' bit fields and sharing no code with the codec, and its FP4 encoder
 against the release's kernel rule. deepseek-v4-tiny, stored the way V4-Flash
 and V4-Flash-Base store theirs, loads to its decoded twin's variables and
-saves back in its own storage.
+saves back in its own storage. The network test holds both directions to
+real tensors of V4-Flash, V4-Flash-Base and V4.1-Flash at pinned commits.
 """
 
 import json
+import os
 import re
+import struct
 from collections.abc import Callable
 from functools import partial
 from pathlib import Path
@@ -25,10 +28,10 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
-from test_quantized import decode_e4m3fn
+from test_quantized import decode_e4m3fn, fetch
 
 from dew.interop import codecs, load_pretrained
-from dew.interop.safetensors_io import read_weights, save_hf_layout
+from dew.interop.safetensors_io import _STORED_DTYPES, read_weights, save_hf_layout
 
 FIXTURE = Path(__file__).parent / "fixtures" / "codecs" / "compressed_tensors_mxfp4.npz"
 
@@ -503,3 +506,83 @@ def test_a_v4_checkpoint_in_the_release_storage_loads_and_saves_in_it(tmp_path, 
             np.testing.assert_array_equal(read(written, name), read(stored, name), err_msg=name)
         elif not name.endswith(".scale"):
             np.testing.assert_array_equal(written[name], value, err_msg=name)
+
+
+# --------------------------------------------------------------------------
+# The releases' own tensors
+# --------------------------------------------------------------------------
+
+V4_RELEASES = {
+    "deepseek-ai/DeepSeek-V4-Flash": "60d8d70770c6776ff598c94bb586a859a38244f1",
+    "deepseek-ai/DeepSeek-V4-Flash-Base": "8855555deef230a27a21a8d6f294b7b7497759b6",
+    "deepseek-ai/DeepSeek-V4.1-Flash": "dba1be0a40aa45a94ad051997016db3960a90277",
+}
+"""The pinned commits the network tests read."""
+
+
+def released_tensor(repo: str, name: str, rows: tuple[int, int] | None) -> np.ndarray:
+    """One tensor of a release, or a run of its rows, read by byte range from
+    its shard at the pinned commit."""
+    from huggingface_hub import hf_hub_download, hf_hub_url
+
+    revision = V4_RELEASES[repo]
+    index = json.loads(Path(hf_hub_download(repo, "model.safetensors.index.json", revision=revision)).read_text())
+    url = hf_hub_url(repo, index["weight_map"][name], revision=revision)
+    length = struct.unpack("<Q", fetch(url, 0, 7))[0]
+    meta = json.loads(fetch(url, 8, 7 + length))[name]
+    start, end = meta["data_offsets"]
+    shape = list(meta["shape"])
+    if rows is not None:
+        row = (end - start) // shape[0]
+        start, end, shape[0] = start + rows[0] * row, start + rows[1] * row, rows[1] - rows[0]
+    return np.frombuffer(fetch(url, 8 + length + start, 8 + length + end - 1),
+                         _STORED_DTYPES[meta["dtype"]]).reshape(shape)
+
+
+@pytest.mark.network
+@pytest.mark.skipif(os.environ.get("DEW_NETWORK_TESTS") != "1",
+                    reason="reads six tensors of DeepSeek-V4-Flash, V4-Flash-Base and V4.1-Flash and their "
+                           "scales from the hub; "
+                           "DEW_NETWORK_TESTS=1 runs it")
+@pytest.mark.parametrize("repo, name, rows, block, fp4_experts", [
+    ("deepseek-ai/DeepSeek-V4-Flash", "layers.0.attn.wkv.weight", None, 128, True),
+    ("deepseek-ai/DeepSeek-V4-Flash", "layers.0.ffn.experts.0.w2.weight", None, 128, True),
+    ("deepseek-ai/DeepSeek-V4-Flash-Base", "layers.0.attn.wkv.weight", None, 128, False),
+    ("deepseek-ai/DeepSeek-V4.1-Flash", "layers.0.attn.wkv.weight", None, 32, True),
+    ("deepseek-ai/DeepSeek-V4.1-Flash", "layers.0.ffn.experts.0.w1.weight", None, 32, True),
+    ("deepseek-ai/DeepSeek-V4.1-Flash", "layers.1.engram.embed.weight", (200_000_000, 200_002_048), 32, True),
+], ids=["v4-fp8", "v4-fp4", "v4-base-fp8-float32-scale", "v41-fp8", "v41-fp4", "v41-engram"])
+def test_a_released_v4_tensor_decodes_as_the_release_reads_it_and_encodes_back(repo, name, rows, block, fp4_experts):
+    """Real tensors at the pinned commits, one engram table read as 2048 of
+    its 384 M rows. Decoding matches the release's formulas bit for bit
+    (FP4: in value, code 8 aside). Encoding the decoded weight writes the
+    shipped bytes back: every FP4 group, whose largest code is 4 or 6, and
+    every FP8 block or engram group but those whose largest code is 224,
+    which the ceil rule moves to half the scale with the same values."""
+    partner = name.removesuffix("weight") + "scale"
+    weight, scale = released_tensor(repo, name, rows), released_tensor(repo, partner, rows)
+    read = partial(codecs.read_deepseek_v4_tensor, block=block, fp4_experts=fp4_experts)
+    layout = codecs.deepseek_v4_layout(name, fp4_experts)
+
+    decoded = read({name: weight, partner: scale}, name)
+    again = codecs.pack_deepseek_v4({name: decoded}, (name,), block=block, fp4_experts=fp4_experts,
+                                    scale_dtype=scale.dtype.name)
+
+    np.testing.assert_array_equal(read(again, name), decoded)
+    if layout == "fp4":
+        np.testing.assert_array_equal(decoded, release_fp4(weight, scale))
+        np.testing.assert_array_equal(again[name].view(np.uint8), weight.view(np.uint8))
+        np.testing.assert_array_equal(again[partner].view(np.uint8), scale.view(np.uint8))
+        return
+    expected = release_fp8(weight, scale, block) if layout == "blocks" else release_engram(weight, scale, block)
+    np.testing.assert_array_equal(decoded.view(np.uint32), expected.view(np.uint32))
+    magnitudes = np.abs(weight.astype(np.float32))
+    if layout == "blocks":
+        largest = magnitudes.reshape(scale.shape[0], block, scale.shape[1], block).max(axis=(1, 3))
+    else:
+        largest = magnitudes.reshape(*scale.shape, block).max(axis=-1)
+    moved = again[partner].astype(np.float32) != scale.astype(np.float32)
+    np.testing.assert_array_equal(moved, largest == 224)
+    np.testing.assert_array_equal(again[partner].astype(np.float32)[moved], scale.astype(np.float32)[moved] / 2)
+    kept = np.repeat(np.repeat(~moved, block if layout == "blocks" else 1, axis=0), block, axis=1)
+    np.testing.assert_array_equal(again[name].view(np.uint8)[kept], weight.view(np.uint8)[kept])
