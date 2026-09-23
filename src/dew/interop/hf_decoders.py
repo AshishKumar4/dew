@@ -591,6 +591,15 @@ _YARN_FIELDS = frozenset({
 })
 
 
+# vLLM's spelling of a YaRN attention scale, which DeepSeek-R1-0528-Qwen3-8B
+# ships. transformers 5.16.1 neither validates nor reads it
+# (`_validate_yarn_rope_parameters` lists it nowhere, `_compute_yarn_parameters`
+# reads `attention_factor`), so the reference scales cos/sin by its own
+# get_mscale(factor) and this ramp follows the reference; vLLM multiplies that
+# by attn_factor.
+_YARN_INERT = frozenset({'attn_factor'})
+
+
 def _yarn_record(entry: Mapping[str, object], field: str, theta: float,
                  max_pos: int) -> YarnRamp:
     """Read a YaRN rope entry into the mixer's yarn record.
@@ -602,7 +611,7 @@ def _yarn_record(entry: Mapping[str, object], field: str, theta: float,
     ValueError. A missing factor falls back the way the reference does, to
     the context ratio off the original length.
     """
-    unknown = sorted(set(entry) - _YARN_FIELDS)
+    unknown = sorted(set(entry) - _YARN_FIELDS - _YARN_INERT)
     if unknown:
         _refuse(f"{field} fields {unknown}",
                 "the YaRN ramp reads no such fields")
