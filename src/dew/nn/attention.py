@@ -173,23 +173,39 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
                           static_argnums=static_argnums)
 
 
-@functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5))
-def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool):
-    """Normalize `x` by its root mean square in fp32, then apply `scale`.
+@functools.partial(normalized_in_fp32, static_argnums=(2, 3, 4, 5, 6))
+def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_after_cast: bool,
+                   fp32_statistics: bool):
+    """Normalize `x` by its root mean square, then apply `scale`.
 
     The families differ on which side of the cast the weight goes, which
     `scale_after_cast` picks. `scale` of None is the weightless norm.
+    `fp32_statistics` of False computes the square, the mean and the
+    normalization in the input's dtype.
     """
-    y = x.astype(jnp.float32)
-    y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + epsilon)
+    if fp32_statistics:
+        y = x.astype(jnp.float32)
+        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + epsilon)
+    else:
+        # The reference rounds every step to the input dtype. XLA fuses the
+        # chain and carries fp32 between the ops, so each rounding is explicit.
+        y = _rounded(x * _rounded(jax.lax.rsqrt(_rounded(
+            _rounded(jnp.mean(_rounded(jnp.square(x)), axis=-1, keepdims=True)) + epsilon))))
     if scale is None:
         # A pure normalization with no learned weight, as Gemma 4 norms
         # its values (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
         return y.astype(dtype)
     weight = (1.0 + scale) if scale_offset else scale
     if scale_after_cast:
-        return y.astype(dtype) * weight.astype(dtype)
+        product = y.astype(dtype) * weight.astype(dtype)
+        return product if fp32_statistics else _rounded(product)
     return (y * weight).astype(dtype)
+
+
+def _rounded(x):
+    """Round `x` to its own dtype's precision, which fusion otherwise skips."""
+    bits = jnp.finfo(x.dtype)
+    return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4))
@@ -227,7 +243,7 @@ def unweighted_rmsnorm(x, eps: float):
 
 
 class RMSNorm(nn.Module):
-    """Normalize the last axis by its root mean square, reducing in fp32.
+    """Normalize the last axis by its root mean square, reducing in fp32 by default.
 
     `scale_offset` stores the weight as Gemma does, (1 + w), and flips the
     initializer to zeros. The identity is the starting point either way, so
@@ -239,6 +255,10 @@ class RMSNorm(nn.Module):
     (modeling_qwen3.py:61-64), which `scale_after_cast` reproduces. The two
     agree at fp32 and differ under bf16.
 
+    timm's `RmsNorm2d` (layers/fast_norm.py `rms_norm2d`) computes
+    x * rsqrt(mean(x^2) + eps) * w in the input dtype, the weight's too.
+    `fp32_statistics=False` with `scale_after_cast` is that order.
+
     The reduction runs under `normalized_in_fp32`, so the backward pass
     keeps this call's input in its own dtype, not an fp32 copy.
     """
@@ -246,6 +266,7 @@ class RMSNorm(nn.Module):
     scale_offset: bool = False
     scale_after_cast: bool = False
     with_scale: bool = True
+    fp32_statistics: bool = True
     dtype: Dtype | None = None
 
     @nn.compact
@@ -255,8 +276,8 @@ class RMSNorm(nn.Module):
             'scale',
             nn.initializers.zeros if self.scale_offset else nn.initializers.ones,
             (x.shape[-1],), jnp.float32) if self.with_scale else None
-        return rms_normalized(x, scale, self.epsilon, dtype,
-                              self.scale_offset, self.scale_after_cast)
+        return rms_normalized(x, scale, self.epsilon, dtype, self.scale_offset,
+                              self.scale_after_cast, self.fp32_statistics)
 
 
 class LayerNorm(nn.Module):

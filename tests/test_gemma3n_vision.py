@@ -59,6 +59,23 @@ def test_bfloat16_gelu_preserves_the_reference_activation():
     assert output.dtype == jnp.bfloat16
 
 
+def test_a_bfloat16_norm_rounds_as_timm_does():
+    """timm's RmsNorm2d on a bf16 tower rounds the square, the mean, the
+    inverse root and both products to bf16, the weight included
+    (tools/timm_rms_norm_reference.py). The block matches it bit for bit
+    under jit, where fusion would otherwise carry fp32 between those steps.
+    An fp32 reduction, or flax's weight folded into the inverse root, moves
+    about a third of the outputs by one bf16 ulp."""
+    fixture = np.load(Path(__file__).parent / "fixtures" / "gemma3n" / "rms_norm2d_bf16.npz")
+    width = fixture["weight"].shape[0]
+    block = MobileConvNormAct(width, activate=False, dtype=jnp.bfloat16)
+    params = {"params": {"conv": {"kernel": jnp.eye(width).reshape(1, 1, width, width)},
+                         "bn": {"scale": jnp.asarray(fixture["weight"])}}}
+    output = jax.jit(block.apply)(params, jnp.asarray(fixture["inputs"], jnp.bfloat16))
+    assert output.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(np.asarray(output, np.float32), fixture["output"])
+
+
 @pytest.mark.parametrize("case", ("odd", "even", "pooled"))
 def test_mobilenet_encoder_and_soft_projection_match_reference(bundle, case):
     """Odd ratios, unchanged resolution and average-pooling are separate paths.
