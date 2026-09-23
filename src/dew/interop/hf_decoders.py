@@ -339,16 +339,19 @@ class DSparkFields(TypedDict):
     markov_rank: int
     experts: int
     top_k: int
+    layer_type: str
 
 
 class HyperConnectionsFields(TypedDict, total=False):
     """Describes one `HyperConnections`: how many residual streams a layer
-    reads and writes, and how they collapse."""
+    reads and writes, how they collapse, and whether each sublayer collapses
+    by the previous site's `pre`."""
 
     hc_mult: int
     hc_eps: float
     hc_sinkhorn_iters: int
     head: str
+    single_pass: bool
 
 
 class AttentionResidualsFields(TypedDict, total=False):
@@ -2322,6 +2325,11 @@ class DecoderFamily:
     """Suffixes of the 1-D source tensors a checkpoint stores longer than their
     leaf, zeros past it: Kimi K3's KDA `A_log`. `prepare_weights` checks and
     trims the tail; export writes the zeros back (`WeightLayout.padded`)."""
+    constants: Callable[[Path, Mapping[str, object]], Mapping[str, object]] = (
+        lambda directory, record: {})
+    """The `constants` collection's entries a family derives from the source
+    directory beside its tensors: DeepSeek-V4.1's engram token map, which
+    its tokenizer defines."""
 
 
 def _kind_mixers(fields: DecoderFields) -> list[MixerBase]:
@@ -2390,7 +2398,11 @@ from dew.interop.families.deepseek import (
     _kimi_k25_config,
     _kimi_k25_path,
 )
-from dew.interop.families.deepseek_v41 import _deepseek_v41_config, _deepseek_v41_path
+from dew.interop.families.deepseek_v41 import (
+    _deepseek_v41_config,
+    _deepseek_v41_constants,
+    _deepseek_v41_path,
+)
 from dew.interop.families.gemma import (
     _gemma2_config,
     _gemma2_export,
@@ -2513,7 +2525,8 @@ _FAMILY_ENTRIES = (
                                      for mixer in _kind_mixers(fields)),
                   'deepseek_v41', 'DeepseekV41ForCausalLM', lambda model: {},
                   weight_path=_deepseek_v41_path, prepare_weights=_deepseek_v4_prepare,
-                  preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight')),
+                  preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight'),
+                  constants=_deepseek_v41_constants),
     # V4's block is nothing another family builds: the mixer kind names its
     # window, its compressor and its grouped output projection at once.
     DecoderFamily(('deepseek_v4',), _deepseek_v4_config,

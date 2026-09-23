@@ -214,7 +214,7 @@ def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
         hyper_connections={'hc_mult': _record_int(text, 'hc_mult', 4),
                            'hc_eps': _record_float(text, 'hc_eps', 1e-6),
                            'hc_sinkhorn_iters': _record_int(text, 'hc_sinkhorn_iters', 20),
-                           'head': 'carried'},
+                           'head': 'carried', 'single_pass': True},
         max_seq_len=min(_record_int(text, 'max_position_embeddings', DEFAULT_MAX_SEQ_LEN),
                         DEFAULT_MAX_SEQ_LEN))
     engram = _v41_engram(text, seen)
@@ -222,7 +222,7 @@ def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
         config['engram'] = engram
     dspark = _v41_dspark(text, layers, ratios, seen)
     if dspark is not None:
-        config.update(dspark=dspark, mtp_layer_type='sliding_attention')
+        config['dspark'] = dspark
     unknown = sorted(set(text) - seen - {'vocab_size', 'rms_norm_eps', 'tie_word_embeddings'})
     if unknown:
         _refuse(f"text_config fields {unknown}",
@@ -253,7 +253,8 @@ def _v41_dspark(text: Mapping[str, object], layers: int, ratios, seen: set[str])
             'experts': _record_int(text, 'dspark_n_routed_experts',
                                    _record_int(text, 'n_routed_experts')),
             'top_k': _record_int(text, 'dspark_num_experts_per_tok',
-                                 _record_int(text, 'num_experts_per_tok'))}
+                                 _record_int(text, 'num_experts_per_tok')),
+            'layer_type': 'sliding_attention'}
 
 
 def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | None:
@@ -347,6 +348,14 @@ def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ..
     for theirs, ours in _DEEPSEEK_V41_NAMES:
         tail = tail.replace(theirs, ours)
     return _dew_path(f"model.layers.{parts[1]}{tail}", config)
+
+
+def _deepseek_v41_constants(directory, record: Mapping[str, object]) -> Mapping[str, object]:
+    """The engram hashes' token map, which the tokenizer defines rather than
+    a tensor (`engram_token_map`); nothing for a config without engram."""
+    if record.get('engram') is None:
+        return {}
+    return {'engram_hashes': {'token_map': engram_token_map(directory, record)}}
 
 
 def engram_token_map(directory, record: Mapping[str, object]) -> np.ndarray:

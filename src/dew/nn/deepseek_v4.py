@@ -245,10 +245,12 @@ class CompressedEntries(nn.Module):
     `compressor/indexer` with its scoring leaves beside them, the nesting
     the checkpoint keeps (conversion_mapping.py:487).
 
-    `csa2` is V4.1's compressor (v41:429-485): no overlap, no position bias,
-    the pooling in fp32, and at rate 1 no gate at all, the normed projection
-    being the entry. `quantized` rounds the rotated entries through FP4 as
-    V4.1's cache stores them (v41:759-760).
+    V4.1's compressor (v41:429-485) differs in two facts: it has no position
+    bias (`position_bias` False), and it pools in fp32 (`pool_dtype`), back
+    in the model's dtype before the norm. A window of one token pools
+    nothing, so at rate 1 there is no gate and the normed projection is the
+    entry; V4's rates are 4 and 128. `quantized` rounds the rotated entries
+    through FP4 as V4.1's cache stores them (v41:759-760).
     """
 
     width: int
@@ -258,46 +260,49 @@ class CompressedEntries(nn.Module):
     rope_theta: float
     yarn: YarnScaling | None
     norm_eps: float
-    csa2: bool = False
+    position_bias: bool = True
+    pool_dtype: Dtype | None = None
     quantized: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @property
     def gated(self) -> bool:
-        return not (self.csa2 and self.rate == 1)
+        return self.rate > 1
 
     def setup(self):
         series = 2 if self.overlap else 1
-        pool_dtype = jnp.float32 if self.csa2 and self.gated else self.dtype
-        dense = functools.partial(nn.Dense, use_bias=False, dtype=pool_dtype, precision=self.precision)
+        projected = self.pool_dtype if self.gated and self.pool_dtype is not None else self.dtype
+        dense = functools.partial(nn.Dense, use_bias=False, dtype=projected, precision=self.precision)
         self.kv_proj = dense(series * self.width, name='kv_proj')
         if self.gated:
             self.gate_proj = dense(series * self.width, name='gate_proj')
-        if not self.csa2:
-            self.position_bias = self.param(
-                'position_bias', nn.initializers.zeros, (self.rate, series * self.width), jnp.float32)
+            if self.position_bias:
+                self.bias = self.param(
+                    'position_bias', nn.initializers.zeros, (self.rate, series * self.width), jnp.float32)
         self.kv_norm = RMSNorm(epsilon=self.norm_eps, scale_after_cast=True,
                                dtype=self.dtype, name='kv_norm')
 
     def _projections(self, x):
-        """`kv` and the gate over it; CSA2 pools in fp32 (v41:464-465)."""
+        """`kv` and the gate over it, in the pooling's dtype (v41:464-465)."""
         if not self.gated:
             return self.kv_proj(x), None
-        if self.csa2:
-            x = x.astype(jnp.float32)
+        if self.pool_dtype is not None:
+            x = x.astype(self.pool_dtype)
         return self.kv_proj(x), self.gate_proj(x)
+
+    def _normed(self, pooled, dtype):
+        """The entry norm over pooled windows, back in the model's `dtype`
+        first where the pooling ran in its own (v41:485)."""
+        return self.kv_norm(pooled if self.pool_dtype is None else pooled.astype(dtype))
 
     def latents(self, x):
         """The normed entries before RoPE `[B, T, width]`, `T = S // rate`."""
         kv, gate = self._projections(x)
         if gate is None:
             return self.kv_norm(kv)
-        if self.csa2:
-            # fp32 pooling, back in the model's dtype before the norm (v41:485)
-            return self.kv_norm(pool_windows(kv, gate, None, self.rate, self.overlap).astype(x.dtype))
-        return self.kv_norm(pool_windows(kv, gate, self.position_bias.astype(x.dtype),
-                                         self.rate, self.overlap))
+        bias = self.bias.astype(x.dtype) if self.position_bias else None
+        return self._normed(pool_windows(kv, gate, bias, self.rate, self.overlap), x.dtype)
 
     def rotate(self, latents, windows):
         """Rotate each entry at its window's first position, `window * rate`."""
@@ -327,8 +332,8 @@ class CompressedEntries(nn.Module):
         kv, gate = self._projections(x)
         if gate is None:
             gate = jnp.zeros_like(kv)
-        elif not self.csa2:
-            gate = gate + self.position_bias[jnp.maximum(slots, 0) % self.rate].astype(gate.dtype)
+        elif self.position_bias:
+            gate = gate + self.bias[jnp.maximum(slots, 0) % self.rate].astype(gate.dtype)
         shape = (x.shape[0], self.rate, kv.shape[-1])
         buffer_kv = self.variable('cache', 'buffer_kv', jnp.zeros, shape, kv.dtype)
         buffer_gate = self.variable('cache', 'buffer_gate', jnp.zeros, shape, gate.dtype)
@@ -342,7 +347,7 @@ class CompressedEntries(nn.Module):
             prior = (overlap_kv.value, overlap_gate.value)
         pooled, emitted, buffered, prior = append_windows(
             kv, gate, slots, (buffer_kv.value, buffer_gate.value), prior, self.rate, self.width)
-        latents = self.kv_norm(pooled.astype(x.dtype) if self.csa2 else pooled)
+        latents = self._normed(pooled, x.dtype)
         entries = self.variable('cache', 'compressed', jnp.zeros,
                                 (x.shape[0], capacity // self.rate, self.width), latents.dtype)
         if write:
@@ -636,7 +641,8 @@ class DeepseekV4Attention(nn.Module):
                 self.compress = CompressedEntries(
                     width=self.head_dim, rate=rate, overlap=False,
                     rope_dim=self.rope_dim, rope_theta=self.rope_theta, yarn=self.yarn,
-                    norm_eps=self.norm_eps, csa2=True, quantized=self.kv_qat,
+                    norm_eps=self.norm_eps, position_bias=False, pool_dtype=jnp.float32,
+                    quantized=self.kv_qat,
                     dtype=self.dtype, precision=self.precision, name='compressor')
             if not self.kv_shared:
                 self.indexer = Csa2Indexer(
@@ -710,8 +716,6 @@ class DeepseekV4Attention(nn.Module):
             raise ValueError("the deepseek_v4 mixer does not implement multi-axis rotary positions")
         valid = (None if attention_metadata is None or attention_metadata.valid is None
                  else jnp.asarray(attention_metadata.valid, bool))
-        if attention_metadata is not None and attention_metadata.draft_context is not None:
-            return self._draft(x, attention_metadata.draft_context, decode)
         batch, length, _ = x.shape
         cache = None
         cached_key = None
@@ -777,21 +781,54 @@ class DeepseekV4Attention(nn.Module):
         keys = rotate_trailing(checkpoint_name(self.kv_norm(self.kv_proj(x)), 'kv_proj'), cos, sin)
         return fake_quant_fp8(keys, 32) if self.kv_qat else keys
 
-    def _draft(self, x, main, decode: bool):
-        """A DSpark drafter layer (V4.1 inference/model.py:1032-1074).
+    def _attend(self, query, keys, allowed, cos, sin):
+        batch, length = query.shape[:2]
+        # One shared key/value head under every query head, the per-head
+        # sink beside the logits, softmax in fp32 and the sink dropped
+        # (:708-736).
+        logits = jnp.einsum('bshd,btd->bhst', query.astype(jnp.float32), keys.astype(jnp.float32),
+                            precision=self.precision) * self.head_dim ** -0.5
+        logits = jnp.where(allowed[:, None], logits, -jnp.inf)
+        sinks = jnp.broadcast_to(self.sinks[None, :, None, None], (batch, self.num_heads, length, 1))
+        probs = jax.nn.softmax(jnp.concatenate([logits, sinks], axis=-1), axis=-1)[..., :-1]
+        context = jnp.einsum('bhst,btd->bshd', probs.astype(keys.dtype), keys, precision=self.precision)
+        # The values are the rotated keys, so the rope slice of the output is
+        # turned back at the query's position (:853-859).
+        context = rotate_trailing(checkpoint_name(context, 'context'), cos, -sin)
+        mixed = self.o_a_proj(context.reshape(batch, length, self.o_groups, -1))
+        return checkpoint_name(self.o_b_proj(mixed.reshape(batch, length, -1)), 'o_proj')
 
-        `main` `[B, M, D]` is the target model's context for positions up to
-        the one the block drafts after; its keys are a sliding window this
-        layer projects with its own `kv_proj`. `x` `[B, K, D]` is the draft
-        block at the `K` positions after the context's last, whose queries
-        attend that window and every key of the block, the block's own
-        included in both directions. Cached, each call appends the context
-        to the window cache and a block of no tokens only does that (the
-        release's prefill); uncached, the context is whole and the block
-        follows its last position.
-        """
+
+DRAFT_CONTEXT = 'draft_context'
+"""The kv_store name a DSpark stage hands its attention the target model's
+context under (`DSparkAttention`)."""
+
+
+class DSparkAttention(DeepseekV4Attention):
+    """A DSpark drafter stage's attention (V4.1 inference/model.py:1032-1074):
+    a sliding V4 layer whose keys are the target's context and the draft
+    block's own.
+
+    `kv_store[DRAFT_CONTEXT]` `[B, M, D]` is the target model's context for
+    the positions up to the one the block drafts after; this layer projects
+    its keys with its own `kv_proj` into a sliding window. `x` `[B, K, D]`
+    is the draft block at the `K` positions after the context's last, whose
+    queries attend that window and every key of the block, the block's own
+    included in both directions. Cached, each call appends the context to
+    the window cache, and a block of no tokens only does that (the
+    release's prefill); uncached, the context is whole and the block
+    follows its last position.
+    """
+
+    @nn.compact
+    def __call__(self, x, decode: bool = False, positions=None, segment_ids=None,
+                 kv_store=None, attention_metadata: AttentionMetadata | None = None):
         if self.compressor is not None:
             raise ValueError("the DSpark drafter's layers are sliding layers")
+        if kv_store is None or DRAFT_CONTEXT not in kv_store:
+            raise ValueError(f"a DSpark stage's attention reads the target's context from "
+                             f"kv_store[{DRAFT_CONTEXT!r}]")
+        main = kv_store[DRAFT_CONTEXT]
         batch, count = main.shape[0], main.shape[1]
         if decode:
             slots, allocated = _cache_positions(self, batch, count, self.max_seq_len, None)
@@ -804,8 +841,7 @@ class DeepseekV4Attention(nn.Module):
             main_keys = cached_key.value
             last = slots[:, -1]
         else:
-            positions = jnp.arange(count)
-            main_keys = self._window_keys(main, *rope_freqs(positions, self.rope_dim,
+            main_keys = self._window_keys(main, *rope_freqs(jnp.arange(count), self.rope_dim,
                                                             self.rope_theta, self.yarn))
             last = jnp.full((batch,), count - 1)
         length = x.shape[1]
@@ -825,23 +861,6 @@ class DeepseekV4Attention(nn.Module):
             jnp.ones((batch, length, length), bool)], axis=-1)
         keys = jnp.concatenate([main_keys, self._window_keys(x, cos, sin)], axis=1)
         return self._attend(query, keys, allowed, cos, sin)
-
-    def _attend(self, query, keys, allowed, cos, sin):
-        batch, length = query.shape[:2]
-        # One shared key/value head under every query head, the per-head
-        # sink beside the logits, softmax in fp32 and the sink dropped
-        # (:708-736).
-        logits = jnp.einsum('bshd,btd->bhst', query.astype(jnp.float32), keys.astype(jnp.float32),
-                            precision=self.precision) * self.head_dim ** -0.5
-        logits = jnp.where(allowed[:, None], logits, -jnp.inf)
-        sinks = jnp.broadcast_to(self.sinks[None, :, None, None], (batch, self.num_heads, length, 1))
-        probs = jax.nn.softmax(jnp.concatenate([logits, sinks], axis=-1), axis=-1)[..., :-1]
-        context = jnp.einsum('bhst,btd->bshd', probs.astype(keys.dtype), keys, precision=self.precision)
-        # The values are the rotated keys, so the rope slice of the output is
-        # turned back at the query's position (:853-859).
-        context = rotate_trailing(checkpoint_name(context, 'context'), cos, -sin)
-        mixed = self.o_a_proj(context.reshape(batch, length, self.o_groups, -1))
-        return checkpoint_name(self.o_b_proj(mixed.reshape(batch, length, -1)), 'o_proj')
 
 
 @mixers("deepseek_v4")
@@ -885,6 +904,15 @@ class DeepseekV4Mixer(MixerBase):
     kv_qat: bool = False
 
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
+        return self._built(DeepseekV4Attention, ctx)
+
+    def drafter(self, ctx: MixerContext) -> Callable[..., nn.Module]:
+        """This kind's attention as a DSpark stage's (`DSparkAttention`)."""
+        if self.compressor is not None:
+            raise ValueError("a DSpark stage attends a sliding window: its kind has no compressor")
+        return self._built(DSparkAttention, ctx)
+
+    def _built(self, attention: type[DeepseekV4Attention], ctx: MixerContext) -> Callable[..., nn.Module]:
         if not ctx.causal:
             raise ValueError("the deepseek_v4 mixer is causal: its window and compressors read the past alone")
         if ctx.sliding_window is None:
@@ -900,7 +928,7 @@ class DeepseekV4Mixer(MixerBase):
                 f"the yarn record's rope_theta ({ctx.yarn.rope_theta}) and the layer's "
                 f"({ctx.rope_theta}) disagree; the rope base is configured once, on the kind")
         return functools.partial(
-            DeepseekV4Attention,
+            attention,
             emb_features=ctx.emb_features,
             num_heads=ctx.num_heads,
             head_dim=ctx.head_dim,

@@ -32,8 +32,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .attention import RMSNorm
-from .hyper_connections import collapse_by, expand_streams, first_stream
-from .inputs import AttentionMetadata
+from .deepseek_v4 import DRAFT_CONTEXT
+from .hyper_connections import Carried, collapse_by, expand_streams, first_stream
 from .sharding import logical_axes
 
 
@@ -43,7 +43,9 @@ class DSpark:
     (num_nextn_predict_layers) blocks drafting `block_size` tokens past the
     one drawn, `noise_token_id` filling the block, `target_layers` the trunk
     layers whose inputs form the context, a Markov head of `markov_rank`,
-    and `experts` routed experts with `top_k` per token."""
+    and `experts` routed experts with `top_k` per token. `layer_type` is the
+    layer kind whose V4 attention every stage attends with, a sliding one
+    in the release (v41:1034)."""
 
     stages: int
     block_size: int
@@ -52,6 +54,7 @@ class DSpark:
     markov_rank: int
     experts: int
     top_k: int
+    layer_type: str
 
     def __post_init__(self):
         object.__setattr__(self, "target_layers", tuple(int(layer) for layer in self.target_layers))
@@ -104,18 +107,17 @@ class DSparkStage(nn.Module):
         return self.main_norm(self.main_proj(hidden))
 
     def __call__(self, carry, context, decode: bool):
-        return self.layer(carry, decode=decode, attention_metadata=AttentionMetadata(draft_context=context))
+        return self.layer(carry, decode=decode, kv_store={DRAFT_CONTEXT: context})
 
     def seed(self, context):
         """Append the context to this stage's window cache, drafting nothing
         (the release's prefill, v41:1044-1052, :1123-1125)."""
         empty = jnp.zeros((context.shape[0], 0, context.shape[-1]), context.dtype)
-        self.layer.self_attn(empty, decode=True, attention_metadata=AttentionMetadata(draft_context=context))
+        self.layer.self_attn(empty, decode=True, kv_store={DRAFT_CONTEXT: context})
 
-    def head(self, carry):
+    def head(self, carry: Carried):
         """The collapsed pre-norm state and the normed one the head scores."""
-        streams, pre = carry[0], carry[1]
-        hidden = collapse_by(pre, streams)
+        hidden = collapse_by(carry.pre, carry.streams)
         return hidden, self.norm(hidden)
 
     def markov(self, tokens):
@@ -131,18 +133,18 @@ class DSparkStage(nn.Module):
 
 
 def draft(stages, spec: DSpark, embed: Callable, logits_of: Callable, hc_mult: int,
-          hidden, tokens, *, decode: bool, key=None, temperature: float = 0.0):
+          states, tokens, *, decode: bool, key=None, temperature: float = 0.0):
     """One drafting pass (Transformer.forward_spec, v41:1274-1282).
 
-    `hidden` `[B, M, targets * D]` is the target's recorded context up to the
-    position the block drafts after, `tokens` `[B]` the token drawn there.
-    Returns the drafted ids `[B, block_size + 1]` (the drawn token first),
-    their logits `[B, block_size, vocab]` with the Markov bias added, and
-    each position's confidence `[B, block_size]`. Draws are greedy unless a
-    `key` and a positive `temperature` are given. `tokens` None only seeds
-    the cached windows.
+    `states` `[B, M, targets * D]` is the target's recorded context up to
+    the position the block drafts after, `tokens` `[B]` the token drawn
+    there. Returns the drafted ids `[B, block_size + 1]` (the drawn token
+    first), their logits `[B, block_size, vocab]` with the Markov bias
+    added, and each position's confidence `[B, block_size]`. Draws are
+    greedy unless a `key` and a positive `temperature` are given. `tokens`
+    None only seeds the cached windows.
     """
-    context = stages[0].context(hidden)
+    context = stages[0].context(states)
     if tokens is None:
         for stage in stages:
             stage.seed(context)
@@ -150,7 +152,7 @@ def draft(stages, spec: DSpark, embed: Callable, logits_of: Callable, hc_mult: i
     block = jnp.full((tokens.shape[0], spec.block_size), spec.noise_token_id, jnp.int32)
     block = block.at[:, 0].set(tokens)
     streams = expand_streams(embed(block), hc_mult)
-    carry = (streams, first_stream(streams))
+    carry = Carried(streams, first_stream(streams))
     for stage in stages:
         carry = stage(carry, context, decode)
     last = stages[-1]
