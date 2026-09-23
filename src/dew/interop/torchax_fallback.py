@@ -41,9 +41,9 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew.interop import hf_decoders as decoders
 from dew.interop.pickles import host_view
 from dew.interop.pretrained import AUTO, Pretrained, _source_processor
-from dew.nn.sharding import LogicalAxes, parameter_path
+from dew.nn.sharding import LogicalAxes, logical_spec, parameter_path
 from dew.registry import resolve_dtype
-from dew.training.distributed import PARAMETER_AXES, Layout, Placement, _mesh_spec, _rule_table
+from dew.training.distributed import PARAMETER_AXES, Layout, Placement
 
 if TYPE_CHECKING:
     import torch
@@ -113,7 +113,6 @@ class TorchLayout(Layout):
 
     def shardings[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         placed = super().shardings(mesh, tree)
-        rules = _rule_table(self.rules)
         sharded_devices = math.prod(mesh.shape[axis] for axis in PARAMETER_AXES)
 
         def leaf_sharding(path, value, heuristic: NamedSharding) -> NamedSharding:
@@ -123,7 +122,7 @@ class TorchLayout(Layout):
                 return heuristic
             if sharded_devices == 1 or math.prod(value.shape) < self.min_shard:
                 return NamedSharding(mesh, P())
-            return NamedSharding(mesh, _mesh_spec(value.shape, axes, rules, mesh))
+            return NamedSharding(mesh, logical_spec(axes, tuple(value.shape), rules=self.axis_rules, mesh=mesh))
 
         return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree), placed)
 
