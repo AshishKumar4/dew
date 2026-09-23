@@ -309,6 +309,25 @@ def test_a_rank_that_stalls_between_collectives_ends_the_pool():
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_rank_busy_on_its_host_before_an_agreement_leaves_the_pool_running():
+    """Rank 1 spends longer on its host than the pool's execution bound, as
+    process 0 uploading a checkpoint to W&B does, before it agrees with rank
+    0, which has arrived. Rank 0 has to wait for it on the host: inside the
+    agreement's device collective, the bound would end it."""
+    program = ("import dew.training.runtime as runtime\n"
+               "runtime.EXECUTION_TIMEOUT = '20s'\n"
+               "runtime.prepare_process()\n"
+               "import time, jax\n"
+               "from dew.artifacts import agreed\n"
+               "if jax.process_index() == 1:\n"
+               "    time.sleep(45)\n"
+               "print('agreed', agreed('upload', lambda: jax.process_index()))\n")
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
+                  devices=1, timeout=300)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_rank_whose_data_fails_mid_fit_stops_the_pool(tmp_path):
     """Rank 1's loader raises on its fourth batch while rank 0 has gone on to
     that step, whose collectives wait for rank 1 for ever on a GPU. Rank 1's
