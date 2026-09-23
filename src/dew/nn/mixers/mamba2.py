@@ -149,26 +149,30 @@ def _entering_state(decay, write, axis: str):
     Shard r's span of the recurrence is affine in the state entering it:
     it leaves `exp(A_r) h + B_r`, with `decay` the span's total log decay
     `A_r` `[B, H]` and `write` the state `B_r` `[B, H, P, N]` it leaves from
-    zero. Every shard all-gathers the pairs and folds those of the shards
-    before it in order, `h_{r+1} = exp(A_r) h_r + B_r` from `h_0 = 0`, the
-    serial prefix over shards of Mamba-2's context parallelism in lm-engine
-    (`sequence_mixer_blocks/mamba2/op.py`, `_SerialPrefixScan`). The fold
-    runs over every shard with the later ones masked out, so each shard
-    traces the same program. Autodiff differentiates the gather into a
-    reduce-scatter and the fold into its reverse; nothing here needs a
-    hand-written backward."""
-    writes = jax.lax.all_gather(write, axis)               # [n, B, H, P, N]
-    decays = jax.lax.all_gather(decay, axis)               # [n, B, H]
-    rank = jax.lax.axis_index(axis)
+    zero. Two spans in order compose to one, `(A_1, B_1)` then `(A_2, B_2)`
+    being `(A_1 + A_2, exp(A_2) B_1 + B_2)`, an associative operation whose
+    identity `(0, 0)` is what `ppermute` hands a shard with no source. So
+    the prefix over shards is a Kogge-Stone scan: at shift 1, 2, 4, ...
+    each shard receives the pair `shift` shards back and composes it in
+    front of its own, which leaves every shard the composition of itself
+    and all shards before it after `ceil(log2 n)` rounds; one more shift by
+    a single shard makes it exclusive, the state entering this shard, zero
+    on the first. Each round moves one pair per shard, where gathering all
+    of them moves n; lm-engine's `_SerialPrefixScan`
+    (`sequence_mixer_blocks/mamba2/op.py`) folds the gathered pairs
+    serially. Autodiff transposes each `ppermute` into the reverse one."""
+    shards = jax.lax.axis_size(axis)
 
-    def fold(entering, step):
-        shard, shard_writes, shard_decay = step
-        passed, _ = _carry(entering, (shard_writes, shard_decay))
-        return jnp.where(shard < rank, passed, entering), None
+    def shifted(value, shift: int):
+        return jax.lax.ppermute(value, axis, [(r, r + shift) for r in range(shards - shift)])
 
-    entering, _ = jax.lax.scan(fold, jnp.zeros_like(write),
-                               (jnp.arange(writes.shape[0]), writes, decays))
-    return entering
+    shift = 1
+    while shift < shards:
+        earlier_decay, earlier_write = shifted(decay, shift), shifted(write, shift)
+        write = jnp.exp(decay)[..., None, None] * earlier_write + write
+        decay = earlier_decay + decay
+        shift *= 2
+    return shifted(write, 1)
 
 
 def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, starts=None):

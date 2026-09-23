@@ -460,7 +460,8 @@ def test_mamba2_agrees_with_whole_sequences_forward_and_backward(split, packed, 
     packed rows put documents on, inside and straddling the shard
     boundaries, so the state and the conv history reset across them. The
     lowered program holds the state exchange: the conv tail's
-    collective-permute and the shards' all-gather."""
+    collective-permutes and the state's, and no all-gather: the shards'
+    states pass in log2(n) + 1 shifts rather than all to every shard."""
     layer = mamba_layer(dtype)
     hidden = jax.random.normal(jax.random.key(0), (2, MAMBA_LENGTH, 16), dtype)
     variables = layer.init(jax.random.key(1), hidden)
@@ -485,7 +486,7 @@ def test_mamba2_agrees_with_whole_sequences_forward_and_backward(split, packed, 
         program = jax.jit(both)
         text = program.lower(variables, hidden).as_text()
         sharded = program(variables, hidden)
-    assert "collective_permute" in text and "all_gather" in text
+    assert "collective_permute" in text and "all_gather" not in text
     for leaf, difference in leafwise_largest(whole, sharded).items():
         exact = dtype == jnp.float32 or any(name in leaf for name in SCAN_LEAVES)
         assert difference < (FP32_BOUND if exact else BF16_CONTRACTION_BOUND), (leaf, difference)
@@ -522,6 +523,6 @@ def test_a_mamba2_hybrid_trains_the_same_step_under_a_split_sequence(make_batch,
     batch = make_batch()
     spec, tolerance = HYBRID_SPLITS[split]
     sharded = one_step(spec, batch, monkeypatch, tolerance, model=hybrid)
-    assert "collective_permute" in sharded[2] and "all_gather" in sharded[2]
+    assert "collective_permute" in sharded[2]
     whole = one_step(WHOLE, batch, model=hybrid)
     assert_same_step(whole, sharded)
