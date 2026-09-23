@@ -336,62 +336,67 @@ def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     return jnp.where(jnp.isnan(x), x, rounded).astype(jnp.bfloat16)
 
 
-def _is_adam(node) -> bool:
-    return isinstance(node, optax.ScaleByAdamState)
+def bf16_moments(inner: optax.GradientTransformation) -> optax.GradientTransformation:
+    """`optax.scale_by_adam`, as `inner`, with both moments stored in bf16.
 
-
-def bf16_adam_state(inner: optax.GradientTransformation) -> optax.GradientTransformation:
-    """`inner` with the moments of every `optax.ScaleByAdamState` in its
-    state stored in bf16.
-
-    Each update widens the stored moments to fp32 and runs `inner`'s own
-    update on them, so the step is optax's; only the storage is Dew's. The
-    new moments are written back stochastically rounded
-    (`stochastic_round_bf16`), seeded by the step count, the leaf and the
-    moment. Round to nearest would lose every increment of the second moment
-    smaller than half its bf16 spacing, which at b2 = 0.999 is most of them;
-    a stochastic rounding keeps each one in expectation. The state keeps
-    optax's layout, so sharding and checkpoints read it as they read fp32
-    state.
+    Each update runs `inner`'s own update one leaf at a time, on that leaf's
+    moments widened to fp32, and writes the new moments back stochastically
+    rounded (`stochastic_round_bf16`), seeded by the step count, the leaf and
+    the moment: the step is optax's, only the storage is Dew's. Leaf by leaf
+    keeps one leaf's fp32 moments live at a time; widening the whole state
+    first held all of them and raised the update's peak from 4.49 to 7.37 GB
+    on the lm-dense tree (RTX 4080). Round to nearest would lose every
+    increment of the second moment smaller than half its bf16 spacing, which
+    at b2 = 0.999 is most of them; a stochastic rounding keeps each one in
+    expectation. The state keeps optax's `ScaleByAdamState` layout, so
+    sharding and checkpoints read it as they read fp32 state.
     """
-    def narrow(state, rounding):
-        return jax.tree.map(
-            lambda node: node._replace(mu=rounding(node.mu, node.count, 1),
-                                       nu=rounding(node.nu, node.count, 2))
-            if _is_adam(node) else node, state, is_leaf=_is_adam)
-
-    def to_nearest(moments, count, which):
-        del count, which
+    def narrow(moments):
         return jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), moments)
 
-    def stochastically(moments, count, which):
-        step = _mix(jnp.asarray(count).astype(jnp.uint32) * jnp.uint32(0x27D4EB2F))
-        leaves, structure = jax.tree.flatten(moments)
-        return structure.unflatten([
-            stochastic_round_bf16(leaf, _mix(
-                step + jnp.uint32(2 * index + which) * jnp.uint32(0x165667B1)))
-            for index, leaf in enumerate(leaves)])
-
-    def widen(state):
-        def wide(node):
-            if not _is_adam(node):
-                return node
-            return node._replace(mu=jax.tree.map(lambda leaf: leaf.astype(jnp.float32), node.mu),
-                                 nu=jax.tree.map(lambda leaf: leaf.astype(jnp.float32), node.nu))
-        return jax.tree.map(wide, state, is_leaf=_is_adam)
-
     def init_fn(params):
-        return narrow(inner.init(params), to_nearest)
+        state = inner.init(params)
+        return state._replace(mu=narrow(state.mu), nu=narrow(state.nu))
 
     def update_fn(updates, state, params=None):
-        updates, state = inner.update(updates, widen(state), params)
-        return updates, narrow(state, stochastically)
+        del params  # scale_by_adam reads none
+        step = _mix(jnp.asarray(state.count).astype(jnp.uint32) * jnp.uint32(0x27D4EB2F))
+        leaves, structure = jax.tree.flatten(updates)
+        mus, nus = structure.flatten_up_to(state.mu), structure.flatten_up_to(state.nu)
+        scaled, new_mu, new_nu, count = [], [], [], state.count
+        for index, (gradient, mu, nu) in enumerate(zip(leaves, mus, nus, strict=True)):
+            one = state._replace(mu=[mu.astype(jnp.float32)], nu=[nu.astype(jnp.float32)])
+            [update], one = inner.update([gradient], one)
+            count = one.count
+            salt = _mix(step + jnp.uint32(2 * index + 1) * jnp.uint32(0x165667B1))
+            scaled.append(update)
+            new_mu.append(stochastic_round_bf16(one.mu[0], salt))
+            new_nu.append(stochastic_round_bf16(one.nu[0], _mix(salt + jnp.uint32(0x9E3779B9))))
+        return structure.unflatten(scaled), state._replace(
+            count=count, mu=structure.unflatten(new_mu), nu=structure.unflatten(new_nu))
 
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-# The optimizers `OptimConfig.state_dtype='bfloat16'` stores in bf16.
-BF16_STATE_OPTIMIZERS = frozenset({'adam', 'adamw'})
+def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, *,
+               nesterov: bool = False, decay: optax.GradientTransformation | None = None):
+    """optax.adam's chain (optax.adamw's with `decay`) over bf16 moments."""
+    return optax.chain(
+        bf16_moments(optax.scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root,
+                                         nesterov=nesterov)),
+        *([] if decay is None else [decay]),
+        optax.scale_by_learning_rate(learning_rate))
+
+
+def _bf16_adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0,
+                weight_decay=1e-4, mask=None, *, nesterov: bool = False):
+    return _bf16_adam(learning_rate, b1, b2, eps, eps_root, nesterov=nesterov,
+                      decay=optax.add_decayed_weights(weight_decay, mask))
+
+
+# The optimizers `OptimConfig.state_dtype='bfloat16'` builds: optax.adam and
+# optax.adamw with the moments stored in bf16, their other options kept.
+BF16_STATE_OPTIMIZERS = {'adam': _bf16_adam, 'adamw': _bf16_adamw}
 
 
 OPTIMIZER_MAP = {
@@ -656,7 +661,9 @@ def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransforma
             raise ValueError(
                 f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
                 f"{sorted(BF16_STATE_OPTIMIZERS)} have; {config.optimizer!r} does not")
-        solver = bf16_adam_state(solver)
+        solver = BF16_STATE_OPTIMIZERS[config.optimizer](learning_rate, **opts)
+    else:
+        solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
 
     if config.clip_grads > 0:
         solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)
