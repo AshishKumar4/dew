@@ -3,6 +3,7 @@
 Run in a vLLM environment on a GPU, from the repository root:
 
     python tools/vllm_replay_reference.py
+    python tools/vllm_replay_reference.py --reference   # only the transformers references, on the record
 
 It serves `tests/fixtures/hf/qwen3-moe-vllm` in bf16 with top-k and top-p
 filtering, `logprobs_mode="processed_logprobs"`, `return_sampling_mask` and
@@ -11,6 +12,13 @@ completion, to `tests/fixtures/rl/vllm_replay.json`: prompt and sampled ids,
 the filtered behavior log-probabilities, each sampled id's kept support and
 the `[forwarded ids, layers, top_k]` expert record. Dew never imports vLLM;
 `tests/test_engine_replay.py` reads the file.
+
+Beside each call it writes `reference`: the recorded ids' filtered
+log-probabilities from transformers at float32 and at float64 (the
+`tests/reference_error.py` rule's reference and truth), each the capped
+logit over the temperature renormalized over the recorded support. It
+refuses a record whose routing transformers' own float64 routers would not
+choose, so the references score what the engine routed.
 
 The checkpoint is written here, from `CONFIG` with transformers' own
 initialization under seed 0, when it is missing. It is a Qwen3-MoE with a
@@ -45,7 +53,42 @@ def make_model() -> None:
     Qwen3MoeForCausalLM(Qwen3MoeConfig(**CONFIG)).save_pretrained(MODEL, safe_serialization=True)
 
 
+def references(record: dict) -> None:
+    """Add each call's transformers float32 and float64 filtered log-probabilities."""
+    import torch
+    from transformers import Qwen3MoeForCausalLM
+
+    temperature = record["sampling"]["temperature"]
+    for dtype, name in ((torch.float32, "float32"), (torch.float64, "float64")):
+        # The grouped-matmul experts refuse float64; the eager loop computes the same sum.
+        model = Qwen3MoeForCausalLM.from_pretrained(MODEL, dtype=dtype, experts_implementation="eager").eval()
+        for call in record["calls"]:
+            ids = call["prompt_ids"] + call["sampled_ids"]
+            with torch.no_grad():
+                out = model(torch.tensor([ids[:-1]]), output_router_logits=True)
+            if name == "float64":
+                routed = np.asarray(call["routed_experts"])
+                for layer, logits in zip((1, 2), out.router_logits[-2:], strict=True):
+                    chosen = np.sort(torch.topk(logits.softmax(-1), 2, dim=-1).indices.numpy(), -1)
+                    if not np.array_equal(chosen, np.sort(routed[:, layer], -1)):
+                        raise ValueError(f"transformers routes layer {layer} otherwise than the record")
+            logits = out.logits[0].double() / temperature
+            start = len(call["prompt_ids"]) - 1
+            scores = []
+            for offset, (token, kept) in enumerate(zip(call["sampled_ids"], call["support"], strict=True)):
+                row = logits[start + offset, kept]
+                scores.append(float(row[kept.index(token)] - torch.logsumexp(row, 0)))
+            call.setdefault("reference", {})[name] = scores
+
+
 def main() -> None:
+    import sys
+
+    if sys.argv[1:] == ["--reference"]:
+        record = json.loads(OUT.read_text())
+        references(record)
+        OUT.write_text(json.dumps(record) + "\n")
+        return
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
 
@@ -68,8 +111,9 @@ def main() -> None:
             calls.append({"prompt_ids": list(request.prompt_token_ids), "sampled_ids": sampled,
                           "behavior_log_probs": behavior, "support": support,
                           "routed_experts": routed.astype(int).tolist(), "routed_dtype": str(routed.dtype)})
-    OUT.write_text(json.dumps({"vllm": version("vllm"), "model": MODEL.name, "sampling": SAMPLING,
-                               "calls": calls}) + "\n")
+    record = {"vllm": version("vllm"), "model": MODEL.name, "sampling": SAMPLING, "calls": calls}
+    references(record)
+    OUT.write_text(json.dumps(record) + "\n")
     print(f"wrote {len(calls)} calls to {OUT}")
 
 
