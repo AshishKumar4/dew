@@ -336,10 +336,11 @@ def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     return jnp.where(jnp.isnan(x), x, rounded).astype(jnp.bfloat16)
 
 
-def bf16_moments(inner: optax.GradientTransformation) -> optax.GradientTransformation:
-    """`optax.scale_by_adam`, as `inner`, with both moments stored in bf16.
+def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
+                 nesterov: bool) -> optax.GradientTransformation:
+    """`optax.scale_by_adam` with both moments stored in bf16.
 
-    Each update runs `inner`'s own update one leaf at a time, on that leaf's
+    Each update runs optax's own update one leaf at a time, on that leaf's
     moments widened to fp32, and writes the new moments back stochastically
     rounded (`stochastic_round_bf16`), seeded by the step count, the leaf and
     the moment: the step is optax's, only the storage is Dew's. Leaf by leaf
@@ -351,14 +352,14 @@ def bf16_moments(inner: optax.GradientTransformation) -> optax.GradientTransform
     expectation. The state keeps optax's `ScaleByAdamState` layout, so
     sharding and checkpoints read it as they read fp32 state.
     """
-    def zeros(moments):
-        return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, jnp.bfloat16), moments)
+    inner = optax.scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root, nesterov=nesterov)
 
     def init_fn(params):
-        # The fp32 zeros `inner.init` would write are never materialised.
-        state = jax.eval_shape(inner.init, params)
-        return state._replace(count=jnp.zeros(state.count.shape, state.count.dtype),
-                              mu=zeros(state.mu), nu=zeros(state.nu))
+        def zeros(leaf):
+            return jnp.zeros(leaf.shape, jnp.bfloat16)
+        return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32),
+                                      mu=jax.tree.map(zeros, params),
+                                      nu=jax.tree.map(zeros, params))
 
     def update_fn(updates, state, params=None):
         del params  # scale_by_adam reads none
@@ -367,14 +368,18 @@ def bf16_moments(inner: optax.GradientTransformation) -> optax.GradientTransform
         mus, nus = structure.flatten_up_to(state.mu), structure.flatten_up_to(state.nu)
         scaled, new_mu, new_nu, count = [], [], [], state.count
         for index, (gradient, mu, nu) in enumerate(zip(leaves, mus, nus, strict=True)):
-            one = state._replace(mu=[mu.astype(jnp.float32)], nu=[nu.astype(jnp.float32)])
-            [update], one = inner.update([gradient], one)
+            # One array is a pytree of one leaf, so optax updates the leaf alone.
+            update, one = inner.update(gradient, optax.ScaleByAdamState(
+                count=state.count, mu=mu.astype(jnp.float32), nu=nu.astype(jnp.float32)))
+            if not isinstance(one, optax.ScaleByAdamState):
+                raise TypeError(f"optax.scale_by_adam returned {type(one).__name__}")
             count = one.count
             salt = _mix(step + jnp.uint32(2 * index + 1) * jnp.uint32(0x165667B1))
             scaled.append(update)
-            new_mu.append(stochastic_round_bf16(one.mu[0], salt))
-            new_nu.append(stochastic_round_bf16(one.nu[0], _mix(salt + jnp.uint32(0x9E3779B9))))
-        return structure.unflatten(scaled), state._replace(
+            new_mu.append(stochastic_round_bf16(jnp.asarray(one.mu), salt))
+            new_nu.append(stochastic_round_bf16(jnp.asarray(one.nu),
+                                                _mix(salt + jnp.uint32(0x9E3779B9))))
+        return structure.unflatten(scaled), optax.ScaleByAdamState(
             count=count, mu=structure.unflatten(new_mu), nu=structure.unflatten(new_nu))
 
     return optax.GradientTransformation(init_fn, update_fn)
@@ -384,8 +389,7 @@ def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, *,
                nesterov: bool = False, decay: optax.GradientTransformation | None = None):
     """optax.adam's chain (optax.adamw's with `decay`) over bf16 moments."""
     return optax.chain(
-        bf16_moments(optax.scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root,
-                                         nesterov=nesterov)),
+        bf16_moments(b1, b2, eps, eps_root, nesterov),
         *([] if decay is None else [decay]),
         optax.scale_by_learning_rate(learning_rate))
 

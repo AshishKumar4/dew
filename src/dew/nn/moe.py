@@ -319,16 +319,16 @@ class Router(nn.Module):
 # The grouped matmul 'auto' runs, per hardware generation (`device_generation`):
 # the measured winner, forward plus backward, at lm-moe's shape (8192 rows,
 # 768 -> 2048, 8 experts, bf16) and at 128 experts; numbers in
-# docs/performance.md. On sm80 (A100) and sm89 (L4, RTX 4080) that is JAX's
+# docs/performance.md. On sm80 (A100), sm86 (RTX 3090) and sm89 (L4, RTX 4080) that is JAX's
 # own Pallas kernels (`dew.nn.kernels.grouped_matmul`), 5x to 61x faster than
 # XLA, which runs ragged_dot there as a product over every expert. On a TPU
 # v5e and v6e it is XLA's ragged_dot; the one kernel that beats it at 8
 # experts (tokamax's mosaic_tpu_v2, 1.11x-1.38x) cannot be a dependency:
 # tokamax 0.0.14 pins typeguard==2.13.3 where tyro needs >=4. Every
 # generation not listed runs 'xla': sm75 cannot compile the kernels, and
-# sm86 [inferred from sm80/sm89], sm90 and sm120 [no hardware] are
-# unmeasured.
-GROUPED_MATMUL_BY_GENERATION = {'sm80': 'pallas', 'sm89': 'pallas', 'v5e': 'xla', 'v6e': 'xla'}
+# sm90 and sm120 are unmeasured.
+GROUPED_MATMUL_BY_GENERATION = {'sm80': 'pallas', 'sm86': 'pallas', 'sm89': 'pallas',
+                                'v5e': 'xla', 'v6e': 'xla'}
 
 # The kernel 'tokamax' names, per generation. tokamax's own dispatch tries its
 # Mosaic kernel first: on a TPU that is the v1 kernel, 4x to 13x slower than
