@@ -1333,16 +1333,15 @@ if __name__ == "__main__":
     main()
 ```
 
-Launch it from the first host. `dew launch` starts one process on each host over ssh and gives each its coordinator, process count and rank. The remote shell reads no login profile, so name the interpreter by its absolute path:
+Launch it from the first host. `dew launch` starts one process per GPU on each host over ssh, four here, and gives each its GPU, the coordinator, the process count and its rank. The remote shell reads no login profile, so name the interpreter by its absolute path:
 
 ```bash
-dew launch --hosts 10.0.0.1 10.0.0.2 \
+dew launch --hosts 10.0.0.1,10.0.0.2 \
     --env DEW_TOKEN_DIR=/shared/tokens --env DEW_CHECKPOINT_DIR=/shared/runs/lm \
-    --env CUDA_VISIBLE_DEVICES=0,1 --env JAX_PLATFORMS=cuda \
     -- /opt/dew/.venv/bin/python train_multihost.py
 ```
 
-`batch=16` is global, so each process reads eight rows. To rehearse the launch on one machine, run `dew launch --processes-per-host 2 --env JAX_PLATFORMS=cpu --env XLA_FLAGS=--xla_force_host_platform_device_count=2 --env DEW_STEPS=20 ...` with local directories: two processes of two simulated devices fill the same `MeshSpec(fsdp=4)`, and each prints `20 updates`.
+`batch=16` is global, so each process reads four rows. The same command without `--hosts` runs on the GPUs of this machine; inside a Slurm allocation it starts `srun`, and `--tpu NAME` runs on every worker of a Cloud TPU. [Training on several nodes](docs/guides/multi-node.md) covers each. To rehearse the launch on a machine without GPUs, run `dew launch --processes-per-host 2 --env JAX_PLATFORMS=cpu --env XLA_FLAGS=--xla_force_host_platform_device_count=2 --env DEW_STEPS=20 ...` with local directories: two processes of two simulated devices fill the same `MeshSpec(fsdp=4)`, and each prints `20 updates`.
 
 ### Generating text with Gemma 4 on one GPU
 
@@ -1402,11 +1401,11 @@ if __name__ == "__main__":
     main()
 ```
 
-`MeshSpec(fsdp=jax.device_count())` distributes eligible weights over the slice; small or indivisible leaves may remain replicated. Cloud TPU environments can supply coordinator discovery for `jax.distributed.initialize()`. For manual clusters, pass the coordinator address, process count, and process ID as in the training example. Authenticate on each worker through its environment or credential store; do not put tokens in launch arguments. Save the script on every worker and preview the launch with the [TPU command](docs/tpu.md):
+`MeshSpec(fsdp=jax.device_count())` distributes eligible weights over the slice; small or indivisible leaves may remain replicated. Cloud TPU environments can supply coordinator discovery for `jax.distributed.initialize()`. For manual clusters, pass the coordinator address, process count, and process ID as in the training example. Authenticate on each worker through its environment or credential store; do not put tokens in launch arguments. Save the script on every worker and preview the launch on every worker (see [Cloud TPUs](docs/tpu.md)):
 
 ```bash
-dew-tpu run dew-16 --zone us-central2-b --dry-run -- \
-    env DEW_MODEL=google/gemma-4-31B-it python generate_tpu.py
+dew launch --tpu dew-16 --zone us-central2-b --dry-run \
+    --env DEW_MODEL=google/gemma-4-31B-it -- python generate_tpu.py
 ```
 
 Each worker needs access to the checkpoint and tokenizer files. A shared download cache does not eliminate per-process loading buffers. Budget for the stored weight dtype, replicated leaves, loading peaks, and KV cache; dividing checkpoint bytes by device count is insufficient. Row counts, tokenized shapes, and execution controls must agree across processes. Use the same seed on every rank; Dew derives global row keys. Rehearse on a small checkpoint and CPU process pool before an authorized TPU run.
