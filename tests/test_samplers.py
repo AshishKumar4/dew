@@ -936,6 +936,36 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     assert relative_gap(gradient[None], SOURCE_ARRAYS[f"{name}.grad_float32"][None]) < 1e-4
 
 
+@pytest.mark.parametrize("config", [
+    {"_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000, "shift": 3.0},
+    "euler.default", "kdpm2.default", "dpm_multi.default"],
+    ids=lambda config: config if isinstance(config, str) else "flow.shift3")
+def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
+    """A prompt alone walks where its row of a batch walks, on the flow, sigma,
+    stage and VP grids.
+
+    One row is the walk XLA compiles differently: each grid read becomes a
+    dynamic slice rather than a gather. On a GPU (the cuda lane) XLA's
+    DynamicSliceAnnotator failed that compile while the lookups searched
+    the grid with jnp.interp's bisection loop inside the scan, which is how
+    every published flow-matching checkpoint first failed on one prompt.
+    """
+    from dew.diffusion.schedules.source import SourceSchedule
+
+    if isinstance(config, str):
+        config = json.loads(str(SOURCE_ARRAYS[f"{config}.config"]))
+    schedule = SourceSchedule.from_config(config)
+    process, times = schedule.sampling(6)
+    model = SourceOracle()
+    x_T = jax.random.normal(jax.random.PRNGKey(3), (2, 3, 4))
+    denoise = process.denoiser(model, model.init(jax.random.PRNGKey(1), x_T[:1], jnp.ones((1,))), {})
+    run = jax.jit(lambda value: sample(denoise, value, solver=schedule.solver(), key=jax.random.PRNGKey(0),
+                                       times=times, final_denoise=False))
+    batch = run(x_T)
+    for row in range(2):
+        np.testing.assert_allclose(run(x_T[row:row + 1])[0], batch[row], rtol=1e-6, atol=1e-6)
+
+
 def source_bridge(depth=None):
     from dew.sampling.solvers import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_noise
 
