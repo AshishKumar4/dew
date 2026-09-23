@@ -40,6 +40,8 @@ from typing import (
     runtime_checkable,
 )
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
 
@@ -2049,8 +2051,12 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
     for name, value in _flatten(params).items():
         target = family.export_path(name, config)
         if target is not None:
-            leaf = np.asarray(value)
-            tensors[target] = np.ascontiguousarray(leaf.T if name.endswith('.kernel') else leaf)
+            # A kernel is transposed on a device, one at a time, and copied to
+            # the host contiguous: numpy copies a transposed bfloat16 kernel at
+            # 0.15 GiB/s on the RTX 3090 box's CPU, where the round trip over
+            # PCIe moves several GiB/s.
+            tensors[target] = (np.asarray(jnp.asarray(value).T) if name.endswith('.kernel')
+                               else np.ascontiguousarray(np.asarray(value)))
     return tensors
 
 
@@ -2341,9 +2347,6 @@ def _check_tree(variables: Mapping[str, object], model) -> None:
     jax.eval_shape builds the template without allocating it, so checking a
     0.6B checkpoint costs no second copy of the weights.
     """
-    import jax
-    import jax.numpy as jnp
-
     template = jax.eval_shape(
         lambda: model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32)))
     expected = {name: leaf.shape for name, leaf in _flatten(template).items()}
