@@ -8,6 +8,11 @@ cross jit, while optional captions and decoded text remain host metadata.
 from __future__ import annotations
 
 import json
+import os
+import sys
+import threading
+import time
+import types
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -192,15 +197,23 @@ def agree_process_phase(error: BaseException | None, *, phase: str,
                         available: bool = True) -> int:
     """Propagate host errors, then count ranks declaring availability.
 
-    All live ranks must reach this boundary. It cannot rescue a failed or
-    blocked device collective. Errors take priority over unavailable input.
+    All live ranks must reach this boundary. It cannot rescue a blocked
+    device collective: a rank that failed between steps meets peers still
+    inside the next step's collectives, which wait for it for ever on a GPU.
+    So a failing rank first publishes its error (`publish_failure`), which
+    ends the pool within `FAILURE_GRACE_SECONDS` unless the agreement
+    completes and withdraws it. Errors take priority over unavailable input.
     """
     if jax.process_count() == 1:
         if error is not None:
             raise error
         return int(available)
+    published = error is not None and publish_failure(error, f"phase {phase}")
     status = 2 if error is not None else int(available)
     statuses = np.asarray(multihost_utils.process_allgather(np.asarray(status, np.int32))).reshape(-1)
+    if published:
+        # Every rank reached this agreement and reads the failure from it.
+        withdraw_failure()
     failed = np.flatnonzero(statuses == 2)
     if not failed.size:
         return int(np.count_nonzero(statuses))
@@ -221,3 +234,81 @@ def agree_process_phase(error: BaseException | None, *, phase: str,
         error.add_note(context)
         raise error
     raise RuntimeError(context)
+
+
+FAILURE_KEY = "dew/failure"
+"""The coordination-service key a failing process writes its error under."""
+
+FAILURE_GRACE_SECONDS = 60.0
+"""How long a published failure may go unheard before every process ends."""
+
+
+def _client():
+    """The jax.distributed client, through orbax's public accessor for it."""
+    from orbax.checkpoint import multihost
+
+    return multihost.get_jax_distributed_client()
+
+
+def publish_failure(error: BaseException, where: str) -> bool:
+    """Write this process's failure where every process's watch sees it.
+
+    Returns False when another failure is already there: the first stands.
+    """
+    text = f"{os.urandom(4).hex()} process {jax.process_index()} failed in {where}: "
+    try:
+        _client().key_value_set(FAILURE_KEY, (text + f"{type(error).__name__}: {error}")[:2048])
+    except jax.errors.JaxRuntimeError:  # the key exists: a failure is already published
+        return False
+    return True
+
+
+def withdraw_failure() -> None:
+    """Remove the published failure once the pool has heard it at an agreement."""
+    _client().key_value_delete(FAILURE_KEY)
+
+
+def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
+    """End this process when a failure goes unheard, or when it fails itself.
+
+    A process of a pool that raises past its program, or meets a peer's
+    failure it cannot hear, would otherwise hang: its peers wait for it in a
+    collective no GPU backend times out, and jax.distributed's shutdown
+    barrier holds an exiting process up to shutdown_timeout_seconds (300 s)
+    for them. So an uncaught exception prints, publishes and leaves at once,
+    and a watch thread ends the process `grace` seconds after any published
+    failure that no agreement withdrew. `dew launch`, srun and a pod's
+    scheduler then see the failure and stop the rest.
+    """
+    previous = sys.excepthook
+    client = _client()
+
+    def leave(kind: type[BaseException], value: BaseException,
+              trace: types.TracebackType | None) -> None:
+        previous(kind, value, trace)
+        publish_failure(value, "the program")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(130 if issubclass(kind, KeyboardInterrupt) else 1)
+
+    def watch() -> None:
+        while True:
+            time.sleep(5.0)
+            try:
+                seen = client.key_value_try_get(FAILURE_KEY)
+            except jax.errors.JaxRuntimeError:  # nothing published, or the pool is gone
+                continue
+            time.sleep(grace)
+            try:
+                if client.key_value_try_get(FAILURE_KEY) != seen:
+                    continue
+            except jax.errors.JaxRuntimeError:  # withdrawn: an agreement heard it
+                continue
+            sys.stderr.write(f"{seen.split(' ', 1)[1]}\nNo agreement heard that failure in "
+                             f"{grace:.0f} s, so this process waits in a collective that will "
+                             f"not complete; process {jax.process_index()} ends.\n")
+            sys.stderr.flush()
+            os._exit(1)
+
+    sys.excepthook = leave
+    threading.Thread(target=watch, name="dew-failure-watch", daemon=True).start()

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import jax
 from jax.experimental import multihost_utils
 
-from dew.artifacts import broadcast_from_process_zero
+from dew.artifacts import broadcast_from_process_zero, end_pool_on_failure
 from dew.pool import PROCESS_COUNT, PROCESS_ID
 from dew.telemetry.devices import apply_xla_flags
 from dew.telemetry.instrumentation import enable_compilation_cache
@@ -92,6 +92,8 @@ def prepare_process(wandb: Wandb | None = None,
             # wandb init and their model builds, and one that arrives late
             # dies in gloo before the run can report it.
             multihost_utils.sync_global_devices("dew process pool joined")
+            if jax.process_count() > 1:
+                end_pool_on_failure()
     if layout is not None and "params" in layout.host:
         from dew.training.distributed import build_mesh
         from dew.training.host import companion_mesh
