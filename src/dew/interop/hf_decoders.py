@@ -49,6 +49,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mi
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
 from dew.nn.kda import KimiDeltaAttentionMixer
+from dew.nn.kv_cache import KVCache
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
@@ -335,6 +336,10 @@ class DecoderFields(TypedDict, total=False):
     precision: PrecisionLike
     force_fp32_for_softmax: bool
     attention_impl: str
+    kv_cache: KVCache
+    """The decode cache's storage layout. Like attention_impl it is the
+    runtime's choice, not the checkpoint's: no HF config field sets it, and a
+    caller's record may."""
     mixture: MixtureFields | None
     use_double_wide_mlp: bool
     causal: bool
