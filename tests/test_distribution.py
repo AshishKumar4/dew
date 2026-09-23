@@ -33,6 +33,7 @@ pytestmark = pytest.mark.mesh
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("distribution_worker.py")
+SCHEDULER = Path(__file__).with_name("scheduler_worker.py")
 # Three adam steps on another topology; observed 2.4e-7.
 TOLERANCE = 1e-5
 
@@ -581,3 +582,38 @@ def test_a_failed_process_stops_the_pool_with_its_exit_code():
                   devices=1, timeout=120)
     assert done.returncode == 3, done.stdout + done.stderr
     assert time.monotonic() - started < 60
+
+def scheduled(tmp_path: Path, mesh: dict, processes: int, *flags: str) -> tuple[dict, dict[str, np.ndarray]]:
+    """The record and the final parameters of a RolloutScheduler run over two devices."""
+    out = tmp_path / f"{len(list(tmp_path.iterdir()))}.json"
+    done = launch("--processes-per-host", str(processes), "--", sys.executable, str(SCHEDULER),
+                  "--out", str(out), "--mesh", json.dumps(mesh), *flags, devices=2 // processes)
+    assert done.returncode == 0, done.stdout + done.stderr
+    with np.load(out.with_suffix(".npz")) as params:
+        return json.loads(out.read_text()), {name: params[name] for name in params.files}
+
+
+@pytest.mark.mesh(devices=2)
+def test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_them(tmp_path):
+    """fsdp across two processes: each schedules the task rows of its own
+    share and packs its own rows. Together they pack the rows one process
+    packs over the whole batch, the proximal rescoring over the pool's rows
+    gives each row the likelihood one process gives it, and the update moves
+    the parameters one process moves."""
+    pool, pooled = scheduled(tmp_path, {"fsdp": 2}, 2)
+    alone, single = scheduled(tmp_path, {"fsdp": 2}, 1)
+    assert pool["partition"] == {"count": 2, "readers": 1} and pool["step"] == 1
+
+    def rows(record: dict) -> dict[str, np.ndarray]:
+        """Every row every process handed the step, sorted: groups complete in any order."""
+        stacked = {name: np.concatenate(value) for name, value in record["rows"].items()}
+        order = np.lexsort(stacked["input_ids"].T[::-1])
+        return {name: value[order] for name, value in stacked.items()}
+
+    together, reference = rows(pool), rows(alone)
+    for name in ("input_ids", "response_mask", "behavior_log_probs"):
+        np.testing.assert_array_equal(together[name], reference[name])
+    np.testing.assert_allclose(together["old_log_probs"], reference["old_log_probs"], atol=TOLERANCE)
+    for name, value in single.items():
+        np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
+
