@@ -51,6 +51,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from .blocks import normal_kernel
 from .inputs import AttentionMetadata
 from .sharding import logical_axes
 
@@ -449,10 +450,6 @@ class GatedDeltaNet(nn.Module):
         return jnp.repeat(x.reshape(B, S, H, 1, D), self.per_v, axis=3).reshape(
             B, S, H * self.per_v, D)
 
-    def _conv_taps(self):
-        """The depthwise taps [D, K]; calling the conv initialises its param."""
-        return jnp.asarray(self.conv1d()[:, 0, :], jnp.float32)
-
     def _project(self, x):
         """(query, key, value, z, b, a) of `x`, flat over heads: `[B, S, H*D]`
         for the four wide ones and `[B, S, Hv]` for b and a."""
@@ -489,6 +486,7 @@ class GatedDeltaNet(nn.Module):
         conv_input = jnp.moveaxis(
             jnp.concatenate([query, key, value], axis=-1).astype(jnp.float32),
             2, 1)  # [B, D, S], the conv's channel-major layout
+        taps, _ = self.conv1d()
         recurrent = None
         if decode:
             # The first decode-mode call only allocates, the way
@@ -505,20 +503,19 @@ class GatedDeltaNet(nn.Module):
             if not allocated:
                 # Allocation only: the caller's first real forward, not this
                 # call, starts the state.
-                mixed = causal_conv1d(conv_input, self._conv_taps())
                 out = jnp.zeros((B, S, self.value_features), self.dtype)
                 return self.out_proj(out)
             if valid is not None:
-                mixed, history = _masked_conv1d(conv_input, self._conv_taps(), valid, conv_state.value)
+                mixed, history = _masked_conv1d(conv_input, taps, valid, conv_state.value)
                 conv_state.value = history
             else:
                 history = jnp.concatenate([conv_state.value, conv_input], axis=2)
                 conv_state.value = history[:, :, -(self.conv_kernel - 1):]
-                mixed = causal_conv1d(history, self._conv_taps())[..., -S:]
+                mixed = causal_conv1d(history, taps)[..., -S:]
         elif valid is not None:
-            mixed, _ = _masked_conv1d(conv_input, self._conv_taps(), valid)
+            mixed, _ = _masked_conv1d(conv_input, taps, valid)
         else:
-            mixed = causal_conv1d(conv_input, self._conv_taps())
+            mixed = causal_conv1d(conv_input, taps)
         mixed = jnp.moveaxis(mixed, 2, 1)  # back to [B, S, D]
 
         query, key, value = jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1)
@@ -560,18 +557,28 @@ class DepthwiseConv1d(nn.Module):
     The checkpoint stores `conv1d.weight` this way, and flax's Conv matches
     neither its [K, D, 1] kernel order nor the reference's channel-major
     [B, D, S] input. The leaf keeps the checkpoint's name, `weight`, because
-    a translation transposes a `kernel` as a Linear's [out, in]; the caller
-    reads `weight[:, 0, :]` for the [D, K] taps. The taps have no matrix
-    axis worth a name, so they take the shape heuristic.
+    a translation transposes a `kernel` as a Linear's [out, in]. The taps
+    have no matrix axis worth a name, so they take the shape heuristic.
+    `use_bias` adds the checkpoint's `conv1d.bias` [D], as Mamba 2's
+    `nn.Conv1d(groups=conv_dim)` has one (modeling_mamba2.py:392-399).
+
+    Returns the [D, K] taps and the bias (None without one), both fp32, the
+    dtype the convolution runs in.
     """
 
     features: int
     kernel: int = 4
+    use_bias: bool = False
+    init_std: float | None = None  # None: lecun normal
 
     @nn.compact
-    def __call__(self):
-        return self.param('weight', nn.initializers.lecun_normal(),
-                         (self.features, 1, self.kernel))
+    def __call__(self) -> tuple[jax.Array, jax.Array | None]:
+        weight = self.param('weight', normal_kernel(self.init_std, nn.initializers.lecun_normal())[
+            'kernel_init'], (self.features, 1, self.kernel))
+        bias = (self.param('bias', nn.initializers.zeros, (self.features,), jnp.float32)
+                if self.use_bias else None)
+        return (jnp.asarray(weight[:, 0, :], jnp.float32),
+                None if bias is None else jnp.asarray(bias, jnp.float32))
 
 
 class RMSNormGated(nn.Module):
