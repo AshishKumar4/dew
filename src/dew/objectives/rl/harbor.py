@@ -20,10 +20,12 @@ has exited.
 sampled ids and behavior log-probabilities as recorded, in submission order,
 with the version the gateway stamped when the request arrived (the
 publication stamps it, see `SafetensorsReload`). vLLM lists the ids as
-`prompt_token_ids` and `choices[0].token_ids`, which the gateway records;
-SGLang's chat route lists them under `sglext.input_ids` and
-`sglext.output_ids`, which the gateway keeps only in the raw response, so
-they are read there.
+`prompt_token_ids` and `choices[0].token_ids`, which the gateway records.
+SGLang 0.5.20 answers the gateway's `return_token_ids` with
+`choices[0].prompt_token_ids` and `choices[0].response_token_ids`; the
+gateway extracts the prompt ids but not `response_token_ids`, so those are
+read from the raw response it keeps. `sglext.input_ids`/`output_ids`, which
+SGLang fills only when asked, are read as a last resort.
 
 `outcome` decides how a trial ended from Harbor's result and the calls:
 
@@ -171,6 +173,13 @@ def calls(traces: Sequence[Mapping[str, Any]], *, unstamped: int) -> Recorded:
             errors.append(str(error.get("message", error) if isinstance(error, Mapping) else error))
             continue
         prompt, sampled = trace.get("prompt_token_ids") or [], trace.get("completion_token_ids") or []
+        # SGLang lists the ids on the choice as prompt_token_ids and response_token_ids; the gateway
+        # extracts only vLLM's token_ids, so they stay in the raw response.
+        choice = (raw.get("choices") or [{}])[0]
+        if not prompt and choice.get("prompt_token_ids"):
+            prompt = choice["prompt_token_ids"]
+        if not sampled and choice.get("response_token_ids"):
+            sampled = choice["response_token_ids"]
         extension = raw.get("sglext") or {}
         if not prompt and extension.get("input_ids"):
             prompt = extension["input_ids"]
