@@ -42,11 +42,19 @@ def free_port() -> int:
 
 
 def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.CompletedProcess:
-    """`dew launch` on this machine, with `devices` CPU devices a process."""
-    env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src")}
+    """`dew launch` on this machine with `devices` devices a process: simulated
+    CPU devices, or on a GPU run that many GPUs of the machine's own."""
+    import jax
+
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
+    if jax.default_backend() == "gpu":
+        placement = ["--devices-per-process", str(devices)]
+    else:
+        env["JAX_PLATFORMS"] = "cpu"
+        placement = ["--env", f"XLA_FLAGS=--xla_force_host_platform_device_count={devices}"]
     return subprocess.run(
-        [sys.executable, "-m", "dew.cli.main", "launch", "--port", str(free_port()),
-         "--env", f"XLA_FLAGS=--xla_force_host_platform_device_count={devices}", *arguments],
+        [sys.executable, "-m", "dew.cli.main", "launch", "--port", str(free_port()), *placement,
+         *arguments],
         cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout)
 
 
@@ -235,6 +243,55 @@ def test_replicas_in_a_process_outside_any_pool_are_refused_by_granule():
 
     with pytest.raises(ValueError, match="replicas 2 must divide both the 1 granules"):
         build_mesh(MeshSpec(fsdp=4, replicas=2))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_rank_that_raises_between_collectives_stops_the_pool():
+    """Rank 1 raises before its fourth step while rank 0 is inside that
+    step's reduction, waiting for a partner that is gone, which no backend
+    times out on its own for minutes. The launch stops rank 0 and returns
+    rank 1's failure within a bound."""
+    program = ("from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "import jax, numpy as np\n"
+               "from jax.sharding import NamedSharding, PartitionSpec\n"
+               "from dew.training import MeshSpec, build_mesh\n"
+               "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+               "rows = NamedSharding(mesh, PartitionSpec('fsdp'))\n"
+               "whole = np.ones((jax.device_count() * 256, 256), np.float32)\n"
+               "x = jax.make_array_from_callback(whole.shape, rows, lambda index: whole[index])\n"
+               "step = jax.jit(lambda x: x / x.sum(), out_shardings=rows)\n"
+               "for index in range(100000):\n"
+               "    if index == 3 and jax.process_index() == 1:\n"
+               "        raise RuntimeError('injected failure')\n"
+               "    x = step(x)\n"
+               "    x.block_until_ready()\n")
+    started = time.monotonic()
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
+                  devices=1, timeout=600)
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "RuntimeError: injected failure" in done.stdout
+    assert time.monotonic() - started < 120, done.stdout + done.stderr
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_pool_refuses_a_checkpoint_directory_its_processes_do_not_share(tmp_path):
+    """Each process names its own disk's copy of the run directory, as hosts
+    with nothing shared do. Orbax writes one checkpoint across the pool and
+    reads any process's shards back, so process 0 would commit steps missing
+    the others' shards while they saw none, and a resume would train
+    different states. Every process refuses, naming the one that cannot see
+    the directory."""
+    program = ("import os, sys\n"
+               "from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "from dew.checkpoints import Checkpoints\n"
+               "host = os.path.join(sys.argv[1], 'host' + os.environ['DEW_PROCESS_ID'])\n"
+               "print('latest', Checkpoints(os.path.join(host, 'run')).latest)\n")
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
+                  str(tmp_path), devices=1, timeout=300)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "is not shared: process(es) [1] of 2 do not see" in done.stdout, done.stdout
 
 
 def test_a_failed_process_stops_the_pool_with_its_exit_code():
