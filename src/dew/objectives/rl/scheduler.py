@@ -79,7 +79,7 @@ from typing import Protocol
 import jax
 import numpy as np
 
-from dew.data.dataset import Batch, Dataset, tapped
+from dew.data.dataset import Batch, DataPartition, Dataset, tapped
 from dew.nn.inputs import local_rows
 from dew.objectives.base import Variables
 from dew.training.state import TrainState
@@ -247,9 +247,9 @@ class RolloutScheduler:
         """
         opened = tapped(dataset.train, self._register)
 
-        def train() -> Iterator[Batch]:
+        def train(partition: DataPartition) -> Iterator[Batch]:
             self._drop_registered()
-            return opened()
+            return opened(partition)
 
         return dataclasses.replace(dataset, train=train)
 
