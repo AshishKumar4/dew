@@ -856,7 +856,7 @@ def softcapped_attention(query, key, value, softcap: float, dtype=None, precisio
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation='auto',
                                  causal=False, sliding_window=None, mask=None, bias=None,
-                                 sinks=None, softcap=None):
+                                 sinks=None, softcap=None, segment_ids=None):
     """Attend over [B, S, H, D] queries, keys and values.
 
     Picks the kernel `implementation` names and returns [B, S, H, Dv]. The
@@ -877,9 +877,12 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     `mask` instead: a step's single query sits at the cache index, not at
     row 0. `bias` is an additive float array broadcastable to [B, H, Q, K];
     T5's relative position table travels in it. `sinks` holds one learned,
-    value-free logit per query head, which the reference and xla paths put
-    in the denominator. `softcap` is Gemma 2's tanh on the scaled logits,
-    which only `softcapped_attention` applies.
+    value-free logit per query head, which the reference, xla and splash
+    paths put in the denominator. `softcap` is Gemma 2's tanh on the scaled
+    logits, which `softcapped_attention` and splash apply. `segment_ids`
+    `[B, S]` keeps each packed document of a self-attention call to itself,
+    with 0 as padding (`document_mask`); splash reads the ids, and every
+    other kernel reads the document mask built from them.
 
     Under a mesh whose sequence axis is above one, the call runs through
     `sequence_parallel_attention`.
@@ -889,19 +892,35 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     backward pass (`remat_block` in dit.py). The name is inert outside
     jax.checkpoint.
     """
+    shards = sequence_shards()
+    if shards > 1 and segment_ids is not None:
+        # The exchanges split an explicit mask along the sequence and have no
+        # split for the ids, so the documents travel as the mask they stand
+        # for, with causality and the window folded in beside them.
+        mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window,
+                                       with_documents(mask, segment_ids))
+        causal, sliding_window, segment_ids = False, None, None
+        implementation = kernel_for_materialized_mask(
+            implementation, query, dtype=dtype, precision=precision,
+            force_fp32_for_softmax=force_fp32_for_softmax)
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
         softcap=softcap)
-    shards = sequence_shards()
     if shards > 1:
         out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
             sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks)
     else:
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
-                     mask=mask, bias=bias, sinks=sinks)
+                     mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids)
     return checkpoint_name(out, 'attention_output')
+
+
+def with_documents(mask, segment_ids):
+    """`mask` narrowed to each packed document's own keys, `[B, 1, S, S]`."""
+    inside = document_mask(segment_ids)[:, None]
+    return inside if mask is None else jnp.logical_and(mask, inside)
 
 
 def refuse_reference_only_arguments(implementation, query, dtype, precision,
@@ -932,12 +951,15 @@ def refuse_reference_only_arguments(implementation, query, dtype, precision,
             "the reference implementation (attention_impl 'reference').")
 
 
-def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation):
+def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
+                    softcap=None, sinks=None, segment_ids=None):
     """Run the fused kernel `implementation` names, at the query's head width.
 
     Every fused kernel runs one head width for the keys and the values, so a
     narrower value rides in padded and its own columns come back out. The
     widths a caller passes are static, so this costs no runtime branch.
+    A softcap, sinks and segment ids reach only 'tpu'; `attention_kernel`
+    runs them elsewhere on its own paths.
     """
     v_head_dim = value.shape[-1]
     if v_head_dim != query.shape[-1]:
@@ -965,6 +987,7 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
             implementation='xla')
     elif implementation == 'tpu':
         out = tpu_attention(query, key, value, bias, mask, causal, sliding_window,
+                            softcap=softcap, sinks=sinks, segment_ids=segment_ids,
                             interpret=jax.default_backend() != 'tpu')
     else:
         raise ValueError(f"Unknown attention implementation: {implementation}")
@@ -974,39 +997,46 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
 def attention_kernel(query, key, value, dtype=None, precision=None,
                      force_fp32_for_softmax=True, implementation='auto',
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
-                     softcap=None):
+                     softcap=None, segment_ids=None):
     """Dispatch one whole-sequence attention call to the kernel it names.
 
-    Sinks and a softcap have no fused kernel, so they run their own path.
     'auto' resolves here, against this call's shapes and this machine's
-    backend. What is left goes to `fused_attention`, after the arguments it
-    cannot honour raise.
+    backend. Splash takes sinks, a softcap and packed segment ids itself.
+    Anywhere else the segment ids become the document mask, and sinks and a
+    softcap run their own XLA paths, because `jax.nn.dot_product_attention`
+    has neither argument. What is left goes to `fused_attention`, after the
+    arguments it cannot honour raise.
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
-    if sinks is not None:
-        if implementation not in ('reference', 'auto', 'xla'):
+    if sinks is not None and softcap is not None:
+        raise ValueError(
+            "attention sinks and a logit softcap have no reference that "
+            "combines them, so no path takes both")
+    implementation = resolve_implementation(
+        implementation, query, key, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
+        causal=causal, sliding_window=sliding_window, mask=mask, bias=bias)
+    if segment_ids is not None and implementation != 'tpu':
+        mask = with_documents(mask, segment_ids)
+        # cuDNN would take the document mask as an additive bias
+        # (`kernel_for_materialized_mask`), so a packed call runs on xla.
+        if implementation == 'cudnn':
+            implementation = 'xla'
+    if sinks is not None and implementation != 'tpu':
+        if implementation not in ('reference', 'xla'):
             raise ValueError(f"attention implementation '{implementation}' cannot honor sinks")
-        if softcap is not None:
-            raise ValueError(
-                "attention sinks and a logit softcap have no reference that "
-                "combines them, so the sink path takes no softcap")
         mask = combined_attention_mask(
             query.shape[-3], key.shape[-3], causal, sliding_window, mask)
         return attention_with_sinks(
             query, key, value, sinks, mask=mask, bias=bias, dtype=dtype,
             precision=precision, force_fp32_for_softmax=force_fp32_for_softmax)
-
-    implementation = resolve_implementation(
-        implementation, query, key, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, causal=causal,
-        sliding_window=sliding_window, mask=mask, bias=bias)
-    if softcap is not None and implementation in ('cudnn', 'tpu'):
+    if softcap is not None and implementation == 'cudnn':
         raise ValueError(
-            f"attention implementation '{implementation}' cannot apply an "
-            f"attention logit softcap of {softcap}: the fused kernel has no tanh "
-            "between its scaling and its softmax. Use attention_impl 'xla' or "
-            "the reference implementation (attention_impl 'reference').")
+            f"attention implementation 'cudnn' cannot apply an attention logit "
+            f"softcap of {softcap}: the fused kernel has no tanh between its "
+            "scaling and its softmax. Use attention_impl 'xla' or the reference "
+            "implementation (attention_impl 'reference').")
     if implementation == 'cudnn' and deterministic_ops_requested():
         raise ValueError(
             "attention implementation 'cudnn' cannot run under "
@@ -1016,7 +1046,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             "at execution time (openxla/xla#46500). Use attention_impl 'xla', "
             "which is deterministic, or drop the flag.")
 
-    if implementation == 'reference' or softcap is not None:
+    if implementation == 'reference' or (softcap is not None and implementation != 'tpu'):
         heads = query.shape[-2]
         key = repeat_kv_heads(key, heads)
         value = repeat_kv_heads(value, heads)
@@ -1039,7 +1069,8 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     refuse_reference_only_arguments(
         implementation, query, dtype, precision, force_fp32_for_softmax)
     return fused_attention(query, key, value, bias, mask, causal, sliding_window,
-                           implementation)
+                           implementation, softcap=softcap, sinks=sinks,
+                           segment_ids=segment_ids)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
@@ -1055,16 +1086,16 @@ def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
 
 
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
-                           force_fp32_for_softmax=True, softcap=None, causal=False,
+                           force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
                            sliding_window=None, mask=None, bias=None) -> str:
     """The concrete kernel an `AttentionImpl` names for this call.
 
     Only 'auto' chooses, against the call's shapes and this machine's
     backend: the reference path when the call asks for arithmetic no fused
-    kernel performs (`reference_only`), else cudnn where `cudnn_runs`, the
-    tpu kernel where `tpu_runs`, and xla anywhere else. Any other name is
-    returned as it is, so an explicit kernel still refuses what it cannot
-    honour by name.
+    kernel performs (`reference_only`), else cudnn where `cudnn_runs` and the
+    call has no sinks, the tpu kernel where `tpu_runs`, and xla anywhere
+    else. Any other name is returned as it is, so an explicit kernel still
+    refuses what it cannot honour by name.
     """
     if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'tpu'):
         raise ValueError(f"Unknown attention implementation: {implementation}")
@@ -1072,10 +1103,9 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
         return implementation
     if reference_only(query, dtype, precision, force_fp32_for_softmax):
         return 'reference'
-    if cudnn_runs(query, softcap):
+    if sinks is None and cudnn_runs(query, softcap):
         return 'cudnn'
-    if tpu_runs(query, key, softcap, causal=causal, sliding_window=sliding_window,
-                mask=mask, bias=bias):
+    if tpu_runs(query, key, causal=causal, sliding_window=sliding_window, mask=mask, bias=bias):
         return 'tpu'
     return 'xla'
 
@@ -1137,10 +1167,12 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     `segment_ids` keeps each packed document to itself (0 is padding) and
     `valid` `[B, S]` drops the keys it marks False.
 
-    No `[S, S]` array is built above two spans. A sliding window without
-    sinks that cudnn or splash takes as a flag runs there, whose kernels
-    skip the blocks outside it. Chunks that start at row multiples fold into the
-    batch, one causal call per chunk, which every kernel takes. Everything
+    No `[S, S]` array is built above two spans. A sliding window that
+    cudnn or splash takes as a flag runs there, whose kernels skip the
+    blocks outside it: cudnn without sinks or packed documents, splash with
+    both, since it reads the segment ids themselves. Chunks that start at
+    row multiples fold into the batch, one causal call per chunk, which
+    every kernel takes. Everything
     else runs banded: the queries in blocks of the span, each against its
     own block and the one before, which holds every key a query of the
     block may read, under a `[W, 2W]` mask per block. The xla kernel's
@@ -1166,26 +1198,29 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     masked = kernel_for_materialized_mask(
         implementation, query, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax)
-    flags_only = segment_ids is None and valid is None
-    if window is not None and flags_only:
+    if window is not None and valid is None:
         resolved = resolve_implementation(
             implementation, query, key, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, causal=True,
-            sliding_window=window)
-        # No fused kernel honours sinks, so a sink call bands wherever the
-        # window would otherwise go to one.
-        if (resolved in ('cudnn', 'tpu') and sinks is None) or length <= 2 * span:
+            force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
+            causal=True, sliding_window=window)
+        # An explicit 'tpu' at a length splash cannot tile would reach the
+        # flash kernel, whose default 128-row blocks must divide the length
+        # (flash_attention.py:113-128, 1707-1715), so it would raise there.
+        on_splash = resolved == 'tpu' and length % SPLASH_LANES == 0
+        if on_splash or (segment_ids is None and (
+                (resolved in ('cudnn', 'tpu') and sinks is None) or length <= 2 * span)):
             return scaled_dot_product_attention(
                 query, key, value, dtype=dtype, precision=precision,
                 force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-                causal=True, sliding_window=window, sinks=sinks, softcap=softcap)
+                causal=True, sliding_window=window, sinks=sinks, softcap=softcap,
+                segment_ids=segment_ids)
+    flags_only = segment_ids is None and valid is None
     if length <= 2 * span:
         places = jnp.arange(length) if positions is None else positions
         mask = (None if chunk is None or (positions is None and length <= chunk)
                 else chunk_mask(places, places, chunk))
         if segment_ids is not None:
-            inside = document_mask(segment_ids)[:, None]
-            mask = inside if mask is None else mask & inside
+            mask = with_documents(mask, segment_ids)
         if valid is not None:
             live = jnp.asarray(valid, bool)[:, None, None, :]
             mask = live if mask is None else mask & live
@@ -1269,15 +1304,15 @@ SPLASH_DTYPES = (jnp.bfloat16, jnp.float32)
 SPLASH_DENSE_MASK_CELLS = 1 << 22
 
 
-def tpu_runs(query, key, softcap=None, *, causal=False, sliding_window=None,
-             mask=None, bias=None) -> bool:
+def tpu_runs(query, key, *, causal=False, sliding_window=None, mask=None, bias=None) -> bool:
     """Report whether splash takes this call.
 
     It needs a tpu backend, one of the two dtypes a TPU matmul reads,
     sequence lengths its mask blocking can tile, a mask it can describe, and
-    neither a bias nor a softcap. Only 'auto' asks this, after `cudnn_runs`;
-    an explicit 'tpu' sends the calls this turns down to the older pallas
-    flash kernel instead.
+    no bias. A softcap, sinks and packed segment ids are arguments of the
+    kernel itself, so none of them is read here. Only 'auto' asks this,
+    after `cudnn_runs`; an explicit 'tpu' sends the calls this turns down
+    to the older pallas flash kernel instead.
 
     The head width is not read, because splash does not constrain it. The
     kernel pads the value width to a whole number of lanes and slices the
@@ -1298,9 +1333,7 @@ def tpu_runs(query, key, softcap=None, *, causal=False, sliding_window=None,
     """
     if jax.default_backend() != 'tpu' or query.dtype not in SPLASH_DTYPES:
         return False
-    if sequence_shards() > 1:
-        return False
-    if softcap is not None or bias is not None:
+    if sequence_shards() > 1 or bias is not None:
         return False
     q_len, kv_len = query.shape[-3], key.shape[-3]
     if q_len % SPLASH_LANES or kv_len % SPLASH_LANES:
@@ -1310,24 +1343,29 @@ def tpu_runs(query, key, softcap=None, *, causal=False, sliding_window=None,
 
 
 def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
-                  interpret: bool):
+                  softcap, sinks, segment_ids, interpret: bool):
     """Attend on pallas: splash where its descriptor covers the call, flash
     everywhere else.
 
     Splash is the block-sparse kernel. Its mask is a descriptor built while
     the executable is, the blocks that descriptor empties are never visited,
     and a causal or windowed long sequence costs its live blocks rather than
-    its rectangle. What it has no form for is a value of the trace: there is
-    no bias argument at all, and the mask has to be readable on the host.
-    Flash takes both as one additive [B, H, Q, K] array and pays the whole
-    rectangle for them, so it stays for exactly these calls:
+    its rectangle. Packed documents are not part of the descriptor: their
+    segment ids are a kernel argument, compared per block. What it has no
+    form for is another value of the trace: there is no bias argument at
+    all, and an explicit mask has to be readable on the host. Flash takes
+    both as one additive [B, H, Q, K] array and pays the whole rectangle for
+    them, so it stays for exactly these calls:
 
     - an additive `bias`, which is T5's relative position table;
-    - a `mask` that is a tracer (a KV-cache decode mask over slots, a packed
-      batch's segment mask, the striped mask sequence parallelism builds), or
-      one past `SPLASH_DENSE_MASK_CELLS`, or one that differs by batch row;
+    - a `mask` that is a tracer (a KV-cache decode mask over slots, the
+      striped mask sequence parallelism builds), or one past
+      `SPLASH_DENSE_MASK_CELLS`, or one that differs by batch row;
     - a query or key length that is not a multiple of `SPLASH_LANES`, which
       leaves the mask blocking no block size that divides its sequence.
+
+    Flash has no softcap and no sinks, so a call with either that splash
+    cannot describe raises here.
 
     `interpret` runs splash under pallas's interpreter instead of Mosaic,
     which is what lets the same arithmetic, forward and backward, run off a
@@ -1342,11 +1380,20 @@ def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,
         descriptor = splash_mask_descriptor(
             q_len, kv_len, query.shape[-2], causal, sliding_window, mask)
     if descriptor is not None:
-        return splash_attention(query, key, value, descriptor, interpret=interpret)
-    return pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window)
+        return splash_attention(query, key, value, descriptor, softcap=softcap, sinks=sinks,
+                                segment_ids=segment_ids, interpret=interpret)
+    if softcap is not None or sinks is not None:
+        raise ValueError(
+            "attention implementation 'tpu' takes a softcap and sinks only on "
+            "the splash kernel, and this call has a bias, a mask splash cannot "
+            "describe or a length that is not a multiple of "
+            f"{SPLASH_LANES}. Use attention_impl 'xla'.")
+    return pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window,
+                                  segment_ids)
 
 
-def splash_attention(query, key, value, descriptor, *, interpret: bool):
+def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_ids,
+                     interpret: bool):
     """Run the splash kernel over [B, S, H, D] arrays under `descriptor`.
 
     The kernel takes one example at a time, as [H, S, D] with the head width
@@ -1357,15 +1404,31 @@ def splash_attention(query, key, value, descriptor, *, interpret: bool):
     in fp32 rather than to a rounding of the scale. Grouped key heads stay
     grouped, because splash reads q_heads % kv_heads itself, so this path
     never materializes the repeated keys the flash path needs.
+
+    `softcap` is the kernel's `attn_logits_soft_cap`, applied to the scaled
+    logits before the mask, the order of `softcapped_attention`. `sinks`
+    `[H]` seeds each head's running maximum and denominator, the logit-space
+    sink of `attention_with_sinks`, and its backward returns their gradient.
+    `segment_ids` `[B, S]` keeps each packed document to itself. The kernel
+    lets equal ids attend, so padding (id 0) reads the other padding where
+    `document_mask` lets it read nothing. No document's query reads a
+    padding key under either rule, so the rows a packed loss reads agree.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
     kernel = splash_attention_kernel.make_splash_mha(
         descriptor, block_sizes=splash_block_sizes(query.shape[-3], key.shape[-3]),
-        head_shards=1, q_seq_shards=1, interpret=interpret)
+        head_shards=1, q_seq_shards=1, attn_logits_soft_cap=softcap, interpret=interpret)
     scale = jnp.asarray(1.0 / math.sqrt(query.shape[-1]), query.dtype)
-    attended = jax.vmap(kernel)(jnp.moveaxis(query, -2, -3) * scale,
-                                jnp.moveaxis(key, -2, -3), jnp.moveaxis(value, -2, -3))
+    segments = (None if segment_ids is None
+                else splash_attention_kernel.SegmentIds(segment_ids, segment_ids))
+
+    def example(q, k, v, ids):
+        return kernel(q, k, v, segment_ids=ids, sinks=sinks)
+
+    attended = jax.vmap(example)(jnp.moveaxis(query, -2, -3) * scale,
+                                 jnp.moveaxis(key, -2, -3), jnp.moveaxis(value, -2, -3),
+                                 segments)
     if isinstance(attended, tuple):
         # make_splash_mha(save_residuals=True) returns the logsumexp beside
         # the output, and this builds a kernel without it, so the pair is a
@@ -1460,21 +1523,24 @@ def splash_dense_mask(mask, q_len: int, kv_len: int, heads: int):
     return [dense[head % dense.shape[0]] for head in range(heads)]
 
 
-def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window):
-    """Run the pallas TPU flash kernel, with every mask as an additive bias.
+def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window, segment_ids):
+    """Run the pallas TPU flash kernel, with every mask but the documents as
+    an additive bias.
 
     The kernel has no mask argument, so a window and an explicit mask become
     one [B, H, Q, K] float array of zeros and the dtype's minimum, added to
-    the logits. Only causality is a flag it takes. That array is the whole
-    rectangle, which is what splash exists to avoid, so this path runs only
-    for the calls `tpu_attention` names.
+    the logits. Causality is a flag it takes, and packed documents are its
+    `segment_ids`, which it compares per block, with splash's rule for the
+    padding (`splash_attention`). The array is the whole rectangle, which is
+    what splash exists to avoid, so this path runs only for the calls
+    `tpu_attention` names.
 
     The 1/sqrt(d) goes onto the query, as on splash, and the kernel's
     `sm_scale` stays 1: the kernel adds `ab` to the logits before it
     multiplies by `sm_scale` (flash_attention.py:402-409), which would scale
     T5's position bias along with them.
     """
-    from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
+    from jax.experimental.pallas.ops.tpu.flash_attention import SegmentIds, flash_attention
 
     heads = query.shape[-2]
     key = repeat_kv_heads(key, heads)
@@ -1496,8 +1562,9 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
             jnp.where(mask, 0, jnp.finfo(q.dtype).min).astype(q.dtype),
             (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
         combined = seated if combined is None else combined + seated
+    segments = None if segment_ids is None else SegmentIds(segment_ids, segment_ids)
     return jnp.moveaxis(
-        flash_attention(q, k, v, ab=combined, causal=causal), -3, -2)
+        flash_attention(q, k, v, ab=combined, segment_ids=segments, causal=causal), -3, -2)
 
 
 @logical_axes({

@@ -24,6 +24,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
     tpu_runs,
 )
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.telemetry.devices import apply_xla_flags, deterministic_ops_requested, xla_flag
 from dew.training import MeshSpec, build_mesh
 
@@ -278,14 +279,49 @@ def test_auto_stays_on_xla_where_the_mesh_splits_the_sequence(tpu_backend):
         assert not tpu_runs(query, key)
 
 
-def test_a_softcapped_call_never_reaches_either_tpu_kernel(tpu_backend):
-    """No fused kernel has Gemma 2's tanh between the scaling and the
-    softmax, so 'auto' resolves it to xla and an explicit 'tpu' refuses by
-    name."""
+@pytest.mark.parametrize("extra", [
+    {"softcap": 30.0},
+    {"sinks": jnp.zeros((8,))},
+    {"segment_ids": jnp.ones((2, 512), jnp.int32)},
+])
+def test_softcap_sinks_and_packed_documents_reach_splash(tpu_backend, extra):
+    """Gemma's softcap, GPT-OSS's sinks and a packed batch's segment ids are
+    arguments of the splash kernel, so 'auto' sends them there rather than
+    to the XLA paths that hold the whole [B, H, S, S] logits."""
     query, key, value = qkv((2, 512, 8, 128))
-    assert not tpu_runs(query, key, 30.0)
-    assert kernel_chosen(query, key, value, implementation='auto', softcap=30.0) == set()
-    with pytest.raises(ValueError, match="'tpu'"):
+    assert kernel_chosen(query, key, value, implementation='auto', causal=True,
+                         **extra) == {'splash'}
+
+
+def test_a_packed_model_hands_splash_its_segment_ids(tpu_backend):
+    """The mixer passes a packed batch's ids down instead of building the
+    [B, 1, S, S] document mask, which as a value of the trace would have
+    kept the call off splash. A full and a sliding layer, since the sliding
+    one runs `local_attention`."""
+    model = CausalTransformer(
+        vocab_size=64, num_layers=2, emb_features=64, num_heads=4, num_kv_heads=2,
+        max_seq_len=512, layer_types=("sliding_attention", "full_attention"),
+        kinds={"sliding_attention": {"window": 128}})
+    ids = jnp.zeros((2, 512), jnp.int32)
+    segment_ids = jnp.asarray(np.repeat(np.arange(1, 5), 128)[None].repeat(2, 0), jnp.int32)
+    positions = jnp.asarray(np.tile(np.arange(128), 4)[None].repeat(2, 0))
+    params = jax.eval_shape(model.init, jax.random.PRNGKey(0), ids)
+    printed = jax.make_jaxpr(lambda p: model.apply(
+        p, ids, positions=positions, segment_ids=segment_ids))(params).pretty_print(
+            use_color=False)
+    # Both layers run splash's segmented forward and nothing builds a mask.
+    assert printed.count('pallas_call') == 2
+    assert 'splash_mha_fwd_segmented' in printed
+    assert 'bool[2,1,512,512]' not in printed and 'bool[2,512,512]' not in printed
+
+
+def test_an_explicit_tpu_call_splash_cannot_describe_refuses_a_softcap(tpu_backend):
+    """A bias sends an explicit 'tpu' to the flash kernel, which has no tanh
+    and no sinks, so the call raises rather than dropping the cap."""
+    query, key, value = qkv((2, 512, 8, 128))
+    bias = jnp.zeros((2, 8, 512, 512), jnp.bfloat16)
+    with pytest.raises(ValueError, match="splash"):
         jax.eval_shape(
-            lambda q, k, v: attention_kernel(q, k, v, implementation='tpu', softcap=30.0),
+            lambda q, k, v: attention_kernel(q, k, v, implementation='tpu', softcap=30.0,
+                                             bias=bias),
             query, key, value)
