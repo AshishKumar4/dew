@@ -84,9 +84,9 @@ def document_mask(segment_ids) -> jax.Array:
     """Keep each packed document to itself: `[B, S, S]` boolean.
 
     Two positions see each other when they carry the same segment id.
-    Segment 0 is padding, which sees nothing and is seen by nothing. A
-    packed batch carries its structure here, so the caller ANDs causality
-    in rather than handing the kernels their causal flag.
+    Segment 0 is padding, which sees nothing and is seen by nothing. This is
+    the mask every kernel but splash and the pallas flash kernel reads for
+    `segment_ids`; those two compare the ids per block.
     """
     segment_ids = jnp.asarray(segment_ids)
     return ((segment_ids[:, :, None] == segment_ids[:, None, :])
@@ -1511,7 +1511,7 @@ def splash_dense_mask(mask, q_len: int, kv_len: int, heads: int):
     Returns None when splash cannot carry it, which three things cause. The
     mask is a value of the trace: the descriptor is built while the
     executable is, so a tracer cannot be read, and a decode mask over cache
-    slots and a packed batch's segment mask are both tracers. Or it has a
+    slots is one. Or it has a
     batch axis wider than one: splash indexes by head and position and has
     no batch axis. Or it is large: unresolved blocks are stored dense inside
     the executable, so past `SPLASH_DENSE_MASK_CELLS` the additive-bias path
