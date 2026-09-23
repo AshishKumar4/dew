@@ -250,6 +250,27 @@ def test_published_qwen_image_prompt_encoding_matches_the_source_pipeline(loaded
         encoder.tokenize(["x" * (encoder.tokens + 1)])
 
 
+def test_the_prompt_states_are_the_decoders_own_last_layer_output():
+    """The conditioner embeds through the decoder's own path, so a decoder
+    that scales its embeddings, by Gemma's sqrt(d) or a muP multiplier,
+    gives the conditioner the last layer's output of its own forward."""
+    from dew.inputs.diffusion import _residual_states
+    from dew.nn.backbones.causal_transformer import (
+        INTERMEDIATES,
+        CausalTransformer,
+        layer_output,
+        layer_outputs,
+    )
+
+    model = CausalTransformer(vocab_size=37, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
+                              max_seq_len=16, embedding_scale=True, embedding_multiplier=12.0)
+    ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 37)
+    params = model.init(jax.random.key(1), ids)
+    _, state = model.apply(params, ids, capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
+    np.testing.assert_array_equal(model.apply(params, ids, method=_residual_states),
+                                  layer_output(state[INTERMEDIATES], 1))
+
+
 def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, record):
     """`load_pretrained().text_to_image()` reproduces the source's own call:
     its 40 default steps, no guidance, the sigmas its call lays out shifted
