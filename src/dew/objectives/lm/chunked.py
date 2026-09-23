@@ -405,7 +405,7 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
     `-inf` for a target outside its support, and whether each target had one;
     a target with none scores 0.0 here.
     """
-    table = head_weight.T
+    table = jnp.asarray(head_weight).T
     width = targets.shape[1]
     kept = support_ids.shape[1]
     block = max(1, min(kept, SUPPORT_BLOCK // targets.shape[0]))
