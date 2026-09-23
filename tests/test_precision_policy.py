@@ -297,3 +297,17 @@ def test_a_rounded_operand_rounds_under_jit_on_this_device():
     rounded = jax.jit(lambda x: rounded_operand(x, jnp.bfloat16))(x)
     assert jnp.array_equal(rounded, x.astype(jnp.bfloat16).astype(jnp.float32))
     assert not jnp.array_equal(rounded, x)
+
+
+@pytest.mark.parametrize("source,target", [(jnp.float16, jnp.bfloat16), (jnp.bfloat16, jnp.float16),
+                                           (jnp.float32, jnp.float16)])
+def test_a_rounded_operand_rounds_between_formats_of_one_width(source, target):
+    """float16 and bfloat16 are both two bytes and each loses bits in the
+    other, so the rounding is the cast round trip whatever the byte counts."""
+    from dew.nn.precision import rounded_operand
+    x = jnp.asarray([1 + 2**-9, 3.0e-5, 1000.25, 70000.0 if source != jnp.float16 else 1.0],
+                    source)
+    rounded = jax.jit(lambda x: rounded_operand(x, target))(x)
+    assert rounded.dtype == source
+    assert jnp.array_equal(rounded, x.astype(target).astype(source), equal_nan=True)
+    assert not jnp.array_equal(rounded, x)
