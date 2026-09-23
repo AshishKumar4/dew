@@ -826,3 +826,33 @@ def test_z_loss_gradient_carries_the_reference_factor():
 def test_a_negative_z_loss_is_refused():
     with pytest.raises(ValueError, match="nonnegative"):
         make_objective(z_loss=-1e-4)
+
+
+def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
+    """The term is the coefficient times each router's squared logsumexp of
+    its gate logits, averaged over the positions it routed and summed over
+    routers, beside the cross entropy and not inside its token mean."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
+                              max_seq_len=8, mixture=Mixture(experts=4, top_k=2, expert_features=16))
+    tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, 64)
+    plain = LMObjective(model, 8, ema_decay=None)
+    zed = LMObjective(model, 8, ema_decay=None, router_z_loss=0.3)
+    params = plain.init(jax.random.key(0))
+    base, _ = plain.reduce_loss(plain.loss(params, {TEXT_KEY: tokens}, step_at())[0])
+    stats, aux = zed.loss(params, {TEXT_KEY: tokens}, step_at())
+    total, _ = zed.reduce_loss(stats)
+
+    # The oracle: each layer's gate logits recomputed from its kernel and
+    # the normed input the router saw, captured by flax's intermediates.
+    _, state = model.apply(params, tokens[:, :-1], capture_intermediates=True,
+                           mutable=["intermediates"])
+    expected = 0.0
+    for index in range(2):
+        layer = state["intermediates"][f"layers_{index}"]
+        normed = layer["post_attention_layernorm"]["__call__"][0]
+        kernel = params["params"][f"layers_{index}"]["mlp"]["gate"]["kernel"]
+        logits = normed.astype(jnp.float32) @ kernel
+        expected += 0.3 * float(jnp.mean(jnp.square(jax.nn.logsumexp(logits, -1))))
+    np.testing.assert_allclose(float(total - base), expected, rtol=1e-5)
+    np.testing.assert_allclose(float(aux.metrics["router_z_loss"]), expected, rtol=1e-5)

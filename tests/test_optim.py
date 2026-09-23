@@ -591,3 +591,32 @@ def test_muonclip_moves_a_real_step():
     assert all(np.isfinite(losses)), losses
     assert all(np.isfinite(plain_losses)), plain_losses
     assert largest_update_difference(params, muon_params) > 1e-6
+
+
+def test_mup_groups_decay_and_scale_the_parameters_lm_engine_does():
+    """A decoder's norms take no decay at the base rate, its embeddings the
+    base rate with decay, and every projection the rate over m_width: one
+    AdamW step on a zero gradient is then pure decay, and it moves exactly
+    the embeddings and projections, by rate * decay and rate / m_width *
+    decay of themselves."""
+    from dew.training.optim import mup_param_groups
+    params = decoder_params()["params"]
+    config = OptimConfig(optimizer="adamw", learning_rate=0.1, weight_decay=0.5,
+                         param_groups=mup_param_groups(4.0))
+    solver = build_optimizer(config, steps=1)
+    updates, _ = solver.update(jax.tree.map(jnp.zeros_like, params), solver.init(params), params)
+    np.testing.assert_allclose(updates["layers_0"]["input_layernorm"]["scale"], 0.0)
+    np.testing.assert_allclose(updates["norm"]["scale"], 0.0)
+    np.testing.assert_allclose(updates["embed_tokens"]["embedding"],
+                               -0.1 * 0.5 * params["embed_tokens"]["embedding"], rtol=1e-6)
+    kernel = params["layers_1"]["self_attn"]["q_proj"]["kernel"]
+    np.testing.assert_allclose(updates["layers_1"]["self_attn"]["q_proj"]["kernel"],
+                               -0.1 / 4.0 * 0.5 * kernel, rtol=1e-6)
+
+
+def test_a_parameter_no_group_claims_is_refused():
+    from dew.training.optim import ParamGroup
+    config = OptimConfig(optimizer="adamw", param_groups=(ParamGroup("norms", ("*/scale",)),))
+    params = decoder_params()["params"]
+    with pytest.raises(ValueError, match="matches no param group"):
+        build_optimizer(config, steps=1).init(params)

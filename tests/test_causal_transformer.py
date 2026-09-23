@@ -919,3 +919,74 @@ def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
     gemma_config = {**base, "model_type": "gemma3_text", "head_dim": 8, "hidden_activation": "gelu_pytorch_tanh",
                     "query_pre_attn_scalar": 8, "sliding_window": 4}
     assert translate_config(gemma_config)["scale_after_cast"] is False
+
+
+def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head():
+    """The float64 projection y - (<y, v> / <v, v>) v with each value head
+    repeated over its query group, forward and backward; the result is
+    orthogonal to the token's own value, and a zero value leaves y alone
+    where lm-engine's unguarded division is NaN."""
+    from jax.test_util import check_grads
+
+    from dew.nn.mixers.attention import exclusive_self_attention
+    with jax.enable_x64(True):
+        keys = jax.random.split(jax.random.key(0), 2)
+        y = jax.random.normal(keys[0], (2, 5, 4, 8), jnp.float64)
+        v = jax.random.normal(keys[1], (2, 5, 2, 8), jnp.float64).at[1, 3, 1].set(0.0)
+
+        def oracle(y, v):
+            v = np.repeat(np.asarray(v), 2, axis=-2)
+            norm = np.sum(v * v, -1, keepdims=True)
+            safe = np.where(norm > 0, norm, 1)
+            return np.asarray(y) - np.where(norm > 0, np.sum(np.asarray(y) * v, -1, keepdims=True) / safe, 0) * v
+
+        out = exclusive_self_attention(y, v)
+        np.testing.assert_allclose(out, oracle(y, v), rtol=1e-13, atol=1e-13)
+        own = jnp.repeat(v, 2, axis=-2)
+        np.testing.assert_allclose(jnp.sum(out * own, -1), 0.0, atol=1e-12)
+        np.testing.assert_array_equal(out[1, 3, 2:], y[1, 3, 2:])
+        # Backward against finite differences, away from the zero value,
+        # where the projection jumps and no derivative exists.
+        smooth = jax.random.normal(keys[1], (2, 5, 2, 8), jnp.float64)
+        check_grads(exclusive_self_attention, (y, smooth), order=1, modes=["rev"])
+
+
+def nope_model(**overrides) -> CausalTransformer:
+    return CausalTransformer(vocab_size=32, emb_features=32, num_layers=1, num_heads=4,
+                             num_kv_heads=2, max_seq_len=16, qk_norm=False, nope=True, **overrides)
+
+
+def test_a_nope_layer_reads_no_positions_and_keeps_its_logit_scale():
+    """Without rotation the positions a caller hands in change nothing, and
+    attention_scale still scales the logits as it does with rope."""
+    tokens = jax.random.randint(jax.random.key(1), (2, 12), 0, 32)
+    model = nope_model()
+    variables = model.init(jax.random.key(0), tokens)
+    plain = model.apply(variables, tokens)
+    shifted = model.apply(variables, tokens, positions=jnp.arange(12) + 100)
+    np.testing.assert_array_equal(plain, shifted)
+    roped = CausalTransformer(vocab_size=32, emb_features=32, num_layers=1, num_heads=4,
+                              num_kv_heads=2, max_seq_len=16, qk_norm=False)
+    assert not np.allclose(roped.apply(variables, tokens), plain)
+    scaled = nope_model(attention_scale=1.0).apply(variables, tokens)
+    assert not np.allclose(scaled, plain)
+
+
+def test_lm_engine_init_draws_each_matrix_at_its_std():
+    """initializer_range 0.02 under m_width 4 and depth scaling: embeddings
+    at 0.02, hidden projections at 0.01, output projections at
+    0.01 / sqrt(2 * layers), norms at one."""
+    from dew.nn.backbones.causal_transformer import Mixture
+    model = CausalTransformer(vocab_size=512, emb_features=128, num_layers=2, num_heads=4,
+                              qk_norm=False, mixture=Mixture(experts=4, top_k=2, expert_features=64),
+                              logits_scaling=4.0, initializer_range=0.02, depth_scaled_init=True)
+    params = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))["params"]
+    layer = params["layers_0"]
+    for leaf, std in ((params["embed_tokens"]["embedding"], 0.02),
+                      (layer["self_attn"]["q_proj"]["kernel"], 0.01),
+                      (layer["mlp"]["gate"]["kernel"], 0.01),
+                      (layer["mlp"]["experts"]["up_proj"]["kernel"], 0.01),
+                      (layer["self_attn"]["o_proj"]["kernel"], 0.01 / 2),
+                      (layer["mlp"]["experts"]["down_proj"]["kernel"], 0.01 / 2)):
+        np.testing.assert_allclose(float(jnp.std(leaf)), std, rtol=0.1)
+    np.testing.assert_array_equal(layer["input_layernorm"]["scale"], 1.0)

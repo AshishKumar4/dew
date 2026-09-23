@@ -45,8 +45,8 @@ def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Arra
 
     Exclusive self attention (arXiv 2603.09078) as lm-engine implements it
     (`SoftmaxAttention._compute_xsa_output`, softmax_attention/module.py at
-    45b6b57b): `y - (<y, v> / <v, v>) v` per token and query head, in fp32,
-    with the key/value head repeated over its query group. `attention` is
+    45b6b57b): `y - (<y, v> / <v, v>) v` per token and query head, in fp32
+    at least, with the key/value head repeated over its query group. `attention` is
     `[B, S, heads, D]`, `value` `[B, S, kv_heads, D]`.
 
     lm-engine divides by `<v, v>` with no guard, so a zero value vector
@@ -57,8 +57,9 @@ def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Arra
     heads, kv_heads = attention.shape[-2], value.shape[-2]
     if heads % kv_heads:
         raise ValueError(f"{heads} query heads do not group over {kv_heads} value heads")
-    value = jnp.repeat(value.astype(jnp.float32), heads // kv_heads, axis=-2)
-    work = attention.astype(jnp.float32)
+    dtype = jnp.promote_types(jnp.promote_types(attention.dtype, value.dtype), jnp.float32)
+    value = jnp.repeat(value.astype(dtype), heads // kv_heads, axis=-2)
+    work = attention.astype(dtype)
     norm = jnp.sum(value * value, axis=-1, keepdims=True)
     along = jnp.sum(work * value, axis=-1, keepdims=True) / jnp.where(norm > 0, norm, 1)
     return (work - jnp.where(norm > 0, along, 0) * value).astype(attention.dtype)
