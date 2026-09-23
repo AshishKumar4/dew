@@ -15,6 +15,15 @@ only through the table, so a server can hand pages out on demand, share the
 pages of a common prompt prefix between rows, and hold more rows than
 `pages * page_size / capacity` whenever they are shorter than the capacity.
 
+A pool may be split into `groups`: the rows fall into that many equal
+groups in row order, the pool into as many equal parts, and a row's table
+names pages of its own group's part, counted from the start of that part.
+Reads and writes run mapped over the groups, so the group is a batch
+dimension of every gather and scatter into the pool. A server whose mesh
+splits its rows `n` ways splits the pool into `n` groups, and each device
+then reads and writes only the pages it holds. A pool indexed as one table
+into the whole of a split pool would be gathered onto every device first.
+
 A quantized cache stores int8 or float8 (e4m3) values with one float32
 scale per token and head, the absmax over the head's features divided by
 the format's largest value. Reads dequantize to the compute dtype.
@@ -88,12 +97,15 @@ class KVCache:
     `capacity` has to be a multiple of it, and `pages` sizes the shared
     pool, None allocating one page per slot of every row the cache is
     opened for (as much memory as the dense layout). A smaller pool is a
-    server's to hand out (`dew.inference.serving.Server`).
+    server's to hand out (`dew.inference.serving.Server`). `groups` splits
+    a paged pool into that many parts, one per equal group of rows (see
+    the module docstring); the row count and `pages` have to divide by it.
     """
 
     quantized: KVDtype | None = None
     page_size: int | None = None
     pages: int | None = None
+    groups: int = 1
 
     def __post_init__(self) -> None:
         if self.quantized is not None and self.quantized not in _LIMITS:
@@ -105,6 +117,12 @@ class KVCache:
                 raise ValueError("a page count needs a page_size")
             if type(self.pages) is not int or self.pages < 1:
                 raise ValueError(f"pages must be a positive integer, got {self.pages!r}")
+        if type(self.groups) is not int or self.groups < 1:
+            raise ValueError(f"groups must be a positive integer, got {self.groups!r}")
+        if self.groups > 1 and self.page_size is None:
+            raise ValueError("groups split a paged pool; a dense cache is already split by its rows")
+        if self.pages is not None and self.pages % self.groups:
+            raise ValueError(f"a pool of {self.pages} pages does not split into {self.groups} equal groups")
 
     def storage(self, dtype: jnp.dtype) -> jnp.dtype:
         """The dtype the cache holds values of `dtype` in."""
@@ -153,10 +171,16 @@ def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
 
 
 def write_cache(buffer: jax.Array, values: jax.Array, positions: jax.Array) -> jax.Array:
-    """`values` `[rows, tokens, ...]` written at per-row slots `positions`; a slot of -1 drops."""
+    """`values` `[rows, tokens, ...]` written at per-row slots `positions`; a slot of -1 drops.
+
+    The write is mapped over rows, so the row is a batch dimension of the
+    scatter. GSPMD splits such a scatter wherever the rows split, with no
+    collective; written as one scatter indexed by an iota over the rows, it
+    gathers the values and indices of every row onto every device first.
+    """
     slots = jnp.where(positions >= 0, positions, buffer.shape[1])
-    return buffer.at[jnp.arange(buffer.shape[0])[:, None], slots].set(
-        values.astype(buffer.dtype), mode="drop")
+    return jax.vmap(lambda row, incoming, at: row.at[at].set(incoming.astype(row.dtype), mode="drop"))(
+        buffer, values, slots)
 
 
 def filled_slots(cursor: jax.Array, capacity: int) -> jax.Array:
@@ -164,17 +188,26 @@ def filled_slots(cursor: jax.Array, capacity: int) -> jax.Array:
     return jnp.arange(capacity)[None, :] < cursor[:, None]
 
 
-def default_page_table(rows: int, per_row: int, pages: int) -> jax.Array:
-    """Row `r` owns pages `r * per_row` onward, a private contiguous block.
+def default_page_table(rows: int, per_row: int, pages: int, groups: int) -> jax.Array:
+    """Each row owns a private contiguous block of `per_row` pages in its group's part.
 
-    That is what a cache opened outside a server reads, over the default
-    pool of one page per slot of every row. A smaller pool cannot give every
-    row a block: the pages past its end read as `pages`, an index no pool
-    holds, and a write through one fails the store's device check. A server
-    writes its rows' tables itself, so it never writes through them.
+    Row `r` of a group holds pages `r * per_row` onward, counted from the
+    start of the part. That is what a cache opened outside a server reads,
+    over the default pool of one page per slot of every row. A smaller pool
+    cannot give every row a block: the pages past the end of a part read as
+    the part's size, an index no part holds, and a write through one fails
+    the store's device check. A server writes its rows' tables itself, so it
+    never writes through them.
     """
-    table = jnp.arange(rows * per_row, dtype=jnp.int32).reshape(rows, per_row)
-    return jnp.where(table < pages, table, pages)
+    part = pages // groups
+    table = jnp.tile(jnp.arange(rows // groups * per_row, dtype=jnp.int32).reshape(rows // groups, per_row),
+                     (groups, 1))
+    return jnp.where(table < part, table, part)
+
+
+def grouped(array: jax.Array, axis: int, groups: int) -> jax.Array:
+    """`array` with `axis` split in two, `[groups, size // groups]`, the group outer."""
+    return array.reshape(*array.shape[:axis], groups, array.shape[axis] // groups, *array.shape[axis + 1:])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -211,9 +244,11 @@ class KVStore:
                 raise ValueError(f"a paged cache of {capacity} slots needs a multiple of "
                                  f"page_size {layout.page_size}")
             per_row = capacity // layout.page_size
+            if rows % layout.groups:
+                raise ValueError(f"{rows} rows do not split into the pool's {layout.groups} groups")
             pages = rows * per_row if layout.pages is None else layout.pages
             shape = (kv_heads, pages, layout.page_size, head_dim)
-            module.variable("cache", TABLE, default_page_table, rows, per_row, pages)
+            module.variable("cache", TABLE, default_page_table, rows, per_row, pages, layout.groups)
         for name in ("cached_key", "cached_value"):
             module.variable("cache", name, jnp.zeros, shape, storage)
         if layout.quantized is not None:
@@ -249,19 +284,25 @@ class KVStore:
         """`values` `[rows, tokens, heads, ...]` stored at `positions`; -1 drops."""
         if self.layout.page_size is None:
             return write_cache(buffer, values, positions)
-        page_size = self.layout.page_size
-        table = self._get(TABLE)
+        page_size, groups = self.layout.page_size, self.layout.groups
+        part = buffer.shape[1] // groups
         safe = jnp.maximum(positions, 0)
-        page = jnp.take_along_axis(table, safe // page_size, axis=1)
+        page = jnp.take_along_axis(self._get(TABLE), safe // page_size, axis=1)
         if self.rows * (self.capacity // page_size) > buffer.shape[1]:
             # A pool smaller than every row's capacity: only a caller that
             # assigns pages (`dew.inference.serving.Server`) may write to it.
-            checkify.check(jnp.all((page < buffer.shape[1]) | (positions < 0)),
+            checkify.check(jnp.all((page < part) | (positions < 0)),
                            "a row wrote past the page pool; a pool smaller than every row's "
                            "capacity needs a server to assign its pages")
-        page = jnp.where(positions >= 0, page, buffer.shape[1])
-        # [rows, tokens, heads, ...] -> [heads, rows, tokens, ...] for the pool's head-major index.
-        return buffer.at[:, page, safe % page_size].set(jnp.moveaxis(values, 2, 0), mode="drop")
+        page = jnp.where(positions >= 0, page, part)
+
+        def stored(pool: jax.Array, page: jax.Array, offset: jax.Array, incoming: jax.Array) -> jax.Array:
+            # [rows, tokens, heads, ...] -> [heads, rows, tokens, ...] for the pool's head-major index.
+            return pool.at[:, page, offset].set(jnp.moveaxis(incoming, 2, 0), mode="drop")
+
+        return jax.vmap(stored, in_axes=(1, 0, 0, 0), out_axes=1)(
+            grouped(buffer, 1, groups), grouped(page, 0, groups), grouped(safe % page_size, 0, groups),
+            grouped(values, 0, groups)).reshape(buffer.shape)
 
     def read(self) -> tuple[jax.Array, jax.Array]:
         return self._read("cached_key", "key_scale"), self._read("cached_value", "value_scale")
@@ -270,13 +311,17 @@ class KVStore:
         stored = self._get(name)
         scale = None if self.layout.quantized is None else self._get(scale_name)
         if self.layout.page_size is not None:
-            table = self._get(TABLE)
-            # [heads, rows, per_row, page, ...] -> [rows, capacity, heads, ...]
-            stored = jnp.moveaxis(stored[:, table].reshape(
-                self.kv_heads, self.rows, self.capacity, self.head_dim), 0, 2)
-            if scale is not None:
-                scale = jnp.moveaxis(scale[:, table].reshape(self.kv_heads, self.rows, self.capacity), 0, 2)
+            stored = self._gathered(stored)
+            scale = None if scale is None else self._gathered(scale)
         return stored.astype(self.dtype) if scale is None else dequantize(stored, scale, self.dtype)
+
+    def _gathered(self, pool: jax.Array) -> jax.Array:
+        """Every row's slots of `pool` `[heads, pages, page_size, ...]`, as `[rows, capacity, heads, ...]`."""
+        groups = self.layout.groups
+        rows = jax.vmap(lambda part, table: part[:, table], in_axes=(1, 0), out_axes=1)(
+            grouped(pool, 1, groups), grouped(self._get(TABLE), 0, groups))
+        # [heads, groups, rows / groups, per_row, page_size, ...] -> [rows, capacity, heads, ...]
+        return jnp.moveaxis(rows.reshape(self.kv_heads, self.rows, self.capacity, *pool.shape[3:]), 0, 2)
 
     def kernel(self) -> bool:
         """Whether decode runs the Pallas TPU paged kernel rather than the XLA gather.
@@ -286,10 +331,13 @@ class KVStore:
         the pool's full width first, so a float32 or quantized pool takes
         the gather. A GPU takes the gather too: jax deprecated its Triton
         paged kernel (`jax.experimental.pallas.ops.gpu.paged_attention`),
-        which ran 2% faster than the gather on an A100.
+        which ran 2% faster than the gather on an A100. A pool split into
+        groups takes the gather as well: the kernel indexes one pool with
+        one table, and the grouped gather is what keeps each group's pages
+        on the device that holds them.
         """
         return (self.layout.page_size is not None and self.layout.quantized is None
-                and self.dtype == jnp.bfloat16 and jax.default_backend() == "tpu")
+                and self.layout.groups == 1 and self.dtype == jnp.bfloat16 and jax.default_backend() == "tpu")
 
     def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None) -> jax.Array:
         """One query per row `[rows, heads, head_dim]` against the first

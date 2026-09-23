@@ -174,6 +174,25 @@ def test_a_pool_too_small_for_every_row_refuses_a_write_no_server_assigned():
     np.testing.assert_array_equal(whole(prompts, 40, seed=0).tokens, dense(prompts, 40, seed=0).tokens)
 
 
+def test_a_pool_split_into_groups_reads_what_each_row_wrote():
+    """A pool in two parts, one per row: each row's table counts pages from
+    the start of its own part, and every read and write runs mapped over the
+    parts. Decoding through it draws what the dense cache draws."""
+    from dew.inference import TextGeneration
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.sampling import Sampling
+
+    def model(layout):
+        return CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                                 mlp_features=32, max_seq_len=128, dtype="float32", kv_cache=layout)
+
+    params = model(KVCache()).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    prompts = np.array([[1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1]])
+    grouped = TextGeneration(model(KVCache(page_size=16, groups=2)), params, sampling=Sampling(temperature=0))
+    dense = TextGeneration(model(KVCache()), params, sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(grouped(prompts, 40, seed=0).tokens, dense(prompts, 40, seed=0).tokens)
+
+
 def test_beam_search_refuses_a_paged_cache():
     from dew.nn.backbones.causal_transformer import gather_cache_rows
 
