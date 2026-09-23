@@ -27,7 +27,14 @@ from dew.data import Dataset
 from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, Observation, Score
+from dew.objectives.rl import (
+    EnvironmentSource,
+    EpisodeStatus,
+    GRPOObjective,
+    Observation,
+    Score,
+    sessions as sessions_module,
+)
 from dew.objectives.rl.scheduler import RolloutScheduler
 from dew.objectives.rl.sessions import Call, Session, Status, pack
 from dew.sampling import Sampling
@@ -244,6 +251,19 @@ def test_an_unscored_truncation_under_score_is_retried_rather_than_failing_the_s
     batch = rollout(State(0), next(iter(data.train())), None)
     assert records[-1].resubmitted == {"unscored": 1} and records[-1].groups == 2
     assert trained(batch)[0] == [0, 1, 2, 3]
+
+
+def test_admission_builds_each_sessions_chains_once_however_many_groups_complete(monkeypatch):
+    # Fitting every completing group against those before it must not rebuild
+    # their chains: once when a group completes, once more in pack.
+    built = []
+    original = sessions_module._chains
+    monkeypatch.setattr(sessions_module, "_chains", lambda *args: built.append(args) or original(*args))
+    tasks = tuple(range(16))
+    source = Scripted(lambda task, submission, sample, version: finished(float(sample), version))
+    rollout, data, records = scheduler(source, ahead=0, rows=32, stream=(tasks,))
+    rollout(State(0), next(iter(data.train())), None)
+    assert records[-1].groups == 16 and len(built) == 2 * 16 * 2
 
 
 def test_oversampled_stragglers_are_cancelled_once_the_group_is_full():
