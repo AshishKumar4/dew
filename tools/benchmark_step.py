@@ -79,7 +79,7 @@ from dew.objectives.lm import LMObjective
 from dew import models  # naming a registry fills it
 from dew.registry import resolve_dtype, with_precision
 from dew.telemetry.instrumentation import model_flops_utilization
-from dew.training import Layout, MeshSpec, Trainer
+from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.runtime import prepare_process
 
@@ -139,6 +139,11 @@ class Case:
     mesh: dict[str, int] = field(default_factory=dict)
     """`MeshSpec` fields, `{"fsdp": 2, "tensor": 2}`; the empty record is
     data parallelism over every device."""
+    device_order: list[int] | None = None
+    """The global device ids, in the order the mesh lays them out; None is
+    `jax.devices()`'s. The innermost axis takes consecutive entries, so
+    `[0, 2, 1, 3]` puts a size-2 inner axis across the pairs `[0, 1]` would
+    keep together."""
     image_size: int = 32
     channels: int = 3
     """Input channels, including four-channel latent diffusion inputs."""
@@ -194,8 +199,9 @@ class Case:
         experts = f" x{mixture['experts']}experts" if isinstance(mixture, dict) else ""
         canvases = f" x{canvas_split(self)[2]}canvas" if self.canvas else ""
         images = f" x{images_per_row(self)}img" if self.media else ""
+        order = "" if self.device_order is None else " order" + "".join(map(str, self.device_order))
         return (f"{self.architecture}{experts}{canvases}{images} b{self.batch_size} "
-                f"{mesh_label(self.mesh)}")
+                f"{mesh_label(self.mesh)}{order}")
 
 
 def mesh_spec(mesh: Mapping[str, int]) -> MeshSpec:
@@ -642,11 +648,15 @@ def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
 def build_trainer(case: Case, attention_impl: str = 'auto',
                   optimizer: optax.GradientTransformation | None = None) -> Trainer:
     """The trainer a recipe would build for this case, minus the tracker and the
-    checkpoints."""
-    return Trainer(
+    checkpoints, on the case's device order."""
+    trainer = Trainer(
         build_objective(case, attention_impl), optimizer or optax.adam(1e-4), key=jax.random.key(0),
         mesh=mesh_spec(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
         checkpoints=None, tracker=None)
+    if case.device_order is not None:
+        by_id = {device.id: device for device in jax.devices()}
+        trainer.device_mesh = build_mesh(trainer.mesh, [by_id[index] for index in case.device_order])
+    return trainer
 
 
 def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> ModelInputs:
@@ -990,6 +1000,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "architecture": case.architecture,
             "batch_size": case.batch_size,
             "mesh": case.mesh,
+            "device_order": case.device_order,
             "mesh_shape": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
             "processes": jax.process_count(),
             "sample_shape": [case.seq_len] if case.is_lm else list(case.sample_shape),
