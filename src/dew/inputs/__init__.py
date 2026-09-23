@@ -9,7 +9,8 @@ objective does the encoding.
 
 Image and video batches arrive as uint8 pixels in [0, 255], the way the data
 workers write them. `unit_range` is the one conversion to the [-1, 1] range
-every diffusion loss, sample, artifact and image metric lives in.
+every diffusion loss, sample, artifact and image metric lives in, and
+`uint8_pixels` the one conversion back.
 """
 
 from __future__ import annotations
@@ -31,6 +32,18 @@ from .encoders import CharTable, CLIPText, ConditionEncoder, T5Text, rebuild
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
     """uint8 pixels in [0, 255] as float32 in [-1, 1]."""
     return (jnp.asarray(pixels, jnp.float32) - 127.5) / 127.5
+
+
+def uint8_pixels(images: jax.typing.ArrayLike) -> np.ndarray:
+    """[-1, 1] pixels as uint8 in [0, 255], on the host.
+
+    Each value goes to its nearest level, `(x + 1) * 127.5` in float32
+    rounded half to even (`np.rint`), then clipped, because a sample can
+    leave the range. A metric scores and a tracker previews these bytes, so
+    the two see the same image.
+    """
+    levels = np.rint((np.asarray(images, np.float32) + 1.0) * 127.5)
+    return np.clip(levels, 0, 255).astype(np.uint8)
 
 
 def pixel_field(height: int, width: int, channels: int = 3) -> Field:
@@ -132,4 +145,4 @@ class InputSpec:
 from .diffusion import DiffusionConditioner
 
 __all__ = ["CLIPText", "CharTable", "Condition", "ConditionEncoder", "DiffusionConditioner", "Field",
-           "InputSpec", "T5Text", "pixel_field", "rebuild", "unit_range"]
+           "InputSpec", "T5Text", "pixel_field", "rebuild", "uint8_pixels", "unit_range"]

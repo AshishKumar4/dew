@@ -26,6 +26,7 @@ import jax
 import numpy as np
 
 from dew.artifacts import Artifact, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
+from dew.inputs import uint8_pixels
 from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value
 
 if TYPE_CHECKING:
@@ -64,8 +65,8 @@ def _home(array: jax.Array | np.ndarray) -> np.ndarray:
     return np.asarray(array)
 
 def _uint8(images: jax.Array | np.ndarray) -> np.ndarray:
-    """[-1, 1] floats as the bytes an image viewer reads."""
-    return np.clip((_home(images).astype(np.float32) + 1.0) * 127.5, 0, 255).astype(np.uint8)
+    """[-1, 1] floats as the bytes an image viewer reads, the bytes a metric scores."""
+    return uint8_pixels(_home(images))
 
 
 def _png(image: np.ndarray) -> bytes:

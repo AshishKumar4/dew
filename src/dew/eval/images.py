@@ -19,9 +19,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.typing import ArrayLike
-from numpy.typing import NDArray
 
 from dew.artifacts import ImageGrid
+from dew.inputs import uint8_pixels
 from dew.objectives.base import Batch
 from dew.registry import metrics
 
@@ -62,12 +62,6 @@ def _equal_counts(images: int, prompts: int) -> None:
     if images != prompts:
         raise ValueError(f"CLIP scored {images} images against {prompts} prompts; "
                          "equal counts are required")
-
-
-def _uint8_pixels(images: ArrayLike) -> NDArray[np.uint8]:
-    """Convert a sampler's [-1, 1] pixels to uint8, nearest value and clipped, because
-    a sample can leave the range."""
-    return np.clip(np.round((np.asarray(images) + 1.0) * 127.5), 0, 255).astype(np.uint8)
 
 
 def clip_image_text_cosine(images: ArrayLike, input_ids: ArrayLike, attention_mask: ArrayLike, *,
@@ -127,7 +121,7 @@ def clip_score(images: ArrayLike, prompts: Sequence[str], *, modelname: str = DE
 def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: str) -> jax.Array:
     """Return the per-image cosine for one sampled grid and its batch's prompts."""
     text = batch[field]
-    return clip_image_text_cosine(_uint8_pixels(artifact.images), text["input_ids"],
+    return clip_image_text_cosine(uint8_pixels(artifact.images), text["input_ids"],
                                   text["attention_mask"], modelname=modelname)
 
 
