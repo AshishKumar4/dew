@@ -401,21 +401,30 @@ def _joined(resident: Slots, carried: Slots) -> Slots:
                         is_leaf=lambda leaf: leaf is None)
 
 
-def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placement,
+def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
              resident: Slots, carried: Slots,
              admission: Admission | None, transforms: tuple[LogitsTransform, ...],
              stopping: tuple[Stopping, ...], grammar: Grammar | None
              ) -> tuple[checkify.Error, tuple[Slots, Slots, Draws]]:
-    """Run `_advanced` over a split state, carrying its device checks as a value.
+    """Run `steps` iterations of `_advanced` over a split state, carrying their device checks as a value.
 
-    `text._checked` carries them the same way. The host throws the error when
-    it reads the draws, one step later. The state comes back split as it went
-    in, so the host passes the halves straight to the next step.
+    The first iteration takes the admission; the draws come back stacked,
+    `[steps, slots]` per leaf. `text._checked` carries the checks the same
+    way. The host throws the error when it reads the draws, one call later.
+    The state comes back split as it went in, so the host passes the halves
+    straight to the next call.
     """
 
     def run(params, resident, carried, admission, transforms, stopping, grammar):
         state, draws = _advanced(model, params, pad_id, placement, _joined(resident, carried), admission,
                                  transforms, stopping, grammar)
+        draws = jax.tree.map(lambda leaf: leaf[None], draws)
+        if steps > 1:
+            def following(state: Slots, _: None) -> tuple[Slots, Draws]:
+                return _advanced(model, params, pad_id, placement, state, None, transforms, stopping, grammar)
+
+            state, more = jax.lax.scan(following, state, length=steps - 1)
+            draws = jax.tree.map(lambda first, rest: jnp.concatenate([first, rest]), draws, more)
         return *_split(state), draws
 
     return checkify.checkify(run, errors=checkify.user_checks)(
@@ -468,14 +477,15 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None) -
     are. The step sets no XLA flag of its own; pass XLA_FLAGS to change the
     backend's defaults. See docs/performance.md for the measurements.
     """
-    return jax.jit(_stepped, static_argnums=(0, 2, 3), donate_argnums=(4,),
+    return jax.jit(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
                    in_shardings=(None, resident, carried, rows, None, None, None),
                    out_shardings=(None, (resident, carried, None)))
 
 
-def _resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, state: Slots,
-                      shardings: Slots, rows: NamedSharding | None, transforms: tuple[LogitsTransform, ...],
-                      stopping: tuple[Stopping, ...], grammar: Grammar | None) -> Formats:
+def _resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
+                      state: Slots, shardings: Slots, rows: NamedSharding | None,
+                      transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
+                      grammar: Grammar | None) -> Formats:
     """Choose the memory layout the resident state keeps, by asking XLA for it.
 
     The attention dot reads the cached keys and values with the slot axis
@@ -493,7 +503,7 @@ def _resident_formats(model: nn.Module, params: Variables, pad_id: int, placemen
                             half, shardings, is_leaf=lambda leaf: leaf is None)
 
     program = _compiled(automatic(resident), automatic(carried), rows)
-    compiled = program.lower(model, params, pad_id, placement, resident, carried, None, transforms,
+    compiled = program.lower(model, params, pad_id, placement, steps, resident, carried, None, transforms,
                              stopping, grammar).compile()
     return _joined(*compiled.output_formats[1][:2])
 
@@ -703,11 +713,13 @@ class Server:
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,
                  sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
-                 default_budget: int | None) -> None:
+                 default_budget: int | None, decode_steps: int) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
             raise ValueError("admission must be between one and the slot count")
+        if type(decode_steps) is not int or decode_steps < 1:
+            raise ValueError("decode_steps must be a positive number of iterations per device call")
         self.mesh = mesh_of(variables)
         self.groups = _row_groups(self.mesh)
         if slots % self.groups or admission % self.groups:
@@ -724,6 +736,7 @@ class Server:
         self.capacity = capacity
         self.admission = admission
         self.default_budget = default_budget
+        self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
         self._rows: dict[int, _Row] = {}
@@ -741,7 +754,7 @@ class Server:
             if isinstance(rows, PagedRows) and prediction_depths(model):
                 raise ValueError("a paged server runs no prediction depths; their cache is seeded "
                                  "over the whole prompt at once")
-            formats = _resident_formats(model, variables, self.pad_id, rows.placement, shapes,
+            formats = _resident_formats(model, variables, self.pad_id, rows.placement, decode_steps, shapes,
                                         _state_shardings(self.mesh, shapes), self._admitted, transforms,
                                         stopping, grammar)
             self._step = _program(formats, self._admitted)
@@ -755,7 +768,7 @@ class Server:
     @classmethod
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
                   admission: int | None = None, kv_cache: KVCache | None = None,
-                  chunk: int | None = None, prefix_cache: bool = False) -> Server:
+                  chunk: int | None = None, prefix_cache: bool = False, decode_steps: int = 1) -> Server:
         """A server over the task's model, weights, processor and policy.
 
         `capacity` rounds up to a shape bucket and may not exceed the
@@ -775,8 +788,18 @@ class Server:
         Weights placed on a mesh are served on it: the slots, the admission
         and the pages split over the mesh's row axes, which have to divide
         them. Admission defaults to the largest multiple of the group count
-        up to eight. A mesh with a stage or a sequence axis above one, or
-        one over several processes, is refused.
+        up to eight rows an iteration. A mesh with a stage or a sequence
+        axis above one, or one over several processes, is refused.
+
+        `decode_steps` runs that many iterations in each device call. The
+        host launches a call's kernels one after another, which on a tensor
+        axis costs about as long as the step computes, so the devices wait
+        on the host; a call of several iterations pays that once. Requests
+        are seated and draws reach the host at call boundaries: a request
+        waits up to `decode_steps` iterations for its slot, and a slot a row
+        leaves mid-call stays empty until the next call. The default
+        admission seats `decode_steps` iterations' worth of rows a call, so
+        the slots fill as fast. The draws are the same for any value.
         """
         mesh = mesh_of(task.variables)
         if mesh is not None:
@@ -828,8 +851,9 @@ class Server:
         return cls(model, task.variables, task.processor, sampling=task.sampling,
                    transforms=transforms, stopping=stopping, grammar=strategy.grammar, rows=rows,
                    slots=slots, capacity=rounded,
-                   admission=max(groups, min(slots, 8) // groups * groups) if admission is None else admission,
-                   default_budget=task.max_new_tokens)
+                   admission=(max(groups, min(slots, 8 * decode_steps) // groups * groups) if admission is None
+                              else admission),
+                   default_budget=task.max_new_tokens, decode_steps=decode_steps)
 
     @property
     def cache(self) -> Variables:
@@ -918,15 +942,15 @@ class Server:
         return _Row(ids[0][valid[0]].astype(np.int32), budget, np.asarray(jax.random.key_data(key)), Ticket())
 
     def step(self) -> None:
-        """One iteration: admit what fits, run the step, read the last one."""
+        """One device call: admit what fits, run `decode_steps` iterations, read the last call's."""
         if self._failed is not None:
             raise RuntimeError("the server stopped after a device check failed") from self._failed
         admission = self._admit()
         with self._context():
             error, (self._resident, self._carried, draws) = self._step(
-                self.model, self.variables, self.pad_id, self.rows.placement, self._resident, self._carried,
-                admission, self.transforms, self.stopping, self.grammar)
-        self.steps += 1
+                self.model, self.variables, self.pad_id, self.rows.placement, self.decode_steps,
+                self._resident, self._carried, admission, self.transforms, self.stopping, self.grammar)
+        self.steps += self.decode_steps
         self._settle()
         self._pending = (error, draws)
 
@@ -1012,7 +1036,7 @@ class Server:
         return Admission(ModelInputs(placed[0], {"attention_mask": placed[1]}), *placed[2:])
 
     def _settle(self) -> None:
-        """Read the previous step's draws into their rows; resolve the rows that ended."""
+        """Read the previous call's draws into their rows, iteration by iteration; resolve the rows that ended."""
         if self._pending is None:
             return
         error, draws = jax.device_get(self._pending)
@@ -1023,18 +1047,19 @@ class Server:
             self._fail(failure)
             raise
         now = time.perf_counter()
-        for slot, row in list(self._rows.items()):
-            if not draws.drawn[slot]:
-                continue
-            if not row.tokens:
-                row.ticket.first = now
-            row.tokens.append(int(draws.token[slot]))
-            row.behavior.append(float(draws.behavior[slot]))
-            row.raw.append(float(draws.raw[slot]))
-            if draws.stopped[slot] or len(row.tokens) == row.budget:
-                del self._rows[slot]
-                self.rows.release(row)
-                self._finish(row, terminated=bool(draws.stopped[slot]))
+        for step in range(draws.drawn.shape[0]):
+            for slot, row in list(self._rows.items()):
+                if not draws.drawn[step, slot]:
+                    continue
+                if not row.tokens:
+                    row.ticket.first = now
+                row.tokens.append(int(draws.token[step, slot]))
+                row.behavior.append(float(draws.behavior[step, slot]))
+                row.raw.append(float(draws.raw[step, slot]))
+                if draws.stopped[step, slot] or len(row.tokens) == row.budget:
+                    del self._rows[slot]
+                    self.rows.release(row)
+                    self._finish(row, terminated=bool(draws.stopped[step, slot]))
 
     def _fail(self, failure: BaseException) -> None:
         self._failed = failure
