@@ -18,9 +18,9 @@ What lands:
   with expand 2), a state of 4 per head, one B/C group so both heads read
   the same B and C, the conv with its bias, and a chunk of 4 so the
   12-token reference crosses two chunk boundaries. `logits.npy` is the fp32
-  forward of tools/hf_reference.py's `write_tiny`, `logits_bf16.npy` the
-  same forward with weights and activations in bfloat16. `source.json`
-  pins the reference release.
+  forward of tools/hf_reference.py's `write_tiny`; its bf16 and float64
+  forwards are tools/numerics_reference.py's. `source.json` pins the
+  reference release.
 """
 
 import json
@@ -115,17 +115,12 @@ def write_mamba2_tiny(name: str = "mamba2-tiny") -> None:
     model = Mamba2ForCausalLM(mamba2_tiny_config())
     write_tiny(name, model, seed=SEED)
     directory = FIXTURES / name
-    ids = np.load(directory / "input_ids.npy")
-    half = Mamba2ForCausalLM.from_pretrained(str(directory), dtype=torch.bfloat16, local_files_only=True).eval()
-    with torch.no_grad():
-        logits = half(input_ids=torch.from_numpy(ids), use_cache=False).logits
-    np.save(directory / "logits_bf16.npy", logits.to(torch.float32).numpy())
     (directory / "source.json").write_text(json.dumps({
         "transformers": {"version": transformers.__version__, "revision": TRANSFORMERS_REVISION},
         "seed": SEED,
     }, indent=1) + "\n")
     (directory / "model.safetensors").chmod(0o644)
-    print(f"{directory}: bf16 logits and source.json written")
+    print(f"{directory}: source.json written")
 
 
 if __name__ == "__main__":

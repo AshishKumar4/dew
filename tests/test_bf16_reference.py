@@ -7,8 +7,8 @@ fp32, the softmax in fp32) coincide with the reference's. In bf16 they do
 not have to, so each family runs three ways on its committed fixture:
 transformers in float64 (the truth), transformers in bf16 and Dew in bf16
 with fp32 parameter masters, the configuration training uses
-(tools/numerics_reference.py writes the first two). Dew's largest logit
-error may be at most twice the reference's (tests/reference_error.py
+(tools/numerics_reference.py writes the first two). Dew's root-mean-square
+logit error may be at most twice the reference's (tests/reference_error.py
 derives the factor). The fp32 forwards are held to the same rule, which
 replaces a fixed 1e-4 with a bound read off the reference's own rounding.
 
@@ -37,10 +37,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_rounds_where_the_reference_does
 from safetensors.numpy import load_file
 
 from dew.interop import diffusion_gemma as adapter, load_pretrained
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inputs import ModelInputs
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -103,9 +104,9 @@ def test_logits_coarser_than_the_reference_fail_the_rule():
     """How coarse an error the rule sees: llama-tiny's bf16 logits rounded
     once more to two significand bits (float8_e5m2's; `reduce_precision`,
     which XLA cannot fold away the way it drops an astype round trip under
-    jit on GPU) land 2.80 times the reference's error away and fail it. The same logits rounded to three bits (e4m3) land at
-    1.73 times the reference and pass, so that is the scale of defect below
-    which the bf16 tier is blind (tests/reference_error.py)."""
+    jit on GPU) land 2.80 times the reference's error away and fail it. The
+    same logits rounded to three bits (e4m3) land at 1.73 times and pass,
+    the scale below which this rule is blind (tests/reference_error.py)."""
     directory = FIXTURES / "llama-tiny"
     pretrained = load_pretrained(str(directory), dtype="bfloat16", attention_impl="reference")
     ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
@@ -113,6 +114,38 @@ def test_logits_coarser_than_the_reference_fail_the_rule():
     coarse = jax.lax.reduce_precision(logits, exponent_bits=5, mantissa_bits=2)
     with np.load(directory / "numerics.npz") as exact, pytest.raises(AssertionError, match="ratio"):
         assert_as_exact_as_the_reference(coarse, exact["bf16"], exact["f64"], "coarse")
+
+
+def bfloat16(bits: np.ndarray) -> jax.Array:
+    return jax.lax.bitcast_convert_type(jnp.asarray(bits), jnp.bfloat16)
+
+
+@pytest.mark.parametrize("softmax_in_fp32", [True, False], ids=["fp32-softmax", "bf16-softmax"])
+def test_bf16_attention_rounds_where_the_reference_does(softmax_in_fp32):
+    """The ordering the whole-model cases cannot resolve: the attention
+    softmax. transformers' eager attention (tools/numerics_reference.py,
+    one head of 512 queries over 512 keys) rounds the bf16 logits, takes the
+    softmax in fp32 and rounds the probabilities once; Dew's reference path
+    claims that order, so it is held to the reference's own bf16 output
+    (tests/reference_error.py). Logits of standard deviation 0.5 spread the
+    weight over hundreds of keys, where the softmax's own roundings, not the
+    logits', make most of the error. Observed ratio 0.041 with the fp32
+    softmax, the 0.04 the flip estimate gives at K 512; taken in bf16 it is
+    1.72 and fails. The 'xla' path keeps the logits in fp32, rounds at other
+    points and sits nearer float64 (1.18e-04 against the reference's
+    1.32e-04), so it answers to the factor-2 rule, not this one."""
+    with np.load(Path(__file__).resolve().parent / "fixtures" / "attention_bf16.npz") as stored:
+        q, k, v, reference = (bfloat16(stored[name]) for name in ("q", "k", "v", "bf16"))
+        truth = stored["f64"]
+    # [batch, heads, length, width] -> [batch, length, heads, width]
+    q, k, v = (jnp.swapaxes(t, 1, 2) for t in (q, k, v))
+    out = scaled_dot_product_attention(q, k, v, implementation="reference",
+                                       force_fp32_for_softmax=softmax_in_fp32)
+    if softmax_in_fp32:
+        assert_rounds_where_the_reference_does(out, reference, truth, "attention")
+    else:
+        with pytest.raises(AssertionError, match="ratio"):
+            assert_rounds_where_the_reference_does(out, reference, truth, "attention")
 
 
 MAMBA2_130M = "AntonV/mamba2-130m-hf"

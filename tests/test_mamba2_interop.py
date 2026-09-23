@@ -97,18 +97,6 @@ def test_the_translated_weights_reproduce_the_reference_logits(hf_config, tensor
     assert np.array_equal(np.asarray(logits).argmax(-1), reference.argmax(-1))
 
 
-def test_a_bfloat16_run_sits_within_bfloat16_of_the_reference(hf_config, tensors):
-    """Compute in bfloat16 over fp32 parameters. Observed 1.5e-02 from the
-    fp32 reference and 2.9e-02 from the reference's bfloat16 forward, whose
-    own distance from fp32 is 2.3e-02: the two round at different points."""
-    config = config_from_hf(hf_config)
-    model = CausalTransformer(**config, max_seq_len=16, dtype=jnp.bfloat16)
-    ids = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
-    logits = jnp.asarray(model.apply(translate(tensors, config), ids)).astype(jnp.float32)
-    assert largest(logits, np.load(FIXTURE / "logits.npy")) < 1e-1
-    assert largest(logits, np.load(FIXTURE / "logits_bf16.npy")) < 1e-1
-
-
 def test_a_tied_head_is_checked_and_dropped(hf_config, tensors):
     config = config_from_hf({**hf_config, "tie_word_embeddings": True})
     tied = {**tensors, "lm_head.weight": tensors["backbone.embeddings.weight"]}
