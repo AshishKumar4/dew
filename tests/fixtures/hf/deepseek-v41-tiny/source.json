@@ -1,0 +1,27 @@
+{
+ "released": {
+  "repo": "deepseek-ai/DeepSeek-V4.1-Flash",
+  "revision": "dba1be0a40aa45a94ad051997016db3960a90277",
+  "code": [
+   "inference/model.py",
+   "inference/engram.py",
+   "inference/vision.py",
+   "inference/image_processor.py"
+  ]
+ },
+ "kernels": "tools/deepseek_v41_kernels.py",
+ "torch": "2.10.0+cu128",
+ "transformers": "5.17.0",
+ "seed": 81,
+ "margins": {
+  "qat_window_scale": 0.00025361070844631683,
+  "qat_window": 4.291534423828125e-05,
+  "qat_selection": 0.001449228497222066,
+  "qat_index_scale": 0.0008964389763840286,
+  "qat_index": 2.5987625122070312e-05,
+  "qat_entries_scale": 0.007000923156738281,
+  "qat_entries": 0.000418931245803833,
+  "selection": 3.659988215076737e-05
+ },
+ "tool": "tools/deepseek_v41_reference.py"
+}
