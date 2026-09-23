@@ -821,8 +821,9 @@ class DeepseekV4Attention(nn.Module):
 
 
 DRAFT_CONTEXT = 'draft_context'
-"""The kv_store name a DSpark stage hands its attention the target model's
-context under (`DSparkAttention`)."""
+DRAFT_VALID = 'draft_valid'
+"""The kv_store names a DSpark stage hands its attention the target model's
+context under, and which of its positions are real (`DSparkAttention`)."""
 
 
 class DSparkAttention(DeepseekV4Attention):
@@ -831,14 +832,16 @@ class DSparkAttention(DeepseekV4Attention):
     block's own.
 
     `kv_store[DRAFT_CONTEXT]` `[B, M, D]` is the target model's context for
-    the positions up to the one the block drafts after; this layer projects
-    its keys with its own `kv_proj` into a sliding window. `x` `[B, K, D]`
-    is the draft block at the `K` positions after the context's last, whose
-    queries attend that window and every key of the block, the block's own
-    included in both directions. Cached, each call appends the context to
-    the window cache, and a block of no tokens only does that (the
-    release's prefill); uncached, the context is whole and the block
-    follows its last position.
+    the positions up to the one the block drafts after, and
+    `kv_store[DRAFT_VALID]` `[B, M]`, when present, which of them are real;
+    this layer projects the context's keys with its own `kv_proj` into a
+    sliding window. `x` `[B, K, D]` is the draft block at the `K` positions
+    after the context's last, whose queries attend that window and every
+    key of the block, the block's own included in both directions. Cached,
+    each call appends the real context positions to the window cache, and
+    a block of no tokens only does that (the release's prefill); a call
+    without context drafts after what the cache holds. Uncached, the
+    context is whole and the block follows its last position.
     """
 
     @nn.compact
@@ -846,25 +849,27 @@ class DSparkAttention(DeepseekV4Attention):
                  kv_store=None, attention_metadata: AttentionMetadata | None = None):
         if self.compressor is not None:
             raise ValueError("the DSpark drafter's layers are sliding layers")
-        if kv_store is None or DRAFT_CONTEXT not in kv_store:
-            raise ValueError(f"a DSpark stage's attention reads the target's context from "
-                             f"kv_store[{DRAFT_CONTEXT!r}]")
-        main = kv_store[DRAFT_CONTEXT]
-        batch, count = main.shape[0], main.shape[1]
+        main = None if kv_store is None else kv_store.get(DRAFT_CONTEXT)
+        batch = x.shape[0]
         if decode:
-            slots, allocated = _cache_positions(self, batch, count, self.max_seq_len, None)
             cached_key = self.variable('cache', 'cached_key', jnp.zeros,
-                                       (batch, self.max_seq_len, self.head_dim), main.dtype)
-            main_keys = self._window_keys(main, *rope_freqs(slots, self.rope_dim, self.rope_theta,
-                                                            self.yarn))
-            if allocated:
-                cached_key.value = write_cache(cached_key.value, main_keys, slots)
+                                       (batch, self.max_seq_len, self.head_dim), x.dtype)
+            if main is not None:
+                assert kv_store is not None
+                slots, allocated = _cache_positions(self, batch, main.shape[1], self.max_seq_len,
+                                                    kv_store.get(DRAFT_VALID))
+                if allocated:
+                    cached_key.value = write_cache(cached_key.value, self._window_keys(
+                        main, *rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn)), slots)
             main_keys = cached_key.value
-            last = slots[:, -1]
+            last = jnp.asarray(self.get_variable('cache', 'cache_index')) - 1
+        elif main is None:
+            raise ValueError(f"uncached, a DSpark stage's attention reads the whole context "
+                             f"from kv_store[{DRAFT_CONTEXT!r}]")
         else:
-            main_keys = self._window_keys(main, *rope_freqs(jnp.arange(count), self.rope_dim,
+            main_keys = self._window_keys(main, *rope_freqs(jnp.arange(main.shape[1]), self.rope_dim,
                                                             self.rope_theta, self.yarn))
-            last = jnp.full((batch,), count - 1)
+            last = jnp.full((batch,), main.shape[1] - 1)
         length = x.shape[1]
         if length == 0:
             return x
@@ -927,17 +932,17 @@ class DeepseekV4Mixer(MixerBase):
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         return self._built(DeepseekV4Attention, ctx)
 
-    def drafter(self, ctx: MixerContext) -> Callable[..., nn.Module]:
-        """This kind's attention as a DSpark stage's (`DSparkAttention`)."""
-        if self.compressor is not None:
-            raise ValueError("a DSpark stage attends a sliding window: its kind has no compressor")
-        return self._built(DSparkAttention, ctx)
     def publishes(self, kv_shared: bool) -> bool:
         """Whether a layer of this kind leaves what later layers read in the
         kv_store: a CSA2 Full layer its entries, index keys and selection, a
         Reindex layer its selection."""
         return self.compressor == 'csa2' and (self.reindex or not kv_shared)
 
+    def drafter(self, ctx: MixerContext) -> Callable[..., nn.Module]:
+        """This kind's attention as a DSpark stage's (`DSparkAttention`)."""
+        if self.compressor is not None:
+            raise ValueError("a DSpark stage attends a sliding window: its kind has no compressor")
+        return self._built(DSparkAttention, ctx)
 
     def _built(self, attention: type[DeepseekV4Attention], ctx: MixerContext) -> Callable[..., nn.Module]:
         if not ctx.causal:

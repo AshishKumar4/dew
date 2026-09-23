@@ -2574,24 +2574,25 @@ class CausalTransformer(nn.Module):
                                  self.embed_tokens.embedding.dtype)).astype(x.dtype)
         return scaled(x, self.embedding_multiplier)
 
-    def draft(self, context, tokens, *, decode: bool = True, key=None, temperature: float = 0.0):
+    def draft(self, context, tokens, *, decode: bool = True, valid=None, choose=None):
         """DSpark's draft after each row's last context position.
 
         `context` `[B, M, targets * D]` is what `draft_context` assembles
         from a forward's sown `prediction_inputs` (the target layers' stream
-        means), `tokens` `[B]` the tokens drawn after it. Returns `(ids [B,
-        block + 1], logits [B, block, vocab], confidence [B, block])`
-        (`dew.nn.dspark.draft`). Cached, call `init_draft_cache` first, pass
-        the prompt's context with `tokens` None to seed the windows, then
-        one position's context per step.
+        means), `valid` `[B, M]` which of its positions are real, `tokens`
+        `[B]` the tokens drawn after it. Returns `(ids [B, block + 1],
+        logits [B, block, vocab], confidence [B, block])`, each drafted
+        token drawn by `choose(index, logits)`, greedily when None
+        (`dew.nn.dspark.draft`). Cached, call `init_draft_cache` first; a
+        call with `tokens` None only appends its context to the windows and
+        one with `context` None drafts after what they hold.
         """
         if self.dspark is None:
             raise ValueError("this model has no DSpark drafter")
         hc = self.hyper_connections
         assert hc is not None
         return dspark_draft(self.dspark_stages, self.dspark, self.token_embeddings, self._logits,
-                            hc.hc_mult, context, tokens, decode=decode, key=key,
-                            temperature=temperature)
+                            hc.hc_mult, context, tokens, decode=decode, valid=valid, choose=choose)
 
     def draft_context(self, prediction_inputs: Mapping) -> jax.Array:
         """DSpark's context `[B, S, targets * D]` from the `prediction_inputs`

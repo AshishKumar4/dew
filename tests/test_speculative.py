@@ -291,11 +291,11 @@ def params_of(model, prompt):
     return model.init(jax.random.key(0), prompt)
 
 
-def test_a_model_without_prediction_depths_is_refused():
+def test_a_model_without_a_drafter_is_refused():
     model = decoder()
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     params = model.init(jax.random.key(0), prompt)
-    with pytest.raises(ValueError, match="no prediction depths|declares none"):
+    with pytest.raises(ValueError, match="has neither"):
         generate(model, params, prompt, 2, key=jax.random.key(0), strategy=Speculative(block=2))
 
 

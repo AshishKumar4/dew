@@ -305,6 +305,8 @@ The target cache is saved before a block and the accepted prefix is replayed int
 
 A depth becomes usable after enough real tokens have preceded it. Rotary offsets and repeated image coordinates do not change that count. A newly available predecessor is retained even if its next depth cannot yet write a cache entry.
 
+A model with a block drafter, DeepSeek-V4.1's DSpark, drafts a block's later candidates in one pass instead of chaining depths. The drafter reads the context its target layers record: the prefill seeds it with the prompt's, and each replayed block appends its kept positions'. The strategy draws each candidate from the drafter's logits for its position, Markov bias included, as the pass reaches it, so `block - 1` may not exceed the drafter's own block size. DSpark drafters for a V4 trunk (DeepSeek-V4-Flash-DSpark) are not built: the stages are V4.1's Single-Pass mHC blocks.
+
 A continuing block emits at least two tokens when the remaining budget allows it. An EOS or the budget can truncate the block earlier. Thus `ceil(budget / 2)` iterations bound the loop. Each active block uses two target forwards. Once every row has finished, later iterations run no model call. The predicate reduces the whole batch, so every rank skips the same blocks.
 
 #### Existing JAX decoding

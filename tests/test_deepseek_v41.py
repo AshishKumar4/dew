@@ -33,7 +33,7 @@ from dew.nn.engram import Engram
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
 from dew.registry import models, with_precision
-from dew.sampling import Sampling, generate
+from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import (
     cached_run,
     captured,
@@ -360,6 +360,55 @@ def test_left_padding_changes_no_row(source):
     batched = greedy(ModelInputs(tokens, {"attention_mask": valid}))
     np.testing.assert_array_equal(batched[0], reference["generated"][0])
     np.testing.assert_array_equal(batched[1], greedy(ModelInputs(ids[1:, :prompt - pad]))[0])
+
+
+def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(source):
+    """At zero temperature every rejected draft is replaced by the target's
+    own token, so Speculative decoding with DSpark's blocks emits the greedy
+    walk, a left-padded row included."""
+    loaded, plain, reference = source
+    ids = jnp.asarray(reference["input_ids"])[:, :int(reference["decode_prompt"])]
+    valid = jnp.ones(ids.shape, bool).at[1, :3].set(False)
+    inputs = ModelInputs(jnp.where(valid, ids, 0), {"attention_mask": valid})
+    walked, speculated = (generate(plain, loaded.variables, inputs, 8, key=jax.random.key(0),
+                                   sampling=Sampling(temperature=0), strategy=strategy)
+                          for strategy in (Sample(), Speculative(block=3)))
+    np.testing.assert_array_equal(np.asarray(speculated.tokens), np.asarray(walked.tokens))
+    np.testing.assert_array_equal(np.asarray(speculated.lengths), 8)
+
+
+def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
+    """After a prefill and a verified stretch whose rows keep different
+    counts, the block the decode ops draft is the one the drafter drafts
+    uncached over each row's real history: the prompt's and the stretch's
+    context reach its windows at their own positions."""
+    from dew.sampling.text import _operations, _prefill
+
+    loaded, plain, reference = source
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    ops = _operations(plain, loaded.variables, 0, 0)
+    assert ops.record is not None and ops.draft is not None and ops.verify is not None
+    state, _ = _prefill(plain, loaded.variables, ModelInputs(ids[:, :prompt]), ops)
+    kept = jnp.asarray([3, 1])
+    keep = jnp.arange(3)[None, :] < kept[:, None]
+    state, _, context = ops.verify(state, ids[:, prompt:prompt + 3], keep)
+    assert context is not None
+    state = ops.record(state, context, keep)
+    drawn, scored = ids[:, prompt + 3], []
+
+    def choose(index, logits):
+        scored.append(logits)
+        return jnp.argmax(logits, axis=-1)
+
+    ops.draft(state, drawn, choose)
+    for row in range(2):
+        history = ids[row:row + 1, :prompt + int(kept[row])]
+        _, sown = plain.apply(loaded.variables, history, mutable=["prediction_inputs"])
+        whole = plain.apply(loaded.variables, sown["prediction_inputs"], method="draft_context")
+        _, logits, _ = plain.apply(loaded.variables, whole, drawn[row:row + 1], decode=False,
+                                   method="draft")
+        np.testing.assert_allclose(jnp.stack(scored, 1)[row], np.asarray(logits)[0],
+                                   atol=TOLERANCE["draft_logits"], rtol=0)
 
 
 def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():

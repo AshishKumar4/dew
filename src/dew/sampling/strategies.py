@@ -74,6 +74,8 @@ Verify = Callable[[DecoderState, jax.Array, jax.Array],
                   tuple[DecoderState, jax.Array, jax.Array | None]]
 Propose = Callable[[DecoderState, jax.Array, jax.Array | None, jax.Array | None, jax.Array,
                     jax.Array, int, PredictionPhase], tuple[DecoderState, jax.Array, jax.Array]]
+Record = Callable[[DecoderState, jax.Array, jax.Array], DecoderState]
+DraftBlock = Callable[[DecoderState, jax.Array, Callable[[int, jax.Array], jax.Array]], None]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,6 +92,11 @@ class DecodeOps:
     None on a model without prediction depths, and `depths` counts them. Its
     prediction_phase distinguishes ordinary recomputation, accepted-history
     extend, and single-chain draft operations; the model owns any reuse policy.
+    `record` and `draft` are a block drafter's instead: `record` appends the
+    context of a stretch's real positions, the states `verify` returns, to
+    the drafter's windows, and `draft` drafts the block after them from each
+    row's first token, handing each position's logits to a `choose` that
+    draws the token there.
     """
 
     advance: Advance
@@ -98,6 +105,8 @@ class DecodeOps:
     propose: Propose | None = None
     embed: Callable[[jax.Array], jax.Array] | None = None
     depths: int = 0
+    record: Record | None = None
+    draft: DraftBlock | None = None
 
 
 class Strategy(Protocol):
@@ -532,13 +541,16 @@ def _beam_draws(done: Completed, start: StepState, prompts: int, n: int, budget:
 
 @struct.dataclass
 class Speculative:
-    """Draft with the model's prediction depths, verify with the model itself.
+    """Draft with the model's prediction depths or its block drafter, verify
+    with the model itself.
 
     The law is algorithm 1 of arXiv 2211.17192, as `_speculative_sampling` in
     Transformers 5.16.1 applies it. The first candidate is an ordinary target
     draw, so it is always accepted, and the model's prediction depths chain
     the rest from the target's last hidden state and each candidate's
-    embedding, which is what vLLM's `Qwen3_5MultiTokenPredictor` does. A
+    embedding, which is what vLLM's `Qwen3_5MultiTokenPredictor` does; a
+    block drafter (DeepSeek-V4.1's DSpark) drafts them in one pass after the
+    first, each drawn from its position's logits as the pass reaches it. A
     proposed `x` is accepted with probability `min(1, p(x) / q(x))` for the
     target's post-transform `p` and the draft's actual `q`, compared as a log
     ratio; the first rejection draws from the normalized positive part of
@@ -578,11 +590,11 @@ class Speculative:
                  transform: Callable[[StepState, jax.Array], jax.Array],
                  stopping: Callable[[StepState, jax.Array], jax.Array],
                  budget: int, n: int) -> Draws:
-        if ops.propose is None or ops.verify is None or ops.embed is None or not ops.depths:
-            raise ValueError("speculative decoding drafts with the model's prediction depths, and "
-                             "this model declares none; load a checkpoint with MTP weights or "
-                             "choose another strategy")
-        assert ops.propose is not None and ops.verify is not None
+        depths = ops.propose is not None and ops.embed is not None and ops.depths
+        if ops.verify is None or not (depths or ops.draft is not None):
+            raise ValueError("speculative decoding drafts with the model's prediction depths or "
+                             "its block drafter, and this model has neither; load a checkpoint "
+                             "with MTP or DSpark weights or choose another strategy")
         return continuations(start, n, lambda drawn: _speculate(
             state, drawn, ops, transform, stopping, budget, self))
 
@@ -617,17 +629,16 @@ class _Drafted(NamedTuple):
 def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepState,
              keys: jax.Array, base: jax.Array, active: jax.Array, budget: int,
              transform, stopping) -> _Drafted:
-    """One block's candidates: an ordinary target draw, then the draft chain.
+    """One block's candidates: an ordinary target draw, then the draft.
 
     The first candidate comes from the target's own logits, so it is always
     accepted. Every later one chains through a prediction depth from the
-    previous candidate's hidden state and the coordinate it sits at.
-    `plan.confidence` stops offering candidates after the first the draft is
-    less sure of than that; they are still computed, at the same shapes, and
-    simply cannot be accepted.
+    previous candidate's hidden state and the coordinate it sits at, or is
+    drawn from a block drafter's logits for its position as its one pass
+    reaches it. `plan.confidence` stops offering candidates after the first
+    the draft is less sure of than that; they are still computed, at the
+    same shapes, and simply cannot be accepted.
     """
-    propose = ops.propose
-    assert propose is not None
     block_size, rows = plan.block, step.rows
 
     def asked(at):
@@ -639,24 +650,50 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
     candidates = [select(keys[:, 0], scores[0], opening.active)]
     offered = [jnp.ones(rows, bool)]
     states = [opening, opening.commit(candidates[0], active)]
-    assert state.hidden is not None, "a drafting pass reads the last hidden state"
-    hidden, drafting, live, ending = state.hidden, state, opening.active, []
-    sure = jnp.ones(rows, bool)
-    for depth in range(1, block_size):
+    live, sure, ending = [opening.active], [jnp.ones(rows, bool)], []
+
+    def reached(depth: int) -> jax.Array:
+        """The rows still drafting at `depth`, once the criteria saw the candidate before it."""
         ending.append(stopping(states[depth], candidates[depth - 1]))
-        live = live & ~ending[depth - 1] & asked(depth)
-        states[depth] = dataclasses.replace(states[depth], active=live)
-        drafting, logits, produced = propose(
-            drafting, hidden[:, None], candidates[depth - 1][:, None], None, live[:, None],
-            base[:, depth - 1][:, None], (depth - 1) % ops.depths, "draft")
-        hidden = produced[:, 0]
-        drawn = transform(states[depth], logits[:, 0].astype(jnp.float32))
-        token = select(keys[:, depth], drawn, live)
+        live.append(live[-1] & ~ending[depth - 1] & asked(depth))
+        states[depth] = dataclasses.replace(states[depth], active=live[-1])
+        return live[-1]
+
+    def drawn_at(depth: int, logits: jax.Array) -> jax.Array:
+        """Candidate `depth`, drawn from the draft's logits for it."""
+        drawn = transform(states[depth], logits.astype(jnp.float32))
+        token = select(keys[:, depth], drawn, live[-1])
         scores.append(drawn)
         candidates.append(token)
-        offered.append(sure)
-        sure = sure & (jnp.exp(token_log_probs(drawn, token)) >= plan.confidence)
+        offered.append(sure[-1])
+        sure.append(sure[-1] & (jnp.exp(token_log_probs(drawn, token)) >= plan.confidence))
         states.append(states[depth].commit(token, active))
+        return token
+
+    drafting = state
+    if ops.draft is not None:
+        def choose(index: int, logits: jax.Array) -> jax.Array:
+            depth = index + 1
+            if depth >= block_size:
+                return jnp.argmax(logits, axis=-1)
+            reached(depth)
+            return drawn_at(depth, logits)
+
+        ops.draft(state, candidates[0], choose)
+        if len(candidates) < block_size:
+            raise ValueError(f"the model's block drafter proposes {len(candidates) - 1} tokens a "
+                             f"pass, fewer than a block of {block_size} candidates needs")
+    else:
+        propose = ops.propose
+        assert propose is not None and state.hidden is not None, \
+            "a drafting pass reads the last hidden state"
+        hidden = state.hidden
+        for depth in range(1, block_size):
+            drafting, logits, produced = propose(
+                drafting, hidden[:, None], candidates[depth - 1][:, None], None, reached(depth)[:, None],
+                base[:, depth - 1][:, None], (depth - 1) % ops.depths, "draft")
+            hidden = produced[:, 0]
+            drawn_at(depth, logits[:, 0])
     # Every candidate gets the real criterion, the last one included: a
     # block accepted whole must not draw its bonus behind a stop.
     ending.append(stopping(states[block_size], candidates[block_size - 1]))
@@ -806,20 +843,23 @@ def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget
                                      slots, index, active, terminated, budget, out)
 
     following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
-    assert seen is not None and ops.embed is not None
+    assert seen is not None
     last = jnp.maximum(count - 1, 0)
-    # The tails reseed hands back are every depth's predecessor at the
-    # last emitted slot, the target's own state first; a row that emitted
-    # nothing keeps what it had.
-    following, _, carried = reseed(
-        ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted),
-        keep, base, last, prior_tokens=step.total())
+    if ops.record is not None:
+        following = ops.record(following, seen, keep)
+    else:
+        assert ops.embed is not None
+        # The tails reseed hands back are every depth's predecessor at the
+        # last emitted slot, the target's own state first; a row that
+        # emitted nothing keeps what it had.
+        following, _, carried = reseed(
+            ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted),
+            keep, base, last, prior_tokens=step.total())
+        following = dataclasses.replace(following, hidden=carried[0], drafts=carried[1:])
     following = dataclasses.replace(
-        following,
-        logits=jnp.where((count > 0)[:, None],
-                         jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
-                         state.logits),
-        hidden=carried[0], drafts=carried[1:])
+        following, logits=jnp.where((count > 0)[:, None],
+                                    jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
+                                    state.logits))
     return (following, committed, terminated, out), None
 
 
@@ -837,8 +877,6 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
     after it.
     """
     block_size, rows = plan.block, start.rows
-    propose, verify = ops.propose, ops.verify
-    assert propose is not None and verify is not None
     slots = jnp.arange(block_size + 1)[None, :]
     index = jnp.arange(rows)[:, None]
 
