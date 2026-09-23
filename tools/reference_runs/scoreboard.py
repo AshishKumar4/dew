@@ -112,7 +112,7 @@ def side_rows(evidence: Path, sides: list[Side]) -> list[dict]:
         record = load(str(path))
         (row,) = performance({label: record}).values()
         versions = record.get("versions") or {}
-        built_from = versions.get("dew") or versions.get("torch") or ""
+        built_from = versions.get("dew") or versions.get("torch") or versions.get("maxtext") or ""
         rows.append({"label": label, "record": relative, "description": description,
                      "recorded_version": built_from[:12], **{
             key: row[key] for key in ("framework", "precision", "parallel", "unit", "rate", "step_ms", "mfu",
