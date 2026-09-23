@@ -43,11 +43,14 @@ tokamax is not a Dew dependency, and its current release cannot be installed cle
 
 The `expert` mesh axis splits the expert dimension across devices. Dense parameter dimensions can use FSDP or tensor placement on their own. See [distributed training](distributed.md) for the global batch and layout requirements.
 
-The mixture's `dispatch` field defaults to `"global"`, which sorts and gathers tokens globally. `"exchange"` sends tokens to their experts through a bounded exchange with public JAX `all_to_all` collectives. It needs an `expert` mesh axis larger than one that divides the number of experts. Every selected token is kept, even when all traffic goes to one shard: later rounds empty that shard's bucket. You can initialize the model outside a mesh, but applying the exchange model needs the mesh. Gated experts and GPT OSS's interleaved biased experts use the same transport and keep their own activation and output-weight arithmetic.
+The mixture's `dispatch` field defaults to `"global"`, which sorts and gathers tokens where they are: on a mesh each device routes its own tokens through every expert, so every layout computes each token once. `"exchange"` is expert parallelism: each device sends its selected tokens to the devices that hold their experts with JAX `all_to_all` collectives, and gets the results back. It needs an `expert` mesh axis larger than one that divides the number of experts, and the data, fsdp and sequence axes may split the tokens further. Every selected token is kept, even when all traffic goes to one shard. The first round sends each shard a device's balanced share of its tokens, and what a skewed routing leaves over follows in later rounds of the same size, which the backward pass recomputes rather than keeps. You can initialize the model outside a mesh, but applying the exchange model needs the mesh. Gated experts and GPT OSS's interleaved biased experts use the same transport and keep their own activation and output-weight arithmetic.
+
+`capacity_factor` drops tokens instead, as GShard and MaxText do. Each sequence keeps `max(ceil(length * top_k / experts) * capacity_factor, capacity_factor)` slots per expert, taken in token order, and a dropped slot adds nothing to its token's output. Both dispatch modes drop the same slots on every placement, because the count runs over whole sequences. Under a capacity the exchange runs one round. None, the default, keeps every slot.
 
 Both dispatch modes run their expert projections through `moe.expert_projection`. It fixes the arithmetic of a routed layer during training, whatever the activation dtype and placement:
 
 - each contraction accumulates in at least fp32 and rounds once to the compute dtype;
+- a kernel gradient sums every device's and every exchange round's share in at least fp32, and rounds to the master dtype once, so a bf16 master gets the same gradient on one device and on any mesh;
 - kernel gradients keep the master dtype;
 - input gradients keep their input's dtype;
 - the exact GELU rounds once.

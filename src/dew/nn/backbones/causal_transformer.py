@@ -293,10 +293,17 @@ class Mixture:
     kernel. It changes which kernel computes the same contraction and
     nothing about the routing.
 
-    `dispatch='exchange'` sends selected tokens to their expert shard in
-    bounded rounds, on an expert mesh axis larger than one that divides the
-    expert count. The default `'global'` sorts and gathers globally. Both
-    share the projection precision and the differentiation contract.
+    `dispatch='exchange'` is expert parallelism: each device trades its
+    selected tokens with the expert shards that own them, in bounded
+    all-to-all rounds, on an expert mesh axis larger than one that divides
+    the expert count. The default `'global'` sorts and gathers where the
+    tokens are. Both share the projection precision and the differentiation
+    contract.
+
+    `capacity_factor` drops slots past each sequence's per-expert capacity,
+    GShard's and MaxText's token dropping (`moe.capacity_positions`); None,
+    the default, keeps every selected slot. Both dispatches drop the same
+    slots on any placement, and the exchange then runs one round.
 
     `hash_layers` names the sparse layers that route by DeepSeek V4's fixed
     token table instead of the scores (`DeepseekV4HashRouter`). Their router
@@ -327,6 +334,7 @@ class Mixture:
     shared_gate: bool = False
     implementation: str = 'auto'
     dispatch: str = 'global'
+    capacity_factor: float | None = None
     hash_layers: tuple[int, ...] | None = None
     latent_features: int | None = None
     latent_norm: bool = False
@@ -368,6 +376,10 @@ class Mixture:
                 f"{list(GROUPED_MATMULS)}, got {self.implementation!r}")
         if self.dispatch not in EXPERT_DISPATCHES:
             raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {self.dispatch!r}")
+        if self.capacity_factor is not None and not self.capacity_factor > 0:
+            raise ValueError(
+                f"capacity_factor scales each expert's share of a sequence, so it is "
+                f"positive, got {self.capacity_factor}; None keeps every slot")
         if self.parallel and (
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
@@ -2033,6 +2045,7 @@ class CausalTransformer(nn.Module):
             activation=self.mlp,
             implementation=mixture.implementation,
             dispatch=mixture.dispatch,
+            capacity_factor=mixture.capacity_factor,
             score_function=mixture.score_function,
             normalize_weights=mixture.norm_topk_prob,
             routed_scaling_factor=mixture.scaling,
@@ -2063,6 +2076,7 @@ class CausalTransformer(nn.Module):
             activation=self.mlp,
             implementation=mixture.implementation,
             dispatch=mixture.dispatch,
+            capacity_factor=mixture.capacity_factor,
             norm_eps=self.norm_eps,
             scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast,
@@ -2080,6 +2094,7 @@ class CausalTransformer(nn.Module):
                 num_local_experts=mixture.experts, num_experts_per_tok=mixture.top_k,
                 implementation=mixture.implementation,
                 dispatch=mixture.dispatch,
+                capacity_factor=mixture.capacity_factor,
                 dtype=self.dtype, precision=self.precision)
         return gated_mlp, routed, parallel
 

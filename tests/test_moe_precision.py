@@ -17,7 +17,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from scipy.special import erfc
 
 from dew.nn.gpt_oss import GptOssExperts
-from dew.nn.moe import ExpertMLP, exact_gelu, expert_projection
+from dew.nn.moe import ExpertMLP, exact_gelu, expert_dispatch, expert_projection
 from dew.training import MeshSpec, build_mesh
 
 # The multi-device layouts need the eight simulated CPU devices conftest
@@ -413,3 +413,61 @@ def test_both_dispatches_carry_the_same_tangents(activation):
                 parameters, x, weights, dp, dx, dw, choices))
     for a, b in zip(*results, strict=True):
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
+
+
+def exchange_residue_case():
+    """Sixteen tokens all routed to expert 0, in values whose every product and
+    partial sum is exact in fp32: the kernel gradient is exact before its one
+    rounding. Two cotangent columns cancel to 2^-8, which a bf16 partial sum
+    of 1 + 2^-8 rounds away (it ties to 1). In column 0 the -1 is token 1,
+    which follows token 0 on its device and so travels a round later; in
+    column 1 it is token 8, which a data axis of two puts in the other half
+    of the batch, so the halves' partial sums meet across devices."""
+    rng = np.random.default_rng(29)
+    x = rng.integers(-2, 3, size=(16, 8)) * 2.0**-2
+    x[:, 0] = 1
+    kernel = rng.integers(-8, 9, size=(8, 8, 8)) * 2.0**-4
+    dy = rng.integers(-40, 41, size=(16, 8)) * 2.0**-8
+    dy[:, :2] = 0
+    dy[0, 0], dy[1, 0], dy[2, 0] = 1, -1, 2.0**-8
+    dy[0, 1], dy[2, 1], dy[8, 1] = 1, 2.0**-8, -1
+    return x, kernel, dy
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize('spec', [MeshSpec(expert=8), MeshSpec(expert=4),
+                                  MeshSpec(expert=2, fsdp=2)],
+                         ids=['expert8', 'expert4-data2', 'expert2-fsdp2-data2'])
+@pytest.mark.parametrize('dispatch', ['global', 'exchange'])
+def test_a_bf16_master_sums_its_expert_gradient_before_rounding(spec, dispatch):
+    """A bf16 kernel's cotangent sums every device's rows and every exchange
+    round in fp32 and rounds once, as one device rounds it: the gradient is
+    the correctly rounded exact sum, bit for bit, on every layout. So are
+    the output and the token gradient, each one rounding of an exact sum."""
+    x, kernel, dy = exchange_residue_case()
+    expected = (rounded(x @ kernel[0]), rounded(np.einsum('ti,to->io', x, dy)),
+                rounded(dy @ kernel[0].T))
+    mesh = build_mesh(spec)
+    rows = NamedSharding(mesh, P(tuple(axis for axis in ('data', 'expert', 'fsdp')
+                                       if mesh.shape[axis] > 1)))
+
+    def project(tokens, sizes, _ids, kernel):
+        return jnp.asarray(expert_projection(tokens, kernel, sizes, jnp.bfloat16, 'xla', None))
+
+    def loss(kernel, x, dy, indices):
+        out = expert_dispatch(project, x, indices, kernel, num_experts=8, dispatch=dispatch,
+                              output_dtype=jnp.bfloat16)[:, 0]
+        return jnp.sum(out.astype(jnp.float32) * dy), out
+
+    arguments = (jax.device_put(jnp.asarray(kernel, jnp.bfloat16), NamedSharding(mesh, P('expert'))),
+                 *(jax.device_put(value, rows) for value in (
+                     jnp.asarray(x, jnp.bfloat16), jnp.asarray(dy, jnp.float32),
+                     jnp.zeros((16, 1), jnp.int32))))
+    with jax.set_mesh(mesh):
+        (_, out), (d_kernel, d_x) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(
+            *arguments)
+    assert d_kernel.dtype == jnp.bfloat16 and d_x.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(np.asarray(out, np.float64), expected[0])
+    np.testing.assert_array_equal(np.asarray(d_kernel[0], np.float64), expected[1])
+    np.testing.assert_array_equal(np.asarray(d_kernel[1:], np.float64), 0)
+    np.testing.assert_array_equal(np.asarray(d_x, np.float64), expected[2])

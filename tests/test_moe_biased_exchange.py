@@ -231,7 +231,9 @@ def test_full_biased_router_and_experts_take_identical_pooled_adam_steps(dtype, 
     model = GptOssMLP(8, 12, 4, 2, dtype=dtype)
     mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
     specs = training_shardings(mesh)
-    tokens = NamedSharding(mesh, P(('expert', 'fsdp')))
+    # Rows over every batch axis, as a decoder's residual stream holds them:
+    # a bf16 router's bias gradient sums its rows in bf16 per device.
+    tokens = NamedSharding(mesh, P(('data', 'expert', 'fsdp')))
     x = jax.device_put(jnp.asarray(arrays['hidden'].reshape(-1, 8), dtype), tokens)
     parameters = jax.device_put(parameters, specs)
     optimizer = optax.adam(1e-3)
