@@ -70,7 +70,7 @@ trainer = Trainer(objective, optimizer, key=key, mesh=mesh)
 
 On GPU hosts whose device ids run host by host, `jax.make_mesh` already puts the data axis outermost, so for one granule per replica `replicas` states the layout rather than changing it. It changes the mesh when a replica spans several granules, when the slices do not follow the device order, and on a multislice TPU run.
 
-With `replicas=1`, `jax.make_mesh` places the devices, which is what a single node or a single TPU slice wants.
+With `replicas=1`, `jax.make_mesh` places the devices, which is what a single node or a single TPU slice wants. To choose which devices share an axis, pass them to `build_mesh(spec, devices)`: it fills the mesh with the list in the order you give, row-major over `MESH_AXES`, so the last axes get neighbouring entries. On a machine whose NVLink pairs are GPUs 0-1 and 2-3, `[0, 2, 1, 3]` puts a two-way tensor axis across the pairs instead of inside them. `jax.make_mesh` would sort GPU devices by id and discard that order.
 
 Hybrid sharding keeps a full copy of the parameters and optimizer state on every replica group. Plain fsdp across all nodes divides them by the total device count instead. Choose hybrid sharding when one node's memory holds the sharded state, and plain fsdp when it does not.
 
