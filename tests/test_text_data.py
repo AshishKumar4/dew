@@ -143,12 +143,7 @@ def test_hf_tokenizer_imports_lazily():
 
 
 def test_every_reader_of_a_tokenizer_shares_one_load():
-    """HFTokenizer and the caption tokenizer load a name through one cache.
-
-    Each used to keep its own copy (a lazy attribute per instance, an eager
-    load per construction), so two readers of one directory read it twice
-    and held two objects.
-    """
+    """HFTokenizer and the caption tokenizer load a name through one cache."""
     from dew.data import AutoTextTokenizer, HFTokenizer
 
     path = str(REPO_ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-chat")

@@ -1236,9 +1236,8 @@ def test_a_jpeg_decodes_at_the_coarsest_scale_that_still_covers_the_target():
 
 
 def test_a_reduced_decode_keeps_the_orientation_the_pixels_are_stored_in():
-    """cv2 applies a JPEG's EXIF rotation under its reduced colour flags and
-    not under IMREAD_UNCHANGED, so `at_least` used to turn the same bytes
-    sideways. Both ignore it now, as PIL's `Image.open` does."""
+    """A JPEG's EXIF rotation is ignored at full size and at a reduced
+    scale alike, as PIL's `Image.open` ignores it."""
     import io
 
     import PIL.Image
