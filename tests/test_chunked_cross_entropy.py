@@ -185,11 +185,13 @@ def small_model(**overrides):
     return CausalTransformer(**{**config, **overrides})
 
 
+@pytest.mark.parametrize("bf16_head", [False, True])
 @pytest.mark.parametrize("tie_embeddings", [True, False])
 @pytest.mark.parametrize("chunks", [4, 8])
-def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embeddings):
-    """Real bf16 hidden states and a real head, tied and untied."""
-    model = small_model(tie_embeddings=tie_embeddings)
+def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embeddings, bf16_head):
+    """Real bf16 hidden states and a real head, tied and untied, with the
+    model's head multiplying as the chunked loss does in both head modes."""
+    model = small_model(tie_embeddings=tie_embeddings, bf16_head=bf16_head)
     rng = jax.random.PRNGKey(0)
     ids = jax.random.randint(rng, (2, 12), 0, 97)
     variables = model.init(rng, ids)
@@ -201,7 +203,8 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
     hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
     head = model.apply(variables, variables['params'],
                        method=CausalTransformer.head_weight)
-    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
+    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks,
+                                                 bf16=bf16_head)
 
     assert hidden.dtype == jnp.bfloat16
     assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
