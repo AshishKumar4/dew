@@ -459,11 +459,19 @@ def test_the_compiled_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size, in_f
     platform = jax.default_backend()
     x, dt, A, B, C, _, state = mixer_operands(shape)
     operands = blocks(x, dt, A, B, C, state, chunk_size)
-    exact = [jnp.asarray(t, jnp.float64) for t in operands]
     seeded = cotangents(*xla_chunk_scan(*operands))
-    truth = jax.jit(stepwise_scan)(*exact)
-    truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](
-        tuple(t.astype(jnp.float64) for t in seeded)))(*exact)
+    # The float64 oracle runs on the host: a TPU emulates float64, and a
+    # 4096-step scan of it did not finish in 20 minutes on a v6e.
+    try:
+        host = jax.devices("cpu")[0]
+    except RuntimeError:
+        pytest.skip("the float64 oracle needs the cpu backend beside the device "
+                    "(JAX_PLATFORMS=tpu,cpu)")
+    with jax.default_device(host):
+        exact = [jnp.asarray(np.asarray(t), jnp.float64) for t in operands]
+        truth = jax.jit(stepwise_scan)(*exact)
+        truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](
+            tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)))(*exact)
 
     xla = jax.jit(xla_chunk_scan)(*operands)
     xla_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](seeded))(*operands)
