@@ -310,7 +310,7 @@ def parameter_movement(tool, case, steps: int = 2):
                 for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
     trainer = tool.build_trainer(case, "reference")
-    source = tool.batches(case)
+    source = tool.batches(case, trainer.device_mesh)
     state = jax.jit(trainer.initial_state)()
     before = jax.tree.map(np.asarray, named(state.params))  # the step consumes the state
     compiled = trainer.compile(state, next(source))
@@ -381,7 +381,7 @@ def test_step_benchmark_refuses_a_case_it_cannot_name():
         tool.build_trainer(ragged, "reference")
     crowded = composite_case(tool, "multimodal_transformer", seq_len=2)
     with pytest.raises(ValueError, match="no room"):
-        next(tool.batches(crowded))
+        tool.global_batch(crowded)
 
 
 def test_step_benchmark_packed_rows_restart_positions_at_every_document():
@@ -392,7 +392,7 @@ def test_step_benchmark_packed_rows_restart_positions_at_every_document():
     case = tool.Case("causal_transformer", dict(TINY_LM), batch_size=2, seq_len=16,
                      packed_documents=4)
 
-    batch = next(tool.batches(case))
+    batch = tool.global_batch(case)
 
     assert batch["text"].shape == (2, 17) and batch["text"].max() < 64
     for row in range(2):
@@ -423,7 +423,7 @@ def test_step_benchmark_native_diffusion_trains_text_and_pooled_conditioning(arc
     case = composite_case(tool, architecture)
     trainer = tool.build_trainer(case, "reference")
     encoder = trainer.objective.inputs.conditions["conditioning"].encoder
-    encoded = encoder.encode(encoder.params, next(tool.batches(case))["text"])
+    encoded = encoder.encode(encoder.params, tool.global_batch(case)["text"])
     assert encoded.context.shape == (case.batch_size, tool.TEXT_TOKENS,
                                      trainer.objective.model.joint_attention_dim)
     assert encoded.pooled.shape == (case.batch_size, trainer.objective.model.pooled_projection_dim)
@@ -448,7 +448,7 @@ def test_step_benchmark_media_rows_mark_one_slot_per_projected_feature():
     case = composite_case(tool, "multimodal_transformer", batch_size=2)
     case = dataclasses.replace(case, media={**case.media, "images": 2})
 
-    inputs = next(tool.batches(case))["text"]
+    inputs = tool.global_batch(case)["text"]
 
     slots = 2 * tool.image_tokens(case)
     assert slots == 8  # two images, four soft tokens each from a 2x2 patch grid
@@ -468,7 +468,7 @@ def test_step_benchmark_canvas_rows_are_whole_unpadded_canvases():
     case = composite_case(tool, "diffusion_gemma", batch_size=2)
 
     assert tool.canvas_split(case) == (8, 4, 2)
-    tokens = next(tool.batches(case))["text"]
+    tokens = tool.global_batch(case)["text"]
     assert tokens.shape == (2, 16) and tokens.min() >= 1 and tokens.max() < 256
 
 
