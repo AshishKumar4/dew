@@ -346,14 +346,15 @@ def pack(rollouts: Sequence[Rollout], width: int, *, rows: int | None = None,
     }
 
 
-def sampled_values(batch: Mapping[str, np.ndarray], rollouts: Sequence[Rollout],
-                   values: Callable[[Rollout, int], Sequence[float]]) -> np.ndarray:
+def sampled_values(batch: Mapping[str, np.ndarray],
+                   values: Callable[[int, int], Sequence[float]]) -> np.ndarray:
     """Scatter per-call host values, one per sampled id, into the packed layout.
 
-    `values(rollout, call)` returns one float per sampled id of that call,
-    such as the raw-policy log-probabilities an in-process sampler recorded.
-    A call's sampled ids sit in one chain in order, so row-major order of
-    its `(rollout_index, call_index)` positions is their order in the call.
+    `values(index, call)` returns one float per sampled id of call `call`
+    of the `index`-th rollout handed to `pack`, such as the raw-policy
+    log-probabilities an in-process sampler recorded. A call's sampled ids
+    sit in one chain in order, so row-major order of its
+    `(rollout_index, call_index)` positions is their order in the call.
     """
     rollout_index = np.asarray(batch[ROLLOUT_INDEX_KEY])
     call_index = np.asarray(batch[CALL_INDEX_KEY])
@@ -368,10 +369,8 @@ def sampled_values(batch: Mapping[str, np.ndarray], rollouts: Sequence[Rollout],
         if not group.size:
             continue
         position = where[group[0]]
-        rollout = rollouts[int(flat_rollout[position])]
-        number = int(flat_call[position])
-        given = np.asarray(values(rollout, number), np.float32)
-        if given.shape != (len(rollout.calls[number].sampled_ids),) or given.shape != (group.size,):
+        given = np.asarray(values(int(flat_rollout[position]), int(flat_call[position])), np.float32)
+        if given.shape != (group.size,):
             raise ValueError("values must return one float per sampled id of the call")
         flat[where[group]] = given
     return out

@@ -166,7 +166,7 @@ def test_sampled_values_scatter_per_call_values_in_call_order():
     rng = np.random.default_rng(3)
     rollouts = [_rollout(rng, sample=index, reward=float(index))[0] for index in range(4)]
     batch = pack(rollouts, 64)
-    placed = sampled_values(batch, rollouts, lambda rollout, number: rollout.calls[number].behavior_log_probs)
+    placed = sampled_values(batch, lambda index, number: rollouts[index].calls[number].behavior_log_probs)
     np.testing.assert_array_equal(placed, batch[BEHAVIOR_LOG_PROBS_KEY])
 
 
