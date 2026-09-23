@@ -1,7 +1,5 @@
 # Evaluation and tracking
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This guide assumes you have done the [first training run](../getting-started.md). The training loss measures the batches the optimizer trains on. Validation uses a separate dataset, and it runs only when you set how often it should run.
 
 ## Enable evaluation explicitly

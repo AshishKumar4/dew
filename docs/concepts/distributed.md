@@ -1,7 +1,5 @@
 # Distributed training
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This page assumes you can train a model on one device and know JAX arrays and Flax variables. Work through [the single-device tutorial](../getting-started.md) before you change placement. You should know your global batch size and the shapes of your model's parameters.
 
 A mesh gives names to groups of devices. A layout maps parameter dimensions to those mesh axes. `Trainer` uses the mesh and the layout to initialize and update sharded state, and JAX compiles the collective communication this needs.

@@ -1,7 +1,5 @@
 # Inference and rollout serving
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Research checked on 2026-09-06. Dew citations refer to `65fd2f4`. Upstream source links pin commits. Hosted documentation describes the page retrieved on this date. MaxText package observations refer to `maxtext==0.2.4`, unpacked at `/tmp/mt/maxtext`; the linked source snapshot is `c55443590e2925b5da66f82ea7bc9a32a8c662e3`. Their line numbers differ. Package citations below use package-relative paths.
 
 This note records capabilities and fit recommendations. It makes no interface decision. It reports no throughput measurement or end-to-end compatibility result. I read source and documentation without loading model weights or running a serving engine. A kernel or export path in source does not establish model-wide serving parity.

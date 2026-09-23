@@ -1,7 +1,5 @@
 # Model families: what Dew's `CausalTransformer` needs for parity
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Research note, 2026-09-02. Scope: the block-level inventory of the large open
 model families, the smallest checkpoint of each that can act as a parity
 fixture on a 16 GB card, and a dependency-ordered plan for Dew.

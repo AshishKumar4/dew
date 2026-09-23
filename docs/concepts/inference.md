@@ -1,7 +1,5 @@
 # Inference
 
-> An AI assistant maintains this document. It is presented as-is.
-
 `dew.pipeline` loads an inference task. It returns `TextGeneration` for decoders, `BlockGeneration` for DiffusionGemma, `MaskedGeneration` for masked-diffusion language models such as LLaDA and Dream, and `TextToImage` for diffusion models. A task holds the native model, its variables, and any tokenizer or condition encoders the source provides. You call it with inputs and a key or seed. Results stay where the task placed them on the devices.
 
 ```python

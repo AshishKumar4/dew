@@ -1,7 +1,5 @@
 # Domain recommendation for Dew
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Measured 2026-09-02 (17:00 to 17:40 UTC). Every registration fact below comes from the authoritative RDAP or WHOIS server for that TLD, and every price from a registrar page or public price API fetched in this session. Aggregator sites were not used: one of them had already reported `dew.sh` as available, and the registry says it is registered (see the availability table).
 
 ## Recommendation

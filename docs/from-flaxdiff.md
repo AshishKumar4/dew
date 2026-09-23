@@ -1,7 +1,5 @@
 # Coming from FlaxDiff
 
-> An AI assistant maintains this document. It is presented as-is.
-
 FlaxDiff was this project's earlier API, built around diffusion. Dew keeps model construction, data loading, task objectives, and training apart, so the same trainer also runs language models and representation learning. The table below tells you where each familiar piece lives now. The Dew names are not import aliases, and you cannot migrate code by search and replace.
 
 If you are new to the project, start with [getting started](getting-started.md). You do not need to learn FlaxDiff first.

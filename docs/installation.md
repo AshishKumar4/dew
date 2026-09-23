@@ -1,7 +1,5 @@
 # Install Dew
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This guide assumes you can create a Python virtual environment and run commands in a terminal. Dew needs Python 3.12 or newer. I recommend Python 3.14 for training, and it is the main version CI runs. That choice is about compatibility and maintenance. A newer Python does not make compiled JAX kernels faster.
 
 The commands below use a POSIX shell and need [uv](https://docs.astral.sh/uv/getting-started/installation/) on your PATH. If the `uv` command is missing, install it first. If your shell is not POSIX, use its own way of activating a virtual environment.

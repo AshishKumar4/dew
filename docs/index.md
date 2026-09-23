@@ -1,7 +1,5 @@
 # Train models with Dew
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Dew is a Python library for training Flax Linen models with JAX. You write an `Objective` that sets up the model's variables, computes a loss, and optionally evaluates. `Trainer` runs the optimization. It also places the model on your devices and writes checkpoints if you ask it to.
 
 I assume you know Python and the basics of machine learning: batches, loss functions, gradients, and train/validation splits. You do not need to have run JAX on more than one device. A page that needs Flax or sharding knowledge says so at the top.

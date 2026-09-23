@@ -1,7 +1,5 @@
 # MaxText configuration parity
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Research date: 2026-09-06. Dew source: `65fd2f4`.
 
 This extends [google-jax-stack.md](google-jax-stack.md) and starts from that note's library verdicts. It audits configuration and execution at Dew's seams as of `65fd2f4`. At that commit Dew already had a six-axis mesh, MoE, layer scanning and async checkpoints, so earlier descriptions of a two-axis mesh without those features were out of date.

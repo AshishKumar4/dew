@@ -1,7 +1,5 @@
 # References and attribution
 
-> An AI assistant maintains this document. It is presented as-is.
-
 The papers below explain methods that Dew uses. The projects below are Dew's dependencies, reference implementations it is checked against, or sources of code it adapts. Citing a paper or project does not mean Dew reproduces all of its results or supports every model it covers. For Dew's own interfaces, use the [core API reference](reference/core-api.md). For measurements with their hardware and revision, see [benchmarks](benchmarks.md).
 
 ## Diffusion and flow models

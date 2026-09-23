@@ -1,7 +1,5 @@
 # The language-model head
 
-> An AI assistant maintains this document. It is presented as-is.
-
 ## Result
 
 Scoring the vocabulary in four chunks instead of one takes the small causal

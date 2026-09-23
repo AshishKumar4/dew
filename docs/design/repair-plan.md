@@ -1,7 +1,5 @@
 # Dew repair and capability plan
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Status: proposed implementation order after the September 2026 research and documentation review. The documentation restructuring and the isolated registry, timeline, and CI repairs are implemented. The training-contract changes below are not implemented, and the documentation tests do not cover them.
 
 Correction (2026-09-22): the training-contract tickets C01 to C04 have since landed in source. `TrainState` has the three clocks and checkpoints the scaler and partial accumulation window (`src/dew/training/state.py:15-61`); evaluation derives per-batch keys (`src/dew/training/evaluation.py:304`); `fit` closes the training source on every exit (`src/dew/training/trainer.py:844-856`). The documentation page runner mentioned under "Qualification and documentation" was deleted in `93a8ee10`, so no test executes the documentation pages today. I checked these by reading source and git history; I did not audit the R, I and S tickets.

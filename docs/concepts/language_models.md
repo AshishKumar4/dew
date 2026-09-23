@@ -1,7 +1,5 @@
 # Training language models
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This page assumes you have done the [first training run](../getting-started.md) and know how next-token prediction works. You do not need a pretrained model to run the first example. It uses a synthetic vocabulary of four tokens, so you can look at every input and output.
 
 ## Train a small decoder

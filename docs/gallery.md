@@ -1,7 +1,5 @@
 # Gallery: historical FlaxDiff experiments
 
-> An AI assistant maintains this document. It is presented as-is.
-
 These images come from my earlier experiments with FlaxDiff, the project Dew grew out of. The settings below copy the run descriptions I recorded at the time, including the old scheduler and model names. You cannot run them as configurations with today's Dew API, and they do not show that a current checkout reproduces these images.
 
 For each run the gallery records the training data, the image size, the sampling settings, and some model fields. It has no complete environment, checkpoint, seed record, or quality evaluation for any of them. For a current workflow, start with [recipes](recipes.md) and the [diffusion guide](guides/diffusion.md). For timed measurements with their revision and hardware, see [benchmarks](benchmarks.md).

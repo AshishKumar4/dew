@@ -1,7 +1,5 @@
 # Review of `main` at `102baa4`
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Review, 2026-09-03. I read these first hand: `training/`, `objectives/`, `diffusion/`, `sampling/`, `inputs/`, `registry.py`, `config/`, the causal transformer and attention, the chunked cross entropy, the DiT head, the data loaders and token sources, the eval metrics, the JEPA mask and probes, the examples, the LM recipe, and the trainer and sampler tests. Four read-only audits covered the data internals, the backbones, the periphery (interop, telemetry, eval, CLI, RL) and the test suite. I re-read every finding cited from them at the named lines. I then executed every finding below on CPU in the project venv (jax 0.11.1, flax 0.12.9, Apple M3) before calling it confirmed. The companion design is `docs/design/api.md`.
 
 ## 1. Verdict

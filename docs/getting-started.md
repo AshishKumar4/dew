@@ -1,7 +1,5 @@
 # Your first training run
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This tutorial assumes you know Python, NumPy-style arrays, and the idea of lowering a loss with gradients. It explains the Flax Linen and JAX ideas the example needs as they come up. Finish [installation](installation.md) first.
 
 We will fit a line to 32 made-up examples. The target is `y = 2x + 1`, so you can measure the trained model's error yourself, without downloading a dataset or a pretrained checkpoint. The point is to see training work end to end. It says nothing about benchmarks or how a model generalizes.

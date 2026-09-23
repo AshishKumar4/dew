@@ -1,7 +1,5 @@
 # Train a representation model with JEPA
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This guide assumes you have done the [first training run](../getting-started.md) and know what image patches are. JEPA trains an encoder by predicting the representations of hidden image regions from the visible ones. The training target is an encoded representation. It is not a pixel reconstruction or a next-token label.
 
 ## Run a small image example

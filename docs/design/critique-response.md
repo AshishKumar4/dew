@@ -1,7 +1,5 @@
 # Review of the external critique
 
-> An AI assistant maintains this document. It is presented as-is.
-
 The critique reviewed `f144a9c1ee543334fcb15832ae910fad2ab7a885`. This response checks its findings against local source at `65fd2f4d7470fe6b6dd168b15977e965810ec1f3`, before the documentation restructuring and isolated repairs in `e5ee70d`.
 
 The reproductions used JAX 0.11.1, Flax 0.12.9, and Optax 0.2.8 on CPU. They ran real Dew paths with small arrays and local Orbax storage. They say nothing about GPU or TPU deployment.

@@ -1,7 +1,5 @@
 # Mixture of experts
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This page assumes you know transformer feed-forward layers and have read the [language model guide](language_models.md). A mixture-of-experts layer holds several feed-forward networks, called experts. For each token, a router scores the experts, picks a few of them, and mixes their outputs with routing weights.
 
 ## Construct a small sparse decoder

@@ -1,7 +1,5 @@
 # JAX and Flax features for Dew
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Research date: 2026-09-06. Dew source: `65fd2f4`.
 
 This extends [google-jax-stack.md](google-jax-stack.md). The [MaxText inventory](maxtext-parity.md) names the missing training capabilities. This note identifies the upstream primitives that can implement them. Fit entries are recommendations, not approved designs.

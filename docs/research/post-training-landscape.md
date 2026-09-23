@@ -1,7 +1,5 @@
 # Post-training landscape
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Research date: 2026-09-06. Dew revision: `65fd2f4`.
 
 This note covers methods, rollout systems, agent environments, model reports, and data contracts. It makes fit recommendations. It does not select an implementation or change an API.

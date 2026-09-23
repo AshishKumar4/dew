@@ -1,7 +1,5 @@
 # Step benchmarks
 
-> An AI assistant maintains this document. It is presented as-is.
-
 These results time one complete compiled optimization step through `Trainer`. Each table states its hardware, source revision and shapes. They are records of past runs, and they do not promise the same throughput on the current checkout. To take a new measurement, run `tools/benchmark_step.py`. To time input loading on its own, run `tools/benchmark_data.py`.
 
 The FLOP counts come from the optimized HLO of the compiled executable, through

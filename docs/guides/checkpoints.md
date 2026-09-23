@@ -1,7 +1,5 @@
 # Resuming training
 
-> An AI assistant maintains this document. It is presented as-is.
-
 A training checkpoint holds the model variables, the optimizer state, three step counters (attempted batches, accepted microbatches and optimizer updates), the root key, the EMA copy when you configure one, the loss scaler's history, and any half-filled gradient accumulation window. To continue the data sequence exactly, the checkpoint also needs the data iterator's position. When you resume, use the same model, optimizer, accumulation length and scaler configuration you trained with.
 
 ## Save and restore a small run

@@ -1,7 +1,5 @@
 # Supplying training data
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This page assumes you have done the [first training run](../getting-started.md) and know the shape and dtype your loss expects. Dew hands named arrays from a dataset to the objective. The objective decides what those fields mean.
 
 ## Start with batches you already have

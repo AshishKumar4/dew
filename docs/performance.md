@@ -1,7 +1,5 @@
 # Performance measurements
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This page records experiments on one RTX 4080, at the revisions and settings stated in each section. For architecture comparisons, see [step benchmarks](benchmarks.md). For how distributed training is configured today, see [distributed training](concepts/distributed.md). A result at one shape and one revision does not settle a default for every case, and it says nothing about TPUs.
 
 The timeline busy percentages below were taken before `e5ee70d`, which fixed the measurement window for nested kernel intervals. Before you reuse those percentages, replay the original traces. The synchronized wall-clock step times are separate measurements, and that arithmetic bug does not affect them.

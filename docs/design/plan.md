@@ -1,7 +1,5 @@
 # Dew at scale: the plan
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Design note, 2026-09-02. Author: the MasterPlan agent. Companion document:
 `docs/design/post-training.md`, the detailed spec for SFT, preference and RL
 objectives. This document is the frame that spec sits in.

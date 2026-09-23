@@ -1,7 +1,5 @@
 # How the frontier and the large open labs train, and what Dew should take from it
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Research note, 2026-09-02.
 
 ## How this was done, and how to read it

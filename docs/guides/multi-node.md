@@ -1,7 +1,5 @@
 # Training on several nodes
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This page shows how to start one training script on several machines, how to lay the mesh out so the slow network between them carries as little as possible, and how to rehearse all of it on one machine first. Read [distributed training](../concepts/distributed.md) before this page. It explains meshes and layouts.
 
 ## How a process pool starts

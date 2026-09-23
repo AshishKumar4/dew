@@ -1,7 +1,5 @@
 # Dew and PyTorch benchmark parity
 
-> An AI assistant maintains this document. It is presented as-is.
-
 ## Result
 
 Dew is not running at 1.6% utilization on the small UNet. The counter is wrong for that executable. The optimized HLO contains 646.39 GFLOP per step. XLA `cost_analysis()` reports 28.73 GFLOP. It omits 623.43 GFLOP in 131 cuDNN convolution calls. The matched step takes 16.32 ms. That is 39.6 analytic TFLOP/s, or 40.6% of Dew's 97.5 TFLOP/s denominator. Evidence: `/tmp/benchmark-parity/audit/unet_b16.rows.json` and `/tmp/benchmark-parity/jax_results.json`.

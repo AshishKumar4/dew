@@ -1,7 +1,5 @@
 # Core API reference
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This page describes the interfaces the tutorials use. It does not list every public module. For a complete example, read [your first training run](../getting-started.md).
 
 ## Objective
