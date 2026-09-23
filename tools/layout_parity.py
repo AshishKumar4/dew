@@ -34,7 +34,7 @@ batch is placed from every process alike:
 
     python tools/layout_parity.py --models dense --layouts data4,fsdp4,tensor4
     python tools/layout_parity.py --models moe --layouts expert4,data2_expert2,expert2_fsdp2 \\
-        --mixture '{"experts": 32, "top_k": 8, "dispatch": "exchange"}'
+        --mixture '{"experts": 32, "top_k": 8, "dispatch": "exchange"}' --objective '{"aux_loss_alpha": 0.01}'
     dew launch --processes-per-host 4 --devices-per-process 1 -- \\
         python tools/layout_parity.py --models dense,dit --out parity.json
 
@@ -353,7 +353,7 @@ def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
 
 
 def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int, anchor: bool,
-        mixture: dict[str, Any], speak: Callable[[str], None],
+        mixture: dict[str, Any], objective: dict[str, Any], speak: Callable[[str], None],
         keep: Callable[[list[dict[str, Any]]], None]) -> list[dict[str, Any]]:
     """Every layout of every model, one row each, `keep` handed the rows so
     far after each. A reference and a layout run as agreed phases: a failure
@@ -374,6 +374,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                 raise ValueError(f"{model} has no mixture for --mixture to change")
             case = dataclasses.replace(case, config={
                 **case.config, "mixture": {**case.config["mixture"], **mixture}})
+        case = dataclasses.replace(case, objective={**case.objective, **objective})
         batch = bench.global_batch(case)
         # The exchange needs an expert axis; one device computes the same
         # layer through the global dispatch.
@@ -405,7 +406,8 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
         speak(f"[{model}] reference losses {ref_losses}, largest floor {floors[widest]:.2e} at {widest}")
         for name in layouts:
             row: dict[str, Any] = {"model": model, "mixture": case.config.get("mixture"),
-                                   "layout": name, "processes": jax.process_count(),
+                                   "objective": case.objective, "layout": name,
+                                   "processes": jax.process_count(),
                                    "reference_losses": ref_losses}
             started = time.perf_counter()
             try:
@@ -439,6 +441,8 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
          out: Path | None = None,
          mixture: Annotated[str, tyro.conf.arg(
              help="JSON merged into each model's mixture, e.g. '{\"dispatch\": \"exchange\"}'")] = "{}",
+         objective: Annotated[str, tyro.conf.arg(
+             help="JSON of LMObjective keywords, e.g. '{\"aux_loss_alpha\": 0.01}'")] = "{}",
          ) -> None:
     """Run the layouts of each model against one device; see the module docstring."""
     from dew.training.runtime import prepare_process
@@ -455,7 +459,7 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
             out.write_text(json.dumps(rows, indent=1))
 
     rows = run(models, layouts, dtype=dtype, steps=steps, anchor=anchor, mixture=json.loads(mixture),
-               speak=lambda line: print(line, flush=True) if speaker else None, keep=keep)
+               objective=json.loads(objective), speak=lambda line: print(line, flush=True) if speaker else None, keep=keep)
     if any(row["status"] != "works" for row in rows):
         raise SystemExit(1)
 
