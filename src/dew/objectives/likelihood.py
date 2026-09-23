@@ -7,6 +7,7 @@ is one of this function's callers.
 
 import jax
 import jax.numpy as jnp
+import optax
 
 
 def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
@@ -16,6 +17,7 @@ def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
     bf16 log partition over a vocabulary carries bf16's 8-bit mantissa into
     every score, which is error in the second decimal of a log probability
     near -10; fp32 carries the logits exactly and rounds only the reduction.
+    optax's cross entropy reads the target logit without building the
+    normalized row.
     """
-    normalized = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)
-    return jnp.take_along_axis(normalized, tokens[..., None], axis=-1)[..., 0]
+    return -optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tokens)
