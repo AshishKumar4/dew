@@ -21,11 +21,14 @@ Tolerances and the differences actually observed, fp32 on CPU:
   magnitude up to 40. Tolerance 1e-5.
 - gradients, the same 70 steps as one chunk of 128 : at most 1.6e-05, on the
   `A dt` gradient of magnitude 49, which is 3.3e-07 of it and under three fp32
-  ulps. Tolerance 2e-5. The difference is the XLA path's rounding rather than
-  the kernel's: against the same scan in float64 the kernel sits 8.0e-06 from
-  it where the XLA path sits 1.6e-05, and the final state 2.9e-07 against
-  4.2e-06. `test_the_kernel_is_at_least_as_exact_as_the_xla_scan` asserts that
-  ordering for every one of them rather than leaving it written here.
+  ulps. Tolerance 2e-5. Against the same scan in float64 both paths sit
+  8.0e-06 from it on that gradient and 2.0e-06 on the output; the final state
+  2.8e-07 (kernel) and 2.1e-07 (XLA). `test_the_kernel_and_the_xla_scan_round_alike`
+  asserts that neither is more than twice the other's distance for every one
+  of them.
+- document resets (`RESET_DECAY` in `A dt`) : output 1.9e-06, final state
+  4.8e-07, gradients at most 5.7e-06 on gradients of magnitude up to 49,
+  and no NaN from the finite reset in the segment-sum matmul.
 - bfloat16 through `chunk_ssd`      : the two round to the same bf16 output,
   0.0 apart over 65536 entries; the final state differs in one entry of 32768,
   0.271484 against 0.273438, which is the one bf16 ulp of that binade. The
@@ -50,7 +53,7 @@ from dew.nn.kernels.ssd import (
     ssd_kernel_platform,
     ssd_kernel_runs,
 )
-from dew.nn.mixers.mamba2 import chunk_ssd, xla_chunk_scan
+from dew.nn.mixers.mamba2 import RESET_DECAY, chunk_ssd, xla_chunk_scan
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 BOUND = 1e-5
@@ -150,11 +153,38 @@ def test_the_kernel_computes_the_xla_gradients(reference, platform, chunk_size):
 
 
 @pytest.mark.parametrize("platform", KERNELS)
-def test_the_kernel_is_at_least_as_exact_as_the_xla_scan(reference, platform, in_float64):
-    """What separates the two at fp32 is rounding, and the kernel's share of it
-    is the smaller one: it sums each chunk's decay over its own range where the
-    XLA path subtracts two cumulative sums that carry the whole chunk's
-    magnitude. Both are measured against the same scan in float64."""
+@pytest.mark.parametrize("chunk_size", SHAPES)
+def test_the_kernel_computes_the_xla_scan_across_document_resets(reference, platform, chunk_size):
+    """Packed documents reach the scan as `RESET_DECAY` in `A dt` at every
+    document's first token: the kernel's segment sums multiply it by the 0/1
+    triangle, which a -inf would turn into NaN. Starts at a chunk's first
+    token and inside one, forward and all five gradients."""
+    x_c, b_c, c_c, a_c, state = scan_operands(reference, chunk_size)
+    a_c = a_c.at[0, 0, :, 7].set(RESET_DECAY).at[0, 1, :, 20].set(RESET_DECAY)
+    if chunk_size == 32:
+        a_c = a_c.at[1, 0, :, 0].set(RESET_DECAY)
+    operands = (x_c, b_c, c_c, a_c, state)
+    expected = xla_chunk_scan(*operands)
+    seeded = cotangents(*expected)
+    expected_gradients = jax.vjp(xla_chunk_scan, *operands)[1](seeded)
+
+    scanned = ssd_chunk_scan(*operands, platform)
+    gradients = jax.vjp(lambda *o: ssd_chunk_scan(*o, platform), *operands)[1](seeded)
+
+    for want, got in zip(expected, scanned, strict=True):
+        assert largest(want, got) < BOUND
+    for name, want, got in zip(("x", "B", "C", "A dt", "state"), expected_gradients, gradients,
+                               strict=True):
+        assert np.all(np.isfinite(np.asarray(got))), name
+        assert largest(want, got) < GRADIENT_BOUND, name
+
+
+@pytest.mark.parametrize("platform", KERNELS)
+def test_the_kernel_and_the_xla_scan_round_alike(reference, platform, in_float64):
+    """What separates the two at fp32 is rounding. Both sum each chunk's
+    decays over their own ranges rather than subtracting cumulative sums, so
+    each sits within fp32 rounding of the same scan in float64, and neither
+    lands more than twice as far from it as the other."""
     operands = scan_operands(reference, 128)
     exact = [jnp.asarray(t, jnp.float64) for t in operands]
     truth, truth_final = xla_chunk_scan(*exact)
@@ -166,11 +196,12 @@ def test_the_kernel_is_at_least_as_exact_as_the_xla_scan(reference, platform, in
     xla_gradients = jax.vjp(xla_chunk_scan, *operands)[1](seeded)
     gradients = jax.vjp(lambda *o: ssd_chunk_scan(*o, platform), *operands)[1](seeded)
 
-    assert largest(final, truth_final) <= largest(rounded_final, truth_final)
-    assert largest(scanned, truth) <= largest(rounded, truth)
-    for name, want, mine, theirs in zip(("x", "B", "C", "A dt", "state"), exact_gradients,
-                                        gradients, xla_gradients, strict=True):
-        assert largest(mine, want) <= largest(theirs, want), name
+    pairs = [("output", scanned, rounded, truth), ("final", final, rounded_final, truth_final),
+             *zip(("x", "B", "C", "A dt", "state"), gradients, xla_gradients, exact_gradients,
+                  strict=True)]
+    for name, mine, theirs, want in pairs:
+        kernel, xla = largest(mine, want), largest(theirs, want)
+        assert kernel <= 2 * xla and xla <= 2 * kernel, name
 
 
 def mixer_operands(shape, seed: int = 0):

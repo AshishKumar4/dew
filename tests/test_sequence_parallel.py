@@ -1,4 +1,4 @@
-"""Sequence-parallel attention on the simulated 8-device mesh.
+"""Sequence-parallel attention and Mamba-2 on the simulated 8-device mesh.
 
 Under a mesh whose sequence axis is above one, the attention seam runs one
 of two exchanges. The all-to-all one (Ulysses) trades every shard's rows of
@@ -9,6 +9,11 @@ striped layout that gives every shard the same causal work, with the
 positions carried into the mask and the output put back in sequence order.
 The proof is equality with whole sequences: the same loss, the same
 gradients, the same attention output, for both.
+
+Mamba-2 splits its conv and its scan over the same axis: each shard reads
+the previous shard's conv tail and starts its scan from the state the
+earlier shards leave, and the proof is the same, the layer's output and
+gradients and a hybrid model's training step against whole sequences.
 """
 
 import jax
@@ -36,6 +41,7 @@ from dew.nn.attention import (
     stripe,
     unstripe,
 )
+from dew.nn.mixers.mamba2 import Mamba2
 from dew.telemetry.instrumentation import compiled_flops
 from dew.objectives.lm import LMObjective
 from dew.registry import models
@@ -321,7 +327,7 @@ def test_decoding_is_refused_under_a_sequence_axis():
 # --------------------------------------------------------------------------
 
 
-def one_step(spec, batch, monkeypatch=None, tolerance=0.02):
+def one_step(spec, batch, monkeypatch=None, tolerance=0.02, model=tiny):
     """The loss of one step and the parameters after it, on `spec`; with
     sgd(1.0) the parameters move by exactly the gradient. With
     `monkeypatch`, also the program the trainer compiles for its own step,
@@ -333,7 +339,7 @@ def one_step(spec, batch, monkeypatch=None, tolerance=0.02):
             lowered.append(program.as_text())
             return compiled_flops(program.compile())
         monkeypatch.setattr(trainer_module, "step_flops", recording)
-    trainer = Trainer(LMObjective(tiny(), SEQ_LEN), optax.sgd(1.0), key=jax.random.key(0),
+    trainer = Trainer(LMObjective(model(), SEQ_LEN), optax.sgd(1.0), key=jax.random.key(0),
                       mesh=spec, layout=Layout(min_shard=TINY_SHARD, tolerance=tolerance))
     state, _, _ = trainer.place()
     placed = shard_batch(trainer.device_mesh, batch)
@@ -382,3 +388,140 @@ def test_the_exchange_runs_inside_the_pipeline_stages(monkeypatch):
     split = one_step(MeshSpec(fsdp=2, stage=2, sequence=2), batch, monkeypatch)
     assert "all_to_all" in split[2]
     assert_same_step(one_step(WHOLE, batch), split)
+
+
+# --------------------------------------------------------------------------
+# Mamba-2: the conv and the scan split over the sequence axis
+# --------------------------------------------------------------------------
+
+MAMBA_LENGTH = 64
+# One document ends on a shard boundary at eight shards (8), one inside a
+# shard (30), a two-token document straddles the boundary at 16, shorter
+# than the conv's three-token history, and the last row ends in padding.
+MAMBA_CUTS = ((8, 30), (15, 17, 60))
+
+
+def mamba_segments():
+    segments = np.ones((2, MAMBA_LENGTH), np.int32)
+    for row, cuts in enumerate(MAMBA_CUTS):
+        for index, cut in enumerate(cuts):
+            segments[row, cut:] = index + 2
+    segments[1, 60:] = 0
+    return jnp.asarray(segments)
+
+
+MAMBA_SPLITS = {
+    "sequence8": MeshSpec(sequence=8),
+    "fsdp2_sequence4": MeshSpec(fsdp=2, sequence=4),
+    "tensor2_sequence4": MeshSpec(tensor=2, sequence=4),
+}
+
+
+def mamba_layer(dtype):
+    return Mamba2(emb_features=16, num_heads=4, head_dim=8, state_size=6, n_groups=2,
+                  chunk_size=4, dtype=dtype)
+
+
+def leafwise_largest(want, got) -> dict[str, float]:
+    """Per leaf, by path, the largest difference as a fraction of the leaf's
+    largest value."""
+    def relative(a, b):
+        a, b = np.asarray(a, np.float32), np.asarray(b, np.float32)
+        return float(np.max(np.abs(a - b)) / np.max(np.abs(a)))
+    differences = jax.tree.map(relative, want, got)
+    return {jax.tree_util.keystr(path): value
+            for path, value in jax.tree_util.tree_flatten_with_path(differences)[0]}
+
+
+# fp32: the shards sum the same terms in another order (a shard's entering
+# state is the chunk writes folded over shards rather than over chunks);
+# observed at most 9.0e-7 of a leaf's largest value, on the output, every
+# parameter gradient and the input gradient. bf16: the conv and the scan
+# run in fp32 on both sides, so the output (observed 0.0) and the gradients
+# of the scan's own parameters (A_log, D, dt_bias, conv1d; observed 8.2e-7)
+# keep the fp32 bound. The projections' and the norm's weight gradients are
+# bf16 contractions over the tokens, which the split program sums as
+# per-shard bf16 partials: two bf16 ulps, 2^-6, observed 1.1e-2 on the norm
+# weight and 9.1e-4 on the input. A shard that started from a zero state
+# instead of the earlier shards' moves the fp32 output by 0.66, and a conv
+# that did not read the previous shard's tail by 3.3.
+FP32_BOUND = 2e-6
+BF16_CONTRACTION_BOUND = 2.0 ** -6
+SCAN_LEAVES = ("output", "A_log", "'D'", "dt_bias", "conv1d")
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
+@pytest.mark.parametrize("split", sorted(MAMBA_SPLITS))
+def test_mamba2_agrees_with_whole_sequences_forward_and_backward(split, packed, dtype):
+    """The layer's output and the gradients of every parameter and of its
+    input, whole sequences against the sequence axis split two to eight
+    ways, the rows over fsdp or the tensor axis replicated beside it. The
+    packed rows put documents on, inside and straddling the shard
+    boundaries, so the state and the conv history reset across them. The
+    lowered program holds the state exchange: the conv tail's
+    collective-permute and the shards' all-gather."""
+    layer = mamba_layer(dtype)
+    hidden = jax.random.normal(jax.random.key(0), (2, MAMBA_LENGTH, 16), dtype)
+    variables = layer.init(jax.random.key(1), hidden)
+    # A step near 1 and decays of 0.05 to 0.5 per unit step, so what one
+    # shard writes into the state still weighs on the shards after it.
+    variables["params"]["dt_bias"] = jnp.full((4,), 0.5)
+    variables["params"]["A_log"] = jnp.log(jnp.linspace(0.05, 0.5, 4))
+    segments = mamba_segments() if packed else None
+
+    def run(variables, hidden):
+        return layer.apply(variables, hidden, segment_ids=segments)
+
+    def loss(variables, hidden):
+        return jnp.sum(jnp.sin(run(variables, hidden).astype(jnp.float32)))
+
+    def both(variables, hidden):
+        parameters, inputs = jax.grad(loss, argnums=(0, 1))(variables, hidden)
+        return {"output": run(variables, hidden), "parameters": parameters, "input": inputs}
+
+    whole = both(variables, hidden)
+    with jax.set_mesh(build_mesh(MAMBA_SPLITS[split])):
+        program = jax.jit(both)
+        text = program.lower(variables, hidden).as_text()
+        sharded = program(variables, hidden)
+    assert "collective_permute" in text and "all_gather" in text
+    for leaf, difference in leafwise_largest(whole, sharded).items():
+        exact = dtype == jnp.float32 or any(name in leaf for name in SCAN_LEAVES)
+        assert difference < (FP32_BOUND if exact else BF16_CONTRACTION_BOUND), (leaf, difference)
+
+
+def hybrid():
+    """Three Mamba-2 layers then one attention layer, the pattern of the
+    Mamba-2 hybrids at toy size."""
+    return models.build(
+        "causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=4,
+        num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN,
+        layer_types=("mamba",) * 3 + ("attention",),
+        kinds={"mamba": {"mixer": {"kind": "mamba2", "num_heads": 4, "head_dim": 8,
+                                   "state_size": 8, "n_groups": 1, "chunk_size": 4}}})
+
+
+# tensor=2 by sequence=4 leaves fsdp at 1, so the layout's tolerance has to
+# allow the widths it cannot split (29.8% of this model's elements).
+HYBRID_SPLITS = {
+    "fsdp2_sequence4": (MeshSpec(fsdp=2, sequence=4), 0.02),
+    "tensor2_sequence4": (MeshSpec(tensor=2, sequence=4), 0.35),
+}
+
+
+@pytest.mark.parametrize("split", sorted(HYBRID_SPLITS))
+@pytest.mark.parametrize("make_batch", [dense_batch, packed_batch])
+def test_a_mamba2_hybrid_trains_the_same_step_under_a_split_sequence(make_batch, split, monkeypatch):
+    """A hybrid decoder, three Mamba-2 layers and one attention layer, takes
+    the step fsdp=8 takes with the sequence split four ways: the same loss
+    and every parameter within fp32 rounding after sgd(1.0), on a dense
+    batch and on a packed one whose documents start at a different column
+    of every row. The trainer's own compiled step holds the Mamba-2 state
+    exchange. Observed: equal losses, parameters at most 3.6e-7 apart."""
+    batch = make_batch()
+    spec, tolerance = HYBRID_SPLITS[split]
+    sharded = one_step(spec, batch, monkeypatch, tolerance, model=hybrid)
+    assert "collective_permute" in sharded[2] and "all_gather" in sharded[2]
+    whole = one_step(WHOLE, batch, model=hybrid)
+    assert_same_step(whole, sharded)
