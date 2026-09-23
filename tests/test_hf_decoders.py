@@ -1495,10 +1495,11 @@ def test_the_v32_fixture_is_the_sparse_model():
 @pytest.mark.parametrize("name", DEEPSEEK)
 def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path, rng):
     """The writer covers the three attention families; a model with the mla
-    mixer raises naming the mixer, and one with routed experts on standard
-    attention raises naming the mixture. Neither writes a checkpoint."""
+    mixer and one with routed experts on standard attention are refused
+    naming the field their written config cannot carry. Neither writes a
+    checkpoint."""
     model, variables = fp32_decoder(FIXTURES / name)
-    with pytest.raises(ValueError, match="a mixer other than attention"):
+    with pytest.raises(ValueError, match="lacks 'qk_nope_head_dim'"):
         save_pretrained_decoder(model, variables, str(tmp_path))
 
     config = translate_config(fixture_config(name))
@@ -1507,7 +1508,7 @@ def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path, rng):
                                "layer_types": None, "kinds": {}},
         dtype="float32", attention_impl="reference"))
     variables = routed.init(rng, jnp.ones((1, 4), jnp.int32))
-    with pytest.raises(ValueError, match="a model with a mixture"):
+    with pytest.raises(ValueError, match="lacks 'num_local_experts'"):
         save_pretrained_decoder(routed, variables, str(tmp_path))
 
 
@@ -3236,7 +3237,7 @@ def test_llama4_logits_match_the_reference_implementation():
 
 def test_llama4_export_is_refused_by_name(tmp_path):
     model, variables = fp32_decoder(LLAMA4)
-    with pytest.raises(ValueError, match="a mixer other than attention"):
+    with pytest.raises(ValueError, match="lacks 'num_local_experts'"):
         save_pretrained_decoder(model, variables, str(tmp_path))
 
 
