@@ -141,7 +141,7 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     objective = LMObjective(loaded.model, seq_len=SEQ, ema_decay=None, pretrained=loaded.variables)
     rows = math.lcm(ROWS, jax.device_count())
     batch = tokens[np.arange(rows) % ROWS]
-    data = Dataset(train=lambda: iter([{"text": batch}] * 4), val=None, records=rows, batch=rows)
+    data = Dataset(train=lambda partition: iter([{"text": batch}] * 4), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=2, tensor=2), layout=TorchLayout(min_shard=1))
 
