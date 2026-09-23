@@ -54,24 +54,34 @@ def make_model() -> None:
 
 
 def references(record: dict) -> None:
-    """Add each call's transformers float32 and float64 filtered log-probabilities."""
+    """Add each call's transformers filtered log-probabilities: float32 and
+    float64 on transformers' own routing, which must be the record's, and
+    bfloat16 with the record's routing forced, so it differs from vLLM's
+    bf16 run by rounding alone."""
     import torch
     from transformers import Qwen3MoeForCausalLM
 
+    # One thread sums in one order, so the float32 references regenerate bit for bit.
+    torch.set_num_threads(1)
     temperature = record["sampling"]["temperature"]
-    for dtype, name in ((torch.float32, "float32"), (torch.float64, "float64")):
+    sparse = [layer for layer in range(CONFIG["num_hidden_layers"]) if layer not in CONFIG["mlp_only_layers"]]
+    for dtype, name in ((torch.float32, "float32"), (torch.float64, "float64"), (torch.bfloat16, "bfloat16")):
         # The grouped-matmul experts refuse float64; the eager loop computes the same sum.
         model = Qwen3MoeForCausalLM.from_pretrained(MODEL, dtype=dtype, experts_implementation="eager").eval()
         for call in record["calls"]:
             ids = call["prompt_ids"] + call["sampled_ids"]
+            routed = torch.as_tensor(np.asarray(call["routed_experts"]), dtype=torch.long)
+            if name == "bfloat16":
+                for layer in sparse:
+                    model.model.layers[layer].mlp.gate.forward = _forced(model.model.layers[layer].mlp.gate,
+                                                                         routed[:, layer])
             with torch.no_grad():
                 out = model(torch.tensor([ids[:-1]]), output_router_logits=True)
-            if name == "float64":
-                routed = np.asarray(call["routed_experts"])
-                for layer, logits in zip((1, 2), out.router_logits[-2:], strict=True):
-                    chosen = np.sort(torch.topk(logits.softmax(-1), 2, dim=-1).indices.numpy(), -1)
-                    if not np.array_equal(chosen, np.sort(routed[:, layer], -1)):
-                        raise ValueError(f"transformers routes layer {layer} otherwise than the record")
+            if name != "bfloat16":
+                for layer, logits in zip(sparse, out.router_logits, strict=True):
+                    chosen = torch.topk(logits.softmax(-1), CONFIG["num_experts_per_tok"], dim=-1).indices
+                    if not torch.equal(chosen.sort(-1).values, routed[:, layer].sort(-1).values):
+                        raise ValueError(f"transformers {name} routes layer {layer} otherwise than the record")
             logits = out.logits[0].double() / temperature
             start = len(call["prompt_ids"]) - 1
             scores = []
@@ -79,6 +89,19 @@ def references(record: dict) -> None:
                 row = logits[start + offset, kept]
                 scores.append(float(row[kept.index(token)] - torch.logsumexp(row, 0)))
             call.setdefault("reference", {})[name] = scores
+
+
+def _forced(gate, indices):
+    """`Qwen3MoeTopKRouter.forward` choosing `indices` instead of its top-k."""
+    import torch
+    import torch.nn.functional as F
+
+    def forward(hidden_states):
+        logits = F.linear(hidden_states.reshape(-1, gate.hidden_dim), gate.weight)
+        probabilities = F.softmax(logits, dtype=torch.float, dim=-1)
+        return logits, probabilities.gather(-1, indices).to(logits.dtype), indices
+
+    return forward
 
 
 def main() -> None:
