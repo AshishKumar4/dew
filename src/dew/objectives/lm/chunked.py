@@ -362,10 +362,15 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     tile. `temperature` divides the capped logits (`head_logits`), which
     scores the draws of a sampler at that temperature.
 
-    On a mesh every device scores its own tokens (`_token_spec`), with the
-    head whole on each: the token tiles are dynamic slices in a loop, which
-    GSPMD would only compute on a replicated operand, so the split is a
-    `shard_map`, and the head's gradient is the one sum that crosses devices.
+    On a mesh every device scores its own tokens (`_token_spec`): the token
+    tiles are dynamic slices in a loop, which GSPMD would only compute on a
+    replicated operand, so the split is a `shard_map`. Where the head's
+    vocabulary is split over axes that split the tokens too, and the tokens
+    of such a group take fewer bytes than the head, the head stays split
+    (`_vocabulary_split`): each device scores every token of its group
+    against its own columns, and only the tokens, their per-token terms and
+    the tokens' gradient cross devices. Otherwise the head is gathered whole
+    on each device, and its gradient is the one sum that crosses devices.
     """
     features = head_weight.shape[1 if vocab_major else 0]
     if hidden.shape[-1] != features:
@@ -386,6 +391,14 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                              BF16 if rounds_to_bf16(hidden.dtype, precision) else precision,
                              predict, float(temperature))
 
+    def column_logits(states, rows, cap):
+        """The capped logit of each state against its own row of the head,
+        as the head's tiles score it."""
+        effective = BF16 if rounds_to_bf16(states.dtype, precision) else precision
+        operands = _operand_dtype(effective)
+        return _capped(jax.vmap(lambda state, row: _tile_logits(
+            state[None].astype(operands), row[None], effective)[0, 0])(states, rows), cap, temperature)
+
     spec = () if jax.sharding.get_abstract_mesh().empty else _token_spec(targets.shape)
     axes = {axis for entry in spec for axis in mesh_axes(entry)}
     if not axes:
@@ -396,19 +409,70 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     # what reaches every token shard alike, the head over the axes that do
     # not split it and the cap, over the shards; checked, the tile loops'
     # carries, which start from constants, would have to be told they vary.
+    # A spec drops its trailing unsplit dimensions; both of the table's count.
+    entries = logical_spec(("vocab", "embed"), table.shape)
     kept = [tuple(axis for axis in mesh_axes(entry) if axis in axes)
-            for entry in logical_spec(("vocab", "embed"), table.shape)]
+            for entry in (*entries, *[None] * (2 - len(entries)))]
     held = P(*(entry if entry else None for entry in kept))
+    group, widths = kept
+    size = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in group)
+    split = bool(group) and (hidden.size // math.prod(
+        jax.sharding.get_abstract_mesh().shape[axis] for axis in axes) * size * hidden.dtype.itemsize
+        < table.size * table.dtype.itemsize)
 
     def local(hidden, table, targets, cap):
-        for dimension, entry in enumerate(held):
-            if entry is not None:
-                table = jax.lax.all_gather(table, entry, axis=dimension, tiled=True)
+        if widths:
+            table = jax.lax.all_gather(table, widths, axis=1, tiled=True)
+        if split:
+            return _vocabulary_split(hidden, table, targets, cap, group, head, column_logits)
+        if group:
+            table = jax.lax.all_gather(table, group, axis=0, tiled=True)
         return head(hidden, table, targets, cap)
 
     return jax.shard_map(local, in_specs=(P(*spec, None), held, spec, P()),
                          out_specs=(spec, spec if predict else None, spec), axis_names=axes, check_vma=False)(
         hidden, table, targets, cap)
+
+
+def _vocabulary_split(hidden, table, targets, cap, group: tuple[str, ...], head, column_logits):
+    """`head` inside a `shard_map` over a vocabulary split `group` ways: every
+    token of the group against this device's rows of the head, the per-token
+    terms combined over the group, and this device's own tokens returned.
+
+    Megatron-LM's parallel cross entropy (Shoeybi et al., 2019). The log
+    partition is the logsumexp of the shards' own, the
+    target's logit the sum of theirs (one shard holds it), the prediction
+    the best of their best columns. Differentiated through the shard_map as
+    written, and correct unchecked: after the combine each device keeps its
+    own tokens, so a psum's cotangent, summed over the group, is every
+    device's share of it, and the gather's transpose scatters the states'
+    gradient back to the devices that hold them. The head's gradient never
+    leaves its device.
+    """
+    features = hidden.shape[-1]
+    count = targets.size
+    states = jax.lax.all_gather(hidden.reshape(count, features), group, axis=0, tiled=True)
+    offset = jax.lax.axis_index(group) * table.shape[0]
+    labels = jax.lax.all_gather(targets.reshape(count), group, axis=0, tiled=True) - offset
+    losses, predicted, log_z = head(states, table, labels, cap)
+    # Stopped before the max: pmax has no derivative rule, and a stop after it
+    # still differentiates it.
+    peak = jax.lax.pmax(jax.lax.stop_gradient(log_z), group)
+    whole = peak + jnp.log(jax.lax.psum(jnp.exp(log_z - peak), group))
+    target = jax.lax.psum(log_z - losses, group)
+    start = jax.lax.axis_index(group) * count
+
+    def own(value):
+        return jax.lax.dynamic_slice_in_dim(value, start, count).reshape(targets.shape)
+
+    if predicted is not None:
+        best = jax.lax.stop_gradient(column_logits(states, jnp.take(table, predicted, axis=0), cap))
+        top = jax.lax.pmax(best, group)
+        # The lowest column among the shards that reach the best logit, as an
+        # argmax over the whole row picks the first.
+        predicted = own(jax.lax.pmin(jnp.where(best == top, predicted + offset,
+                                               jnp.iinfo(jnp.int32).max), group))
+    return own(whole - target), predicted, own(whole)
 
 
 SUPPORT_BLOCK = 1 << 15
