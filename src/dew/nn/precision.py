@@ -119,9 +119,9 @@ def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     # it, which changes a bf16 product with where the fusion boundary falls.
     if jnp.dtype(dtype).itemsize >= jnp.dtype(x.dtype).itemsize:
         return jax.lax.optimization_barrier(x)
-    info = jnp.finfo(dtype)
+    widths = jnp.finfo(dtype)
     return jax.lax.optimization_barrier(
-        jax.lax.reduce_precision(x, exponent_bits=info.nexp, mantissa_bits=info.nmant))
+        jax.lax.reduce_precision(x, exponent_bits=widths.nexp, mantissa_bits=widths.nmant))
 
 
 @rounded_operand.defjvp
