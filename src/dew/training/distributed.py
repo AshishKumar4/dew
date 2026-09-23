@@ -68,10 +68,10 @@ type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
 #
 # The tensor axis carries Megatron's split. That is the mlp's hidden width
 # ('mlp'), the attention's query heads ('heads') and its grouped key and value
-# heads ('kv'), and the vocabulary of the embedding table and the output head
-# ('vocab'). Each of those is the output side of one matmul and the input
-# side of the next, so splitting it splits both and leaves the block one
-# reduction.
+# heads ('kv'), the attention width o_proj reads back ('attention'), and the
+# vocabulary of the embedding table and the output head ('vocab'). Each of
+# those is the output side of one matmul and the input side of the next, so
+# splitting it splits both and leaves the block one reduction.
 #
 # 'embed', the residual width, is the side those matmuls share with every
 # norm, residual add, rotary rotation and the loss. It stays whole on the
@@ -88,7 +88,7 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("vocab", (FSDP_AXIS, TENSOR_AXIS)),
     ("mlp", (FSDP_AXIS, TENSOR_AXIS)),
     ("modulation", FSDP_AXIS),
-    ("attention", FSDP_AXIS),
+    ("attention", (FSDP_AXIS, TENSOR_AXIS)),
     # The gated delta net's projected width (keys, values and their gate),
     # placed like the attention's: the width over the model dimension.
     ("linear", FSDP_AXIS),
@@ -105,9 +105,11 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("exp", EXPERT_AXIS),
     # A projection from the residual width to the heads, q_proj's shape: the
     # rule above gave 'embed' fsdp, so the heads take the tensor axis by
-    # itself rather than fall back to replication.
+    # itself rather than fall back to replication. 'attention' has the same
+    # second choice for a table that gives 'embed' fsdp before it.
     ("heads", TENSOR_AXIS),
     ("kv", TENSOR_AXIS),
+    ("attention", TENSOR_AXIS),
 )
 
 
@@ -233,7 +235,10 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
     several processes on one machine share slice 0, and there the process
     is the granule.
     """
-    by_process = len({device.slice_index for device in devices}) == 1
+    # A device outside any process pool, such as a lone CPU process's,
+    # carries no slice_index: it is on the one slice there is.
+    slices = {device.slice_index if hasattr(device, "slice_index") else 0 for device in devices}
+    by_process = len(slices) == 1
     granules = len({device.process_index if by_process else device.slice_index
                     for device in devices})
     data_width = shape[0]

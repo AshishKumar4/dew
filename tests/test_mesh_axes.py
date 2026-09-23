@@ -76,8 +76,9 @@ def test_the_default_mesh_places_like_the_three_axis_one():
 
 def test_the_default_rules_split_the_megatron_widths_on_the_tensor_axis():
     """Four tensor shards beside two fsdp: the mlp's hidden width, the query
-    and grouped key-value heads and the vocabulary take the tensor axis, and
-    the residual width the blocks pass between themselves does not."""
+    and grouped key-value heads, the attention width o_proj reads and the
+    vocabulary take the tensor axis, and the residual width the blocks pass
+    between themselves does not."""
     mesh = build_mesh(MeshSpec(fsdp=2, tensor=4))
     layout = Layout(min_shard=TINY_SHARD)
     specs = jax.tree.map(
@@ -90,13 +91,27 @@ def test_the_default_rules_split_the_megatron_widths_on_the_tensor_axis():
     assert specs["layers_0"]["mlp"]["gate_proj"]["kernel"] == P(None, ("fsdp", "tensor"))
     assert specs["layers_0"]["mlp"]["down_proj"]["kernel"] == P(("fsdp", "tensor"))
     assert specs["embed_tokens"]["embedding"] == P(("fsdp", "tensor"))
-    # o_proj reads the attention width and writes the residual stream, and the
-    # width is the dimension 'embed' already took fsdp for, so neither side of
-    # this kernel names the tensor axis. The final norm is embed alone.
-    assert attention["o_proj"]["kernel"] == P("fsdp")
+    # o_proj reads the heads the q/k/v projections split and writes the
+    # residual stream: Megatron's row-parallel side, the attention's twin of
+    # down_proj. The final norm is embed alone.
+    assert attention["o_proj"]["kernel"] == P(("fsdp", "tensor"))
     assert specs["norm"]["scale"] == P()
     layout.check(variables()["params"],
                  layout.shardings(mesh, variables())["params"], mesh)
+
+
+def test_a_tensor_only_mesh_splits_every_projection_of_the_block():
+    """Tensor parallelism alone, no fsdp: every attention and mlp projection
+    names the tensor axis, so the default tolerance holds with nothing but
+    the norms left whole."""
+    mesh = build_mesh(MeshSpec(tensor=4))
+    layout = Layout(min_shard=TINY_SHARD)
+    shardings = layout.shardings(mesh, variables())
+    attention = jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]["layers_0"]["self_attn"]
+
+    assert attention["q_proj"]["kernel"] == P(None, "tensor")
+    assert attention["o_proj"]["kernel"] == P("tensor")
+    layout.check(variables()["params"], shardings["params"], mesh)
 
 
 def test_redirected_widths_take_the_tensor_axis():
