@@ -1713,15 +1713,17 @@ def _repo_files(name: str, directory: Path) -> set[str]:
     """Every file of the snapshot's commit, by repo-relative name.
 
     A dry run lists the Hub tree the metadata fetch has just cached. Offline
-    it cannot, and the cache is then all a load can read anyway, so the
+    it cannot: without a cached tree it raises DryRunError, and with one it
+    raises LocalEntryNotFoundError for the first listed file that was never
+    downloaded. The cache is then all a load can read anyway, so the
     snapshot directory's own files are the listing.
     """
     from huggingface_hub import snapshot_download
-    from huggingface_hub.errors import DryRunError
+    from huggingface_hub.errors import DryRunError, LocalEntryNotFoundError
 
     try:
         return {entry.filename for entry in snapshot_download(name, revision=directory.name, dry_run=True)}
-    except DryRunError:
+    except (DryRunError, LocalEntryNotFoundError):
         return {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
 
 
