@@ -315,6 +315,10 @@ def test_a_rank_that_stalls_between_collectives_ends_the_pool():
     inside that step's reduction. Every process stays alive and none fails,
     so only a bound on one execution can end the pool: rank 0's runs past
     the pool's execution timeout, shortened here, and the launch ends."""
+    import jax
+
+    if jax.default_backend() != "gpu":
+        pytest.skip("the execution bound is XLA's GPU watchdog; CPU pools have none")
     started = time.monotonic()
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c",
                   stepping_pool("threading.Event().wait()", execution_timeout="20s"),
