@@ -124,47 +124,166 @@ def test_every_repeated_env_flag_reaches_the_ranks():
         cwd=REPO_ROOT, env=ENV, capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stdout
     assert "[0] 12" in done.stdout
+
+
+def test_a_failing_rank_stops_the_pool_and_is_named_with_its_last_lines(tmp_path):
+    """Rank 1 fails while rank 0 waits as one in a collective would. The
+    launch stops rank 0, exits with rank 1's code, and ends with rank 1's
+    last lines, after rank 0's shutdown output, so the reason is the last
+    thing on the screen."""
+    program = ("import os, pathlib, sys, time\n"
+               "rank = os.environ['DEW_PROCESS_ID']\n"
+               "pathlib.Path(sys.argv[1], 'rank' + rank).write_text(str(os.getpid()))\n"
+               "if rank == '1':\n"
+               "    time.sleep(1)\n"
+               "    print('loading shard 7'); print('OSError: shard 7 is gone'); sys.exit(3)\n"
+               "time.sleep(600)\n")
+    launch = launcher("--processes-per-host", "2", "--port", "1", "--",
+                      sys.executable, "-c", program, str(tmp_path))
+    try:
+        output, _ = launch.communicate(timeout=60)
+    finally:
+        launch.kill()
+    ranks = [int(path.read_text()) for path in tmp_path.glob("rank*")]
+    lines = output.decode().splitlines()
+    assert launch.returncode == 3
+    assert "rank 1 on localhost exited 3; stopping the other 1" in lines
+    assert lines[-3:] == ["last lines of rank 1:", "[1] loading shard 7",
+                          "[1] OSError: shard 7 is gone"]
+    assert not any(alive(pid) for pid in ranks)
+
+
+@pytest.mark.parametrize(("gpus", "processes", "devices", "expected"), [
+    (4, None, None, (4, 1)),
+    (8, 2, None, (2, 4)),
+    (8, None, 2, (4, 2)),
+    (1, None, None, (1, None)),
+    (0, 4, None, (4, None)),
+])
+def test_a_pool_splits_the_gpus_of_a_host_between_its_processes(monkeypatch, gpus, processes,
+                                                                 devices, expected):
+    """Unset, a host runs one process per GPU; a process count alone gets
+    an even share each; a machine with at most one GPU runs one process
+    with all of it; a CPU pool leaves devices alone."""
+    from dew.cli import launch
+
+    monkeypatch.setattr(launch, "gpu_count", lambda host: gpus)
+    monkeypatch.delenv("JAX_PLATFORMS", raising=False)
+    plan = launch.Launch(command=("python",), processes_per_host=processes,
+                         devices_per_process=devices)
+    assert plan.layout("localhost") == expected
+
+
+def test_a_share_of_gpus_that_does_not_divide_is_refused_and_cpu_pools_ignore_gpus(monkeypatch):
+    from dew.cli import launch
+
+    monkeypatch.setattr(launch, "gpu_count", lambda host: 8)
+    with pytest.raises(ValueError, match="do not split"):
+        launch.Launch(command=("python",), processes_per_host=3).layout("localhost")
+    rehearsal = launch.Launch(command=("python",), processes_per_host=4,
+                              env=("JAX_PLATFORMS=cpu",))
+    assert rehearsal.layout("localhost") == (4, None)
+
+
+def test_a_hostfile_names_hosts_by_the_first_word_of_each_line(tmp_path):
+    """An MPI hostfile's `slots=` and comments are not host names."""
+    from dew.cli.launch import Launch
+
+    hostfile = tmp_path / "hosts"
+    hostfile.write_text("# the rack\nnode0 slots=8\n\nnode1  # spare\n")
+    assert Launch(command=("python",), hostfile=hostfile).host_names() == ("node0", "node1")
+    assert Launch(command=("python",), hosts=("a,b", "c")).host_names() == ("a", "b", "c")
+
+
+def launched(*arguments: str, env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-m", "dew.cli.main", "launch", *arguments],
+                          cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=120)
+
+
+SLURM_STEP = {"SLURM_JOB_ID": "77", "SLURM_STEP_NODELIST": "gpu[01-02]", "SLURM_NTASKS": "16",
+              "SLURM_PROCID": "3", "SLURM_LOCALID": "3"}
+
+
+@pytest.mark.parametrize(("variables", "arguments", "expected"), [
+    (SLURM_STEP, (), "slurm: process 3 of 16, placed by the cluster"),
+    ({"OMPI_MCA_orte_hnp_uri": "1531576320.0;tcp://10.0.0.5:34911", "OMPI_COMM_WORLD_SIZE": "4",
+      "OMPI_COMM_WORLD_RANK": "2", "OMPI_COMM_WORLD_LOCAL_RANK": "2"},
+     (), "ompi: process 2 of 4, placed by the cluster"),
+    ({"SLURM_JOB_ID": "77", "SLURM_NTASKS_PER_NODE": "8"}, (),
+     "srun --kill-on-bad-exit=1 --export=ALL python train.py"),
+    (SLURM_STEP, ("--hosts", "localhost", "--processes-per-host", "1", "--port", "5"),
+     "DEW_PROCESS_COUNT=1"),
+])
+def test_where_the_launch_runs_follows_jax_detection_and_names_win(variables, arguments,
+                                                                   expected):
+    """A Slurm step or an Open MPI rank is already placed and runs the
+    program in place, where jax reads the rank; a Slurm allocation outside a
+    step starts srun; named hosts win over any cluster around them."""
+    env = {name: value for name, value in ENV.items()
+           if not name.startswith(("SLURM_", "OMPI_"))}
+    done = launched("--dry-run", *arguments, "--", "python", "train.py",
+                    env={**env, **variables})
+    assert done.returncode == 0, done.stderr
+    assert expected in done.stdout
+
+
 def fake_srun(tmp_path: Path) -> dict:
-    """An environment whose `srun` records its arguments and the variables
-    it would hand its tasks, in place of Slurm's."""
+    """An allocation's environment whose `srun` records its arguments and
+    the variables it would hand its tasks, in place of Slurm's."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     srun = bin_dir / "srun"
     srun.write_text("#!/bin/sh\n"
                     f"printf '%s\\n' \"$@\" > {tmp_path}/argv\n"
-                    f"printf '%s' \"$CUDA_VISIBLE_DEVICES|$XLA_FLAGS\" > {tmp_path}/env\n")
+                    f"printf '%s' \"$XLA_FLAGS\" > {tmp_path}/env\n")
     srun.chmod(0o755)
-    return {**ENV, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+    env = {name: value for name, value in ENV.items() if not name.startswith("SLURM_")}
+    return {**env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "SLURM_JOB_ID": "77",
+            "CUDA_VISIBLE_DEVICES": "0,1,2,3"}
 
 
-def test_srun_receives_values_with_commas_whole(tmp_path):
-    """Slurm reads --export as a comma-separated list, so a value holding a
-    comma would be cut there. The variables travel in srun's environment,
+def test_srun_runs_a_task_per_gpu_and_receives_values_with_commas_whole(tmp_path):
+    """jax gives each Slurm task the one GPU at its SLURM_LOCALID, so a node
+    runs a task per GPU Slurm left it. Slurm reads --export as a
+    comma-separated list, so the variables travel in srun's environment,
     which --export=ALL hands to every task."""
-    done = subprocess.run(
-        [sys.executable, "-m", "dew.cli.main", "launch", "--slurm",
-         "--env", "CUDA_VISIBLE_DEVICES=0,1", "--env", "XLA_FLAGS=--a=1,--b=2",
-         "--", "python", "train.py"],
-        cwd=REPO_ROOT, env=fake_srun(tmp_path), capture_output=True, text=True, timeout=60)
+    done = launched("--env", "XLA_FLAGS=--a=1,--b=2", "--", "python", "train.py",
+                    env=fake_srun(tmp_path))
     assert done.returncode == 0, done.stderr
-    assert (tmp_path / "env").read_text() == "0,1|--a=1,--b=2"
-    assert "--export=ALL" in (tmp_path / "argv").read_text().split()
+    assert (tmp_path / "argv").read_text().split() == [
+        "--kill-on-bad-exit=1", "--export=ALL", "--ntasks-per-node=4", "python", "train.py"]
+    assert (tmp_path / "env").read_text() == "--a=1,--b=2"
 
 
-def test_slurm_runs_one_task_per_gpu_and_refuses_to_split_them_otherwise(tmp_path):
-    """Under Slurm jax gives each task the one GPU at its SLURM_LOCALID, so a
-    node's tasks are its GPUs. A per-task GPU count would narrow each task's
-    visible GPUs to one that jax then numbers by the local rank, and is
-    refused rather than passed to srun."""
-    from dew.cli.launch import Launch
+def test_srun_refuses_a_per_process_gpu_count(tmp_path):
+    """A per-task GPU count would narrow each task's visible GPUs to one that
+    jax then numbers by the local rank."""
+    done = launched("--devices-per-process", "1", "--", "python", "train.py",
+                    env=fake_srun(tmp_path))
+    assert done.returncode != 0
+    assert "SLURM_LOCALID" in done.stderr
+    assert not (tmp_path / "argv").exists()
 
-    with pytest.raises(ValueError, match="SLURM_LOCALID"):
-        Launch(command=("python",), slurm=True, devices_per_process=1)
-    done = subprocess.run(
-        [sys.executable, "-m", "dew.cli.main", "launch", "--slurm", "--processes-per-host", "8",
-         "--", "python", "train.py"],
-        cwd=REPO_ROOT, env=fake_srun(tmp_path), capture_output=True, text=True, timeout=60)
-    assert done.returncode == 0, done.stderr
-    argv = (tmp_path / "argv").read_text().split()
-    assert "--ntasks-per-node=8" in argv
-    assert not any(word.startswith("--gpus") for word in argv)
+
+@pytest.mark.distributed
+def test_a_bare_launch_runs_one_process_per_gpu_of_this_machine():
+    """`dew launch -- python ...` with no flags: every GPU here gets a
+    process of its own, and each joins the pool holding one device."""
+    from dew.cli.launch import local_gpu_count
+
+    gpus = local_gpu_count()
+    if gpus < 2:
+        pytest.skip(f"needs two GPUs; this machine has {gpus}")
+    program = ("from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "import jax\n"
+               "print('placed', jax.process_index(), jax.process_count(), "
+               "[d.id for d in jax.local_devices()])\n")
+    env = {name: value for name, value in ENV.items() if name != "JAX_PLATFORMS"}
+    done = launched("--", sys.executable, "-c", program, env=env)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert f"pool: {gpus} processes on localhost, 1 GPU each" in done.stdout
+    placed = sorted(line.split("placed ", 1)[1] for line in done.stdout.splitlines()
+                    if "placed " in line)
+    assert placed == [f"{rank} {gpus} [{rank}]" for rank in range(gpus)]
+

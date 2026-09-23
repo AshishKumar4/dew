@@ -451,6 +451,66 @@ def test_run_detached_writes_a_log_per_worker(fake, capsys):
     assert "dew tpu logs slice job1 --follow" in capsys.readouterr().out
 
 
+# ------------------------------------------------------------------ dew launch --tpu
+
+
+def launch(*argv: str) -> int:
+    from dew.cli.main import main
+
+    return main(["launch", *argv])
+
+
+def pool_ssh(worker: int, name: str, command: str) -> list[str]:
+    return gcloud("compute", "tpus", "tpu-vm", "ssh", f"you@{name}", "--zone=us-central2-b",
+                  f"--worker={worker}", f"--command={env_prefix()}{command}", "--ssh-flag=-tt")
+
+
+def test_launch_on_a_tpu_starts_one_process_per_worker_through_gcloud(fake, capsys):
+    """Every worker runs the program in the environment setup wrote, in the
+    named directory under its home, with a terminal so that stopping the
+    pool hangs the remote program up. jax reads the rank from the TPU."""
+    fake.offer("slice", "us-central2-b")
+    assert launch("--tpu", "slice", "--cwd", "dew", "--env", "A=1 2", "--",
+                  "python", "train.py") == 0
+    command = "cd dew && exec env A='1 2' python train.py"
+    assert sorted(only(fake.gcloud_calls(), "ssh")) == [
+        pool_ssh(0, "slice", command), pool_ssh(1, "slice", command)]
+    out = capsys.readouterr().out.splitlines()
+    assert "pool: 2 processes on slice, one per worker" in out
+    assert f"[1] ran {env_prefix()}{command}" in out
+
+
+def test_launch_on_several_tpus_joins_them_as_one_multislice_pool(fake):
+    """Each slice's workers learn the slice count, their slice and the first
+    worker of slice 0, which is where the slices meet and jax's coordinator."""
+    for name in ("left", "right"):
+        fake.offer(name, "us-central2-b")
+    assert launch("--tpu", "left,right", "--", "python", "train.py") == 0
+    calls = only(fake.gcloud_calls(), "ssh")
+    expected = []
+    for slice_id, name in enumerate(("left", "right")):
+        command = ("exec env MEGASCALE_COORDINATOR_ADDRESS=10.0.0.1 MEGASCALE_PORT=8081 "
+                   f"MEGASCALE_NUM_SLICES=2 MEGASCALE_SLICE_ID={slice_id} python train.py")
+        expected += [pool_ssh(0, name, command), pool_ssh(1, name, command)]
+    assert sorted(calls) == sorted(expected)
+
+
+def test_launch_on_a_tpu_stops_the_pool_when_a_worker_fails(fake, capsys):
+    fake.offer("slice", "us-central2-b")
+    fake.fail_on("--worker=1")
+    assert launch("--tpu", "slice", "--", "python", "train.py") == 3
+    out = capsys.readouterr().out
+    assert "rank 1 on slice worker 1 exited 3" in out
+    assert "[1] the fake was told to fail here" in out
+
+
+def test_launch_on_a_tpu_that_is_not_ready_says_so(fake):
+    fake.offer("slice", "us-central2-b", states=["CREATING"])
+    with pytest.raises(SystemExit, match="slice is CREATING, not READY"):
+        launch("--tpu", "slice", "--", "python", "train.py")
+    assert only(fake.gcloud_calls(), "ssh") == []
+
+
 def test_logs_tails_one_worker_by_default_and_all_on_request(fake):
     fake.offer("slice", "us-central2-b")
     assert run("logs", "slice", "job1", "--lines", "50") == 0
