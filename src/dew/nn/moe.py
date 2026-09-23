@@ -44,7 +44,7 @@ from .blocks import normal_kernel
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
 from .precision import rounded_operand, rounded_to
-from .sharding import EXPERT_AXIS, FSDP_AXIS, axis_rules, logical_axes, logical_spec, mesh_axes
+from .sharding import EXPERT_AXIS, FSDP_AXIS, logical_axes, logical_spec, mesh_axes, row_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -761,12 +761,10 @@ def expert_dispatch[Parameters](
                                num_experts=num_experts)
     rows = x.shape[0]
     if exchanging:
-        # Each expert shard sends tokens of its own, so the rows split over
-        # every axis the table's first batch rule names, padded to a whole
-        # share of them; padding routes to the sentinel.
-        first_rule = next(axes for name, axes in axis_rules() if name == 'activation_batch')
-        share = math.prod(mesh.shape[axis] for axis in mesh_axes(first_rule)
-                          if axis in mesh.axis_names and axis not in mesh.manual_axes)
+        # Each expert shard sends tokens of its own: the rows are padded until
+        # every axis `activation_batch` can take splits them, and the padding
+        # routes to the sentinel.
+        share = math.prod(mesh.shape[axis] for axis in row_axes(math.prod(mesh.shape.values())))
         padding = ((0, -rows % share),)
         x = jnp.pad(x, padding + ((0, 0),) * (x.ndim - 1))
         routed = padding + ((0, 0),) * (indices.ndim - 1)
@@ -778,9 +776,6 @@ def expert_dispatch[Parameters](
     routing = logical_spec((*positions_axes, None), indices.shape)
     manual = {axis for entry in tokens for axis in mesh_axes(entry)}
     if exchanging:
-        if EXPERT_AXIS not in manual:
-            raise ValueError("exchange dispatch splits the token rows over the expert axis, "
-                             "and the rule table's activation_batch does not name it")
         body = functools.partial(_exchange_shard, project, num_experts=num_experts,
                                  shards=shards, output_dtype=output_dtype, capacity=capacity)
         experts = jax.tree.map(
