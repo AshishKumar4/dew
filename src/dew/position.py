@@ -42,11 +42,19 @@ class Global:
 
     records: int
     order: str
+    completed: tuple[tuple[str, int], ...] = ()
+    """The orders a phased run read before `order`, each with the global
+    record count it ended at, oldest first; empty for a run of one order.
+    `records` counts every record of the run, the completed phases' too."""
 
 
 def encode(place: Global) -> bytes:
     """`place` as the bytes a checkpoint stores for it."""
-    return json.dumps({ENVELOPE: dataclasses.asdict(place)}).encode()
+    stored = dataclasses.asdict(place)
+    if not place.completed:
+        # A one-order position keeps the envelope it always had.
+        del stored["completed"]
+    return json.dumps({ENVELOPE: stored}).encode()
 
 
 def decode(position: bytes) -> Global | None:
@@ -69,7 +77,9 @@ def decode(position: bytes) -> Global | None:
         raise ValueError(
             f"a saved global data position is missing {sorted({'records', 'order'} - set(envelope))}; "
             f"the checkpoint's position was written by dew and is damaged")
-    return Global(records=int(envelope["records"]), order=str(envelope["order"]))
+    completed = tuple((str(order), int(end)) for order, end in envelope.get("completed", ()))
+    return Global(records=int(envelope["records"]), order=str(envelope["order"]),
+                  completed=completed)
 
 
 def read(position: bytes) -> Global:

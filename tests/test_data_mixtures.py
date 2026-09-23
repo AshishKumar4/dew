@@ -27,7 +27,7 @@ import pytest
 from flax import linen as nn
 
 import dew.data
-from dew.data import Corpus, Loading, PackedTokens, Ramp, ramped
+from dew.data import Corpus, DataPhase, Loading, PackedTokens, Ramp, ramped
 from dew.data.dataset import CAPTION, Dataset, mixed_records, mixed_stream, mixture, tokenized, train_stream
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -473,6 +473,91 @@ def test_corpora_from_different_tokenizers_are_not_mixed(tmp_path):
     (Path(second) / "meta.json").write_text(json.dumps({**meta, "tokenizer": "gpt2"}))
     with pytest.raises(ValueError, match="one vocabulary"):
         spec.load(batch=4)
+
+
+# --------------------------------------------------------------------------
+# Mixture phases
+# --------------------------------------------------------------------------
+
+def phased_packed(first: str, second: str, *phases: tuple[object, int | None]) -> PackedTokens:
+    return PackedTokens(phases=tuple(DataPhase(path, until) for path, until in phases),
+                        seq_len=8, val_batches=None, packing_bins=2, loading=READ)
+
+
+def test_phases_switch_the_mixture_at_a_step_and_start_its_own_order(tmp_path):
+    """Rigel's curriculum: three steps of the first corpus alone, then both
+    at equal shares, the second phase reading its mixture from that
+    mixture's own first window, as a run of it alone would."""
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    both = {first: 1.0, second: 1.0}
+    spec = phased_packed(first, second, (first, 3), (both, None))
+
+    steps = packed_rows(spec.load(batch=4).train(), 7)
+
+    assert all(corpus_of(row) == 0 for step in steps[:3] for row in step)
+    alone = PackedTokens(path=both, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
+    assert steps[3:] == packed_rows(alone.load(batch=4).train(), 4)
+
+
+def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(monkeypatch, tmp_path):
+    """Resuming onto a changed mixture is refused, but resuming onto a phase
+    list whose first phase is the run's mixture, with a boundary it has not
+    passed, is the same run with a switch ahead of it, at any process count."""
+    spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    both = {first: 1.0, second: 1.0}
+    plain = PackedTokens(path=first, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
+    stopped = plain.load(batch=4).train()
+    packed_rows(stopped, 2)
+    state = stopped.get_state()
+    phases = phased_packed(first, second, (first, 4), (both, None))
+    open_stream = lambda: phases.load(batch=4).train()  # noqa: E731  one line, read once
+    whole = pooled(monkeypatch, open_stream, 1, 7, rows=windows_of)
+
+    for processes in (1, 2):
+        assert pooled(monkeypatch, open_stream, processes, 5, state, rows=windows_of) == whole[2:]
+    with pytest.raises(ValueError, match="phase 0 reads something else"):
+        phased_packed(first, second, (both, 4), (first, None)).load(batch=4).train().set_state(state)
+    with pytest.raises(ValueError, match="past this run's end of phase 0"):
+        phased_packed(first, second, (first, 1), (both, None)).load(batch=4).train().set_state(state)
+
+
+def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_path):
+    """Two steps into the second phase, the position names the first phase
+    and where it ended. The same list, or one with a phase appended, resumes
+    on the next step; a list that moved the finished boundary or changed the
+    finished mixture, or a run of one order, is refused."""
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    both = {first: 1.0, second: 1.0}
+    spec = phased_packed(first, second, (first, 3), (both, None))
+    stream = spec.load(batch=4).train()
+    packed_rows(stream, 5)
+    state = stream.get_state()
+    rest = packed_rows(stream, 3)
+
+    saved = json.loads(state)["dew_global_position"]
+    assert saved["records"] == 20 and saved["completed"][0][1] == 12
+    for resumed_spec in (spec, phased_packed(first, second, (first, 3), (both, 9), (second, None))):
+        resumed = resumed_spec.load(batch=4).train()
+        resumed.set_state(state)
+        assert packed_rows(resumed, 3) == rest
+    for changed in (phased_packed(first, second, (first, 2), (both, None)),
+                    phased_packed(first, second, (second, 3), (both, None))):
+        with pytest.raises(ValueError, match="cannot change under it"):
+            changed.load(batch=4).train().set_state(state)
+    plain = PackedTokens(path=both, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
+    with pytest.raises(ValueError, match="phased run"):
+        plain.load(batch=4).train().set_state(state)
+
+
+def test_phases_are_a_list_of_ends_and_refuse_a_ramp(tmp_path):
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    with pytest.raises(ValueError, match="ends must increase"):
+        phased_packed(first, second, (first, 3), (second, 3), (first, None)).load(batch=4).train()
+    with pytest.raises(ValueError, match="the last runs on"):
+        phased_packed(first, second, (first, 3), (second, 5)).load(batch=4).train()
+    spec = phased_packed(first, second, (first, 3), (second, None))
+    with pytest.raises(TypeError, match="ramp a run of one order"):
+        ramped(spec.load(batch=4), Ramp(start=2, increment=2, samples=8)).train()
 
 
 # --------------------------------------------------------------------------

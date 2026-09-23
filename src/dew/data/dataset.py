@@ -108,6 +108,36 @@ def json_argument[Options: DataclassInstance](
     )
 
 
+def json_list_argument[Entry: DataclassInstance](
+        entry: type[Entry]) -> tyro.constructors.PrimitiveConstructorSpec[tuple[Entry, ...]]:
+    """A tuple of `entry` records written as one JSON list on the command
+    line, `[{"field": ...}, ...]`, since a flag per field cannot spell a list
+    of records whose length the command line decides."""
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="JSON",
+        instance_from_str=lambda given: tuple(entry(**record) for record in json.loads(given[0])),
+        is_instance=lambda given: isinstance(given, tuple) and all(
+            isinstance(value, entry) for value in given),
+        str_from_instance=lambda given: [json.dumps([dataclasses.asdict(value) for value in given])],
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class DataPhase:
+    """One phase of a run's data: what it reads and the step it ends at.
+
+    `path` names one corpus or a weighted mixture the way the spec's own
+    `path` does. `until_step` is the step the phase ends before, counted from
+    the run's start in steps of the full batch; None for the last phase,
+    which runs to the end. `PhasedStream` says how a resume treats a changed
+    list.
+    """
+
+    path: str | Mapping[str, float]
+    until_step: int | None = None
+
+
 @runtime_checkable
 class Closeable(Protocol):
     """A stream that holds something a stopped run has to give back: worker
@@ -865,8 +895,18 @@ class GlobalStream:
     def get_state(self) -> bytes:
         return position.encode(position.Global(records=self._records, order=self._order))
 
+    @property
+    def order(self) -> str:
+        """The description a saved position is compared against."""
+        return self._order
+
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
+        if saved.completed:
+            raise ValueError(
+                f"the saved data position is {saved.records} records into a phased run "
+                f"past {len(saved.completed)} phase(s), and this run reads one order "
+                f"({self._order}); resume it with the phases that wrote it")
         if saved.order != self._order:
             raise ValueError(
                 f"the saved data position is {saved.records} records into "
@@ -880,6 +920,109 @@ class GlobalStream:
         reads, self._reads = self._reads, None
         if reads is not None:
             reads.close()
+
+
+class PhasedStream:
+    """Reads one global order per phase, switching at step boundaries.
+
+    Each phase is a `GlobalStream` factory (`train_stream`, `mixed_stream`)
+    and the global record count it ends at, None for the last, which runs
+    on. Phase k starts its own order at its own record zero when the run's
+    count reaches phase k - 1's end, so which records a step reads is a
+    function of the step and the phase list alone, at any process count.
+
+    The saved position is the run's record count, the current phase's order,
+    and each completed phase's order with its end (`position.Global`). A
+    restore checks the phases the run already read against this list, and
+    the current phase's order, and nothing after it: a run may append
+    phases, or move a boundary it has not reached, and resume where it
+    stopped. A one-order run's position is phase 0 with none completed, so a
+    run that trained on one mixture resumes into a phase list starting with
+    it. Changing a phase the run has read, or ending the current one before
+    the records the run already read in it, is refused.
+    """
+
+    def __init__(self, phases: Sequence[tuple[Callable[[], GlobalStream], int | None]],
+                 stop_seconds: float):
+        ends = [end for _, end in phases]
+        if not phases or ends[-1] is not None or None in ends[:-1]:
+            raise ValueError("every phase but the last ends at a record count; the last runs on")
+        if any(later <= earlier for earlier, later in itertools.pairwise([0, *ends[:-1]])):
+            raise ValueError(f"phase ends must increase from above zero, got {ends[:-1]}")
+        self._streams = [open_stream() for open_stream, _ in phases]
+        self._ends = tuple(ends[:-1])
+        self._records = 0
+        self._current: int | None = None
+        self.stop_seconds = stop_seconds
+
+    def __iter__(self) -> Iterator[Batch]:
+        return self
+
+    def _phase(self, records: int) -> int:
+        return bisect.bisect_right(self._ends, records)
+
+    def _start(self, phase: int) -> int:
+        return 0 if phase == 0 else self._ends[phase - 1]
+
+    def __next__(self) -> Batch:
+        phase = self._phase(self._records)
+        if phase != self._current:
+            if self._current is not None:
+                self._streams[self._current].close()
+            stream = self._streams[phase]
+            stream.set_state(position.encode(position.Global(
+                records=self._records - self._start(phase), order=stream.order)))
+            self._current = phase
+        stream = self._streams[phase]
+        before = stream.get_state()
+        batch = next(stream)
+        read = position.read(stream.get_state()).records - position.read(before).records
+        self._records += read
+        if phase < len(self._ends) and self._records > self._ends[phase]:
+            raise ValueError(
+                f"a step of {read} records crossed the phase boundary at record "
+                f"{self._ends[phase]}; phases end on step boundaries")
+        return batch
+
+    def get_state(self) -> bytes:
+        phase = self._phase(self._records)
+        return position.encode(position.Global(
+            records=self._records, order=self._streams[phase].order,
+            completed=tuple((self._streams[index].order, self._ends[index])
+                            for index in range(phase))))
+
+    def set_state(self, state: bytes) -> None:
+        saved = position.read(state)
+        for index, (order, end) in enumerate(saved.completed):
+            if index >= len(self._ends) or (self._streams[index].order, self._ends[index]) != (order, end):
+                raise ValueError(
+                    f"the saved run finished phase {index} reading {order} to record "
+                    f"{end}, and this run's phase {index} is not that; a phase the "
+                    f"run has read cannot change under it")
+        phase = len(saved.completed)
+        if phase >= len(self._streams) or self._streams[phase].order != saved.order:
+            raise ValueError(
+                f"the saved position is {saved.records} records into phase {phase}, "
+                f"reading {saved.order}, and this run's phase {phase} reads something "
+                f"else; resume with the order the checkpoint was written in")
+        if phase < len(self._ends) and saved.records > self._ends[phase]:
+            raise ValueError(
+                f"the saved run has read {saved.records} records, past this run's end "
+                f"of phase {phase} at {self._ends[phase]}")
+        self.close()
+        self._records = saved.records
+
+    def close(self) -> None:
+        if self._current is not None:
+            self._streams[self._current].close()
+        self._current = None
+
+
+def phased(phases: Sequence[tuple[Callable[[], GlobalStream], int | None]], *,
+           loading: Loading) -> Callable[[], PhasedStream]:
+    """A `PhasedStream` factory over `phases`, each a stream factory and the
+    global record count it ends at (None for the last)."""
+    return lambda: PhasedStream(phases, loading.stop_seconds)
 
 
 @runtime_checkable
@@ -993,6 +1136,11 @@ def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
 
     def train() -> Iterator[Batch]:
         stream = dataset.train()
+        if isinstance(stream, PhasedStream):
+            stream.close()
+            raise TypeError(
+                "phases end at step boundaries of the full batch, and a batch ramp "
+                "cuts other steps; ramp a run of one order")
         if isinstance(stream, Resumable):
             state = stream.get_state()
             if isinstance(state, bytes) and position.translates(state):

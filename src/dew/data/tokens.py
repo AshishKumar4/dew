@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from typing import Callable, Iterator, Mapping, overload
+from typing import Annotated, Callable, Iterator, Mapping, overload
 
 import grain.python as pygrain
 import numpy as np
@@ -32,11 +32,13 @@ from dew.registry import datasets
 from .dataset import (
     Batch,
     Corpus,
+    DataPhase,
     Dataset,
     DatasetSpec,
     Forwarding,
     Tokenize,
     describe,
+    json_list_argument,
     local_batch,
     train_stream,
     validation_pass,
@@ -341,14 +343,24 @@ class PackedTokens(DatasetSpec):
     reads, and a position is still one global window count. The corpora
     have to come from one tokenizer, which their `meta.json` records.
 
+    `phases` switches what a run reads at step boundaries instead: each
+    `DataPhase` names a corpus or mixture and the step it ends before, the
+    last running on, and each phase starts its own order at its own first
+    window (`dew.data.dataset.PhasedStream`). A resume checks the phases the
+    run has read and accepts phases appended or moved past its step, so a run
+    of one mixture continues into a phase list that begins with it. `path`
+    is then unset, and validation reads the first phase's held-out split.
+
     `records` counts the windows a pass over the split holds, exactly, so
     `steps_per_epoch` is that pass; a mixture's pass is the windows in which
-    every corpus has been read at least once (`mixed_records`).
+    every corpus has been read at least once (`mixed_records`), and a phased
+    run's is its first phase's.
     `val_batches` bounds a validation pass; None scores the whole split, a
     mixture's split mixed at the same weights, each corpus in its own order.
     """
 
     path: str | Mapping[str, float] | None = None
+    phases: Annotated[tuple[DataPhase, ...], json_list_argument(DataPhase)] = ()
     seq_len: int = 256
     val_batches: int | None = 4
     field: str | None = None
@@ -358,16 +370,25 @@ class PackedTokens(DatasetSpec):
     """Windows the plan keeps open at once. More of them leave less padding
     in a window and let documents further apart in the file share one."""
 
+    @property
+    def corpora(self) -> list[str]:
+        """Every tokenized directory the run reads, in name order."""
+        from .providers import name_ordered
+        named = {name for phase in self.phases for name in name_ordered(phase.path)}
+        return sorted(named | set(name_ordered(self.path)))
+
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        from .providers import corpora_dataset, name_ordered
+        from .providers import corpora_dataset, name_ordered, phased_dataset
         from .sources.text import TokenDocumentSource, same_tokenizer, token_corpus
 
         self.uncaptioned(tokenize)
+        if self.phases and self.path:
+            raise ValueError("PackedTokens reads path= or phases=, not both")
         weighted = name_ordered(self.path)
-        if not weighted:
+        if not weighted and not self.phases:
             raise ValueError("PackedTokens needs path= set to the directory "
                              "tools/tokenize_text.py wrote, or several with weights")
-        same_tokenizer(list(weighted))
+        same_tokenizer(self.corpora)
         window = self.seq_len + 1
 
         # One source per split, and one plan over it. Finding the boundaries
@@ -378,10 +399,23 @@ class PackedTokens(DatasetSpec):
             return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
                                  self.packing_bins, describe(source))
 
-        train, held = [], []
-        for path, weight in weighted.items():
-            corpus, held_out = token_corpus(path, "PackedTokens", field=self.field)
-            train.append(Corpus(path, packed(corpus), weight))
-            held.append(Corpus(path, packed(held_out), weight))
-        return corpora_dataset(train, held, [], batch=batch, seed=self.seed,
-                               loading=self.loading, val_batches=self.val_batches)
+        splits: dict[str, tuple[PackedWindows, PackedWindows]] = {}
+
+        def corpora(named: Mapping[str, float]) -> tuple[list[Corpus], list[Corpus]]:
+            train, held = [], []
+            for path, weight in named.items():
+                if path not in splits:
+                    corpus, held_out = token_corpus(path, "PackedTokens", field=self.field)
+                    splits[path] = packed(corpus), packed(held_out)
+                train.append(Corpus(path, splits[path][0], weight))
+                held.append(Corpus(path, splits[path][1], weight))
+            return train, held
+
+        if not self.phases:
+            train, held = corpora(weighted)
+            return corpora_dataset(train, held, [], batch=batch, seed=self.seed,
+                                   loading=self.loading, val_batches=self.val_batches)
+        phases = [(corpora(name_ordered(phase.path)), phase.until_step) for phase in self.phases]
+        return phased_dataset([(train, until) for (train, _), until in phases], phases[0][0][1], [],
+                              batch=batch, seed=self.seed, loading=self.loading,
+                              val_batches=self.val_batches)
