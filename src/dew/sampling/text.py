@@ -295,7 +295,7 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     scored = (inputs.tokens, slot) if selective else (inputs.tokens,)
     answer, updated = model.apply(
         {**params, "cache": held}, *scored, decode=True,
-        mutable=["cache", "embeddings", *_recorded(ops)], rngs=None,
+        mutable=["cache", "embeddings", *(["prediction_inputs"] if ops.record is not None else [])], rngs=None,
         method=("states_and_logits_at" if selective else
                 "states_and_logits" if exposed else None), capture_intermediates=False,
         **inputs.kwargs())
@@ -334,11 +334,6 @@ def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps
     for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
         cache.update(flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"])))
     return unflatten_dict(cache)
-
-
-def _recorded(ops: DecodeOps) -> list[str]:
-    """The collections a forward opens so a block drafter can read its context."""
-    return ["prediction_inputs"] if ops.record is not None else []
 
 
 def _context(model: nn.Module, params: Variables, updated: Mapping) -> jax.Array:

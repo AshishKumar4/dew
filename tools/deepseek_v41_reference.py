@@ -12,11 +12,15 @@ Run it in its own environment, never the project's:
     VIRTUAL_ENV=... uv pip install torch==2.10.0 numpy safetensors sympy \
         tokenizers transformers huggingface_hub tilelang==0.1.8
     PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
-        tools/deepseek_v41_reference.py [--search N | --check-kernels]
+        tools/deepseek_v41_reference.py [--search N | --check-kernels | --fp64 PATH | --vision]
 
 `--check-kernels` compares the stand-ins with the release's tilelang kernels
 on a CUDA GPU (`check_kernels`). `--search N` ranks N seeds from `--seed` by
 what fp32 noise can reach in them (`search`); SEED is the first of 119.
+`--fp64 PATH` writes the seed's plain outputs from a run widened to fp64
+(`widened_outputs`), which `tools/deepseek_v41_numerics.py fp64` holds Dew's
+own fp64 run to. `--vision` writes the vision half beside the fixture
+(`write_vision`).
 
 It writes tests/fixtures/hf/deepseek-v41-tiny: the release's config.json
 spelling at toy width, a model.safetensors under the release's tensor names,

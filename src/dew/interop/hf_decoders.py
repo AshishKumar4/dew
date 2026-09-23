@@ -1179,7 +1179,7 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     elif model_type == "gemma3n":
         record = _gemma3n_wrapper(hf_config, used)
     elif model_type == "deepseek_v41":
-        record = deepseek_v41_wrapper(hf_config, used)
+        record = _deepseek_v41_wrapper(hf_config, used)
     else:
         _refuse(f"model_type {model_type!r}",
                 "no supported multimodal wrapper is registered for this model")
@@ -2413,7 +2413,7 @@ from dew.interop.families.deepseek_v41 import (
     _deepseek_v41_config,
     _deepseek_v41_constants,
     _deepseek_v41_path,
-    deepseek_v41_wrapper,
+    _deepseek_v41_wrapper,
 )
 from dew.interop.families.gemma import (
     _gemma2_config,
