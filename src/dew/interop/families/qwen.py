@@ -80,10 +80,15 @@ def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
     return theta, factor
 
 
+_QWEN_READS = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
+"""The shared fields Qwen2Config and Qwen3Config declare; neither reads Gemma 3's rope_local_base_freq."""
+
+
 def _qwen2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     # Qwen2Attention biases q, k and v and builds o_proj without one
     # (modeling_qwen2.py:189-192), whatever the config says.
-    config = _base_config(hf_config, used, layer_types=_qwen_layer_types(hf_config, used))
+    config = _base_config(hf_config, used, layer_types=_qwen_layer_types(hf_config, used),
+                          reads=_QWEN_READS)
     config.update(attention_bias=True, o_proj_bias=False)
     return config
 
@@ -97,9 +102,9 @@ def _qwen3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     DeepSeek-R1-0528-Qwen3-8B ships it.
     """
     rope = _rope(hf_config, used, records.integer(hf_config.get(
-        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
+        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'), local=False)
     return _base_config(hf_config, used, qk_norm=True, rope=rope,
-                        layer_types=_qwen_layer_types(hf_config, used))
+                        layer_types=_qwen_layer_types(hf_config, used), reads=_QWEN_READS)
 
 
 def _sparse_step_layers(hf_config: Mapping[str, object], layers: int, used: set[str]) -> tuple[int, ...]:

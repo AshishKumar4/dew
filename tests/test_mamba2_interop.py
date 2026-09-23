@@ -14,9 +14,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from safetensors.numpy import load_file
+from safetensors.numpy import load_file, save_file
 
-from dew.interop.mamba2 import config_from_hf, export_path, translate, weight_path
+from dew.interop.mamba2 import config_from_hf, config_from_mamba_ssm, export_path, translate, weight_path
 from dew.interop.pretrained import load_pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
@@ -131,3 +131,98 @@ def test_the_public_loader_reads_the_fixture(tensors):
     logits = source.model.apply(source.variables, ids)
     reference = np.load(FIXTURE / "logits.npy")
     assert largest(logits, reference) < 1e-5
+
+
+HF_FIXTURES = FIXTURE.parent
+
+
+def mamba_ssm_config() -> dict:
+    """The mamba2-tiny fixture as mamba_ssm's own config.json spells it
+    (mamba_ssm/models/config_mamba.py), its vocabulary unpadded."""
+    return {"d_model": 8, "d_intermediate": 0, "n_layer": 2, "vocab_size": 30,
+            "ssm_cfg": {"layer": "Mamba2", "d_state": 4, "headdim": 8, "chunk_size": 4},
+            "attn_layer_idx": [], "attn_cfg": {}, "rms_norm": True, "residual_in_fp32": True,
+            "fused_add_norm": True, "pad_vocab_size_multiple": 16, "tie_embeddings": False}
+
+
+def test_mamba2_130ms_mamba_ssm_config_reads_as_its_hf_port():
+    """state-spaces/mamba2-130m's config.json against AntonV/mamba2-130m-hf's,
+    which transformers' conversion script wrote from it."""
+    ssm = json.loads((HF_FIXTURES / "mamba2-130m-ssm" / "config.json").read_text())
+    port = json.loads((HF_FIXTURES / "mamba2-130m-hf" / "config.json").read_text())
+
+    adapted = config_from_mamba_ssm(ssm)
+
+    assert config_from_hf(adapted) == config_from_hf(port)
+    assert {key: adapted[key] for key in ("vocab_size", "bos_token_id", "pad_token_id", "eos_token_id")} == {
+        key: port[key] for key in ("vocab_size", "bos_token_id", "pad_token_id", "eos_token_id")}
+
+
+def test_a_mamba_ssm_checkpoint_loads_and_saves_as_its_hf_port(tmp_path, tensors):
+    """mamba_ssm's tensor names differ from the port's in the embedding
+    alone. The load reproduces the reference logits within the fixture's
+    fp32 bound, and a save writes the port's names and config."""
+    source = tmp_path / "ssm"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps(mamba_ssm_config()))
+    save_file({name.replace("backbone.embeddings.", "backbone.embedding."): array
+               for name, array in tensors.items()}, source / "model.safetensors")
+
+    loaded = load_pretrained(source, dtype="float32", attention_impl="reference")
+    loaded.save(tmp_path / "saved")
+
+    logits = loaded.model.apply(loaded.variables, jnp.asarray(np.load(FIXTURE / "input_ids.npy")))
+    assert largest(logits, np.load(FIXTURE / "logits.npy")) < 1e-5
+    assert sorted(load_file(tmp_path / "saved" / "model.safetensors")) == sorted(tensors)
+    saved = json.loads((tmp_path / "saved" / "config.json").read_text())
+    assert config_from_hf(saved) == config_from_hf(json.loads((FIXTURE / "config.json").read_text()))
+
+
+@pytest.mark.parametrize("field, value, message", [
+    ("ssm_cfg", {"layer": "Mamba1"}, "Mamba1"),
+    ("d_intermediate", 16, "d_intermediate"),
+    ("attn_layer_idx", [1], "attn_layer_idx"),
+    ("ssm_cfg", {"layer": "Mamba2", "D_has_hdim": True}, "D_has_hdim"),
+])
+def test_a_mamba_ssm_model_the_port_cannot_express_is_refused(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        config_from_mamba_ssm({**mamba_ssm_config(), field: value})
+
+
+MAMBA2_130M = "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49"
+MAMBA2_130M_HF = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
+
+
+@pytest.mark.network
+def test_state_spaces_mamba2_130m_computes_its_hf_ports_logits():
+    """state-spaces/mamba2-130m (mamba_ssm config and names, pickles on
+    main, loaded from SFconvertbot's refs/pr/1) against transformers 5.16.1
+    running AntonV/mamba2-130m-hf in fp32 on CPU, on two prompts cut to a
+    common 13 tokens.
+
+    Observed on CPU: fp32 4.7e-4 on logits of magnitude 170, every argmax
+    equal; tolerance 1e-3, about twice that. Dew computing and storing
+    bfloat16 sits 4.8 from the fp32 reference, where the reference's own
+    bfloat16 forward sits 9.1; tolerance 10, about twice Dew's.
+    """
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    tokenizer = transformers.AutoTokenizer.from_pretrained("AntonV/mamba2-130m-hf", revision=MAMBA2_130M_HF)
+    prompts = ["The capital of France is Paris, and the capital of Germany is",
+               "def fibonacci(n):\n    if n < 2:\n        return n\n    return"]
+    rows = [tokenizer(prompt)["input_ids"] for prompt in prompts]
+    ids = np.asarray([row[:min(map(len, rows))] for row in rows], np.int32)
+    port = transformers.Mamba2ForCausalLM.from_pretrained("AntonV/mamba2-130m-hf", revision=MAMBA2_130M_HF,
+                                                          dtype=torch.float32).eval()
+    with torch.no_grad():
+        reference = port(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
+
+    fp32 = load_pretrained("state-spaces/mamba2-130m", revision=MAMBA2_130M, dtype="float32")
+    bf16 = load_pretrained("state-spaces/mamba2-130m", revision=MAMBA2_130M,
+                           dtype="bfloat16", param_dtype="bfloat16")
+
+    logits = np.asarray(fp32.model.apply(fp32.variables, ids), np.float32)
+    assert fp32.revision == "ea6060f68a4289e9c06f80effa896629ba519216"
+    assert largest(logits, reference) < 1e-3
+    assert np.array_equal(logits.argmax(-1), reference.argmax(-1))
+    assert largest(bf16.model.apply(bf16.variables, ids), reference) < 10

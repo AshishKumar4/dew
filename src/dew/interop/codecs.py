@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from typing import Literal
@@ -188,64 +188,90 @@ def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     return codes.reshape(*exponents.shape, GROUP // 2), exponents
 
 
-def mxfp4_stems(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """The names a checkpoint ships as an MXFP4 `<stem>_blocks`/`<stem>_scales` pair, sorted.
+@dataclass(frozen=True)
+class SourceQuantization:
+    """One quantized storage format: which tensors of a checkpoint hold one
+    weight, how that weight decodes and how a dense weight encodes back.
 
-    Taken before `unpack_mxfp4`, after which nothing says which tensors
-    arrived packed. Half a pair is refused: the checkpoint has lost a weight.
+    `names` finds the weights a checkpoint ships quantized, refusing a pair
+    that has lost a part; take it before `dequantize`, after which nothing
+    says which tensors arrived quantized. `partners(name)` are the stored
+    tensors that hold `name` besides a tensor of that name itself.
+    `decode(tensors, name)` is its value in float32 and `encode(name,
+    weight)` the stored tensors it writes back. `scale_dtype` reads the
+    dtype a source stored its scales in where the format leaves that to the
+    checkpoint (DeepSeek-V4), for `source_quantization` to write back.
     """
+
+    names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
+    partners: Callable[[str], tuple[str, ...]]
+    decode: Callable[[Mapping[str, np.ndarray], str], np.ndarray]
+    encode: Callable[[str, np.ndarray], dict[str, np.ndarray]]
+    scale_dtype: Callable[[Mapping[str, np.ndarray]], str | None] = lambda tensors: None
+
+    def tensor_names(self, tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+        """The names left once every quantized weight is decoded."""
+        names = self.names(tensors)
+        stored = {partner for name in names for partner in self.partners(name)}
+        return (tuple(name for name in tensors if name not in stored)
+                + tuple(name for name in names if name not in tensors))
+
+    def read(self, tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
+        """One original tensor, a quantized weight decoded in float32 on
+        demand, so alias checks never build a float32 copy of the checkpoint."""
+        return self.decode(tensors, name) if self.partners(name)[0] in tensors else tensors[name]
+
+    def dequantize(self, tensors: Mapping[str, np.ndarray], *,
+                   param_dtype: str = "float32") -> dict[str, np.ndarray]:
+        """Decode each quantized weight in float32, keep it in `param_dtype`
+        and drop its parts. Every other tensor passes through unchanged."""
+        out = dict(tensors)
+        for name in self.names(tensors):
+            out[name] = checkpoint_array(self.decode(tensors, name), param_dtype)
+            for partner in self.partners(name):
+                out.pop(partner)
+        return out
+
+    def requantize(self, tensors: Mapping[str, np.ndarray], names: Iterable[str]) -> dict[str, np.ndarray]:
+        """Write each of `names` back in the format, for the names a source
+        shipped quantized (`names`). Every other tensor passes through as
+        itself. A name the caller no longer holds is refused rather than
+        written dense under a config that calls it quantized, and so is a
+        part already among the tensors, which the encoding would overwrite."""
+        out = dict(tensors)
+        for name in names:
+            if name not in out:
+                raise ValueError(f"{name} was quantized in the source and is not among the tensors to write")
+            taken = [partner for partner in self.partners(name) if partner in out]
+            if taken:
+                raise ValueError(f"{', '.join(taken)} is already among the tensors to write, so "
+                                 f"quantizing {name} would overwrite it")
+            out.update(self.encode(name, np.asarray(out.pop(name))))
+        return out
+
+
+def _paired(tensors: Mapping[str, np.ndarray], suffixes: tuple[str, ...], weight: str) -> tuple[str, ...]:
+    """The weights stored as `<stem><suffix>` parts, `<stem><weight>` each, sorted.
+    Half a pair is refused: the checkpoint has lost a weight."""
     stems = sorted({name.removesuffix(suffix) for name in tensors
-                    for suffix in ('_blocks', '_scales') if name.endswith(suffix)})
+                    for suffix in suffixes if name.endswith(suffix)})
     for stem in stems:
-        for suffix in ('_blocks', '_scales'):
+        for suffix in suffixes:
             if stem + suffix not in tensors:
-                raise ValueError(
-                    f"{stem} arrives MXFP4 packed and the checkpoint holds no {stem}{suffix}")
-    return tuple(stems)
+                raise ValueError(f"{stem}{weight} arrives quantized and the checkpoint holds no {stem}{suffix}")
+    return tuple(stem + weight for stem in stems)
 
 
-def mxfp4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """Decoded names, using the codec's validated pair discovery."""
-    stems = mxfp4_stems(tensors)
-    return tuple(name for name in tensors if not name.endswith(('_blocks', '_scales'))) + tuple(
-        stem for stem in stems if stem not in tensors)
+MXFP4_SUFFIXES = ('_blocks', '_scales')
+"""GPT OSS's `<stem>_blocks` and `<stem>_scales`."""
 
-
-def read_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
-    """One original tensor, with a packed weight decoded in FP32 on demand."""
-    if name + '_blocks' in tensors:
-        return dequantize_mxfp4(tensors[name + '_blocks'], tensors[name + '_scales'])
-    return tensors[name]
-
-
-def unpack_mxfp4(tensors: Mapping[str, np.ndarray], *,
-                 param_dtype: str = "float32") -> dict[str, np.ndarray]:
-    """Decode each packed pair in FP32, then retain that weight in param_dtype.
-    Biases and every other unpaired tensor remain untouched.
-    """
-    unpacked = dict(tensors)
-    for stem in mxfp4_stems(tensors):
-        unpacked[stem] = checkpoint_array(read_mxfp4_tensor(tensors, stem), param_dtype)
-        unpacked.pop(stem + '_blocks')
-        unpacked.pop(stem + '_scales')
-    return unpacked
-
-
-def pack_mxfp4(tensors: Mapping[str, np.ndarray],
-               stems: Collection[str]) -> dict[str, np.ndarray]:
-    """Replace each named `<stem>` with the `<stem>_blocks` and `<stem>_scales` it encodes to.
-
-    Only the stems a source shipped packed (`mxfp4_stems`): every other
-    tensor is written back as itself. A named stem the tensors no longer
-    hold is refused, since the config would still promise its blocks.
-    """
-    packed = dict(tensors)
-    for stem in stems:
-        if stem not in packed:
-            raise ValueError(
-                f"{stem} arrived MXFP4 packed and is not among the tensors to write back")
-        packed[f'{stem}_blocks'], packed[f'{stem}_scales'] = quantize_mxfp4(packed.pop(stem))
-    return packed
+MXFP4 = SourceQuantization(
+    lambda tensors: _paired(tensors, MXFP4_SUFFIXES, ''),
+    lambda name: tuple(name + suffix for suffix in MXFP4_SUFFIXES),
+    lambda tensors, name: dequantize_mxfp4(*(tensors[name + suffix] for suffix in MXFP4_SUFFIXES)),
+    lambda name, weight: dict(zip((name + suffix for suffix in MXFP4_SUFFIXES), quantize_mxfp4(weight),
+                                  strict=True)))
+"""GPT OSS's MXFP4 (`quant_method: mxfp4`), [E, in, out] weights under their stems."""
 
 
 # --------------------------------------------------------------------------
@@ -335,33 +361,23 @@ def quantize_packed_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     return codes.reshape(*groups.shape[:-2], groups.shape[-2] * GROUP // 2), exponents
 
 
-def packed_mxfp4_stems(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """The `<module>.weight` names a checkpoint ships as a compressed-tensors
-    MXFP4 pair, sorted. Half a pair, or a pair beside a dense weight of the
-    same name, is refused: the checkpoint would hold one weight twice or not at all."""
-    modules = sorted({name.removesuffix(suffix) for name in tensors
-                      for suffix in PACKED_SUFFIXES if name.endswith(suffix)})
-    for module in modules:
-        for suffix in PACKED_SUFFIXES:
-            if module + suffix not in tensors:
-                raise ValueError(f"{module}.weight arrives MXFP4 packed and the checkpoint holds no {module}{suffix}")
-        if module + '.weight' in tensors:
-            raise ValueError(f"{module}.weight arrives both dense and MXFP4 packed")
-    return tuple(module + '.weight' for module in modules)
+def _packed_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """The `<module>.weight` names shipped as a compressed-tensors pair; a
+    pair beside a dense weight of the same name is refused too."""
+    names = _paired(tensors, PACKED_SUFFIXES, '.weight')
+    dense = [name for name in names if name in tensors]
+    if dense:
+        raise ValueError(f"{dense} arrive both dense and MXFP4 packed")
+    return names
 
 
-def packed_mxfp4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """Decoded names: every unpaired tensor, then each packed Linear's weight."""
-    stems = packed_mxfp4_stems(tensors)
-    return tuple(name for name in tensors if not name.endswith(PACKED_SUFFIXES)) + stems
+def _packed_partners(name: str) -> tuple[str, ...]:
+    return tuple(name.removesuffix('.weight') + suffix for suffix in PACKED_SUFFIXES)
 
 
-def read_packed_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
-    """One original tensor; a packed Linear's weight decodes to FP32 `[output, input]`."""
-    module = name.removesuffix('.weight')
-    if name == module or module + PACKED_SUFFIXES[0] not in tensors:
-        return tensors[name]
-    packed, scales = tensors[module + PACKED_SUFFIXES[0]], tensors[module + PACKED_SUFFIXES[1]]
+def _decode_packed(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
+    """A packed Linear's weight, FP32 `[output, input]`."""
+    packed, scales = (tensors[partner] for partner in _packed_partners(name))
     if (packed.dtype != np.uint8 or scales.dtype != np.uint8 or packed.ndim != 2
             or packed.shape[1] % (GROUP // 2)
             or scales.shape != (packed.shape[0], packed.shape[1] // (GROUP // 2))):
@@ -371,35 +387,14 @@ def read_packed_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np
     return decode_e2m1(packed, scales)
 
 
-def unpack_packed_mxfp4(tensors: Mapping[str, np.ndarray], *,
-                        param_dtype: str = "float32") -> dict[str, np.ndarray]:
-    """Decode each compressed-tensors pair in FP32 into its Linear's `.weight`,
-    retained in param_dtype. Every other tensor remains untouched."""
-    unpacked = dict(tensors)
-    for stem in packed_mxfp4_stems(tensors):
-        unpacked[stem] = checkpoint_array(read_packed_mxfp4_tensor(tensors, stem), param_dtype)
-        for suffix in PACKED_SUFFIXES:
-            unpacked.pop(stem.removesuffix('.weight') + suffix)
-    return unpacked
+def _encode_packed(name: str, weight: np.ndarray) -> dict[str, np.ndarray]:
+    if weight.ndim != 2:
+        raise ValueError(f"{name} packs a Linear's [output, input] weight, got {weight.shape}")
+    return dict(zip(_packed_partners(name), quantize_packed_mxfp4(weight), strict=True))
 
 
-def pack_packed_mxfp4(tensors: Mapping[str, np.ndarray],
-                      stems: Collection[str]) -> dict[str, np.ndarray]:
-    """Replace each named `<module>.weight` `[output, input]` with the
-    compressed-tensors pair `quantize_packed_mxfp4` encodes it to. Only the
-    stems a source shipped packed (`packed_mxfp4_stems`); a named stem the
-    tensors no longer hold is refused, since the config would still promise
-    its codes."""
-    packed = dict(tensors)
-    for stem in stems:
-        if stem not in packed:
-            raise ValueError(f"{stem} arrived MXFP4 packed and is not among the tensors to write back")
-        weight = np.asarray(packed.pop(stem))
-        if weight.ndim != 2:
-            raise ValueError(f"{stem} packs a Linear's [output, input] weight, got {weight.shape}")
-        module = stem.removesuffix('.weight')
-        packed[module + PACKED_SUFFIXES[0]], packed[module + PACKED_SUFFIXES[1]] = quantize_packed_mxfp4(weight)
-    return packed
+PACKED_MXFP4 = SourceQuantization(_packed_names, _packed_partners, _decode_packed, _encode_packed)
+"""compressed-tensors' `mxfp4-pack-quantized`, `<module>.weight` under its pair."""
 
 
 # --------------------------------------------------------------------------
@@ -474,56 +469,6 @@ def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
     for index in range(blocks[0]):
         out[index * block:(index + 1) * block] *= np.repeat(scales[index], block)[:cols]
     return out
-
-
-def fp8_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """Return the tensor names that survive decoding.
-
-    A `_scale_inv` partner is metadata, not a model tensor, so it is dropped.
-    """
-    return tuple(name for name in tensors if not name.endswith(SCALE_SUFFIX))
-
-
-def read_fp8_tensor(tensors: Mapping[str, np.ndarray], name: str, *, block: int) -> np.ndarray:
-    """Return one tensor in its original values, decoding it in FP32 if it is scaled.
-
-    Only the requested tensor is decoded, so alias validation never builds an
-    FP32 copy of the checkpoint. An unscaled value keeps its stored dtype.
-    """
-    value = tensors[name]
-    scale = tensors.get(name + SCALE_SUFFIX)
-    return value if scale is None else dequantize_fp8_blocks(value, scale, block)
-
-
-def dequantize_checkpoint(tensors: Mapping[str, np.ndarray], block: int, *,
-                          param_dtype: str = "float32") -> dict[str, np.ndarray]:
-    """Apply each scale to its weight, drop the scale, and cast to `param_dtype`.
-
-    The block multiply stays FP32 and each weight is cast as it is written, so
-    no whole decoded model is held in FP32. A scale whose weight is absent is
-    refused. Unscaled tensors pass through unchanged.
-    """
-    out = dict(tensors)
-    for name in tuple(out):
-        if not name.endswith(SCALE_SUFFIX):
-            continue
-        scaled = name[:-len(SCALE_SUFFIX)]
-        if scaled not in out:
-            raise ValueError(
-                f"{name} scales {scaled}, which the checkpoint does not hold")
-        out[scaled] = checkpoint_array(read_fp8_tensor(out, scaled, block=block), param_dtype)
-        out.pop(name)
-    return out
-
-
-def scaled_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """Return the names in `tensors` that have a `<name>_scale_inv` partner, in order.
-
-    Take these before `dequantize_checkpoint` consumes the partners; afterwards
-    nothing says which tensors arrived quantized.
-    """
-    return tuple(name[:-len(SCALE_SUFFIX)] for name in tensors
-                 if name.endswith(SCALE_SUFFIX))
 
 
 def _fp8_scale_inv(amax: np.ndarray, ue8m0: bool) -> np.ndarray:
@@ -603,29 +548,32 @@ def quantize_fp8_blocks(weight: ArrayLike, block: int = BLOCK, *,
     return out, scale_inv
 
 
-def pack_fp8(tensors: Mapping[str, np.ndarray], names: Iterable[str], block: int, *,
-             ue8m0: bool) -> dict[str, np.ndarray]:
-    """Return `tensors` with each of `names` written back as fp8 blocks and scales.
-
-    `dequantize_checkpoint` run backwards, for the names a source shipped
-    quantized (`scaled_names`) in the format its own config declares
-    (`fp8_format`). Every tensor not named passes through as itself; a name
-    the caller no longer holds is refused rather than written dense under a
-    config that calls it quantized.
-    """
-    out = dict(tensors)
+def scaled_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """The names in `tensors` that have a `<name>_scale_inv` partner, in
+    order. A scale whose weight is absent is refused."""
+    names = tuple(name.removesuffix(SCALE_SUFFIX) for name in tensors if name.endswith(SCALE_SUFFIX))
     for name in names:
-        if name not in out:
-            raise ValueError(
-                f"{name} was quantized in the source and is not among the tensors "
-                f"to write")
-        partner = name + SCALE_SUFFIX
-        if partner in out:
-            raise ValueError(
-                f"{partner} is already among the tensors to write, so quantizing "
-                f"{name} would overwrite it")
-        out[name], out[partner] = quantize_fp8_blocks(out[name], block, ue8m0=ue8m0)
-    return out
+        if name not in tensors:
+            raise ValueError(f"{name}{SCALE_SUFFIX} scales {name}, which the checkpoint does not hold")
+    return names
+
+
+def fp8_blocks(block: int = BLOCK, *, ue8m0: bool = False) -> SourceQuantization:
+    """DeepSeek's FP8 blocks of `block` x `block` under `_scale_inv`
+    partners, encoded back with ue8m0 scales where the source's are."""
+    return SourceQuantization(
+        scaled_names, lambda name: (name + SCALE_SUFFIX,),
+        lambda tensors, name: dequantize_fp8_blocks(tensors[name], tensors[name + SCALE_SUFFIX], block),
+        lambda name, weight: dict(zip((name, name + SCALE_SUFFIX),
+                                      quantize_fp8_blocks(weight, block, ue8m0=ue8m0), strict=True)))
+
+
+def dequantize_checkpoint(tensors: Mapping[str, np.ndarray], block: int, *,
+                          param_dtype: str = "float32") -> dict[str, np.ndarray]:
+    """Apply each `_scale_inv` to its weight, drop the scale, and keep the
+    weight in `param_dtype`. The block multiply stays FP32 and each weight is
+    cast as it is written, so no whole decoded model is held in FP32."""
+    return fp8_blocks(block).dequantize(tensors, param_dtype=param_dtype)
 
 
 # --------------------------------------------------------------------------
@@ -655,7 +603,7 @@ def deepseek_v4_layout(name: str, fp4_experts: bool) -> Literal['blocks', 'rows'
     return 'rows' if name.endswith('.engram.embed.weight') else 'blocks'
 
 
-def deepseek_v4_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+def _v4_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
     """The `<m>.weight` names a DeepSeek-V4 checkpoint ships beside a `<m>.scale`, in order.
 
     A `.scale` whose weight is absent is refused: the checkpoint has lost it.
@@ -670,25 +618,23 @@ def deepseek_v4_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
     return tuple(names)
 
 
-def deepseek_v4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """Decoded names: every tensor but the `.scale` partners."""
-    return tuple(name for name in tensors if not name.endswith(V4_SCALE_SUFFIX))
+def _v4_partners(name: str) -> tuple[str, ...]:
+    return (name.removesuffix('.weight') + V4_SCALE_SUFFIX,)
 
 
-def deepseek_v4_scale_dtype(tensors: Mapping[str, np.ndarray]) -> str | None:
+def _v4_scale_dtype(tensors: Mapping[str, np.ndarray]) -> str | None:
     """The dtype a DeepSeek-V4 checkpoint stores its `.scale` tensors in, or
     None without any. Scales in more than one dtype are refused."""
-    stored = sorted({tensors[name.removesuffix('.weight') + V4_SCALE_SUFFIX].dtype.name
-                     for name in deepseek_v4_names(tensors)})
+    stored = sorted({tensors[_v4_partners(name)[0]].dtype.name for name in _v4_names(tensors)})
     if len(stored) > 1:
         raise ValueError(f"a DeepSeek-V4 checkpoint stores its `.scale` tensors in one dtype, "
                          f"this one in {stored}")
     return stored[0] if stored else None
 
 
-def read_deepseek_v4_tensor(tensors: Mapping[str, np.ndarray], name: str, *, block: int,
-                            fp4_experts: bool) -> np.ndarray:
-    """One tensor in its original values, a scaled weight decoded in FP32.
+def _decode_v4(tensors: Mapping[str, np.ndarray], name: str, *, block: int,
+               fp4_experts: bool) -> np.ndarray:
+    """A scaled weight decoded in FP32.
 
     The release's own dequantization: an FP8 Linear is float32(weight) *
     float32(scale) per block (convert.py on `wo_a`), an engram row is
@@ -700,11 +646,8 @@ def read_deepseek_v4_tensor(tensors: Mapping[str, np.ndarray], name: str, *, blo
     decoded weight encodes back to the same byte.
     """
     value = tensors[name]
-    module = name.removesuffix('.weight')
-    scale = tensors.get(module + V4_SCALE_SUFFIX) if module != name else None
-    if scale is None:
-        return value
-    partner, layout = module + V4_SCALE_SUFFIX, deepseek_v4_layout(name, fp4_experts)
+    partner, layout = _v4_partners(name)[0], deepseek_v4_layout(name, fp4_experts)
+    scale = tensors[partner]
     if layout == 'fp4':
         if (value.dtype not in _CODE_DTYPES or value.ndim != 2 or scale.dtype != ml_dtypes.float8_e8m0fnu
                 or scale.shape != (value.shape[0], 2 * value.shape[1] // GROUP) or 2 * value.shape[1] % GROUP):
@@ -726,18 +669,6 @@ def read_deepseek_v4_tensor(tensors: Mapping[str, np.ndarray], name: str, *, blo
     rows = value.astype(np.float32).reshape(value.shape[0], value.shape[1] // block, block)
     rows *= scale.astype(np.float32)[..., None]
     return rows.reshape(value.shape)
-
-
-def unpack_deepseek_v4(tensors: Mapping[str, np.ndarray], *, block: int, fp4_experts: bool,
-                       param_dtype: str = "float32") -> dict[str, np.ndarray]:
-    """Decode each `.scale` pair in FP32 into its weight, retained in
-    param_dtype, and drop the `.scale`. Every other tensor remains untouched."""
-    unpacked = dict(tensors)
-    for name in deepseek_v4_names(tensors):
-        unpacked[name] = checkpoint_array(
-            read_deepseek_v4_tensor(tensors, name, block=block, fp4_experts=fp4_experts), param_dtype)
-        unpacked.pop(name.removesuffix('.weight') + V4_SCALE_SUFFIX)
-    return unpacked
 
 
 def quantize_deepseek_v4_fp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
@@ -778,66 +709,33 @@ def quantize_fp8_rows(weight: ArrayLike, group: int) -> tuple[np.ndarray, np.nda
     return codes.reshape(values.shape), scale_inv
 
 
-def pack_deepseek_v4(tensors: Mapping[str, np.ndarray], names: Iterable[str], *, block: int,
-                     fp4_experts: bool, scale_dtype: str | None = None) -> dict[str, np.ndarray]:
-    """Return `tensors` with each of `names` written back as a DeepSeek-V4
-    weight and `.scale`, in the layout `deepseek_v4_layout` gives it.
+def _encode_v4(name: str, weight: np.ndarray, *, block: int, fp4_experts: bool,
+               scale_dtype: str | None) -> dict[str, np.ndarray]:
+    """`name` written back as a DeepSeek-V4 weight and `.scale`, in the
+    layout `deepseek_v4_layout` gives it. An FP8 weight takes
+    `quantize_fp8_blocks` or `quantize_fp8_rows` under ue8m0, its scale
+    stored in `scale_dtype`, the dtype the source stored its scales in (E8M0
+    when None). An FP4 expert takes `quantize_deepseek_v4_fp4`, whose scales
+    are E8M0."""
+    partner, layout = _v4_partners(name)[0], deepseek_v4_layout(name, fp4_experts)
+    if layout == 'fp4':
+        return dict(zip((name, partner), quantize_deepseek_v4_fp4(weight), strict=True))
+    codes, scale_inv = (quantize_fp8_rows(weight, block) if layout == 'rows'
+                        else quantize_fp8_blocks(weight, block, ue8m0=True))
+    return {name: codes, partner: scale_inv.astype(np.dtype(scale_dtype or V4_SCALE_DTYPES[0]))}
 
-    An FP8 weight takes `quantize_fp8_blocks` or `quantize_fp8_rows` under
-    ue8m0, its scale stored in `scale_dtype`, the dtype the source stored
-    its scales in (`deepseek_v4_scale_dtype`; E8M0 when None). An FP4
-    expert takes `quantize_deepseek_v4_fp4`, whose scales are E8M0. A name
-    the caller no longer holds is refused, and so is a `.scale` already
-    among the tensors.
-    """
-    stored = np.dtype(scale_dtype or V4_SCALE_DTYPES[0])
-    out = dict(tensors)
-    for name in names:
-        if name not in out:
-            raise ValueError(f"{name} was quantized in the source and is not among the tensors to write")
-        partner = name.removesuffix('.weight') + V4_SCALE_SUFFIX
-        if partner in out:
-            raise ValueError(f"{partner} is already among the tensors to write, so quantizing "
-                             f"{name} would overwrite it")
-        layout = deepseek_v4_layout(name, fp4_experts)
-        if layout == 'fp4':
-            out[name], out[partner] = quantize_deepseek_v4_fp4(out[name])
-            continue
-        codes, scale_inv = (quantize_fp8_rows(out[name], block) if layout == 'rows'
-                            else quantize_fp8_blocks(out[name], block, ue8m0=True))
-        out[name], out[partner] = codes, scale_inv.astype(stored)
-    return out
+
+def deepseek_v4(block: int, *, fp4_experts: bool, scale_dtype: str | None = None) -> SourceQuantization:
+    """DeepSeek-V4's `.scale` storage at `block`, with routed experts as E2M1
+    pairs under `fp4_experts`, written back with scales in `scale_dtype`."""
+    return SourceQuantization(
+        _v4_names, _v4_partners, partial(_decode_v4, block=block, fp4_experts=fp4_experts),
+        partial(_encode_v4, block=block, fp4_experts=fp4_experts, scale_dtype=scale_dtype), _v4_scale_dtype)
 
 
 # --------------------------------------------------------------------------
 # Dispatch from quantization_config
 # --------------------------------------------------------------------------
-
-def _one_scale_dtype(tensors: Mapping[str, np.ndarray]) -> None:
-    """A format whose scales have one dtype records none."""
-
-
-@dataclass(frozen=True)
-class SourceQuantization:
-    """Describes a source format the loader undoes and `Pretrained.save` restores.
-
-    `names` reads which tensors arrived quantized off the raw checkpoint,
-    before `dequantize` replaces them with dense weights in requested
-    storage; `requantize` writes those names back in the format.
-    `tensor_names` and `read` expose original values one tensor at a time,
-    for alias checks; `read` decodes on demand rather than holding an FP32
-    model. `scale_dtype` reads the dtype a source stored its scales in where
-    the format leaves that to the checkpoint (DeepSeek-V4), for
-    `source_quantization` to write back.
-    """
-
-    names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
-    dequantize: Callable[[Mapping[str, np.ndarray]], dict[str, np.ndarray]]
-    requantize: Callable[[Mapping[str, np.ndarray], tuple[str, ...]], dict[str, np.ndarray]]
-    tensor_names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
-    read: Callable[[Mapping[str, np.ndarray], str], np.ndarray]
-    scale_dtype: Callable[[Mapping[str, np.ndarray]], str | None] = _one_scale_dtype
-
 
 def _refuse_mlx(config: Mapping[str, object]) -> None:
     """Refuse MLX quantization by name.
@@ -856,7 +754,7 @@ def _refuse_mlx(config: Mapping[str, object]) -> None:
                 "safetensors repo it was converted from (the model card's base_model)")
 
 
-def source_quantization(config: Mapping[str, object], *, param_dtype: str = "float32",
+def source_quantization(config: Mapping[str, object], *,
                         scale_dtype: str | None = None) -> SourceQuantization | None:
     """Return the format a config's `quantization_config` declares, or None.
 
@@ -890,28 +788,15 @@ def source_quantization(config: Mapping[str, object], *, param_dtype: str = "flo
         if experts not in ("fp4", "fp8", None):
             raise ValueError(f"expert_dtype {experts!r}: DeepSeek-V4 ships routed experts as fp4 E2M1 "
                              f"pairs or as fp8 blocks and nothing else")
-        fp4_experts = experts == "fp4"
-        return SourceQuantization(
-            deepseek_v4_names,
-            partial(unpack_deepseek_v4, block=block, fp4_experts=fp4_experts, param_dtype=param_dtype),
-            partial(pack_deepseek_v4, block=block, fp4_experts=fp4_experts, scale_dtype=scale_dtype),
-            deepseek_v4_tensor_names, partial(read_deepseek_v4_tensor, block=block, fp4_experts=fp4_experts),
-            deepseek_v4_scale_dtype)
+        return deepseek_v4(block, fp4_experts=experts == "fp4", scale_dtype=scale_dtype)
     if method == "fp8":
         block, ue8m0 = fp8_format(quantization)
-        return SourceQuantization(
-            scaled_names, partial(dequantize_checkpoint, block=block, param_dtype=param_dtype),
-            partial(pack_fp8, block=block, ue8m0=ue8m0),
-            fp8_tensor_names, partial(read_fp8_tensor, block=block))
+        return fp8_blocks(block, ue8m0=ue8m0)
     if method == "mxfp4":
-        return SourceQuantization(
-            mxfp4_stems, partial(unpack_mxfp4, param_dtype=param_dtype), pack_mxfp4,
-            mxfp4_tensor_names, read_mxfp4_tensor)
+        return MXFP4
     if method == "compressed-tensors":
         packed_mxfp4_format(quantization)
-        return SourceQuantization(
-            packed_mxfp4_stems, partial(unpack_packed_mxfp4, param_dtype=param_dtype), pack_packed_mxfp4,
-            packed_mxfp4_tensor_names, read_packed_mxfp4_tensor)
+        return PACKED_MXFP4
     raise ValueError(
         f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
         f"fp8 blocks and V4 `.scale` storage, GPT OSS's mxfp4 and compressed-tensors' "

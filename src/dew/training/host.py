@@ -10,6 +10,7 @@ from __future__ import annotations
 import mmap
 from collections import defaultdict
 from collections.abc import Mapping
+from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -116,17 +117,43 @@ def stream(tree: Variables, placement, held: Variables | None = None) -> Variabl
     return tree
 
 
+@runtime_checkable
+class HostSource(Protocol):
+    """A host leaf a placement reads one shard at a time.
+
+    `read` returns the values at a global index, as
+    `jax.make_array_from_callback` asks for them, so no process holds more
+    of the leaf than its own devices take. `release` gives back what the
+    reads left resident.
+    """
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def ndim(self) -> int: ...
+
+    def read(self, index: tuple[slice, ...] | None) -> np.ndarray: ...
+
+    def release(self) -> None: ...
+
+
 def place_leaf(value, target: NamedSharding) -> jax.Array:
     """Move one array into `target`, releasing the source once it lands.
 
     A host array or a single device's array is cut into shards by each
     process, so a sharded placement lands sharded. An array already on the
-    mesh moves as it is. Memory-mapped source pages are given back to the
-    kernel, which is what keeps a large checkpoint from being resident
-    twice."""
+    mesh moves as it is. A `HostSource` is read shard by shard. Memory-mapped
+    source pages are given back to the kernel, which is what keeps a large
+    checkpoint from being resident twice."""
     if isinstance(value, jax.Array) and (isinstance(value.sharding, NamedSharding)
                                          or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
         return transfer(value, target)
+    if isinstance(value, HostSource):
+        landed = jax.make_array_from_callback(value.shape, target, value.read)
+        jax.block_until_ready(landed)
+        value.release()
+        return landed
     source = np.asarray(value)
     landed = jax.make_array_from_callback(source.shape, target, lambda index: source[index])
     jax.block_until_ready(landed)

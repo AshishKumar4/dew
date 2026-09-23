@@ -107,7 +107,8 @@ def _gemma_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     :374). Its released config names hidden_act 'gelu', which the reference
     computes as the erf gelu (modeling_gemma.py:93, ACT2FN['gelu']).
     """
-    config = _base_config(hf_config, used, scale_after_cast=False, tie_embeddings=True)
+    config = _base_config(hf_config, used, scale_after_cast=False, tie_embeddings=True,
+                          reads=frozenset({'attention_bias'}))
     config.update(scale_offset=True, embedding_scale=True)
     return config
 
@@ -143,7 +144,12 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         'sliding_attention' if (index + 1) % 2 else 'full_attention'
         for index in range(layers)))
     config = _base_config(hf_config, used, scale_after_cast=False,
-                          tie_embeddings=True, layer_types=layer_types)
+                          tie_embeddings=True, layer_types=layer_types,
+                          reads=frozenset({'layer_types', 'sliding_window', 'attention_bias'}))
+    sliding = (config.get('kinds') or {}).get('sliding_attention') or {}
+    if 'rope_theta' in sliding or 'yarn' in sliding or 'rope_scaling' in sliding:
+        _refuse("rope_parameters.sliding_attention",
+                "Gemma2RotaryEmbedding rotates every layer at one base and ramp")
     _gemma_softcaps(hf_config, used, config)
     softcap = hf_config.get('attn_logit_softcapping')
     if softcap is not None:
@@ -152,7 +158,10 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
 
 
 def _gemma3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
+    # Gemma3TextConfig's rope_local_base_freq default: a config that states
+    # only rope_theta rotates its sliding layers at this base.
+    rope = _rope(hf_config, used, local_default=10000.0)
+    config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False, rope=rope,
                           tie_embeddings=True, layer_types=_gemma_layer_types(hf_config, used))
     _gemma_softcaps(hf_config, used, config)
     return config

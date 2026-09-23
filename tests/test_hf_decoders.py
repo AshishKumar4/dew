@@ -1011,6 +1011,43 @@ def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rn
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
 
 
+MIXED = ("sliding_attention", "full_attention")
+
+
+@pytest.mark.parametrize("fixture, changes, model_type", [
+    # Llama's block with a window on some layers: LlamaConfig has no window,
+    # MinistralConfig names one per layer.
+    ("llama31-tiny", {"layer_types": MIXED, "kinds": {"sliding_attention": LayerKind(window=3)}}, "ministral"),
+    # Gemma3TextConfig rotates the sliding layers of a config that states only
+    # rope_theta at its own 10000, not at rope_theta.
+    ("gemma3-tiny", {"layer_types": MIXED, "kinds": {"sliding_attention": LayerKind(window=3)}}, "gemma3_text"),
+    # Olmo3Config moves a flat rope_theta onto the full layers alone.
+    ("olmo3-tiny", {"rope_theta": 500.0}, "olmo3"),
+])
+def test_an_export_transformers_reads_computes_what_dew_computes(tmp_path, fixture, changes, model_type):
+    model, variables = fp32_decoder(FIXTURES / fixture)
+    model = model.clone(**changes)
+    save_pretrained_decoder(model, variables, tmp_path / "exported")
+    assert json.loads((tmp_path / "exported" / "config.json").read_text())["model_type"] == model_type
+    ids = np.random.default_rng(0).integers(3, model.vocab_size, (2, 12))
+    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+    difference = float(np.max(np.abs(transformers_logits(tmp_path / "exported", ids, tmp_path) - ours)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+
+
+@pytest.mark.parametrize("fixture, changes, lost", [
+    ("llama-tiny", {"final_logit_softcap": 1.5}, "final_logit_softcap"),
+    ("qwen3-tiny", {"causal": False}, "causal"),
+    ("gemma-tiny", {"attention_scale": 0.9}, "attention_scale"),
+    ("qwen3-tiny", {"swiglu_limit": 0.5}, "swiglu_limit"),
+])
+def test_an_export_no_family_carries_is_refused_naming_what_it_would_lose(tmp_path, fixture, changes, lost):
+    model, variables = fp32_decoder(FIXTURES / fixture)
+    with pytest.raises(ValueError, match=lost):
+        save_pretrained_decoder(model.clone(**changes), variables, str(tmp_path))
+    assert not (tmp_path / "config.json").exists()
+
+
 
 # --------------------------------------------------------------------------
 # Gemma 4 gaps: per-layer input embeddings and cross-layer KV sharing

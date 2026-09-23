@@ -28,8 +28,8 @@ from dew.interop.codecs import (
     SCALE_SUFFIX,
     dequantize_checkpoint,
     dequantize_fp8_blocks,
+    fp8_blocks,
     fp8_format,
-    pack_fp8,
     quantize_fp8_blocks,
     scaled_names,
 )
@@ -507,7 +507,7 @@ PACK_BLOCK = 16
 
 
 def test_the_packer_writes_the_named_tensors_and_leaves_the_rest():
-    """`pack_fp8` re-encodes the names it is handed and nothing else, so a
+    """`fp8_blocks(...).requantize` re-encodes the names it is handed and nothing else, so a
     source that shipped its embeddings and its norms dense re-exports them
     dense, as the same arrays rather than as copies or casts of them."""
     rng = np.random.default_rng(3)
@@ -516,7 +516,7 @@ def test_the_packer_writes_the_named_tensors_and_leaves_the_rest():
                quantized: rng.standard_normal((48, 32)).astype(np.float32),
                "model.layers.0.input_layernorm.weight": np.ones(16, np.float32)}
 
-    written = pack_fp8(tensors, (quantized,), PACK_BLOCK, ue8m0=False)
+    written = fp8_blocks(PACK_BLOCK, ue8m0=False).requantize(tensors, (quantized,))
 
     assert set(written) == set(tensors) | {quantized + SCALE_SUFFIX}
     assert written[quantized].dtype == FP8
@@ -531,8 +531,8 @@ def test_the_packer_refuses_a_recorded_tensor_it_was_not_handed():
     would otherwise be written dense under a config that calls it
     quantized, which is the lie this whole path exists to avoid."""
     with pytest.raises(ValueError, match="up_proj.weight was quantized"):
-        pack_fp8({"a.weight": np.ones((16, 16), np.float32)},
-                 ("model.layers.0.mlp.up_proj.weight",), PACK_BLOCK, ue8m0=False)
+        fp8_blocks(PACK_BLOCK).requantize({"a.weight": np.ones((16, 16), np.float32)},
+                                          ("model.layers.0.mlp.up_proj.weight",))
 
 
 def test_the_packer_refuses_to_overwrite_an_existing_scale_partner():
@@ -540,7 +540,7 @@ def test_the_packer_refuses_to_overwrite_an_existing_scale_partner():
                "a.weight_scale_inv": np.ones((1, 1), np.float32)}
 
     with pytest.raises(ValueError, match="a.weight_scale_inv is already"):
-        pack_fp8(tensors, ("a.weight",), PACK_BLOCK, ue8m0=False)
+        fp8_blocks(PACK_BLOCK, ue8m0=False).requantize(tensors, ("a.weight",))
 
 
 # --------------------------------------------------------------------------
@@ -606,7 +606,7 @@ def reexport(request, tmp_path_factory):
     loaded = load_pretrained(str(directory), dtype="float32", attention_impl="reference")
     values = one_training_step(loaded.variables)
     dense = source_tensors(loaded, values)
-    written = pack_fp8(dense, names, REEXPORT_BLOCK, ue8m0=ue8m0)
+    written = fp8_blocks(REEXPORT_BLOCK, ue8m0=ue8m0).requantize(dense, names)
     shutil.copytree(directory, destination)
     write_safetensors(destination / "model.safetensors", written)
     reloaded = load_pretrained(str(destination), dtype="float32", attention_impl="reference")

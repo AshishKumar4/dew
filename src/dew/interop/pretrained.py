@@ -31,10 +31,12 @@ from dew.artifacts import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
+from dew.inference.pipeline import place
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition, DiffusionConditioner, QwenImageConditioner, T5Segment
-from dew.interop import hf_decoders as decoders
+from dew.interop import gguf, hf_decoders as decoders, mamba2, verify
 from dew.interop.codecs import source_quantization
+from dew.interop.streaming import SourceLeaf
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -54,6 +56,8 @@ from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
+
+    from dew.training.distributed import Layout, MeshSpec
 
 
 class ProcessorCall(TypedDict, total=False):
@@ -713,7 +717,7 @@ def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
         if not isinstance(node, Mapping) or part not in node:
             raise ValueError(f"the loaded tree holds no {path}, which {part!r} names")
         node = node[part]
-    if not isinstance(node, np.ndarray | jax.Array):
+    if not isinstance(node, np.ndarray | jax.Array | SourceLeaf):
         return 0
     rank = node.ndim - (0 if expert_index is None else 1)
     return max(rank - 2, 0)
@@ -940,6 +944,12 @@ class Pretrained:
             raise TypeError("a latent diffusion source generates through text_to_image")
         if isinstance(self.model, DiffusionGemma):
             raise TypeError("a DiffusionGemma source generates through block_generation")
+        if not isinstance(self.model, CausalTransformer | MultimodalTransformer):
+            raise TypeError(
+                f"text_generation decodes through a native Dew decoder's KV cache, and this "
+                f"source loaded as {type(self.model).__name__}; generate with transformers' "
+                f"AutoModelForCausalLM.from_pretrained({str(self.source)!r}).generate, or load a "
+                f"registered family without fallback")
         decoder = self.model if isinstance(self.model, CausalTransformer) else None
         mask_id = None if decoder is None else decoder.mask_token_id
         if decoder is not None and not decoder.causal and mask_id is not None:
@@ -1004,7 +1014,8 @@ class Pretrained:
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif (isinstance(self.model, CausalTransformer) and isinstance(family, str)
-              and not decoders._FAMILIES[family].preserve_source_layout and quantization is None):
+              and not decoders._FAMILIES.get(family, decoders._FAMILIES[verify.CONVENTION]).preserve_source_layout
+              and quantization is None):
             # A family that derives its export from the model is written by
             # the decoder export, which writes the whole directory: weights,
             # this processor's files and this generation config, and a
@@ -2356,7 +2367,9 @@ def _checkpoint_dtype(config: Mapping[str, object], tensors: Mapping[str, np.nda
 
 def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                     attention_impl: str = "auto", max_seq_len: int | None = None,
-                    revision: str | None = None) -> Pretrained:
+                    revision: str | None = None, gguf_file: str | None = None,
+                    mesh: MeshSpec | None = None, layout: Layout | None = None,
+                    fallback: str | None = None) -> Pretrained:
     """Load a source into a native Flax model with explicit parameter trees.
 
     ``name_or_dir`` is a local HF directory or a Hub model identifier. The
@@ -2368,7 +2381,33 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     checkpoint's own dtype (`_checkpoint_dtype`). Frozen component weights
     (text encoders and VAE) follow it too; router, clipping, positional and
     safety state retain their own FP32/integer contracts.
+
+    Without `mesh` or `layout` the variables are host arrays. With either,
+    they are placed on that mesh (the default `MeshSpec()` when only
+    `layout` is given) under that layout, one leaf at a time: a decoder's
+    leaves are read from the mapped checkpoint one device shard at a time
+    and cast and transposed there (`dew.interop.streaming`), so the host
+    never holds the translated model. Towers, projectors and a quantized
+    source's dequantized tensors are still built whole on the host first.
+
+    ``gguf_file`` names a GGUF file in the repo or directory: its metadata is
+    the config, its block-quantized tensors are dequantized to float32
+    (`dew.interop.gguf`), and its tokenizer is the processor where the repo
+    ships no tokenizer.
+
+    `fallback="torchax"` opts into tier 3 for any causal LM transformers
+    can build, registered or not: transformers' PyTorch forward lowered to
+    JAX by torchax (`dew.interop.torchax_fallback`), with no Dew kernels,
+    sharding rules or cached generation.
     """
+    if fallback not in (None, "torchax"):
+        raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
+                         "tier 3 through transformers' PyTorch forward")
+    streaming = mesh is not None or layout is not None
+
+    def placed(variables: Variables) -> Variables:
+        return place(variables, mesh, layout) if streaming else variables
+
     if param_dtype != AUTO:
         storage = dtype_name(resolve_dtype(param_dtype))
         if storage is None:
@@ -2377,6 +2416,11 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     directory = decoders._snapshot(str(name_or_dir), revision, weights=False)
     # A Hub snapshot directory is named by its commit.
     commit = None if os.path.isdir(name_or_dir) else directory.name
+    if fallback is not None:
+        from dew.interop import torchax_fallback
+        loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype, param_dtype=param_dtype,
+                                       attention_impl=attention_impl, max_seq_len=max_seq_len)
+        return replace(loaded, variables=placed(loaded.variables))
     if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
         # A latent diffusion pipeline is a directory of components with no
         # model of its own; a decoder that also ships a pipeline index for its
@@ -2391,15 +2435,25 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             from dew.interop import diffusion
             denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
             param_dtype = _checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
-        return replace(
-            _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
-                                   param_dtype=param_dtype), revision=commit)
-    if not (directory / "config.json").is_file():
-        # A GGUF or pickle repo often ships no config.json; the weights read
-        # says what it ships instead.
-        decoders._load_shards(decoders._snapshot(str(name_or_dir), directory.name))
-    with open(directory / "config.json") as handle:
-        config = json.load(handle)
+        loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
+                                        param_dtype=param_dtype)
+        return replace(loaded, variables=placed(loaded.variables), revision=commit)
+    tensors = None
+    if gguf_file is not None:
+        config, tensors = gguf.read(gguf.resolve(name_or_dir, directory, gguf_file))
+    else:
+        if not (directory / "config.json").is_file():
+            # A GGUF or pickle repo often ships no config.json; the weights read
+            # says what it ships instead.
+            decoders._load_shards(decoders._snapshot(str(name_or_dir), directory.name))
+        with open(directory / "config.json") as handle:
+            config = json.load(handle)
+    # mamba_ssm's own format reads as the transformers port it converts to.
+    mamba_ssm = mamba2.is_mamba_ssm(config)
+    if mamba_ssm:
+        adapted = mamba2.config_from_mamba_ssm(config)
+        config.clear()
+        config.update(adapted)
     text_config = config.get("text_config")
     if (config.get("model_type") == "kimi_k25" and isinstance(text_config, Mapping)
             and text_config.get("quantization_config") is not None):
@@ -2410,11 +2464,18 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     # Before any weight downloads: a format the codec cannot read is refused
     # on the config alone.
     source_quantization(config)
-    directory = decoders._snapshot(str(name_or_dir), directory.name)
-    tensors = decoders._load_shards(directory)
+    # An unregistered decoder is checked against transformers on the config
+    # alone, before its weights download (tier 2, dew.interop.verify).
+    verified = (verify.verify_mapping(config) if isinstance(family, str) and family not in decoders._FAMILIES
+                and family != "diffusion_gemma" and "text_config" not in config else None)
+    if tensors is None:
+        directory = decoders._snapshot(str(name_or_dir), directory.name)
+        tensors = decoders._load_shards(directory)
+    if mamba_ssm:
+        tensors = mamba2.tensors_from_mamba_ssm(tensors)
     if param_dtype == AUTO:
         param_dtype = _checkpoint_dtype(config, tensors)
-    quantization = source_quantization(config, param_dtype=param_dtype)
+    quantization = source_quantization(config)
     quantized_tensors, scale_dtype = ((), None) if quantization is None else (
         quantization.names(tensors), quantization.scale_dtype(tensors))
     if quantization is not None:
@@ -2422,7 +2483,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         if param_dtype != "float32":
             aliases = decoders.validate_source_aliases(
                 quantization.tensor_names(tensors), partial(quantization.read, tensors), config)
-        tensors = quantization.dequantize(tensors)
+        tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
         _share_quantized_aliases(tensors, aliases, quantized_tensors)
     layouts: tuple[WeightLayout, ...] = ()
     retained: dict[str, np.ndarray] = {}
@@ -2451,15 +2512,22 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         if not isinstance(language_model, CausalTransformer):
             raise TypeError("causal_transformer registry entry must build CausalTransformer")
         model = _wrapper_model(config, record, language_model, dtype=dtype)
-        variables = _native_variables(decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype))
+        variables = _native_variables(decoders.translate_wrapper_weights(
+            tensors, record, param_dtype=param_dtype, lazy=streaming))
         layouts, retained = _wrapper_layouts(tensors, record, variables)
     else:
-        record = decoders.translate_config(config)
+        if verified is None:
+            record = decoders.translate_config(config)
+            # translate_config refused every model_type but a registered family's name.
+            family = records.text(family, "model_type")
+        else:
+            record = verified.translate(config, tensors)
+            family = verify.CONVENTION
         if max_seq_len is not None:
             record["max_seq_len"] = max_seq_len
         built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
         model = models.build("causal_transformer", built)
-        variables = decoders.translate_weights(tensors, record, family, param_dtype=param_dtype)
+        variables = decoders.translate_weights(tensors, record, family, param_dtype=param_dtype, lazy=streaming)
         decoders._check_tree(variables, model)
         # The bindings are what an adapter loader resolves source names
         # through and what a quantized source is written back through, so a
@@ -2471,13 +2539,19 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         if entry.preserve_source_layout or entry.prepare_weights is dict:
             bindings = []
             for name, tensor in tensors.items():
-                layout = _language_layout(name, name, tensor, record, family, variables)
-                if layout is None:
+                binding = _language_layout(name, name, tensor, record, family, variables)
+                if binding is None:
                     retained[name] = tensor
                 else:
-                    bindings.append(layout)
+                    bindings.append(binding)
             layouts = tuple(bindings)
     processor = _source_processor(directory, config, record, model)
+    if processor is None and gguf_file is not None:
+        # transformers converts the tokenizer the file carries.
+        from transformers import AutoTokenizer
+        processor = Processor(AutoTokenizer.from_pretrained(str(directory), gguf_file=gguf_file,
+                                                            local_files_only=True),
+                              config, record, model.vocab_size)
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
     def policy_read() -> None:
@@ -2490,6 +2564,8 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             raise ValueError("generation_config.json must contain an object")
 
     agreed("pretrained generation policy", policy_read)
-    return Pretrained(model, variables, processor, config, directory, built, generation_config,
+    return Pretrained(model, placed(variables), processor, config, directory, built, generation_config,
                       layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
-                      quantized_scale_dtype=scale_dtype, revision=commit)
+                      quantized_scale_dtype=scale_dtype,
+                      # The weights' commit: a pickle repo's may be its conversion's.
+                      revision=None if commit is None else directory.name)

@@ -9,6 +9,11 @@ variables tree, and `translate` walks a whole state dict through it,
 transposing the linear kernels as `dew.interop.hf_decoders.translate_weights`
 does.
 
+mamba_ssm's own checkpoints (state-spaces/mamba2-*) read through the same
+path: `config_from_mamba_ssm` writes their config as the `Mamba2Config` dict
+transformers' conversion script does, and `tensors_from_mamba_ssm` renames
+their tensors as the reference's load hook does.
+
 `hf_decoders._FAMILY_ENTRIES` registers this module as the `mamba2` family.
 The entry lives there rather than here so that one table names every family.
 """
@@ -165,6 +170,90 @@ def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
             if leaf == ["norm", "weight"]:
                 return f"{prefix}.mixer.norm.weight"
     raise ValueError(f"{dew_name!r} is not a Mamba-2 CausalTransformer parameter")
+
+
+# mamba_ssm's own checkpoint format (state-spaces/mamba2-*): a config.json
+# with no model_type, spelled as mamba_ssm/models/config_mamba.py's
+# MambaConfig, and the Mamba2 layer's arguments under ssm_cfg.
+_MAMBA_SSM_KEYS = frozenset({"d_model", "n_layer", "ssm_cfg"})
+
+# The Mamba2 layer arguments (mamba_ssm/modules/mamba2.py) the port's config
+# states, by its field name, with mamba_ssm's defaults. `dt_limit` has the
+# port's default, (0, inf), and is carried over only where it is set.
+_SSM_FIELDS = {"d_state": ("state_size", 128), "d_conv": ("conv_kernel", 4), "expand": ("expand", 2),
+               "headdim": ("head_dim", 64), "ngroups": ("n_groups", 1), "chunk_size": ("chunk_size", 256),
+               "bias": ("use_bias", False), "conv_bias": ("use_conv_bias", True),
+               "dt_min": ("time_step_min", 0.001), "dt_max": ("time_step_max", 0.1),
+               "dt_init_floor": ("time_step_floor", 1e-4)}
+
+# Layer arguments the port computes only at mamba_ssm's default, with that default.
+_SSM_FIXED = {"rmsnorm": True, "norm_before_gate": False, "D_has_hdim": False, "d_ssm": None}
+
+# Initialization and kernel choices, which change no forward.
+_SSM_INERT = frozenset({"layer", "conv_init", "A_init_range", "use_mem_eff_path"})
+
+
+def is_mamba_ssm(config: Mapping[str, object]) -> bool:
+    """Whether a config.json is mamba_ssm's MambaConfig rather than a transformers config."""
+    return "model_type" not in config and config.keys() >= _MAMBA_SSM_KEYS
+
+
+def config_from_mamba_ssm(config: Mapping[str, object]) -> dict[str, object]:
+    """Return the `Mamba2Config` dict transformers' conversion writes for a mamba_ssm config.
+
+    transformers' convert_mamba2_ssm_checkpoint_to_pytorch.py (mamba_ssm
+    branch): the width, depth and tying carried over, the vocabulary padded
+    up to `pad_vocab_size_multiple`, token ids 0, num_heads derived from the
+    width. The script takes every Mamba2 layer argument at its default; here
+    those `ssm_cfg` sets are carried over, and one the port cannot compute
+    is refused, since the checkpoint's tensors were built with it. A model
+    with MLPs or attention layers is not a Mamba-2 port.
+    """
+    known = {"d_model", "d_intermediate", "n_layer", "vocab_size", "ssm_cfg", "attn_layer_idx", "attn_cfg",
+             "rms_norm", "residual_in_fp32", "fused_add_norm", "pad_vocab_size_multiple", "tie_embeddings"}
+    unknown = sorted(set(config) - known)
+    if unknown:
+        raise ValueError(f"mamba_ssm config fields {unknown} are not MambaConfig's; remove them or load a "
+                         "transformers Mamba2 conversion of the checkpoint")
+    ssm = records.record(config["ssm_cfg"], "ssm_cfg")
+    if ssm.get("layer") != "Mamba2":
+        raise ValueError(f"ssm_cfg layer {ssm.get('layer', 'Mamba1')!r} is not Mamba2; only mamba_ssm's "
+                         "Mamba2 checkpoints read as the mamba2 family")
+    for key, value in (("d_intermediate", 0), ("attn_layer_idx", []), ("rms_norm", True)):
+        if config.get(key, value) != value:
+            raise ValueError(f"{key}={config[key]!r}: transformers' Mamba2 port holds only Mamba2 layers "
+                             f"under RMSNorm, which is {key}={value!r}")
+    for key, value in _SSM_FIXED.items():
+        if ssm.get(key, value) != value:
+            raise ValueError(f"ssm_cfg {key}={ssm[key]!r}: transformers' Mamba2 port computes only "
+                             f"{key}={value!r}")
+    unread = sorted(set(ssm) - set(_SSM_FIELDS) - set(_SSM_FIXED) - _SSM_INERT - {"dt_limit"})
+    if unread:
+        raise ValueError(f"ssm_cfg arguments {unread} are not Mamba2 layer arguments the port reads; "
+                         "remove them if they change no forward")
+    fields = {field: ssm.get(key, default) for key, (field, default) in _SSM_FIELDS.items()}
+    if "dt_limit" in ssm:
+        fields["time_step_limit"] = ssm["dt_limit"]
+    hidden, expand, head_dim = (records.integer(value, name) for name, value in (
+        ("d_model", config["d_model"]), ("expand", fields["expand"]), ("headdim", fields["head_dim"])))
+    # MambaConfig's defaults.
+    vocab = records.integer(config.get("vocab_size", 50277), "vocab_size")
+    multiple = records.integer(config.get("pad_vocab_size_multiple", 8), "pad_vocab_size_multiple")
+    return {"model_type": MODEL_TYPE, "hidden_size": hidden, "num_hidden_layers": config["n_layer"],
+            "num_heads": hidden * expand // head_dim, **fields,
+            "vocab_size": vocab + (-vocab % multiple),
+            "tie_word_embeddings": config.get("tie_embeddings", True),
+            "residual_in_fp32": config.get("residual_in_fp32", True),
+            "bos_token_id": 0, "pad_token_id": 0, "eos_token_id": 0}
+
+
+def tensors_from_mamba_ssm(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Rename a mamba_ssm state dict to the port's names.
+
+    `Mamba2Model.load_hook` (modeling_mamba2.py) is the whole rename:
+    `embedding.` becomes `embeddings.` wherever a name holds it.
+    """
+    return {name.replace("embedding.", "embeddings."): tensor for name, tensor in tensors.items()}
 
 
 def translate(state_dict: Mapping[str, np.ndarray], config: Mapping[str, object], *,

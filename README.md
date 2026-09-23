@@ -351,8 +351,17 @@ all-visible attention mask: `LlamaForCausalLM` for LLaDA and
 `load_pretrained` reads SD, SDXL, SD3, Flux, and Qwen-Image 2.1 pipeline directories.
 SD and SDXL include img2img, inpainting, and the SDXL refiner.
 
-For supported FP8 and MXFP4 checkpoints, `Pretrained.save` requantizes trained
-weights into the source format's blocks and scales.
+The loader reads four quantized storage formats:
+
+- DeepSeek's FP8 blocks (`weight_scale_inv`);
+- DeepSeek-V4 and V4.1's `.scale` storage (FP8 layers, FP4 routed experts,
+  engram tables);
+- GPT-OSS's MXFP4;
+- compressed-tensors' `mxfp4-pack-quantized`.
+
+It decodes them to the same values each release's own dequantization gives.
+`Pretrained.save` writes trained weights back in the source's format and scale
+dtype, using the encoding rule of the tool that wrote the source.
 
 Model-family tests use small source-shaped fixtures. I have not validated
 full-size checkpoint execution, accelerator performance, or physical multi-host

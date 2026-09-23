@@ -214,7 +214,8 @@ WEIGHT_STEMS = ("diffusion_pytorch_model", "model")
 
 
 def weight_files(files: Collection[str], folder: str,
-                 read_json: Callable[[str], JSON]) -> tuple[str, ...]:
+                 read_json: Callable[[str], JSON], *,
+                 stems: tuple[str, ...] = WEIGHT_STEMS, suffix: str = ".safetensors") -> tuple[str, ...]:
     """Return the safetensors files that hold one checkpoint folder's weights.
 
     `files` are the repo-relative names a directory or a Hub listing holds,
@@ -230,11 +231,13 @@ def weight_files(files: Collection[str], folder: str,
     `variant_compatible_siblings` (pipelines/pipeline_loading_utils.py:205,
     diffusers 0.34.0) leaves out of a load with `variant=None`; that module
     imports torch, so its rule is restated here rather than called.
-    Returns () when the folder holds no safetensors weights.
+    `stems` and `suffix` select another format by the same rule, as
+    transformers' `pytorch_model.bin` and its index.
+    Returns () when the folder holds no such weights.
     """
     prefix = f"{folder}/" if folder else ""
-    for stem in WEIGHT_STEMS:
-        index = f"{prefix}{stem}.safetensors.index.json"
+    for stem in stems:
+        index = f"{prefix}{stem}{suffix}.index.json"
         if index in files:
             record = read_json(index)
             weight_map = record.get("weight_map") if isinstance(record, dict) else None
@@ -243,7 +246,7 @@ def weight_files(files: Collection[str], folder: str,
             if not isinstance(weight_map, dict) or len(shards) != len(weight_map):
                 raise ValueError(f"{index} has no weight_map of tensor names to shard files")
             return tuple(sorted({prefix + shard for shard in shards}))
-        single = f"{prefix}{stem}.safetensors"
+        single = f"{prefix}{stem}{suffix}"
         if single in files:
             return (single,)
     return ()

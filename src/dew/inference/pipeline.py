@@ -116,32 +116,38 @@ def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
                  revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     from dew.interop import load_pretrained
     from dew.nn.diffusion_gemma import DiffusionGemma
+    from dew.training.distributed import MeshSpec as DefaultMesh
 
     storage = "float32" if param_dtype is None else param_dtype
-    loaded = (load_pretrained(source, revision=revision, param_dtype=storage) if dtype is None else
-              load_pretrained(source, revision=revision, dtype=dtype, param_dtype=storage))
+    placement = DefaultMesh() if mesh is None else mesh
+    loaded = (load_pretrained(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
+              if dtype is None else
+              load_pretrained(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
+                              layout=layout))
     if loaded.process is not None:
-        task = loaded.text_to_image()
-    elif isinstance(loaded.model, DiffusionGemma):
-        task = loaded.block_generation()
-    else:
-        task = loaded.text_generation()
-    return task.bind(place(loaded.variables, mesh, layout))
+        return loaded.text_to_image()
+    if isinstance(loaded.model, DiffusionGemma):
+        return loaded.block_generation()
+    return loaded.text_generation()
 
 
 def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) -> Variables:
-    """Place `variables` on the mesh `mesh` describes.
+    """Place `variables` on the mesh `mesh` describes, one leaf at a time.
 
     The sharding is the one the trainer gives a train state's parameters under
-    `layout`.
+    `layout`. Each leaf lands on its sharding before the next is read
+    (`dew.training.host.place_leaf`); a `SourceLeaf` is read from the
+    mapped checkpoint one device shard at a time, so no host copy of the
+    whole tree is made.
     """
     from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
+    from dew.training.host import place_leaf
 
     device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
     chosen_layout = DefaultLayout() if layout is None else layout
     shardings = chosen_layout.shardings(device_mesh, variables)
     chosen_layout.check(variables, shardings, device_mesh)
-    return jax.device_put(variables, shardings)
+    return jax.tree.map(place_leaf, variables, shardings)
 
 
 class RunTokenizer(Protocol):

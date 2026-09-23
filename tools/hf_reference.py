@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Write the Hugging Face fixtures tests/test_hf_decoders.py checks against.
 
-Everything here runs under torch and transformers, which dew does not depend
-on, so this is the only place where the reference implementation is executed.
-The fixtures it writes are what CI compares against.
-
-Set up the venv and run it:
+Everything here runs the transformers reference under torch, which dew does
+not depend on. The fixtures it writes are what CI compares against. The
+weight scattering and the reference run come from dew.interop.verify, which
+runs the same recipe at load time for an unregistered model_type, so dew and
+torch share one venv:
 
     uv venv /tmp/hfref --python 3.12
     uv pip install --python /tmp/hfref/bin/python torch torchvision \
         --index-url https://download.pytorch.org/whl/cpu
-    uv pip install --python /tmp/hfref/bin/python transformers safetensors \
-        sentencepiece numpy
+    uv pip install --python /tmp/hfref/bin/python -e '.[verify]' safetensors \
+        sentencepiece
     /tmp/hfref/bin/python tools/hf_reference.py
 
 What lands in tests/fixtures/hf:
@@ -108,6 +108,8 @@ from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration, Qwen3_5VisionModel,
 )
 
+from dew.interop.verify import BATCH, probe_ids, reference_logits, scatter_weights
+
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 REAL_MODEL = "Qwen/Qwen3-0.6B"
 # google/gemma-3-1b-pt is gated; this mirror carries the identical config
@@ -120,7 +122,6 @@ PROMPT = (
 )
 PROMPT_TOKENS = 48
 TOP_K = 32
-BATCH, LENGTH = 2, 12
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
@@ -576,8 +577,7 @@ def write_diffusion_tiny(name: str, model: torch.nn.Module, config: dict,
     model = model.float().eval()
     save_file(model.state_dict(), directory / "model.safetensors")
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
-    ids = np.random.RandomState(7).randint(
-        0, config["vocab_size"], (BATCH, LENGTH)).astype(np.int64)
+    ids = probe_ids(config["vocab_size"]).astype(np.int64)
     np.save(directory / "input_ids.npy", ids.astype(np.int32))
     with torch.no_grad():
         logits = model(torch.from_numpy(ids)).to(torch.float32).numpy()
@@ -1243,36 +1243,6 @@ def write_diffusion_denoiser_tiny() -> None:
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
-
-def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
-    """Random weights with something in every tensor.
-
-    A freshly constructed model leaves the RMSNorm scales at their identity
-    value, and a fixture whose norms are all ones or all zeros would pass a
-    parity test that had the (1 + w) offset backwards.
-    """
-    generator = torch.Generator().manual_seed(seed)
-    with torch.no_grad():
-        for name, tensor in model.named_parameters():
-            noise = torch.randn(tensor.shape, generator=generator) * 0.05
-            tensor.copy_(tensor + noise if "norm" in name or "layernorm" in name
-                         else noise * 4.0)
-        # DeepSeek's balancing bias is a buffer the checkpoint carries, and
-        # the reference selects on it: nonzero, or the load path that reads
-        # it would agree with one that drops it.
-        for name, tensor in model.named_buffers():
-            if name.endswith("e_score_correction_bias"):
-                tensor.copy_(torch.linspace(-0.4, 0.4, tensor.shape[0]))
-
-
-def reference_logits(model: PreTrainedModel, ids: np.ndarray) -> np.ndarray:
-    model.eval()
-    model.set_attn_implementation("eager")
-    with torch.no_grad():
-        out = model(input_ids=torch.from_numpy(ids), use_cache=False)
-    return out.logits.to(torch.float32).numpy()
-
-
 def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234) -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
@@ -1280,8 +1250,7 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234) -> None:
     model = model.float()
     model.save_pretrained(directory, safe_serialization=True)
 
-    ids = np.random.RandomState(7).randint(
-        0, model.config.vocab_size, (BATCH, LENGTH)).astype(np.int32)
+    ids = probe_ids(model.config.vocab_size)
     np.save(directory / "input_ids.npy", ids)
     np.save(directory / "logits.npy", reference_logits(model, ids))
     size = sum(path.stat().st_size for path in directory.iterdir())
