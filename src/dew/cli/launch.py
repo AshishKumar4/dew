@@ -172,10 +172,13 @@ class Launch:
         if hosts:
             return self.start(self.pool(hosts))
         cluster = detected_cluster()
-        if cluster is not None:
+        if cluster is not None and cluster.count > 1:
             return self.in_place(cluster)
-        if "SLURM_JOB_ID" in os.environ:
+        if cluster is None and "SLURM_JOB_ID" in os.environ:
             return self.srun()
+        # Nothing placed a pool here, or a cluster placed this one process
+        # alone, as a one-task Slurm step does: this machine's GPUs are the
+        # launcher's to share out.
         return self.start(self.pool(("localhost",)))
 
     def pool_flags(self) -> list[str]:
@@ -241,11 +244,14 @@ class Launch:
 
     def layout(self, first_host: str) -> tuple[int, int | None]:
         """Processes per host and GPUs per process. A host's GPUs are
-        counted on the first host, only when a flag leaves them to decide,
-        and not at all when JAX_PLATFORMS keeps the pool off GPUs, as a CPU
-        rehearsal on a GPU machine does."""
+        counted on the first host, unless the flags already say both, and
+        not at all when JAX_PLATFORMS keeps the pool off GPUs, as a CPU
+        rehearsal on a GPU machine does. Every GPU process names its GPUs,
+        even a single process holding all of them: jax would otherwise let
+        a cluster it detects, such as the one-task Slurm step the launcher
+        may run in, narrow it to the GPU at the step's local rank."""
         processes, devices = self.processes_per_host, self.devices_per_process
-        if processes is not None and (devices is not None or processes == 1):
+        if processes is not None and devices is not None:
             return processes, devices
         # What the pool's processes will see: the --env values, and on this
         # machine the launcher's own environment, which ssh does not carry.
@@ -255,7 +261,9 @@ class Launch:
         gpus = gpu_count(first_host, env.get("CUDA_VISIBLE_DEVICES")) if on_gpu else 0
         if processes is None:
             processes = max(1, gpus // (devices or 1))
-        if devices is None and gpus > 1 and processes > 1:
+        # More processes than GPUs, as in a rehearsal of programs that do
+        # not use them, leaves every process every GPU.
+        if devices is None and processes <= gpus:
             if gpus % processes:
                 raise ValueError(f"{processes} processes do not split {first_host}'s {gpus} "
                                  "GPUs evenly; set --devices-per-process")
