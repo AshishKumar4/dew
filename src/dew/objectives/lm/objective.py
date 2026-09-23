@@ -70,7 +70,7 @@ from dew.objectives.base import (
     merge_totals,
     thaw,
 )
-from dew.objectives.lm.chunked import bf16_head, chunked_cross_entropy, head_logits
+from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
 from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
 
@@ -713,8 +713,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         losses, predicted, log_z = chunked_cross_entropy(
             hidden, head, targets, self.head_chunks,
             softcap=self.model.final_logit_softcap,
-            precision=self.model.precision, predict=self.token_accuracy,
-            bf16=bf16_head(self.model))
+            precision=self.model.precision, predict=self.token_accuracy)
         valid = prepared.token_fields.get("attention_mask")
         weights = self._row_weights(prepared, targets, segment_ids, roles, losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
@@ -740,8 +739,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 depth_losses, _, _ = chunked_cross_entropy(
                     state, head, targets[:, depth:], self.head_chunks,
                     softcap=self.model.final_logit_softcap,
-                    precision=self.model.precision, predict=False,
-                    bf16=bf16_head(self.model))
+                    precision=self.model.precision, predict=False)
                 depth_scores.append((depth_losses, self._depth_weights(
                     targets, segment_ids, valid, roles, losses.dtype, depth)))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
@@ -949,7 +947,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         variables = thaw(params)
         head = self.model.apply(variables, variables["params"], method=type(self.model).head_weight)
         logits = head_logits(scores.hidden, head, softcap=self.model.final_logit_softcap,
-                             precision=self.model.precision, bf16=bf16_head(self.model))
+                             precision=self.model.precision)
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()

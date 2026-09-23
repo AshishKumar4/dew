@@ -144,13 +144,13 @@ def _algorithm_operand(value: jax.Array) -> jax.Array:
 
 
 def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
-    """A flax layer's `dot_general` for a bf16 vocabulary head
-    (`CausalTransformer.bf16_head`): an fp32 result whose operands are the
-    bf16 compute dtype's values, in both directions.
+    """A flax layer's `dot_general` for a vocabulary head: an fp32 result
+    whose operands are the compute dtype's values, in both directions.
 
     `dtype` is the model's compute dtype, not the layer's: the layer
-    promotes the states to fp32. Under any other compute dtype, or a
-    precision above the default, the product is the layer's own fp32 one.
+    promotes the states to fp32. Under bf16 compute at the default precision
+    both operands multiply as bf16 (`head_product`); otherwise the product
+    is the layer's own fp32 one.
     """
     resolved = bf16_operand_precision(dtype, precision)
     rounds = rounds_to_bf16(dtype, precision)
@@ -167,14 +167,16 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
 
 
 def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
-                 precision: PrecisionLike = None, *, bf16: bool = False) -> jax.Array:
+                 precision: PrecisionLike = None) -> jax.Array:
     """`jnp.einsum(subscripts, hidden, head)` as a vocabulary head computes
     it, with fp32 accumulation and an fp32 result.
 
-    By default the states are widened to fp32 and multiply the head as
-    stored. With `bf16` and bf16 states at the default precision, both
-    operands multiply as bf16 (`head_dot_general`'s arithmetic)."""
-    if bf16 and rounds_to_bf16(hidden.dtype, precision):
+    The product follows the compute dtype, the states' dtype, as torch
+    autocast and MaxText (`logits_dot_in_fp32=False`) run it: bf16 states
+    at the default precision multiply the head as bf16, anything else
+    multiplies fp32 states by the head as stored. The softmax and the loss
+    read the fp32 result."""
+    if rounds_to_bf16(hidden.dtype, precision):
         return jnp.einsum(subscripts, hidden.astype(jnp.float32), _algorithm_operand(head),
                           precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
                           preferred_element_type=jnp.float32)

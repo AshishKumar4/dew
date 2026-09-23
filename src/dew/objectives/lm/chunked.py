@@ -24,12 +24,8 @@ from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 from flax.typing import PrecisionLike
 
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import head_product, rounded_operand, rounds_to_bf16
 
 
@@ -62,17 +58,6 @@ def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ..
 BF16 = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
 
 
-def bf16_head(model: nn.Module) -> bool:
-    """Whether `model`'s vocabulary head multiplies as bf16
-    (`CausalTransformer.bf16_head`), read through the wrappers that hold a
-    decoder: a multimodal model's language model, DiffusionGemma's text."""
-    if isinstance(model, MultimodalTransformer):
-        model = model.language_model
-    if isinstance(model, DiffusionGemma):
-        model = model.text
-    return isinstance(model, CausalTransformer) and model.bf16_head
-
-
 def _operand_dtype(precision: jax.lax.PrecisionLike):
     """The dtype the head's operands take: bf16 under the bf16 algorithm, fp32
     otherwise."""
@@ -87,16 +72,14 @@ def _capped(logits, softcap):
 
 
 def head_logits(hidden, head_weight, *, softcap: float | None,
-                precision: PrecisionLike, vocab_major: bool = False,
-                bf16: bool = False) -> jax.Array:
-    """`hidden @ head_weight` as the model's forward scores it: fp32 states
+                precision: PrecisionLike, vocab_major: bool = False) -> jax.Array:
+    """`hidden @ head_weight` as the model's forward scores it: the states
     against the `[features, vocab]` head (`[vocab, features]` with
-    `vocab_major`) in its stored dtype, accumulated in fp32, softcapped when
-    the backbone caps; `[..., vocab]`. With `bf16`, bf16 states multiply the
-    head as bf16 (`CausalTransformer.bf16_head`,
-    `dew.nn.precision.head_product`)."""
+    `vocab_major`), accumulated in fp32, softcapped when the backbone caps;
+    `[..., vocab]` fp32. The product follows the states' dtype
+    (`dew.nn.precision.head_product`)."""
     return _capped(head_product('...d,vd->...v' if vocab_major else '...d,dv->...v',
-                                hidden, head_weight, precision, bf16=bf16), softcap)
+                                hidden, head_weight, precision), softcap)
 
 
 def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
@@ -289,8 +272,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                           precision: PrecisionLike = None,
                           tile: tuple[int, int] = (1024, 8192),
                           vocab_major: bool = False,
-                          predict: bool = True,
-                          bf16: bool = False):
+                          predict: bool = True):
     """Per-token cross entropy of `hidden @ head_weight`, its top-1 column
     and its log partition.
 
@@ -310,10 +292,10 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     array, a vocabulary-sized copy of a tied table (`head_table` on the
     backbone hands out the stored orientation).
 
-    The states are widened to fp32 and multiply the head as stored. With
-    `bf16` (`CausalTransformer.bf16_head`), bf16 states at the default
-    precision multiply the head as bf16 and accumulate in fp32, forward and
-    backward.
+    The product follows the states' dtype, forward and backward: bf16
+    states at the default precision multiply the head as bf16 and accumulate
+    in fp32, and fp32 states multiply it as stored. The softmax, the
+    logsumexp and the loss are fp32 either way.
 
     `softcap` is the backbone's `final_logit_softcap`. It is elementwise, so
     capping a tile and capping the row agree. `tile` is a `(tokens, columns)`
@@ -337,5 +319,5 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     cap = None if softcap is None else jnp.asarray(softcap, jnp.float32)
     table = head_weight if vocab_major else head_weight.T
     return _bounded_head(hidden, table, targets, chunks, tile, cap,
-                         BF16 if bf16 and rounds_to_bf16(hidden.dtype, precision) else precision,
+                         BF16 if rounds_to_bf16(hidden.dtype, precision) else precision,
                          predict)
