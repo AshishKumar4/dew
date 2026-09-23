@@ -322,11 +322,39 @@ COLLECTIVE = re.compile(
     r"^\s*(?:ROOT\s+)?%\S+\s+=\s+(?P<shape>.+?)\s+"
     r"(?P<op>all-reduce|all-gather|reduce-scatter|all-to-all|collective-permute)(?:-start)?\(")
 ARRAY = re.compile(r"[a-z]+\d*\[([\d,]*)\]")
+TYPED = re.compile(r"([a-z]+\d*)\[([\d,]*)\]")
+ITEMSIZE = {"pred": 1, "s8": 1, "u8": 1, "bf16": 2, "f16": 2, "f32": 4, "s32": 4, "u32": 4, "f64": 8, "s64": 8}
 
 
 def collectives(spec, model):
     """`(op, result shapes)` of every collective one loss-and-gradient step of
     an LM objective over `model` compiles to under `spec` on four devices."""
+    found = []
+    for line in step_text(spec, model).splitlines():
+        match = COLLECTIVE.match(line)
+        if match:
+            shapes = [tuple(int(size) for size in dims.split(",") if size)
+                      for dims in ARRAY.findall(match["shape"])]
+            found.append((match["op"], shapes))
+    return found
+
+
+def collective_bytes(spec, model, ops):
+    """Bytes of the results of every collective among `ops` the step
+    compiles to: a measure no combining of collectives into one, or
+    flattening of their operands, changes."""
+    total = 0
+    for line in step_text(spec, model).splitlines():
+        match = COLLECTIVE.match(line)
+        if match and match["op"] in ops:
+            total += sum(ITEMSIZE[dtype] * math.prod(int(size) for size in dims.split(",") if size)
+                         for dtype, dims in TYPED.findall(match["shape"]))
+    return total
+
+
+def step_text(spec, model):
+    """The compiled text of one loss-and-gradient step of an LM objective
+    over `model` under `spec` on four devices."""
     mesh = build_mesh(spec, jax.devices()[:4])
     objective = LMObjective(model, SEQ_LEN)
     initial = jax.eval_shape(objective.init, jax.random.key(0))
@@ -343,16 +371,8 @@ def collectives(spec, model):
     rest = {name: value for name, value in placed.items() if name != "params"}
     with jax.set_mesh(mesh):
         # The gradient lands where its parameter is, as the optimizer reads it.
-        text = jax.jit(jax.grad(loss), out_shardings=shardings["params"]).lower(
+        return jax.jit(jax.grad(loss), out_shardings=shardings["params"]).lower(
             placed["params"], rest, tokens).compile().as_text()
-    found = []
-    for line in text.splitlines():
-        match = COLLECTIVE.match(line)
-        if match:
-            shapes = [tuple(int(size) for size in dims.split(",") if size)
-                      for dims in ARRAY.findall(match["shape"])]
-            found.append((match["op"], shapes))
-    return found
 
 
 def wide():
@@ -389,6 +409,29 @@ def test_the_loss_scores_each_devices_own_tokens():
 
     assert not [shape for shape in gathered
                 if shape[:2] == (BATCH, SEQ_LEN) or shape[:1] == (tokens,)], gathered
+
+
+@pytest.mark.mesh(devices=4)
+def test_the_token_lookups_gradient_sums_no_table_under_data_parallelism():
+    """Data parallelism has to sum a gradient across devices only where the
+    devices' shares of it differ, and a token lookup's gradient is decided
+    by the batch's rows: 128 here against a table of 4096. GSPMD scattered
+    each device's rows into a table-sized buffer and all-reduced the buffers
+    every step, at the dense bench's shape (16 x 1024 tokens, Qwen3's 151936
+    rows) nineteen times the rows' bytes; the rows travel instead. The head
+    is untied, so every other gradient, its own included, is summed once:
+    the sums hold every gradient's bytes but the table's. Measured in bytes,
+    since the GPU compiler combines the sums into buffers of its own."""
+    model = models.build(
+        "causal_transformer", vocab_size=4096, emb_features=32, num_layers=1,
+        num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN,
+        tie_embeddings=False)
+    shapes = jax.eval_shape(LMObjective(model, SEQ_LEN).init, jax.random.key(0))["params"]
+    gradients = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(shapes))
+    table = 4096 * 32 * 4
+    summed = collective_bytes(MeshSpec(), model, {"all-reduce"})
+
+    assert summed < gradients - table // 2, (summed, gradients, table)
 
 
 def test_tensor_parallelism_keeps_every_projection_weight_in_place():
