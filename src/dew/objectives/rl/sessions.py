@@ -209,8 +209,6 @@ class _Chain:
     versions: list[int] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)
     """Per token, the call that sampled it, or -1 for a prompt or interstitial id."""
-    merged: int = 0
-    """How many calls this chain holds."""
 
     def extend(self, call: Call, index: int, start: int) -> None:
         """Append `call`'s prompt from `start`, then its sampled ids."""
@@ -223,7 +221,6 @@ class _Chain:
         self.behavior.extend(call.behavior_log_probs)
         self.versions.extend([call.version] * len(call.sampled_ids))
         self.calls.extend([index] * len(call.sampled_ids))
-        self.merged += 1
 
 
 def merges(chain: Sequence[int], call: Call) -> bool:
@@ -240,8 +237,7 @@ def _chains(session: Session, index: int, width: int) -> list[_Chain]:
     """Split one session's calls into strict append-only chains no wider than `width`.
 
     A call that does not continue the current chain starts a new chain from
-    its own full prompt. A single call
-    wider than `width` is refused: dropping it would hide a session the
+    its own full prompt. A single call wider than `width` is refused: dropping it would hide a session the
     scheduler admitted. A merged chain is never wider than its last call,
     whose prompt holds the whole chain, so fitting each call fits the chain.
     """
