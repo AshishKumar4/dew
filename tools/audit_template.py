@@ -12,8 +12,8 @@ training a new family or harness setting (agentic RL memo, section 6).
 Two audits, one JSON report on stdout:
 
 - `template`: renders a two-turn tool episode with the tokenizer's own chat
-  template under each harness setting, takes the sampled ids as the
-  canonical encoding of the assistant text plus the end-of-turn token, and
+  template under each harness setting, takes the sampled ids as what that
+  template writes for the assistant turn through its end-of-turn token, and
   checks the strict rule and the prompt-only rule. A case where the
   prompt-only rule holds and the strict one fails is one a lenient merger
   would get wrong. Sampled ids are canonical encodings, so a real sampler
@@ -38,39 +38,50 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 TOOLS = [{"type": "function", "function": {
     "name": "bash", "description": "run a shell command",
     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}}]
-CALL = '<tool_call>\n{"name": "bash", "arguments": {"command": "ls"}}\n</tool_call>'
-COMPACT_CALL = '<tool_call>\n{"name":"bash","arguments":{"command":"ls"}}\n</tool_call>'
-
-
 def divergence(left: Sequence[int], right: Sequence[int]) -> int | None:
     """The first index where two id sequences differ, or None when one prefixes the other."""
     return next((index for index, (a, b) in enumerate(zip(left, right, strict=False)) if a != b), None)
 
 
-def template_case(tokenizer, end: int, observation_role: str, reasoning: bool, *,
-                  arguments_as_string: bool = False, compact_json: bool = False,
-                  think: tuple[str, str] = ("<think>\n", "\n</think>\n\n")) -> dict:
-    """Render turn 1, append the sampled ids, render turn 2, and check both merge rules."""
+def template_case(tokenizer, end: int, observation_role: str, *, reasoning: bool,
+                  arguments_as_string: bool = False, compact_json: bool = False) -> dict:
+    """Render turn 1, derive the sampled turn from the template, render turn 2, check both rules.
+
+    The sampled ids are what the template itself writes for the assistant
+    turn, from the end of the generation prompt through the first end token,
+    so a family's own tool-call and reasoning syntax is what the model is
+    taken to have sampled. `compact_json` has the model sample the arguments
+    as compact JSON that the server then parses; the history carries the
+    parsed arguments for the template to re-serialize.
+    """
     from dew.objectives.rl.rollouts import Call, merges
 
-    def render(messages):
-        return list(tokenizer.apply_chat_template(messages, tools=TOOLS, add_generation_prompt=True,
+    def render(messages, prompt=True):
+        return list(tokenizer.apply_chat_template(messages, tools=TOOLS, add_generation_prompt=prompt,
                                                   tokenize=True, return_dict=False))
+
+    def assistant(arguments):
+        turn = {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_0", "type": "function", "function": {"name": "bash", "arguments": arguments}}]}
+        if reasoning:
+            turn["reasoning_content"] = "I should list the files first."
+        return turn
 
     messages = [{"role": "system", "content": "You are a coding agent."},
                 {"role": "user", "content": "Fix the failing test in repo/."}]
+    parsed = '{"command": "ls"}' if arguments_as_string else {"command": "ls"}
     first = render(messages)
-    thought = "I should list the files first."
-    text = (think[0] + thought + think[1] if reasoning else "") + (COMPACT_CALL if compact_json else CALL)
-    sampled = [*tokenizer.encode(text, add_special_tokens=False), end]
-    arguments = '{"command": "ls"}' if arguments_as_string else {"command": "ls"}
-    assistant = {"role": "assistant", "content": "",
-                 "tool_calls": [{"type": "function", "function": {"name": "bash", "arguments": arguments}}]}
-    if reasoning:
-        assistant["reasoning_content"] = thought
-    observation = ({"role": "tool", "content": "src/ tests/"} if observation_role == "tool"
-                   else {"role": "user", "content": "Observation: src/ tests/"})
-    second = render([*messages, assistant, observation])
+    written = render([*messages, assistant('{"command":"ls"}' if compact_json else parsed)], prompt=False)
+    if written[:len(first)] != first:
+        raise ValueError("the template renders an assistant turn that does not start with its own "
+                         "generation prompt, so the sampled turn cannot be read off it")
+    tail = written[len(first):]
+    if end not in tail:
+        raise ValueError("the template's assistant turn never writes the end token")
+    sampled = tail[:tail.index(end) + 1]
+    observation = ({"role": "tool", "tool_call_id": "call_0", "name": "bash", "content": "src/ tests/"}
+                   if observation_role == "tool" else {"role": "user", "content": "Observation: src/ tests/"})
+    second = render([*messages, assistant(parsed), observation])
     history = [*first, *sampled]
     strict = merges(history, Call(tuple(second), (), (), "stop", 0))
     at = divergence(second, history)
@@ -92,7 +103,7 @@ def audit_template(name: str, end_token: str | None) -> dict:
     end = tokenizer.convert_tokens_to_ids(end_token) if end_token else tokenizer.eos_token_id
     if end is None:
         raise ValueError("the tokenizer names no EOS; pass --end-token")
-    cases = [template_case(tokenizer, end, role, reasoning)
+    cases = [template_case(tokenizer, end, role, reasoning=reasoning)
              for role in ("tool", "user") for reasoning in (False, True)]
     cases.append(template_case(tokenizer, end, "tool", reasoning=False, arguments_as_string=True))
     cases.append(template_case(tokenizer, end, "tool", reasoning=False, compact_json=True))
