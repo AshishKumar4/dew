@@ -177,7 +177,7 @@ def rollout_width(config: Config) -> int:
 
 def attempt_scorer(reward: CodeReward, decode: Callable[[Sequence[int]], str]) -> Callable[[str, Action], float]:
     """The fraction of `cases` an attempt's program passes, its EOS excluded; each program runs once."""
-    @functools.cache
+    @functools.lru_cache(maxsize=4096)
     def passed(cases: str, program: tuple[int, ...]) -> float:
         return reward("code", decode(program), cases, "")
 
