@@ -44,6 +44,7 @@ from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
 
 from dew.inference.tasks import TextGeneration, _ceiling
+from dew.objectives.likelihood import token_log_probs
 from dew.sampling.text import Sampling
 
 DEFAULT_CONTEXT = 2048
@@ -62,10 +63,8 @@ def _scored(model, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
     a causal model cannot read backwards, so a short row's own slots hold
     what they would hold alone.
     """
-    logits = model.apply(variables, rows[:, :-1]).astype(jnp.float32)
-    targets = rows[:, 1:, None]
-    picked = jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), targets, axis=-1)
-    return picked[..., 0], jnp.argmax(logits, axis=-1) == rows[:, 1:]
+    logits = model.apply(variables, rows[:, :-1])
+    return token_log_probs(logits, rows[:, 1:]), jnp.argmax(logits, axis=-1) == rows[:, 1:]
 
 
 def _batches(count: int, size: int) -> list[range]:

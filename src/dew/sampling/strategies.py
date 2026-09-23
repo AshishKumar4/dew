@@ -24,6 +24,7 @@ from jax.experimental import checkify
 
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.objectives.base import Variables
+from dew.objectives.likelihood import token_log_probs
 from dew.sampling.decoding import StepState
 from dew.sampling.guided import Grammar
 
@@ -195,8 +196,8 @@ def draw(state: StepState, logits: jax.Array,
     scores = transform(state, raw)
     keys = jax.vmap(jax.random.fold_in)(state.keys, state.step)
     token = select(keys, scores, state.active)
-    behavior = jnp.take_along_axis(jax.nn.log_softmax(scores), token[:, None], -1)[:, 0]
-    selected = jnp.take_along_axis(jax.nn.log_softmax(raw), token[:, None], -1)[:, 0]
+    behavior = token_log_probs(scores, token)
+    selected = token_log_probs(raw, token)
     return token, behavior, selected
 
 
@@ -654,8 +655,7 @@ def _drafted(plan: Speculative, ops: DecodeOps, state: DecoderState, step: StepS
         scores.append(drawn)
         candidates.append(token)
         offered.append(sure)
-        sure = sure & (jnp.exp(jnp.take_along_axis(
-            jax.nn.log_softmax(drawn), token[:, None], -1)[:, 0]) >= plan.confidence)
+        sure = sure & (jnp.exp(token_log_probs(drawn, token)) >= plan.confidence)
         states.append(states[depth].commit(token, active))
     # Every candidate gets the real criterion, the last one included: a
     # block accepted whole must not draw its bonus behind a stop.
@@ -679,9 +679,8 @@ def _accepted(block_size: int, keys: jax.Array, targets: list[jax.Array], drafte
     rows = active.shape[0]
     accepted = []
     for at in range(1, block_size):
-        chosen = candidates[at][:, None]
-        ratio = (jnp.take_along_axis(jax.nn.log_softmax(targets[at]), chosen, -1)[:, 0]
-                 - jnp.take_along_axis(jax.nn.log_softmax(drafts[at]), chosen, -1)[:, 0])
+        ratio = (token_log_probs(targets[at], candidates[at])
+                 - token_log_probs(drafts[at], candidates[at]))
         uniform = jax.vmap(jax.random.uniform)(keys[:, block_size + at])
         accepted.append((jnp.log(uniform) <= ratio) & offered[at])
     available = 1 + sum(offered_flag.astype(jnp.int32) for offered_flag in offered[1:])
@@ -714,11 +713,9 @@ def _emission(block_size: int, slots: jax.Array, matched: jax.Array, replacement
     emitted = jnp.where(slots < matched[:, None],
                         jnp.concatenate([proposed, jnp.zeros((rows, 1), jnp.int32)], axis=1),
                         replacement[:, None])
-    behavior = jnp.stack([jnp.take_along_axis(jax.nn.log_softmax(targets[at]),
-                                              emitted[:, at:at + 1], -1)[:, 0]
+    behavior = jnp.stack([token_log_probs(targets[at], emitted[:, at])
                           for at in range(block_size + 1)], axis=1)
-    original = jnp.stack([jnp.take_along_axis(jax.nn.log_softmax(raw[at]),
-                                              emitted[:, at:at + 1], -1)[:, 0]
+    original = jnp.stack([token_log_probs(raw[at], emitted[:, at])
                           for at in range(block_size + 1)], axis=1)
     return emitted, behavior, original
 
