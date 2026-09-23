@@ -142,29 +142,23 @@ def xla_chunk_scan(x_c, B_c, C_c, a_c, carried):
     return y_diag + y_off, final
 
 
-def _entering_state(x_c, B_c, a_c, axis: str):
+def _entering_state(decay, write, axis: str):
     """The state entering this shard of a sequence the mesh axis `axis`
     splits, inside a `shard_map` that holds it manual.
 
     Shard r's span of the recurrence is affine in the state entering it:
-    it leaves `exp(A_r) h + B_r`, with `A_r` the span's total log decay and
-    `B_r` the state it leaves from zero, both per row and head. Every shard
-    computes its own pair from its chunks' writes (no intra-chunk output, a
-    small part of a scan's work), all-gathers them, `[n, B, H]` and
-    `[n, B, H, P, N]`, and folds the pairs of the shards before it in order,
-    `h_{r+1} = exp(A_r) h_r + B_r` from `h_0 = 0`, the serial prefix over
-    shards of Mamba-2's context parallelism in lm-engine
+    it leaves `exp(A_r) h + B_r`, with `decay` the span's total log decay
+    `A_r` `[B, H]` and `write` the state `B_r` `[B, H, P, N]` it leaves from
+    zero. Every shard all-gathers the pairs and folds those of the shards
+    before it in order, `h_{r+1} = exp(A_r) h_r + B_r` from `h_0 = 0`, the
+    serial prefix over shards of Mamba-2's context parallelism in lm-engine
     (`sequence_mixer_blocks/mamba2/op.py`, `_SerialPrefixScan`). The fold
     runs over every shard with the later ones masked out, so each shard
     traces the same program. Autodiff differentiates the gather into a
     reduce-scatter and the fold into its reverse; nothing here needs a
     hand-written backward."""
-    batch, heads, head_dim, state_size = (x_c.shape[1], x_c.shape[3], x_c.shape[4], B_c.shape[-1])
-    zero = jnp.zeros((batch, heads, head_dim, state_size), jnp.float32)
-    chunk_decay = jnp.sum(a_c, axis=-1)                     # [NC, B, H]
-    leaving, _ = jax.lax.scan(_carry, zero, (_chunk_writes(x_c, B_c, a_c), chunk_decay))
-    writes = jax.lax.all_gather(leaving, axis)             # [n, B, H, P, N]
-    decays = jax.lax.all_gather(jnp.sum(chunk_decay, axis=0), axis)   # [n, B, H]
+    writes = jax.lax.all_gather(write, axis)               # [n, B, H, P, N]
+    decays = jax.lax.all_gather(decay, axis)               # [n, B, H]
     rank = jax.lax.axis_index(axis)
 
     def fold(entering, step):
@@ -172,12 +166,12 @@ def _entering_state(x_c, B_c, a_c, axis: str):
         passed, _ = _carry(entering, (shard_writes, shard_decay))
         return jnp.where(shard < rank, passed, entering), None
 
-    entering, _ = jax.lax.scan(fold, zero, (jnp.arange(writes.shape[0]), writes, decays))
+    entering, _ = jax.lax.scan(fold, jnp.zeros_like(write),
+                               (jnp.arange(writes.shape[0]), writes, decays))
     return entering
 
 
-def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, starts=None,
-              axis: str | None = None):
+def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, starts=None):
     """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357).
 
     `x` `[B, S, H, P]`, `dt` `[B, S, H]` already through softplus and the
@@ -187,17 +181,11 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
 
     `starts` `[B, S]` marks the tokens that open a packed document: the
     state entering such a token is dropped, so no document reads another's.
-    `axis` names the mesh axis a `shard_map` splits the sequence over; the
-    scan then starts from the state the shards before this one leave
-    (`_entering_state`) rather than from `state`, which it refuses.
 
     The scan over chunks runs on the Pallas kernel where `ssd_kernel_platform`
     takes the backend and the geometry, and on `xla_chunk_scan` everywhere
     else. The two agree to fp32 tolerance (tests/test_ssd_kernel.py).
     """
-    if axis is not None and state is not None:
-        raise ValueError("a sequence-parallel scan starts from the earlier shards' state, "
-                         "so it takes no initial state of its own")
     dtype = x.dtype
     x, dt, A, B, C, D = (jnp.asarray(t, jnp.float32) for t in (x, dt, A, B, C, D))
     batch, length, heads, head_dim = x.shape
@@ -219,11 +207,8 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
 
     x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
     a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]
-    if axis is not None:
-        carried = _entering_state(x_c, B_c, a_c, axis)
-    else:
-        carried = (jnp.zeros((batch, heads, head_dim, state_size), jnp.float32) if state is None
-                   else jnp.asarray(state, jnp.float32))
+    carried = (jnp.zeros((batch, heads, head_dim, state_size), jnp.float32) if state is None
+               else jnp.asarray(state, jnp.float32))
     platform = ssd_kernel_platform(chunk_size, head_dim, state_size)
     scanned, final = (xla_chunk_scan(x_c, B_c, C_c, a_c, carried) if platform is None else
                       ssd_chunk_scan(x_c, B_c, C_c, a_c, carried, platform))
@@ -322,9 +307,10 @@ class Mamba2(nn.Module):
     Under a mesh whose sequence axis is above one, a training or scoring
     call runs the conv and the scan inside a `shard_map` over that axis
     (`_sequence_mix`): each shard's conv reads the previous shard's last
-    `K-1` tokens through a `ppermute`, and its scan starts from the state
-    the earlier shards leave (`_entering_state`), packed documents resetting
-    both across shard boundaries as within one. Decoding and rows with
+    `K-1` tokens through a `ppermute`, and its scan runs from zero and
+    then adds what the state the earlier shards leave (`_entering_state`)
+    contributes to each output, packed documents resetting both across
+    shard boundaries as within one. Decoding and rows with
     padding slots hold one state per row and are refused there.
     """
 
@@ -465,7 +451,17 @@ def _ssd(convolved, dt, dt_bias, A, D, *, num_heads: int, head_dim: int, n_group
     """The scan after the conv: `convolved` `[B, conv_dim, S]` split into
     `x`, `B` and `C`, the step through softplus with its bias and the limit,
     then the recurrent step for one token and the chunked scan otherwise.
-    Returns the output `[B, S, H * P]` and the state leaving it."""
+    Returns the output `[B, S, H * P]` and the state leaving it.
+
+    Under `axis`, this shard's slice of a sequence inside a `shard_map`,
+    the scan runs from zero and the output is then corrected for the state
+    `h` the earlier shards leave, which the recurrence carries linearly: the
+    state at token t is its zero-start value plus `exp(acs_t) h`, with
+    `acs_t` the inclusive sum of this shard's `A dt` (a document start's
+    `RESET_DECAY` in it takes the term to 0), so the output gains
+    `C_t . exp(acs_t) h`. The zero-start scan's final state is the shard's
+    own write `B_r` the exchange needs (`_entering_state`); the state
+    returned is that zero-start one."""
     batch, _, length = convolved.shape
     mixed = jnp.moveaxis(convolved, 2, 1)
     intermediate = num_heads * head_dim
@@ -477,8 +473,20 @@ def _ssd(convolved, dt, dt_bias, A, D, *, num_heads: int, head_dim: int, n_group
     if valid is not None:
         # A zero step neither decays nor writes the state.
         step = jnp.where(valid[:, :, None], step, 0.0)
-    out, final = (recurrent_ssd(xs, step, A, B, C, D, held, starts) if length == 1 and axis is None else
-                  chunk_ssd(xs, step, A, B, C, D, held, chunk_size, starts=starts, axis=axis))
+    if length == 1 and axis is None:
+        out, final = recurrent_ssd(xs, step, A, B, C, D, held, starts)
+    else:
+        out, final = chunk_ssd(xs, step, A, B, C, D, held, chunk_size, starts=starts)
+    if axis is not None:
+        log_decay = A * step                                # [B, S, H]
+        if starts is not None:
+            log_decay = jnp.where(starts[..., None], RESET_DECAY, log_decay)
+        entering = _entering_state(jnp.sum(log_decay, axis=1), final, axis)
+        entering = entering.reshape(batch, n_groups, num_heads // n_groups, head_dim, state_size)
+        decayed = jnp.exp(jnp.cumsum(log_decay, axis=1)).reshape(
+            batch, length, n_groups, num_heads // n_groups)
+        carried = jnp.einsum('bsgn,bgkpn,bsgk->bsgkp', C, entering, decayed)
+        out = out + carried.reshape(batch, length, num_heads, head_dim)
     return out.reshape(batch, length, intermediate), final
 
 
@@ -491,8 +499,8 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
     bias and the heads' `dt_bias`, `A` and `D`. Under `axis` the conv reads
     the previous shard's last `K-1` tokens, and their segments, through one
     `ppermute` (the first shard receives zeros, the history a sequence
-    starts from), and the scan starts from the state the earlier shards
-    leave. A packed document resets both: the conv reads nothing across a
+    starts from), and the scan's output is corrected for the state the
+    earlier shards leave (`_ssd`). A packed document resets both: the conv reads nothing across a
     segment change and the scan drops the state at it, wherever the change
     falls, a shard boundary included."""
     taps, bias, dt_bias, A, D = weights
