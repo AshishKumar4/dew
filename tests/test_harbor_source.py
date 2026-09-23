@@ -162,12 +162,23 @@ def harbor(tmp_path):
     return executable
 
 
-def fake_gateway():
-    """A gateway whose every session recorded one call sampling [10 + sample]."""
+def fake_gateway(unhealthy_checks=0):
+    """A gateway whose every session recorded one call sampling [10 + sample].
+
+    Its one worker is dead for the first `unhealthy_checks` health reads, like rllm-model-gateway
+    started beside an engine still loading: its health loop marks the worker dead, and until the
+    next check revives it every proxied call answers a traceless 500.
+    """
     asked = []
+    checks = [0]
 
     def network(request):
         asked.append((request.method, request.url.path))
+        if request.url.path == "/health/workers":
+            checks[0] += 1
+            healthy = int(checks[0] > unhealthy_checks)
+            return httpx.Response(200, json={"workers": [{"url": "http://engine", "healthy": bool(healthy)}],
+                                             "healthy": healthy, "total": 1})
         if request.method == "DELETE":
             return httpx.Response(200, json={"deleted": 1})
         session = request.url.path.removeprefix("/sessions/").removesuffix("/traces")
@@ -268,6 +279,34 @@ def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
     assert [future.result(timeout=1).status for future in futures] == [Status.CANCELLED, Status.CANCELLED]
     # The queued sample never started a trial.
     assert len(list((tmp_path / "trials").glob("*/seen.json"))) == 1
+
+
+def test_the_first_submission_waits_for_a_healthy_gateway_worker(tmp_path, harbor):
+    (tmp_path / "task").mkdir()
+    gateway, asked = fake_gateway(unhealthy_checks=3)
+    source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials", ready_poll=0.01)
+    try:
+        (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0)
+        assert future.result(timeout=60).status is Status.COMPLETED
+    finally:
+        source.close()
+    # No trial started until the gateway reported a healthy worker, and it asked only once per source.
+    assert asked.count(("GET", "/health/workers")) == 4
+    assert asked.index(("GET", "/health/workers"), 3) < next(
+        index for index, entry in enumerate(asked) if entry[1].endswith("/traces"))
+
+
+def test_a_gateway_with_no_healthy_worker_refuses_the_submission(tmp_path, harbor):
+    (tmp_path / "task").mkdir()
+    gateway, _ = fake_gateway(unhealthy_checks=10 ** 9)
+    source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials",
+                          ready_timeout=0.2, ready_poll=0.01)
+    try:
+        with pytest.raises(RuntimeError, match=r"no healthy worker.*http://gateway/health/workers"):
+            source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0)
+        assert not (tmp_path / "trials").exists()
+    finally:
+        source.close()
 
 
 def test_a_task_without_a_harbor_directory_is_refused(tmp_path, harbor):
