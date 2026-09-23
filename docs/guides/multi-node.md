@@ -31,6 +31,8 @@ Every output line carries its rank, such as `[1] Joined the JAX process pool: pr
 
 A process of a pool that fails does not wait for its peers. It prints the error, writes it to the coordination service and exits at once, instead of sitting in `jax.distributed`'s shutdown barrier for up to 300 seconds. When a rank fails between steps, for example because its data loader raised, its peers may already be inside the next step's collectives, which no GPU backend times out. The failing rank's error is written before it tries to agree with them, and a watch thread in every process ends the process when a published failure has not been heard at an agreement within 60 seconds. So the whole pool ends within about a minute, under `dew launch`, `srun` or a scheduler alike.
 
+A rank can also stall without failing: blocked on a read, or in a compile that waits for its peers. Then every process stays alive and none reports anything, while the others wait inside a collective or a communicator's setup. For this case a pool bounds each device execution with XLA's execution watchdog. `prepare_process` sets `--xla_gpu_execution_terminate_timeout=30m` unless the run already set it. A process whose step, or whose sampling loop, runs longer than that ends, and the launcher, `srun` or the scheduler stops the rest. If you know how long your steps take, set a tighter value in `XLA_FLAGS` or through the recipe's `xla_flags`.
+
 To run one process per GPU instead of one per host:
 
 ```bash
