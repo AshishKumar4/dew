@@ -41,6 +41,7 @@ from dew.interop.hf_decoders import (
     DecoderFields,
     KindFields,
     MixtureFields,
+    SituFields,
     _dew_path,
     _record_float,
     _record_int,
@@ -103,7 +104,7 @@ def _layer_schedule(linear: Mapping[str, object], layers: int) -> tuple[str, ...
     return tuple('linear_attention' if index + 1 in kda else 'full_attention' for index in range(layers))
 
 
-def _situ(text: Mapping[str, object]) -> dict[str, float | None] | None:
+def _situ(text: Mapping[str, object]) -> SituFields:
     """The SiTU betas `_get_situ_activation_params` reads: an unset or zero
     beta is 1.0 (`beta or 1.0`), an unset linear beta leaves up uncapped."""
     beta = text.get('activation_situ_beta')
@@ -206,8 +207,7 @@ def _kimi_k3_text(text: Mapping[str, object], tied: bool) -> DecoderFields:
         'num_heads': heads,
         'num_kv_heads': heads,
         'head_dim': hidden // heads,
-        'mlp': 'situ' if activation == 'situ' else _ACTIVATIONS[activation],
-        'situ': _situ(text) if activation == 'situ' else None,
+        'mlp': _situ(text) if activation == 'situ' else _ACTIVATIONS[activation],
         'mlp_features': _record_int(text, 'intermediate_size'),
         'max_seq_len': min(_record_int(text, 'max_position_embeddings', 4096), 8192),
         'layer_types': types,

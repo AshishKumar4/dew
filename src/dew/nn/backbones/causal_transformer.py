@@ -35,7 +35,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.registry import models
+from dew.registry import from_record, models
 
 from ..attention import RMSNorm, RopeScaling
 from ..attention_residuals import AttentionResiduals, DepthAttention, ResidualSite, expand_blocks, sources
@@ -383,7 +383,9 @@ def _gated_activation(activation: str, gate):
 class GatedMLP(nn.Module):
     """down_proj(act(gate_proj(x)) * up_proj(x)): swiglu is silu, geglu is
     the tanh approximation of gelu (HF's gelu_pytorch_tanh) and geglu_exact
-    the erf form (HF's gelu, which Gemma's released config names).
+    the erf form (HF's gelu, which Gemma's released config names). A `Situ`
+    in place of the name is Kimi K3's SiTU, which transforms both halves
+    (`dew.nn.moe.Situ`).
 
     Bias-free, like the gated MLP of every open decoder this loads.
 
@@ -392,22 +394,20 @@ class GatedMLP(nn.Module):
     swiglu_limit is the clamp GLM-5.3-Flash and DeepSeek V4 apply before the
     activation (`Glm5NextTextMLP.forward`, modeling_glm5_next.py:98-104): the
     gate capped at the limit from above and the up projection on both sides.
-    None is the plain gated MLP. situ holds the betas of Kimi K3's `'situ'`
-    activation, which transforms both halves (`dew.nn.moe.Situ`).
+    None is the plain gated MLP.
     """
     hidden_features: int
     out_features: int
-    activation: str = 'swiglu'
+    activation: str | Situ = 'swiglu'
     activation_sparsity: float = 0.0
     swiglu_limit: float | None = None
     init_std: float | None = None  # gate/up normal std; None: lecun normal
     output_init_std: float | None = None  # down normal std; None follows init_std
-    situ: Situ | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
-        check_gated_activation(self.activation, self.situ)
+        check_gated_activation(self.activation)
         if not 0 <= self.activation_sparsity < 1:
             raise ValueError(
                 f"activation_sparsity is the fraction of gate activations dropped, "
@@ -428,8 +428,8 @@ class GatedMLP(nn.Module):
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        if self.situ is not None:
-            return checkpoint_name(self.down_proj(self.situ(gate, up)), 'down_proj')
+        if isinstance(self.activation, Situ):
+            return checkpoint_name(self.down_proj(self.activation(gate, up)), 'down_proj')
         gate = _gated_activation(self.activation, gate)
         return checkpoint_name(self.down_proj(gate * up), 'down_proj')
 
@@ -1443,8 +1443,9 @@ class CausalTransformer(nn.Module):
     softmax over finished blocks of layers (`dew.nn.attention_residuals`):
     the embeddings enter as the first partial sum, every sublayer reads a
     mixture over depth, and a model-level site mixes the blocks once more
-    before the final norm. `situ` holds the betas of the `'situ'` gated
-    activation every feed-forward then shares (`dew.nn.moe.Situ`).
+    before the final norm. `mlp` may be a `Situ` in place of an activation
+    name: Kimi K3's SiTU, which every feed-forward then shares
+    (`dew.nn.moe.Situ`).
 
     `partial_rotary_factor` rotates that fraction of an unwindowed kind's
     head dims and passes the rest through; a windowed kind rotates whole.
@@ -1486,7 +1487,7 @@ class CausalTransformer(nn.Module):
     num_heads: int = 8
     num_kv_heads: int | None = None       # None: as many as the query heads
     head_dim: int | None = None           # None: emb_features // num_heads
-    mlp: str = 'swiglu'                      # 'swiglu' | 'geglu' | 'geglu_exact' | 'situ'
+    mlp: str | Situ = 'swiglu'               # 'swiglu' | 'geglu' | 'geglu_exact', or Kimi K3's Situ
     mlp_features: int | tuple[int, ...] | None = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n); 0: no feed-forward (Mamba-2)
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
@@ -1569,7 +1570,6 @@ class CausalTransformer(nn.Module):
     hyper_connections: HyperConnections | None = None  # mHC's stack of residual streams; None disables
     attention_residuals: AttentionResiduals | None = None  # Kimi K3's block depth mixture; None disables
     swiglu_limit: float | None = None      # GLM-5.3-Flash's clamp before every gated MLP's activation
-    situ: Situ | None = None               # Kimi K3's SiTU betas; set exactly when mlp is 'situ'
     activation_sparsity_pattern: tuple[float, ...] | None = None  # Gemma 3n's gaussian top-k, one fraction per layer
     mask_token_id: int | None = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
     scan_layers: bool = False                 # runs of like layers under flax's scan
@@ -1607,8 +1607,9 @@ class CausalTransformer(nn.Module):
             object.__setattr__(self, "hyper_connections", HyperConnections(**self.hyper_connections))
         if isinstance(self.attention_residuals, Mapping):
             object.__setattr__(self, "attention_residuals", AttentionResiduals(**self.attention_residuals))
-        if isinstance(self.situ, Mapping):
-            object.__setattr__(self, "situ", Situ(**self.situ))
+        if isinstance(self.mlp, Mapping):
+            # A config states SiTU's betas as a record in the activation's place.
+            object.__setattr__(self, "mlp", from_record(Situ, self.mlp))
         if isinstance(self.mtp_hyper_connections, Mapping):
             object.__setattr__(self, "mtp_hyper_connections", HyperConnections(**self.mtp_hyper_connections))
         # A value arrives as a record from a config and as itself from code,
@@ -2004,7 +2005,7 @@ class CausalTransformer(nn.Module):
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
                                       activation=self.mlp, swiglu_limit=self.swiglu_limit,
                                       init_std=init_std, output_init_std=output_init_std,
-                                      situ=self.situ, dtype=self.dtype, precision=self.precision)
+                                      dtype=self.dtype, precision=self.precision)
         shared = None if mixture is None or not mixture.shared_features else functools.partial(
             gated_mlp, hidden_features=mixture.shared_features)
         routed = None if mixture is None else functools.partial(
@@ -2027,7 +2028,6 @@ class CausalTransformer(nn.Module):
             expert_bias=mixture.bias,
             scale_inputs=mixture.scale_inputs,
             swiglu_limit=self.swiglu_limit,
-            situ=self.situ,
             shared=shared,
             shared_gate=mixture.shared_gate,
             init_std=init_std,
@@ -2157,7 +2157,8 @@ class CausalTransformer(nn.Module):
                 # feed-forward does; gpt-oss's clamped swiglu and Kimi's
                 # SiTU are not among the three names that gate shares, so
                 # they keep silu.
-                gate_activation='swiglu' if self.mlp in ('swigluoai', 'situ') else self.mlp,
+                gate_activation=('swiglu' if self.mlp == 'swigluoai' or isinstance(self.mlp, Situ)
+                                 else self.mlp),
                 parallel=parallel if spec.routed else None,
                 altup=self.altup,
                 laurel_rank=self.laurel_rank,

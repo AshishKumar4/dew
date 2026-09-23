@@ -455,8 +455,8 @@ class Situ:
     tanh(up / linear_beta)` when set. Both halves run in fp32 and the product
     returns in the gate's dtype, as the reference computes it. The released
     text config names the two `activation_situ_beta` and
-    `activation_situ_linear_beta`; a gated MLP whose activation is `'situ'`
-    takes one of these in place of a nonlinearity on the gate alone.
+    `activation_situ_linear_beta`. A gated MLP takes one of these as its
+    activation in place of a name, since it transforms the up projection too.
     """
     beta: float = 1.0
     linear_beta: float | None = None
@@ -475,17 +475,15 @@ class Situ:
         return (activated * work_up).astype(gate.dtype)
 
 
-GATED_ACTIVATIONS = ('swiglu', 'geglu', 'geglu_exact', 'situ')
-"""The gated MLP's activations: silu, the tanh gelu and the erf gelu on the
-gate, or Kimi K3's SiTU over both halves (`Situ`)."""
+GATED_ACTIVATIONS = ('swiglu', 'geglu', 'geglu_exact')
+"""The gated MLP's activations by name: silu, the tanh gelu and the erf gelu
+on the gate. A `Situ` takes a name's place for Kimi K3's SiTU."""
 
 
-def check_gated_activation(activation: str, situ: Situ | None) -> None:
-    """Refuse an activation name no gated MLP computes, and a SiTU without its betas."""
-    if activation not in GATED_ACTIVATIONS:
-        raise ValueError(f"mlp must be one of {GATED_ACTIVATIONS}, got {activation!r}")
-    if (activation == 'situ') != (situ is not None):
-        raise ValueError("the 'situ' activation and its Situ betas come together")
+def check_gated_activation(activation: str | Situ) -> None:
+    """Refuse an activation no gated MLP computes."""
+    if not isinstance(activation, Situ) and activation not in GATED_ACTIVATIONS:
+        raise ValueError(f"mlp must be one of {GATED_ACTIVATIONS} or a Situ, got {activation!r}")
 
 
 class ExpertLinear(nn.Module):
@@ -670,25 +668,24 @@ class ExpertMLP(nn.Module):
     `Llama4TextMoe.forward`, `routed_in * router_scores`), which is not the
     weighted sum of outputs because the gate is not linear.
 
-    `situ` holds the betas of the `'situ'` activation (`Situ`), None for the
-    other three.
+    `activation` names the gate's nonlinearity, or is a `Situ` for Kimi
+    K3's SiTU over both halves.
     """
     num_experts: int
     hidden_features: int
     out_features: int
-    activation: str = 'swiglu'
+    activation: str | Situ = 'swiglu'
     implementation: str = 'xla'
     dispatch: str = 'global'
     swiglu_limit: float | None = None
     scale_inputs: bool = False
     init_std: float | None = None  # gate/up normal std; None: per-expert lecun normal
     output_init_std: float | None = None  # down normal std; None follows init_std
-    situ: Situ | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
-        check_gated_activation(self.activation, self.situ)
+        check_gated_activation(self.activation)
         if self.swiglu_limit is not None and self.swiglu_limit <= 0:
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is "
@@ -721,8 +718,8 @@ class ExpertMLP(nn.Module):
         if self.swiglu_limit is not None:
             gate = jnp.minimum(gate, self.swiglu_limit)
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
-        if self.situ is not None:
-            return checkpoint_name(linear(self.situ(gate, up), kernels[2]), 'down_proj')
+        if isinstance(self.activation, Situ):
+            return checkpoint_name(linear(self.activation(gate, up), kernels[2]), 'down_proj')
         if self.activation == 'swiglu':
             gate = nn.silu(gate)
         elif self.activation == 'geglu':
@@ -789,14 +786,12 @@ class SparseMLP(nn.Module):
     backbone's RMSNorm; None for none) and `routed_expert_up_proj` back to
     `out_features`. The shared branch reads the full-width input. None is
     every other mixture, whose experts run at `out_features`.
-
-    `situ` holds the betas of the `'situ'` activation (`Situ`).
     """
     num_experts: int
     top_k: int
     hidden_features: int
     out_features: int
-    activation: str = 'swiglu'
+    activation: str | Situ = 'swiglu'
     implementation: str = 'xla'
     dispatch: str = 'global'
     score_function: str = 'softmax'
@@ -818,7 +813,6 @@ class SparseMLP(nn.Module):
     """Normal std of the experts' down kernels; None follows init_std."""
     latent_features: int | None = None
     latent_norm: Callable[..., nn.Module] | None = None
-    situ: Situ | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -842,7 +836,7 @@ class SparseMLP(nn.Module):
             out_features=width, activation=self.activation,
             implementation=self.implementation, dispatch=self.dispatch,
             swiglu_limit=self.swiglu_limit,
-            scale_inputs=self.scale_inputs, situ=self.situ,
+            scale_inputs=self.scale_inputs,
             init_std=self.init_std, output_init_std=self.output_init_std,
             dtype=self.dtype, precision=self.precision, name='experts')
         if self.latent_features is not None:

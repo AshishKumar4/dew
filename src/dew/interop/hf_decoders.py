@@ -55,6 +55,7 @@ from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
+from dew.nn.moe import Situ
 from dew.nn.text_encoders import ParamTree, checkpoint_array
 from dew.objectives.base import Variables
 from dew.registry import from_record
@@ -75,6 +76,14 @@ _HF_ACTIVATIONS = {ours: theirs for theirs, ours in _ACTIVATIONS.items()}
 # GPT OSS names its clamped experts 'silu' too; the family's own dial is
 # the mlp value, so the export vocabulary maps it back to the reference's.
 _HF_ACTIVATIONS['swigluoai'] = 'silu'
+
+
+def _hf_activation(activation: str | Situ) -> str:
+    """The `hidden_act` a family's config names an activation by; Kimi K3's
+    SiTU carries its betas in fields of its own and has no such name."""
+    if isinstance(activation, Situ):
+        _refuse('mlp', "SiTU is named only by Kimi K3's own config fields")
+    return _HF_ACTIVATIONS[activation]
 
 _GEMMA = 'gemma3_text'
 _QWEN35 = 'qwen3_5_text'
@@ -317,7 +326,7 @@ class DecoderFields(TypedDict, total=False):
     num_heads: int
     num_kv_heads: int | None
     head_dim: int | None
-    mlp: str
+    mlp: str | SituFields
     mlp_features: int | tuple[int, ...] | None
     max_seq_len: int
     rope_theta: float
@@ -380,7 +389,6 @@ class DecoderFields(TypedDict, total=False):
     hyper_connections: HyperConnectionsFields | None
     attention_residuals: AttentionResidualsFields | None
     swiglu_limit: float | None
-    situ: SituFields | None
     activation_sparsity_pattern: tuple[float, ...] | None
     mask_token_id: int | None
     scan_layers: bool
@@ -1976,7 +1984,7 @@ def _export_config(model) -> Mapping[str, object]:
         'rms_norm_eps': model.norm_eps,
         'attention_bias': model.attention_bias,
         'tie_word_embeddings': model.tie_embeddings,
-        'hidden_act': _HF_ACTIVATIONS[model.mlp],
+        'hidden_act': _hf_activation(model.mlp),
         'use_cache': True,
     }
     # A dial only some families' references read cannot ride in another
