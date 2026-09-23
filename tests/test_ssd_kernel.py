@@ -281,6 +281,8 @@ def within_one_ulp(got, expected) -> bool:
     return bool(np.all(np.abs(got - expected) <= np.ldexp(1.0, binade - 8)))
 
 
+@pytest.mark.skipif(jax.default_backend() == "gpu", reason="on a GPU host the XLA path it is "
+                    "held to bit for bit multiplies at TF32; the kernel runs on TPU only")
 @pytest.mark.parametrize("platform", KERNELS)
 def test_bfloat16_keeps_the_state_in_f32_and_rounds_the_output_the_same(monkeypatch, platform):
     """The scan is fp32 either way, so what bf16 inputs change is the cast at
