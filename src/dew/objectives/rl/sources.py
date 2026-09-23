@@ -96,9 +96,12 @@ class EnvironmentSource:
     `environment` enters one environment per `EpisodeId`; task ids must be
     decimal integers, as `EpisodeRollout`'s are. `verifier` scores completed
     and truncated episodes. `workers` bounds concurrent sessions; the server
-    batches their calls. Environments see the draw's raw likelihoods when
-    the server reports them, and its behavior likelihoods otherwise, which
-    are the same distribution only for a sampling policy without transforms.
+    batches their calls. `cancel` stops a session at its next turn or
+    mid-draw, never inside `environment.step`: an environment must bound its
+    own step time, or a hung step holds its worker until it returns.
+    Environments see the draw's raw likelihoods when the server reports
+    them, and its behavior likelihoods otherwise, which are the same
+    distribution only for a sampling policy without transforms.
     """
 
     def __init__(self, server: RolloutServer, environment: EnvironmentFactory,

@@ -227,6 +227,22 @@ def test_a_straggler_is_waited_for_and_admitted_when_it_finishes():
     assert not source.cancelled
 
 
+def test_a_rollout_past_its_deadline_is_cancelled_and_retried_and_counts_as_a_failed_attempt():
+    source = Scripted(lambda task, submission, sample, version: None if (task, submission, sample) == ("1", 0, 0)
+                      else finished(float(sample), version))
+    rollout, data, records = scheduler(source, ahead=0, timeout=0.05)
+    batch = rollout(State(0), next(iter(data.train())), None)
+    assert records[-1].resubmitted == {"timeout": 1} and records[-1].cancelled == 1
+    assert source.cancelled == source.running and trained(batch)[0] == [0, 1, 2, 3]
+
+    hung = Scripted(lambda task, submission, sample, version: None if task == "1" else finished(
+        float(sample), version))
+    rollout, data, records = scheduler(hung, ahead=0, timeout=0.05, max_attempts=2)
+    rollout(State(0), next(iter(data.train())), None)
+    assert (records[-1].groups, records[-1].abandoned) == (1, 1)
+    assert all(future.cancelled() for future in hung.running)
+
+
 def test_admit_takes_the_first_complete_groups_and_cancels_the_rest():
     source = Scripted(lambda task, submission, sample, version: None if task == "2" else finished(
         float(sample), version))
