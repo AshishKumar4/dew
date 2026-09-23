@@ -29,7 +29,6 @@ its PIL image processor.
 import functools
 import json
 import math
-import os
 from pathlib import Path
 from typing import Mapping, NamedTuple, TypedDict
 
@@ -636,17 +635,15 @@ def _check_tree(params: Mapping[str, object], module: nn.Module, *inputs) -> Non
 def _checkpoint_dir(name_or_dir: str, revision: str | None, *, weights: bool = True) -> Path:
     """The directory holding config.json and the safetensors weights.
 
-    A local directory is taken as it is. A repo id fetches the config and the
-    weights, whole (`model.safetensors`) or sharded
-    (`model-0000N-of-0000M.safetensors`, T5-XXL). openai's repos also carry
-    torch, TensorFlow and Flax copies of the same weights, five gigabytes this
-    never reads, so the patterns leave them out.
+    A local directory is taken as it is. A repo id fetches the config and
+    the weights `dew.interop.safetensors_io.weight_files` selects: the one
+    `model.safetensors` or the shards its index names (T5-XXL). openai's
+    repos also carry torch, TensorFlow and Flax copies of the same weights,
+    and a pipeline's encoders their fp16 variants, which are never fetched.
     """
-    if os.path.isdir(name_or_dir):
-        return Path(name_or_dir)
-    from huggingface_hub import snapshot_download
-    return Path(snapshot_download(name_or_dir, revision=revision,
-                                  allow_patterns=[CONFIG_FILE, *(["model*.safetensors"] if weights else [])]))
+    from dew.interop.hf_decoders import _snapshot
+
+    return _snapshot(name_or_dir, revision, weights=weights)
 
 
 def _read_config(directory: Path) -> Mapping[str, object]:
@@ -656,24 +653,10 @@ def _read_config(directory: Path) -> Mapping[str, object]:
 
 def _read_tensors(directory: Path) -> dict[str, np.ndarray]:
     """Every tensor of the checkpoint in `directory` by its Hugging Face
-    name, from the one weights file or from every shard. A name has no '/',
-    so `load_params` hands the flat table back as it is."""
-    from dew.interop import load_params
+    name, from the one weights file or from the shards its index names."""
+    from dew.interop.safetensors_io import read_weights
 
-    shards = sorted(directory.glob("model*.safetensors"))
-    if not shards:
-        raise FileNotFoundError(
-            f"no {WEIGHTS_FILE} in {directory}: a Hub repo holds {WEIGHTS_FILE} or "
-            "sharded model-0000N-of-0000M.safetensors")
-    tensors: dict[str, np.ndarray] = {}
-    for shard in shards:
-        for name, tensor in load_params(shard).items():
-            if name in tensors:
-                raise ValueError(f"tensor {name!r} is in more than one shard")
-            if not isinstance(tensor, np.ndarray):
-                raise ValueError(f"{name!r} holds a group of tensors; a checkpoint name is one array")
-            tensors[name] = tensor
-    return tensors
+    return read_weights(directory)
 
 
 class CLIPTextModel:

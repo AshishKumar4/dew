@@ -1,0 +1,21 @@
+{
+  "repo": "mistralai/Mistral-7B-Instruct-v0.3",
+  "revision": "c170c708c41dac9275d15a8fff4eca08d52bab71",
+  "files": [
+    ".gitattributes",
+    "README.md",
+    "config.json",
+    "consolidated.safetensors",
+    "generation_config.json",
+    "model-00001-of-00003.safetensors",
+    "model-00002-of-00003.safetensors",
+    "model-00003-of-00003.safetensors",
+    "model.safetensors.index.json",
+    "params.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer.model.v3",
+    "tokenizer_config.json"
+  ]
+}

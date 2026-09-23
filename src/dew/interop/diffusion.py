@@ -15,7 +15,7 @@ from flax.typing import Dtype
 from jax.typing import DTypeLike
 
 from dew import records
-from dew.interop.safetensors_io import load_params
+from dew.interop.safetensors_io import read_weights
 from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
 from dew.nn.text_encoders import checkpoint_array
 from dew.registry import resolve_dtype
@@ -534,29 +534,9 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
 
 
 def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
-    """Read published safetensors, including sharded component directories."""
-    folder = directory / component
-    weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
-    index = folder / f"{weights}.safetensors.index.json"
-    def arrays(path: Path) -> dict[str, np.ndarray]:
-        values = load_params(path)
-        tensors: dict[str, np.ndarray] = {}
-        for name, value in values.items():
-            if not isinstance(value, np.ndarray):
-                raise ValueError(f"Published component tensors must be flat named arrays: {path}")
-            tensors[name] = value
-        return tensors
-    if index.is_file():
-        record = json.loads(index.read_text())
-        shards = sorted(set(record["weight_map"].values()))
-        tensors = {}
-        for name in shards:
-            values = arrays(folder / name)
-            if tensors.keys() & values.keys():
-                raise ValueError(f"Duplicate tensors across {component} shards")
-            tensors.update(values)
-        return tensors
-    return arrays(folder / f"{weights}.safetensors")
+    """Read one published component's weights: the shards its index names or
+    its one weights file, never a precision variant beside them."""
+    return read_weights(directory / component)
 
 
 def record_layouts(component: str, tensors: Mapping[str, np.ndarray],

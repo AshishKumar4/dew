@@ -691,12 +691,13 @@ def _read_vae_weights(directory: Path) -> dict:
         if not isinstance(restored, dict):
             raise ValueError(f"{msgpack} does not hold a param tree")
         return restored
-    safetensors = directory / "diffusion_pytorch_model.safetensors"
-    if not safetensors.exists():
+    from dew.interop.safetensors_io import read_weights
+
+    try:
+        tensors: ParamTree = dict(read_weights(directory))
+    except FileNotFoundError as error:
         raise FileNotFoundError(
             f"no VAE weights in {directory}: neither diffusion_flax_model.msgpack "
-            "nor diffusion_pytorch_model.safetensors")
-    from dew.interop import load_params
-
-    # A diffusers name has no '/', so load_params hands the flat table back.
-    return translate_vae_weights(load_params(safetensors))
+            "nor diffusion_pytorch_model.safetensors (or its index)") from error
+    # A diffusers name has no '/', so the flat table is the one translated.
+    return translate_vae_weights(tensors)

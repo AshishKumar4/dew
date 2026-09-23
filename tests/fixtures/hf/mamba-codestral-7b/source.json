@@ -1,0 +1,21 @@
+{
+  "repo": "mistralai/Mamba-Codestral-7B-v0.1",
+  "revision": "4f086c08c1e0f07bdc50ca25125dbbf7475d21da",
+  "files": [
+    ".gitattributes",
+    "README.md",
+    "config.json",
+    "consolidated.safetensors",
+    "generation_config.json",
+    "model-00001-of-00003.safetensors",
+    "model-00002-of-00003.safetensors",
+    "model-00003-of-00003.safetensors",
+    "model.safetensors.index.json",
+    "params.json",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer.model",
+    "tokenizer.model.v3",
+    "tokenizer_config.json"
+  ]
+}
