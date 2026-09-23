@@ -109,9 +109,8 @@ def batches(*rows):
 
 def scheduler(source, publisher=None, stream=((1, 2), (3, 4), (5, 6)), **options):
     records = []
-    options = {"groups": 2, "max_lag": 1, "ahead": 1, **options}
-    rollout = RolloutScheduler(Objective(), source, publisher or Publisher(), width=WIDTH, rows=ROWS,
-                               log=records.append, **options)
+    options = {"groups": 2, "max_lag": 1, "ahead": 1, "width": WIDTH, "rows": ROWS, **options}
+    rollout = RolloutScheduler(Objective(), source, publisher or Publisher(), log=records.append, **options)
     data = rollout.tasks(Dataset(train=lambda: batches(*stream), val=None, records=None, batch=2))
     return rollout, data, records
 
@@ -200,6 +199,27 @@ def test_a_scored_truncation_trains_on_its_reward_when_the_scheduler_says_so():
     batch = rollout(State(0), next(iter(data.train())), None)
     assert trained(batch)[0] == [0, 1, 2, 3]
     assert records[-1].metrics["reward/mean"] == 3.0 and "masked/truncated" not in records[-1].metrics
+
+
+def split(reward, version):
+    """Two calls whose second prompt rewrites the first id, so each packs as its own chain."""
+    calls = (Call((1, 2), (3, EOS), (-.5, -.25), "stop", version),
+             Call((6, 2, 3, EOS, 4), (3, EOS), (-.5, -.25), "stop", version))
+    return Session("source-task", "source-group", 7, 7, calls, Status.COMPLETED, reward, {}, "")
+
+
+def test_a_group_whose_chains_overflow_the_rows_is_cut_instead_of_failing_the_step():
+    # A group of two split sessions needs three 8-id rows; two groups need six, above rows=4.
+    source = Scripted(lambda task, submission, sample, version: split(float(sample), version))
+    rollout, data, records = scheduler(source, ahead=0, rows=4)
+    batch = rollout(State(0), next(iter(data.train())), None)
+    assert batch["input_ids"].shape == (4, WIDTH)
+    assert (records[-1].groups, records[-1].cut) == (1, 1)
+    assert trained(batch)[0] == [0, 1]
+
+    rollout, data, _ = scheduler(source, ahead=0, rows=2)
+    with pytest.raises(ValueError, match="rows"):
+        rollout(State(0), next(iter(data.train())), None)
 
 
 def test_oversampled_stragglers_are_cancelled_once_the_group_is_full():
