@@ -26,10 +26,12 @@ while this side broadcasts them; `POST /finish_weight_update` with `v`; `POST
 the weights that computed it; `POST /resume`. A replica that fails after the
 pause stays paused, as under `SafetensorsReload`.
 
-Every process of a multi-process trainer calls the push. The served policy is
-replicated over its mesh, the process holding the mesh's first device exports
-and sends that device's copy, and every process learns the outcome at an
-agreement point.
+Every process of a multi-process trainer calls the push. The pool gathers
+the served policy to host memory leaf by leaf, as `SafetensorsReload` does
+(`collective_host`), so a device holds one leaf of it at a time beside the
+trainer's state. The process holding the mesh's first device exports it and
+sends from that device, `chunk` bytes placed there at a time, and every
+process learns the outcome at an agreement point.
 """
 
 from __future__ import annotations
@@ -46,9 +48,9 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import NamedSharding, PartitionSpec as P, SingleDeviceSharding
+from jax.sharding import SingleDeviceSharding
 
-from dew.artifacts import agreed
+from dew.artifacts import agreed, collective_host
 from dew.nn.inputs import mesh_of
 from dew.objectives.base import Variables
 from dew.records import JSON
@@ -163,14 +165,15 @@ class NCCLPush:
     `source` is the `Pretrained` the replicas were launched from; its `export`
     gives the tensors. `engines` are the replicas' roots, not their `/v1` APIs.
     `library` is the engine's own libnccl.so.2. `chunk` bounds the bytes of
-    tensors resident on the sender device at once beside the trainer's state:
-    the next chunk is copied over while the current one broadcasts. Groups open
-    on the first push and stay open until `close`.
+    tensors placed on the sender device beside the trainer's state: the next
+    chunk is copied over while the current one broadcasts, so a push holds
+    at most two chunks there, or two of its largest tensor. Groups open on
+    the first push and stay open until `close`.
 
     `timings` holds the seconds each phase of the last push took: `gather`
-    (the cast and the replication over the mesh, every process), and on the
-    sending process `export`, `send` (copies and broadcasts until every
-    replica has loaded the tensors) and `total`.
+    (the cast and the gather to host, every process), and on the sending
+    process `export`, `send` (copies and broadcasts until every replica has
+    loaded the tensors) and `total`.
     """
 
     source: Pretrained
@@ -192,19 +195,12 @@ class NCCLPush:
 
     def __call__(self, variables: Variables, version: int) -> None:
         began = time.perf_counter()
-        served = _served(variables, jnp.dtype(self.dtype))
-        mesh = mesh_of(served)
-        if mesh is not None:
-            served = jax.jit(lambda tree: tree, out_shardings=NamedSharding(mesh, P()))(served)
-        leaves, structure = jax.tree.flatten(served)
-        sender = next(iter(leaves[0].devices())) if mesh is None else mesh.devices.flat[0]
-        held = [[shard.data for shard in leaf.addressable_shards if shard.device == sender] for leaf in leaves]
-        policy = jax.tree.unflatten(structure, [copies[0] for copies in held]) if all(held) else None
-        jax.block_until_ready(leaves)
+        mesh = mesh_of(variables)
+        sender = jax.local_devices()[0] if mesh is None else mesh.devices.flat[0]
+        served = collective_host(_served(variables, jnp.dtype(self.dtype)), phase="weight push gather")
         self.timings["gather"] = time.perf_counter() - began
-        target = SingleDeviceSharding(sender)
-        agreed("weight push", lambda: None if policy is None else self._push(
-            policy, target, sender.local_hardware_id, version))
+        agreed("weight push", lambda: self._push(served, SingleDeviceSharding(sender), sender.local_hardware_id,
+                                                 version) if sender in jax.local_devices() else None)
         self.timings["total"] = time.perf_counter() - began
 
     def close(self) -> None:
