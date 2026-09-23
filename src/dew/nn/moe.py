@@ -44,7 +44,7 @@ from .blocks import normal_kernel
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
 from .precision import rounded_operand, rounded_to
-from .sharding import EXPERT_AXIS, FSDP_AXIS, LogicalAxes, logical_axes, logical_spec, mesh_axes, row_axes
+from .sharding import EXPERT_AXIS, LogicalAxes, logical_axes, logical_spec, mesh_axes, row_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -391,11 +391,7 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
     """The one choice of grouped matmul: 'xla', 'pallas' or 'tokamax'.
 
     'auto' takes the hardware generation's measured one
-    (`GROUPED_MATMUL_BY_GENERATION`) and 'xla' on an unmeasured generation,
-    and 'xla' where a mesh shards the experts over fsdp but not over the
-    expert axis: each device's kernels would all-gather every expert's
-    weights, and one ExpertMLP layer on 2x RTX 3090 took 98.1 ms on the
-    kernels against XLA's 83.3 (docs/performance.md).
+    (`GROUPED_MATMUL_BY_GENERATION`) and 'xla' on an unmeasured generation.
     'pallas', named or chosen, needs a GPU the kernels compile for and a
     product they compute exactly (`ragged_dot_runs`); elsewhere it is 'xla'.
     `operands` are the dtypes of the input and the kernel as stored.
@@ -404,13 +400,8 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
         raise ValueError(
             f"implementation must be one of {list(GROUPED_MATMULS)}, got "
             f"{implementation!r}")
-    chosen = implementation
-    if implementation == 'auto':
-        mesh = jax.sharding.get_abstract_mesh()
-        split = {name: mesh.shape[name] for name in mesh.axis_names
-                 if name not in mesh.manual_axes}
-        gathered = split.get(FSDP_AXIS, 1) > 1 and split.get(EXPERT_AXIS, 1) == 1
-        chosen = 'xla' if gathered else GROUPED_MATMUL_BY_GENERATION.get(device_generation(), 'xla')
+    chosen = (GROUPED_MATMUL_BY_GENERATION.get(device_generation(), 'xla')
+              if implementation == 'auto' else implementation)
     if chosen != 'pallas':
         return chosen
     runs = ragged_dot_runs(compute, operands, precision)

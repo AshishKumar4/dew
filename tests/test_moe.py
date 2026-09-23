@@ -1071,19 +1071,3 @@ def test_pallas_steps_aside_for_a_product_its_kernels_would_change(monkeypatch):
                                      'highest') == 'xla'
     assert moe.grouped_matmul_kernel('pallas', jnp.float32, (jnp.float32, jnp.float32),
                                      'default') == 'pallas'
-
-
-@pytest.mark.parametrize('layout,chosen', [({'fsdp': 2}, 'xla'), ({'expert': 2}, 'pallas'),
-                                           ({'fsdp': 2, 'expert': 2}, 'pallas'), ({}, 'pallas')])
-def test_auto_takes_xla_where_fsdp_alone_shards_the_experts(monkeypatch, layout, chosen):
-    """Under fsdp without an expert axis each device's kernels would gather
-    every expert's weights, which measured slower than XLA's partitioned
-    product; an explicit 'pallas' is still honoured."""
-    import dew.nn.moe as moe
-    monkeypatch.setattr(moe, 'device_generation', lambda: 'sm89')
-    monkeypatch.setattr(moe, 'triton_runs', lambda: True)
-    names = tuple(layout) or ('data',)
-    mesh = jax.sharding.AbstractMesh(tuple(layout.values()) or (1,), names)
-    with jax.sharding.use_abstract_mesh(mesh):
-        assert moe.grouped_matmul_kernel('auto', jnp.bfloat16, (jnp.bfloat16,), None) == chosen
-        assert moe.grouped_matmul_kernel('pallas', jnp.bfloat16, (jnp.bfloat16,), None) == 'pallas'
