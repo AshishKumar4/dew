@@ -73,6 +73,7 @@ from dew.inference import (
 )
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop import load_pretrained
+from dew.nn.backbones.causal_transformer import remat_policy
 from dew.objectives.rl import (
     Action,
     CodeReward,
@@ -152,6 +153,9 @@ class Config:
     max_lag: int = 1
     tasks: int = 2048
     turns: int = 1
+    thinking: bool = False
+    """Whether a reasoning template opens a think block (Qwen3's `enable_thinking`); others ignore it.
+    Off by default: the task asks for one code block, and a think block eats the budget."""
     """Attempts per task; above one, a failed program's test count comes back and the model tries again."""
     window: int = 10
     """Updates averaged at each end of the run for the reward comparison."""
@@ -296,7 +300,10 @@ def main(config: Config) -> dict:
     # then the behavior policy's, on either backend.
     sampling = Sampling(temperature=1.0, eos_id=eos, pad_id=stock.pad_id)
 
-    objective = GRPOObjective(source.model, width - 1, pretrained=source.variables,
+    # Recompute each block's forward in the backward: without it the saved
+    # activations of Qwen3-0.6B at 64 rows of 320 ids are 61.6 GiB, with it 3.4 GiB.
+    policy = source.model.clone(remat=remat_policy("full"))
+    objective = GRPOObjective(policy, width - 1, pretrained=source.variables,
                               behavior_importance=2.0, epsilon_high=0.28)
     pushes: list[float] = []
     if config.backend == "native":
@@ -350,6 +357,7 @@ def main(config: Config) -> dict:
         sessions = attempts_source(server, reward, words.decode,
                                    lambda text: words.tokenizer.encode(text, add_special_tokens=False), config)
     data = Prompts(tokenizer=tokenizer, records=records(config.tasks, config.seed),
+                   thinking=config.thinking,
                    max_prompt_len=config.prompt_tokens, pad_id=sampling.pad_id, val_batches=None,
                    loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
                    seed=config.seed).load(batch=config.prompts)
