@@ -328,6 +328,11 @@ class DecoderFields(TypedDict, total=False):
     attn_logit_softcap: float | None
     output_gate: bool
     embedding_scale: bool
+    embedding_multiplier: float
+    residual_multiplier: float
+    logits_scaling: float
+    initializer_range: float | None
+    depth_scaled_init: bool
     final_logit_softcap: float | None
     tie_embeddings: bool
     embedding_zero_ids: tuple[int, ...]
