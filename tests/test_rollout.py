@@ -375,6 +375,22 @@ def test_the_mask_stops_after_the_first_stop_token():
     np.testing.assert_array_equal(chain["response_mask"], [0] * PROMPT_WIDTH + [1])
 
 
+def test_a_completion_that_hits_its_budget_is_a_truncation_the_policy_decides():
+    """Without a stop token every draw runs out of budget. SampledRollout
+    classifies those as PromptSource does, TRUNCATED: its default `score`
+    trains them on their reward, and `mask` drops them."""
+    objective = tiny_objective()
+    params = objective.init(jax.random.key(0))
+
+    def draw(truncation):
+        return SampledRollout(objective, Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
+                              sampling=Sampling(temperature=0.0), truncation=truncation)(
+                                  FakeState(params), prompt_batch(), jax.random.key(1))
+
+    assert draw("score")["response_mask"].sum() == 4 * NEW_TOKENS
+    assert draw("mask")["response_mask"].sum() == 0
+
+
 def test_the_rollout_names_its_advantage_family_the_way_pack_does():
     """One estimator name for every producer: Dr.GRPO's centred rewards too."""
     objective = tiny_objective()

@@ -15,7 +15,16 @@ from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.sampling.text import Sampling
 
 from ..lm import LMObjective
-from .sessions import OLD_LOG_PROBS_KEY, Call, Session, Status, check_estimator, pack, sampled_values
+from .sessions import (
+    OLD_LOG_PROBS_KEY,
+    Call,
+    Session,
+    Status,
+    check_estimator,
+    check_truncation,
+    pack,
+    sampled_values,
+)
 
 type Reward = Callable[[str, str, str, str], float]
 """Score ``(data_source, completion, ground_truth, extra_info)``."""
@@ -56,14 +65,17 @@ def check_rollout(groups: int, max_new_tokens: int, estimator: str) -> None:
 
 def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np.ndarray,
                     lengths: np.ndarray, terminated: np.ndarray, behavior: np.ndarray,
-                    rewards: np.ndarray, versions: np.ndarray, estimator: str) -> dict[str, np.ndarray]:
+                    rewards: np.ndarray, versions: np.ndarray, estimator: str,
+                    truncation: str) -> dict[str, np.ndarray]:
     """Pack `[rows, groups, ...]` completions as one-call sessions through `pack`.
 
     `prompts` is `[rows, width]` left-padded ids with `prompt_lengths` real
     tokens each; `sampled` and `behavior` are `[rows, groups, R]` with
     `lengths` valid actions per draw, `terminated` whether each stopped at
     EOS; `rewards` and `versions` are `[rows, groups]`. Each prompt's group
-    is advantaged by the `estimator` family. The batch is `rows * groups` rows
+    is advantaged by the `estimator` family. A draw that did not stop at EOS
+    is TRUNCATED, as `PromptSource` records it, and `truncation` decides
+    whether it trains. The batch is `rows * groups` rows
     of `width + R` ids, the packed layout every GRPO batch has; session
     `row * groups + group` is that draw, which is what `sampled_values`
     hands its callback.
@@ -78,9 +90,9 @@ def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np
             call = Call(prompt, tuple(int(token) for token in sampled[row, group, :count]),
                         tuple(float(value) for value in behavior[row, group, :count]),
                         "stop" if bool(terminated[row, group]) else "length", int(versions[row, group]))
-            sessions.append(Session(str(row), "", group, 0, (call,), Status.COMPLETED,
-                                    float(rewards[row, group])))
-    return pack(sessions, width + budget, rows=rows * groups, estimator=estimator)
+            status = Status.COMPLETED if bool(terminated[row, group]) else Status.TRUNCATED
+            sessions.append(Session(str(row), "", group, 0, (call,), status, float(rewards[row, group])))
+    return pack(sessions, width + budget, rows=rows * groups, estimator=estimator, truncation=truncation)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -89,8 +101,9 @@ class SampledRollout:
 
     EOS is a valid action in the response mask but excluded from reward text.
     The batch is `pack`'s layout, `prompts * groups` rows of the prompt
-    width plus the response budget. Every completion is scored, truncated or
-    not. `old_log_probs` holds the raw likelihoods the cached model recorded
+    width plus the response budget. Every completion is scored; one that
+    ran out of `max_new_tokens` is TRUNCATED, and `truncation` (default
+    `score`, train it on its reward) decides whether it trains. `old_log_probs` holds the raw likelihoods the cached model recorded
     at each sampled action, and `behavior_log_probs` the sampling ones.
     """
 
@@ -100,10 +113,12 @@ class SampledRollout:
     groups: int = 4
     max_new_tokens: int = 32
     estimator: str = "group"
+    truncation: str = "score"
     sampling: Sampling = Sampling()
 
     def __post_init__(self) -> None:
         check_rollout(self.groups, self.max_new_tokens, self.estimator)
+        check_truncation(self.truncation)
 
     def _prepared(self, batch, key: jax.Array):
         """Validate one prompt batch and build the inputs generation reads.
@@ -162,7 +177,7 @@ class SampledRollout:
             for row in range(rows)], np.float32)
         versions = np.full((rows, self.groups), int(state.updates), np.int32)
         packed = completion_rows(prompts, prompt_lengths, sampled, lengths, terminated, behavior,
-                                    rewards, versions, self.estimator)
+                                    rewards, versions, self.estimator, self.truncation)
         packed[OLD_LOG_PROBS_KEY] = sampled_values(
             packed, lambda index, _: raw[index // self.groups, index % self.groups,
                                          :int(lengths[index // self.groups, index % self.groups])].tolist())
