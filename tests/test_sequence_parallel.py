@@ -28,7 +28,6 @@ pytestmark = pytest.mark.mesh
 
 import functools
 
-import dew.training.trainer as trainer_module
 from dew.nn.attention import (
     NormalAttention,
     all_to_all_moves_less,
@@ -42,7 +41,6 @@ from dew.nn.attention import (
 )
 from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.rope import rotary_freqs
-from dew.telemetry.instrumentation import compiled_flops
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
@@ -332,24 +330,18 @@ def test_decoding_is_refused_under_a_sequence_axis():
 # --------------------------------------------------------------------------
 
 
-def one_step(spec, batch, monkeypatch=None, tolerance=0.02, model=tiny):
+def one_step(spec, batch, tolerance=0.02, model=tiny):
     """The loss of one step and the parameters after it, on `spec`; with
-    sgd(1.0) the parameters move by exactly the gradient. With
-    `monkeypatch`, also the program the trainer compiles for its own step,
-    as lowered, before GSPMD adds collectives of its own."""
-    lowered = []
-    if monkeypatch is not None:
-        def recording(jitted, *arguments):
-            program = jitted.lower(*arguments)
-            lowered.append(program.as_text())
-            return compiled_flops(program.compile())
-        monkeypatch.setattr(trainer_module, "step_flops", recording)
+    sgd(1.0) the parameters move by exactly the gradient. Also the program
+    the trainer compiles for its own step, as lowered, before GSPMD adds
+    collectives of its own."""
     trainer = Trainer(LMObjective(model(), SEQ_LEN), optax.sgd(1.0), key=jax.random.key(0),
                       mesh=spec, layout=Layout(min_shard=TINY_SHARD, tolerance=tolerance))
     state, _, _ = trainer.place()
     placed = shard_batch(trainer.device_mesh, batch)
     state, loss, _, _, _ = trainer.compile(state, placed)(state, placed)
-    return float(loss), jax.tree.map(np.asarray, state.params["params"]), "".join(lowered)
+    assert trainer.program is not None
+    return float(loss), jax.tree.map(np.asarray, state.params["params"]), trainer.program.as_text()
 
 
 def assert_same_step(whole, split):
@@ -374,23 +366,23 @@ TRAINED_EXCHANGES = {
 
 @pytest.mark.parametrize("exchange", sorted(TRAINED_EXCHANGES))
 @pytest.mark.parametrize("make_batch", [dense_batch, packed_batch])
-def test_loss_and_gradients_agree_with_whole_sequences(make_batch, exchange, monkeypatch):
+def test_loss_and_gradients_agree_with_whole_sequences(make_batch, exchange):
     """Loss and every gradient leaf equal between fsdp=8 and a split
     sequence, on a dense batch and on a packed one with segment ids and
     positions. The trainer's compiled step shows which exchange ran."""
     batch = make_batch()
     spec, tolerance = TRAINED_EXCHANGES[exchange]
-    split = one_step(spec, batch, monkeypatch, tolerance)
+    split = one_step(spec, batch, tolerance)
     assert ("all_to_all" in split[2]) is (exchange == "all_to_all")
     assert_same_step(one_step(WHOLE, batch), split)
 
 
-def test_the_exchange_runs_inside_the_pipeline_stages(monkeypatch):
+def test_the_exchange_runs_inside_the_pipeline_stages():
     """The pipeline vmaps its stages over the stage axis, and the exchange's
     shard_map runs inside that vmap: fsdp=2, stage=2, sequence=2 trains the
     step fsdp=8 does, loss and gradients."""
     batch = packed_batch()
-    split = one_step(MeshSpec(fsdp=2, stage=2, sequence=2), batch, monkeypatch)
+    split = one_step(MeshSpec(fsdp=2, stage=2, sequence=2), batch)
     assert "all_to_all" in split[2]
     assert_same_step(one_step(WHOLE, batch), split)
 
@@ -532,7 +524,7 @@ HYBRID_SPLITS = {
 
 @pytest.mark.parametrize("split", sorted(HYBRID_SPLITS))
 @pytest.mark.parametrize("make_batch", [dense_batch, packed_batch])
-def test_a_mamba2_hybrid_trains_the_same_step_under_a_split_sequence(make_batch, split, monkeypatch):
+def test_a_mamba2_hybrid_trains_the_same_step_under_a_split_sequence(make_batch, split):
     """A hybrid decoder, three Mamba-2 layers and one attention layer, takes
     the step fsdp=8 takes with the sequence split four ways: the same loss
     and every parameter within fp32 rounding after sgd(1.0), on a dense
@@ -541,7 +533,7 @@ def test_a_mamba2_hybrid_trains_the_same_step_under_a_split_sequence(make_batch,
     exchange. Observed: equal losses, parameters at most 3.6e-7 apart."""
     batch = make_batch()
     spec, tolerance = HYBRID_SPLITS[split]
-    sharded = one_step(spec, batch, monkeypatch, tolerance, model=hybrid)
+    sharded = one_step(spec, batch, tolerance, model=hybrid)
     assert "collective_permute" in sharded[2]
     whole = one_step(WHOLE, batch, model=hybrid)
     assert_same_step(whole, sharded)
