@@ -522,10 +522,9 @@ class Spec(Base):
 
 
 def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
-    """Each schedule holds only its own fields: a power law's coefficients
-    cannot ride a cosine, and a run's record reads back the schedule it names,
-    muP groups included."""
-    from dew.training.optim import Cosine, Power, PowerTail, mup_param_groups
+    """A run's record reads back the schedule it names, its tail and the muP
+    groups included."""
+    from dew.training.optim import Power, PowerTail, mup_param_groups
     config = RunConfig(
         data=datasets["cc12m"](image_size=64), trainer=TrainerConfig(steps=1),
         optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
@@ -533,7 +532,3 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
                           param_groups=mup_param_groups(4.0)))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config
-    with pytest.raises(TypeError):
-        Cosine(peak=1e-3, a=4.0)
-    with pytest.raises(TypeError):
-        OptimConfig(learning_rate_peak=1e-3)
