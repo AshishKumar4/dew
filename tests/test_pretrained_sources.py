@@ -318,3 +318,24 @@ def test_every_inert_field_is_one_the_reference_config_class_does_not_declare():
     for model_type, fields in hf_decoders._INERT_FIELDS.items():
         cls = transformers.PreTrainedConfig if model_type is None else CONFIG_MAPPING[model_type]
         assert not set(fields) & declared(cls), (model_type, set(fields) & declared(cls))
+
+
+def test_the_r1_0528_qwen3_yarn_is_the_references_table():
+    """deepseek-ai/DeepSeek-R1-0528-Qwen3-8B's rope_scaling is YaRN factor 4
+    over 32768 positions at base 1e6, plus vLLM's attn_factor, which
+    transformers neither validates nor reads. The frequencies and the cos/sin
+    scale are the reference's own `ROPE_INIT_FUNCTIONS['yarn']` values."""
+    pytest.importorskip("torch")
+    from transformers import Qwen3Config
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    from dew.nn.mla import YarnScaling, yarn_attention_factor, yarn_inv_freq
+
+    released = fixture_config("deepseek-r1-0528-qwen3-8b")
+    record = hf_decoders.translate_config(released)
+    expected, attention_factor = ROPE_INIT_FUNCTIONS["yarn"](Qwen3Config.from_dict(released), None)
+
+    scaling = YarnScaling(**record["yarn"])
+    assert record["yarn"]["factor"] == 4.0 and record["yarn"]["original_max_position_embeddings"] == 32768
+    assert np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling)) - expected.numpy())) < 1e-7
+    assert yarn_attention_factor(scaling) == pytest.approx(attention_factor)

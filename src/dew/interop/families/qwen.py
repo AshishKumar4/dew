@@ -16,6 +16,7 @@ from dew import records
 from dew.interop.hf_decoders import (
     _LINEAR_FIELDS,
     _MOE_SHARED,
+    DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
     MixtureFields,
     _base_config,
@@ -23,6 +24,7 @@ from dew.interop.hf_decoders import (
     _kinds_of,
     _record_int,
     _refuse,
+    _rope,
     _Ropes,
     _softmax_mixture,
     _specified_layer_types,
@@ -87,7 +89,16 @@ def _qwen2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
 
 
 def _qwen3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    return _base_config(hf_config, used, qk_norm=True,
+    """Read a qwen3 config: the llama block with q/k head norms.
+
+    Qwen3RotaryEmbedding builds its table through `ROPE_INIT_FUNCTIONS`
+    (modeling_qwen3.py), so a YaRN `rope_scaling` is the reference's own
+    ramp: Qwen3's model cards extend to 131072 tokens with it, and
+    DeepSeek-R1-0528-Qwen3-8B ships it.
+    """
+    rope = _rope(hf_config, used, records.integer(hf_config.get(
+        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
+    return _base_config(hf_config, used, qk_norm=True, rope=rope,
                         layer_types=_qwen_layer_types(hf_config, used))
 
 
