@@ -1,8 +1,9 @@
 """GPT OSS parity with transformers 5.16.1, from tools/gpt_oss_reference.py.
 
-The MXFP4 encoder is held to the released encoder transcribed to numpy
-(`released_encode`, since triton_kernels' `downcast_to_mxfp` needs a GPU)
-and its bytes are read back through the released reader, transformers'
+The MXFP4 encoder is held to the bytes transformers' own encoder wrote
+(`quantize_to_mxfp4` over `downcast_to_mxfp_torch` of
+kernels-community/gpt-oss-triton-kernels, `write_mxfp4_encoder`), and its
+bytes are read back through the released reader, transformers'
 `convert_moe_packed_tensors`.
 """
 
@@ -10,7 +11,6 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 import pytest
 
@@ -19,11 +19,11 @@ from dew.nn.gpt_oss import GptOssMLP
 
 FIXTURES = Path(__file__).parent / "fixtures" / "gpt_oss"
 
+ENCODER = FIXTURES / "mxfp4_encoder.npz"
+"""Weights and the blocks and scales transformers' encoder wrote for them, by domain."""
+
 E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], np.float32)
 """Every E2M1 magnitude, in code order."""
-
-MIDPOINTS = np.array([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], np.float32)
-"""Halfway between neighbouring magnitudes, each one exact in fp32."""
 
 
 def released_decode(blocks: np.ndarray, scales: np.ndarray) -> np.ndarray:
@@ -34,44 +34,11 @@ def released_decode(blocks: np.ndarray, scales: np.ndarray) -> np.ndarray:
                                       torch.from_numpy(np.array(scales))).float().numpy()
 
 
-def nearest_codes(values: np.ndarray) -> np.ndarray:
-    """The nearest E2M1 code, ties to even, from the grid's midpoints alone."""
-    below = np.searchsorted(MIDPOINTS, np.abs(values), side='left')
-    upto = np.searchsorted(MIDPOINTS, np.abs(values), side='right')
-    # The two counts differ exactly on a tie, where the even code wins.
-    index = np.where(below != upto, np.where(below % 2 == 0, below, upto), below)
-    return (index + 8 * np.signbit(values)).astype(np.uint8)
-
-
-def released_encode(weight: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """triton_kernels' `downcast_to_mxfp_torch` under ROUND_UP, as transformers
-    5.16.1's `quantize_to_mxfp4` calls it: bf16 in, the group's largest
-    magnitude over 6 rounded up to a power of two in the fp32 bits, the
-    reciprocal of that (zero for a zero group) across the group, and the
-    nearest E2M1 value."""
-    rows = weight.astype(ml_dtypes.bfloat16).astype(np.float32).swapaxes(1, 2)
-    groups = np.ascontiguousarray(rows).reshape(*rows.shape[:2], -1, 32)
-    rounded = ((np.abs(groups).max(-1, keepdims=True) / np.float32(6)).view(np.uint32)
-               + 0x007fffff) & 0x7f800000
-    dequant = rounded.view(np.float32)
-    with np.errstate(divide='ignore'):
-        codes = nearest_codes(groups * np.where(dequant == 0, np.float32(0),
-                                                np.float32(1) / dequant))
-    return ((codes[..., 0::2] | (codes[..., 1::2] << 4)).astype(np.uint8),
-            (rounded >> 23).astype(np.uint8).squeeze(-1))
-
-
 def group_codes(blocks: np.ndarray) -> np.ndarray:
     """The 32 codes a group's 16 bytes hold, low nibble first."""
     codes = np.empty((*blocks.shape[:-1], 32), np.uint8)
     codes[..., 0::2], codes[..., 1::2] = blocks & 15, blocks >> 4
     return codes
-
-
-def bf16_magnitudes() -> np.ndarray:
-    """Every finite non-negative bf16 value, as fp32: subnormals included."""
-    patterns = np.arange(1 << 15, dtype=np.uint16).view(ml_dtypes.bfloat16).astype(np.float32)
-    return patterns[np.isfinite(patterns)]
 
 
 def test_biased_interleaved_experts_match_reference():
@@ -133,44 +100,23 @@ def test_mxfp4_encodes_every_codepoint_and_the_released_reader_agrees():
     np.testing.assert_array_equal(np.signbit(decoded), np.signbit(weight))
 
 
-def test_mxfp4_encodes_what_the_released_encoder_encodes():
-    """Both bytes of every group against the released encoder written out in
-    numpy, atol 0, over three domains: random bf16 bit patterns, so every
-    exponent, both signs, the subnormals and the zeros are in there; groups
-    where one large value sets the scale and the rest sit under the grid;
-    and trained-shaped weights. The scale rounds up, so no value reaches the
-    saturating clamp and no group takes 0xff, the byte E8M0 reserves for
-    NaN."""
-    rng = np.random.default_rng(4242)
-    patterns = rng.integers(0, 1 << 16, size=20_000 * 32, dtype=np.uint16)
-    random_bf16 = patterns.view(ml_dtypes.bfloat16).astype(np.float32)
-    random_bf16[~np.isfinite(random_bf16)] = 0
-    small = np.ldexp(rng.integers(1, 256, size=(5_000, 31)).astype(np.float32), -141)
-    large = np.ldexp(np.float32(1), rng.integers(-132, 8, size=(5_000, 1))).astype(np.float32)
-    mixed = np.concatenate([large, small * rng.choice([-1, 1], size=(5_000, 31))], axis=1)
+@pytest.mark.parametrize("domain", ["midpoints", "random_bf16", "mixed", "trained", "every_bf16_magnitude"])
+def test_mxfp4_encodes_what_the_released_encoder_encodes(domain):
+    """Both bytes of every group against what the released encoder wrote,
+    atol 0. The domains: E2M1 midpoints of both signs at the scales 2 ** 0,
+    2 ** -3, 2 ** 10 and 2 ** -126, beside values bf16 carries onto one, all
+    of which the kernel rounds away from zero; random bf16 bit patterns, so
+    every exponent, both signs, the subnormals and the zeros are in there;
+    groups where one large value sets the scale and the rest sit under the
+    grid; trained-shaped weights; and one group per finite bf16 magnitude,
+    so the scale's round-up meets every exponent and mantissa."""
+    with np.load(ENCODER) as fixture:
+        weight, blocks, scales = (fixture[f"{domain}_{part}"] for part in ("weight", "blocks", "scales"))
 
-    for weight in (random_bf16.reshape(1, -1, 1), mixed.reshape(1, -1, 1).astype(np.float32),
-                   (rng.standard_normal((4, 128, 9)) * 0.08).astype(np.float32)):
-        blocks, scales = quantize_mxfp4(weight)
-        want_blocks, want_scales = released_encode(weight)
-        np.testing.assert_array_equal(scales, want_scales)
-        np.testing.assert_array_equal(blocks, want_blocks)
-        assert scales.max() < 0xff
-        rows = weight.astype(ml_dtypes.bfloat16).astype(np.float32).swapaxes(1, 2)
-        groups = np.ascontiguousarray(rows).reshape(*rows.shape[:2], -1, 32)
-        largest = np.abs(groups).max(-1)
-        assert np.all(largest / np.ldexp(np.float32(1), scales.astype(np.int32) - 127) <= 6)
+    ours = quantize_mxfp4(weight)
 
-
-def test_mxfp4_encodes_every_bf16_magnitude_as_the_released_encoder_does():
-    """One group per finite bf16 magnitude, subnormals included: both bytes,
-    atol 0. The groups under 6 * 2 ** -126 take a subnormal quotient, which
-    XLA on CPU would flush before the round-up reaches the 2 ** -126 scale."""
-    weight = np.repeat(bf16_magnitudes(), 32).reshape(1, -1, 1)
-    blocks, scales = quantize_mxfp4(weight)
-    want_blocks, want_scales = released_encode(weight)
-    np.testing.assert_array_equal(scales, want_scales)
-    np.testing.assert_array_equal(blocks, want_blocks)
+    np.testing.assert_array_equal(ours[1], scales)
+    np.testing.assert_array_equal(ours[0], blocks)
 
 
 def test_mxfp4_keeps_a_group_of_bf16_subnormals():
@@ -197,7 +143,7 @@ def test_mxfp4_keeps_a_group_of_bf16_subnormals():
 
 def test_mxfp4_rounds_an_fp32_weight_through_bf16_first():
     """0.7495 is nearer 0.5 than 1.0 in the E2M1 grid and still comes back as
-    1.0: bf16 carries it onto the 0.75 tie, which rounds to even. That second
+    1.0: bf16 carries it onto the 0.75 midpoint, which rounds up. That second
     rounding is the released encoder's own first step, so an fp32-trained
     weight can land one code away from where a single rounding would put it."""
     weight = np.full((1, 32, 1), 0.7495, np.float32)
@@ -205,7 +151,6 @@ def test_mxfp4_rounds_an_fp32_weight_through_bf16_first():
     blocks, scales = quantize_mxfp4(weight)
 
     assert int(scales[0, 0, 0]) == 127
-    assert nearest_codes(np.array([0.7495], np.float32)).tolist() == [1]
     assert int(group_codes(blocks)[0, 0, 0, 1]) == 2
     assert released_decode(blocks, scales)[0, 1, 0] == 1.0
 
@@ -301,6 +246,6 @@ def test_pack_mxfp4_writes_back_the_recorded_stems_and_nothing_else():
 
     with pytest.raises(ValueError, match="not among the tensors to write back"):
         pack_mxfp4({name: value for name, value in unpacked.items() if name != stem}, (stem,))
-    with pytest.raises(ValueError, match="holds no .*_scales"):
+    with pytest.raises(ValueError, match=r"holds no .*_scales"):
         mxfp4_stems({name: value for name, value in tensors.items()
                      if not name.endswith("_scales")})

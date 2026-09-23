@@ -21,7 +21,8 @@ Every FP4 format here stores the OCP MX element that `decode_e2m1` and
 `encode_e2m1` read and write: E2M1 codes two to a byte, the even element in
 the low nibble, bit 3 the sign, 32 consecutive inputs under one E8M0
 exponent byte b meaning 2 ** (b - 127). The formats differ in where the
-bytes sit and in the rule that picks a group's exponent.
+bytes sit, in the rule that picks a group's exponent, and in where a value
+halfway between two E2M1 values goes.
 
 The arithmetic is NumPy's on a host copy. XLA on CPU reads and writes
 float32 subnormals as zero, and these formats keep them: an MXFP4 group of
@@ -60,6 +61,9 @@ E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -
 _E2M1_BYTES = np.stack((E2M1[np.arange(256) & 15], E2M1[np.arange(256) >> 4]), axis=-1)
 """The two values each packed byte holds, low nibble first."""
 
+_E2M1_MIDPOINTS = (E2M1[:7] + E2M1[1:8]) / 2
+"""The magnitudes halfway between neighbouring E2M1 values, 0.25 up to 5."""
+
 _CODE_DTYPES = (np.dtype(np.uint8), np.dtype(np.int8))
 """Packed E2M1 pairs: U8 in GPT OSS and compressed-tensors, I8 in DeepSeek-V4."""
 
@@ -97,16 +101,21 @@ def decode_e2m1(packed: ArrayLike, exponents: ArrayLike) -> np.ndarray:
     return values.reshape(*codes.shape[:-1], 2 * codes.shape[-1])
 
 
-def encode_e2m1(quotients: np.ndarray) -> np.ndarray:
+def encode_e2m1(quotients: np.ndarray, *, ties: Literal['even', 'away']) -> np.ndarray:
     """Values already over their group's scale, [..., n], to packed codes [..., n / 2].
 
-    Each rounds to the nearest E2M1 value, ties to even, and a negative that
-    rounds to zero keeps its sign (code 8). float4_e2m1fn has no infinity
-    and saturates beyond +-6 (measured, ml_dtypes 0.6), the clamp every
-    rule here applies before its cast. The even element goes in the low
-    nibble.
+    Each rounds to the nearest E2M1 value and saturates at +-6, and a
+    negative that rounds to zero keeps its sign (code 8). A value halfway
+    between two E2M1 values goes to the even code under 'even', the IEEE
+    rounding of ml_dtypes' float4_e2m1fn cast (which has no infinity and
+    saturates, measured, ml_dtypes 0.6), and to the larger magnitude under
+    'away'. The even element goes in the low nibble.
     """
-    codes = quotients.astype(ml_dtypes.float4_e2m1fn).view(np.uint8)
+    if ties == 'even':
+        codes = quotients.astype(ml_dtypes.float4_e2m1fn).view(np.uint8)
+    else:
+        magnitudes = np.searchsorted(_E2M1_MIDPOINTS, np.abs(quotients), side='right')
+        codes = magnitudes.astype(np.uint8) | (np.signbit(quotients).astype(np.uint8) << 3)
     return codes[..., 0::2] | (codes[..., 1::2] << 4)
 
 
@@ -154,15 +163,18 @@ def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike) -> np.ndarray:
 def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     """[expert, input, output] weights to packed [expert, output, group, 16] blocks and E8M0 scales.
 
-    The released encoder, transformers 5.16.1's `quantize_to_mxfp4` over
-    triton_kernels' `downcast_to_mxfp(..., ROUND_UP)`: the weight rounds to
-    bf16, a group's scale is its largest magnitude over 6 rounded up to a
-    power of two on the float32 bits (an all-zero group takes the 0x00
-    byte), and each value over that scale rounds to the nearest E2M1 value,
-    ties to even. The round-up keeps every scaled value at or under 6, so
-    the saturation never acts. The scale rule is spelled out because no
-    cast performs it: float8_e8m0fnu rounds to nearest and sends 0 to the
-    NaN byte 0xff.
+    The released encoder: transformers 5.16.1's `quantize_to_mxfp4`
+    (integrations/mxfp4.py:231-234) runs `downcast_to_mxfp_torch` of
+    kernels-community/gpt-oss-triton-kernels (numerics_details/mxfp.py at
+    v1, 0f351046) on the weight rounded to bf16. A group's scale is its
+    largest magnitude over 6 rounded up to a power of two on the float32
+    bits (an all-zero group takes the 0x00 byte), and each value over that
+    scale rounds to the nearest E2M1 value, ties away from zero: the kernel
+    adds one to the magnitude's exponent and two leading mantissa bits and
+    halves the sum (mxfp.py:220). The round-up keeps every scaled value at
+    or under 6, so the saturation never acts. The scale rule is spelled out
+    because no cast performs it: float8_e8m0fnu rounds to nearest and sends
+    0 to the NaN byte 0xff.
     """
     values = np.asarray(weight)
     if values.ndim != 3 or values.shape[1] % GROUP:
@@ -172,7 +184,7 @@ def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     groups = _float_groups(values.swapaxes(1, 2), "MXFP4", ml_dtypes.bfloat16).astype(np.float32)
     bits = (np.abs(groups).max(-1) / np.float32(6)).view(np.uint32)
     exponents = ((bits + np.uint32(0x007fffff)) >> 23).astype(np.uint8)
-    codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None])
+    codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None], ties='away')
     return codes.reshape(*exponents.shape, GROUP // 2), exponents
 
 
@@ -319,7 +331,7 @@ def quantize_packed_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     scales = e8m0_scales(exponents).astype(groups.dtype)
     underflow = scales == 0
     scales[underflow], exponents[underflow] = 1, 127
-    codes = encode_e2m1(groups / scales[..., None] + groups.dtype.type(0))
+    codes = encode_e2m1(groups / scales[..., None] + groups.dtype.type(0), ties='even')
     return codes.reshape(*groups.shape[:-2], groups.shape[-2] * GROUP // 2), exponents
 
 
@@ -744,7 +756,7 @@ def quantize_deepseek_v4_fp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]
     amax = np.maximum(np.abs(groups).max(-1), np.float32(6 * 2.0 ** -126))
     bits = (amax * np.float32(1 / 6)).view(np.uint32)
     exponents = ((bits >> 23) + ((bits & 0x007fffff) != 0)).astype(np.uint8)
-    codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None])
+    codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None], ties='even')
     return (codes.reshape(*groups.shape[:-2], groups.shape[-2] * GROUP // 2).view(np.int8),
             exponents.view(ml_dtypes.float8_e8m0fnu))
 
