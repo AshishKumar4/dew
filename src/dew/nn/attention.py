@@ -478,34 +478,42 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
                                 sliding_window, mask, bias, sinks, key_value_seq_lengths=None):
     """Run `kernel` over a sequence the mesh's sequence axis splits.
 
-    Two exchanges are exact for every call they take, and they differ in
-    what crosses the interconnect. `exchanged_heads_attention` (Ulysses)
-    takes a call whose query heads divide by tensor times sequence and whose
-    query and key lengths both divide by the shard count, and runs where
-    `all_to_all_moves_less` says it moves fewer bytes. Every other call runs
-    `gathered_keys_attention`, which takes any head count and any key
-    length: joint and cross attention over an odd length, a head count the
-    split does not divide, and grouped-query calls with no mask.
+    Two exchanges are exact for every call they take.
+    `exchanged_heads_attention` (Ulysses) takes a call whose query heads
+    divide by tensor times sequence and whose query and key lengths both
+    divide by the shard count. `gathered_keys_attention` takes any head
+    count and any length: joint and cross attention over an odd length, a
+    head count the split does not divide.
+
+    Where both can run, a causal, windowed or masked call takes the
+    all-to-all. Its kernel sees whole sequences with the causal flag or the
+    window, which cuDNN and splash skip block by block, while the gather
+    hands its kernel a striped explicit mask that no kernel skips: cuDNN runs
+    it as a dense bias over every logit, twice the causal work. On a pair of
+    RTX 3090s the gather took 2.0 to 3.9 times the all-to-all's time for
+    causal grouped-query attention at 4k to 64k tokens (the tables in
+    docs/guides/multi-node.md). The all-to-all also never sends more bytes
+    for such a call (`all_to_all_moves_less`). A call with no mask does the
+    same work either way, and takes the exchange that sends fewer bytes.
     """
     mesh = jax.sharding.get_abstract_mesh()
     tensor = (mesh.shape[TENSOR_AXIS]
               if TENSOR_AXIS in mesh.axis_names and TENSOR_AXIS not in mesh.manual_axes else 1)
     heads, kv_heads = query.shape[-2], key.shape[-2]
-    reordered = causal or sliding_window is not None or mask is not None
+    masked = causal or sliding_window is not None or mask is not None
     exchangeable = (heads % (tensor * shards) == 0
                     and query.shape[-3] % shards == 0 and key.shape[-3] % shards == 0)
     run = (exchanged_heads_attention
-           if exchangeable and all_to_all_moves_less(heads, kv_heads, tensor, shards,
-                                                     reordered=reordered)
+           if exchangeable and (masked or all_to_all_moves_less(heads, kv_heads, tensor, shards))
            else gathered_keys_attention)
     return run(kernel, query, key, value, shards, causal=causal,
                sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks,
                key_value_seq_lengths=key_value_seq_lengths)
 
 
-def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int, *,
-                          reordered: bool) -> bool:
-    """Whether Ulysses sends fewer bytes per device than gathering the keys.
+def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int) -> bool:
+    """Whether Ulysses sends fewer bytes per device than gathering the keys,
+    for a call with no mask.
 
     Counted per device, per batch row, in units of S * D * (n - 1) / n for
     a sequence of S rows, head width D and n = `shards`, over one tensor
@@ -517,23 +525,20 @@ def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int, *
     is 2 (H + K') / n.
 
     The gather receives the (n - 1) / n of the whole keys and values it
-    does not hold, 2 K. A causal, windowed or masked call also stripes its
-    S / n query rows and unstripes its output rows, and that reorder moves
-    (n - 1) / n of both, 2 H / n. So the gather sends 2 K, plus 2 H / n
-    when reordered.
+    does not hold, 2 K, the key heads repeated out to lcm(kv_heads, tensor)
+    over tensor. A causal, windowed or masked call also stripes its S / n
+    query rows and unstripes its output rows, which adds 2 H / n, so for
+    such a call the all-to-all never sends more: K' / n is at most K.
 
-    At H = 32, K = 8, n = 2 with one tensor shard, in units of S * D the
-    all-to-all sends 20 either way, the gather 8 unmasked and 24 causal:
-    grouped-query attention with no mask gathers, causal attention
-    exchanges. The gather wins ties, as the path that takes every shape.
+    At H = 32, K = 8, n = 2 with one tensor shard, in those units the
+    all-to-all sends 40, the gather 16: grouped-query attention with no mask
+    gathers. The gather wins ties, as the path that takes every shape.
     Mask and bias blocks are left out; both paths carry them.
     """
     local_heads = heads // tensor
     repeated = math.lcm(kv_heads, tensor * shards) // tensor
-    # Key heads the tensor axis cannot split stay whole on every shard.
-    gathered = kv_heads // tensor if kv_heads % tensor == 0 else kv_heads
-    exchanged = 2 * (local_heads + repeated) / shards
-    return exchanged < 2 * gathered + (2 * local_heads / shards if reordered else 0)
+    gathered = math.lcm(kv_heads, tensor) // tensor
+    return 2 * (local_heads + repeated) / shards < 2 * gathered
 
 
 def _broadcast_spec(x, batch: int, heads: int, query_len: int, rows, head_entry, query_entry):
