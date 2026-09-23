@@ -142,7 +142,7 @@ class _SpatialAttention(nn.Module):
     @nn.compact
     def __call__(self, x, context, *, train=False):
         residual = x
-        x = nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, name="norm")(x)
+        x = nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
         batch, height, width, channels = x.shape
         if self.linear_projection:
             x = x.reshape(batch, height * width, channels)
@@ -291,5 +291,6 @@ class UNet2DCondition(nn.Module):
                           norm_groups=self.norm_groups, norm_epsilon=self.norm_epsilon,
                           attention_norm_epsilon=self.attention_norm_epsilon, approximate_gelu=self.approximate_gelu,
                           name=f"up_{index}")(x, time, conditioning.context, inputs, upsample_shape=target, train=train)
-        x = nn.silu(nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, name="output_norm")(x))
+        x = nn.silu(nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype,
+                                  name="output_norm")(x))
         return nn.Conv(self.out_channels, (3, 3), dtype=self.dtype, precision=self.precision, name="output")(x)

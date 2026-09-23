@@ -39,7 +39,8 @@ class SimpleEncoder(nn.Module):
                 name=f"down_{i}",
             )(x)
             if self.norm_groups > 0:
-                x = nn.GroupNorm(_group_count(features, self.norm_groups), name=f"down_norm_{i}")(x)
+                x = nn.GroupNorm(_group_count(features, self.norm_groups), dtype=self.dtype,
+                                 name=f"down_norm_{i}")(x)
             x = self.activation(x)
         return nn.Conv(
             features=self.latent_channels,
@@ -77,7 +78,8 @@ class SimpleDecoder(nn.Module):
                 name=f"up_{i}",
             )(z)
             if self.norm_groups > 0:
-                z = nn.GroupNorm(_group_count(features, self.norm_groups), name=f"up_norm_{i}")(z)
+                z = nn.GroupNorm(_group_count(features, self.norm_groups), dtype=self.dtype,
+                                 name=f"up_norm_{i}")(z)
             z = self.activation(z)
         return nn.Conv(
             features=self.out_channels,

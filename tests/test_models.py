@@ -13,11 +13,15 @@ import pytest
 from flax import linen as nn
 from flax.traverse_util import flatten_dict
 
+from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import LayerNorm, Stage
+from dew.nn.autoencoders.simple import SimpleDecoder, SimpleEncoder
+from dew.nn.autoencoders.vae import FlaxDecoder, FlaxEncoder
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 from dew.nn.backbones.unet import Unet
+from dew.nn.backbones.unet_condition import UNet2DCondition, UNetStage
 from dew.nn.dit import ModulatedBlock, TextContext
 from dew.nn.scan_orders import hilbert_indices, zigzag_indices
 from dew.registry import models
@@ -52,25 +56,63 @@ def test_a_bf16_dit_predicts_in_fp32(rng):
     assert not jnp.array_equal(out, out.astype(jnp.bfloat16).astype(jnp.float32))
 
 
-@pytest.mark.parametrize("norm_groups", [8, 0], ids=["group_norm", "rms_norm"])
-def test_a_bf16_unet_keeps_its_activations_in_bf16(rng, norm_groups):
-    """With fp32 parameters and a bf16 compute dtype, every image-shaped
-    activation the Unet produces is bf16, the norms' outputs included. A norm
-    that leaves its dtype to promotion returns fp32 against its fp32 scale,
-    and the activation and convolution after it then read fp32 activations
-    the step keeps for the backward pass."""
+def _unet(norm_groups):
     stage = Stage(heads=2, dtype=jnp.bfloat16, force_fp32_for_softmax=True)
     model = Unet(output_channels=3, emb_features=32, feature_depths=(16, 32),
                  attention_configs=(None, stage), num_res_blocks=1, norm_groups=norm_groups,
                  dtype=jnp.bfloat16)
-    x = jax.random.normal(rng, (2, 16, 16, 3), jnp.bfloat16)
-    temb = jnp.ones((2,))
-    params = model.init(rng, x, temb)
-    _, state = model.apply(params, x, temb, capture_intermediates=True)
+    return model, (jnp.ones((2, 16, 16, 3), jnp.bfloat16), jnp.ones((2,))), {}
+
+
+def _unet_condition():
+    model = UNet2DCondition(stages=(UNetStage(32, 2), UNetStage(64, 2)), blocks_per_level=1,
+                            norm_groups=8, dtype=jnp.bfloat16)
+    context = DenoisingCondition(context=jnp.ones((2, 8, 32), jnp.bfloat16))
+    return model, (jnp.ones((2, 16, 16, 4), jnp.bfloat16), jnp.ones((2,))), {"conditioning": context}
+
+
+def _vae_encoder():
+    model = FlaxEncoder(in_channels=3, out_channels=4, down_block_types=("DownEncoderBlock2D",) * 2,
+                        block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
+                        double_z=True, dtype=jnp.bfloat16)
+    return model, (jnp.ones((2, 16, 16, 3), jnp.bfloat16),), {}
+
+
+def _vae_decoder():
+    model = FlaxDecoder(in_channels=4, out_channels=3, up_block_types=("UpDecoderBlock2D",) * 2,
+                        block_out_channels=(32, 64), layers_per_block=1, norm_num_groups=8,
+                        dtype=jnp.bfloat16)
+    return model, (jnp.ones((2, 8, 8, 4), jnp.bfloat16),), {}
+
+
+def _simple_encoder():
+    model = SimpleEncoder(latent_channels=4, feature_depths=(16, 32), dtype=jnp.bfloat16)
+    return model, (jnp.ones((2, 16, 16, 3), jnp.bfloat16),), {}
+
+
+def _simple_decoder():
+    model = SimpleDecoder(out_channels=3, feature_depths=(16, 32), dtype=jnp.bfloat16)
+    return model, (jnp.ones((2, 4, 4, 4), jnp.bfloat16),), {}
+
+
+@pytest.mark.parametrize("build", [
+    lambda: _unet(8), lambda: _unet(0), _unet_condition, _vae_encoder, _vae_decoder,
+    _simple_encoder, _simple_decoder,
+], ids=["unet_group_norm", "unet_rms_norm", "unet_condition", "vae_encoder", "vae_decoder",
+        "simple_encoder", "simple_decoder"])
+def test_a_bf16_convolutional_model_keeps_its_activations_in_bf16(rng, build):
+    """With fp32 parameters and a bf16 compute dtype, every image-shaped
+    activation the convolutional models produce is bf16, the norms' outputs
+    included. A norm that leaves its dtype to promotion returns fp32 against
+    its fp32 scale, and the activation and convolution after it then read
+    fp32 activations the step keeps for the backward pass."""
+    model, inputs, kwargs = build()
+    params = model.init(rng, *inputs, **kwargs)
+    _, state = model.apply(params, *inputs, **kwargs, capture_intermediates=True)
     activations = {"/".join(path): leaf.dtype
                    for path, outputs in flatten_dict(state["intermediates"]).items()
-                   for leaf in outputs if leaf.ndim == 4}
-    assert any(path.endswith("norm1/__call__") for path in activations)
+                   for leaf in jax.tree.leaves(outputs) if leaf.ndim == 4}
+    assert any("norm" in path for path in activations)
     assert {path: dtype for path, dtype in activations.items() if dtype != jnp.bfloat16} == {}
 
 
