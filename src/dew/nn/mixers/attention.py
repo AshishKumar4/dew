@@ -32,9 +32,9 @@ from dew.nn.attention import (
     rotary_freqs,
     scaled_dot_product_attention,
 )
+from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
-from dew.nn.blocks import normal_kernel
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, mla_rope_freqs
 from dew.nn.sharding import logical_axes
