@@ -48,10 +48,6 @@ class AttentionResiduals:
 
     block_size: int
 
-    def __post_init__(self):
-        if isinstance(self.block_size, bool) or not isinstance(self.block_size, int) or self.block_size < 1:
-            raise ValueError(f"attention residuals group layers into blocks of at least one, got {self.block_size!r}")
-
     def blocks(self, num_layers: int) -> int:
         """The finished blocks after `num_layers` layers: every layer opening one counts."""
         return -(-num_layers // self.block_size)
@@ -72,12 +68,6 @@ class ResidualSite:
 
     finished: int
     opens: bool
-
-
-def expand_blocks(x, blocks: int):
-    """The embeddings as the first partial sum: `[B, S, D]` -> `[B, S, blocks + 1, D]`."""
-    empty = jnp.zeros((*x.shape[:2], blocks, x.shape[-1]), x.dtype)
-    return jnp.concatenate([empty, x[:, :, None, :]], axis=2)
 
 
 def sources(state, finished: int, partial):

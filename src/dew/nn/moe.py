@@ -461,12 +461,6 @@ class Situ:
     beta: float = 1.0
     linear_beta: float | None = None
 
-    def __post_init__(self):
-        if self.beta <= 0 or (self.linear_beta is not None and self.linear_beta <= 0):
-            raise ValueError(
-                f"SiTU divides by its betas, so both are positive, got beta {self.beta} "
-                f"and linear_beta {self.linear_beta}; None leaves the up projection uncapped")
-
     def __call__(self, gate: jax.Array, up: jax.Array) -> jax.Array:
         work_gate, work_up = gate.astype(jnp.float32), up.astype(jnp.float32)
         activated = self.beta * jnp.tanh(work_gate / self.beta) * jax.nn.sigmoid(work_gate)
@@ -475,15 +469,11 @@ class Situ:
         return (activated * work_up).astype(gate.dtype)
 
 
-GATED_ACTIVATIONS = ('swiglu', 'geglu', 'geglu_exact')
-"""The gated MLP's activations by name: silu, the tanh gelu and the erf gelu
-on the gate. A `Situ` takes a name's place for Kimi K3's SiTU."""
-
-
 def check_gated_activation(activation: str | Situ) -> None:
-    """Refuse an activation no gated MLP computes."""
-    if not isinstance(activation, Situ) and activation not in GATED_ACTIVATIONS:
-        raise ValueError(f"mlp must be one of {GATED_ACTIVATIONS} or a Situ, got {activation!r}")
+    """Refuse an activation no gated MLP computes: silu, the tanh gelu and
+    the erf gelu on the gate by name, or SiTU over both halves."""
+    if not isinstance(activation, Situ) and activation not in ('swiglu', 'geglu', 'geglu_exact'):
+        raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
 
 
 class ExpertLinear(nn.Module):
@@ -667,9 +657,6 @@ class ExpertMLP(nn.Module):
     outputs are summed unweighted (`modeling_llama4.py`,
     `Llama4TextMoe.forward`, `routed_in * router_scores`), which is not the
     weighted sum of outputs because the gate is not linear.
-
-    `activation` names the gate's nonlinearity, or is a `Situ` for Kimi
-    K3's SiTU over both halves.
     """
     num_experts: int
     hidden_features: int
@@ -828,8 +815,6 @@ class SparseMLP(nn.Module):
                            expert_bias=self.expert_bias,
                            hash_vocab=self.hash_vocab, init_std=self.init_std,
                            precision=self.precision, name='gate')
-        if self.latent_norm is not None and self.latent_features is None:
-            raise ValueError("latent_norm norms the latent experts' output, which needs latent_features")
         width = self.out_features if self.latent_features is None else self.latent_features
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,

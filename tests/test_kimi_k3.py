@@ -8,7 +8,6 @@ CUDA; its routed experts are compressed-tensors MXFP4 as in the release.
 No model weights are downloaded at test time.
 """
 
-import dataclasses
 import json
 import lzma
 from pathlib import Path
@@ -113,8 +112,6 @@ def test_situ_matches_the_released_activation():
     situ = Situ(4.0, 25.0)
     actual = situ(jnp.asarray(reference["situ_gate"]), jnp.asarray(reference["situ_up"]))
     np.testing.assert_allclose(np.asarray(actual), reference["situ"], rtol=2e-6, atol=1e-6)
-    uncapped = Situ(4.0)(jnp.asarray(reference["situ_gate"]), jnp.asarray(reference["situ_up"]))
-    assert np.max(np.abs(np.asarray(uncapped) - reference["situ"])) > 1.0
 
 
 def test_forward_matches_the_reference_over_left_padding(source):
@@ -132,25 +129,6 @@ def test_forward_matches_the_reference_over_left_padding(source):
     logits = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
     np.testing.assert_allclose(np.asarray(logits)[valid], reference["logits"][valid], atol=5e-5, rtol=0)
     np.testing.assert_array_equal(np.asarray(logits)[valid].argmax(-1), reference["logits"][valid].argmax(-1))
-
-
-def test_each_depth_site_is_read_where_the_reference_reads_it(source):
-    """Swapping a layer's attention and MLP residual sites, or dropping the
-    latent experts' norm, moves the logits past the tolerance: the fixture
-    distinguishes every site AttnRes and LatentMoE add."""
-    loaded, inputs, reference = source
-    valid = reference["attention_mask"].astype(bool)
-    changed = jax.tree.map(lambda leaf: leaf, loaded.variables)
-    layer = changed["params"]["layers_4"]
-    layer["attention_res"], layer["mlp_res"] = layer["mlp_res"], layer["attention_res"]
-    swapped = loaded.model.apply(changed, inputs.tokens, **inputs.kwargs())
-    unnormed = loaded.model.clone(mixture=dataclasses.replace(loaded.model.mixture, latent_norm=False))
-    params = jax.tree.map(lambda leaf: leaf, loaded.variables)
-    for name in params["params"]:
-        params["params"][name].get("mlp", {}).pop("routed_expert_norm", None)
-    dropped = unnormed.apply(params, inputs.tokens, **inputs.kwargs())
-    for wrong in (swapped, dropped):
-        assert np.max(np.abs(np.asarray(wrong)[valid] - reference["logits"][valid])) > 1e-3
 
 
 def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):

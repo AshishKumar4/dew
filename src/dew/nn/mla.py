@@ -421,8 +421,6 @@ class MultiHeadLatentAttention(nn.Module):
         if self.output_gate:
             self.g_proj = nn.Dense(self.num_heads * self.v_head_dim, use_bias=False,
                                    dtype=self.dtype, precision=self.precision, name='g_proj')
-        if not self.rotary and self.index_n_heads is not None:
-            raise ValueError("the indexer rotates its keys, which a layer without positions cannot do")
         if self.index_n_heads is not None and self.index_head_dim is not None:
             if self.q_lora_rank is None:
                 raise ValueError(
@@ -775,11 +773,6 @@ class MLAMixer(MixerBase):
     keys its provider chose, which needs the kind to select. The dials a
     standard attention honours and this cannot (a values norm, a window, an
     attention scale, a partial rotary) are refused.
-
-    `mla_use_nope` and `mla_use_output_gate` are Kimi K3's config fields
-    under their own names: a rope head that is never rotated, and a sigmoid
-    gate on the heads' output (`MultiHeadLatentAttention.rotary`,
-    `.output_gate`).
     """
 
     q_lora_rank: int | None = None
@@ -823,8 +816,6 @@ class MLAMixer(MixerBase):
                 "attention scales by its head dims and the yarn mscale, "
                 "rotates its rope head whole, attends the whole sequence "
                 "and norms its latents, not its values")
-        if self.mla_use_nope and self.yarn is not None:
-            raise ValueError("mla_use_nope rotates nothing, so a yarn ramp has nothing to scale")
         if self.yarn is not None and self.yarn.rope_theta != ctx.rope_theta:
             raise ValueError(
                 f"the yarn record's rope_theta ({self.yarn.rope_theta}) and "

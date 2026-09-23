@@ -85,6 +85,7 @@ def _hf_activation(activation: str | Situ) -> str:
         _refuse('mlp', "SiTU is named only by Kimi K3's own config fields")
     return _HF_ACTIVATIONS[activation]
 
+
 _GEMMA = 'gemma3_text'
 _QWEN35 = 'qwen3_5_text'
 # A multimodal repo's config.json is a wrapper whose model_type names the
