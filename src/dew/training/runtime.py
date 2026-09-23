@@ -60,7 +60,10 @@ def prepare_process(wandb: Wandb | None = None,
     environment it raises a ValueError naming the missing coordinator
     address, the single-host signature. Every other failure propagates,
     since a pod run would otherwise continue on one host. multi_host=True
-    requires the pool, multi_host=False never asks for it.
+    requires the pool, multi_host=False never asks for it. A Slurm
+    allocation of one task is no pool: JAX's Slurm detection would still
+    start one, at a coordinator named after the node, which a container on
+    the node need not resolve.
 
     xla_flags reaches XLA through the environment, which XLA reads when it
     opens a backend. So this call has to come before the first JAX call in
@@ -91,7 +94,9 @@ def prepare_process(wandb: Wandb | None = None,
         (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
     resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
 
-    if multi_host is not False:
+    one_task = (multi_host is None and PROCESS_COUNT not in os.environ
+                and os.environ.get("SLURM_NTASKS") == "1")
+    if multi_host is not False and not one_task:
         try:
             if PROCESS_COUNT in os.environ:
                 jax.distributed.initialize(num_processes=int(os.environ[PROCESS_COUNT]),
