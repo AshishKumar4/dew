@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Literal, NamedTuple, Sequence
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +17,9 @@ from dew.nn.safety import CLIPSafetyHead
 from dew.nn.text_encoders import CLIPTextTransformer, T5EncoderTransformer
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, encoders
+
+if TYPE_CHECKING:
+    from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def _prompt(record: Mapping[str, object], key: str, default: str) -> str:
@@ -305,6 +308,103 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def to_json(self):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.towers[0].dtype),
                 "param_dtype": self.param_dtype}
+
+
+def _residual_states(decoder, ids):
+    """The last decoder layer's output, before the final norm.
+
+    `QwenImage21Pipeline` reads `hidden_states[-1]` with the norm hooked out,
+    since that is what the transformer was trained on. The decoders this
+    reads embed their tokens unscaled and run one residual stream.
+    """
+    return decoder.stack(decoder.token_embeddings(ids), train=False, decode=False,
+                         positions=None, segment_ids=None, per_layer_input=None)
+
+
+@encoders("qwen_image_text")
+@dataclass(eq=False)
+class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
+    """The text conditioning of a Qwen-Image 2.1 checkpoint: its Qwen3-VL
+    encoder's language model over the pipeline's text-to-image template.
+
+    `QwenImage21Pipeline._get_qwen_prompt_embeds` formats each prompt into
+    its template, reads the last decoder layer's output before the final
+    norm, and drops the system turn's tokens. A prompt with no image puts the
+    encoder's three rotary axes at one position, so its interleaved sections
+    rotate as the plain one-axis table `decoder` applies.
+
+    Rows are padded on the right to the system turn plus `tokens`. The
+    encoder is causal, so a real token never reads a later pad and its state
+    is the one the pipeline's left padding gives; the condition's `mask`
+    marks those tokens and the pads carry zeros, as the pipeline's stacking
+    writes them. An empty prompt is the single space the pipeline encodes in
+    its place. A prompt past the budget is refused rather than cut, since
+    the template's closing turn would go with it.
+    """
+
+    decoder: CausalTransformer
+    tokenizer: PreTrainedTokenizerBase
+    params: Variables
+    checkpoint: str
+    height: int
+    width: int
+    tokens: int = 512
+    param_dtype: str = "float32"
+    name: str = "text_encoder"
+    drop: int = field(init=False)
+    """The system turn's token count, which the pipeline derives the same way."""
+
+    SYSTEM: ClassVar[str] = "Comprehend and analyze the provided prompt."
+    USER: ClassVar[tuple[str, str]] = ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n")
+
+    def __post_init__(self):
+        system = [{"role": "system", "content": [{"type": "text", "text": self.SYSTEM}]}]
+        self.drop = len(self.tokenizer.apply_chat_template(system, tokenize=True, return_dict=False))
+
+    @classmethod
+    def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
+                        param_dtype: str = "float32", revision: str | None = None,
+                        attention_impl: str = "auto", tokens: int = 512,
+                        params: Variables | None = None):
+        from dew.interop.pretrained import load_qwen_image_conditioner
+
+        return load_qwen_image_conditioner(checkpoint, dtype=dtype, param_dtype=param_dtype,
+                                           revision=revision, attention_impl=attention_impl,
+                                           tokens=tokens, params=params)
+
+    def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
+        system = f"<|im_start|>system\n{self.SYSTEM}<|im_end|>\n"
+        rows, zero, negative = [], [], []
+        for prompt in texts:
+            record: Mapping[str, object] = {"text": prompt} if isinstance(prompt, str) else prompt
+            rows.append(f"{system}{self.USER[0]}{_prompt(record, 'text', '') or ' '}{self.USER[1]}")
+            zero.append(bool(record.get("zero", False)))
+            negative.append(bool(record.get("negative", False)))
+        length = self.drop + self.tokens
+        encoded = self.tokenizer(rows, padding="max_length", padding_side="right",
+                                 max_length=length)
+        if any(len(ids) > length for ids in encoded.input_ids):
+            raise ValueError(f"A prompt runs past the {self.tokens}-token budget; raise `tokens`")
+        return {"input_ids": np.asarray(encoded.input_ids, np.int32),
+                "attention_mask": np.asarray(encoded.attention_mask, np.int32),
+                "zero_condition": np.asarray(zero, bool), "negative": np.asarray(negative, bool)}
+
+    def encode(self, params, tokens) -> DenoisingCondition:
+        states = self.decoder.apply({"params": params[self.name]["params"]},
+                                    jnp.asarray(tokens["input_ids"]), method=_residual_states)
+        valid = jnp.asarray(tokens["attention_mask"], bool)[:, self.drop:]
+        dropped = jnp.asarray(tokens["zero_condition"])[:, None, None]
+        context = jnp.where(valid[..., None] & ~dropped, states[:, self.drop:], 0)
+        return DenoisingCondition(context, mask=valid)
+
+    def captions(self, tokens):
+        texts = self.tokenizer.batch_decode(np.asarray(tokens["input_ids"])[:, self.drop:],
+                                            skip_special_tokens=True)
+        return tuple(text.removeprefix("user\n").removesuffix("\nassistant\n") for text in texts)
+
+    def to_json(self):
+        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.decoder.dtype),
+                "param_dtype": self.param_dtype, "tokens": self.tokens}
 
 
 @lru_cache(maxsize=32)

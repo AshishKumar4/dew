@@ -157,3 +157,139 @@ def test_the_image_grid_is_centred_as_the_source_lays_it_out():
     heights, widths = image_grid(3, 4)
     np.testing.assert_array_equal(heights, [-2] * 4 + [-1] * 4 + [0] * 4)
     np.testing.assert_array_equal(widths, [-2, -1, 0, 1] * 3)
+
+
+@pytest.fixture(scope="module")
+def loaded(source):
+    from dew.interop.pretrained import load_pretrained
+
+    return load_pretrained(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+
+
+def test_published_qwen_image_prompt_encoding_matches_the_source_pipeline(loaded, arrays, record):
+    """The conditioner composes what `encode_prompt` composes: the template,
+    the last layer before the final norm, the system turn dropped. Each row
+    is padded on the right to the budget, its real tokens are the source's
+    states for that prompt alone, and its padding is masked and zero."""
+    encoder = loaded.inputs.conditions["conditioning"].encoder
+    params = loaded.variables["encoders"]["conditioning"]
+    prompts = record["pipeline"]["prompts"]
+    condition = encoder.encode(params, encoder.tokenize(prompts))
+    assert condition.context.shape == (2, encoder.tokens, record["pipeline"]["config"]["context_in_dim"])
+    for row in range(len(prompts)):
+        expected = arrays[f"pipeline.context.{row}"][0]
+        length = expected.shape[0]
+        np.testing.assert_array_equal(np.asarray(condition.mask[row]),
+                                      np.arange(encoder.tokens) < length)
+        assert relative_gap(condition.context[row, :length], expected) < 1e-5
+        assert not np.asarray(condition.context[row, length:]).any()
+    assert encoder.captions(encoder.tokenize(prompts)) == tuple(prompts)
+    # The pipeline encodes an empty prompt as one space.
+    np.testing.assert_array_equal(encoder.tokenize([""])["input_ids"],
+                                  encoder.tokenize([" "])["input_ids"])
+    with pytest.raises(ValueError, match="token budget"):
+        encoder.tokenize(["x" * (encoder.tokens + 1)])
+
+
+def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, record):
+    """`load_pretrained().text_to_image()` reproduces the source's own call:
+    its 40 default steps, no guidance, the sigmas its call lays out shifted
+    by the mu of this latent's token count, and the RGBA decode. Both rows
+    walk in one batch, the shorter prompt padded, and each lands on the
+    source's call for its prompt alone."""
+    pipeline = record["pipeline"]
+    task = loaded.text_to_image()
+    assert task.steps == pipeline["default_steps"] == 40
+    assert task.guidance is None and pipeline["true_cfg"] == 1.0
+    rows, columns = pipeline["height"] // 16, pipeline["width"] // 16
+    initial = nhwc(arrays["pipeline.x_T"], rows, columns)
+    walked = task(task.prepare(pipeline["prompts"], initial=initial, seed=0),
+                  key=jax.random.PRNGKey(0)).host()
+    images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
+    for row in range(len(pipeline["prompts"])):
+        expected = nhwc(arrays[f"pipeline.latents.{row}"], rows, columns)[0]
+        assert relative_gap(np.asarray(walked.latents)[row], expected) < 2e-5
+        assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < 2e-5
+
+
+def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, record, tmp_path):
+    """A real flow-matching step over the published source, then a resume and
+    an export.
+
+    The objective runs the whole source: the VAE encodes the RGBA pixels,
+    the Qwen3-VL language model encodes the prompts, and the transformer
+    takes the gradient. The encoder and the autoencoder are state, so every
+    leaf survives the step and their tensors - the vision tower the prompt
+    never reads included - go back out byte for byte; the export reloads to
+    the trained forward.
+    """
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.inputs.diffusion import QwenImageConditioner
+    from dew.interop.diffusion import component_tensors
+    from dew.interop.pretrained import load_pretrained
+    from dew.objectives import Step
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.training import Trainer
+
+    height, width, channels = loaded.inputs.sample.shape
+    assert channels == 4
+    objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
+                                   autoencoder=loaded.autoencoder, pretrained=loaded.variables,
+                                   unconditional_prob=0.0, ema_decay=None, steps=2)
+    rows = jax.device_count()
+    pixels = np.tile(np.arange(height * width * channels, dtype=np.uint8).reshape(
+        1, height, width, channels), (rows, 1, 1, 1))
+    prompts = record["pipeline"]["prompts"]
+    batch = {"image": pixels,
+             **loaded.inputs.tokenize([prompts[row % len(prompts)] for row in range(rows)])}
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3),
+                      checkpoints=checkpoints)
+    initial = trainer.initial_state()
+    fixed = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
+
+    def value(params) -> float:
+        loss, _ = objective.loss(params, batch, fixed)
+        return float(loss.total / loss.mass)
+
+    before = value(initial.params)
+    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    assert bool(accepted)
+    assert value(state.params) < before
+    assert not np.allclose(state.params["params"]["proj_out"]["kernel"],
+                           initial.params["params"]["proj_out"]["kernel"])
+    for held in ("encoders", "autoencoder"):
+        for got, want in zip(jax.tree.leaves(state.params[held]),
+                             jax.tree.leaves(initial.params[held]), strict=True):
+            np.testing.assert_array_equal(got, want)
+
+    checkpoints.save(1, state, None, {})
+    checkpoints.wait()
+    restored, _, _ = trainer.place()
+    for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
+        np.testing.assert_array_equal(got, want)
+
+    export = tmp_path / "export"
+    loaded.save(export, variables=state.params)
+    for component in ("text_encoder", "vae"):
+        published, written = (component_tensors(source / "pipeline", component),
+                              component_tensors(export, component))
+        assert written.keys() == published.keys()
+        for name, tensor in published.items():
+            np.testing.assert_array_equal(written[name], tensor)
+    again = load_pretrained(str(export), dtype="float32", attention_impl="xla")
+    rebuilt = QwenImageConditioner.from_pretrained(
+        str(export), dtype="float32", **{key: value for key, value in
+                                          again.inputs.conditions["conditioning"].encoder.to_json().items()
+                                          if key not in ("checkpoint", "dtype")},
+        params=again.variables["encoders"]["conditioning"])
+    tokens = rebuilt.tokenize(prompts)
+    condition = rebuilt.encode(again.variables["encoders"]["conditioning"], tokens)
+    grid = (record["pipeline"]["height"] // 16, record["pipeline"]["width"] // 16)
+    latent = jnp.asarray(nhwc(arrays["pipeline.x_T"], *grid))
+    times = jnp.asarray([500.0, 100.0])
+    trained = loaded.model.apply({"params": state.params["params"]}, latent, times, condition)
+    reloaded = again.model.apply({"params": again.variables["params"]}, latent, times, condition)
+    np.testing.assert_array_equal(reloaded, trained)

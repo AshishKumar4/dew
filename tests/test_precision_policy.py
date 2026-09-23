@@ -200,6 +200,8 @@ PER_ARCH = {
                          "num_single_layers": 1, "heads": 2, "head_dim": 12,
                          "joint_attention_dim": 16, "pooled_projection_dim": 10,
                          "guidance_embeds": True, "axes_dims_rope": (4, 4, 4)},
+    "qwen_image_transformer": {"in_channels": 4, "out_channels": 4, "num_layers": 1, "heads": 2,
+                               "head_dim": 12, "context_in_dim": 16, "axes_dims_rope": (4, 4, 4)},
 }
 COMPOSITES = ("diffusion_gemma", "multimodal_transformer")
 RES, FRAMES = 16, 2
@@ -210,7 +212,7 @@ def build_model(architecture, dtype="bfloat16"):
     it enters: leaf models through `with_precision`; the composites wrap a
     language model built that way, so the compute dtype reaches their trunk."""
     if architecture not in COMPOSITES:
-        own = ("unet_2d_condition", "sd3_transformer", "flux_transformer")
+        own = ("unet_2d_condition", "sd3_transformer", "flux_transformer", "qwen_image_transformer")
         fields = PER_ARCH[architecture] if architecture in own else {**TINY, **PER_ARCH[architecture]}
         return models.build(architecture, **with_precision(
             architecture, fields, dtype=dtype, attention_impl="auto"))
@@ -244,6 +246,10 @@ def tiny_inputs(architecture, rng):
         latents = jax.random.normal(rng, (1, 8, 8, 4))
         return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
             text.hidden[:, :, :16], jnp.ones((1, 10)), guidance=jnp.full((1,), 3.5))}
+    if architecture == "qwen_image_transformer":
+        latents = jax.random.normal(rng, (1, 4, 4, 4))
+        return (latents, jnp.ones((1,))), {"conditioning": DenoisingCondition(
+            text.hidden[:, :, :16], mask=text.mask)}
     if architecture == "jepa_encoder":
         return (image,)
     if architecture == "causal_transformer":
