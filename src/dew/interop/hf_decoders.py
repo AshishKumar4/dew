@@ -23,6 +23,7 @@ raises a ValueError naming it.
 import dataclasses
 import json
 import logging
+import operator
 import os
 from dataclasses import asdict, dataclass, field
 from functools import partial
@@ -737,8 +738,9 @@ _OPTIONAL_FIELDS = frozenset({'layer_types', 'sliding_window', 'rope_local_base_
 """Fields `_base_config` reads for a family whose reference reads them."""
 
 
-def _neutral(field: str, value: object) -> bool:
-    """Whether `value` for `field` computes what leaving the field out computes."""
+def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
+    """Whether the config's `field` computes what leaving it out computes."""
+    value = hf_config[field]
     if field == 'layer_types' and isinstance(value, (list, tuple)):
         return all(layer == 'full_attention' for layer in value)
     return value is None or value is False
@@ -764,7 +766,7 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
     attention_bias false, every layer full) is accepted.
     """
     for unread in _OPTIONAL_FIELDS - reads:
-        if unread in hf_config and _neutral(unread, hf_config[unread]):
+        if unread in hf_config and _neutral(hf_config, unread):
             used.add(unread)
     hidden = records.integer(hf_config['hidden_size'], 'hidden_size')
     heads = records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
@@ -2216,18 +2218,19 @@ def _refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object])
     except ValueError as error:
         raise ValueError(f"the {config['model_type']} config written for this model does not read back: "
                          f"{error}") from error
-    def computed(held: CausalTransformer, name: str) -> object:
-        resolve = _RESOLVED.get(name)
-        return getattr(held, name) if resolve is None else resolve(held)
-
-    lost = sorted(declared.name for declared in dataclasses.fields(model)
-                  if declared.name not in _RUNTIME_FIELDS
-                  and computed(model, declared.name) != computed(rebuilt, declared.name))
+    lost: dict[str, tuple[str, str]] = {}
+    for declared in dataclasses.fields(model):
+        if declared.name in _RUNTIME_FIELDS:
+            continue
+        resolve = _RESOLVED.get(declared.name, operator.attrgetter(declared.name))
+        ours, theirs = resolve(model), resolve(rebuilt)
+        if ours != theirs:
+            lost[declared.name] = (repr(theirs), repr(ours))
     if lost:
         raise ValueError(
-            f"{lost} would not survive an export as {config['model_type']}: its config reads back "
-            f"{ {name: computed(rebuilt, name) for name in lost} } where this model has "
-            f"{ {name: computed(model, name) for name in lost} }, so transformers would compute "
+            f"{sorted(lost)} would not survive an export as {config['model_type']}: its config reads back "
+            f"{ {name: read for name, (read, _) in lost.items()} } where this model has "
+            f"{ {name: held for name, (_, held) in lost.items()} }, so transformers would compute "
             "another model; no exported family carries this computation")
 
 

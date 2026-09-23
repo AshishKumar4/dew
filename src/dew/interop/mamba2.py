@@ -198,7 +198,7 @@ def is_mamba_ssm(config: Mapping[str, object]) -> bool:
     return "model_type" not in config and config.keys() >= _MAMBA_SSM_KEYS
 
 
-def config_from_mamba_ssm(config: Mapping[str, object]) -> dict[str, object]:
+def config_from_mamba_ssm(config: Mapping[str, object]) -> Mapping[str, object]:
     """Return the `Mamba2Config` dict transformers' conversion writes for a mamba_ssm config.
 
     transformers' convert_mamba2_ssm_checkpoint_to_pytorch.py (mamba_ssm

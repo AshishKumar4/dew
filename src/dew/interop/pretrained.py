@@ -2455,13 +2455,11 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             raise FileNotFoundError(f"{name_or_dir} has no config.json, which says what model its weights "
                                     f"are; {shipped}")
         with open(directory / "config.json") as handle:
-            config = json.load(handle)
+            config = records.record(json.load(handle), "config.json")
     # mamba_ssm's own format reads as the transformers port it converts to.
     mamba_ssm = mamba2.is_mamba_ssm(config)
     if mamba_ssm:
-        adapted = mamba2.config_from_mamba_ssm(config)
-        config.clear()
-        config.update(adapted)
+        config = mamba2.config_from_mamba_ssm(config)
     text_config = config.get("text_config")
     if (config.get("model_type") == "kimi_k25" and isinstance(text_config, Mapping)
             and text_config.get("quantization_config") is not None):
