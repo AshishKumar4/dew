@@ -433,21 +433,62 @@ def leafwise_largest(want, got) -> dict[str, float]:
             for path, value in jax.tree_util.tree_flatten_with_path(differences)[0]}
 
 
-# fp32: the shards sum the same terms in another order (a shard's entering
-# state is the chunk writes folded over shards rather than over chunks);
-# observed at most 9.0e-7 of a leaf's largest value, on the output, every
-# parameter gradient and the input gradient. bf16: the conv and the scan
-# run in fp32 on both sides, so the output (observed 0.0) and the gradients
-# of the scan's own parameters (A_log, D, dt_bias, conv1d; observed 8.2e-7)
-# keep the fp32 bound. The projections' and the norm's weight gradients are
-# bf16 contractions over the tokens, which the split program sums as
-# per-shard bf16 partials: two bf16 ulps, 2^-6, observed 1.1e-2 on the norm
-# weight and 9.1e-4 on the input. A shard that started from a zero state
-# instead of the earlier shards' moves the fp32 output by 0.66, and a conv
-# that did not read the previous shard's tail by 3.3.
+# fp32: the shards sum the same terms in another order (the entering state
+# composed over shards rather than carried over chunks); observed at most
+# 9.0e-7 of a leaf's largest value, on the output, every parameter gradient
+# and the input gradient. bf16: no fixed bound between the whole and the
+# split run holds. The projection and norm weight gradients are bf16
+# reductions over the tokens, rounded on each shard's partial sum, so any
+# change of summation order moves them by bf16 rounding, sequence split or
+# not (the same layer split 8 ways over fsdp alone moves norm.weight by
+# 2.9e-2). What the split must not do is add error of its own, so each bf16
+# run is measured against an fp32 run of the same variables, and the split
+# one may land at most twice as far from it as the whole one; over hidden
+# seeds 0 to 7, the three meshes, dense and packed, the worst ratio seen is
+# 1.68, on out_proj's kernel. A shard that
+# started from a zero state instead of the earlier shards' moves the fp32
+# output by 0.66, and a conv that did not read the previous shard's tail
+# by 3.3.
 FP32_BOUND = 2e-6
-BF16_CONTRACTION_BOUND = 2.0 ** -6
-SCAN_LEAVES = ("output", "A_log", "'D'", "dt_bias", "conv1d")
+
+
+def mamba_parity(split: str, packed: bool, dtype, seed: int = 0) -> list[tuple[str, float, float]]:
+    """The leaves where the split run misses its bound, each with the split
+    run's and the whole run's distance (fp32: from each other; bf16: from
+    the fp32 run); asserts the lowered state exchange on the way."""
+    hidden = jax.random.normal(jax.random.key(seed), (2, MAMBA_LENGTH, 16), dtype)
+    variables = mamba_layer(dtype).init(jax.random.key(1), hidden)
+    # A step near 1 and decays of 0.05 to 0.5 per unit step, so what one
+    # shard writes into the state still weighs on the shards after it.
+    variables["params"]["dt_bias"] = jnp.full((4,), 0.5)
+    variables["params"]["A_log"] = jnp.log(jnp.linspace(0.05, 0.5, 4))
+    segments = mamba_segments() if packed else None
+
+    def both(layer):
+        def run(variables, hidden):
+            return layer.apply(variables, hidden, segment_ids=segments)
+
+        def loss(variables, hidden):
+            return jnp.sum(jnp.sin(run(variables, hidden).astype(jnp.float32)))
+
+        def outputs(variables, hidden):
+            parameters, inputs = jax.grad(loss, argnums=(0, 1))(variables, hidden)
+            return {"output": run(variables, hidden), "parameters": parameters, "input": inputs}
+        return outputs
+
+    whole = both(mamba_layer(dtype))(variables, hidden)
+    with jax.set_mesh(build_mesh(MAMBA_SPLITS[split])):
+        program = jax.jit(both(mamba_layer(dtype)))
+        text = program.lower(variables, hidden).as_text()
+        sharded = program(variables, hidden)
+    assert "collective_permute" in text and "all_gather" not in text
+    if dtype == jnp.float32:
+        return [(leaf, difference, 0.0) for leaf, difference in leafwise_largest(whole, sharded).items()
+                if difference >= FP32_BOUND]
+    exact = both(mamba_layer(jnp.float32))(variables, hidden.astype(jnp.float32))
+    whole_error, split_error = leafwise_largest(exact, whole), leafwise_largest(exact, sharded)
+    return [(leaf, split_error[leaf], whole_error[leaf]) for leaf in whole_error
+            if split_error[leaf] > 2 * whole_error[leaf]]
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
@@ -462,34 +503,7 @@ def test_mamba2_agrees_with_whole_sequences_forward_and_backward(split, packed, 
     lowered program holds the state exchange: the conv tail's
     collective-permutes and the state's, and no all-gather: the shards'
     states pass in log2(n) + 1 shifts rather than all to every shard."""
-    layer = mamba_layer(dtype)
-    hidden = jax.random.normal(jax.random.key(0), (2, MAMBA_LENGTH, 16), dtype)
-    variables = layer.init(jax.random.key(1), hidden)
-    # A step near 1 and decays of 0.05 to 0.5 per unit step, so what one
-    # shard writes into the state still weighs on the shards after it.
-    variables["params"]["dt_bias"] = jnp.full((4,), 0.5)
-    variables["params"]["A_log"] = jnp.log(jnp.linspace(0.05, 0.5, 4))
-    segments = mamba_segments() if packed else None
-
-    def run(variables, hidden):
-        return layer.apply(variables, hidden, segment_ids=segments)
-
-    def loss(variables, hidden):
-        return jnp.sum(jnp.sin(run(variables, hidden).astype(jnp.float32)))
-
-    def both(variables, hidden):
-        parameters, inputs = jax.grad(loss, argnums=(0, 1))(variables, hidden)
-        return {"output": run(variables, hidden), "parameters": parameters, "input": inputs}
-
-    whole = both(variables, hidden)
-    with jax.set_mesh(build_mesh(MAMBA_SPLITS[split])):
-        program = jax.jit(both)
-        text = program.lower(variables, hidden).as_text()
-        sharded = program(variables, hidden)
-    assert "collective_permute" in text and "all_gather" not in text
-    for leaf, difference in leafwise_largest(whole, sharded).items():
-        exact = dtype == jnp.float32 or any(name in leaf for name in SCAN_LEAVES)
-        assert difference < (FP32_BOUND if exact else BF16_CONTRACTION_BOUND), (leaf, difference)
+    assert mamba_parity(split, packed, dtype) == []
 
 
 def hybrid():
