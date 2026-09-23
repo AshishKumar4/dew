@@ -42,13 +42,14 @@ from __future__ import annotations
 
 import itertools
 import json
+import logging
 import os
 import re
 import signal
 import subprocess
 import threading
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,8 @@ from .rollouts import Call, Rollout, Status, Task
 
 if TYPE_CHECKING:
     import httpx
+
+_logger = logging.getLogger(__name__)
 
 HARBOR_KEY = "harbor"
 """`Task.data[HARBOR_KEY]` is the Harbor task directory the trial runs."""
@@ -280,28 +283,34 @@ class HarborSource:
             with self._lock:
                 record.process = None
                 cancelled = record.cancelled
-            trial = self._trials / name
             try:
-                records = calls(self._gateway.traces(session), unstamped=version)
-            except Exception as error:
-                future.set_result(rollout(Status.CANCELLED if cancelled else Status.INFRA_ERROR,
-                                          detail=f"{trial}: unusable gateway traces: {error}"))
-                return
-            if cancelled:
-                future.set_result(rollout(Status.CANCELLED, records, detail=str(trial)))
-                return
-            if not (trial / "result.json").is_file():
-                future.set_result(rollout(Status.INFRA_ERROR, records,
-                                          detail=f"harbor exited {process.returncode} with no result: {log[-2000:]}"))
-                return
-            status, reward, components, detail = outcome(
-                json.loads((trial / "result.json").read_text()), records,
-                harness_exit=_harness_exit(trial), reward_key=self._reward_key)
-            future.set_result(rollout(status, records, reward, components, f"{trial}: {detail}".rstrip(": ")))
-            self._gateway.forget(session)
+                future.set_result(self._verdict(rollout, session, self._trials / name, log, process.returncode,
+                                                cancelled, version))
+            finally:
+                # The session's traces leave the gateway on every exit path; the future already has its verdict.
+                try:
+                    self._gateway.forget(session)
+                except Exception as error:
+                    _logger.warning("could not delete gateway session %s: %s", session, error)
         except BaseException as error:
             if not future.done():
                 future.set_exception(error)
+
+    def _verdict(self, rollout: Callable[..., Rollout], session: str, trial: Path, log: str, returncode: int,
+                 cancelled: bool, version: int) -> Rollout:
+        try:
+            records = calls(self._gateway.traces(session), unstamped=version)
+        except Exception as error:
+            return rollout(Status.CANCELLED if cancelled else Status.INFRA_ERROR,
+                           detail=f"{trial}: unusable gateway traces: {error}")
+        if cancelled:
+            return rollout(Status.CANCELLED, records, detail=str(trial))
+        if not (trial / "result.json").is_file():
+            return rollout(Status.INFRA_ERROR, records, detail=f"harbor exited {returncode} with no result: {log[-2000:]}")
+        status, reward, components, detail = outcome(
+            json.loads((trial / "result.json").read_text()), records,
+            harness_exit=_harness_exit(trial), reward_key=self._reward_key)
+        return rollout(status, records, reward, components, f"{trial}: {detail}".rstrip(": "))
 
 
 @dataclass
