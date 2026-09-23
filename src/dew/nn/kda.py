@@ -228,8 +228,7 @@ class KimiDeltaAttention(nn.Module):
             x = jnp.where(valid[:, :, None], x, 0)
         conv_input = jnp.moveaxis(
             jnp.concatenate([self.q_proj(x), self.k_proj(x), self.v_proj(x)], axis=-1).astype(jnp.float32), 2, 1)
-        taps = jnp.concatenate([jnp.asarray(conv()[:, 0, :], jnp.float32)
-                                for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
+        taps = jnp.concatenate([conv()[0] for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
         recurrent = None
         if decode:
             allocated = self.has_variable('cache', 'recurrent_state')

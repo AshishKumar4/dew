@@ -59,7 +59,7 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
-from dew.nn.linear import _masked_conv1d, causal_conv1d, document_conv1d, document_starts
+from dew.nn.linear import DepthwiseConv1d, _masked_conv1d, causal_conv1d, document_conv1d, document_starts
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.sharding import SEQUENCE_AXIS, logical_axes, row_axes, sequence_shards
 
@@ -246,24 +246,6 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
     return jnp.moveaxis(out, 0, 1).astype(dtype), final.astype(dtype)
 
 
-class Conv1dTaps(nn.Module):
-    """The depthwise conv's taps `[D, 1, K]` and bias `[D]`, the checkpoint's
-    `conv1d.{weight,bias}` (`nn.Conv1d(groups=conv_dim)`, modeling_mamba2.py:392-399)."""
-
-    features: int
-    kernel: int = 4
-    use_bias: bool = True
-    init_std: float | None = None  # None: lecun normal
-
-    @nn.compact
-    def __call__(self):
-        weight = self.param('weight', normal_kernel(self.init_std, nn.initializers.lecun_normal())[
-            'kernel_init'], (self.features, 1, self.kernel))
-        bias = (self.param('bias', nn.initializers.zeros, (self.features,), jnp.float32)
-                if self.use_bias else None)
-        return weight, bias
-
-
 class MambaRMSNormGated(nn.Module):
     """`MambaRMSNormGated` (modeling_mamba2.py:105-121): the gate first, the
     norm over the whole width after, both in fp32, the weight applied to the
@@ -360,8 +342,8 @@ class Mamba2(nn.Module):
         dense = functools.partial(nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision)
         self.in_proj = dense(2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,
                              name='in_proj', **normal_kernel(self.init_std))
-        self.conv1d = Conv1dTaps(features=self.conv_features, kernel=self.conv_kernel,
-                                 use_bias=self.use_conv_bias, init_std=self.init_std, name='conv1d')
+        self.conv1d = DepthwiseConv1d(features=self.conv_features, kernel=self.conv_kernel,
+                                      use_bias=self.use_conv_bias, init_std=self.init_std, name='conv1d')
         # The reference's init: A_log = log(1..H), dt_bias the inverse
         # softplus of a step drawn between time_step_min and max, D ones
         # (init_mamba2_weights, modeling_mamba2.py:428-442).
@@ -399,9 +381,7 @@ class Mamba2(nn.Module):
         # The conv and the scan run in fp32, as the reference's torch path
         # casts them (modeling_mamba2.py:271, 305).
         mixed, dt = mixed.astype(jnp.float32), dt.astype(jnp.float32)
-        weight, bias = self.conv1d()
-        taps = jnp.asarray(weight[:, 0, :], jnp.float32)
-        bias = None if bias is None else jnp.asarray(bias, jnp.float32)
+        taps, bias = self.conv1d()
         heads = (jnp.asarray(self.dt_bias, jnp.float32), -jnp.exp(self.A_log.astype(jnp.float32)),
                  jnp.asarray(self.D, jnp.float32))
         scan = functools.partial(
