@@ -139,7 +139,8 @@ def test_complete_groups_are_packed_and_the_next_batch_is_submitted_ahead():
     assert by_rollout == pytest.approx({0: -.5, 1: .5, 2: -.5, 3: .5})
     np.testing.assert_allclose(batch["old_log_probs"], -0.75 * batch["response_mask"])
     record = records[-1]
-    assert (record.groups, record.lag, record.reward, record.statuses) == (2, 0, 0.5, {"completed": 4})
+    assert (record.groups, record.lag) == (2, 0)
+    assert record.metrics["reward/mean"] == 0.5 and record.metrics["status/completed"] == 1.0
 
 
 def test_an_infra_failure_is_resubmitted_into_its_own_group_and_never_trained():
@@ -154,7 +155,7 @@ def test_an_infra_failure_is_resubmitted_into_its_own_group_and_never_trained():
     # The failed sample went back once, alone, under the served version.
     assert source.submitted == [("1", 2, 0), ("2", 2, 0), ("1", 1, 0)]
     assert records[-1].resubmitted == {"infra_error": 1}
-    assert records[-1].statuses == {"completed": 4}
+    assert records[-1].metrics["status/completed"] == 1.0
     indices, _ = trained(batch)
     assert indices == [0, 1, 2, 3]
     # The retry joined task 1's group as sample 0, attempt 1: its reward 0
@@ -184,7 +185,8 @@ def test_a_truncated_member_completes_its_group_but_carries_no_loss():
         5.0, version, status=Status.TRUNCATED) if sample == 1 else finished(1.0, version))
     rollout, data, records = scheduler(source, ahead=0, groups=3)
     batch = rollout(State(0), next(iter(data.train())), None)
-    assert records[-1].statuses == {"completed": 4, "truncated": 2}
+    metrics = records[-1].metrics
+    assert metrics["status/completed"] == pytest.approx(4 / 6) and metrics["status/truncated"] == pytest.approx(2 / 6)
     assert source.submitted == [("1", 3, 0), ("2", 3, 0)]
     indices, _ = trained(batch)
     assert indices == [0, 2, 3, 5]
@@ -300,7 +302,8 @@ def test_reward_components_from_the_source_are_averaged_into_the_record():
         float(sample), version, components={"tests": float(sample), "format": 1.0}))
     rollout, data, records = scheduler(source, ahead=0)
     rollout(State(0), next(iter(data.train())), None)
-    assert records[-1].components == {"format": 1.0, "tests": 0.5}
+    metrics = records[-1].metrics
+    assert (metrics["reward/component/format"], metrics["reward/component/tests"]) == (1.0, 0.5)
 
 
 def test_a_batch_that_did_not_come_through_the_stream_is_refused():
@@ -389,7 +392,10 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
     assert int(state.updates) == 4 and [record.updates for record in records] == [0, 1, 2, 3]
     assert all(0 <= record.lag <= 2 for record in records)
     assert any(record.lag > 0 for record in records), "no batch was ever drawn ahead of its update"
-    assert all(record.components["turns"] >= 1 for record in records)
+    # Every scored session took both turns, and each pair of calls merged into one chain.
+    assert all(record.metrics.get("reward/component/turns", 2.0) == 2.0 for record in records)
+    assert all(record.metrics["merge/calls_per_chain"] in (0.0, 2.0) for record in records)
+    assert all(record.metrics["latency/max"] >= record.metrics["latency/p50"] > 0 for record in records)
     completed = [rollout for rollout in rollouts if rollout.status == Status.COMPLETED]
     assert completed, "no session completed both tool turns"
     # Every completed session made two calls, and the second extends the first,

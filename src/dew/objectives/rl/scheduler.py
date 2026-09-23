@@ -76,7 +76,7 @@ from dew.training.state import TrainState
 
 from .grpo import GRPOObjective
 from .rollout import OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY
-from .rollouts import Rollout, RolloutSource, Status, Task, pack
+from .rollouts import Rollout, RolloutSource, Status, Task, pack, rollout_metrics
 
 TASK_ID_KEY = "task_id"
 
@@ -97,25 +97,26 @@ class Publisher(Protocol):
 class SchedulerRecord:
     """What one trainer call consumed and what it cost.
 
-    `version` and `lag` are the oldest admitted call's; `reward` and
-    `components` are means over the admitted rollouts that carry them;
-    `statuses` counts admitted rollouts by status; `resubmitted` counts
-    resubmissions by cause (`infra_error`, `cancelled`, `stale`);
-    `cancelled` counts in-flight rollouts cancelled as surplus, stale or
-    abandoned; `abandoned` counts groups given up after `max_attempts`.
+    `version` and `lag` are the oldest admitted call's; `groups` counts
+    admitted groups; `resubmitted` counts resubmissions by cause
+    (`infra_error`, `cancelled`, `stale`); `cancelled` counts in-flight
+    rollouts cancelled as surplus, stale or abandoned; `abandoned` counts
+    groups given up after `max_attempts`; `waited` is the seconds the
+    trainer waited. `metrics` is `rollout_metrics` over the admitted
+    rollouts and their packed batch: merge ratio, status shares and masked
+    shares, mean reward and reward components, submission-to-finish
+    latency tail, token lag and proximal-behavior mismatch.
     """
 
     updates: int
     version: int
     lag: int
     groups: int
-    reward: float
-    components: Mapping[str, float]
-    statuses: Mapping[str, int]
     resubmitted: Mapping[str, int]
     cancelled: int
     abandoned: int
     waited: float
+    metrics: Mapping[str, float]
 
 
 def task_ids(batch: Batch) -> list[Task]:
@@ -132,6 +133,11 @@ class _Sample:
     attempt: int
     submitted: int
     future: Future[Rollout]
+    started: float = field(default_factory=time.perf_counter)
+    finished: list[float] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.future.add_done_callback(lambda _: self.finished.append(time.perf_counter()))
 
 
 @dataclass
@@ -140,6 +146,7 @@ class _Group:
     label: str
     live: list[_Sample] = field(default_factory=list)
     done: list[Rollout] = field(default_factory=list)
+    latencies: list[float] = field(default_factory=list)
     failures: Counter[int] = field(default_factory=Counter)
     abandoned: bool = False
 
@@ -304,6 +311,9 @@ class RolloutScheduler:
             return
         group.done.append(dataclasses.replace(rollout, task=group.task.id, group=group.label,
                                               sample=sample.index, attempt=sample.attempt))
+        # The future is done; its callback may still be on the resolving thread.
+        finished = sample.finished[0] if sample.finished else time.perf_counter()
+        group.latencies.append(finished - sample.started)
         if len(group.done) == self.groups:
             entry.complete.append(group)
 
@@ -353,23 +363,14 @@ class RolloutScheduler:
         admitted = self._admit(entry, updates, tally)
         waited = time.perf_counter() - began
         rollouts = [rollout for group in admitted for rollout in group.done[:self.groups]]
+        latencies = [latency for group in admitted for latency in group.latencies[:self.groups]]
         packed = pack(rollouts, self.width, rows=self.rows, estimator=self.estimator)
         proximal = np.asarray(self._rescore(state.params, packed), np.float32)
         packed[OLD_LOG_PROBS_KEY] = proximal * packed[RESPONSE_MASK_KEY]
         if self.log is not None:
-            self.log(self._record(updates, rollouts, len(admitted), tally, waited))
+            versions = [call.version for rollout in rollouts for call in rollout.calls]
+            oldest = min(versions, default=updates)
+            self.log(SchedulerRecord(
+                updates, oldest, updates - oldest, len(admitted), dict(tally.resubmitted), tally.cancelled,
+                tally.abandoned, waited, rollout_metrics(rollouts, packed, latencies=latencies, version=updates)))
         return packed
-
-    @staticmethod
-    def _record(updates: int, rollouts: Sequence[Rollout], groups: int, tally: _Tally,
-                waited: float) -> SchedulerRecord:
-        versions = [call.version for rollout in rollouts for call in rollout.calls]
-        oldest = min(versions, default=updates)
-        rewards = [rollout.reward for rollout in rollouts if rollout.reward is not None]
-        names = sorted({name for rollout in rollouts for name in rollout.components})
-        components = {name: float(np.mean([rollout.components[name] for rollout in rollouts
-                                            if name in rollout.components])) for name in names}
-        return SchedulerRecord(
-            updates, oldest, updates - oldest, groups, float(np.mean(rewards)) if rewards else float("nan"),
-            components, dict(Counter(rollout.status.value for rollout in rollouts)), dict(tally.resubmitted),
-            tally.cancelled, tally.abandoned, waited)

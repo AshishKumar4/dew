@@ -255,9 +255,10 @@ def main(config: Config) -> dict:
 
     def log(record: SchedulerRecord) -> None:
         history.append(record)
-        print(f"update {record.updates:3d}  reward {record.reward:.3f}  version {record.version}  "
+        print(f"update {record.updates:3d}  reward {record.metrics.get('reward/mean', 0.0):.3f}  "
+              f"version {record.version}  "
               f"lag {record.lag}  resubmitted {sum(record.resubmitted.values())}  "
-              f"truncated {record.statuses.get('truncated', 0)}  waited {record.waited:.1f}s", flush=True)
+              f"truncated {record.metrics['status/truncated']:.2f}  waited {record.waited:.1f}s", flush=True)
 
     limits = SandboxLimits(wall_seconds=5.0, cpu_seconds=2, memory_bytes=512 * 1024 ** 2, message_bytes=65536)
     if config.runner not in ("process", "container"):
@@ -288,7 +289,8 @@ def main(config: Config) -> dict:
         if remote is not None:
             remote.terminate()
             remote.wait(timeout=60)
-    rewards = [record.reward for record in history]
+    # A batch with no scored rollout (every one truncated) reports no reward; it counts as zero.
+    rewards = [record.metrics.get("reward/mean", 0.0) for record in history]
     window = min(config.window, len(rewards) // 2 or 1)
     summary = {
         "backend": config.backend, "model": config.model, "updates": int(state.updates),
