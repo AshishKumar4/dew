@@ -38,7 +38,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.registry import models
 
 from ..attention import RMSNorm, RopeScaling
-from ..blocks import TokenEmbedding
+from ..blocks import TokenEmbedding, normal_kernel
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
 from ..gemma4_moe import Gemma4Experts
@@ -54,6 +54,7 @@ from ..hyper_connections import (
 from ..inputs import AttentionMetadata, PredictionPhase
 from ..kv_cache import KVCache, is_paged
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
+from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION, YarnScaling
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
@@ -94,6 +95,9 @@ class LayerKind:
     scales its full-attention layers alone (configuration_olmo3.py:110-113),
     so a YaRN ramp is a kind's as much as the model's."""
     head_dim: int | None = None
+    nope: bool | None = None
+    """True: this kind's attention layers rotate neither queries nor keys
+    (NoPE); None rides the model's `nope`."""
     mixer: MixerBase | None = None
     """This kind's mixer value or its record; None is the model's mixer."""
 
@@ -130,6 +134,7 @@ class ResolvedKind:
     rope_scaling: RopeScaling | None
     yarn: YarnScaling | None
     head_dim: int
+    nope: bool
     mixer: MixerBase | None
 
 
@@ -381,6 +386,8 @@ class GatedMLP(nn.Module):
     activation: str = 'swiglu'
     activation_sparsity: float = 0.0
     swiglu_limit: float | None = None
+    init_std: float | None = None  # gate/up normal std; None: lecun normal
+    output_init_std: float | None = None  # down normal std; None follows init_std
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -393,10 +400,12 @@ class GatedMLP(nn.Module):
                 f"activation_sparsity is the fraction of gate activations dropped, "
                 f"within [0, 1), got {self.activation_sparsity}")
         dense = functools.partial(
-            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+            **normal_kernel(self.init_std))
         self.gate_proj = dense(self.hidden_features, name='gate_proj')
         self.up_proj = dense(self.hidden_features, name='up_proj')
-        self.down_proj = dense(self.out_features, name='down_proj')
+        self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
+            self.init_std if self.output_init_std is None else self.output_init_std))
 
     def __call__(self, x):
         gate = checkpoint_name(self.gate_proj(x), 'gate_proj')
@@ -597,6 +606,7 @@ class DecoderBlock(nn.Module):
     laurel_rank: int | None = None  # Gemma 3n's learned augmented residual
     hyper_connections: HyperConnections | None = None  # mHC's stack of residual streams
     hash_routed: bool = False  # the feed-forward routes by the token ids the metadata carries
+    residual_multiplier: float = 1.0  # each sublayer's output scaled before it joins the residual
     dropout_rate: float = 0.0
     remat: RematPolicy | None = None
     dtype: Dtype | None = None
@@ -715,6 +725,7 @@ class DecoderBlock(nn.Module):
                                **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
+        mixed = self._scaled_branch(mixed)
         x = x + self.dropout(mixed, deterministic=not train)
         if self.laurel_rank is not None:
             x = (x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), x.dtype)
@@ -725,6 +736,7 @@ class DecoderBlock(nn.Module):
                 hidden = self.moe(x, hidden)
             if self.wiring.output_norms:
                 hidden = self.mlp_output_norm(hidden)
+            hidden = self._scaled_branch(hidden)
             x = x + self.dropout(hidden, deterministic=not train)
         if altup is not None and predictions is not None:
             corrected = self.altup_layer.correct(predictions, x, train=train)
@@ -758,6 +770,13 @@ class DecoderBlock(nn.Module):
         hidden = self.mlp(self.post_attention_layernorm(collapsed),
                           **self._feedforward_inputs(attention_metadata))
         return mix_streams(post, comb, self.dropout(hidden, deterministic=not train), streams)
+
+    def _scaled_branch(self, branch):
+        """A sublayer's output times `residual_multiplier` (lm-engine's
+        m_residual, GraniteMoeHybrid's residual_multiplier), in its own dtype."""
+        if self.residual_multiplier == 1.0:
+            return branch
+        return branch * jnp.asarray(self.residual_multiplier, branch.dtype)
 
     def _feedforward_inputs(self, attention_metadata) -> dict:
         """The token ids for a hash-routed feed-forward, nothing for the rest."""
@@ -1415,7 +1434,37 @@ class CausalTransformer(nn.Module):
     yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
+    nope: bool = False
+    """No positional encoding on the attention layers of every kind that does
+    not say otherwise (`LayerKind.nope`): Granite 4.0-H and lm-engine's
+    `position_embedding_type="nope"`. Rotary fields stay validated and unused."""
+    exclusive_self_attention: bool = False
+    """XSA on every attention layer (arXiv 2603.09078, lm-engine's
+    `exclusive_self_attention`): `dew.nn.mixers.attention.exclusive_self_attention`."""
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
+    embedding_multiplier: float = 1.0
+    """Token embeddings times this before the first layer: muP's m_emb in
+    lm-engine, GraniteMoeHybrid's `embedding_multiplier`."""
+    residual_multiplier: float = 1.0
+    """Every sublayer output times this before it joins the residual stream:
+    lm-engine's m_residual, GraniteMoeHybrid's `residual_multiplier`."""
+    logits_scaling: float = 1.0
+    """The logits divided by this: lm-engine's m_width (`lm_logits *
+    (1 / m_width)`), GraniteMoeHybrid's `logits_scaling`. The final states
+    carry the division, in fp32, so every head that contracts them with
+    `head_weight` scores the same logits `__call__` returns."""
+    initializer_range: float | None = None
+    """lm-engine's initialisation: the embedding table (and an untied head)
+    drawn from N(0, initializer_range^2), every hidden matrix (attention and
+    Mamba-2 projections, conv taps, router, experts, dense MLPs) from
+    N(0, (initializer_range / sqrt(logits_scaling))^2), biases zero and norms
+    one. With `logits_scaling` as m_width that is lm-engine's
+    `init_method="mup"`, and with it 1 its `"normal"` (init_utils.py at
+    45b6b57b). None keeps each module's own initializer."""
+    depth_scaled_init: bool = False
+    """With `initializer_range`, the projections back into the residual stream
+    (o_proj, out_proj, down_proj) divide their std by sqrt(2 * num_layers),
+    lm-engine's `use_depth_scaled_init`."""
     final_logit_softcap: float | None = None
     tie_embeddings: bool = True
     embedding_zero_ids: tuple[int, ...] = ()
@@ -1515,6 +1564,17 @@ class CausalTransformer(nn.Module):
 
 
     @property
+    def init_stds(self) -> tuple[float | None, float | None]:
+        """The normal std of the hidden matrices and of the projections back
+        into the residual stream, or (None, None) for the modules' own
+        initializers (`initializer_range`)."""
+        if self.initializer_range is None:
+            return None, None
+        hidden = self.initializer_range / math.sqrt(self.logits_scaling)
+        output = hidden / math.sqrt(2 * self.num_layers) if self.depth_scaled_init else hidden
+        return hidden, output
+
+    @property
     def kv_heads(self) -> int:
         return self.num_heads if self.num_kv_heads is None else self.num_kv_heads
 
@@ -1562,6 +1622,7 @@ class CausalTransformer(nn.Module):
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
             yarn=self.yarn if kind.yarn is None else kind.yarn,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
+            nope=self.nope if kind.nope is None else kind.nope,
             mixer=kind.mixer)
 
     @property
@@ -1680,7 +1741,11 @@ class CausalTransformer(nn.Module):
             kv_cache=self.kv_cache,
             partial_rotary_factor=(None if kind.window is not None
                                    else self.partial_rotary_factor),
-            partial_rotary_type=self.partial_rotary_type)
+            partial_rotary_type=self.partial_rotary_type,
+            nope=kind.nope,
+            exclusive_self_attention=self.exclusive_self_attention,
+            init_std=self.init_stds[0],
+            output_init_std=self.init_stds[1])
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
@@ -1717,6 +1782,29 @@ class CausalTransformer(nn.Module):
         Each check names the field the caller set and what a model without
         it looks like, so a translated config says which entry to fix.
         """
+        mup = (self.embedding_multiplier != 1.0 or self.residual_multiplier != 1.0
+               or self.logits_scaling != 1.0 or self.initializer_range is not None)
+        if mup and (self.num_nextn_predict_layers or self.hyper_connections is not None
+                    or (self.mixture is not None and self.mixture.parallel)
+                    or self.mlp == 'swigluoai'):
+            raise ValueError(
+                "embedding_multiplier, residual_multiplier, logits_scaling and "
+                "initializer_range are lm-engine's dense and routed blocks; prediction "
+                "depths, hyper-connection streams, Gemma 4's parallel experts and "
+                "gpt-oss experts do not carry them")
+        if self.logits_scaling <= 0 or (self.initializer_range is not None
+                                        and self.initializer_range <= 0):
+            raise ValueError("logits_scaling and initializer_range are positive")
+        if self.initializer_range is not None:
+            for layer_type, kind in sorted(kinds.items()):
+                mixer = kind.mixer or self.mixer
+                if mixer is not None and not isinstance(mixer, (AttentionMixer, Mamba2Mixer)):
+                    raise ValueError(
+                        f"initializer_range draws the attention and mamba2 mixers' "
+                        f"projections; {layer_type!r} runs {type(mixer).__name__}, "
+                        f"which keeps its own initializers")
+        elif self.depth_scaled_init:
+            raise ValueError("depth_scaled_init scales initializer_range's std; set it")
         mtp_hc = self.mtp_hyper_connections
         if mtp_hc is not None:
             if self.num_nextn_predict_layers != 1:
@@ -1828,8 +1916,10 @@ class CausalTransformer(nn.Module):
         # takes its own slots.
         # Every gated MLP in the model shares the activation and the clamp:
         # the dense feed-forwards, the shared branch and the routed experts.
+        init_std, output_init_std = self.init_stds
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
                                       activation=self.mlp, swiglu_limit=self.swiglu_limit,
+                                      init_std=init_std, output_init_std=output_init_std,
                                       dtype=self.dtype, precision=self.precision)
         shared = None if mixture is None or not mixture.shared_features else functools.partial(
             gated_mlp, hidden_features=mixture.shared_features)
@@ -1855,6 +1945,8 @@ class CausalTransformer(nn.Module):
             swiglu_limit=self.swiglu_limit,
             shared=shared,
             shared_gate=mixture.shared_gate,
+            init_std=init_std,
+            output_init_std=output_init_std,
             dtype=self.dtype,
             precision=self.precision)
         parallel = None if mixture is None or not mixture.parallel else functools.partial(
@@ -1909,7 +2001,9 @@ class CausalTransformer(nn.Module):
 
         self.embed_tokens = TokenEmbedding(
             num_embeddings=self.vocab_size, features=self.emb_features,
-            dtype=self.dtype, name='embed_tokens')
+            dtype=self.dtype, name='embed_tokens',
+            **({} if self.initializer_range is None else
+               {"embedding_init": nn.initializers.normal(self.initializer_range)}))
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
@@ -1961,6 +2055,7 @@ class CausalTransformer(nn.Module):
                     functools.partial(gated_mlp, hidden_features=spec.width,
                                       activation_sparsity=spec.sparsity)),
                 hash_routed=spec.hash_routed,
+                residual_multiplier=self.residual_multiplier,
                 emb_features=self.emb_features,
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
@@ -2039,7 +2134,8 @@ class CausalTransformer(nn.Module):
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
                 features=self.vocab_size, use_bias=False, dtype=jnp.float32,
-                precision=self.precision, name='lm_head')
+                precision=self.precision, name='lm_head',
+                **normal_kernel(self.initializer_range))
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None,
@@ -2257,6 +2353,10 @@ class CausalTransformer(nn.Module):
             scaled = x * jnp.asarray(math.sqrt(self.emb_features),
                                      self.embed_tokens.embedding.dtype)
             x = scaled.astype(x.dtype)
+        if self.embedding_multiplier != 1.0:
+            # lm-engine multiplies the looked-up states (`hidden_states *
+            # m_emb`, mixins/dense/base.py at 45b6b57b), in their dtype.
+            x = x * jnp.asarray(self.embedding_multiplier, x.dtype)
         x = self._scatter_inputs(x, tokens, input_embeddings, embedding_positions)
         # A prediction depth reads the embeddings `mtp_hidden_states` pairs
         # with, which are the unscaled ones with any media replacement already
@@ -2292,6 +2392,11 @@ class CausalTransformer(nn.Module):
         if hc is not None:
             x = collapse_streams(x, self.hc_head if hc.head == 'weighted' else None)
         hidden = self.norm(x)
+        if self.logits_scaling != 1.0:
+            # (h W) / s is (h / s) W: dividing the states in fp32 scores every
+            # head that contracts them, the chunked losses' included, as
+            # lm-engine's logits * (1 / m_width) does.
+            hidden = hidden.astype(jnp.float32) / jnp.float32(self.logits_scaling)
         prediction = hidden if self.mtp_hyper_connections is None else streams
         if (self.mtp_hyper_connections is not None and not self.is_initializing()
                 and self.is_mutable_collection('prediction_inputs')):

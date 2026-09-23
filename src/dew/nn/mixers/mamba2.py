@@ -58,6 +58,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
+from dew.nn.blocks import normal_kernel
 from dew.nn.linear import _masked_conv1d, causal_conv1d, document_conv1d, document_starts
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.sharding import SEQUENCE_AXIS, logical_axes, row_axes, sequence_shards
@@ -252,10 +253,12 @@ class Conv1dTaps(nn.Module):
     features: int
     kernel: int = 4
     use_bias: bool = True
+    init_std: float | None = None  # None: lecun normal
 
     @nn.compact
     def __call__(self):
-        weight = self.param('weight', nn.initializers.lecun_normal(), (self.features, 1, self.kernel))
+        weight = self.param('weight', normal_kernel(self.init_std, nn.initializers.lecun_normal())[
+            'kernel_init'], (self.features, 1, self.kernel))
         bias = (self.param('bias', nn.initializers.zeros, (self.features,), jnp.float32)
                 if self.use_bias else None)
         return weight, bias
@@ -329,6 +332,11 @@ class Mamba2(nn.Module):
     use_conv_bias: bool = True
     time_step_limit: tuple[float, float] = (0.0, float('inf'))
     norm_eps: float = 1e-5
+    init_std: float | None = None
+    """Normal std of in_proj and the conv taps (lm-engine draws both from the
+    same std); None keeps lecun normal."""
+    output_init_std: float | None = None
+    """Normal std of out_proj; None follows init_std."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -351,9 +359,9 @@ class Mamba2(nn.Module):
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
         dense = functools.partial(nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision)
         self.in_proj = dense(2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,
-                             name='in_proj')
+                             name='in_proj', **normal_kernel(self.init_std))
         self.conv1d = Conv1dTaps(features=self.conv_features, kernel=self.conv_kernel,
-                                 use_bias=self.use_conv_bias, name='conv1d')
+                                 use_bias=self.use_conv_bias, init_std=self.init_std, name='conv1d')
         # The reference's init: A_log = log(1..H), dt_bias the inverse
         # softplus of a step drawn between time_step_min and max, D ones
         # (init_mamba2_weights, modeling_mamba2.py:428-442).
@@ -361,7 +369,8 @@ class Mamba2(nn.Module):
         self.dt_bias = self.param('dt_bias', _inverse_softplus_step, (self.num_heads,))
         self.D = self.param('D', nn.initializers.ones, (self.num_heads,), jnp.float32)
         self.norm = MambaRMSNormGated(epsilon=self.norm_eps, dtype=self.dtype, name='norm')
-        self.out_proj = dense(self.emb_features, name='out_proj')
+        self.out_proj = dense(self.emb_features, name='out_proj', **normal_kernel(
+            self.init_std if self.output_init_std is None else self.output_init_std))
 
     def _conv(self, mixed, taps, bias, valid, conv_state, segments):
         """The conv over `[B, D, S]` with the bias before silu, from the
@@ -614,5 +623,7 @@ class Mamba2Mixer(MixerBase):
             use_conv_bias=self.use_conv_bias,
             time_step_limit=(float(self.time_step_limit[0]), float(self.time_step_limit[1])),
             norm_eps=ctx.norm_eps,
+            init_std=ctx.init_std,
+            output_init_std=ctx.output_init_std,
             dtype=ctx.dtype,
             precision=ctx.precision)

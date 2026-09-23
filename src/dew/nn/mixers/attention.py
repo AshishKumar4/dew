@@ -34,9 +34,34 @@ from dew.nn.attention import (
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
+from dew.nn.blocks import normal_kernel
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, mla_rope_freqs
 from dew.nn.sharding import logical_axes
+
+
+def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Array:
+    """Remove each head's component along its token's own value vector.
+
+    Exclusive self attention (arXiv 2603.09078) as lm-engine implements it
+    (`SoftmaxAttention._compute_xsa_output`, softmax_attention/module.py at
+    45b6b57b): `y - (<y, v> / <v, v>) v` per token and query head, in fp32,
+    with the key/value head repeated over its query group. `attention` is
+    `[B, S, heads, D]`, `value` `[B, S, kv_heads, D]`.
+
+    lm-engine divides by `<v, v>` with no guard, so a zero value vector
+    (padding under a values norm, or a zero-initialised projection) is NaN
+    there; here it leaves the output unchanged, which is the limit of the
+    projection onto a vanishing direction's span being empty.
+    """
+    heads, kv_heads = attention.shape[-2], value.shape[-2]
+    if heads % kv_heads:
+        raise ValueError(f"{heads} query heads do not group over {kv_heads} value heads")
+    value = jnp.repeat(value.astype(jnp.float32), heads // kv_heads, axis=-2)
+    work = attention.astype(jnp.float32)
+    norm = jnp.sum(value * value, axis=-1, keepdims=True)
+    along = jnp.sum(work * value, axis=-1, keepdims=True) / jnp.where(norm > 0, norm, 1)
+    return (work - jnp.where(norm > 0, along, 0) * value).astype(attention.dtype)
 
 
 @logical_axes({
@@ -99,10 +124,25 @@ class CausalSelfAttention(nn.Module):
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None
     kv_cache: KVCache = KVCache()  # the decode cache's storage: dense or paged, full or quantized
+    nope: bool = False
+    """No positional encoding: q and k enter the kernel unrotated, and the
+    logits keep their scale (lm-engine's `position_embedding_type="nope"`)."""
+    exclusive_self_attention: bool = False
+    """XSA (arXiv 2603.09078): each head's output loses its component along
+    the token's own value vector before the output projection."""
+    init_std: float | None = None
+    """Normal std of the q/k/v kernels; None keeps flax's lecun normal."""
+    output_init_std: float | None = None
+    """Normal std of o_proj; None follows init_std."""
 
     def setup(self):
+        if self.exclusive_self_attention and self.kv_shared:
+            raise ValueError(
+                "exclusive self attention subtracts the token's own value, and a "
+                "KV-sharing layer projects none of its own")
         dense = functools.partial(
-            nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision)
+            nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision,
+            **normal_kernel(self.init_std))
         # The gate doubles the query projection: the reference chunks its
         # output in half, one half the query and the other the gate the
         # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
@@ -116,7 +156,8 @@ class CausalSelfAttention(nn.Module):
             if not self.k_eq_v:
                 self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
         self.o_proj = dense(self.emb_features, name='o_proj', use_bias=(
-            self.attention_bias if self.o_proj_bias is None else self.o_proj_bias))
+            self.attention_bias if self.o_proj_bias is None else self.o_proj_bias),
+            **normal_kernel(self.init_std if self.output_init_std is None else self.output_init_std))
         if self.qk_norm:
             if self.qk_norm_scope not in ('head', 'projection'):
                 raise ValueError(
@@ -355,15 +396,24 @@ class CausalSelfAttention(nn.Module):
         rotary_positions = positions if logical_positions is None else logical_positions
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             rotary_positions = attention_metadata.rotary_positions
-        freqs_cos, freqs_sin = self._rotary_angles(rotary_positions)
-        # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
-        # query carries the ratio to the scale the checkpoint asks for.
-        query = apply_rotary(
-            query, freqs_cos, freqs_sin,
-            scale=(None if self.attention_scale is None
-                   else self.attention_scale * math.sqrt(self.head_dim)))
+        if self.nope:
+            # NoPE rotates nothing; the query still carries the logit scale
+            # the checkpoint asks for, which apply_rotary folds in otherwise.
+            if self.attention_scale is not None:
+                query = query * jnp.asarray(
+                    self.attention_scale * math.sqrt(self.head_dim), query.dtype)
+        else:
+            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions)
+            # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
+            # query carries the ratio to the scale the checkpoint asks for.
+            query = apply_rotary(
+                query, freqs_cos, freqs_sin,
+                scale=(None if self.attention_scale is None
+                       else self.attention_scale * math.sqrt(self.head_dim)))
+        own_value = value
         if not self.kv_shared:
-            key = apply_rotary(key, freqs_cos, freqs_sin)
+            if not self.nope:
+                key = apply_rotary(key, freqs_cos, freqs_sin)
             if kv_store is not None and self.kv_store_key is not None:
                 # Post-norm, post-rope, the same tensors the reference hands
                 # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
@@ -380,7 +430,7 @@ class CausalSelfAttention(nn.Module):
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
                 implementation=self.attention_impl, sinks=sinks,
                 softcap=self.attn_logit_softcap), 'context')
-            return self._output(attention, gate, B, S)
+            return self._output(attention, gate, B, S, own_value)
         causal, mask = self.causal, None
         implementation = self.attention_impl
         masked = kernel_for_materialized_mask(
@@ -489,7 +539,7 @@ class CausalSelfAttention(nn.Module):
                 implementation=implementation, causal=causal,
                 sliding_window=window, mask=mask, sinks=sinks,
                 softcap=self.attn_logit_softcap), 'context')
-        return self._output(attention, gate, B, S)
+        return self._output(attention, gate, B, S, own_value)
 
     def _decode_masks(self, positions, key_length: int) -> tuple[jax.Array, jax.Array]:
         """The cursor mask over the cache's filled slots, and the layer's decode mask.
@@ -528,8 +578,11 @@ class CausalSelfAttention(nn.Module):
             metadata.pairwise_mask is None
             and not (self.bidirectional_images and metadata.image_groups is not None))
 
-    def _output(self, attention, gate, batch: int, length: int):
-        """Gate the attended values where the layer gates, then project them."""
+    def _output(self, attention, gate, batch: int, length: int, own_value):
+        """Exclude the own value where the layer does, gate the attended values
+        where it gates, then project them."""
+        if self.exclusive_self_attention:
+            attention = exclusive_self_attention(attention, own_value)
         if gate is not None:
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
@@ -592,5 +645,9 @@ class AttentionMixer(MixerBase):
             partial_rotary_factor=ctx.partial_rotary_factor,
             partial_rotary_type=ctx.partial_rotary_type,
             kv_cache=ctx.kv_cache,
+            nope=ctx.nope,
+            exclusive_self_attention=ctx.exclusive_self_attention,
+            init_std=ctx.init_std,
+            output_init_std=ctx.output_init_std,
             bidirectional_images=self.bidirectional_images, mrope_section=self.mrope_section)
 
