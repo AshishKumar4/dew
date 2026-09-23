@@ -766,9 +766,9 @@ def expert_dispatch[Parameters](
     rows = x.shape[0]
     if exchanging:
         # Each expert shard sends tokens of its own: the rows are padded until
-        # every axis `activation_batch` can take splits them, and the padding
-        # routes to the sentinel.
-        share = math.prod(mesh.shape[axis] for axis in row_axes(math.prod(mesh.shape.values())))
+        # every axis `activation_batch` takes splits them (the axes a batch of
+        # one row per device takes), and the padding routes to the sentinel.
+        share = math.prod(mesh.shape[axis] for axis in row_axes(mesh.size))
         padding = ((0, -rows % share),)
         x = jnp.pad(x, padding + ((0, 0),) * (x.ndim - 1))
         routed = padding + ((0, 0),) * (indices.ndim - 1)
