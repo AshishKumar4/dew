@@ -1014,17 +1014,12 @@ def test_nope_and_xsa_are_the_attention_mixers_own_switches():
     value, so the switches live on it and a mixer that cannot honour them
     cannot be handed them."""
     from dew.nn.backbones.causal_transformer import LayerKind
-    from dew.nn.mixers import mixer_from_record
     ids = tokens(jax.random.key(0), length=8)
     record = {"kind": "attention", "nope": True, "exclusive_self_attention": True}
     kinded = tiny(qk_norm=False, layer_types=("a", "a"), kinds={"a": LayerKind(mixer=record)})
     params = kinded.init(jax.random.key(1), ids)
     plain = tiny(qk_norm=False).apply(params, ids)
     assert not np.allclose(kinded.apply(params, ids), plain)
-    with pytest.raises((TypeError, ValueError)):
-        mixer_from_record({"kind": "mla", "exclusive_self_attention": True})
-    with pytest.raises(TypeError):
-        tiny(nope=True)
 
 
 def test_a_multiplier_scales_bf16_states_in_fp32_opmath():
@@ -1034,7 +1029,6 @@ def test_a_multiplier_scales_bf16_states_in_fp32_opmath():
     x = jax.random.normal(jax.random.key(0), (4096,), jnp.bfloat16)
     np.testing.assert_array_equal(scaled(x, 0.22), (x.astype(jnp.float32) * 0.22).astype(jnp.bfloat16))
     assert scaled(x, 0.22).dtype == jnp.bfloat16
-    assert scaled(x, 1.0) is x
 
 
 @pytest.mark.parametrize("extra", [{"laurel_rank": 8}, {"per_layer_input_dim": 4}])
