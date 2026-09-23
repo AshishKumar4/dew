@@ -190,21 +190,26 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
         # The reference rounds every step to the input dtype. XLA fuses the
         # chain and carries fp32 between the ops, so each rounding is explicit.
         y = _rounded(x * _rounded(jax.lax.rsqrt(_rounded(
-            _rounded(jnp.mean(_rounded(jnp.square(x)), axis=-1, keepdims=True)) + epsilon))))
+            _rounded(jnp.mean(_rounded(jnp.square(x), x.dtype), axis=-1, keepdims=True), x.dtype)
+            + epsilon, x.dtype)), x.dtype), x.dtype)
     if scale is None:
         # A pure normalization with no learned weight, as Gemma 4 norms
         # its values (modeling_gemma4.py, Gemma4RMSNorm with_scale=False).
         return y.astype(dtype)
     weight = (1.0 + scale) if scale_offset else scale
     if scale_after_cast:
-        product = y.astype(dtype) * weight.astype(dtype)
-        return product if fp32_statistics else _rounded(product)
+        # The reference casts the activations, then multiplies by its weight:
+        # a bf16 product for a bf16 weight, an fp32 one for an fp32 master
+        # that the next layer rounds. Rounding in place keeps both roundings
+        # under jit, where XLA drops a narrowing cast that a widening one
+        # follows, and keeps the weight's product and gradient in fp32.
+        return _rounded(_rounded(y, dtype) * weight, dtype).astype(dtype)
     return (y * weight).astype(dtype)
 
 
-def _rounded(x):
-    """Round `x` to its own dtype's precision, which fusion otherwise skips."""
-    bits = jnp.finfo(x.dtype)
+def _rounded(x, dtype):
+    """Round `x` to `dtype`'s precision, keeping its own dtype."""
+    bits = jnp.finfo(dtype)
     return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
@@ -251,12 +256,12 @@ class RMSNorm(nn.Module):
 
     The families differ in where the scale meets the activation dtype. Gemma
     multiplies in fp32 and casts the product (modeling_gemma3.py:147-150).
-    Llama and Qwen3 cast first and multiply in that dtype
+    Llama and Qwen3 cast first and multiply by the weight
     (modeling_qwen3.py:61-64), which `scale_after_cast` reproduces. The two
     agree at fp32 and differ under bf16.
 
     timm's `RmsNorm2d` (layers/fast_norm.py `rms_norm2d`) computes
-    x * rsqrt(mean(x^2) + eps) * w in the input dtype, the weight's too.
+    x * rsqrt(mean(x^2) + eps) * w in the input dtype.
     `fp32_statistics=False` with `scale_after_cast` is that order.
 
     The reduction runs under `normalized_in_fp32`, so the backward pass
