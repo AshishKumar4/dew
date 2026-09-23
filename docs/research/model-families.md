@@ -66,7 +66,7 @@ code. Checked against the source on 2026-09-22:
   `deepseek_v3`, `deepseek_v32`, `deepseek_v4`, `diffusion_gemma_text`,
   `dream`, `gemma`, `gemma2`, `gemma3_text`, `gemma3n_text`, `gemma4_text`,
   `glm4_moe`, `glm5_next_text`, `glm_moe_dsa`, `gpt_oss`, `kimi_k2`,
-  `kimi_k25`, `llada`, `llama`, `llama4_text`, `mamba2`, `mistral`, `mixtral`,
+  `kimi_k25`, `kimi_k3`, `llada`, `llama`, `llama4_text`, `mamba2`, `mistral`, `mixtral`,
   `olmo3`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_next`, `qwen3_5_text` and
   `qwen3_5_moe_text`. The MiniMax families, `nemotron_h`, `qwen4_exp`,
   `kimi_linear` and `llada2_moe` are not in that list.
@@ -129,7 +129,8 @@ Component by family. "Dew today" is the last row: what
 | GLM-5.2 / 5.3 (`glm_moe_dsa`) | MLA (nope 192, rope 64, v 256) plus DSA indexer, `indexer_types` full or shared | RMSNorm | SwiGLU | sigmoid + bias, top-8 of 256, scaling 2.5 | 1 layer | indexer reuse across 4-layer groups |
 | GLM-5.3-Flash (`glm5_next`) | 3 KDA linear then 1 MLA+DSA with k-pooling | RMSNorm, gated RMSNorm, unweighted-mean hyper head | clamped SwiGLU (10.0) | sigmoid + bias, top-8 of 288 | 1 layer | hyper-connections with Sinkhorn, `qk_rope_head_dim=0` (NoPE) |
 | Kimi Linear (`kimi_linear`) | 3 KDA then 1 MLA with NoPE (`mla_use_nope`) | RMSNorm | SwiGLU | sigmoid, grouped top-8 of 256, scaling 2.446 | 0 | remote code on the hub, not in transformers 5.16.1 |
-| Kimi K2.5 / K3 (`kimi_k25`, `kimi_k3`) | DeepSeek-V3 MLA text backbone | RMSNorm | SwiGLU | sigmoid, top-8 of 384 (K2.5) or 896 experts (K3) | 0 | `kimi_k25` maps its text config to `deepseek_v3` |
+| Kimi K2.5 (`kimi_k25`) | DeepSeek-V3 MLA text backbone | RMSNorm | SwiGLU | sigmoid, top-8 of 384 | 0 | `kimi_k25` maps its text config to `deepseek_v3` |
+| Kimi K3 (`kimi_k3`, text `kimi_linear`) | 3 KDA (full-rank output gate) then 1 NoPE MLA with a sigmoid output gate, Attention Residuals over blocks of 12 | RMSNorm | SiTU (betas 4, 25) | sigmoid + bias, top-16 of 896, latent experts at 3584 with a norm, 2 shared | 0 | routed experts ship compressed-tensors MXFP4; `A_log` padded 96 to 128 |
 | MiniMax-Text-01 / M1 (`minimax`) | lightning attention alternating with full attention, per-block alpha/beta scaling | RMSNorm | SwiGLU | softmax top-2 of 8 | no | decay slopes per head |
 | MiniMax-M2 (`minimax_m2`) | full GQA every layer, qk-norm over the whole projection | RMSNorm | SwiGLU experts | sigmoid top-8 of 256, no renormalisation | no | FP8 weights |
 | MiniMax-M3 (`minimax_m3_vl`) | GQA, partial rotary 0.5 | RMSNorm | clamped SwiGLU (7.0) | sigmoid + `e_score_correction_bias`, top-4 of 128, shared expert | 1 layer | 1M context |
@@ -683,8 +684,11 @@ backbone is DeepSeek-V3 MLA plus a sigmoid router:
 `qk_rope_head_dim=64`, `qk_nope_head_dim=128`, `v_head_dim=128`, 384 experts,
 8 active, 1 shared, `routed_scaling_factor=2.827`,
 `first_k_dense_replace=1`, `rope_theta=50000`, 61 layers, vocab 163840.
-`Kimi-K3` is the same family scaled up: 93 layers, 896 experts,
-`max_position_embeddings=1048576`.
+`Kimi-K3` (arXiv 2607.24653) is not that decoder. Its `text_config` is
+`kimi_linear`: 93 layers, KDA on 69 and NoPE MLA with an output gate on 24,
+Attention Residuals (`attn_res_block_size=12`), 896 latent experts of which
+16 route, SiTU, and MXFP4 routed experts. Dew loads it as `kimi_k3`
+(`src/dew/interop/families/kimi.py`).
 
 `Kimi-Linear-48B-A3B-*` has `model_type=kimi_linear` with an `auto_map`
 pointing at `configuration_kimi.KimiLinearConfig` and
