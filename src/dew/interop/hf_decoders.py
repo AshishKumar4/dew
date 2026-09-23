@@ -2229,8 +2229,8 @@ def _refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object])
     if lost:
         raise ValueError(
             f"{sorted(lost)} would not survive an export as {config['model_type']}: its config reads back "
-            f"{ {name: read for name, (read, _) in lost.items()} } where this model has "
-            f"{ {name: held for name, (_, held) in lost.items()} }, so transformers would compute "
+            f"{', '.join(f'{name}={read}' for name, (read, _) in lost.items())} where this model has "
+            f"{', '.join(f'{name}={held}' for name, (_, held) in lost.items())}, so transformers would compute "
             "another model; no exported family carries this computation")
 
 
