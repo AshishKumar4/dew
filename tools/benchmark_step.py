@@ -137,6 +137,9 @@ class Case:
     """Compute dtype, written into the model config by the precision policy;
     None takes the run's --dtype."""
     batch_size: int = 8
+    accumulation: int = 1
+    """Microbatches of `batch_size` rows the trainer pools into one optimizer
+    step; a timed step is one microbatch."""
     mesh: dict[str, int] = field(default_factory=dict)
     """`MeshSpec` fields, `{"fsdp": 2, "tensor": 2}`; the empty record is
     data parallelism over every device."""
@@ -201,7 +204,8 @@ class Case:
         canvases = f" x{canvas_split(self)[2]}canvas" if self.canvas else ""
         images = f" x{images_per_row(self)}img" if self.media else ""
         order = "" if self.device_order is None else " order" + "".join(map(str, self.device_order))
-        return (f"{self.architecture}{experts}{canvases}{images} b{self.batch_size} "
+        pooled = "" if self.accumulation == 1 else f" x{self.accumulation}acc"
+        return (f"{self.architecture}{experts}{canvases}{images} b{self.batch_size}{pooled} "
                 f"{mesh_label(self.mesh)}{order}")
 
 
@@ -659,7 +663,7 @@ def build_trainer(case: Case, attention_impl: str = 'auto',
     trainer = Trainer(
         build_objective(case, attention_impl), optimizer or optax.adam(1e-4), key=jax.random.key(0),
         mesh=mesh_spec(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
-        checkpoints=None, tracker=None)
+        accumulation=case.accumulation, checkpoints=None, tracker=None)
     if case.device_order is not None:
         by_id = {device.id: device for device in jax.devices()}
         trainer.device_mesh = build_mesh(trainer.mesh, [by_id[index] for index in case.device_order])
@@ -1006,6 +1010,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         row: Row = {
             "architecture": case.architecture,
             "batch_size": case.batch_size,
+            "accumulation": case.accumulation,
             "mesh": case.mesh,
             "device_order": case.device_order,
             "mesh_shape": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
