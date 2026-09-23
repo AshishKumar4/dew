@@ -28,7 +28,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from .attention import scaled_dot_product_attention
+from .attention import RMSNorm, scaled_dot_product_attention
 from .blocks import torch_nearest_resize
 from .sharding import logical_axes
 
@@ -74,6 +74,11 @@ def _conv(features: int, kernel: int, *, stride: int = 1, groups: int = 1,
         name=name)
 
 
+def _timm_rms_norm(dtype: Dtype | None, name: str) -> RMSNorm:
+    """Build timm's `RmsNorm2d` (eps 1e-6), which reduces and scales in the input dtype."""
+    return RMSNorm(epsilon=1e-6, fp32_statistics=False, scale_after_cast=True, dtype=dtype, name=name)
+
+
 def _gelu(x):
     """Apply the tanh-approximate GELU, evaluated in at least fp32."""
     # Torch's fused GELU evaluates the polynomial in fp32 for bf16/fp16
@@ -98,10 +103,7 @@ class MobileConvNormAct(nn.Module):
         x = _conv(self.features, self.kernel, stride=self.stride, groups=self.groups,
                   padding=self.padding, bias=self.bias, dtype=self.dtype,
                   precision=self.precision, name="conv")(x)
-        # timm RmsNorm2d computes statistics in the input dtype. Gemma's text
-        # RMSNorm has a different fp32-reduction contract.
-        x = nn.RMSNorm(epsilon=1e-6, force_float32_reductions=False,
-                       dtype=self.dtype, name="bn")(x)
+        x = _timm_rms_norm(self.dtype, "bn")(x)
         return _gelu(x) if self.activate else x
 
 
@@ -199,13 +201,11 @@ class MobileResidual(nn.Module):
             x = _conv(middle, spec.middle_kernel, stride=spec.stride,
                       groups=groups(middle), padding=self.padding, dtype=self.dtype,
                       precision=self.precision, name="conv_exp")(x)
-            x = nn.RMSNorm(epsilon=1e-6, force_float32_reductions=False,
-                           dtype=self.dtype, name="bn1")(x)
+            x = _timm_rms_norm(self.dtype, "bn1")(x)
             x = _gelu(x)
             x = _conv(self.features, 1, padding=self.padding, dtype=self.dtype,
                       precision=self.precision, name="conv_pwl")(x)
-            x = nn.RMSNorm(epsilon=1e-6, force_float32_reductions=False,
-                           dtype=self.dtype, name="bn2")(x)
+            x = _timm_rms_norm(self.dtype, "bn2")(x)
         else:
             if spec.start_kernel:
                 stride = 1 if spec.middle_kernel else spec.stride
@@ -239,8 +239,7 @@ class MobileKVProjection(nn.Module):
             x = _conv(x.shape[-1], 3, stride=self.stride, groups=x.shape[-1],
                       padding=self.padding, dtype=self.dtype,
                       precision=self.precision, name="down_conv")(x)
-            x = nn.RMSNorm(epsilon=1e-6, force_float32_reductions=False,
-                           dtype=self.dtype, name="norm")(x)
+            x = _timm_rms_norm(self.dtype, "norm")(x)
         return _conv(self.features, 1, padding=self.padding, dtype=self.dtype,
                      precision=self.precision, name="proj")(x)
 
@@ -302,8 +301,7 @@ class MobileAttention(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool = False):
         shortcut = x
-        x = nn.RMSNorm(epsilon=1e-6, force_float32_reductions=False,
-                       dtype=self.dtype, name="norm")(x)
+        x = _timm_rms_norm(self.dtype, "norm")(x)
         x = MobileMultiQueryAttention(
             self.spec, self.features, padding=self.padding, dtype=self.dtype,
             precision=self.precision, attention_impl=self.attention_impl,
@@ -375,8 +373,7 @@ class MobileMultiScaleFusion(nn.Module):
             else:
                 strides = (height // size, width // size)
                 x = nn.avg_pool(x, strides, strides=strides, padding="VALID")
-        return nn.RMSNorm(epsilon=1e-6, force_float32_reductions=False,
-                          dtype=self.dtype, name="norm")(x)
+        return _timm_rms_norm(self.dtype, "norm")(x)
 
 
 # The stem reads three image channels, which is no width worth naming, and the
