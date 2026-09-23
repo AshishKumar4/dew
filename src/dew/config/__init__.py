@@ -45,7 +45,7 @@ from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON
 from dew.registry import REGISTRIES, _declared_type, datasets, models, schedules, with_precision
-from dew.telemetry.instrumentation import default_compilation_cache_dir
+from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
 from dew.telemetry.records import RunRecord, json_value, packages_installed
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
@@ -250,12 +250,12 @@ def _local_tracker(directory: str, name: str):
     """Return the journal directory for a run, beside its checkpoints where it can be.
 
     A bucket URI is not a directory this process can write journals into, so a
-    remote run journals under ~/.cache/dew/tracking, keyed by the run name and
+    remote run journals under Dew's cache (`dew_cache_dir`), keyed by the run name and
     a digest of the bucket path.
     """
     if "://" not in directory:
         return LocalTracker(os.path.join(directory, "tracking"))
-    return LocalTracker(os.path.join(os.path.expanduser("~/.cache/dew/tracking"),
+    return LocalTracker(os.path.join(dew_cache_dir(), "tracking",
                                      _artifact_name(name) + "-"
                                      + hashlib.sha256(directory.encode()).hexdigest()[:12]))
 

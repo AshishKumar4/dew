@@ -10,7 +10,7 @@ torch share one venv:
     uv venv /tmp/hfref --python 3.12
     uv pip install --python /tmp/hfref/bin/python torch torchvision \
         --index-url https://download.pytorch.org/whl/cpu
-    uv pip install --python /tmp/hfref/bin/python -e '.[verify]' safetensors \
+    uv pip install --python /tmp/hfref/bin/python -e '.[torch]' safetensors \
         sentencepiece
     /tmp/hfref/bin/python tools/hf_reference.py
 

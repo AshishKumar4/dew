@@ -31,6 +31,7 @@ Usage (one process per measurement, so VmHWM is that load's alone):
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -110,11 +111,15 @@ def abstract() -> dict[str, object]:
         layout.check(variables, shardings, device_mesh)
         leaves = jax.tree.leaves(variables)
         lazy = [leaf for leaf in leaves if isinstance(leaf, SourceLeaf)]
+
+        def nbytes(leaf) -> int:
+            return math.prod(leaf.shape) * np.dtype(leaf.dtype).itemsize
+
         reads = [int(np.prod(sharding.shard_shape(leaf.shape))) * np.dtype(leaf.dtype).itemsize
                  for leaf, sharding in zip(leaves, jax.tree.leaves(shardings), strict=True)]
         report.update({"leaves": len(leaves), "lazy_leaves": len(lazy),
-                       "lazy_gb": round(sum(leaf.nbytes for leaf in lazy) / 1e9, 1),
-                       "host_built_gb": round(sum(leaf.nbytes for leaf in leaves
+                       "lazy_gb": round(sum(nbytes(leaf) for leaf in lazy) / 1e9, 1),
+                       "host_built_gb": round(sum(nbytes(leaf) for leaf in leaves
                                                   if not isinstance(leaf, SourceLeaf)) / 1e9, 3),
                        "per_device_gb": round(sum(reads) / 1e9, 2),
                        "largest_single_read_gb": round(max(reads) / 1e9, 3)})
