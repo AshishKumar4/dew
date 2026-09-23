@@ -23,6 +23,7 @@ from ..dit import (
     ModulatedBlock,
     PatchEmbedding,
     PatchSequenceOutput,
+    RematChoice,
     remat_block,
 )
 from ..rope import rotary_freqs
@@ -227,7 +228,7 @@ class SimpleUDiT(nn.Module):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     attention_impl: str = "auto"  # an AttentionImpl
-    remat: bool = False
+    remat: RematChoice = False
     norm_epsilon: float = 1e-5
     scan_order: Literal["raster", "hilbert"] = "raster"
 

@@ -11,7 +11,7 @@ sandwich; the model files arrange blocks.
 
 import inspect
 import math
-from typing import Sequence
+from typing import Literal, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -302,7 +302,13 @@ def saved_through_remat(prim, *args, **params) -> bool:
             or _DOTS_AND_ATTENTION_OUTPUT(prim, *args, **params))
 
 
-def remat_block(block_cls, enabled: bool, policy: str | None = 'dots'):
+RematChoice = bool | Literal['dots', 'full']
+"""A diffusion backbone's `remat`: False keeps every activation, True or
+'dots' recomputes a block but keeps its matmul outputs and attention
+forward, 'full' recomputes the whole block from its inputs."""
+
+
+def remat_block(block_cls, enabled: RematChoice, policy: str | None = 'dots'):
     """Optionally rematerialize a block class.
 
     Recomputing a block during the backward pass trades extra compute for a
@@ -317,6 +323,8 @@ def remat_block(block_cls, enabled: bool, policy: str | None = 'dots'):
     """
     if not enabled:
         return block_cls
+    if enabled == 'full':
+        policy = None
     names = list(inspect.signature(block_cls.__call__).parameters)
     return nn.remat(
         block_cls,
