@@ -22,6 +22,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 
@@ -515,3 +516,142 @@ def test_no_matmul_is_wider_than_one_tile():
         "a tile's VJP formed the full head gradient"
     oversized = [shape for shape in shapes if math.prod(shape) > math.prod(RAGGED)]
     assert not oversized, f"matmuls larger than one {RAGGED} tile: {oversized}"
+
+
+# --- a production vocabulary against float64 ---------------------------------
+
+# Gemma's 262,144 columns. What changes with the width is the length of the
+# reductions: the partition sums 262,144 exponentials and the hidden
+# gradient 262,144 products. The worst-case bound for such a sum, (V - 1) u,
+# is 1.6e-2 and says nothing, so the bounds here are Higham and Mary's
+# probabilistic ones ("A New Approach to Probabilistic Rounding Error
+# Analysis", SIAM J. Sci. Comput. 41(5), 2019, theorem 3.1): a sum of n
+# terms rounded independently in fp32 is off by at most lambda sqrt(n) u
+# times the sum of its absolute terms, except with probability
+# 2 exp(-lambda^2 / 2), which lambda = 6 puts at 3e-8 a sum.
+GEMMA_VOCAB = 262_144
+LAMBDA = 6.0
+U32 = 2.0 ** -24
+
+
+def float64_cross_entropy(hidden, head, targets, weights, softcap):
+    """Losses, log partitions and both gradients of `sum(weights * losses)`,
+    in NumPy float64, with the sums of absolute terms the bounds scale."""
+    hidden, head = np.asarray(hidden, np.float64), np.asarray(head, np.float64)
+    weights, targets = np.asarray(weights, np.float64), np.asarray(targets)
+    scores = hidden @ head
+    magnitude = np.abs(hidden) @ np.abs(head)
+    logits, slope = scores, np.ones_like(scores)
+    if softcap is not None:
+        logits = softcap * np.tanh(scores / softcap)
+        slope = 1 - np.tanh(scores / softcap) ** 2
+    peak = logits.max(-1, keepdims=True)
+    log_z = (peak + np.log(np.exp(logits - peak).sum(-1, keepdims=True)))[:, 0]
+    rows = np.arange(len(targets))
+    losses = log_z - logits[rows, targets]
+    probabilities = np.exp(logits - log_z[:, None])
+    residual = probabilities.copy()
+    residual[rows, targets] -= 1
+    cotangent = weights[:, None] * residual * slope
+    return {"losses": losses, "log_z": log_z, "hidden": cotangent @ head.T,
+            "head": hidden.T @ cotangent, "magnitude": magnitude, "logits": logits,
+            "probabilities": probabilities, "residual": residual, "slope": slope}
+
+
+def float64_bounds(hidden, head, weights, exact, chunks=None):
+    """The fp32 bound on every loss and gradient entry.
+
+    A logit is a dot over F features, so it is off by at most
+    lambda sqrt(F) u of its absolute terms, plus 3 u of itself through a
+    softcap's divide, tanh and multiply; the largest of a row's is E. The
+    partition's exponentials are each off by |dz| + 2 u relative, and their
+    sum by lambda sqrt(V) u relative more, so log Z is off by at most
+    E + (lambda sqrt(V) + 4) u + C u |log Z|, where C counts the roundings
+    of log Z itself: one for the whole row, one per chunk for the chunked
+    loop, whose logaddexp rounds the running log Z at every chunk (observed:
+    the log Z error grows from 1.0e-06 unchunked to 2.9e-06 at 16 chunks, on
+    log Z near 17, where u |log Z| is 1.0e-06). A loss is off by that plus its target
+    logit's error. A probability exp(z - log Z) carries the same E + log Z
+    error plus 2 u relative, and the gradients sum weight * (p - onehot)
+    against the head over V columns and against the states over T tokens.
+    """
+    hidden, head = np.asarray(hidden, np.float64), np.asarray(head, np.float64)
+    weights = np.abs(np.asarray(weights, np.float64))
+    features, vocab = head.shape
+    tokens = hidden.shape[0]
+    logit_error = LAMBDA * np.sqrt(features) * U32 * exact["magnitude"] + 3 * U32 * np.abs(exact["logits"])
+    largest = logit_error.max(-1)
+    z_error = largest + (LAMBDA * np.sqrt(vocab) + 4) * U32 + (chunks or 1) * U32 * np.abs(exact["log_z"])
+    probability_error = (largest + z_error + 2 * U32)[:, None] * exact["probabilities"]
+    spread = weights[:, None] * exact["slope"]
+    gradient_error = spread * probability_error
+    terms = spread * np.abs(exact["residual"])
+    return {
+        "losses": z_error + largest + U32 * np.abs(exact["losses"]),
+        "log_z": z_error,
+        "hidden": (gradient_error @ np.abs(head).T
+                   + LAMBDA * np.sqrt(vocab) * U32 * (terms @ np.abs(head).T)),
+        "head": (np.abs(hidden).T @ gradient_error
+                 + LAMBDA * np.sqrt(tokens) * U32 * (np.abs(hidden).T @ terms)),
+    }
+
+
+@pytest.fixture(scope="module")
+def gemma_vocabulary():
+    keys = jax.random.split(jax.random.PRNGKey(7), 4)
+    tokens, features = 32, 64
+    hidden = jax.random.normal(keys[0], (tokens, features), jnp.float32)
+    # Logits of standard deviation 3, so the partition is carried by a few
+    # hundred columns scattered over every chunk rather than by all of them
+    # equally or by one.
+    head = 3 / np.sqrt(features) * jax.random.normal(keys[1], (features, GEMMA_VOCAB), jnp.float32)
+    targets = jax.random.randint(keys[2], (tokens,), 0, GEMMA_VOCAB)
+    weights = jax.random.uniform(keys[3], (tokens,), jnp.float32, 0.5, 1.5)
+    return hidden, head, targets, weights
+
+
+def fp32_cross_entropy(hidden, head, targets, weights, softcap, chunks):
+    """Losses, log partitions and both gradients from the chunked head, or
+    with `chunks` None from the full-vocabulary pass it replaced."""
+    def run(states, matrix):
+        if chunks is None:
+            losses, log_z = oracle(states, matrix, targets, softcap)
+        else:
+            losses, _, log_z = chunked_cross_entropy(states, matrix, targets, chunks, softcap=softcap)
+        return jnp.sum(weights * losses), (losses, log_z)
+
+    (_, (losses, log_z)), (d_hidden, d_head) = jax.jit(
+        jax.value_and_grad(run, argnums=(0, 1), has_aux=True))(hidden, head)
+    return {"losses": losses, "log_z": log_z, "hidden": d_hidden, "head": d_head}
+
+
+@pytest.mark.parametrize("softcap", [None, 30.0], ids=["plain", "softcap-30"])
+@pytest.mark.parametrize("chunks", [None, 4, 16], ids=["unchunked", "4-chunks", "16-chunks"])
+def test_a_gemma_sized_vocabulary_is_within_fp32_rounding_of_float64(gemma_vocabulary, chunks, softcap):
+    """Losses, log partitions and the gradients of both the states and the
+    head, chunked and unchunked, every entry inside its bound. Observed at
+    most 1.2e-2 of the bound on log Z and the losses (errors 1.0e-06 to
+    3.4e-06), 5.5e-3 on the states' gradient and 0.23 on the head's."""
+    hidden, head, targets, weights = gemma_vocabulary
+    exact = float64_cross_entropy(hidden, head, targets, weights, softcap)
+    bounds = float64_bounds(hidden, head, weights, exact, chunks)
+
+    actual = fp32_cross_entropy(hidden, head, targets, weights, softcap, chunks)
+
+    for name, value in actual.items():
+        error = np.abs(np.asarray(value, np.float64) - exact[name])
+        assert np.all(error <= bounds[name]), (name, float(np.max(error / bounds[name])))
+
+
+def test_the_gemma_bound_is_tighter_than_a_dropped_chunk(gemma_vocabulary):
+    """The loss bound has to reject the mutation a chunk loop invites: the
+    partition without its last of 16 chunks moves every loss by more than
+    the bound admits."""
+    hidden, head, targets, weights = gemma_vocabulary
+    exact = float64_cross_entropy(hidden, head, targets, weights, None)
+    bounds = float64_bounds(hidden, head, weights, exact, 16)
+    first, last = vocabulary_chunks(GEMMA_VOCAB, 16)[-1]
+    kept = np.delete(exact["logits"], np.s_[first:last], axis=-1)
+    peak = kept.max(-1, keepdims=True)
+    partial = (peak + np.log(np.exp(kept - peak).sum(-1, keepdims=True)))[:, 0]
+    assert np.all(np.abs(partial - exact["log_z"]) > bounds["log_z"])
