@@ -952,7 +952,7 @@ def refuse_reference_only_arguments(implementation, query, dtype, precision,
 
 
 def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
-                    softcap=None, sinks=None, segment_ids=None):
+                    softcap, sinks, segment_ids):
     """Run the fused kernel `implementation` names, at the query's head width.
 
     Every fused kernel runs one head width for the keys and the values, so a
