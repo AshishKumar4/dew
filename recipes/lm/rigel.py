@@ -1,10 +1,13 @@
 """Rigel: a hybrid Mamba-2 + GQA base model with 128-expert top-2 MoE on every
 layer, reconstructed from the Rigel blog post and lm-engine 45b6b57b.
 
-    python recipes/lm/rigel.py --corpora web=data/web code=data/code ... \\
-        [LmRunConfig flags, e.g. --trainer.checkpoint-dir runs/rigel]
-    python recipes/lm/rigel.py --width 256 --corpora web=data/web --steps 2000 \\
-        --batch-size 32 --seq-len 1024    # a muP proxy on one corpus
+    python recipes/lm/rigel.py --corpora web data/web code data/code \\
+        --trainer.checkpoint-dir runs/rigel
+    python recipes/lm/rigel.py --width 256 --corpora web data/web --steps 2000 \\
+        --batch-size 32 --seq-len 1024
+
+`--corpora` is name, directory pairs; the second line is a muP proxy on one
+corpus, and any `LmRunConfig` flag follows the recipe's own.
 
 The architecture reproduces the published parameter counts exactly at width
 1024 (2,345,567,552 total, 260,998,464 active non-embedding): 40 layers in
@@ -119,7 +122,8 @@ class RigelArgs:
     """What sizes a Rigel run; everything else is `LmRunConfig`'s."""
 
     corpora: dict[str, str]
-    """Rigel's corpus names to tokenized directories: web, code, math,
+    """Rigel's corpus names to tokenized directories, as name, directory
+    pairs (`--corpora web data/web code data/code`): web, code, math,
     multilingual, stem, nemotron_cc_v2, finepdf, other."""
     width: int = 1024
     steps: int = STEPS
