@@ -204,6 +204,16 @@ def test_oversampled_stragglers_are_cancelled_once_the_group_is_full():
     assert records[-1].groups == 2 and records[-1].cancelled == 2
 
 
+def test_a_spare_that_fails_after_its_group_filled_neither_abandons_nor_retries_it():
+    source = Scripted(lambda task, submission, sample, version: finished(
+        0.0, version, status=Status.INFRA_ERROR) if sample == 2 else finished(float(sample), version))
+    rollout, data, records = scheduler(source, ahead=0, oversample=1, max_attempts=1)
+    batch = rollout(State(0), next(iter(data.train())), None)
+    assert (records[-1].groups, records[-1].abandoned, records[-1].resubmitted) == (2, 0, {})
+    assert trained(batch)[0] == [0, 1, 2, 3]
+    assert source.submitted == [("1", 3, 0), ("2", 3, 0)]
+
+
 def test_a_straggler_is_waited_for_and_admitted_when_it_finishes():
     source = Scripted(lambda task, submission, sample, version: None if (task, sample) == ("2", 1) else finished(
         float(sample), version))

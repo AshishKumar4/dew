@@ -127,7 +127,7 @@ def task_ids(batch: Batch) -> list[Task]:
     return [Task(str(int(value))) for value in ids]
 
 
-@dataclass
+@dataclass(eq=False)
 class _Sample:
     index: int
     attempt: int
@@ -281,23 +281,29 @@ class RolloutScheduler:
         self._submit(group, [(sample.index, sample.attempt + 1)])
 
     def _harvest(self, entry: _Entry, group: _Group, updates: int, tally: _Tally) -> None:
-        """Move one group's finished rollouts into it, replacing what cannot be admitted."""
+        """Move one group's finished rollouts into it, replacing what cannot be admitted.
+
+        A group stops taking rollouts once it is full or abandoned; its
+        remaining samples are left for `_admit`'s final cancel.
+        """
         stale = [sample for sample in group.live
                  if not sample.future.done() and updates - sample.submitted > self.max_lag]
         if stale:
             tally.cancelled += len(stale)
             self._cancel(stale)
-        for sample in [sample for sample in group.live if any(sample is late for late in stale)
-                       or sample.future.done()]:
-            if group.abandoned:
+            group.live = [sample for sample in group.live if sample not in stale]
+        for sample in [sample for sample in group.live if sample.future.done()]:
+            if group.abandoned or len(group.done) >= self.groups:
                 return
             group.live.remove(sample)
-            if any(sample is late for late in stale):
-                self._replace(group, sample, "stale", tally)
-            elif sample.future.cancelled():
+            if sample.future.cancelled():
                 self._replace(group, sample, "cancelled", tally)
             else:
                 self._settle(entry, group, sample, sample.future.result(), updates, tally)
+        for sample in stale:
+            if group.abandoned or len(group.done) >= self.groups:
+                return
+            self._replace(group, sample, "stale", tally)
 
     def _settle(self, entry: _Entry, group: _Group, sample: _Sample, rollout: Rollout, updates: int,
                 tally: _Tally) -> None:
