@@ -22,6 +22,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
+from dew.nn.moe import gated_product
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.text_encoders import checkpoint_array
 from dew.registry import models
@@ -50,9 +51,7 @@ class SelfConditioning(nn.Module):
 
     def __call__(self, inputs_embeds, signal):
         normed = self.pre_norm(signal)
-        gated = self.down_proj(
-            jax.nn.gelu(self.gate_proj(normed), approximate=True)
-            * self.up_proj(normed))
+        gated = self.down_proj(gated_product('geglu')(self.gate_proj(normed), self.up_proj(normed)))
         return self.post_norm(inputs_embeds + gated)
 
 

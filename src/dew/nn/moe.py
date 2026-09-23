@@ -44,7 +44,7 @@ from .blocks import normal_kernel
 from .inputs import BATCH_AXES
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
-from .precision import rounded_operand
+from .precision import rounded_operand, rounded_to
 from .sharding import EXPERT_AXIS, FSDP_AXIS, SEQUENCE_AXIS, logical_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
@@ -605,17 +605,34 @@ GatedActivation = str | Situ
 
 
 def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array], jax.Array]:
-    """The product a gated MLP takes of its gate and up projections: silu
-    ('swiglu'), the tanh gelu ('geglu') or the erf gelu rounded once from
-    fp32 ('geglu_exact', `exact_gelu`) on the gate times up, or a `Situ`
-    over both halves."""
+    """The product a gated MLP takes of its gate and up projections, rounded
+    where torch rounds `act_fn(gate) * up`: the activation, silu ('swiglu'),
+    the tanh gelu ('geglu') or the erf gelu ('geglu_exact', `exact_gelu`),
+    runs in fp32 and rounds to the gate's dtype, and its product with up
+    rounds again. Every rounding is made in place (`rounded_to`), the
+    inputs' included, since a projection's fp32 sum can otherwise reach the
+    activation past its own cast: written as `activate(gate) * up` on bf16
+    values, jit left the roundings to XLA, and a third of Qwen3-0.6B's
+    products differed from transformers' by up to 2 ulp. fp32 and wider
+    compute round nowhere, so their product is `activate(gate) * up` as it
+    was. A `Situ` computes its own product."""
     if isinstance(activation, Situ):
         return activation
     gates = {'swiglu': nn.silu, 'geglu': functools.partial(nn.gelu, approximate=True), 'geglu_exact': exact_gelu}
     if activation not in gates:
         raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
     activate = gates[activation]
-    return lambda gate, up: activate(gate) * up
+
+    def product(gate: jax.Array, up: jax.Array) -> jax.Array:
+        dtype = jnp.result_type(gate, up)
+        if jnp.finfo(dtype).bits >= 32:
+            return activate(gate) * up
+        gate_fp32 = rounded_to(gate.astype(jnp.float32), gate.dtype)
+        up_fp32 = rounded_to(up.astype(jnp.float32), up.dtype)
+        activated = rounded_to(activate(gate_fp32), gate.dtype)
+        return rounded_to(activated * up_fp32, dtype).astype(dtype)
+
+    return product
 
 
 class ExpertLinear(nn.Module):
