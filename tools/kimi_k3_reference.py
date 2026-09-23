@@ -5,7 +5,8 @@ REVISION: configuration_kimi_k3.py, modeling_kimi_k3.py and
 modeling_kimi_linear.py, fetched at that revision into CACHE. Their KDA
 layers call fla-core's Triton kernels (chunk_kda, fused_recurrent_kda,
 ShortConvolution, FusedRMSNormGated), so this runs on a CUDA device, in fp32,
-with TRITON_F32_DEFAULT=ieee so no kernel rounds through TF32. The routed
+with TRITON_F32_DEFAULT=ieee for every dot that leaves its precision unset
+and IEEE forced on the one that sets it (the third item below). The routed
 experts are encoded by compressed-tensors' own MXFP4 compressor and the
 reference computes with its own decompression of them, so the packed file
 and the logits describe one model.
@@ -13,7 +14,7 @@ and the logits describe one model.
 Environment (~/.cache/dew/reference-venvs/kimi-k3): torch 2.8.0+cu128,
 transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1.
 
-Two things change how the reference runs, neither what it computes:
+Three things change how the reference runs, neither what it computes:
 
 - KimiLinearModel pins `flash_attention_2`; MLA runs the file's own
   `eager_attention_forward` instead (flash-attn is not installed).
@@ -21,6 +22,15 @@ Two things change how the reference runs, neither what it computes:
   cut the routed experts out of the backward pass; the gradient step calls
   the undecorated function. The gate asserts eval mode, so the model stays
   in eval mode, where nothing in the text model is stochastic.
+- fla-core 0.5.2's chunk_kda multiplies the blocks of each chunk's inverted
+  triangular system with `input_precision='tf32'` on any GPU that has TF32
+  (fla/ops/kda/chunk_intra.py:20-23 and 314-351), which TRITON_F32_DEFAULT
+  does not reach. `main` sets that constant to 'ieee', the value fla takes
+  on a GPU without TF32. At TF32 the logits of tokens early in one of the
+  kernel's 16-token sub-chunks missed a float64 forward by up to 1.3e-4,
+  five times the 2.3e-5 the IEEE run misses by. Triton keys its disk cache
+  on a kernel's source and not on the globals it reads, so these kernels
+  compile into a cache directory of their own, which no TF32 build can enter.
 
 The tiny config keeps the release's fields and layer pattern at small widths:
 7 layers, KDA on 1-3 and 5-6 and MLA on 4 and 7 (1-based, as the release
@@ -125,9 +135,14 @@ def mxfp4(weight: torch.Tensor):
 def main() -> None:
     if os.environ.get("TRITON_F32_DEFAULT") != "ieee":
         raise SystemExit("run with TRITON_F32_DEFAULT=ieee so fla's kernels keep fp32")
+    os.environ["TRITON_CACHE_DIR"] = str(CACHE / "triton-ieee")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     configuration, modeling, linear = remote_package()
+    from fla.ops.kda import chunk_intra
+    from triton.language import constexpr
+
+    chunk_intra.SOLVE_TRIL_DOT_PRECISION = constexpr("ieee")
     config = tiny_config()
     DESTINATION.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(3180)
