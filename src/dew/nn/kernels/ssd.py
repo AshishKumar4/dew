@@ -1,4 +1,4 @@
-"""The Mamba-2 chunked SSD scan as one Pallas kernel, for GPU and for TPU.
+"""The Mamba-2 chunked SSD scan as one Pallas kernel, for TPU.
 
 `dew.nn.mixers.mamba2.chunk_ssd` splits a sequence into chunks of `C` steps
 and, per batch element and head, runs
@@ -14,23 +14,18 @@ so every chunk's `[C, C]` segment sums, its `[C, C]` Gram matrix and its
 only `y`, the final state, and (when a gradient needs it) the state each chunk
 entered with.
 
-The two backends need different loop structures around the same chunk, which
-`_chunk_forward` and `_chunk_backward` hold:
-
-- Triton's grid is a parallel launch, so no program may depend on another's
-  state. The GPU kernel runs `grid=(batch, heads)` and carries the state
-  through a `fori_loop` over the chunks inside one program.
-- Mosaic's grid is ordered and a window it revisits survives a grid step, so
-  the TPU kernel runs `grid=(batch, heads, chunks)` with the chunk innermost
-  and the state in the output window the chunks share.
+Mosaic's grid is ordered and a window it revisits survives a grid step, so
+the kernel runs `grid=(batch, heads, chunks)` with the chunk innermost and the
+state in the output window the chunks share; `_chunk_forward` and
+`_chunk_backward` hold one chunk's work.
 
 The backward pass is the reverse recurrence, `dS_n = exp(acs_C-1) dS_n+1 +
 dy^T (C exp(acs))`, with each chunk's own gradients from the matrices the
 forward built. It is written by hand rather than left to autodiff, which
 would hold every intermediate of every chunk alive to the backward pass.
 
-The XLA path stays the oracle and the fallback: CPU takes it, and so does any
-geometry `ssd_kernel_runs` refuses. tests/test_ssd_kernel.py holds the kernel
+The XLA path stays the oracle and the fallback: GPU and CPU take it, and so
+does any geometry `ssd_kernel_runs` refuses. tests/test_ssd_kernel.py holds the kernel
 to `chunk_ssd` and to `jax.grad` of it.
 """
 
@@ -42,16 +37,13 @@ import logging
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu, triton as plgpu
-
-from .generation import filter_triton_deprecation
+from jax.experimental.pallas import tpu as pltpu
 
 _log = logging.getLogger(__name__)
 
 MIN_WIDTH = 8
 """The narrowest chunk, head width or state width the kernel is chosen for.
-Below it a tile is mostly padding: 8 is Mosaic's sublane count and the
-smallest block shape Triton lays out without splitting a warp's lanes."""
+Below it a tile is mostly padding: 8 is Mosaic's sublane count."""
 
 MIN_CHUNK = 64
 """The shortest chunk worth a program. The intra-chunk term is `C` times the
@@ -62,15 +54,6 @@ TPU_PROGRAM_WORDS = 1 << 20
 """The fp32 words one Mosaic program may hold, 4 MiB. Its operands live in VMEM,
 128 MiB of it per core, so what bounds the window here is the double buffering
 the pipeline runs around it rather than the window itself."""
-
-GPU_WARPS = 8
-"""256 threads per program. The widest tile is `[C, C]`, so the warps split
-its rows; 8 keeps a 128-row chunk at 16 rows per warp, the shape Triton's
-`dot` emits without a cross-warp reduction."""
-
-GPU_STAGES = 2
-"""A program's chunks carry state through each other, so two of them cannot
-run at once; the pipeline has only the next chunk's loads to overlap."""
 
 EXACT = jax.lax.Precision.HIGHEST
 """The precision of the two matmuls that build and unbuild the segment sums.
@@ -93,13 +76,10 @@ def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: st
     two so that Mosaic's tiling throws no lanes away, and a tile inside the
     per-program budget.
 
-    A GPU is never chosen. On an RTX 4080 (sm89, jax 0.11.2) the Triton
-    kernel ran 6x to 12x slower than the XLA path forward plus backward
-    wherever it compiled (chunk 64: 1.39 against 0.22 ms; at batch 8 and 16
-    heads 22.7 against 2.2 ms), and every chunk of 128 or 256 asked for
-    131 to 590 KB of shared memory against 101 KB (docs/performance.md).
-    `ssd_chunk_scan(..., 'gpu')` still builds it by name, which is how
-    tools/benchmark_ssd.py measures it.
+    A GPU takes the XLA path. A Triton port of this kernel ran 6x to 12x
+    slower than XLA on an RTX 4080 wherever it compiled, and every chunk of
+    128 or 256 overflowed shared memory (docs/performance.md); it was
+    removed.
 
     `chunk_ssd` asks this at trace time and takes the XLA path when it says
     no, the way attention's 'auto' asks `cudnn_runs`.
@@ -210,21 +190,6 @@ def _chunk_backward(x, b, c, a, state, dy, dnext):
     return dx, db, dc, da, dstate
 
 
-def _gpu_forward(x_ref, b_ref, c_ref, a_ref, state_ref, y_ref, final_ref, *saved,
-                 chunks: int):
-    """`grid=(batch, heads)`: every chunk of one head is this program's, and
-    the recurrence over them is a loop inside it."""
-    def chunk(index, carried):
-        for entered_ref in saved:
-            entered_ref[index] = carried
-        y, leaving = _chunk_forward(x_ref[index], b_ref[index], c_ref[index],
-                                    a_ref[index], carried)
-        y_ref[index] = y
-        return leaving
-
-    final_ref[...] = jax.lax.fori_loop(0, chunks, chunk, state_ref[...])
-
-
 def _tpu_forward(x_ref, b_ref, c_ref, a_ref, state_ref, y_ref, final_ref, *saved):
     """`grid=(batch, heads, chunks)` with the chunk innermost. `final_ref`'s
     window does not move with the chunk, so it carries the state as well as
@@ -236,20 +201,6 @@ def _tpu_forward(x_ref, b_ref, c_ref, a_ref, state_ref, y_ref, final_ref, *saved
     y, leaving = _chunk_forward(x_ref[...], b_ref[...], c_ref[...], a_ref[...], carried)
     y_ref[...] = y
     final_ref[...] = leaving
-
-
-def _gpu_backward(x_ref, b_ref, c_ref, a_ref, entered_ref, dy_ref, dfinal_ref,
-                  dx_ref, db_ref, dc_ref, da_ref, dstate_ref, *, chunks: int):
-    """`_gpu_forward` read backwards, the last chunk of a head first."""
-    def chunk(step, dnext):
-        index = chunks - 1 - step
-        dx, db, dc, da, dstate = _chunk_backward(
-            x_ref[index], b_ref[index], c_ref[index], a_ref[index],
-            entered_ref[index], dy_ref[index], dnext)
-        dx_ref[index], db_ref[index], dc_ref[index], da_ref[index] = dx, db, dc, da
-        return dstate
-
-    dstate_ref[...] = jax.lax.fori_loop(0, chunks, chunk, dfinal_ref[...])
 
 
 def _tpu_backward(x_ref, b_ref, c_ref, a_ref, entered_ref, dy_ref, dfinal_ref,
@@ -265,7 +216,7 @@ def _tpu_backward(x_ref, b_ref, c_ref, a_ref, entered_ref, dy_ref, dfinal_ref,
 
 
 def _specs(chunks: int, chunk_size: int, head_dim: int, state_size: int, *,
-           whole: bool, reverse: bool = False):
+           reverse: bool = False):
     """The block specs of the arrays a chunk reads or writes, in the kernel's
     own layout: `[B, H, NC, C, P]` for `x` and `y`, `[B, H, NC, C, N]` for `b`
     and `c`, `[B, H, NC, 1, C]` for `a`, `[B, H, NC, P, N]` for the state each
@@ -274,15 +225,10 @@ def _specs(chunks: int, chunk_size: int, head_dim: int, state_size: int, *,
 
     Mosaic blocks the last two dimensions or nothing, which is what puts the
     heads ahead of the chunks here rather than in the layout `chunk_ssd`
-    builds. `whole` gives one program every chunk at once, the grid the GPU
-    kernel loops over; otherwise a program holds one chunk and the grid counts
-    them, backwards when `reverse`.
+    builds. A program holds one chunk and the grid counts them, backwards
+    when `reverse`.
     """
-    leading = chunks if whole else None
-
     def position(grid: tuple[int, ...]) -> tuple[int, int, int]:
-        if whole:
-            return grid[0], grid[1], 0
         return grid[0], grid[1], chunks - 1 - grid[2] if reverse else grid[2]
 
     def over_chunk(*grid):
@@ -293,11 +239,11 @@ def _specs(chunks: int, chunk_size: int, head_dim: int, state_size: int, *,
         batch, head, _ = position(grid)
         return batch, head, 0, 0
 
-    return (pl.BlockSpec((None, None, leading, chunk_size, head_dim), over_chunk),
-            pl.BlockSpec((None, None, leading, chunk_size, state_size), over_chunk),
-            pl.BlockSpec((None, None, leading, chunk_size, state_size), over_chunk),
-            pl.BlockSpec((None, None, leading, None, chunk_size), over_chunk),
-            pl.BlockSpec((None, None, leading, head_dim, state_size), over_chunk),
+    return (pl.BlockSpec((None, None, None, chunk_size, head_dim), over_chunk),
+            pl.BlockSpec((None, None, None, chunk_size, state_size), over_chunk),
+            pl.BlockSpec((None, None, None, chunk_size, state_size), over_chunk),
+            pl.BlockSpec((None, None, None, None, chunk_size), over_chunk),
+            pl.BlockSpec((None, None, None, head_dim, state_size), over_chunk),
             pl.BlockSpec((None, None, head_dim, state_size), over_carry))
 
 
@@ -320,13 +266,8 @@ def _interpreting(platform: str) -> bool:
 
 
 def _call(body, platform: str, grid: tuple[int, ...], in_specs, out_specs, out_shape):
-    """One `pallas_call` built for the backend `platform` names."""
-    if platform == 'gpu':
-        filter_triton_deprecation()
-        params = plgpu.CompilerParams(num_warps=GPU_WARPS, num_stages=GPU_STAGES)
-    else:
-        params = pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel", "arbitrary"))
+    """One Mosaic `pallas_call`, interpreted where the process holds no TPU."""
+    params = pltpu.CompilerParams(dimension_semantics=("parallel", "parallel", "arbitrary"))
     return pl.pallas_call(body, grid=grid, in_specs=list(in_specs), out_specs=list(out_specs),
                           out_shape=out_shape, compiler_params=params,
                           interpret=_interpreting(platform))
@@ -338,9 +279,8 @@ def _forward(x_c, b_c, c_c, a_c, state, platform: str, *, keep_entered: bool):
     entered with, which is the residual the backward pass reads."""
     chunks, batch, chunk_size, heads, head_dim = x_c.shape
     state_size = b_c.shape[-1]
-    whole = platform == 'gpu'
     x_spec, b_spec, c_spec, a_spec, entered_spec, carry_spec = _specs(
-        chunks, chunk_size, head_dim, state_size, whole=whole)
+        chunks, chunk_size, head_dim, state_size)
     laid_out = (batch, heads, chunks, chunk_size, head_dim)
     out_shape = [jax.ShapeDtypeStruct(laid_out, jnp.float32),
                  jax.ShapeDtypeStruct(state.shape, jnp.float32)]
@@ -349,8 +289,7 @@ def _forward(x_c, b_c, c_c, a_c, state, platform: str, *, keep_entered: bool):
         out_shape.append(jax.ShapeDtypeStruct((batch, heads, chunks, head_dim, state_size),
                                               jnp.float32))
         out_specs.append(entered_spec)
-    body = functools.partial(_gpu_forward, chunks=chunks) if whole else _tpu_forward
-    run = _call(body, platform, (batch, heads) if whole else (batch, heads, chunks),
+    run = _call(_tpu_forward, platform, (batch, heads, chunks),
                 (x_spec, b_spec, c_spec, a_spec, carry_spec), out_specs, out_shape)
     y, final, *entered = run(_heads_first(x_c), _heads_first(b_c), _heads_first(c_c),
                              jnp.transpose(a_c, (1, 2, 0, 3))[:, :, :, None, :], state)
@@ -361,16 +300,14 @@ def _backward(x_c, b_c, c_c, a_c, entered, dy, dfinal, platform: str):
     """The backward kernel, one reverse pass over the same blocks."""
     chunks, batch, chunk_size, heads, head_dim = x_c.shape
     state_size = b_c.shape[-1]
-    whole = platform == 'gpu'
     x_spec, b_spec, c_spec, a_spec, entered_spec, carry_spec = _specs(
-        chunks, chunk_size, head_dim, state_size, whole=whole, reverse=not whole)
+        chunks, chunk_size, head_dim, state_size, reverse=True)
     widths = (head_dim, state_size, state_size)
     out_shape = [jax.ShapeDtypeStruct((batch, heads, chunks, chunk_size, width), jnp.float32)
                  for width in widths]
     out_shape.append(jax.ShapeDtypeStruct((batch, heads, chunks, 1, chunk_size), jnp.float32))
     out_shape.append(jax.ShapeDtypeStruct(dfinal.shape, jnp.float32))
-    body = functools.partial(_gpu_backward, chunks=chunks) if whole else _tpu_backward
-    run = _call(body, platform, (batch, heads) if whole else (batch, heads, chunks),
+    run = _call(_tpu_backward, platform, (batch, heads, chunks),
                 (x_spec, b_spec, c_spec, a_spec, entered_spec, x_spec, carry_spec),
                 (x_spec, b_spec, c_spec, a_spec, carry_spec), out_shape)
     dx, db, dc, da, dstate = run(
