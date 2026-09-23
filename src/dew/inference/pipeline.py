@@ -147,6 +147,8 @@ def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) ->
 class RunTokenizer(Protocol):
     """Declares what a run's tokenizer offers, as `ByteTokenizer` and `HFTokenizer` do."""
 
+    @property
+    def bos_id(self) -> int | None: ...
 
     def encode(self, text: str) -> list[int]: ...
 
@@ -173,3 +175,8 @@ class RunProcessor:
 
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
         return [self.tokenizer.decode(row) for row in np.asarray(tokens)]
+
+    @property
+    def bos_id(self) -> int | None:
+        """The id the run's tokenizer starts a sequence with, or None."""
+        return self.tokenizer.bos_id

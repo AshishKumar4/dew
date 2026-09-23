@@ -167,6 +167,17 @@ class DewLM(TemplateLM):
         return stops if isinstance(stops, int) else (stops[0] if stops else 0)
 
     @property
+    def prefix_token_id(self) -> int:
+        """Return the id a first token is conditioned on: the tokenizer's BOS, else EOS.
+
+        This is `HFLM.prefix_token_id`. A vocabulary that starts every
+        sequence with BOS scores its first token after BOS, and conditioning
+        it on EOS instead would move every rolling and empty-context score.
+        """
+        bos = self._processor.bos_id
+        return self.eot_token_id if bos is None else bos
+
+    @property
     def max_length(self) -> int:
         """Return how many ids one scoring row may hold, as the model declares it.
 
