@@ -58,14 +58,14 @@ def _take(grid):
     return np.stack([grid[s // 2, (s % 2) * CHAIN + 1:(s % 2 + 1) * CHAIN] for s in range(4)])
 
 
-def _batch(reference, rollouts):
+def _batch(reference, rollouts, proximal=True):
     mask = reference["mask"]
     counts = {}
     for sequence, rollout in enumerate(rollouts):
         counts[rollout] = counts.get(rollout, 0) + mask[sequence].sum()
     weights = np.stack([mask[s] / counts[rollouts[s]] for s in range(4)])
     segments = np.repeat([[1] * CHAIN + [2] * CHAIN], 2, axis=0).astype(np.int32)
-    return {
+    batch = {
         IDS_KEY: np.ones((2, WIDTH), np.int32), SEGMENT_IDS_KEY: segments,
         POSITIONS_KEY: np.tile(np.arange(CHAIN, dtype=np.int32), (2, 2)),
         RESPONSE_MASK_KEY: _place(mask), OLD_LOG_PROBS_KEY: _place(reference["old"]),
@@ -73,6 +73,9 @@ def _batch(reference, rollouts):
         ADVANTAGES_KEY: _place(np.repeat(reference["advantages"][:, None], 6, axis=1)),
         SESSION_WEIGHTS_KEY: _place(weights.astype(np.float32)),
     }
+    if not proximal:
+        batch.pop(OLD_LOG_PROBS_KEY)
+    return batch
 
 
 class Fixed(GRPOObjective):
@@ -90,9 +93,11 @@ def _objective(reference, **options):
                  dual_clip=float(reference["dual_clip"]), **options)
 
 
-def _run(reference, rollouts=("a", "b", "c", "d"), **options):
+def _run(reference, rollouts=("a", "b", "c", "d"), proximal=True, mask=None, **options):
     objective = _objective(reference, **options)
-    batch = _batch(reference, list(rollouts))
+    batch = _batch(reference, list(rollouts), proximal)
+    if mask is not None:
+        batch[RESPONSE_MASK_KEY] = _place(mask)
     step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
 
     def scalar(current):
@@ -143,6 +148,23 @@ def test_token_corrections_match_verl_rollout_correction(reference):
     assert metrics["masked/band"] == pytest.approx(float(reference["band_oob"]), abs=1e-6)
     assert metrics["mismatch/kl"] == pytest.approx(float(reference["offpolicy_kl"]), abs=1e-6)
     assert metrics["mismatch/k3_kl"] == pytest.approx(float(reference["offpolicy_k3_kl"]), abs=1e-6)
+
+
+def test_the_bypass_band_masks_tokens_and_weighs_none(reference):
+    """Without old_log_probs the band is verl's bypass-mode token rejection
+    (token_k1 on current against behavior, no IS weight): the loss equals
+    the plain loss with the out-of-band tokens dropped from the mask. A band
+    that also multiplied its weight in would count the correction twice."""
+    band = tuple(float(value) for value in reference["band"])
+    kept = reference["bypass_band_mask"]
+    assert (kept < reference["mask"]).any(), "the fixture puts a token outside the band"
+    loss, grad, metrics = _run(reference, proximal=False, behavior_importance=band)
+    _check(reference, "ppo_bypass_band_token", loss, grad)
+    plain, plain_grad, _ = _run(reference, proximal=False, mask=kept)
+    assert loss == pytest.approx(plain, abs=TOLERANCE)
+    np.testing.assert_allclose(grad, plain_grad, atol=TOLERANCE)
+    expected = ((reference["mask"] - kept).sum() / reference["mask"].sum())
+    assert metrics["masked/band"] == pytest.approx(expected, abs=1e-6)
 
 
 @pytest.mark.parametrize("name", ["sequence", "geometric"])
