@@ -149,6 +149,16 @@ def collect(rollout, state, key=23):
     return rollout.collect(state, {"task_id": np.array([31], np.int32)}, jax.random.key(key))
 
 
+def per_call(batch, name, episodes):
+    """A packed column read back one `[TURNS * RESPONSE]`-wide row per call, in draw order."""
+    out = np.zeros((len(episodes) * TURNS, RESPONSE), np.asarray(batch[name]).dtype)
+    for index, episode in enumerate(episodes):
+        for turn, transition in enumerate(episode.transitions):
+            where = (batch["rollout_index"] == index) & (batch["call_index"] == turn)
+            out[index * TURNS + turn, :len(transition.action.tokens)] = np.asarray(batch[name])[where]
+    return out
+
+
 def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targets():
     harness = Harness()
     trainer, rollout = build(harness)
@@ -161,16 +171,19 @@ def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targe
     assert len(harness.calls) == GROUPS
     assert {episode.reward for episode in episodes} == {0., 1.}
     table = transition_logits()
-    expected = np.zeros_like(batch["old_log_probs"])
+    expected = np.zeros((len(episodes) * TURNS, RESPONSE), np.float32)
     for index, episode in enumerate(episodes):
         assert episode.status == EpisodeStatus.COMPLETED
         assert len(episode.transitions) == 2
+        # The tool's context extends the call's context and actions, so the
+        # two calls merge into one chain holding the second call's context.
+        second = episode.transitions[1].action
+        chain = batch["input_ids"][batch["rollout_index"] == index]
+        np.testing.assert_array_equal(chain, (*second.context, *second.tokens))
         for turn, transition in enumerate(episode.transitions):
             action = transition.action
             row = index * TURNS + turn
             assert action.terminated and len(action.tokens) == 2
-            assert batch["prompt_length"][row] == len(action.context)
-            np.testing.assert_array_equal(batch["input_ids"][row, PROMPT - len(action.context):PROMPT], action.context)
             context = list(action.context)
             for position, token in enumerate(action.tokens):
                 logits = table[context[-1]]
@@ -182,20 +195,16 @@ def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targe
                 np.testing.assert_allclose(action.raw_log_probs[position], raw, atol=2e-6)
                 np.testing.assert_allclose(action.behavior_log_probs[position], behavior, atol=2e-6)
                 context.append(token)
-        np.testing.assert_array_equal(batch["response_mask"][index * TURNS:(index + 1) * TURNS],
-                                      [[1, 1, 0], [1, 1, 0], [0, 0, 0]])
-    np.testing.assert_allclose(batch["old_log_probs"], expected, atol=2e-6)
+    np.testing.assert_allclose(per_call(batch, "old_log_probs", episodes), expected, atol=2e-6)
     assert np.max(np.abs(batch["old_log_probs"] - batch["behavior_log_probs"])) > .01
-    targets = batch["input_ids"][:, PROMPT:][batch["response_mask"].astype(bool)]
+    targets = batch["input_ids"][batch["response_mask"].astype(bool)]
     assert NINE not in targets and SIXTEEN not in targets
+    assert batch["response_mask"].sum() == sum(len(turn.action.tokens) for e in episodes for turn in e.transitions)
 
-    # Ordinary GRPO rescoring sees the exact contexts that produced the actions.
+    # Packed GRPO rescoring sees the exact contexts that produced the actions.
     assert isinstance(trainer.objective, GRPOObjective)
-    raw = trainer.objective.per_token_log_probs(
-        state.params, jnp.asarray(batch["input_ids"]),
-        left_padding=jnp.asarray(PROMPT - batch["prompt_length"]))[:, PROMPT - 1:]
-    np.testing.assert_allclose(np.asarray(raw)[batch["response_mask"].astype(bool)],
-                               expected[batch["response_mask"].astype(bool)], atol=2e-6)
+    raw = np.asarray(trainer.objective.packed_log_probs(state.params, batch))
+    np.testing.assert_allclose(raw, batch["old_log_probs"], atol=2e-6)
 
 
 def test_grpo_gradient_matches_action_only_categorical_reference():

@@ -4,13 +4,13 @@ A `GRPOObjective` is an `LMObjective` whose loss is the section 6
 composition from `dew.rl`: a clipped policy surrogate plus `beta` times the
 k3 KL against the frozen reference. It reads one of two batch layouts.
 
-- The windowed layout `SampledRollout` and `AsyncRollout` build: each row
+- The windowed layout `SampledRollout` builds: each row
   is `[left-padded prompt | response]`, and `old_log_probs`, `advantages`
   and `response_mask` are response-width.
 - The packed layout `rollouts.pack` builds: rows of strictly merged chains
   with `text_segment_ids` and `text_positions`, every column `[rows, width]`
-  and aligned with `input_ids`. `behavior_log_probs` is required there and
-  stands in for `old_log_probs` when no proximal rescoring supplied one.
+  and aligned with `input_ids`. `behavior_log_probs` stands in for
+  `old_log_probs` when no proximal rescoring supplied one.
 
 The reference is the objective's own frozen tree, `step.ema` at unit decay,
 rescored only when `beta` is positive. Validation scores the prompts' own
@@ -210,7 +210,8 @@ class GRPOObjective(LMObjective):
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         for key in (SEGMENT_IDS_KEY, POSITIONS_KEY, RESPONSE_MASK_KEY):
             if jnp.shape(batch[key]) != ids.shape:
-                raise ValueError(f"{key} {jnp.shape(batch[key])} aligns with {IDS_KEY} {ids.shape}")
+                raise ValueError(f"{key} has shape {jnp.shape(batch[key])}; a packed column has "
+                                 f"the shape of {IDS_KEY}, {ids.shape}")
         scores = self.token_scores(params, ids, segment_ids=segments,
                                    positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32))
         scored = jnp.concatenate([jnp.zeros((ids.shape[0], 1), jnp.float32),
@@ -218,18 +219,28 @@ class GRPOObjective(LMObjective):
         return jnp.where(mask != 0, scored, 0.0)
 
     def _packed_terms(self, params, batch) -> _Terms:
-        """Read a packed batch onto its own `[rows, width]` grid."""
-        for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY):
-            if key not in batch:
-                raise ValueError(f"a packed GRPO batch carries {key}; the batch has {sorted(batch)}")
+        """Read a packed batch onto its own `[rows, width]` grid.
+
+        The proximal policy is `old_log_probs` when a rescoring or the
+        sampler supplied it, and the recorded behavior otherwise, so one of
+        the two is required.
+        """
+        if ADVANTAGES_KEY not in batch:
+            raise ValueError(f"a packed GRPO batch carries {ADVANTAGES_KEY}; the batch has {sorted(batch)}")
+        if OLD_LOG_PROBS_KEY not in batch and BEHAVIOR_LOG_PROBS_KEY not in batch:
+            raise ValueError(f"a packed GRPO batch carries {BEHAVIOR_LOG_PROBS_KEY} or {OLD_LOG_PROBS_KEY}; "
+                             f"the batch has {sorted(batch)}")
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY], jnp.float32)
-        behavior = jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], jnp.float32)
-        proximal = OLD_LOG_PROBS_KEY in batch
-        old = jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32) if proximal else behavior
-        weights = batch.get(ROLLOUT_WEIGHTS_KEY)
         for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY, ROLLOUT_WEIGHTS_KEY):
             if key in batch and jnp.shape(batch[key]) != mask.shape:
-                raise ValueError(f"{key} {jnp.shape(batch[key])} aligns with {IDS_KEY} {mask.shape}")
+                raise ValueError(f"{key} has shape {jnp.shape(batch[key])}; a packed column has "
+                                 f"the shape of {IDS_KEY}, {mask.shape}")
+        behavior = (jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], jnp.float32)
+                    if BEHAVIOR_LOG_PROBS_KEY in batch else None)
+        proximal = OLD_LOG_PROBS_KEY in batch
+        old = jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32) if proximal else behavior
+        assert old is not None
+        weights = batch.get(ROLLOUT_WEIGHTS_KEY)
         return _Terms(self.packed_log_probs(params, batch), old, behavior,
                       jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32), mask,
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),

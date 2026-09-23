@@ -24,6 +24,7 @@ from .episodes import (
                        RecoverableEnvironment,
                        Transition,
                        Verifier,
+                       rollout_of,
 )
 from .fleet import ContainerRunner, Outcome, ProcessRunner, Program, Runner, SandboxFleet, Verdict
 from .flow import FlowGRPOObjective, FlowReward, FlowRollout
@@ -52,4 +53,4 @@ __all__ = ["ADVANTAGES_KEY", "IDS_KEY", "OLD_LOG_PROBS_KEY", "POLICY_VERSION_KEY
            "FlowRollout", "GRPOObjective", "MathReward", "Observation", "Outcome", "PPOObjective", "PPORollout",
            "ProcessRunner", "Program", "RecoverableEnvironment", "Reward", "Rollout", "RolloutRecord", "RolloutSource", "Runner",
            "SampledRollout", "SandboxFleet", "SandboxLimits", "Status", "SubprocessEnvironment",
-           "Task", "Transition", "ValueHead", "Verdict", "Verifier", "code_block", "pack"]
+           "Task", "Transition", "ValueHead", "Verdict", "Verifier", "code_block", "pack", "rollout_of"]

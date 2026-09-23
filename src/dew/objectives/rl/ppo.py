@@ -13,13 +13,12 @@ from flax import linen as nn
 from jax.experimental import multihost_utils
 
 from dew.artifacts import agreed
-from dew.data.prompts import LENGTH_KEY
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables, mean_loss
-from dew.objectives.lm.objective import _shift_rows
 from dew.registry import objectives
 from dew.rl import gae
+from dew.rl.advantage import MEAN_EPS, WHITEN_EPS
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
 from dew.training.distributed import shard_batch
@@ -27,7 +26,8 @@ from dew.training.state import TrainState
 
 from .episodes import EpisodeInference, EpisodeRollout
 from .grpo import GRPOObjective
-from .rollout import ADVANTAGES_KEY, IDS_KEY, RESPONSE_MASK_KEY, REWARDS_KEY
+from .rollout import ADVANTAGES_KEY, IDS_KEY, RESPONSE_MASK_KEY
+from .rollouts import CALL_INDEX_KEY, POSITIONS_KEY, ROLLOUT_INDEX_KEY, SEGMENT_IDS_KEY
 
 OLD_VALUES_KEY = "old_values"
 RETURNS_KEY = "returns"
@@ -35,17 +35,23 @@ RETURNS_KEY = "returns"
 
 class ValueBackbone(Protocol):
     def hidden_states(self, tokens: jax.Array, train: bool = False, *,
-                      attention_mask: jax.Array | None = None) -> jax.Array: ...
+                      segment_ids: jax.Array | None = None,
+                      positions: jax.Array | None = None) -> jax.Array: ...
 
 
 class ValueHead(nn.Module):
-    """Project a decoder's hidden states to one float32 value per position."""
+    """Project a decoder's hidden states to one float32 value per position.
+
+    Packed rows pass their chains' `segment_ids` and `positions`, so no
+    state reads another chain.
+    """
 
     backbone: ValueBackbone
 
     @nn.compact
-    def __call__(self, tokens: jax.Array, *, attention_mask: jax.Array | None = None) -> jax.Array:
-        hidden = self.backbone.hidden_states(tokens, train=False, attention_mask=attention_mask)
+    def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,
+                 positions: jax.Array | None = None) -> jax.Array:
+        hidden = self.backbone.hidden_states(tokens, train=False, segment_ids=segment_ids, positions=positions)
         return nn.Dense(1, dtype=jnp.float32, name="value")(hidden)[..., 0]
 
 
@@ -88,8 +94,9 @@ class PPOObjective(Objective[Mean, Variables]):
     the ordinary Trainer. The unit-decay reference selects only policy leaves.
     Rollout targets are detached. beta and policy clip controls are GRPO's
     existing composition; value_coefficient weights verl's half-squared,
-    clipped value error. A critic consumes token rows and attention_mask and
-    returns [B, T] values; ValueHead supplies that interface for a decoder.
+    clipped value error. A critic consumes packed token rows with their
+    segment_ids and positions and returns [B, T] values; ValueHead supplies
+    that interface for a decoder.
     """
 
     _ema_is_reference = True
@@ -99,6 +106,10 @@ class PPOObjective(Objective[Mean, Variables]):
         for name, value in (("value_coefficient", value_coefficient), ("value_clip", value_clip)):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
+        if (policy_options.get("aggregation", "token-mean") != "token-mean"
+                or any(policy_options.get(name) is not None for name in ("sequence_mask", "geometric_mask"))):
+            raise ValueError("the critic shares the actor's token mass, so PPO keeps token-mean "
+                             "aggregation and no sequence masks")
         self.actor = GRPOObjective(model, seq_len, **policy_options)
         self.critic, self.seq_len = critic, seq_len
         self.value_coefficient, self.value_clip = value_coefficient, value_clip
@@ -131,22 +142,20 @@ class PPOObjective(Objective[Mean, Variables]):
         return self.actor.pipeline(actor_state, ema=ema, processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
-        """Score the states before each response action, with left padding removed."""
+        """Score the state before each packed id, `[rows, width]` aligned with `input_ids`.
+
+        Entry t is the critic's value of the chain prefix that predicts id
+        t, the state its action was taken from; chain starts and padding,
+        which no action follows, are zero.
+        """
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
-        mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
-        start = ids.shape[1] - mask.shape[1] - 1
-        lengths = LENGTH_KEY in batch
-        padding = (start + 1 - jnp.asarray(batch[LENGTH_KEY], jnp.int32) if lengths
-                   else jnp.zeros(ids.shape[0], jnp.int32))
-        aligned = _shift_rows(ids, padding)[:, :-1]
-        # A rollout without lengths padded nothing, so every slot is real and
-        # the critic reads the rows with no validity at all.
-        valid = (jnp.arange(aligned.shape[1])[None, :] < aligned.shape[1] - padding[:, None]
-                 if lengths else None)
-        values = self.critic.apply(_part(variables, "critic"), aligned, attention_mask=valid)
-        if not isinstance(values, jax.Array) or values.shape != aligned.shape:
+        segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
+        values = self.critic.apply(_part(variables, "critic"), ids[:, :-1], segment_ids=segments[:, :-1],
+                                   positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :-1])
+        if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
-        return _shift_rows(values, -padding)[:, start:start + mask.shape[1]]
+        aligned = jnp.concatenate([jnp.zeros((ids.shape[0], 1), jnp.float32), values.astype(jnp.float32)], axis=1)
+        return jnp.where(jnp.asarray(batch[RESPONSE_MASK_KEY]) != 0, aligned, 0.0)
 
     def loss(self, params: Variables, batch, step: Step) -> tuple[Mean, Aux[Variables]]:
         """Add the actor's policy loss to the clipped value error on the same mass."""
@@ -173,10 +182,11 @@ class PPOObjective(Objective[Mean, Variables]):
 class PPORollout:
     """Collect episodes, then add critic baselines and verl's masked GAE.
 
-    GAE continues across the action tokens of all turns in one episode. Tool
-    observations and unused slots have no support. The terminal verifier
-    reward lands on the last action; completed and budget-truncated episodes
-    have zero tail bootstrap, matching the pinned verl GAE input convention.
+    GAE continues across the action tokens of all turns in one episode,
+    wherever the packer placed them. Tool observations and padding have no
+    support. The terminal verifier reward lands on the last action with zero
+    tail bootstrap, matching the pinned verl GAE input convention; truncated
+    episodes are masked by the packer and take no targets.
     """
 
     objective: PPOObjective
@@ -190,31 +200,67 @@ class PPORollout:
         if self.objective.seq_len != self.episodes.max_prompt_tokens + self.episodes.max_new_tokens - 1:
             raise ValueError("PPO objective and episode token budgets must agree")
 
-    def _targets(self, variables: Variables, batch) -> dict[str, jax.Array]:
-        """Compute the critic's baselines, the GAE advantages and the returns.
-
-        The reward of an episode lands on its last action token, and GAE
-        runs across the action tokens of all its turns at once.
-        """
-        values = self.objective.values(variables, batch)
-        mask = jnp.asarray(batch[RESPONSE_MASK_KEY]).reshape(-1, self.episodes.max_turns * values.shape[1])
-        baselines = values.reshape(mask.shape)
-        reward = jnp.asarray(batch[REWARDS_KEY]).reshape(-1, self.episodes.max_turns)[:, 0]
-        positions = jnp.arange(mask.shape[1])[None, :]
-        last = jnp.max(jnp.where(mask != 0, positions, -1), axis=1)
-        rewards = jnp.where(positions == last[:, None], reward[:, None], 0)
-        advantage, returns = gae(rewards, baselines, mask, self.gamma, self.lam)
-        return {OLD_VALUES_KEY: values, ADVANTAGES_KEY: advantage.reshape(values.shape),
-                RETURNS_KEY: returns.reshape(values.shape)}
-
     @cached_property
-    def _compiled_targets(self):
-        return jax.jit(self._targets)
+    def _compiled_values(self):
+        return jax.jit(self.objective.values)
+
+    def _order(self, batch: Mapping[str, np.ndarray], count: int) -> np.ndarray:
+        """Per episode, the flat packed positions of its action ids in the order they were drawn.
+
+        `[episodes, max_turns * max_new_tokens]`, padded with -1. A call's
+        ids sit in one chain in order, so sorting by call then position
+        reads an episode's actions across its chains and rows.
+        """
+        mask = np.asarray(batch[RESPONSE_MASK_KEY]).reshape(-1) != 0
+        owner = np.asarray(batch[ROLLOUT_INDEX_KEY]).reshape(-1)
+        call = np.asarray(batch[CALL_INDEX_KEY]).reshape(-1).astype(np.int64)
+        order = np.full((count, self.episodes.max_turns * self.episodes.max_new_tokens), -1, np.int64)
+        where = np.flatnonzero(mask)
+        for episode in range(count):
+            mine = where[owner[where] == episode]
+            mine = mine[np.lexsort((mine, call[mine]))]
+            order[episode, :mine.size] = mine
+        return order
+
+    def _targets(self, values: np.ndarray, batch: Mapping[str, np.ndarray],
+                 rewards: np.ndarray) -> dict[str, np.ndarray]:
+        """Run verl's masked GAE over each episode's actions, then whiten over every process.
+
+        The reward of an episode lands on its last action id, and GAE runs
+        across the actions of all its turns at once. Whitening reads the
+        global action count and moments, as it did over one device batch.
+        """
+        order = self._order(batch, rewards.shape[0])
+        keep = order >= 0
+        flat = values.reshape(-1)
+        baselines = np.where(keep, flat[np.maximum(order, 0)], 0).astype(np.float32)
+        last = np.where(keep.any(axis=1), keep.shape[1] - 1 - np.argmax(keep[:, ::-1], axis=1), -1)
+        token_rewards = np.zeros_like(baselines)
+        scored = last >= 0
+        token_rewards[scored, last[scored]] = rewards[scored]
+        _, returns = gae(jnp.asarray(token_rewards), jnp.asarray(baselines), jnp.asarray(keep, jnp.float32),
+                         self.gamma, self.lam)
+        returns = np.asarray(returns)
+        raw = returns - baselines
+        moments = np.asarray([np.sum(keep), np.sum(raw * keep), np.sum(raw * raw * keep)], np.float64)
+        if jax.process_count() > 1:
+            moments = np.sum(multihost_utils.process_allgather(moments), axis=0)
+        count, total, squares = moments
+        mean = total / (count + MEAN_EPS)
+        variance = (squares - 2 * mean * total + mean * mean * count) / (count + MEAN_EPS)
+        advantages = (raw - mean) / np.sqrt(variance * (count / (count - 1)) + WHITEN_EPS)
+        shape = values.shape
+        placed_advantages = np.zeros(flat.shape, np.float32)
+        placed_returns = np.zeros(flat.shape, np.float32)
+        placed_advantages[order[keep]] = advantages[keep]
+        placed_returns[order[keep]] = returns[keep]
+        return {OLD_VALUES_KEY: values.astype(np.float32), ADVANTAGES_KEY: placed_advantages.reshape(shape),
+                RETURNS_KEY: placed_returns.reshape(shape)}
 
     def __call__(self, state: TrainState, batch: Mapping[str, object], key: jax.Array) -> dict[str, np.ndarray]:
-        """Collect one cohort of episodes and return its rows with critic targets."""
+        """Collect one cohort of episodes and return its packed rows with critic targets."""
         episodes = self.episodes.collect(state, batch, key)
-        projected = agreed("PPO episode tensors", lambda: self.episodes.tensors(episodes))
+        projected = agreed("PPO episode projection", lambda: self.episodes.project(episodes))
         count = np.asarray(min(2, np.count_nonzero(projected[RESPONSE_MASK_KEY])), np.int32)
         if jax.process_count() > 1:
             count = np.sum(multihost_utils.process_allgather(count))
@@ -222,5 +268,6 @@ class PPORollout:
             raise ValueError("PPO GAE whitening requires at least two action tokens globally")
         mesh = mesh_of(state.params)
         device = agreed("PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected))
-        targets = agreed("PPO critic targets", lambda: self._compiled_targets(state.params, device))
-        return {**projected, **{name: local_rows(value) for name, value in targets.items()}}
+        values = agreed("PPO critic values", lambda: local_rows(self._compiled_values(state.params, device)))
+        rewards = np.asarray([0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32)
+        return {**projected, **self._targets(np.asarray(values), projected, rewards)}

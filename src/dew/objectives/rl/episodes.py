@@ -24,21 +24,13 @@ import numpy as np
 from jax.experimental import multihost_utils
 
 from dew.artifacts import PeerFailure, agree_process_phase, agreed
-from dew.data.prompts import LENGTH_KEY
 from dew.nn.inputs import ModelInputs, local_rows
 from dew.objectives.base import Batch, Variables
-from dew.rl import group_advantage
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
 
-from .rollout import (
-    ADVANTAGES_KEY,
-    BEHAVIOR_LOG_PROBS_KEY,
-    IDS_KEY,
-    OLD_LOG_PROBS_KEY,
-    RESPONSE_MASK_KEY,
-    REWARDS_KEY,
-)
+from .rollout import OLD_LOG_PROBS_KEY
+from .rollouts import Call, Rollout, Status, pack, sampled_values
 
 if TYPE_CHECKING:
     from .journal import EpisodeJournal, JournalRun
@@ -255,10 +247,13 @@ class EpisodeRollout:
     and cancellation abort the whole group before a Trainer update; record
     receives the partial episode before the exception propagates.
 
-    Each model call becomes one fixed-width GRPO row. Set the objective's
-    seq_len to max_prompt_tokens + max_new_tokens - 1. The terminal group
-    advantage is shared by the episode's actions; no per-turn credit rule
-    is inferred. Host records and numeric rows carry the trainer's committed
+    Episodes train through `rollouts.pack`: a call whose context extends the
+    previous call's context and actions merges into its chain, and chains
+    share rows of max_prompt_tokens + max_new_tokens ids, so set the
+    objective's seq_len one below that. `rows` fixes the packed row count;
+    None reserves one row per possible call, which always fits. The terminal
+    group advantage is shared by the episode's actions; no per-turn credit
+    rule is inferred, and truncated episodes are masked. Host records and numeric rows carry the trainer's committed
     update clock. Raw and behavior likelihoods come from actual draws.
 
     The policy binds one immutable variables snapshot for the whole
@@ -279,6 +274,7 @@ class EpisodeRollout:
     groups: int = 2
     record: EpisodeRecorder | None = None
     journal: EpisodeJournal | None = None
+    rows: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("max_prompt_tokens", "max_new_tokens", "max_turns"):
@@ -286,6 +282,8 @@ class EpisodeRollout:
                 raise ValueError(f"{name} must be a positive integer")
         if type(self.groups) is not int or self.groups < 2:
             raise ValueError("an episode group needs at least two samples")
+        if self.rows is not None and (type(self.rows) is not int or self.rows < 1):
+            raise ValueError("rows is a positive integer, or None to reserve one row per possible call")
         if self.sampling.eos_id is None:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
 
@@ -588,18 +586,13 @@ class EpisodeRollout:
         return agreed("episode projection", lambda: self.project(episodes))
 
     def project(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
-        """Build GRPO action rows with one group-relative advantage per episode."""
-        batch = self.tensors(episodes)
-        rewards = jnp.asarray([episode.reward for episode in episodes], jnp.float32)
-        advantages = np.asarray(group_advantage(rewards, self.groups))
-        batch[ADVANTAGES_KEY] = np.broadcast_to(np.repeat(advantages, self.max_turns)[:, None],
-                                               batch[RESPONSE_MASK_KEY].shape)
-        return batch
+        """Pack one collection's episodes into GRPO rows through `rollouts.pack`.
 
-    def tensors(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
-        """Project one collection's action tokens into fixed-width rows.
-
-        Padded turns have zero support.
+        Each episode becomes a `Rollout` (`rollout_of`), so its calls merge
+        into one chain wherever the environment's next context extends the
+        previous one, and the chains share `[rows, width]` rows with segment
+        ids. `old_log_probs` carries the sampler's raw likelihoods, recorded
+        under the same snapshot. A truncated episode is masked, not scored.
 
         Every episode and action must retain that collection's private binding
         origin. Equal training clocks do not establish equal weight snapshots.
@@ -612,7 +605,6 @@ class EpisodeRollout:
         binding_id = episodes[0]._binding_id
         if not binding_id:
             raise ValueError("episode records must retain their collection binding")
-        rewards = []
         for index, episode in enumerate(episodes):
             if (episode._binding_id != binding_id
                     or any(turn.action._binding_id != binding_id for turn in episode.transitions)):
@@ -630,31 +622,31 @@ class EpisodeRollout:
             group_start = episodes[index - index % self.groups]
             if episode.identity.task != group_start.identity.task:
                 raise ValueError("an advantage group must contain the same task")
-            rewards.append(episode.reward)
+        rollouts = [rollout_of(episode, group=str(index // self.groups))
+                    for index, episode in enumerate(episodes)]
+        rows = len(episodes) * self.max_turns if self.rows is None else self.rows
+        batch = pack(rollouts, self.max_prompt_tokens + self.max_new_tokens, rows=rows)
+        sources = {id(rollout): episode for rollout, episode in zip(rollouts, episodes, strict=True)}
+        batch[OLD_LOG_PROBS_KEY] = sampled_values(
+            batch, rollouts, lambda rollout, number: sources[id(rollout)].transitions[number].action.raw_log_probs)
+        return batch
 
-        rows = len(episodes) * self.max_turns
-        prompt, response = self.max_prompt_tokens, self.max_new_tokens
-        ids = np.full((rows, prompt + response), self.sampling.pad_id, np.int32)
-        mask = np.zeros((rows, response), np.float32)
-        raw = np.zeros_like(mask)
-        behavior = np.zeros_like(mask)
-        prompt_lengths = np.ones(rows, np.int32)
-        for index, episode in enumerate(episodes):
-            for turn_index, transition in enumerate(episode.transitions):
-                action = transition.action
-                size, count = len(action.context), len(action.tokens)
-                if not 0 < size <= prompt or count > response:
-                    raise ValueError("recorded action does not fit the projection's token budgets")
-                row = index * self.max_turns + turn_index
-                ids[row, prompt - size:prompt] = action.context
-                ids[row, prompt:prompt + count] = action.tokens
-                mask[row, :count] = 1
-                raw[row, :count] = action.raw_log_probs
-                behavior[row, :count] = action.behavior_log_probs
-                prompt_lengths[row] = size
-        return {
-            IDS_KEY: ids, RESPONSE_MASK_KEY: mask, OLD_LOG_PROBS_KEY: raw,
-            BEHAVIOR_LOG_PROBS_KEY: behavior, LENGTH_KEY: prompt_lengths,
-            REWARDS_KEY: np.repeat(np.asarray(rewards, np.float32), self.max_turns),
-            "task_id": np.repeat(np.asarray([episode.identity.task for episode in episodes], np.int32), self.max_turns),
-        }
+
+def rollout_of(episode: Episode, *, group: str) -> Rollout:
+    """Read an episode as an engine-style `Rollout` of the advantage group `group`.
+
+    Each transition's action is one call: its context is the prompt, its
+    tokens the sampled ids with their behavior likelihoods, `stop` when it
+    ended on EOS and `length` otherwise. An environment-reported error is an
+    infrastructure failure; how well the agent did is the verifier's reward.
+    """
+    if episode.status == EpisodeStatus.RUNNING:
+        raise ValueError("a running episode has not ended, so it is no rollout yet")
+    status = {EpisodeStatus.COMPLETED: Status.COMPLETED, EpisodeStatus.TRUNCATED: Status.TRUNCATED,
+              EpisodeStatus.ERROR: Status.INFRA_ERROR, EpisodeStatus.CANCELLED: Status.CANCELLED}[episode.status]
+    calls = tuple(Call(turn.action.context, turn.action.tokens, turn.action.behavior_log_probs,
+                       "stop" if turn.action.terminated else "length", turn.action.policy_step)
+                  for turn in episode.transitions)
+    identity = episode.identity
+    return Rollout(str(identity.task), group, identity.sample, identity.attempt, calls, status,
+                   episode.reward, detail=episode.detail)
