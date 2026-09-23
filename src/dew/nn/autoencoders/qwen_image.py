@@ -61,7 +61,7 @@ class _RMSNorm(nn.Module):
         return normalized * math.sqrt(self.features) * gamma.reshape(-1).astype(self.dtype)
 
 
-def _conv(features: int, kernel: int, dtype: Dtype, name: str) -> nn.Conv:
+def _conv(features: int, kernel: int, dtype: Dtype, name: str | None) -> nn.Conv:
     """The source's padded "causal" convolution, which is a 2D one on a frame."""
     pad = kernel // 2
     return nn.Conv(features, (kernel, kernel), padding=((pad, pad), (pad, pad)), dtype=dtype, name=name)
@@ -132,7 +132,7 @@ class _Downsampler(nn.Module):
     def __call__(self, x):
         if self.temporal:
             _TimeConv(self.features, self.features, name="time_conv")()
-        return FlaxDownsample2D(self.features, dtype=self.dtype, name="resample")(x)
+        return FlaxDownsample2D(self.features, dtype=jnp.dtype(self.dtype), name="resample")(x)
 
 
 class _Upsampler(nn.Module):
@@ -144,7 +144,7 @@ class _Upsampler(nn.Module):
     def __call__(self, x):
         if self.temporal:
             _TimeConv(self.features, 2 * self.features, name="time_conv")()
-        return FlaxUpsample2D(self.features, dtype=self.dtype, name="resample")(x)
+        return FlaxUpsample2D(self.features, dtype=jnp.dtype(self.dtype), name="resample")(x)
 
 
 def _average_down(x, features: int, temporal: bool, spatial: int):

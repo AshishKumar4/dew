@@ -2138,8 +2138,10 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
 
     config = _component_config(directory, "text_encoder")
     record = decoders.translate_config(_qwen_vl_text_config(config))
-    built = with_precision("causal_transformer", record, dtype=dtype_name(compute),
-                           attention_impl=attention_impl)
+    named = dtype_name(compute)
+    if named is None:
+        raise ValueError("Qwen-Image's Qwen3-VL encoder computes in a named dtype; pass dtype")
+    built = with_precision("causal_transformer", record, dtype=named, attention_impl=attention_impl)
     decoder = models.build("causal_transformer", built)
     if not isinstance(decoder, CausalTransformer):
         raise TypeError("causal_transformer registry entry must build CausalTransformer")
