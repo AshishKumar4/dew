@@ -1,5 +1,5 @@
-"""Hybrid sharded data parallelism and context parallelism across real
-processes, started by `dew launch`.
+"""Hybrid sharded data parallelism, context parallelism and rollout
+scheduling across real processes, started by `dew launch`.
 
 Each pool is two processes of four simulated CPU devices on this machine,
 launched the way a two-node run is: `dew launch` puts the coordinator, the
@@ -583,6 +583,7 @@ def test_a_failed_process_stops_the_pool_with_its_exit_code():
     assert done.returncode == 3, done.stdout + done.stderr
     assert time.monotonic() - started < 60
 
+
 def scheduled(tmp_path: Path, mesh: dict, processes: int, *flags: str) -> tuple[dict, dict[str, np.ndarray]]:
     """The record and the final parameters of a RolloutScheduler run over two devices."""
     out = tmp_path / f"{len(list(tmp_path.iterdir()))}.json"
@@ -591,6 +592,11 @@ def scheduled(tmp_path: Path, mesh: dict, processes: int, *flags: str) -> tuple[
     assert done.returncode == 0, done.stdout + done.stderr
     with np.load(out.with_suffix(".npz")) as params:
         return json.loads(out.read_text()), {name: params[name] for name in params.files}
+
+
+def handed(record: dict, process: int) -> dict[str, np.ndarray]:
+    """The rows `process` handed the step."""
+    return {name: np.asarray(rows[process]) for name, rows in record["rows"].items()}
 
 
 @pytest.mark.mesh(devices=2)
@@ -617,3 +623,23 @@ def test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_
     for name, value in single.items():
         np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
 
+
+@pytest.mark.mesh(devices=2)
+def test_the_readers_of_one_share_train_on_the_rows_its_first_reader_sampled(tmp_path):
+    """tensor across two processes: both read the one share, and their
+    engines would draw differently (`--vary`). The first reader samples and
+    the second trains on its rows, so the step's two tensor shards hold one
+    batch, the batch one process samples, and the update is that process's.
+    Both sampling, the shards held different rows and the step trained on
+    them as one batch."""
+    pool, pooled = scheduled(tmp_path, {"tensor": 2}, 2, "--vary")
+    alone, single = scheduled(tmp_path, {"tensor": 2}, 1, "--vary")
+    assert pool["partition"] == {"count": 1, "readers": 2} and pool["step"] == 1
+    first, second, reference = handed(pool, 0), handed(pool, 1), handed(alone, 0)
+    for name, value in first.items():
+        np.testing.assert_array_equal(second[name], value)
+    for name in ("input_ids", "response_mask", "behavior_log_probs"):
+        np.testing.assert_array_equal(first[name], reference[name])
+    np.testing.assert_allclose(first["old_log_probs"], reference["old_log_probs"], atol=TOLERANCE)
+    for name, value in single.items():
+        np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)

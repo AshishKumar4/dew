@@ -3,8 +3,9 @@
 tests/test_distribution.py starts it through the launcher, so the process
 joins exactly as a multi-node run does (`prepare_process`). Each process
 schedules the rollouts of the task rows its share of the batch holds, from a
-source that answers every sample of a task with a completion the task
-fixes. The pool fits one update on `--mesh`, and process 0 writes
+source that answers every sample of a task with a completion the task fixes;
+with `--vary`, the answer also depends on the process, as independent draws
+from engines do. The pool fits one update on `--mesh`, and process 0 writes
 the rows each process handed the step and the parameters the pool ended with.
 The same script on one process is the reference.
 """
@@ -26,6 +27,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--mesh", required=True, help="MeshSpec fields as JSON")
+    parser.add_argument("--vary", action="store_true", help="each process's draws depend on the process")
     args = parser.parse_args()
 
     from dew.training.runtime import prepare_process
@@ -53,7 +55,7 @@ def main() -> None:
         def submit(self, task, samples, *, version):
             futures = []
             for sample in range(samples):
-                draw = int(task.id) * 10 + sample
+                draw = int(task.id) * 10 + sample + (process if args.vary else 0)
                 call = Call((1 + int(task.id) % 7, 2 + int(task.id) % 5), (3 + draw % 4, 4 + sample),
                             (-0.5 - 0.01 * sample, -0.25), "stop", version)
                 future = Future()

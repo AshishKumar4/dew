@@ -80,14 +80,19 @@ class DataPartition:
     """The processes that read this share. Each reads the same records, so a
     source whose rows are not the same on every read of one share, as a
     fetch over the network that drops what failed is not, refuses more than
-    one."""
+    one, or reads on the first reader alone and hands its batch to the
+    others (`dew.training.distributed.first_reader_batch`)."""
+    reader: int = 0
+    """Which of the share's readers this process is, in process order: 0
+    for the first."""
 
     def __post_init__(self):
-        if not 0 <= self.index < self.count or self.readers < 1:
+        if not 0 <= self.index < self.count or not 0 <= self.reader < self.readers:
             raise ValueError(
                 f"a data partition is share index of count, 0 <= index < count, read "
-                f"by one or more readers; got index {self.index} of {self.count} "
-                f"read by {self.readers}")
+                f"by one or more readers, of which this is reader 0 <= reader < readers; "
+                f"got index {self.index} of {self.count} read by {self.readers}, reader "
+                f"{self.reader}")
 
     def rows(self, batch: int) -> int:
         """The rows of a `batch`-row global batch one share holds.
