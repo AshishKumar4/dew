@@ -79,6 +79,9 @@ def arguments() -> argparse.Namespace:
                         help="MoE: transformers' experts_implementation. Its default on sm80, "
                              "grouped_mm, is outside autocast and runs the experts at the fp32 "
                              "weights' dtype; 'eager' loops F.linear, which autocast runs in bf16")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile every decoder layer before DDP or fully_shard wraps it, "
+                             "the placement torchtitan uses")
     parser.add_argument("--steps", type=int, default=None, help="stop early; unset runs every epoch")
     parser.add_argument("--lr-peak", type=float, default=2e-5)
     parser.add_argument("--lr-init", type=float, default=2e-6)
@@ -224,6 +227,17 @@ class Run:
     active: int  # experts a token takes; 0 without the balance loss
 
 
+def decoder_layers(model) -> torch.nn.ModuleList:
+    """The repeated blocks of a transformers causal LM: a decoder's
+    `model.layers`, a Mamba's `backbone.layers`."""
+    trunk = getattr(model, "model", None)
+    if trunk is None:
+        trunk = getattr(model, "backbone", None)
+    if trunk is None or not hasattr(trunk, "layers"):
+        raise ValueError(f"{type(model).__name__} has no model.layers or backbone.layers")
+    return trunk.layers
+
+
 def build(args: argparse.Namespace, place: Ranks) -> Run:
     from transformers import AutoConfig, AutoModelForCausalLM
 
@@ -236,6 +250,9 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
     model.train()
     if args.precision == "autocast-bf16-residual":
         bf16_residual(model)
+    if args.compile:
+        for layer in decoder_layers(model):
+            layer.compile()
     routed = args.router_aux is not None
     if routed:
         model.config.output_router_logits = False
@@ -261,7 +278,7 @@ def build(args: argparse.Namespace, place: Ranks) -> Run:
         from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
         policy = (MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
                   if args.precision == "fsdp-bf16" else MixedPrecisionPolicy())
-        for layer in model.model.layers:
+        for layer in decoder_layers(model):
             fully_shard(layer, mp_policy=policy)
         fully_shard(model, mp_policy=policy)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(args.b1, args.b2),
