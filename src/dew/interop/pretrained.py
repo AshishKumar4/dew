@@ -12,8 +12,9 @@ from __future__ import annotations
 import functools
 import json
 import math
+import os
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
@@ -943,6 +944,9 @@ class Pretrained:
     task: SourceTask | None = None
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
     quantized_tensors: tuple[str, ...] = ()
+    revision: str | None = None
+    """The Hub commit the source resolved to, whatever branch or tag was
+    asked for; None for a local directory."""
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -2151,6 +2155,21 @@ def _source_processor(directory: Path, config: Mapping[str, object], record: Map
     return None
 
 
+def split_revision(source: str) -> tuple[str, str | None]:
+    """Split a `repo@revision` reference into the repo and the revision.
+
+    Levanter's `RepoRef` spelling: a branch, tag or commit after the last
+    '@'. A local directory, or a reference without '@', names no revision.
+    Hub repo ids cannot contain '@'.
+    """
+    if os.path.isdir(source) or "@" not in source:
+        return source, None
+    name, revision = source.rsplit("@", 1)
+    if not name or not revision:
+        raise ValueError(f"{source!r} is not a repo@revision reference")
+    return name, revision
+
+
 AUTO = "auto"
 """The param_dtype that stores a checkpoint's parameters in its own dtype."""
 
@@ -2201,6 +2220,8 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             raise ValueError("param_dtype must select floating parameter storage")
         param_dtype = storage
     directory = decoders._snapshot(str(name_or_dir), revision, weights=False)
+    # A Hub snapshot directory is named by its commit.
+    commit = None if os.path.isdir(name_or_dir) else directory.name
     if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
         # A latent diffusion pipeline is a directory of components with no
         # model of its own; a decoder that also ships a pipeline index for its
@@ -2215,8 +2236,9 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             from dew.interop import diffusion
             denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
             param_dtype = _checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
-        return _load_diffusion_source(directory, index, dtype=dtype,
-                                      attention_impl=attention_impl, param_dtype=param_dtype)
+        return replace(
+            _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
+                                   param_dtype=param_dtype), revision=commit)
     if not (directory / "config.json").is_file():
         # A GGUF or pickle repo often ships no config.json; the weights read
         # says what it ships instead.
@@ -2313,4 +2335,5 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
 
     agreed("pretrained generation policy", policy_read)
     return Pretrained(model, variables, processor, config, directory, built, generation_config,
-                      layouts, retained, export_adapter, quantized_tensors=quantized_tensors)
+                      layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
+                      revision=commit)

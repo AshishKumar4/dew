@@ -294,6 +294,42 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
         np.testing.assert_array_equal(np.asarray(held), np.asarray(leaf))
 
 
+def test_a_hub_reference_at_a_revision_is_recorded_at_its_commit(tmp_path, monkeypatch):
+    """`--pretrained repo@revision` loads that revision, and run.json names
+    the commit it resolved to, so the record pins the weights the run
+    started from even after the branch moves."""
+    from types import SimpleNamespace
+
+    import huggingface_hub
+
+    recipe = load_recipe()
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    published = export_tiny_decoder(tmp_path / "published")
+    commit = "c" * 40
+    snapshot = tmp_path / "hub" / "snapshots" / commit
+    asked = []
+
+    def download(repo_id, *, revision=None, allow_patterns=None, dry_run=False):
+        asked.append((repo_id, revision))
+        files = [path.relative_to(published).as_posix() for path in published.rglob("*") if path.is_file()]
+        if dry_run:
+            return [SimpleNamespace(filename=name) for name in files]
+        for name in files:
+            (snapshot / name).parent.mkdir(parents=True, exist_ok=True)
+            (snapshot / name).write_bytes((published / name).read_bytes())
+        return str(snapshot)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
+    config = pretrained_config(recipe, tokens, "acme/tiny@v1", "--trainer.steps", "0",
+                               "--sample-tokens", "0", "--trainer.name", "pinned")
+
+    recipe.main(config)
+
+    assert asked[0] == ("acme/tiny", "v1") and {revision for _, revision in asked[1:]} == {commit}
+    recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "pinned"))
+    assert recorded.pretrained == f"acme/tiny@{commit}"
+
+
 def test_a_pretrained_run_refuses_overrides_and_a_foreign_tokenizer(tmp_path):
     """The two refusals on that path: the checkpoint owns every architecture
     field but max_seq_len, and ids from another vocabulary would train the

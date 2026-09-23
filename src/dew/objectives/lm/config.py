@@ -52,9 +52,11 @@ class LMRunConfig(RunConfig):
         default_factory=lambda: Sampling(temperature=0.8, top_k=40))
     """The preview policy, recorded with the run for inference."""
     pretrained: str | None = None
-    """Hugging Face decoder to continue training: a hub repo id or a local
-    directory in that layout. The checkpoint decides the architecture, so
-    --model.config may then carry max_seq_len alone."""
+    """Hugging Face decoder to continue training: a hub repo id, `repo@revision`
+    (a branch, tag or commit), or a local directory in that layout. A run
+    records a hub repo as `repo@commit`, the commit it resolved to. The
+    checkpoint decides the architecture, so --model.config may then carry
+    max_seq_len alone."""
     balance_rate: float | None = None
     """How far a sparse run moves each router's balancing bias against its
     load every step (DeepSeek's aux-loss-free balancing). Needs a mixture

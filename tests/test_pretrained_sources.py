@@ -101,13 +101,12 @@ def test_a_pipeline_downloads_only_the_component_files_it_reads(hub, monkeypatch
     OpenVINO copy, and no folder model_index.json does not declare
     (SDXL's vae_1_0): the non-variant weights of each declared component."""
     fake = hub(name)
-    loaded = []
-    monkeypatch.setattr(pretrained, "_load_diffusion_source",
-                        lambda directory, index, **kwargs: loaded.append(directory))
+    monkeypatch.setattr(pretrained, "_load_diffusion_source", lambda directory, index, **kwargs:
+                        pretrained.Pretrained(None, {}, None, index, directory, {}))
 
-    pretrained.load_pretrained(repo)
+    loaded = pretrained.load_pretrained(repo)
 
-    assert loaded == [fake.snapshot]
+    assert loaded.source == fake.snapshot and loaded.revision == fake.commit
     assert sorted(fake.fetched) == sorted(
         f"{component}/{'model' if component.startswith(('text', 'safety')) else 'diffusion_pytorch_model'}"
         ".safetensors" for component in components)
@@ -381,3 +380,4 @@ def test_the_pipeline_places_a_source_in_its_own_dtype(tmp_path):
     task = dew.pipeline(str(bf16_source(tmp_path)), dtype="float32", param_dtype="auto")
 
     assert leaf_dtypes(task.variables) == {np.dtype(ml_dtypes.bfloat16)}
+
