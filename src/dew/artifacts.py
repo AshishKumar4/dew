@@ -10,6 +10,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -270,12 +271,18 @@ def _client():
     return multihost.get_jax_distributed_client()
 
 
+def this_process() -> str:
+    """This process as `host:pid`, named without the backend, which may be
+    the thing that failed or be opening in another thread."""
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
 def publish_failure(error: BaseException, where: str) -> bool:
     """Write this process's failure where every process's watch sees it.
 
     Returns False when another failure is already there: the first stands.
     """
-    text = f"{os.urandom(4).hex()} process {jax.process_index()} failed in {where}: "
+    text = f"{os.urandom(4).hex()} {this_process()} failed in {where}: "
     try:
         _client().key_value_set(FAILURE_KEY, (text + f"{type(error).__name__}: {error}")[:2048])
     except jax.errors.JaxRuntimeError:  # the key exists: a failure is already published
@@ -299,6 +306,11 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
     and a watch thread ends the process `grace` seconds after any published
     failure that no agreement withdrew. `dew launch`, srun and a pod's
     scheduler then see the failure and stop the rest.
+
+    It needs only the pool's coordination service, not the backend, so it
+    goes in before the backend opens: a process whose devices fail to open
+    after the pool has formed would otherwise wait in that barrier for peers
+    that wait for its devices.
     """
     previous = sys.excepthook
     client = _client()
@@ -330,7 +342,7 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
                 continue
             sys.stderr.write(f"{seen.split(' ', 1)[1]}\nNo agreement heard that failure in "
                              f"{grace:.0f} s, so this process waits in a collective that will "
-                             f"not complete; process {jax.process_index()} ends.\n")
+                             f"not complete; {this_process()} ends.\n")
             sys.stderr.flush()
             os._exit(1)
 
