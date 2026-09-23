@@ -333,12 +333,19 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
     for model in models:
         case = dataclasses.replace(zoo()[model], dtype=dtype)
         batch = bench.global_batch(case)
-        ref_losses, ref_gradient, ref_compiled = trained(case, {}, batch, steps=steps,
-                                                         one_device=True)
-        floors, loss_floor = floor(case, batch, ref_gradient, ref_losses[0])
-        if anchor and reassociates(case):
-            rounding = exact(case, ref_gradient)
-            floors = {leaf: max(value, rounding[leaf]) for leaf, value in floors.items()}
+        try:
+            ref_losses, ref_gradient, ref_compiled = trained(case, {}, batch, steps=steps,
+                                                             one_device=True)
+            floors, loss_floor = floor(case, batch, ref_gradient, ref_losses[0])
+            if anchor and reassociates(case):
+                rounding = exact(case, ref_gradient)
+                floors = {leaf: max(value, rounding[leaf]) for leaf, value in floors.items()}
+        except Exception as error:  # no reference judges no layout: the model's one row
+            rows.append({"model": model, "layout": "reference", "processes": jax.process_count(),
+                         "status": "error", "error": f"{type(error).__name__}: {error}"[:2000],
+                         "traceback": traceback.format_exc()[-4000:]})
+            speak(f"[{model}] reference error {rows[-1]['error'][:300]}")
+            continue
         speak(f"[{model}] reference losses {ref_losses}, largest floor {max(floors.values()):.2e}")
         for name in layouts:
             row: dict[str, Any] = {"model": model, "layout": name, "processes": jax.process_count(),
