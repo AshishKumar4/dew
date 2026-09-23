@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, NamedTuple, Protocol, TypedDict, Unpack
+from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, TypedDict, TypeGuard, Unpack
 
 import jax
 import jax.numpy as jnp
@@ -60,6 +60,9 @@ from dew.sampling.pipelines import TextToImage
 from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling
 
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
+
 
 class ProcessorCall(TypedDict, total=False):
     """Names every keyword dew hands a host processor beside `images`.
@@ -88,6 +91,18 @@ class HostProcessor(Protocol):
     def apply_chat_template(self, conversation: Sequence[Mapping[str, object]],
                             **kwargs: JSON) -> str | Sequence[int] | Mapping[str, object]: ...
     def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]: ...
+
+
+def _hosts(reference: PreTrainedTokenizerBase) -> TypeGuard[HostProcessor]:
+    """Whether `reference` offers every HostProcessor operation.
+
+    A transformers tokenizer does, but its annotations are narrower than
+    what dew passes (`apply_chat_template` types its messages as
+    `list[dict[str, str]]`, where dew renders tool calls and content parts),
+    so it is admitted by its operations rather than by its signatures.
+    """
+    return all(callable(getattr(reference, name, None))
+               for name in ("__call__", "save_pretrained", "apply_chat_template", "batch_decode"))
 
 
 def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | None, *,
@@ -2162,8 +2177,10 @@ def _source_processor(directory: Path, config: Mapping[str, object], record: Map
         return Processor(reference, config, record, model.vocab_size)
     if (directory / "tokenizer_config.json").exists():
         from dew.data.text import load_tokenizer
-        return Processor(load_tokenizer(str(directory), local_files_only=True),
-                         config, record, model.vocab_size)
+        tokenizer = load_tokenizer(str(directory), local_files_only=True)
+        if not _hosts(tokenizer):
+            raise TypeError(f"the tokenizer in {directory} lacks a host processor operation")
+        return Processor(tokenizer, config, record, model.vocab_size)
     return None
 
 

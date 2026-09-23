@@ -21,11 +21,8 @@ if TYPE_CHECKING:
 _load_lock = threading.Lock()
 
 
-# The return stays as transformers types it, unannotated, because the
-# typed PreTrainedTokenizerBase signatures (list[dict[str, str]] chat
-# messages, save_pretrained's tuple) do not satisfy interop's HostProcessor,
-# which `interop.pretrained` hands a loaded tokenizer as.
-def load_tokenizer(name: str, *, revision: str | None = None, local_files_only: bool = False):
+def load_tokenizer(name: str, *, revision: str | None = None,
+                   local_files_only: bool = False) -> PreTrainedTokenizerBase:
     """The HF tokenizer of a hub repo or local directory, loaded once per process.
 
     Every Dew path that needs an HF tokenizer loads it here, so one name at
@@ -37,15 +34,20 @@ def load_tokenizer(name: str, *, revision: str | None = None, local_files_only: 
 
 # Positional, because functools.cache keys `f(x)` and `f(x, flag=False)` apart.
 @functools.cache
-def _loaded(name: str, revision: str | None, local_files_only: bool):
+def _loaded(name: str, revision: str | None, local_files_only: bool) -> PreTrainedTokenizerBase:
     # The lock serializes the first import: transformers swaps in its lazy
     # module object while it initializes, and two threads importing it
     # together can catch it half built.
     with _load_lock:
-        from transformers import AutoTokenizer
+        from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-        return AutoTokenizer.from_pretrained(
+        tokenizer = AutoTokenizer.from_pretrained(
             name, revision=revision, local_files_only=local_files_only)
+    # from_pretrained's annotation names classes transformers binds to None
+    # without their backend, so its result is untyped until checked here.
+    if not isinstance(tokenizer, PreTrainedTokenizerBase):
+        raise TypeError(f"{name!r} loads as {type(tokenizer).__name__}, not a transformers tokenizer")
+    return tokenizer
 
 
 @runtime_checkable
