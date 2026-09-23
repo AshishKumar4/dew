@@ -13,7 +13,14 @@ every compared output's largest distance from the reference in fp32;
 how far Dew's inputs to each rounding and selection sit from the ones the
 reference recorded, in the units of its margins (a quantizer's input over
 its block's amax, a top-k row over its largest finite magnitude), which the
-reference tool's NOISE bounds at twice the largest over CPU and GPU.
+reference tool's NOISE bounds at twice the largest over CPU and GPU;
+
+    PYTHONPATH=. <reference venv>/bin/python tools/deepseek_v41_reference.py --fp64 /tmp/v41-fp64.npz
+    PYTHONPATH=src:. python tools/deepseek_v41_numerics.py fp64 /tmp/v41-fp64.npz
+
+the plain outputs again with both sides widened to fp64, every fp32 pin
+included, where two implementations of the same arithmetic agree to fp64
+rounding: what remains of `residuals` in fp32 is rounding.
 
 The tests share `unquantized`, `loss_and_gradient`, `stepped`,
 `cached_run`, `captured` and the noise measures from here.
@@ -234,13 +241,42 @@ def residuals() -> dict[str, float]:
             **distances(loaded.model, loaded.variables, reference, "qat_", reference)}
 
 
+def fp64(path: Path) -> dict[str, float]:
+    """The plain outputs' distances from the reference's widened run
+    (`tools/deepseek_v41_reference.py --fp64`), Dew widened alike: the
+    fixture's fp32 weights in fp64, the model's dtype fp64 and every fp32
+    pin Dew names as `jnp.float32` (the rotary tables, the norms, the
+    softmaxes, the mHC mixing, the pooling, the router and the engram gate)
+    read as fp64 while the model traces. Beside them, `reference_fp32_*` is
+    the reference's own fp32 output's distance from its fp64 one: how far
+    fp32 rounding alone moves each output."""
+    fixture, widened = np.load(TINY / "reference.npz"), np.load(path)
+    with jax.enable_x64(new_val=True):
+        loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
+        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+                                 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, loaded.variables)
+        single = jnp.float32
+        jnp.float32 = jnp.float64
+        try:
+            model = unquantized(loaded.model).clone(dtype=jnp.float64)
+            measured = distances(model, variables, widened, "", fixture)
+        finally:
+            jnp.float32 = single
+    return {**measured, **{f"reference_fp32_{name}": float(np.max(np.abs(fixture[name] - widened[name])))
+                           for name in measured if name != "draft_ids"}}
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("measure", choices=("residuals", "noise"))
-    measure = parser.parse_args().measure
+    parser.add_argument("measure", choices=("residuals", "noise", "fp64"))
+    parser.add_argument("widened", nargs="?", type=Path, help="fp64: the reference's --fp64 output")
+    options = parser.parse_args()
     # The reference multiplies in fp32, where a GPU's default is TF32.
     with jax.default_matmul_precision("highest"):
-        measured = residuals() if measure == "residuals" else noise()
+        if options.measure == "fp64":
+            measured = fp64(options.widened)
+        else:
+            measured = residuals() if options.measure == "residuals" else noise()
     sys.stdout.write(json.dumps({"backend": jax.default_backend(), **measured}, indent=1) + "\n")
 
 
