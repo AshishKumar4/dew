@@ -137,13 +137,19 @@ def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds(tokens):
     block of three."""
     from jax.experimental.pallas import tpu as pltpu
 
+    # The interpreter runs its kernel through io_callback, which places on a
+    # CPU device, so the call runs there even on a GPU host.
+    try:
+        host = jax.devices("cpu")[0]
+    except RuntimeError:
+        pytest.skip("the TPU interpreter needs the cpu platform (JAX_PLATFORMS=cuda,cpu)")
     rows, heads, width = 2, 2, 128
-    key, value = (jax.random.normal(jax.random.key(seed), (rows, tokens, heads, width), jnp.bfloat16)
-                  for seed in (0, 1))
-    query = jax.random.normal(jax.random.key(2), (rows, 2 * heads, width), jnp.bfloat16)
-    lengths = jnp.array([tokens, 19], jnp.int32)
-    module = Decoder(KVCache(page_size=16))
-    with pltpu.force_tpu_interpret_mode():
+    with jax.default_device(host), pltpu.force_tpu_interpret_mode():
+        key, value = (jax.random.normal(jax.random.key(seed), (rows, tokens, heads, width),
+                                        jnp.bfloat16) for seed in (0, 1))
+        query = jax.random.normal(jax.random.key(2), (rows, 2 * heads, width), jnp.bfloat16)
+        lengths = jnp.array([tokens, 19], jnp.int32)
+        module = Decoder(KVCache(page_size=16))
         variables = module.init(jax.random.key(0), key, value, query, lengths)
         (attended, (keys, values)), _ = module.apply(variables, key, value, query, lengths, mutable=["cache"])
     keys, values = (jnp.repeat(part.astype(jnp.float32), 2, axis=2) for part in (keys, values))
