@@ -26,6 +26,7 @@ from dew.nn.attention import (
     SPLASH_DENSE_MASK_CELLS,
     SPLASH_LANES,
     combined_attention_mask,
+    document_mask,
     scaled_dot_product_attention,
     splash_block_sizes,
     splash_dense_mask,
@@ -176,22 +177,14 @@ def test_the_flash_fallback_keeps_packed_documents_apart_by_their_segment_ids(dt
                   reference(query, key, value, bias=bias, **structure), dtype)
 
 
-def segment_mask(lengths, length):
-    """A packed batch's mask as one concrete [1, 1, S, S] boolean array: token
-    i and token j attend when the same document holds both."""
-    segments = np.repeat(np.arange(len(lengths)), lengths)
-    segments = np.pad(segments, (0, length - segments.size), constant_values=-1)
-    return (segments[:, None] == segments[None, :])[None, None]
-
-
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_splash_carries_a_packed_batch_as_dense_mask_blocks(dtype):
-    """Three documents concatenated into one 256-token row. The mask has no
-    structural form, so it reaches the kernel as dense blocks of a NumpyMask
-    ANDed with the causal descriptor; what comes out is still the reference's
-    attention."""
+def test_splash_carries_a_concrete_mask_as_dense_blocks(dtype):
+    """A concrete block-diagonal mask, three documents in one 256-token row,
+    has no structural form, so it reaches the kernel as dense blocks of a
+    NumpyMask ANDed with the causal descriptor; what comes out is still the
+    reference's attention."""
     query, key, value = qkv((2, 256, 4, 64), dtype)
-    packed = segment_mask((100, 84, 72), 256)
+    packed = np.asarray(document_mask(packed_ids((100, 84, 72))[:1]))[:, None]
     assert_agrees(value_and_grads('tpu', query, key, value, mask=packed, causal=True),
                   reference(query, key, value, mask=jnp.asarray(packed), causal=True), dtype)
 
@@ -304,8 +297,8 @@ def test_the_descriptor_stands_for_the_mask_the_other_paths_build(causal, slidin
 
 def test_an_explicit_mask_is_anded_into_the_descriptor():
     """A dense mask does not replace the structural one; a causal call with a
-    packed mask keeps both."""
-    packed = segment_mask((100, 84, 72), 256)
+    block-diagonal mask keeps both."""
+    packed = np.asarray(document_mask(packed_ids((100, 84, 72))[:1]))[:, None]
     descriptor = splash_mask_descriptor(256, 256, 2, True, None, packed)
     expected = np.asarray(combined_attention_mask(256, 256, True, None, jnp.asarray(packed)))
     assert np.array_equal(dense(descriptor, 2, 256, 256),
