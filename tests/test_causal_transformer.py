@@ -135,8 +135,8 @@ def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, mon
     """Gemma 2's tanh on the logits, against the equation on a hand-computed
     case: reference and xla agree with it, and 'auto' resolves a softcapped
     call to that same math even where cudnn would otherwise run (bf16 inputs,
-    an 8-wide head, a gpu backend), while cudnn and tpu raise a ValueError
-    naming the implementation. A cap of 2 on logits of order 10 changes the
+    an 8-wide head, a gpu backend), while cudnn raises a ValueError naming
+    the implementation. A cap of 2 on logits of order 10 changes the
     weights by a wide margin; an uncapped path fails the comparison."""
     query, key, value = (jax.random.normal(k, (1, 6, 2, 8)) * 3
                          for k in jax.random.split(rng, 3))
@@ -159,10 +159,8 @@ def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, mon
     routed = scaled_dot_product_attention(*halves, causal=True, softcap=2.0,
                                           implementation='auto')
     assert np.allclose(routed.astype(jnp.float32), expected, atol=5e-2)
-    for implementation in ('cudnn', 'tpu'):
-        with pytest.raises(ValueError, match=f"'{implementation}' cannot apply an attention logit softcap"):
-            scaled_dot_product_attention(*halves, causal=True, softcap=2.0,
-                                         implementation=implementation)
+    with pytest.raises(ValueError, match="'cudnn' cannot apply an attention logit softcap"):
+        scaled_dot_product_attention(*halves, causal=True, softcap=2.0, implementation='cudnn')
 
 
 def test_registry_builds_the_backbone_and_takes_the_precision_policy():

@@ -24,13 +24,13 @@ from dew.nn.attention import (
     causal_attention_mask,
     chunk_mask,
     combined_attention_mask,
-    document_mask,
     kernel_for_materialized_mask,
     local_attention,
     max_attention_logits,
     open_kv_cache,
     rotary_freqs,
     scaled_dot_product_attention,
+    with_documents,
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
@@ -433,7 +433,7 @@ class CausalSelfAttention(nn.Module):
                 implementation=self.attention_impl, sinks=sinks,
                 softcap=self.attn_logit_softcap), 'context')
             return self._output(attention, gate, B, S, own_value)
-        causal, mask = self.causal, None
+        causal, mask, documents = self.causal, None, None
         implementation = self.attention_impl
         masked = kernel_for_materialized_mask(
             implementation, query, dtype=self.dtype, precision=self.precision,
@@ -476,24 +476,22 @@ class CausalSelfAttention(nn.Module):
             if kv_store is not None and self.kv_store_key is not None:
                 kv_store[self.kv_store_key] = (key, value, positions)
         elif segment_ids is not None:
-            # Attention stays inside each packed document: the segment ids
-            # make the mask block-diagonal, padding (segment 0) sees nothing,
-            # and causality (with the layer's window) travels in the same mask
-            # and not as the kernels' flag.
-            inside = document_mask(segment_ids)[:, None]
-            mask = inside
-            if causal:
-                mask = jnp.logical_and(
-                    inside, causal_attention_mask(jnp.arange(S), S, self.sliding_window))
-            causal, window = False, None
-            implementation = masked
+            # Attention stays inside each packed document. The ids travel to
+            # the kernel beside the causal flag and the window: splash compares
+            # them per block, and every other kernel builds the document mask
+            # from them (`attention_kernel`). A bidirectional layer reads its
+            # whole document.
+            documents = segment_ids
+            if not causal:
+                window = None
         if prefix is None and self._restricts_visibility(attention_metadata, decode):
             # A decode step's cache mask already holds the rows' validity; only
             # image groups add to it there.
             if not decode or self.bidirectional_images:
                 mask = self._metadata_mask(attention_metadata, positions, B, S, key.shape[-3], decode)
                 if segment_ids is not None and not decode:
-                    mask = mask & document_mask(segment_ids)[:, None]
+                    mask = with_documents(mask, segment_ids)
+            documents = None
             causal, window = False, None
             implementation = masked
         if attention_metadata is not None and attention_metadata.pairwise_mask is not None:
@@ -509,7 +507,7 @@ class CausalSelfAttention(nn.Module):
                     query_positions = jnp.broadcast_to(jnp.asarray(rotary_positions), (B, S))
                     distance = query_positions[:, :, None] - key_positions[:, None, :]
                     mask = mask & (jnp.abs(distance) < self.sliding_window)[:, None]
-            causal, window = False, None
+            causal, window, documents = False, None, None
             implementation = masked
         if self.attention_chunk is not None:
             # The decode and diagnostic paths: the chunk joins the mask the
@@ -519,6 +517,8 @@ class CausalSelfAttention(nn.Module):
             if attention_metadata is not None and attention_metadata.key_positions is not None:
                 key_places = attention_metadata.key_positions
             chunked = chunk_mask(positions, key_places, self.attention_chunk)
+            if documents is not None:
+                mask, documents = with_documents(mask, documents), None
             base = combined_attention_mask(S, key.shape[-3], causal, window, mask)
             mask = chunked if base is None else base & chunked
             causal, window = False, None
@@ -529,7 +529,8 @@ class CausalSelfAttention(nn.Module):
         sowing = not self.is_initializing() and self.is_mutable_collection("qk")
         if sowing:
             self.sow("qk", "max_logits", max_attention_logits(
-                query, key, causal=causal, sliding_window=window, mask=mask))
+                query, key, causal=causal, sliding_window=window,
+                mask=mask if documents is None else with_documents(mask, documents)))
         # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
         if (append is not None and mask is cursor and S == 1 and sinks is None and not sowing
                 and self.attention_impl in ('auto', 'tpu') and append.store.kernel()):
@@ -540,7 +541,7 @@ class CausalSelfAttention(nn.Module):
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
                 implementation=implementation, causal=causal,
                 sliding_window=window, mask=mask, sinks=sinks,
-                softcap=self.attn_logit_softcap), 'context')
+                softcap=self.attn_logit_softcap, segment_ids=documents), 'context')
         return self._output(attention, gate, B, S, own_value)
 
     def _decode_masks(self, positions, key_length: int) -> tuple[jax.Array, jax.Array]:
