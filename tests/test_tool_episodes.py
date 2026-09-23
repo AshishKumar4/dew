@@ -154,7 +154,7 @@ def per_call(batch, name, episodes):
     out = np.zeros((len(episodes) * TURNS, RESPONSE), np.asarray(batch[name]).dtype)
     for index, episode in enumerate(episodes):
         for turn, transition in enumerate(episode.transitions):
-            where = (batch["rollout_index"] == index) & (batch["call_index"] == turn)
+            where = (batch["session_index"] == index) & (batch["call_index"] == turn)
             out[index * TURNS + turn, :len(transition.action.tokens)] = np.asarray(batch[name])[where]
     return out
 
@@ -178,7 +178,7 @@ def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targe
         # The tool's context extends the call's context and actions, so the
         # two calls merge into one chain holding the second call's context.
         second = episode.transitions[1].action
-        chain = batch["input_ids"][batch["rollout_index"] == index]
+        chain = batch["input_ids"][batch["session_index"] == index]
         np.testing.assert_array_equal(chain, (*second.context, *second.tokens))
         for turn, transition in enumerate(episode.transitions):
             action = transition.action

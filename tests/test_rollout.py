@@ -285,8 +285,8 @@ class FakeState:
 def chains(out):
     """Each completion's chain, sampled mask and columns, by rollout index."""
     found = {}
-    for index in np.unique(out["rollout_index"][out["rollout_index"] >= 0]):
-        where = out["rollout_index"] == index
+    for index in np.unique(out["session_index"][out["session_index"] >= 0]):
+        where = out["session_index"] == index
         found[int(index)] = {name: np.asarray(out[name])[where]
                              for name in ("input_ids", "response_mask", "old_log_probs",
                                           "behavior_log_probs", "advantages", "versions")}

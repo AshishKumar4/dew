@@ -82,7 +82,7 @@ The rollout returns fixed-width arrays even when EOS ends a completion early. Re
 
 Correction (2026-09-22): `SampledRollout` returns `input_ids`, `response_mask`, `old_log_probs`, `behavior_log_probs`, `advantages`, `rewards` and `prompt_length`. It returns no `response_length` or `terminated` key (`src/dew/objectives/rl/rollout.py:139-147`).
 
-Correction (2026-09-22, packed layout): the table above is superseded. `SampledRollout` builds its batch with `rollouts.pack`, one call per completion: every column is `[N, P+T]` and aligned with `input_ids`, with `text_segment_ids`, `text_positions`, `versions`, `rollout_index` and `call_index` beside the mask, likelihoods and advantages. No `rewards` or `prompt_length` column remains; GRPO reads only this layout.
+Correction (2026-09-22, packed layout): the table above is superseded. `SampledRollout` builds its batch with `sessions.pack`, one call per completion: every column is `[N, P+T]` and aligned with `input_ids`, with `text_segment_ids`, `text_positions`, `versions`, `session_index` and `call_index` beside the mask, likelihoods and advantages. No `rewards` or `prompt_length` column remains; GRPO reads only this layout.
 
 ### 1.4 verl's parquet schema, mapped
 

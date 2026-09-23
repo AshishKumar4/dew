@@ -1324,7 +1324,7 @@ def mode_rollout(args) -> dict:
         "response_mask": np.asarray(rolled["response_mask"]).tolist(),
         "old_log_probs": np.asarray(rolled["old_log_probs"]).tolist(),
         "behavior_log_probs": np.asarray(rolled["behavior_log_probs"]).tolist(),
-        "rollout_index": np.asarray(rolled["rollout_index"]).tolist(),
+        "session_index": np.asarray(rolled["session_index"]).tolist(),
         "step": int(final.step),
         "drawn_tokens": np.asarray(drawn.tokens).tolist(),
         "drawn_lengths": np.asarray(drawn.lengths).tolist(),

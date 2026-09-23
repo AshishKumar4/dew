@@ -29,7 +29,7 @@ from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
 
-from .rollouts import OLD_LOG_PROBS_KEY, Call, Rollout, Status, pack, sampled_values
+from .sessions import OLD_LOG_PROBS_KEY, Call, Session, Status, pack, sampled_values
 
 if TYPE_CHECKING:
     from .journal import EpisodeJournal, JournalRun
@@ -246,7 +246,7 @@ class EpisodeRollout:
     and cancellation abort the whole group before a Trainer update; record
     receives the partial episode before the exception propagates.
 
-    Episodes train through `rollouts.pack`: a call whose context extends the
+    Episodes train through `sessions.pack`: a call whose context extends the
     previous call's context and actions merges into its chain, and chains
     share rows of max_prompt_tokens + max_new_tokens ids, so set the
     objective's seq_len one below that. `rows` fixes the packed row count;
@@ -585,9 +585,9 @@ class EpisodeRollout:
         return agreed("episode projection", lambda: self.project(episodes))
 
     def project(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
-        """Pack one collection's episodes into GRPO rows through `rollouts.pack`.
+        """Pack one collection's episodes into GRPO rows through `sessions.pack`.
 
-        Each episode becomes a `Rollout` (`rollout_of`), so its calls merge
+        Each episode becomes a `Session` (`session_of`), so its calls merge
         into one chain wherever the environment's next context extends the
         previous one, and the chains share `[rows, width]` rows with segment
         ids. `old_log_probs` carries the sampler's raw likelihoods, recorded
@@ -621,7 +621,7 @@ class EpisodeRollout:
             group_start = episodes[index - index % self.groups]
             if episode.identity.task != group_start.identity.task:
                 raise ValueError("an advantage group must contain the same task")
-        rollouts = [rollout_of(episode, group=str(index // self.groups))
+        rollouts = [session_of(episode, group=str(index // self.groups))
                     for index, episode in enumerate(episodes)]
         rows = len(episodes) * self.max_turns if self.rows is None else self.rows
         batch = pack(rollouts, self.max_prompt_tokens + self.max_new_tokens, rows=rows)
@@ -630,8 +630,8 @@ class EpisodeRollout:
         return batch
 
 
-def rollout_of(episode: Episode, *, group: str) -> Rollout:
-    """Read an episode as an engine-style `Rollout` of the advantage group `group`.
+def session_of(episode: Episode, *, group: str) -> Session:
+    """Read an episode as an engine-style `Session` of the advantage group `group`.
 
     Each transition's action is one call: its context is the prompt, its
     tokens the sampled ids with their behavior likelihoods, `stop` when it
@@ -646,5 +646,5 @@ def rollout_of(episode: Episode, *, group: str) -> Rollout:
                        "stop" if turn.action.terminated else "length", turn.action.policy_step)
                   for turn in episode.transitions)
     identity = episode.identity
-    return Rollout(str(identity.task), group, identity.sample, identity.attempt, calls, status,
+    return Session(str(identity.task), group, identity.sample, identity.attempt, calls, status,
                    episode.reward, detail=episode.detail)

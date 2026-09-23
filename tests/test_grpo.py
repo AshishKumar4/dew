@@ -24,7 +24,7 @@ from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.rollout import SampledRollout
-from dew.objectives.rl.rollouts import (
+from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
     IDS_KEY,

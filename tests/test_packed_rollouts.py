@@ -9,24 +9,25 @@ positions alone and compared with that structure.
 import numpy as np
 import pytest
 
-from dew.objectives.rl.rollouts import (
+from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
     CALL_INDEX_KEY,
     IDS_KEY,
     POSITIONS_KEY,
     RESPONSE_MASK_KEY,
-    ROLLOUT_INDEX_KEY,
-    ROLLOUT_WEIGHTS_KEY,
     SEGMENT_IDS_KEY,
+    SESSION_INDEX_KEY,
+    SESSION_WEIGHTS_KEY,
     VERSIONS_KEY,
     Call,
-    Rollout,
+    Session,
     Status,
     advantages,
+    chains,
     pack,
-    rollout_metrics,
     sampled_values,
+    session_metrics,
 )
 
 
@@ -60,7 +61,7 @@ def _rollout(rng, task="t", group="g", sample=0, reward=1.0, status=Status.COMPL
         call = _call(rng, prompt, number)
         calls.append(call)
         history = call.prompt_ids + call.sampled_ids
-    return Rollout(task, group, sample, 0, tuple(calls), status, reward), expected
+    return Session(task, group, sample, 0, tuple(calls), status, reward), expected
 
 
 def _read_chains(batch):
@@ -78,7 +79,7 @@ def _read_chains(batch):
             assert (np.diff(span) == 1).all(), "a chain is contiguous"
             start, stop = int(span[0]), int(span[-1]) + 1
             np.testing.assert_array_equal(batch[POSITIONS_KEY][row, start:stop], np.arange(stop - start))
-            owners = np.unique(batch[ROLLOUT_INDEX_KEY][row, start:stop])
+            owners = np.unique(batch[SESSION_INDEX_KEY][row, start:stop])
             assert owners.size == 1
             found.append((int(owners[0]), row, start, stop))
     return found
@@ -120,11 +121,11 @@ def test_strict_merge_follows_append_only_history_and_splits_on_any_rewrite(seed
             assert (batch[BEHAVIOR_LOG_PROBS_KEY][row, others] == 0).all()
         assert not wanted
     pad = batch[SEGMENT_IDS_KEY] == 0
-    assert (batch[ROLLOUT_INDEX_KEY][pad] == -1).all() and (batch[RESPONSE_MASK_KEY][pad] == 0).all()
-    # Rollout weights give each trainable rollout unit mass.
+    assert (batch[SESSION_INDEX_KEY][pad] == -1).all() and (batch[RESPONSE_MASK_KEY][pad] == 0).all()
+    # Session weights give each trainable rollout unit mass.
     for index in range(len(rollouts)):
-        mine = batch[ROLLOUT_INDEX_KEY] == index
-        assert batch[ROLLOUT_WEIGHTS_KEY][mine].sum() == pytest.approx(1.0)
+        mine = batch[SESSION_INDEX_KEY] == index
+        assert batch[SESSION_WEIGHTS_KEY][mine].sum() == pytest.approx(1.0)
         assert (batch[ADVANTAGES_KEY][mine] == advantages(rollouts)[index]).all()
 
 
@@ -133,8 +134,8 @@ def test_a_prompt_only_prefix_does_not_merge():
     first = Call((1, 2, 3), (7, 8, 9), (-.1, -.2, -.3), "tool_calls", 0)
     rewritten = Call((1, 2, 3, 9, 4), (5,), (-.5,), "stop", 0)
     appended = Call((1, 2, 3, 7, 8, 9, 4), (5,), (-.5,), "stop", 0)
-    split = pack([Rollout("t", "g", 0, 0, (first, rewritten), Status.COMPLETED, 1.0)], 16)
-    merged = pack([Rollout("t", "g", 0, 0, (first, appended), Status.COMPLETED, 1.0)], 16)
+    split = pack([Session("t", "g", 0, 0, (first, rewritten), Status.COMPLETED, 1.0)], 16)
+    merged = pack([Session("t", "g", 0, 0, (first, appended), Status.COMPLETED, 1.0)], 16)
     assert split[SEGMENT_IDS_KEY].max() == 2
     assert merged[SEGMENT_IDS_KEY].max() == 1
     np.testing.assert_array_equal(merged[IDS_KEY][0, :8], [1, 2, 3, 7, 8, 9, 4, 5])
@@ -143,12 +144,12 @@ def test_a_prompt_only_prefix_does_not_merge():
 
 def test_masked_rollouts_take_no_rows_and_no_baseline():
     call = Call((1, 2), (3,), (-.1,), "stop", 0)
-    rollouts = [Rollout("t", "g", 0, 0, (call,), Status.COMPLETED, 1.0),
-                Rollout("t", "g", 1, 0, (call,), Status.AGENT_ERROR, 0.0),
-                Rollout("t", "g", 2, 0, (call,), Status.TRUNCATED, 5.0),
-                Rollout("t", "g", 3, 0, (call,), Status.INFRA_ERROR, None)]
+    rollouts = [Session("t", "g", 0, 0, (call,), Status.COMPLETED, 1.0),
+                Session("t", "g", 1, 0, (call,), Status.AGENT_ERROR, 0.0),
+                Session("t", "g", 2, 0, (call,), Status.TRUNCATED, 5.0),
+                Session("t", "g", 3, 0, (call,), Status.INFRA_ERROR, None)]
     batch = pack(rollouts, 3)
-    assert set(np.unique(batch[ROLLOUT_INDEX_KEY])) == {0, 1}
+    assert set(np.unique(batch[SESSION_INDEX_KEY])) == {0, 1}
     np.testing.assert_allclose(advantages(rollouts, "mean"), [.5, -.5, 0, 0])
     lonely = [rollouts[0], rollouts[2]]
     assert (advantages(lonely) == 0).all()
@@ -156,7 +157,7 @@ def test_masked_rollouts_take_no_rows_and_no_baseline():
 
 def test_rows_pad_to_a_fixed_count_and_refuse_overflow():
     call = Call((1, 2), (3,), (-.1,), "stop", 0)
-    rollouts = [Rollout("t", "g", sample, 0, (call,), Status.COMPLETED, float(sample)) for sample in range(4)]
+    rollouts = [Session("t", "g", sample, 0, (call,), Status.COMPLETED, float(sample)) for sample in range(4)]
     assert pack(rollouts, 6)[IDS_KEY].shape == (2, 6)
     assert pack(rollouts, 6, rows=5)[IDS_KEY].shape == (5, 6)
     with pytest.raises(ValueError, match="more than the 1"):
@@ -173,19 +174,19 @@ def test_sampled_values_scatter_per_call_values_in_call_order():
     np.testing.assert_array_equal(placed, batch[BEHAVIOR_LOG_PROBS_KEY])
 
 
-def test_rollout_metrics_report_merge_masking_reward_latency_and_lag():
+def test_session_metrics_report_merge_masking_reward_latency_and_lag():
     first = Call((1, 2), (3,), (-.1,), "tool_calls", 4)
     merged = Call((1, 2, 3, 7), (8, 9), (-.2, -.3), "stop", 5)
     rewritten = Call((1, 5), (6,), (-.4,), "stop", 5)
     rollouts = [
-        Rollout("t", "g", 0, 0, (first, merged), Status.COMPLETED, 1.0, {"tests": 1.0}),
-        Rollout("t", "g", 1, 0, (first, rewritten), Status.AGENT_ERROR, 0.0, {"tests": 0.0}),
-        Rollout("t", "g", 2, 0, (first,), Status.TRUNCATED, None),
-        Rollout("u", "g", 3, 0, (first, merged), Status.INFRA_ERROR, None),
+        Session("t", "g", 0, 0, (first, merged), Status.COMPLETED, 1.0, {"tests": 1.0}),
+        Session("t", "g", 1, 0, (first, rewritten), Status.AGENT_ERROR, 0.0, {"tests": 0.0}),
+        Session("t", "g", 2, 0, (first,), Status.TRUNCATED, None),
+        Session("u", "g", 3, 0, (first, merged), Status.INFRA_ERROR, None),
     ]
     batch = pack(rollouts, 8)
     batch["old_log_probs"] = batch[BEHAVIOR_LOG_PROBS_KEY] + .1 * batch[RESPONSE_MASK_KEY]
-    metrics = rollout_metrics(rollouts, batch, source=lambda rollout: rollout.task,
+    metrics = session_metrics(rollouts, batch, source=lambda rollout: rollout.task,
                               latencies=[1.0, 2.0, 3.0, 40.0], version=6)
     assert metrics["merge/calls_per_chain"] == pytest.approx(4 / 3)
     assert metrics["status/completed"] == metrics["status/truncated"] == .25
@@ -205,30 +206,38 @@ def test_each_sampled_id_weighs_one_over_its_rollouts_sampled_count():
     first = Call((1, 2), (3, 4), (-.1, -.2), "tool_calls", 0)
     rewritten = Call((1, 9), (5,), (-.3,), "stop", 0)
     lonely = Call((6,), (7, 8, 9), (-.1, -.1, -.1), "stop", 0)
-    rollouts = [Rollout("t", "g", 0, 0, (first, rewritten), Status.COMPLETED, 1.0),
-                Rollout("t", "g", 1, 0, (lonely,), Status.COMPLETED, 0.0)]
+    rollouts = [Session("t", "g", 0, 0, (first, rewritten), Status.COMPLETED, 1.0),
+                Session("t", "g", 1, 0, (lonely,), Status.COMPLETED, 0.0)]
     batch = pack(rollouts, 4)
     assert batch[SEGMENT_IDS_KEY].shape[0] == 3, "the first rollout splits into two rows"
     sampled = batch[RESPONSE_MASK_KEY] != 0
     for index, count in ((0, 3), (1, 3)):
-        mine = sampled & (batch[ROLLOUT_INDEX_KEY] == index)
-        np.testing.assert_allclose(batch[ROLLOUT_WEIGHTS_KEY][mine], 1 / count)
-    assert (batch[ROLLOUT_WEIGHTS_KEY][~sampled] == 0).all()
+        mine = sampled & (batch[SESSION_INDEX_KEY] == index)
+        np.testing.assert_allclose(batch[SESSION_WEIGHTS_KEY][mine], 1 / count)
+    assert (batch[SESSION_WEIGHTS_KEY][~sampled] == 0).all()
 
 
 def test_group_advantages_match_hand_computed_values_across_uneven_groups():
     """Two groups of different sizes, one with a masked member: the group
     estimator normalises by each group's own deviation (ddof 1)."""
     call = Call((1, 2), (3,), (-.1,), "stop", 0)
-    rollouts = [Rollout("a", "g", 0, 0, (call,), Status.COMPLETED, 1.0),
-                Rollout("a", "g", 1, 0, (call,), Status.COMPLETED, 0.0),
-                Rollout("a", "g", 2, 0, (call,), Status.AGENT_ERROR, 1.0),
-                Rollout("a", "g", 3, 0, (call,), Status.INFRA_ERROR, None),
-                Rollout("b", "g", 0, 0, (call,), Status.COMPLETED, 0.0),
-                Rollout("b", "g", 1, 0, (call,), Status.COMPLETED, 1.0)]
+    rollouts = [Session("a", "g", 0, 0, (call,), Status.COMPLETED, 1.0),
+                Session("a", "g", 1, 0, (call,), Status.COMPLETED, 0.0),
+                Session("a", "g", 2, 0, (call,), Status.AGENT_ERROR, 1.0),
+                Session("a", "g", 3, 0, (call,), Status.INFRA_ERROR, None),
+                Session("b", "g", 0, 0, (call,), Status.COMPLETED, 0.0),
+                Session("b", "g", 1, 0, (call,), Status.COMPLETED, 1.0)]
     expected = [0.57735, -1.15470, 0.57735, 0.0, -0.70711, 0.70711]
     np.testing.assert_allclose(advantages(rollouts), expected, atol=1e-4)
     batch = pack(rollouts, 3)
     for index, value in enumerate(expected):
-        mine = batch[ROLLOUT_INDEX_KEY] == index
+        mine = batch[SESSION_INDEX_KEY] == index
         np.testing.assert_allclose(batch[ADVANTAGES_KEY][mine], value, atol=1e-4)
+
+
+def test_chains_report_the_ids_pack_would_place():
+    first = Call((1, 2), (3,), (-.1,), "tool_calls", 0)
+    appended = Call((1, 2, 3, 4), (5,), (-.2,), "stop", 0)
+    rewritten = Call((1, 9), (6,), (-.3,), "stop", 0)
+    session = Session("t", "g", 0, 0, (first, appended, rewritten), Status.COMPLETED, 1.0)
+    assert chains(session, 8) == ((1, 2, 3, 4, 5), (1, 9, 6))

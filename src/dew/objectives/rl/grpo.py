@@ -3,7 +3,7 @@
 A `GRPOObjective` is an `LMObjective` whose loss is the section 6
 composition from `dew.rl`: a clipped policy surrogate plus `beta` times the
 k3 KL against the frozen reference. It reads the one batch layout
-`rollouts.pack` builds, which every rollout in Dew produces: rows of strictly
+`sessions.pack` builds, which every rollout in Dew produces: rows of strictly
 merged chains with `text_segment_ids` and `text_positions`, every column
 `[rows, width]` and aligned with `input_ids`. `behavior_log_probs` stands in
 for `old_log_probs` when no proximal rescoring supplied one.
@@ -36,25 +36,25 @@ from dew.rl.surrogate import (
 
 from ..lm import LMObjective
 from ..lm.objective import _shift_rows, _unpadded
-from .rollouts import (
+from .sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
     IDS_KEY,
     OLD_LOG_PROBS_KEY,
     POSITIONS_KEY,
     RESPONSE_MASK_KEY,
-    ROLLOUT_WEIGHTS_KEY,
     SEGMENT_IDS_KEY,
+    SESSION_WEIGHTS_KEY,
 )
 
 POLICY_LOSSES = ("ppo", "gspo", "cispo")
-AGGREGATIONS = ("token-mean", "rollout-mean")
+AGGREGATIONS = ("token-mean", "session-mean")
 
 
 class _Terms(NamedTuple):
     """The loss's inputs on the packed grid, aligned with `input_ids`: current,
     old and behavior log-probabilities, advantages, the trainable mask, chain
-    ids, the per-rollout weights when the batch carries them, and whether the
+    ids, the per-session weights when the batch carries them, and whether the
     old policy was rescored rather than standing in for behavior."""
 
     policy: jax.Array
@@ -63,7 +63,7 @@ class _Terms(NamedTuple):
     advantages: jax.Array
     mask: jax.Array
     segments: jax.Array
-    rollout_weights: jax.Array | None
+    session_weights: jax.Array | None
     proximal: bool
 
 
@@ -96,33 +96,36 @@ class GRPOObjective(LMObjective):
     `"ppo"` (`compute_policy_loss_vanilla`), `"gspo"`
     (`compute_policy_loss_gspo`: the sequence ratio of `sequence_log_ratio`,
     clipped, no dual clip) and `"cispo"` (`compute_policy_loss_cispo`). A
-    sequence is a windowed row or a packed chain.
+    sequence is a packed chain.
 
-    `aggregation` is `"token-mean"` (verl's default) or `"rollout-mean"`:
-    each rollout's token mean, averaged over rollouts, so a long rollout or
+    `aggregation` is `"token-mean"` (verl's default) or `"session-mean"`:
+    each session's token mean, averaged over sessions, so a long session or
     one split over several rows weighs as one (Agent Lightning's
-    `per_rollout_mean`, verl's `seq-mean-token-mean` when a rollout is one
-    row). Packed batches carry the weights in `rollout_weights`; a windowed
-    row is its own rollout.
+    `per_rollout_mean`, verl's `seq-mean-token-mean` when a session is one
+    row). The batch carries the weights in `session_weights`.
 
     Behavior corrections read `behavior_log_probs` against the proximal
     policy (`old_log_probs`), all detached, from verl's
-    `rollout_corr_helper`: `behavior_importance_cap` caps the token ratio
-    (TIS); `behavior_band` zeroes it outside `(low, high)` instead (IcePop);
+    `rollout_corr_helper`. `behavior_importance` is one threshold, as verl's
+    `rollout_is_threshold` is: a number caps the token ratio (TIS), a
+    `(low, high)` pair zeroes it outside the band instead (IcePop);
     `sequence_mask` and `geometric_mask` reject every token of a sequence
     whose summed (`seq_sum_k1`) or mean (`seq_mean_k1`) k1 statistic lies
     outside `(log low, log high)`. Metrics add `mismatch/kl`,
     `mismatch/k3_kl` and `mismatch/ess` whenever behavior likelihoods are
     present, and the fraction of trainable tokens each correction masked.
+    Without `old_log_probs` the corrections follow verl's bypass mode: they
+    compare the detached current policy with behavior, the band only masks,
+    and a TIS cap is refused, since the ratio already is current over
+    behavior.
     """
 
     _ema_is_reference = True
 
     def __init__(self, model, seq_len: int, beta: float = 0.0,
                  epsilon_low: float = 0.2, epsilon_high: float = 0.2,
-                 dual_clip: float = 3.0, behavior_importance_cap: float | None = None, *,
-                 policy_loss: str = "ppo", aggregation: str = "token-mean",
-                 behavior_band: tuple[float, float] | None = None,
+                 dual_clip: float = 3.0, *, policy_loss: str = "ppo", aggregation: str = "token-mean",
+                 behavior_importance: float | tuple[float, float] | None = None,
                  sequence_mask: tuple[float, float] | None = None,
                  geometric_mask: tuple[float, float] | None = None, **kwargs):
         if beta < 0:
@@ -144,13 +147,16 @@ class GRPOObjective(LMObjective):
         self.epsilon_low = epsilon_low
         self.epsilon_high = epsilon_high
         self.dual_clip = dual_clip
-        if behavior_importance_cap is not None and (isinstance(behavior_importance_cap, bool)
-                                                    or not behavior_importance_cap > 0):
-            raise ValueError("behavior_importance_cap must be positive, or None to disable correction")
-        self.behavior_band = _band("behavior_band", behavior_band)
-        if behavior_importance_cap is not None and self.behavior_band is not None:
-            raise ValueError("behavior_importance_cap and behavior_band are two token corrections; pick one")
-        self.behavior_importance_cap = behavior_importance_cap
+        self.behavior_importance = behavior_importance
+        self._cap: float | None = None
+        self._band: tuple[float, float] | None = None
+        if isinstance(behavior_importance, tuple):
+            self._band = _band("behavior_importance", behavior_importance)
+        elif behavior_importance is not None:
+            if isinstance(behavior_importance, bool) or not behavior_importance > 0:
+                raise ValueError("behavior_importance is a positive TIS cap, a (low, high) IcePop band, "
+                                 "or None to disable correction")
+            self._cap = float(behavior_importance)
         self.sequence_mask = _band("sequence_mask", sequence_mask)
         self.geometric_mask = _band("geometric_mask", geometric_mask)
         self.policy_loss = policy_loss
@@ -190,14 +196,14 @@ class GRPOObjective(LMObjective):
             if key not in batch:
                 raise ValueError(f"a GRPO batch carries {key} from pack; the batch has {sorted(batch)}")
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY], jnp.float32)
-        for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY, ROLLOUT_WEIGHTS_KEY):
+        for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY, SESSION_WEIGHTS_KEY):
             if key in batch and jnp.shape(batch[key]) != mask.shape:
                 raise ValueError(f"{key} has shape {jnp.shape(batch[key])}; a packed column has "
                                  f"the shape of {IDS_KEY}, {mask.shape}")
         behavior = jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], jnp.float32)
         proximal = OLD_LOG_PROBS_KEY in batch
         old = jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32) if proximal else behavior
-        weights = batch.get(ROLLOUT_WEIGHTS_KEY)
+        weights = batch.get(SESSION_WEIGHTS_KEY)
         return _Terms(self.packed_log_probs(params, batch), old, behavior,
                       jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32), mask,
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
@@ -211,11 +217,11 @@ class GRPOObjective(LMObjective):
         """
         terms = self._terms(params, batch)
         mask = terms.mask
-        if self.behavior_importance_cap is not None and not terms.proximal:
+        if self._cap is not None and not terms.proximal:
             raise ValueError(
                 "without old_log_probs the ratio is already current over behavior, so a TIS cap "
                 "would count the correction twice (verl's bypass mode applies no IS weight); "
-                "rescore old_log_probs or drop behavior_importance_cap")
+                "rescore old_log_probs or give behavior_importance a (low, high) band")
         # Without a proximal rescoring, behavior stands in for the old policy,
         # and the corrections compare the detached current policy with behavior,
         # as verl's compute_policy_loss_bypass_mode does.
@@ -232,13 +238,12 @@ class GRPOObjective(LMObjective):
         # Weights and diagnostics read every trainable token, as verl's do;
         # rejection reaches the loss through `effective` alone.
         importance = None
-        if self.behavior_importance_cap is not None:
-            importance = behavior_importance_weights(proximal, terms.behavior, mask,
-                                                     self.behavior_importance_cap)
-        elif self.behavior_band is not None:
-            importance = behavior_band_weights(proximal, terms.behavior, mask, *self.behavior_band)
+        if self._cap is not None:
+            importance = behavior_importance_weights(proximal, terms.behavior, mask, self._cap)
+        elif self._band is not None:
+            importance = behavior_band_weights(proximal, terms.behavior, mask, *self._band)
             metrics["masked/band"] = masked_mean(importance == 0, mask)
-        cap = (self.behavior_importance_cap if self.behavior_band is None else self.behavior_band[1])
+        cap = self._cap if self._band is None else self._band[1]
         mismatch = mismatch_metrics(proximal, terms.behavior, mask, importance, cap)
         metrics.update({f"mismatch/{key}": value for key, value in mismatch.items()})
         if importance is not None and not terms.proximal:
@@ -284,16 +289,16 @@ class GRPOObjective(LMObjective):
     def _weights(self, terms: _Terms, effective: jax.Array, keep: jax.Array) -> jax.Array:
         """Each token's share of the loss mass under the chosen aggregation.
 
-        Token-mean weighs every kept token 1. Rollout-mean weighs it one
-        over its rollout's trainable count, the batch's own `rollout_weights`;
+        Token-mean weighs every kept token 1. Session-mean weighs it one
+        over its session's trainable count, the batch's own `session_weights`;
         rejected sequences drop out of the numerator and the mass alike.
         """
         effective = effective.astype(jnp.float32)
         if self.aggregation == "token-mean":
             return effective
-        if terms.rollout_weights is None:
-            raise ValueError(f"rollout-mean aggregation reads {ROLLOUT_WEIGHTS_KEY} from pack")
-        return terms.rollout_weights * keep * (effective != 0)
+        if terms.session_weights is None:
+            raise ValueError(f"session-mean aggregation reads {SESSION_WEIGHTS_KEY} from pack")
+        return terms.session_weights * keep * (effective != 0)
 
     def evaluate(self, params, batch, step):
         """Score the prompts' perplexity under the policy.

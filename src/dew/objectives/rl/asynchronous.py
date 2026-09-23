@@ -25,7 +25,7 @@ Off-policy correction is decoupled PPO (AReaL, arXiv:2505.24298): the ratio's
 old policy is the proximal one, the trainer's current weights, rescored over
 the drawn tokens whenever the batch is stale or the server reports no raw
 likelihood; the recorded behavior likelihoods stay as the server reported
-them, and the objective's `behavior_importance_cap` weights each token by
+them, and the objective's `behavior_importance` weights each token by
 proximal over behavior. A run that allows any lag must set that cap.
 """
 
@@ -51,7 +51,7 @@ from dew.training.state import TrainState
 
 from .grpo import GRPOObjective
 from .rollout import Reward, check_rollout, completion_rows, prompt_rows
-from .rollouts import OLD_LOG_PROBS_KEY, sampled_values
+from .sessions import OLD_LOG_PROBS_KEY, sampled_values
 
 
 @dataclass(frozen=True)
@@ -109,8 +109,8 @@ class AsyncRollout:
             raise ValueError(
                 f"ahead={ahead} and sync_every={sync_every} let a batch fall {ahead + sync_every - 1} "
                 f"updates behind, past max_lag={max_lag}")
-        if max_lag > 0 and objective.behavior_importance_cap is None:
-            raise ValueError("stale rollouts need the objective's behavior_importance_cap: "
+        if max_lag > 0 and objective.behavior_importance is None:
+            raise ValueError("stale rollouts need the objective's behavior_importance: "
                              "the proximal-to-behavior importance weight is the off-policy correction")
         self.objective, self.server, self.reward, self.decode = objective, server, reward, decode
         self.groups, self.max_new_tokens, self.estimator = groups, max_new_tokens, estimator

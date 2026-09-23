@@ -3,7 +3,7 @@
 
 `pack` merges call k + 1 into call k's training row only when call k + 1's
 prompt ids start with call k's prompt ids plus its sampled ids
-(`dew.objectives.rl.rollouts.merges`). Whether that holds is decided by the
+(`dew.objectives.rl.sessions.merges`). Whether that holds is decided by the
 model family's chat template and by harness settings: how observations
 return (a `tool` or a `user` message), whether reasoning is kept in
 history, how tool-call arguments are re-serialized. Run this before
@@ -54,7 +54,7 @@ def template_case(tokenizer, end: int, observation_role: str, *, reasoning: bool
     as compact JSON that the server then parses; the history carries the
     parsed arguments for the template to re-serialize.
     """
-    from dew.objectives.rl.rollouts import Call, merges
+    from dew.objectives.rl.sessions import Call, merges
 
     def render(messages, prompt=True):
         return list(tokenizer.apply_chat_template(messages, tools=TOOLS, add_generation_prompt=prompt,
@@ -116,7 +116,7 @@ def audit_template(name: str, end_token: str | None) -> dict:
 
 def audit_sessions(lines: Sequence[str]) -> dict:
     """Calls per strict chain over recorded sessions, and where every split diverged."""
-    from dew.objectives.rl.rollouts import Call, Rollout, Status, chains
+    from dew.objectives.rl.sessions import Call, Session, Status, chains
 
     calls_total = chains_total = 0
     splits = []
@@ -131,7 +131,7 @@ def audit_sessions(lines: Sequence[str]) -> dict:
         if not calls:
             continue
         width = max(len(call.prompt_ids) + len(call.sampled_ids) for call in calls)
-        built = chains(Rollout("audit", "audit", 0, 0, calls, Status.CANCELLED, None), 0, width)
+        built = chains(Session("audit", "audit", 0, 0, calls, Status.COMPLETED, 0.0), width)
         calls_total += len(calls)
         chains_total += len(built)
         history: list[int] = []
