@@ -26,7 +26,7 @@ import pytest
 from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
-from dew.nn.autoencoders import (
+from dew.nn.autoencoders.qwen_image import (
     QwenImageAutoencoder,
     load_qwen_image_vae,
     qwen_image_vae_fields,
