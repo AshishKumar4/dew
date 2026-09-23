@@ -428,11 +428,9 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
     # The running trial died with its trainer rather than running on without it.
     pid = json.loads(seen.read_text())["pid"]
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
+    while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
         time.sleep(0.1)
-    os.kill(pid, 9)
-    raise AssertionError("the interrupted trainer's running trial outlived it")
+    alive = Path(f"/proc/{pid}").exists()
+    if alive:
+        os.kill(pid, 9)
+    assert not alive, "the interrupted trainer's running trial outlived it"

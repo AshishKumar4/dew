@@ -65,6 +65,8 @@ from dew.records import JSON
 from .sessions import Call, Session, Status, Task
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     import httpx
 
 _logger = logging.getLogger(__name__)
@@ -129,7 +131,7 @@ class Gateway:
             raise ValueError(f"session ids are URL-path safe: letters, digits and ._:-; got {session!r}")
         return f"{self.sandbox_url}/sessions/{session}/v1"
 
-    def traces(self, session: str) -> list[JSON]:
+    def traces(self, session: str) -> Sequence[object]:
         response = self._client.get(f"{self.url}/sessions/{session}/traces")
         response.raise_for_status()
         traces = response.json()
@@ -155,9 +157,10 @@ class Gateway:
         while True:
             try:
                 response = self._client.get(url)
-                health = _object(response.json()) if response.status_code == 200 else {}
+                answer = response.json() if response.status_code == 200 else None
                 seen = f"{response.status_code} {response.text[:500]}"
-                if isinstance(healthy := health.get("healthy"), int) and healthy > 0:
+                healthy = answer.get("healthy") if isinstance(answer, dict) else None
+                if isinstance(healthy, int) and healthy > 0:
                     # The gateway calls a worker healthy until its first probe fails, so also see the
                     # engine answer through it; a request without a session leaves no trace.
                     listing = self._client.get(f"{self.url}/v1/models")
@@ -175,27 +178,25 @@ class Gateway:
     def stamp(self, version: int) -> None:
         """Make the gateway label the calls it records from now on with `version` (a `Publication` stamp)."""
         response = self._client.post(f"{self.url}/admin/weight_version", json={"weight_version": version})
-        if response.status_code != 200 or _object(response.json()).get("weight_version") != version:
+        answer = response.json()
+        if response.status_code != 200 or not isinstance(answer, dict) or answer.get("weight_version") != version:
             raise RuntimeError(f"the gateway refused version {version}: {response.status_code} {response.text}")
 
     def forget(self, session: str) -> None:
         self._client.delete(f"{self.url}/sessions/{session}").raise_for_status()
 
 
-def _object(value: JSON) -> dict[str, JSON]:
-    """`value` when it is a JSON object, else an empty one: an absent or null field reads as empty."""
-    return value if isinstance(value, dict) else {}
-
-
-def _number(name: str, value: JSON) -> float:
+def _number(name: str, value: object) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} is not a number: {value!r}")
     return float(value)
 
 
-def _ids(name: str, values: JSON) -> tuple[int, ...]:
-    ids = tuple(value for value in values if type(value) is int) if isinstance(values, list) else ()
-    if not isinstance(values, list) or len(ids) != len(values):
+def _ids(name: str, values: object) -> tuple[int, ...]:
+    if not isinstance(values, list):
+        raise ValueError(f"the trace's {name} are not a list of token ids")
+    ids = tuple(value for value in values if type(value) is int)
+    if len(ids) != len(values):
         raise ValueError(f"the trace's {name} are not a list of token ids")
     return ids
 
@@ -208,7 +209,49 @@ class Recorded:
     errors: tuple[str, ...]
 
 
-def calls(traces: Sequence[JSON], *, unstamped: int) -> Recorded:
+@dataclass(frozen=True)
+class _Trace:
+    """One gateway trace, read: when its request arrived, and either the call or the engine's error."""
+
+    arrival: float
+    call: Call | None
+    error: str
+
+
+def _trace(trace: object, unstamped: int) -> _Trace:
+    """Read one gateway trace, refusing any field that is not the JSON type the gateway writes."""
+    if not isinstance(trace, dict):
+        raise ValueError(f"a gateway trace is a JSON object, got {type(trace).__name__}")
+    raw = trace.get("raw_response") or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"a trace's raw response is a JSON object, got {type(raw).__name__}")
+    arrival = _number("timestamp", trace.get("timestamp")) - _number("latency_ms", trace.get("latency_ms")) / 1000
+    # vLLM answers {"error": {"message": ...}}; SGLang {"object": "error", "message": ...}.
+    error = raw.get("error") or (raw.get("message") if raw.get("object") == "error" else None)
+    if error:
+        return _Trace(arrival, None, str(error.get("message", error) if isinstance(error, dict) else error))
+    sampled = trace.get("completion_token_ids") or []
+    if not sampled:
+        # SGLang lists the sampled ids as choices[0].response_token_ids, which the gateway does not extract.
+        choices = raw.get("choices")
+        choice = choices[0] if isinstance(choices, list) and choices else None
+        sampled = (choice.get("response_token_ids") if isinstance(choice, dict) else None) or []
+    prompt = trace.get("prompt_token_ids") or []
+    if not prompt:
+        raise ValueError("a trace carries no prompt ids: the engine was not asked for them or cannot list them")
+    version = trace.get("weight_version")
+    if version is not None and type(version) is not int:
+        raise ValueError(f"a trace's weight version is an integer, got {version!r}")
+    likelihoods = trace.get("logprobs") or []
+    if not isinstance(likelihoods, list):
+        raise ValueError("a trace's log-probabilities are a list")
+    call = Call(_ids("prompt ids", prompt), _ids("sampled ids", sampled),
+                tuple(_number("a log-probability", value) for value in likelihoods),
+                str(trace.get("finish_reason")), unstamped if version is None else version)
+    return _Trace(arrival, call, "")
+
+
+def calls(traces: Sequence[object], *, unstamped: int) -> Recorded:
     """The gateway's traces of one session as `Call`s in submission order, and its engine errors.
 
     A trace records its arrival indirectly: `timestamp` is when the answer
@@ -223,41 +266,9 @@ def calls(traces: Sequence[JSON], *, unstamped: int) -> Recorded:
     too many, or with a field of the wrong JSON type raises `ValueError`;
     training on it would mean guessing or re-tokenizing text.
     """
-    checked = []
-    for trace in traces:
-        if not isinstance(trace, dict):
-            raise ValueError(f"a gateway trace is a JSON object, got {type(trace).__name__}")
-        raw = trace.get("raw_response")
-        if raw is not None and not isinstance(raw, dict):
-            raise ValueError(f"a trace's raw response is a JSON object, got {type(raw).__name__}")
-        arrival = _number("timestamp", trace.get("timestamp")) - _number("latency_ms", trace.get("latency_ms")) / 1000
-        checked.append((arrival, trace, _object(raw)))
-    checked.sort(key=lambda entry: entry[0])
-    records, errors = [], []
-    for _, trace, raw in checked:
-        # vLLM answers {"error": {"message": ...}}; SGLang {"object": "error", "message": ...}.
-        error = raw.get("error") or (raw.get("message") if raw.get("object") == "error" else None)
-        if error:
-            errors.append(str(_object(error).get("message", error)))
-            continue
-        prompt, sampled = trace.get("prompt_token_ids") or [], trace.get("completion_token_ids") or []
-        if not sampled:
-            # SGLang lists the sampled ids as choices[0].response_token_ids, which the gateway does not extract.
-            choices = raw.get("choices")
-            sampled = (_object(choices[0]) if isinstance(choices, list) and choices else {}).get(
-                "response_token_ids") or []
-        if not prompt:
-            raise ValueError("a trace carries no prompt ids: the engine was not asked for them or cannot list them")
-        version = trace.get("weight_version")
-        if version is not None and type(version) is not int:
-            raise ValueError(f"a trace's weight version is an integer, got {version!r}")
-        likelihoods = trace.get("logprobs") or []
-        if not isinstance(likelihoods, list):
-            raise ValueError("a trace's log-probabilities are a list")
-        records.append(Call(_ids("prompt ids", prompt), _ids("sampled ids", sampled),
-                            tuple(_number("a log-probability", value) for value in likelihoods),
-                            str(trace.get("finish_reason")), unstamped if version is None else version))
-    return Recorded(tuple(records), tuple(errors))
+    read = sorted((_trace(trace, unstamped) for trace in traces), key=lambda trace: trace.arrival)
+    return Recorded(tuple(trace.call for trace in read if trace.call is not None),
+                    tuple(trace.error for trace in read if trace.call is None))
 
 
 # How vLLM 0.30.0 ("This model's maximum context length is ...") and SGLang 0.5.20 ("The input (N
@@ -267,11 +278,39 @@ _OVERFLOW = re.compile(r"maximum context length|longer than the model's context 
                        r"|longer than the maximum model length", re.IGNORECASE)
 
 
-def outcome(result: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (),
+@dataclass(frozen=True)
+class _Judged:
+    """What Harbor's result says of one trial: its exception, if any, and the verifier's rewards."""
+
+    kind: str | None
+    detail: str
+    rewards: dict[str, float]
+
+
+def _judged(trial: object) -> _Judged:
+    """Read Harbor's `TrialResult` JSON, refusing any field that is not the type Harbor writes."""
+    if not isinstance(trial, dict):
+        raise ValueError(f"Harbor's result is a JSON object, got {type(trial).__name__}")
+    failure, verdict = trial.get("exception_info") or {}, trial.get("verifier_result") or {}
+    if not isinstance(failure, dict) or not isinstance(verdict, dict):
+        raise ValueError(f"Harbor's result is malformed: {trial!r:.200}")
+    kind = failure.get("exception_type")
+    if kind is not None and not isinstance(kind, str):
+        raise ValueError(f"Harbor's exception type is not a name: {kind!r}")
+    reported = verdict.get("rewards") or {}
+    if not isinstance(reported, dict):
+        raise ValueError(f"the verifier's rewards are not an object: {reported!r}")
+    rewards = {str(name): _number(f"reward {name!r}", value) for name, value in reported.items()}
+    if len(rewards) > 1 and "reward" not in rewards:
+        raise ValueError(f"the verifier reported {sorted(rewards)} and no 'reward'")
+    return _Judged(kind, f"{kind}: {failure.get('exception_message', '')}".strip() if kind else "", rewards)
+
+
+def outcome(trial: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (),
             harness_exit: str | None = None) -> tuple[Status, float | None, dict[str, float], str]:
     """Status, reward, reward components and failure detail of one finished trial.
 
-    `result` is Harbor's `TrialResult` as JSON, `records` the session's calls,
+    `trial` is Harbor's `TrialResult` as JSON, `records` the session's calls,
     `errors` the engine errors the gateway recorded for it, and `harness_exit`
     the harness's own exit status when it reports one. An engine that refused
     an overflowing prompt truncated the rollout; any other engine error makes
@@ -279,24 +318,12 @@ def outcome(result: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = 
     fields have the wrong JSON types is infra: nothing in it can be trusted
     to score.
     """
-    trial = _object(result)
-    failure, verdict = trial.get("exception_info"), trial.get("verifier_result")
-    if not isinstance(result, dict) or not isinstance(failure, (dict, type(None))) \
-            or not isinstance(verdict, (dict, type(None))):
-        return Status.INFRA_ERROR, None, {}, f"Harbor's result is malformed: {result!r:.200}"
-    kind = _object(failure).get("exception_type")
-    kind = kind if isinstance(kind, str) else None
-    detail = f"{kind}: {_object(failure).get('exception_message', '')}".strip() if kind else ""
-    reported = _object(verdict).get("rewards") or {}
     try:
-        if not isinstance(reported, dict):
-            raise ValueError(f"the verifier's rewards are not an object: {reported!r}")
-        rewards = {name: _number(f"reward {name!r}", value) for name, value in reported.items()}
-        if len(rewards) > 1 and "reward" not in rewards:
-            raise ValueError(f"the verifier reported {sorted(rewards)} and no 'reward'")
-        reward = rewards.get("reward", next(iter(rewards.values()), None))
+        judged = _judged(trial)
     except ValueError as error:
         return Status.INFRA_ERROR, None, {}, str(error)
+    kind, detail, rewards = judged.kind, judged.detail, judged.rewards
+    reward = rewards.get("reward", next(iter(rewards.values()), None))
     if any(_OVERFLOW.search(error) for error in errors):
         return Status.TRUNCATED, reward, rewards, f"the engine refused a prompt: {errors[0]}"
     if errors:
@@ -458,7 +485,8 @@ class HarborSource:
     def __enter__(self) -> HarborSource:
         return self
 
-    def __exit__(self, *_: object) -> None:
+    def __exit__(self, kind: type[BaseException] | None, error: BaseException | None,
+                 trace: TracebackType | None) -> None:
         self.close()
 
     def _trial(self, future: Future[Session], task: Task, directory: Path, group: str, sample: int,
@@ -517,9 +545,13 @@ class HarborSource:
             return ended(Status.CANCELLED, records, detail=str(trial))
         if not (trial / "result.json").is_file():
             return ended(Status.INFRA_ERROR, records, detail=f"harbor exited {returncode} with no result: {log[-2000:]}")
+        try:
+            harness_exit = _harness_exit(trial)
+        except ValueError as error:
+            return ended(Status.INFRA_ERROR, records, detail=f"{trial}: unreadable harness trajectory: {error}")
         status, reward, components, detail = outcome(
             json.loads((trial / "result.json").read_text()), records, errors=recorded.errors,
-            harness_exit=_harness_exit(trial))
+            harness_exit=harness_exit)
         return ended(status, records, reward, components, f"{trial}: {detail}".rstrip(": "))
 
 
@@ -532,9 +564,10 @@ class _Trial:
     timer: threading.Timer | None = None
 
 
-def _timer(seconds: float, action: Callable[..., None], *arguments: object) -> threading.Timer:
+def _timer(seconds: float, action: Callable[[_Trial, signal.Signals], None], record: _Trial,
+           sent: signal.Signals) -> threading.Timer:
     """A daemon timer: an escalation still pending must not hold the interpreter open at exit."""
-    timer = threading.Timer(seconds, action, arguments)
+    timer = threading.Timer(seconds, action, (record, sent))
     timer.daemon = True
     timer.start()
     return timer
@@ -564,12 +597,13 @@ def _stop_all(records: dict[Future[Session], _Trial], lock: threading.Lock, grac
 
 
 def _harness_exit(trial: Path) -> str | None:
-    """mini-swe-agent's own exit status for the trial, when its trajectory is there."""
+    """mini-swe-agent's own exit status for the trial, when its trajectory is there; ValueError when unreadable."""
     path = trial / "agent" / "mini-swe-agent.trajectory.json"
     if not path.is_file():
         return None
-    try:
-        status = _object(_object(json.loads(path.read_text())).get("info")).get("exit_status")
-        return status if isinstance(status, str) else None
-    except (OSError, ValueError):
-        return None
+    trajectory = json.loads(path.read_text())
+    summary = trajectory.get("info") if isinstance(trajectory, dict) else None
+    status = summary.get("exit_status") if isinstance(summary, dict) else None
+    if status is not None and not isinstance(status, str):
+        raise ValueError(f"mini-swe-agent's exit status is not a name: {status!r}")
+    return status
