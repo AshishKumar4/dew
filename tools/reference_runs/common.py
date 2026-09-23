@@ -1,10 +1,12 @@
-"""What both sides of a reference run share: the record, the schedule, the
-FLOP count and the kernel categories.
+"""What both sides of a reference run share: the record, the schedule and
+the FLOP count.
 
 The torch generators run in a venv without Dew, the Dew generators in one
-without torch, so this module imports numpy and the standard library only.
-Every number the comparison reads is produced by one definition here, so a
-difference between two records is a difference between the runs.
+without torch, so this module imports numpy and the standard library only,
+and `tools/trace_window.py`, which names and splits a profile's kernels the
+way `tools/benchmark_step.py` does. Every number the comparison reads is
+produced by one definition, so a difference between two records is a
+difference between the runs.
 """
 
 from __future__ import annotations
@@ -17,10 +19,14 @@ import os
 import platform
 import re
 import subprocess
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from trace_window import kernel_category, window_split
 
 # Dense bf16 tensor throughput with fp32 accumulation, the figure MFU is
 # taken against. GA102 whitepaper, appendix table: RTX 3090 71 TFLOPS dense
@@ -84,62 +90,25 @@ def train_flops_per_token(config: Mapping, seq: int) -> float:
     return 6.0 * matmul + 12.0 * layers * heads * head_dim * seq
 
 
-# Kernel categories, first match wins, read off lower-cased kernel names of
-# both vocabularies: XLA's fusions and cuDNN/cuBLAS custom calls, and torch's
-# ATen, cuBLAS, flash and NCCL kernels. A needle matches anywhere in the name,
-# except one written "=word", which matches a whole alphanumeric token, so
-# XLA's `loop_convert_fusion` is not a convolution and cuBLAS's
-# `s16816gemm` still is a GEMM.
-CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("collective", ("nccl",)),
-    ("attention", ("flash", "fmha", "sdpa", "cudnn::fusion", "attention")),
-    ("conv", ("=conv", "convolution", "fprop", "dgrad", "wgrad", "implicit")),
-    ("gemm", ("gemm", "cublas", "cutlass", "nvjet", "xmma", "matmul", "splitk", "=dot")),
-    ("optimizer", ("multi_tensor_apply", "adam")),
-    ("loss", ("softmax", "nll_loss", "cross_entropy", "logsumexp")),
-    ("norm", ("layer_norm", "group_norm", "batch_norm", "rms_norm", "layernorm", "groupnorm")),
-    ("reduce", ("reduce",)),
-    ("convert", ("convert",)),
-    ("copy", ("memcpy", "memset", "=copy", "transpose", "concatenate", "catarray", "gather",
-              "scatter", "=index", "=slice", "=pad", "=broadcast", "embedding", "dynamic")),
-    ("elementwise", ("elementwise", "fusion", "triton")),
-)
-
-
-def kernel_category(name: str) -> str:
-    lowered = name.lower()
-    tokens = set(re.split(r"[^a-z0-9]+", lowered))
-    for category, needles in CATEGORIES:
-        if any(needle[1:] in tokens if needle.startswith("=") else needle in lowered
-               for needle in needles):
-            return category
-    return "other"
-
-
 def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> dict:
     """Per-step device time from `(name, start_ns, end_ns, device)` kernel
     records of `steps` traced steps.
 
-    Busy is the union of one device's kernel intervals, averaged over the
-    devices; the window runs from a device's first kernel start to its last
-    end. Category and kernel times are per device and per step, summed over
-    streams, so overlapping streams can add past busy."""
+    Each device's window is split by `trace_window.window_split`, the split
+    `tools/benchmark_step.py` reports, and the figures are averaged over the
+    devices: busy is the union of a device's kernels, the window runs from its
+    first kernel's start to its last one's end, and the window is compute +
+    exposed communication + idle ended by an input copy + idle ended by
+    anything else. Category and kernel times are per device and per step,
+    summed over streams, so overlapping streams can add past busy."""
     if not kernels:
         raise ValueError("the trace holds no device kernels")
     devices = sorted({device for *_, device in kernels})
-    busy = window = 0.0
+    figures: dict[str, float] = {}
     for device in devices:
-        spans = sorted((start, end) for _, start, end, owner in kernels if owner == device)
-        total, (low, high) = 0, spans[0]
-        for start, end in spans[1:]:
-            if start > high:
-                total += high - low
-                low, high = start, end
-            else:
-                high = max(high, end)
-        total += high - low
-        busy += total
-        window += high - spans[0][0]
+        for key, value in window_split([(name, start, end) for name, start, end, owner in kernels
+                                        if owner == device]).items():
+            figures[key] = figures.get(key, 0.0) + value
     scale = 1e-6 / steps / len(devices)
     by_category: dict[str, float] = {}
     by_name: dict[str, list[float]] = {}
@@ -153,9 +122,12 @@ def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> 
         "profiled_steps": steps,
         "devices": len(devices),
         "kernels_per_step": len(kernels) / steps / len(devices),
-        "device_busy_ms_per_step": busy * scale,
-        "device_window_ms_per_step": window * scale,
-        "device_busy_percent": 100.0 * busy / window,
+        "device_busy_ms_per_step": figures["busy"] * scale,
+        "device_window_ms_per_step": figures["window"] * scale,
+        "device_busy_percent": 100.0 * figures["busy"] / figures["window"],
+        "compute_busy_percent": 100.0 * figures["compute"] / figures["window"],
+        **{f"{key}_ms_per_step": figures[key] * scale
+           for key in ("compute", "communication", "exposed_communication", "idle_input", "idle_host")},
         "kernel_ms_by_category": {k: v * scale for k, v in
                                   sorted(by_category.items(), key=lambda item: -item[1])},
         "top_kernels": [

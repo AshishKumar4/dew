@@ -546,3 +546,39 @@ def test_step_benchmark_table_shows_each_column_in_its_unit():
     assert lines[2].split() == ["simple_dit", "8", "fsdp2-tensor2", "1,234,567", "5.5", "3.9",
                                 "4.2", "4.4", "1435.7", "2.5", "43.2", "3.00"]
     assert lines[3].split()[-2:] == ["n/a", "n/a"]
+
+
+# ---------------------------------------------------------------------------
+# tools/trace_window.py
+# ---------------------------------------------------------------------------
+
+def test_a_traced_window_splits_into_compute_exposed_collectives_and_idle():
+    """One device's kernels, in microseconds: an all-reduce half hidden
+    behind compute, a gap a batch's host-to-device copy ends, and a gap
+    compute ends. benchmark_step and the reference runs both report these
+    figures, and the window is their sum."""
+    tool = load("trace_window")
+    events = [("loop_add_fusion", 0, 10), ("ncclDevKernel_AllReduce_Sum_bf16_RING_LL", 5, 20),
+              ("MemcpyH2D", 25, 26), ("gemm_fusion_dot", 26, 30), ("loop_multiply_fusion", 40, 50)]
+    split = tool.window_split([(name, start * 1000, end * 1000) for name, start, end in events])
+
+    assert {key: value / 1000 for key, value in split.items()
+            if key in ("window", "busy", "compute", "communication", "exposed_communication",
+                       "idle_input", "idle_host", "AllReduce", "AllGather")} == {
+        "window": 50, "busy": 35, "compute": 25, "communication": 15,
+        "exposed_communication": 10, "idle_input": 5, "idle_host": 10, "AllReduce": 15,
+        "AllGather": 0}
+    assert split["window"] == (split["compute"] + split["exposed_communication"]
+                               + split["idle_input"] + split["idle_host"])
+
+
+@pytest.mark.parametrize("name,category", [
+    ("loop_convert_fusion", "convert"),  # whole tokens: convert is not conv
+    ("ampere_bf16_s16816gemm_bf16_128x64_ldg8_f2f_stages_64x4_tn", "gemm"),  # cuBLAS's family token
+    ("ncclDevKernel_AllGather_RING_LL", "collective"),
+    ("cudnn::fusion::compute_dot_do_o", "attention"),  # not the gemm its dot names
+    ("nll_loss_forward_reduce_cuda_kernel_2d<float, long>", "loss"),  # a token run, before reduce
+    ("void at::native::multi_tensor_apply_kernel<FusedAdamMathFunctor<float, 4>>", "optimizer"),
+])
+def test_kernel_categories_read_whole_tokens(name, category):
+    assert load("trace_window").kernel_category(name) == category
