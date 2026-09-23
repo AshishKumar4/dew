@@ -594,6 +594,11 @@ _QWEN_IMAGE_EMBEDDERS = {
 }
 
 
+# `QwenImage21SwiGLUFeedForward` is `out(silu(gate_layer(x)) * proj(x))`, bias
+# free: GatedMLP's swiglu under its own projection names.
+_QWEN_IMAGE_MLP = {"gate_layer": "gate_proj", "proj": "up_proj", "out": "down_proj"}
+
+
 def _qwen_image_path(name: str) -> tuple[str, ...]:
     """Return the `QwenImageTransformer` path for a published Qwen-Image 2.1 tensor name.
 
@@ -614,8 +619,8 @@ def _qwen_image_path(name: str) -> tuple[str, ...]:
         rest = parts[2:-1]
         if rest == ["attn", "to_out", "0"]:
             return (*block, "attn", "to_out_0", "kernel")
-        if len(rest) == 2 and rest[0] == "img_mlp" and rest[1] in ("proj", "gate_layer", "out"):
-            return (*block, "img_mlp", rest[1], "kernel")
+        if len(rest) == 2 and rest[0] == "img_mlp" and rest[1] in _QWEN_IMAGE_MLP:
+            return (*block, "img_mlp", _QWEN_IMAGE_MLP[rest[1]], "kernel")
         if len(rest) > 1 and rest[0] == "attn":
             return _dit_attention(block, "attn", rest[1:], leaf, name, joint=False)
     raise ValueError(f"unknown tensor name {name!r}")

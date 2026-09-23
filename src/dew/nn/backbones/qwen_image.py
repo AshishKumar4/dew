@@ -40,6 +40,7 @@ from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.sharding import logical_axes
 from dew.registry import models
 
+from .causal_transformer import GatedMLP
 from .flux import apply_rotary
 from .sd3 import _layer_norm
 
@@ -145,8 +146,6 @@ class _Attention(nn.Module):
             attended.reshape(*x.shape[:2], self.heads * self.head_dim))
 
 
-@logical_axes({("img_mlp", "proj"): ("embed", "mlp"), ("img_mlp", "gate_layer"): ("embed", "mlp"),
-               ("img_mlp", "out"): ("mlp", "embed")})
 class QwenImageBlock(nn.Module):
     """One single-stream block, holding no modulation of its own: the
     model's shared projection hands every block the same scales and gates."""
@@ -169,28 +168,13 @@ class QwenImageBlock(nn.Module):
             _per_rows(_layer_norm(self.dtype, self.eps)(x), scale, image, _scaled),
             cos, sin, lengths, image)
         x = x + _per_rows(attended, gate, image, lambda rows, value: jnp.tanh(value) * rows)
-        hidden = _SwiGLU(self.features * self.mlp_ratio, self.features, dtype=self.dtype,
-                         precision=self.precision, name="img_mlp")(
+        hidden = GatedMLP(self.features * self.mlp_ratio, self.features, dtype=self.dtype,
+                          precision=self.precision, name="img_mlp")(
             _per_rows(_layer_norm(self.dtype, self.eps)(x), scale_mlp, image, _scaled))
         x = x + _per_rows(hidden, gate_mlp, image, lambda rows, value: jnp.tanh(value) * rows)
         if x.dtype == jnp.float16:
             x = jnp.clip(x, -65504, 65504)
         return x
-
-
-class _SwiGLU(nn.Module):
-    """`QwenImage21SwiGLUFeedForward`: `out(silu(gate_layer(x)) * proj(x))`."""
-
-    hidden: int
-    features: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    @nn.compact
-    def __call__(self, x):
-        gated = nn.silu(_dense(self.hidden, "gate_layer", self.dtype, self.precision)(x))
-        return _dense(self.features, "out", self.dtype, self.precision)(
-            gated * _dense(self.hidden, "proj", self.dtype, self.precision)(x))
 
 
 @models("qwen_image_transformer")
