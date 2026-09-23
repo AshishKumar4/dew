@@ -10,11 +10,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
 from dew.nn.moe import ExpertMLP, capacity_positions
-from dew.training import MeshSpec, build_mesh
+from dew.training import DEFAULT_RULES, MeshSpec, build_mesh
 
 pytestmark = pytest.mark.mesh
 
@@ -117,6 +118,19 @@ def test_exchange_requires_an_expert_axis_that_owns_whole_experts():
         mesh = build_mesh(MeshSpec(expert=shards))
         with jax.set_mesh(mesh), pytest.raises(ValueError, match='divides num_experts'):
             module.apply(parameters, x, weights, indices)
+
+
+@pytest.mark.mesh(devices=4)
+def test_exchange_refuses_experts_the_rules_keep_off_the_expert_axis():
+    """The exchange holds each device's own experts, so a rule table that
+    leaves the expert dimension off the expert axis is refused, not run."""
+    x, weights, indices = map(jnp.asarray, routing_case(8, 8, 2, False))
+    module = ExpertMLP(8, 12, 8, dispatch='exchange')
+    parameters = module.init(jax.random.key(0), x, weights, indices)
+    rules = tuple(rule for rule in DEFAULT_RULES if rule[0] != 'exp')
+    with (jax.set_mesh(build_mesh(MeshSpec(expert=2), jax.devices()[:4])), nn.logical_axis_rules(rules),
+          pytest.raises(ValueError, match='first dimension over the expert axis')):
+        module.apply(parameters, x, weights, indices)
 
 
 def test_unknown_dispatch_is_rejected_at_the_mixture():
