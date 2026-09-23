@@ -173,3 +173,30 @@ def test_the_fixture_names_its_references(reference):
     assert str(reference["verl_revision"]) == "12ebe0cb4d300c58449fb6c675379e8700015c51"
     assert str(reference["lightning_revision"]) == "ff9457587fb6ec900e16e93be9ad2d77409afa08"
 
+
+
+@pytest.mark.mesh
+def test_chain_reductions_stay_row_local_under_data_parallelism():
+    """A chain lives inside one row, so pooling it needs no collective when
+    rows are sharded; the result is each chain's masked mean."""
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.rl.surrogate import segment_mean
+
+    rng = np.random.default_rng(0)
+    rows, width = 16, 12
+    values = rng.normal(size=(rows, width)).astype(np.float32)
+    mask = (rng.random((rows, width)) < 0.7).astype(np.float32)
+    segments = np.sort(rng.integers(0, 4, (rows, width)), axis=1).astype(np.int32)
+    mesh = Mesh(np.asarray(jax.devices()[:8]), ("data",))
+    sharded = NamedSharding(mesh, PartitionSpec("data"))
+    placed = [jax.device_put(array, sharded) for array in (values, mask, segments)]
+    compiled = jax.jit(segment_mean).lower(*placed).compile()
+    assert "all-reduce" not in compiled.as_text()
+    pooled = np.asarray(compiled(*placed))
+    for row in range(rows):
+        for segment in np.unique(segments[row]):
+            where = segments[row] == segment
+            kept = mask[row, where]
+            expected = (values[row, where] * kept).sum() / max(kept.sum(), 1.0)
+            np.testing.assert_allclose(pooled[row, where], expected, rtol=1e-5, atol=1e-6)

@@ -83,19 +83,21 @@ def token_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array) -> jax.Array
 
 def _segment_totals(values: jax.Array, mask: jax.Array,
                     segments: jax.Array | None) -> tuple[jax.Array, jax.Array]:
-    """Each position's sequence masked sum and unmasked count, broadcast to `[B, T]`."""
+    """Each position's sequence masked sum and unmasked count, broadcast to `[B, T]`.
+
+    A sequence never crosses a row, so each row sums its own segments: under
+    data parallelism the reduction stays on the device that holds the row.
+    Without `segments` each row is one sequence.
+    """
     values = jnp.asarray(values, jnp.float32)
     keep = mask.astype(jnp.float32)
     kept = jnp.where(keep != 0, values, 0) * keep
-    if segments is None:
-        return (jnp.broadcast_to(jnp.sum(kept, axis=-1, keepdims=True), values.shape),
-                jnp.broadcast_to(jnp.sum(keep, axis=-1, keepdims=True), values.shape))
-    rows, width = values.shape
-    keys = (jnp.arange(rows)[:, None] * (width + 1) + jnp.asarray(segments, jnp.int32)).reshape(-1)
-    count = rows * (width + 1)
-    total = jax.ops.segment_sum(kept.reshape(-1), keys, num_segments=count)
-    counted = jax.ops.segment_sum(keep.reshape(-1), keys, num_segments=count)
-    return total[keys].reshape(rows, width), counted[keys].reshape(rows, width)
+    width = values.shape[1]
+    keys = (jnp.ones(values.shape, jnp.int32) if segments is None
+            else jnp.asarray(segments, jnp.int32))
+    per_row = jax.vmap(lambda row, ids: jax.ops.segment_sum(row, ids, num_segments=width + 1))
+    total, counted = per_row(kept, keys), per_row(keep, keys)
+    return jnp.take_along_axis(total, keys, axis=1), jnp.take_along_axis(counted, keys, axis=1)
 
 
 def segment_mean(values: jax.Array, mask: jax.Array, segments: jax.Array | None = None) -> jax.Array:
