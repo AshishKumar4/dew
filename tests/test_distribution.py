@@ -26,7 +26,8 @@ from dew.nn.sharding import MESH_AXES
 from dew.training import MeshSpec
 from dew.training.distributed import hybrid_devices
 
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
+# Needs the eight simulated CPU devices conftest configures, except the tests
+# that name fewer, which a four-GPU run takes as one GPU a process.
 pytestmark = pytest.mark.mesh
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
