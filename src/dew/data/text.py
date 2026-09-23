@@ -8,7 +8,6 @@ tokenizer on first use, so a host without the hub cache still imports
 
 from __future__ import annotations
 
-import functools
 import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -19,6 +18,7 @@ if TYPE_CHECKING:
 
 
 _load_lock = threading.Lock()
+_loaded: dict[tuple[str, str | None, bool], PreTrainedTokenizerBase] = {}
 
 
 def load_tokenizer(name: str, *, revision: str | None = None,
@@ -29,25 +29,26 @@ def load_tokenizer(name: str, *, revision: str | None = None,
     one revision is one object however many readers share it. Grain workers
     unpickle only the name and load their own copy on their first record.
     """
-    return _loaded(name, revision, local_files_only)
-
-
-# Positional, because functools.cache keys `f(x)` and `f(x, flag=False)` apart.
-@functools.cache
-def _loaded(name: str, revision: str | None, local_files_only: bool) -> PreTrainedTokenizerBase:
-    # The lock serializes the first import: transformers swaps in its lazy
-    # module object while it initializes, and two threads importing it
-    # together can catch it half built.
+    key = (name, revision, local_files_only)
+    held = _loaded.get(key)
+    if held is not None:
+        return held
+    # Readers that miss together wait here and find the first one's load.
+    # The lock also serializes the first transformers import, whose lazy
+    # module two threads can otherwise catch half built.
     with _load_lock:
-        from transformers import AutoTokenizer, PreTrainedTokenizerBase
+        held = _loaded.get(key)
+        if held is None:
+            from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            name, revision=revision, local_files_only=local_files_only)
-    # from_pretrained's annotation names classes transformers binds to None
-    # without their backend, so its result is untyped until checked here.
-    if not isinstance(tokenizer, PreTrainedTokenizerBase):
-        raise TypeError(f"{name!r} loads as {type(tokenizer).__name__}, not a transformers tokenizer")
-    return tokenizer
+            loaded = AutoTokenizer.from_pretrained(
+                name, revision=revision, local_files_only=local_files_only)
+            # from_pretrained's annotation names classes transformers binds
+            # to None without their backend, so its result is untyped until here.
+            if not isinstance(loaded, PreTrainedTokenizerBase):
+                raise TypeError(f"{name!r} loads as {type(loaded).__name__}, not a transformers tokenizer")
+            held = _loaded[key] = loaded
+    return held
 
 
 @runtime_checkable

@@ -8,8 +8,10 @@ that no test needs the network.
 import itertools
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 from collections import Counter
 from pathlib import Path
 
@@ -153,6 +155,30 @@ def test_every_reader_of_a_tokenizer_shares_one_load():
     first = HFTokenizer(path).tokenizer
     assert HFTokenizer(path).tokenizer is first
     assert AutoTextTokenizer(modelname=path).tokenizer is first
+
+
+def test_readers_that_miss_the_cache_together_share_one_load(tmp_path):
+    """The chat render map reads the tokenizer from every loader thread at
+    once, and all of them get the one object the cache keeps."""
+    from dew.data.text import load_tokenizer
+
+    path = tmp_path / "tokenizer"
+    shutil.copytree(REPO_ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-chat", path)
+    readers = 8
+    start = threading.Barrier(readers)
+    loaded = [None] * readers
+
+    def read(index: int) -> None:
+        start.wait()
+        loaded[index] = load_tokenizer(str(path), local_files_only=True)
+
+    threads = [threading.Thread(target=read, args=(index,)) for index in range(readers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert all(tokenizer is loaded[0] for tokenizer in loaded)
 
 
 # ---------------------------------------------------------------------------------
