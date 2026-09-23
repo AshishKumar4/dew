@@ -39,8 +39,14 @@ from dew.interop.quantized import (
     fp8_format,
     fp8_tensor_names,
     pack_fp8,
+    pack_packed_mxfp4,
+    packed_mxfp4_format,
+    packed_mxfp4_stems,
+    packed_mxfp4_tensor_names,
     read_fp8_tensor,
+    read_packed_mxfp4_tensor,
     scaled_names,
+    unpack_packed_mxfp4,
 )
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
@@ -619,6 +625,11 @@ class WeightLayout:
     not its leaf's: DeepSeek V4's token-to-expert table is int64 on disk
     and int32 in the collection, and the export writes back what the
     checkpoint held.
+
+    `padded` is the length a 1-D source tensor stores past its leaf's, as
+    zeros: Kimi K3 ships each KDA layer's `A_log` for 96 heads padded to 128
+    entries (model-00001-of-000096.safetensors at f831ab6, zeros past 96).
+    The family's prepare step trims and checks the tail, and export pads it back.
     """
 
     name: str
@@ -628,6 +639,7 @@ class WeightLayout:
     concatenate: int | None = None
     expert_index: int | None = None
     dtype: np.dtype | None = None
+    padded: int | None = None
 
     def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
         leaves = []
@@ -658,6 +670,8 @@ class WeightLayout:
         value = leaves[0] if self.concatenate is None else np.concatenate(leaves, axis=self.concatenate)
         if self.transpose is not None:
             value = value.transpose(self.transpose)
+        if self.padded is not None:
+            value = np.pad(np.asarray(value), (0, self.padded - value.shape[0]))
         if value.size != math.prod(self.shape):
             raise ValueError(
                 f"{self.name} assembles {value.shape} from {self.paths}, which does not "
@@ -675,6 +689,8 @@ class WeightLayout:
             raise ValueError(f"{self.name} is assembled from several leaves, so no one leaf restores it")
         if tensor.shape != self.shape:
             raise ValueError(f"{self.name} stores {self.shape}, not {tensor.shape}")
+        if self.padded is not None:
+            return np.ascontiguousarray(tensor[:shape[0]])
         transpose = self.transpose or tuple(range(len(shape)))
         stored = tensor.reshape(tuple(shape[axis] for axis in transpose))
         return np.ascontiguousarray(stored.transpose(sorted(range(len(shape)), key=transpose.__getitem__)))
@@ -768,8 +784,24 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
     # A weight is fp32 in the tree whatever the checkpoint stored it as, so
     # only an index table's own width has to be carried back.
     stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
+    padded = None
+    if tensor.ndim == 1 and len(paths) == 1 and expert_index is None:
+        leaf = _leaf(variables, paths[0])
+        if leaf is not None and leaf.ndim == 1 and leaf.shape[0] < tensor.shape[0]:
+            # The family trimmed a zero tail the source pads to (WeightLayout.padded).
+            padded = tensor.shape[0]
     return WeightLayout(name, paths, tensor.shape, transpose, concatenate,
-                        expert_index, stored)
+                        expert_index, stored, padded)
+
+
+def _leaf(variables: Mapping[str, object], path: tuple[str, ...]) -> np.ndarray | jax.Array | None:
+    """The loaded array at `path`, or None where the tree holds none."""
+    node: object = variables
+    for part in path:
+        if not isinstance(node, Mapping) or part not in node:
+            return None
+        node = node[part]
+    return node if isinstance(node, np.ndarray | jax.Array) else None
 
 
 
@@ -884,9 +916,16 @@ def _refuse_mlx(config: Mapping[str, object]) -> None:
 
 
 def _source_quantization(config: Mapping[str, object], *, param_dtype: str = "float32") -> _SourceQuantization | None:
-    """Return the format a config's `quantization_config` declares, or None."""
+    """Return the format a config's `quantization_config` declares, or None.
+
+    A wrapper may declare it on its text_config alone: KimiK3Config lifts
+    `text_config.quantization_config` onto itself (configuration_kimi_k3.py:282-283).
+    """
     _refuse_mlx(config)
     quantization = config.get("quantization_config")
+    text = config.get("text_config")
+    if quantization is None and isinstance(text, Mapping):
+        quantization = text.get("quantization_config")
     if quantization is None:
         return None
     if not isinstance(quantization, Mapping):
@@ -902,9 +941,14 @@ def _source_quantization(config: Mapping[str, object], *, param_dtype: str = "fl
         return _SourceQuantization(
             mxfp4_stems, partial(unpack_mxfp4, param_dtype=param_dtype), pack_mxfp4,
             mxfp4_tensor_names, read_mxfp4_tensor)
+    if method == "compressed-tensors":
+        packed_mxfp4_format(quantization)
+        return _SourceQuantization(
+            packed_mxfp4_stems, partial(unpack_packed_mxfp4, param_dtype=param_dtype), pack_packed_mxfp4,
+            packed_mxfp4_tensor_names, read_packed_mxfp4_tensor)
     raise ValueError(
         f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
-        f"fp8 blocks and GPT OSS's mxfp4 and nothing else")
+        f"fp8 blocks, GPT OSS's mxfp4 and compressed-tensors' mxfp4-pack-quantized and nothing else")
 
 
 def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tuple[str, str], ...],
