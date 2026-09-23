@@ -236,7 +236,8 @@ def agree_process_phase(error: BaseException | None, *, phase: str,
     raise RuntimeError(context)
 
 
-FAILURE_KEY = "dew/failure"
+FAILURE_DIRECTORY = "dew/failure/"
+FAILURE_KEY = FAILURE_DIRECTORY + "published"
 """The coordination-service key a failing process writes its error under."""
 
 FAILURE_GRACE_SECONDS = 60.0
@@ -291,18 +292,22 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
         sys.stderr.flush()
         os._exit(130 if issubclass(kind, KeyboardInterrupt) else 1)
 
+    def published() -> str | None:
+        # A directory read finds nothing without an error, where reading the
+        # key alone raises every time no failure is there.
+        return dict(client.key_value_dir_get(FAILURE_DIRECTORY)).get(FAILURE_KEY)
+
     def watch() -> None:
         while True:
             time.sleep(5.0)
             try:
-                seen = client.key_value_try_get(FAILURE_KEY)
-            except jax.errors.JaxRuntimeError:  # nothing published, or the pool is gone
-                continue
-            time.sleep(grace)
-            try:
-                if client.key_value_try_get(FAILURE_KEY) != seen:
+                seen = published()
+                if seen is None:
                     continue
-            except jax.errors.JaxRuntimeError:  # withdrawn: an agreement heard it
+                time.sleep(grace)
+                if published() != seen:  # an agreement heard and withdrew it
+                    continue
+            except jax.errors.JaxRuntimeError:  # the pool's coordination service is gone
                 continue
             sys.stderr.write(f"{seen.split(' ', 1)[1]}\nNo agreement heard that failure in "
                              f"{grace:.0f} s, so this process waits in a collective that will "
