@@ -16,6 +16,13 @@ or a pipeline's microbatches compute. The floor is the largest deviation per
 leaf, and a layout `works` when every leaf is within `FLOOR_FACTOR` of it
 and the loss within as much of its own.
 
+A split sequence, a tensor axis and an expert axis also reassociate sums
+inside a row (over positions, heads and widths), which no reordering of rows
+samples. With `--anchor` (and JAX_ENABLE_X64=1), each leaf's floor is at
+least the reference's own distance from the same step computed in fp64, so
+any reassociation of fp32 sums is held to fp32's own rounding of the step,
+while a defect lands orders of magnitude past it.
+
 An objective that draws noise per row (a DiT's diffusion) draws other noise
 for permuted or pooled rows, so neither is a reassociation of its step. Its
 floor is data parallelism over every device instead, the layout that splits
@@ -240,6 +247,30 @@ def floor(case, batch, reference, reference_loss: float) -> tuple[dict[str, floa
     return leaves, loss
 
 
+def exact(case, reference_gradient) -> dict[str, float]:
+    """Each leaf's distance, relative to the fp64 gradient, of the fp32
+    reference's step one from the same step in fp64: the model built with no
+    dtype of its own, on the same variables widened to fp64."""
+    import benchmark_step as bench
+    import jax
+    import jax.numpy as jnp
+
+    from dew.objectives.base import Step, scalar_loss
+    from dew.registry import models
+
+    variables = jax.jit(bench.build_objective(case).init)(jax.random.key(0))
+    wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
+                        if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, variables)
+    objective = bench.lm_objective(case, models.build(case.architecture, **case.config, dtype=None))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+
+    def loss(params, batch):
+        return scalar_loss(objective, {**wide, "params": params}, batch, step)[0]
+
+    gradient = jax.jit(jax.grad(loss))(wide["params"], bench.global_batch(case))
+    return leaf_errors(gradient, reference_gradient)
+
+
 def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
            loss_floor: float, reference_loss: float) -> dict[str, Any]:
     """Every leaf against FLOOR_FACTOR times its floor, fp32 epsilon at least."""
@@ -254,7 +285,7 @@ def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
             "status": "works" if ratios[worst] <= 1.0 and loss <= loss_bound else "MISMATCH"}
 
 
-def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int,
+def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int, anchor: bool,
         speak: Callable[[str], None]) -> list[dict[str, Any]]:
     import benchmark_step as bench
     import jax
@@ -267,6 +298,9 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
         ref_losses, ref_gradient, ref_compiled = trained(case, {}, batch, steps=steps,
                                                          one_device=True)
         floors, loss_floor = floor(case, batch, ref_gradient, ref_losses[0])
+        if anchor and case.is_lm:
+            rounding = exact(case, ref_gradient)
+            floors = {leaf: max(value, rounding[leaf]) for leaf, value in floors.items()}
         speak(f"[{model}] reference losses {ref_losses}, largest floor {max(floors.values()):.2e}")
         for name in layouts:
             row: dict[str, Any] = {"model": model, "layout": name, "processes": jax.process_count(),
@@ -297,15 +331,18 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
 
 def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] = ("dense",),
          layouts: Annotated[tuple[str, ...], tyro.conf.arg(help="LAYOUTS names")] = tuple(LAYOUTS),
-         dtype: str = "float32", steps: int = 3, out: Path | None = None) -> None:
+         dtype: str = "float32", steps: int = 3, anchor: bool = False,
+         out: Path | None = None) -> None:
     """Run the layouts of each model against one device; see the module docstring."""
     from dew.training.runtime import prepare_process
 
     prepare_process()
     import jax
 
+    if anchor and not jax.config.jax_enable_x64:
+        raise SystemExit("--anchor computes the step in fp64, which needs JAX_ENABLE_X64=1")
     speaker = jax.process_index() == 0
-    rows = run(models, layouts, dtype=dtype, steps=steps,
+    rows = run(models, layouts, dtype=dtype, steps=steps, anchor=anchor,
                speak=lambda line: print(line, flush=True) if speaker else None)
     if speaker and out is not None:
         out.write_text(json.dumps(rows, indent=1))
