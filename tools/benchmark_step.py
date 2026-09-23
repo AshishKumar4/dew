@@ -61,22 +61,22 @@ import optax
 import tyro
 from jax.sharding import Mesh
 
+from dew import models  # naming a registry fills it
 from dew.diffusion import presets
+from dew.diffusion.process import DenoisingCondition
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
-from dew.diffusion.process import DenoisingCondition
-from dew.objectives.base import Objective, Variables
-from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.sd3 import SD3Transformer
 from dew.nn.backbones.unet_condition import UNet2DCondition
+from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import ProjectorBase, TowerBase, projector_from_record, tower_from_record
+from dew.objectives.base import Objective, Variables
 from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
-from dew import models  # naming a registry fills it
 from dew.registry import resolve_dtype, with_precision
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
@@ -745,17 +745,16 @@ def batches(case: Case, mesh: Mesh) -> Iterator[Batch]:
         yield mine
 
 
-def device_peak_bytes() -> int | None:
-    """The allocator's high-water mark on this process's fullest device, where
-    the backend reports one (not CPU).
-
-    Monotonic for the life of the process and with no reset hook, so in a sweep
-    it is this case's own peak only for the first case; every later case gets
-    an upper bound plus its own delta.
-    """
-    peaks = [stats.get('peak_bytes_in_use') or stats.get('bytes_in_use')
-             for stats in (device.memory_stats() for device in jax.local_devices()) if stats]
-    return max(peaks) if peaks else None
+def step_bytes(executable: jax.stages.Compiled | None) -> int | None:
+    """The bytes one device holds while the compiled step runs, as XLA planned
+    them: its arguments, the outputs not written over them, and the
+    temporaries. Per case, where the allocator's high-water mark only ever
+    grows over a sweep."""
+    stats = None if executable is None else executable.memory_analysis()
+    if stats is None:
+        return None
+    return (stats.argument_size_in_bytes + stats.output_size_in_bytes
+            - stats.alias_size_in_bytes + stats.temp_size_in_bytes)
 
 
 def parameter_count(params) -> int:
@@ -935,13 +934,12 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps."""
     if config.steps < 1:
         raise ValueError(f"--steps must be at least 1, got {config.steps}")
-    peak_before = device_peak_bytes()
     trainer = build_trainer(case, config.attention_impl)
 
     with DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh) as source:
         abstract = jax.eval_shape(trainer.initial_state)
         state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
-        
+
 
         initial_batch = next(source)
         jax.block_until_ready((state, initial_batch))
@@ -1004,7 +1002,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         flops = trainer.flops_per_step
         step_time = elapsed / config.steps
         utilization = model_flops_utilization(flops, step_time)
-        peak = device_peak_bytes()
+        peak = step_bytes(trainer.executable)
         row: Row = {
             "architecture": case.architecture,
             "batch_size": case.batch_size,
@@ -1037,8 +1035,6 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "flops_per_step": flops,
             "utilization": utilization,
             "peak_device_bytes": peak,
-            "case_peak_delta_bytes": (
-                None if peak is None or peak_before is None else max(0, peak - peak_before)),
             "loss": float(loss),
             "finite": bool(is_finite),
             **timeline,

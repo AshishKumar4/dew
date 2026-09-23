@@ -27,7 +27,6 @@ from dew.telemetry.instrumentation import (
     enable_compilation_cache,
     hlo_flops,
     model_flops_utilization,
-    step_flops,
 )
 from dew.training import ProfileWindow, Trainer
 from dew.training.distributed import shard_batch
@@ -184,11 +183,6 @@ ENTRY %main (start: (f32[8,32], f32[32,32])) -> (f32[8,32], f32[32,32]) {
 condition=%condition, body=%body
 }
 """
-
-
-def test_step_flops_reads_a_jitted_function():
-    flops = step_flops(jax.jit(lambda a, b: a @ b), jnp.ones((8, 16)), jnp.ones((16, 4)))
-    assert flops == pytest.approx(2 * 8 * 16 * 4)
 
 
 def test_throughput_metrics_are_consistent():

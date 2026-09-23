@@ -360,9 +360,6 @@ def _merged_call_counts(computation: _Computation) -> dict[str, float]:
 def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
     """FLOPs for one call of an executable that is already compiled.
 
-    Reading the count off the executable the loop runs costs nothing, where
-    `step_flops` pays a compile.
-
     Every matmul and convolution in the optimized module counts once per time
     the module runs it, whether it is a `dot`, a `convolution`, or one of the
     cuBLAS, cuDNN convolution and cuDNN fused-attention custom calls a GPU
@@ -389,18 +386,6 @@ def hlo_flops(text: str) -> float | None:
             continue
         total += weights[name] * instructions
     return total if math.isfinite(total) else None
-
-
-def step_flops(jitted: jax.stages.Wrapped, *arguments: Traced) -> float | None:
-    """FLOPs for one call of a jitted function, straight from the compiler.
-
-    Measured, so architectures, remat and gradient accumulation are counted
-    as compiled, with no parameter-count formula.
-
-    Compiles the function; a caller that already holds the compiled
-    executable uses `compiled_flops`.
-    """
-    return compiled_flops(jitted.lower(*arguments).compile())
 
 
 def model_flops_utilization(

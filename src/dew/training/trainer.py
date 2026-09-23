@@ -47,7 +47,7 @@ from dew.objectives.base import (
     select,
 )
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.instrumentation import model_flops_utilization, step_flops
+from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
     CheckpointRequested,
@@ -231,8 +231,13 @@ class Trainer(Generic[Loss, Effects]):
         self.rollout = rollout
         self.profile = profile
         # Set by `compile`, for the batch shape it was called with. A ramped
-        # run has one value per stage; `fit` keeps them beside each step.
+        # run has one value per stage; `fit` keeps them beside each step. The
+        # program is the step as handed to XLA, before GSPMD partitions it,
+        # and the executable the step as compiled, whose memory analysis a
+        # benchmark reads.
         self.flops_per_step = None
+        self.program: jax.stages.Lowered | None = None
+        self.executable: jax.stages.Compiled | None = None
 
     @classmethod
     def from_config(
@@ -625,7 +630,9 @@ class Trainer(Generic[Loss, Effects]):
                              donate_argnums=0)
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
-            self.flops_per_step = step_flops(jitted, prepared, batch)
+            self.program = jitted.lower(prepared, batch)
+            self.executable = self.program.compile()
+            self.flops_per_step = compiled_flops(self.executable)
 
         def run(current, batch):
             with self._traced_on(mesh):
