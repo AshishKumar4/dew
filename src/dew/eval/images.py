@@ -43,16 +43,6 @@ def _get_clip(modelname: str):
     return CLIPModel.from_pretrained(modelname), CLIPImageProcessorPil.from_pretrained(modelname)
 
 
-@functools.cache
-def _get_tokenizer(modelname: str):
-    """Load the checkpoint's prompt tokenizer, once per model name. It pads
-    and truncates to the model's context exactly as the loader does, so a
-    prompt scored here is the prompt a run's batch would carry."""
-    from dew.data.processors import AutoTextTokenizer
-    _log.info("loading CLIP tokenizer %r (cached for reuse)", modelname)
-    return AutoTextTokenizer(tensor_type="np", modelname=modelname)
-
-
 def _equal_counts(images: int, prompts: int) -> None:
     """Refuse a prompt count and an image count that disagree.
 
@@ -103,7 +93,8 @@ def clip_score(images: ArrayLike, prompts: Sequence[str], *, modelname: str = DE
     _equal_counts(pixels.shape[0], len(prompts))
     if pixels.shape[0] == 0:
         raise ValueError("clip_score: no images to score")
-    tokens = _get_tokenizer(modelname)(list(prompts))
+    from dew.data.processors import AutoTextTokenizer
+    tokens = AutoTextTokenizer(tensor_type="np", modelname=modelname)(list(prompts))
     total = 0.0
     with metric_device():
         for start in range(0, pixels.shape[0], batch_size):
