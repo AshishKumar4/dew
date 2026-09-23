@@ -375,6 +375,9 @@ class HarborSource:
         self._grace = grace
         self._ready_timeout, self._ready_poll = ready_timeout, ready_poll
         self._ready = False
+        # Serializes the readiness wait apart from `_lock`, so cancel and close never wait on the gateway.
+        self._ready_lock = threading.Lock()
+        self._closed = False
         self._gateway = gateway
         self._command = [os.fspath(harbor), "trials", "start", "-a", agent, "-m", model, *arguments]
         self._environment = dict(environment or {})
@@ -405,7 +408,7 @@ class HarborSource:
             raise ValueError(f"task {task.id!r} names no Harbor task directory under data[{HARBOR_KEY!r}]")
         if not _SESSION.fullmatch(task.id):
             raise ValueError(f"a Harbor task id is URL-path safe (letters, digits and ._-); got {task.id!r}")
-        with self._lock:
+        with self._ready_lock:
             if not self._ready:
                 self._gateway.ready(self._ready_timeout, poll=self._ready_poll)
                 self._ready = True
@@ -414,10 +417,13 @@ class HarborSource:
         for sample in range(samples):
             future: Future[Session] = Future()
             with self._lock:
+                if self._closed:
+                    raise RuntimeError("the Harbor source is closed")
                 self._records[future] = _Trial()
+                self._queue.put(functools.partial(self._trial, future, task, Path(directory), group, sample,
+                                                  version))
             future.add_done_callback(self._forget_record)
             futures.append(future)
-            self._queue.put(functools.partial(self._trial, future, task, Path(directory), group, sample, version))
         return futures
 
     def _forget_record(self, future: Future[Session]) -> None:
@@ -449,6 +455,8 @@ class HarborSource:
     def close(self) -> None:
         """Cancel every unresolved trial, queued or running, and wait for the running ones to tear down."""
         with self._lock:
+            # A submission checks this under the same lock, so none queues a trial behind the stop marks.
+            self._closed = True
             pending = list(self._records)
         self.cancel(pending)
         for _ in self._workers:
