@@ -28,7 +28,7 @@ _log = logging.getLogger(__name__)
 
 # Two FID values are comparable only when the features behind them and the
 # population counts agree, so every distance is logged with this line.
-FEATURES = "FID InceptionV3 pool3, bilinear 299x299 without antialiasing, [-1, 1]"
+FEATURES = "pytorch-fid InceptionV3 pool3, bilinear 299x299 without antialiasing, [-1, 1]"
 
 
 def _features(weights: str | None) -> str:
@@ -164,11 +164,8 @@ def _get_activations(weights: str | None = None):
 
     @jax.jit
     def activations(images):
-        # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048].
-        # pytorch-fid resizes with F.interpolate(bilinear, align_corners=False),
-        # half-pixel centres and no antialiasing; jax.image.resize antialiases
-        # a downsample unless told not to, which moved pool3 features by up to
-        # 0.55 against pytorch-fid on images larger than 299.
+        # pytorch-fid's F.interpolate(bilinear, align_corners=False) does not
+        # antialias; jax.image.resize does unless told not to.
         resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear',
                                    antialias=False)
         features = model.apply(variables, resized)
@@ -239,7 +236,9 @@ def fid(generated: NDArray[np.uint8] | jax.Array | Iterable[ArrayLike],
     in safetensors, which `tools/convert_inception_weights.py` writes. Unset
     downloads the published checkpoint and converts it. Two distances are
     comparable only when both were measured with the same one, which is why
-    every distance logs which it was.
+    every distance logs which it was. With the published weights, features
+    and distance reproduce pytorch-fid 0.3.0's (bilinear resize without
+    antialiasing); tests/test_metrics.py holds the distance to 1e-5 relative.
     """
     if batch_size < 1:
         raise ValueError(f"fid: a batch holds at least one image, got batch_size={batch_size}")
