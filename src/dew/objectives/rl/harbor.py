@@ -42,20 +42,23 @@ SGLang fills only when asked, are read as a last resort.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
+import functools
 import itertools
 import json
 import logging
 import os
+import queue
 import re
+import secrets
 import signal
 import subprocess
 import threading
 import time
 import uuid
-import weakref
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -83,7 +86,7 @@ _HARNESS_LIMITS = frozenset({"LimitsExceeded", "TimeExceeded", "ContextWindowExc
 _CLIENT_FAILURES = frozenset({"APIConnectionError", "APIError", "APIResponseValidationError", "BadGatewayError",
                               "InternalServerError", "RateLimitError", "ServiceUnavailableError", "Timeout",
                               "APITimeoutError"})
-_SESSION = re.compile(r"[A-Za-z0-9._:/-]+")
+_SESSION = re.compile(r"[A-Za-z0-9._:-]+")
 
 
 class Gateway:
@@ -127,7 +130,7 @@ class Gateway:
     def session(self, session: str) -> str:
         """The OpenAI base URL a harness uses so its calls are recorded under `session`."""
         if not _SESSION.fullmatch(session):
-            raise ValueError(f"session ids are URL-path safe: letters, digits and ._:/-; got {session!r}")
+            raise ValueError(f"session ids are URL-path safe: letters, digits and ._:-; got {session!r}")
         return f"{self.sandbox_url}/sessions/{session}/v1"
 
     def traces(self, session: str) -> list[JSON]:
@@ -338,10 +341,12 @@ class HarborSource:
     must speak the OpenAI chat API through `OPENAI_BASE_URL`, as Harbor's
     mini-swe-agent does.
 
-    Sessions are named `{task}:{group}:{sample}`, where `group` is unique to
-    one `submit` across runs. Every future resolves to a `Session`: a
-    failure of Harbor, the sandbox, the gateway or the engine is an
-    `INFRA_ERROR` rollout, not an exception, and a cancelled trial is a
+    Gateway sessions are named `{task}:{group}:{sample}:{token}`, where
+    `group` is unique to one `submit` across runs and `token` is 128 secret
+    bits, so a sandbox can address only the session it was handed. Every
+    future resolves to a `Session`: a failure of Harbor, the sandbox, the
+    gateway or the engine is an `INFRA_ERROR` session, not an exception, and
+    a cancelled trial is a
     `CANCELLED` one. `attempt` is always 0: a retry is a fresh `submit`,
     relabelled by the scheduler that owns group identity.
 
@@ -349,6 +354,12 @@ class HarborSource:
     reports a healthy worker (`Gateway.ready`), so a source started beside
     engines that are still loading launches no trial the gateway would answer
     with a traceless 500.
+
+    Use it as a context manager, or call `close`, to cancel every trial on
+    the way out. A trainer that exits without either (an uncaught
+    KeyboardInterrupt) still stops its trials: trials run on daemon threads,
+    and an atexit hook cancels queued trials and interrupts, then kills after
+    `grace`, the running ones.
     """
 
     def __init__(self, gateway: Gateway, *, harbor: str | os.PathLike[str], model: str, trials: os.PathLike[str],
@@ -369,13 +380,20 @@ class HarborSource:
         self._reward_key = reward_key
         self._run = uuid.uuid4().hex[:8]
         self._serial = itertools.count()
-        self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dew-harbor-trial")
+        # Daemon workers, not a ThreadPoolExecutor: concurrent.futures joins its pool before atexit
+        # hooks run, which would wait out every running trial and start every queued one on exit.
+        self._queue: queue.SimpleQueue[Callable[[], None] | None] = queue.SimpleQueue()
+        self._workers = [threading.Thread(target=self._work, name=f"dew-harbor-trial-{index}", daemon=True)
+                         for index in range(workers)]
+        for worker in self._workers:
+            worker.start()
         self._lock = threading.Lock()
         # One record per submitted, unresolved future, queued or running; a done-callback drops it.
         self._records: dict[Future[Session], _Trial] = {}
-        # Trials run in their own process groups, so an interrupted trainer does not reach them: on
-        # interpreter exit or collection, every live trial's group is killed.
-        weakref.finalize(self, _kill_all, self._records, self._lock)
+        # Trials run in their own process groups, so a Ctrl-C of the trainer does not reach them: at
+        # interpreter exit this hook cancels every record and stops every live trial.
+        self._exit_hook = functools.partial(_stop_all, self._records, self._lock, grace)
+        atexit.register(self._exit_hook)
 
     def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Session]]:
         if type(samples) is not int or samples < 1:
@@ -383,6 +401,8 @@ class HarborSource:
         directory = task.data.get(HARBOR_KEY)
         if not isinstance(directory, (str, os.PathLike)) or not Path(directory).is_dir():
             raise ValueError(f"task {task.id!r} names no Harbor task directory under data[{HARBOR_KEY!r}]")
+        if not _SESSION.fullmatch(task.id):
+            raise ValueError(f"a Harbor task id is URL-path safe (letters, digits and ._-); got {task.id!r}")
         with self._lock:
             if not self._ready:
                 self._gateway.ready(self._ready_timeout, poll=self._ready_poll)
@@ -395,7 +415,7 @@ class HarborSource:
                 self._records[future] = _Trial()
             future.add_done_callback(self._forget_record)
             futures.append(future)
-            self._pool.submit(self._trial, future, task, Path(directory), group, sample, version)
+            self._queue.put(functools.partial(self._trial, future, task, Path(directory), group, sample, version))
         return futures
 
     def _forget_record(self, future: Future[Session]) -> None:
@@ -412,7 +432,7 @@ class HarborSource:
                 record.cancelled = True
                 if record.process is not None and record.process.poll() is None:
                     _signal(record.process, signal.SIGINT)
-                    threading.Timer(self._grace, self._escalate, (record, signal.SIGTERM)).start()
+                    record.timer = _timer(self._grace, self._escalate, record, signal.SIGTERM)
 
     def _escalate(self, record: _Trial, sent: signal.Signals) -> None:
         """Harbor ignored the last signal for a whole grace period: send the next, SIGTERM then SIGKILL."""
@@ -422,18 +442,33 @@ class HarborSource:
             _logger.warning("Harbor trial %d outlived its grace; sending %s", record.process.pid, sent.name)
             _signal(record.process, sent)
             if sent is signal.SIGTERM:
-                threading.Timer(self._grace, self._escalate, (record, signal.SIGKILL)).start()
+                record.timer = _timer(self._grace, self._escalate, record, signal.SIGKILL)
 
     def close(self) -> None:
         """Cancel every unresolved trial, queued or running, and wait for the running ones to tear down."""
         with self._lock:
             pending = list(self._records)
         self.cancel(pending)
-        self._pool.shutdown(wait=True, cancel_futures=False)
+        for _ in self._workers:
+            self._queue.put(None)
+        for worker in self._workers:
+            worker.join()
+        atexit.unregister(self._exit_hook)
+
+    def _work(self) -> None:
+        while (trial := self._queue.get()) is not None:
+            trial()
+
+    def __enter__(self) -> HarborSource:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
     def _trial(self, future: Future[Session], task: Task, directory: Path, group: str, sample: int,
                version: int) -> None:
-        session = f"{task.id}:{group}:{sample}"
+        # The token keeps a sandbox from addressing its group siblings' sessions through the gateway.
+        session = f"{task.id}:{group}:{sample}:{secrets.token_hex(16)}"
         name = f"dew-{group}-{sample}"
 
         def ended(status: Status, records: tuple[Call, ...] = (), reward: float | None = None,
@@ -459,6 +494,8 @@ class HarborSource:
             with self._lock:
                 record.process = None
                 cancelled = record.cancelled
+                if record.timer is not None:
+                    record.timer.cancel()
             try:
                 future.set_result(self._verdict(ended, session, self._trials / name, log, process.returncode,
                                                 cancelled, version))
@@ -496,6 +533,15 @@ class _Trial:
 
     cancelled: bool = False
     process: subprocess.Popen[str] | None = None
+    timer: threading.Timer | None = None
+
+
+def _timer(seconds: float, action: Callable[..., None], *arguments: object) -> threading.Timer:
+    """A daemon timer: an escalation still pending must not hold the interpreter open at exit."""
+    timer = threading.Timer(seconds, action, arguments)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def _signal(process: subprocess.Popen[str], sent: signal.Signals) -> None:
@@ -503,11 +549,22 @@ def _signal(process: subprocess.Popen[str], sent: signal.Signals) -> None:
         os.killpg(process.pid, sent)
 
 
-def _kill_all(records: dict[Future[Session], _Trial], lock: threading.Lock) -> None:
+def _stop_all(records: dict[Future[Session], _Trial], lock: threading.Lock, grace: float) -> None:
+    """At interpreter exit: cancel every trial, interrupt the live ones, and kill any still alive after `grace`."""
     with lock:
+        live = []
         for record in records.values():
+            record.cancelled = True
             if record.process is not None and record.process.poll() is None:
-                _signal(record.process, signal.SIGKILL)
+                live.append(record.process)
+    for process in live:
+        _signal(process, signal.SIGINT)
+    deadline = time.monotonic() + grace
+    for process in live:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(max(0.0, deadline - time.monotonic()))
+        if process.poll() is None:
+            _signal(process, signal.SIGKILL)
 
 
 def _harness_exit(trial: Path) -> str | None:

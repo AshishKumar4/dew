@@ -6,7 +6,10 @@ start` arguments and writes a `TrialResult`-shaped `result.json`.
 """
 
 import json
+import os
+import re
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -202,7 +205,7 @@ def fake_gateway(unhealthy_checks=0, unreachable_models=0):
         if request.method == "DELETE":
             return httpx.Response(200, json={"deleted": 1})
         session = request.url.path.removeprefix("/sessions/").removesuffix("/traces")
-        sample = int(session.rsplit(":", 1)[1])
+        sample = int(session.split(":")[2])
         return httpx.Response(200, json=[trace([1, 2], [10 + sample], [-.5], version=7)])
 
     return Gateway("http://gateway", sandbox_url="http://172.17.0.1:9090",
@@ -240,9 +243,11 @@ def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
         # The session's own call, stamped by the gateway, came back to its own sample.
         assert rollout.calls == (Call((1, 2), (10 + rollout.sample,), (-.5,), "stop", 7),)
         seen = json.loads((tmp_path / "trials" / f"dew-{rollout.group}-{rollout.sample}" / "seen.json").read_text())
-        session = f"hello:{rollout.group}:{rollout.sample}"
-        assert seen["agent"] == {"MSWEA_API_KEY": "none",
-                                 "OPENAI_BASE_URL": f"http://172.17.0.1:9090/sessions/{session}/v1"}
+        url = seen["agent"]["OPENAI_BASE_URL"]
+        session = url.removeprefix("http://172.17.0.1:9090/sessions/").removesuffix("/v1")
+        # A sample's session carries a secret token, so a sandbox cannot address its siblings' sessions.
+        assert re.fullmatch(rf"hello:{rollout.group}:{rollout.sample}:[0-9a-f]{{32}}", session)
+        assert seen["agent"] == {"MSWEA_API_KEY": "none", "OPENAI_BASE_URL": url}
         assert seen["arguments"][:6] == ["trials", "start", "-a", "mini-swe-agent", "-m", "hosted_vllm/policy"]
         assert ("DELETE", f"/sessions/{session}") in asked
 
@@ -263,7 +268,8 @@ def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbo
         source.close()
     assert rollout.status is Status.CANCELLED and time.monotonic() - began < 30
     # A cancelled session's traces leave the gateway too, not only a scored one's.
-    assert ("DELETE", f"/sessions/slow:{rollout.group}:0") in asked
+    assert any(method == "DELETE" and path.startswith(f"/sessions/slow:{rollout.group}:0:")
+               for method, path in asked)
 
 
 def test_a_harbor_that_ignores_the_interrupt_is_terminated_after_the_grace(tmp_path, harbor):
@@ -349,3 +355,59 @@ def test_a_task_without_a_harbor_directory_is_refused(tmp_path, harbor):
             source.submit(Task("nothing"), 1, version=0)
     finally:
         source.close()
+
+
+def test_session_ids_are_single_path_segments():
+    gateway, _ = fake_gateway()
+    with pytest.raises(ValueError, match="URL-path safe"):
+        gateway.session("org/task:group:0:token")
+
+
+def test_a_cancelled_trial_leaves_no_escalation_timer_holding_the_interpreter(tmp_path, harbor):
+    (tmp_path / "slow").mkdir()
+    gateway, _ = fake_gateway()
+    source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials", grace=60.0)
+    try:
+        (future,) = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 1, version=0)
+        deadline = time.monotonic() + 30
+        while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        source.cancel([future])
+        assert future.result(timeout=30).status is Status.CANCELLED
+    finally:
+        source.close()
+    # Harbor died on the interrupt; nothing may keep the interpreter alive for the rest of the grace.
+    assert not [thread for thread in threading.enumerate()
+                if isinstance(thread, threading.Timer) and thread.is_alive() and not thread.daemon]
+
+
+TRAINER = """
+import sys, time
+from pathlib import Path
+sys.path.insert(0, {src!r}); sys.path.insert(0, {tests!r})
+from test_harbor_source import fake_gateway
+from dew.objectives.rl.harbor import HARBOR_KEY, HarborSource
+from dew.objectives.rl.sessions import Task
+root = Path({root!r})
+source = HarborSource(fake_gateway()[0], harbor=root / "harbor", model="m/p", trials=root / "trials", workers=1,
+                      grace=2.0)
+source.submit(Task("slow", {{HARBOR_KEY: str(root / "slow")}}), 2, version=0)
+while not list((root / "trials").glob("*/seen.json")):
+    time.sleep(0.05)
+raise KeyboardInterrupt  # the trainer is interrupted mid-trial and never calls close()
+"""
+
+
+def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_path, harbor):
+    (tmp_path / "slow").mkdir()
+    script = tmp_path / "trainer.py"
+    script.write_text(TRAINER.format(src=str(Path(__file__).resolve().parents[1] / "src"),
+                                     tests=str(Path(__file__).parent), root=str(tmp_path)))
+    began = time.monotonic()
+    trainer = subprocess.run([sys.executable, str(script)], capture_output=True, text=True, timeout=120,
+                             env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert "KeyboardInterrupt" in trainer.stderr
+    # The running trial was killed (its 60 s sleep never finished) and the queued one never launched.
+    assert time.monotonic() - began < 30
+    assert len(list((tmp_path / "trials").glob("*/seen.json"))) == 1
+    assert not list((tmp_path / "trials").glob("*/result.json"))
