@@ -140,6 +140,7 @@ def maxtext_capacity(length: int, top_k: int, experts: int, factor: float) -> in
     return int(max(math.ceil(length * top_k / experts) * factor, factor))
 
 
+@pytest.mark.mesh(devices=1)
 @pytest.mark.parametrize('experts,top_k,factor', [(8, 2, 1.0), (4, 1, 1.25), (16, 4, 0.5)])
 def test_capacity_queues_each_sequence_in_token_order(experts, top_k, factor):
     scores = np.random.default_rng(3).normal(size=(3, 10, experts))
