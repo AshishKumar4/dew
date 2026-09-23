@@ -922,6 +922,10 @@ class Pretrained:
     task: SourceTask | None = None
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
     quantized_tensors: tuple[str, ...] = ()
+    quantized_scale_dtype: str | None = None
+    """The dtype a quantized source stored its scales in, where its format
+    leaves that to the checkpoint (DeepSeek-V4's `.scale`: float8_e8m0fnu,
+    float32 in the Base releases), so `save` writes them back in it."""
     revision: str | None = None
     """The Hub commit the source resolved to, whatever branch or tag was
     asked for; None for a local directory."""
@@ -1002,7 +1006,7 @@ class Pretrained:
         """Write trained variables back to the source layout with its tokenizer assets."""
         from dew.interop.safetensors_io import save_hf_layout
         values = self.variables if variables is None else variables
-        quantization = source_quantization(self.config)
+        quantization = source_quantization(self.config, scale_dtype=self.quantized_scale_dtype)
         if quantization is not None and not self.quantized_tensors:
             raise ValueError(
                 "this source's config declares a quantization_config and the loader recorded "
@@ -2244,7 +2248,8 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     if param_dtype == AUTO:
         param_dtype = _checkpoint_dtype(config, tensors)
     quantization = source_quantization(config, param_dtype=param_dtype)
-    quantized_tensors = () if quantization is None else quantization.names(tensors)
+    quantized_tensors, scale_dtype = ((), None) if quantization is None else (
+        quantization.names(tensors), quantization.scale_dtype(tensors))
     if quantization is not None:
         aliases: tuple[tuple[str, str], ...] = ()
         if param_dtype != "float32":
@@ -2320,4 +2325,4 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     agreed("pretrained generation policy", policy_read)
     return Pretrained(model, variables, processor, config, directory, built, generation_config,
                       layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
-                      revision=commit)
+                      quantized_scale_dtype=scale_dtype, revision=commit)

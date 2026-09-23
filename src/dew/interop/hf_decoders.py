@@ -106,9 +106,10 @@ _IGNORED_FIELDS = {
 }
 
 # Read by the codec rather than by any family: `codecs.source_quantization`
-# decodes the weights this names and refuses a format it cannot, before a
-# family translator sees the config.
-_CODEC_FIELDS = frozenset({'quantization_config'})
+# decodes the weights these name and refuses a format it cannot, before a
+# family translator sees the config. DeepSeek-V4 names its routed experts'
+# storage as `expert_dtype` beside its quantization_config.
+_CODEC_FIELDS = frozenset({'quantization_config', 'expert_dtype'})
 
 
 def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
