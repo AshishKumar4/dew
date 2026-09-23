@@ -47,7 +47,11 @@ type Traced = (jax.Array | np.ndarray | np.generic | bool | int | float | comple
 # HBM3`, `NVIDIA H100 PCIe`, `NVIDIA H200`, `NVIDIA GeForce RTX 4080`. The
 # datasheets state bf16 tensor throughput with sparsity: A100 624, H100 SXM
 # 1979, H100 PCIe 1513, H100 NVL and H200 NVL 1671, H200 SXM 1979; the dense
-# figure is half. The RTX 4080's 97.5 dense is from the Ada whitepaper.
+# figure is half. A GeForce card runs a 16-bit product into an fp32
+# accumulator, which is what an XLA bf16 matmul asks for, at half the rate of
+# a 16-bit accumulator, and that fp32-accumulate dense rate is the entry: the
+# RTX 4080's 97.5 from the Ada whitepaper and the RTX 3090's 71 from the GA102
+# whitepaper (82 SMs, 256 fp32-accumulate FMAs an SM a clock, 1.695 GHz).
 PEAK_FLOPS_PER_DEVICE = {
     'TPU v2': 22.5e12,
     'TPU v3': 61.5e12,
@@ -62,6 +66,7 @@ PEAK_FLOPS_PER_DEVICE = {
     'NVIDIA H200': 989e12,
     'NVIDIA H200 NVL': 835e12,
     'NVIDIA GeForce RTX 4080': 97.5e12,
+    'NVIDIA GeForce RTX 3090': 71e12,
 }
 
 
