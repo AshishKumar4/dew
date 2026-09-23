@@ -1,9 +1,11 @@
 """Native CLIP conditioning and image preprocessing for latent diffusion."""
 from __future__ import annotations
 
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Sequence
 
 import jax
@@ -309,6 +311,19 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.towers[0].dtype),
                 "param_dtype": self.param_dtype}
 
+    def save_assets(self, destination: Path) -> None:
+        """Write the tokenizer files an exported directory carries beside the weights."""
+        for name, tokenizer in zip(self.names, self.tokenizers, strict=True):
+            folder = destination / ("tokenizer" + name.removeprefix("text_encoder"))
+            tokenizer.save_pretrained(folder)
+            # A CLIP tokenizer's own vocabulary and merges beside its config.
+            tokenizer.backend_tokenizer.model.save(str(folder))
+        if self.t5 is not None:
+            # The T5 tokenizer ships one file, which `save_pretrained` writes, in
+            # the slot its own family keeps it.
+            self.t5.tokenizer.save_pretrained(
+                destination / ("tokenizer" + self.t5.name.removeprefix("text_encoder")))
+
 
 def _residual_states(decoder, ids):
     """The last decoder layer's output, before the final norm.
@@ -390,8 +405,9 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
                 "zero_condition": np.asarray(zero, bool), "negative": np.asarray(negative, bool)}
 
     def encode(self, params, tokens) -> DenoisingCondition:
-        states = self.decoder.apply({"params": params[self.name]["params"]},
-                                    jnp.asarray(tokens["input_ids"]), method=_residual_states)
+        states = jnp.asarray(self.decoder.apply({"params": params[self.name]["params"]},
+                                                jnp.asarray(tokens["input_ids"]),
+                                                method=_residual_states))
         valid = jnp.asarray(tokens["attention_mask"], bool)[:, self.drop:]
         dropped = jnp.asarray(tokens["zero_condition"])[:, None, None]
         context = jnp.where(valid[..., None] & ~dropped, states[:, self.drop:], 0)
@@ -405,6 +421,11 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def to_json(self):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.decoder.dtype),
                 "param_dtype": self.param_dtype, "tokens": self.tokens}
+
+    def save_assets(self, destination: Path) -> None:
+        """Copy the processor's files as they came: they are read, never trained."""
+        shutil.copytree(Path(self.checkpoint) / "processor", destination / "processor",
+                        dirs_exist_ok=True)
 
 
 @lru_cache(maxsize=32)
