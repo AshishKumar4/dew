@@ -161,7 +161,7 @@ class Launch:
         if self.hostfile is not None:
             lines = (line.split("#", 1)[0].split() for line in self.hostfile.read_text().splitlines())
             return tuple(words[0] for words in lines if words)
-        return tuple(name for entry in self.hosts for name in entry.split(",") if name)
+        return split_names(self.hosts)
 
     def run_command(self) -> int:
         if self.tpu:
@@ -302,7 +302,7 @@ class Launch:
         gcloud ssh in a shell that sources the environment `dew tpu setup`
         wrote. jax reads each worker's rank from the TPU metadata; several
         slices also get the MEGASCALE variables that join them."""
-        slices = [reach(name, self.zone, self.dry_run) for name in self.tpu]
+        slices = [reach(name, self.zone, self.dry_run) for name in split_names(self.tpu)]
         processes = []
         for slice_id, (tpu, addresses) in enumerate(slices):
             env = self.extra_env()
@@ -328,6 +328,11 @@ class Launch:
             emit(f"{prefix} {shlex.join(process.argv)}" if process.local
                  else shlex.join(process.argv))
         return 0
+
+
+def split_names(entries: Sequence[str]) -> tuple[str, ...]:
+    """Names given as `a,b`, `a b` or both."""
+    return tuple(name for entry in entries for name in entry.split(",") if name)
 
 
 def remote_script(command: Sequence[str], env: dict[str, str], cwd: str | None) -> str:
