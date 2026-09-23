@@ -23,6 +23,7 @@ the newest checkpoint every process can read wins.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, overload
 
@@ -83,6 +84,39 @@ def _processes(count: int) -> str:
 
 def _loss(metrics):
     return metrics['loss']
+
+
+def _check_shared(directory: str) -> None:
+    """Refuse a directory the processes of a pool do not all see.
+
+    Orbax writes one checkpoint across a pool: every process writes the
+    shards it holds, process 0 writes the metadata and commits the step once
+    they all have, and a restore reads shards other processes wrote. On
+    disks of their own, process 0 commits a step without the others' shards
+    while they see no step at all, so a resume trains different states on
+    different processes. Process 0 leaves a file in the directory and every
+    process looks for it; a bucket is one store for every process already.
+    """
+    if jax.process_count() == 1 or is_uri(directory):
+        return
+    token = multihost_utils.broadcast_one_to_all(np.frombuffer(os.urandom(8), np.uint8))
+    marker = epath.Path(directory) / f".shared-{np.asarray(token).tobytes().hex()}"
+    if jax.process_index() == 0:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("")
+    multihost_utils.sync_global_devices("dew checkpoints: directory marked")
+    seen = np.asarray(multihost_utils.process_allgather(np.asarray(marker.exists())))
+    if jax.process_index() == 0:
+        marker.unlink()
+    blind = [index for index, saw in enumerate(seen.reshape(-1)) if not saw]
+    if blind:
+        raise ValueError(
+            f"The checkpoint directory {directory} is not shared: process(es) {blind} of "
+            f"{jax.process_count()} do not see the file process 0 wrote there. A checkpoint "
+            f"is written by every process of the pool and read back by any, so the "
+            f"directory has to be one every process reads and writes, on a shared "
+            f"filesystem or in a bucket. Each host's own disk can hold local checkpoints "
+            f"beside it (local_directory).")
 
 
 def gather_positions(saved: bytes, share: DataPartition) -> dict:
@@ -261,6 +295,7 @@ class Checkpoints:
 
     def _open(self) -> ocp.CheckpointManager:
         if self._manager is None:
+            _check_shared(self.directory)
             options = ocp.CheckpointManagerOptions(
                 preservation_policy=preservation.AnyPreservationPolicy([
                     preservation.LatestN(n=self.keep),
