@@ -109,7 +109,7 @@ class EnvironmentSource:
         self.seed = seed
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dew-episode")
         self._lock = threading.Lock()
-        self._sessions: dict[Future[Session], _Handle] = {}
+        self._handles: dict[Future[Session], _Handle] = {}
         self._serial = 0
 
     def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Session]]:
@@ -118,11 +118,11 @@ class EnvironmentSource:
             self._serial += 1
         futures = []
         for sample in range(samples):
-            session = _Handle()
+            handle = _Handle()
             identity = EpisodeId(serial, 0, sample, (self.seed, serial, sample))
-            future = self._pool.submit(self._run, task, identity, version, session)
+            future = self._pool.submit(self._run, task, identity, version, handle)
             with self._lock:
-                self._sessions[future] = session
+                self._handles[future] = handle
             future.add_done_callback(self._forget)
             futures.append(future)
         return futures
@@ -133,31 +133,31 @@ class EnvironmentSource:
             if future.cancel():
                 continue
             with self._lock:
-                session = self._sessions.get(future)
-            if session is not None:
-                session.cancelled = True
-                session.wake.set()
+                handle = self._handles.get(future)
+            if handle is not None:
+                handle.cancelled = True
+                handle.wake.set()
 
     def close(self) -> None:
         """Cancel every session and wait for the running ones to release their environments."""
         with self._lock:
-            running = list(self._sessions)
+            running = list(self._handles)
         self.cancel(running)
         self._pool.shutdown(wait=True, cancel_futures=True)
 
     def _forget(self, future: Future[Session]) -> None:
         with self._lock:
-            self._sessions.pop(future, None)
+            self._handles.pop(future, None)
 
-    def _draw(self, context: tuple[int, ...], seed: int, session: _Handle) -> Draw | None:
+    def _draw(self, context: tuple[int, ...], seed: int, handle: _Handle) -> Draw | None:
         """One call on the server, or None when the session is cancelled while it runs."""
-        session.wake.clear()
-        if session.cancelled:
+        handle.wake.clear()
+        if handle.cancelled:
             return None
         pending = self.server.submit(context, self.max_new_tokens, seed=seed)
-        pending.add_done_callback(lambda _: session.wake.set())
-        session.wake.wait()
-        if session.cancelled and not pending.done():
+        pending.add_done_callback(lambda _: handle.wake.set())
+        handle.wake.wait()
+        if handle.cancelled and not pending.done():
             return None
         return pending.result()
 
@@ -172,7 +172,7 @@ class EnvironmentSource:
             raise _Refused("the server returned a draw for another context")
         return Action(context, draw.tokens, raw, draw.behavior_log_probs, draw.terminated, draw.version, sampling)
 
-    def _run(self, task: Task, identity: EpisodeId, version: int, session: _Handle) -> Session:
+    def _run(self, task: Task, identity: EpisodeId, version: int, handle: _Handle) -> Session:
         initial: Observation | None = None
         transitions: list[Transition] = []
         pending: Action | None = None
@@ -193,7 +193,7 @@ class EnvironmentSource:
                         status, detail = limit.status, limit.detail
                         break
                     draw = self._draw(observation.context, _seed(self.seed, identity.task, identity.sample, turn),
-                                  session)
+                                  handle)
                     if draw is None:
                         status, detail = EpisodeStatus.CANCELLED, "cancelled by the scheduler"
                         break
@@ -215,7 +215,7 @@ class EnvironmentSource:
                 episode = replace(episode, reward=_scored(self.verifier(task, episode)))
             except Exception as error:
                 episode = replace(episode, status=EpisodeStatus.ERROR, detail=f"verifier: {_failure(error)}")
-        return session_of(episode, group="")
+        return replace(session_of(episode, group=""), task=task.id)
 
 
 def prompt_tasks(batch: Batch) -> list[Task]:
