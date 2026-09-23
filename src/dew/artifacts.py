@@ -211,9 +211,6 @@ def agree_process_phase(error: BaseException | None, *, phase: str,
     published = error is not None and publish_failure(error, f"phase {phase}")
     status = 2 if error is not None else int(available)
     statuses = np.asarray(multihost_utils.process_allgather(np.asarray(status, np.int32))).reshape(-1)
-    if published:
-        # Every rank reached this agreement and reads the failure from it.
-        withdraw_failure()
     failed = np.flatnonzero(statuses == 2)
     if not failed.size:
         return int(np.count_nonzero(statuses))
@@ -229,6 +226,10 @@ def agree_process_phase(error: BaseException | None, *, phase: str,
         np.asarray(len(message), np.int32), is_source=is_source))
     payload = np.frombuffer(message, np.uint8) if is_source else np.zeros(length, np.uint8)
     diagnostic = multihost_utils.broadcast_one_to_all(payload, is_source=is_source).tobytes()
+    if published:
+        # Every rank took part in the agreement's collectives and holds the
+        # failure; one that met a peer's pending step instead never gets here.
+        withdraw_failure()
     context = f"Process phase {phase} failed on rank {source}: {diagnostic.decode('utf-8', errors='replace')}"
     if error is not None:
         error.add_note(context)
