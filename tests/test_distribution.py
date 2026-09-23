@@ -26,7 +26,8 @@ from dew.training import MeshSpec
 from dew.training.distributed import hybrid_devices
 
 # Needs the eight simulated CPU devices conftest configures, except the tests
-# that name fewer, which a four-GPU run takes as one GPU a process.
+# that name fewer: those of stand-in devices need none, and a four-GPU run
+# takes the pool tests of two as one GPU a process.
 pytestmark = pytest.mark.mesh
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -96,14 +97,14 @@ def test_hybrid_sharding_groups_hosts_into_replicas_and_trains_like_fsdp(tmp_pat
 
 @dataclasses.dataclass(frozen=True)
 class StandIn:
-    """What `hybrid_devices` reads of a device, for a topology this machine
-    does not have."""
+    """What the mesh builders read of a GPU device, for a topology this
+    machine does not have; XLA numbers GPU slices per host boot."""
 
     id: int
     process_index: int
     slice_index: int
-    platform: str = "cpu"
-    device_kind: str = "cpu"
+    platform: str = "gpu"
+    device_kind: str = "NVIDIA GeForce RTX 3090"
 
 
 def standins(slices: int, processes: int, per_process: int) -> list[StandIn]:
@@ -122,6 +123,7 @@ def groups(array: np.ndarray, attribute: str, axis: int) -> list[list[int]]:
             for group in moved.reshape(-1, moved.shape[-1])]
 
 
+@pytest.mark.mesh(devices=0)
 def test_replicas_over_processes_split_fsdp_across_the_hosts_of_one_replica():
     """Four hosts of two devices on one slice, fsdp=2 over replicas=2: fsdp
     pairs hosts 0-1 and 2-3, and the data axis's outer half crosses the
@@ -132,6 +134,7 @@ def test_replicas_over_processes_split_fsdp_across_the_hosts_of_one_replica():
         [0, 1], [0, 1], [2, 3], [2, 3]]
 
 
+@pytest.mark.mesh(devices=0)
 def test_replicas_over_slices_keep_every_axis_but_data_inside_a_slice():
     """Two slices of two hosts: fsdp=4 over replicas=2 keeps each fsdp group
     in one slice across its two hosts, and only the data axis crosses the
@@ -142,6 +145,7 @@ def test_replicas_over_slices_keep_every_axis_but_data_inside_a_slice():
     assert groups(array, "slice_index", 0) == [[0, 1]] * 4
 
 
+@pytest.mark.mesh(devices=0)
 def test_gpu_hosts_are_the_granules_however_many_processes_each_runs():
     """Two GPU hosts of four one-device processes, which XLA gives a slice
     index per host: the granules are the two hosts, so fsdp=4 over two
@@ -154,6 +158,7 @@ def test_gpu_hosts_are_the_granules_however_many_processes_each_runs():
         hybrid_devices(MeshSpec(fsdp=2, replicas=4), (4, 1, 2, 1, 1, 1), hosts)
 
 
+@pytest.mark.mesh(devices=0)
 def test_replicas_the_granules_cannot_hold_are_refused():
     with pytest.raises(ValueError, match="replicas 3 must divide both the 4 granules"):
         hybrid_devices(MeshSpec(fsdp=2, replicas=3), (4, 1, 2, 1, 1, 1), standins(1, 4, 2))
@@ -195,17 +200,6 @@ def test_more_replicas_than_hosts_are_refused(tmp_path):
     assert "replicas 2 must divide both the 1 granules" in done.stdout
 
 
-@dataclasses.dataclass(frozen=True)
-class StandIn:
-    """What the mesh builders read of a GPU device on one of two hosts, each
-    host its own slice, as XLA numbers GPU slices per boot."""
-    id: int
-    process_index: int
-    slice_index: int
-    platform: str = "gpu"
-    device_kind: str = "NVIDIA GeForce RTX 3090"
-
-
 def crossing(spec: MeshSpec) -> list[str]:
     """The axes of `spec`'s device grid over two hosts of four GPUs whose
     groups span both hosts."""
@@ -217,6 +211,7 @@ def crossing(spec: MeshSpec) -> list[str]:
             if len(set(np.moveaxis(hosts, axis, -1).reshape(-1, hosts.shape[axis])[0])) > 1]
 
 
+@pytest.mark.mesh(devices=0)
 def test_two_gpu_hosts_split_the_data_axis_unless_asked_otherwise():
     """Every GPU host is its own slice. Without replicas the hosts take the
     data axis where it divides, and fsdp only where it does not; before,
