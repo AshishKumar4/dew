@@ -233,8 +233,8 @@ class EngramHashes(nn.Module):
 
     Tokens map through the compressed vocabulary, the `constants`
     collection's `token_map`: a loaded checkpoint derives it from its
-    tokenizer (`compressed_token_map`), a fresh model starts as the
-    identity. Each position hashes with the valid tokens before it: padding
+    tokenizer (`compressed_token_map`), and a fresh model maps each id to
+    itself modulo the compressed vocabulary's size. Each position hashes with the valid tokens before it: padding
     is skipped, and look-back stops at a row's start, at a packed document's
     (`positions`) and, while decoding, where the cached history of the row's
     earlier calls runs out. Padding positions get ids nothing reads.
