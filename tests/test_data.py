@@ -1123,7 +1123,8 @@ def test_a_truncated_image_raises_rather_than_becoming_an_array():
     """cv2.imdecode hands back None for a half-written jpeg, and None resized
     to the training size would be a black record; the decoder raises a
     ValueError ("cv2 could not decode ...") before the colour conversion sees it."""
-    whole = np.random.RandomState(0).randint(0, 256, (16, 16, 3), np.uint8)
+    # Large enough that the half kept still holds the whole header.
+    whole = np.random.RandomState(0).randint(0, 256, (64, 64, 3), np.uint8)
     encoded, buffer = cv2.imencode(".jpg", whole)
     assert encoded
     truncated = buffer.tobytes()[:len(buffer) // 2]
