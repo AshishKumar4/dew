@@ -869,26 +869,27 @@ def _exchange_shard[Parameters](
         first = min(slots, math.prod(indices.shape[:-2]) * per_shard * capacity)
     order = jnp.argsort(indices.ravel())
     experts = indices.ravel()[order]
-    grouped = tokens[order // top_k]
-    if input_weights is not None:
-        grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
     sizes = jnp.bincount(experts // per_shard, length=shards + 1)[:shards]
     starts = jnp.cumsum(sizes) - sizes
+    rows = order // top_k
+    scales = None if input_weights is None else input_weights.ravel()[order]
 
     def exchange_round(offset: jax.Array | int) -> tuple[jax.Array, jax.Array]:
         """Send each shard its `first` slots from `offset` on, project them
         there, and bring them back.
 
-        Returns the returned rows and the local address each one belongs
-        at. Padding addresses land past the end, so the caller's
-        scatter drops them.
+        The rows are gathered from the tokens themselves, through the
+        sort's index. Returns the returned rows and the slot each belongs
+        at, in token order; padding's lies past the end, so the caller's
+        scatter drops it.
         """
         offsets = offset + jnp.arange(first)
         valid = offsets[None, :] < sizes[:, None]
-        addresses = starts[:, None] + offsets
-        send = jnp.where(valid[..., None], grouped[jnp.minimum(addresses, slots - 1)], 0)
-        ids = jnp.where(valid, experts[jnp.minimum(addresses, slots - 1)] % per_shard,
-                        per_shard)
+        addresses = jnp.minimum(starts[:, None] + offsets, slots - 1)
+        send = jnp.where(valid[..., None], tokens[rows[addresses]], 0)
+        if scales is not None:
+            send = send * scales[addresses][..., None].astype(send.dtype)
+        ids = jnp.where(valid, experts[addresses] % per_shard, per_shard)
         received = jax.lax.all_to_all(send, EXPERT_AXIS, 0, 0, tiled=True).reshape(
             -1, tokens.shape[-1])
         received_ids = jax.lax.all_to_all(ids, EXPERT_AXIS, 0, 0, tiled=True).ravel()
@@ -899,12 +900,11 @@ def _exchange_shard[Parameters](
         computed = jnp.where((received_ids < per_shard)[:, None], computed, 0)
         returned = jax.lax.all_to_all(computed.reshape(shards, first, -1),
                                      EXPERT_AXIS, 0, 0, tiled=True)
-        # Only padding has an out-of-bounds address; every real slot has
-        # one unique writer across all rounds.
-        return returned, jnp.where(valid, addresses, slots)
+        # Every real slot has one writer across all rounds.
+        return returned, jnp.where(valid, order[addresses], slots)
 
-    returned, addresses = exchange_round(0)
-    combined = jnp.zeros((slots, tokens.shape[-1]), output_dtype).at[addresses].set(
+    returned, targets = exchange_round(0)
+    combined = jnp.zeros((slots, tokens.shape[-1]), output_dtype).at[targets].set(
         returned, mode='drop')
     if capacity is None and slots > first:
         rounds = -(-(slots - first) // first)
@@ -916,12 +916,12 @@ def _exchange_shard[Parameters](
             those rows. The scan's length is static, and the rounds past
             `needed` keep the carry unchanged."""
             def active(out: jax.Array) -> jax.Array:
-                returned, addresses = later((iteration + 1) * first)
-                return out.at[addresses].set(returned, mode='drop')
+                returned, targets = later((iteration + 1) * first)
+                return out.at[targets].set(returned, mode='drop')
             return jax.lax.cond(iteration < needed, active, lambda out: out, out), None
 
         combined, _ = jax.lax.scan(step, combined, jnp.arange(rounds))
-    return combined[jnp.argsort(order)].reshape(*indices.shape, tokens.shape[-1])
+    return combined.reshape(*indices.shape, tokens.shape[-1])
 
 
 def _widened[Tree](parameters: Tree) -> Tree:
