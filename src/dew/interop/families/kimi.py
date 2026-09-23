@@ -63,6 +63,8 @@ from dew.interop.hf_decoders import (
     _ACTIVATIONS,
     _CODEC_FIELDS,
     _IGNORED_FIELDS,
+    _SERIALIZED_ENCODER_FIELDS,
+    _SERIALIZED_TEXT_FIELDS,
     DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
     KindFields,
@@ -72,6 +74,7 @@ from dew.interop.hf_decoders import (
     _record_float,
     _record_int,
     _refuse,
+    _refuse_encoder_fields,
 )
 
 # KimiLinearConfig's __init__ arguments (configuration_kimi.py:11-52 of
@@ -96,22 +99,6 @@ _K3_FIELDS = frozenset({
     'latent_moe_use_norm', 'max_position_embeddings', 'mla_use_output_gate',
     'routed_expert_hidden_size', 'topk_method',
 })
-# moonshotai/Kimi-K3's text_config was serialized by transformers 4.56.2,
-# which writes every PreTrainedConfig attribute; past `_IGNORED_FIELDS`, the
-# decoding policy and metadata that no forward pass consults.
-_K3_TEXT_SERIALIZED = frozenset({
-    'bad_words_ids', 'begin_suppress_tokens', 'decoder_start_token_id', 'diversity_penalty',
-    'do_sample', 'early_stopping', 'encoder_no_repeat_ngram_size', 'exponential_decay_length_penalty',
-    'finetuning_task', 'forced_bos_token_id', 'forced_eos_token_id', 'is_decoder', 'length_penalty',
-    'max_length', 'min_length', 'no_repeat_ngram_size', 'num_beam_groups', 'num_beams',
-    'num_return_sequences', 'output_scores', 'prefix', 'remove_invalid_values', 'repetition_penalty',
-    'return_dict_in_generate', 'sep_token_id', 'suppress_tokens', 'task_specific_params',
-    'temperature', 'tf_legacy_loss', 'tokenizer_class', 'top_k', 'top_p', 'torchscript',
-    'typical_p', 'use_bfloat16',
-})
-# Serialized fields that would name another model if set, read by value.
-_K3_TEXT_ENCODER = ('add_cross_attention', 'cross_attention_hidden_size',
-                    'tie_encoder_decoder', 'pruned_heads')
 _LINEAR_ATTN_FIELDS = frozenset({'full_attn_layers', 'kda_layers', 'num_heads', 'head_dim',
                                  'short_conv_kernel_size'})
 _K3_LINEAR_ATTN_FIELDS = frozenset({'gate_lower_bound', 'use_full_rank_gate'})
@@ -186,9 +173,6 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
     Kimi Linear's computation; each family's reader refuses first the
     fields its own release does not compute.
     """
-    for key in _K3_TEXT_ENCODER:
-        if text.get(key):
-            _refuse(f"{key}={text[key]!r}", "the decoder has no cross attention, encoder or pruned heads")
     if text.get('model_type', 'kimi_linear') != 'kimi_linear':
         _refuse(f"model_type {text.get('model_type')!r}", "the Kimi decoder is kimi_linear")
     if not text.get('mla_use_nope'):
@@ -288,10 +272,12 @@ def _kimi_k3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     text = hf_config.get('text_config')
     if not isinstance(text, Mapping):
         _refuse('text_config', f"the wrapper carries its decoder under text_config, got {text!r}")
-    unknown = sorted(key for key in set(text) - _LINEAR_FIELDS - _K3_FIELDS - _K3_TEXT_SERIALIZED
-                     - set(_K3_TEXT_ENCODER) - _IGNORED_FIELDS - _CODEC_FIELDS if not str(key).startswith('_'))
+    unknown = sorted(key for key in set(text) - _LINEAR_FIELDS - _K3_FIELDS - _SERIALIZED_TEXT_FIELDS
+                     - set(_SERIALIZED_ENCODER_FIELDS) - _IGNORED_FIELDS - _CODEC_FIELDS
+                     if not str(key).startswith('_'))
     if unknown:
         _refuse(f"text_config fields {unknown}", "KimiLinearConfig has no such field to compute")
+    _refuse_encoder_fields(text)
     linear = records.record(text.get('linear_attn_config'), 'linear_attn_config')
     extra = sorted(set(linear) - _LINEAR_ATTN_FIELDS - _K3_LINEAR_ATTN_FIELDS)
     if extra:
