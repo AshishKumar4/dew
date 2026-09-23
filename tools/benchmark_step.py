@@ -2,10 +2,11 @@
 """Time the real training step, one architecture at a time.
 
 tools/benchmark_data.py measures the loader. This measures what a step of the
-Trainer costs for a given architecture, batch size and fsdp width. The step
-is the one the trainer compiles for a real run (same objective, same
-sharding and state ownership), so a number from this tool is a number from
-training.
+Trainer costs for a given architecture, batch size and mesh. The step is
+the one the trainer compiles for a real run (same objective, same sharding
+and state ownership), so a number from this tool is a number from training.
+Under `dew launch` every process measures its own devices and process 0
+reports.
 
 FLOPs are read off the compiled executable's optimized HLO
 (dew.telemetry.instrumentation), and the utilisation is the figure the
@@ -32,7 +33,11 @@ Usage:
         --profile-dir /tmp/dew-trace --profile-steps 5
     python tools/benchmark_step.py --cases '[{"architecture": "simple_dit",
         "config": {"patch_size": 2, "emb_features": 512, "num_layers": 12,
-        "num_heads": 8}, "batch_size": 32, "image_size": 32, "fsdp_size": 2}]'
+        "num_heads": 8}, "batch_size": 32, "image_size": 32, "mesh": {"fsdp": 2}}]'
+    python tools/benchmark_step.py --preset small --architectures causal_transformer \\
+        --mesh '{"fsdp": 2, "tensor": 2}' --profile-dir /tmp/dew-trace
+    dew launch --processes-per-host 4 --devices-per-process 1 -- \\
+        python tools/benchmark_step.py --mesh '{"fsdp": 2, "replicas": 2}' ...
     python tools/benchmark_step.py --preset small \\
         --architectures multimodal_transformer diffusion_gemma
 """
@@ -55,11 +60,12 @@ import numpy as np
 import optax
 import tyro
 
+from dew.data.dataset import local_batch
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
 from dew.diffusion.process import DenoisingCondition
-from dew.objectives.base import Variables
+from dew.objectives.base import Objective, Variables
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.sd3 import SD3Transformer
@@ -72,10 +78,10 @@ from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
 from dew import models  # naming a registry fills it
 from dew.registry import resolve_dtype, with_precision
-from dew.telemetry.devices import apply_xla_flags
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
+from dew.training.runtime import prepare_process
 
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
 # of the model should not spend its first minute downloading a text tower, and
@@ -130,10 +136,9 @@ class Case:
     dtype: str = 'float32'
     """Compute dtype, written into the model config by the precision policy."""
     batch_size: int = 8
-    fsdp_size: int = 1
-    expert_size: int = 1
-    """Devices the expert dimension of an MoE layer is split over, as
-    --trainer.expert-size; 1 replicates every expert."""
+    mesh: dict[str, int] = field(default_factory=dict)
+    """`MeshSpec` fields, `{"fsdp": 2, "tensor": 2}`; the empty record is
+    data parallelism over every device."""
     image_size: int = 32
     channels: int = 3
     """Input channels, including four-channel latent diffusion inputs."""
@@ -190,7 +195,23 @@ class Case:
         canvases = f" x{canvas_split(self)[2]}canvas" if self.canvas else ""
         images = f" x{images_per_row(self)}img" if self.media else ""
         return (f"{self.architecture}{experts}{canvases}{images} b{self.batch_size} "
-                f"fsdp{self.fsdp_size} expert{self.expert_size}")
+                f"{mesh_label(self.mesh)}")
+
+
+def mesh_spec(mesh: Mapping[str, int]) -> MeshSpec:
+    """The `MeshSpec` a case's mesh record names, refusing a field it lacks."""
+    fields = {f.name for f in dataclasses.fields(MeshSpec)}
+    unknown = sorted(set(mesh) - fields)
+    if unknown:
+        raise ValueError(f"mesh has no field {unknown}; MeshSpec's fields are {sorted(fields)}")
+    return MeshSpec(**mesh)
+
+
+def mesh_label(mesh: Mapping[str, int]) -> str:
+    """`fsdp2-tensor2`, the mesh's sharded axes in MeshSpec order; `data` for none."""
+    named = [f"{name}{mesh[name]}" for name in (f.name for f in dataclasses.fields(MeshSpec))
+             if mesh.get(name) not in (None, 1)]
+    return "-".join(named) or "data"
 
 
 def _count(record: Mapping[str, object], key: str, owner: str) -> int:
@@ -295,6 +316,28 @@ JsonCases = Annotated[
     ),
 ]
 """A list of cases, written as one JSON string on the command line."""
+
+
+def mesh_from_json(text: str) -> dict[str, int]:
+    """`--mesh`: one JSON object of MeshSpec fields, checked by building it."""
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("--mesh is a JSON object of MeshSpec fields")
+    mesh_spec(parsed)
+    return parsed
+
+
+JsonMesh = Annotated[
+    dict[str, int] | None,
+    tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="JSON",
+        instance_from_str=lambda args: mesh_from_json(args[0]),
+        is_instance=lambda value: value is None or isinstance(value, dict),
+        str_from_instance=lambda mesh: [json.dumps(mesh)],
+    ),
+]
+"""A mesh, written as one JSON object on the command line."""
 
 
 def cpu_smoke_cases() -> list[Case]:
@@ -470,7 +513,8 @@ class BenchmarkConfig:
     yet, so a sweep runs one configuration per process."""
     batch_size: int | None = None
     """Override every case's batch size."""
-    fsdp_size: int | None = None
+    mesh: JsonMesh = None
+    """Override every case's mesh with these MeshSpec fields."""
     image_size: int | None = None
     frames: int | None = None
     """Frame count for the video cases; image cases are left alone."""
@@ -505,8 +549,8 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
             raise ValueError(f"--architectures {sorted(unknown)} not in preset {config.preset}")
         cases = [case for case in cases if case.architecture in wanted]
 
-    overrides: dict[str, int] = {}
-    for name in ('batch_size', 'fsdp_size', 'image_size'):
+    overrides: dict[str, object] = {}
+    for name in ('batch_size', 'mesh', 'image_size'):
         value = getattr(config, name)
         if value is not None:
             overrides[name] = value
@@ -531,10 +575,8 @@ def lm_objective(case: Case, model) -> LMObjective:
     return LMObjective(model, case.seq_len, head_chunks=case.head_chunks)
 
 
-def build_trainer(case: Case, attention_impl: str = 'auto',
-                  optimizer: optax.GradientTransformation | None = None) -> Trainer:
-    """The trainer a recipe would build for this case, minus the tracker and the
-    checkpoints.
+def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
+    """The objective a recipe would train for this case.
 
     The model goes through the same precision function the recipes use, so the
     dtype and the attention kernel land in the nested unet attention configs
@@ -594,11 +636,16 @@ def build_trainer(case: Case, attention_impl: str = 'auto',
         inputs = InputSpec(Field(sample_key, case.sample_shape),
                            {keyword: Condition(encoder)})
         objective = DiffusionObjective(model, process, inputs)
+    return objective
 
+
+def build_trainer(case: Case, attention_impl: str = 'auto',
+                  optimizer: optax.GradientTransformation | None = None) -> Trainer:
+    """The trainer a recipe would build for this case, minus the tracker and the
+    checkpoints."""
     return Trainer(
-        objective, optimizer or optax.adam(1e-4), key=jax.random.key(0),
-        mesh=MeshSpec(fsdp=case.fsdp_size, expert=case.expert_size),
-        layout=Layout(min_shard=case.fsdp_min_param_size),
+        build_objective(case, attention_impl), optimizer or optax.adam(1e-4), key=jax.random.key(0),
+        mesh=mesh_spec(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
         checkpoints=None, tracker=None)
 
 
@@ -633,8 +680,8 @@ def media_row(case: Case, tokens: np.ndarray, rng: np.random.Generator) -> Model
                        {"pixel_values": pixels.astype(np.float32)})
 
 
-def batches(case: Case) -> Iterator[Batch]:
-    """One host batch, reused: the loader is benchmarked by benchmark_data.py."""
+def global_batch(case: Case) -> Batch:
+    """The case's whole batch, drawn the same on every process."""
     rng = np.random.default_rng(0)
     batch: Batch = {}
     if case.is_lm:
@@ -665,21 +712,31 @@ def batches(case: Case) -> Iterator[Batch]:
             0, 256, size=(case.batch_size, *case.sample_shape)).astype(np.float32)
         if not case.is_jepa:
             batch["text"] = CharTable.from_pretrained(tokens=TEXT_TOKENS).tokenize(["a flower"] * case.batch_size)
+    return batch
+
+
+def batches(case: Case) -> Iterator[Batch]:
+    """This process's rows of one host batch, reused: the loader is
+    benchmarked by benchmark_data.py. Every process draws the same global
+    batch and keeps its own `local_batch` rows, the share a loader reads."""
+    rows = local_batch(case.batch_size)
+    start = jax.process_index() * rows
+    mine = jax.tree.map(lambda leaf: leaf[start:start + rows], global_batch(case))
     while True:
-        yield batch
+        yield mine
 
 
 def device_peak_bytes() -> int | None:
-    """The allocator's high-water mark, where the backend reports one (not CPU).
+    """The allocator's high-water mark on this process's fullest device, where
+    the backend reports one (not CPU).
 
     Monotonic for the life of the process and with no reset hook, so in a sweep
     it is this case's own peak only for the first case; every later case gets
     an upper bound plus its own delta.
     """
-    stats = jax.local_devices()[0].memory_stats()
-    if not stats:
-        return None
-    return stats.get('peak_bytes_in_use') or stats.get('bytes_in_use')
+    peaks = [stats.get('peak_bytes_in_use') or stats.get('bytes_in_use')
+             for stats in (device.memory_stats() for device in jax.local_devices()) if stats]
+    return max(peaks) if peaks else None
 
 
 def parameter_count(params) -> int:
@@ -769,6 +826,92 @@ def device_timeline(directory: str, steps: int) -> dict[str, Any]:
     }
 
 
+# NCCL names its kernels after the collective it runs:
+# `ncclDevKernel_AllGather_RING_LL`, `ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL`,
+# `ncclDevKernel_SendRecv` (collective-permute and all-to-all), and the same
+# with `ncclKernel_` before NCCL 2.19.
+COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast", "Reduce")
+
+
+def _union(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _overlap(first: list[tuple[int, int]], second: list[tuple[int, int]]) -> int:
+    """Nanoseconds two disjoint, sorted interval lists share."""
+    shared, i, j = 0, 0, 0
+    while i < len(first) and j < len(second):
+        start, end = max(first[i][0], second[j][0]), min(first[i][1], second[j][1])
+        shared += max(0, end - start)
+        if first[i][1] < second[j][1]:
+            i += 1
+        else:
+            j += 1
+    return shared
+
+
+def communication(directory: str, steps: int) -> dict[str, Any]:
+    """Each device's traced window split into compute, every collective, and
+    the communication no compute kernel overlapped, averaged over the devices.
+
+    A kernel is a collective when NCCL runs it, and anything else is compute.
+    Only the stream lines are read, since the derived lines (`XLA Ops`,
+    `XLA Modules`) repeat the same time under the program's names. A
+    collective's kernel spans its wait for the slowest peer as well as the
+    transfer, so the times include the skew between devices.
+    `exposed_communication_ms_per_step` is the collective time no compute
+    kernel on the same device ran beside: what overlap did not hide.
+    """
+    from jax.profiler import ProfileData
+
+    traces = sorted(glob.glob(os.path.join(directory, "**", "*.xplane.pb"), recursive=True),
+                    key=os.path.getmtime)
+    devices = []
+    for plane in ProfileData.from_file(traces[-1]).planes:
+        if not plane.name.startswith("/device:"):
+            continue
+        streams = [line for line in plane.lines if line.name.startswith("Stream")]
+        events = [(event.name, event.start_ns, event.end_ns)
+                  for line in streams or plane.lines for event in line.events]
+        if events:
+            devices.append(events)
+    if not devices:
+        raise ValueError(f"the trace under {directory} holds no device kernels")
+
+    def length(intervals: list[tuple[int, int]]) -> int:
+        return sum(end - start for start, end in intervals)
+
+    totals: dict[str, float] = {}
+    for events in devices:
+        compute = _union([(start, end) for name, start, end in events if "nccl" not in name.lower()])
+        collectives = [(name, start, end) for name, start, end in events if "nccl" in name.lower()]
+        every = _union([(start, end) for _, start, end in collectives])
+        window = max(end for _, _, end in events) - min(start for _, start, _ in events)
+        figures = {"window": window, "compute": length(compute),
+                   "communication": length(every),
+                   "exposed_communication": length(every) - _overlap(every, compute)}
+        for kind in COLLECTIVES:
+            figures[kind] = length(_union([
+                (start, end) for name, start, end in collectives
+                if f"_{kind.lower()}_" in f"_{name.lower()}_".replace("(", "_")]))
+        for key, value in figures.items():
+            totals[key] = totals.get(key, 0.0) + value
+    per_step = 1e-6 / steps / len(devices)
+    window = totals.pop("window")
+    return {
+        "traced_devices": len(devices),
+        "window_ms_per_step": window * per_step,
+        **{f"{key}_ms_per_step": value * per_step for key, value in totals.items()},
+        "exposed_communication_percent": 100.0 * totals["exposed_communication"] / window,
+    }
+
+
 def measure(case: Case, config: BenchmarkConfig) -> Row:
     """Warm up, then time the compiled step over a fixed number of steps."""
     if config.steps < 1:
@@ -819,8 +962,11 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
 
         timeline = {}
         if config.profile_dir:
-            # After the timed windows, so the trace's own overhead is not in them.
-            directory = os.path.join(config.profile_dir, case.label.replace(" ", "_"))
+            # After the timed windows, so the trace's own overhead is not in
+            # them. Each process traces its own devices into its own
+            # directory, since the trace file is named after the host.
+            directory = os.path.join(config.profile_dir, case.label.replace(" ", "_"),
+                                     f"process{jax.process_index()}")
             jax.profiler.start_trace(directory)
             try:
                 for _ in range(config.profile_steps):
@@ -834,7 +980,8 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
                     if primary is None:
                         raise
                     primary.add_note(f"Profiler stop failed: {error!r}")
-            timeline = device_timeline(directory, config.profile_steps)
+            timeline = {**device_timeline(directory, config.profile_steps),
+                        **communication(directory, config.profile_steps)}
         flops = trainer.flops_per_step
         step_time = elapsed / config.steps
         utilization = model_flops_utilization(flops, step_time)
@@ -842,8 +989,9 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         row: Row = {
             "architecture": case.architecture,
             "batch_size": case.batch_size,
-            "fsdp_size": case.fsdp_size,
-            "expert_size": case.expert_size,
+            "mesh": case.mesh,
+            "mesh_shape": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
+            "processes": jax.process_count(),
             "sample_shape": [case.seq_len] if case.is_lm else list(case.sample_shape),
             "packed_documents": case.packed_documents,
             # A row's own extra work, so a number is readable without its
@@ -865,6 +1013,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "p50_ms": round(float(p50), 3),
             "p90_ms": round(float(p90), 3),
             "samples_per_sec": round(case.batch_size / step_time, 2),
+            "tokens_per_sec": round(case.batch_size * case.seq_len / step_time, 1) if case.is_lm else None,
             "flops_per_step": flops,
             "utilization": utilization,
             "peak_device_bytes": peak,
@@ -881,8 +1030,7 @@ TABLE_COLUMNS = (
     # Wide enough for the longest registry name, multimodal_transformer.
     ("architecture", "architecture", 22, "{}"),
     ("batch_size", "batch", 6, "{}"),
-    ("fsdp_size", "fsdp", 5, "{}"),
-    ("expert_size", "expert", 7, "{}"),
+    ("mesh", "mesh", 24, "{}"),
     ("params", "params", 12, "{:,}"),
     ("ms_per_step", "ms/step", 9, "{:.1f}"),
     ("p10_ms", "p10", 7, "{:.1f}"),
@@ -908,6 +1056,8 @@ def format_table(rows: list[Row]) -> str:
             value = row.get(key)
             if value is None:
                 text = "n/a"
+            elif key == "mesh" and isinstance(value, dict):
+                text = mesh_label(value)
             elif isinstance(value, (int, float)):
                 text = fmt.format(value * TABLE_SCALE.get(key, 1))
             else:
@@ -919,6 +1069,8 @@ def format_table(rows: list[Row]) -> str:
 
 def run(config: BenchmarkConfig) -> list[Row]:
     rows: list[Row] = []
+    # Every process of a pool measures its own devices; process 0 speaks.
+    speaker = jax.process_index() == 0
     for case in build_cases(config):
         # The trainer narrates state generation and input shapes per case,
         # which buries the numbers this tool exists to print.
@@ -927,6 +1079,8 @@ def run(config: BenchmarkConfig) -> list[Row]:
         with sink:
             row = measure(case, config)
         rows.append(row)
+        if not speaker:
+            continue
         print(f"{case.label}: {row['ms_per_step']} ms/step, "
               f"{row['samples_per_sec']} samples/s")
         categories = row.get("kernel_ms_by_category")
@@ -936,6 +1090,10 @@ def run(config: BenchmarkConfig) -> list[Row]:
                   f"{row['device_window_ms_per_step']:.2f} ms/step, "
                   f"{row['kernels_per_step']:.0f} kernels/step; ms/step by category: "
                   f"{categories}")
+            print(f"  per device: compute {row['compute_ms_per_step']:.2f}, communication "
+                  f"{row['communication_ms_per_step']:.2f}, exposed "
+                  f"{row['exposed_communication_ms_per_step']:.2f} ms/step "
+                  f"({row['exposed_communication_percent']:.1f}% of the window)")
         if config.json_out:
             # A GPU sweep is minutes of compilation per case; rewriting the
             # file as each case lands means an interrupted sweep still keeps
@@ -950,11 +1108,18 @@ def write_json(rows: list[Row], path: str) -> None:
 
 
 def main(config: BenchmarkConfig) -> list[Row]:
-    apply_xla_flags(config.xla_flags)
-    print(f"Devices: {jax.device_count()} x {jax.devices()[0].device_kind}")
-    print(f"dtype {config.dtype}, attention_impl {config.attention_impl}, "
-          f"XLA_FLAGS {os.environ.get('XLA_FLAGS', '')!r}")
+    # Joins a `dew launch` pool when one launched this process, and applies
+    # the flags before the backend opens either way.
+    prepare_process(xla_flags=config.xla_flags)
+    speaker = jax.process_index() == 0
+    if speaker:
+        print(f"Devices: {jax.device_count()} x {jax.devices()[0].device_kind}, "
+              f"{jax.process_count()} process(es)")
+        print(f"dtype {config.dtype}, attention_impl {config.attention_impl}, "
+              f"XLA_FLAGS {os.environ.get('XLA_FLAGS', '')!r}")
     rows = run(config)
+    if not speaker:
+        return rows
     print()
     print(format_table(rows))
     if config.json_out:
