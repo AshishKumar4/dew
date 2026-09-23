@@ -285,6 +285,25 @@ def test_lm_head_variants_compute_the_same_loss_accuracy_and_gradients():
 
 
 # ---------------------------------------------------------------------------
+# tools/layout_parity.py
+# ---------------------------------------------------------------------------
+
+def test_layout_parity_refuses_a_floor_past_its_compute_dtypes_rounding():
+    """A floor is how far the reference moves under a reassociation of its
+    sums, and a floor as wide as the gradient passes any layout. What counts
+    as too wide follows the compute dtype: a bf16 MoE's reassociations move
+    its router by a few percent, which is rounding in bf16 and not in fp32."""
+    tool = load("layout_parity")
+    few_percent = {"['router']['kernel']": 2.4e-2, "['head']['kernel']": 3e-6}
+
+    assert tool.widest_floor(few_percent, "bfloat16") == "['router']['kernel']"
+    with pytest.raises(ValueError, match=r"\['router'\]\['kernel'\].*float32 rounding"):
+        tool.widest_floor(few_percent, "float32")
+    with pytest.raises(ValueError, match="bfloat16 rounding"):
+        tool.widest_floor({"['layers_23']['layer_scalar']": 2.21}, "bfloat16")
+
+
+# ---------------------------------------------------------------------------
 # tools/benchmark_step.py
 # ---------------------------------------------------------------------------
 
