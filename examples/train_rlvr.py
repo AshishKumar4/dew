@@ -144,20 +144,31 @@ class Config:
     """Two updates of the committed tiny Qwen2 on CPU, native backend."""
 
 
+def engine_context(config: Config) -> int:
+    """The context window the engine is started with: the rollout width, and SGLang's reserve on top.
+
+    SGLang 0.5.20 caps a request's budget at `context - input - 2` and
+    refuses an input of `context - 6` ids or more, so at a context equal to
+    the width a prompt at the window would draw fewer than `new_tokens` ids
+    and end with a "length" the rollout refuses. vLLM's `--max-model-len`
+    admits the full width.
+    """
+    width = config.prompt_tokens + config.new_tokens
+    return width + 6 if config.backend == "sglang" else width
+
+
 def engine_command(config: Config, directory: Path) -> tuple[list[str], dict[str, str]]:
     """The command line and extra environment that serve `directory` on `config.backend`."""
-    width = str(config.prompt_tokens + config.new_tokens)
+    context = str(engine_context(config))
     if config.backend == "vllm":
         return ([config.vllm, "serve", str(directory), "--served-model-name", "policy", "--port", str(config.port),
                  "--gpu-memory-utilization", str(config.vllm_memory), "--dtype", "bfloat16",
-                 "--max-model-len", width, "--generation-config", "vllm",
+                 "--max-model-len", context, "--generation-config", "vllm",
                  "--enable-prefix-caching", "--seed", str(config.seed)],
                 {"VLLM_SERVER_DEV_MODE": "1"})
-    # Request fields set every sampling control; `--sampling-defaults openai`
-    # keeps the checkpoint's generation_config from supplying any it leaves out.
     return ([config.sglang, "serve", "--model-path", str(directory), "--served-model-name", "policy",
              "--port", str(config.port), "--mem-fraction-static", str(config.sglang_memory), "--dtype", "bfloat16",
-             "--context-length", width, "--sampling-defaults", "openai", "--random-seed", str(config.seed)], {})
+             "--context-length", context, "--random-seed", str(config.seed)], {})
 
 
 def launch_engine(config: Config, directory: Path) -> subprocess.Popen:
@@ -194,8 +205,9 @@ def main(config: Config) -> dict:
     config.out.mkdir(parents=True, exist_ok=True)
     tokenizer = str(SMOKE_MODEL.parents[0] / "diffusion-gemma-workflow") if config.smoke else config.model
     width = config.prompt_tokens + config.new_tokens
-    # The server rounds its cache up to a power-of-two shape bucket; the model's context covers it.
-    context = next(bucket for bucket in SHAPE_BUCKETS if bucket >= width)
+    # The server rounds its cache up to a power-of-two shape bucket, and an
+    # engine refuses a context past the export's; the model's context covers both.
+    context = next(bucket for bucket in SHAPE_BUCKETS if bucket >= engine_context(config))
     source = load_pretrained(config.model, dtype="float32" if config.smoke else "bfloat16",
                              param_dtype="float32", max_seq_len=context)
     stock = source.text_generation().sampling
