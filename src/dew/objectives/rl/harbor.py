@@ -19,13 +19,9 @@ has exited.
 `calls` maps gateway traces onto `Call` records: the engine's prompt ids,
 sampled ids and behavior log-probabilities as recorded, in submission order,
 with the version the gateway stamped when the request arrived (the
-publication stamps it, see `SafetensorsReload`). vLLM lists the ids as
-`prompt_token_ids` and `choices[0].token_ids`, which the gateway records.
-SGLang 0.5.20 answers the gateway's `return_token_ids` with
-`choices[0].prompt_token_ids` and `choices[0].response_token_ids`; the
-gateway extracts the prompt ids but not `response_token_ids`, so those are
-read from the raw response it keeps. `sglext.input_ids`/`output_ids`, which
-SGLang fills only when asked, are read as a last resort.
+publication stamps it, see `Publication`). The gateway extracts vLLM's
+ids and SGLang's prompt ids; SGLang's sampled ids
+(`choices[0].response_token_ids`) are read from the raw response it keeps.
 
 `outcome` decides how a trial ended from Harbor's result and the calls:
 
@@ -119,13 +115,12 @@ class Gateway:
     `sandbox_url` defaults to `url` only for trusted harnesses and tests.
     """
 
-    def __init__(self, url: str, *, sandbox_url: str | None = None, timeout: float = 30.0,
-                 client: httpx.Client | None = None):
+    def __init__(self, url: str, *, sandbox_url: str | None = None, client: httpx.Client | None = None):
         import httpx
 
         self.url = url.rstrip("/")
         self.sandbox_url = (sandbox_url or url).rstrip("/")
-        self._client = client or httpx.Client(timeout=timeout)
+        self._client = client or httpx.Client(timeout=30.0)
 
     def session(self, session: str) -> str:
         """The OpenAI base URL a harness uses so its calls are recorded under `session`."""
@@ -244,15 +239,11 @@ def calls(traces: Sequence[JSON], *, unstamped: int) -> Recorded:
             errors.append(str(_object(error).get("message", error)))
             continue
         prompt, sampled = trace.get("prompt_token_ids") or [], trace.get("completion_token_ids") or []
-        # SGLang lists the ids on the choice as prompt_token_ids and response_token_ids; the gateway
-        # extracts only vLLM's token_ids, so they stay in the raw response.
-        choices = raw.get("choices")
-        choice = _object(choices[0]) if isinstance(choices, list) and choices else {}
-        extension = _object(raw.get("sglext"))
-        outputs = extension.get("output_ids")
-        prompt = prompt or choice.get("prompt_token_ids") or extension.get("input_ids") or []
-        sampled = sampled or choice.get("response_token_ids") or (
-            outputs[0] if isinstance(outputs, list) and outputs else [])
+        if not sampled:
+            # SGLang lists the sampled ids as choices[0].response_token_ids, which the gateway does not extract.
+            choices = raw.get("choices")
+            sampled = (_object(choices[0]) if isinstance(choices, list) and choices else {}).get(
+                "response_token_ids") or []
         if not prompt:
             raise ValueError("a trace carries no prompt ids: the engine was not asked for them or cannot list them")
         version = trace.get("weight_version")
@@ -274,16 +265,8 @@ _OVERFLOW = re.compile(r"maximum context length|longer than the model's context 
                        r"|longer than the maximum model length", re.IGNORECASE)
 
 
-def _reward(rewards: Mapping[str, float], key: str) -> float:
-    if key in rewards:
-        return rewards[key]
-    if len(rewards) == 1:
-        return next(iter(rewards.values()))
-    raise ValueError(f"the verifier reported {sorted(rewards)} and no {key!r}")
-
-
 def outcome(result: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = (),
-            harness_exit: str | None = None, reward_key: str = "reward") -> tuple[Status, float | None, dict[str, float], str]:
+            harness_exit: str | None = None) -> tuple[Status, float | None, dict[str, float], str]:
     """Status, reward, reward components and failure detail of one finished trial.
 
     `result` is Harbor's `TrialResult` as JSON, `records` the session's calls,
@@ -307,7 +290,9 @@ def outcome(result: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = 
         if not isinstance(reported, dict):
             raise ValueError(f"the verifier's rewards are not an object: {reported!r}")
         rewards = {name: _number(f"reward {name!r}", value) for name, value in reported.items()}
-        reward = _reward(rewards, reward_key) if rewards else None
+        if len(rewards) > 1 and "reward" not in rewards:
+            raise ValueError(f"the verifier reported {sorted(rewards)} and no 'reward'")
+        reward = rewards.get("reward", next(iter(rewards.values()), None))
     except ValueError as error:
         return Status.INFRA_ERROR, None, {}, str(error)
     if any(_OVERFLOW.search(error) for error in errors):
@@ -366,7 +351,7 @@ class HarborSource:
 
     def __init__(self, gateway: Gateway, *, harbor: str | os.PathLike[str], model: str, trials: os.PathLike[str],
                  agent: str = "mini-swe-agent", environment: Mapping[str, str] | None = None,
-                 arguments: Sequence[str] = (), workers: int = 8, reward_key: str = "reward", grace: float = 60.0,
+                 arguments: Sequence[str] = (), workers: int = 8, grace: float = 60.0,
                  ready_timeout: float = 900.0, ready_poll: float = 2.0):
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive number of concurrent trials")
@@ -382,7 +367,6 @@ class HarborSource:
         self._command = [os.fspath(harbor), "trials", "start", "-a", agent, "-m", model, *arguments]
         self._environment = dict(environment or {})
         self._trials = Path(trials)
-        self._reward_key = reward_key
         self._run = uuid.uuid4().hex[:8]
         self._serial = itertools.count()
         # Daemon workers, not a ThreadPoolExecutor: concurrent.futures joins its pool before atexit
@@ -533,7 +517,7 @@ class HarborSource:
             return ended(Status.INFRA_ERROR, records, detail=f"harbor exited {returncode} with no result: {log[-2000:]}")
         status, reward, components, detail = outcome(
             json.loads((trial / "result.json").read_text()), records, errors=recorded.errors,
-            harness_exit=_harness_exit(trial), reward_key=self._reward_key)
+            harness_exit=_harness_exit(trial))
         return ended(status, records, reward, components, f"{trial}: {detail}".rstrip(": "))
 
 
