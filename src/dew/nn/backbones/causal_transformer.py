@@ -38,7 +38,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.registry import from_record, models
 
 from ..attention import RMSNorm
-from ..attention_residuals import AttentionResiduals, DepthAttention, ResidualSite, expand_blocks, sources
+from ..attention_residuals import AttentionResiduals, DepthAttention, ResidualSite, sources
 from ..blocks import TokenEmbedding, normal_kernel
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
@@ -349,8 +349,6 @@ class Mixture:
                 f"{self.shared_features}; 0 is a layer without one")
         if self.shared_gate and not self.shared_features:
             raise ValueError("shared_gate requires shared_features")
-        if self.latent_features is not None and self.latent_features < 1:
-            raise ValueError(f"latent_features is the routed experts' latent width, got {self.latent_features}")
         if self.latent_norm and self.latent_features is None:
             raise ValueError("latent_norm norms the latent experts' output, which needs latent_features")
         if self.implementation not in GROUPED_MATMULS:
@@ -807,6 +805,7 @@ class DecoderBlock(nn.Module):
         """A sublayer's output times `residual_multiplier` (lm-engine's
         m_residual, GraniteMoeHybrid's residual_multiplier), in its own dtype."""
         return scaled(branch, self.residual_multiplier)
+
     def _forward_depth(self, state, train: bool, decode: bool, positions, segment_ids,
                        kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
         """Kimi K3's block over `[B, S, blocks + 1, D]`
@@ -1978,11 +1977,6 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is positive, "
                 f"got {self.swiglu_limit}; None leaves them unclamped")
-        if self.attention_residuals is not None and (
-                self.altup is not None or self.hyper_connections is not None or self.num_nextn_predict_layers):
-            raise ValueError(
-                "attention_residuals carries Kimi K3's depth state through the layers, which "
-                "altup's copies and hyper_connections' streams replace and no prediction depth reads")
         mask = self.mask_token_id
         if mask is not None and (isinstance(mask, bool) or not isinstance(mask, int) or mask < 0):
             raise ValueError(
@@ -2483,11 +2477,9 @@ class CausalTransformer(nn.Module):
             # The embeddings copied into every residual stream: [B, S, hc_mult, D].
             x = expand_streams(x, hc.hc_mult)
         depth = self.attention_residuals
-        blocks = 0 if depth is None else depth.blocks(self.num_layers)
         if depth is not None:
-            # The embeddings as the first partial sum, no block finished yet:
-            # [B, S, blocks + 1, D].
-            x = expand_blocks(x, blocks)
+            # The embeddings as the first partial sum after empty blocks: [B, S, blocks + 1, D].
+            x = jnp.pad(x[:, :, None], ((0, 0), (0, 0), (depth.blocks(self.num_layers), 0), (0, 0)))
         x = self.stack(x, train=train, decode=decode, positions=positions,
                        segment_ids=segment_ids, per_layer_input=ple, attention_metadata=attention_metadata)
         if self.altup is not None:

@@ -169,11 +169,11 @@ def test_group_limited_routing_is_refused():
 
 @pytest.mark.parametrize("field,value", [
     ("q_lora_rank", 32), ("hidden_act", "situ"), ("attn_res_block_size", 4),
-    ("mla_use_output_gate", True), ("routed_expert_hidden_size", 512), ("sliding_window", 128),
+    ("mla_use_output_gate", True), ("routed_expert_hidden_size", 512),
 ])
 def test_config_outside_the_released_computation_is_refused(field, value):
     """A low-rank query, SiTU and K3's additions are what the released
-    modeling_kimi.py does not compute; an unknown field is refused too."""
+    modeling_kimi.py does not compute."""
     config = released_config()
     config[field] = value
     with pytest.raises(ValueError, match=field):

@@ -62,6 +62,7 @@ from dew import records
 from dew.interop.hf_decoders import (
     _ACTIVATIONS,
     _CODEC_FIELDS,
+    _IGNORED_FIELDS,
     DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
     KindFields,
@@ -96,21 +97,17 @@ _K3_FIELDS = frozenset({
     'routed_expert_hidden_size', 'topk_method',
 })
 # moonshotai/Kimi-K3's text_config was serialized by transformers 4.56.2,
-# which writes every PreTrainedConfig attribute: decoding policy, token ids
-# and metadata that no forward pass consults.
+# which writes every PreTrainedConfig attribute; past `_IGNORED_FIELDS`, the
+# decoding policy and metadata that no forward pass consults.
 _K3_TEXT_SERIALIZED = frozenset({
-    '_name_or_path', 'architectures', 'auto_map', 'bad_words_ids', 'begin_suppress_tokens',
-    'bos_token_id', 'chunk_size_feed_forward', 'decoder_start_token_id', 'diversity_penalty',
-    'do_sample', 'dtype', 'early_stopping', 'encoder_no_repeat_ngram_size', 'eos_token_id',
-    'exponential_decay_length_penalty', 'finetuning_task', 'forced_bos_token_id',
-    'forced_eos_token_id', 'id2label', 'initializer_range', 'is_decoder', 'is_encoder_decoder',
-    'label2id', 'length_penalty', 'max_length', 'min_length', 'no_repeat_ngram_size',
-    'num_beam_groups', 'num_beams', 'num_return_sequences', 'output_attentions',
-    'output_hidden_states', 'output_scores', 'pad_token_id', 'prefix', 'problem_type',
-    'remove_invalid_values', 'repetition_penalty', 'return_dict', 'return_dict_in_generate',
-    'sep_token_id', 'suppress_tokens', 'task_specific_params', 'temperature', 'tf_legacy_loss',
-    'tokenizer_class', 'top_k', 'top_p', 'torchscript', 'transformers_version', 'typical_p',
-    'use_bfloat16', 'use_cache', 'torch_dtype',
+    'bad_words_ids', 'begin_suppress_tokens', 'decoder_start_token_id', 'diversity_penalty',
+    'do_sample', 'early_stopping', 'encoder_no_repeat_ngram_size', 'exponential_decay_length_penalty',
+    'finetuning_task', 'forced_bos_token_id', 'forced_eos_token_id', 'is_decoder', 'length_penalty',
+    'max_length', 'min_length', 'no_repeat_ngram_size', 'num_beam_groups', 'num_beams',
+    'num_return_sequences', 'output_scores', 'prefix', 'remove_invalid_values', 'repetition_penalty',
+    'return_dict_in_generate', 'sep_token_id', 'suppress_tokens', 'task_specific_params',
+    'temperature', 'tf_legacy_loss', 'tokenizer_class', 'top_k', 'top_p', 'torchscript',
+    'typical_p', 'use_bfloat16',
 })
 # Serialized fields that would name another model if set, read by value.
 _K3_TEXT_ENCODER = ('add_cross_attention', 'cross_attention_hidden_size',
@@ -274,9 +271,7 @@ def _kimi_linear_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
                 '(modeling_kimi.py:684-685)')
     if hf_config.get('hidden_act') == 'situ':
         _refuse('hidden_act situ', "Kimi Linear's modeling_kimi.py registers no SiTU")
-    tied = hf_config.get('tie_word_embeddings', False)
-    if not isinstance(tied, bool):
-        _refuse(f"tie_word_embeddings {tied!r}", "the head takes a boolean tying policy")
+    tied = records.boolean(hf_config.get('tie_word_embeddings', False), 'tie_word_embeddings')
     # model_max_length is a keyword the release's config.json carries and
     # KimiLinearConfig stores without reading; NoPE MLA and KDA have no
     # position limit to take from it.
@@ -294,16 +289,14 @@ def _kimi_k3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     if not isinstance(text, Mapping):
         _refuse('text_config', f"the wrapper carries its decoder under text_config, got {text!r}")
     unknown = sorted(key for key in set(text) - _LINEAR_FIELDS - _K3_FIELDS - _K3_TEXT_SERIALIZED
-                     - set(_K3_TEXT_ENCODER) - _CODEC_FIELDS if not str(key).startswith('_'))
+                     - set(_K3_TEXT_ENCODER) - _IGNORED_FIELDS - _CODEC_FIELDS if not str(key).startswith('_'))
     if unknown:
         _refuse(f"text_config fields {unknown}", "KimiLinearConfig has no such field to compute")
     linear = records.record(text.get('linear_attn_config'), 'linear_attn_config')
     extra = sorted(set(linear) - _LINEAR_ATTN_FIELDS - _K3_LINEAR_ATTN_FIELDS)
     if extra:
         _refuse(f'linear_attn_config fields {extra}', 'KimiDeltaAttention reads no such field')
-    tied = hf_config.get('tie_word_embeddings', False)
-    if not isinstance(tied, bool):
-        _refuse(f"tie_word_embeddings {tied!r}", "the head takes a boolean tying policy")
+    tied = records.boolean(hf_config.get('tie_word_embeddings', False), 'tie_word_embeddings')
     used.update(_K3_WRAPPER_FIELDS)
     # KimiLinearConfig's own default (configuration_kimi_k3.py:55), capped
     # at the context every family builds by default.
