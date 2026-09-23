@@ -14,9 +14,11 @@ import functools
 import io
 import os
 import queue
+import struct
 import sys
 import threading
 import time
+import zlib
 from contextlib import closing, contextmanager
 
 import jax
@@ -188,6 +190,26 @@ def test_bytes_that_are_no_image_decode_to_nothing():
     assert np.array_equal(online_loader.decode_pixels(_png(pixels)), pixels)
     assert online_loader.decode_pixels(b"<html>not found</html>") is None
     assert online_loader.decode_pixels(_png(pixels)[:40]) is None
+
+
+def _bomb_png(width: int, height: int) -> bytes:
+    """A PNG whose header declares `width` by `height` and holds no pixels."""
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        return (struct.pack(">I", len(body)) + kind + body
+                + struct.pack(">I", zlib.crc32(kind + body)))
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IEND", b"")
+
+
+def test_a_decompression_bomb_decodes_to_nothing():
+    """200M declared pixels, past PIL's refusal at twice MAX_IMAGE_PIXELS.
+    PIL raises its own DecompressionBombError, which is no OSError, so an
+    uncaught one would kill the fetcher and the stream with it."""
+    blob = _bomb_png(20000, 10000)
+    assert 20000 * 10000 > 2 * PIL.Image.MAX_IMAGE_PIXELS
+
+    assert online_loader.decode_pixels(blob) is None
+
 
 
 @pytest.mark.parametrize("pixels", [

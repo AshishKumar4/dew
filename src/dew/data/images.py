@@ -87,20 +87,27 @@ def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
 
     With `at_least`, a JPEG is decoded at the largest 1/2, 1/4 or 1/8 DCT
     reduction that keeps both sides >= `at_least`, so the resize after it
-    still only shrinks and most of the decode is skipped. cv2 hands back None
-    for a half-written file; that becomes an error here.
+    still only shrinks and most of the decode is skipped.
+
+    Every failure is a ValueError. PIL reads the header first, since it
+    refuses a decompression bomb from the header alone where cv2 would
+    decode up to 2**30 pixels, and cv2 hands back None for a half-written
+    file.
     """
     import cv2
+    shortest = min(_encoded_size(encoded))
     buffer = np.frombuffer(encoded, dtype=np.uint8)
     flags = cv2.IMREAD_COLOR
     if at_least is not None:
-        shortest = min(_encoded_size(encoded))
         for factor, reduced in ((8, cv2.IMREAD_REDUCED_COLOR_8), (4, cv2.IMREAD_REDUCED_COLOR_4),
                                 (2, cv2.IMREAD_REDUCED_COLOR_2)):
             if shortest // factor >= at_least:
                 flags = reduced
                 break
-    image = cv2.imdecode(buffer, flags | cv2.IMREAD_IGNORE_ORIENTATION)
+    try:
+        image = cv2.imdecode(buffer, flags | cv2.IMREAD_IGNORE_ORIENTATION)
+    except cv2.error as error:
+        raise ValueError(f"cv2 refused {len(encoded)} bytes of image") from error
     if image is None:
         raise ValueError(f"cv2 could not decode {len(encoded)} bytes of image")
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)

@@ -12,14 +12,12 @@ from __future__ import annotations
 
 import dataclasses
 import http.client
-import io
 import itertools
 import logging
 import multiprocessing
 import multiprocessing.queues
 import multiprocessing.synchronize
 import queue
-import struct
 import threading
 import time
 import urllib.request
@@ -29,7 +27,6 @@ from typing import TYPE_CHECKING, Callable, Mapping, Sequence
 
 import cv2
 import numpy as np
-import PIL.Image
 
 from .dataset import CAPTION, Batch
 from .images import decode_image
@@ -124,22 +121,15 @@ def fetch_bytes(url: str, timeout: float, retries: int) -> bytes | None:
 
 
 def decode_pixels(blob: bytes) -> np.ndarray | None:
-    """`blob` as RGB uint8 by `images.decode_image`, the decoder every image
-    dataset uses, or None when it is no image.
+    """`blob` as RGB uint8 by `images.decode_image`, or None when it is no image.
 
-    The bytes are whatever the open internet returned. PIL reads the header
-    first because it refuses a decompression bomb from the header alone,
-    where cv2 would decode up to 2**30 pixels; it reports a bad header as
-    OSError, SyntaxError, ValueError, its own DecompressionBombError or a
-    struct.error depending on which is broken. cv2 then hands back None for
-    pixels it cannot decode, which `decode_image` raises as ValueError, and
-    raises cv2.error itself for a buffer it refuses.
+    The bytes are whatever the open internet returned, and `decode_image`
+    raises every way they can fail, a decompression bomb included, as
+    ValueError.
     """
     try:
-        with PIL.Image.open(io.BytesIO(blob)):
-            pass
         return decode_image(blob)
-    except (OSError, SyntaxError, ValueError, struct.error, cv2.error) as error:
+    except ValueError as error:
         _log.debug("undecodable image of %d bytes: %s", len(blob), error)
         return None
 
