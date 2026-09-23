@@ -611,6 +611,12 @@ class WeightLayout:
     not its leaf's: DeepSeek V4's token-to-expert table is int64 on disk
     and int32 in the collection, and the export writes back what the
     checkpoint held.
+
+    `padded` is the length a 1-D source tensor stores past its leaf's, as
+    zeros, for the names its family declares (`DecoderFamily.zero_padded`):
+    Kimi K3 ships each KDA layer's `A_log` for 96 heads padded to 128
+    entries. The family's prepare step checks and trims the tail, and export
+    writes the zeros back.
     """
 
     name: str
@@ -620,6 +626,7 @@ class WeightLayout:
     concatenate: int | None = None
     expert_index: int | None = None
     dtype: np.dtype | None = None
+    padded: int | None = None
 
     def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
         leaves = []
@@ -650,6 +657,8 @@ class WeightLayout:
         value = leaves[0] if self.concatenate is None else np.concatenate(leaves, axis=self.concatenate)
         if self.transpose is not None:
             value = value.transpose(self.transpose)
+        if self.padded is not None:
+            value = np.pad(np.asarray(value), (0, self.padded - value.shape[0]))
         if value.size != math.prod(self.shape):
             raise ValueError(
                 f"{self.name} assembles {value.shape} from {self.paths}, which does not "
@@ -760,9 +769,9 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
     # A weight is fp32 in the tree whatever the checkpoint stored it as, so
     # only an index table's own width has to be carried back.
     stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
+    padded = tensor.shape[0] if text_name.endswith(family.zero_padded) else None
     return WeightLayout(name, paths, tensor.shape, transpose, concatenate,
-                        expert_index, stored)
-
+                        expert_index, stored, padded)
 
 
 def _wrapper_layouts(tensors, record, variables):

@@ -2128,6 +2128,10 @@ class DecoderFamily:
     tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight')
     """The head and the embedding a tied checkpoint stores two copies of, in
     the source's own names. A wrapper nests both under its language model."""
+    zero_padded: tuple[str, ...] = ()
+    """Suffixes of the 1-D source tensors a checkpoint stores longer than their
+    leaf, zeros past it: Kimi K3's KDA `A_log`. `prepare_weights` checks and
+    trims the tail; export writes the zeros back (`WeightLayout.padded`)."""
 
 
 def _kind_mixers(fields: DecoderFields) -> list[MixerBase]:
@@ -2222,7 +2226,7 @@ from dew.interop.families.glm import (
     _glm_moe_dsa_config,
 )
 from dew.interop.families.gpt_oss import _gpt_oss_config, _gpt_oss_export, _gpt_oss_export_path, _gpt_oss_path
-from dew.interop.families.kimi import _kimi_k3_config, _kimi_k3_path, _kimi_k3_prepare
+from dew.interop.families.kimi import _KDA_ZERO_PADDED, _kimi_k3_config, _kimi_k3_path, _kimi_k3_prepare
 from dew.interop.families.llama import _mistral_config, _mixtral_config, _mixtral_path
 from dew.interop.families.llama4 import _llama4_config, _llama4_export, _llama4_path, _llama4_prepare
 from dew.interop.families.masked_diffusion import (
@@ -2332,7 +2336,8 @@ _FAMILY_ENTRIES = (
     # Kimi K3's text decoder under its vision wrapper; provenance-only, like K2.5.
     DecoderFamily(('kimi_k3',), _kimi_k3_config, lambda fields: False,
                   'kimi_k3', 'KimiK3ForConditionalGeneration', lambda model: {},
-                  weight_path=_kimi_k3_path, prepare_weights=_kimi_k3_prepare, preserve_source_layout=True,
+                  weight_path=_kimi_k3_path, prepare_weights=_kimi_k3_prepare, zero_padded=_KDA_ZERO_PADDED,
+                  preserve_source_layout=True,
                   tied_head_names=('language_model.lm_head.weight',
                                    'language_model.model.embed_tokens.weight')),
     DecoderFamily(('deepseek_v3',), _deepseek_config,

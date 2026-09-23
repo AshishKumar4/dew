@@ -296,6 +296,10 @@ def _kimi_k3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     return _dew_path('model.' + '.'.join(parts), config)
 
 
+_KDA_ZERO_PADDED = ('.self_attn.A_log',)
+"""The tensors the release stores past their heads as zeros (`DecoderFamily.zero_padded`)."""
+
+
 def _kimi_k3_prepare(tensors: Mapping[str, np.ndarray]) -> Mapping[str, np.ndarray]:
     """Trim each KDA layer's zero-padded `A_log` to its heads.
 
@@ -308,7 +312,7 @@ def _kimi_k3_prepare(tensors: Mapping[str, np.ndarray]) -> Mapping[str, np.ndarr
     """
     prepared = dict(tensors)
     for name, value in tensors.items():
-        if not name.endswith('.self_attn.A_log'):
+        if not name.endswith(_KDA_ZERO_PADDED):
             continue
         stem = name.removesuffix('A_log')
         rank = tensors.get(stem + 'f_a_proj.weight')
