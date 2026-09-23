@@ -268,10 +268,12 @@ class Launch:
         count = len(hosts) * per_host
         address = self.coordinator_address(hosts)
         shared = {**self.extra_env(), COORDINATOR: address, PROCESS_COUNT: str(count)}
-        each = "every device of its host" if devices is None else \
-            f"{devices} GPU{'s' if devices > 1 else ''}"
+        if devices is not None:
+            holds = f"{devices} GPU{'s' if devices > 1 else ''} each"
+        else:
+            holds = "each with every local device" if per_host > 1 else "with every local device"
         emit(f"pool: {count} process{'es' if count > 1 else ''} on {', '.join(hosts)}, "
-             f"{each} each, coordinator {address}")
+             f"{holds}, coordinator {address}")
         processes = []
         for rank in range(count):
             host = hosts[rank // per_host]
