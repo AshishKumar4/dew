@@ -37,6 +37,7 @@ from dew import registry
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import RUN_FILE, Checkpoints
 from dew.data import Dataset, DatasetSpec, Ramp, ramped
+from dew.data.dataset import json_list_argument
 from dew.lora import LoRA, attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
@@ -146,7 +147,7 @@ class OptimConfig:
     power_c: float = 1.0
     """What a step counts for in the law, lm-engine's `c` (tokens per step)."""
     weight_decay: float | None = None
-    param_groups: tuple[ParamGroup, ...] = ()
+    param_groups: Annotated[tuple[ParamGroup, ...], json_list_argument(ParamGroup)] = ()
     """Per-group learning-rate multipliers and weight decay, first match wins;
     empty moves every parameter alike. `dew.training.optim.mup_param_groups`
     is lm-engine's muP split."""

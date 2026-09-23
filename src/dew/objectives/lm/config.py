@@ -61,6 +61,16 @@ class LMRunConfig(RunConfig):
     """How far a sparse run moves each router's balancing bias against its
     load every step (DeepSeek's aux-loss-free balancing). Needs a mixture
     with bias=True; unset leaves the bias where it is."""
+    aux_loss_alpha: float | None = None
+    """The expert balance loss's weight (`LMObjective.aux_loss_alpha`); with
+    --no-seq-aux it is the Switch loss over the step's routed positions,
+    lm-engine's `router_aux_loss_coef`. Unset adds no balance loss."""
+    seq_aux: bool = True
+    """Form the balance loss within each sequence (DeepSeek V2) rather than
+    over the whole step."""
+    router_z_loss: float = 0.0
+    """The routers' z-loss weight (`LMObjective.router_z_loss`); lm-engine
+    uses 0.1 times its aux coefficient. Zero adds nothing."""
     mtp_weight: float | None = None
     """DeepSeek's lambda on the multi-token-prediction term. Needs a model
     with num_nextn_predict_layers above zero; unset leaves the term out."""
