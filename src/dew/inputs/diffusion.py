@@ -365,7 +365,6 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
     width: int
     tokens: int = 512
     param_dtype: str = "float32"
-    name: str = "text_encoder"
     drop: int = field(init=False)
     """The system turn's token count, which the pipeline derives the same way."""
 
@@ -389,28 +388,24 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         system = f"<|im_start|>system\n{self.SYSTEM}<|im_end|>\n"
-        rows, zero, negative = [], [], []
+        rows = []
         for prompt in texts:
             record: Mapping[str, object] = {"text": prompt} if isinstance(prompt, str) else prompt
             rows.append(f"{system}{self.USER[0]}{_prompt(record, 'text', '') or ' '}{self.USER[1]}")
-            zero.append(bool(record.get("zero", False)))
-            negative.append(bool(record.get("negative", False)))
         length = self.drop + self.tokens
         encoded = self.tokenizer(rows, padding="max_length", padding_side="right",
                                  max_length=length)
         if any(len(ids) > length for ids in encoded.input_ids):
             raise ValueError(f"A prompt runs past the {self.tokens}-token budget; raise `tokens`")
         return {"input_ids": np.asarray(encoded.input_ids, np.int32),
-                "attention_mask": np.asarray(encoded.attention_mask, np.int32),
-                "zero_condition": np.asarray(zero, bool), "negative": np.asarray(negative, bool)}
+                "attention_mask": np.asarray(encoded.attention_mask, np.int32)}
 
     def encode(self, params, tokens) -> DenoisingCondition:
-        states = jnp.asarray(self.decoder.apply({"params": params[self.name]["params"]},
+        states = jnp.asarray(self.decoder.apply({"params": params["text_encoder"]["params"]},
                                                 jnp.asarray(tokens["input_ids"]),
                                                 method=_residual_states))
         valid = jnp.asarray(tokens["attention_mask"], bool)[:, self.drop:]
-        dropped = jnp.asarray(tokens["zero_condition"])[:, None, None]
-        context = jnp.where(valid[..., None] & ~dropped, states[:, self.drop:], 0)
+        context = jnp.where(valid[..., None], states[:, self.drop:], 0)
         return DenoisingCondition(context, mask=valid)
 
     def captions(self, tokens):
