@@ -45,8 +45,8 @@ from .precision import rounded_operand
 from .precision import precision_names, rounded_operand
 from .sharding import EXPERT_AXIS, logical_axes
 from .inputs import BATCH_AXES
-from .kernels.generation import device_generation
-from .kernels.grouped_matmul import gpu_runs, grouped_projection, ragged_dot_runs
+from .kernels.generation import device_generation, triton_runs
+from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
 from .precision import rounded_operand
 from .sharding import EXPERT_AXIS, SEQUENCE_AXIS, logical_axes
 
@@ -363,7 +363,7 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
     if chosen != 'pallas':
         return chosen
     runs = ragged_dot_runs(compute, operands, precision)
-    placed = gpu_runs() or (implementation == 'pallas' and jax.default_backend() == 'cpu')
+    placed = triton_runs() or (implementation == 'pallas' and jax.default_backend() == 'cpu')
     return 'pallas' if runs and placed else 'xla'
 
 

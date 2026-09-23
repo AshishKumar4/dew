@@ -7,6 +7,9 @@ and sends every other one to its portable path. The measurements are in
 docs/performance.md, "Kernel choices per generation".
 """
 
+import functools
+import warnings
+
 import jax
 
 # `device_kind` of the TPU generations Dew names.
@@ -45,3 +48,46 @@ def bf16_dot_runs(generation: str | None = None) -> bool:
     and CPU, and a GPU from `BF16_GPU` on."""
     version = sm_version(device_generation() if generation is None else generation)
     return version is None or version >= BF16_GPU
+
+
+# jax 0.11.2 deprecates the Pallas Triton backend and warns at every
+# lowering. Dew's Triton kernels (the grouped matmul, the Mamba-2 SSD scan)
+# stay on sm80 to sm89 on purpose: JAX's Mosaic GPU kernels use wgmma, which
+# those cards do not have.
+TRITON_DEPRECATION = (r"The Pallas Triton backend is deprecated and will be removed in"
+                      r" a future JAX version\.")
+
+
+def triton_runs() -> bool:
+    """The one eligibility rule for Dew's Pallas GPU (Triton) kernels: this
+    process holds a GPU of compute capability 8.0 or later, the bound JAX's
+    own Pallas lowerings apply (`_backend_supports_triton`). A T4 fails to
+    compile them ("Triton support is only enabled for cc>=8.0")."""
+    gpus = _gpu_versions()
+    return bool(gpus) and min(gpus) >= BF16_GPU
+
+
+def triton_compiles() -> bool:
+    """`triton_runs`, or no GPU in the process at all: a pallas_call named
+    for 'gpu' on a host without one runs Pallas's interpreter, which any
+    host can. Only a GPU older than sm80 refuses."""
+    gpus = _gpu_versions()
+    return not gpus or min(gpus) >= BF16_GPU
+
+
+def _gpu_versions() -> list[int]:
+    return [int(device.compute_capability.replace('.', ''))
+            for device in jax.devices() if device.platform == 'gpu']
+
+
+@functools.cache
+def filter_triton_deprecation() -> None:
+    """Ignore `TRITON_DEPRECATION`, only that message and only as a
+    DeprecationWarning, once a Triton kernel is first used.
+
+    JAX raises it when a pallas_call is lowered, which is when the jit
+    around a whole step compiles, after the kernel's call has returned and
+    with none of Dew's frames on the stack. A filter scoped to the call
+    cannot see it, so this one lasts for the process, and a process that
+    never runs the kernels never installs it."""
+    warnings.filterwarnings('ignore', message=TRITON_DEPRECATION, category=DeprecationWarning)

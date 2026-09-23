@@ -18,14 +18,14 @@ jax 0.11.2 deprecates the Pallas Triton backend and warns at every
 lowering. These kernels stay on compute capability 8.0 to 8.9 on purpose:
 JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses
 wgmma, which sm_80 and sm_89 do not have, and tokamax's sm80 Mosaic config
-exceeds an Ada card's shared memory and has no backward. `TRITON_DEPRECATION`
-is filtered by its exact text once the kernels are used.
+exceeds an Ada card's shared memory and has no backward. Where they run is
+`dew.nn.kernels.generation.triton_runs`, the rule every Triton kernel in Dew
+shares, and its deprecation warning is filtered there.
 """
 
 from __future__ import annotations
 
 import functools
-import warnings
 
 import jax
 import jax.numpy as jnp
@@ -34,19 +34,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from ..precision import asks_default_precision
 from . import ragged_dot
-from .generation import BF16_GPU
-
-TRITON_DEPRECATION = (r"The Pallas Triton backend is deprecated and will be removed in"
-                      r" a future JAX version\.")
-
-
-def gpu_runs() -> bool:
-    """Whether this process holds a GPU the kernels compile for: compute
-    capability 8.0 on, the bound JAX's own Pallas ragged_dot lowering applies
-    (`_backend_supports_triton`)."""
-    return any(device.platform == 'gpu'
-               and int(device.compute_capability.replace('.', '')) >= BF16_GPU
-               for device in jax.devices())
+from .generation import filter_triton_deprecation
 
 
 def ragged_dot_runs(compute: Dtype, operands: tuple[Dtype, ...],
@@ -72,19 +60,6 @@ def ragged_dot_runs(compute: Dtype, operands: tuple[Dtype, ...],
         precision, configured=True)
 
 
-@functools.cache
-def _filter_triton_deprecation() -> None:
-    """Ignore `TRITON_DEPRECATION`, only that message and only as a
-    DeprecationWarning, once the kernels are first used.
-
-    JAX raises it when a pallas_call is lowered, which is when the jit
-    around a whole step compiles, after this module's call has returned and
-    with none of its frames on the stack. A filter scoped to the call cannot
-    see it, so this one lasts for the process, and a process that never runs
-    the kernels never installs it."""
-    warnings.filterwarnings('ignore', message=TRITON_DEPRECATION, category=DeprecationWarning)
-
-
 def _gmm(tokens, kernel, sizes, out_dtype, *, trans_rhs: bool, interpret: bool):
     compute = tokens.dtype
     return ragged_dot.gmm(tokens, kernel.astype(compute), sizes,
@@ -102,7 +77,7 @@ def _tgmm(tokens, cotangent, sizes, out_dtype, *, interpret: bool):
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     """`kernel` where the call lowers for CUDA, interpreted on the CPU when
     asked for, and `fallback` everywhere else."""
-    _filter_triton_deprecation()
+    filter_triton_deprecation()
     branches = {'cuda': functools.partial(kernel, interpret=False)}
     if interpret_on_cpu:
         branches['cpu'] = functools.partial(kernel, interpret=True)
