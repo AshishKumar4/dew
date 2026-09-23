@@ -107,7 +107,7 @@ from dew.nn.kv_cache import (
     is_paged,
     leaf_name,
 )
-from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, row_axes
+from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes, logical_spec
 from dew.objectives.base import Variables
 from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState, Stopping
@@ -127,16 +127,9 @@ Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""
 
 
-def _row_axes(mesh: Mesh) -> tuple[str, ...]:
-    """The axes of `mesh` that split the slots: `row_axes` of a row count
-    every axis divides, so each axis `activation_batch` takes splits them."""
-    with jax.set_mesh(mesh):
-        return row_axes(mesh.size)
-
-
 def _row_groups(mesh: Mesh | None) -> int:
     """How many groups of rows a server over `mesh` keeps, one per share of the slots."""
-    return 1 if mesh is None else math.prod(mesh.shape[axis] for axis in _row_axes(mesh))
+    return 1 if mesh is None else math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
 
 
 @struct.dataclass
@@ -746,7 +739,7 @@ class Server:
         self.grammar = grammar
         self.prefix_hits = 0
         """Prompt tokens served from shared prefix pages instead of prefilled."""
-        self._admitted = None if self.mesh is None else NamedSharding(self.mesh, P(_row_axes(self.mesh) or None))
+        self._admitted = None if self.mesh is None else NamedSharding(self.mesh, P(batch_axes(self.mesh) or None))
         with self._context():
             shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
                                                       capacity=capacity), variables)
