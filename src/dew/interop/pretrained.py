@@ -36,7 +36,7 @@ from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition, DiffusionConditioner, QwenImageConditioner, T5Segment
 from dew.interop import gguf, hf_decoders as decoders, mamba2, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
-from dew.interop.families.deepseek import engram_token_map
+from dew.interop.families.deepseek_v41 import engram_token_map
 from dew.interop.streaming import SourceLeaf
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
