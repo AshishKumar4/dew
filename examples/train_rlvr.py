@@ -29,10 +29,9 @@ closed code block followed by cut-off prose can pass every test.
 `--turns N` gives each task up to N attempts through an `EnvironmentSource`,
 Dew's in-process multi-turn session source. An attempt that fails a test
 gets back how many of the three it passed and tries again; the reward is the
-last attempt's. The report is appended as plain text after the model's own
-turn, so every attempt extends the ids before it and a session packs as one
-chain. A harness would render it as a user turn with the chat template
-instead, and `tools/audit_template.py` tells whether that stays append-only.
+last attempt's. A harness would render the report as a user turn with the
+chat template instead, and `tools/audit_template.py` tells whether that
+stays append-only.
 
 The run prints one line per update and writes `rewards.json` to `--out`
 with the per-update reward, policy version and lag, the mean reward of the
@@ -44,13 +43,14 @@ first and last `--window` updates, and the seconds each weight push took.
 
 from __future__ import annotations
 
-import itertools
+import functools
 import json
 import os
 import random
 import shutil
 import subprocess
 import time
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -58,12 +58,10 @@ from pathlib import Path
 import httpx
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 import tyro
 
-from dew.data import Dataset, Loading, tokenizer_for
-from dew.data.chat import Conversation, load_tokenizer, render_prompt
+from dew.data import Loading, tokenizer_for
 from dew.data.prompts import Prompts
 from dew.inference import (
     NativeRolloutServer,
@@ -76,6 +74,7 @@ from dew.inference import (
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop import load_pretrained
 from dew.objectives.rl import (
+    Action,
     CodeReward,
     ContainerRunner,
     EnvironmentSource,
@@ -89,8 +88,8 @@ from dew.objectives.rl import (
     SandboxFleet,
     SandboxLimits,
     SchedulerRecord,
+    Task,
     prompt_tasks,
-    task_ids,
 )
 from dew.sampling import Sampling
 from dew.training import Trainer
@@ -176,28 +175,51 @@ def rollout_width(config: Config) -> int:
     return config.prompt_tokens + config.turns * config.new_tokens + (config.turns - 1) * FEEDBACK_TOKENS
 
 
-def tests_passed(reward: CodeReward, words, cases: str, action) -> float:
-    """The fraction of `cases` the program in an attempt passes, its EOS excluded."""
-    return reward("code", words.decode(action.tokens[:len(action.tokens) - int(action.terminated)]), cases, "")
+def attempt_scorer(reward: CodeReward, decode: Callable[[Sequence[int]], str]) -> Callable[[str, Action], float]:
+    """The fraction of `cases` an attempt's program passes, its EOS excluded; each program runs once."""
+    @functools.cache
+    def passed(cases: str, program: tuple[int, ...]) -> float:
+        return reward("code", decode(program), cases, "")
+
+    return lambda cases, action: passed(cases, action.tokens[:len(action.tokens) - int(action.terminated)])
 
 
 class Attempts:
-    """One task's attempts at a program: a failing one hears how many tests passed and tries again."""
+    """One task's attempts at a program: a failing one hears how many tests passed and tries again.
 
-    def __init__(self, prompt: tuple[int, ...], cases: str, reward: CodeReward, words):
-        self.prompt, self.cases, self.reward, self.words = prompt, cases, reward, words
+    The report is appended as plain text after the model's own turn, so every
+    attempt extends the ids before it and a session packs as one chain.
+    """
+
+    def __init__(self, task: Task, score: Callable[[str, Action], float], encode: Callable[[str], list[int]]):
+        self.prompt, self.cases = tuple(task.data["prompt"]), str(task.data["truth"])
+        self.score, self.encode = score, encode
 
     def reset(self) -> Observation:
         return Observation(self.prompt)
 
-    def step(self, action) -> Observation:
-        passed = tests_passed(self.reward, self.words, self.cases, action)
+    def step(self, action: Action) -> Observation:
+        passed = self.score(self.cases, action)
         if passed == 1.0:
             return Observation((), EpisodeStatus.COMPLETED, "every test passes")
-        report = self.words.tokenizer.encode(
-            f"\n\nThat program passed {round(3 * passed)} of 3 tests. Reply with one corrected ```python "
-            "code block.\n", add_special_tokens=False)[:FEEDBACK_TOKENS]
+        report = self.encode(f"\n\nThat program passed {round(3 * passed)} of 3 tests. Reply with one corrected "
+                             "```python code block.\n")[:FEEDBACK_TOKENS]
         return Observation(action.context + action.tokens + tuple(report))
+
+
+def attempts_source(server, reward: CodeReward, decode: Callable[[Sequence[int]], str],
+                    encode: Callable[[str], list[int]], config: Config) -> EnvironmentSource:
+    """`config.turns` attempts per session of a `prompt_tasks` task, scored on the last attempt."""
+    score = attempt_scorer(reward, decode)
+
+    def verify(task: Task, episode: Episode) -> float:
+        # A session cut off before its first attempt scores zero.
+        return score(str(task.data["truth"]), episode.transitions[-1].action) if episode.transitions else 0.0
+
+    return EnvironmentSource(
+        server, lambda task, identity: nullcontext(Attempts(task, score, encode)), verify,
+        max_prompt_tokens=rollout_width(config) - config.new_tokens, max_new_tokens=config.new_tokens,
+        max_turns=config.turns, workers=config.prompts * config.groups * (config.max_lag + 1), seed=config.seed)
 
 
 def engine_context(config: Config) -> int:
@@ -321,43 +343,19 @@ def main(config: Config) -> dict:
     runner = ProcessRunner() if config.runner == "process" else ContainerRunner(config.image)
     fleet = SandboxFleet(runner, limits=limits, workers=max(os.cpu_count() or 1, 4))
     reward = CodeReward(fleet)
-    rows = records(config.tasks, config.seed)
     if config.turns == 1:
         sessions = PromptSource(server, reward, decode=words.decode, max_new_tokens=config.new_tokens,
                                 seed=config.seed)
-        tasks = prompt_tasks
-        data = Prompts(tokenizer=tokenizer, records=rows, max_prompt_len=config.prompt_tokens,
-                       pad_id=sampling.pad_id, val_batches=None,
-                       loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
-                       seed=config.seed).load(batch=config.prompts)
     else:
-        template = load_tokenizer(tokenizer)
-        attempts = []
-        for number, row in enumerate(map(json.loads, rows)):
-            where = f"task {number}"
-            prompt = tuple(render_prompt(template, Conversation.parse(row["prompt"], None, where), where))
-            attempts.append((prompt, row["ground_truth"]))
-
-        def verify(episode: Episode) -> float:
-            """The last attempt's score; a session cut off before its first attempt scores zero."""
-            if not episode.transitions:
-                return 0.0
-            return tests_passed(reward, words, attempts[episode.identity.task][1], episode.transitions[-1].action)
-
-        sessions = EnvironmentSource(
-            server, lambda identity: nullcontext(Attempts(*attempts[identity.task], reward, words)), verify,
-            max_prompt_tokens=width - config.new_tokens, max_new_tokens=config.new_tokens,
-            max_turns=config.turns, workers=config.prompts * config.groups * (config.max_lag + 1), seed=config.seed)
-        tasks = task_ids
-
-        def task_batches():
-            for step in itertools.count():
-                yield {"task_id": ((np.arange(config.prompts) + step * config.prompts) % config.tasks).astype(np.int32)}
-
-        data = Dataset(train=task_batches, val=None, records=None, batch=config.prompts)
+        sessions = attempts_source(server, reward, words.decode,
+                                   lambda text: words.tokenizer.encode(text, add_special_tokens=False), config)
+    data = Prompts(tokenizer=tokenizer, records=records(config.tasks, config.seed),
+                   max_prompt_len=config.prompt_tokens, pad_id=sampling.pad_id, val_batches=None,
+                   loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
+                   seed=config.seed).load(batch=config.prompts)
     # Every session packs as one chain within the width.
     rollout = RolloutScheduler(objective, sessions, server, width=width, rows=config.prompts * config.groups,
-                               tasks=tasks, groups=config.groups,
+                               tasks=prompt_tasks, groups=config.groups,
                                max_lag=config.max_lag, ahead=config.max_lag, truncation="score", log=log)
     optimizer = optax.chain(optax.clip_by_global_norm(1.0),
                             optax.adamw(config.learning_rate, b2=0.99, weight_decay=0.0))

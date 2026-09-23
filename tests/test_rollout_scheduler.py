@@ -32,7 +32,6 @@ from dew.objectives.rl import (
     EpisodeStatus,
     GRPOObjective,
     Observation,
-    Score,
     sessions as sessions_module,
 )
 from dew.objectives.rl.scheduler import RolloutScheduler
@@ -493,13 +492,12 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
                                                   slots=16, capacity=64))
 
     @contextmanager
-    def environment(identity):
-        yield Tools(identity.task)
+    def environment(task, identity):
+        yield Tools(int(task.id))
 
-    def verifier(episode):
+    def verifier(task, episode):
         sampled = [token for turn in episode.transitions for token in turn.action.tokens if token != STOP]
-        share = sum(token == 5 for token in sampled) / max(len(sampled), 1)
-        return Score(share, {"turns": float(len(episode.transitions))})
+        return sum(token == 5 for token in sampled) / max(len(sampled), 1)
 
     episodes = EnvironmentSource(server, environment, verifier, max_prompt_tokens=32, max_new_tokens=16,
                                  max_turns=3, workers=16)
@@ -530,8 +528,7 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
     assert int(state.updates) == 4 and [record.updates for record in records] == [0, 1, 2, 3]
     assert all(0 <= record.lag <= 2 for record in records)
     assert any(record.lag > 0 for record in records), "no batch was ever drawn ahead of its update"
-    # Every scored session took both turns, and each pair of calls merged into one chain.
-    assert all(record.metrics.get("reward/component/turns", 2.0) == 2.0 for record in records)
+    # Each completed session's pair of calls merged into one chain.
     assert all(record.metrics["merge/calls_per_chain"] in (0.0, 2.0) for record in records)
     assert all(record.metrics["latency/max"] >= record.metrics["latency/p50"] > 0 for record in records)
     completed = [rollout for rollout in rollouts if rollout.status == Status.COMPLETED]

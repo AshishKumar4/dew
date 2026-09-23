@@ -21,7 +21,7 @@ import pytest
 from dew.inference import Draw
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
 from dew.objectives.rl.sessions import Status, Task, pack
-from dew.objectives.rl.sources import EnvironmentSource, PromptSource, Score, prompt_tasks
+from dew.objectives.rl.sources import EnvironmentSource, PromptSource, prompt_tasks
 from dew.sampling import Sampling
 
 EOS = 9
@@ -77,17 +77,17 @@ class Counter:
 
 def factory(entered, exited, **options):
     @contextmanager
-    def environment(identity):
-        entered.append(identity)
+    def environment(task, identity):
+        entered.append((task.id, identity))
         try:
             yield Counter(**options)
         finally:
-            exited.append(identity)
+            exited.append((task.id, identity))
     return environment
 
 
-def verifier(episode):
-    return Score(float(len(episode.transitions)), {"turns": float(len(episode.transitions))}, "verified")
+def verifier(task, episode):
+    return float(len(episode.transitions))
 
 
 def source(server, environment, **options):
@@ -106,10 +106,9 @@ def test_a_multi_turn_session_keeps_each_calls_version_and_packs_into_one_chain(
     rollout = episodes.submit(Task("3"), 1, version=0)[0].result(timeout=10)
     episodes.close()
     assert rollout.status == Status.COMPLETED and rollout.reward == 3.0
-    assert rollout.components == {"turns": 3.0} and "verified" in rollout.detail
     assert [call.version for call in rollout.calls] == [0, 1, 2]
     assert [call.prompt_ids for call in rollout.calls] == [(1, 2), (1, 2, 5, EOS, 4), (1, 2, 5, EOS, 4, 5, EOS, 4)]
-    assert entered == exited and entered[0].task == 3
+    assert entered == exited and entered[0][0] == "3"
     batch = pack([rollout], 16)
     assert batch["input_ids"].shape == (1, 16) and set(batch["text_segment_ids"][0].tolist()) == {0, 1}
     np.testing.assert_array_equal(batch["versions"][0][batch["response_mask"][0] > 0], [0, 0, 1, 1, 2, 2])
@@ -127,7 +126,7 @@ def test_an_environment_failure_is_an_unscored_infra_error(fail, detail):
 
 
 def test_a_verifier_crash_is_an_infra_error():
-    def crash(episode):
+    def crash(task, episode):
         raise TimeoutError("verifier sandbox timed out")
 
     episodes = source(Server(), factory([], []), verifier=crash)
@@ -188,15 +187,14 @@ def test_the_prompt_source_scores_decoded_text_without_eos_and_masks_the_budget_
 
     def reward(source, completion, truth, info):
         seen.append((source, completion, truth))
-        return Score(float(completion == truth), {"exact": float(completion == truth)})
+        return float(completion == truth)
 
     [task] = prompt_tasks(prompt_batch())
     assert task.data["prompt"] == (1, 2)
     prompts = PromptSource(Server(), reward, decode=lambda ids: " ".join(map(str, ids)), max_new_tokens=4)
     rollouts = [future.result(timeout=10) for future in prompts.submit(task, 2, version=0)]
     assert seen == [("math", "5", "5")] * 2
-    assert all(r.status == Status.COMPLETED and r.reward == 1.0 and r.components == {"exact": 1.0}
-               for r in rollouts)
+    assert all(r.status == Status.COMPLETED and r.reward == 1.0 for r in rollouts)
 
     long = PromptSource(Server(tokens=(5, 6, 7, 8)), reward, decode=str, max_new_tokens=4)
     assert long.submit(task, 1, version=0)[0].result(timeout=10).status == Status.TRUNCATED
@@ -223,10 +221,16 @@ def test_a_failed_draw_or_reward_is_an_infra_error():
 
 
 def test_a_prompt_source_failure_outside_the_reward_resolves_the_future_instead_of_hanging():
-    # A bool reward passes the verifier's finiteness check but no Session accepts it.
+    # A decode that raises something other than Exception escapes the reward's handler.
+    class Interrupted(BaseException):
+        pass
+
+    def decode(ids):
+        raise Interrupted
+
     [task] = prompt_tasks(prompt_batch())
-    prompts = PromptSource(Server(), lambda *_: Score(True), decode=str, max_new_tokens=4)
+    prompts = PromptSource(Server(), lambda *_: 1.0, decode=decode, max_new_tokens=4)
     future = prompts.submit(task, 1, version=0)[0]
-    with pytest.raises(ValueError, match="finite number"):
+    with pytest.raises(Interrupted):
         future.result(timeout=10)
     prompts.close()

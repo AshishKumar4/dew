@@ -9,8 +9,8 @@ engine's continuous batch instead of waiting on a lock-step cohort.
 `EpisodeRollout` runs, one session per sample on a worker thread, with
 `EpisodeRollout`'s own per-turn limits (`turn_limit`, `step_action`). Each
 turn submits the observation's context and steps the environment with the
-drawn action; the episode becomes a `Session` through `session_of`, the converter
-`EpisodeRollout` packs with, so both paths feed one packer. Each call keeps
+drawn action; the episode becomes a `Session` through `session_of`, the
+converter `EpisodeRollout` packs with, so both paths feed one packer. Each call keeps
 the version its request was submitted under, so a session that spans a
 weight push carries both versions. The statuses follow the scheduler's
 failure policy: an environment that raises or reports ERROR is an
@@ -20,9 +20,6 @@ limit truncates; only COMPLETED and TRUNCATED sessions reach the verifier.
 `PromptSource` is the single-turn case: one call per sample, scored on
 decoded text by a reward on scorer threads as each draw finishes, so
 verification overlaps generation.
-
-Verifiers return a float or a `Score` whose `components` travel with the
-rollout for logging.
 """
 
 from __future__ import annotations
@@ -30,9 +27,9 @@ from __future__ import annotations
 import hashlib
 import math
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
@@ -43,7 +40,7 @@ from dew.objectives.base import Batch
 
 from .episodes import (
     Action,
-    EnvironmentFactory,
+    Environment,
     Episode,
     EpisodeId,
     EpisodeStatus,
@@ -53,24 +50,15 @@ from .episodes import (
     step_action,
     turn_limit,
 )
-from .rollout import prompt_rows
+from .rollout import Reward, prompt_rows
 from .sessions import Call, Session, Status, Task
 
 
-@dataclass(frozen=True)
-class Score:
-    """A verifier's reward with its named sub-scores and provenance."""
-
-    reward: float
-    components: Mapping[str, float] = field(default_factory=dict)
-    detail: str = ""
-
-
-def _scored(value: float | Score) -> Score:
-    score = value if isinstance(value, Score) else Score(float(value))
-    if not math.isfinite(score.reward) or not all(math.isfinite(part) for part in score.components.values()):
+def _scored(value: float) -> float:
+    reward = float(value)
+    if not math.isfinite(reward):
         raise ValueError("the verifier returned a non-finite score")
-    return score
+    return reward
 
 
 def _seed(*parts: int) -> int:
@@ -86,7 +74,7 @@ class _Refused(Exception):
 
 
 @dataclass
-class _Session:
+class _Handle:
     wake: threading.Event = field(default_factory=threading.Event)
     cancelled: bool = False
 
@@ -94,9 +82,10 @@ class _Session:
 class EnvironmentSource:
     """Run `Environment` sessions against a `RolloutServer`, one worker thread each.
 
-    `environment` enters one environment per `EpisodeId`; task ids must be
-    decimal integers, as `EpisodeRollout`'s are. `verifier` scores completed
-    and truncated episodes. `workers` bounds concurrent sessions; the server
+    `environment(task, identity)` enters one environment per session and
+    `verifier(task, episode)` scores completed and truncated episodes; both
+    read the task's own payload, and `identity.task` is the submission's
+    serial number. `workers` bounds concurrent sessions; the server
     batches their calls. `cancel` stops a session at its next turn or
     mid-draw, never inside `environment.step`: an environment must bound its
     own step time, or a hung step holds its worker until it returns.
@@ -105,8 +94,9 @@ class EnvironmentSource:
     distribution only for a sampling policy without transforms.
     """
 
-    def __init__(self, server: RolloutServer, environment: EnvironmentFactory,
-                 verifier: Callable[[Episode], float | Score], *, max_prompt_tokens: int, max_new_tokens: int,
+    def __init__(self, server: RolloutServer,
+                 environment: Callable[[Task, EpisodeId], AbstractContextManager[Environment]],
+                 verifier: Callable[[Task, Episode], float], *, max_prompt_tokens: int, max_new_tokens: int,
                  max_turns: int, workers: int = 64, seed: int = 0):
         for name, value in (("max_prompt_tokens", max_prompt_tokens), ("max_new_tokens", max_new_tokens),
                             ("max_turns", max_turns), ("workers", workers)):
@@ -119,20 +109,18 @@ class EnvironmentSource:
         self.seed = seed
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dew-episode")
         self._lock = threading.Lock()
-        self._sessions: dict[Future[Session], _Session] = {}
+        self._sessions: dict[Future[Session], _Handle] = {}
         self._serial = 0
 
     def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Session]]:
-        if not task.id.isdecimal():
-            raise ValueError(f"an environment task id is a decimal integer, got {task.id!r}")
         with self._lock:
             serial = self._serial
             self._serial += 1
         futures = []
         for sample in range(samples):
-            session = _Session()
-            identity = EpisodeId(int(task.id), serial, sample, (self.seed, serial, sample))
-            future = self._pool.submit(self._run, identity, version, session)
+            session = _Handle()
+            identity = EpisodeId(serial, 0, sample, (self.seed, serial, sample))
+            future = self._pool.submit(self._run, task, identity, version, session)
             with self._lock:
                 self._sessions[future] = session
             future.add_done_callback(self._forget)
@@ -161,7 +149,7 @@ class EnvironmentSource:
         with self._lock:
             self._sessions.pop(future, None)
 
-    def _draw(self, context: tuple[int, ...], seed: int, session: _Session) -> Draw | None:
+    def _draw(self, context: tuple[int, ...], seed: int, session: _Handle) -> Draw | None:
         """One call on the server, or None when the session is cancelled while it runs."""
         session.wake.clear()
         if session.cancelled:
@@ -184,13 +172,13 @@ class EnvironmentSource:
             raise _Refused("the server returned a draw for another context")
         return Action(context, draw.tokens, raw, draw.behavior_log_probs, draw.terminated, draw.version, sampling)
 
-    def _run(self, identity: EpisodeId, version: int, session: _Session) -> Session:
+    def _run(self, task: Task, identity: EpisodeId, version: int, session: _Handle) -> Session:
         initial: Observation | None = None
         transitions: list[Transition] = []
         pending: Action | None = None
         status, detail = EpisodeStatus.RUNNING, ""
         try:
-            with self.environment(identity) as environment:
+            with self.environment(task, identity) as environment:
                 observation = environment.reset()
                 initial = observation
                 for turn in range(self.max_turns + 1):
@@ -204,8 +192,8 @@ class EnvironmentSource:
                     if limit is not None:
                         status, detail = limit.status, limit.detail
                         break
-                    draw = self._draw(observation.context, _seed(self.seed, identity.attempt,
-                                                                 identity.sample, turn), session)
+                    draw = self._draw(observation.context, _seed(self.seed, identity.task, identity.sample, turn),
+                                  session)
                     if draw is None:
                         status, detail = EpisodeStatus.CANCELLED, "cancelled by the scheduler"
                         break
@@ -222,17 +210,12 @@ class EnvironmentSource:
                 transitions.append(Transition(pending, Observation((), status, detail)))
         episode = Episode(identity, version, initial, tuple(transitions), status, detail, None,
                           _binding_id=uuid4().hex)
-        score = None
         if status in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED):
             try:
-                score = _scored(self.verifier(episode))
+                episode = replace(episode, reward=_scored(self.verifier(task, episode)))
             except Exception as error:
                 episode = replace(episode, status=EpisodeStatus.ERROR, detail=f"verifier: {_failure(error)}")
-        if score is None:
-            return session_of(episode, group="")
-        rollout = session_of(replace(episode, reward=score.reward), group="")
-        return replace(rollout, components=dict(score.components),
-                       detail="; ".join(part for part in (rollout.detail, score.detail) if part))
+        return session_of(episode, group="")
 
 
 def prompt_tasks(batch: Batch) -> list[Task]:
@@ -257,29 +240,29 @@ class _Prompt:
     ids: tuple[int, ...]
     source: str
     truth: str
-    extra: str
+    info: str
 
     @classmethod
     def of(cls, task: Task) -> _Prompt:
-        ids, source, truth, extra = (task.data.get(name) for name in ("prompt", "source", "truth", "info"))
+        ids, source, truth, extra_info = (task.data.get(name) for name in ("prompt", "source", "truth", "info"))
         if not (isinstance(ids, tuple) and isinstance(source, str) and isinstance(truth, str)
-                and isinstance(extra, str)):
+                and isinstance(extra_info, str)):
             raise TypeError(f"task {task.id!r} is not a prompt_tasks task: it needs prompt ids "
                             "and source, truth and info strings")
-        return cls(ids, source, truth, extra)
+        return cls(ids, source, truth, extra_info)
 
 
 class PromptSource:
     """Draw one completion per sample of a `prompt_tasks` task and score its decoded text.
 
-    `reward` scores the completion with EOS excluded, on `scorers` threads,
-    returning a float or a `Score`. A draw that ends on its token budget is
+    `reward` scores the completion with EOS excluded, on `scorers` threads.
+    A draw that ends on its token budget is
     TRUNCATED and still scored; a failed draw or reward is an
     infrastructure failure. Anything else that fails resolves the rollout's
     future with the exception, so no future is left pending.
     """
 
-    def __init__(self, server: RolloutServer, reward: Callable[[str, str, str, str], float | Score], *,
+    def __init__(self, server: RolloutServer, reward: Reward, *,
                  decode: Callable[[Sequence[int]], str], max_new_tokens: int, scorers: int = 16, seed: int = 0):
         if type(max_new_tokens) is not int or max_new_tokens < 1:
             raise ValueError("a rollout generates at least one token")
@@ -318,10 +301,10 @@ class PromptSource:
         status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
         try:
             text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
-            score = _scored(self.reward(prompt.source, text, prompt.truth, prompt.extra))
+            score = _scored(self.reward(prompt.source, text, prompt.truth, prompt.info))
         except Exception as error:
             return Session(task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}")
-        return Session(task.id, "", 0, 0, (call,), status, score.reward, dict(score.components), score.detail)
+        return Session(task.id, "", 0, 0, (call,), status, score)
 
     def _scored(self, task: Task, prompt: _Prompt, drawn: Future[Draw]) -> Future[Session]:
         """The draw's future, chained into its reward on a scorer thread."""

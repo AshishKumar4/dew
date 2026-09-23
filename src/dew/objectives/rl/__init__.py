@@ -46,7 +46,7 @@ from .sessions import (
                        Task,
                        pack,
 )
-from .sources import EnvironmentSource, PromptSource, Score, prompt_tasks
+from .sources import EnvironmentSource, PromptSource, prompt_tasks
 from .verifiers import CodeReward, MathReward, code_block
 
 __all__ = [
@@ -95,7 +95,6 @@ __all__ = [
                        "SandboxFleet",
                        "SandboxLimits",
                        "SchedulerRecord",
-                       "Score",
                        "Session",
                        "SessionSource",
                        "Status",
