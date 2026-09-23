@@ -89,6 +89,27 @@ def test_the_logits_and_the_objective_loss_are_transformers(source, loaded, toke
     assert abs(objective_loss(objective, loaded.variables, tokens) - expected) <= LOSS
 
 
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="a device allocation shows on a GPU's allocator")
+def test_a_load_puts_nothing_on_a_device(source):
+    """The weights come to the host as views of torch's storage; only the
+    caller's placement moves them, so a model larger than one GPU loads."""
+    import subprocess
+    import sys
+
+    script = """
+import sys, warnings
+import jax
+from dew.interop import load_pretrained
+warnings.simplefilter("ignore")
+load_pretrained(sys.argv[1], fallback="torchax", dtype="float32")
+print(jax.devices()[0].memory_stats()["peak_bytes_in_use"])
+"""
+    run = subprocess.run([sys.executable, "-c", script, str(source[0])], capture_output=True, text=True,
+                         env={**os.environ, "XLA_PYTHON_CLIENT_PREALLOCATE": "false"})
+    assert run.returncode == 0, run.stderr[-1500:]
+    assert int(run.stdout.split()[-1]) == 0
+
+
 @pytest.mark.mesh
 def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     """AdamW through the Trainer on a fsdp x tensor mesh: the loss falls,
