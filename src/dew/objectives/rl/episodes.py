@@ -236,6 +236,27 @@ class _Session:
         return Episode(self.identity, policy_step, self.initial, tuple(self.transitions),
                        self.status, self.detail, self.reward, _binding_id=binding_id)
 
+
+def turn_limit(observation: Observation, turn: int, *, max_turns: int, max_prompt_tokens: int) -> Observation | None:
+    """The truncation that ends a running episode before its call `turn`, or None to draw it.
+
+    Every episode driver applies these limits: `turn` counts calls already
+    made, and a context the model cannot read is not drawn from.
+    """
+    if turn >= max_turns:
+        return Observation((), EpisodeStatus.TRUNCATED, "episode turn limit reached")
+    if len(observation.context) > max_prompt_tokens:
+        return Observation((), EpisodeStatus.TRUNCATED, "next context exceeds max_prompt_tokens")
+    return None
+
+
+def step_action(environment: Environment, action: Action) -> Observation:
+    """Step the environment with an action that ended on EOS; one that hit its token limit truncates instead."""
+    if action.terminated:
+        return environment.step(action)
+    return Observation((), EpisodeStatus.TRUNCATED, "model turn reached its token limit")
+
+
 @dataclass(frozen=True)
 class EpisodeRollout:
     """Collect complete episode groups under one policy snapshot, then train on their actions.
@@ -333,8 +354,10 @@ class EpisodeRollout:
                 observation = slot.observation
                 assert observation is not None
                 length = len(observation.context)
-                if length > self.max_prompt_tokens:
-                    slot.status, slot.detail = EpisodeStatus.TRUNCATED, "next context exceeds max_prompt_tokens"
+                limit = turn_limit(observation, turn, max_turns=self.max_turns,
+                                   max_prompt_tokens=self.max_prompt_tokens)
+                if limit is not None:
+                    slot.status, slot.detail = limit.status, limit.detail
                 else:
                     tokens[row, -length:] = observation.context
                     valid[row, -length:] = True
@@ -373,10 +396,7 @@ class EpisodeRollout:
                 continue
             environment = slot.environment
             assert environment is not None
-            if action.terminated:
-                observation = slot.invoke(environment.step, action)
-            else:
-                observation = Observation((), EpisodeStatus.TRUNCATED, "model turn reached its token limit")
+            observation = slot.invoke(step_action, environment, action)
             if not isinstance(observation, Observation):
                 slot.invoke(slot.observe, observation)
             slot.transitions.append(Transition(action, observation))
@@ -394,7 +414,12 @@ class EpisodeRollout:
             if slot.reward is not None:
                 continue
             if slot.status == EpisodeStatus.RUNNING:
-                slot.status, slot.detail = EpisodeStatus.TRUNCATED, "episode turn limit reached"
+                # The cohort ran every turn; this slot drew on each of them.
+                assert slot.observation is not None
+                limit = turn_limit(slot.observation, len(slot.transitions), max_turns=self.max_turns,
+                                   max_prompt_tokens=self.max_prompt_tokens)
+                assert limit is not None
+                slot.status, slot.detail = limit.status, limit.detail
             def score() -> float:
                 reward = float(self.verifier(slot.episode(policy_step, binding_id)))
                 if not math.isfinite(reward):
