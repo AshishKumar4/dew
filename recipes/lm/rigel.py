@@ -144,4 +144,4 @@ def run_config(args: RigelArgs):
 if __name__ == "__main__":
     from train import LmRunConfig, main
     args, rest = tyro.cli(RigelArgs, return_unknown_args=True)
-    main(tyro.cli(LmRunConfig, default=run_config(args), args=rest))
+    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[LmRunConfig], default=run_config(args), args=rest))
