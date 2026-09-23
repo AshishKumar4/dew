@@ -631,16 +631,17 @@ class DeepseekV4Attention(nn.Module):
         self.o_b_proj = dense(self.emb_features, name='o_b_proj')
         self.sinks = self.param('sinks', nn.initializers.zeros, (self.num_heads,), jnp.float32)
         if self.compressor == 'csa2':
+            rate, index = self.csa2_geometry()
             if not self.kv_shared and not self.reindex:
                 self.compress = CompressedEntries(
-                    width=self.head_dim, rate=self.compress_rate, overlap=False,
+                    width=self.head_dim, rate=rate, overlap=False,
                     rope_dim=self.rope_dim, rope_theta=self.rope_theta, yarn=self.yarn,
                     norm_eps=self.norm_eps, csa2=True, quantized=self.kv_qat,
                     dtype=self.dtype, precision=self.precision, name='compressor')
             if not self.kv_shared:
                 self.indexer = Csa2Indexer(
-                    n_heads=self.index_n_heads, head_dim=self.index_head_dim, rope_dim=self.rope_dim,
-                    top_k=self.index_topk, owns_keys=not self.reindex, quantized=self.kv_qat,
+                    n_heads=index[1], head_dim=index[2], rope_dim=self.rope_dim,
+                    top_k=index[0], owns_keys=not self.reindex, quantized=self.kv_qat,
                     norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision, name='indexer')
         elif self.compressor is not None and self.compress_rate is not None:
             self.compress = Compressor(
@@ -650,13 +651,20 @@ class DeepseekV4Attention(nn.Module):
                 index_head_dim=self.index_head_dim, index_topk=self.index_topk,
                 dtype=self.dtype, precision=self.precision, name='compressor')
 
+    def csa2_geometry(self) -> tuple[int, tuple[int, int, int]]:
+        """A CSA2 layer's rate and its indexer's (top_k, heads, head width),
+        which setup has already required."""
+        rate, index = self.compress_rate, (self.index_topk, self.index_n_heads, self.index_head_dim)
+        assert rate is not None and index[0] is not None and index[1] is not None and index[2] is not None
+        return rate, (index[0], index[1], index[2])
+
     def _csa2(self, x, q_resid, positions, cos, sin, cache, kv_store):
         """CSA2's entries `[B, T, head_dim]` and the ones each query attends
         `[B, S, T]`, by the layer's mode (section 2.3.1, v41:722-763)."""
         if self.kv_shared:
             return (_published(kv_store, CSA2_ENTRIES, 'Reuse'),
                     _published(kv_store, CSA2_SELECTED, 'Reuse'))
-        rate = self.compress_rate
+        rate, (top_k, _, index_head_dim) = self.csa2_geometry()
         if self.reindex:
             entries = _published(kv_store, CSA2_ENTRIES, 'Reindex')
             keys = _published(kv_store, CSA2_INDEX_KEYS, 'Reindex')
@@ -669,7 +677,7 @@ class DeepseekV4Attention(nn.Module):
             slots, capacity, allocated = cache
             entries, latents, windows = self.compress.cached_entries(x, slots, capacity, allocated)
             held = self.variable('cache', 'index_keys', jnp.zeros,
-                                 (x.shape[0], capacity // rate, self.index_head_dim), latents.dtype)
+                                 (x.shape[0], capacity // rate, index_head_dim), latents.dtype)
             fresh = self.indexer.keys(latents, *rope_freqs(windows * rate, self.rope_dim,
                                                            self.rope_theta, self.yarn))
             if allocated:
@@ -685,7 +693,7 @@ class DeepseekV4Attention(nn.Module):
                 kv_store[CSA2_CANDIDATES] = pool
         elif self.candidates == 'restrict':
             keep = visible & _published(kv_store, CSA2_CANDIDATES, 'Reindex')
-        selected = top_k_keys(scores, keep, self.index_topk)
+        selected = top_k_keys(scores, keep, top_k)
         if kv_store is not None:
             if not self.reindex:
                 kv_store[CSA2_ENTRIES] = entries
