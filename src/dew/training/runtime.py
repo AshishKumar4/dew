@@ -102,6 +102,9 @@ def prepare_process(wandb: Wandb | None = None,
             if multi_host or "coordinator_address" not in str(e):
                 raise
         else:
+            # Before the backend opens, which can fail on one process of a
+            # pool that has formed, a GPU with no memory left for one.
+            end_pool_on_failure()
             # XLA reads its flags when the backend opens, which the first
             # line below does. The watchdog is the CUDA plugin's, and a TPU
             # host's libtpu need not know its flag.
@@ -121,8 +124,6 @@ def prepare_process(wandb: Wandb | None = None,
             # wandb init and their model builds, and one that arrives late
             # dies in gloo before the run can report it.
             multihost_utils.sync_global_devices("dew process pool joined")
-            if jax.process_count() > 1:
-                end_pool_on_failure()
     if layout is not None and "params" in layout.host:
         from dew.training.distributed import build_mesh
         from dew.training.host import companion_mesh
