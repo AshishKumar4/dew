@@ -1,9 +1,9 @@
 """dew tpu: create Cloud TPUs, set them up for dew, and reach their workers.
 
 Reads its defaults from ~/.config/dew/tpu.toml, which `dew tpu init` writes;
-every command's --help lists the ones it reads. Every command takes
---dry-run, which prints the commands it would run and exits. `dew launch
---tpu NAME` runs a program on every worker as one pool.
+every command's help lists the ones it reads. Every command takes a dry run
+flag, which prints the commands it would run and exits. To run a program on
+every worker as one pool, use `dew launch --tpu NAME`.
 """
 
 from __future__ import annotations
