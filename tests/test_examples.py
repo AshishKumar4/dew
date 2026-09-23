@@ -258,6 +258,14 @@ def test_train_rlvr_turns_feed_a_failed_attempt_back_and_run_each_program_once()
     assert runs == ["5 5", "6 6"]
 
 
+def test_train_harbor_smoke_trains_on_gateway_recorded_harness_calls(tmp_path):
+    """Two updates of HarborSource trials whose model calls the stand-in gateway records from the policy's
+    own draws; the second trains on sessions submitted one update earlier."""
+    smoke("train_harbor", tmp_path)
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["updates"] == 2 and summary["max_lag"] == 1
+
+
 def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):
     """The evaluation report of a run the script trains first: the perplexity
     `evaluate` scores over the held-out split, a greedy continuation, and a
