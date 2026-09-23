@@ -222,6 +222,15 @@ def test_a_group_whose_chains_overflow_the_rows_is_cut_instead_of_failing_the_st
         rollout(State(0), next(iter(data.train())), None)
 
 
+def test_a_group_that_cannot_fit_the_rows_alone_is_refused_whichever_group_completes_first():
+    # Task 1's group needs one row and completes first; task 2's needs three alone.
+    source = Scripted(lambda task, submission, sample, version: split(float(sample), version) if task == "2"
+                      else finished(float(sample), version))
+    rollout, data, _ = scheduler(source, ahead=0, rows=2)
+    with pytest.raises(ValueError, match="group of task 2 needs 3 rows"):
+        rollout(State(0), next(iter(data.train())), None)
+
+
 def test_an_unscored_truncation_under_score_is_retried_rather_than_failing_the_step():
     # A harness that hit the context limit before its verifier ran reports a
     # truncation with no reward; `score` has nothing to train it on.
