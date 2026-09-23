@@ -75,6 +75,9 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--tolerance", type=float, default=None,
                         help="Layout's sharding tolerance; an expert mesh keeps the dense weights "
                              "replicated, as DDP does, which the default 2%% refuses")
+    parser.add_argument("--dispatch", choices=("global", "exchange"), default=None,
+                        help="MoE: the mixture's token dispatch; the checkpoint's model runs 'global', "
+                             "and 'exchange' sends tokens to the expert axis's devices (all-to-all)")
     parser.add_argument("--attention", default="auto")
     parser.add_argument("--head-chunks", type=int, default=4)
     parser.add_argument("--steps", type=int, default=None)
@@ -125,6 +128,7 @@ def build(args: argparse.Namespace) -> Run:
 
     from dew.config import OptimConfig
     from dew.interop import load_pretrained
+    from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import Layout, MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
@@ -139,7 +143,12 @@ def build(args: argparse.Namespace) -> Run:
 
     pretrained = load_pretrained(args.model, dtype=args.dtype, param_dtype="float32",
                                  attention_impl=args.attention)
-    objective = LMObjective(pretrained.model, seq, ema_decay=None, head_chunks=args.head_chunks,
+    model = pretrained.model
+    if args.dispatch is not None:
+        if not isinstance(model, CausalTransformer) or model.mixture is None:
+            raise SystemExit(f"--dispatch sets a mixture's dispatch, and {args.model} builds no mixture")
+        model = model.clone(mixture=dataclasses.replace(model.mixture, dispatch=args.dispatch))
+    objective = LMObjective(model, seq, ema_decay=None, head_chunks=args.head_chunks,
                             pretrained=pretrained.variables, aux_loss_alpha=args.aux_loss_alpha,
                             seq_aux=args.seq_aux)
     schedule = Cosine(peak=args.lr_peak, warmup_steps=args.warmup, end=args.lr_end, init=args.lr_init)
