@@ -1,9 +1,9 @@
 """Run a saved run as an lm-evaluation-harness model.
 
-`DewLM` puts a `TextGeneration` behind the three calls lm-eval-harness's `LM`
-interface asks for, so any task suite runs against a run directory. The
-trainer's own perplexity says how well a run predicts its training data and
-nothing about what it can do, which is the other question a suite answers.
+`DewLM` puts a `TextGeneration` behind lm-eval-harness's `TemplateLM`, so
+any task suite runs against a run directory. The trainer's own perplexity
+says how well a run predicts its training data and nothing about what it
+can do, which is the other question a suite answers.
 
 `lm_eval` is an optional extra (`pip install dew-ml[eval-harness]`), so this
 module is the only one that imports it and `dew.eval` does not import this
@@ -18,12 +18,16 @@ own, so the import has to happen in the process that runs the command:
 is `lm_eval`'s own command line with this module imported first. In a
 program that already imported it, plain `lm_eval --model dew` finds it too.
 
-Scoring is the model's own forward under `jax.jit`, log-softmax over its
-logits, read at the targets each row's continuation names. That is the
-computation a prefill already runs; what this adds is the alignment, which
-is where a harness adapter goes wrong: slot `i` of the logits predicts token
-`i + 1` of the row, so a continuation of `n` tokens is read at the `n` slots
-ending one before the row's last token.
+Everything that decides which tokens are scored is lm-eval's own code:
+`TemplateLM.loglikelihood` splits each pair (moving a context's trailing
+whitespace into the continuation, conditioning an empty context on the
+prefix token), and `get_rolling_token_windows` with `make_disjoint_window`
+cuts a long string so every token is scored exactly once. What this module
+adds is `_loglikelihood_tokens`, the row `HFLM` builds from each
+`(context, continuation)` pair, scored by the model's own forward under
+`jax.jit`: slot `i` of the logits predicts token `i + 1` of the row, so a
+continuation of `n` tokens is read at the `n` slots ending one before the
+row's last token.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 from lm_eval import utils
 from lm_eval.api.instance import Instance
-from lm_eval.api.model import LM
+from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
 
 from dew.inference.tasks import TextGeneration, _ceiling
@@ -44,6 +48,9 @@ from dew.sampling.text import Sampling
 
 DEFAULT_CONTEXT = 2048
 """The scoring window for a model that declares no `max_seq_len`."""
+
+TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
+"""One `_loglikelihood_tokens` request: the strings, context ids, continuation ids."""
 
 
 @functools.partial(jax.jit, static_argnums=(0,))
@@ -74,23 +81,9 @@ def _padded(rows: Sequence[Sequence[int]]) -> np.ndarray:
     return np.asarray([[*row, *([0] * (width - len(row)))] for row in rows], np.int32)
 
 
-def _windows(tokens: Sequence[int], width: int) -> list[list[int]]:
-    """`tokens` cut into consecutive rows of at most `width` ids.
-
-    A row of one id scores nothing, because its only token has no context,
-    so a tail of one id joins the row before it instead of standing alone.
-    """
-    if width < 2:
-        raise ValueError(f"a scoring window holds at least two ids, and this model declares {width}")
-    rows = [list(tokens[start:start + width]) for start in range(0, len(tokens), width)]
-    if len(rows) > 1 and len(rows[-1]) < 2:
-        rows[-2] = rows[-2] + rows.pop()
-    return [row for row in rows if len(row) > 1]
-
-
 @register_model("dew")
-class DewLM(LM):
-    """Puts a `TextGeneration` behind lm-eval-harness's `LM` interface.
+class DewLM(TemplateLM):
+    """Puts a `TextGeneration` behind lm-eval-harness's `TemplateLM` interface.
 
     `task` is the run's own generation task, with its model, its weights and
     its processor; `batch_size` is how many rows one scoring call runs at
@@ -183,9 +176,16 @@ class DewLM(LM):
         declared = _ceiling(self.task.model)
         return DEFAULT_CONTEXT if declared is None else declared
 
-    def tok_encode(self, text: str) -> list[int]:
-        """Encode `text` with the run's own tokenizer, one row of ids."""
-        return [int(token) for token in np.asarray(self._processor([text]).tokens)[0]]
+    def tok_encode(self, string: str, add_special_tokens: bool | None = None,
+                   **kwargs: int | None) -> list[int]:
+        """Encode `string` with the run's own tokenizer, one row of ids.
+
+        The run's processor decides special tokens the way it did in
+        training, so `add_special_tokens` and the harness's other integer
+        options (`left_truncate_len`) are accepted and not read.
+        """
+        del add_special_tokens, kwargs
+        return [int(token) for token in np.asarray(self._processor([string]).tokens)[0]]
 
     def tok_decode(self, tokens: Sequence[int]) -> str:
         return self._processor.decode(np.asarray([list(tokens)], np.int32))[0]
@@ -197,65 +197,71 @@ class DewLM(LM):
             raise ValueError("this task lost its processor; a harness model needs one")
         return processor
 
-    def _rows(self, rows: Sequence[Sequence[int]]) -> list[tuple[np.ndarray, np.ndarray]]:
-        """Return every row's per-target log-probabilities and argmax agreement."""
-        scored: list[tuple[np.ndarray, np.ndarray]] = []
-        for batch in _batches(len(rows), self.batch_size):
-            tokens = _padded([rows[index] for index in batch])
-            probabilities, greedy = _scored(self.task.model, self.task.variables,
-                                            jnp.asarray(tokens))
-            values, matched = np.asarray(probabilities), np.asarray(greedy)
-            for offset, index in enumerate(batch):
-                width = len(rows[index]) - 1
-                scored.append((values[offset, :width], matched[offset, :width]))
-        return scored
+    def _loglikelihood_tokens(self, requests: Sequence[TokenRequest],
+                              disable_tqdm: bool = False,
+                              **kwargs: int | None) -> list[tuple[float, bool]]:
+        """Return each pair's summed continuation log-probability, and whether
+        greedy decoding of the context would have produced the continuation.
 
-    def loglikelihood(self, requests: list[Instance]) -> list[tuple[float, bool]]:
-        """Return each `(context, continuation)`'s summed log-probability, and whether
-        greedy decoding of the context would have produced it.
-
-        A request with no context is conditioned on `eot_token_id`, which is
-        what the harness's own models condition such a request on.
+        A continuation of at most `max_length` ids is `HFLM`'s row: context
+        and continuation joined, the last `max_length + 1` ids kept, so the
+        forward reads `max_length` ids and the continuation's targets are the
+        row's last ones. `HFLM` refuses a longer continuation; here it is
+        scored in consecutive blocks of `max_length` targets, each block the
+        end of such a row over the ids before it, so every target is still
+        read once. An empty continuation scores 0 and counts as greedy, as
+        it does there.
         """
+        del disable_tqdm, kwargs
         rows: list[list[int]] = []
         widths: list[int] = []
-        for request in requests:
-            arguments = list(request.args)
-            context, continuation = str(arguments[0]), str(arguments[1])
-            prefix = self.tok_encode(context) if context else [self.eot_token_id]
-            whole = (self.tok_encode(context + continuation) if context
-                     else [*prefix, *self.tok_encode(continuation)])
-            if len(whole) <= len(prefix):
-                raise ValueError(
-                    f"{continuation!r} adds no token to its context, so there is nothing "
-                    f"to score; the tokenizer read the pair as {len(whole)} ids")
-            rows.append(whole[-self.max_length:])
-            widths.append(min(len(whole) - len(prefix), self.max_length - 1))
-        return [(float(values[-width:].sum()), bool(matched[-width:].all()))
-                for (values, matched), width in zip(self._rows(rows), widths, strict=True)]
+        owners: list[int] = []
+        for owner, (_, context, continuation) in enumerate(requests):
+            whole = [*context, *continuation]
+            for start in range(len(context), len(whole), self.max_length):
+                end = min(start + self.max_length, len(whole))
+                rows.append(whole[:end][-(self.max_length + 1):])
+                widths.append(end - start)
+                owners.append(owner)
+        totals = [0.0] * len(requests)
+        greedy = [True] * len(requests)
+        for batch in _batches(len(rows), self.batch_size):
+            tokens = _padded([rows[index] for index in batch])
+            probabilities, argmax = _scored(self.task.model, self.task.variables,
+                                            jnp.asarray(tokens))
+            values, matched = np.asarray(probabilities), np.asarray(argmax)
+            for offset, index in enumerate(batch):
+                end = len(rows[index]) - 1
+                start = end - widths[index]
+                totals[owners[index]] += float(values[offset, start:end].sum())
+                greedy[owners[index]] &= bool(matched[offset, start:end].all())
+        return list(zip(totals, greedy, strict=True))
 
-    def loglikelihood_rolling(self, requests: list[Instance]) -> list[float]:
-        """Return each string's own log-probability, every token after the first scored.
+    def loglikelihood_rolling(self, requests: list[Instance],
+                              disable_tqdm: bool = False) -> list[float]:
+        """Return each string's own log-probability, every token scored once.
 
-        A string longer than the model's context is scored in consecutive
-        windows, each conditioned on what it holds, which is the harness's
-        non-overlapping rolling window.
+        The windows are lm-eval's: the first conditioned on the prefix
+        token, each later one on the `max_length` ids before it, none
+        overlapping in what it scores.
         """
-        windows: list[list[int]] = []
+        windows: list[TokenRequest] = []
         counts: list[int] = []
         for request in requests:
             text = str(next(iter(request.args)))
-            parts = _windows(self.tok_encode(text), self.max_length)
-            windows.extend(parts)
+            parts = [utils.make_disjoint_window(pair) for pair in utils.get_rolling_token_windows(
+                token_list=self.tok_encode(text), prefix_token=self.prefix_token_id,
+                max_seq_len=self.max_length, context_len=1)]
+            windows.extend((None, context, scored) for context, scored in parts)
             counts.append(len(parts))
-        scored = self._rows(windows)
+        scored = self._loglikelihood_tokens(windows, disable_tqdm=disable_tqdm)
         answers, start = [], 0
         for count in counts:
-            answers.append(sum(float(values.sum()) for values, _ in scored[start:start + count]))
+            answers.append(sum(value for value, _ in scored[start:start + count]))
             start += count
         return answers
 
-    def generate_until(self, requests: list[Instance]) -> list[str]:
+    def generate_until(self, requests: list[Instance], disable_tqdm: bool = False) -> list[str]:
         """Continue each context until one of its stop strings or its budget.
 
         The stop strings cut the decoded text, so a sequence that spans two

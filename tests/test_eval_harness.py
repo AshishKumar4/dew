@@ -1,15 +1,18 @@
 """The lm-evaluation-harness adapter over a saved run.
 
-The arithmetic is checked against a direct log-softmax over the model's own
-logits, which is the only thing a harness adapter can get wrong on its own:
-everything else is the suite's. The end-to-end run of a real task needs the
-task's dataset from the Hub, so it carries the `network` marker; lm_eval
+The numbers are checked against lm-eval's own `HFLM` running the same
+weights in transformers: the tiny Llama fixture, loaded into Dew and into
+torch, read through one byte-level vocabulary on both sides. Every step a
+harness adapter can get wrong on its own (the context and continuation
+split, the rolling windows, which logits slot reads which target) is then
+compared with the harness's own. The end-to-end run of a real task needs
+the task's dataset from the Hub, so it carries the `network` marker; lm_eval
 0.4 ships no task whose data is in the package.
 """
 
-import jax
-import jax.numpy as jnp
-import numpy as np
+import dataclasses
+from pathlib import Path
+
 import pytest
 from test_inference import make_lm_run
 
@@ -19,6 +22,8 @@ from lm_eval.api.instance import Instance  # noqa: E402  the extra has to be the
 
 from dew.eval.harness import DewLM  # noqa: E402
 from dew.inference import TextGeneration  # noqa: E402
+
+LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 
 
 def instance(*arguments, request_type="loglikelihood"):
@@ -37,30 +42,100 @@ def adapter(run):
     return DewLM(TextGeneration.from_run(str(run)), batch_size=2)
 
 
-def _reference(task, context: str, continuation: str) -> tuple[float, bool]:
-    """The same number by hand: log-softmax over the whole row's logits, read
-    at the continuation's targets."""
-    prefix = np.asarray(task.processor([context]).tokens)[0]
-    whole = np.asarray(task.processor([context + continuation]).tokens)[0]
-    logits = task.model.apply(task.variables, jnp.asarray(whole[None, :-1], jnp.int32))
-    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)[0]
-    width = len(whole) - len(prefix)
-    targets = whole[1:]
-    picked = [float(log_probs[slot, targets[slot]]) for slot in range(len(targets) - width, len(targets))]
-    greedy = [int(np.argmax(np.asarray(log_probs[slot]))) == int(targets[slot])
-              for slot in range(len(targets) - width, len(targets))]
-    return float(sum(picked)), all(greedy)
+def _byte_tokenizer():
+    """Dew's `ByteTokenizer` as a transformers tokenizer: one id per utf-8 byte,
+    id = byte value, EOS 255, no BOS, which is what `HFLM` needs to be handed."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+    symbols = bytes_to_unicode()
+    vocabulary = {symbols[byte]: byte for byte in range(256)}
+    tokenizer = Tokenizer(models.BPE(vocab=vocabulary, merges=[]))
+    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
+    tokenizer.decoder = decoders.ByteLevel()
+    return PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token=symbols[255])
 
 
-def test_loglikelihood_is_the_log_softmax_over_the_models_own_logits(adapter):
-    """The one number the adapter computes itself, against the direct one.
+def _pair(max_length: int):
+    """The same weights behind `DewLM` and behind lm-eval's `HFLM`, both
+    scoring windows of `max_length` ids."""
+    import torch
+    from lm_eval.models.huggingface import HFLM
+    from transformers import LlamaForCausalLM
 
-    The pair fits the model's 16-id context, so no window is taken and the
-    two read the same row."""
-    expected, greedy = _reference(adapter.task, "the ", "quick")
-    (score, is_greedy), = adapter.loglikelihood([instance("the ", "quick")])
-    assert score == pytest.approx(expected, abs=1e-5)
-    assert is_greedy == greedy
+    from dew.data.text import ByteTokenizer
+    from dew.inference.pipeline import RunProcessor
+    from dew.interop.pretrained import load_pretrained
+    from dew.sampling import Sampling
+
+    loaded = load_pretrained(LLAMA, dtype="float32", attention_impl="reference",
+                             max_seq_len=max_length)
+    ours = DewLM(TextGeneration(loaded.model, loaded.variables, RunProcessor(ByteTokenizer()),
+                                sampling=Sampling(eos_id=255)), batch_size=2)
+    model = LlamaForCausalLM.from_pretrained(LLAMA, dtype=torch.float32).eval()
+    theirs = HFLM(pretrained=model, tokenizer=_byte_tokenizer(), max_length=max_length,
+                  batch_size=2)
+    return ours, theirs
+
+
+# Both sides run fp32 over the same weights, torch against XLA; summed
+# log-probabilities agree to 2.6e-7 relative (-89.84966 against -89.84964
+# for the pair beyond the window), so 1e-6 relative is the float32 bound.
+RELATIVE = 1e-6
+
+
+def _text(length: int) -> str:
+    return "".join(chr(ord("a") + (7 * step) % 26) for step in range(length))
+
+
+def test_loglikelihood_equals_lm_evals_own_model_on_the_same_weights():
+    """Contexts with trailing whitespace, where lm-eval moves the spaces into
+    the continuation; an empty context, conditioned on the prefix token; a
+    pair longer than the window, truncated from the left; one batch holding
+    rows of different lengths."""
+    ours, theirs = _pair(16)
+    requests = [instance(*pair) for pair in (
+        ("the ", "quick"), ("a  ", "b"), ("hello", " world"), ("", "empty context"),
+        ("a context much longer than sixteen bytes, ", "then the end"))]
+    expected = theirs.loglikelihood(requests)
+    got = ours.loglikelihood(requests)
+    for (score, greedy), (reference, reference_greedy) in zip(got, expected, strict=True):
+        assert score == pytest.approx(reference, rel=RELATIVE)
+        assert greedy == reference_greedy
+
+
+def test_a_continuation_longer_than_the_window_is_scored_in_lm_evals_rolling_windows():
+    """`HFLM` refuses a continuation longer than its window; the adapter
+    scores it in consecutive blocks, each conditioned on the ids before it.
+    From an empty context those are the rolling windows lm-eval scores the
+    same string with, so the two numbers are one."""
+    ours, theirs = _pair(16)
+    text = _text(50)
+    (reference,) = theirs.loglikelihood_rolling([instance(text, request_type="loglikelihood_rolling")])
+    (score, _), = ours.loglikelihood([instance("", text)])
+    assert score == pytest.approx(reference, rel=RELATIVE)
+
+
+@pytest.mark.parametrize("length, max_length", [(3, 16), (50, 16), (5000, 2048)])
+def test_rolling_likelihood_scores_every_token_once_as_lm_eval_does(length, max_length):
+    """lm-eval's rolling windows score all `length` tokens, the first one
+    conditioned on the prefix token (Appendix A.5 of the audit: 5000 of 5000
+    at `max_length` 2048, where cutting consecutive rows scored 4997). A
+    dropped token moves the sum by its whole log-probability, about 5.5
+    nats for this vocabulary, so equal sums mean the same tokens scored."""
+    from lm_eval.utils import get_rolling_token_windows, make_disjoint_window
+
+    text = _text(length)
+    ours, theirs = _pair(max_length)
+    tokens = ours.tok_encode(text)
+    assert len(tokens) == length
+    windows = [make_disjoint_window(pair) for pair in get_rolling_token_windows(
+        tokens, ours.eot_token_id, max_length, 1)]
+    assert sum(len(scored) for _, scored in windows) == length
+    (reference,) = theirs.loglikelihood_rolling([instance(text, request_type="loglikelihood_rolling")])
+    (score,) = ours.loglikelihood_rolling([instance(text, request_type="loglikelihood_rolling")])
+    assert score == pytest.approx(reference, rel=RELATIVE)
 
 
 def test_a_batch_scores_every_request_as_it_would_alone_and_keeps_the_order(adapter):
@@ -71,38 +146,11 @@ def test_a_batch_scores_every_request_as_it_would_alone_and_keeps_the_order(adap
     together = adapter.loglikelihood([instance(*pair) for pair in pairs])
     assert len(together) == len(pairs)
     for pair, (score, _) in zip(pairs, together, strict=True):
-        alone, _ = _reference(adapter.task, *pair)
-        assert score == pytest.approx(alone, abs=1e-5)
+        (alone, _), = adapter.loglikelihood([instance(*pair)])
+        assert score == pytest.approx(alone, rel=RELATIVE)
     reordered = adapter.loglikelihood([instance(*pair) for pair in reversed(pairs)])
     assert [score for score, _ in reordered] == pytest.approx(
-        [score for score, _ in reversed(together)], abs=1e-6)
-
-
-def test_rolling_likelihood_scores_every_token_after_the_first(adapter):
-    """One window: the sum of the row's own per-target log-probabilities."""
-    text = "the quick brown"
-    tokens = np.asarray(adapter.task.processor([text]).tokens)[0]
-    assert len(tokens) <= adapter.max_length
-    logits = adapter.task.model.apply(adapter.task.variables,
-                                      jnp.asarray(tokens[None, :-1], jnp.int32))
-    log_probs = jax.nn.log_softmax(logits.astype(jnp.float32), axis=-1)[0]
-    expected = sum(float(log_probs[slot, tokens[slot + 1]]) for slot in range(len(tokens) - 1))
-    (score,) = adapter.loglikelihood_rolling([instance(text)])
-    assert score == pytest.approx(expected, abs=1e-5)
-
-
-def test_a_string_longer_than_the_context_scores_in_consecutive_windows(adapter):
-    """The model declares 16 ids, so a longer string is scored in windows
-    rather than refused, and each window scores its own tokens."""
-    text = "x" * (adapter.max_length * 2 + 1)
-    tokens = adapter.tok_encode(text)
-    assert len(tokens) > adapter.max_length
-    (score,) = adapter.loglikelihood_rolling([instance(text)])
-    windows = [tokens[start:start + adapter.max_length]
-               for start in range(0, len(tokens), adapter.max_length)]
-    counted = sum(len(window) - 1 for window in windows if len(window) > 1)
-    assert counted == len(tokens) - len(windows)
-    assert score < 0.0
+        [score for score, _ in reversed(together)], rel=RELATIVE)
 
 
 def test_generate_until_cuts_the_answer_at_the_first_stop_string(adapter):
@@ -120,8 +168,6 @@ def test_generate_until_cuts_the_answer_at_the_first_stop_string(adapter):
 def test_the_adapter_refuses_a_task_it_cannot_score(run):
     """It scores next-token likelihoods, so it takes the task that has them,
     and it needs the processor that turns the harness's text into tokens."""
-    import dataclasses
-
     task = TextGeneration.from_run(str(run))
     with pytest.raises(TypeError, match="TextToImage is a different task"):
         DewLM(_NotText())
