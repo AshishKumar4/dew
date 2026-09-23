@@ -99,6 +99,21 @@ def test_a_live_session_and_overflow_through_the_gateway(engine):
     assert outcome(result(rewards={"reward": 0}), session.calls, errors=overflow.errors)[0] is Status.TRUNCATED
 
 
+@pytest.mark.parametrize("message", [
+    # vLLM 0.30.0's input processor (v1/engine/input_processor.py:_validate_prompt_len), reached by
+    # token-id prompts that skip the renderer's check.
+    "The decoder prompt (length 4200) is longer than the maximum model length of 4096. Make sure that "
+    "`max_model_len` is no smaller than the number of text tokens.",
+    "The decoder prompt (length 4096) plus the number of requested output tokens (at least 1) is longer than "
+    "the maximum model length of 4096. Make sure that `max_model_len` is no smaller than the number of text "
+    "tokens (prompt + requested output tokens).",
+])
+def test_vllm_input_processor_overflow_truncates(message):
+    refused = {**trace([], [], None, None), "raw_response": {"error": {"message": message, "code": 400}}}
+    recorded = calls([trace([1, 2], [3], [-.5]), refused], unstamped=0)
+    assert outcome(result(rewards={"reward": 0}), recorded.calls, errors=recorded.errors)[0] is Status.TRUNCATED
+
+
 def test_engine_errors_are_events_not_calls():
     overflow = json.loads((FIXTURES / "vllm_overflow_trace.json").read_text())
     recorded = calls([trace([1, 2], [3], [-.5]), {**overflow, "timestamp": 9.0, "latency_ms": 10.0}], unstamped=0)
