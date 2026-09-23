@@ -234,13 +234,13 @@ A `Program` is files written into a fresh temporary directory, an argv run there
 | `policy_loss="ppo"` | Dual-clipped token surrogate | `compute_policy_loss_vanilla` |
 | `policy_loss="gspo"` | Clipped sequence ratio, pooled per chain, no dual clip | `compute_policy_loss_gspo` |
 | `policy_loss="cispo"` | `-sg(clip(r)) * A * log pi` | `compute_policy_loss_cispo` |
-| `aggregation="session-mean"` | Mean over rollouts of each rollout's token mean | `seq-mean-token-mean`; Agent Lightning `per_rollout_mean` |
+| `aggregation="session-mean"` | Mean over sessions of each session's token mean | `seq-mean-token-mean`; Agent Lightning `per_rollout_mean` |
 | `behavior_importance=c` | Token TIS weight `min(pi_old / mu, c)` | `compute_rollout_correction_weights` |
 | `behavior_importance=(lo, hi)` | IcePop: token weight zero outside the band | same, `"lo_hi"` threshold |
 | `sequence_mask=(lo, hi)` | Reject a chain whose summed k1 leaves `[log lo, log hi]` | `compute_rollout_rejection_mask`, `seq_sum_k1` |
 | `geometric_mask=(lo, hi)` | Same with the mean k1 | `seq_mean_k1` |
 
-Whenever behavior likelihoods are present the loss reports `mismatch/kl`, `mismatch/k3_kl` and `mismatch/ess`, and each mask reports the share of trainable tokens it removed. `tests/test_packed_grpo.py` checks that packed GRPO equals GRPO over one windowed row per call, gradients included.
+Whenever behavior likelihoods are present the loss reports `mismatch/kl`, `mismatch/k3_kl` and `mismatch/ess`, and each mask reports the share of trainable tokens it removed. `tests/test_packed_grpo.py` checks that packed GRPO equals GRPO over the unmerged chains, one call per row, gradients included.
 
 Before training a new model family or harness setting, run `tools/audit_template.py template --tokenizer <name>` to see whether its chat template keeps histories append-only, and `tools/audit_template.py sessions traces.jsonl` to measure calls per chain on recorded sessions. The audit takes the sampled turn to be what the template writes for a final assistant turn, so each family's own tool-call and reasoning syntax is checked. With Qwen3 (`Qwen/Qwen3-0.6B`), only a reasoning turn followed by a tool-role observation merges: user-role observations drop the reasoning from history, a turn without reasoning is written with an empty `<think></think>` block that history drops, and compact tool-call JSON is re-serialized with spaces.
 

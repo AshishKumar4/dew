@@ -1,4 +1,4 @@
-"""Host-side grouped rollouts with sampling-policy likelihoods."""
+"""Host-side grouped completions, packed as one-call sessions with their sampling likelihoods."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def check_rollout(groups: int, max_new_tokens: int, estimator: str) -> None:
 def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np.ndarray,
                     lengths: np.ndarray, terminated: np.ndarray, behavior: np.ndarray,
                     rewards: np.ndarray, versions: np.ndarray, estimator: str) -> dict[str, np.ndarray]:
-    """Pack `[rows, groups, ...]` completions as one-call rollouts through `pack`.
+    """Pack `[rows, groups, ...]` completions as one-call sessions through `pack`.
 
     `prompts` is `[rows, width]` left-padded ids with `prompt_lengths` real
     tokens each; `sampled` and `behavior` are `[rows, groups, R]` with
@@ -70,7 +70,7 @@ def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np
     """
     rows, groups, budget = sampled.shape
     width = prompts.shape[1]
-    rollouts = []
+    sessions = []
     for row in range(rows):
         prompt = tuple(int(token) for token in prompts[row, width - int(prompt_lengths[row]):])
         for group in range(groups):
@@ -78,14 +78,14 @@ def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np
             call = Call(prompt, tuple(int(token) for token in sampled[row, group, :count]),
                         tuple(float(value) for value in behavior[row, group, :count]),
                         "stop" if bool(terminated[row, group]) else "length", int(versions[row, group]))
-            rollouts.append(Session(str(row), "", group, 0, (call,), Status.COMPLETED,
+            sessions.append(Session(str(row), "", group, 0, (call,), Status.COMPLETED,
                                     float(rewards[row, group])))
-    return pack(rollouts, width + budget, rows=rows * groups, estimator=estimator)
+    return pack(sessions, width + budget, rows=rows * groups, estimator=estimator)
 
 
 @dataclasses.dataclass(frozen=True)
 class SampledRollout:
-    """Draw G completions per prompt and pack them as one-call rollouts.
+    """Draw G completions per prompt and pack them as one-call sessions.
 
     EOS is a valid action in the response mask but excluded from reward text.
     The batch is `pack`'s layout, `prompts * groups` rows of the prompt
