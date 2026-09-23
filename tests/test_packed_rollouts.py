@@ -197,3 +197,38 @@ def test_rollout_metrics_report_merge_masking_reward_latency_and_lag():
     assert metrics["lag/max"] == 2 and metrics["lag/mean"] == pytest.approx((2 + 1 + 1 + 2 + 1) / 5)
     # The loss owns the mismatch metrics, over the same mask its weights read.
     assert not any(key.startswith("mismatch/") for key in metrics)
+
+
+def test_each_sampled_id_weighs_one_over_its_rollouts_sampled_count():
+    """A rollout split over two chains still weighs as one: each of its
+    sampled ids carries 1 / (sampled ids of the rollout), not of its chain."""
+    first = Call((1, 2), (3, 4), (-.1, -.2), "tool_calls", 0)
+    rewritten = Call((1, 9), (5,), (-.3,), "stop", 0)
+    lonely = Call((6,), (7, 8, 9), (-.1, -.1, -.1), "stop", 0)
+    rollouts = [Rollout("t", "g", 0, 0, (first, rewritten), Status.COMPLETED, 1.0),
+                Rollout("t", "g", 1, 0, (lonely,), Status.COMPLETED, 0.0)]
+    batch = pack(rollouts, 4)
+    assert batch[SEGMENT_IDS_KEY].shape[0] == 3, "the first rollout splits into two rows"
+    sampled = batch[RESPONSE_MASK_KEY] != 0
+    for index, count in ((0, 3), (1, 3)):
+        mine = sampled & (batch[ROLLOUT_INDEX_KEY] == index)
+        np.testing.assert_allclose(batch[ROLLOUT_WEIGHTS_KEY][mine], 1 / count)
+    assert (batch[ROLLOUT_WEIGHTS_KEY][~sampled] == 0).all()
+
+
+def test_group_advantages_match_hand_computed_values_across_uneven_groups():
+    """Two groups of different sizes, one with a masked member: the group
+    estimator normalises by each group's own deviation (ddof 1)."""
+    call = Call((1, 2), (3,), (-.1,), "stop", 0)
+    rollouts = [Rollout("a", "g", 0, 0, (call,), Status.COMPLETED, 1.0),
+                Rollout("a", "g", 1, 0, (call,), Status.COMPLETED, 0.0),
+                Rollout("a", "g", 2, 0, (call,), Status.AGENT_ERROR, 1.0),
+                Rollout("a", "g", 3, 0, (call,), Status.INFRA_ERROR, None),
+                Rollout("b", "g", 0, 0, (call,), Status.COMPLETED, 0.0),
+                Rollout("b", "g", 1, 0, (call,), Status.COMPLETED, 1.0)]
+    expected = [0.57735, -1.15470, 0.57735, 0.0, -0.70711, 0.70711]
+    np.testing.assert_allclose(advantages(rollouts), expected, atol=1e-4)
+    batch = pack(rollouts, 3)
+    for index, value in enumerate(expected):
+        mine = batch[ROLLOUT_INDEX_KEY] == index
+        np.testing.assert_allclose(batch[ADVANTAGES_KEY][mine], value, atol=1e-4)
