@@ -222,6 +222,21 @@ def test_a_group_whose_chains_overflow_the_rows_is_cut_instead_of_failing_the_st
         rollout(State(0), next(iter(data.train())), None)
 
 
+def test_an_unscored_truncation_under_score_is_retried_rather_than_failing_the_step():
+    # A harness that hit the context limit before its verifier ran reports a
+    # truncation with no reward; `score` has nothing to train it on.
+    def outcome(task, submission, sample, version):
+        if (task, submission, sample) == ("1", 0, 0):
+            return Session("t", "g", 0, 0, finished(0.0, version).calls, Status.TRUNCATED, None)
+        return finished(float(sample), version, status=Status.TRUNCATED)
+
+    source = Scripted(outcome)
+    rollout, data, records = scheduler(source, ahead=0, truncation="score")
+    batch = rollout(State(0), next(iter(data.train())), None)
+    assert records[-1].resubmitted == {"unscored": 1} and records[-1].groups == 2
+    assert trained(batch)[0] == [0, 1, 2, 3]
+
+
 def test_oversampled_stragglers_are_cancelled_once_the_group_is_full():
     source = Scripted(lambda task, submission, sample, version: None if sample == 0 else finished(
         float(sample), version))

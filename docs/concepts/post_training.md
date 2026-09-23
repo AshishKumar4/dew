@@ -207,7 +207,7 @@ Reinforcement learning with verifiable rewards (RLVR) scores each completion by 
 Each task becomes one group of `G` rollouts. The scheduler relabels every admitted rollout with its own group id, sample index and attempt, so a resubmitted sample rejoins its group. Admission goes by status:
 
 - `COMPLETED` and `AGENT_ERROR` rollouts are admitted with their verifier reward.
-- `TRUNCATED` rollouts complete their group and train as `truncation` says (`"mask"` by default: no loss, no baseline; see [packed rows](#engine-sourced-rollouts-and-packed-rows)).
+- `TRUNCATED` rollouts complete their group and train as `truncation` says (`"mask"` by default: no loss, no baseline; see [packed rows](#engine-sourced-rollouts-and-packed-rows)). Under `"score"`, a truncation that arrives without a reward is submitted again as a failed attempt: its verifier never ran, which is an infrastructure failure, not an outcome of the policy.
 - `INFRA_ERROR` and `CANCELLED` rollouts are never scored. The sample is submitted again under the served weights, up to `max_attempts` failures per sample, after which its group is abandoned.
 - A rollout whose oldest call is more than `max_lag` updates behind is discarded and submitted again. One still running whose submission is already past the bound is cancelled without being waited on.
 - With `timeout=S`, a rollout still running `S` seconds after its submission is cancelled and submitted again as a failed attempt. Cancelling asks the source to stop; a thread stuck inside an environment step cannot be reclaimed, so environments must bound their own step time.

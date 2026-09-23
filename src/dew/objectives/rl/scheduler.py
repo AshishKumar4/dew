@@ -20,7 +20,10 @@ rejoins its group. Admission is per rollout, by status:
 - TRUNCATED is admitted and trains as `truncation` says: `mask` (the
   default, for agentic context, turn and wall-clock limits), `score` on its
   verifier reward (single-turn RLVR), or `zero` (a length penalty); see
-  `dew.objectives.rl.sessions`.
+  `dew.objectives.rl.sessions`. Under `score`, a truncation without a reward
+  is resubmitted as a failed attempt (cause `unscored`), like an
+  INFRA_ERROR: its verifier never ran, so masking it would drop a sample
+  for a reason unrelated to the policy, and training it has no reward.
 - INFRA_ERROR and CANCELLED are never scored. The sample is submitted again
   under the served weights, up to `max_attempts` failures per sample, after
   which the group is abandoned rather than trained incomplete.
@@ -116,15 +119,16 @@ class SchedulerRecord:
 
     `version` and `lag` are the oldest admitted call's; `groups` counts
     admitted groups; `resubmitted` counts resubmissions by cause
-    (`infra_error`, `cancelled`, `stale`); `cancelled` counts in-flight
-    rollouts cancelled as surplus, stale or abandoned; `abandoned` counts
-    groups given up after `max_attempts`; `cut` counts complete groups
-    left out because their chains did not fit the batch's `rows`, beside
-    the groups admitted before them; `waited` is the seconds the
-    trainer waited. `metrics` is `session_metrics` over the admitted
-    rollouts and their packed batch: merge ratio, status shares and masked
-    shares, mean reward and reward components, submission-to-finish
-    latency tail, token lag and proximal-behavior mismatch.
+    (`infra_error`, `cancelled`, `stale`, `timeout`, `unscored`);
+    `cancelled` counts in-flight rollouts cancelled as surplus, stale or
+    abandoned; `abandoned` counts groups given up after `max_attempts`;
+    `cut` counts complete groups left out because their chains did not fit
+    the batch's `rows` beside the groups admitted before them; `waited` is
+    the seconds the trainer waited. `metrics` is `session_metrics` over the
+    admitted rollouts and their packed batch: merge ratio, status shares
+    and masked shares, mean reward and reward components,
+    submission-to-finish latency tail and token lag. The loss reports the
+    trainer-engine mismatch.
     """
 
     updates: int
@@ -355,6 +359,11 @@ class RolloutScheduler:
         """Admit one finished rollout into its group, or replace it."""
         if rollout.status in (Status.INFRA_ERROR, Status.CANCELLED):
             self._replace(group, sample, rollout.status.value, tally)
+            return
+        if rollout.status is Status.TRUNCATED and rollout.reward is None and self.truncation == "score":
+            # The policy trains truncations on their score, and none was given:
+            # the verifier did not run, which is the infrastructure's failure.
+            self._replace(group, sample, "unscored", tally)
             return
         oldest = min((call.version for call in rollout.calls), default=sample.submitted)
         if updates - oldest > self.max_lag:
