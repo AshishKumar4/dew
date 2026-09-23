@@ -29,7 +29,7 @@ import dataclasses
 import functools
 import importlib
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -44,7 +44,7 @@ from .blocks import normal_kernel
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
 from .precision import rounded_operand, rounded_to
-from .sharding import EXPERT_AXIS, FSDP_AXIS, logical_axes, logical_spec, mesh_axes, row_axes
+from .sharding import EXPERT_AXIS, FSDP_AXIS, LogicalAxes, logical_axes, logical_spec, mesh_axes, row_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -694,7 +694,8 @@ def capacity_positions(indices: jax.Array, num_experts: int,
 
 def expert_dispatch[Parameters](
         project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
-        x: jax.Array, indices: jax.Array, parameters: Parameters, *,
+        x: jax.Array, indices: jax.Array, parameters: Parameters,
+        parameter_axes: Sequence[LogicalAxes], *,
         num_experts: int, dispatch: str, output_dtype: Dtype,
         input_weights: jax.Array | None = None, initializing: bool = False,
         capacity_factor: float | None = None) -> jax.Array:
@@ -703,7 +704,8 @@ def expert_dispatch[Parameters](
 
     `project` takes rows sorted by expert, the group sizes, the sorted
     expert ids and the expert-major parameters, and returns rows of the same
-    width. The caller owns the activation, the biases and the output
+    width. `parameter_axes` names each parameter's dimensions as its module
+    declares them. The caller owns the activation, the biases and the output
     weights; `input_weights` scales each expert's input instead, as Llama 4
     does. `x` is `[batch, length, width]` or `[tokens, width]`.
 
@@ -721,6 +723,11 @@ def expert_dispatch[Parameters](
     device's experts enter it alone, split as the `exp` rule splits them.
     Rows the batch axes do not divide are padded until they do, so every
     shard sends tokens of its own.
+
+    The parameters enter the map in the shards they are stored in and are
+    gathered inside it, all but a device's own experts under the exchange,
+    so their gradient leaves reduce-scattered onto those shards rather than
+    summed whole on every device.
 
     `capacity_factor` drops instead, as GShard and MaxText do: each
     sequence keeps `capacity_positions`' count of slots per expert, in
@@ -775,19 +782,37 @@ def expert_dispatch[Parameters](
     tokens = logical_spec((*positions_axes, 'activation_embed'), x.shape)
     routing = logical_spec((*positions_axes, None), indices.shape)
     manual = {axis for entry in tokens for axis in mesh_axes(entry)}
+    stored = []
+    for leaf, axes in zip(jax.tree.leaves(parameters), parameter_axes, strict=True):
+        kept = [tuple(axis for axis in mesh_axes(entry) if axis in manual)
+                for entry in logical_spec(axes, leaf.shape)]
+        stored.append(P(*(entry if entry else None for entry in kept)))
+    held = jax.tree.unflatten(jax.tree.structure(parameters), stored)
     if exchanging:
-        body = functools.partial(_exchange_shard, project, num_experts=num_experts,
-                                 shards=shards, output_dtype=output_dtype, capacity=capacity)
-        experts = jax.tree.map(
-            lambda leaf: logical_spec(('exp', *(None,) * (leaf.ndim - 1)), leaf.shape), parameters)
+        if any(not spec or EXPERT_AXIS not in mesh_axes(spec[0]) for spec in stored):
+            raise ValueError("exchange dispatch holds each device's own experts, so every "
+                             "expert parameter splits its first dimension over the expert "
+                             f"axis; the rule table places them {stored}")
+        inner = functools.partial(_exchange_shard, project, num_experts=num_experts,
+                                  shards=shards, output_dtype=output_dtype, capacity=capacity)
     else:
-        body = functools.partial(_sorted_locally, project, num_experts=num_experts)
-        experts = jax.tree.map(lambda _: P(), parameters)
+        inner = functools.partial(_sorted_locally, project, num_experts=num_experts)
+
+    def body(x, indices, parameters, input_weights):
+        def gathered(leaf: jax.Array, spec: P) -> jax.Array:
+            for dimension, entry in enumerate(spec):
+                axes = tuple(axis for axis in mesh_axes(entry)
+                             if not (exchanging and dimension == 0 and axis == EXPERT_AXIS))
+                if axes:
+                    leaf = jax.lax.all_gather(leaf, axes, axis=dimension, tiled=True)
+            return leaf
+        return inner(x, indices, jax.tree.map(gathered, parameters, held), input_weights)
+
     # The kernels carry no manual-axis type, so this map does not check them;
     # MaxText hosts its gmm the same way.
     return jax.shard_map(
         body, mesh=mesh, axis_names=manual,
-        in_specs=(tokens, routing, experts, None if input_weights is None else routing),
+        in_specs=(tokens, routing, held, None if input_weights is None else routing),
         out_specs=P(*routing, None), check_vma=False)(
             x, indices, parameters, input_weights)[:rows]
 
@@ -913,6 +938,14 @@ def _widened[Tree](parameters: Tree) -> Tree:
     return jax.tree.map(widen, parameters)
 
 
+EXPERT_AXES: Mapping[str, LogicalAxes] = {
+    'gate_proj': ('exp', 'embed', 'mlp'),
+    'up_proj': ('exp', 'embed', 'mlp'),
+    'down_proj': ('exp', 'mlp', 'embed'),
+}
+"""The stacked expert kernels' axes, in the order `ExpertMLP` projects through them."""
+
+
 class ExpertMLP(nn.Module):
     """The routed experts of one layer: each token through the gated MLPs its
     router chose.
@@ -1012,7 +1045,7 @@ class ExpertMLP(nn.Module):
         compute = canonicalize_dtype(x, *kernels, dtype=self.dtype)
         slots = expert_dispatch(
             functools.partial(self._project, dtype=compute), x, indices, kernels,
-            num_experts=self.num_experts, dispatch=self.dispatch,
+            tuple(EXPERT_AXES.values()), num_experts=self.num_experts, dispatch=self.dispatch,
             initializing=self.is_initializing(), output_dtype=compute,
             input_weights=weights if self.scale_inputs else None,
             capacity_factor=self.capacity_factor)
@@ -1024,9 +1057,7 @@ class ExpertMLP(nn.Module):
     # A sparse layer's experts are stacked on one leaf, so the expert
     # dimension is named here and the longer path wins over the dense
     # projection of the same name.
-    ("experts", "gate_proj"): ("exp", "embed", "mlp"),
-    ("experts", "up_proj"): ("exp", "embed", "mlp"),
-    ("experts", "down_proj"): ("exp", "mlp", "embed"),
+    **{("experts", name): axes for name, axes in EXPERT_AXES.items()},
     # The shared branch is one dense gated MLP beside the experts, sharded
     # like the dense layers' own.
     ("shared_experts", "gate_proj"): ("embed", "mlp"),
