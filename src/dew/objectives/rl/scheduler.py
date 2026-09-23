@@ -26,6 +26,10 @@ rejoins its group. Admission is per rollout, by status:
   discarded and resubmitted. One still running whose submission is already
   past the bound is cancelled before anyone waits on it: its first call was
   made under that version.
+- A rollout still running `timeout` seconds after its submission is
+  cancelled and resubmitted as a failed attempt, like an INFRA_ERROR.
+  Cancelling asks the source to stop; a thread stuck inside an environment
+  step cannot be reclaimed, so environments must bound their own step time.
 
 A source that raises instead of returning a status is broken; the exception
 propagates after the batch's work is cancelled.
@@ -170,7 +174,9 @@ class RolloutScheduler:
     """Train on complete rollout groups from `source`, `ahead` task batches early.
 
     `tasks` turns one registered batch into its tasks (`task_ids` for
-    integer `task_id` rows). `width` and `rows` fix the packed batch shape;
+    integer `task_id` rows). `timeout` is each rollout's deadline in seconds
+    from its submission; a rollout past it is cancelled and resubmitted as a
+    failed attempt. `width` and `rows` fix the packed batch shape;
     `estimator` is `pack`'s advantage family. `log`, when given, receives
     a `SchedulerRecord` per call.
     """
@@ -179,13 +185,16 @@ class RolloutScheduler:
                  width: int, rows: int, tasks: Callable[[Batch], Sequence[Task]] = task_ids,
                  groups: int = 4, oversample: int = 0, admit: int | None = None,
                  max_lag: int = 1, ahead: int = 1, sync_every: int = 1, max_attempts: int = 3,
-                 estimator: str = "group", log: Callable[[SchedulerRecord], None] | None = None):
+                 timeout: float | None = None, estimator: str = "group", log: Callable[[SchedulerRecord], None] | None = None):
         for name, value, least in (("width", width, 2), ("rows", rows, 1), ("groups", groups, 2),
                                    ("oversample", oversample, 0), ("ahead", ahead, 0),
                                    ("sync_every", sync_every, 1), ("max_lag", max_lag, 0),
                                    ("max_attempts", max_attempts, 1)):
             if type(value) is not int or value < least:
                 raise ValueError(f"{name} must be an integer of at least {least}")
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                                    or not timeout > 0):
+            raise ValueError("timeout must be a positive number of seconds, or None to wait without a deadline")
         if admit is not None and (type(admit) is not int or admit < 1):
             raise ValueError("admit must be a positive number of groups, or None to admit every task")
         if ahead + sync_every - 1 > max_lag:
@@ -198,7 +207,7 @@ class RolloutScheduler:
         self.objective, self.source, self.weights, self.tasks_of = objective, source, weights, tasks
         self.width, self.rows, self.groups, self.oversample, self.admit = width, rows, groups, oversample, admit
         self.max_lag, self.ahead, self.sync_every, self.max_attempts = max_lag, ahead, sync_every, max_attempts
-        self.estimator, self.log = estimator, log
+        self.timeout, self.estimator, self.log = timeout, estimator, log
         self._lock = threading.Lock()
         self._registered: deque[_Entry] = deque()
         self._serial = 0
@@ -309,6 +318,18 @@ class RolloutScheduler:
             if group.abandoned or len(group.done) >= self.groups:
                 return
             self._replace(group, sample, "stale", tally)
+        if self.timeout is None:
+            return
+        now = time.perf_counter()
+        expired = [sample for sample in group.live if not sample.future.done() and now - sample.started >= self.timeout]
+        if expired:
+            tally.cancelled += len(expired)
+            self._cancel(expired)
+            group.live = [sample for sample in group.live if sample not in expired]
+        for sample in expired:
+            if group.abandoned or len(group.done) >= self.groups:
+                return
+            self._replace(group, sample, "timeout", tally)
 
     def _settle(self, entry: _Entry, group: _Group, sample: _Sample, rollout: Rollout, updates: int,
                 tally: _Tally) -> None:
@@ -340,7 +361,10 @@ class RolloutScheduler:
                 pending = [group for group in pending if not group.abandoned and len(group.done) < self.groups]
                 if len(entry.complete) >= target or not pending:
                     break
-                wait([sample.future for group in pending for sample in group.live], return_when=FIRST_COMPLETED)
+                live = [sample for group in pending for sample in group.live]
+                deadline = None if self.timeout is None else max(
+                    min(sample.started for sample in live) + self.timeout - time.perf_counter(), 0.0)
+                wait([sample.future for sample in live], timeout=deadline, return_when=FIRST_COMPLETED)
         finally:
             leftover = [sample for group in entry.groups for sample in group.live]
             tally.cancelled += len(leftover)

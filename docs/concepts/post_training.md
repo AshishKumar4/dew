@@ -210,6 +210,7 @@ Each task becomes one group of `G` rollouts. The scheduler relabels every admitt
 - `TRUNCATED` rollouts complete their group, and `pack` masks them: they carry no loss and enter no baseline.
 - `INFRA_ERROR` and `CANCELLED` rollouts are never scored. The sample is submitted again under the served weights, up to `max_attempts` failures per sample, after which its group is abandoned.
 - A rollout whose oldest call is more than `max_lag` updates behind is discarded and submitted again. One still running whose submission is already past the bound is cancelled without being waited on.
+- With `timeout=S`, a rollout still running `S` seconds after its submission is cancelled and submitted again as a failed attempt. Cancelling asks the source to stop; a thread stuck inside an environment step cannot be reclaimed, so environments must bound their own step time.
 
 A source that raises instead of returning a status is broken: the exception propagates after the batch's work is cancelled. Two settings cut the long tail without changing the batch shape. `oversample=K` runs `G + K` samples per group and admits the first `G` to finish. `admit=M` admits the first `M` groups of a batch to complete and cancels the rest. Both select by completion time, which favors short rollouts. Rollouts running when a push lands keep running; their later calls carry the new version, and the rollout's staleness is its oldest call's.
 
