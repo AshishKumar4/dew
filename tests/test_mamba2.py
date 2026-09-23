@@ -33,9 +33,10 @@ import numpy as np
 import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import AttentionMetadata
+from dew.nn.inputs import AttentionMetadata, ModelInputs
 from dew.nn.mixers import mixer_from_record
 from dew.nn.mixers.mamba2 import Mamba2, Mamba2Mixer, chunk_ssd, recurrent_ssd, segment_sum
+from dew.objectives.lm import LMObjective
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 BOUND = 1e-5
@@ -265,6 +266,53 @@ def test_the_chunked_and_recurrent_forms_reset_alike(reference):
     assert largest(chunked, recurrent) < BOUND
     assert largest(chunked_final, recurrent_final) < BOUND
     assert largest(chunked, chunk_ssd(x, step, A, B, C, D, initial, 32)[0]) > 1e-1
+
+
+def padded_packed_row(length: int):
+    """Two documents of six real tokens in `length` slots, padding at slots
+    2, 7, 8 and 13: the second document's first token follows the gap at 7
+    and 8. Returns the ids, validity and segments of the padded row and of
+    the same twelve tokens with the holes closed."""
+    holes = [2, 7, 8, 13]
+    valid = np.ones((1, length), bool)
+    valid[0, holes] = False
+    real = np.flatnonzero(valid[0])
+    segments = np.zeros((1, length), np.int32)
+    segments[0, real[:6]] = 1
+    segments[0, real[6:]] = 2
+    ids = np.asarray(jax.random.randint(jax.random.key(3), (1, length), 1, 32), np.int32)
+    closed = ids[:, valid[0]], segments[:, valid[0]]
+    return (jnp.asarray(ids), jnp.asarray(valid), jnp.asarray(segments)), tuple(map(jnp.asarray, closed))
+
+
+def test_padded_packed_rows_reset_at_each_document():
+    """Padding slots and packed documents together: every real token of the
+    padded row computes what it computes with the holes closed, the second
+    document starting fresh after the gap, through the model's
+    `hidden_and_mtp_inputs` and through `LMObjective.token_scores` with both
+    token fields. Observed 0.0 apart in fp32. The padded row without its
+    segment ids, and the layer before it passed segments to its stateful
+    path, sit 2.7 away on states of magnitude 2.7."""
+    model = tiny_lm()
+    (ids, valid, segments), (closed_ids, closed_segments) = padded_packed_row(16)
+    params = model.init(jax.random.key(0), ids)
+
+    def hidden(tokens, **fields):
+        return model.apply(params, tokens, method=CausalTransformer.hidden_and_mtp_inputs, **fields)[0]
+
+    closed = hidden(closed_ids, segment_ids=closed_segments)[0]
+    padded = hidden(ids, attention_mask=valid, segment_ids=segments)[0]
+    assert largest(padded[valid[0]], closed) < BOUND
+    carried = hidden(ids, attention_mask=valid)[0]
+    assert largest(carried[valid[0]], closed) > 1e-1
+
+    (ids, valid, segments), (closed_ids, closed_segments) = padded_packed_row(17)
+    scored = LMObjective(model, 16).token_scores(
+        params, ModelInputs(ids, {"attention_mask": valid, "segment_ids": segments}))
+    alone = LMObjective(model, 12).token_scores(
+        params, ModelInputs(closed_ids, {"segment_ids": closed_segments}))
+    kept = valid[0, :-1]
+    assert largest(scored.hidden[0][kept], alone.hidden[0][:int(kept.sum())]) < BOUND
 
 
 def test_the_kind_builds_from_the_configs_fields():

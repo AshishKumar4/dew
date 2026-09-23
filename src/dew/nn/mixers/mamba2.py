@@ -373,11 +373,12 @@ class Mamba2(nn.Module):
         self.norm = MambaRMSNormGated(epsilon=self.norm_eps, dtype=self.dtype, name='norm')
         self.out_proj = dense(self.emb_features, name='out_proj')
 
-    def _conv(self, mixed, taps, bias, valid, conv_state):
+    def _conv(self, mixed, taps, bias, valid, conv_state, segments):
         """The conv over `[B, D, S]` with the bias before silu, from the
         held history when decoding, and the history it leaves."""
-        if valid is not None:
-            return _masked_conv1d(mixed, taps, valid, conv_state, bias=bias)
+        if valid is not None or segments is not None:
+            valid = jnp.ones(mixed.shape[::2], bool) if valid is None else valid
+            return _masked_conv1d(mixed, taps, valid, conv_state, bias=bias, segments=segments)
         length = mixed.shape[-1]
         history = mixed if conv_state is None else jnp.concatenate([conv_state, mixed], axis=2)
         out = causal_conv1d(history, taps, bias=bias)[..., -length:]
@@ -415,7 +416,7 @@ class Mamba2(nn.Module):
                     f"mamba2 under a sequence axis of {shards} runs whole training sequences; "
                     "decoding and rows with padding slots (attention_metadata.valid) hold one "
                     "state per row. Run them on a mesh with sequence=1.")
-            out = self._stateful(mixed, dt, taps, bias, heads, scan, decode, valid)
+            out = self._stateful(mixed, dt, taps, bias, heads, scan, decode, valid, segment_ids)
             if out is None:
                 # Allocation only, as the delta net: init_cache's dummy token
                 # must not consume a position or leave state behind.
@@ -427,10 +428,12 @@ class Mamba2(nn.Module):
             out = _sequence_mix(mixed, dt, segment_ids, (taps, bias, *heads), scan=scan)
         return self.out_proj(self.norm(out, gate))
 
-    def _stateful(self, mixed, dt, taps, bias, heads, scan, decode: bool, valid):
+    def _stateful(self, mixed, dt, taps, bias, heads, scan, decode: bool, valid, segments):
         """The scan of a call that holds per-row state: a decode step or
         prefill advancing the flax cache, or rows with padding slots. None
-        for the allocation-only decode call."""
+        for the allocation-only decode call. Packed `segments` reset the conv
+        and the state at each document's first real token; the held state
+        counts as the call's first document, which it continues."""
         batch = mixed.shape[0]
         mixed = jnp.moveaxis(mixed, 2, 1)                   # [B, D, S]
         ssm = conv_state = None
@@ -443,10 +446,12 @@ class Mamba2(nn.Module):
             if not allocated:
                 return None
         mixed, history = self._conv(mixed, taps, bias, valid,
-                                    None if conv_state is None else conv_state.value)
+                                    None if conv_state is None else conv_state.value, segments)
         if conv_state is not None:
             conv_state.value = history
-        out, final = scan(mixed, dt, *heads, valid=valid, held=None if ssm is None else ssm.value)
+        starts = None if segments is None else document_starts(segments, valid=valid)
+        out, final = scan(mixed, dt, *heads, starts=starts, valid=valid,
+                          held=None if ssm is None else ssm.value)
         if ssm is not None:
             ssm.value = final
         if valid is not None:
@@ -472,7 +477,7 @@ def _ssd(convolved, dt, dt_bias, A, D, *, num_heads: int, head_dim: int, n_group
     if valid is not None:
         # A zero step neither decays nor writes the state.
         step = jnp.where(valid[:, :, None], step, 0.0)
-    out, final = (recurrent_ssd(xs, step, A, B, C, D, held) if length == 1 and axis is None else
+    out, final = (recurrent_ssd(xs, step, A, B, C, D, held, starts) if length == 1 and axis is None else
                   chunk_ssd(xs, step, A, B, C, D, held, chunk_size, starts=starts, axis=axis))
     return out.reshape(batch, length, intermediate), final
 

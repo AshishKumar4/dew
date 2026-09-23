@@ -100,12 +100,20 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None):
     return windows
 
 
-def document_starts(segments, before):
+def document_starts(segments, before=None, valid=None):
     """`[B, S]`: whether each token's segment differs from the one before it.
-    `before` `[B]` is the segment of the token ahead of the first, the
-    first's own where nothing precedes it."""
-    previous = jnp.concatenate([before[:, None], segments[:, :-1]], axis=1)
-    return segments != previous
+    `before` `[B]` is the segment of the token ahead of the first; None
+    takes the first token's own, a row that continues whatever preceded it.
+    With `valid` `[B, S]`, "before" is the previous real token, across any
+    padding slots between, and a padding slot starts nothing."""
+    if valid is None:
+        before = segments[:, 0] if before is None else before
+        previous = jnp.concatenate([before[:, None], segments[:, :-1]], axis=1)
+        return segments != previous
+    rank, source = _stream_order(valid)
+    compact = jnp.take_along_axis(segments, source, axis=1, mode='fill', fill_value=-1)
+    starts = document_starts(compact, before)
+    return valid & jnp.take_along_axis(starts, jnp.maximum(rank, 0), axis=1)
 
 
 def document_conv1d(history, x, history_segments, segments, taps, bias=None):
@@ -126,7 +134,22 @@ def document_conv1d(history, x, history_segments, segments, taps, bias=None):
     return nn.silu(out)
 
 
-def _masked_conv1d(x, kernel, valid, state=None, bias=None):
+def _stream_order(valid):
+    """Each slot's index among its row's real tokens (`cumsum(valid) - 1`)
+    and, per compact column, the physical slot it holds. A column past the
+    row's real tokens keeps an out-of-range index, so it gathers a zero and
+    scatters no cotangent back onto a padded slot; every real token writes
+    its own column, so no two writers meet."""
+    batch, length = valid.shape
+    valid = jnp.asarray(valid, bool)
+    rank = jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+    source = jnp.full((batch, length), length, jnp.int32).at[
+        jnp.arange(batch)[:, None], jnp.where(valid, rank, length)].set(
+            jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length)), mode='drop')
+    return rank, source
+
+
+def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     """Convolve real tokens without advancing a paused row's history.
 
     A row's real tokens keep their order and their history: the j-th of them
@@ -138,32 +161,36 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None):
     stream a token-by-token scan fed it, behind the row's existing history,
     in one convolution instead of S sequential windows.
 
+    `segments` `[B, S]` makes each packed document convolve alone: a tap
+    reads a real token only if it shares the output token's segment
+    (`document_conv1d` over the compact stream). The held `state` counts as
+    the first real token's document, which a decode call continues.
+
     Masking the input of an ordinary convolution over the physical slots
     instead is a different function: a token after an interior gap would read
     the zeros in the gap rather than the real tokens before it. On nine slots
     with holes at 2, 5 and 6 that moves the outputs by 5.0 in fp32, which
     test_the_masked_conv_reads_across_a_gap measures.
     """
-    batch, channels, length = x.shape
+    batch, channels, _ = x.shape
     width = kernel.shape[1] - 1
     if state is None:
         state = jnp.zeros((batch, channels, width), x.dtype)
     valid = jnp.asarray(valid, bool)
-    rank = jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
-    # Which physical slot each compact column holds. A column past the row's
-    # real tokens keeps an out-of-range index, so it gathers a zero and
-    # scatters no cotangent back onto a padded slot; every real token writes
-    # its own column, so no two writers meet.
-    source = jnp.full((batch, length), length, jnp.int32).at[
-        jnp.arange(batch)[:, None], jnp.where(valid, rank, length)].set(
-            jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length)), mode='drop')
+    rank, source = _stream_order(valid)
     compact = jnp.take_along_axis(x, source[:, None, :], axis=2, mode='fill', fill_value=0)
     stream = jnp.concatenate([state, compact], axis=2)
-    # The history in front carries the K-1 taps the first real token reads, so
-    # column width + j of the convolution is the output of real token j, and
-    # the K-1 columns from the row's token count on are the history it leaves.
-    convolved = causal_conv1d(stream, kernel, bias=bias)
-    output = jnp.take_along_axis(convolved, (rank + width)[:, None, :], axis=2)
+    if segments is None:
+        # The history in front carries the K-1 taps the first real token
+        # reads, so column width + j of the convolution is the output of real
+        # token j.
+        convolved = causal_conv1d(stream, kernel, bias=bias)[..., width:]
+    else:
+        ordered = jnp.take_along_axis(segments, source, axis=1, mode='fill', fill_value=-1)
+        held = jnp.broadcast_to(ordered[:, :1], (batch, width))
+        convolved = document_conv1d(state, compact, held, ordered, kernel, bias)
+    output = jnp.take_along_axis(convolved, jnp.maximum(rank, 0)[:, None, :], axis=2)
+    # The K-1 stream columns from the row's token count on are the history it leaves.
     history = jnp.take_along_axis(
         stream, (rank[:, -1] + 1)[:, None, None] + jnp.arange(width)[None, None, :], axis=2)
     return jnp.where(valid[:, None, :], output, 0), history
