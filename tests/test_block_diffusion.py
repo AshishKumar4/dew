@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.diffusion.block import BlockProcess
@@ -33,6 +34,8 @@ def system():
     process = adapter.generation_process(config, json.loads((WORKFLOW / "generation_config.json").read_text()))
     with np.load(WORKFLOW / "reference.npz") as stored:
         reference = {name: stored[name] for name in stored.files}
+    with np.load(WORKFLOW / "numerics.npz") as stored:
+        reference.update({name: stored[name] for name in stored.files})
     return model, variables, process, reference, config
 
 
@@ -62,7 +65,10 @@ def test_invalid_sampling_geometry_is_rejected(fields):
 
 
 def test_native_shared_model_forward_matches_reference(system):
-    """fp32 maximum error 2.2e-6, identical argmax, tolerance 1e-4.
+    """Bare and self-conditioned canvas logits, held to twice the fp32
+    reference's own distance from its float64 run (tests/reference_error.py).
+    Observed RMS: bare 3.5e-07 against the reference's 3.3e-07, conditioned
+    3.5e-07 against 3.7e-07.
 
     Five prompt tokens exceed the four-token local window. Every canvas query
     reads the same last three prefix keys and all four canvas keys; the old
@@ -74,8 +80,9 @@ def test_native_shared_model_forward_matches_reference(system):
     bare = model.apply({**variables, "cache": cache}, reference["canvas"])
     conditioned = model.apply({**variables, "cache": cache}, reference["canvas"],
                               self_conditioning_logits=reference["previous"])
-    np.testing.assert_allclose(bare, reference["bare"], atol=1e-4, rtol=0)
-    np.testing.assert_allclose(conditioned, reference["conditioned"], atol=1e-4, rtol=0)
+    assert_as_exact_as_the_reference(bare, reference["bare"], reference["bare_f64"], "bare")
+    assert_as_exact_as_the_reference(conditioned, reference["conditioned"],
+                                     reference["conditioned_f64"], "conditioned")
     np.testing.assert_array_equal(jnp.argmax(conditioned, -1), reference["conditioned"].argmax(-1))
     for expected, actual in zip(jax.tree.leaves(before), jax.tree.leaves(cache), strict=True):
         np.testing.assert_array_equal(actual, expected)
@@ -207,6 +214,53 @@ def test_zero_tokens_does_not_prefill_and_capacity_uses_whole_canvases(system):
         process.generate(small, variables, inputs, 6, key=jax.random.key(11))
 
 
+def test_a_one_term_change_to_self_conditioning_fails_the_reference(system, monkeypatch):
+    """The bound above is tight enough for the self-conditioning branch: its
+    GELU in the erf form instead of the reference's tanh form puts the
+    conditioned logits 124 times the reference's rounding away, while the
+    bare logits, whose signal is zero, stay inside it."""
+    model, variables, _, reference, _ = system
+
+    def erf_gelu(self, inputs_embeds, signal):
+        normed = self.pre_norm(signal)
+        gated = self.down_proj(jax.nn.gelu(self.gate_proj(normed), approximate=False)
+                               * self.up_proj(normed))
+        return self.post_norm(inputs_embeds + gated)
+
+    monkeypatch.setattr(SelfConditioning, "__call__", erf_gelu)
+    cache = prefill(model, variables, reference["prompt"])
+    bare = model.apply({**variables, "cache": cache}, reference["canvas"])
+    conditioned = model.apply({**variables, "cache": cache}, reference["canvas"],
+                              self_conditioning_logits=reference["previous"])
+    assert_as_exact_as_the_reference(bare, reference["bare"], reference["bare_f64"], "bare")
+    with pytest.raises(AssertionError, match="ratio"):
+        assert_as_exact_as_the_reference(conditioned, reference["conditioned"],
+                                         reference["conditioned_f64"], "conditioned")
+
+
+def test_the_released_layout_denoiser_matches_the_reference():
+    """tools/hf_reference.py's diffusion-gemma-denoise-tiny: the released
+    checkpoint layout (text weights under both the encoder and the decoder
+    prefix, a separate head, two full layers with routed experts), read
+    through the public wrapper translation. One prompt of four, one canvas of
+    four, bare and self-conditioned, each held to twice the fp32 reference's
+    distance from float64: observed RMS bare 4.4e-08 against 4.3e-08,
+    conditioned 5.2e-08 against 6.0e-08."""
+    directory = FIXTURES / "diffusion-gemma-denoise-tiny"
+    config = {"model_type": "diffusion_gemma", "canvas_length": 4,
+              "text_config": json.loads((directory / "config.json").read_text())}
+    model = adapter.build(config, dtype="float32", attention_impl="xla")
+    variables = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
+    cache = prefill(model, variables, np.load(directory / "prompt.npy"))
+    canvas = np.load(directory / "canvas.npy")
+    with np.load(directory / "numerics.npz") as exact:
+        for name, previous in (("ref_bare", None), ("ref_conditioned", np.load(directory / "prev_logits.npy"))):
+            logits = model.apply({**variables, "cache": cache}, canvas, self_conditioning_logits=previous)
+            reference = np.load(directory / f"{name}.npy")
+            assert_as_exact_as_the_reference(logits, reference, exact[f"{name}_f64"], name)
+            np.testing.assert_array_equal(np.argmax(logits, -1), reference.argmax(-1))
+
+
 def test_self_conditioning_matches_the_reference_implementation():
     """Independent self-conditioning fixture: observed fp32 error 1.1e-6."""
     directory = FIXTURES / "diffusion-gemma-sc-tiny"
@@ -224,7 +278,8 @@ def test_soft_embeddings_averages_the_table_under_the_distribution():
 
 
 def test_media_prefill_and_canvas_generation_match_reference(system):
-    """Complete image-conditioned forward: observed fp32 maximum error 1.4e-6."""
+    """Complete image-conditioned forward, held to twice the fp32 reference's
+    distance from float64: observed RMS 3.3e-07 against the reference's 2.9e-07."""
     model, variables, process, reference, _ = system
     inputs = ModelInputs(
         jnp.asarray(reference["image_prompt"]),
@@ -236,7 +291,8 @@ def test_media_prefill_and_canvas_generation_match_reference(system):
         method=lambda module, batch: module.encode(batch.tokens, **batch.kwargs()),
         mutable=["cache"])[1]["cache"]
     logits = model.apply({**variables, "cache": cache}, reference["canvas"])
-    np.testing.assert_allclose(np.asarray(logits), reference["image_logits"], atol=1e-4, rtol=0)
+    assert_as_exact_as_the_reference(logits, reference["image_logits"],
+                                     reference["image_logits_f64"], "image")
     generated = process.generate(model, variables, inputs, 7, key=jax.random.key(11))
     np.testing.assert_array_equal(generated.tokens, reference["image_tokens"][:, :12])
     np.testing.assert_array_equal(generated.decoder_steps, reference["image_steps"])
