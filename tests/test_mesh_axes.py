@@ -440,7 +440,13 @@ def test_the_causal_convs_taps_gradient_under_a_partly_replicated_batch():
         split = jax.jit(jax.grad(loss, argnums=1))(
             jax.device_put(x, rows), taps, jax.device_put(cotangent, rows))
 
-    np.testing.assert_allclose(split, alone, rtol=1e-6)
+    # A tap's gradient sums one product per row and position; any order of
+    # that sum lands within their count times fp32 epsilon times the sum of
+    # the products' magnitudes, which the same gradient of |x| and
+    # |cotangent| is. The doubled gradient missed by the whole sum.
+    terms = x.shape[0] * x.shape[2]
+    magnitude = jax.grad(loss, argnums=1)(np.abs(x), taps, np.abs(cotangent))
+    np.testing.assert_array_less(np.abs(split - alone), terms * np.finfo(np.float32).eps * magnitude)
 
 
 def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused():
