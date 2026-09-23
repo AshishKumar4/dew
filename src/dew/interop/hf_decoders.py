@@ -2214,6 +2214,7 @@ from dew.interop.families.glm import (
     _glm_moe_dsa_config,
 )
 from dew.interop.families.gpt_oss import _gpt_oss_config, _gpt_oss_export, _gpt_oss_export_path, _gpt_oss_path
+from dew.interop.families.kimi import _kimi_k3_config, _kimi_k3_path, _kimi_k3_prepare
 from dew.interop.families.llama import _mistral_config, _mixtral_config, _mixtral_path
 from dew.interop.families.llama4 import _llama4_config, _llama4_export, _llama4_path, _llama4_prepare
 from dew.interop.families.masked_diffusion import (
@@ -2318,6 +2319,12 @@ _FAMILY_ENTRIES = (
     DecoderFamily(('kimi_k25',), _kimi_k25_config, lambda fields: False,
                   'kimi_k25', 'Kimi_K25ForConditionalGeneration', lambda model: {},
                   weight_path=_kimi_k25_path, preserve_source_layout=True,
+                  tied_head_names=('language_model.lm_head.weight',
+                                   'language_model.model.embed_tokens.weight')),
+    # Kimi K3's text decoder under its vision wrapper; provenance-only, like K2.5.
+    DecoderFamily(('kimi_k3',), _kimi_k3_config, lambda fields: False,
+                  'kimi_k3', 'KimiK3ForConditionalGeneration', lambda model: {},
+                  weight_path=_kimi_k3_path, prepare_weights=_kimi_k3_prepare, preserve_source_layout=True,
                   tied_head_names=('language_model.lm_head.weight',
                                    'language_model.model.embed_tokens.weight')),
     DecoderFamily(('deepseek_v3',), _deepseek_config,
