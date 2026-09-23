@@ -90,9 +90,14 @@ class Status(Enum):
         return self in (Status.COMPLETED, Status.AGENT_ERROR)
 
 
-def _real(value: float) -> bool:
-    """Whether `value` is a finite number; a bool is a flag, not a score."""
-    return type(value) is not bool and math.isfinite(value)
+def _real(value: float | str | None) -> bool:
+    """Whether `value` is a finite number; a bool is a flag, not a score.
+
+    Records arrive from gateways and JSON, so anything may land here, and
+    anything that is not a finite number is refused as a ValueError.
+    """
+    return (isinstance(value, (int, float, np.floating)) and not isinstance(value, bool)
+            and math.isfinite(value))
 
 
 def _token_ids(name: str, ids: object) -> None:
