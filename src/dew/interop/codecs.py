@@ -568,14 +568,6 @@ def fp8_blocks(block: int = BLOCK, *, ue8m0: bool = False) -> SourceQuantization
                                       quantize_fp8_blocks(weight, block, ue8m0=ue8m0), strict=True)))
 
 
-def dequantize_checkpoint(tensors: Mapping[str, np.ndarray], block: int, *,
-                          param_dtype: str = "float32") -> dict[str, np.ndarray]:
-    """Apply each `_scale_inv` to its weight, drop the scale, and keep the
-    weight in `param_dtype`. The block multiply stays FP32 and each weight is
-    cast as it is written, so no whole decoded model is held in FP32."""
-    return fp8_blocks(block).dequantize(tensors, param_dtype=param_dtype)
-
-
 # --------------------------------------------------------------------------
 # DeepSeek-V4: quant_method fp8 beside expert_dtype, <m>.weight and <m>.scale
 # --------------------------------------------------------------------------

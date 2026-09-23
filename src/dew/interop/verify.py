@@ -63,7 +63,7 @@ _WINDOW = 4
 # stores. The quantization record is the codec's, and the probe's weights are
 # plain floats.
 _PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoders._CODEC_FIELDS
-_INSTALL = "pip install 'dew-ml[verify]'"
+_INSTALL = "pip install 'dew-ml[torch]'"
 _FALLBACK = 'load_pretrained(..., fallback="torchax")'
 # fp32 rounding between Dew and transformers on a registered family, in eps
 # per layer per unit of the largest reference logit. The thirteen dense and

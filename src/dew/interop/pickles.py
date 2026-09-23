@@ -30,6 +30,7 @@ import ml_dtypes
 import numpy as np
 
 from dew.interop.safetensors_io import WEIGHTS_FILE, weight_files, write_file
+from dew.telemetry.instrumentation import dew_cache_dir
 
 if TYPE_CHECKING:
     import torch
@@ -41,11 +42,6 @@ SUFFIX = ".bin"
 
 CONVERT_SPACE = "https://huggingface.co/spaces/safetensors/convert"
 """SFconvertbot's space, which opens a repo's safetensors conversion as a pull request."""
-
-
-def cache_root() -> Path:
-    """Dew's cache directory: `$DEW_CACHE`, else ~/.cache/dew."""
-    return Path(os.environ.get("DEW_CACHE") or Path.home() / ".cache" / "dew")
 
 
 def converted(directory: Path, shards: Sequence[str]) -> Path:
@@ -62,14 +58,14 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
     for name in shards:
         status = (directory / name).stat()
         identity.append([name, os.path.realpath(directory / name), status.st_size, status.st_mtime_ns])
-    target = cache_root() / "converted" / hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
+    target = Path(dew_cache_dir()) / "converted" / hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
     if target.is_dir() and weight_files({entry.name for entry in target.iterdir()}, "",
                                         lambda name: json.loads((target / name).read_text())):
         return target
     if importlib.util.find_spec("torch") is None:
         raise ImportError(
             f"{directory} holds PyTorch pickles ({', '.join(shards)}), and converting them needs torch: "
-            f"pip install 'dew-ml[pickles]', or open their safetensors conversion at {CONVERT_SPACE} "
+            f"pip install 'dew-ml[torch]', or open their safetensors conversion at {CONVERT_SPACE} "
             "and load its refs/pr/N revision")
     target.mkdir(parents=True, exist_ok=True)
     outputs = ([WEIGHTS_FILE] if len(shards) == 1 else

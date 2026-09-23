@@ -12,7 +12,6 @@ reads the next, so a process holds one device shard of one leaf at a time.
 """
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -58,10 +57,6 @@ class SourceLeaf:
     @property
     def ndim(self) -> int:
         return len(self.shape)
-
-    @property
-    def nbytes(self) -> int:
-        return math.prod(self.shape) * self.dtype.itemsize
 
     def _view(self, member: np.ndarray) -> np.ndarray:
         return np.swapaxes(member, -1, -2) if self.transposed else member

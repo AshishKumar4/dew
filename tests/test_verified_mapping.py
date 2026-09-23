@@ -138,7 +138,7 @@ def test_a_type_that_computes_something_else_is_refused_with_its_error(tmp_path,
 def test_without_torch_the_refusal_names_the_extra_and_the_generic_route(tmp_path, monkeypatch):
     write_tiny(tmp_path, "cwm")
     monkeypatch.setitem(sys.modules, "torch", None)
-    with pytest.raises(ValueError, match=r"pip install 'dew-ml\[verify\]'") as refused:
+    with pytest.raises(ValueError, match=r"pip install 'dew-ml\[torch\]'") as refused:
         load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
     assert TORCHAX in str(refused.value)
 

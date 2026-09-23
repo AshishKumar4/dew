@@ -574,7 +574,7 @@ def test_the_latent_norms_keep_the_reference_epsilon(name, tmp_path):
 
 @pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
 def test_codec_parameter_storage_follows_fp32_dequantization(kind):
-    from dew.interop.codecs import MXFP4, dequantize_checkpoint, fp8_blocks
+    from dew.interop.codecs import MXFP4, fp8_blocks
 
     weight = (np.arange(15, dtype=np.float32).reshape(3, 5) - 7) / 11 if kind == "fp8" else (
         np.arange(2 * 64 * 48, dtype=np.float32).reshape(2, 64, 48) % 13 - 6) / 7
@@ -582,8 +582,8 @@ def test_codec_parameter_storage_follows_fp32_dequantization(kind):
               "indices": np.asarray([0, 255], np.uint8)}
     if kind == "fp8":
         packed = fp8_blocks(2, ue8m0=False).requantize(source, ("weight",))
-        masters = dequantize_checkpoint(packed, block=2)
-        native = dequantize_checkpoint(packed, block=2, param_dtype="bfloat16")
+        masters = fp8_blocks(2).dequantize(packed)
+        native = fp8_blocks(2).dequantize(packed, param_dtype="bfloat16")
     else:
         packed = MXFP4.requantize(source, ("weight",))
         masters = MXFP4.dequantize(packed)
@@ -598,13 +598,13 @@ def test_codec_parameter_storage_follows_fp32_dequantization(kind):
 
 @pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
 def test_codec_rejects_integer_parameter_storage(kind):
-    from dew.interop.codecs import MXFP4, dequantize_checkpoint
+    from dew.interop.codecs import MXFP4, fp8_blocks
 
     if kind == "fp8":
         packed = {"weight": np.ones((1, 1), np.float32),
                   "weight_scale_inv": np.full((1, 1), 1.25, np.float32)}
         with pytest.raises(ValueError, match="int32"):
-            dequantize_checkpoint(packed, 1, param_dtype="int32")
+            fp8_blocks(1).dequantize(packed, param_dtype="int32")
     else:
         packed = MXFP4.requantize({"weight": np.full((1, 32, 2), 1.5, np.float32)}, ("weight",))
         with pytest.raises(ValueError, match="int32"):

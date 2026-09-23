@@ -105,8 +105,10 @@ eval-harness = ["lm_eval>=0.4.10"]
 tfds = ["tensorflow-datasets>=4.9.10"]
 # Flax <-> safetensors conversion (dew.interop)
 interop = ["safetensors"]
-# PyTorch pickle checkpoints (pytorch_model.bin), unpickled once into Dew's cache as safetensors.
-pickles = ["torch"]
+# PyTorch on the host, never for a JAX computation: unpickling pytorch_model.bin
+# once into Dew's cache (dew.interop.pickles), and the tier-2 check that runs
+# transformers' own model for an unregistered decoder (dew.interop.verify).
+torch = ["torch"]
 # GGUF files (load_pretrained(..., gguf_file=)): llama.cpp's reader and block dequantizers.
 gguf = ["gguf==0.19.0"]
 # Official client transports and native request/result schemas; no model runtime.
@@ -115,9 +117,6 @@ inference-clients = ["ollama>=0.6.2,<0.7", "openai>=3.8,<4"]
 guided = ["outlines-core>=0.2.14"]
 # HF image processors use torchvision on the host; model computation stays JAX.
 vision = ["torchvision>=0.29"]
-# Loading an unregistered decoder through the verified Llama convention
-# (dew.interop.verify) runs transformers' own model for it on torch first.
-verify = ["torch"]
 # load_pretrained(fallback="torchax"): transformers' PyTorch forward lowered to
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build
 # the fallback's tests ran against.

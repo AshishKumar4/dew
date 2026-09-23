@@ -135,19 +135,17 @@ def place(variables: Variables, mesh: MeshSpec | None, layout: Layout | None) ->
     """Place `variables` on the mesh `mesh` describes, one leaf at a time.
 
     The sharding is the one the trainer gives a train state's parameters under
-    `layout`. Each leaf lands on its sharding before the next is read
-    (`dew.training.host.place_leaf`); a `SourceLeaf` is read from the
-    mapped checkpoint one device shard at a time, so no host copy of the
-    whole tree is made.
+    `layout`; `dew.training.host.stream` places the leaves, updating the
+    dict nodes of `variables` in place.
     """
     from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, build_mesh
-    from dew.training.host import place_leaf
+    from dew.training.host import stream
 
     device_mesh = build_mesh(DefaultMesh() if mesh is None else mesh)
     chosen_layout = DefaultLayout() if layout is None else layout
     shardings = chosen_layout.shardings(device_mesh, variables)
     chosen_layout.check(variables, shardings, device_mesh)
-    return jax.tree.map(place_leaf, variables, shardings)
+    return stream(variables, shardings)
 
 
 class RunTokenizer(Protocol):

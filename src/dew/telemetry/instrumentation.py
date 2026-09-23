@@ -405,6 +405,11 @@ def model_flops_utilization(
     return flops_per_step / step_time / peak
 
 
+def dew_cache_dir() -> str:
+    """Dew's cache directory: `$XDG_CACHE_HOME/dew`, else ~/.cache/dew."""
+    return os.path.expanduser(os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.join('~', '.cache'), 'dew'))
+
+
 def default_compilation_cache_dir() -> str:
     """Where compiled executables go unless a run names somewhere else.
 
@@ -413,9 +418,7 @@ def default_compilation_cache_dir() -> str:
     interpreter can therefore read bytes using the wrong codec. Explicit
     paths passed to enable_compilation_cache remain unchanged.
     """
-    home = os.environ.get('XDG_CACHE_HOME') or os.path.join('~', '.cache')
-    runtime = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    return os.path.expanduser(os.path.join(home, 'dew', 'xla', runtime))
+    return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}")
 
 
 def enable_compilation_cache(path: str):

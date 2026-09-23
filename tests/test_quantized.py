@@ -26,7 +26,6 @@ from dew.interop.codecs import (
     BLOCK,
     E4M3_MAX,
     SCALE_SUFFIX,
-    dequantize_checkpoint,
     dequantize_fp8_blocks,
     fp8_blocks,
     fp8_format,
@@ -115,7 +114,7 @@ def test_the_loader_hook_dequantizes_every_paired_weight_and_nothing_else():
         "model.norm.weight": norm,
     }
 
-    out = dequantize_checkpoint(tensors, BLOCK)
+    out = fp8_blocks(BLOCK).dequantize(tensors)
 
     assert set(out) == {"model.layers.0.mlp.up_proj.weight",
                         "model.layers.0.self_attn.o_proj.weight", "model.norm.weight"}
@@ -128,8 +127,7 @@ def test_the_loader_hook_dequantizes_every_paired_weight_and_nothing_else():
 
 def test_a_scale_without_its_weight_is_refused():
     with pytest.raises(ValueError, match="scales model.layers.0.mlp.up_proj.weight, which"):
-        dequantize_checkpoint({"model.layers.0.mlp.up_proj.weight_scale_inv": np.ones((1, 1))},
-                              BLOCK)
+        fp8_blocks(BLOCK).dequantize({"model.layers.0.mlp.up_proj.weight_scale_inv": np.ones((1, 1))})
 
 
 DEEPSEEK_V3 = {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
@@ -485,7 +483,7 @@ def test_the_quantized_names_come_off_the_sources_own_scale_partners():
     """What a loader has to record before it dequantizes: which tensors the
     source shipped quantized, read off the `_scale_inv` partners in
     checkpoint order rather than guessed from a name or a shape. After
-    `dequantize_checkpoint` the partners are gone and an fp8 weight is an
+    `fp8_blocks(...).dequantize` the partners are gone and an fp8 weight is an
     fp32 array like every other one, so the record cannot be taken later."""
     tensors = {"model.embed_tokens.weight": np.ones((4, 4), np.float32),
                "model.layers.0.mlp.up_proj.weight": np.ones((4, 4), FP8),
@@ -498,7 +496,7 @@ def test_the_quantized_names_come_off_the_sources_own_scale_partners():
 
     assert names == ("model.layers.0.mlp.up_proj.weight",
                      "model.layers.0.self_attn.o_proj.weight")
-    dense = dequantize_checkpoint(tensors, BLOCK)
+    dense = fp8_blocks(BLOCK).dequantize(tensors)
     assert scaled_names(dense) == (), "the record cannot be taken after the load"
     assert all(dense[name].dtype == np.float32 for name in names)
 
@@ -767,8 +765,8 @@ def test_deepseek_v3_kv_a_proj_dequantizes_like_the_reference():
     scale_inv = tensor(TENSOR + "_scale_inv", np.float32)
     assert weight.shape == (576, 7168) and scale_inv.shape == (5, 56)
 
-    out = dequantize_checkpoint({TENSOR: weight.astype(np.float32),
-                                 TENSOR + "_scale_inv": scale_inv}, BLOCK)[TENSOR]
+    out = fp8_blocks(BLOCK).dequantize({TENSOR: weight.astype(np.float32),
+                                        TENSOR + "_scale_inv": scale_inv})[TENSOR]
 
     assert np.array_equal(bits(out), bits(reference(weight, scale_inv, BLOCK)))
     assert np.all(np.isfinite(out))

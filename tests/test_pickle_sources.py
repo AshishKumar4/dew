@@ -1,7 +1,7 @@
 """PyTorch pickle checkpoints through a one-time safetensors conversion.
 
 A `pytorch_model.bin`, or the shards its index names, is unpickled once with
-torch, written as safetensors under `$DEW_CACHE`, and mapped from there; a
+torch, written as safetensors under Dew's cache (`$XDG_CACHE_HOME/dew`), and mapped from there; a
 later load of the same files maps the cache and never imports torch. The
 offline cases use the committed mamba2-tiny fixture pickled into a temporary
 directory, so the whole load is checked against its transformers logits.
@@ -28,7 +28,7 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "hf" / "mamba2-tiny"
 @pytest.fixture
 def cache(monkeypatch, tmp_path):
     root = tmp_path / "cache"
-    monkeypatch.setenv("DEW_CACHE", str(root))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(root))
     return root
 
 
@@ -55,12 +55,12 @@ def test_a_pickle_checkpoint_converts_once_and_then_loads_without_torch(tmp_path
     reference = np.load(FIXTURE / "logits.npy")
 
     first = load_pretrained(source, dtype="float32", attention_impl="reference")
-    conversions = sorted((cache / "converted").iterdir())
+    conversions = sorted((cache / "dew" / "converted").iterdir())
     monkeypatch.setitem(sys.modules, "torch", None)
     second = load_pretrained(source, dtype="float32", attention_impl="reference")
 
     assert float(np.max(np.abs(logits(first) - reference))) < 1e-5
-    assert len(conversions) == 1 and sorted((cache / "converted").iterdir()) == conversions
+    assert len(conversions) == 1 and sorted((cache / "dew" / "converted").iterdir()) == conversions
     assert jax.tree.all(jax.tree.map(np.array_equal, first.variables, second.variables))
 
 
@@ -90,7 +90,7 @@ def test_without_torch_a_pickle_checkpoint_is_refused_naming_the_extra(tmp_path,
     source = pickled_fixture(tmp_path / "source")
     monkeypatch.setitem(sys.modules, "torch", None)
 
-    with pytest.raises(ImportError, match=r"dew-ml\[pickles\].*huggingface\.co/spaces/safetensors/convert"):
+    with pytest.raises(ImportError, match=r"dew-ml\[torch\].*huggingface\.co/spaces/safetensors/convert"):
         load_pretrained(source)
 
 
