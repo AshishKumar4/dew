@@ -100,6 +100,32 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None):
     return windows
 
 
+def document_starts(segments, before):
+    """`[B, S]`: whether each token's segment differs from the one before it.
+    `before` `[B]` is the segment of the token ahead of the first, the
+    first's own where nothing precedes it."""
+    previous = jnp.concatenate([before[:, None], segments[:, :-1]], axis=1)
+    return segments != previous
+
+
+def document_conv1d(history, x, history_segments, segments, taps, bias=None):
+    """The causal depthwise conv of `causal_conv1d` over `x` `[B, D, S]`
+    behind `history` `[B, D, K-1]`, where a tap reads a token only if it
+    shares the output token's segment: each packed document convolves as if
+    zeros preceded it, as mamba_ssm's `causal_conv1d_fn(seq_idx=...)` does.
+    `taps` `[D, K]`, `history_segments` `[B, K-1]`, `segments` `[B, S]`;
+    silu after the bias."""
+    width = taps.shape[1] - 1
+    length = x.shape[-1]
+    stream = jnp.concatenate([history, x], axis=2)
+    stream_segments = jnp.concatenate([history_segments, segments], axis=1)
+    out = jnp.zeros_like(x) if bias is None else jnp.broadcast_to(bias[None, :, None], x.shape)
+    for tap in range(width + 1):
+        same = stream_segments[:, tap:tap + length] == segments
+        out = out + taps[None, :, tap, None] * jnp.where(same[:, None], stream[..., tap:tap + length], 0)
+    return nn.silu(out)
+
+
 def _masked_conv1d(x, kernel, valid, state=None, bias=None):
     """Convolve real tokens without advancing a paused row's history.
 

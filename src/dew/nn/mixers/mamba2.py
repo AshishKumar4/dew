@@ -58,7 +58,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
-from dew.nn.linear import _masked_conv1d, causal_conv1d
+from dew.nn.linear import _masked_conv1d, causal_conv1d, document_conv1d, document_starts
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.sharding import SEQUENCE_AXIS, logical_axes, row_axes, sequence_shards
 
@@ -254,32 +254,6 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
         one_token, jnp.asarray(state, jnp.float32),
         tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
     return jnp.moveaxis(out, 0, 1).astype(dtype), final.astype(dtype)
-
-
-def document_starts(segments, before):
-    """`[B, S]`: whether each token's segment differs from the one before it.
-    `before` `[B]` is the segment of the token ahead of the first, the
-    first's own where nothing precedes it."""
-    previous = jnp.concatenate([before[:, None], segments[:, :-1]], axis=1)
-    return segments != previous
-
-
-def document_conv1d(history, x, history_segments, segments, taps, bias=None):
-    """The causal depthwise conv of `causal_conv1d` over `x` `[B, D, S]`
-    behind `history` `[B, D, K-1]`, where a tap reads a token only if it
-    shares the output token's segment: each packed document convolves as if
-    zeros preceded it, as mamba_ssm's `causal_conv1d_fn(seq_idx=...)` does.
-    `taps` `[D, K]`, `history_segments` `[B, K-1]`, `segments` `[B, S]`;
-    silu after the bias."""
-    width = taps.shape[1] - 1
-    length = x.shape[-1]
-    stream = jnp.concatenate([history, x], axis=2)
-    stream_segments = jnp.concatenate([history_segments, segments], axis=1)
-    out = jnp.zeros_like(x) if bias is None else jnp.broadcast_to(bias[None, :, None], x.shape)
-    for tap in range(width + 1):
-        same = stream_segments[:, tap:tap + length] == segments
-        out = out + taps[None, :, tap, None] * jnp.where(same[:, None], stream[..., tap:tap + length], 0)
-    return nn.silu(out)
 
 
 class Conv1dTaps(nn.Module):
