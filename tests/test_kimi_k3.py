@@ -119,14 +119,18 @@ def test_situ_matches_the_released_activation():
 
 def test_forward_matches_the_reference_over_left_padding(source):
     """fp32 logits over 70 tokens (past one KDA chunk), one row left-padded
-    by 9, against fla 0.5.2 on CUDA: per-token max errors are 2e-6 to 1.7e-5
-    except three isolated tokens (4.6e-5, 4.9e-5, 1.24e-4) whose neighbours
-    are back at 1e-5, so the excess does not travel the KDA recurrence or the
-    depth mixture. Tolerance 2e-4; argmax exact."""
+    by 9, against fla 0.5.2 on CUDA with its intra-chunk solve in IEEE fp32
+    (tools/kimi_k3_reference.py). The tolerance adds the two sides' fp32
+    rounding, each measured against a float64 forward of these weights with
+    the exact KDA recurrence: Dew's logits miss it by at most 2.2e-5 on CPU
+    (1.6e-5 on the 4080 at matmul precision highest) and the fixture's by
+    2.3e-5. Tolerance 5e-5; largest difference 4.4e-5 on CPU and 3.5e-5 on
+    the 4080, argmax exact. At fla's default TF32 solve the fixture itself
+    missed the float64 logits by up to 1.3e-4, which this tolerance refuses."""
     loaded, inputs, reference = source
     valid = reference["attention_mask"].astype(bool)
     logits = jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
-    np.testing.assert_allclose(np.asarray(logits)[valid], reference["logits"][valid], atol=2e-4, rtol=0)
+    np.testing.assert_allclose(np.asarray(logits)[valid], reference["logits"][valid], atol=5e-5, rtol=0)
     np.testing.assert_array_equal(np.asarray(logits)[valid].argmax(-1), reference["logits"][valid].argmax(-1))
 
 
@@ -151,11 +155,17 @@ def test_each_depth_site_is_read_where_the_reference_reads_it(source):
 
 def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_path):
     """One all-parameter SGD step at the reference's learning rate (1e-2,
-    which moves the logits by up to 4.2): loss within 1e-5 and updated logits
-    within 5e-4 (measured max 3.6e-4, the forward's isolated tokens grown by
-    the step). The export writes every source name back: towers
-    byte-exact, A_log zero-padded to its stored length, trained experts as
-    MXFP4 pairs, everything else as trained; reloading reproduces that."""
+    which moves the logits by up to 4.2): loss within 1e-5, and updated
+    logits within the sum of the two sides' distances from a float64 step.
+    Those distances are the fp32 rounding of the gradient, most of it in
+    layer 0's A_log, whose gradient sums 2,096 token and key-dimension terms
+    to 1/70 of their absolute sum. Against the float64 step the updated
+    logits miss by at most 5.1e-5 for Dew on CPU, 1.25e-4 for Dew on the
+    4080 and 2.0e-4 for the fixture. Tolerance 3.5e-4; largest difference
+    2.1e-4 on CPU and 2.3e-4 on the 4080. The export writes every source
+    name back: towers byte-exact, A_log zero-padded to its stored length,
+    trained experts as MXFP4 pairs, everything else as trained; reloading
+    reproduces that."""
     loaded, inputs, reference = source
     objective = LMObjective(loaded.model, inputs.tokens.shape[1] - 1, pretrained=loaded.variables,
                             ema_decay=None, pad_id=0)
@@ -171,7 +181,7 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
         lambda weight, grad: weight - reference["learning_rate"] * grad, loaded.variables["params"], gradient)}
     valid = reference["attention_mask"].astype(bool)
     updated = loaded.model.apply(variables, inputs.tokens, **inputs.kwargs())
-    np.testing.assert_allclose(np.asarray(updated)[valid], reference["updated_logits"][valid], atol=5e-4, rtol=0)
+    np.testing.assert_allclose(np.asarray(updated)[valid], reference["updated_logits"][valid], atol=3.5e-4, rtol=0)
 
     loaded.save(tmp_path, variables=variables)
     written, shipped = load_file(str(tmp_path / "model.safetensors")), load_file(str(TINY / "model.safetensors"))
