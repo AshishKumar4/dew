@@ -68,8 +68,14 @@ HARBOR_KEY = "harbor"
 # Harbor's exception class names (harbor.trial.errors, harbor.agents.installed.base).
 _TRUNCATIONS = frozenset({"AgentTimeoutError", "ContextWindowExceededError", "OutputTokenExceededError"})
 _AGENT_FAILURES = frozenset({"NonZeroAgentExitCodeError"})
-# mini-swe-agent's exit statuses for a run it stopped at its own step or time limit.
-_HARNESS_LIMITS = frozenset({"LimitsExceeded", "TimeExceeded"})
+# mini-swe-agent's exit statuses for a run it stopped at its own step or time limit, or that the
+# model call's context overflowed (mini-swe-agent records the raised exception's class name).
+_HARNESS_LIMITS = frozenset({"LimitsExceeded", "TimeExceeded", "ContextWindowExceededError"})
+# Exit statuses naming a litellm or OpenAI client exception: the harness's model call failed after its
+# own retries. Harbor's error patterns do not match litellm's wording, so it reports only a nonzero exit.
+_CLIENT_FAILURES = frozenset({"APIConnectionError", "APIError", "APIResponseValidationError", "BadGatewayError",
+                              "InternalServerError", "RateLimitError", "ServiceUnavailableError", "Timeout",
+                              "APITimeoutError"})
 _SESSION = re.compile(r"[A-Za-z0-9._:/-]+")
 
 
@@ -169,6 +175,8 @@ def outcome(result: Mapping[str, Any], records: tuple[Call, ...], *, harness_exi
         return Status.TRUNCATED, reward, rewards, detail or harness_exit or "the last call stopped at its length limit"
     if not records:
         return Status.INFRA_ERROR, reward, rewards, detail or "no model call reached the gateway session"
+    if harness_exit in _CLIENT_FAILURES:
+        return Status.INFRA_ERROR, reward, rewards, f"the harness's model client failed: {harness_exit}"
     if reward is not None and kind is None:
         return Status.COMPLETED, reward, rewards, ""
     if reward is not None and kind in _AGENT_FAILURES:
