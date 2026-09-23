@@ -55,6 +55,7 @@ from .dataset import (
     mixed_records,
     mixed_stream,
     mixture,
+    phased,
     train_stream,
     validation_pass,
 )
@@ -125,6 +126,36 @@ def corpora_dataset(train: Sequence[Corpus], held: Sequence[Corpus] | None,
         validation = bounded(validation_pass(ordered, operations, batch=rows, seed=seed,
                                              loading=loading), val_batches)
     return Dataset(train=stream, val=validation, records=pass_records, batch=batch)
+
+
+def phased_dataset(phases: Sequence[tuple[Sequence[Corpus], int | None]],
+                   held: Sequence[Corpus] | None,
+                   operations: Sequence[pygrain.Transformation], *, batch: int, seed: int,
+                   loading: Loading, val_batches: int | None) -> Dataset:
+    """The batches of one corpus or mixture per phase, each phase ending at a
+    step of `batch` records (None for the last).
+
+    Each phase streams as `corpora_dataset` streams it, from its own record
+    zero, and `PhasedStream` switches at the boundaries and resumes onto an
+    extended or re-planned phase list. A pass is the first phase's; `held`
+    is validated as `corpora_dataset` validates it.
+    """
+    rows = local_batch(batch)
+    streams = []
+    for corpora, until in phases:
+        stream = (train_stream(corpora[0].source, operations, batch=rows, seed=seed, loading=loading)
+                  if len(corpora) == 1 else
+                  mixed_stream(corpora, operations, batch=rows, seed=seed, loading=loading))
+        streams.append((stream, None if until is None else until * batch))
+    first = phases[0][0]
+    records = counted(first[0].source, None, first[0].name) if len(first) == 1 else mixed_records(first)
+    validation = None
+    if held is not None:
+        ordered = held[0].source if len(held) == 1 else mixture(held, None)
+        validation = bounded(validation_pass(ordered, operations, batch=rows, seed=seed,
+                                             loading=loading), val_batches)
+    return Dataset(train=phased(streams, loading=loading), val=validation, records=records,
+                   batch=batch)
 
 class Preprocessing(pygrain.RandomMapTransform):
     """`preprocess` as the grain transformation that runs inside the workers."""
