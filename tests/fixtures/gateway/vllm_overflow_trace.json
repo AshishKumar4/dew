@@ -1,0 +1,42 @@
+{
+ "trace_id": "f7367df1-f92f-4c73-ab10-03b7b467dffe",
+ "session_id": "fixture",
+ "model": "Qwen/Qwen3-0.6B",
+ "messages": [
+  {
+   "role": "user",
+   "content": "Say hi."
+  }
+ ],
+ "prompt_token_ids": [],
+ "response_message": {},
+ "completion_token_ids": [],
+ "logprobs": null,
+ "routing_matrices": null,
+ "finish_reason": null,
+ "weight_version": null,
+ "latency_ms": 3.0,
+ "token_counts": {},
+ "timestamp": 1790131354.5651987,
+ "metadata": {},
+ "raw_request": {
+  "model": "Qwen/Qwen3-0.6B",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Say hi."
+   }
+  ],
+  "max_tokens": 16,
+  "logprobs": true,
+  "return_token_ids": true
+ },
+ "raw_response": {
+  "error": {
+   "message": "This model's maximum context length is 2048 tokens. However, you requested 16 output tokens and your prompt contains 4012 input tokens, for a total of 4028 tokens. Please reduce the length of the input prompt or the number of requested output tokens.",
+   "type": "BadRequestError",
+   "param": "input_tokens",
+   "code": 400
+  }
+ }
+}

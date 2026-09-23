@@ -1,0 +1,241 @@
+{
+ "status": 200,
+ "body": {
+  "id": "5192187e520d4da7832ceb968cee7545",
+  "object": "chat.completion",
+  "created": 1790130807,
+  "model": "Qwen/Qwen3-0.6B",
+  "choices": [
+   {
+    "index": 0,
+    "message": {
+     "role": "assistant",
+     "content": "<think>\nOkay, the user just said \"Say hi.\" So I need to",
+     "reasoning_content": null,
+     "tool_calls": null
+    },
+    "logprobs": {
+     "content": [
+      {
+       "token": "<think>",
+       "bytes": [
+        60,
+        116,
+        104,
+        105,
+        110,
+        107,
+        62
+       ],
+       "logprob": 0.0,
+       "top_logprobs": []
+      },
+      {
+       "token": "\n",
+       "bytes": [
+        10
+       ],
+       "logprob": 0.0,
+       "top_logprobs": []
+      },
+      {
+       "token": "Okay",
+       "bytes": [
+        79,
+        107,
+        97,
+        121
+       ],
+       "logprob": -0.002960111480206251,
+       "top_logprobs": []
+      },
+      {
+       "token": ",",
+       "bytes": [
+        44
+       ],
+       "logprob": 0.0,
+       "top_logprobs": []
+      },
+      {
+       "token": " the",
+       "bytes": [
+        32,
+        116,
+        104,
+        101
+       ],
+       "logprob": -0.00017924723215401173,
+       "top_logprobs": []
+      },
+      {
+       "token": " user",
+       "bytes": [
+        32,
+        117,
+        115,
+        101,
+        114
+       ],
+       "logprob": 0.0,
+       "top_logprobs": []
+      },
+      {
+       "token": " just",
+       "bytes": [
+        32,
+        106,
+        117,
+        115,
+        116
+       ],
+       "logprob": -0.28673630952835083,
+       "top_logprobs": []
+      },
+      {
+       "token": " said",
+       "bytes": [
+        32,
+        115,
+        97,
+        105,
+        100
+       ],
+       "logprob": -0.04304320365190506,
+       "top_logprobs": []
+      },
+      {
+       "token": " \"",
+       "bytes": [
+        32,
+        34
+       ],
+       "logprob": -0.0021232240833342075,
+       "top_logprobs": []
+      },
+      {
+       "token": "Say",
+       "bytes": [
+        83,
+        97,
+        121
+       ],
+       "logprob": -0.00826672837138176,
+       "top_logprobs": []
+      },
+      {
+       "token": " hi",
+       "bytes": [
+        32,
+        104,
+        105
+       ],
+       "logprob": -4.780406743520871e-05,
+       "top_logprobs": []
+      },
+      {
+       "token": ".\"",
+       "bytes": [
+        46,
+        34
+       ],
+       "logprob": -0.00018449338676873595,
+       "top_logprobs": []
+      },
+      {
+       "token": " So",
+       "bytes": [
+        32,
+        83,
+        111
+       ],
+       "logprob": -1.940600037574768,
+       "top_logprobs": []
+      },
+      {
+       "token": " I",
+       "bytes": [
+        32,
+        73
+       ],
+       "logprob": -0.06909709423780441,
+       "top_logprobs": []
+      },
+      {
+       "token": " need",
+       "bytes": [
+        32,
+        110,
+        101,
+        101,
+        100
+       ],
+       "logprob": -0.0008401822997257113,
+       "top_logprobs": []
+      },
+      {
+       "token": " to",
+       "bytes": [
+        32,
+        116,
+        111
+       ],
+       "logprob": 0.0,
+       "top_logprobs": []
+      }
+     ]
+    },
+    "finish_reason": "length",
+    "matched_stop": null,
+    "prompt_token_ids": [
+     151644,
+     872,
+     198,
+     45764,
+     15588,
+     13,
+     151645,
+     198,
+     151644,
+     77091,
+     198
+    ],
+    "response_token_ids": [
+     151667,
+     198,
+     32313,
+     11,
+     279,
+     1196,
+     1101,
+     1053,
+     330,
+     45764,
+     15588,
+     1189,
+     2055,
+     358,
+     1184,
+     311
+    ]
+   }
+  ],
+  "usage": {
+   "prompt_tokens": 11,
+   "total_tokens": 27,
+   "completion_tokens": 16,
+   "prompt_tokens_details": null,
+   "reasoning_tokens": 0
+  },
+  "metadata": {
+   "weight_version": "default",
+   "weight_versions": [
+    {
+     "version": "default",
+     "start": 0,
+     "end": 16
+    }
+   ]
+  }
+ }
+}
