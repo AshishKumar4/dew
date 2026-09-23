@@ -4,6 +4,7 @@
 """
 
 import functools
+from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
@@ -12,7 +13,15 @@ from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.moe import Routes, chosen_experts, expert_dispatch, expert_projection, gather_expert_bias
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import LogicalAxes, logical_axes
+
+FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
+    "gate_up_proj": ("exp", "embed", "mlp"),
+    "gate_up_proj_bias": ("exp", "mlp"),
+    "down_proj": ("exp", "mlp", "embed"),
+    "down_proj_bias": ("exp", "embed"),
+}
+"""The fused expert leaves' axes, in the order `GptOssExperts` creates them."""
 
 
 class GptOssExperts(nn.Module):
@@ -50,7 +59,8 @@ class GptOssExperts(nn.Module):
             raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
         slots = expert_dispatch(
             functools.partial(self._project, dtype=compute_dtype), x.astype(compute_dtype), indices,
-            (gate_up, gate_bias, down, down_bias), num_experts=self.num_local_experts,
+            (gate_up, gate_bias, down, down_bias), tuple(FUSED_EXPERT_AXES.values()),
+            num_experts=self.num_local_experts,
             dispatch=self.dispatch, output_dtype=compute_dtype, initializing=self.is_initializing(),
             capacity_factor=self.capacity_factor)
         return jnp.sum(slots * weights[..., None], axis=-2)
@@ -72,10 +82,7 @@ class GptOssExperts(nn.Module):
 
 @logical_axes({
     ("router",): ("embed", "exp"),
-    ("experts", "gate_up_proj"): ("exp", "embed", "mlp"),
-    ("experts", "gate_up_proj_bias"): ("exp", "mlp"),
-    ("experts", "down_proj"): ("exp", "mlp", "embed"),
-    ("experts", "down_proj_bias"): ("exp", "embed"),
+    **{("experts", name): axes for name, axes in FUSED_EXPERT_AXES.items()},
 })
 class GptOssMLP(nn.Module):
     """Softmax over the selected biased logits, then the selected expert sum.
