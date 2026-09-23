@@ -621,10 +621,10 @@ class EpisodeRollout:
             group_start = episodes[index - index % self.groups]
             if episode.identity.task != group_start.identity.task:
                 raise ValueError("an advantage group must contain the same task")
-        rollouts = [session_of(episode, group=str(index // self.groups))
+        sessions = [session_of(episode, group=str(index // self.groups))
                     for index, episode in enumerate(episodes)]
         rows = len(episodes) * self.max_turns if self.rows is None else self.rows
-        batch = pack(rollouts, self.max_prompt_tokens + self.max_new_tokens, rows=rows)
+        batch = pack(sessions, self.max_prompt_tokens + self.max_new_tokens, rows=rows)
         batch[OLD_LOG_PROBS_KEY] = sampled_values(
             batch, lambda index, number: episodes[index].transitions[number].action.raw_log_probs)
         return batch
@@ -639,7 +639,7 @@ def session_of(episode: Episode, *, group: str) -> Session:
     infrastructure failure; how well the agent did is the verifier's reward.
     """
     if episode.status == EpisodeStatus.RUNNING:
-        raise ValueError("a running episode has not ended, so it is no rollout yet")
+        raise ValueError("a running episode has not ended, so it is no session yet")
     status = {EpisodeStatus.COMPLETED: Status.COMPLETED, EpisodeStatus.TRUNCATED: Status.TRUNCATED,
               EpisodeStatus.ERROR: Status.INFRA_ERROR, EpisodeStatus.CANCELLED: Status.CANCELLED}[episode.status]
     calls = tuple(Call(turn.action.context, turn.action.tokens, turn.action.behavior_log_probs,

@@ -167,6 +167,8 @@ Both compute per-token log-probabilities through `LMObjective.per_token_log_prob
 
 Correction (2026-09-22): the objectives now call the `_terms` forms and reduce by the mask mass themselves: GRPO uses `token_log_ratio`, `clipped_surrogate_terms` and `k3_kl` (`src/dew/objectives/rl/grpo.py:142-162`), and DPO uses `preference_logsigmoid_terms` (`src/dew/objectives/rl/preference.py:100`). GRPO also takes `epsilon_low`, `epsilon_high`, a `dual_clip` that defaults to 3.0, and an optional `behavior_importance_cap` (`grpo.py:58-60`). Current lines in `src/dew/rl/surrogate.py`: `token_mean` 59, `token_log_ratio` 72, `clipped_surrogate` 154, `k3_kl` 163, `preference_logsigmoid` 199. In `src/dew/rl/advantage.py`: `group_advantage` 99, `rloo_advantage` 120.
 
+Correction (2026-09-22, packed layout): GRPO no longer slices a concatenation through `per_token_log_probs`. It scores each packed chain with `GRPOObjective.packed_log_probs`, the policy and the reference alike, and the notes above are superseded where it says otherwise. `behavior_importance_cap` is now `behavior_importance`, which takes a TIS cap or an IcePop band.
+
 ## 7. Diffusion RL
 
 Built in `dew.sampling.flow` and `dew.objectives.rl.flow`. FlowSDE implements the Solver contract; FlowTrajectory records states, times, joint Gaussian log densities, and stochastic support. FlowRollout collects complete reward groups through the existing host capability. FlowGRPOObjective returns additive Mean statistics for clipped per-coordinate policy ratios and conditional Gaussian transition KL. It excludes deterministic intervals. The policy loss has no dual clip. The reference is frozen only when beta is positive; evaluation uses live policy parameters.
