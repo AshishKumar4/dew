@@ -80,14 +80,16 @@ def pack_dict_of_byte_arrays(unpacked: dict) -> bytes:
 def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
     """An encoded image as RGB uint8, in the orientation its pixels are stored.
 
-    cv2's colour flags give three 8-bit channels for any source: grey is
-    replicated, alpha dropped rather than composited, a 16-bit sample kept to
-    its high byte. EXIF orientation is ignored, as PIL's `Image.open` ignores
-    it, on the reduced decodes too, which would otherwise apply it.
+    Grey is replicated and a 16-bit sample kept to its high byte. An image
+    with transparency is composited onto white, as img2dataset does for the
+    url shards the online loader streams. EXIF orientation is ignored, as
+    PIL's `Image.open` ignores it, on the reduced decodes too, which would
+    otherwise apply it.
 
-    With `at_least`, a JPEG is decoded at the largest 1/2, 1/4 or 1/8 DCT
-    reduction that keeps both sides >= `at_least`, so the resize after it
-    still only shrinks and most of the decode is skipped.
+    With `at_least`, an opaque image is decoded at the largest 1/2, 1/4 or
+    1/8 reduction that keeps both sides >= `at_least` (the DCT scale of a
+    JPEG), so the resize after it still only shrinks and most of the decode
+    is skipped.
 
     Every failure is a ValueError. PIL reads the header first, since it
     refuses a decompression bomb from the header alone where cv2 would
@@ -95,26 +97,37 @@ def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
     file.
     """
     import cv2
-    shortest = min(_encoded_size(encoded))
+    height, width, transparent = _header(encoded)
     buffer = np.frombuffer(encoded, dtype=np.uint8)
-    flags = cv2.IMREAD_COLOR
-    if at_least is not None:
+    # IMREAD_UNCHANGED keeps the alpha the colour flags drop, and ignores EXIF.
+    flags = cv2.IMREAD_UNCHANGED if transparent else cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION
+    if at_least is not None and not transparent:
         for factor, reduced in ((8, cv2.IMREAD_REDUCED_COLOR_8), (4, cv2.IMREAD_REDUCED_COLOR_4),
                                 (2, cv2.IMREAD_REDUCED_COLOR_2)):
-            if shortest // factor >= at_least:
-                flags = reduced
+            if min(height, width) // factor >= at_least:
+                flags = reduced | cv2.IMREAD_IGNORE_ORIENTATION
                 break
     try:
-        image = cv2.imdecode(buffer, flags | cv2.IMREAD_IGNORE_ORIENTATION)
+        image = cv2.imdecode(buffer, flags)
     except cv2.error as error:
         raise ValueError(f"cv2 refused {len(encoded)} bytes of image") from error
     if image is None:
         raise ValueError(f"cv2 could not decode {len(encoded)} bytes of image")
+    if image.dtype == np.uint16:
+        image = np.right_shift(image, 8).astype(np.uint8)
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    elif image.shape[-1] == 4:
+        # c * a / 255 + 255 - a, rounded to nearest in integers; the exact
+        # quotient is k / 255, which is never a tie.
+        alpha = image[..., 3:].astype(np.uint32)
+        image = ((image[..., :3] * alpha + 255 * (255 - alpha) + 127) // 255).astype(np.uint8)
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
-def _encoded_size(encoded: bytes) -> tuple[int, int]:
-    """(height, width) from the header alone; PIL reads no pixels for this."""
+def _header(encoded: bytes) -> tuple[int, int, bool]:
+    """(height, width, whether it carries transparency) from the header alone;
+    PIL reads no pixels for this."""
     import io
 
     from PIL import Image
@@ -122,9 +135,10 @@ def _encoded_size(encoded: bytes) -> tuple[int, int]:
     try:
         with Image.open(io.BytesIO(encoded)) as header:
             width, height = header.size
+            transparent = "A" in header.getbands() or "transparency" in header.info
     except Exception as error:
-        raise ValueError(f"could not read the size of {len(encoded)} bytes of image") from error
-    return height, width
+        raise ValueError(f"could not read the header of {len(encoded)} bytes of image") from error
+    return height, width, transparent
 
 
 def resize_image(image: np.ndarray, size: int) -> np.ndarray:

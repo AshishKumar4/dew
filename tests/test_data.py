@@ -1095,16 +1095,19 @@ def test_decoding_gives_a_grayscale_record_three_channels():
     np.testing.assert_array_equal(out[..., 0], out[..., 2])
 
 
-def test_decoding_drops_alpha_and_hands_back_rgb():
-    """Records arrive as BGR(A) from cv2; the model is trained on RGB."""
-    bgra = np.dstack([np.full((16, 16), 10, np.uint8), np.full((16, 16), 20, np.uint8),
-                      np.full((16, 16), 30, np.uint8), np.full((16, 16), 40, np.uint8)])
+@pytest.mark.parametrize("at_least", [None, 8])
+def test_decoding_composites_transparency_onto_white(at_least):
+    """c * a / 255 + 255 - a per channel, rounded: a transparent pixel is
+    white and an opaque one keeps its colour, at any requested scale."""
+    bgra = np.random.RandomState(0).randint(0, 256, (32, 32, 4), np.uint8)
+    bgra[0, 0, 3], bgra[0, 1, 3] = 0, 255
     encoded = cv2.imencode(".png", bgra)[1].tobytes()
+    alpha = bgra[..., 3:].astype(np.float64)
+    expected = np.rint(bgra[..., 2::-1] * alpha / 255 + 255 - alpha).astype(np.uint8)
 
-    out = decode_image(encoded)
+    out = decode_image(encoded, at_least=at_least)
 
-    assert out.shape == (16, 16, 3)
-    np.testing.assert_array_equal(out[0, 0], [30, 20, 10])
+    np.testing.assert_array_equal(out, expected)
 
 
 def test_a_sixteen_bit_png_decodes_to_its_high_byte():
