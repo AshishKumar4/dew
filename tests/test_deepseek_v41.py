@@ -10,9 +10,19 @@ the same run widened to fp64 (`--fp64`), the truth Dew and the reference are
 both measured from by tests/reference_error.py's rule: Dew's RMS distance
 from it at most FACTOR times the reference's own, for every output and for
 the inputs of every quantizer and top-k call. Dew's quantizers are held bit
-for bit to each recorded call. `tools/deepseek_v41_numerics.py residuals`
-reports every ratio, and its `fp64` mode shows Dew widened alike agrees with
-the truth to 1e-13, so what the rule measures is fp32 rounding.
+for bit to each recorded call.
+
+A value within fp32 noise of where a rounding or a pick changes can go
+either way in two fp32 runs, and every seed leaves some (an L4 rounded one
+window key of the cached prefill the other way at the seed a CPU and an RTX
+4080 had passed). So each run compared here takes every rounding and pick
+from its own float64 twin (`decided`), the way the exact value goes, which
+is the way the reference went (`--fp64` refuses a fixture it did not):
+the rule then measures fp32 rounding alone, whatever the seed. Each twin is
+held within float64 rounding of the truth (`twin_close`), which a single
+rounding or pick taken otherwise than the truth's would move it far past.
+`tools/deepseek_v41_numerics.py residuals` reports every ratio and each
+twin's distance from the truth.
 """
 
 import dataclasses
@@ -43,12 +53,13 @@ from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import (
     QUANTIZERS,
     cached_run,
-    captured,
+    decided,
+    forward,
     loss_and_gradient,
-    recorded_outputs,
     scores,
     stepped,
     unquantized,
+    updated,
     vision_bundle,
     vision_run,
 )
@@ -57,6 +68,9 @@ ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "deepseek-v41-tiny"
 RELEASED = ROOT / "deepseek-v41-flash"
 TRUTH = np.load(TINY / "reference_f64.npz")
+# float64 rounds 2**-29 times as finely as float32, so the reference's
+# arithmetic run in float64 lies that much closer to the truth than in fp32.
+FINER = float(np.finfo(np.float64).eps / np.finfo(np.float32).eps)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -72,6 +86,16 @@ def source():
     return loaded, unquantized(loaded.model), np.load(TINY / "reference.npz")
 
 
+@pytest.fixture(scope="module")
+def forwards(source):
+    """The plain and the quantization-aware forward (`decided`), each with
+    the quantizer inputs and top-k rows it met."""
+    loaded, plain, reference = source
+    ids = jnp.asarray(reference["input_ids"])
+    return {prefix: decided(lambda model, variables: forward(model, variables, ids), model, loaded.variables)
+            for prefix, model in (("", plain), ("qat_", loaded.model))}
+
+
 def close(actual, reference, name: str):
     """`actual` as exact as the reference's `name`, both measured from the
     float64 truth, its argmax the reference's."""
@@ -80,15 +104,26 @@ def close(actual, reference, name: str):
     np.testing.assert_array_equal(actual.argmax(-1), reference[name].argmax(-1), err_msg=name)
 
 
+def twin_close(twin, name: str):
+    """A float64 twin (`decided`) within FACTOR times the reference's own
+    rounding, scaled to float64 (FINER), of the truth: the reference's
+    arithmetic in float64, deciding every rounding and pick as the truth
+    does, since one taken otherwise moves an output by fp32-sized steps."""
+    apart = distance(twin, TRUTH[name])
+    assert apart <= FACTOR * FINER * rounding(name), f"{name}: the float64 twin is {apart:.3e} from the truth"
+
+
 def loss_close(value, prefix: str):
     """The loss within reach of the logits' rule: it is the mean of each
     position's cross entropy, whose gradient in that position's logits has
     norm at most sqrt(2), so logits RMS `r` from the float64 truth move it at
     most sqrt(2 V) r, and the rule holds the logits to FACTOR times the
-    reference's own `r`; one fp32 spacing of the loss covers its own sum."""
-    reference = np.load(TINY / "reference.npz")
-    loss, logits = reference[f"{prefix}loss"], reference[f"{prefix}logits"]
-    bound = np.sqrt(2 * logits.shape[-1]) * FACTOR * rounding(f"{prefix}logits") + np.spacing(loss)
+    reference's own `r`, scaled to float64 for a float64 twin's loss (FINER);
+    one spacing of the loss, in its own dtype, covers its own sum."""
+    value = np.asarray(value)
+    finer = float(np.finfo(value.dtype).eps / np.finfo(np.float32).eps)
+    logits = np.load(TINY / "reference.npz")[f"{prefix}logits"]
+    bound = np.sqrt(2 * logits.shape[-1]) * FACTOR * rounding(f"{prefix}logits") * finer + np.spacing(value)
     assert abs(float(value) - float(TRUTH[f"{prefix}loss"])) <= bound, f"{prefix}loss"
 
 
@@ -138,19 +173,18 @@ def test_the_quantizers_round_every_call_the_reference_made(source):
                                       err_msg=site)
 
 
-def test_every_quantizer_and_top_k_input_is_as_exact_as_the_reference(source):
+def test_every_quantizer_and_top_k_input_is_as_exact_as_the_reference(source, forwards):
     """Dew's quantization-aware and plain forwards hand every quantizer and
     top-k call its input as exactly as the reference does, both measured
-    from the float64 truth. Each quantizer passes on the recorded output, so
-    a value that rounds the other way cannot move what later calls read."""
-    loaded, plain, reference = source
-    ids = jnp.asarray(reference["input_ids"])
-    for prefix, model in (("qat_", loaded.model), ("", plain)):
-        record = captured(model, loaded.variables, ids, recorded_outputs(reference, prefix))
+    from the float64 truth, calling each as often and on as many blocks."""
+    _, _, reference = source
+    for prefix, (_, _, record) in forwards.items():
         assert set(record.blocks) == ({*QUANTIZERS} if prefix else set())
         for site, blocks in record.blocks.items():
             name = f"{prefix}{site}_in"
-            assert_as_exact_as_the_reference(np.concatenate(blocks), reference[name], TRUTH[name], name)
+            ours = np.concatenate(blocks)
+            assert ours.shape == reference[name].shape, name
+            assert_as_exact_as_the_reference(ours, reference[name], TRUTH[name], name)
         assert_as_exact_as_the_reference(*scores(record, reference, TRUTH, prefix), f"{prefix}selection_rows")
 
 
@@ -266,28 +300,31 @@ def test_every_matrix_of_the_released_decoder_shards_by_a_declared_rule(released
     assert engram == [("vocab", None)] * 2
 
 
-def test_the_forward_matches_the_reference(source):
-    loaded, plain, reference = source
-    ids = jnp.asarray(reference["input_ids"])
-    close(jax.jit(plain.apply)(loaded.variables, ids), reference, "logits")
+def test_the_forward_matches_the_reference(source, forwards):
+    given, twin, _ = forwards[""]
+    close(given, source[2], "logits")
+    twin_close(twin, "logits")
 
 
-def test_the_quantization_aware_forward_matches_the_reference(source):
-    loaded, _, reference = source
-    ids = jnp.asarray(reference["input_ids"])
-    close(jax.jit(loaded.model.apply)(loaded.variables, ids), reference, "qat_logits")
+def test_the_quantization_aware_forward_matches_the_reference(source, forwards):
+    given, twin, _ = forwards["qat_"]
+    close(given, source[2], "qat_logits")
+    twin_close(twin, "qat_logits")
 
 
 def test_the_quantization_aware_loss_and_gradient_match_the_reference(source):
     """The loss through every quantizer, and one SGD step along its gradient,
     which passes each quantizer straight through, read back through the
     forward without quantization, so the step compares the gradient alone."""
-    loaded, plain, reference = source
+    loaded, _, reference = source
     ids = jnp.asarray(reference["input_ids"])
-    value, gradient = loss_and_gradient(loaded.model, loaded.variables, ids)
+    (value, logits), (twin_value, twin_logits), _ = decided(
+        lambda model, variables: updated(model, variables, ids, reference["learning_rate"]),
+        loaded.model, loaded.variables)
     loss_close(value, "qat_")
-    variables = stepped(loaded.variables, gradient, reference["learning_rate"])
-    close(jax.jit(plain.apply)(variables, ids), reference, "qat_updated_logits")
+    loss_close(twin_value, "qat_")
+    close(logits, reference, "qat_updated_logits")
+    twin_close(twin_logits, "qat_updated_logits")
 
 
 def test_the_candidate_pool_decides_the_logits(source):
@@ -311,8 +348,10 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
     bit for bit, and greedy decoding after the fixture's prompt."""
     loaded, plain, reference = source
     ids = jnp.asarray(reference["input_ids"])
-    value, gradient = loss_and_gradient(plain, loaded.variables, ids)
+    (value, gradient), (twin_value, _), _ = decided(
+        lambda model, variables: loss_and_gradient(model, variables, ids), plain, loaded.variables)
     loss_close(value, "")
+    loss_close(twin_value, "")
     indexer = [np.max(np.abs(leaf)) for path, leaf in _flatten(gradient).items() if ".indexer." in f".{path}."]
     assert indexer and max(indexer) == 0
     variables = stepped(loaded.variables, gradient, reference["learning_rate"])
@@ -322,7 +361,10 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
     assert held.keys() == again.keys()
     for name, leaf in again.items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]), err_msg=name)
-    close(unquantized(restored.model).apply(restored.variables, ids), reference, "updated_logits")
+    # The float64 twin of this forward starts from the fp32 step, which the
+    # truth does not take, so only its decisions count here.
+    close(decided(lambda model, variables: forward(model, variables, ids), unquantized(restored.model),
+                  restored.variables)[0], reference, "updated_logits")
     prompt = int(reference["decode_prompt"])
     generated = generate(plain, loaded.variables, ModelInputs(ids[:, :prompt]),
                          reference["generated"].shape[1], key=jax.random.key(1),
@@ -332,15 +374,19 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
 
 
 def cached_matches(model, variables, reference, prefix: str):
-    ids = jnp.asarray(reference["input_ids"])
-    prompt_logits, steps, (draft_ids, draft_logits, confidence) = cached_run(
-        model, variables, ids, int(reference["decode_prompt"]))
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    (prompt_logits, steps, draft_ids, draft_logits, confidence), twin, _ = decided(
+        lambda model, variables: cached_run(model, variables, ids, prompt), model, variables)
     close(prompt_logits, reference, f"{prefix}prompt_logits")
     close(steps, reference, f"{prefix}decode_logits")
     close(draft_logits, reference, f"{prefix}draft_logits")
     name = f"{prefix}draft_confidence"
     assert_as_exact_as_the_reference(confidence, reference[name], TRUTH[name], name)
     np.testing.assert_array_equal(draft_ids, reference[f"{prefix}draft_ids"])
+    wide_prompt, wide_steps, _, wide_draft, wide_confidence = twin
+    for name, wide in (("prompt_logits", wide_prompt), ("decode_logits", wide_steps),
+                       ("draft_logits", wide_draft), ("draft_confidence", wide_confidence)):
+        twin_close(wide, prefix + name)
 
 
 def test_the_decode_cache_and_the_drafter_match_the_reference(source):
@@ -463,10 +509,13 @@ def test_the_vision_half_matches_the_reference(tmp_path):
     release's Transformer.forward with the quantizers off."""
     reference = np.load(TINY / "vision.npz")
     loaded = load_pretrained(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
-    span, prompt_logits, steps = vision_run(loaded.model, loaded.variables, reference)
+    (span, prompt_logits, steps), twin, _ = decided(
+        lambda model, variables: vision_run(model, variables, reference), loaded.model, loaded.variables)
     assert_as_exact_as_the_reference(span, reference["vision_span"], TRUTH["vision_span"], "vision_span")
     close(prompt_logits, reference, "vision_prompt_logits")
     close(steps, reference, "vision_decode_logits")
+    for name, wide in zip(("vision_span", "vision_prompt_logits", "vision_decode_logits"), twin, strict=True):
+        twin_close(wide, name)
 
 
 def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):

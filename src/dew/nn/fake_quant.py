@@ -49,7 +49,7 @@ def _e2m1(values):
     return _round(values, 1, 0)
 
 
-def _straight_through(x, rounded):
+def straight_through(x, rounded):
     """`rounded` forward, bit for bit in any dtype, and the identity's
     gradient backward. `stop_gradient(x) - x` is +0, and subtracting +0
     leaves every value as it is, a negative zero included, which the
@@ -68,7 +68,7 @@ def fake_quant_fp8(x, block: int):
     amax = jnp.maximum(jnp.max(jnp.abs(blocks), -1, keepdims=True), 1e-4)
     scale = _power_of_two_ceil(amax * jnp.float32(1 / _E4M3_MAX))
     rounded = _round_e4m3fn(jnp.clip(blocks / scale, -_E4M3_MAX, _E4M3_MAX))
-    return _straight_through(x, (rounded * scale).reshape(x.shape))
+    return straight_through(x, (rounded * scale).reshape(x.shape))
 
 
 def fake_quant_fp4(x, block: int, e4m3_scale: bool):
@@ -85,4 +85,4 @@ def fake_quant_fp4(x, block: int, e4m3_scale: bool):
         scale = _power_of_two_ceil(
             jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
     rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
-    return _straight_through(x, (rounded * scale).reshape(x.shape))
+    return straight_through(x, (rounded * scale).reshape(x.shape))

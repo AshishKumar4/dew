@@ -156,7 +156,7 @@ def draft(stages, spec: DSpark, embed: Callable, logits_of: Callable, hc_mult: i
             stage.seed(store)
         return None
     block = jnp.full((tokens.shape[0], spec.block_size), spec.noise_token_id, jnp.int32)
-    block = block.at[:, 0].set(tokens)
+    block = block.at[:, 0].set(tokens.astype(block.dtype))
     streams = expand_streams(embed(block), hc_mult)
     carry = Carried(streams, first_stream(streams))
     for stage in stages:

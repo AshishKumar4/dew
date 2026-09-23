@@ -9,23 +9,19 @@ one thing, on the backend JAX picks:
 
 every compared output's and every quantizer input's and top-k row's RMS
 distance from the float64 truth, Dew's beside the reference's, whose
-ratio tests/reference_error.py bounds;
+ratio tests/reference_error.py bounds, and each output's float64 twin's
+(`decided`), which agrees with the truth to float64 rounding: what remains
+in fp32 is rounding;
 
     PYTHONPATH=src:. python tools/deepseek_v41_numerics.py noise
 
 how far Dew's inputs to each rounding and selection sit from the ones the
 reference recorded, in the units of its margins (a quantizer's input over
 its block's amax, a top-k row over its largest finite magnitude), which the
-reference tool's NOISE, its seed rank's estimate, takes twice the largest of;
+reference tool's NOISE, its seed rank's estimate, takes twice the largest of.
 
-    PYTHONPATH=src:. python tools/deepseek_v41_numerics.py fp64
-
-the plain outputs with Dew widened to fp64 as the truth is, every fp32 pin
-included, where two implementations of the same arithmetic agree to fp64
-rounding: what remains in fp32 is rounding.
-
-The tests share `unquantized`, `loss_and_gradient`, `stepped`,
-`cached_run`, `captured`, `selections` and the vision bundle from here.
+The tests share the runs (`forward`, `updated`, `cached_run`,
+`vision_run`), `decided`, `selections` and the vision bundle from here.
 """
 
 from __future__ import annotations
@@ -36,17 +32,18 @@ import json
 import shutil
 import sys
 import tempfile
-from collections.abc import Mapping
 from pathlib import Path
 
 import flax
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental import io_callback
 
 from dew.interop import load_pretrained
-from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
+from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8, straight_through
 from dew.nn.inputs import ModelInputs
+from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from tests.reference_error import distance
@@ -70,6 +67,12 @@ def unquantized(model):
     return model.clone(kinds=flax.core.freeze(kinds))
 
 
+def forward(model, variables, ids):
+    """The model's logits over `ids`, compiled from a function made for the
+    call, so what a run under `decided` stands in for traces afresh."""
+    return jax.jit(lambda held, tokens: model.apply(held, tokens))(variables, ids)
+
+
 def loss_and_gradient(model, variables, ids):
     """The next-token loss LMObjective reports and its gradient in the parameters."""
     objective = LMObjective(model, ids.shape[1] - 1, pretrained=variables, ema_decay=None)
@@ -88,10 +91,19 @@ def stepped(variables, gradient, rate):
         lambda weight, grad: weight - rate * grad, variables["params"], gradient)}
 
 
+def updated(model, variables, ids, rate):
+    """The loss, and the logits after one SGD step of `rate` along its
+    gradient, read through the forward without quantization, so the step
+    compares the gradient alone."""
+    value, gradient = loss_and_gradient(model, variables, ids)
+    return value, forward(unquantized(model), stepped(variables, gradient, rate), ids)
+
+
 def cached_run(model, variables, ids, prompt):
-    """Prefill `prompt` tokens, then one token per step; the prompt's logits,
-    each step's logits, and DSpark's drafts after each step over the context
-    each call recorded. Every call is compiled once per shape."""
+    """Prefill `prompt` tokens, then one token per step: the prompt's logits,
+    each step's logits, and DSpark's draft ids, logits and confidence after
+    each step over the context each call recorded. Every call is compiled
+    once per shape."""
     rows = ids.shape[0]
     cache = model.apply(variables, rows, method=model.init_cache, mutable=["cache"])[1]
     drafts = model.apply(variables, rows, method=model.init_draft_cache, mutable=["cache"])[1]
@@ -116,7 +128,8 @@ def cached_run(model, variables, ids, prompt):
         steps.append(np.asarray(logits[:, 0]))
         out, drafts = draft(drafts, context, jnp.argmax(logits[:, -1], -1))
         drafted.append([np.asarray(value) for value in out])
-    return np.asarray(prompt_logits), np.stack(steps, 1), [np.stack(value, 1) for value in zip(*drafted, strict=True)]
+    return (np.asarray(prompt_logits), np.stack(steps, 1),
+            *(np.stack(value, 1) for value in zip(*drafted, strict=True)))
 
 
 @dataclasses.dataclass
@@ -129,33 +142,77 @@ class Captured:
     picks: list[np.ndarray] = dataclasses.field(default_factory=list)
 
 
-def captured(model, variables, ids, forced: Mapping[str, np.ndarray] | None = None) -> Captured:
-    """One compiled forward with every quantizer input and every top-k's rows
-    and picks recorded in call order.
+def widened(model, variables):
+    """The model and its variables in float64, a media model's language
+    model included; x64 has to be on. A media model's towers also ask for
+    HIGHEST precision, at which float64 multiplies anyway: it sends their
+    attention down Dew's reference path (`reference_only`), where jax's own
+    attention takes its softmax in float32 whatever its inputs."""
+    wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
+                        if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, variables)
+    if isinstance(model, MultimodalTransformer):
+        return model.clone(dtype=jnp.float64, precision=jax.lax.Precision.HIGHEST,
+                           language_model=model.language_model.clone(dtype=jnp.float64)), wide
+    return model.clone(dtype=jnp.float64), wide
 
-    Wrappers stand in for the quantizers `dew.nn.deepseek_v4` calls and for
-    `jax.lax.top_k` while the forward traces, hand their operands to the
-    host through ordered callbacks and call the originals; they are removed
-    again after. `forced` holds each site's recorded outputs in call order
-    for the quantizers to return in place of their own rounding, so a value
-    that rounds the other way within the noise cannot move what the
-    forward's later calls read."""
+
+def decided(run, model, variables):
+    """`run(model, variables)` with every rounding and top-k pick taken from
+    its float64 twin: the same run with x64 on, the model and its variables
+    widened (`widened`) and every fp32 pin Dew names as `jnp.float32` (the
+    rotary tables, the norms, the softmaxes, the mHC mixing, the pooling, the
+    router and the engram gate) read as float64 while it traces. There each
+    quantizer rounds its input's float32, which rounds as the float64 value
+    does but at a tie.
+
+    A value within fp32 noise of where its rounding or pick changes then goes
+    the way the exact value goes, as the reference's did: `--fp64` refuses a
+    fixture whose recorded roundings and picks its float64 run makes
+    otherwise. So no comparison rests on the seed keeping every value clear
+    of such a boundary, and the given run is held to the reference's
+    rounding error alone.
+
+    Wrappers stand in for `dew.nn.deepseek_v4`'s quantizers and for
+    `jax.lax.top_k` while the runs trace or execute: the twin's hand each
+    decision to the host through an ordered callback, and the given run's
+    take them back through one in the same order and record the quantizer
+    inputs and top-k rows they meet. Returns the given run's result, the
+    twin's, and that record."""
     from dew.nn import deepseek_v4
 
-    record = Captured()
     fp8, fp4, top_k = deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k
-    taken = dict.fromkeys(forced or (), 0)
+    single, made, record = jnp.float32, [], Captured()
 
-    def rounded(site: str, x, block: int, own):
-        """`own` rounding, or the next `forced` rows of the site in its place."""
-        if forced is None:
-            return own()
-        rows = x.size // block
-        held = forced[site][taken[site]:taken[site] + rows]
-        taken[site] += rows
-        return jnp.asarray(held.reshape(x.shape), x.dtype)
+    def keep(value):
+        made.append(np.asarray(value))
 
-    def keep(site: str, block: int):
+    def exact(quantize):
+        def call(*args, **kwargs):
+            jnp.float32 = single  # the quantizer's own fp32 arithmetic
+            try:
+                out = quantize(*args, **kwargs)
+            finally:
+                jnp.float32 = jnp.float64
+            jax.debug.callback(keep, out, ordered=True)
+            return out
+        return call
+
+    def picked(values, k, is_stable=True):
+        out = top_k(values, k, is_stable=is_stable)
+        jax.debug.callback(keep, out[1], ordered=True)
+        return out
+
+    def taken(shape, dtype):
+        """The twin's next decision, which has to be of `shape`."""
+        def fetch():
+            value = next(pending, None)
+            if value is None or value.shape != shape:
+                raise ValueError(f"the run makes a {shape} decision where its float64 twin made "
+                                 f"{None if value is None else value.shape}")
+            return value.astype(dtype)
+        return io_callback(fetch, jax.ShapeDtypeStruct(shape, dtype), ordered=True)
+
+    def kept(site: str, block: int):
         def store(x):
             record.blocks.setdefault(site, []).append(np.asarray(x, np.float32).reshape(-1, block))
         return store
@@ -166,37 +223,36 @@ def captured(model, variables, ids, forced: Mapping[str, np.ndarray] | None = No
         record.picks.append(np.sort(picks.reshape(-1, picks.shape[-1]), -1))
 
     def window(x, block):
-        jax.debug.callback(keep("window", block), x, ordered=True)
-        return rounded("window", x, block, lambda: fp8(x, block))
+        jax.debug.callback(kept("window", block), x, ordered=True)
+        return straight_through(x, taken(x.shape, x.dtype))
 
     def fourbit(x, block, e4m3_scale):
-        site = "entries" if e4m3_scale else "index"
-        jax.debug.callback(keep(site, block), x, ordered=True)
-        return rounded(site, x, block, lambda: fp4(x, block, e4m3_scale))
+        jax.debug.callback(kept("entries" if e4m3_scale else "index", block), x, ordered=True)
+        return straight_through(x, taken(x.shape, x.dtype))
 
-    def ranked(values, k, **kwargs):
-        out = top_k(values, k, **kwargs)
-        jax.debug.callback(selected, values, out[1], ordered=True)
-        return out
+    def ranked(values, k, is_stable=True):
+        picks = taken((*values.shape[:-1], k), jnp.int32)
+        jax.debug.callback(selected, values, picks, ordered=True)
+        return jnp.take_along_axis(values, picks, -1), picks
 
-    deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = window, fourbit, ranked
     try:
-        jax.block_until_ready(jax.jit(lambda held, tokens: model.apply(held, tokens))(variables, ids))
+        deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = exact(fp8), exact(fp4), picked
+        with jax.enable_x64(new_val=True):
+            jnp.float32 = jnp.float64
+            try:
+                wide = run(*widened(model, variables))
+                jax.effects_barrier()
+            finally:
+                jnp.float32 = single
+        pending = iter(made)
+        deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = window, fourbit, ranked
+        given = run(model, variables)
         jax.effects_barrier()
     finally:
         deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = fp8, fp4, top_k
-    for site, count in taken.items():
-        if count != len(forced[site]):
-            raise ValueError(f"the forward rounds {count} {site} blocks where the reference rounded "
-                             f"{len(forced[site])}")
-    return record
-
-
-def recorded_outputs(reference, prefix: str) -> dict[str, np.ndarray]:
-    """The reference's quantizer outputs of one forward, per site in call
-    order, for `captured` to force."""
-    return {site: reference[f"{prefix}{site}_out"] for site in ("window", "entries", "index")
-            if f"{prefix}{site}_out" in reference}
+    if next(pending, None) is not None:
+        raise ValueError("the run leaves decisions its float64 twin made untaken")
+    return given, wide, record
 
 
 def padded(parts: list[np.ndarray], width: int, fill) -> np.ndarray:
@@ -277,7 +333,7 @@ def noise() -> dict[str, float]:
     ids = jnp.asarray(reference["input_ids"])
     measured = {}
     for prefix, model in (("qat_", loaded.model), ("", unquantized(loaded.model))):
-        record = captured(model, loaded.variables, ids, recorded_outputs(reference, prefix))
+        _, _, record = decided(lambda model, variables: forward(model, variables, ids), model, loaded.variables)
         for site, blocks in record.blocks.items():
             measured[f"{prefix}{site}"] = float(np.max(input_noise(
                 np.concatenate(blocks), reference[f"{prefix}{site}_in"])))
@@ -287,28 +343,35 @@ def noise() -> dict[str, float]:
     return measured
 
 
-def outputs(model, variables, fixture, prefix: str) -> dict[str, np.ndarray]:
-    """One run's outputs under the reference's `prefix` names: the forward,
-    the loss, the update (read through the forward without quantization)
-    and the cached run with its drafts. `fixture` supplies the ids, the
-    update's rate and the prompt length."""
-    ids = jnp.asarray(fixture["input_ids"])
-    value, gradient = loss_and_gradient(model, variables, ids)
-    moved = stepped(variables, gradient, fixture["learning_rate"])
-    prompt_logits, steps, (draft_ids, draft_logits, confidence) = cached_run(
-        model, variables, ids, int(fixture["decode_prompt"]))
-    return {prefix + name: np.asarray(value) for name, value in {
-        "logits": jax.jit(model.apply)(variables, ids), "loss": value,
-        "updated_logits": jax.jit(unquantized(model).apply)(moved, ids),
-        "prompt_logits": prompt_logits, "decode_logits": steps, "draft_logits": draft_logits,
-        "draft_confidence": confidence, "draft_ids": draft_ids}.items()}
+def outputs(model, variables, fixture, prefix: str) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], Captured]:
+    """One run's outputs under the reference's `prefix` names, each as the
+    run makes it and as its float64 twin does (`decided`): the forward, the
+    loss, the update (read through the forward without quantization) and the
+    cached run with its drafts; with the forward's quantizer inputs and
+    top-k rows. `fixture` supplies the ids, the update's rate and the prompt
+    length."""
+    ids, prompt = jnp.asarray(fixture["input_ids"]), int(fixture["decode_prompt"])
+    runs = {("logits",): lambda model, variables: (forward(model, variables, ids),),
+            ("loss", "updated_logits"): lambda model, variables: updated(
+                model, variables, ids, fixture["learning_rate"]),
+            ("prompt_logits", "decode_logits", "draft_ids", "draft_logits", "draft_confidence"):
+                lambda model, variables: cached_run(model, variables, ids, prompt)}
+    measured, records = {}, []
+    for names, run in runs.items():
+        given, wide, record = decided(run, model, variables)
+        measured.update({prefix + name: (np.asarray(value), np.asarray(twin))
+                         for name, value, twin in zip(names, given, wide, strict=True)})
+        records.append(record)
+    return measured, records[0]
 
 
-def apart(ours, reference, truth) -> dict[str, float]:
+def apart(ours, reference, truth, wide=None) -> dict[str, float]:
     """Dew's and the reference's RMS distances from the float64 truth and
-    their ratio (tests/reference_error.py)."""
+    their ratio (tests/reference_error.py), with the float64 twin's distance
+    where there is one (`decided`)."""
     dew, theirs = distance(ours, truth), distance(reference, truth)
-    return {"dew": dew, "reference": theirs, "ratio": dew / theirs}
+    return {"dew": dew, "reference": theirs, "ratio": dew / theirs,
+            **({} if wide is None else {"float64": distance(wide, truth)})}
 
 
 def vision_bundle(directory: Path) -> Path:
@@ -328,21 +391,23 @@ def vision_bundle(directory: Path) -> Path:
 
 def vision_run(model, variables, reference) -> tuple[jax.Array, jax.Array, np.ndarray]:
     """The span the fixture's image fills, the prefill's logits with it and
-    the text steps' after it, with the quantizers off as the reference ran."""
+    the text steps' after it, with the quantizers off as the reference ran.
+    Every call is compiled once per shape."""
     model = model.clone(language_model=unquantized(model.language_model))
     ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
     media = reference["token_types"] >= 0
     image_indices = jnp.asarray(np.where(media, np.cumsum(media, -1) - 1, -1))
     conditioning = {"pixel_values": jnp.asarray(reference["pixels"])[None, None]}
-    span = model.apply(variables, conditioning, method=lambda module, held: module.conditioner(held))
+    span = jax.jit(lambda held, media: model.apply(
+        held, media, method=lambda module, pixels: module.conditioner(pixels)))(variables, conditioning)
     cache = model.apply(variables, ids.shape[0], method=model.init_cache, mutable=["cache"])[1]
-    prompt_logits, cache = model.apply(
-        {**variables, **cache}, ids[:, :prompt], decode=True, image_indices=image_indices[:, :prompt],
-        conditioning=conditioning, mutable=["cache"])
+    prompt_logits, cache = jax.jit(lambda cache, tokens, indices, media: model.apply(
+        {**variables, **cache}, tokens, decode=True, image_indices=indices, conditioning=media,
+        mutable=["cache"]))(cache, ids[:, :prompt], image_indices[:, :prompt], conditioning)
+    step = jax.jit(lambda cache, tokens: model.apply({**variables, **cache}, tokens, decode=True, mutable=["cache"]))
     steps = []
     for position in range(prompt, ids.shape[1]):
-        logits, cache = model.apply({**variables, **cache}, ids[:, position:position + 1],
-                                    decode=True, mutable=["cache"])
+        logits, cache = step(cache, ids[:, position:position + 1])
         steps.append(np.asarray(logits[:, 0]))
     return span[0], prompt_logits, np.stack(steps, 1)
 
@@ -350,20 +415,21 @@ def vision_run(model, variables, reference) -> tuple[jax.Array, jax.Array, np.nd
 def residuals() -> dict[str, object]:
     """Every output the tests compare, every quantizer input and every top-k
     row, as Dew's and the reference's RMS distances from the float64 truth
-    (`apart`); the draft ids as the count that differ, and each quantizer
-    site as the count of recorded values its compiled quantizer does not
-    reproduce bit for bit."""
+    with each output's float64 twin's (`apart`); the draft ids as the count
+    that differ, and each quantizer site as the count of recorded values its
+    compiled quantizer does not reproduce bit for bit. The twins agree with
+    the truth to float64 rounding, so the fp32 runs differ from it by fp32
+    rounding alone."""
     loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
     reference, truth = np.load(TINY / "reference.npz"), np.load(TINY / "reference_f64.npz")
-    ids = jnp.asarray(reference["input_ids"])
     measured: dict[str, object] = {f"qat_{site}_mismatches": int(np.sum(
         np.asarray(jax.jit(quantize)(jnp.asarray(reference[f"qat_{site}_in"]))).view(np.uint32)
         != reference[f"qat_{site}_out"].view(np.uint32))) for site, quantize in QUANTIZERS.items()}
     for prefix, model in (("", unquantized(loaded.model)), ("qat_", loaded.model)):
-        for name, value in outputs(model, loaded.variables, reference, prefix).items():
+        run, record = outputs(model, loaded.variables, reference, prefix)
+        for name, (value, wide) in run.items():
             measured[name] = (int(np.sum(value != reference[name])) if name.endswith("draft_ids")
-                              else apart(value, reference[name], truth[name]))
-        record = captured(model, loaded.variables, ids, recorded_outputs(reference, prefix))
+                              else apart(value, reference[name], truth[name], wide))
         for site, blocks in record.blocks.items():
             measured[f"{prefix}{site}_in"] = apart(np.concatenate(blocks), reference[f"{prefix}{site}_in"],
                                                    truth[f"{prefix}{site}_in"])
@@ -371,37 +437,18 @@ def residuals() -> dict[str, object]:
     vision = np.load(TINY / "vision.npz")
     with tempfile.TemporaryDirectory() as directory:
         bundle = load_pretrained(vision_bundle(Path(directory)), dtype="float32", attention_impl="reference")
-    for name, value in zip(("vision_span", "vision_prompt_logits", "vision_decode_logits"),
-                           vision_run(bundle.model, bundle.variables, vision), strict=True):
-        measured[name] = apart(np.asarray(value), vision[name], truth[name])
+        given, wide, _ = decided(lambda model, variables: vision_run(model, variables, vision),
+                                 bundle.model, bundle.variables)
+    for name, value, twin in zip(("vision_span", "vision_prompt_logits", "vision_decode_logits"),
+                                 given, wide, strict=True):
+        measured[name] = apart(np.asarray(value), vision[name], truth[name], np.asarray(twin))
     return measured
-
-
-def fp64() -> dict[str, float]:
-    """The plain outputs' largest distances from the float64 truth with Dew
-    widened alike: the fixture's fp32 weights in fp64, the model's dtype
-    fp64 and every fp32 pin Dew names as `jnp.float32` (the rotary tables,
-    the norms, the softmaxes, the mHC mixing, the pooling, the router and
-    the engram gate) read as fp64 while the model traces."""
-    fixture, truth = np.load(TINY / "reference.npz"), np.load(TINY / "reference_f64.npz")
-    with jax.enable_x64(new_val=True):
-        loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
-        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                                 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, loaded.variables)
-        single = jnp.float32
-        jnp.float32 = jnp.float64
-        try:
-            measured = outputs(unquantized(loaded.model).clone(dtype=jnp.float64), variables, fixture, "")
-        finally:
-            jnp.float32 = single
-    return {name: float(np.sum(value != fixture[name]) if name == "draft_ids"
-                        else np.max(np.abs(value - truth[name]))) for name, value in measured.items()}
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("measure", choices=("residuals", "noise", "fp64"))
-    measure = {"residuals": residuals, "noise": noise, "fp64": fp64}[parser.parse_args().measure]
+    parser.add_argument("measure", choices=("residuals", "noise"))
+    measure = {"residuals": residuals, "noise": noise}[parser.parse_args().measure]
     # The reference multiplies in fp32, where a GPU's default is TF32.
     with jax.default_matmul_precision("highest"):
         measured = measure()
