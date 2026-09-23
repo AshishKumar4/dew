@@ -11,7 +11,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from jax.experimental import checkify
 
 from dew.nn.kv_cache import KVCache, KVStore, hadamard, quantize, rotated
 
@@ -152,10 +151,10 @@ def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds():
     np.testing.assert_allclose(attended.astype(jnp.float32), expected, atol=3e-2, rtol=3e-2)
 
 
-def test_a_pool_too_small_for_every_row_refuses_a_write_no_server_assigned():
-    """Outside a server nobody hands out pages, so a row whose default block
-    runs past the pool must fail its write rather than share another row's
-    pages."""
+def test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages():
+    """Outside a server nobody hands out pages, so a pool that cannot give
+    every row its default block is refused before anything runs, rather
+    than dropping the writes of the rows past it."""
     from dew.inference import TextGeneration
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.sampling import Sampling
@@ -167,7 +166,7 @@ def test_a_pool_too_small_for_every_row_refuses_a_write_no_server_assigned():
     params = model(KVCache()).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     prompts = np.array([[1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1]])
     small = TextGeneration(model(KVCache(page_size=16, pages=10)), params, sampling=Sampling(temperature=0))
-    with pytest.raises(checkify.JaxRuntimeError, match="past the page pool"):
+    with pytest.raises(ValueError, match="needs a server to assign its pages"):
         small(prompts, 40, seed=0)
     whole = TextGeneration(model(KVCache(page_size=16)), params, sampling=Sampling(temperature=0))
     dense = TextGeneration(model(KVCache()), params, sampling=Sampling(temperature=0))

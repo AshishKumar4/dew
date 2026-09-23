@@ -133,6 +133,9 @@ DEFAULT_RULES: LogicalAxisRules = (
     ("activation_kv", TENSOR_AXIS),
     ("activation_mlp", TENSOR_AXIS),
     ("activation_vocab", TENSOR_AXIS),
+    # A served paged cache's pool splits its pages as the served rows split,
+    # one part of the pool per group of rows (`dew.inference.serving`).
+    ("pages", BATCH_AXES),
     # Rows too few for every batch axis split over the first ones.
     ("activation_batch", (DATA_AXIS, EXPERT_AXIS)),
     ("activation_batch", DATA_AXIS),

@@ -13,10 +13,13 @@ import pytest
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.pages import Pages
+from dew.inference.pipeline import place
 from dew.inference.serving import PagedRows, Server
-from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
 from dew.nn.kv_cache import KVCache
+from dew.nn.sharding import BATCH_AXES
 from dew.sampling import Sampling
+from dew.training import Layout, MeshSpec
 
 VOCAB = 13
 EOS = 12
@@ -179,10 +182,10 @@ def test_a_request_over_the_capacity_is_refused_as_the_task_refuses_it():
                                          sampling=bound.sampling, n=2), slots=2, capacity=64)
 
 
-def served_alongside(bound, **options):
+def served_alongside(bound, slots=4, admission=2, **options):
     """Every prompt submitted at once, plus the longest again once it is done,
     through a server with `options`; returns the server and the tickets."""
-    server = Server.from_task(bound, slots=4, capacity=128, admission=2, **options)
+    server = Server.from_task(bound, slots=slots, capacity=128, admission=admission, **options)
     tickets = [server.submit(prompt, budget, seed=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
@@ -212,6 +215,43 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("mesh, options", [
+    (MeshSpec(), {}),
+    (MeshSpec(tensor=2), {"kv_cache": KVCache(page_size=4, pages=64), "chunk": 3, "prefix_cache": True}),
+    (MeshSpec(fsdp=2, tensor=2), {"kv_cache": KVCache(page_size=16, pages=16)}),
+], ids=["data", "data-tensor-chunked-prefix", "data-fsdp-tensor-paged"])
+def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
+    """Weights placed on a mesh serve on it: the slots and the pool's pages
+    split over the row axes, one group of rows per device group, the heads
+    over the tensor axis. Every row is still the lone single-device call, a
+    chunked prompt included, and the repeated prompt starts from the page the
+    first one published in its group."""
+    bound = task()
+    alone = [bound(prompt, budget, seed=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    placed = bound.bind(place(bound.variables, mesh, Layout(min_shard=1, tolerance=1.0)))
+    server, tickets = served_alongside(placed, slots=8, admission=8, **options)
+    assert server.groups == jax.device_count() // mesh.tensor
+    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), lone)
+    assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
+    if "kv_cache" in options:
+        pool = next(leaf for leaf in jax.tree.leaves(server.cache) if leaf.ndim == 4)
+        pages = pool.sharding.spec[1]
+        assert ((pages,) if isinstance(pages, str) else tuple(pages)) == tuple(
+            axis for axis in BATCH_AXES if server.mesh.shape[axis] > 1)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("mesh", [MeshSpec(sequence=2), MeshSpec(stage=2)], ids=["sequence", "stage"])
+def test_a_server_refuses_a_mesh_that_splits_a_row_or_the_layer_stack(mesh):
+    bound = task()
+    with pytest.raises(ValueError, match=r"sequence=1|stage=1"):
+        Server.from_task(bound.bind(place(bound.variables, mesh, Layout(min_shard=1, tolerance=1.0))),
+                         slots=8, capacity=128)
+
+
 def test_a_full_pool_queues_a_request_until_a_row_gives_pages_back():
     """Three pages of sixteen hold one request of prompt and budget at a time:
     the second waits in the queue, not in a slot, and draws what it draws
@@ -229,6 +269,36 @@ def test_a_full_pool_queues_a_request_until_a_row_gives_pages_back():
         server.submit("1234567", 60, seed=0)
 
 
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("dispatch", ["exchange", "global"])
+def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
+    """A mixture layer on an expert mesh can run its dispatch in a shard_map,
+    and jax's checkify cannot carry a device check into one (jax-ml/jax#40907).
+    The server's step runs the model before its draws check anything, and a
+    pool smaller than every row's capacity checks nothing on the device, so
+    either dispatch serves what the global one draws alone on one device.
+    TextGeneration, whose loop carries each draw's checks into the next
+    step's model call, refuses the exchange."""
+    def generation(dispatch, params):
+        model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                                  mlp_features=32, max_seq_len=128, dtype="float32",
+                                  mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
+        params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)) if params is None else params
+        return TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_id=EOS))
+
+    lone = generation("global", None)
+    alone = [lone(prompt, budget, seed=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    served = generation(dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0)))
+    server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32))
+    assert server.groups == jax.device_count()
+    for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), row)
+    if dispatch == "exchange":
+        with pytest.raises(ValueError, match="dispatch='global'"):
+            served("12", 3, seed=0)
+
+
 def test_chunks_and_prefix_sharing_need_a_paged_cache():
     with pytest.raises(ValueError, match="paged cache"):
         Server.from_task(task(), slots=2, capacity=128, chunk=4)
@@ -241,7 +311,7 @@ def test_a_paged_server_refuses_a_model_whose_layers_kept_a_dense_cache():
     bound = task()
     dense = Server.from_task(bound, slots=2, capacity=128)
     with pytest.raises(ValueError, match="did not take the paged layout"):
-        PagedRows(Pages(8, 16, prefix_cache=False), None, 8).check(dense.cache)
+        PagedRows([Pages(8, 16, prefix_cache=False)], None, 8).check(dense.cache)
 
 
 def test_a_released_prefix_page_is_shared_until_the_free_pages_run_out():

@@ -49,12 +49,11 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Mapping
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
-from jax.experimental import checkify
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
 """The storage formats a quantized cache takes."""
@@ -188,6 +187,33 @@ def filled_slots(cursor: jax.Array, capacity: int) -> jax.Array:
     return jnp.arange(capacity)[None, :] < cursor[:, None]
 
 
+@runtime_checkable
+class Layered(Protocol):
+    """A model that declares its decode cache's layout, as `CausalTransformer` does."""
+
+    @property
+    def kv_cache(self) -> KVCache: ...
+
+
+def refuse_unassigned(layout: KVCache, rows: int, capacity: int) -> None:
+    """Refuse a paged pool that cannot give each of `rows` rows its whole `capacity`.
+
+    A caller that writes through the default page tables, as generation
+    does, needs a private block of pages for every row. Jax's checkify
+    cannot carry a device check into a model layer's shard_map
+    (jax-ml/jax#40907), so the store checks no write, and the shapes decide
+    it here instead, before any write. A server hands a smaller pool out
+    itself (`dew.inference.serving.Server`).
+    """
+    if layout.page_size is None or layout.pages is None:
+        return
+    needed = rows * (capacity // layout.page_size)
+    if layout.pages < needed:
+        raise ValueError(f"{rows} rows of {capacity} slots need {needed} pages; the pool holds "
+                         f"{layout.pages}. A pool smaller than every row's capacity needs a server "
+                         "to assign its pages")
+
+
 def default_page_table(rows: int, per_row: int, pages: int, groups: int) -> jax.Array:
     """Each row owns a private contiguous block of `per_row` pages in its group's part.
 
@@ -195,9 +221,9 @@ def default_page_table(rows: int, per_row: int, pages: int, groups: int) -> jax.
     start of the part. That is what a cache opened outside a server reads,
     over the default pool of one page per slot of every row. A smaller pool
     cannot give every row a block: the pages past the end of a part read as
-    the part's size, an index no part holds, and a write through one fails
-    the store's device check. A server writes its rows' tables itself, so it
-    never writes through them.
+    the part's size, an index no part holds, and a write through one is
+    dropped, so `refuse_unassigned` refuses such a pool before any write. A
+    server writes its rows' tables itself, so it never writes through them.
     """
     part = pages // groups
     table = jnp.tile(jnp.arange(rows // groups * per_row, dtype=jnp.int32).reshape(rows // groups, per_row),
@@ -288,12 +314,6 @@ class KVStore:
         part = buffer.shape[1] // groups
         safe = jnp.maximum(positions, 0)
         page = jnp.take_along_axis(self._get(TABLE), safe // page_size, axis=1)
-        if self.rows * (self.capacity // page_size) > buffer.shape[1]:
-            # A pool smaller than every row's capacity: only a caller that
-            # assigns pages (`dew.inference.serving.Server`) may write to it.
-            checkify.check(jnp.all((page < part) | (positions < 0)),
-                           "a row wrote past the page pool; a pool smaller than every row's "
-                           "capacity needs a server to assign its pages")
         page = jnp.where(positions >= 0, page, part)
 
         def stored(pool: jax.Array, page: jax.Array, offset: jax.Array, incoming: jax.Array) -> jax.Array:
