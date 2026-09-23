@@ -28,7 +28,7 @@ Dew changed after this survey. Line numbers elsewhere in this note refer to `65f
 - A layout can keep `params`, `opt_state` or `ema` in pinned host memory between steps (`HOST_RESIDENT`, `src/dew/training/distributed.py:271-276`; `Trainer.shardings`, `src/dew/training/trainer.py:342-356`). The state-residency rows that say every field inherits device memory describe the older source.
 - TPU attention runs the Pallas Splash kernel, with the older Pallas flash kernel behind it for masks Splash cannot carry (`src/dew/nn/attention.py:35-38,961-1005`).
 - Weighted corpus mixtures exist: `mixture` builds a Grain `MapDataset.mix` over corpora and their shares (`src/dew/data/dataset.py:650-685`).
-- `pyproject.toml:15-16` requires `flax>=0.12.9` and `jax>=0.11.1`, so the old `jax>=0.4.28` and `flax>=0.8.4` floors quoted under "Versions and evidence" are gone.
+- `pyproject.toml` requires flax at google/flax@4f42ed06 (the first commit whose `flax.nnx` imports on jax 0.11.2; no release has it yet) and `jax>=0.11.2`, so the old `jax>=0.4.28` and `flax>=0.8.4` floors quoted under "Versions and evidence" are gone.
 - `pyproject.toml:10` requires Python 3.12 or newer, which settles open question 2: tokamax's Python floor no longer conflicts with core Dew.
 
 These still hold: the cuDNN head-dimension cap is 128 (`CUDNN_MAX_HEAD_DIM`, `src/dew/nn/attention.py:611`), and attention does not import tokamax.
