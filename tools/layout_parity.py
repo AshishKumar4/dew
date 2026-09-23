@@ -58,6 +58,9 @@ sys.path.insert(0, str(REPO / "tools"))
 
 FLOOR_FACTOR = 4.0
 PERMUTATIONS = 16
+ANCHOR_LIMIT = 1e-2
+"""A reference leaf farther than this from the fp64 step is not fp32's
+rounding of it but another computation, which no floor may absorb."""
 
 LAYOUTS: dict[str, dict[str, int]] = {
     "data4": {},
@@ -339,6 +342,12 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
             floors, loss_floor = floor(case, batch, ref_gradient, ref_losses[0])
             if anchor and reassociates(case):
                 rounding = exact(case, ref_gradient)
+                farthest = max(rounding, key=rounding.__getitem__)
+                if rounding[farthest] > ANCHOR_LIMIT:
+                    raise ValueError(
+                        f"the fp32 reference is {rounding[farthest]:.2e} from the fp64 step at "
+                        f"{farthest}, past fp32 rounding ({ANCHOR_LIMIT:.0e}): the two compute "
+                        f"different steps, so the anchor cannot bound the layouts")
                 floors = {leaf: max(value, rounding[leaf]) for leaf, value in floors.items()}
         except Exception as error:  # no reference judges no layout: the model's one row
             rows.append({"model": model, "layout": "reference", "processes": jax.process_count(),
