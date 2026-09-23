@@ -11,7 +11,7 @@ Every node runs the same script. Each copy is one process of a `jax.distributed`
 | Where you run | Who provides the three facts |
 |---|---|
 | Cloud TPU VM or pod | The TPU metadata server. JAX reads it. |
-| Slurm (`srun`) | Slurm's `SLURM_*` variables. JAX reads them. |
+| Slurm (`srun`) | Slurm's `SLURM_*` variables. JAX reads them. One task (`SLURM_NTASKS=1`) is no pool, and the process runs on its own. |
 | Open MPI (`mpirun`) | The `OMPI_*` variables. JAX reads them. |
 | Plain machines over ssh | `dew launch`, through `JAX_COORDINATOR_ADDRESS`, `DEW_PROCESS_COUNT` and `DEW_PROCESS_ID`. |
 
