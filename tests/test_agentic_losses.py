@@ -20,14 +20,16 @@ import pytest
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step, mean_loss
 from dew.objectives.rl import GRPOObjective
-from dew.objectives.rl.rollout import (
+from dew.objectives.rl.rollouts import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
     IDS_KEY,
     OLD_LOG_PROBS_KEY,
+    POSITIONS_KEY,
     RESPONSE_MASK_KEY,
+    ROLLOUT_WEIGHTS_KEY,
+    SEGMENT_IDS_KEY,
 )
-from dew.objectives.rl.rollouts import POSITIONS_KEY, ROLLOUT_WEIGHTS_KEY, SEGMENT_IDS_KEY
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "agentic.npz"
 CHAIN = 7
@@ -170,3 +172,4 @@ def test_rollout_mean_matches_agent_lightning_per_rollout_mean(reference):
 def test_the_fixture_names_its_references(reference):
     assert str(reference["verl_revision"]) == "12ebe0cb4d300c58449fb6c675379e8700015c51"
     assert str(reference["lightning_revision"]) == "ff9457587fb6ec900e16e93be9ad2d77409afa08"
+

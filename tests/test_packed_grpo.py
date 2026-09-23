@@ -1,9 +1,9 @@
-"""GRPO over packed rows against GRPO over one windowed row per model call.
+"""GRPO over packed rows against GRPO over one unmerged row per model call.
 
 A multi-call rollout whose history stays append-only merges into one chain,
 and several chains share a row. Each sampled id must still be scored with
 exactly the prefix its call saw, so the packed loss, its gradient and its
-proximal log-probabilities equal the windowed ones computed call by call.
+proximal log-probabilities equal the ones computed call by call.
 """
 
 import jax
@@ -11,19 +11,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.data.prompts import LENGTH_KEY
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step, mean_loss
 from dew.objectives.rl import GRPOObjective
-from dew.objectives.rl.rollout import (
+from dew.objectives.rl.rollouts import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
+    CALL_INDEX_KEY,
     IDS_KEY,
     OLD_LOG_PROBS_KEY,
+    POSITIONS_KEY,
     RESPONSE_MASK_KEY,
-)
-from dew.objectives.rl.rollouts import (
-    CALL_INDEX_KEY,
     ROLLOUT_INDEX_KEY,
     SEGMENT_IDS_KEY,
     Call,
@@ -35,8 +33,6 @@ from dew.objectives.rl.rollouts import (
 
 VOCAB = 16
 WIDTH = 24
-PROMPT = 12
-RESPONSE = 4
 
 
 def _model():
@@ -65,25 +61,24 @@ def _rollouts():
     return rollouts
 
 
-def _windowed(rollouts):
-    """One left-padded `[prompt | response]` row per call, the old per-call layout."""
+def _per_call(rollouts):
+    """One chain per row, one row per call: the unmerged layout, each call's
+    prompt then its sampled ids, carrying its rollout's advantage."""
     values = advantages(rollouts)
-    rows = [(rollout, call, values[index]) for index, rollout in enumerate(rollouts) for call in rollout.calls]
-    ids = np.zeros((len(rows), PROMPT + RESPONSE), np.int32)
-    mask = np.zeros((len(rows), RESPONSE), np.float32)
-    behavior = np.zeros_like(mask)
-    advantage = np.zeros_like(mask)
-    lengths = np.zeros(len(rows), np.int32)
-    for row, (_, call, value) in enumerate(rows):
+    calls = [(call, values[index]) for index, rollout in enumerate(rollouts) for call in rollout.calls]
+    shape = (len(calls), WIDTH)
+    ids, segments, positions = np.zeros(shape, np.int32), np.zeros(shape, np.int32), np.zeros(shape, np.int32)
+    mask, behavior, advantage = np.zeros(shape, np.float32), np.zeros(shape, np.float32), np.zeros(shape, np.float32)
+    for row, (call, value) in enumerate(calls):
         size, count = len(call.prompt_ids), len(call.sampled_ids)
-        ids[row, PROMPT - size:PROMPT] = call.prompt_ids
-        ids[row, PROMPT:PROMPT + count] = call.sampled_ids
-        mask[row, :count] = 1
-        behavior[row, :count] = call.behavior_log_probs
-        advantage[row] = value
-        lengths[row] = size
-    return {IDS_KEY: ids, RESPONSE_MASK_KEY: mask, OLD_LOG_PROBS_KEY: behavior,
-            BEHAVIOR_LOG_PROBS_KEY: behavior, ADVANTAGES_KEY: advantage, LENGTH_KEY: lengths}
+        ids[row, :size + count] = (*call.prompt_ids, *call.sampled_ids)
+        segments[row, :size + count] = 1
+        positions[row, :size + count] = np.arange(size + count)
+        mask[row, size:size + count] = 1
+        behavior[row, size:size + count] = call.behavior_log_probs
+        advantage[row, :size + count] = value
+    return {IDS_KEY: ids, SEGMENT_IDS_KEY: segments, POSITIONS_KEY: positions, RESPONSE_MASK_KEY: mask,
+            OLD_LOG_PROBS_KEY: behavior, BEHAVIOR_LOG_PROBS_KEY: behavior, ADVANTAGES_KEY: advantage}
 
 
 def _loss(objective, params, batch, reference):
@@ -97,15 +92,14 @@ def test_packed_grpo_equals_per_call_grpo_on_the_unmerged_chains(policy_loss):
     packed = pack(rollouts, WIDTH)
     assert packed[IDS_KEY].shape[0] < sum(len(rollout.calls) for rollout in rollouts)
     assert packed[SEGMENT_IDS_KEY].max() >= 2, "rows share chains"
-    windowed = _windowed(rollouts)
-    model = _model()
-    packed_objective = GRPOObjective(model, WIDTH - 1, beta=0.1, policy_loss=policy_loss)
-    windowed_objective = GRPOObjective(model, PROMPT + RESPONSE - 1, beta=0.1, policy_loss=policy_loss)
-    params = packed_objective.init(jax.random.key(1))
+    packed[OLD_LOG_PROBS_KEY] = packed[BEHAVIOR_LOG_PROBS_KEY]
+    unmerged = _per_call(rollouts)
+    objective = GRPOObjective(_model(), WIDTH - 1, beta=0.1, policy_loss=policy_loss)
+    params = objective.init(jax.random.key(1))
     reference = jax.tree.map(lambda leaf: leaf * 0.9, params)
 
-    a, grad_a = jax.value_and_grad(lambda p: _loss(packed_objective, p, packed, reference))(params)
-    b, grad_b = jax.value_and_grad(lambda p: _loss(windowed_objective, p, windowed, reference))(params)
+    a, grad_a = jax.value_and_grad(lambda p: _loss(objective, p, packed, reference))(params)
+    b, grad_b = jax.value_and_grad(lambda p: _loss(objective, p, unmerged, reference))(params)
     assert float(a) == pytest.approx(float(b), abs=1e-6)
     for left, right in zip(jax.tree.leaves(grad_a), jax.tree.leaves(grad_b), strict=True):
         np.testing.assert_allclose(left, right, atol=1e-6)
@@ -114,14 +108,12 @@ def test_packed_grpo_equals_per_call_grpo_on_the_unmerged_chains(policy_loss):
 def test_packed_log_probs_score_each_id_with_its_own_calls_prefix():
     rollouts = _rollouts()
     packed = pack(rollouts, WIDTH)
-    windowed = _windowed(rollouts)
+    unmerged = _per_call(rollouts)
     objective = GRPOObjective(_model(), WIDTH - 1)
     params = objective.init(jax.random.key(2))
     scored = np.asarray(objective.packed_log_probs(params, packed))
-    per_call = GRPOObjective(_model(), PROMPT + RESPONSE - 1)
-    padding = PROMPT - jnp.asarray(windowed[LENGTH_KEY])
-    expected = np.asarray(per_call.per_token_log_probs(params, windowed[IDS_KEY], left_padding=padding))
-    expected = expected[:, PROMPT - 1:PROMPT - 1 + RESPONSE][windowed[RESPONSE_MASK_KEY] != 0]
+    alone = np.asarray(objective.packed_log_probs(params, unmerged))
+    expected = alone[unmerged[RESPONSE_MASK_KEY] != 0]
     order = [(index, number) for index, rollout in enumerate(rollouts) for number in range(len(rollout.calls))]
     placed = np.concatenate([scored[(packed[ROLLOUT_INDEX_KEY] == index) & (packed[CALL_INDEX_KEY] == number)]
                              for index, number in order])

@@ -127,24 +127,22 @@ Pick a reward whose score you can check independently of training. For example, 
 
 Construct `SampledRollout` with the objective, the reward callable, `groups=G` and `max_new_tokens=R`, and pass it to the trainer as `rollout`. `G` must be at least 2. The trainer calls the rollout on the host before the compiled update. Each prompt gets `G` sampled completions. Group-relative rewards, or leave-one-out rewards with `sample="rloo"`, give their advantages. An advantage says how a completion's reward compares with the other rewards in its group.
 
-With `N = B * G`, the objective reads:
+The rollout turns each completion into a one-call `Rollout` and builds the batch with `pack`, the same layout every GRPO batch in Dew has ([Engine-sourced rollouts and packed rows](#engine-sourced-rollouts-and-packed-rows)). With `N = B * G`, every column is `[N, P + R]` and aligned with `input_ids`: each chain is a prompt without its padding, then the sampled response, and chains may share a row.
 
-| Field | Shape | Meaning |
-| --- | --- | --- |
-| `input_ids` | `[N, P + R]` | Prompt followed by sampled response, with each prompt's group contiguous. |
-| `old_log_probs` | `[N, R]` | Raw model-policy likelihoods recorded at each sampled action. |
-| `behavior_log_probs` | `[N, R]` | Actual temperature/top-k sampling likelihoods. |
-| `response_length` | `[N]` | Valid response actions, including EOS. |
-| `terminated` | `[N]` | True for EOS termination, false for the token budget. |
-| `advantages` | `[N, R]` | Each completion's advantage repeated across response positions. |
-| `response_mask` | `[N, R]` | Response positions that count toward the loss. |
-| `rewards` | `[N]` | Scalar reward for each completion. |
+| Field | Meaning |
+| --- | --- |
+| `input_ids`, `text_segment_ids`, `text_positions` | The chains, which chain each id belongs to, and its position in that chain. |
+| `response_mask` | 1 on sampled ids, EOS included. |
+| `old_log_probs` | Raw model-policy likelihoods recorded at each sampled id. |
+| `behavior_log_probs` | Actual temperature/top-k sampling likelihoods. |
+| `advantages` | The completion's advantage repeated across its chain. |
+| `versions`, `rollout_index`, `call_index` | The policy version, the completion (`row * G + group`) and its call, on sampled ids. |
 
-Use `GRPOObjective(model, seq_len=P + R - 1)`, and give the decoder enough context for `P + R` tokens. GRPO combines a clipped policy-ratio loss with a k3 KL penalty against the frozen reference when `beta > 0`. The clipping parameters are `epsilon_low`, `epsilon_high` and `dual_clip`.
+Use `GRPOObjective(model, seq_len=P + R - 1)`, and give the decoder enough context for `P + R` tokens. Every completion is scored, whether it stopped on EOS or on the budget. GRPO combines a clipped policy-ratio loss with a k3 KL penalty against the frozen reference when `beta > 0`. The clipping parameters are `epsilon_low`, `epsilon_high` and `dual_clip`.
 
-Pass `sampling=Sampling(eos_id=..., temperature=..., top_k=...)` from `dew.sampling`. You can give one EOS id or a tuple of ids. The response mask includes EOS. `response_length` counts valid actions, and `terminated` marks rows that stopped at EOS. The text passed to the reward leaves out EOS and padding. The rollout turns `Prompts.prompt_length` into the standard `ModelInputs` attention mask.
+Pass `sampling=Sampling(eos_id=..., temperature=..., top_k=...)` from `dew.sampling`. You can give one EOS id or a tuple of ids. The response mask includes EOS. The text passed to the reward leaves out EOS and padding. The rollout turns `Prompts.prompt_length` into the standard `ModelInputs` attention mask.
 
-Generation prefills the padded batch once and packs the real tokens into each row's cache, so prompts of different valid lengths reuse the same compiled shape. After a row hits EOS, later steps leave its cache unchanged. Full rescoring left-aligns the real context inside a fixed shape. GRPO validation scores prompt perplexity over real next-token transitions. It does not generate answers for a separate reward evaluation.
+Generation prefills the padded batch once and packs the real tokens into each row's cache, so prompts of different valid lengths reuse the same compiled shape. After a row hits EOS, later steps leave its cache unchanged. Rescoring reads each chain on its own through its segment ids and positions. GRPO validation scores prompt perplexity over real next-token transitions. It does not generate answers for a separate reward evaluation.
 
 `old_log_probs` holds the raw policy likelihoods from the cached forward pass at sampling time. `behavior_log_probs` holds the likelihoods after temperature and top-k. For greedy sampling, the chosen action has a behavior log-probability of zero. GRPO's PPO ratio compares the current raw policy with the old raw policy. A correction from behavior policy to proximal policy is a separate algorithm choice, and Dew does not apply one unless you ask.
 
@@ -208,7 +206,7 @@ Reinforcement learning with verifiable rewards (RLVR) scores each completion by 
 
 Construct `AsyncRollout(objective, server, reward, decode=..., groups=G, max_new_tokens=R, max_lag=1, ahead=1, sync_every=1)`, then train on `rollout.prompts(dataset)` with `Trainer(..., rollout=rollout)`. The wrapped prompt stream registers each batch as the trainer's prefetch reads it. When the trainer hands the rollout batch `i`, the rollout submits batches `i + 1` through `i + ahead` under the weights the server holds at that moment. Batch `i` itself was submitted `ahead` calls earlier, and its draws have been generating and scoring since. The rollout reads nothing ahead of the trainer's own prefetch, so the checkpointed data position stays the trainer's: a resumed run re-reads and resubmits whatever was in flight.
 
-Every row carries `policy_version`. The lag is the trainer's `updates` minus that version. The rollout pushes weights whenever the served version falls `sync_every` updates behind, so a batch is at most `ahead + sync_every - 1` updates stale. Construction refuses a `max_lag` below that. The bound is also checked at consumption: a batch staler than `max_lag`, for example after a resume or a push that did not take, is discarded, the weights are pushed, and its prompts are drawn again. `log` receives a `RolloutRecord` per call with the version, lag, mean reward, redraw count and seconds waited.
+Every sampled id carries its draw's version in `versions`. The lag is the trainer's `updates` minus the oldest draw's version. The rollout pushes weights whenever the served version falls `sync_every` updates behind, so a batch is at most `ahead + sync_every - 1` updates stale. Construction refuses a `max_lag` below that. The bound is also checked at consumption: a batch staler than `max_lag`, for example after a resume or a push that did not take, is discarded, the weights are pushed, and its prompts are drawn again. `log` receives a `RolloutRecord` per call with the version, lag, mean reward, redraw count and seconds waited.
 
 The off-policy correction is decoupled PPO ([AReaL](https://arxiv.org/abs/2505.24298)). When a batch is stale, or the server reported no raw likelihoods, `old_log_probs` is rescored under the trainer's current weights, which serve as the proximal policy. `behavior_log_probs` keeps what the server reported. `GRPOObjective(behavior_importance_cap=...)` then weights each token by proximal over behavior. A rollout that allows any lag requires that cap. Only single-process trainers are supported: one server endpoint receives one process's full weight tree.
 

@@ -281,18 +281,17 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
     else:
         ids = np.tile(np.asarray([[1, 2, 3]], np.int32), (count, 1))
         before = trainer.initial_state()
-        if kind == "grpo":
-            old = np.asarray(objective.per_token_log_probs(before.params, ids))[:, -1:]
-            batch = {"input_ids": ids, "old_log_probs": old, "response_mask": np.ones_like(old),
-                     "advantages": np.ones_like(old)}
-        else:
-            # PPO trains packed episode rows: one chain per row, the last id sampled.
-            mask = np.tile(np.asarray([[0, 0, 1]], np.float32), (count, 1))
-            batch = {"input_ids": ids, "text_segment_ids": np.ones_like(ids),
-                     "text_positions": np.tile(np.arange(3, dtype=np.int32), (count, 1)),
-                     "response_mask": mask, "advantages": mask}
-            weights = {collection: value["policy"] for collection, value in before.params.items()}
-            batch["old_log_probs"] = np.asarray(objective.actor.packed_log_probs(weights, batch))
+        # One packed chain per row, its last id sampled.
+        mask = np.tile(np.asarray([[0, 0, 1]], np.float32), (count, 1))
+        batch = {"input_ids": ids, "text_segment_ids": np.ones_like(ids),
+                 "text_positions": np.tile(np.arange(3, dtype=np.int32), (count, 1)),
+                 "response_mask": mask, "advantages": mask}
+        actor = objective.actor if kind == "ppo" else objective
+        weights = ({collection: value["policy"] for collection, value in before.params.items()}
+                   if kind == "ppo" else before.params)
+        batch["old_log_probs"] = np.asarray(actor.packed_log_probs(weights, batch))
+        batch["behavior_log_probs"] = batch["old_log_probs"]
+        if kind == "ppo":
             values = np.asarray(objective.values(before.params, batch))
             batch.update(old_values=values, returns=values + mask)
     data = Dataset(train=lambda: iter([batch, batch]), val=None, records=2 * count, batch=count)

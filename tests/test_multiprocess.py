@@ -993,17 +993,24 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
         assert report["process_count"] == 2
         assert report["sharding"]["fully_addressable"] == [False]
         assert report["step"] == 1
-    expected = single["single"]
-    pooled = {name: reports[0][name] + reports[1][name]
-              for name in ("input_ids", "response_mask", "old_log_probs", "behavior_log_probs")}
-    assert pooled["input_ids"] == expected["input_ids"]
-    assert pooled["response_mask"] == expected["response_mask"]
-    np.testing.assert_allclose(pooled["old_log_probs"], expected["old_log_probs"],
-                               rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(pooled["behavior_log_probs"], expected["behavior_log_probs"],
-                               rtol=1e-5, atol=1e-6)
+    def completions(report):
+        """Each completion's chain and columns, in rollout order: packing
+        places chains per rank, so rows are compared through their chains."""
+        index = np.asarray(report["rollout_index"])
+        return [{name: np.asarray(report[name])[index == number]
+                 for name in ("input_ids", "response_mask", "old_log_probs", "behavior_log_probs")}
+                for number in range(int(index.max()) + 1)]
+
+    pooled = completions(reports[0]) + completions(reports[1])
+    expected = completions(single["single"])
+    assert len(pooled) == len(expected)
+    for mine, theirs in zip(pooled, expected, strict=True):
+        np.testing.assert_array_equal(mine["input_ids"], theirs["input_ids"])
+        np.testing.assert_array_equal(mine["response_mask"], theirs["response_mask"])
+        for name in ("old_log_probs", "behavior_log_probs"):
+            np.testing.assert_allclose(mine[name], theirs[name], rtol=1e-5, atol=1e-6)
     # The ranks stop at different steps and hold different prompt lengths.
-    drawn = [sum(row) for row in pooled["response_mask"]]
+    drawn = [int(completion["response_mask"].sum()) for completion in pooled]
     assert len(set(drawn)) > 1
     assert reports[0]["response_mask"] != reports[1]["response_mask"]
     assert sorted(set(reports[0]["prompt_lengths"])) != sorted(set(reports[1]["prompt_lengths"]))

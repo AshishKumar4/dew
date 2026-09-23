@@ -277,33 +277,45 @@ def prompt_batch(rows=2):
 
 
 class FakeState:
-    def __init__(self, params):
+    def __init__(self, params, updates=0):
         self.params = params
+        self.updates = updates
 
 
-def test_a_sampled_rollout_packs_fixed_shapes():
+def chains(out):
+    """Each completion's chain, sampled mask and columns, by rollout index."""
+    found = {}
+    for index in np.unique(out["rollout_index"][out["rollout_index"] >= 0]):
+        where = out["rollout_index"] == index
+        found[int(index)] = {name: np.asarray(out[name])[where]
+                             for name in ("input_ids", "response_mask", "old_log_probs",
+                                          "behavior_log_probs", "advantages", "versions")}
+    return found
+
+
+def test_a_sampled_rollout_packs_its_completions():
     """G completions per prompt from the real sampler, greedy and
-    deterministic: full-bleed rectangles with the prompt order kept and
-    groups contiguous inside each row."""
+    deterministic, packed as one-call rollouts: a fixed [prompts * G, prompt
+    width + budget] batch in the packed layout, each chain its prompt then its
+    sampled ids, groups contiguous in rollout order."""
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
-    reward = Calls()
-    rollout = SampledRollout(objective, reward, groups=GROUPS,
+    rollout = SampledRollout(objective, Calls(), groups=GROUPS,
                              max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
     batch = prompt_batch()
 
-    out = rollout(FakeState(params), batch, jax.random.key(1))
+    out = rollout(FakeState(params, updates=3), batch, jax.random.key(1))
 
-    assert out["input_ids"].shape == (4, PROMPT_WIDTH + NEW_TOKENS)
-    assert out["response_mask"].shape == (4, NEW_TOKENS)
-    assert out["old_log_probs"].shape == (4, NEW_TOKENS)
-    assert out["advantages"].shape == (4, NEW_TOKENS)
-    assert out["rewards"].shape == (4,)
-    assert out["prompt_length"].shape == (4,)
-    np.testing.assert_array_equal(out["input_ids"][:, :PROMPT_WIDTH],
-                                  np.repeat(batch["prompt"], GROUPS, axis=0))
-    np.testing.assert_array_equal(out["response_mask"], np.ones((4, NEW_TOKENS)))
-    again = rollout(FakeState(params), batch, jax.random.key(1))
+    for name in ("input_ids", "text_segment_ids", "text_positions", "response_mask",
+                 "old_log_probs", "behavior_log_probs", "advantages"):
+        assert out[name].shape == (4, PROMPT_WIDTH + NEW_TOKENS), name
+    found = chains(out)
+    assert sorted(found) == [0, 1, 2, 3]
+    for index, chain in found.items():
+        np.testing.assert_array_equal(chain["input_ids"][:PROMPT_WIDTH], batch["prompt"][index // GROUPS])
+        np.testing.assert_array_equal(chain["response_mask"], [0] * PROMPT_WIDTH + [1] * NEW_TOKENS)
+        assert (chain["versions"][PROMPT_WIDTH:] == 3).all()
+    again = rollout(FakeState(params, updates=3), batch, jax.random.key(1))
     for key in out:
         np.testing.assert_array_equal(np.asarray(out[key]), np.asarray(again[key]))
 
@@ -322,19 +334,15 @@ def test_rewards_and_advantages_follow_the_calls():
     assert len(reward.seen) == 4
     assert [seen[0] for seen in reward.seen] == ["rule", "rule", "other", "other"]
     assert [seen[2] for seen in reward.seen] == ["1", "1", "2", "2"]
-    assert all(isinstance(seen[1], str) for seen in reward.seen)
-    expected = np.asarray(group_advantage(
-        np.asarray(out["rewards"], np.float32).reshape(-1), GROUPS), np.float32)
-    np.testing.assert_allclose(
-        np.asarray(out["advantages"]).reshape(2, GROUPS, NEW_TOKENS),
-        np.broadcast_to(expected.reshape(2, GROUPS)[..., None], (2, GROUPS, NEW_TOKENS)),
-        rtol=1e-5)
+    scores = np.asarray([reward(*seen) for seen in reward.seen[:4]], np.float32)
+    expected = np.asarray(group_advantage(scores, GROUPS), np.float32)
+    for index, chain in chains(out).items():
+        np.testing.assert_allclose(chain["advantages"], expected[index], rtol=1e-5)
 
 
 def test_old_log_probs_come_from_the_sampling_head():
-    """The stored log-probabilities are the objective's own head over the
-    concatenation, at the response slice: position p predicts token p + 1, so
-    the response starts one before the prompt width."""
+    """The stored raw log-probabilities are the objective's own head over each
+    chain: entry t scores id t given the chain before it."""
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
     rollout = SampledRollout(objective, Calls(), groups=GROUPS,
@@ -342,10 +350,10 @@ def test_old_log_probs_come_from_the_sampling_head():
 
     out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
-    rescored = np.asarray(objective.per_token_log_probs(params, out["input_ids"]))
-    np.testing.assert_allclose(
-        np.asarray(out["old_log_probs"]),
-        rescored[:, PROMPT_WIDTH - 1:PROMPT_WIDTH - 1 + NEW_TOKENS], rtol=1e-5)
+    for chain in chains(out).values():
+        rescored = np.asarray(objective.per_token_log_probs(params, chain["input_ids"][None]))[0]
+        sampled = chain["response_mask"] != 0
+        np.testing.assert_allclose(chain["old_log_probs"][sampled], rescored[sampled[1:]], rtol=1e-5)
 
 
 def test_the_mask_stops_after_the_first_stop_token():
@@ -357,27 +365,30 @@ def test_the_mask_stops_after_the_first_stop_token():
     first = SampledRollout(objective, Calls(), groups=GROUPS,
                            max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))(
                                FakeState(params), batch, jax.random.key(1))
-    stop = int(np.asarray(first["input_ids"])[0, PROMPT_WIDTH])
+    stop = int(chains(first)[0]["input_ids"][PROMPT_WIDTH])
 
     stopped = SampledRollout(objective, Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0, eos_id=stop))(FakeState(params), batch, jax.random.key(1))
+                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0, eos_id=stop))(
+                                 FakeState(params), batch, jax.random.key(1))
 
-    np.testing.assert_array_equal(np.asarray(stopped["response_mask"])[0], [1, 0, 0, 0])
+    chain = chains(stopped)[0]
+    np.testing.assert_array_equal(chain["response_mask"], [0] * PROMPT_WIDTH + [1])
 
 
-def test_rloo_advantages_keep_fixed_shapes():
-    """The leave-one-out family flows through the same rectangles."""
+def test_rloo_advantages_follow_the_calls():
+    """The leave-one-out family flows through the same packer."""
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
-    rollout = SampledRollout(objective, Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0), sample="rloo")
+    reward = Calls()
+    rollout = SampledRollout(objective, reward, groups=GROUPS, max_new_tokens=NEW_TOKENS,
+                             sampling=Sampling(temperature=0.0), sample="rloo")
 
     out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
-    expected = np.asarray(rloo_advantage(
-        np.asarray(out["rewards"], np.float32).reshape(-1), GROUPS), np.float32)
-    np.testing.assert_allclose(
-        np.asarray(out["advantages"])[:, 0], expected.reshape(-1), rtol=1e-5)
+    scores = np.asarray([reward(*seen) for seen in reward.seen[:4]], np.float32)
+    expected = np.asarray(rloo_advantage(scores, GROUPS), np.float32)
+    for index, chain in chains(out).items():
+        np.testing.assert_allclose(chain["advantages"], expected[index], rtol=1e-5)
 
 
 def test_a_misconfigured_rollout_is_refused():

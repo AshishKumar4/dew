@@ -9,10 +9,13 @@ positions alone and compared with that structure.
 import numpy as np
 import pytest
 
-from dew.objectives.rl.rollout import ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, IDS_KEY, RESPONSE_MASK_KEY
 from dew.objectives.rl.rollouts import (
+    ADVANTAGES_KEY,
+    BEHAVIOR_LOG_PROBS_KEY,
     CALL_INDEX_KEY,
+    IDS_KEY,
     POSITIONS_KEY,
+    RESPONSE_MASK_KEY,
     ROLLOUT_INDEX_KEY,
     ROLLOUT_WEIGHTS_KEY,
     SEGMENT_IDS_KEY,

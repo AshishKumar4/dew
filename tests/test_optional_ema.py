@@ -104,12 +104,15 @@ def test_zero_beta_grpo_has_no_reference_and_keeps_live_updates_and_preview():
     initial = trainer.initial_state()
     assert initial.ema is None
     ids = jnp.tile(jnp.array([[1, 2, 3, 4, 5, 6]], jnp.int32), (jax.device_count(), 1))
-    old = objective.per_token_log_probs(initial.params, ids)[:, 2:]
-    batch = {"input_ids": ids, "old_log_probs": old, "advantages": jnp.ones_like(old),
-             "response_mask": jnp.ones_like(old), "prompt_length": jnp.full((ids.shape[0],), 3, jnp.int32)}
+    mask = jnp.tile(jnp.array([[0, 0, 0, 1, 1, 1]], jnp.float32), (ids.shape[0], 1))
+    batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
+             "text_positions": jnp.tile(jnp.arange(6, dtype=jnp.int32), (ids.shape[0], 1)),
+             "response_mask": mask, "advantages": mask}
+    old = objective.packed_log_probs(initial.params, batch)
+    batch.update(old_log_probs=old, behavior_log_probs=old)
     def unregularized(params):
-        current = objective.per_token_log_probs({"params": params}, ids)[:, 2:]
-        return -jnp.mean(jnp.exp(current - old))
+        current = objective.packed_log_probs({"params": params}, batch)
+        return -jnp.sum(jnp.exp(current - old) * mask) / jnp.sum(mask)
     expected_gradient = jax.grad(unregularized)(initial.params["params"])
     updates, _ = optimizer.update(expected_gradient, initial.opt_state, initial.params["params"])
     expected = optax.apply_updates(initial.params["params"], updates)
