@@ -4,15 +4,17 @@ The release's `inference/model.py` imports its tilelang kernels from a
 module named `kernel`. The reference tool installs this module under that
 name so the pinned model code runs on CPU, in fp32 and under autograd. Each
 function reproduces its kernel's arithmetic operation for operation
-(kernel.py at DEEPSEEK_V41_REVISION, the lines cited per function);
-`tools/deepseek_v41_reference.py --check-kernels` compares them against the
-tilelang kernels on a GPU.
+(kernel.py at DEEPSEEK_V41_REVISION, the lines cited per function), except
+that sparse_attn keeps its probabilities in fp32 where the kernel rounds
+them to bf16; `tools/deepseek_v41_reference.py --check-kernels` compares
+them against the tilelang kernels on a GPU.
 
 The quantizers are fake-quantizers, as the kernels' `inplace=True` path is:
 the value leaves in the input's dtype, rounded through the storage format.
-Under autograd they pass the gradient straight through, the
-quantization-aware training the paper names (section 2.4.4). The GEMMs over
-fp8 and fp4 weights have no stand-in: the reference runs dense weights.
+Under autograd they pass the gradient straight through, an estimator the
+reference chooses: the release is inference code and the paper names none.
+The GEMMs over fp8 and fp4 weights have no stand-in: the reference runs
+dense weights.
 """
 
 import torch
@@ -46,36 +48,51 @@ def _fake_quant(x: torch.Tensor, rounded: torch.Tensor, inplace: bool):
     raise NotImplementedError("only the fake-quantizing inplace path has a stand-in")
 
 
+def fp8_quotient(amax: torch.Tensor) -> torch.Tensor:
+    """act_quant's scale before its rounding (kernel.py:74-80): amax floored
+    at 1e-4 times fp32(1/448)."""
+    return amax.clamp_min(1e-4) * torch.tensor(1 / FP8_MAX, dtype=torch.float32)
+
+
+def fp8_scale(amax: torch.Tensor, power_of_two: bool) -> torch.Tensor:
+    """act_quant's scale for a block's amax: the quotient, rounded up to a
+    power of two when the scale format asks for it."""
+    quotient = fp8_quotient(amax)
+    return _power_of_two_ceil(quotient) if power_of_two else quotient
+
+
+def fp4_quotient(amax: torch.Tensor, e4m3: bool) -> torch.Tensor:
+    """fp4_act_quant's scale before its rounding (kernel.py:159-166): amax
+    over 6 with amax floored at 6 * 2**-9 and the quotient saturating at
+    E4M3's 448 (compressed KV, whose kernel casts with cvt.rn.satfinite), or
+    amax times fp32(1/6) with amax floored at 6 * 2**-126 (the indexer)."""
+    if e4m3:
+        return (amax.clamp_min(FP4_MAX * 2 ** -9) / FP4_MAX).clamp_max(FP8_MAX)
+    return amax.clamp_min(FP4_MAX * 2 ** -126) * torch.tensor(1 / FP4_MAX, dtype=torch.float32)
+
+
+def fp4_scale(amax: torch.Tensor, e4m3: bool) -> torch.Tensor:
+    """fp4_act_quant's scale for a block's amax: the quotient cast to E4M3,
+    or rounded up to a power of two."""
+    quotient = fp4_quotient(amax, e4m3)
+    return quotient.to(torch.float8_e4m3fn).float() if e4m3 else _power_of_two_ceil(quotient)
+
+
 def act_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, inplace=False):
-    """FP8 E4M3 per `block_size` channels (kernel.py:40-124): amax floored at
-    1e-4, scale amax * (1/448) rounded up to a power of two when `scale_fmt`
-    is set, value x / scale clamped to +-448, cast to E4M3, times scale."""
+    """FP8 E4M3 per `block_size` channels (kernel.py:40-124): the value
+    x / fp8_scale clamped to +-448, cast to E4M3, times the scale."""
     blocks = x.float().unflatten(-1, (-1, block_size))
-    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4)
-    scale = amax * torch.tensor(1 / FP8_MAX, dtype=torch.float32)
-    if scale_fmt is not None:
-        scale = _power_of_two_ceil(scale)
+    scale = fp8_scale(blocks.abs().amax(-1, keepdim=True), scale_fmt is not None)
     quantized = (blocks / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float() * scale
     return _fake_quant(x, quantized.flatten(-2), inplace)
 
 
 def fp4_act_quant(x, block_size=32, inplace=False, scale_dtype=torch.float8_e8m0fnu):
-    """FP4 E2M1 per `block_size` channels (kernel.py:127-204). An E4M3 scale
-    (compressed KV) is amax / 6 cast to E4M3, saturating, with amax floored at 6 * 2**-9;
-    an E8M0 scale (the indexer) is amax * (1/6) rounded up to a power of two
-    with amax floored at 6 * 2**-126. The value x / scale clamps to +-6 and
-    rounds to E2M1."""
+    """FP4 E2M1 per `block_size` channels (kernel.py:127-204): the value
+    x / fp4_scale clamped to +-6 and rounded to E2M1, times the scale."""
     blocks = x.float().unflatten(-1, (-1, block_size))
-    amax = blocks.abs().amax(-1, keepdim=True)
-    if scale_dtype == torch.float8_e4m3fn:
-        # the kernel's cast saturates (cvt.rn.satfinite), where torch's would not
-        scale = (amax.clamp_min(FP4_MAX * 2 ** -9) / FP4_MAX).clamp_max(FP8_MAX).to(
-            torch.float8_e4m3fn).float()
-    else:
-        scale = _power_of_two_ceil(amax.clamp_min(FP4_MAX * 2 ** -126)
-                                   * torch.tensor(1 / FP4_MAX, dtype=torch.float32))
-    scaled = (blocks / scale).clamp(-FP4_MAX, FP4_MAX)
-    quantized = e2m1(scaled) * scale
+    scale = fp4_scale(blocks.abs().amax(-1, keepdim=True), scale_dtype == torch.float8_e4m3fn)
+    quantized = e2m1((blocks / scale).clamp(-FP4_MAX, FP4_MAX)) * scale
     return _fake_quant(x, quantized.flatten(-2), inplace)
 
 
