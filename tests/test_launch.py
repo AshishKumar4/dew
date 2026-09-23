@@ -228,7 +228,7 @@ def test_where_the_launch_runs_follows_jax_detection_and_names_win(variables, ar
     one-task step, as a scheduler's GPU wrapper runs, leaves its GPUs to a
     pool of the launcher's own."""
     env = {name: value for name, value in ENV.items()
-           if not name.startswith(("SLURM_", "OMPI_"))}
+           if not name.startswith(("SLURM_", "OMPI_")) and name != "JAX_PLATFORMS"}
     done = launched("--dry-run", *arguments, "--", "python", "train.py",
                     env={**env, **variables})
     assert done.returncode == 0, done.stderr
