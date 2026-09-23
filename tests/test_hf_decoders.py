@@ -519,7 +519,6 @@ def test_the_real_gemma3_1b_config_translates():
     ('rope_parameters', {'rope_type': 'linear', 'factor': 8.0, 'rope_theta': 1e6},
      "rope_type 'linear'"),
     ('sliding_window', None, "sliding_window is not set"),
-    ('quantization_config', {'bits': 4}, "quantization_config"),
 ])
 def test_a_config_field_with_no_counterpart_is_refused(field, value, message):
     config = {**fixture_config("gemma3-tiny"), field: value}

@@ -104,6 +104,11 @@ _IGNORED_FIELDS = {
     'torch_dtype', 'transformers_version',
 }
 
+# Read by the codec rather than by any family: `pretrained._source_quantization`
+# decodes the weights this names and refuses a format it cannot, before a
+# family translator sees the config.
+_CODEC_FIELDS = frozenset({'quantization_config'})
+
 
 def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
@@ -734,7 +739,7 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
 
     config = family.translate_config(hf_config, used)
 
-    unknown = (set(hf_config) - used - _IGNORED_FIELDS
+    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS
                - {key for key in hf_config if str(key).startswith('_')})
     if unknown:
         _refuse(f"config fields {sorted(unknown)}",
@@ -975,7 +980,7 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     else:
         _refuse(f"model_type {model_type!r}",
                 "no supported multimodal wrapper is registered for this model")
-    unknown = (set(hf_config) - used - _IGNORED_FIELDS
+    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS
                - {key for key in hf_config if str(key).startswith("_")})
     if unknown:
         _refuse(f"config fields {sorted(unknown)}",

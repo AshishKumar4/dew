@@ -58,22 +58,31 @@ AMAX_FLOOR = 1e-4
 """`per_block_cast_to_fp8`'s `clamp(1e-4)` on a block's amax."""
 
 
+E4M3_NAMES = (None, 'e4m3', 'float8_e4m3fn')
+"""The `fmt` spellings of E4M3 weights. transformers' `FineGrainedFP8Config`
+(utils/quantization_config.py:1692-1742, 5.16.1) declares no `fmt` and
+always stores float8_e4m3fn, so Qwen3's FP8 repos that omit it are E4M3;
+DeepSeek writes 'e4m3' and MiniMax 'float8_e4m3fn'."""
+
+
 def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
     """Return the block size and whether the scales are ue8m0, from `quantization`.
 
-    DeepSeek's format or refused: e4m3 in a square block, the scales float32
-    (V3) or `scale_fmt` ue8m0 (V3.2). A per-tensor or rectangular scale, or
-    a scale format with no rounding rule here, is not this format.
+    The finegrained format or refused: E4M3 weights (`E4M3_NAMES`) in a
+    square block, the scales float32 (`scale_fmt` absent or 'float', V3)
+    or ue8m0 (V3.2). A per-tensor or rectangular scale, or a scale format
+    with no rounding rule here, is not this format.
     """
     fmt, block, scale_fmt = (quantization.get(key)
                              for key in ('fmt', 'weight_block_size', 'scale_fmt'))
-    if (fmt != 'e4m3' or not isinstance(block, list) or len(block) != 2
+    if (fmt not in E4M3_NAMES or not isinstance(block, list) or len(block) != 2
             or any(type(side) is not int or side < 1 for side in block)
-            or block[0] != block[1] or scale_fmt not in (None, 'ue8m0')):
+            or block[0] != block[1] or scale_fmt not in (None, 'float', 'ue8m0')
+            or quantization.get('weight_per_tensor')):
         raise ValueError(
             f"quantization_config names fp8 with fmt {fmt!r}, weight_block_size "
-            f"{block!r} and scale_fmt {scale_fmt!r}; this loader reads DeepSeek's e4m3 "
-            f"weights in square blocks with float32 or ue8m0 scales and nothing else")
+            f"{block!r} and scale_fmt {scale_fmt!r}; this loader reads e4m3 weights "
+            f"in square blocks, not per tensor, with float32 or ue8m0 scales and nothing else")
     return block[0], scale_fmt == 'ue8m0'
 
 

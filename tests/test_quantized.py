@@ -138,9 +138,13 @@ DEEPSEEK_V32 = {**DEEPSEEK_V3, "scale_fmt": "ue8m0"}
 
 
 def test_the_config_names_the_block_and_the_scale_format():
-    """The two DeepSeek configs as they are on the hub."""
+    """The two DeepSeek configs as they are on the hub, and the spellings
+    transformers' FineGrainedFP8Config reads the same way: no fmt (it
+    declares none and stores E4M3), and scale_fmt 'float', its default."""
     assert fp8_format(DEEPSEEK_V3) == (128, False)
     assert fp8_format(DEEPSEEK_V32) == (128, True)
+    assert fp8_format({key: value for key, value in DEEPSEEK_V3.items() if key != "fmt"}) == (128, False)
+    assert fp8_format({**DEEPSEEK_V3, "fmt": "float8_e4m3fn", "scale_fmt": "float"}) == (128, False)
 
 
 @pytest.mark.parametrize("field, value", [("fmt", "e5m2"), ("weight_block_size", None),
@@ -148,9 +152,9 @@ def test_the_config_names_the_block_and_the_scale_format():
                                           ("weight_block_size", [128.0, 128.0]),
                                           ("weight_block_size", [True, True]),
                                           ("weight_block_size", [0, 0]),
-                                          ("scale_fmt", "e8m0"), ("scale_fmt", "float"),
-                                          ("scale_fmt", "")])
-def test_an_fp8_config_outside_deepseeks_format_is_refused(field, value):
+                                          ("weight_per_tensor", True),
+                                          ("scale_fmt", "e8m0"), ("scale_fmt", "")])
+def test_an_fp8_config_outside_the_finegrained_format_is_refused(field, value):
     """A per-tensor or rectangular scale, or a scale format with no rounding
     rule here, is refused at load rather than read under an invented one."""
     with pytest.raises(ValueError, match="nothing else"):
