@@ -1,4 +1,4 @@
-"""The subprocesses dew-tpu starts: every one is built, printed and run here.
+"""The subprocesses dew tpu starts: every one is built, printed and run here.
 
 A dry run prints the command and returns success without touching gcloud.
 """
@@ -49,7 +49,7 @@ class Result:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Node:
-    """The parts of a describe response that dew-tpu reads."""
+    """The parts of a describe response that dew tpu reads."""
 
     name: str
     zone: str

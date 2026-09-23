@@ -1,4 +1,4 @@
-"""dew-tpu against a fake gcloud: argv per command, fan-out, dry runs, config."""
+"""dew tpu and dew launch --tpu against a fake gcloud: argv per command, fan-out, pools, dry runs, config."""
 
 import json
 import os
@@ -89,7 +89,7 @@ if verb == "ssh":
         print("ran " + command)
     raise SystemExit(0)
 
-if verb in ("create", "delete", "start", "stop", "scp"):
+if verb in ("create", "delete", "start", "stop", "scp", "attach-disk"):
     raise SystemExit(0)
 die("the fake does not know " + " ".join(argv))
 '''
@@ -325,8 +325,8 @@ def test_list_reads_every_configured_zone(fake, capsys):
         "compute", "tpus", "tpu-vm", "list", f"--zone={zone}", "--format=json")
         for zone in CONFIG.zones]
     lines = capsys.readouterr().out.splitlines()
-    assert lines[0].split() == ["NAME", "TYPE", "STATE", "HEALTH", "WORKERS", "ZONE", "SPOT"]
-    assert lines[1].split() == ["one", "v5e-8", "READY", "-", "1", "us-east1-d", "yes"]
+    assert lines[0].split() == ["NAME", "TYPE", "STATE", "HEALTH", "WORKERS", "ZONE", "SPOT", "IP"]
+    assert lines[1].split() == ["one", "v5e-8", "READY", "-", "1", "us-east1-d", "yes", "34.0.0.1"]
 
 
 def test_list_says_so_when_there_is_nothing(fake, capsys):
@@ -366,6 +366,32 @@ def test_ssh_forwards_ports_and_passes_extra_args(fake):
         "compute", "tpus", "tpu-vm", "ssh", "you@slice", "--zone=us-central2-b",
         "--worker=0", "--ssh-flag=-L 8888:localhost:8888",
         "--ssh-flag=-L 6006:localhost:6006") + ["--", "-vv"]
+
+
+def test_ssh_config_names_every_worker_and_delete_removes_it(fake, capsys):
+    """Writing the entries again replaces them; the user's own entries stay."""
+    fake.offer("slice", "us-central2-b")
+    ssh_dir = Path(os.environ["HOME"]) / ".ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "config").write_text("Host mine\n    HostName 1.2.3.4\n")
+    assert run("ssh-config", "slice") == 0
+    assert run("ssh-config", "slice") == 0
+    text = (ssh_dir / "config").read_text()
+    assert text.startswith("Host mine\n    HostName 1.2.3.4\n# dew tpu slice\nHost slice\n")
+    assert text.count("Host slice\n    HostName 34.0.0.1\n    User you\n") == 1
+    assert "Host slice-worker-1\n    HostName 34.0.0.2\n" in text
+    assert run("delete", "slice") == 0
+    assert (ssh_dir / "config").read_text() == "Host mine\n    HostName 1.2.3.4\n"
+
+
+def test_attach_disk_attaches_then_mounts_on_every_worker(fake):
+    fake.offer("slice", "us-central2-b")
+    assert run("attach-disk", "slice", "data", "--read-only") == 0
+    assert gcloud("compute", "tpus", "tpu-vm", "attach-disk", "slice", "--zone=us-central2-b",
+                  "--disk=projects/my-project/zones/us-central2-b/disks/data",
+                  "--mode=read-only") in fake.gcloud_calls()
+    mount = f"sudo -n bash -c {shlex.quote(tpu_setup.disk_startup_script())}"
+    assert sorted(only(fake.gcloud_calls(), "ssh")) == [ssh("0", mount), ssh("1", mount)]
 
 
 def test_copy_sends_a_file_to_every_worker(fake):
@@ -422,7 +448,7 @@ def test_run_detached_writes_a_log_per_worker(fake, capsys):
             f"> $HOME/dew-runs/job1/worker-{worker}.log 2>&1 < /dev/null & "
             'echo "job job1 pid $!"')
         assert ssh(str(worker), command) in fake.gcloud_calls()
-    assert "dew-tpu logs slice job1 --follow" in capsys.readouterr().out
+    assert "dew tpu logs slice job1 --follow" in capsys.readouterr().out
 
 
 def test_logs_tails_one_worker_by_default_and_all_on_request(fake):
@@ -531,6 +557,27 @@ def test_setup_fails_when_a_worker_cannot_see_the_slice(fake, capsys):
     assert run("setup", "slice") == 1
     assert ["1", "8", "8", "want", "16"] in [
         line.split() for line in capsys.readouterr().out.splitlines()]
+
+
+def test_setup_installs_a_git_key_on_every_worker(fake, tmp_path):
+    fake.offer("slice", "us-central2-b")
+    key = tmp_path / "tpukey"
+    key.write_text("secret")
+    assert run("setup", "slice", "--git-key", str(key)) == 0
+    assert gcloud("compute", "tpus", "tpu-vm", "scp", str(key), "you@slice:~/.ssh/id_ed25519",
+                  "--zone=us-central2-b", "--worker=all") in fake.gcloud_calls()
+    script = (config_dir() / "setup-slice.sh").read_text()
+    assert "GIT_KEY=1" in script
+    assert "ssh-keyscan -t ed25519 github.com" in script
+
+
+def test_help_lists_the_config_defaults_the_command_reads(fake, capsys):
+    with pytest.raises(SystemExit):
+        run("setup", "--help")
+    out = capsys.readouterr().out
+    assert f"defaults ({config_dir() / 'tpu.toml'}):" in out
+    assert "  gcs_bucket        my-bucket" in out
+    assert "data_disk" not in out.split("defaults (")[1]
 
 
 def test_setup_installs_a_release_when_asked(fake):

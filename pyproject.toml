@@ -50,7 +50,6 @@ license = "MIT"
 
 [project.scripts]
 dew = "dew.cli.main:main"
-dew-tpu = "dew.cli.tpu:main"
 
 [project.optional-dependencies]
 # The accelerator builds of the pinned jax, installed as `dew-ml[cuda13]`. pip

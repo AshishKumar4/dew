@@ -1,4 +1,4 @@
-"""The scripts dew-tpu runs on the workers.
+"""The scripts dew tpu runs on the workers.
 
 The setup script is rendered from the Python version, the extras and the
 source mode. Every step is guarded, so a second run re-creates nothing, but
@@ -107,6 +107,13 @@ DEW_GCSFUSE
     || gcsfuse --config-file "$HOME/gcsfuse.yml" --implicit-dirs "$GCS_BUCKET" "$MOUNT_PATH"
 fi
 
+if [ "$GIT_KEY" = 1 ]; then
+  step "git key"
+  chmod 600 "$HOME/.ssh/id_ed25519"
+  grep -qs '^github.com ' "$HOME/.ssh/known_hosts" \\
+    || ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+fi
+
 step "ready: $("$PY" -V)"
 """
 
@@ -141,17 +148,19 @@ def render(
     package_spec: str,
     editable: bool = False,
     gcs_bucket: str = "",
+    git_key: bool = False,
 ) -> str:
     """The setup script for one worker."""
     header = [
         "#!/bin/bash",
-        "# Rendered by dew-tpu setup.",
+        "# Rendered by dew tpu setup.",
         "set -euo pipefail",
         f"PYTHON_VERSION={shlex.quote(python_version)}",
         f"JAX_SPEC={shlex.quote(JAX_SPEC)}",
         f"PACKAGE_SPEC={shlex.quote(package_spec)}",
         f"EDITABLE={int(editable)}",
         f"GCS_BUCKET={shlex.quote(gcs_bucket)}",
+        f"GIT_KEY={int(git_key)}",
         f'VENV="{VENV}"',
         f'ENV_FILE="{ENV_FILE}"',
         f'RUNS_DIR="{RUNS_DIR}"',

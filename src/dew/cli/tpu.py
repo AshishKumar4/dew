@@ -1,7 +1,9 @@
-"""dew-tpu: create Cloud TPUs, set them up for dew, and run on every worker.
+"""dew tpu: create Cloud TPUs, set them up for dew, and reach their workers.
 
-Reads its defaults from ~/.config/dew/tpu.toml. Every command takes --dry-run,
-which prints the commands it would run and exits.
+Reads its defaults from ~/.config/dew/tpu.toml, which `dew tpu init` writes;
+every command's --help lists the ones it reads. Every command takes
+--dry-run, which prints the commands it would run and exits. `dew launch
+--tpu NAME` runs a program on every worker as one pool.
 """
 
 from __future__ import annotations
@@ -16,11 +18,11 @@ import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, ClassVar
 
 import tyro
 
-from dew.cli import config, tpu_setup
+from dew.cli import config, ssh_config, tpu_setup
 from dew.cli.gcloud import Gcloud, Node, Tpu, emit, exit_code
 
 #: States a create never recovers from.
@@ -47,11 +49,15 @@ Worker = Annotated[str, tyro.conf.arg(metavar="N|all")]
 Job = Annotated[str, tyro.conf.arg(metavar="JOB")]
 Extras = Annotated[str, tyro.conf.arg(metavar="LIST")]
 Release = Annotated[str, tyro.conf.arg(metavar="VERSION")]
+KeyFile = Annotated[Path | None, tyro.conf.arg(metavar="FILE")]
 
 
 @dataclasses.dataclass(kw_only=True)
 class Base:
     """Flags shared by every command that talks to a TPU."""
+
+    reads: ClassVar[tuple[str, ...]] = ("project", "zones", "ssh_user")
+    """The config fields the command falls back to, which its --help lists."""
 
     zone: Zone = None
     """Zone of the TPU. Searched across the configured zones when omitted."""
@@ -114,6 +120,27 @@ def _missing(tpu: Tpu) -> SystemExit:
 
 def _tpu(cmd: Base, cfg: config.TpuConfig, gcloud: Gcloud, name: str) -> Tpu:
     return Tpu(gcloud, name, _zone(gcloud, cfg, name, cmd.zone), cfg.ssh_user)
+
+
+def reach(name: str, zone: str | None, dry_run: bool) -> tuple[Tpu, list[str]]:
+    """A READY TPU and its workers' internal addresses, in worker order.
+
+    The zone is searched as every command searches it. A dry run reads
+    nothing from gcloud and names the addresses of as many workers as the
+    configured accelerator type has.
+    """
+    cfg = config.load()
+    gcloud = Gcloud(project=cfg.project, dry_run=dry_run)
+    tpu = Tpu(gcloud, name, _zone(gcloud, cfg, name, zone), cfg.ssh_user)
+    if dry_run:
+        count = config.worker_count(cfg.accelerator_type)
+        return tpu, [f"<{name}-worker-{index}-ip>" for index in range(count)]
+    node = tpu.describe()
+    if node is None:
+        raise _missing(tpu)
+    if node.state != "READY" or not node.internal_ips:
+        raise SystemExit(f"{name} is {node.state}, not READY")
+    return tpu, list(node.internal_ips)
 
 
 def _slice(tpu: Tpu, cfg: config.TpuConfig, type_hint: str = "") -> tuple[int, str]:
@@ -246,6 +273,9 @@ def _job(job: str, name: str) -> str:
 class Init:
     """Write ~/.config/dew/tpu.toml from flags, asking for what is missing."""
 
+    reads: ClassVar[tuple[str, ...]] = tuple(
+        field.name for field in dataclasses.fields(config.TpuConfig))
+
     project: Project = None
     """Google Cloud project that owns the TPUs."""
     zones: Zones = None
@@ -293,6 +323,9 @@ class Init:
 class Create(Base):
     """Create a TPU VM or pod slice and wait until it is ready."""
 
+    reads: ClassVar[tuple[str, ...]] = (
+        "project", "zones", "accelerator_type", "runtime_version", "data_disk", "ssh_user")
+
     name: Positional[str]
     """Name of the TPU."""
     type: Kind = None
@@ -304,7 +337,7 @@ class Create(Base):
     version: Version = None
     """Runtime version, or auto to pick it from the accelerator generation."""
     disk: Disk = None
-    """Persistent disk to attach, mounted on the worker at /mnt/persist."""
+    """Persistent disk to attach, mounted on the worker at /mnt/persist; '' attaches none."""
 
     def run(self, rest: list[str]) -> int:
         cfg, gcloud = _open(self)
@@ -363,8 +396,9 @@ class Delete(Base):
         else:
             argv = tpu.vm("delete", self.name, f"--zone={tpu.zone}", "--quiet")
         code = gcloud.run(argv, capture=False).code
-        if not code:
+        if not code and not gcloud.dry_run:
             config.forget_zone(self.name)
+            ssh_config.forget(self.name)
         return code
 
 
@@ -414,11 +448,11 @@ class List(Base):
                 node = Node.parse(entry)
                 rows.append((node.name, node.accelerator_type, node.state,
                              node.health or "-", str(node.workers), zone,
-                             "yes" if node.spot else "-"))
+                             "yes" if node.spot else "-", next(iter(node.ips), "") or "-"))
         if not rows:
             emit(f"no TPUs in {', '.join(zones)}")
             return 0
-        _table(("NAME", "TYPE", "STATE", "HEALTH", "WORKERS", "ZONE", "SPOT"), rows)
+        _table(("NAME", "TYPE", "STATE", "HEALTH", "WORKERS", "ZONE", "SPOT", "IP"), rows)
         return 0
 
 
@@ -478,6 +512,59 @@ class Ssh(Base):
 
 
 @dataclasses.dataclass
+class SshConfig(Base):
+    """Write ~/.ssh/config entries for every worker: NAME, NAME-worker-1 and on."""
+
+    name: Positional[str]
+    """Name of the TPU."""
+
+    def run(self, rest: list[str]) -> int:
+        cfg, gcloud = _open(self)
+        tpu = _tpu(self, cfg, gcloud, self.name)
+        if gcloud.dry_run:
+            addresses = [f"<worker-{index}-ip>" for index in range(_slice(tpu, cfg)[0])]
+        else:
+            node = tpu.describe()
+            if node is None:
+                raise _missing(tpu)
+            addresses = [ip or internal for ip, internal in zip(node.ips, node.internal_ips,
+                                                                  strict=True)]
+        block = ssh_config.block(self.name, addresses, cfg.ssh_user or getpass.getuser())
+        if gcloud.dry_run:
+            emit(f"# {ssh_config.path()}")
+            emit(block.rstrip())
+            return 0
+        ssh_config.write(self.name, block)
+        emit(f"ssh {self.name} reaches worker 0 of {len(addresses)}; entries in {ssh_config.path()}")
+        return 0
+
+
+@dataclasses.dataclass
+class AttachDisk(Base):
+    """Attach a persistent disk to every worker and mount it at /mnt/persist."""
+
+    name: Positional[str]
+    """Name of the TPU."""
+    disk: Positional[str]
+    """Name of the disk, in the TPU's zone."""
+    read_only: bool = False
+    """Attach it read-only, which a disk shared by several workers needs."""
+
+    def run(self, rest: list[str]) -> int:
+        cfg, gcloud = _open(self)
+        tpu = _tpu(self, cfg, gcloud, self.name)
+        source = f"projects/{_project(gcloud, cfg)}/zones/{tpu.zone}/disks/{self.disk}"
+        mode = "read-only" if self.read_only else "read-write"
+        attached = gcloud.run(tpu.vm("attach-disk", self.name, f"--zone={tpu.zone}",
+                                     f"--disk={source}", f"--mode={mode}"), capture=False)
+        if not attached.ok:
+            return attached.code
+        count, _ = _slice(tpu, cfg)
+        mount = f"sudo -n bash -c {shlex.quote(tpu_setup.disk_startup_script())}"
+        return exit_code(tpu.fanout([(index, mount) for index in range(count)]))
+
+
+@dataclasses.dataclass
 class Run(Base):
     """Run a command on the workers. Put the command after --."""
 
@@ -492,7 +579,7 @@ class Run(Base):
 
     def run(self, rest: list[str]) -> int:
         if not rest:
-            raise SystemExit("dew-tpu run NAME -- COMMAND")
+            raise SystemExit("dew tpu run NAME -- COMMAND")
         cfg, gcloud = _open(self)
         tpu = _tpu(self, cfg, gcloud, self.name)
         workers = _workers(self.worker, tpu, cfg)
@@ -502,7 +589,7 @@ class Run(Base):
         job = _job(self.job, self.name)
         outcomes = tpu.fanout([
             (index, tpu_setup.detached(command, job, index)) for index in workers])
-        emit(f"job {job}: dew-tpu logs {self.name} {job} --follow")
+        emit(f"job {job}: dew tpu logs {self.name} {job} --follow")
         return exit_code(outcomes)
 
 
@@ -580,6 +667,9 @@ class Sync(Base):
 class Setup(Base):
     """Install uv, a venv, jax and dew on every worker, then count the devices."""
 
+    reads: ClassVar[tuple[str, ...]] = (
+        "project", "zones", "ssh_user", "accelerator_type", "gcs_bucket", "python_version")
+
     name: Positional[str]
     """Name of the TPU."""
     from_source: bool = False
@@ -596,6 +686,8 @@ class Setup(Base):
     """Accelerator type to expect, for the device check in a dry run."""
     delete: bool = False
     """With --from-source, mirror the tree instead of only adding to it."""
+    git_key: KeyFile = None
+    """Private key the workers use for git over ssh, installed as ~/.ssh/id_ed25519."""
 
     def run(self, rest: list[str]) -> int:
         cfg, gcloud = _open(self)
@@ -614,6 +706,7 @@ class Setup(Base):
             package_spec=spec,
             editable=editable,
             gcs_bucket=cfg.gcs_bucket if self.gcs_bucket is None else self.gcs_bucket,
+            git_key=self.git_key is not None,
         )
         path = config.config_dir() / f"setup-{self.name}.sh"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -623,6 +716,11 @@ class Setup(Base):
                           capture=False)
         if not copy.ok:
             return copy.code
+        if self.git_key is not None:
+            copy = gcloud.run(tpu.scp_argv([str(self.git_key)], f"{tpu.host}:~/.ssh/id_ed25519",
+                                           worker="all"), capture=False)
+            if not copy.ok:
+                return copy.code
         code = exit_code(tpu.fanout([(index, "bash ~/dew-setup.sh") for index in range(count)]))
         if code:
             return code
@@ -661,7 +759,7 @@ class Train(Base):
 
     def run(self, rest: list[str]) -> int:
         if not rest:
-            raise SystemExit("dew-tpu train NAME -- recipes/lm/train.py [FLAGS]")
+            raise SystemExit("dew tpu train NAME -- recipes/lm/train.py [FLAGS]")
         job = _job(self.job, self.name)
         cfg, gcloud = _open(self)
         tpu = _tpu(self, cfg, gcloud, self.name)
@@ -724,6 +822,10 @@ class Reset(Base):
 class Spawn(Base):
     """Create N independent TPUs, set them up, and start a command on each."""
 
+    reads: ClassVar[tuple[str, ...]] = (
+        "project", "zones", "accelerator_type", "runtime_version", "data_disk", "ssh_user",
+        "gcs_bucket", "python_version")
+
     base: Positional[str]
     """Name prefix. The TPUs are base-0, base-1 and so on."""
     count: Positional[int]
@@ -785,6 +887,8 @@ COMMANDS = {
     "list": List,
     "describe": Describe,
     "ssh": Ssh,
+    "ssh-config": SshConfig,
+    "attach-disk": AttachDisk,
     "run": Run,
     "logs": Logs,
     "copy": Copy,
@@ -811,10 +915,30 @@ def _split(argv: Sequence[str]) -> tuple[list[str], list[str]]:
     return argv[:cut], argv[cut + 1:]
 
 
+def _show_defaults(flags: Sequence[str]) -> None:
+    """After a command's --help, the config values that command falls back to."""
+    named = next((word for word in flags if word in COMMANDS), None)
+    reads = COMMANDS[named].reads if named else Init.reads
+    path = config.config_path()
+    cfg = config.load()
+    source = str(path) if path.is_file() else f"built-in; `dew tpu init` writes {path}"
+    emit(f"defaults ({source}):")
+    width = max(len(field) for field in reads)
+    for field in reads:
+        value = getattr(cfg, field)
+        shown = ", ".join(value) if isinstance(value, tuple) else value
+        emit(f"  {field.ljust(width)}  {shown or '(unset)'}")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     flags, rest = _split(sys.argv[1:] if argv is None else argv)
-    command = tyro.extras.subcommand_cli_from_dict(
-        COMMANDS, args=flags, prog="dew-tpu", description=__doc__, config=CONFIG)
+    try:
+        command = tyro.extras.subcommand_cli_from_dict(
+            COMMANDS, args=flags, prog="dew tpu", description=__doc__, config=CONFIG)
+    except SystemExit as done:
+        if done.code == 0 and ("-h" in flags or "--help" in flags):
+            _show_defaults(flags)
+        raise
     return command.run(rest)
 
 
