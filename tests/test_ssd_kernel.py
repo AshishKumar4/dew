@@ -324,6 +324,17 @@ def test_the_gpu_budget_refuses_what_the_tpu_budget_takes():
     assert GPU_PROGRAM_WORDS < TPU_PROGRAM_WORDS
 
 
+def test_a_gpu_older_than_sm80_takes_the_xla_path(monkeypatch):
+    """Triton does not compile below compute capability 8.0; the rule every
+    Dew Triton kernel shares sends such a card to the XLA path."""
+    from dew.nn.kernels import generation
+    monkeypatch.setattr(generation, "_gpu_versions", lambda: [75])
+    assert not ssd_kernel_runs(128, 64, 64, "gpu")
+    assert ssd_kernel_runs(256, 64, 128, "tpu")
+    monkeypatch.setattr(generation, "_gpu_versions", lambda: [89])
+    assert ssd_kernel_runs(128, 64, 64, "gpu")
+
+
 def kernels_in(jaxpr) -> int:
     """How many pallas calls a traced program holds, the kernel's own mark."""
     found = 0

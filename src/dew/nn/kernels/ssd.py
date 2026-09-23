@@ -44,6 +44,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu, triton as plgpu
 
+from .generation import filter_triton_deprecation, triton_compiles
+
 _log = logging.getLogger(__name__)
 
 MIN_WIDTH = 8
@@ -94,7 +96,8 @@ def _program_words(chunk_size: int, head_dim: int, state_size: int) -> int:
 
 
 def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: str) -> bool:
-    """Whether the SSD kernel takes this geometry: a gpu or tpu backend, a
+    """Whether the SSD kernel takes this geometry: a tpu backend or a gpu the
+    Triton kernels compile for (`dew.nn.kernels.generation.triton_compiles`), a
     chunk long enough to pay for a program, three widths that are powers of
     two so that neither Triton's block padding nor Mosaic's tiling throws
     lanes away, and a tile inside the backend's per-program budget.
@@ -102,7 +105,7 @@ def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: st
     `chunk_ssd` asks this at trace time and takes the XLA path when it says
     no, the way attention's 'auto' asks `cudnn_runs`.
     """
-    if backend not in ('gpu', 'tpu'):
+    if backend not in ('gpu', 'tpu') or (backend == 'gpu' and not triton_compiles()):
         return False
     widths = (chunk_size, head_dim, state_size)
     if any(width < MIN_WIDTH or width & (width - 1) for width in widths):
@@ -321,6 +324,7 @@ def _interpreting(platform: str) -> bool:
 def _call(body, platform: str, grid: tuple[int, ...], in_specs, out_specs, out_shape):
     """One `pallas_call` built for the backend `platform` names."""
     if platform == 'gpu':
+        filter_triton_deprecation()
         params = plgpu.CompilerParams(num_warps=GPU_WARPS, num_stages=GPU_STAGES)
     else:
         params = pltpu.CompilerParams(
