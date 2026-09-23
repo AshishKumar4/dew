@@ -23,11 +23,11 @@ least the reference's own distance from the same step computed in fp64, so
 any reassociation of fp32 sums is held to fp32's own rounding of the step,
 while a defect lands orders of magnitude past it.
 
-An objective that draws noise per row (a DiT's diffusion) draws other noise
-for permuted or pooled rows, so neither is a reassociation of its step. Its
-floor is data parallelism over every device instead, the layout that splits
-the batch sum and nothing else; the language models check that layout
-against the permutation floor.
+An objective that draws noise per row (a DiT's diffusion, a DiffusionGemma
+canvas's masks) draws other noise for permuted or pooled rows, so neither is
+a reassociation of its step. Its floor is data parallelism over every device
+instead, the layout that splits the batch sum and nothing else; the
+next-token models check that layout against the permutation floor.
 
 The same command runs in one process or under `dew launch`, where the global
 batch is placed from every process alike:
@@ -53,7 +53,8 @@ from typing import Annotated, Any
 
 import tyro
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "tools"))
 
 FLOOR_FACTOR = 4.0
 PERMUTATIONS = 16
@@ -76,16 +77,39 @@ LAYOUTS: dict[str, dict[str, int]] = {
 """Four-device layouts: every axis alone and the combinations worth running."""
 
 
+def _fixture(name: str) -> dict[str, Any]:
+    """The decoder config Dew builds from a model's Hugging Face config."""
+    from dew.interop.hf_decoders import translate_config
+
+    config = json.loads((REPO / "tests/fixtures/hf" / name / "config.json").read_text())
+    return dict(translate_config(config.get("text_config", config)))
+
+
 def zoo() -> dict[str, Any]:
     """Small models of every family a layout splits differently: a dense
-    decoder, an MoE decoder, a Mamba-2 hybrid and a DiT, each at widths
-    every layout above divides."""
+    decoder, MoE decoders with 8 and with Qwen3-30B-A3B's 128 experts, a
+    Mamba-2 hybrid, a DiT and DiffusionGemma, each at widths every layout
+    above divides. The last two MoE models and DiffusionGemma keep their
+    released configs' routing and layer kinds."""
     from benchmark_step import Case
 
     dense = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8,
              "num_kv_heads": 4, "head_dim": 8, "mlp_features": 128, "max_seq_len": 33}
     moe = {**dense, "mixture": {"experts": 8, "top_k": 2, "expert_features": 32,
                                 "layers": (0, 1, 2, 3)}}
+    moe128 = {**dense, "mixture": {**_fixture("qwen3-30b-a3b")["mixture"], "expert_features": 32,
+                                   "layers": (0, 1, 2, 3)}}
+    # Four periods of five sliding layers and one global one, so each stage
+    # of two or four holds whole periods; the trunk is the causal encoder
+    # view DiffusionGemma clones its bidirectional decoder from.
+    released = _fixture("diffusiongemma-26b")
+    dgemma = {**released, "vocab_size": 512, "emb_features": 64, "num_heads": 4,
+              "num_kv_heads": 2, "head_dim": 16, "mlp_features": 64, "num_layers": 24,
+              "layer_types": tuple(released["layer_types"][:6]) * 4, "max_seq_len": 32,
+              "layer_scalar": "frozen", "causal": True,
+              "kinds": {"sliding_attention": {"window": 8, "rope_theta": 10000.0},
+                        "full_attention": {"head_dim": 32, "num_kv_heads": 1}},
+              "mixture": {**released["mixture"], "experts": 8, "top_k": 2, "expert_features": 32}}
     hybrid = {**dense, "layer_types": ("mamba", "attention") * 2,
               "kinds": {"mamba": {"mixer": {"kind": "mamba2", "num_heads": 4, "head_dim": 16,
                                             "state_size": 8, "n_groups": 1, "chunk_size": 8}},
@@ -96,10 +120,20 @@ def zoo() -> dict[str, Any]:
     return {
         "dense": Case("causal_transformer", dense, **lm),
         "moe": Case("causal_transformer", moe, **lm),
+        "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
         "dit": Case("simple_dit", dit, batch_size=8, image_size=8, channels=4,
                     fsdp_min_param_size=256),
+        "dgemma": Case("diffusion_gemma", dgemma, canvas={"prompt_length": 16, "canvas_size": 8},
+                       batch_size=8, seq_len=31, fsdp_min_param_size=256),
     }
+
+
+def reassociates(case) -> bool:
+    """Whether reordering or pooling the batch's rows only reassociates the
+    step's sums: a next-token loss draws nothing per row, a diffusion
+    objective draws its noise by row."""
+    return case.is_lm and case.canvas is None
 
 
 def stash():
@@ -237,7 +271,7 @@ def strided(batch, pieces: int):
 def floor(case, batch, reference, reference_loss: float) -> tuple[dict[str, float], float]:
     """Per leaf, the largest deviation of the reference from itself under a
     reassociation of the batch's sums, and the same of the step-one loss."""
-    if not case.is_lm:
+    if not reassociates(case):
         losses, gradient, _ = trained(case, {}, batch, steps=1)
         return leaf_errors(reference, gradient), abs(losses[0] - reference_loss)
     runs = pooled(case, [reordered(batch, seed) for seed in range(PERMUTATIONS)], 1)
@@ -302,7 +336,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
         ref_losses, ref_gradient, ref_compiled = trained(case, {}, batch, steps=steps,
                                                          one_device=True)
         floors, loss_floor = floor(case, batch, ref_gradient, ref_losses[0])
-        if anchor and case.is_lm:
+        if anchor and reassociates(case):
             rounding = exact(case, ref_gradient)
             floors = {leaf: max(value, rounding[leaf]) for leaf, value in floors.items()}
         speak(f"[{model}] reference losses {ref_losses}, largest floor {max(floors.values()):.2e}")
