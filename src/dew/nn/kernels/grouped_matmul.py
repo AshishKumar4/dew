@@ -19,8 +19,9 @@ lowering. These kernels stay on compute capability 8.0 to 8.9 on purpose:
 JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses
 wgmma, which sm_80 and sm_89 do not have, and tokamax's sm80 Mosaic config
 exceeds an Ada card's shared memory and has no backward. Where they run is
-`dew.nn.kernels.generation.triton_runs`, the rule every Triton kernel in Dew
-shares, and its deprecation warning is filtered there.
+`dew.nn.kernels.generation.triton_runs`. jax 0.11.2 warns at each lowering
+that the Triton backend is deprecated; Dew leaves that warning to the
+user's filters (docs/performance.md records the deprecation).
 """
 
 from __future__ import annotations
@@ -33,8 +34,6 @@ import numpy as np
 from flax.typing import Dtype, PrecisionLike
 
 from ..precision import asks_default_precision
-from . import ragged_dot
-from .generation import filter_triton_deprecation
 
 
 def ragged_dot_runs(compute: Dtype, operands: tuple[Dtype, ...],
@@ -61,6 +60,9 @@ def ragged_dot_runs(compute: Dtype, operands: tuple[Dtype, ...],
 
 
 def _gmm(tokens, kernel, sizes, out_dtype, *, trans_rhs: bool, interpret: bool):
+    # Imported at first use: the kernels need jax's Pallas Triton backend,
+    # which jax 0.11.2 deprecates, and importing a model must not load it.
+    from . import ragged_dot
     compute = tokens.dtype
     return ragged_dot.gmm(tokens, kernel.astype(compute), sizes,
                           **ragged_dot._hyperparam_selection_rule(np.dtype(compute)), trans_rhs=trans_rhs,
@@ -68,6 +70,7 @@ def _gmm(tokens, kernel, sizes, out_dtype, *, trans_rhs: bool, interpret: bool):
 
 
 def _tgmm(tokens, cotangent, sizes, out_dtype, *, interpret: bool):
+    from . import ragged_dot
     compute = tokens.dtype
     return ragged_dot.tgmm(tokens, cotangent.astype(compute), sizes,
                            **ragged_dot._hyperparam_selection_rule(np.dtype(compute)), interpret=interpret,
@@ -77,7 +80,6 @@ def _tgmm(tokens, cotangent, sizes, out_dtype, *, interpret: bool):
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
     """`kernel` where the call lowers for CUDA, interpreted on the CPU when
     asked for, and `fallback` everywhere else."""
-    filter_triton_deprecation()
     branches = {'cuda': functools.partial(kernel, interpret=False)}
     if interpret_on_cpu:
         branches['cpu'] = functools.partial(kernel, interpret=True)

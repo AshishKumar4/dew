@@ -7,9 +7,6 @@ and sends every other one to its portable path. The measurements are in
 docs/performance.md, "Kernel choices per generation".
 """
 
-import functools
-import warnings
-
 import jax
 
 # `device_kind` of the TPU generations Dew names.
@@ -44,30 +41,9 @@ def bf16_dot_runs() -> bool:
     return not generation.startswith('sm') or int(generation[2:]) >= BF16_GPU
 
 
-# jax 0.11.2 deprecates the Pallas Triton backend and warns at every
-# lowering. Dew's Triton kernel, the grouped matmul, stays on sm80 to sm89 on
-# purpose: JAX's Mosaic GPU grouped matmul uses wgmma, which those cards do
-# not have.
-TRITON_DEPRECATION = (r"The Pallas Triton backend is deprecated and will be removed in"
-                      r" a future JAX version\.")
-
-
 def triton_runs() -> bool:
     """The one eligibility rule for Dew's Pallas GPU (Triton) kernels: a GPU
     of compute capability 8.0 or later, the bound JAX's own Pallas lowerings
     apply (`_backend_supports_triton`). A T4 fails to compile them ("Triton
     support is only enabled for cc>=8.0")."""
     return jax.default_backend() == 'gpu' and bf16_dot_runs()
-
-
-@functools.cache
-def filter_triton_deprecation() -> None:
-    """Ignore `TRITON_DEPRECATION`, only that message and only as a
-    DeprecationWarning, once a Triton kernel is first used.
-
-    JAX raises it when a pallas_call is lowered, which is when the jit
-    around a whole step compiles, after the kernel's call has returned and
-    with none of Dew's frames on the stack. A filter scoped to the call
-    cannot see it, so this one lasts for the process, and a process that
-    never runs the kernels never installs it."""
-    warnings.filterwarnings('ignore', message=TRITON_DEPRECATION, category=DeprecationWarning)
