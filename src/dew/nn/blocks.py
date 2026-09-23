@@ -12,6 +12,18 @@ from flax.typing import Dtype, PrecisionLike
 from .sharding import logical_axes
 
 
+def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
+    """The `kernel_init` keyword for a normal draw of `std`, as lm-engine
+    initialises its linears (`nn.init.normal_`, init_utils.py at 45b6b57b).
+
+    None keeps `default`, or the module's own initializer when that is None
+    too, so a model that states no std builds exactly what it built before.
+    """
+    if std is not None:
+        return {"kernel_init": nn.initializers.normal(std)}
+    return {} if default is None else {"kernel_init": default}
+
+
 class TokenEmbedding(nn.Embed):
     """Token lookup with cotangent accumulation in the parameter dtype."""
 

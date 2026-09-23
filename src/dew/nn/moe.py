@@ -37,6 +37,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
+from .blocks import normal_kernel
 from .sharding import EXPERT_AXIS, logical_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
@@ -186,6 +187,7 @@ class Router(nn.Module):
     group_score: str = 'top2'
     expert_bias: bool = False
     hash_vocab: int | None = None
+    init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
 
     def setup(self):
@@ -226,7 +228,7 @@ class Router(nn.Module):
         # the leaf is `gate/kernel` where a Hugging Face sparse layer keeps
         # `gate.weight`.
         self.kernel = self.param(
-            'kernel', nn.initializers.lecun_normal(),
+            'kernel', normal_kernel(self.init_std, nn.initializers.lecun_normal())['kernel_init'],
             (self.in_features, self.num_experts), jnp.float32)
         if self.expert_bias:
             self.bias = self.variable(
@@ -442,6 +444,7 @@ class ExpertLinear(nn.Module):
     in_features: int
     features: int
     implementation: str = 'xla'
+    init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -450,9 +453,9 @@ class ExpertLinear(nn.Module):
         # every expert initialises like the matching nn.Dense of a dense MLP.
         self.kernel = self.param(
             'kernel',
-            nn.initializers.variance_scaling(
+            normal_kernel(self.init_std, nn.initializers.variance_scaling(
                 1.0, 'fan_in', 'truncated_normal', in_axis=-2, out_axis=-1,
-                batch_axis=(0,)),
+                batch_axis=(0,)))['kernel_init'],
             (self.num_experts, self.in_features, self.features), jnp.float32)
 
     def __call__(self, tokens, group_sizes):
@@ -624,6 +627,8 @@ class ExpertMLP(nn.Module):
     dispatch: str = 'global'
     swiglu_limit: float | None = None
     scale_inputs: bool = False
+    init_std: float | None = None  # gate/up normal std; None: per-expert lecun normal
+    output_init_std: float | None = None  # down normal std; None follows init_std
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -640,11 +645,15 @@ class ExpertMLP(nn.Module):
             implementation=self.implementation, dtype=self.dtype,
             precision=self.precision)
         self.gate_proj = expert(in_features=self.out_features,
-                                features=self.hidden_features, name='gate_proj')
+                                features=self.hidden_features, init_std=self.init_std,
+                                name='gate_proj')
         self.up_proj = expert(in_features=self.out_features,
-                              features=self.hidden_features, name='up_proj')
+                              features=self.hidden_features, init_std=self.init_std,
+                              name='up_proj')
         self.down_proj = expert(in_features=self.hidden_features,
-                                features=self.out_features, name='down_proj')
+                                features=self.out_features, name='down_proj',
+                                init_std=(self.init_std if self.output_init_std is None
+                                          else self.output_init_std))
 
     def _project(self, tokens: jax.Array, sizes: jax.Array, _expert_ids: jax.Array,
                  kernels: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
@@ -732,6 +741,11 @@ class SparseMLP(nn.Module):
     scale_inputs: bool = False
     shared: Callable[..., nn.Module] | None = None
     shared_gate: bool = False
+    init_std: float | None = None
+    """Normal std of the router and the experts' gate and up kernels, one std
+    as lm-engine's MoE draws them (`up_std`); None keeps the modules' own."""
+    output_init_std: float | None = None
+    """Normal std of the experts' down kernels; None follows init_std."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -745,7 +759,7 @@ class SparseMLP(nn.Module):
                            groups_per_token=self.groups_per_token,
                            group_score=self.group_score,
                            expert_bias=self.expert_bias,
-                           hash_vocab=self.hash_vocab,
+                           hash_vocab=self.hash_vocab, init_std=self.init_std,
                            precision=self.precision, name='gate')
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
@@ -753,6 +767,7 @@ class SparseMLP(nn.Module):
             implementation=self.implementation, dispatch=self.dispatch,
             swiglu_limit=self.swiglu_limit,
             scale_inputs=self.scale_inputs,
+            init_std=self.init_std, output_init_std=self.output_init_std,
             dtype=self.dtype, precision=self.precision, name='experts')
         if self.shared_gate and self.shared is None:
             raise ValueError("shared_gate requires a shared expert")
@@ -761,7 +776,7 @@ class SparseMLP(nn.Module):
             if self.shared_gate:
                 self.shared_expert_gate = nn.Dense(
                     1, use_bias=False, dtype=self.dtype, precision=self.precision,
-                    name='shared_expert_gate')
+                    name='shared_expert_gate', **normal_kernel(self.init_std))
 
     def __call__(self, x, tokens=None):
         weights, indices = self.gate(x, tokens)
