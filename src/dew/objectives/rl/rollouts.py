@@ -80,8 +80,9 @@ class Status(Enum):
         return self in (Status.COMPLETED, Status.AGENT_ERROR)
 
 
-def _real(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+def _real(value: float) -> bool:
+    """Whether `value` is a finite number; a bool is a flag, not a score."""
+    return type(value) is not bool and math.isfinite(value)
 
 
 def _token_ids(name: str, ids: object) -> None:
@@ -409,14 +410,15 @@ def rollout_metrics(rollouts: Sequence[Rollout], batch: Mapping[str, np.ndarray]
     calls = sum(len(rollout.calls) for rollout in rollouts if rollout.status.trainable)
     metrics["merge/calls_per_chain"] = calls / chain_count if chain_count else 0.0
     metrics["pack/fill"] = float(np.mean(segments > 0))
-    scored = [rollout for rollout in rollouts if rollout.status.trainable and rollout.reward is not None]
+    scored = [(rollout, rollout.reward) for rollout in rollouts
+              if rollout.status.trainable and rollout.reward is not None]
     if scored:
-        metrics["reward/mean"] = float(np.mean([rollout.reward for rollout in scored]))
+        metrics["reward/mean"] = float(np.mean([reward for _, reward in scored]))
         by_source: dict[str, list[float]] = {}
         components: dict[str, list[float]] = {}
-        for rollout in scored:
+        for rollout, reward in scored:
             if source is not None:
-                by_source.setdefault(source(rollout), []).append(float(rollout.reward or 0.0))
+                by_source.setdefault(source(rollout), []).append(float(reward))
             for name, value in rollout.components.items():
                 components.setdefault(name, []).append(float(value))
         metrics.update({f"reward/{name}": float(np.mean(values)) for name, values in by_source.items()})
