@@ -856,3 +856,18 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
         expected += 0.3 * float(jnp.mean(jnp.square(jax.nn.logsumexp(logits, -1))))
     np.testing.assert_allclose(float(total - base), expected, rtol=1e-5)
     np.testing.assert_allclose(float(aux.metrics["router_z_loss"]), expected, rtol=1e-5)
+
+
+def test_router_z_loss_refuses_routers_that_sow_no_log_partition():
+    """gpt-oss's router scores its experts through its own Dense and sows
+    nothing, so a z-loss over it would add nothing; it raises instead, as the
+    balance loss does."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
+                              max_seq_len=8, mlp='swigluoai', mlp_features=16,
+                              mixture=Mixture(experts=4, top_k=2))
+    objective = LMObjective(model, 8, ema_decay=None, router_z_loss=0.3)
+    params = objective.init(jax.random.key(0))
+    tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, 64)
+    with pytest.raises(ValueError, match="router_z_loss"):
+        objective.loss(params, {TEXT_KEY: tokens}, step_at())
