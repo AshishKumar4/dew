@@ -11,7 +11,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import Stage, stage_attention
+from ..attention import RMSNorm, Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
 from ..sharding import logical_axes
 
@@ -122,9 +122,9 @@ class Unet(nn.Module):
 
     def setup(self):
         if self.norm_groups > 0:
-            self.conv_out_norm = nn.GroupNorm(self.norm_groups)
+            self.conv_out_norm = nn.GroupNorm(self.norm_groups, dtype=self.dtype)
         else:
-            self.conv_out_norm = nn.RMSNorm(1e-5)
+            self.conv_out_norm = RMSNorm(epsilon=1e-5, dtype=self.dtype)
 
     @nn.compact
     def __call__(self, x, temb, textcontext=None, train: bool = False):
