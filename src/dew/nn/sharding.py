@@ -229,12 +229,14 @@ def sequence_shards() -> int:
     return mesh.shape.get(SEQUENCE_AXIS, 1)
 
 
-def row_axes(batch: int) -> tuple[str, ...]:
+def row_axes(batch: int, *, mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None
+             ) -> tuple[str, ...]:
     """The mesh axes a `shard_map` over the sequence axis splits `batch` rows
-    over: the ones `activation_batch` takes for `batch` rows in context
-    (`logical_spec`). A batch too small for them is computed alike on those
-    axes' shards, the way GSPMD replicates a dimension it cannot split."""
-    spec = logical_spec(("activation_batch",), (batch,))
+    over: the ones `activation_batch` takes for `batch` rows on `mesh`, the
+    mesh in context by default (`logical_spec`). A batch too small for them is
+    computed alike on those axes' shards, the way GSPMD replicates a dimension
+    it cannot split."""
+    spec = logical_spec(("activation_batch",), (batch,), mesh=mesh)
     return mesh_axes(spec[0]) if spec else ()
 
 
@@ -260,6 +262,12 @@ def manual_map(local, in_specs, out_specs):
     manual = {axis for axis in mesh.axis_names if axis not in mesh.manual_axes}
     return jax.shard_map(local, in_specs=in_specs, out_specs=out_specs, axis_names=manual,
                          check_vma=False)
+
+
+def batch_axes(mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh) -> tuple[str, ...]:
+    """The axes of `mesh` a batch's rows split over: every axis
+    `activation_batch` takes, each of which divides `mesh.size` rows."""
+    return row_axes(mesh.size, mesh=mesh)
 
 
 def mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:

@@ -44,7 +44,7 @@ from .blocks import normal_kernel
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
 from .precision import rounded_operand, rounded_to
-from .sharding import EXPERT_AXIS, LogicalAxes, logical_axes, logical_spec, mesh_axes, row_axes
+from .sharding import EXPERT_AXIS, LogicalAxes, batch_axes, logical_axes, logical_spec, mesh_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -757,9 +757,9 @@ def expert_dispatch[Parameters](
     rows = x.shape[0]
     if exchanging:
         # Each expert shard sends tokens of its own: the rows are padded until
-        # every axis `activation_batch` takes splits them (the axes a batch of
-        # one row per device takes), and the padding routes to the sentinel.
-        share = math.prod(mesh.shape[axis] for axis in row_axes(mesh.size))
+        # every axis `activation_batch` takes splits them (`batch_axes`), and
+        # the padding routes to the sentinel.
+        share = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
         padding = ((0, -rows % share),)
         x = jnp.pad(x, padding + ((0, 0),) * (x.ndim - 1))
         routed = padding + ((0, 0),) * (indices.ndim - 1)
