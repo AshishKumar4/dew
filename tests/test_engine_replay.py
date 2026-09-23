@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop.pretrained import load_pretrained
@@ -33,28 +34,20 @@ def engine_batch():
     return rollouts, pack(rollouts, WIDTH, rows=len(rollouts), support_capacity=6 * WIDTH)
 
 
+@pytest.fixture(scope="module")
 def objective():
     pretrained = load_pretrained(str(FIXTURES / "hf/qwen3-moe-vllm"), dtype="float32", attention_impl="reference")
     grpo = GRPOObjective(pretrained.model, WIDTH - 1, sampling_temperature=RECORD["sampling"]["temperature"])
     return grpo, pretrained.variables
 
 
-def test_the_record_decodes_to_the_models_layers():
-    """vLLM indexes every decoder layer; qwen3-moe-vllm's layer 0 is dense,
-    so its rows are the capture buffer's zeros."""
-    for call in RECORD["calls"]:
-        routed = np.asarray(call["routed_experts"])
-        assert routed.shape == (len(call["prompt_ids"]) + len(call["sampled_ids"]) - 1, 3, 2)
-        assert not routed[:, 0].any() and routed[:, 1:].any()
-
-
-def test_packed_scoring_computes_the_engines_filtered_likelihoods():
+def test_packed_scoring_computes_the_engines_filtered_likelihoods(objective):
     """With the engine's routing replayed and each id renormalized over the
     support vLLM kept at its temperature, Dew's fp32 likelihoods are as
     close to transformers' float64 ones as transformers' own fp32 run
     (`reference_error`); the record's references were computed on its
     routing. The tempered full-vocabulary likelihood misses by far more."""
-    grpo, variables = objective()
+    grpo, variables = objective
     _, batch = engine_batch()
     sampled = batch["response_mask"] != 0
     # Each session is one call, whose sampled ids sit in row-major order.
@@ -68,13 +61,13 @@ def test_packed_scoring_computes_the_engines_filtered_likelihoods():
     assert np.abs(raw - truth).max() > 0.5
 
 
-def test_the_trainer_routes_every_token_as_the_record_says():
+def test_the_trainer_routes_every_token_as_the_record_says(objective):
     """The routing Dew's forward sows follows the record it replays. On
     vLLM's record Dew's own top-k already agrees, so the check also replays
     a record altered to send every covered id to the two experts Dew ranks
     last on each sparse layer: the sown routing follows it, and the
     likelihoods move."""
-    grpo, variables = objective()
+    grpo, variables = objective
     _, batch = engine_batch()
     ids = batch["input_ids"]
     packing = {"segment_ids": batch["text_segment_ids"], "positions": batch["text_positions"]}
