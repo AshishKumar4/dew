@@ -35,7 +35,7 @@ from dew.inference.pipeline import place
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition, DiffusionConditioner, QwenImageConditioner, T5Segment
 from dew.interop import gguf, hf_decoders as decoders, mamba2, verify
-from dew.interop.codecs import source_quantization
+from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.streaming import SourceLeaf
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
@@ -995,44 +995,25 @@ class Pretrained:
                            grid=self.task.grid, final_denoise=False, sampler=self.schedule.solver(),
                            steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
 
-    def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
-        """Write trained variables back to the source layout with its tokenizer assets."""
-        from dew.interop.safetensors_io import save_hf_layout
+    def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+        """The tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
+
+        A diffusion source writes one set per component, so it has none.
+        """
         values = self.variables if variables is None else variables
-        quantization = source_quantization(self.config, scale_dtype=self.quantized_scale_dtype)
-        if quantization is not None and not self.quantized_tensors:
-            raise ValueError(
-                "this source's config declares a quantization_config and the loader recorded "
-                "no quantized tensors to write back in it")
-        destination = Path(directory)
-        generation_config = dict(self.generation_config)
+        quantization = self._quantization()
         if self.schedule is not None:
-            from dew.interop import diffusion
-            diffusion.save_source(self, values, destination)
-            return
+            raise ValueError("a diffusion source writes one tensor set per component; save it instead")
         family = self.config.get("model_type")
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
         elif (isinstance(self.model, CausalTransformer) and isinstance(family, str)
               and not decoders._FAMILIES.get(family, decoders._FAMILIES[verify.CONVENTION]).preserve_source_layout
               and quantization is None):
-            # A family that derives its export from the model is written by
-            # the decoder export, which writes the whole directory: weights,
-            # this processor's files and this generation config, and a
-            # config replaced below by the source's. One export path, so a
-            # decoder saved here and one saved directly leave the same
-            # weights behind. A quantized source is not derived: its packed
-            # format goes back over the source names, so it takes the layout
-            # writer below.
-            decoders.save_pretrained_decoder(self.model, values, destination,
-                                             tokenizer=self.processor,
-                                             generation_config=generation_config)
-            # The derived config states this load's runtime context as
-            # max_position_embeddings and respells the rest; the model is
-            # the source's, so its config.json goes back as published.
-            with open(destination / "config.json", "w") as handle:
-                json.dump(dict(self.config), handle, indent=2)
-            return
+            # The decoder export's own encoder, so this and `save_pretrained_decoder`
+            # leave the same weights. A quantized source keeps its packed format
+            # by going back over its source names, below.
+            return decoders.export_decoder_weights(self.model, values, decoders._export_config(self.model))
         elif self.weight_layouts:
             # Source names and geometry first; the packed format goes back over them.
             text = self.model.language_model if isinstance(self.model, MultimodalTransformer) else self.model
@@ -1043,9 +1024,30 @@ class Pretrained:
             raise ValueError("this source has no reversible weight layout")
         if quantization is not None:
             tensors = quantization.requantize(tensors, self.quantized_tensors)
-        save_hf_layout(tensors, dict(self.config), destination)
+        return tensors
+
+    def _quantization(self) -> SourceQuantization | None:
+        """The config's quantization format, refused when the loader recorded no tensors to write back in it."""
+        quantization = source_quantization(self.config, scale_dtype=self.quantized_scale_dtype)
+        if quantization is not None and not self.quantized_tensors:
+            raise ValueError(
+                "this source's config declares a quantization_config and the loader recorded "
+                "no quantized tensors to write back in it")
+        return quantization
+
+    def save(self, directory: str | Path, *, variables: Mapping[str, object] | None = None) -> None:
+        """Write `export`'s tensors, the source's own config.json, as published, and its tokenizer assets."""
+        from dew.interop.safetensors_io import save_hf_layout
+        values = self.variables if variables is None else variables
+        destination = Path(directory)
+        if self.schedule is not None:
+            from dew.interop import diffusion
+            self._quantization()
+            diffusion.save_source(self, values, destination)
+            return
+        save_hf_layout(self.export(values), dict(self.config), destination)
         decoders.save_export_assets(destination, tokenizer=self.processor,
-                                    generation_config=generation_config)
+                                    generation_config=dict(self.generation_config))
 
 
 def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:
