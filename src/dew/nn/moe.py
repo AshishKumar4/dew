@@ -25,6 +25,7 @@ leaf, which is the layout `jax.lax.ragged_dot` takes and the `expert` mesh axis
 shards.
 """
 
+import dataclasses
 import functools
 import importlib
 from collections.abc import Callable
@@ -446,6 +447,47 @@ def _exact_gelu_jvp(primals: tuple[jax.Array], tangents: tuple[jax.Array]
     return output, jax.lax.optimization_barrier(tangent.astype(x.dtype))
 
 
+@dataclasses.dataclass(frozen=True)
+class Situ:
+    """Moonshot's SiTU gated product, `SituAndMul` (modeling_kimi_linear.py:64-82
+    of moonshotai/Kimi-K3 at f831ab6): `beta * tanh(gate / beta) * sigmoid(gate)`
+    times the up projection, which `linear_beta` soft-caps as `linear_beta *
+    tanh(up / linear_beta)` when set. Both halves run in fp32 and the product
+    returns in the gate's dtype, as the reference computes it. The released
+    text config names the two `activation_situ_beta` and
+    `activation_situ_linear_beta`; a gated MLP whose activation is `'situ'`
+    takes one of these in place of a nonlinearity on the gate alone.
+    """
+    beta: float = 1.0
+    linear_beta: float | None = None
+
+    def __post_init__(self):
+        if self.beta <= 0 or (self.linear_beta is not None and self.linear_beta <= 0):
+            raise ValueError(
+                f"SiTU divides by its betas, so both are positive, got beta {self.beta} "
+                f"and linear_beta {self.linear_beta}; None leaves the up projection uncapped")
+
+    def __call__(self, gate: jax.Array, up: jax.Array) -> jax.Array:
+        work_gate, work_up = gate.astype(jnp.float32), up.astype(jnp.float32)
+        activated = self.beta * jnp.tanh(work_gate / self.beta) * jax.nn.sigmoid(work_gate)
+        if self.linear_beta is not None:
+            work_up = self.linear_beta * jnp.tanh(work_up / self.linear_beta)
+        return (activated * work_up).astype(gate.dtype)
+
+
+GATED_ACTIVATIONS = ('swiglu', 'geglu', 'geglu_exact', 'situ')
+"""The gated MLP's activations: silu, the tanh gelu and the erf gelu on the
+gate, or Kimi K3's SiTU over both halves (`Situ`)."""
+
+
+def check_gated_activation(activation: str, situ: Situ | None) -> None:
+    """Refuse an activation name no gated MLP computes, and a SiTU without its betas."""
+    if activation not in GATED_ACTIVATIONS:
+        raise ValueError(f"mlp must be one of {GATED_ACTIVATIONS}, got {activation!r}")
+    if (activation == 'situ') != (situ is not None):
+        raise ValueError("the 'situ' activation and its Situ betas come together")
+
+
 class ExpertLinear(nn.Module):
     """One matrix per expert, `[exp, in_features, features]`, over tokens
     already sorted by expert, through `expert_projection` on `implementation`."""
@@ -627,6 +669,9 @@ class ExpertMLP(nn.Module):
     outputs are summed unweighted (`modeling_llama4.py`,
     `Llama4TextMoe.forward`, `routed_in * router_scores`), which is not the
     weighted sum of outputs because the gate is not linear.
+
+    `situ` holds the betas of the `'situ'` activation (`Situ`), None for the
+    other three.
     """
     num_experts: int
     hidden_features: int
@@ -638,13 +683,12 @@ class ExpertMLP(nn.Module):
     scale_inputs: bool = False
     init_std: float | None = None  # gate/up normal std; None: per-expert lecun normal
     output_init_std: float | None = None  # down normal std; None follows init_std
+    situ: Situ | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.activation not in ('swiglu', 'geglu', 'geglu_exact'):
-            raise ValueError(
-                f"mlp must be 'swiglu', 'geglu' or 'geglu_exact', got {self.activation!r}")
+        check_gated_activation(self.activation, self.situ)
         if self.swiglu_limit is not None and self.swiglu_limit <= 0:
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is "
@@ -677,6 +721,8 @@ class ExpertMLP(nn.Module):
         if self.swiglu_limit is not None:
             gate = jnp.minimum(gate, self.swiglu_limit)
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
+        if self.situ is not None:
+            return checkpoint_name(linear(self.situ(gate, up), kernels[2]), 'down_proj')
         if self.activation == 'swiglu':
             gate = nn.silu(gate)
         elif self.activation == 'geglu':
@@ -717,6 +763,10 @@ class ExpertMLP(nn.Module):
     ("shared_experts", "up_proj"): ("embed", "mlp"),
     ("shared_experts", "down_proj"): ("mlp", "embed"),
     ("shared_expert_gate",): ("embed", None),
+    # Kimi K3's latent projections around the routed experts: the experts
+    # themselves run at the latent width under the expert names above.
+    ("routed_expert_down_proj",): ("embed", None),
+    ("routed_expert_up_proj",): (None, "embed"),
 })
 class SparseMLP(nn.Module):
     """A router over `num_experts` gated MLPs, `top_k` of them per token.
@@ -730,6 +780,17 @@ class SparseMLP(nn.Module):
     computes: the routed output plus the shared branch of the same input.
     With shared_gate, a learned scalar sigmoid independently weights the
     shared branch, as Qwen3_5MoeSparseMoeBlock does.
+
+    `latent_features` is Kimi K3's latent MoE (`KimiSparseMoeBlock`,
+    modeling_kimi_linear.py:762-838 of moonshotai/Kimi-K3 at f831ab6): the
+    router reads the full-width input, `routed_expert_down_proj` narrows it
+    to the latent width the experts run at, and the weighted sum of their
+    outputs goes through `latent_norm` (a factory taking a name, the
+    backbone's RMSNorm; None for none) and `routed_expert_up_proj` back to
+    `out_features`. The shared branch reads the full-width input. None is
+    every other mixture, whose experts run at `out_features`.
+
+    `situ` holds the betas of the `'situ'` activation (`Situ`).
     """
     num_experts: int
     top_k: int
@@ -755,6 +816,9 @@ class SparseMLP(nn.Module):
     as lm-engine's MoE draws them (`up_std`); None keeps the modules' own."""
     output_init_std: float | None = None
     """Normal std of the experts' down kernels; None follows init_std."""
+    latent_features: int | None = None
+    latent_norm: Callable[..., nn.Module] | None = None
+    situ: Situ | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -770,14 +834,23 @@ class SparseMLP(nn.Module):
                            expert_bias=self.expert_bias,
                            hash_vocab=self.hash_vocab, init_std=self.init_std,
                            precision=self.precision, name='gate')
+        if self.latent_norm is not None and self.latent_features is None:
+            raise ValueError("latent_norm norms the latent experts' output, which needs latent_features")
+        width = self.out_features if self.latent_features is None else self.latent_features
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
-            out_features=self.out_features, activation=self.activation,
+            out_features=width, activation=self.activation,
             implementation=self.implementation, dispatch=self.dispatch,
             swiglu_limit=self.swiglu_limit,
-            scale_inputs=self.scale_inputs,
+            scale_inputs=self.scale_inputs, situ=self.situ,
             init_std=self.init_std, output_init_std=self.output_init_std,
             dtype=self.dtype, precision=self.precision, name='experts')
+        if self.latent_features is not None:
+            dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            self.routed_expert_down_proj = dense(self.latent_features, name='routed_expert_down_proj')
+            self.routed_expert_up_proj = dense(self.out_features, name='routed_expert_up_proj')
+            if self.latent_norm is not None:
+                self.routed_expert_norm = self.latent_norm(name='routed_expert_norm')
         if self.shared_gate and self.shared is None:
             raise ValueError("shared_gate requires a shared expert")
         if self.shared is not None:
@@ -789,7 +862,13 @@ class SparseMLP(nn.Module):
 
     def __call__(self, x, tokens=None):
         weights, indices = self.gate(x, tokens)
-        routed = self.experts(x, weights, indices)
+        if self.latent_features is None:
+            routed = self.experts(x, weights, indices)
+        else:
+            routed = self.experts(self.routed_expert_down_proj(x), weights, indices)
+            if self.latent_norm is not None:
+                routed = self.routed_expert_norm(routed)
+            routed = self.routed_expert_up_proj(routed)
         if self.shared is None:
             return routed
         shared = self.shared_experts(x)

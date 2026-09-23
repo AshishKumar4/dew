@@ -493,6 +493,13 @@ class MultiHeadLatentAttention(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
+    rotary: bool = True
+    """False is Kimi K3's MLA (`mla_use_nope`, modeling_kimi_linear.py:396-437
+    of moonshotai/Kimi-K3 at f831ab6): the decoupled rope head is kept as
+    shared key dims but never rotated, so the layer has no position at all."""
+    output_gate: bool = False
+    """Kimi K3's `mla_use_output_gate`: the heads' output times
+    `sigmoid(g_proj(x))` before `o_proj` (modeling_kimi_linear.py:398-401, 470-472)."""
 
     def setup(self):
         if self.qk_rope_head_dim % 2:
@@ -548,6 +555,11 @@ class MultiHeadLatentAttention(nn.Module):
             use_bias=False, dtype=self.dtype, precision=self.precision,
             name='kv_b_proj')
         self.o_proj = dense(self.emb_features, name='o_proj')
+        if self.output_gate:
+            self.g_proj = nn.Dense(self.num_heads * self.v_head_dim, use_bias=False,
+                                   dtype=self.dtype, precision=self.precision, name='g_proj')
+        if not self.rotary and self.index_n_heads is not None:
+            raise ValueError("the indexer rotates its keys, which a layer without positions cannot do")
         if self.index_n_heads is not None and self.index_head_dim is not None:
             if self.q_lora_rank is None:
                 raise ValueError(
@@ -628,6 +640,11 @@ class MultiHeadLatentAttention(nn.Module):
         return apply_rotary(part, freqs_cos, freqs_sin)
 
     def _rotated(self, q_rot, rot, positions):
+        if not self.rotary:
+            return q_rot, rot, None, None
+        return self._rotated_at(q_rot, rot, positions)
+
+    def _rotated_at(self, q_rot, rot, positions):
         """Rotate the query's and the latent's rope heads at `positions`.
 
         Returns the rotated pair and the angles, which the indexer rotates
@@ -752,7 +769,7 @@ class MultiHeadLatentAttention(nn.Module):
                     selection = self._select(index_scores, keep, kv_store)
                     if self._attends_sparsely(selection, length):
                         return self._sparse_attention(
-                            q_pass, q_rot, latent, rot, selection, index_scores)
+                            x, q_pass, q_rot, latent, rot, selection, index_scores)
                     keep = selection_mask(selection, length)
                     mask, causal = keep[:, None], False
                 if (index_scores is not None and not self.is_initializing()
@@ -785,7 +802,7 @@ class MultiHeadLatentAttention(nn.Module):
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             implementation=implementation, causal=causal, mask=mask)
-        return self._output(attention)
+        return self._output(attention, x)
 
     def _qk_open(self) -> bool:
         return not self.is_initializing() and self.is_mutable_collection("qk")
@@ -827,7 +844,7 @@ class MultiHeadLatentAttention(nn.Module):
             index_scores, query, key, index_keep,
             1.0 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)))
 
-    def _sparse_attention(self, q_pass, q_rot, latent, rot, selection, index_scores):
+    def _sparse_attention(self, x, q_pass, q_rot, latent, rot, selection, index_scores):
         """Attend the selection in the latent space (`sparse_latent_attention`).
 
         `kv_b_proj` applied to the identity is its matrix as the layer
@@ -852,12 +869,14 @@ class MultiHeadLatentAttention(nn.Module):
             q_rot * scale if scale != 1.0 else q_rot,
             latent, rot, key_weight, value_weight, selection,
             scale=1.0 / math.sqrt(nope + self.qk_rope_head_dim), precision=self.precision)
-        return self._output(attention)
+        return self._output(attention, x)
 
-    def _output(self, attention):
+    def _output(self, attention, x):
         batch, length = attention.shape[:2]
-        return checkpoint_name(self.o_proj(checkpoint_name(attention, 'context').reshape(
-            batch, length, self.num_heads * self.v_head_dim)), 'o_proj')
+        context = checkpoint_name(attention, 'context').reshape(batch, length, self.num_heads * self.v_head_dim)
+        if self.output_gate:
+            context = context * nn.sigmoid(self.g_proj(x))
+        return checkpoint_name(self.o_proj(context), 'o_proj')
 
 
 # The standard attention mixer reads the YaRN ramp above, so the registry
@@ -894,6 +913,11 @@ class MLAMixer(MixerBase):
     keys its provider chose, which needs the kind to select. The dials a
     standard attention honours and this cannot (a values norm, a window, an
     attention scale, a partial rotary) are refused.
+
+    `mla_use_nope` and `mla_use_output_gate` are Kimi K3's config fields
+    under their own names: a rope head that is never rotated, and a sigmoid
+    gate on the heads' output (`MultiHeadLatentAttention.rotary`,
+    `.output_gate`).
     """
 
     q_lora_rank: int | None = None
@@ -907,6 +931,8 @@ class MLAMixer(MixerBase):
     index_n_heads: int | None = None
     index_head_dim: int | None = None
     index_rope_interleave: bool = False
+    mla_use_nope: bool = False
+    mla_use_output_gate: bool = False
 
     @property
     def indexed(self) -> bool:
@@ -935,6 +961,8 @@ class MLAMixer(MixerBase):
                 "attention scales by its head dims and the yarn mscale, "
                 "rotates its rope head whole, attends the whole sequence "
                 "and norms its latents, not its values")
+        if self.mla_use_nope and self.yarn is not None:
+            raise ValueError("mla_use_nope rotates nothing, so a yarn ramp has nothing to scale")
         if self.yarn is not None and self.yarn.rope_theta != ctx.rope_theta:
             raise ValueError(
                 f"the yarn record's rope_theta ({self.yarn.rope_theta}) and "
@@ -970,4 +998,6 @@ class MLAMixer(MixerBase):
             kv_store_key=ctx.kv_store_key,
             dtype=ctx.dtype,
             precision=ctx.precision,
-            attention_impl=ctx.attention_impl)
+            attention_impl=ctx.attention_impl,
+            rotary=not self.mla_use_nope,
+            output_gate=self.mla_use_output_gate)

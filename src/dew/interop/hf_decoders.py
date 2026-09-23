@@ -264,6 +264,8 @@ class MixtureFields(TypedDict, total=False):
     implementation: str
     dispatch: str
     hash_layers: tuple[int, ...] | None
+    latent_features: int | None
+    latent_norm: bool
 
 
 class AltUpFields(TypedDict, total=False):
@@ -283,6 +285,19 @@ class HyperConnectionsFields(TypedDict, total=False):
     hc_eps: float
     hc_sinkhorn_iters: int
     head: str
+
+
+class AttentionResidualsFields(TypedDict, total=False):
+    """Describes one `AttentionResiduals`: Kimi K3's block size over depth."""
+
+    block_size: int
+
+
+class SituFields(TypedDict, total=False):
+    """Describes one `Situ`: Kimi K3's SiTU betas."""
+
+    beta: float
+    linear_beta: float | None
 
 
 class DecoderFields(TypedDict, total=False):
@@ -363,7 +378,9 @@ class DecoderFields(TypedDict, total=False):
     altup: AltUpFields | None
     laurel_rank: int | None
     hyper_connections: HyperConnectionsFields | None
+    attention_residuals: AttentionResidualsFields | None
     swiglu_limit: float | None
+    situ: SituFields | None
     activation_sparsity_pattern: tuple[float, ...] | None
     mask_token_id: int | None
     scan_layers: bool

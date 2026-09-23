@@ -150,6 +150,7 @@ def recurrent_kimi_delta_rule(query, key, value, g, beta, state=None):
     ("f_b_proj",): (None, "heads"),
     ("g_a_proj",): ("embed", None),
     ("g_b_proj",): (None, "heads"),
+    ("g_proj",): ("embed", "heads"),
 }, heuristic=(("q_conv1d",), ("k_conv1d",), ("v_conv1d",)))
 class KimiDeltaAttention(nn.Module):
     """The token mixer of a GLM-5.3-Flash `linear_attention` layer.
@@ -165,6 +166,13 @@ class KimiDeltaAttention(nn.Module):
     `lower_bound * sigmoid(exp(A_log) * g)`, without it the softplus form
     (modeling_glm5_next.py:327-335). The decode state is the same pair of
     `cache` leaves `GatedDeltaNet` keeps, allocated on the first decode call.
+
+    `full_rank_gate` is Kimi K3's output gate, one `g_proj` from the model
+    width straight to the heads in place of the low-rank pair
+    (`use_full_rank_gate`, modeling_kimi_linear.py:531-537, 651-656 of
+    moonshotai/Kimi-K3 at f831ab6). The rest of K3's layer is this one: its
+    fla `chunk_kda` call takes the same gate, lower bound, beta sigmoid and
+    in-kernel l2 norm (fla-core 0.5.2, fla/ops/kda/gate.py:57-70).
     """
 
     emb_features: int
@@ -172,6 +180,7 @@ class KimiDeltaAttention(nn.Module):
     head_dim: int
     conv_kernel: int = 4
     lower_bound: float | None = -5.0
+    full_rank_gate: bool = False
     chunk_size: int = CHUNK_SIZE
     norm_eps: float = 1e-5
     dtype: Dtype | None = None
@@ -196,8 +205,11 @@ class KimiDeltaAttention(nn.Module):
         self.dt_bias = self.param('dt_bias', nn.initializers.zeros, (self.qkv_features,), jnp.float32)
         self.A_log = self.param('A_log', nn.initializers.zeros, (self.num_heads,), jnp.float32)
         self.b_proj = dense(self.num_heads, name='b_proj')
-        self.g_a_proj = dense(self.head_dim, name='g_a_proj')
-        self.g_b_proj = dense(self.qkv_features, name='g_b_proj')
+        if self.full_rank_gate:
+            self.g_proj = dense(self.qkv_features, name='g_proj')
+        else:
+            self.g_a_proj = dense(self.head_dim, name='g_a_proj')
+            self.g_b_proj = dense(self.qkv_features, name='g_b_proj')
         # The reference's fp32 norm with its weight, then the sigmoid of the
         # gate (Glm5NextTextRMSNormGated, modeling_glm5_next.py:346-358).
         self.o_norm = RMSNormGated(epsilon=self.norm_eps, activation='sigmoid', dtype=self.dtype, name='o_norm')
@@ -265,7 +277,8 @@ class KimiDeltaAttention(nn.Module):
         out, final = rule(query, key, value, g, beta, None if recurrent is None else recurrent.value)
         if recurrent is not None:
             recurrent.value = final
-        gate = self.g_b_proj(self.g_a_proj(x)).reshape(B, S, self.num_heads, self.head_dim)
+        gate = self.g_proj(x) if self.full_rank_gate else self.g_b_proj(self.g_a_proj(x))
+        gate = gate.reshape(B, S, self.num_heads, self.head_dim)
         out = self.o_norm(out, gate).reshape(B, S, self.qkv_features)
         return self.o_proj(out)
 
@@ -275,12 +288,14 @@ class KimiDeltaAttention(nn.Module):
 class KimiDeltaAttentionMixer(MixerBase):
     """The `kimi_delta_attention` kind, by GLM-5.3-Flash's config fields:
     `linear_num_heads` heads of `linear_head_dim`, the depthwise conv's
-    window and the forget gate's lower bound (configuration_glm5_next.py:143-146)."""
+    window and the forget gate's lower bound (configuration_glm5_next.py:143-146),
+    and Kimi K3's `use_full_rank_gate` output gate."""
 
     linear_num_heads: int = 64
     linear_head_dim: int = 128
     linear_conv_kernel_dim: int = 4
     linear_lower_bound: float | None = -5.0
+    use_full_rank_gate: bool = False
 
     def build(self, ctx: MixerContext):
         if not ctx.causal:
@@ -292,6 +307,7 @@ class KimiDeltaAttentionMixer(MixerBase):
             head_dim=self.linear_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
             lower_bound=self.linear_lower_bound,
+            full_rank_gate=self.use_full_rank_gate,
             norm_eps=ctx.norm_eps,
             dtype=ctx.dtype,
             precision=ctx.precision)
