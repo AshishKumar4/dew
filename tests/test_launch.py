@@ -178,6 +178,7 @@ def test_a_share_of_gpus_that_does_not_divide_is_refused_and_cpu_pools_ignore_gp
     from dew.cli import launch
 
     monkeypatch.setattr(launch, "gpu_count", lambda host, visible: 8)
+    monkeypatch.delenv("JAX_PLATFORMS", raising=False)
     with pytest.raises(ValueError, match="do not split"):
         launch.Launch(command=("python",), processes_per_host=3).layout("localhost")
     rehearsal = launch.Launch(command=("python",), processes_per_host=4,
