@@ -23,7 +23,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 from .attention_sinks import attention_with_sinks
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import precision_names
-from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, sequence_shards
+from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, row_axes, sequence_shards
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
 """Names which kernel an attention call runs.
@@ -655,11 +655,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     usable = [axis for axis in mesh.axis_names
               if axis not in mesh.manual_axes and mesh.shape[axis] > 1]
     batch, _, heads, _ = query.shape
-    rows: tuple[str, ...] = ()
-    for axis in usable:
-        if (axis not in (TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
-                and batch % (math.prod(mesh.shape[a] for a in rows) * mesh.shape[axis]) == 0):
-            rows = (*rows, axis)
+    rows = row_axes(batch)
     tensor = (TENSOR_AXIS,) if TENSOR_AXIS in usable else ()
     split = shards * math.prod(mesh.shape[axis] for axis in tensor)
     if heads % split or query.shape[1] % shards or key.shape[1] % shards:
