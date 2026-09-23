@@ -18,6 +18,7 @@ import pytest
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
+from dew.objectives.lm.chunked import head_logits
 from dew.registry import models, with_precision
 
 VOCAB = 37
@@ -216,11 +217,8 @@ def test_hidden_states_times_head_weight_are_the_logits(rng, config):
 
     hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
     head = model.apply(params, params['params'], method=CausalTransformer.head_weight)
-    logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head,
-                        precision=model.precision)
-    if model.final_logit_softcap is not None:
-        cap = jnp.asarray(model.final_logit_softcap, jnp.float32)
-        logits = cap * jnp.tanh(logits / cap)
+    logits = head_logits(hidden, head, softcap=model.final_logit_softcap,
+                         precision=model.precision)
 
     assert hidden.shape == (ids.shape[0], SEQ, model.emb_features)
     stored = params['params']['embed_tokens']['embedding'].dtype
