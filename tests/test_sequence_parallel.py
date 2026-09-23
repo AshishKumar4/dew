@@ -1,4 +1,5 @@
-"""Sequence-parallel attention and Mamba-2 on the simulated 8-device mesh.
+"""Sequence-parallel attention and Mamba-2 on the simulated 8-device mesh,
+and cuDNN's attention inside both exchanges on two GPUs.
 
 Under a mesh whose sequence axis is above one, the attention seam runs one
 of two exchanges. The all-to-all one (Ulysses) trades every shard's rows of
@@ -22,9 +23,6 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
 
 import functools
 
@@ -172,6 +170,7 @@ def through(exchange, query, key, value, *, implementation="reference", **call):
         key_value_seq_lengths=call.get("key_value_seq_lengths"))
 
 
+@pytest.mark.mesh
 @pytest.mark.parametrize("exchange", sorted(EXCHANGES))
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
 @pytest.mark.parametrize("name", sorted(CALLS))
@@ -192,6 +191,7 @@ def test_the_seam_agrees_with_whole_sequences(name, implementation, exchange):
 HEAD_SPLITS = [MeshSpec(fsdp=2, tensor=2, sequence=2), MeshSpec(fsdp=2, sequence=4)]
 
 
+@pytest.mark.mesh
 @pytest.mark.parametrize("spec", HEAD_SPLITS, ids=["tensor2_sequence2", "sequence4"])
 @pytest.mark.parametrize("name", ["causal", "packed", "bias", "sinks", "causal_key_lengths"])
 def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec, name):
@@ -229,6 +229,7 @@ def exchanges_heads(spec, query, key, value, **call) -> bool:
         return "all_to_all" in attend.lower(*operands).as_text()
 
 
+@pytest.mark.mesh
 def test_the_exchange_moves_heads_and_never_gathers_a_key():
     """Ulysses's point: a causal call trades rows for heads with all-to-alls,
     and no device ever assembles the whole key or value."""
@@ -255,6 +256,7 @@ def test_the_byte_count_picks_the_exchange_the_arithmetic_favours():
         16, 4, 1, 2, reordered=True)
 
 
+@pytest.mark.mesh
 @pytest.mark.parametrize("case, spec, shape, call, exchanged", [
     ("causal", SPLIT, (BATCH, SEQ_LEN, 4, 2), dict(causal=True), True),
     ("unmasked_grouped", SPLIT, (BATCH, SEQ_LEN, 8, 1), dict(), False),
@@ -278,6 +280,7 @@ def test_every_call_takes_the_exchange_its_shape_admits(case, spec, shape, call,
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
 
+@pytest.mark.mesh
 def test_splash_runs_inside_the_exchange():
     """The all-to-all hands the kernel whole sequences, so splash takes a
     causal call under a split sequence with its causal descriptor. The
@@ -293,6 +296,46 @@ def test_splash_runs_inside_the_exchange():
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
 
+@pytest.mark.skipif(jax.default_backend() != "gpu" or jax.device_count() < 2,
+                    reason="cuDNN's fused attention, split over two GPUs")
+@pytest.mark.parametrize("exchange", sorted(EXCHANGES))
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_cudnn_runs_inside_either_exchange(exchange, causal, without_deterministic_ops):
+    """cuDNN's partitioning rule refuses queries split unlike their keys
+    (`_check_qkv_bias_mask_spec` in jax/_src/cudnn/fused_attention_stablehlo.py),
+    which is what the gather hands a kernel it leaves to GSPMD: every call
+    that took the gather failed to compile on a GPU. Both exchanges run the
+    kernel on local arrays, forward and backward. bf16 has no fixed bound,
+    so each is measured against fp32 attention on one device and may land
+    at most twice as far from it as the same cuDNN call on one GPU."""
+    keys = jax.random.split(jax.random.key(0), 3)
+    query = jax.random.normal(keys[0], (2, 256, 4, 64), jnp.bfloat16)
+    key, value = (jax.random.normal(k, (2, 256, 2, 64), jnp.bfloat16) for k in keys[1:])
+
+    def outputs(attend):
+        def loss(q, k, v):
+            return jnp.sum(attend(q, k, v).astype(jnp.float32) ** 2)
+        return jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2)))
+
+    exact = outputs(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, causal=causal, implementation="xla"))(
+            *(x.astype(jnp.float32) for x in (query, key, value)))
+    whole = outputs(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, causal=causal, implementation="cudnn"))(query, key, value)
+    with jax.set_mesh(build_mesh(MeshSpec(sequence=2), jax.devices()[:2])):
+        split = outputs(lambda q, k, v: through(
+            exchange, q, k, v, causal=causal, implementation="cudnn"))(query, key, value)
+
+    def distance(got):
+        return [float(np.max(np.abs(np.asarray(a, np.float32) - np.asarray(b, np.float32)))
+                      / np.max(np.abs(np.asarray(b, np.float32))))
+                for a, b in zip(jax.tree.leaves(got), jax.tree.leaves(exact), strict=True)]
+
+    for split_distance, whole_distance in zip(distance(split), distance(whole), strict=True):
+        assert split_distance <= 2 * whole_distance, (split_distance, whole_distance)
+
+
+@pytest.mark.mesh
 def test_a_shape_the_exchange_cannot_split_is_refused_by_name():
     query, key, value = heads(jax.random.key(0), kv_heads=2)
     with jax.set_mesh(build_mesh(MeshSpec(tensor=2, sequence=4))):
@@ -301,6 +344,7 @@ def test_a_shape_the_exchange_cannot_split_is_refused_by_name():
                 query, key, value)
 
 
+@pytest.mark.mesh
 def test_rotary_positions_and_the_causal_mask_survive_the_exchange():
     """A full attention module: rotary angles from the row's position, then
     the causal mask. Both were applied in sequence order, and the exchanged
@@ -315,6 +359,7 @@ def test_rotary_positions_and_the_causal_mask_survive_the_exchange():
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
 
+@pytest.mark.mesh
 def test_decoding_is_refused_under_a_sequence_axis():
     model = tiny()
     tokens = jnp.ones((1, SEQ_LEN), jnp.int32)
@@ -364,6 +409,7 @@ TRAINED_EXCHANGES = {
 }
 
 
+@pytest.mark.mesh
 @pytest.mark.parametrize("exchange", sorted(TRAINED_EXCHANGES))
 @pytest.mark.parametrize("make_batch", [dense_batch, packed_batch])
 def test_loss_and_gradients_agree_with_whole_sequences(make_batch, exchange):
@@ -377,6 +423,7 @@ def test_loss_and_gradients_agree_with_whole_sequences(make_batch, exchange):
     assert_same_step(one_step(WHOLE, batch), split)
 
 
+@pytest.mark.mesh
 def test_the_exchange_runs_inside_the_pipeline_stages():
     """The pipeline vmaps its stages over the stage axis, and the exchange's
     shard_map runs inside that vmap: fsdp=2, stage=2, sequence=2 trains the
@@ -488,6 +535,7 @@ def mamba_parity(split: str, packed: bool, dtype, seed: int = 0) -> list[tuple[s
             if split_error[leaf] > 2 * whole_error[leaf]]
 
 
+@pytest.mark.mesh
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
 @pytest.mark.parametrize("split", sorted(MAMBA_SPLITS))
@@ -522,6 +570,7 @@ HYBRID_SPLITS = {
 }
 
 
+@pytest.mark.mesh
 @pytest.mark.parametrize("split", sorted(HYBRID_SPLITS))
 @pytest.mark.parametrize("make_batch", [dense_batch, packed_batch])
 def test_a_mamba2_hybrid_trains_the_same_step_under_a_split_sequence(make_batch, split):

@@ -28,7 +28,6 @@ from .rope import apply_rotary
 from .sharding import (
     HEADS,
     SEQUENCE_AXIS,
-    STAGE_AXIS,
     TENSOR_AXIS,
     constrain,
     logical_axes,
@@ -537,6 +536,40 @@ def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int, *
     return exchanged < 2 * gathered + (2 * local_heads / shards if reordered else 0)
 
 
+def _broadcast_spec(x, batch: int, heads: int, query_len: int, rows, head_entry, query_entry):
+    """A mask or a bias `[.., Q, K]` broadcastable to `[B, H, Q, K]`, as four
+    dimensions, with the spec a sequence exchange hands it in: its rows,
+    heads and query rows split as the exchange splits the query's, where it
+    has them, and a broadcast dimension whole."""
+    x = x.reshape((1,) * (4 - x.ndim) + x.shape)
+    return x, P(rows if x.shape[0] == batch else None,
+                head_entry if x.shape[1] == heads else None,
+                query_entry if x.shape[2] == query_len else None, None)
+
+
+def _manual_map(local, in_specs, out_specs):
+    """`local` in a `shard_map` over every axis the context leaves automatic.
+
+    Those the specs do not name go manual too, and the operands are
+    replicated over them. A Mosaic kernel (splash) refuses to lower where any
+    axis is still left to the partitioner, whatever its size, and cuDNN's
+    partitioning rule refuses queries split unlike their keys
+    (`_check_qkv_bias_mask_spec`, jax/_src/cudnn/fused_attention_stablehlo.py),
+    so the kernel has to see local arrays. The pipeline also needs it: it
+    vmaps its stages with spmd_axis_name=stage, and a vmapped shard_map can
+    only split the new dimension over an axis it holds manual.
+
+    Pallas kernels state no varying-manual-axes type for their outputs, so
+    splash inside the map needs the check off, as MaxText wraps it. Every
+    operand is split on the axes the specs name and nothing is reduced over
+    another, so the check has nothing to catch.
+    """
+    mesh = jax.sharding.get_abstract_mesh()
+    manual = {axis for axis in mesh.axis_names if axis not in mesh.manual_axes}
+    return jax.shard_map(local, in_specs=in_specs, out_specs=out_specs, axis_names=manual,
+                         check_vma=False)
+
+
 def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
                               sliding_window, mask, bias, sinks, key_value_seq_lengths=None):
     """DeepSpeed Ulysses: trade a slice of the sequence for a slice of the heads.
@@ -570,7 +603,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     usable = [axis for axis in mesh.axis_names
               if axis not in mesh.manual_axes and mesh.shape[axis] > 1]
     batch, _, heads, _ = query.shape
-    rows = row_axes(batch)
+    rows = row_axes(batch) or None
     tensor = (TENSOR_AXIS,) if TENSOR_AXIS in usable else ()
     split = shards * math.prod(mesh.shape[axis] for axis in tensor)
     if heads % split or query.shape[1] % shards or key.shape[1] % shards:
@@ -583,22 +616,14 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     kv_heads = math.lcm(key.shape[-2], split)
     key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
 
-    row_entry = rows or None
     head_entry = (*tensor, SEQUENCE_AXIS)
-    in_rows = P(row_entry, SEQUENCE_AXIS, tensor or None, None)
-
-    def whole_rows(x):
-        # [.., Q, K] broadcastable to [B, H, Q, K]: split its rows and heads
-        # where it has them, keep its query and key dimensions whole.
-        x = x.reshape((1,) * (4 - x.ndim) + x.shape)
-        return x, P(row_entry if x.shape[0] == batch else None,
-                    head_entry if x.shape[1] == heads else None, None, None)
-
-    extras = {name: whole_rows(x) for name, x in (('mask', mask), ('bias', bias)) if x is not None}
+    in_rows = P(rows, SEQUENCE_AXIS, tensor or None, None)
+    extras = {name: _broadcast_spec(x, batch, heads, query.shape[1], rows, head_entry, None)
+              for name, x in (('mask', mask), ('bias', bias)) if x is not None}
     if sinks is not None:
         extras['sinks'] = (sinks, P(head_entry))
     if key_value_seq_lengths is not None:
-        extras['key_value_seq_lengths'] = (key_value_seq_lengths, P(row_entry))
+        extras['key_value_seq_lengths'] = (key_value_seq_lengths, P(rows))
     names = tuple(extras)
 
     def local(query, key, value, *arrays):
@@ -610,32 +635,25 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
                      key_value_seq_lengths=given.get('key_value_seq_lengths'))
         return jax.lax.all_to_all(out, SEQUENCE_AXIS, 1, 2, tiled=True)
 
-    # Every axis the context leaves automatic goes manual here, those the
-    # specs do not name included, over which the operands are replicated. A
-    # Mosaic kernel (splash) refuses to lower where any axis is still left
-    # to the partitioner, whatever its size. The pipeline also needs it: it
-    # vmaps its stages with spmd_axis_name=stage, and a vmapped shard_map
-    # can only split the new dimension over an axis it holds manual.
-    manual = {axis for axis in mesh.axis_names if axis not in mesh.manual_axes}
-    # Pallas kernels state no varying-manual-axes type for their outputs, so
-    # splash inside the map needs the check off, as MaxText wraps it. Every
-    # operand here is split on the axes the specs name and nothing is
-    # reduced, so the check has nothing to catch.
-    exchanged = jax.shard_map(
-        local, in_specs=(in_rows,) * 3 + tuple(spec for _, spec in extras.values()),
-        out_specs=in_rows, axis_names=manual, check_vma=False)
+    exchanged = _manual_map(
+        local, (in_rows,) * 3 + tuple(spec for _, spec in extras.values()), in_rows)
     return exchanged(query, key, value, *(x for x, _ in extras.values()))
 
 
 def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
                             sliding_window, mask, bias, sinks, key_value_seq_lengths=None):
-    """Run `kernel` with the queries split along the mesh's sequence axis.
+    """Run `kernel` on each shard's slice of the queries against the whole
+    keys and values, which every shard gathers over the sequence axis.
 
-    The keys and values are gathered whole once. Batch rows stay split over
-    every other mesh axis but tensor and stage, which hold a width and a
-    pipeline stage and never a row. The heads are left to GSPMD, so a width
-    the rules put on the tensor axis stays there. This takes any head count,
-    and costs every shard the whole of every key and value.
+    This takes any head count and any length, at the cost of every shard
+    holding the whole of every key and value. Batch rows split as
+    `exchanged_heads_attention` splits them. The heads split over the tensor
+    axis where the query heads divide by it, the key heads repeated to the
+    least common multiple of their count and the tensor axis as the exchange
+    repeats them, and stay whole on every tensor shard otherwise. A query
+    length the shards do not divide is padded at the end and the padding's
+    output dropped; a key length they do not divide arrives whole instead of
+    gathered.
 
     A causal, windowed or masked call reorders the queries with `stripe` so
     each shard holds equal causal work, and puts the output back with
@@ -647,35 +665,64 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     whole keys, which neither order moves.
     """
     mesh = jax.sharding.get_abstract_mesh()
-    rows = tuple(axis for axis in mesh.axis_names
-                 if axis not in (TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS))
-    split = P(rows or None, SEQUENCE_AXIS, P.UNCONSTRAINED, P.UNCONSTRAINED)
-    whole = P(rows or None, None, P.UNCONSTRAINED, P.UNCONSTRAINED)
-    constrain = jax.lax.with_sharding_constraint
-    query = constrain(query, split)
-    key, value = constrain(key, whole), constrain(value, whole)
-    if not (causal or sliding_window is not None or mask is not None):
-        return constrain(kernel(query, key, value, causal=False, sliding_window=None,
-                                mask=None, bias=bias, sinks=sinks,
-                                key_value_seq_lengths=key_value_seq_lengths), split)
+    batch, q_len, heads, _ = query.shape
+    kv_len = key.shape[-3]
+    rows = row_axes(batch) or None
+    tensor = (TENSOR_AXIS,) if (TENSOR_AXIS in mesh.axis_names
+                                and TENSOR_AXIS not in mesh.manual_axes
+                                and mesh.shape[TENSOR_AXIS] > 1
+                                and heads % mesh.shape[TENSOR_AXIS] == 0) else ()
+    if tensor:
+        kv_heads = math.lcm(key.shape[-2], mesh.shape[TENSOR_AXIS])
+        key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
 
-    q_len, kv_len = query.shape[-3], key.shape[-3]
-    query = constrain(stripe(query, shards), split)
+    reordered = causal or sliding_window is not None or mask is not None
+    if reordered:
+        def rows_in_order(x: jax.Array | None) -> jax.Array | None:
+            # A broadcast query row has the same value in either order.
+            if x is not None and x.ndim >= 2 and x.shape[-2] == q_len:
+                return stripe(x, shards, axis=-2)
+            return x
 
-    def rows_in_order(x: jax.Array | None) -> jax.Array | None:
-        # A broadcast query row has the same value in either order.
-        if x is not None and x.ndim >= 2 and x.shape[-2] == q_len:
-            return stripe(x, shards, axis=-2)
-        return x
+        query = stripe(query, shards)
+        mask, bias = rows_in_order(mask), rows_in_order(bias)
+        if causal or sliding_window is not None:
+            structural = causal_attention_mask(
+                stripe(jnp.arange(q_len), shards, axis=0), kv_len, sliding_window)
+            mask = structural if mask is None else jnp.logical_and(mask, structural)
+        padding = 0
+    else:
+        padding = -q_len % shards
+        query = _pad_rows(query, padding)
+        if bias is not None and bias.ndim >= 2 and bias.shape[-2] == q_len:
+            bias = jnp.pad(bias, ((0, 0),) * (bias.ndim - 2) + ((0, padding), (0, 0)))
 
-    mask, bias = rows_in_order(mask), rows_in_order(bias)
-    if causal or sliding_window is not None:
-        structural = causal_attention_mask(
-            stripe(jnp.arange(q_len), shards, axis=0), kv_len, sliding_window)
-        mask = structural if mask is None else jnp.logical_and(mask, structural)
-    out = kernel(query, key, value, causal=False, sliding_window=None, mask=mask, bias=bias,
-                 sinks=sinks, key_value_seq_lengths=key_value_seq_lengths)
-    return constrain(unstripe(constrain(out, split), shards), split)
+    gathered = kv_len % shards == 0
+    heads_entry = tensor or None
+    queries = P(rows, SEQUENCE_AXIS, heads_entry, None)
+    keys = P(rows, SEQUENCE_AXIS if gathered else None, heads_entry, None)
+    extras = {name: _broadcast_spec(x, batch, heads, q_len + padding, rows, heads_entry,
+                                    SEQUENCE_AXIS)
+              for name, x in (('mask', mask), ('bias', bias)) if x is not None}
+    if sinks is not None:
+        extras['sinks'] = (sinks, P(heads_entry))
+    if key_value_seq_lengths is not None:
+        extras['key_value_seq_lengths'] = (key_value_seq_lengths, P(rows))
+    names = tuple(extras)
+
+    def local(query, key, value, *arrays):
+        if gathered:
+            key, value = (jax.lax.all_gather(x, SEQUENCE_AXIS, axis=1, tiled=True)
+                          for x in (key, value))
+        given = dict(zip(names, arrays, strict=True))
+        return kernel(query, key, value, causal=False, sliding_window=None,
+                      mask=given.get('mask'), bias=given.get('bias'), sinks=given.get('sinks'),
+                      key_value_seq_lengths=given.get('key_value_seq_lengths'))
+
+    attended = _manual_map(
+        local, (queries, keys, keys) + tuple(spec for _, spec in extras.values()), queries)
+    out = attended(query, key, value, *(x for x, _ in extras.values()))
+    return unstripe(out, shards) if reordered else out[:, :q_len]
 
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
