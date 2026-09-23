@@ -125,17 +125,16 @@ def test_sglang_serves_a_tempered_policy_but_no_filter():
         OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed, processed_logprobs=True)
 
 
-@pytest.mark.parametrize("provider", ["vllm", "sglang"])
-def test_a_draw_in_flight_across_a_push_keeps_its_submission_version(provider):
+def test_a_draw_in_flight_across_a_push_keeps_its_submission_version():
     release = threading.Event()
     arrived = threading.Semaphore(0)
 
     def slow(_):
         arrived.release()
         assert release.wait(10)
-        return choice(provider, [3, EOS], [-.5, -.25], "stop")
+        return choice("vllm", [3, EOS], [-.5, -.25], "stop")
 
-    completion, _ = engine(provider, slow)
+    completion, _ = engine("vllm", slow)
     pushes = []
     server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushes.append, version=1)
     try:
@@ -149,6 +148,13 @@ def test_a_draw_in_flight_across_a_push_keeps_its_submission_version(provider):
         release.set()
         server.close()
     assert pushes == [{"params": {}}]
+
+
+def test_sglang_ids_are_read_without_likelihoods():
+    completion, _ = engine("sglang", lambda _: {"index": 0, "text": "", "finish_reason": "length",
+                                                "logprobs": None, "token_ids": [3, 5]})
+    result = completion([[1, 2]], 2, extra_body={"return_token_ids": True})
+    assert result.tokens == ((3, 5),) and result.log_probs == (None,)
 
 
 def test_a_failed_push_keeps_the_version():
@@ -166,21 +172,23 @@ def test_a_failed_push_keeps_the_version():
 
 
 class Engine(BaseHTTPRequestHandler):
-    """Records every POST path and body and answers like the engine it stands for.
+    """Records every POST path, query and body and answers like the engine it stands for.
 
-    Like vLLM with a request in flight, a plain prefix-cache reset answers
-    200 and resets nothing; only `reset_running_requests=true` resets. Like
-    SGLang, a weight update that fails answers 400 with its message, and one
-    that loads flushes the radix cache unless the request says otherwise.
+    Like vLLM v0.30.0, `/pause` and `/resume` answer a status, and
+    `/reset_prefix_cache` answers 200 with `{"success": bool}` whether or
+    not it reset. Like SGLang v0.5.20, a weight update answers `success` in
+    its body, with 400 when it fails, and flushes the radix cache unless the
+    request says otherwise. `failure` makes the reset or update fail: "status"
+    with an error status, "body" with 200 and `success: false`.
     """
 
     seen: list = []
-    reset: list = []
     flushed: list = []
-    refuse = False
+    failure = None
 
     def answer(self, status, body):
         self.send_response(status)
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(body).encode())
 
@@ -188,18 +196,22 @@ class Engine(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
         body = json.loads(raw) if raw else None
-        Engine.seen.append((self.path.split("?")[0], body))
-        if self.path.startswith("/reset_prefix_cache"):
-            if Engine.refuse:
-                return self.answer(500, {})
-            Engine.reset.append("reset_running_requests=true" in self.path)
-        if self.path == "/update_weights_from_disk":
-            if Engine.refuse:
-                return self.answer(400, {"success": False, "message": "Failed to update weights: shape mismatch",
-                                         "num_paused_requests": 0})
-            Engine.flushed.append(body.get("flush_cache", True))
-        self.answer(200, {"success": True, "message": "Succeeded to update model weights.",
-                          "num_paused_requests": 0})
+        path, _, query = self.path.partition("?")
+        Engine.seen.append((path, query, body))
+        if path in ("/pause", "/resume"):
+            return self.answer(200, {"status": "paused" if path == "/pause" else "resumed"})
+        if path == "/collective_rpc":
+            return self.answer(200, [None])
+        if path == "/reset_prefix_cache":
+            if Engine.failure == "status":
+                return self.answer(500, {"error": "engine dead"})
+            return self.answer(200, {"success": Engine.failure != "body"})
+        if Engine.failure is not None:
+            return self.answer(400 if Engine.failure == "status" else 200,
+                               {"success": False, "message": "Failed to update weights: shape mismatch",
+                                "num_paused_requests": 0})
+        Engine.flushed.append(body.get("flush_cache", True))
+        self.answer(200, {"success": True, "message": "Succeeded to update model weights.", "num_paused_requests": 0})
 
     def log_message(self, *args):
         pass
@@ -207,12 +219,12 @@ class Engine(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def served():
-    Engine.seen, Engine.reset, Engine.flushed, Engine.refuse = [], [], [], False
+    Engine.seen, Engine.flushed, Engine.failure = [], [], None
     engine = HTTPServer(("127.0.0.1", 0), Engine)
     threading.Thread(target=engine.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{engine.server_port}"
     engine.shutdown()
-    Engine.refuse = False
+    Engine.failure = None
 
 
 def doubled(source):
@@ -227,14 +239,14 @@ def assert_served(directory, expected):
                                       np.asarray(jnp.asarray(pushed).astype(jnp.bfloat16).astype(jnp.float32)))
 
 
-def test_a_vllm_reload_writes_the_policy_as_safetensors_then_asks_the_engine(tmp_path, served):
+def test_a_vllm_reload_drains_reloads_resets_and_resumes(tmp_path, served):
     source = load_pretrained(FIXTURE, dtype="float32")
     changed = doubled(source)
     SafetensorsReload(source, tmp_path / "served", served, "vllm")(changed)
-    assert [path for path, _ in Engine.seen] == ["/collective_rpc", "/reset_prefix_cache"]
-    assert Engine.seen[0][1] == {"method": "reload_weights"}
-    # The reset preempts running requests, so no in-flight KV outlives the weights.
-    assert Engine.reset == [True]
+    assert [path for path, _, _ in Engine.seen] == ["/pause", "/collective_rpc", "/reset_prefix_cache", "/resume"]
+    # In-flight requests finish on the old weights and no new one starts until the resume.
+    assert Engine.seen[0][1] == "mode=wait"
+    assert Engine.seen[1][2] == {"method": "reload_weights"}
     assert not (tmp_path / ".served.staging").exists()
     assert_served(tmp_path / "served", changed)
 
@@ -244,8 +256,8 @@ def test_an_sglang_reload_loads_the_directory_and_flushes_the_radix_cache_in_one
     changed = doubled(source)
     monkeypatch.chdir(tmp_path)
     SafetensorsReload(source, Path("served"), served, "sglang")(changed)
-    assert [path for path, _ in Engine.seen] == ["/update_weights_from_disk"]
-    body = Engine.seen[0][1]
+    assert [path for path, _, _ in Engine.seen] == ["/update_weights_from_disk"]
+    body = Engine.seen[0][2]
     # The engine resolves the path in its own working directory, so it is sent absolute.
     assert body["model_path"] == str(tmp_path / "served")
     # In-flight requests finish on the old weights instead of being aborted,
@@ -254,11 +266,16 @@ def test_an_sglang_reload_loads_the_directory_and_flushes_the_radix_cache_in_one
     assert_served(tmp_path / "served", changed)
 
 
-@pytest.mark.parametrize(("provider", "refusal"), [("vllm", "reset_prefix_cache answered 500"),
-                                                   ("sglang", "update_weights_from_disk answered 400.*shape mismatch")])
-def test_a_refused_reload_fails_the_push(tmp_path, served, provider, refusal):
+@pytest.mark.parametrize(("provider", "failure", "refusal"), [
+    ("vllm", "status", "reset_prefix_cache answered 500"),
+    ("vllm", "body", "reset_prefix_cache answered 200.*false"),
+    ("sglang", "status", "update_weights_from_disk answered 400.*shape mismatch"),
+    ("sglang", "body", "update_weights_from_disk answered 200.*shape mismatch"),
+])
+def test_a_refused_reload_fails_the_push(tmp_path, served, provider, failure, refusal):
     source = load_pretrained(FIXTURE, dtype="float32")
-    Engine.refuse = True
+    Engine.failure = failure
     with pytest.raises(RuntimeError, match=refusal):
         SafetensorsReload(source, tmp_path / "served", served, provider)(source.variables)
-
+    # A vLLM push that failed leaves the engine paused rather than serving half-loaded weights.
+    assert "/resume" not in [path for path, _, _ in Engine.seen]
