@@ -205,6 +205,7 @@ def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(hub, convers
     that commit adds model.safetensors, and only that file downloads."""
     import huggingface_hub
 
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     main = hub("mamba2-130m-ssm")
     pull = FakeHub(FIXTURES / "mamba2-130m-ssm", tmp_path / "pull")
     pull.commit, pull.files = MAMBA2_130M_CONVERSION, [*main.files, "model.safetensors"]
@@ -218,6 +219,16 @@ def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(hub, convers
     assert directory == pull.snapshot
     assert (main.fetched, pull.fetched) == ([], ["model.safetensors"])
     assert "refs/pr/1" in caplog.text
+
+    # Offline the lookup fails; the conversion it found stands, and no pickle downloads.
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    def offline(*args, **kwargs):
+        raise OfflineModeIsEnabled("offline")
+
+    monkeypatch.setattr(huggingface_hub.HfApi, "get_repo_discussions", offline)
+    assert hf_decoders._snapshot("state-spaces/mamba2-130m", None) == pull.snapshot
+    assert main.fetched == []
 
 
 def test_without_a_conversion_of_its_commit_a_pickle_repo_fetches_its_pickles(hub, conversion):
