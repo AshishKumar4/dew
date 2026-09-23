@@ -40,6 +40,7 @@ they are read there.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 import logging
@@ -49,6 +50,7 @@ import signal
 import subprocess
 import threading
 import uuid
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -256,9 +258,12 @@ class HarborSource:
 
     def __init__(self, gateway: Gateway, *, harbor: str | os.PathLike[str], model: str, trials: os.PathLike[str],
                  agent: str = "mini-swe-agent", environment: Mapping[str, str] | None = None,
-                 arguments: Sequence[str] = (), workers: int = 8, reward_key: str = "reward"):
+                 arguments: Sequence[str] = (), workers: int = 8, reward_key: str = "reward", grace: float = 60.0):
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive number of concurrent trials")
+        if not grace > 0:
+            raise ValueError("grace is a positive number of seconds")
+        self._grace = grace
         self._gateway = gateway
         self._command = [os.fspath(harbor), "trials", "start", "-a", agent, "-m", model, *arguments]
         self._environment = dict(environment or {})
@@ -270,6 +275,9 @@ class HarborSource:
         self._lock = threading.Lock()
         # One record per submitted, unresolved future, queued or running; a done-callback drops it.
         self._records: dict[Future[Rollout], _Trial] = {}
+        # Trials run in their own process groups, so an interrupted trainer does not reach them: on
+        # interpreter exit or collection, every live trial's group is killed.
+        weakref.finalize(self, _kill_all, self._records, self._lock)
 
     def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Rollout]]:
         if type(samples) is not int or samples < 1:
@@ -295,15 +303,24 @@ class HarborSource:
     def cancel(self, futures: Sequence[Future[Rollout]]) -> None:
         """Interrupt the named trials; Harbor tears their sandboxes down, and each resolves `CANCELLED`."""
         with self._lock:
-            running = []
             for future in futures:
                 record = self._records.get(future)
-                if record is not None:
-                    record.cancelled = True
-                    if record.process is not None:
-                        running.append(record.process)
-        for process in running:
-            os.killpg(process.pid, signal.SIGINT)
+                if record is None or record.cancelled:
+                    continue
+                record.cancelled = True
+                if record.process is not None and record.process.poll() is None:
+                    _signal(record.process, signal.SIGINT)
+                    threading.Timer(self._grace, self._escalate, (record, signal.SIGTERM)).start()
+
+    def _escalate(self, record: _Trial, sent: signal.Signals) -> None:
+        """Harbor ignored the last signal for a whole grace period: send the next, SIGTERM then SIGKILL."""
+        with self._lock:
+            if record.process is None or record.process.poll() is not None:
+                return
+            _logger.warning("Harbor trial %d outlived its grace; sending %s", record.process.pid, sent.name)
+            _signal(record.process, sent)
+            if sent is signal.SIGTERM:
+                threading.Timer(self._grace, self._escalate, (record, signal.SIGKILL)).start()
 
     def close(self) -> None:
         """Cancel every unresolved trial, queued or running, and wait for the running ones to tear down."""
@@ -377,6 +394,18 @@ class _Trial:
 
     cancelled: bool = False
     process: subprocess.Popen[str] | None = None
+
+
+def _signal(process: subprocess.Popen[str], sent: signal.Signals) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, sent)
+
+
+def _kill_all(records: dict[Future[Rollout], _Trial], lock: threading.Lock) -> None:
+    with lock:
+        for record in records.values():
+            if record.process is not None and record.process.poll() is None:
+                _signal(record.process, signal.SIGKILL)
 
 
 def _harness_exit(trial: Path) -> str | None:
