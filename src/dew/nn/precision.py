@@ -114,10 +114,14 @@ def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     op: XLA's GPU default `xla_allow_excess_precision` may delete a cast
     round trip under jit, and then nothing would round.
     """
+    # The barrier holds the value in `x`'s dtype: under excess precision XLA
+    # may otherwise carry a bf16 operand wider inside the fusion that reads
+    # it, which changes a bf16 product with where the fusion boundary falls.
     if jnp.dtype(dtype).itemsize >= jnp.dtype(x.dtype).itemsize:
-        return x
+        return jax.lax.optimization_barrier(x)
     info = jnp.finfo(dtype)
-    return jax.lax.reduce_precision(x, exponent_bits=info.nexp, mantissa_bits=info.nmant)
+    return jax.lax.optimization_barrier(
+        jax.lax.reduce_precision(x, exponent_bits=info.nexp, mantissa_bits=info.nmant))
 
 
 @rounded_operand.defjvp
