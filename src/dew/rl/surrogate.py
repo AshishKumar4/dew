@@ -34,10 +34,12 @@ reference forward and a reward all happen outside.
 """
 
 
+import math
+
 import jax
 import jax.numpy as jnp
 
-from dew.rl.advantage import masked_mean
+from dew.rl.advantage import MEAN_EPS, masked_mean
 
 LOG_RATIO_CLAMP = 20.0
 """Bound on a token's log importance ratio before it is exponentiated. Both
@@ -79,8 +81,37 @@ def token_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array) -> jax.Array
     return jnp.clip(log_ratio, -LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)
 
 
+def _segment_totals(values: jax.Array, mask: jax.Array,
+                    segments: jax.Array | None) -> tuple[jax.Array, jax.Array]:
+    """Each position's sequence masked sum and unmasked count, broadcast to `[B, T]`."""
+    values = jnp.asarray(values, jnp.float32)
+    keep = mask.astype(jnp.float32)
+    kept = jnp.where(keep != 0, values, 0) * keep
+    if segments is None:
+        return (jnp.broadcast_to(jnp.sum(kept, axis=-1, keepdims=True), values.shape),
+                jnp.broadcast_to(jnp.sum(keep, axis=-1, keepdims=True), values.shape))
+    rows, width = values.shape
+    keys = (jnp.arange(rows)[:, None] * (width + 1) + jnp.asarray(segments, jnp.int32)).reshape(-1)
+    count = rows * (width + 1)
+    total = jax.ops.segment_sum(kept.reshape(-1), keys, num_segments=count)
+    counted = jax.ops.segment_sum(keep.reshape(-1), keys, num_segments=count)
+    return total[keys].reshape(rows, width), counted[keys].reshape(rows, width)
+
+
+def segment_mean(values: jax.Array, mask: jax.Array, segments: jax.Array | None = None) -> jax.Array:
+    """Each position's masked mean over its sequence, broadcast back to `[B, T]`.
+
+    A sequence is a row, or with `segments` one run of equal nonzero ids in
+    a row, the packed layout's chain. The denominator is the sequence's
+    unmasked count clipped at one, verl's `clamp(min=1)`, so a fully masked
+    sequence pools to zero.
+    """
+    total, count = _segment_totals(values, mask, segments)
+    return total / jnp.clip(count, min=1.0)
+
+
 def sequence_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array,
-                       mask: jax.Array) -> jax.Array:
+                       mask: jax.Array, segments: jax.Array | None = None) -> jax.Array:
     """GSPO's sequence-level log ratio, carrying a per-token gradient.
 
     The sequence ratio is the geometric mean of the token ratios, so its log is
@@ -91,23 +122,25 @@ def sequence_log_ratio(log_probs: jax.Array, old_log_probs: jax.Array,
     the value untouched and changes every gradient. The test pins the
     gradients for that reason.
 
+    A sequence is a row, or with `segments` one packed chain of it
+    (`segment_mean`), which is what verl's per-row pooling sees when each
+    chain is its own row.
+
     Tunix clamps the token log ratios to +-20 before pooling them. This pools
     the raw difference, as verl's `compute_policy_loss_gspo` does. The clamp
     at 10 on the result bounds what is exponentiated either way.
     """
     log_probs = jnp.asarray(log_probs, jnp.float32)
     log_ratio = log_probs - jnp.asarray(old_log_probs, jnp.float32)
-    keep = mask.astype(jnp.float32)
-    pooled = (jnp.sum(log_ratio * keep, axis=-1)
-              / jnp.clip(jnp.sum(keep, axis=-1), min=1.0))
+    pooled = segment_mean(log_ratio, mask, segments)
     sequence = (log_probs - jax.lax.stop_gradient(log_probs)
-                + jax.lax.stop_gradient(pooled)[:, None])
+                + jax.lax.stop_gradient(pooled))
     return jnp.clip(sequence, max=SEQUENCE_RATIO_CLAMP)
 
 
 def clipped_surrogate_terms(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Array,
                             epsilon_low: float = 0.2, epsilon_high: float = 0.2,
-                            dual_clip: float = 3.0) -> tuple[jax.Array, dict[str, jax.Array]]:
+                            dual_clip: float | None = 3.0) -> tuple[jax.Array, dict[str, jax.Array]]:
     """PPO policy terms before normalization, with the dual clip.
 
     `max(-A r, -A clip(r, 1 - eps_low, 1 + eps_high))` per token, and for a
@@ -122,8 +155,11 @@ def clipped_surrogate_terms(log_ratio: jax.Array, advantages: jax.Array, mask: j
     handed in, so with `sequence_log_ratio` the `ppo_kl` entry is the
     sequence-pooled quantity, and a GSPO run reads its `ppo_kl` from
     `token_log_ratio`, as verl's GSPO loss does.
+
+    `dual_clip=None` leaves the negative side uncapped, verl's
+    `compute_policy_loss_gspo`, and reports `pg_clipfrac_lower` as zero.
     """
-    if dual_clip <= 1.0:
+    if dual_clip is not None and dual_clip <= 1.0:
         raise ValueError("the dual clip caps a negative advantage, so it needs "
                          f"dual_clip > 1, got {dual_clip}")
 
@@ -137,23 +173,52 @@ def clipped_surrogate_terms(log_ratio: jax.Array, advantages: jax.Array, mask: j
     unclipped = -advantages * ratio
     clipped = -advantages * jnp.clip(ratio, 1 - epsilon_low, 1 + epsilon_high)
     worse = jnp.maximum(unclipped, clipped)
+    aux = {
+        "pg_clipfrac": masked_mean(jnp.greater(clipped, unclipped).astype(jnp.float32), keep),
+        "pg_clipfrac_lower": jnp.zeros((), jnp.float32),
+        "ppo_kl": masked_mean(-log_ratio, keep),
+    }
+    if dual_clip is None:
+        return worse, aux
     capped = -advantages * dual_clip
     negative = advantages < 0.0
     per_token = jnp.where(negative, jnp.minimum(capped, worse), worse)
+    aux["pg_clipfrac_lower"] = masked_mean(
+        jnp.greater(worse, capped).astype(jnp.float32) * negative.astype(jnp.float32), keep)
+    return per_token, aux
 
+
+def cispo_terms(log_probs: jax.Array, old_log_probs: jax.Array, advantages: jax.Array,
+                mask: jax.Array, epsilon_low: float = 0.2,
+                epsilon_high: float = 0.2) -> tuple[jax.Array, dict[str, jax.Array]]:
+    """CISPO's policy terms: `-sg(clip(r, 1 - eps_low, 1 + eps_high)) * A * log pi`.
+
+    MiniMax-M1 section 3.1 (arXiv:2506.13585), as verl's
+    `compute_policy_loss_cispo` at 12ebe0c writes it: the ratio is clamped in
+    log space to +-20, clipped, then detached, so every token keeps the
+    gradient of its own log-probability, however far its ratio moved.
+    `pg_clipfrac` counts tokens whose ratio the clip changed.
+    """
+    log_probs = jnp.asarray(log_probs, jnp.float32)
+    log_ratio = token_log_ratio(log_probs, old_log_probs)
+    advantages = jnp.asarray(advantages, jnp.float32)
+    if advantages.ndim == 1:
+        advantages = advantages[:, None]
+    keep = mask.astype(jnp.float32)
+    ratio = jnp.exp(log_ratio)
+    clipped = jnp.clip(ratio, 1 - epsilon_low, 1 + epsilon_high)
+    terms = -jax.lax.stop_gradient(clipped) * advantages * log_probs
     aux = {
-        "pg_clipfrac": masked_mean(jnp.greater(clipped, unclipped).astype(jnp.float32), keep),
-        "pg_clipfrac_lower": masked_mean(
-            jnp.greater(worse, capped).astype(jnp.float32) * negative.astype(jnp.float32),
-            keep),
+        "pg_clipfrac": masked_mean((ratio != clipped).astype(jnp.float32), keep),
+        "pg_clipfrac_lower": jnp.zeros((), jnp.float32),
         "ppo_kl": masked_mean(-log_ratio, keep),
     }
-    return per_token, aux
+    return terms, aux
 
 
 def clipped_surrogate(log_ratio: jax.Array, advantages: jax.Array, mask: jax.Array,
                       epsilon_low: float = 0.2, epsilon_high: float = 0.2,
-                      dual_clip: float = 3.0) -> tuple[jax.Array, dict[str, jax.Array]]:
+                      dual_clip: float | None = 3.0) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Token-mean reduction of the dual-clipped policy terms."""
     terms, aux = clipped_surrogate_terms(
         log_ratio, advantages, mask, epsilon_low, epsilon_high, dual_clip)
@@ -222,6 +287,76 @@ def behavior_importance_weights(old_log_probs: jax.Array, behavior_log_probs: ja
     ratio = token_log_ratio(old_log_probs, behavior_log_probs)
     weights = jnp.where(mask != 0, jnp.exp(ratio) * mask, 0)
     return jax.lax.stop_gradient(jnp.minimum(weights, cap))
+
+
+def behavior_band_weights(old_log_probs: jax.Array, behavior_log_probs: jax.Array,
+                          mask: jax.Array, low: float, high: float) -> jax.Array:
+    """Detached IcePop weights: the token ratio inside `[low, high]`, zero outside.
+
+    verl 12ebe0c `compute_rollout_correction_weights(rollout_is="token")`
+    with a `"low_high"` threshold: exp of the proximal-over-behavior log
+    ratio clamped to +-20, masked, then zeroed outside the band instead of
+    capped (arXiv:2510.18855). The band is inclusive at both ends.
+    """
+    if not 0 < low <= high:
+        raise ValueError(f"an IcePop band needs 0 < low <= high, got [{low}, {high}]")
+    ratio = jnp.exp(token_log_ratio(old_log_probs, behavior_log_probs))
+    weights = jnp.where(mask != 0, ratio * mask, 0)
+    return jax.lax.stop_gradient(jnp.where((weights >= low) & (weights <= high), weights, 0))
+
+
+def sequence_rejection_mask(old_log_probs: jax.Array, behavior_log_probs: jax.Array,
+                            mask: jax.Array, low: float, high: float, *, geometric: bool,
+                            segments: jax.Array | None = None) -> jax.Array:
+    """Keep 1 for every token of a sequence whose k1 statistic lies in `[log low, log high]`.
+
+    verl 12ebe0c `compute_rollout_rejection_mask` with `seq_sum_k1`
+    (`geometric=False`) or `seq_mean_k1` (`geometric=True`). verl's k1 is the
+    negated log ratio, `log behavior - log proximal`, clamped to +-20 per
+    token, then summed or averaged over the sequence; a sequence outside the
+    band is rejected whole. The geometric form with a band near one is
+    SkyRL's geometric sequence mask (0.99 to 1.01). A sequence is a row or a
+    packed chain, as in `segment_mean`; outside `mask` the result is 1.
+    """
+    if not 0 < low <= high:
+        raise ValueError(f"a rejection band needs 0 < low <= high, got [{low}, {high}]")
+    k1 = -token_log_ratio(old_log_probs, behavior_log_probs)
+    total, count = _segment_totals(k1, mask, segments)
+    statistic = total / (count + MEAN_EPS) if geometric else total
+    keep = (statistic >= math.log(low)) & (statistic <= math.log(high))
+    return (keep | (mask == 0)).astype(jnp.float32)
+
+
+def mismatch_metrics(proximal_log_probs: jax.Array, behavior_log_probs: jax.Array,
+                     mask: jax.Array, weights: jax.Array | None = None,
+                     cap: float | None = None) -> dict[str, jax.Array]:
+    """Trainer-versus-engine diagnostics over the trainable tokens.
+
+    verl 12ebe0c `compute_offpolicy_metrics`: `kl` is the direct estimate
+    `mean(log behavior - log proximal)` and `k3_kl` the mean of
+    `r - log r - 1` for `r = proximal / behavior`, the quantity prime-rl logs
+    as `mismatch_kl`. `ess` is verl's `rollout_is_eff_sample_size`, one over
+    the mean square of the applied weights clamped to `[0, cap]` and divided
+    by their mean plus 1e-8; without applied `weights` it reads the raw
+    token ratios. A value of one means every token weighs alike.
+    """
+    proximal = jnp.asarray(proximal_log_probs, jnp.float32)
+    behavior = jnp.asarray(behavior_log_probs, jnp.float32)
+    log_ratio = proximal - behavior
+    keep = mask.astype(jnp.float32)
+    count = jnp.sum(keep)
+
+    def mean(values: jax.Array) -> jax.Array:
+        return jnp.sum(jnp.where(keep != 0, values, 0) * keep) / (count + MEAN_EPS)
+
+    if weights is None:
+        weights = jnp.exp(jnp.clip(log_ratio, -LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)) * keep
+    if cap is not None:
+        weights = jnp.clip(weights, 0.0, cap)
+    normalized = weights / (mean(weights) + MEAN_EPS)
+    spread = mean(jnp.square(normalized))
+    return {"kl": mean(behavior - proximal), "k3_kl": mean(jnp.exp(log_ratio) - log_ratio - 1),
+            "ess": jnp.where(spread > 0, 1.0 / jnp.where(spread > 0, spread, 1.0), 0.0)}
 
 
 def clipped_value_loss_terms(predicted: jax.Array, returns: jax.Array, old_values: jax.Array,
