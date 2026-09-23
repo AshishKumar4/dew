@@ -121,7 +121,10 @@ trial = os.path.join(value("--trials-dir"), value("--trial-name"))
 os.makedirs(trial)
 with open(os.path.join(trial, "seen.json"), "w") as seen:
     json.dump({"arguments": arguments, "agent": agent}, seen)
-if "slow" in value("-p"):
+if "stubborn" in value("-p"):
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+if "slow" in value("-p") or "stubborn" in value("-p"):
     time.sleep(60)
 with open(os.path.join(trial, "result.json"), "w") as out:
     json.dump({"exception_info": None, "verifier_result": {"rewards": {"reward": 1}}}, out)
@@ -193,6 +196,23 @@ def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbo
     assert rollout.status is Status.CANCELLED and time.monotonic() - began < 30
     # A cancelled session's traces leave the gateway too, not only a scored one's.
     assert ("DELETE", f"/sessions/slow:{rollout.group}:0") in asked
+
+
+def test_a_harbor_that_ignores_the_interrupt_is_terminated_after_the_grace(tmp_path, harbor):
+    (tmp_path / "stubborn").mkdir()
+    gateway, _ = fake_gateway()
+    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials", grace=1.0)
+    try:
+        (future,) = source.submit(Task("stubborn", {HARBOR_KEY: str(tmp_path / "stubborn")}), 1, version=0)
+        deadline = time.monotonic() + 30
+        while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        source.cancel([future])
+        assert future.result(timeout=15).status is Status.CANCELLED
+        # Cancelling a resolved future again is a no-op, not a signal to a reaped process group.
+        source.cancel([future])
+    finally:
+        source.close()
 
 
 def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
