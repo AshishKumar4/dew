@@ -60,6 +60,26 @@ def test_a_trace_that_cannot_train_is_refused(broken):
         calls([broken], unstamped=0)
 
 
+@pytest.mark.parametrize("malformed", [
+    {**trace([1], [3], [-.5]), "raw_response": "upstream said no"},  # a raw response that is not an object
+    {**trace([1], [3], [-.5]), "logprobs": ["-0.5"]},  # a likelihood that is not a number
+    {**trace([1], [3], [-.5]), "weight_version": "7"},  # a stamp that is not an integer
+    [1, 2, 3],  # not a trace at all
+])
+def test_a_malformed_trace_is_refused_as_such(malformed):
+    with pytest.raises(ValueError):
+        calls([malformed], unstamped=0)
+
+
+@pytest.mark.parametrize("malformed", [
+    {"exception_info": None, "verifier_result": {"rewards": {"reward": "1"}}},
+    {"exception_info": "boom", "verifier_result": None},
+    {"exception_info": None, "verifier_result": {"rewards": [1]}},
+])
+def test_a_malformed_trial_result_is_infra(malformed):
+    assert outcome(malformed, (STOP,))[0] is Status.INFRA_ERROR
+
+
 BROKEN = {**trace([], [], None, None), "raw_response": {"error": {"message": "EngineCore died", "type": "InternalServerError",
                                                  "code": 500}}}
 
