@@ -25,8 +25,9 @@ parameter carries any more, so a renamed submodule fails there.
 
 The mesh axis names live here too, with the readers of the mesh in context:
 `pipeline_stages` for the decoder's stage count, `microbatches` for the
-schedule the trainer puts in context around its compiled step, and
-`sequence_shards` for how many ways attention splits a sequence.
+schedule the trainer puts in context around its compiled step,
+`sequence_shards` for how many ways attention and the Mamba-2 mixer split a
+sequence, and `row_axes` for the axes their `shard_map`s split rows over.
 """
 
 from __future__ import annotations
@@ -107,6 +108,25 @@ def sequence_shards() -> int:
     if mesh.empty or SEQUENCE_AXIS in mesh.manual_axes:
         return 1
     return mesh.shape.get(SEQUENCE_AXIS, 1)
+
+
+def row_axes(batch: int) -> tuple[str, ...]:
+    """The mesh axes a `shard_map` over the sequence axis splits `batch` rows
+    over: every axis still automatic in context but tensor, sequence and
+    stage, which hold a width, a slice of the sequence and a pipeline stage
+    and never a row, taken in mesh order while their product divides the
+    rows. A batch too small for the rest is computed alike on those axes'
+    shards, the way GSPMD replicates a dimension it cannot split."""
+    mesh = jax.sharding.get_abstract_mesh()
+    rows: tuple[str, ...] = ()
+    split = 1
+    for axis in mesh.axis_names:
+        if (axis in mesh.manual_axes or mesh.shape[axis] == 1
+                or axis in (TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)):
+            continue
+        if batch % (split * mesh.shape[axis]) == 0:
+            rows, split = (*rows, axis), split * mesh.shape[axis]
+    return rows
 
 
 def logical_axes(declared: Mapping[Suffix, LogicalAxes], *,
