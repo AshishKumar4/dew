@@ -194,6 +194,8 @@ class AttentionMetadata:
     such a layer. `engram_ids` are every engram layer's n-gram bucket ids,
     `[B, S, layers, columns]`, which the model hashes once from the token
     ids for the stack (`dew.nn.engram`), as it hands a hash router the ids.
+    `media` `[B, S]` marks the positions a media encoder fills, which
+    DeepSeek-V4.1 routes by its image bias and keeps out of every n-gram.
     """
 
     valid: jax.Array | None = None
@@ -203,6 +205,7 @@ class AttentionMetadata:
     key_positions: jax.Array | None = None
     token_ids: jax.Array | None = None
     engram_ids: jax.Array | None = None
+    media: jax.Array | None = None
 
 
 @struct.dataclass

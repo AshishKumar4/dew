@@ -234,21 +234,25 @@ class EngramHashes(nn.Module):
     Tokens map through the compressed vocabulary, the `constants`
     collection's `token_map`: a loaded checkpoint derives it from its
     tokenizer (`compressed_token_map`), and a fresh model maps each id to
-    itself modulo the compressed vocabulary's size. Each position hashes with the valid tokens before it: padding
-    is skipped, and look-back stops at a row's start, at a packed document's
-    (`positions`) and, while decoding, where the cached history of the row's
-    earlier calls runs out. Padding positions get ids nothing reads.
+    itself modulo the compressed vocabulary's size. Each position hashes
+    with the valid tokens before it: padding is skipped, and look-back stops
+    at a row's start, at a packed document's (`positions`), at a `media`
+    position (an image span, dead as in engram.py:164-166) and, while
+    decoding, where the cached history of the row's earlier calls runs out.
+    Padding positions get ids nothing reads.
     """
 
     spec: Engram
     vocab_size: int
 
     @nn.compact
-    def __call__(self, tokens, valid, positions, decode: bool):
+    def __call__(self, tokens, valid, positions, decode: bool, media=None):
         spec, vocab = self.spec, self.vocab_size
         table = self.variable('constants', 'token_map',
                               lambda: jnp.arange(vocab, dtype=jnp.int32) % spec.compressed_vocab_size).value
         compressed = jnp.take(table, tokens, axis=0)
+        if media is not None:
+            compressed = jnp.where(media, DEAD, compressed)
         valid = jnp.ones(tokens.shape, bool) if valid is None else jnp.asarray(valid, bool)
         size = spec.max_ngram_size
         history = held = None

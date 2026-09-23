@@ -16,10 +16,12 @@ from dew.registry import models
 
 @struct.dataclass
 class Fusion:
-    """Decoder token identities and their scaled, conditioned embeddings."""
+    """Decoder token identities, their scaled, conditioned embeddings, and
+    which positions media fill."""
 
     tokens: jax.Array
     embeddings: jax.Array
+    media: jax.Array
 
 
 class VisionConditioner(nn.Module):
@@ -80,7 +82,8 @@ class VisionConditioner(nn.Module):
         """Replace marked text slots with the corresponding soft feature."""
         if image_indices.shape != tokens.shape:
             raise ValueError("image_indices must align with the token rows")
-        return Fusion(tokens, _place(embeddings, self(conditioning, train=train), image_indices))
+        return Fusion(tokens, _place(embeddings, self(conditioning, train=train), image_indices),
+                      image_indices >= 0)
 
 
 class AudioConditioner(nn.Module):
@@ -252,7 +255,7 @@ class MultimodalTransformer(nn.Module):
             if self.audio is None:
                 raise ValueError("audio_indices require an audio tower")
             embeddings = _place(embeddings, self.audio_conditioner(conditioning), audio_indices)
-        return Fusion(decoder_tokens, embeddings)
+        return Fusion(decoder_tokens, embeddings, media)
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False, positions=None,
                           segment_ids=None, image_indices=None, conditioning=None,
@@ -343,12 +346,12 @@ class MultimodalTransformer(nn.Module):
                 routed_experts=routed_experts, routed=routed)
         fused = self._conditioned_embeddings(tokens, image_indices, conditioning,
                                              train=train, audio_indices=audio_indices)
-        decoder_tokens, embeddings = fused.tokens, fused.embeddings
         slots = jnp.broadcast_to(jnp.arange(tokens.shape[1]), tokens.shape)
         return self.language_model.hidden_states(
-            decoder_tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-            input_embeddings=embeddings, embedding_positions=slots, attention_mask=attention_mask,
-            image_groups=image_groups, rotary_positions=rotary_positions, routed_experts=routed_experts, routed=routed)
+            fused.tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
+            input_embeddings=fused.embeddings, embedding_positions=slots, attention_mask=attention_mask,
+            image_groups=image_groups, rotary_positions=rotary_positions, media_mask=fused.media,
+            routed_experts=routed_experts, routed=routed)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
@@ -360,6 +363,8 @@ class MultimodalTransformer(nn.Module):
                                     conditioning=conditioning, attention_mask=attention_mask,
                                     image_groups=image_groups, rotary_positions=rotary_positions,
                                     audio_indices=audio_indices)
+        if self.is_initializing() and self.language_model.dspark is not None:
+            self.language_model.reach_drafter(tokens, hidden.dtype)
         if self.is_initializing() and self.num_nextn_predict_layers:
             self.mtp_hidden_states(hidden, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, image_indices=image_indices,

@@ -327,6 +327,10 @@ class Mixture:
     width between a down and an up projection, with the model's RMSNorm on
     their weighted sum when `latent_norm` is set (`SparseMLP`). None runs
     them at the model width.
+
+    `media_bias` gives every router DeepSeek-V4.1's second balancing bias,
+    which selects for an image span's tokens (`Router`); the block hands it
+    the media mask.
     """
 
     experts: int
@@ -351,6 +355,7 @@ class Mixture:
     hash_layers: tuple[int, ...] | None = None
     latent_features: int | None = None
     latent_norm: bool = False
+    media_bias: bool = False
 
     def __post_init__(self):
         if self.layers is not None:
@@ -664,6 +669,7 @@ class DecoderBlock(nn.Module):
     residual_multiplier: float = 1.0  # each sublayer's output scaled before it joins the residual
     residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
     routed: bool = False  # the feed-forward, or the parallel branch, routes over experts
+    media_routed: bool = False  # the feed-forward routes a media span by its own bias
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
     prediction_slot: int | None = None  # records its input's stream mean for DSpark
@@ -851,8 +857,10 @@ class DecoderBlock(nn.Module):
             if attention_metadata is None or attention_metadata.engram_ids is None:
                 raise ValueError("an engram layer reads the bucket ids the model hashes into "
                                  "attention_metadata.engram_ids")
+            # A media position takes no engram contribution (model.py:351-365).
             streams = self.engram_layer(
-                streams, attention_metadata.engram_ids[:, :, self.engram_index])
+                streams, attention_metadata.engram_ids[:, :, self.engram_index],
+                None if attention_metadata.media is None else ~attention_metadata.media)
         if (self.prediction_slot is not None and not self.is_initializing()
                 and self.is_mutable_collection('prediction_inputs')):
             # DSpark reads each target layer's attention input, after its
@@ -928,7 +936,12 @@ class DecoderBlock(nn.Module):
                               **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
 
     def _feedforward_inputs(self, attention_metadata) -> dict:
-        """The token ids for a hash-routed feed-forward, nothing for the rest."""
+        """The token ids for a hash-routed feed-forward, the media mask, when
+        the call has one, for one that routes a media span apart, nothing for
+        the rest."""
+        if self.media_routed:
+            media = None if attention_metadata is None else attention_metadata.media
+            return {} if media is None else {"media": media}
         if not self.hash_routed:
             return {}
         if attention_metadata is None or attention_metadata.token_ids is None:
@@ -2075,15 +2088,28 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 "altup and hyper_connections each carry their own stack of residual "
                 "copies through the layers, so a model has one or the other")
-        engram = self.engram
+        self.refuse_unbuildable_stream_fields()
+        if self.swiglu_limit is not None and self.swiglu_limit <= 0:
+            raise ValueError(
+                f"swiglu_limit caps the gate and up projections, so it is positive, "
+                f"got {self.swiglu_limit}; None leaves them unclamped")
+        mask = self.mask_token_id
+        if mask is not None and (isinstance(mask, bool) or not isinstance(mask, int) or mask < 0):
+            raise ValueError(
+                f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
+                "model trained on plain next-token prediction")
+
+    def refuse_unbuildable_stream_fields(self):
+        """Raise for the fields riding mHC's streams that cannot be built:
+        engram's layers, DSpark's stages and the Single-Pass schedule."""
+        engram, hc = self.engram, self.hyper_connections
         if engram is not None:
-            if self.hyper_connections is None:
+            if hc is None:
                 raise ValueError("engram gates its lookup into each of mHC's residual streams, "
                                  "so it needs hyper_connections")
             outside = sorted(set(engram.layer_ids) - set(range(self.num_layers)))
             if outside:
                 raise ValueError(f"engram layers {outside} are outside the {self.num_layers} layers")
-        hc = self.hyper_connections
         if self.dspark is not None:
             # The stages are V4.1's Single-Pass blocks (v41:1100-1156); a
             # drafter for another trunk's residual is not built here.
@@ -2098,15 +2124,6 @@ class CausalTransformer(nn.Module):
         if hc is not None and hc.single_pass and self.mtp_hyper_connections:
             raise ValueError("Single-Pass mHC carries the next sublayer's collapse beside the "
                              "streams, which no stream prediction depth reads")
-        if self.swiglu_limit is not None and self.swiglu_limit <= 0:
-            raise ValueError(
-                f"swiglu_limit caps the gate and up projections, so it is positive, "
-                f"got {self.swiglu_limit}; None leaves them unclamped")
-        mask = self.mask_token_id
-        if mask is not None and (isinstance(mask, bool) or not isinstance(mask, int) or mask < 0):
-            raise ValueError(
-                f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
-                "model trained on plain next-token prediction")
 
     def feedforward_factories(self):
         """Build the three feed-forward factories a layer can be given.
@@ -2147,6 +2164,7 @@ class CausalTransformer(nn.Module):
             groups_per_token=mixture.groups_per_token,
             group_score=mixture.group_score,
             expert_bias=mixture.bias,
+            media_bias=mixture.media_bias,
             scale_inputs=mixture.scale_inputs,
             swiglu_limit=self.swiglu_limit,
             shared=shared,
@@ -2270,7 +2288,7 @@ class CausalTransformer(nn.Module):
                 mixer=(spec.kind.mixer or mixer_spec).build(
                     self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared)),
                 feedforward=(
-                    functools.partial(routed, expert_bias=False, hash_vocab=self.vocab_size)
+                    functools.partial(routed, expert_bias=False, media_bias=False, hash_vocab=self.vocab_size)
                     if spec.hash_routed and routed is not None else
                     routed
                     if spec.routed and routed is not None else
@@ -2281,6 +2299,8 @@ class CausalTransformer(nn.Module):
                 hash_routed=spec.hash_routed,
                 residual_multiplier=self.residual_multiplier,
                 routed=spec.routed,
+                media_routed=(spec.routed and not spec.hash_routed
+                              and self.mixture is not None and self.mixture.media_bias),
                 engram=None if spec.engram is None or self.engram is None else functools.partial(
                     EngramLayer, rows=self.engram.num_embeddings[spec.engram],
                     columns=self.engram.columns, head_dim=self.engram.head_dim,
@@ -2412,10 +2432,7 @@ class CausalTransformer(nn.Module):
                                attention_pairwise_mask=attention_pairwise_mask,
                                attention_key_positions=attention_key_positions)
         if self.is_initializing() and self.dspark is not None:
-            # Reach the drafter's parameters, as the depths' below, over a
-            # context of the width its first stage projects.
-            width = len(self.dspark.target_layers) * self.emb_features
-            self.draft(jnp.zeros((tokens.shape[0], 1, width), x.dtype), tokens[:, -1], decode=False)
+            self.reach_drafter(tokens, x.dtype)
         if self.is_initializing() and self.mtp:
             # Flax creates a parameter where a call first reaches it, and the
             # main forward never enters the prediction depths. Reaching them
@@ -2594,6 +2611,14 @@ class CausalTransformer(nn.Module):
         return dspark_draft(self.dspark_stages, self.dspark, self.token_embeddings, self._logits,
                             hc.hc_mult, context, tokens, decode=decode, valid=valid, choose=choose)
 
+    def reach_drafter(self, tokens, dtype):
+        """Create the DSpark drafter's parameters, which no forward reaches, by
+        drafting after `tokens` over a context of the width its first stage
+        projects."""
+        assert self.dspark is not None
+        width = len(self.dspark.target_layers) * self.emb_features
+        self.draft(jnp.zeros((tokens.shape[0], 1, width), dtype), tokens[:, -1], decode=False)
+
     def draft_context(self, prediction_inputs: Mapping) -> jax.Array:
         """DSpark's context `[B, S, targets * D]` from the `prediction_inputs`
         a forward sows when the caller makes them mutable: each target
@@ -2629,7 +2654,7 @@ class CausalTransformer(nn.Module):
                       input_embeddings=None, embedding_positions=None,
                       attention_mask=None, image_groups=None, rotary_positions=None,
                       attention_pairwise_mask=None, attention_key_positions=None,
-                      routed_experts=None, routed=None):
+                      routed_experts=None, routed=None, media_mask=None):
         """The final normalized states and the prediction depth's input.
 
         V4's depth reads the raw residual streams before the collapse head
@@ -2656,6 +2681,11 @@ class CausalTransformer(nn.Module):
         return), with `routed`, `[B, S]`, marking the tokens the record covers
         (None for all). Every sparse layer's router selects its slice
         (`dew.nn.moe.Routes`).
+
+        `media_mask` [B, S] marks the positions `input_embeddings` fill from
+        a media encoder. A model with engram keeps them out of every n-gram
+        and a router with a media bias selects for them by it; the rest
+        ignore it.
         """
         if attention_key_positions is not None and attention_pairwise_mask is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask")
@@ -2663,19 +2693,21 @@ class CausalTransformer(nn.Module):
             kinds = [self.mixer] + [kind.mixer for kind in (self.kinds or {}).values()]
             if any(kind is not None and not isinstance(kind, AttentionMixer) for kind in kinds):
                 raise ValueError("explicit pairwise masks require ordinary attention mixers")
+        if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
+            media_mask = None
         engram_ids = (None if self.engram is None
-                      else self.engram_hashes(tokens, attention_mask, positions, decode))
+                      else self.engram_hashes(tokens, attention_mask, positions, decode, media_mask))
         attention_metadata = (None if attention_mask is None and image_groups is None
                               and rotary_positions is None and attention_pairwise_mask is None
                               and attention_key_positions is None and not self.hash_layers
-                              and engram_ids is None
+                              and engram_ids is None and media_mask is None
                               else AttentionMetadata(
                                   valid=attention_mask, image_groups=image_groups,
                                   rotary_positions=rotary_positions,
                                   pairwise_mask=attention_pairwise_mask,
                                   key_positions=attention_key_positions,
                                   token_ids=tokens if self.hash_layers else None,
-                                  engram_ids=engram_ids))
+                                  engram_ids=engram_ids, media=media_mask))
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.

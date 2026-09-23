@@ -305,6 +305,7 @@ class MixtureFields(TypedDict, total=False):
     hash_layers: tuple[int, ...] | None
     latent_features: int | None
     latent_norm: bool
+    media_bias: bool
 
 
 class AltUpFields(TypedDict, total=False):
@@ -1177,6 +1178,8 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
         record = _qwen35_wrapper(hf_config, used)
     elif model_type == "gemma3n":
         record = _gemma3n_wrapper(hf_config, used)
+    elif model_type == "deepseek_v41":
+        record = deepseek_v41_wrapper(hf_config, used)
     else:
         _refuse(f"model_type {model_type!r}",
                 "no supported multimodal wrapper is registered for this model")
@@ -1196,6 +1199,7 @@ _WRAPPER_TOWER_PARAMS = {
     "llama4": vision_nn.translate_llama4_vision_weights,
     "qwen3_5": vision_nn.translate_qwen35_vision_weights,
     "gemma3n": vision_nn.translate_gemma3n_vision_weights,
+    "deepseek_v41": vision_nn.translate_deepseek_v41_vision_weights,
 }
 
 _WRAPPER_PROJECTOR_WEIGHTS = {
@@ -1204,6 +1208,7 @@ _WRAPPER_PROJECTOR_WEIGHTS = {
     "gemma4": vision_nn.translate_gemma4_projector_weights,
     "qwen3_5": vision_nn.translate_qwen35_projector_weights,
     "gemma3n": vision_nn.translate_gemma3n_projector_weights,
+    "deepseek_v41": vision_nn.translate_deepseek_v41_projector_weights,
 }
 
 
@@ -1231,10 +1236,13 @@ def _wrapper_projector_weights(
 
 _WRAPPER_TOWER_PREFIX = {"siglip": "vision_tower.", "llama4": "vision_model.",
                          "gemma4": "vision_tower.", "qwen3_5": "visual.",
-                         "gemma3n": "vision_tower."}
+                         "gemma3n": "vision_tower.", "deepseek_v41": "vision."}
 _WRAPPER_PROJECTOR_PREFIX = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
                              "gemma4": "embed_vision.", "qwen3_5": "visual.merger.",
-                             "gemma3n": "embed_vision."}
+                             "gemma3n": "embed_vision.", "deepseek_v41": "aligner."}
+# DeepSeek-V4.1 keeps its decoder unprefixed and the image span's learned
+# vectors at the top level, beside the aligner (model.py:1201-1222).
+_V41_SPAN = ("image_start", "image_newline", "image_end")
 # Gemma 3n and Gemma 4 nest their audio encoder and embedder beside the vision ones.
 _WRAPPER_AUDIO_PREFIX = "audio_tower."
 _WRAPPER_AUDIO_PROJECTOR_PREFIX = "embed_audio."
@@ -1266,6 +1274,8 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], 
             group, local = "audio_tower", bare[len(_WRAPPER_AUDIO_PREFIX):]
         elif (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
             group, local = "language_model", bare
+        elif record["text_model_type"] == "deepseek_v41":
+            group, local = ("projector" if bare in _V41_SPAN else "language_model"), bare
         else:
             raise ValueError(f"unknown tensor name {name!r}")
         previous = sources[group].get(local)
@@ -1491,10 +1501,11 @@ _V4_MODULES = ('compressor', 'indexer', 'scorer')
 _V4_TENSORS = ('sinks', 'position_bias')
 _V4_HC = ('fn', 'base', 'scale')
 _V4_HEAD = ('hc_fn', 'hc_base', 'hc_scale')
-# The router state a training step moves, beside the frozen table a hash
-# router selects by; neither is a parameter, so both land where `Router`
-# keeps them (modeling_deepseek_v4.py:1033, :1062).
-_MOE_STATE = ('e_score_correction_bias', 'tid2eid')
+# The router state a training step moves (DeepSeek-V4.1 adds a second bias,
+# for image spans), beside the frozen table a hash router selects by; none is
+# a parameter, so each lands where `Router` keeps it
+# (modeling_deepseek_v4.py:1033, :1062).
+_MOE_STATE = ('e_score_correction_bias', 'media_bias', 'tid2eid')
 
 
 def _norm_names(sandwich: bool) -> dict[str, str]:
@@ -2402,6 +2413,7 @@ from dew.interop.families.deepseek_v41 import (
     _deepseek_v41_config,
     _deepseek_v41_constants,
     _deepseek_v41_path,
+    deepseek_v41_wrapper,
 )
 from dew.interop.families.gemma import (
     _gemma2_config,

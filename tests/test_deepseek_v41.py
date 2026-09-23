@@ -11,10 +11,12 @@ Dew's own calls may round or select differently only where the recorded
 margin sits within the fp32 noise between the two (source.json's `noise`).
 
 TOLERANCE is twice the largest distance from the reference that
-`tools/deepseek_v41_numerics.py residuals` measures on CPU and on GPU. Its
-`fp64` mode runs both sides widened to fp64, where they agree to 1e-13 on
-every output, so each distance is fp32 rounding; one SGD step amplifies it,
-as the reference's own fp32 update already lies 1.3e-4 from its fp64 one.
+`tools/deepseek_v41_numerics.py residuals` measures on CPU, and for the
+vision outputs twice the larger of CPU and an RTX 4080; the whole file
+passes on the RTX 4080. Its `fp64` mode runs both sides widened to fp64,
+where they agree to 1e-13 on every output, so each distance is fp32
+rounding; one SGD step amplifies it, as the reference's own fp32 update
+already lies 1.3e-4 from its fp64 one.
 """
 
 import dataclasses
@@ -26,23 +28,34 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.interop import load_pretrained
-from dew.interop.hf_decoders import _FAMILIES, _flatten, translate_config
+from dew.interop.hf_decoders import (
+    _FAMILIES,
+    _flatten,
+    _wrapper_sources,
+    translate_config,
+    translate_wrapper_config,
+)
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
 from dew.registry import models, with_precision
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import (
+    QUANTIZERS,
     cached_run,
     captured,
     input_noise,
     loss_and_gradient,
+    recorded_outputs,
     row_noise,
     selections,
     stepped,
     unquantized,
+    vision_bundle,
+    vision_run,
 )
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
@@ -53,6 +66,7 @@ TOLERANCE = {
     "decode_logits": 1e-5, "draft_logits": 1e-5, "draft_confidence": 1.6e-5,
     "qat_logits": 8e-6, "qat_loss": 1e-6, "qat_updated_logits": 1.5e-3, "qat_prompt_logits": 2.5e-5,
     "qat_decode_logits": 7e-6, "qat_draft_logits": 4e-6, "qat_draft_confidence": 6.2e-6,
+    "vision_span": 1.9e-6, "vision_prompt_logits": 2.7e-5, "vision_decode_logits": 6.4e-6,
 }
 
 
@@ -103,10 +117,6 @@ def test_the_quantizers_round_as_the_release_kernels():
         np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
 
-QUANTIZERS = {"window": lambda v: fake_quant_fp8(v, 32), "entries": lambda v: fake_quant_fp4(v, 16, True),
-              "index": lambda v: fake_quant_fp4(v, 32, False)}
-
-
 def test_the_quantizers_round_every_call_the_reference_made(source):
     """Every quantizer call of the reference's quantization-aware forward,
     fed the input it recorded, gives the output it recorded bit for bit:
@@ -125,12 +135,14 @@ def test_every_rounding_and_selection_meets_the_reference_within_the_noise(sourc
     noise between the two (source.json's `noise`, which
     tools/deepseek_v41_numerics.py measures), and a rounded value or a pick
     differs from the recorded one only where the reference had it within
-    that noise of where it changes. No seed's margins enter."""
+    that noise of where it changes. Each quantizer passes on the recorded
+    output, so one rounding the other way within the noise moves nothing
+    after it. No seed's margins enter."""
     loaded, plain, reference = source
     noise = json.loads((TINY / "source.json").read_text())["noise"]
     ids = jnp.asarray(reference["input_ids"])
     for prefix, model in (("qat_", loaded.model), ("", plain)):
-        record = captured(model, loaded.variables, ids)
+        record = captured(model, loaded.variables, ids, recorded_outputs(reference, prefix))
         assert set(record.blocks) == ({*QUANTIZERS} if prefix else set())
         for site, blocks in record.blocks.items():
             ours = np.concatenate(blocks)
@@ -186,21 +198,26 @@ def test_the_engram_hash_is_the_releases_int64_arithmetic():
 
 @pytest.fixture(scope="module")
 def released():
-    """The released config, its fields, the model they build and its tree's shapes."""
+    """The released bundle's config, its wrapper record, the model it builds
+    and its tree's shapes."""
+    from dew.interop.pretrained import _wrapper_model
+
     config = json.loads((RELEASED / "config.json").read_text())
-    fields = translate_config(config)
-    model = models.build("causal_transformer", **fields)
+    record = translate_wrapper_config(config)
+    model = _wrapper_model(config, record, models.build("causal_transformer", record["text"]), dtype="float32")
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
-    return config, fields, model, shapes
+    return config, record, model, shapes
 
 
 def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(released):
     """The pinned weight index's 96085 tensors, their FP8/FP4 `.scale`
-    partners aside, map onto the tree the released config builds, and
-    together they cover it; the vision tower, its aligner, the image span
-    embeddings and the routers' image-token bias are the vision half, which
-    the text model retains by name."""
-    config, fields, model, shapes = released
+    partners aside, map onto the tree the released bundle builds, and
+    together they cover it: the decoder with its DSpark stages and every
+    router's image bias, the ViT, and the aligner with the image span's
+    vectors."""
+    from dew.nn.vision import deepseek_v41_vision_path, projector_weight_path
+
+    config, record, model, shapes = released
     family = _FAMILIES["deepseek_v41"]
     text = config["text_config"]
     names = []
@@ -212,38 +229,43 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(released):
         else:
             names.append(name)
     assert len(names) == len(set(names))
-    placeholders = {name: np.zeros((2, 4, 2) if name.endswith("wo_a.weight") else (1,)) for name in names}
+    sources, _ = _wrapper_sources(names, lambda name: np.zeros(1), record)
+    decoder = sources["language_model"]
+    placeholders = {name: np.zeros((2, 4, 2) if name.endswith("wo_a.weight") else (1,)) for name in decoder}
     placeholders.update({name.removesuffix("wo_a.weight") + "wq_b.weight": np.zeros((8, 1))
-                         for name in names if name.endswith("wo_a.weight")})
-    prepared = family.prepare_weights(placeholders)
-    paths = {name: family.weight_path(name, fields) for name in prepared}
-    retained = {name for name, path in paths.items() if path is None}
-    assert retained and all(name.startswith(("vision.", "aligner.", "image_")) or name.endswith("bias_vl")
-                            for name in retained)
-    bound = [path for path in paths.values() if path is not None]
+                         for name in decoder if name.endswith("wo_a.weight")})
+    paths = [family.weight_path(name, record["text"]) for name in family.prepare_weights(placeholders)]
+    assert None not in paths
+    bound = [(path[0], "language_model", *path[1:]) for path in paths if path is not None]
+    bound += [("params", "tower", *deepseek_v41_vision_path(name)) for name in sources["tower"]]
+    bound += [("params", "projector", *projector_weight_path("deepseek_v41", name))
+              for name in sources["projector"]]
     assert len(set(bound)) == len(bound)
     # One tensor per expert stacks into one leaf per projection.
     bound = {tuple(part for index, part in enumerate(path)
                    if not (index and path[index - 1] == 'experts' and part.isdigit()))
              for path in bound}
     tree = {tuple(name.split(".")) for name in _flatten(dict(shapes))}
-    tree.discard(("constants", "engram_hashes", "token_map"))
+    tree.discard(("constants", "language_model", "engram_hashes", "token_map"))
     assert bound == tree
-    assert model.num_layers == 40 and model.dspark.stages == 3 and model.mixture.experts == 384
+    language = model.language_model
+    assert language.num_layers == 40 and language.dspark.stages == 3 and language.mixture.experts == 384
 
 
-def test_every_matrix_of_the_released_tree_shards_by_a_declared_rule(released):
-    """No weight of two or more axes is left to the shape heuristic unasked:
-    the engram tables alone hold 384M rows a layer, which shard as a
-    vocabulary's do."""
+def test_every_matrix_of_the_released_decoder_shards_by_a_declared_rule(released):
+    """No decoder weight of two or more axes is left to the shape heuristic
+    unasked: the engram tables alone hold 384M rows a layer, which shard as
+    a vocabulary's do. The ViT's, like every tower's, are the heuristic's."""
     from dew.nn.sharding import declared_axes, is_heuristic
 
     *_, shapes = released
-    uncovered = [jax.tree_util.keystr(path) for path, leaf in jax.tree_util.tree_flatten_with_path(shapes)[0]
-                 if leaf.ndim >= 2 and declared_axes(path, leaf.ndim) is None and not is_heuristic(path)]
+    leaves = [(jax.tree_util.keystr(path), path, leaf)
+              for path, leaf in jax.tree_util.tree_flatten_with_path(shapes)[0]]
+    uncovered = [name for name, path, leaf in leaves if "['language_model']" in name and leaf.ndim >= 2
+                 and declared_axes(path, leaf.ndim) is None and not is_heuristic(path)]
     assert uncovered == []
-    engram = [declared_axes(path, leaf.ndim) for path, leaf in jax.tree_util.tree_flatten_with_path(shapes)[0]
-              if jax.tree_util.keystr(path).endswith("['engram']['embed']['embedding']")]
+    engram = [declared_axes(path, leaf.ndim) for name, path, leaf in leaves
+              if name.endswith("['engram']['embed']['embedding']")]
     assert engram == [("vocab", None)] * 2
 
 
@@ -434,3 +456,38 @@ def test_a_config_without_swiglu_limit_clamps_nothing():
     config = json.loads((TINY / "config.json").read_text())
     text = {key: value for key, value in config["text_config"].items() if key != "swiglu_limit"}
     assert translate_config({**config, "text_config": text})["swiglu_limit"] is None
+
+
+def test_the_vision_half_matches_the_reference(tmp_path):
+    """The bundle's vision half: the ViT's patches, blocks and 2D rotary, the
+    aligner over a patch grid it pads to whole squares, the span's learned
+    vectors, every router's image bias and the engram's dead image positions,
+    through a prefill with the image and text steps after it, against the
+    release's Transformer.forward with the quantizers off."""
+    reference = np.load(TINY / "vision.npz")
+    loaded = load_pretrained(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
+    span, prompt_logits, steps = vision_run(loaded.model, loaded.variables, reference)
+    np.testing.assert_allclose(span, reference["vision_span"], atol=TOLERANCE["vision_span"], rtol=0)
+    close(prompt_logits, reference, "vision_prompt_logits")
+    close(steps, reference, "vision_decode_logits")
+
+
+def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):
+    """Routing the image span by the text bias moves the prefill's logits
+    past the tolerance, and the image positions change the n-gram ids of the
+    text after them, so the fixture exercises both."""
+    reference = np.load(TINY / "vision.npz")
+    loaded = load_pretrained(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
+    routers = flatten_dict(loaded.variables["moe"])
+    routers.update({path: routers[(*path[:-1], "e_score_correction_bias")]
+                    for path in routers if path[-1] == "media_bias"})
+    _, moved, _ = vision_run(loaded.model, {**loaded.variables, "moe": unflatten_dict(routers)}, reference)
+    assert np.max(np.abs(np.asarray(moved) - reference["vision_prompt_logits"])) > TOLERANCE["vision_prompt_logits"]
+    ids = jnp.asarray(reference["input_ids"])
+    media = jnp.asarray(reference["token_types"] >= 0)
+    language = {collection: tree["language_model"] for collection, tree in loaded.variables.items()}
+    hashed = [np.asarray(loaded.model.language_model.apply(
+        language, ids, jnp.ones(ids.shape, bool), jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape),
+        False, mask, method=lambda module, *inputs: module.engram_hashes(*inputs))) for mask in (media, None)]
+    after = int(np.flatnonzero(reference["token_types"][0] >= 0)[-1]) + 1
+    assert np.any(hashed[0][:, after] != hashed[1][:, after])

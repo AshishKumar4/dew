@@ -15,11 +15,13 @@ import numpy as np
 
 from dew.interop.families.deepseek import _V4_SCORES
 from dew.interop.hf_decoders import (
+    _NO_AUDIO,
     DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
     DSparkFields,
     EngramFields,
     KindFields,
+    WrapperFields,
     _base_config,
     _dew_path,
     _record_float,
@@ -28,6 +30,7 @@ from dew.interop.hf_decoders import (
     _Ropes,
     _yarn_record,
 )
+from dew.nn import vision as vision_nn
 from dew.nn.dspark import DSpark
 
 # DeepSeek-V4.1-Flash (arXiv 2609.19969). There is no transformers class: the
@@ -94,7 +97,30 @@ def _int_list(record: Mapping[str, object], field: str) -> tuple[int, ...]:
 
 
 def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    """Read a DeepSeek-V4.1-Flash config into `CausalTransformer` fields.
+    """Read a text-only DeepSeek-V4.1 config into `CausalTransformer` fields
+    (`_v41_decoder`); a bundle with its ViT is the wrapper
+    (`deepseek_v41_wrapper`)."""
+    if hf_config.get('vision_config') is not None:
+        _refuse('vision_config', "a DeepSeek-V4.1 bundle with its ViT is a multimodal wrapper, "
+                "which translate_wrapper_config reads")
+    return _v41_decoder(hf_config, used, media_bias=False)
+
+
+def deepseek_v41_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read a DeepSeek-V4.1 bundle: the decoder with its routers' image-span
+    bias, the ViT and the aligner (v41:1215-1222)."""
+    text = _v41_decoder(hf_config, used, media_bias=True)
+    return {
+        'model_type': 'deepseek_v41', 'text_model_type': 'deepseek_v41', 'text': text,
+        'tower': vision_nn.translate_deepseek_v41_vision_config(hf_config),
+        'projector': vision_nn.translate_deepseek_v41_projector_config(
+            hf_config, _record_int(text, 'emb_features')),
+        'image_token_id': _record_int(hf_config, 'image_token_id'),
+        'tokens_per_image': None, **_NO_AUDIO}
+
+
+def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias: bool) -> DecoderFields:
+    """Read a DeepSeek-V4.1-Flash text_config into `CausalTransformer` fields.
 
     The language model is 40 layers of mHC streams under Single-Pass mixing
     around one CSA2 attention and one routed MoE each (section 2). The
@@ -102,11 +128,9 @@ def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
     sliding, then a Full kind per ratio whose Reuse layers the model lists
     as `kv_shared_layers`, and a Reindex kind per ratio; the candidate source
     builds the pool the later Reindex layers search. Engram rides the
-    `engram_*` fields, and the tower, its aligner and the image-routing bias
-    are the vision half, which has no counterpart here: the loader retains
-    their tensors by name and the text model reads image placeholders as
-    tokens. The DSpark drafter's fields and tensors are the prediction
-    depths, read by the drafter alone.
+    `engram_*` fields. The DSpark drafter's fields and tensors are the
+    prediction depths, read by the drafter alone. `media_bias` gives every
+    router the image-span bias a bundle with its ViT carries (v41:807).
     """
     text = hf_config.get('text_config')
     if not isinstance(text, Mapping) or text.get('model_type', _V41_TEXT_TYPE) != _V41_TEXT_TYPE:
@@ -149,42 +173,8 @@ def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
         'rope_head_dim': rope_width, 'compressor': None, 'compress_rate': None,
         'query_norm': False, 'kv_qat': True}
     seen.update(('q_lora_rank', 'o_groups', 'o_lora_rank'))
-    candidate = text.get('candidate_source_layer_id', -1)
-    seen.update(('candidate_source_layer_id', 'candidate_topk_blocks', 'candidate_block_size'))
-    pool = {}
-    if type(candidate) is not int:
-        _refuse('candidate_source_layer_id', 'expected a layer index, or -1 for none')
-    if candidate >= 0:
-        if candidate >= layers or modes[candidate] != 'full':
-            _refuse(f"candidate_source_layer_id {candidate}", "the candidate pool is a Full layer's")
-        pool = {'candidate_blocks': _record_int(text, 'candidate_topk_blocks'),
-                'candidate_block_size': _record_int(text, 'candidate_block_size')}
-    kinds: dict[str, KindFields] = {'sliding_attention': {'window': window, 'mixer': mixer}}
-    layer_types, shared = [], []
-    for layer, (rate, mode) in enumerate(zip(ratios, modes, strict=True)):
-        if mode == 'sliding':
-            layer_types.append('sliding_attention')
-            continue
-        name = f'csa2_ratio_{rate}' + ('_reindex' if mode == 'reindex' else '')
-        role = None
-        if candidate >= 0 and layer > candidate and mode == 'full':
-            _refuse(f"layer {layer}", "a Full layer after the candidate source would search "
-                    "a pool it builds no part of")
-        if mode == 'full' and layer == candidate:
-            role = 'source'
-        elif mode == 'reindex' and 0 <= candidate < layer:
-            role = 'restrict'
-        record: KindFields = {'window': window, 'rope_theta': compress_theta, 'yarn': ramp,
-                  'mixer': {**mixer, 'compressor': 'csa2', 'compress_rate': rate, **index,
-                            'reindex': mode == 'reindex', 'candidates': role,
-                            **(pool if role else {})}}
-        held = kinds.setdefault(name, record)
-        if mode != 'reuse' and held != record:
-            _refuse(f"layer {layer}", f"the {name} layers would need different candidate "
-                    "roles, which one kind cannot hold")
-        layer_types.append(name)
-        if mode == 'reuse':
-            shared.append(layer)
+    kinds, layer_types, shared = _v41_kinds(text, layers, ratios, modes, mixer, {
+        'window': window, 'rope_theta': compress_theta, 'yarn': ramp}, index, seen)
     moe = _record_int(text, 'moe_intermediate_size')
     base_used: set[str] = set()
     config = _base_config({**text, 'intermediate_size': moe, 'num_key_value_heads': 1,
@@ -209,7 +199,7 @@ def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
                  'layers': tuple(range(layers)), 'score_function': scoring, 'bias': True,
                  'norm_topk_prob': norm_topk,
                  'scaling': _record_float(text, 'routed_scaling_factor', 1.0),
-                 'shared_features': moe, 'expert_features': moe},
+                 'shared_features': moe, 'expert_features': moe, 'media_bias': media_bias},
         swiglu_limit=_record_float(text, 'swiglu_limit', 0.0) or None,
         hyper_connections={'hc_mult': _record_int(text, 'hc_mult', 4),
                            'hc_eps': _record_float(text, 'hc_eps', 1e-6),
@@ -228,6 +218,52 @@ def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
         _refuse(f"text_config fields {unknown}",
                 "CausalTransformer has no counterpart, so translating them would silently change the model")
     return config
+
+
+def _v41_kinds(text: Mapping[str, object], layers: int, ratios, modes, mixer: Mapping[str, object],
+               compressed: KindFields, index: Mapping[str, int], seen: set[str]):
+    """Every layer's kind (section 2.3.1): the sliding kind, a Full kind per
+    ratio, and a Reindex kind per ratio, whose layers after the candidate
+    source search the pool it builds. Returns the kinds, each layer's kind
+    name, and the Reuse layers, which `kv_shared_layers` lists. `compressed`
+    holds the window and rope the compressed kinds share."""
+    candidate = text.get('candidate_source_layer_id', -1)
+    seen.update(('candidate_source_layer_id', 'candidate_topk_blocks', 'candidate_block_size'))
+    pool = {}
+    if type(candidate) is not int:
+        _refuse('candidate_source_layer_id', 'expected a layer index, or -1 for none')
+    if candidate >= 0:
+        if candidate >= layers or modes[candidate] != 'full':
+            _refuse(f"candidate_source_layer_id {candidate}", "the candidate pool is a Full layer's")
+        pool = {'candidate_blocks': _record_int(text, 'candidate_topk_blocks'),
+                'candidate_block_size': _record_int(text, 'candidate_block_size')}
+    kinds: dict[str, KindFields] = {'sliding_attention': {'window': compressed.get('window'), 'mixer': mixer}}
+    layer_types, shared = [], []
+    for layer, (rate, mode) in enumerate(zip(ratios, modes, strict=True)):
+        if mode == 'sliding':
+            layer_types.append('sliding_attention')
+            continue
+        name = f'csa2_ratio_{rate}' + ('_reindex' if mode == 'reindex' else '')
+        role = None
+        if candidate >= 0 and layer > candidate and mode == 'full':
+            _refuse(f"layer {layer}", "a Full layer after the candidate source would search "
+                    "a pool it builds no part of")
+        if mode == 'full' and layer == candidate:
+            role = 'source'
+        elif mode == 'reindex' and 0 <= candidate < layer:
+            role = 'restrict'
+        record: KindFields = {**compressed,
+                              'mixer': {**mixer, 'compressor': 'csa2', 'compress_rate': rate, **index,
+                                        'reindex': mode == 'reindex', 'candidates': role,
+                                        **(pool if role else {})}}
+        held = kinds.setdefault(name, record)
+        if mode != 'reuse' and held != record:
+            _refuse(f"layer {layer}", f"the {name} layers would need different candidate "
+                    "roles, which one kind cannot hold")
+        layer_types.append(name)
+        if mode == 'reuse':
+            shared.append(layer)
+    return kinds, layer_types, shared
 
 
 def _v41_dspark(text: Mapping[str, object], layers: int, ratios, seen: set[str]) -> DSparkFields | None:
@@ -289,6 +325,7 @@ _DEEPSEEK_V41_NAMES = (
     ('.compressor.wgate.', '.compressor.gate_proj.'),
     ('.wo_a.', '.o_a_proj.'),
     ('.wo_b.', '.o_b_proj.'),
+    ('.gate.bias_vl', '.gate.media_bias'),
     ('.gate.bias', '.gate.e_score_correction_bias'),
     ('.w1.', '.gate_proj.'),
     ('.w2.', '.down_proj.'),
@@ -302,17 +339,11 @@ _DEEPSEEK_V41_NAMES = (
 )
 _V41_TRUNK = {'embed.weight': 'model.embed_tokens.weight', 'norm.weight': 'model.norm.weight',
               'head.weight': 'lm_head.weight'}
-# The vision half: the tower, its aligner, the image span delimiters and the
-# routers' image-token bias, none of which the text model computes.
-_V41_VISION = ('vision.', 'aligner.', 'image_start', 'image_end', 'image_newline')
 
 
 def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    """Return the decoder's path for one DeepSeek-V4.1 tensor name, or None
-    for a tensor the text model retains by name (the vision half and the
-    DSpark drafter's `mtp.*`)."""
-    if name.startswith(_V41_VISION) or name.endswith('.gate.bias_vl'):
-        return None
+    """Return the decoder's path for one DeepSeek-V4.1 tensor name, the
+    DSpark drafter's `mtp.*` included; the tied head's copy is None."""
     if name.startswith('mtp.'):
         parts = name.split('.')
         dspark = config.get('dspark')
