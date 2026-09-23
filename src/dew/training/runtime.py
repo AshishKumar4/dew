@@ -71,6 +71,11 @@ def prepare_process(wandb: Wandb | None = None,
     accelerator. JAX_NUM_CPU_DEVICES, or the existing XLA flags, must
     establish one CPU device per local accelerator before this call.
     Validation never changes backend configuration after initialization.
+
+    A GPU pool compiles without the persistent compilation cache. JAX keys a
+    cached executable by a topology serialization that differs between the
+    processes of one GPU pool, so some ranks would load a step that the
+    others compile, and that compile waits for every rank for ever.
     """
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
@@ -102,6 +107,9 @@ def prepare_process(wandb: Wandb | None = None,
                 apply_xla_flags(f"--xla_gpu_execution_terminate_timeout={EXECUTION_TIMEOUT}")
             print(f"Joined the JAX process pool: process {jax.process_index()} "
                   f"of {jax.process_count()}")
+            if jax.process_count() > 1 and jax.default_backend() == "gpu":
+                # Before the first compile, which fixes whether the cache is used.
+                jax.config.update("jax_enable_compilation_cache", val=False)
             # One collective while the processes are still in lockstep;
             # initialize() returns on every process once the last one has
             # connected. On CPU, collectives rendezvous through the
