@@ -32,7 +32,6 @@ from .dataset import (
     Tokenize,
     checked_count,
     hold_out,
-    local_batch,
     tokenized,
     train_stream,
     validation_pass,
@@ -345,16 +344,15 @@ class ImageDataset(DatasetSpec):
         held_out = 0 if self.val_split else (self.val_batches or 0) * batch
         train, validation = hold_out(source, self.records(source), held_out,
                                      type(self).__name__)
-        rows = local_batch(batch)
         if self.val_split:
             validation = self.source(self.val_split)
         scored = None if validation is None else tokenized(
-            validation_pass(validation, [ImageTransform(self)], batch=rows,
+            validation_pass(validation, [ImageTransform(self)], batch=batch,
                             seed=self.seed, loading=self.loading), tokenize)
         if self.val_split and scored is not None:
             scored = bounded(scored, self.val_batches)
         return Dataset(
-            train=tokenized(train_stream(train, [ImageTransform(self)], batch=rows, seed=self.seed, loading=self.loading), tokenize),
+            train=tokenized(train_stream(train, [ImageTransform(self)], batch=batch, seed=self.seed, loading=self.loading), tokenize),
             val=scored,
             records=len(train),
             batch=batch,

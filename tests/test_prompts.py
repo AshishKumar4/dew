@@ -14,7 +14,7 @@ import json
 import numpy as np
 import pytest
 
-from dew.data import Loading, Prompts
+from dew.data import DataPartition, Loading, Prompts
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptSource
 
 TOKENIZER = "tests/fixtures/tokenizers/tiny-chat"
@@ -173,7 +173,7 @@ def test_tool_schemas_need_a_chat_prompt(prompt):
                    records=records({"prompt": prompt, "tools": []}),
                    max_prompt_len=WINDOW, loading=Loading(workers=0))
     with pytest.raises(ValueError, match="tools require chat messages"):
-        next(spec.load(batch=1).train())
+        next(spec.load(batch=1).train(DataPartition()))
 
 
 def test_parquet_carries_the_verl_columns(tmp_path):
@@ -210,7 +210,7 @@ def test_the_dataset_batches_fixed_width_rows():
         {"prompt": IDS}, {"prompt": LONG}, {"prompt": "hi"}),
         max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=2)
 
-    batch = next(data.train())
+    batch = next(data.train(DataPartition()))
 
     assert data.records == 3
     assert batch[PROMPT_KEY].shape == (2, WINDOW)
@@ -237,7 +237,7 @@ def test_validation_is_one_pass_over_a_second_file(tmp_path):
                    max_prompt_len=WINDOW, loading=Loading(workers=0)).load(batch=1)
 
     assert data.val is not None
-    batches = list(data.val())
+    batches = list(data.val(DataPartition()))
 
     assert len(batches) == 1
     np.testing.assert_array_equal(batches[0][PROMPT_KEY][0], [0, 0, 0, 1, 2, 3, 4, 5])
@@ -250,6 +250,6 @@ def test_the_train_stream_encodes_inside_workers():
     data = Prompts(tokenizer=TOKENIZER, records=records({"prompt": IDS}),
                    max_prompt_len=WINDOW, loading=Loading(workers=1)).load(batch=1)
 
-    batch = next(data.train())
+    batch = next(data.train(DataPartition()))
 
     np.testing.assert_array_equal(batch[PROMPT_KEY][0], [0, 0, 0, 1, 2, 3, 4, 5])

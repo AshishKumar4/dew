@@ -85,7 +85,10 @@ def main(config: Benchmark) -> None:
     dataset = config.data.load(batch=config.batch)
     print(f"{datasets.name_of(type(config.data))}: {dataset.records} records, "
           f"batch {dataset.batch} across every process")
-    source = dataset.train()
+    from dew.training import build_mesh, data_partition
+
+    # The share this process reads on the plain data-parallel mesh.
+    source = dataset.train(data_partition(build_mesh()))
     try:
         report(measure(source, config.steps, config.warmup), dataset.batch)
     finally:

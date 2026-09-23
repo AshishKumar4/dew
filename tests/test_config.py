@@ -329,7 +329,7 @@ def test_a_record_that_names_a_field_the_value_does_not_have_is_refused():
 def _data(records=48, batch=8):
     """A Dataset value with nothing behind it: the intervals read only its
     record count and its batch."""
-    return Dataset(train=lambda: iter(()), val=None, records=records, batch=batch)
+    return Dataset(train=lambda partition: iter(()), val=None, records=records, batch=batch)
 
 
 def test_an_interval_is_steps_a_pass_or_never():
@@ -354,9 +354,9 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path):
         eval_every=None, checkpoint_every=None))
 
     with pytest.raises(ValueError, match="batch-size is 8 and this dataset reads 16"):
-        run.train(Regression(), Dataset(batches, None, None, 16), name="batch")
+        run.train(Regression(), Dataset(lambda partition: batches(), None, None, 16), name="batch")
 
-    state = run.train(Regression(), Dataset(batches, None, None, 8), name="batch")
+    state = run.train(Regression(), Dataset(lambda partition: batches(), None, None, 8), name="batch")
     assert int(state.step) == 1
 
 

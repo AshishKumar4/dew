@@ -19,7 +19,7 @@ from dew.objectives.jepa import JepaObjective, multi_block_mask
 
 rng = np.random.default_rng(0)
 images = rng.integers(0, 256, size=(8, 16, 16, 3), dtype=np.uint8)
-data = Dataset(train=lambda: itertools.repeat({"image": images}),
+data = Dataset(train=lambda partition: itertools.repeat({"image": images}),
                val=None, records=8, batch=8)
 encoder = models.JepaEncoder(patch_size=4, emb_features=32, num_layers=2, num_heads=2)
 predictor = models.JepaPredictor(grid=(4, 4), emb_features=32,

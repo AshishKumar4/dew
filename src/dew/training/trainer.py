@@ -17,7 +17,7 @@ import dataclasses
 import functools
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Generic, Protocol, TypeVar
 
 import jax
@@ -64,6 +64,7 @@ from dew.training.distributed import (
     batch_divisor,
     batch_shardings,
     build_mesh,
+    data_partition,
     shard_batch,
 )
 from dew.training.evaluation import Evaluation, evaluate
@@ -414,7 +415,8 @@ class Trainer(Generic[Loss, Effects]):
         template = jax.tree.map(
             lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
             abstract, shardings)
-        state, position = checkpoints.restore(template, resume)
+        state, position = checkpoints.restore(template, resume,
+                                              share=data_partition(self.device_mesh))
         if int(state.window_size) != self.accumulation:
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         print(f"Resumed from step {resume} in {checkpoints.source(resume)}")
@@ -567,6 +569,16 @@ class Trainer(Generic[Loss, Effects]):
     def _default_step(self, shapes):
         return Transaction(self.objective, self.optimizer, self.accumulation, shapes).step()
 
+    @contextlib.contextmanager
+    def _traced_on(self, mesh: Mesh) -> Iterator[None]:
+        """What a traced step reads from context: the mesh, the pipeline's
+        microbatch count, and the layout's rules, which place the activations
+        the model constrains (`dew.nn.sharding.constrain`) as they place the
+        parameters."""
+        with (jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches),
+              nn.logical_axis_rules(self.layout.axis_rules)):
+            yield
+
     def compile(self, state: TrainState, batch: Batch) -> CompiledStep:
         """Compile a transaction over state and one already-produced global batch.
 
@@ -588,7 +600,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             return self._compile_host(state, batch)
         mesh = self.device_mesh
-        with jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches):
+        with self._traced_on(mesh):
             shapes = None if self.step is not None else self._loss_shape(state, batch)
             prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
             body = self.step(self.objective, self.optimizer) if self.step is not None else self._default_step(shapes)
@@ -610,7 +622,7 @@ class Trainer(Generic[Loss, Effects]):
             self.flops_per_step = step_flops(jitted, prepared, batch)
 
         def run(current, batch):
-            with jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches):
+            with self._traced_on(mesh):
                 if current.accumulation is None and self.accumulation > 1 and self.step is None:
                     current = self._initialize_accumulation(current, batch, shapes)
                     current = jax.device_put(current, shardings)
@@ -623,7 +635,7 @@ class Trainer(Generic[Loss, Effects]):
         cpu = self.state_mesh
         execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
-        with jax.set_mesh(cpu), pipeline_microbatches(self.mesh.microbatches):
+        with self._traced_on(cpu):
             shapes = self._loss_shape(state, cpu_batch)
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, shape_only=True)
             placement = self.shardings(prepared)
@@ -632,7 +644,7 @@ class Trainer(Generic[Loss, Effects]):
 
         def run(current, batch):
             batch = transfer(batch, batch_shardings(cpu, batch))
-            with jax.set_mesh(cpu), pipeline_microbatches(self.mesh.microbatches):
+            with self._traced_on(cpu):
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes)
                 advanced, loss, aux = body(current, batch)
@@ -725,7 +737,7 @@ class Trainer(Generic[Loss, Effects]):
             first_step = None
 
             if current < steps:
-                source = dataset.train()
+                source = dataset.train(data_partition(mesh))
                 self._check_stream(source, mesh,
                                    checkpointing=bool(checkpoint_every or local_every))
                 train = DevicePrefetchIterator(source, mesh, source_state=position)
@@ -842,7 +854,8 @@ class Trainer(Generic[Loss, Effects]):
                 # make a resume restart the schedule from the beginning.
                 checkpoints.save(
                     current, state, position,
-                    {"loss": float(interval_loss / interval_steps)} if interval_steps else None)
+                    {"loss": float(interval_loss / interval_steps)} if interval_steps else None,
+                    share=data_partition(mesh))
                 self._report(CheckpointRequested(checkpoints.directory), current)
             other += time.perf_counter() - paused
         finally:
@@ -1013,7 +1026,8 @@ class Trainer(Generic[Loss, Effects]):
         included: that read waits on the device, and the wait is time the
         steps did not have."""
         paused = time.perf_counter()
-        checkpoints.save(step, state, position, {"loss": float(book[0] / interval_steps)})
+        checkpoints.save(step, state, position, {"loss": float(book[0] / interval_steps)},
+                         share=data_partition(self.device_mesh))
         self._report(CheckpointRequested(checkpoints.directory), step)
         return time.perf_counter() - paused
 
@@ -1024,7 +1038,7 @@ class Trainer(Generic[Loss, Effects]):
         Returns the seconds it took. The local copy carries no metadata; it
         is the one a restarted node reads back, not the run's record."""
         paused = time.perf_counter()
-        checkpoints.save_local(step, state, position)
+        checkpoints.save_local(step, state, position, share=data_partition(self.device_mesh))
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         return time.perf_counter() - paused
 
@@ -1157,11 +1171,12 @@ class Trainer(Generic[Loss, Effects]):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)
         assert params is not None, "evaluation always has model variables"
-        self._report_evaluation(evaluate(
-            self.objective, params, dataset.val, metrics=metrics, key=key,
-            step=state.step, schedule_step=state.microstep,
-            averaged=averaged,
-            preview=preview, mesh=mesh))
+        with self._traced_on(mesh):
+            evaluation = evaluate(
+                self.objective, params, dataset.val, metrics=metrics, key=key,
+                step=state.step, schedule_step=state.microstep,
+                averaged=averaged, preview=preview, mesh=mesh)
+        self._report_evaluation(evaluation)
 
     def _report_evaluation(self, advanced: Evaluation) -> None:
         """Print one evaluation on rank zero and log its previews and scores."""

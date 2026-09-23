@@ -35,7 +35,7 @@ from dew.objectives.lm import LMObjective
 from dew import models  # naming a registry fills it
 from dew.registry import with_precision
 from dew.training import MeshSpec, Trainer
-from dew.training.distributed import DevicePrefetchIterator
+from dew.training.distributed import DevicePrefetchIterator, data_partition
 from dew.training.optim import build_optimizer
 
 Solver = Literal["adam", "adamw", "lamb", "muon", "muon-unsplit"]
@@ -118,7 +118,8 @@ def run(config: Comparison) -> Curve:
     state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
     parameters = sum(x.size for x in jax.tree.leaves(state.params))
 
-    with DevicePrefetchIterator(data.train(), trainer.device_mesh) as source:
+    with DevicePrefetchIterator(data.train(data_partition(trainer.device_mesh)),
+                                trainer.device_mesh) as source:
         train_step = trainer.compile(state, next(source))
         
         losses: list[float] = []

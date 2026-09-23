@@ -606,7 +606,7 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
         batch = {name: np.concatenate([arrays[source_name]] * (rows // 2))
                  for name, source_name in (("text", "tokens"), ("canvas_mask", "canvas_mask"),
                                            ("encoder_target_mask", "encoder_target_mask"))}
-    data = Dataset(train=lambda: iter([batch, batch]), val=None, records=rows, batch=rows)
+    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
 
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(0)).fit(data, steps=1, log_every=1)
     source.save(tmp_path / "trained", variables=thaw(state.params))

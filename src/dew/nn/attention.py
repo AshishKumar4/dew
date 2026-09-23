@@ -25,7 +25,16 @@ from .kernels.generation import bf16_dot_runs
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import precision_names, rounded_to
 from .rope import apply_rotary
-from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, row_axes, sequence_shards
+from .sharding import (
+    HEADS,
+    SEQUENCE_AXIS,
+    STAGE_AXIS,
+    TENSOR_AXIS,
+    constrain,
+    logical_axes,
+    row_axes,
+    sequence_shards,
+)
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
 """Names which kernel an attention call runs.
@@ -1576,9 +1585,10 @@ class NormalAttention(nn.Module):
         if len(context.shape) == 4:
             context = context.reshape(
                 (context.shape[0], context.shape[1] * context.shape[2], context.shape[3]))
-        query = self.query(x)
-        key = self.key(context)
-        value = self.value(context)
+        # [B, S, heads, head_dim], column-parallel under a tensor axis.
+        query = constrain(self.query(x), HEADS)
+        key = constrain(self.key(context), HEADS)
+        value = constrain(self.value(context), HEADS)
         if self.qk_norm:
             query = self.q_norm(query)
             key = self.k_norm(key)
@@ -1601,7 +1611,7 @@ class NormalAttention(nn.Module):
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             implementation=self.attention_impl, causal=causal, mask=mask,
         )
-        proj = self.proj_attn(hidden_states)
+        proj = self.proj_attn(constrain(hidden_states, HEADS))
         return proj.reshape(orig_x_shape)
 
 

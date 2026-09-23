@@ -94,7 +94,7 @@ def main() -> None:
     compared = collective_host((scores, reassembled["old_log_probs"], reassembled["rewards"],
                                 reassembled["advantages"]), phase="flow test likelihoods")
     error = float(np.max(np.abs(compared[0] - compared[1])))
-    data = Dataset(train=lambda: itertools.repeat(local), val=lambda: iter((local,)), records=4, batch=4)
+    data = Dataset(train=lambda partition: itertools.repeat(local), val=lambda partition: iter((local,)), records=4, batch=4)
     final = trainer.fit(data, steps=1, log_every=1, eval_every=1, metrics=(metric,), preview=True)
     change = float(optax.tree.norm(jax.tree.map(
         lambda a, b: a - b, final.params["params"], initial.params["params"])))

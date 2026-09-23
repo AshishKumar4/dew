@@ -14,9 +14,9 @@ from dew.data import Dataset
 x = np.arange(16, dtype=np.float32).reshape(8, 2)
 y = x.sum(axis=1, keepdims=True)
 batch = {"features": x, "target": y}
-data = Dataset(train=lambda: itertools.repeat(batch),
-               val=lambda: iter([batch]), records=8, batch=8)
-first = next(data.train())
+data = Dataset(train=lambda partition: itertools.repeat(batch),
+               val=lambda partition: iter([batch]), records=8, batch=8)
+first = next(data.train(DataPartition()))
 assert first["features"].shape == (8, 2)
 np.testing.assert_array_equal(first["target"], y)
 ```

@@ -116,14 +116,15 @@ Import `TrainState` from `dew.training`.
 
 ## Dataset and Loading
 
-Import `Dataset` and `Loading` from `dew.data`.
+Import `Dataset`, `DataPartition` and `Loading` from `dew.data`.
 
 ```text
 Dataset(train, val, records, batch, ramp=None)
+DataPartition(index=0, count=1, readers=1)
 Loading(workers=32, threads=64, read_buffer=128, worker_buffer=2)
 ```
 
-`train` opens a training iterator, and `val` opens one finite validation pass or is `None`. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
+`train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass, or `val` is `None`. Each reads the share of every global batch the `DataPartition` names: the `index`th of `count` disjoint shares, which `readers` processes read alike. `dew.training.data_partition(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row. `records` is the known training-record count or `None`; `batch` is global. `steps_per_epoch` is integer division of records by batch, or `None`. `epoch_steps(epochs=1)` requires a finite record count. `ramp` is set when the run grows its batch over its first records; `batch` is then the batch the ramp ends at.
 
 Each factory call must return a fresh, exclusively owned iterator. Ordinary `close()` is finalization and must not race `next()` or checkpoint operations. A source that needs to interrupt blocking reads may additionally implement `request_stop()`: a thread-safe, nonblocking, idempotent signal, safe alongside both `next()` and `close()`. Tokenized wrappers forward these operations.
 
@@ -139,7 +140,7 @@ Every dataset specification declares `seed` and `loading` as keyword-only fields
 
 An image specification takes validation from `val_split`, a split of the dataset's own bounded by `val_batches` batches, or, with `val_split` unset, from `val_batches * batch` records held out of the head of the training source.
 
-`Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())` builds a run over Grain datasets a caller assembled: a `MapDataset` is repeated, batched per process and saved as one global record count, and an `IterDataset` is batched where it is and reports Grain's own iterator state.
+`Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())` builds a run over Grain pipelines a caller assembled: a `MapDataset` is repeated, cut into the reader's share and saved as one global record count; a pipeline read as it comes arrives as a function of the `DataPartition` that builds the `IterDataset` of that share, which is batched where it is and reports Grain's own iterator state.
 
 A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file, `TokenRecords` over ArrayRecord shards of token arrays, or `TokenColumn` over a parquet column of them. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in all three.
 
@@ -150,7 +151,7 @@ Import `Checkpoints` from `dew`.
 
 `Checkpoints(directory, *, keep=2, local_directory=None, local_every=None)` configures persistent storage and optional local emergency checkpoints. Local directory and cadence must be specified together. The object opens storage on use.
 
-`save(step, state, saved, metrics=None)` schedules a persistent save; `saved` is the iterator position as bytes, or `None`. `wait()` waits for pending writes. `latest` reports the newest eligible checkpoint. `restore(template=None, step=None)` returns restored state data and iterator position; a template controls structure and placement. `path(step)` identifies the persistent checkpoint location.
+`save(step, state, saved, metrics=None, *, share=None)` schedules a persistent save; `saved` is the iterator position as bytes, or `None`, and `share` the `DataPartition` its stream read, required with a position. `wait()` waits for pending writes. `latest` reports the newest eligible checkpoint. `restore(template=None, step=None, *, share=None)` returns restored state data and the iterator position the reader of `share` resumes from, or `None` without a share; a template controls structure and placement. `path(step)` identifies the persistent checkpoint location.
 
 This object does not write `run.json`; run configuration saving is separate. Use the [complete resume example](../guides/checkpoints.md) before adapting these lower-level calls.
 

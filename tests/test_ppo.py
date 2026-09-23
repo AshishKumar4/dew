@@ -105,7 +105,7 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
 def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
     trainer, rollout = build_ppo()
     initial = trainer.initial_state()
-    data = Dataset(train=lambda: itertools.repeat({"task_id": np.arange(jax.device_count(), dtype=np.int32)}),
+    data = Dataset(train=lambda partition: itertools.repeat({"task_id": np.arange(jax.device_count(), dtype=np.int32)}),
                    val=None, records=None, batch=jax.device_count())
     final = trainer.fit(data, steps=2, log_every=1)
     assert int(final.updates) == 2

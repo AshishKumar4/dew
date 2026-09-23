@@ -302,7 +302,7 @@ episodes = EpisodeRollout(objective.policy(objective.init(key)), Harness(), veri
                           groups=4, sampling=SAMPLING)
 trainer = Trainer(objective, optax.sgd(.05), key=key,
                   rollout=PPORollout(objective, episodes, gamma=.97, lam=.9))
-data = Dataset(train=lambda: itertools.repeat({
+data = Dataset(train=lambda partition: itertools.repeat({
     "task_id": np.arange(jax.device_count(), dtype=np.int32)}),
     val=None, records=None, batch=jax.device_count())
 state = trainer.fit(data, steps=2, log_every=1)
@@ -337,7 +337,7 @@ def brightness(images, batch):
 
 rollout = FlowRollout(objective, brightness, groups=4, steps=5, train_steps=2)
 batch = {"image": np.zeros((2, 4, 4, 1), dtype=np.uint8)}
-data = Dataset(train=lambda: itertools.repeat(batch), val=None, records=2, batch=2)
+data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=2, batch=2)
 trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), rollout=rollout)
 state = trainer.fit(data, steps=2, log_every=1)
 print(int(state.updates))

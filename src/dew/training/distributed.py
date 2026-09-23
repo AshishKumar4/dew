@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
+import functools
 import json
 import logging
 import math
@@ -16,21 +17,24 @@ from typing import Iterator
 import jax
 import numpy as np
 from flax import linen as nn
-from flax.linen import spmd
 from jax.experimental import mesh_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
-from dew.data.dataset import Budgeted, Checkpointable, Closeable, Stoppable
-from dew.nn.inputs import BATCH_AXES, filled_validity
+from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
+from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
-    DATA_AXIS,
+    BATCH_AXES,
+    DEFAULT_RULES,
     EXPERT_AXIS,
     FSDP_AXIS,
+    MESH_AXES,
     SEQUENCE_AXIS,
-    STAGE_AXIS,
     TENSOR_AXIS,
-    LogicalAxes,
+    LogicalAxisRules,
+    MeshAxes,
     declared_axes,
+    logical_spec,
+    mesh_axes,
 )
 from dew.objectives.base import Batch, Variables
 from dew.telemetry.profile import region
@@ -39,16 +43,14 @@ from dew.telemetry.profile import region
 # expert axis, the widths of Megatron's split take tensor, everything else
 # takes fsdp. The data and sequence axes split the batch, and the stage axis
 # holds the pipeline's stages of the layer stack. None of the three ever
-# places a parameter, which is why `Layout` refuses a rule for them.
+# places a parameter, which is why `Layout` refuses a parameter placed there.
 PARAMETER_AXES = (EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 
-# The batch's rows split across every axis but sequence and stage, whichever
-# they sit on; the sequence dimension splits over the sequence axis. Every
-# stage sees the whole batch, since the pipeline hands its microbatches from
-# stage to stage itself. Only parameters distinguish the axes further.
+# The batch's rows split over the batch axes and its sequence dimension over
+# the sequence axis. Every stage sees the whole batch, since the pipeline
+# hands its microbatches from stage to stage itself.
 BATCH_SPEC = P(BATCH_AXES, SEQUENCE_AXIS)
 
-type MeshAxes = str | tuple[str, ...] | None
 type Placement[TreeT] = TreeT
 """`TreeT`'s own structure, with a `NamedSharding` at every leaf.
 
@@ -58,60 +60,6 @@ keys. Only the leaves differ, and Python has no way to say "this structure
 with those leaves". So the parameter carries the structure and this name
 carries the leaves. Every caller reads the leaves as shardings, through
 `jax.jit`, `device_put` or `Layout.check`."""
-
-type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
-
-# Rule order is precedence when two logical dimensions target the one mesh
-# axis. A name written twice is an ordered pair of choices, the form flax
-# documents for `logical_to_mesh_axes`: the second pair places a width the
-# first could not, because another dimension of the same array took that axis.
-#
-# The tensor axis carries Megatron's split. That is the mlp's hidden width
-# ('mlp'), the attention's query heads ('heads') and its grouped key and value
-# heads ('kv'), the attention width o_proj reads back ('attention'), and the
-# vocabulary of the embedding table and the output head ('vocab'). Each of
-# those is the output side of one matmul and the input side of the next, so
-# splitting it splits both and leaves the block one reduction.
-#
-# 'embed', the residual width, is the side those matmuls share with every
-# norm, residual add, rotary rotation and the loss. It stays whole on the
-# tensor axis and keeps fsdp, because sharding it would put a collective
-# between every pair of sublayers, the cost tensor parallelism is arranged
-# to avoid. A width that holds fsdp composes the two axes and splits fsdp
-# times tensor ways; a width the residual took fsdp from first takes tensor
-# alone, through the pairs at the end.
-#
-# The tensor axis at size 1 drops out of every spec it appears in. So the
-# table places what the fsdp-only table placed, with the largest-axis choice
-# for the declared model shapes.
-DEFAULT_RULES: LogicalAxisRules = (
-    ("vocab", (FSDP_AXIS, TENSOR_AXIS)),
-    ("mlp", (FSDP_AXIS, TENSOR_AXIS)),
-    ("modulation", FSDP_AXIS),
-    ("attention", (FSDP_AXIS, TENSOR_AXIS)),
-    # The gated delta net's projected width (keys, values and their gate),
-    # placed like the attention's: the width over the model dimension.
-    ("linear", FSDP_AXIS),
-    ("embed", FSDP_AXIS),
-    ("head_dim", FSDP_AXIS),
-    ("heads", (FSDP_AXIS, TENSOR_AXIS)),
-    ("kv", (FSDP_AXIS, TENSOR_AXIS)),
-    # The latent widths multi-head latent attention compresses through and
-    # the sparse indexer's head dim: model-width-like, so they ride fsdp.
-    ("index", FSDP_AXIS),
-    ("kvlora", FSDP_AXIS),
-    ("qlora", FSDP_AXIS),
-    ("output", FSDP_AXIS),
-    ("exp", EXPERT_AXIS),
-    # A projection from the residual width to the heads, q_proj's shape: the
-    # rule above gave 'embed' fsdp, so the heads take the tensor axis by
-    # itself rather than fall back to replication. 'attention' has the same
-    # second choice for a table that gives 'embed' fsdp before it.
-    ("heads", TENSOR_AXIS),
-    ("kv", TENSOR_AXIS),
-    ("attention", TENSOR_AXIS),
-)
-
 
 _log = logging.getLogger(__name__)
 
@@ -162,13 +110,6 @@ class MeshSpec:
                 f"({self.stage}), got {self.microbatches}")
 
 
-def _mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
-    """Read one entry of a spec or a rule as the mesh axes it names."""
-    if assignment is None:
-        return ()
-    return (assignment,) if isinstance(assignment, str) else tuple(assignment)
-
-
 def _rule_table(rules: LogicalAxisRules | Mapping[str, MeshAxes]) -> LogicalAxisRules:
     """Return `rules` as the tuple of pairs flax reads, in precedence order.
 
@@ -216,10 +157,17 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
             f"{spec.stage} must be a positive divisor of device count {len(devices)}")
     shape = (len(devices) // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence,
              spec.stage)
-    names = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
-    if spec.replicas == 1:
-        return jax.make_mesh(shape, names, devices=devices, axis_types=(AxisType.Auto,) * 6)
-    return Mesh(hybrid_devices(spec, shape, devices), names, axis_types=(AxisType.Auto,) * 6)
+    # `jax.make_mesh` lays out one slice; devices on several, every GPU host
+    # its own, take the hybrid layout even as one replica.
+    if spec.replicas == 1 and len({_slice(device) for device in devices}) == 1:
+        return jax.make_mesh(shape, MESH_AXES, devices=devices, axis_types=(AxisType.Auto,) * 6)
+    return Mesh(hybrid_devices(spec, shape, devices), MESH_AXES, axis_types=(AxisType.Auto,) * 6)
+
+
+def _slice(device) -> int:
+    """The slice a device sits on; one outside any process pool, such as a
+    lone CPU process's, carries no slice_index and sits on the one there is."""
+    return device.slice_index if hasattr(device, "slice_index") else 0
 
 
 def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.ndarray:
@@ -235,10 +183,7 @@ def hybrid_devices(spec: MeshSpec, shape: tuple[int, ...], devices: list) -> np.
     several processes on one machine share slice 0, and there the process
     is the granule.
     """
-    # A device outside any process pool, such as a lone CPU process's,
-    # carries no slice_index: it is on the one slice there is.
-    slices = {device.slice_index if hasattr(device, "slice_index") else 0 for device in devices}
-    by_process = len(slices) == 1
+    by_process = len({_slice(device) for device in devices}) == 1
     granules = len({device.process_index if by_process else device.slice_index
                     for device in devices})
     data_width = shape[0]
@@ -290,40 +235,6 @@ def parameter_spec(shape: tuple, fsdp_size: int, min_shard_size: int) -> P:
     return P()
 
 
-def _mesh_spec(shape: tuple, axes: LogicalAxes, rules: LogicalAxisRules, mesh: Mesh) -> P:
-    """Reduce the spec these logical axes ask for to one the shape can take.
-
-    A mesh axis of size 1 shards nothing, so it is dropped from the spec,
-    where it would only obscure what is replicated.
-
-    A dimension its assigned axes do not divide evenly cannot be split at
-    all, so its name is dropped and the rules hand the axis to the next
-    dimension that names it. An odd vocabulary shards the embedding on its
-    width and keeps the table in the layout. Only a parameter no named
-    dimension can split stays whole, which the tolerance check turns into an
-    error when it matters.
-    """
-    names: list[str | None] = list(axes)
-    while True:
-        mapped = spmd.logical_to_mesh_axes(tuple(names), rules)
-        assert mapped is not None, "flax answers None for array_dim_names=None only"
-        assigned = [
-            tuple(axis for axis in _mesh_axes(assignment) if mesh.shape[axis] > 1)
-            for assignment in mapped]
-        blocked = [
-            dimension for dimension, mesh_axes in enumerate(assigned)
-            if shape[dimension] % math.prod(mesh.shape[axis] for axis in mesh_axes)]
-        if not blocked:
-            break
-        for dimension in blocked:
-            names[dimension] = None
-    entries = [mesh_axes[0] if len(mesh_axes) == 1 else mesh_axes or None
-               for mesh_axes in assigned]
-    while entries and entries[-1] is None:
-        entries.pop()
-    return P(*entries)
-
-
 HOST_RESIDENT = ("params", "opt_state", "ema")
 """The train-state fields a layout may keep in pinned host memory between
 steps. Naming params selects a CPU-owned complete transaction state, including
@@ -356,13 +267,14 @@ class Layout:
     """Says how a train state is placed on a mesh.
 
     `rules` map the logical axes the modules declare (`dew.nn.sharding`) onto
-    the parameter axes of the mesh, in precedence order. An axis of size 1
-    shards nothing, so the same table serves every topology.
+    the mesh, in precedence order, for the parameters and for the activations
+    a compiled step constrains (the trainer puts them in context). An axis of
+    size 1 shards nothing, so the same table serves every topology.
 
-    A rule onto the data, sequence or stage axis is refused. The first two
-    split the batch, and a parameter placed on either would be gathered on
-    every use. The stage axis holds the layer stack's pipeline stages, which
-    the decoder places itself from the stored tree.
+    A parameter the rules place on the data, sequence or stage axis is
+    refused. The first two split the batch, and a parameter placed on either
+    would be gathered on every use. The stage axis holds the layer stack's
+    pipeline stages, which the decoder places itself from the stored tree.
 
     Below `min_shard` elements a parameter costs more in collectives than it
     saves in memory, so it stays replicated. `tolerance` is the fraction of
@@ -401,12 +313,11 @@ class Layout:
                 f"sharding tolerance must be between 0 and 1, got {self.tolerance}")
         rules = _rule_table(self.rules)
         for name, axes in rules:
-            outside = [axis for axis in _mesh_axes(axes) if axis not in PARAMETER_AXES]
-            if outside:
+            unknown = [axis for axis in mesh_axes(axes) if axis not in MESH_AXES]
+            if unknown:
                 raise ValueError(
-                    f"rule {name!r} places a parameter on {outside}; parameters "
-                    f"split over {list(PARAMETER_AXES)}, the data and sequence "
-                    f"axes split the batch, and the stage axis holds the pipeline")
+                    f"rule {name!r} names {unknown}, which no mesh has; the axes are "
+                    f"{list(MESH_AXES)}")
         object.__setattr__(self, "rules", rules)
         host = tuple(self.host)
         unknown = sorted(set(host) - set(HOST_RESIDENT))
@@ -417,6 +328,11 @@ class Layout:
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "host_parameters", tuple(self.host_parameters))
 
+    @property
+    def axis_rules(self) -> LogicalAxisRules:
+        """The rules as flax reads them, pairs in precedence order."""
+        return _rule_table(self.rules)
+
     def shardings[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Derive a NamedSharding per leaf of `tree` from the declared axes.
 
@@ -426,7 +342,6 @@ class Layout:
         because the state the trainer materialises against this tree carries
         plain arrays.
         """
-        rules = _rule_table(self.rules)
         fsdp_size = mesh.shape[FSDP_AXIS]
         sharded_devices = math.prod(mesh.shape[axis] for axis in PARAMETER_AXES)
 
@@ -438,7 +353,14 @@ class Layout:
             elif sharded_devices == 1 or size < self.min_shard:
                 spec = P()
             else:
-                spec = _mesh_spec(value.shape, axes, rules, mesh)
+                spec = logical_spec(axes, value.shape, rules=self.axis_rules, mesh=mesh)
+            outside = sorted({axis for entry in spec for axis in mesh_axes(entry)}
+                             - set(PARAMETER_AXES))
+            if outside:
+                raise ValueError(
+                    f"the rules place {_variable_path(path)} on {outside}; parameters "
+                    f"split over {list(PARAMETER_AXES)}, the data and sequence axes "
+                    f"split the batch, and the stage axis holds the pipeline")
             return NamedSharding(mesh, spec)
 
         return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
@@ -509,7 +431,7 @@ class Layout:
             if elements < self.min_shard:
                 continue
             shardable_elements += elements
-            if any(axis in _mesh_axes(assignment)
+            if any(axis in mesh_axes(assignment)
                    for assignment in sharding.spec for axis in PARAMETER_AXES):
                 continue
             replicated.append((elements, jax.tree_util.keystr(path), param.shape))
@@ -535,7 +457,7 @@ def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]
     Rows split over the data, expert, fsdp, and tensor axes. A leaf of rank 2
     or 3 is a sequence per row: token ids, segment ids, positions, encoded
     tokens. Its second dimension splits over the sequence axis when the axis
-    divides it, and otherwise stays whole, the way `_mesh_spec` drops a name
+    divides it, and otherwise stays whole, the way `logical_spec` drops a name
     no dimension can split. An image or a video is not a sequence, so only
     its rows split.
 
@@ -558,10 +480,46 @@ def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]
     return jax.tree.map(leaf_sharding, batch)
 
 
-def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
-    """Assemble this process's slice of each array into a globally sharded one.
+@functools.cache
+def data_partition(mesh: Mesh) -> DataPartition:
+    """The share of every global batch this process reads on `mesh`.
 
-    A pool assembles one leaf per process, so every process has to hand this
+    A batch's rows split over the batch axes and no others (`BATCH_SPEC`):
+    the sequence axis splits positions, the tensor axis widths, and the stage
+    axis holds a pipeline's stages. So the processes whose devices hold the
+    same row shards need the same rows, and the processes fall into groups by
+    the rows they hold.
+    Each group reads one share, numbered by the first row shard it holds,
+    and every process of the group reads it (`readers`).
+
+    Groups whose rows overlap without being the same rows, which a device
+    order built by hand can produce, leave no share each could read whole,
+    so they are refused.
+    """
+    shards = math.prod(mesh.shape[axis] for axis in BATCH_AXES)
+    held: dict[int, set[int]] = {}
+    placement = NamedSharding(mesh, P(BATCH_AXES)).devices_indices_map((shards,))
+    for device, index in placement.items():
+        held.setdefault(device.process_index, set()).add(index[0].start or 0)
+    groups = sorted({frozenset(rows) for rows in held.values()}, key=min)
+    if (sum(len(group) for group in groups) != shards
+            or len({len(group) for group in groups}) != 1):
+        raise ValueError(
+            f"the processes of this mesh hold the row shards "
+            f"{ {process: sorted(rows) for process, rows in sorted(held.items())} }, "
+            f"which overlap without being the same; each group of processes has to "
+            f"hold rows no other group holds, so it can read them as its own share")
+    mine = frozenset(held[jax.process_index()])
+    return DataPartition(index=groups.index(mine), count=len(groups),
+                         readers=sum(frozenset(rows) == mine for rows in held.values()))
+
+
+def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
+    """Assemble this process's share of each array into a globally sharded one.
+
+    The share is the one `data_partition(mesh)` names: that share's rows, each
+    whole in every other dimension. A pool assembles one leaf per process,
+    so every process has to hand this
     the same tree. Validity is the one optional token field, and whether a
     process's own rows needed padding is rank-local. So a pool materializes
     it at every `ModelInputs` of the batch that lacks it, before the
@@ -578,10 +536,18 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
     request, belongs where the caller's own collectives are issued.
     """
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
-    return jax.tree.map(
-        lambda leaf, sharding: jax.make_array_from_process_local_data(
-            sharding, leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)),
-        batch, batch_shardings(mesh, batch))
+    count = data_partition(mesh).count
+
+    def place(leaf, sharding: NamedSharding) -> jax.Array:
+        # The share holds whole rows: `count` shares make the rows, and every
+        # other dimension is already whole, so a device of a sequence or a
+        # stage that spans processes picks its own slice out of it.
+        local = leaf if isinstance(leaf, jax.Array) else np.asarray(leaf)
+        shape = np.shape(local)
+        return jax.make_array_from_process_local_data(
+            sharding, local, (shape[0] * count, *shape[1:]) if shape else ())
+
+    return jax.tree.map(place, batch, batch_shardings(mesh, batch))
 
 
 class DevicePrefetchIterator:

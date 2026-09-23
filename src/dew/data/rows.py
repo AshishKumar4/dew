@@ -13,7 +13,7 @@ from collections.abc import Callable, Mapping, Sequence
 
 from dew.records import JSON
 
-from .dataset import Dataset, DatasetSpec, Records, local_batch, train_stream, validation_pass
+from .dataset import Dataset, DatasetSpec, Records, train_stream, validation_pass
 from .tokens import bounded
 
 
@@ -75,15 +75,13 @@ def row_dataset(spec: DatasetSpec, *, batch: int, path: str | None,
             f"{type(spec).__name__} reads one source: --data.path names a parquet file, "
             "or records holds JSON rows")
     source = from_parquet(path) if path is not None else from_records(records)
-    per_process = local_batch(batch)
     validation = None
     if val_path is not None:
         validation = bounded(validation_pass(
-            from_parquet(val_path), [], batch=per_process, seed=spec.seed,
+            from_parquet(val_path), [], batch=batch, seed=spec.seed,
             loading=spec.loading), val_batches)
     return Dataset(
-        train=train_stream(source, [], batch=per_process, seed=spec.seed,
-                           loading=spec.loading),
+        train=train_stream(source, [], batch=batch, seed=spec.seed, loading=spec.loading),
         val=validation,
         records=len(source),
         batch=batch,

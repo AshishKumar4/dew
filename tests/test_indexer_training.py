@@ -443,7 +443,7 @@ class Data:
     def __init__(self, batches):
         self._batches = batches
 
-    def train(self):
+    def train(self, partition):
         return self._batches()
 
     val, batch, records, steps_per_epoch = None, 8, None, None

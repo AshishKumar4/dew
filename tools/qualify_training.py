@@ -43,7 +43,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
     from dew.interop import load_pretrained
     from dew.objectives.base import Step
     from dew.objectives.lm import LMObjective
-    from dew.training import Trainer
+    from dew.training import Trainer, data_partition
     from dew.training.tracker import LocalTracker
 
     run = directory / ("baseline" if mode == "baseline" else "restarted")
@@ -99,7 +99,7 @@ def worker(directory: Path, mode: str, dtype: str) -> None:
         or float(before.accumulation.mass) <= 0
     ):
         raise RuntimeError("Resume lost the partially accumulated gradient")
-    stream = data.train()
+    stream = data.train(data_partition(trainer.device_mesh))
     if not isinstance(stream, GlobalStream):
         raise TypeError(
             "Qualification requires the token loader's global-position stream"

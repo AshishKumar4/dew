@@ -10,6 +10,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
 
 from dew.checkpoints import Checkpoints
+from dew.data import DataPartition
 from dew.nn.backbones.causal_transformer import CausalTransformer, Mixture, group_layers
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import FROZEN, Aux, EMASpec, Mean, Objective, merge
@@ -135,7 +136,7 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
     start, _, _ = trainer.place()
     step = trainer.compile(start, data[0])
     prefix, *_ = step(start, data[0])
-    checkpoints.save(1, prefix, b"position")
+    checkpoints.save(1, prefix, b"position", share=DataPartition())
     checkpoints.wait()
     restored, _, position = trainer.place()
     assert position == b"position"

@@ -107,7 +107,7 @@ def flow_images(out: Path):
     images = np.zeros((8, 8, 8, 3), dtype=np.uint8)
     images[:, :, ::2, :] = 255
     batch = {"image": images}
-    data = Dataset(train=lambda: itertools.repeat(batch), val=None,
+    data = Dataset(train=lambda partition: itertools.repeat(batch), val=None,
                    records=8, batch=8)
     model = models.build(
         "simple_dit", patch_size=4, emb_features=16, num_layers=1,

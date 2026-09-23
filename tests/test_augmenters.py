@@ -30,7 +30,7 @@ from absl import flags
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
-from dew.data import CC12M, Loading, OxfordFlowers, images
+from dew.data import CC12M, DataPartition, Loading, OxfordFlowers, images
 from dew.data.images import ImageTransform
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -326,7 +326,7 @@ def _by_record(spec, worker_count):
                                                     read_buffer=1, worker_buffer=1)).load(
         batch=4, tokenize=keep_captions)
     records = {}
-    for batch in itertools.islice(data.train(), data.steps_per_epoch):
+    for batch in itertools.islice(data.train(DataPartition()), data.steps_per_epoch):
         for position, label in enumerate(batch["label"]):
             records[int(label)] = (batch["image"][position].tobytes(),
                                    str(batch["caption"][position]))

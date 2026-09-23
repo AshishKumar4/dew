@@ -49,7 +49,7 @@ def main() -> None:
     trainer.rollout = rollout
     width = 2 // processes
     task_ids = np.arange(2, dtype=np.int32)[rank * width:(rank + 1) * width]
-    data = Dataset(train=lambda: itertools.repeat({"task_id": task_ids}), val=None, records=2, batch=2)
+    data = Dataset(train=lambda partition: itertools.repeat({"task_id": task_ids}), val=None, records=2, batch=2)
     state = None
     failed = None
     try:

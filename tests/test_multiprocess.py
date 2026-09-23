@@ -537,16 +537,16 @@ def test_a_pool_resumes_every_process_at_its_own_position(tmp_path, pool_checkpo
 def test_a_pool_checkpoint_refuses_a_different_process_count(tmp_path, pool_checkpoint):
     """One process cannot take over two processes' positions, and says so.
 
-    Each position is where one shard stopped, and a sampler over one shard
-    of one has no such place. Before the positions were per process this
+    Each position is where one share stopped, and the one share of one
+    process has no such place. Before the positions were per process this
     surfaced as grain's repr comparison of two samplers; now it stops at load
-    with both counts in the message.
+    with the shares in the message.
     """
     refused = spawn("fit", tmp_path / "single.json", fsdp_size=1, steps=2 * POOL_STEPS,
                     records=RECORDS, name="pool", run_dir=pool_checkpoint["checkpoints"].parent)
     log = refused.communicate(timeout=600)[0]
     assert refused.returncode != 0, "one process resumed a two-process position"
-    assert "position for each of 2 processes and this run has 1 process" in log
+    assert "shares [(0, 2), (1, 2)] (index, count), and this reader reads share 0 of 1" in log
     assert "Sampler in checkpoint" not in log, "grain's repr error is what the user sees"
 
 
@@ -928,7 +928,7 @@ def test_a_local_checkpoint_refuses_another_process_count(tmp_path, killed_local
                        records=RECORDS, name="local", run_dir=directory / "run")
     log = persistent.communicate(timeout=600)[0]
     assert persistent.returncode != 0
-    assert "position for each of 2 processes and this run has 1 process" in log
+    assert "shares [(0, 2), (1, 2)] (index, count), and this reader reads share 0 of 1" in log
 
 # --------------------------------------------------------------------------
 # Validation and artifacts in a pool

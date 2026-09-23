@@ -14,7 +14,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.data import Loading
+from dew.data import DataPartition, Loading
 from dew.objectives.base import scalar_loss
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -77,10 +77,11 @@ class DeterministicObjective(Objective):
 
 class Data:
     def __init__(self, train, val=None, batch=BATCH, records=None):
-        self._train, self.val = train, val
+        self._train = train
+        self.val = None if val is None else lambda partition: val()
         self.batch, self.records = batch, records
 
-    def train(self):
+    def train(self, partition):
         return self._train()
 
     @property
@@ -321,14 +322,15 @@ def test_a_rule_onto_an_axis_of_size_one_shards_nothing():
 
 
 def test_a_rule_onto_an_axis_that_places_no_parameter_is_refused():
-    """The data and sequence axes split the batch: a parameter placed on
-    either would be gathered on every use. A misspelt axis is refused the
-    same way, at construction, before placement reads the rules, and the
-    message names the axis it could not place."""
-    with pytest.raises(ValueError, match=r"places a parameter on \['data'\]"):
-        Layout(rules={"embed": "data"})
-    with pytest.raises(ValueError, match=r"places a parameter on \['fspd'\]"):
+    """The data and sequence axes split the batch: a parameter the rules
+    place on either would be gathered on every use, and placing one there
+    names it. A misspelt axis is refused at construction, before any rule is
+    read, since the activations' rules share the table."""
+    with pytest.raises(ValueError, match=r"names \['fspd'\], which no mesh has"):
         Layout(rules={"embed": "fspd"})
+    with pytest.raises(ValueError, match=r"the rules place params/.* on \['data'\]"):
+        Layout(rules={"mlp": "data"}, min_shard=1).shardings(
+            build_mesh(MeshSpec(fsdp=2)), dit_variables())
 
 
 class IndivisibleModel(nn.Module):
@@ -489,13 +491,13 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
                         packing_bins=2).load(batch=jax.device_count())
 
     mesh = build_mesh()
-    with DevicePrefetchIterator(data.train(), mesh, depth=2) as it:
+    with DevicePrefetchIterator(data.train(DataPartition()), mesh, depth=2) as it:
         next(it)
         state = it.source_state
         expected = np.asarray(next(it)["text"])
         assert isinstance(state, bytes), "a checkpoint carries the position as bytes"
 
-        with DevicePrefetchIterator(data.train(), mesh, depth=2,
+        with DevicePrefetchIterator(data.train(DataPartition()), mesh, depth=2,
                                     source_state=state) as resumed:
             assert np.array_equal(np.asarray(next(resumed)["text"]), expected)
 
@@ -632,7 +634,7 @@ def test_a_checkpoint_without_a_position_resumes_from_the_top_of_the_stream(tmp_
     """A stream without get_state writes no position; a resume from that
     checkpoint restores the state and reads the stream from its start."""
     make_trainer(tmp_path).fit(Data(batches), steps=1, log_every=1)
-    _, position = Checkpoints(str(tmp_path)).restore()
+    _, position = Checkpoints(str(tmp_path)).restore(share=DataPartition())
     assert position is None
     resumed = make_trainer(tmp_path).fit(Data(batches), steps=2, log_every=1)
     assert int(resumed.step) == 2
@@ -774,7 +776,7 @@ def test_a_resumed_run_reads_the_batch_after_its_checkpoint(tmp_path):
     """A resumed run must not replay the batches it already trained on."""
     data = Data(grain_image_loader, records=BATCH * 64)
     make_trainer(tmp_path).fit(data, steps=3, log_every=1)
-    _, position = Checkpoints(str(tmp_path)).restore()
+    _, position = Checkpoints(str(tmp_path)).restore(share=DataPartition())
     assert position is not None, "iterator position was never captured"
 
     mesh = build_mesh()

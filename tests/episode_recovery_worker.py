@@ -24,7 +24,7 @@ def main() -> None:
     records = []
     trainer, rollout = build(environment, journal=EpisodeJournal(str(directory / "journal")), record=records.append)
     trainer.rollout = rollout
-    data = Dataset(train=lambda: itertools.repeat({"task_id": np.arange(jax.device_count(), dtype=np.int32)}),
+    data = Dataset(train=lambda partition: itertools.repeat({"task_id": np.arange(jax.device_count(), dtype=np.int32)}),
                    val=None, records=None, batch=jax.device_count())
     state = trainer.fit(data, steps=1, log_every=1)
     np.save(directory / "parameters.npy", np.asarray(state.params["params"]["table"]))

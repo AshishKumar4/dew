@@ -20,13 +20,16 @@ tile runs the head forward and backward in 250 ms holding 1.07 GiB of
 temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
 """
 
+import math
 from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
 from flax.typing import PrecisionLike
+from jax.sharding import PartitionSpec as P
 
 from dew.nn.precision import head_product, rounded_operand, rounds_to_bf16
+from dew.nn.sharding import logical_spec, mesh_axes
 
 
 def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ...]:
@@ -270,6 +273,27 @@ _bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(3, 4, 6, 7, 
 _bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
 
 
+def _token_spec(shape: tuple[int, ...]) -> P:
+    """How the loss splits `[batch, length, ...]` targets over the mesh in
+    context: rows and positions where the rule table puts the hidden's, then
+    over every other axis whose shards the tokens still divide into, the
+    minor end of the rows first. A token's loss reads no other token, so
+    splitting the tokens further only slices a replicated operand."""
+    mesh = jax.sharding.get_abstract_mesh()
+    names = ("activation_batch", "activation_length", *[None] * len(shape))[:len(shape)]
+    spec = logical_spec(names, shape)
+    entries = [list(mesh_axes(entry)) for entry in (*spec, *[None] * (len(shape) - len(spec)))]
+    for axis in mesh.axis_names:
+        if (mesh.shape[axis] == 1 or axis in mesh.manual_axes
+                or any(axis in entry for entry in entries)):
+            continue
+        for size, entry in zip(shape[:2], entries, strict=False):
+            if size % (math.prod(mesh.shape[name] for name in entry) * mesh.shape[axis]) == 0:
+                entry.append(axis)
+                break
+    return P(*(entry[0] if len(entry) == 1 else tuple(entry) or None for entry in entries))
+
+
 def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                           softcap: float | None = None,
                           precision: PrecisionLike = None,
@@ -307,6 +331,11 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     temporaries. The default is measured; a tile wider than the input is one
     tile. `temperature` divides the capped logits (`head_logits`), which
     scores the draws of a sampler at that temperature.
+
+    On a mesh every device scores its own tokens (`_token_spec`), with the
+    head whole on each: the token tiles are dynamic slices in a loop, which
+    GSPMD would only compute on a replicated operand, so the split is a
+    `shard_map`, and the head's gradient is the one sum that crosses devices.
     """
     features = head_weight.shape[1 if vocab_major else 0]
     if hidden.shape[-1] != features:
@@ -322,9 +351,34 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     # held vocabulary-major so a column tile is a row slice.
     cap = None if softcap is None else jnp.asarray(softcap, jnp.float32)
     table = head_weight if vocab_major else head_weight.T
-    return _bounded_head(hidden, table, targets, chunks, tile, cap,
-                         BF16 if rounds_to_bf16(hidden.dtype, precision) else precision,
-                         predict, float(temperature))
+    def head(hidden, table, targets, cap):
+        return _bounded_head(hidden, table, targets, chunks, tile, cap,
+                             BF16 if rounds_to_bf16(hidden.dtype, precision) else precision,
+                             predict, float(temperature))
+
+    spec = () if jax.sharding.get_abstract_mesh().empty else _token_spec(targets.shape)
+    axes = {axis for entry in spec for axis in mesh_axes(entry)}
+    if not axes:
+        return head(hidden, table, targets, cap)
+    # The head arrives in its own shards on the token axes and is gathered
+    # whole inside, so its gradient leaves reduce-scattered onto them rather
+    # than summed whole. Unchecked, the transpose sums the cotangents of
+    # what reaches every token shard alike, the head over the axes that do
+    # not split it and the cap, over the shards; checked, the tile loops'
+    # carries, which start from constants, would have to be told they vary.
+    kept = [tuple(axis for axis in mesh_axes(entry) if axis in axes)
+            for entry in logical_spec(("vocab", "embed"), table.shape)]
+    held = P(*(entry if entry else None for entry in kept))
+
+    def local(hidden, table, targets, cap):
+        for dimension, entry in enumerate(held):
+            if entry is not None:
+                table = jax.lax.all_gather(table, entry, axis=dimension, tiled=True)
+        return head(hidden, table, targets, cap)
+
+    return jax.shard_map(local, in_specs=(P(*spec, None), held, spec, P()),
+                         out_specs=(spec, spec if predict else None, spec), axis_names=axes, check_vma=False)(
+        hidden, table, targets, cap)
 
 
 SUPPORT_BLOCK = 1 << 15

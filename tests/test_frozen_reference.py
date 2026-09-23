@@ -76,7 +76,7 @@ class Data:
 
     batch = 8
 
-    def train(self):
+    def train(self, partition):
         return Counting()
 
 

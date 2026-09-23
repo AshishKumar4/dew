@@ -23,6 +23,7 @@ import pytest
 import dew.data
 from dew.data import (
     Checkpointable,
+    DataPartition,
     Dataset,
     DatasetSpec,
     HFDatasetSource,
@@ -31,7 +32,6 @@ from dew.data import (
     LocalVideos,
     VoxCeleb2,
     images,
-    local_batch,
     video,
 )
 from dew.data.dataset import Forwarding, _batches, hold_out, train_stream, validation_pass
@@ -154,7 +154,7 @@ def test_a_run_config_loads_its_dataset_through_the_base_spec(tmp_path):
     data = spec.load(batch=2)
 
     assert data.batch == 2
-    assert next(data.train())["text"].shape == (2, 9)
+    assert next(data.train(DataPartition()))["text"].shape == (2, 9)
 
 
 # ---------------------------------------------------------------------------------
@@ -192,8 +192,7 @@ class Indexed(DatasetSpec):
         source = self.source()
         records = len(source) if self.count is None else self.count
         train, val = hold_out(source, records, (self.val_batches or 0) * batch, "Indexed")
-        knobs = dict(batch=local_batch(batch), seed=self.seed,
-                     loading=self.loading)
+        knobs = dict(batch=batch, seed=self.seed, loading=self.loading)
         return Dataset(train=train_stream(train, [], **knobs),
                        val=None if val is None else validation_pass(val, [], **knobs),
                        records=len(train), batch=batch)
@@ -228,11 +227,11 @@ def test_the_validation_split_is_ordered_and_disjoint_from_train():
 
     # Validation walks its own records in canonical order, not the shuffled
     # train sampler's, and repeats identically.
-    val_batches = _indices(data.val(), 2)
+    val_batches = _indices(data.val(DataPartition()), 2)
     assert val_batches == [list(range(8))]
-    assert _indices(data.val(), 2) == val_batches
+    assert _indices(data.val(DataPartition()), 2) == val_batches
 
-    train_indices = [i for batch in _indices(data.train(), 3) for i in batch]
+    train_indices = [i for batch in _indices(data.train(DataPartition()), 3) for i in batch]
     assert set(train_indices).isdisjoint(range(8))
     assert train_indices != sorted(train_indices)  # the train sampler still shuffles
 
@@ -248,11 +247,11 @@ def test_a_validation_pass_reads_every_held_out_record_once(workers):
     """
     data = Indexed(val_batches=3, loading=Loading(workers=workers)).load(batch=8)
 
-    batches, ended = _bounded(data.val(), 12)
+    batches, ended = _bounded(data.val(DataPartition()), 12)
     assert [[int(i) for i in b["index"]] for b in batches] == [
         list(range(8)), list(range(8, 16)), list(range(16, 24))]
     assert ended
-    train = [index for batch in _indices(data.train(), 2) for index in batch]
+    train = [index for batch in _indices(data.train(DataPartition()), 2) for index in batch]
     assert set(train).isdisjoint(range(24))
 
 
@@ -284,8 +283,8 @@ def test_a_named_validation_split_is_its_own_records_and_costs_training_none():
 
     assert data.records == 16, "a named split holds nothing out of training"
     assert data.val is not None
-    val = _labels(data.val())
-    train = _labels(data.train(), batches=4)
+    val = _labels(data.val(DataPartition()))
+    train = _labels(data.train(DataPartition()), batches=4)
     assert val == [1000, 1001, 1002, 1003]
     assert set(val).isdisjoint(train)
     assert sorted(train) == list(range(16)), "training reads every record"
@@ -301,8 +300,8 @@ def test_val_batches_bounds_a_named_split_and_none_scores_all_of_it():
     whole_pass = Augmenting(val_batches=None, **fields).load(batch=4)
 
     assert bounded_pass.val is not None and whole_pass.val is not None
-    assert len(_labels(bounded_pass.val(), batches=8)) == 4
-    assert _labels(whole_pass.val(), batches=8) == list(range(1000, 1008))
+    assert len(_labels(bounded_pass.val(DataPartition()), batches=8)) == 4
+    assert _labels(whole_pass.val(DataPartition()), batches=8) == list(range(1000, 1008))
 
 
 def test_without_a_named_split_the_head_hold_out_is_unchanged():
@@ -314,9 +313,9 @@ def test_without_a_named_split_the_head_hold_out_is_unchanged():
     data = spec.load(batch=4, tokenize=keep_captions)
 
     assert data.records == 12 and data.steps_per_epoch == 3
-    held = next(data.val())
+    held = next(data.val(DataPartition()))
     assert _labels(iter([held])) == [0, 1, 2, 3]
-    assert set(_labels(data.train(), batches=3)).isdisjoint(range(4))
+    assert set(_labels(data.train(DataPartition()), batches=3)).isdisjoint(range(4))
     expected = ImageTransform(spec).random_map(_Images(16)[0], np.random.default_rng(0))
     assert held["image"][0].tobytes() == expected["image"].tobytes()
 
@@ -358,7 +357,7 @@ def test_a_source_without_a_length_needs_an_explicit_count():
 
     data = Unsized(count=16, val_batches=None, image_size=4, **WORKERS).load(batch=8)
     assert data.records == 16
-    assert sorted(int(i) for batch in itertools.islice(data.train(), 2)
+    assert sorted(int(i) for batch in itertools.islice(data.train(DataPartition()), 2)
                   for i in batch["label"]) == list(range(16))
 
 
@@ -376,7 +375,7 @@ def test_a_count_past_the_end_of_the_source_is_refused(tmp_path):
 def test_a_count_uses_the_head_of_the_source():
     data = Indexed(count=16).load(batch=8)
     assert data.records == 16
-    assert sorted(i for batch in _indices(data.train(), 2) for i in batch) == list(range(16))
+    assert sorted(i for batch in _indices(data.train(DataPartition()), 2) for i in batch) == list(range(16))
 
 
 def test_the_training_stream_repeats_instead_of_ending():
@@ -385,7 +384,7 @@ def test_the_training_stream_repeats_instead_of_ending():
     data = Indexed(val_batches=2).load(batch=8)
 
     epoch = data.steps_per_epoch  # the sixteen training records, in two batches
-    batches, ended = _bounded(data.train(), 3 * epoch)
+    batches, ended = _bounded(data.train(DataPartition()), 3 * epoch)
     first_epoch = [int(i) for batch in batches[:epoch] for i in batch["index"]]
     later = [int(i) for batch in batches[epoch:] for i in batch["index"]]
 
@@ -396,14 +395,14 @@ def test_the_training_stream_repeats_instead_of_ending():
 
 def test_a_dataset_of_one_record_yields_batches_of_it():
     data = Indexed(length=1).load(batch=1)
-    assert _indices(data.train(), 2) == [[0], [0]]
+    assert _indices(data.train(DataPartition()), 2) == [[0], [0]]
 
 
 def test_the_training_iterator_carries_its_position():
     """A checkpoint records the iterator's state and a restored run resumes
     on the batch after it."""
     data = Indexed().load(batch=8)
-    first = data.train()
+    first = data.train(DataPartition())
     # The trainer reads the protocol statically, and a caption stage that only
     # forwarded get_state through __getattr__ failed it while hasattr passed.
     assert isinstance(first, Checkpointable)
@@ -411,7 +410,7 @@ def test_the_training_iterator_carries_its_position():
     state = first.get_state()
     rest = _indices(first, 2)
 
-    resumed = data.train()
+    resumed = data.train(DataPartition())
     resumed.set_state(state)
     assert _indices(resumed, 2) == rest
     assert sorted(i for batch in seen + rest for i in batch) == list(range(32))
@@ -459,7 +458,7 @@ def test_which_records_a_batch_holds_does_not_depend_on_who_stacked_it(workers):
     permuted; unpermuted, three workers at a batch of four would have stacked
     records 0, 3, 6, 9 into batch 0."""
     source = _Indexed(30)
-    stream = _batches(_order(source, seed=5), batch=4, loading=Loading(
+    stream = _batches(_order(source, seed=5), rows=4, partition=DataPartition(), loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2))
 
     read = _fields(stream, 12)
@@ -480,7 +479,7 @@ def test_a_pass_over_a_split_the_workers_do_not_divide_is_still_whole_batches(wo
     passes = validation_pass(_Indexed(30), [], batch=4, seed=0, loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2))
 
-    batches, ended = _bounded(passes(), 12)
+    batches, ended = _bounded(passes(DataPartition()), 12)
 
     assert [[int(index) for index in batch["index"]] for batch in batches] == [
         list(range(start, start + 4)) for start in range(0, 28, 4)]
@@ -492,7 +491,7 @@ def test_an_offset_stays_a_bound_on_the_slice_this_process_reads(workers):
     """A resume opens the stream `offset` records in, and the permutation the
     workers read through sits behind that slice, so the first batch is still
     the first four records the interrupted run had not reached."""
-    stream = _batches(_order(_Indexed(30)), batch=4, offset=8, loading=Loading(
+    stream = _batches(_order(_Indexed(30)), rows=4, partition=DataPartition(), offset=8, loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2))
 
     first = _fields(stream, 1)
@@ -502,50 +501,56 @@ def test_an_offset_stays_a_bound_on_the_slice_this_process_reads(workers):
 
 
 # ---------------------------------------------------------------------------------
-# The global batch over JAX processes
+# The global batch over the shares of a partition
 # ---------------------------------------------------------------------------------
 
-def test_a_global_batch_that_does_not_split_over_the_processes_is_refused(monkeypatch):
-    """Integer division hid the remainder: 65 over eight processes trained on
-    64 records a step while the run reported 65, and 7 gave every process a
+def test_a_global_batch_that_does_not_split_into_the_shares_is_refused():
+    """Integer division hid the remainder: 65 over eight shares trained on
+    64 records a step while the run reported 65, and 7 gave every share a
     batch of nothing."""
-    monkeypatch.setattr(jax, "process_count", lambda: 8)
-
+    data = Indexed(length=256)
     for batch in (65, 7):
-        with pytest.raises(ValueError, match=rf"batch {batch} does not split over 8 JAX processes"):
-            local_batch(batch)
-        with pytest.raises(ValueError, match="8 JAX processes"):
-            Indexed(length=256).load(batch=batch)
-    assert local_batch(64) == 8
-    assert Indexed(length=256).load(batch=64).batch == 64
+        with pytest.raises(ValueError, match=rf"batch {batch} does not split into 8 equal shares"):
+            DataPartition(0, 8).rows(batch)
+        with pytest.raises(ValueError, match="8 equal shares"):
+            data.load(batch=batch).train(DataPartition(3, 8))
+    assert DataPartition(0, 8).rows(64) == 8
 
 
-def test_each_process_reads_its_own_slice_of_the_validation_split(monkeypatch):
-    """Process p of n validates records p, p + n, ... of the split, in whole
-    batches of the per-process size."""
-    monkeypatch.setattr(jax, "process_count", lambda: 2)
-    monkeypatch.setattr(jax, "process_index", lambda: 1)
-
+def test_each_share_reads_its_own_slice_of_the_validation_split():
+    """Share p of n validates records p, p + n, ... of the split, in whole
+    batches of the share's size."""
     data = Indexed(val_batches=2).load(batch=8)
 
-    assert _indices(data.val(), 3) == [[1, 3, 5, 7], [9, 11, 13, 15]]
+    assert _indices(data.val(DataPartition(1, 2)), 3) == [[1, 3, 5, 7], [9, 11, 13, 15]]
 
 
-def _steps(monkeypatch, processes, count, *, position=None, length=32, seed=0, batch=8):
-    """`(global batches, saved positions)` for `processes` simulated processes.
+def test_the_readers_of_one_share_read_the_same_records():
+    """Processes a sequence or a pipeline spans between them hold the same
+    rows, so they read one share, and read it alike: that is what makes
+    their copies of the batch agree."""
+    data = Indexed(length=32).load(batch=8)
+    first = data.train(DataPartition(1, 2, readers=2))
+    second = data.train(DataPartition(1, 2, readers=2))
 
-    A global batch is the step every process contributes its rows to, so the
-    records are collected across the processes; which process holds which row
+    assert _indices(first, 3) == _indices(second, 3)
+    first.close()
+    second.close()
+
+
+def _steps(processes, count, *, position=None, length=32, seed=0, batch=8):
+    """`(global batches, saved positions)` for `processes` readers, one share each.
+
+    A global batch is the step every share contributes its rows to, so the
+    records are collected across the shares; which device holds which row
     is the mesh's business and which records a step trains on is the
-    dataset's. Each process is opened in turn, resumed from `position` when
+    dataset's. Each share is opened in turn, resumed from `position` when
     one is given, and asked where it stopped.
     """
-    monkeypatch.setattr(jax, "process_count", lambda: processes)
     read, saved = [], []
     for index in range(processes):
-        monkeypatch.setattr(jax, "process_index", lambda index=index: index)
         stream = Indexed(length=length, seed=seed).load(batch=batch).train
-        iterator = stream()
+        iterator = stream(DataPartition(index, processes))
         if position is not None:
             iterator.set_state(position)
         read.append(_indices(iterator, count))
@@ -556,53 +561,51 @@ def _steps(monkeypatch, processes, count, *, position=None, length=32, seed=0, b
 
 
 @pytest.mark.parametrize("processes", [1, 2, 4])
-def test_a_training_step_reads_the_same_records_at_every_process_count(
-        monkeypatch, processes):
+def test_a_training_step_reads_the_same_records_at_every_share_count(processes):
     """Step k is records [k * batch, (k + 1) * batch) of one order whatever
-    the process count is, because the iterator owns the sharding and the
+    the share count is, because the iterator owns the sharding and the
     batching together. Shuffling the corpus per shard first, as an index
     sampler does, gave each count a different order, which no encoding of a
     position could have translated."""
-    alone, _ = _steps(monkeypatch, 1, 4)
-    together, _ = _steps(monkeypatch, processes, 4)
+    alone, _ = _steps(1, 4)
+    together, _ = _steps(processes, 4)
 
     assert together == alone
     assert sorted(index for step in alone for index in step) == list(range(32)), (
         "four steps of eight is one pass over the corpus, each record once")
 
 
-def test_every_process_saves_the_same_global_position(monkeypatch):
+def test_every_share_saves_the_same_global_position():
     """A position is a record count over the whole run's order, so every
-    process reports the same bytes; that is what lets a checkpoint written by
+    share reports the same bytes; that is what lets a checkpoint written by
     two processes be handed to one or to four."""
-    _, saved = _steps(monkeypatch, 4, 3)
+    _, saved = _steps(4, 3)
 
     assert len(set(saved)) == 1
     assert json.loads(saved[0])[ENVELOPE]["records"] == 3 * 8
 
 
 @pytest.mark.parametrize("processes", [1, 4])
-def test_a_position_saved_by_two_processes_resumes_on_another_count(
-        monkeypatch, processes):
+def test_a_position_saved_by_two_shares_resumes_on_another_count(processes):
     """The steps after a resume are the steps the run that was never stopped
-    would have trained on, whether the resume has half the processes or twice
+    would have trained on, whether the resume has half the shares or twice
     them."""
-    whole, _ = _steps(monkeypatch, 2, 6)
-    _, saved = _steps(monkeypatch, 2, 3)
+    whole, _ = _steps(2, 6)
+    _, saved = _steps(2, 3)
 
-    resumed, _ = _steps(monkeypatch, processes, 3, position=saved[0])
+    resumed, _ = _steps(processes, 3, position=saved[0])
 
     assert resumed == whole[3:]
 
 
-def test_a_position_over_another_order_is_refused(monkeypatch):
+def test_a_position_over_another_order_is_refused():
     """A record count is a place in one order and another place in another, so
     a corpus, record count or seed the position was not written over is
     refused instead of resumed at the same offset into different data."""
-    _, saved = _steps(monkeypatch, 2, 3)
+    _, saved = _steps(2, 3)
 
     for other in (dict(length=64), dict(seed=1)):
-        stream = Indexed(**other).load(batch=8).train()
+        stream = Indexed(**other).load(batch=8).train(DataPartition())
         with pytest.raises(ValueError, match="records into"):
             stream.set_state(saved[0])
         stream.close()
@@ -612,7 +615,7 @@ def test_a_shard_offset_cannot_resume_a_global_stream():
     """A stream whose windows come out of one shard reports where that shard
     stopped. Handing such a position to a stream that reads its records
     globally would resume it somewhere else, so it is refused by name."""
-    stream = Indexed().load(batch=8).train()
+    stream = Indexed().load(batch=8).train(DataPartition())
 
     with pytest.raises(ValueError, match="one process's own offset into its shard"):
         stream.set_state(json.dumps({"last_seen_indices": {"0": 15}}).encode())
@@ -822,7 +825,7 @@ def _augmented(worker_count, length=16, batch=4, seed=3):
                       loading=Loading(workers=worker_count, threads=1, read_buffer=1,
                                       worker_buffer=1)).load(batch=batch, tokenize=keep_captions)
     return {index: (pixels, caption)
-            for b in itertools.islice(data.train(), data.steps_per_epoch)
+            for b in itertools.islice(data.train(DataPartition()), data.steps_per_epoch)
             for index, pixels, caption in _rows(b)}
 
 
@@ -845,7 +848,7 @@ def test_the_close_budget_is_the_sources_worker_count():
     waits what the stream's Loading says, through every wrapper over it."""
     loading = Loading(workers=8, threads=1, read_buffer=1)
     stream = Augmenting(length=16, image_size=8, seed=3, val_batches=None,
-                        loading=loading).load(batch=4, tokenize=keep_captions).train()
+                        loading=loading).load(batch=4, tokenize=keep_captions).train(DataPartition())
     assert isinstance(stream, Forwarding)
     assert stream.stop_seconds == loading.stop_seconds > 5.0
     stream.close()
@@ -924,12 +927,12 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
                                           worker_buffer=1)).load(
         batch=4, tokenize=keep_captions)
 
-    interrupted = loader().train()
+    interrupted = loader().train(DataPartition())
     seen = _rows(next(interrupted))
     state = interrupted.get_state()
     rest = [row for batch in itertools.islice(interrupted, 3) for row in _rows(batch)]
 
-    restored = loader().train()
+    restored = loader().train(DataPartition())
     restored.set_state(state)
     resumed = [row for batch in itertools.islice(restored, 3) for row in _rows(batch)]
 
@@ -940,13 +943,13 @@ def test_an_interrupted_epoch_resumes_on_exactly_the_records_it_had_not_seen(
     assert sorted(index for index, _, _ in seen + rest[:4]) == list(range(8, 16))
 
 
-def _validated(length, val_batches, batch, **read):
-    """{record index: (pixels, caption)} for one validation pass."""
+def _validated(length, val_batches, batch, partition=DataPartition(), **read):
+    """{record index: (pixels, caption)} for one share's validation pass."""
     data = Augmenting(length=length, image_size=8, seed=3, val_batches=val_batches,
                       loading=Loading(workers=0, worker_buffer=1, **read)).load(
         batch=batch, tokenize=keep_captions)
     return {index: (pixels, caption)
-            for b in data.val() for index, pixels, caption in _rows(b)}
+            for b in data.val(partition) for index, pixels, caption in _rows(b)}
 
 
 def test_validation_pixels_do_not_depend_on_the_read_thread_count():
@@ -962,10 +965,9 @@ def test_validation_pixels_do_not_depend_on_the_read_thread_count():
     assert threaded == serial
 
 
-@pytest.mark.parametrize("process_count", [2, 8])
-def test_a_validation_record_does_not_depend_on_the_process_count(
-        monkeypatch, process_count):
-    """Process p of n validates records p, p + n, ... of the split. The rng
+@pytest.mark.parametrize("shares", [2, 8])
+def test_a_validation_record_does_not_depend_on_the_share_count(shares):
+    """Share p of n validates records p, p + n, ... of the split. The rng
     behind a record's flip, jitter and caption has to be keyed by its place in
     the split, not in that slice, or the same seed validates one record with
     one augmentation on a single host and another on a pod: keyed by the
@@ -973,10 +975,8 @@ def test_a_validation_record_does_not_depend_on_the_process_count(
     alone = _validated(64, 4, 8, threads=1, read_buffer=1)
 
     together = {}
-    monkeypatch.setattr(jax, "process_count", lambda: process_count)
-    for index in range(process_count):
-        monkeypatch.setattr(jax, "process_index", lambda index=index: index)
-        together.update(_validated(64, 4, 8, threads=1, read_buffer=1))
+    for index in range(shares):
+        together.update(_validated(64, 4, 8, DataPartition(index, shares), threads=1, read_buffer=1))
 
     assert sorted(alone) == list(range(32))
     assert together == alone
@@ -1004,7 +1004,7 @@ def test_a_prepared_set_is_the_deterministic_half_of_the_transform(tmp_path):
                                     augmentation="none", val_batches=None,
                                     **WORKERS).load(batch=4, tokenize=keep_captions)
     seen = {}
-    for batch in itertools.islice(data.train(), data.steps_per_epoch):
+    for batch in itertools.islice(data.train(DataPartition()), data.steps_per_epoch):
         for index, pixels, caption in _rows(batch):
             seen[index] = (pixels, caption)
     assert sorted(seen) == list(range(16))
@@ -1064,7 +1064,7 @@ def test_a_record_that_cannot_be_read_stops_the_stream(worker_count):
 
     delivered = []
     with pytest.raises(RuntimeError, match="record 3 is unreadable"):
-        for batch in data.train():
+        for batch in data.train(DataPartition()):
             delivered.extend(int(i) for i in batch["index"])
 
     assert 3 not in delivered
@@ -1075,7 +1075,7 @@ def test_a_source_that_fails_on_every_record_raises_instead_of_an_empty_batch():
     data = Raising(length=8, bad=None).load(batch=2)
 
     with pytest.raises(RuntimeError, match="is unreadable"):
-        next(data.train())
+        next(data.train(DataPartition()))
 
 
 # ---------------------------------------------------------------------------------
@@ -1192,13 +1192,13 @@ def test_a_batch_carries_captions_and_each_encoder_tokenizes_them_its_own_way():
     from dew.inputs import CharTable, Condition, Field, InputSpec
 
     spec = Augmenting(length=8, image_size=8, val_batches=None, **WORKERS)
-    captions = next(spec.load(batch=4, tokenize=keep_captions).train())["caption"]
+    captions = next(spec.load(batch=4, tokenize=keep_captions).train(DataPartition()))["caption"]
     assert captions.shape == (4,)
 
     def tokens(encoder):
         inputs = InputSpec(Field("image", (8, 8, 3)),
                            {"textcontext": Condition(encoder, field="text")})
-        batch = next(spec.load(batch=4, tokenize=inputs.tokenize).train())
+        batch = next(spec.load(batch=4, tokenize=inputs.tokenize).train(DataPartition()))
         assert "caption" not in batch, "strings cannot ride a batch onto a device"
         return batch["text"]["input_ids"].shape
 
@@ -1216,7 +1216,7 @@ def test_a_run_with_no_condition_leaves_no_captions_in_the_batch():
     spec = Augmenting(length=8, image_size=8, val_batches=None, **WORKERS)
     inputs = InputSpec(Field("image", (8, 8, 3)))
 
-    batch = next(spec.load(batch=4, tokenize=inputs.tokenize).train())
+    batch = next(spec.load(batch=4, tokenize=inputs.tokenize).train(DataPartition()))
 
     assert sorted(batch) == ["image", "label"]
 
@@ -1285,31 +1285,35 @@ def test_from_grain_batches_a_map_dataset_per_process_and_counts_its_records():
     data = Dataset.from_grain(_grain_points(), batch=4, **WORKERS)
 
     assert data.records == 16 and data.batch == 4 and data.steps_per_epoch == 4
-    batch = next(data.train())
+    batch = next(data.train(DataPartition()))
     assert batch["x"].shape == (4, 3) and batch["index"].shape == (4,)
 
 
 def test_from_grain_repeats_a_map_dataset_so_a_run_outlasts_the_corpus():
     """`Dataset.train` is endless; a caller's finite pipeline would otherwise
     stop the run one pass in."""
-    stream = Dataset.from_grain(_grain_points(8), batch=4, **WORKERS).train()
+    stream = Dataset.from_grain(_grain_points(8), batch=4, **WORKERS).train(DataPartition())
 
     assert len(_indices(stream, 6)) == 6
 
 
 def test_from_grain_takes_a_streamed_pipeline_and_carries_grains_own_state():
-    """An IterDataset has no index, so it is batched where it is and reports
-    the position grain keeps for it."""
-    rows = pygrain.MapDataset.source(_Points(8)).repeat(None).to_iter_dataset()
+    """An IterDataset has no index, so the caller builds the one a share
+    reads, it is batched where it is and it reports the position grain keeps
+    for it."""
+    def rows(partition):
+        return pygrain.MapDataset.source(_Points(8))[partition.index::partition.count].repeat(
+            None).to_iter_dataset()
+
     data = Dataset.from_grain(rows, batch=4, records=8, **WORKERS)
 
-    stream = data.train()
+    stream = data.train(DataPartition())
     assert isinstance(stream, Checkpointable)
     first = _indices(stream, 1)
     state = stream.get_state()
     rest = _indices(stream, 1)
 
-    resumed = data.train()
+    resumed = data.train(DataPartition())
     resumed.set_state(state)
     assert _indices(resumed, 1) == rest != first
 
@@ -1320,7 +1324,7 @@ def test_from_grain_scores_a_validation_pass_that_ends():
                               **WORKERS)
 
     assert data.val is not None
-    assert _indices(data.val(), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert _indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
 
 
 def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path):

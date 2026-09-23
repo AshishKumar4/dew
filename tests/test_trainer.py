@@ -22,6 +22,7 @@ from flax import linen as nn
 from dew import position
 from dew.artifacts import Representations
 from dew.config import TrainerConfig
+from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, merge, select, under
 from dew.training import (
     Checkpoints,
@@ -89,12 +90,12 @@ class Data:
         self._train, self._val = train, val
         self.batch = batch
 
-    def train(self):
+    def train(self, partition):
         return self._train()
 
     @property
     def val(self):
-        return self._val
+        return None if self._val is None else lambda partition: self._val()
 
 
 def endless():
@@ -244,9 +245,9 @@ def test_checkpoint_every_saves_on_its_own_cadence(tmp_path):
     saved = []
     real_save = trainer.checkpoints.save
 
-    def spy(step, state, position, metrics=None):
+    def spy(step, state, position, metrics=None, *, share=None):
         saved.append((step, None if metrics is None else sorted(metrics)))
-        return real_save(step, state, position, metrics)
+        return real_save(step, state, position, metrics, share=share)
 
     trainer.checkpoints.save = spy
     trainer.fit(Data(), steps=6, log_every=4, checkpoint_every=2)
@@ -455,7 +456,7 @@ def test_a_resumed_run_continues_the_data_where_it_stopped(tmp_path):
                                 jax.tree.leaves(resumed.params), strict=True):
         np.testing.assert_allclose(np.asarray(expected), np.asarray(actual), rtol=1e-6)
     # The position written at the end names the batch a resume would read next.
-    _, position = Checkpoints(str(tmp_path / "run")).restore()
+    _, position = Checkpoints(str(tmp_path / "run")).restore(share=DataPartition())
     assert json.loads(position)["index"] == 4
 
 
@@ -507,8 +508,8 @@ def stop_at_local_step(trainer, stop: int):
 
     save_local = trainer.checkpoints.save_local
 
-    def save_then_stop(step, state, position):
-        save_local(step, state, position)
+    def save_then_stop(step, state, position, *, share=None):
+        save_local(step, state, position, share=share)
         trainer.checkpoints.wait()
         if step == stop:
             raise Stop()
@@ -617,27 +618,51 @@ def test_a_checkpoint_that_does_not_land_fails_the_run(tmp_path):
         trainer.fit(Data(), steps=1, log_every=1)
 
 
-def _rewrite_position(trainer, step, rows):
-    """Save `step` again with `rows` as the checkpoint's position table."""
+def _rewrite_position(trainer, step, rows, shares=None):
+    """Save `step` again with `rows` as the checkpoint's position table, each
+    row read for the share `shares` names; no shares is a table written
+    before they were recorded."""
     restored, _ = trainer.checkpoints.restore()
     written = [np.frombuffer(row, np.uint8) for row in rows]
     table = {"rows": np.stack(written),
              "lengths": np.array([len(row) for row in written], np.int64)}
+    if shares is not None:
+        table["shares"] = np.array(shares, np.int64)
     manager = trainer.checkpoints._open()
     manager.save(step, args=ocp.args.PyTreeSave({**restored, "position": table}), force=True)
     manager.wait_until_finished()
 
 
 def test_a_position_written_by_another_process_count_is_refused(tmp_path):
-    """`Counting` reports where its own stream stopped; a table with two rows
-    has no row this single process can take over, and says so."""
+    """`Counting` reports where its own stream stopped; a table two processes
+    wrote, each over its own share, has no row the single share of one
+    process can take over, and says so."""
     trainer = make_trainer(tmp_path)
     trainer.fit(Data(), steps=1, log_every=1)
-    _, saved = trainer.checkpoints.restore()
+    _, saved = trainer.checkpoints.restore(share=DataPartition())
     _rewrite_position(trainer, 2, [saved, saved])
 
-    with pytest.raises(ValueError, match="position for each of 2 processes and this run has 1 process"):
+    with pytest.raises(ValueError, match=r"shares \[\(0, 2\), \(1, 2\)\] \(index, count\), and this "
+                                         r"reader reads share 0 of 1"):
         make_trainer(tmp_path).fit(Data(), steps=3)
+
+
+def test_a_share_offset_resumes_on_whichever_processes_read_that_share(tmp_path):
+    """Two processes that read one share, as a sequence split across them
+    does, wrote one offset twice; a single process reading that share
+    resumes from it, and a table whose readers of one share disagree is
+    refused rather than resumed from either."""
+    trainer = make_trainer(tmp_path)
+    trainer.fit(Data(), steps=1, log_every=1)
+    _, saved = trainer.checkpoints.restore(share=DataPartition())
+    _rewrite_position(trainer, 2, [saved, saved], shares=[[0, 1], [0, 1]])
+
+    assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == saved
+
+    other = json.dumps({"index": 7}).encode()
+    _rewrite_position(trainer, 3, [saved, other], shares=[[0, 1], [0, 1]])
+    with pytest.raises(ValueError, match="share 0 of 1 that differ between the processes"):
+        Checkpoints(str(tmp_path / "run")).restore(step=3, share=DataPartition())
 
 
 def test_a_global_position_is_read_by_any_process_count(tmp_path):
@@ -650,7 +675,7 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     global_position = position.encode(position.Global(records=16, order="Counting"))
     _rewrite_position(trainer, 2, [global_position, global_position])
 
-    assert Checkpoints(str(tmp_path / "run")).restore(step=2)[1] == global_position
+    assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position
 
 
 def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
@@ -663,7 +688,7 @@ def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
         for records in (16, 32)])
 
     with pytest.raises(ValueError, match="global data position that differs between the 2 processes"):
-        Checkpoints(str(tmp_path / "run")).restore(step=2)
+        Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())
 
 
 # --------------------------------------------------------------------------
@@ -874,9 +899,9 @@ def test_goodput_counts_evaluations_and_checkpoints_as_time_outside_steps(monkey
         clock.now += 5.0
         return evaluate(*args, **kwargs)
 
-    def slow_save(*args):
+    def slow_save(*args, **keywords):
         clock.now += 2.0
-        return save(*args)
+        return save(*args, **keywords)
 
     monkeypatch.setattr(trainer, "compile", compile_then_time_each_step)
     monkeypatch.setattr(trainer_module, "evaluate", slow_evaluate)

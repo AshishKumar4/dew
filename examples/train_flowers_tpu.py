@@ -41,7 +41,7 @@ from dew.eval import clip_score, fid
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
-from dew.training import MeshSpec, ProfileWindow, prepare_process
+from dew.training import MeshSpec, ProfileWindow, build_mesh, data_partition, prepare_process
 from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
@@ -160,7 +160,9 @@ def held_out(run: DiffusionRunConfig) -> np.ndarray:
     data = run.data.load(batch=run.trainer.batch_size)
     if data.val is None:
         raise ValueError("scoring FID needs a held-out split: set data.val_batches")
-    return np.concatenate([np.asarray(batch["image"], np.uint8) for batch in data.val()])
+    # This process's share of the pass on the run's plain data-parallel mesh.
+    share = data_partition(build_mesh(run.trainer.mesh))
+    return np.concatenate([np.asarray(batch["image"], np.uint8) for batch in data.val(share)])
 
 
 def grid(images: np.ndarray, path: Path) -> None:

@@ -130,7 +130,7 @@ def dataset(batch):
     rows = next(iter(batch.values())).shape[0]
     records = [{name: value[row] for name, value in batch.items()} for row in range(rows)]
     stream = grain.MapDataset.source(records).repeat().to_iter_dataset().batch(rows, drop_remainder=True)
-    return Dataset(train=lambda: iter(stream), val=None, records=rows, batch=rows)
+    return Dataset(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
 
 
 def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
@@ -256,7 +256,7 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     rows = math.lcm(2, jax.device_count())
     batch = {"text": jax.tree.map(lambda leaf: np.concatenate([leaf] * (rows // 2)), inputs)}
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
-    data = Dataset(train=lambda: iter(stream), val=None, records=rows, batch=rows)
+    data = Dataset(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
     run_key = jax.random.key(2)
     step = Step(step=jnp.asarray(0, jnp.int32),
                 key=jax.random.fold_in(jax.random.split(run_key)[1], 0), ema=None)

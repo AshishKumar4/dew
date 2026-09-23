@@ -266,7 +266,7 @@ def test_a_checkpoint_of_this_state_resumes_in_place(tmp_path):
         return Trainer(make_objective(), optax.adam(1e-3), key=jax.random.PRNGKey(0),
                        checkpoints=Checkpoints(str(tmp_path), keep=1))
 
-    data = Dataset(train=Stream, val=None, records=None, batch=8)
+    data = Dataset(train=lambda partition: Stream(), val=None, records=None, batch=8)
     first = trainer()
     first.fit(data, steps=1, log_every=100, checkpoint_every=1)
     assert first.checkpoints is not None
@@ -409,7 +409,7 @@ def test_diffusion_objective_reproduces_the_golden_fingerprint(tmp_path):
     """
     objective = make_objective()
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0))
-    data = Dataset(train=batches, val=None, records=32, batch=8)
+    data = Dataset(train=lambda partition: batches(), val=None, records=32, batch=8)
     state = trainer.fit(data, steps=5, log_every=100)
 
     assert int(state.step) == 5

@@ -38,7 +38,6 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import grain.python as pygrain
-import jax
 import numpy as np
 
 from dew.registry import datasets
@@ -46,12 +45,13 @@ from dew.registry import datasets
 from .dataset import (
     Batch,
     Corpus,
+    DataPartition,
     Dataset,
     DatasetSpec,
     Loading,
+    Reader,
     Records,
     Tokenize,
-    local_batch,
     mixed_counts,
     mixed_records,
     mixed_stream,
@@ -108,9 +108,8 @@ def corpora_dataset(train: Sequence[Corpus], held: Sequence[Corpus] | None,
     ordered pass, a mixture's mixed at the same weights with each split in
     its own order, bounded by `val_batches`.
     """
-    rows = local_batch(batch)
     if len(train) == 1:
-        stream = train_stream(train[0].source, operations, batch=rows, seed=seed,
+        stream = train_stream(train[0].source, operations, batch=batch, seed=seed,
                               loading=loading, offset=train[0].offset)
         pass_records = counted(train[0].source, records, train[0].name)
     else:
@@ -119,12 +118,12 @@ def corpora_dataset(train: Sequence[Corpus], held: Sequence[Corpus] | None,
                 "a mixture's pass is the records in which every corpus has been "
                 "read at least once, which its corpora's lengths and weights give, "
                 "so it takes no records=")
-        stream = mixed_stream(train, operations, batch=rows, seed=seed, loading=loading)
+        stream = mixed_stream(train, operations, batch=batch, seed=seed, loading=loading)
         pass_records = mixed_records(train)
     validation = None
     if held is not None:
         ordered = held[0].source if len(held) == 1 else mixture(held, None)
-        validation = bounded(validation_pass(ordered, operations, batch=rows, seed=seed,
+        validation = bounded(validation_pass(ordered, operations, batch=batch, seed=seed,
                                              loading=loading), val_batches)
     return Dataset(train=stream, val=validation, records=pass_records, batch=batch)
 
@@ -352,13 +351,12 @@ class HubDataset(ProviderDataset):
         from .sources.hf import HFDatasetSource
 
         source = HFDatasetSource(split=self.split, dataset=dataset)
-        rows = local_batch(batch)
         return Dataset(
-            train=train_stream(source, self.transforms, batch=rows, seed=self.seed,
+            train=train_stream(source, self.transforms, batch=batch, seed=self.seed,
                                loading=self.loading),
             val=None if self.val_split is None else bounded(
                 validation_pass(HFDatasetSource(split=self.val_split, dataset=dataset),
-                                self.transforms, batch=rows, seed=self.seed,
+                                self.transforms, batch=batch, seed=self.seed,
                                 loading=self.loading), self.val_batches),
             records=counted(source, self.records, _GIVEN),
             batch=batch)
@@ -375,16 +373,16 @@ class HubDataset(ProviderDataset):
                 "splits read at random, or train on one stream")
         if self.records is not None and self.records < 1:
             raise ValueError("records over a stream is a positive count or None")
-        name, rows = next(iter(named)), local_batch(batch)
+        name = next(iter(named))
         return Dataset(
             train=_stream(name, self.split, options=self.options, dataset=dataset,
-                          batch=rows, seed=self.seed, shuffle_buffer=self.shuffle_buffer,
+                          batch=batch, seed=self.seed, shuffle_buffer=self.shuffle_buffer,
                           loading=self.loading, epochs=None, preprocess=self.preprocess),
             # A validation pass is the split in its own order and is never
             # shuffled; a score over other rows every time is not a score.
             val=None if self.val_split is None else bounded(
                 _stream(name, self.val_split, options=self.options, dataset=dataset,
-                        batch=rows, seed=self.seed, shuffle_buffer=0,
+                        batch=batch, seed=self.seed, shuffle_buffer=0,
                         loading=self.loading, epochs=1, preprocess=self.preprocess),
                 self.val_batches),
             records=self.records,
@@ -465,13 +463,14 @@ def _sources(source: Named) -> tuple[str, Named]:
 def _stream(name: str, split: str, *, options: HFOptions,
             dataset: ArrowDataset | IterableDataset | None, batch: int, seed: int,
             shuffle_buffer: int, loading: Loading, epochs: int | None,
-            preprocess: Preprocess | None) -> Callable[[], Iterator[Batch]]:
-    """Opens one process's share of a streamed split, once per call.
+            preprocess: Preprocess | None) -> Reader:
+    """Opens one share of a streamed split, once per call.
 
     The rows are grain's from the first stage on. The per-record transform is
-    `random_map`, the batch is `batch`, and the buffer ahead of the step is
-    grain's thread prefetch, bounded by `Loading.worker_buffer` batches. The
-    position is handed on only where the rows can be put back exactly.
+    `random_map`, the share's rows of the global `batch` are one batch, and
+    the buffer ahead of the step is grain's thread prefetch, bounded by
+    `Loading.worker_buffer` batches. The position is handed on only where the
+    rows can be put back exactly.
     """
     from grain.experimental import ThreadPrefetchIterDataset
 
@@ -492,16 +491,16 @@ def _stream(name: str, split: str, *, options: HFOptions,
 
     where = f"{name!r} split {split!r}" if dataset is None else "the given dataset"
 
-    def stream() -> Iterator[Batch]:
-        source = HFRows(open_split, what=where, seed=seed, rank=jax.process_index(),
-                        world_size=jax.process_count(),
+    def stream(partition: DataPartition) -> Iterator[Batch]:
+        source = HFRows(open_split, what=where, seed=seed, rank=partition.index,
+                        world_size=partition.count,
                         shuffle_buffer=shuffle_buffer, epochs=epochs,
                         given=dataset is not None)
         piped: pygrain.IterDataset = source
         if preprocess is not None:
             piped = piped.random_map(Preprocessing(preprocess), seed=seed)
         batches = ThreadPrefetchIterDataset(
-            piped.batch(batch, drop_remainder=True),
+            piped.batch(partition.rows(batch), drop_remainder=True),
             prefetch_buffer_size=max(1, loading.worker_buffer))
         reads = iter(batches)
         return reads if source.resumable else Unresumable(reads)

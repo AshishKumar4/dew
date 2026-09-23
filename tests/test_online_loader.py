@@ -28,7 +28,7 @@ import optax
 import PIL.Image
 import pytest
 
-from dew.data import Loading, online_loader
+from dew.data import DataPartition, Loading, online_loader
 from dew.data.online_loader import Fetch, ImageStream
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -433,7 +433,7 @@ def test_the_streaming_spec_repeats_its_records_instead_of_ending(monkeypatch):
     loop and a run bounds training by steps, so `for batch in loader` must not
     stop at the end of the dataset."""
     rows, batch, passes = 12, 4, 3
-    with closing(_online_spec(monkeypatch, rows, passes).load(batch=batch).train()) as loader:
+    with closing(_online_spec(monkeypatch, rows, passes).load(batch=batch).train(DataPartition())) as loader:
 
         seen = [[int(v) for v in next(loader)["image"][:, 0, 0, 0]]
                 for _ in range(rows // batch * passes)]
@@ -452,7 +452,7 @@ def test_the_streaming_spec_reports_its_records_and_holds_nothing_out(monkeypatc
 
     assert data.records == 12 and data.batch == 4 and data.steps_per_epoch == 3
     assert data.val is None
-    with closing(data.train()) as stream:
+    with closing(data.train(DataPartition())) as stream:
         assert len(next(stream)["image"]) == 4
 
 
@@ -470,7 +470,7 @@ def test_the_streaming_spec_opens_nothing_before_the_stream_is_asked_for(monkeyp
     monkeypatch.setattr(online_loader, "fetch_rows", produce)
     assert started == []
 
-    with closing(data.train()) as stream:
+    with closing(data.train(DataPartition())) as stream:
         assert len(next(stream)["image"]) == 4
         assert len(started) == 1
 
@@ -493,7 +493,7 @@ def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
                         functools.partial(ImageStream, queue_timeout=0.05))
     monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubRows(4))
     with closing(OnlineImages(sources=("fake_online",), image_size=4,
-                          loading=Loading(workers=1)).load(batch=4).train()) as loader:
+                          loading=Loading(workers=1)).load(batch=4).train(DataPartition())) as loader:
 
         assert len(next(loader)["image"]) == 4
         with pytest.raises(StopIteration):
@@ -526,7 +526,7 @@ def test_the_streaming_spec_cannot_report_a_position(monkeypatch):
     fetch stream carries no get_state, and `tokenized` does not invent one."""
     data = _online_spec(monkeypatch, 12, 1).load(batch=4)
 
-    with closing(data.train()) as stream:
+    with closing(data.train(DataPartition())) as stream:
         assert not hasattr(stream, "get_state") and not hasattr(stream, "set_state")
 
 

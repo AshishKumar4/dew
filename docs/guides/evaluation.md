@@ -22,8 +22,8 @@ from dew.objectives.lm import LMObjective
 
 train_tokens = np.tile(np.array([0, 1, 2, 3, 0, 1, 2, 3, 0], np.int32), (8, 1))
 val_tokens = np.tile(np.array([1, 2, 3, 0, 1, 2, 3, 0, 1], np.int32), (8, 1))
-data = Dataset(train=lambda: itertools.repeat({"text": train_tokens}),
-               val=lambda: iter([{"text": val_tokens}]), records=8, batch=8)
+data = Dataset(train=lambda partition: itertools.repeat({"text": train_tokens}),
+               val=lambda partition: iter([{"text": val_tokens}]), records=8, batch=8)
 model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
                           dtype="float32", attention_impl="xla")

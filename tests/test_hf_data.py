@@ -23,7 +23,7 @@ import grain.python as pygrain
 
 datasets = pytest.importorskip("datasets")
 
-from dew.data import HFImages, HFOptions, Loading  # noqa: E402
+from dew.data import DataPartition, HFImages, HFOptions, Loading  # noqa: E402
 from dew.data.sources.hf import HFDatasetSource  # noqa: E402
 
 RECORDS = 16
@@ -206,7 +206,7 @@ def test_a_hub_dataset_spec_builds_the_image_pipeline(hub):
     assert hub == [{"name": "acme/pets", "split": "train"}]
     assert data.records == RECORDS and data.val is None
 
-    batch = next(data.train())
+    batch = next(data.train(DataPartition()))
     assert batch["image"].shape == (4, SCALE, SCALE, 3)
     # The train stream shuffles, so the captions are the table's, in some order.
     assert set(map(str, batch["caption"])) <= set(_captions(*range(RECORDS)))
@@ -259,7 +259,7 @@ def test_the_caption_comes_from_the_record(hub):
     caption belongs in which row is known here.
     """
     data = _hub_images(val_batches=1).load(batch=2, tokenize=keep_captions)
-    batch = next(data.val())
+    batch = next(data.val(DataPartition()))
 
     assert list(map(str, batch["caption"])) == _captions(0, 1)
 
@@ -273,8 +273,8 @@ def test_a_hub_dataset_scores_a_named_split_instead_of_the_head(hub):
 
     assert data.records == RECORDS, "the named split holds nothing out"
     assert data.val is not None
-    assert len(list(data.val())) == 1, "val_batches bounds the pass"
-    assert list(map(str, next(data.val())["caption"])) == _captions(0, 1, 2, 3)
+    assert len(list(data.val(DataPartition()))) == 1, "val_batches bounds the pass"
+    assert list(map(str, next(data.val(DataPartition()))["caption"])) == _captions(0, 1, 2, 3)
     # The training records come from `split` and the pass from `val_split`,
     # each opened as its own source.
     assert {call["split"] for call in hub} == {"train", "validation"}
@@ -284,7 +284,7 @@ def test_a_hub_dataset_holds_its_validation_batches_out_of_training(hub):
     data = _hub_images(val_batches=1).load(batch=4, tokenize=keep_captions)
 
     assert data.records == RECORDS - 4 and data.steps_per_epoch == 3
-    batch = next(data.val())
+    batch = next(data.val(DataPartition()))
     assert batch["image"].shape == (4, SCALE, SCALE, 3)
     # The held-out records, in table order.
     assert list(map(str, batch["caption"])) == _captions(0, 1, 2, 3)

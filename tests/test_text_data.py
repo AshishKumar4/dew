@@ -23,7 +23,7 @@ import pytest
 
 import grain.python as pygrain
 
-from dew.data import ByteTokenizer, Loading, PackedTokens, TokenWindows
+from dew.data import ByteTokenizer, DataPartition, Loading, PackedTokens, TokenWindows
 from dew.data.dataset import describe
 from dew.data.tokens import PackedWindows
 from dew.data.sources.text import (
@@ -260,8 +260,8 @@ def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
 
     assert data.records == 16 and data.batch == batch and data.steps_per_epoch == 4
 
-    for batches, windows, first in ((itertools.islice(data.train(), 4), 16, 5 * seq_len),
-                                    (data.val(), 4, 0)):
+    for batches, windows, first in ((itertools.islice(data.train(DataPartition()), 4), 16, 5 * seq_len),
+                                    (data.val(DataPartition()), 4, 0)):
         rows = np.concatenate([b["text"] for b in batches])
         assert rows.shape == (windows, seq_len + 1) and rows.dtype == np.int32
         starts = rows[:, 0] - first
@@ -269,7 +269,7 @@ def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
         assert np.array_equal(rows, starts[:, None] + first + np.arange(seq_len + 1)), \
             "each row is seq_len + 1 consecutive tokens"
 
-    val_rows = np.concatenate([b["text"] for b in data.val()])
+    val_rows = np.concatenate([b["text"] for b in data.val(DataPartition())])
     assert np.array_equal(val_rows[:-1, -1], val_rows[1:, 0]), "the pass is in order"
 
 
@@ -285,7 +285,7 @@ def test_token_loader_val_is_unshuffled_and_disjoint_from_train(tmp_path):
 
     data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
-    val_batches = [b["text"] for b in data.val()]
+    val_batches = [b["text"] for b in data.val(DataPartition())]
     assert len(val_batches) == 2  # 8 windows, batch 4, drop_remainder
     # Unshuffled: windows come in file order, each overlapping the next by one.
     np.testing.assert_array_equal(val_batches[0][0], val_tokens[:seq_len + 1])
@@ -294,7 +294,7 @@ def test_token_loader_val_is_unshuffled_and_disjoint_from_train(tmp_path):
 
     # Train and val are disjoint files: no train window equals a val window.
     train_windows = {w.tobytes() for w in np.concatenate(
-        [b["text"] for b in itertools.islice(data.train(), data.steps_per_epoch)])}
+        [b["text"] for b in itertools.islice(data.train(DataPartition()), data.steps_per_epoch)])}
     val_windows = {w.tobytes() for w in np.concatenate(val_batches)}
     assert not (train_windows & val_windows)
 
@@ -313,7 +313,7 @@ def test_token_loader_validation_pass_reads_every_window_once(tmp_path, worker_c
 
     data = _windows(tmp_path, seq_len=seq_len, seed=0, loading=Loading(workers=worker_count)).load(batch=4)
 
-    windows = [list(window) for batch in itertools.islice(data.val(), 12)
+    windows = [list(window) for batch in itertools.islice(data.val(DataPartition()), 12)
                for window in batch["text"]]
     assert windows == [list(val_tokens[start:start + seq_len + 1])
                        for start in range(0, 12 * seq_len, seq_len)]
@@ -327,7 +327,7 @@ def test_token_loader_records_do_not_depend_on_worker_count(tmp_path):
     def by_record(worker_count):
         data = _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=worker_count)).load(batch=4)
         out = {}
-        for b in itertools.islice(data.train(), data.steps_per_epoch):
+        for b in itertools.islice(data.train(DataPartition()), data.steps_per_epoch):
             for row in b["text"]:
                 # First token ids a window; the tail keeps the record's identity.
                 out[int(row[0]) * 4096 + int(row[-1])] = row.tobytes()
@@ -347,7 +347,7 @@ def test_token_loader_seeds_its_train_sampler(tmp_path):
 
     def first_batch(seed):
         data = _windows(tmp_path, seq_len=seq_len, seed=seed, loading=Loading(workers=0)).load(batch=4)
-        return next(data.train())["text"]
+        return next(data.train(DataPartition()))["text"]
 
     assert np.array_equal(first_batch(0), first_batch(0))
     assert not np.array_equal(first_batch(0), first_batch(1))
@@ -364,7 +364,7 @@ def test_a_registered_token_spec_reads_the_directory(tmp_path):
 
     data = datasets.build("token_windows", path=str(tmp_path), seq_len=seq_len,
                           loading=Loading(workers=0)).load(batch=4)
-    batch = next(data.train())
+    batch = next(data.train(DataPartition()))
     assert batch["text"].shape == (4, seq_len + 1)
     assert batch["text"].dtype == np.int32
     assert data.records == 40 and data.batch == 4
@@ -519,7 +519,7 @@ def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
 
     # Two windows hold the three documents, and records is that pass exactly.
     assert data.records == 2 and data.batch == 2 and data.steps_per_epoch == 1
-    batch = next(data.val())
+    batch = next(data.val(DataPartition()))
 
     for key in ("text", "text_segment_ids", "text_positions"):
         assert batch[key].shape == (2, seq_len + 1)
@@ -543,8 +543,8 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
     _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document
     data = _packed_tokens(tmp_path, seq_len=seq_len, packing_bins=1).load(batch=1)
 
-    rows = [batch["text"][0] for batch in data.val()]
-    positions = [batch["text_positions"][0] for batch in data.val()]
+    rows = [batch["text"][0] for batch in data.val(DataPartition())]
+    positions = [batch["text_positions"][0] for batch in data.val(DataPartition())]
     assert len(rows) == 3  # ceil(10 / 4) pieces, one per window
     np.testing.assert_array_equal(np.concatenate(rows)[:10],
                                   list(range(10, 19)) + [0])
@@ -559,7 +559,7 @@ def test_packed_loader_lengths_count_windows_not_documents(tmp_path):
     data = _packed_tokens(tmp_path, seq_len=seq_len, packing_bins=1).load(batch=1)
 
     assert data.records == 3
-    assert len(list(data.val())) == 3, "the length is not the pass it counts"
+    assert len(list(data.val(DataPartition()))) == 3, "the length is not the pass it counts"
 
 
 def test_packed_loader_state_restores_the_next_unseen_batch(tmp_path):
@@ -568,12 +568,12 @@ def test_packed_loader_state_restores_the_next_unseen_batch(tmp_path):
     _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 60, 3)])
     data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)
 
-    iterator = data.val()
+    iterator = data.val(DataPartition())
     next(iterator)
     state = iterator.get_state()
     expected = [next(iterator)["text"] for _ in range(2)]
 
-    restored = data.val()
+    restored = data.val(DataPartition())
     restored.set_state(state)
     for wanted, got in zip(expected, [next(restored)["text"] for _ in range(2)]):
         np.testing.assert_array_equal(wanted, got)
@@ -585,7 +585,7 @@ def test_packed_loader_windows_do_not_depend_on_worker_count(tmp_path):
     def windows(worker_count):
         data = _packed_tokens(tmp_path, seq_len=8, loading=Loading(workers=worker_count, worker_buffer=1),
                               packing_bins=2).load(batch=2)
-        return sorted(row.tobytes() for batch in data.val()
+        return sorted(row.tobytes() for batch in data.val(DataPartition())
                       for row in batch["text"])
 
     serial = windows(0)
@@ -599,7 +599,7 @@ def test_packed_train_stream_does_not_end_with_the_documents(tmp_path):
     _document_dir(tmp_path, [[i, i + 1] for i in range(10, 30, 2)])
     data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)
 
-    iterator = data.train()
+    iterator = data.train(DataPartition())
     assert len([next(iterator)["text"] for _ in range(20)]) == 20
 
 
@@ -611,7 +611,7 @@ def test_a_packed_validation_pass_covers_the_split_once(tmp_path):
     _document_dir(tmp_path, documents)
     data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)
 
-    batches = list(itertools.islice(data.val(), 20))
+    batches = list(itertools.islice(data.val(DataPartition()), 20))
     # Ten documents of three ids (the eos counts) pack three to a nine-id
     # window, so four windows and two batches of two.
     assert len(batches) == 2
@@ -624,10 +624,10 @@ def test_a_packed_validation_pass_covers_the_split_once(tmp_path):
 def test_only_the_packed_spec_carries_segment_ids_and_positions(tmp_path):
     _document_dir(tmp_path, [[10, 11, 12], [20, 21, 22, 23], [30, 31]])
 
-    packed = next(_packed_tokens(tmp_path, seq_len=8).load(batch=2).train())
+    packed = next(_packed_tokens(tmp_path, seq_len=8).load(batch=2).train(DataPartition()))
     assert set(packed) == {"text", "text_segment_ids", "text_positions"}
 
-    fixed = next(_windows(tmp_path, seq_len=8).load(batch=2).train())
+    fixed = next(_windows(tmp_path, seq_len=8).load(batch=2).train(DataPartition()))
     assert set(fixed) == {"text"}, "the fixed-window loader grew packing keys"
 
 
@@ -652,7 +652,7 @@ def test_a_single_file_corpus_packs_when_its_val_split_holds_no_eos(tmp_path):
 
     seq_len = 63
     data = _packed_tokens(out, seq_len=seq_len).load(batch=1)
-    row = next(data.val())
+    row = next(data.val(DataPartition()))
 
     padding = seq_len + 1 - len(val_tokens)
     np.testing.assert_array_equal(row["text"][0], val_tokens + [0] * padding)
@@ -692,7 +692,7 @@ def test_a_token_validation_pass_ends_when_the_split_runs_out(tmp_path):
     _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len)
     data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
-    batches, ended = _bounded(data.val(), 3)
+    batches, ended = _bounded(data.val(DataPartition()), 3)
 
     assert len(batches) == 2 and ended, ENDLESS_VAL
     assert len(set(_rows(batches))) == 8, "a pass must not repeat a window"
@@ -711,7 +711,7 @@ def test_a_token_validation_pass_stops_at_the_last_full_batch(tmp_path):
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
     data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
-    batches, ended = _bounded(data.val(), 3)
+    batches, ended = _bounded(data.val(DataPartition()), 3)
 
     assert len(batches) == 10 // 4 and ended, ENDLESS_VAL
     assert len(set(_rows(batches))) == 8, "a pass must not repeat a window"
@@ -728,10 +728,10 @@ def test_a_packed_validation_pass_reads_each_window_once_and_stops(tmp_path):
     _document_dir(tmp_path, documents)
     data = _packed_tokens(tmp_path, seq_len=8, packing_bins=2).load(batch=2)
 
-    batches, ended = _bounded(data.val(), 2 + len(documents))
+    batches, ended = _bounded(data.val(DataPartition()), 2 + len(documents))
     heads = [int(t) for batch in batches for row in batch["text"] for t in row
              if int(t) in {d[0] for d in documents}]
-    again, _ = _bounded(data.val(), len(batches))
+    again, _ = _bounded(data.val(DataPartition()), len(batches))
 
     assert ended, ENDLESS_VAL
     assert all(batch["text"].shape[0] == 2 for batch in batches)
@@ -745,11 +745,11 @@ def test_val_batches_bounds_a_validation_pass(tmp_path):
     seq_len = 4
     _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len)
 
-    batches, ended = _bounded(_windows(tmp_path, seq_len=seq_len).load(batch=4).val(), 3)
+    batches, ended = _bounded(_windows(tmp_path, seq_len=seq_len).load(batch=4).val(DataPartition()), 3)
     assert len(batches) == 2 and ended, ENDLESS_VAL
 
     batches, ended = _bounded(
-        _windows(tmp_path, seq_len=seq_len, val_batches=1).load(batch=4).val(), 3)
+        _windows(tmp_path, seq_len=seq_len, val_batches=1).load(batch=4).val(DataPartition()), 3)
     assert len(batches) == 1 and ended
     np.testing.assert_array_equal(batches[0]["text"][0],
                                   np.fromfile(tmp_path / "val.bin", "<u2")[:seq_len + 1])
@@ -763,7 +763,7 @@ def test_the_token_training_stream_repeats_rather_than_ending(tmp_path):
     data = _windows(tmp_path, seq_len=seq_len).load(batch=4)
 
     epoch = data.records // 4
-    batches, ended = _bounded(data.train(), 3 * epoch)
+    batches, ended = _bounded(data.train(DataPartition()), 3 * epoch)
 
     assert data.records == 8 and not ended
     assert len(batches) == 3 * epoch
@@ -786,7 +786,7 @@ def _packed(tmp_path, documents, seq_len, batch=1, bins=4):
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
     (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
     return list(_packed_tokens(tmp_path, seq_len=seq_len, packing_bins=bins)
-                .load(batch=batch).val())
+                .load(batch=batch).val(DataPartition()))
 
 
 def _tiny_backbone(seq_len):
@@ -986,7 +986,7 @@ def test_token_windows_are_the_same_records_at_every_worker_count(tmp_path,
     def windows(workers):
         data = _windows(tmp_path, seq_len=seq_len, seed=7, loading=Loading(workers=workers)).load(batch=4)
         return sorted(row.tobytes()
-                      for batch in itertools.islice(data.train(), data.steps_per_epoch)
+                      for batch in itertools.islice(data.train(DataPartition()), data.steps_per_epoch)
                       for row in batch["text"])
 
     serial = windows(0)
@@ -1008,13 +1008,13 @@ def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
 
     data = loader()
     epoch = data.steps_per_epoch  # 32 windows in eight batches
-    interrupted = data.train()
+    interrupted = data.train(DataPartition())
     seen = [row.tobytes() for row in next(interrupted)["text"]]
     state = interrupted.get_state()
     rest = list(itertools.islice(interrupted, 2 * epoch - 1))
     unseen = [row.tobytes() for batch in rest for row in batch["text"]]
 
-    restored = loader().train()
+    restored = loader().train(DataPartition())
     restored.set_state(state)
     after = list(itertools.islice(restored, 2 * epoch - 1))
     resumed = [row.tobytes() for batch in after for row in batch["text"]]
@@ -1036,13 +1036,13 @@ def test_an_interrupted_packed_epoch_resumes_through_mp_prefetch(tmp_path):
         return _packed_tokens(tmp_path, seq_len=8, loading=Loading(workers=2, worker_buffer=1),
                               packing_bins=2).load(batch=2)
 
-    interrupted = loader().val()
+    interrupted = loader().val(DataPartition())
     seen = [row.tobytes() for row in next(interrupted)["text"]]
     state = interrupted.get_state()
     rest, ended = _bounded(interrupted, 40)
     unseen = [row.tobytes() for batch in rest for row in batch["text"]]
 
-    restored = loader().val()
+    restored = loader().val(DataPartition())
     restored.set_state(state)
     after, ended_again = _bounded(restored, 40)
     resumed = [row.tobytes() for batch in after for row in batch["text"]]

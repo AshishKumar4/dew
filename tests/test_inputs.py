@@ -110,7 +110,7 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     assert placed["text"].tokens.dtype == jnp.int32
     assert placed["text"].conditioning["pixel_values"].dtype == jnp.float32
     assert "attention_mask" not in placed["text"].token_fields
-    row_axes = ("data", "expert", "fsdp", "tensor")
+    row_axes = ("data", "expert", "fsdp")
     assert placed["text"].tokens.sharding == NamedSharding(mesh, P(row_axes, "sequence"))
     assert placed["text"].conditioning["pixel_values"].sharding == NamedSharding(mesh, P(row_axes))
     assert placed["labels"].sharding == NamedSharding(mesh, P(row_axes))

@@ -8,6 +8,8 @@ did. A fit on each of the sim-mesh topologies trains the same losses:
 sharding moves values, never changes them.
 """
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -53,8 +55,7 @@ def variables():
 
 
 def tensor_layout():
-    rules = dict(Layout().rules)
-    rules.update(TENSOR_RULES)
+    rules = tuple((name, TENSOR_RULES.get(name, axes)) for name, axes in Layout().rules)
     return Layout(rules=rules, min_shard=TINY_SHARD)
 
 
@@ -145,7 +146,7 @@ def test_a_width_the_sequence_axis_cannot_split_stays_replicated():
     mesh = build_mesh(MeshSpec(fsdp=4, sequence=2))
     batch = shard_batch(mesh, np.zeros((BATCH, SEQ_LEN + 1), np.float32))
 
-    assert batch.sharding.spec == P(("data", "expert", "fsdp", "tensor"))
+    assert batch.sharding.spec == P(("data", "expert", "fsdp"))
     assert batch.addressable_shards[0].data.shape == (BATCH // 4, SEQ_LEN + 1)
 
 
@@ -157,8 +158,8 @@ def test_an_image_batch_never_takes_the_sequence_axis():
     images = np.zeros((BATCH, 8, 8, 3), np.float32)
     batch = shard_batch(mesh, {"image": images, "label": np.zeros((BATCH,), np.int32)})
 
-    assert batch["image"].sharding.spec == P(("data", "expert", "fsdp", "tensor"))
-    assert batch["label"].sharding.spec == P(("data", "expert", "fsdp", "tensor"))
+    assert batch["image"].sharding.spec == P(("data", "expert", "fsdp"))
+    assert batch["label"].sharding.spec == P(("data", "expert", "fsdp"))
     assert batch_shardings(mesh, batch)["image"].spec == batch["image"].sharding.spec
 
 
@@ -190,7 +191,7 @@ def run_losses(mesh, layout, steps):
     trainer = Trainer(
         LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
         mesh=mesh, layout=layout, tracker=tracker)
-    trainer.fit(Dataset(train=token_batches, val=None, records=None, batch=BATCH),
+    trainer.fit(Dataset(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
                 steps=steps, log_every=1)
     return [entry["train/loss"] for entry in tracker.scalars if "train/loss" in entry]
 
@@ -312,3 +313,92 @@ def test_a_dit_steps_under_a_tensor_axis():
     assert jax.tree.all(jax.tree.map(
         lambda leaf, sharding: leaf.sharding == sharding, placed, shardings))
     layout.check(placed["params"], shardings["params"], mesh)
+
+
+COLLECTIVE = re.compile(
+    r"^\s*(?:ROOT\s+)?%\S+\s+=\s+(?P<shape>.+?)\s+"
+    r"(?P<op>all-reduce|all-gather|reduce-scatter|all-to-all|collective-permute)(?:-start)?\(")
+ARRAY = re.compile(r"[a-z]+\d*\[([\d,]*)\]")
+
+
+def collectives(spec, model):
+    """`(op, result shapes)` of every collective one loss-and-gradient step of
+    an LM objective over `model` compiles to under `spec` on four devices."""
+    mesh = build_mesh(spec, jax.devices()[:4])
+    objective = LMObjective(model, SEQ_LEN)
+    initial = jax.eval_shape(objective.init, jax.random.key(0))
+    shardings = Layout(min_shard=TINY_SHARD).shardings(mesh, initial)
+    tokens = jax.ShapeDtypeStruct((BATCH, SEQ_LEN + 1), jnp.int32,
+                                  sharding=batch_shardings(mesh, {"text": np.zeros((BATCH, SEQ_LEN + 1))})["text"])
+
+    def loss(params, rest, text):
+        return scalar_loss(objective, {**rest, "params": params}, {"text": text},
+                           Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None))[0]
+
+    placed = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
+                          initial, shardings)
+    rest = {name: value for name, value in placed.items() if name != "params"}
+    with jax.set_mesh(mesh):
+        # The gradient lands where its parameter is, as the optimizer reads it.
+        text = jax.jit(jax.grad(loss), out_shardings=shardings["params"]).lower(
+            placed["params"], rest, tokens).compile().as_text()
+    found = []
+    for line in text.splitlines():
+        match = COLLECTIVE.match(line)
+        if match:
+            shapes = [tuple(int(size) for size in dims.split(",") if size)
+                      for dims in ARRAY.findall(match["shape"])]
+            found.append((match["op"], shapes))
+    return found
+
+
+def wide():
+    """A decoder wide enough that GSPMD, placing activations from the weights,
+    splits their width over four fsdp shards; no weight is as long as the
+    batch's 128 tokens."""
+    return models.build(
+        "causal_transformer", vocab_size=VOCAB, emb_features=96, num_layers=2,
+        num_heads=8, num_kv_heads=4, mlp_features=192, max_seq_len=SEQ_LEN)
+
+
+def test_fsdp_sums_no_activation_across_devices():
+    """Fully sharded data parallelism gathers each weight and splits the rows.
+    GSPMD, left to place the activations from the weights around them, split
+    the residual width where fsdp splits the matrices and all-reduced every
+    projection's partial products instead: arrays of a batch's rows and
+    positions, where the only sums fsdp needs are gradients, of matrices at
+    most. (The CPU backend all-reduces the gradients whole and slices them
+    rather than reduce-scattering them, so their shapes say nothing here.)"""
+    summed = [shape for op, shapes in collectives(MeshSpec(fsdp=4), wide())
+              if op == "all-reduce" for shape in shapes]
+
+    assert summed and all(len(shape) <= 2 for shape in summed), summed
+
+
+def test_the_loss_scores_each_devices_own_tokens():
+    """The cross entropy walks its tokens in tiles, and GSPMD computed those
+    on the whole of every token's hidden state, gathered onto every device:
+    the head's work times the device count. Scored on each device's own
+    rows, only the head and its gradient cross devices."""
+    tokens = BATCH * SEQ_LEN
+    gathered = [shape for op, shapes in collectives(MeshSpec(fsdp=4), wide())
+                if op == "all-gather" for shape in shapes]
+
+    assert not [shape for shape in gathered
+                if shape[:2] == (BATCH, SEQ_LEN) or shape[:1] == (tokens,)], gathered
+
+
+def test_tensor_parallelism_keeps_every_projection_weight_in_place():
+    """Megatron's split computes each projection on the shard of the weight a
+    device holds and sums the row-parallel outputs; it never gathers a
+    projection's weight. Without the activations placed, GSPMD compiled the
+    tensor axis to the collectives of fsdp: every weight gathered whole. Every
+    head a shard of its own, and a vocabulary no projection's shape shares."""
+    model = models.build(
+        "causal_transformer", vocab_size=96, emb_features=32, num_layers=2,
+        num_heads=4, num_kv_heads=4, mlp_features=64, max_seq_len=SEQ_LEN)
+    projections = {(32, 32), (32, 64), (64, 32)}
+    gathered = [shape for op, shapes in collectives(MeshSpec(tensor=4), model)
+                if op == "all-gather" for shape in shapes]
+
+    assert not projections & set(gathered), gathered

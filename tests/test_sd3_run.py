@@ -107,7 +107,7 @@ def test_one_trainer_step_and_a_sample(tmp_path):
     objective = config.build()
 
 
-    data = Dataset(train=batches(objective), val=None, records=None, batch=BATCH)
+    data = Dataset(train=lambda partition: batches(objective)(), val=None, records=None, batch=BATCH)
     state = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0)).fit(
         data, steps=2, log_every=100)
     assert int(state.step) == 2
@@ -136,7 +136,7 @@ def test_the_frozen_text_tower_is_not_optimized(tmp_path):
     objective = config.build()
     loaded = objective.inputs.conditions["textcontext"].encoder.params["params"]
 
-    data = Dataset(train=batches(objective), val=None, records=None, batch=BATCH)
+    data = Dataset(train=lambda partition: batches(objective)(), val=None, records=None, batch=BATCH)
     state = Trainer(objective, optax.adam(1e-1), key=jax.random.PRNGKey(0)).fit(
         data, steps=2, log_every=100)
 
