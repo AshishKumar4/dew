@@ -10,6 +10,7 @@ import importlib.util
 import itertools
 import json
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -256,6 +257,21 @@ def test_train_rlvr_turns_feed_a_failed_attempt_back_and_run_each_program_once()
     assert second.prompt_ids == (*first.prompt_ids, *first.sampled_ids, 7, 7)
     assert pack([session], 32)["text_segment_ids"].max() == 1
     assert runs == ["5 5", "6 6"]
+
+
+def test_train_harbor_waits_for_the_gateway_it_is_told_to_launch(tmp_path):
+    """The real path writes the served policy and then waits for the gateway the user starts; with none
+    up it gives up with the readiness error instead of failing on the first gateway call."""
+    example = load_example("train_harbor")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    config = example.Config(model=str(REPO_ROOT / "tests/fixtures/hf/qwen2-tiny"), tasks=(tmp_path,), width=64,
+                            gateway=f"http://127.0.0.1:{port}", served=tmp_path / "served", out=tmp_path / "out",
+                            ready_timeout=1.0)
+    with pytest.raises(RuntimeError, match="no healthy worker"):
+        example.main(config)
+    assert (tmp_path / "served" / "config.json").is_file()
 
 
 def test_train_harbor_smoke_trains_on_gateway_recorded_harness_calls(tmp_path):

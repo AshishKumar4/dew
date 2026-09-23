@@ -15,7 +15,7 @@ sampled ids only. `Publication` pushes each version to every engine with
 version it was sampled under.
 
 The example writes the policy to `--served` and then waits, up to
-`HarborSource`'s ready timeout, for the gateway to route to an engine:
+`--ready-timeout` seconds, for the gateway to route to an engine:
 launch the engines on `--served` (vLLM with `VLLM_SERVER_DEV_MODE=1`) and
 the gateway in front of them while it waits, as
 docs/concepts/post_training.md describes (warm each engine, size the
@@ -82,6 +82,8 @@ class Config:
     learning_rate: float = 1e-6
     max_lag: int = 1
     truncation: str = "mask"
+    ready_timeout: float = 900.0
+    """Seconds to wait for the gateway to route to an engine."""
     smoke: bool = False
     seed: int = 0
     workers: int = 16
@@ -106,9 +108,12 @@ def main(config: Config) -> dict:
         gateway = Gateway(config.gateway, sandbox_url=config.sandbox_gateway)
         push = SafetensorsReload(source, config.served, config.engines, config.engine)
         push.write(source.variables)
+        # The engines launch on --served now; the Publication below stamps the gateway at once.
+        gateway.ready(config.ready_timeout)
     trials = HarborSource(gateway, harbor=harbor, model=config.harness_model, trials=config.out / "trials",
                           agent=config.agent, environment={"OPENAI_API_KEY": "none", "MSWEA_API_KEY": "none"},
-                          arguments=config.harbor_arguments, workers=config.workers)
+                          arguments=config.harbor_arguments, workers=config.workers,
+                          ready_timeout=config.ready_timeout)
     history: list[SchedulerRecord] = []
 
     def log(record: SchedulerRecord) -> None:
