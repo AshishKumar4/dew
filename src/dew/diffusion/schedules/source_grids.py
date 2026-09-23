@@ -63,8 +63,8 @@ def _interpolate(x, xp, fp):
     slices whose offsets come out of that loop, and XLA:GPU's
     DynamicSliceAnnotator (jax 0.11.1) evaluates each offset without running
     the loop, then fails the whole compile on the unknown value instead of
-    skipping the slice. A grid holds a few dozen points, so comparing against
-    all of them costs nothing and leaves no loop.
+    skipping the slice (openxla/xla#49299). A grid holds a few dozen points,
+    so comparing against all of them costs nothing and leaves no loop.
     """
     x = jnp.asarray(x, jnp.float32)
     i = jnp.clip(jnp.searchsorted(xp, x, side="right", method="compare_all"), 1, len(xp) - 1)
