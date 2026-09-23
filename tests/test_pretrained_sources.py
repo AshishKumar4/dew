@@ -19,7 +19,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-from dew.interop import hf_decoders, pretrained
+from dew.interop import codecs, hf_decoders, pretrained
 
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
 
@@ -233,7 +233,7 @@ def test_a_gguf_repo_is_named_as_gguf_before_any_weight_downloads(hub):
 ])
 def test_mlx_quantization_is_refused_by_name(name, stated):
     with pytest.raises(ValueError, match=f"is MLX quantization \\({stated}\\)"):
-        pretrained._source_quantization(fixture_config(name))
+        codecs.source_quantization(fixture_config(name))
 
 
 @pytest.mark.parametrize("name", [
@@ -246,7 +246,7 @@ def test_a_qwen3_fp8_config_is_read_by_the_codec_and_translates(name):
     scales); the family translator does not refuse it as a field it lacks."""
     config = fixture_config(name)
 
-    quantization = pretrained._source_quantization(config)
+    quantization = codecs.source_quantization(config)
     record = hf_decoders.translate_config(config)
 
     assert quantization is not None
@@ -258,7 +258,7 @@ def test_a_format_the_codec_cannot_read_is_still_refused_on_the_same_config():
     config["quantization_config"] = {**config["quantization_config"], "quant_method": "awq"}
 
     with pytest.raises(ValueError, match="quant_method 'awq'"):
-        pretrained._source_quantization(config)
+        codecs.source_quantization(config)
 
 
 @pytest.mark.parametrize("name, inert", [

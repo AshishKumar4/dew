@@ -1,148 +1,18 @@
-"""GPT OSS's biased router, interleaved experts and MXFP4 checkpoint math.
+"""GPT OSS's biased router and interleaved experts with the clamped SwiGLU.
 
-The MXFP4 arithmetic is NumPy's on the host. XLA on CPU reads and writes
-float32 subnormals as zero, and the released encoder and reader keep them:
-a group of 2 ** -127 weights encodes to the 0.5 code at the 2 ** -126 scale
-and decodes back to 2 ** -127, which the same code under jax.numpy returns
-as zeros (measured, jax 0.11 CPU, scale bytes 0 and 1).
+`dew.interop.codecs` reads and writes the MXFP4 checkpoints these experts ship in.
 """
 
 import functools
-from collections.abc import Collection, Mapping
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
-import numpy as np
 from flax import linen as nn
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
-from numpy.typing import ArrayLike
 
 from dew.nn.moe import expert_dispatch, expert_projection, gather_expert_bias
 from dew.nn.sharding import logical_axes
-
-GROUP = 32
-"""Values along the input axis that share one E8M0 scale; 16 packed bytes."""
-
-E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], np.float32)
-"""The value of each E2M1 code, in code order."""
-
-
-def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike) -> np.ndarray:
-    """Packed [expert, output, group, 16] blocks and E8M0 scales to float32 [expert, input, output].
-
-    transformers' `convert_moe_packed_tensors`: the low nibble precedes the
-    high nibble, and every value is exact in the bf16 it decodes to.
-    """
-    blocks, scales = np.asarray(blocks), np.asarray(scales)
-    if blocks.ndim != 4 or blocks.shape[-1] != GROUP // 2 or blocks.shape[:-1] != scales.shape:
-        raise ValueError("MXFP4 blocks must be [expert, output, group, 16] with one scale per group")
-    if blocks.dtype != np.uint8 or scales.dtype != np.uint8:
-        raise ValueError("MXFP4 blocks and scales must be uint8")
-    codes = np.stack((blocks & 15, blocks >> 4), axis=-1).reshape(*scales.shape, GROUP)
-    values = np.ldexp(E2M1[codes], scales.astype(np.int32)[..., None] - 127)
-    return values.reshape(*blocks.shape[:2], -1).swapaxes(1, 2)
-
-
-def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
-    """[expert, input, output] weights to packed [expert, output, group, 16] blocks and E8M0 scales.
-
-    The released encoder, transformers 5.16.1's `quantize_to_mxfp4` over
-    triton_kernels' `downcast_to_mxfp(..., ROUND_UP)`: the weight rounds to
-    bf16, a group's scale is its largest magnitude over 6 rounded up to a
-    power of two on the float32 bits (an all-zero group takes the 0x00
-    byte), and each value over that scale rounds to the nearest E2M1 value,
-    ties to even. The round-up keeps every scaled value at or under 6, so
-    the float4_e2m1fn cast never saturates. The scale rule is spelled out
-    because no cast performs it: float8_e8m0fnu rounds to nearest and sends
-    0 to the NaN byte 0xff. An infinite or NaN weight would take that byte
-    too, and is refused instead.
-    """
-    values = np.asarray(weight)
-    # jnp's dtype lattice counts ml_dtypes' bfloat16 as floating; NumPy's does not.
-    if not jnp.issubdtype(values.dtype, jnp.floating):
-        raise ValueError(f"MXFP4 encodes float weights, got {values.dtype}")
-    if values.ndim != 3 or values.shape[1] % GROUP:
-        raise ValueError(
-            "MXFP4 takes an [expert, input, output] weight whose input axis is a "
-            f"multiple of the {GROUP}-value group, got {values.shape}")
-    rows = values.astype(ml_dtypes.bfloat16).astype(np.float32).swapaxes(1, 2)
-    groups = np.ascontiguousarray(rows).reshape(*rows.shape[:2], -1, GROUP)
-    largest = np.abs(groups).max(-1, keepdims=True)
-    if not np.isfinite(largest).all():
-        raise ValueError(
-            "MXFP4 holds no infinite or NaN weight: E2M1 encodes neither, and this "
-            "rule gives such a group the reserved E8M0 NaN scale 0xff, which reads "
-            "back as 2 ** 128")
-    rounded = ((largest / np.float32(6)).view(np.uint32) + 0x007fffff) & 0x7f800000
-    scale = rounded.view(np.float32)
-    with np.errstate(divide='ignore'):
-        reciprocal = np.where(scale == 0, np.float32(0), np.float32(1) / scale)
-    codes = (groups * reciprocal).astype(ml_dtypes.float4_e2m1fn).view(np.uint8)
-    return codes[..., 0::2] | (codes[..., 1::2] << 4), (rounded >> 23).astype(np.uint8).squeeze(-1)
-
-
-def mxfp4_stems(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """The names a checkpoint ships as an MXFP4 `<stem>_blocks`/`<stem>_scales` pair, sorted.
-
-    Taken before `unpack_mxfp4`, after which nothing says which tensors
-    arrived packed. Half a pair is refused: the checkpoint has lost a weight.
-    """
-    stems = sorted({name.removesuffix(suffix) for name in tensors
-                    for suffix in ('_blocks', '_scales') if name.endswith(suffix)})
-    for stem in stems:
-        for suffix in ('_blocks', '_scales'):
-            if stem + suffix not in tensors:
-                raise ValueError(
-                    f"{stem} arrives MXFP4 packed and the checkpoint holds no {stem}{suffix}")
-    return tuple(stems)
-
-
-def mxfp4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
-    """Decoded names, using the codec's validated pair discovery."""
-    stems = mxfp4_stems(tensors)
-    return tuple(name for name in tensors if not name.endswith(('_blocks', '_scales'))) + tuple(
-        stem for stem in stems if stem not in tensors)
-
-
-def read_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
-    """One original tensor, with a packed weight decoded in FP32 on demand."""
-    if name + '_blocks' in tensors:
-        return dequantize_mxfp4(tensors[name + '_blocks'], tensors[name + '_scales'])
-    return tensors[name]
-
-
-def unpack_mxfp4(tensors: Mapping[str, np.ndarray], *,
-                 param_dtype: str = "float32") -> dict[str, np.ndarray]:
-    """Decode each packed pair in FP32, then retain that weight in param_dtype.
-    Biases and every other unpaired tensor remain untouched.
-    """
-    from dew.nn.text_encoders import checkpoint_array
-
-    unpacked = dict(tensors)
-    for stem in mxfp4_stems(tensors):
-        unpacked[stem] = checkpoint_array(read_mxfp4_tensor(unpacked, stem), param_dtype)
-        unpacked.pop(stem + '_blocks')
-        unpacked.pop(stem + '_scales')
-    return unpacked
-
-
-def pack_mxfp4(tensors: Mapping[str, np.ndarray],
-               stems: Collection[str]) -> dict[str, np.ndarray]:
-    """Replace each named `<stem>` with the `<stem>_blocks` and `<stem>_scales` it encodes to.
-
-    Only the stems a source shipped packed (`mxfp4_stems`): every other
-    tensor is written back as itself. A named stem the tensors no longer
-    hold is refused, since the config would still promise its blocks.
-    """
-    packed = dict(tensors)
-    for stem in stems:
-        if stem not in packed:
-            raise ValueError(
-                f"{stem} arrived MXFP4 packed and is not among the tensors to write back")
-        packed[f'{stem}_blocks'], packed[f'{stem}_scales'] = quantize_mxfp4(packed.pop(stem))
-    return packed
 
 
 class GptOssExperts(nn.Module):

@@ -143,7 +143,7 @@ def test_every_stored_dtype_reads_back_exactly(tmp_path):
 def test_float8_payloads_are_mapped_without_numpy_dtype_conversion(tmp_path):
     """FP8 array, scalar and empty payloads use the official format tag.
     Compare stored bits, including signed zero, rather than widened values."""
-    from dew.interop.quantized import E4M3
+    from dew.interop.codecs import E4M3
 
     stored = {
         "weight": np.asarray([0.0, -0.0, 1.5, -2.0, 448.0], dtype=E4M3),

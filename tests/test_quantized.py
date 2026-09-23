@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 from dew.interop import load_pretrained
-from dew.interop.quantized import (
+from dew.interop.codecs import (
     AMAX_FLOOR,
     BLOCK,
     E4M3_MAX,

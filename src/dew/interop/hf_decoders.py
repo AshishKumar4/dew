@@ -105,7 +105,7 @@ _IGNORED_FIELDS = {
     'torch_dtype', 'transformers_version',
 }
 
-# Read by the codec rather than by any family: `pretrained._source_quantization`
+# Read by the codec rather than by any family: `codecs.source_quantization`
 # decodes the weights this names and refuses a format it cannot, before a
 # family translator sees the config.
 _CODEC_FIELDS = frozenset({'quantization_config'})

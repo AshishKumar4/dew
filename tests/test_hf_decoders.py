@@ -110,7 +110,7 @@ from dew.interop import hf_decoders
 from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
 from dew.nn.gemma3n import AltUp
-from dew.nn.gpt_oss import dequantize_mxfp4, quantize_mxfp4
+from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
 from dew.nn.hyper_connections import HyperConnections
 from dew.registry import models, with_precision
 
