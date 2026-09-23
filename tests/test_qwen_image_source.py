@@ -29,6 +29,7 @@ from dew.interop.diffusion import (component_tensors, qwen_image_fields,
 from dew.nn.backbones.qwen_image import QwenImageTransformer, image_grid
 
 ROOT = Path(__file__).resolve().parents[1]
+RELEASED = ROOT / "tests/fixtures/hf/qwen-image-2.1-source"
 CASES = ("square", "rect", "odd", "padded", "acausal", "eps")
 
 
@@ -197,6 +198,33 @@ def test_the_image_grid_is_centred_as_the_source_lays_it_out():
     heights, widths = image_grid(3, 4)
     np.testing.assert_array_equal(heights, [-2] * 4 + [-1] * 4 + [0] * 4)
     np.testing.assert_array_equal(widths, [-2, -1, 0, 1] * 3)
+
+
+def test_the_released_configs_and_weight_maps_translate():
+    """Qwen/Qwen-Image-2.1 at 790c9263 as published: the transformer and VAE
+    configs build their modules, and every tensor name the transformer and
+    the Qwen3-VL encoder store, the vision tower's included, maps to a
+    parameter path of its own."""
+    from dew.interop import hf_decoders
+    from dew.interop.diffusion import _qwen_image_path
+    from dew.interop.pretrained import _qwen_text_path, _qwen_vl_text_config
+    from dew.nn.autoencoders.qwen_image import QwenImageVAE, qwen_image_vae_fields
+
+    def read(name):
+        return json.loads((RELEASED / name).read_text())
+
+    fields = qwen_image_fields(read("transformer/config.json"))
+    assert (fields["num_layers"], fields["heads"], fields["head_dim"], fields["context_in_dim"],
+            fields["axes_dims_rope"]) == (32, 32, 128, 4096, (16, 56, 56))
+    names = read("transformer/diffusion_pytorch_model.safetensors.index.json")["weight_map"]
+    assert len({_qwen_image_path(name) for name in names}) == len(names) == 297
+    text = _qwen_text_path(hf_decoders.translate_config(_qwen_vl_text_config(read("text_encoder/config.json"))))
+    names = read("text_encoder/model.safetensors.index.json")["weight_map"]
+    paths = [text(name) for name in names]
+    assert None not in paths and len(set(paths)) == len(names) == 750
+    assert sum(path[0] == "visual" for path in paths) == 351
+    vae = QwenImageVAE(**qwen_image_vae_fields(read("vae/config.json")))
+    assert (vae.downscale_factor, vae.latent_channels, vae.image_channels) == (16, 64, 4)
 
 
 @pytest.fixture(scope="module")

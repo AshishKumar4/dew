@@ -1,6 +1,0 @@
-{
-  "repo": "Qwen/Qwen-Image-2.1",
-  "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
-  "diffusers": "6256aa7666cedd47443adc8f82da9a10e110b09c",
-  "transformers": "5.17.0"
-}
