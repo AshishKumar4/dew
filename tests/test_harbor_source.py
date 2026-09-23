@@ -38,6 +38,23 @@ def test_calls_follow_submission_order_and_carry_the_gateway_stamp():
         Call((1, 2), (3, 4), (-1., -2.), "tool_calls", 2), Call((1, 2, 3, 4, 5), (6, 7), (-.5, -.25), "stop", 3))
 
 
+def test_a_trace_carries_vllms_routed_experts_into_its_call():
+    """vLLM's chat and completions choices carry `routed_experts`; the gateway
+    keeps the raw response, so the call replays what the engine routed."""
+    import base64
+    import io
+
+    import numpy as np
+
+    record = np.arange(4 * 2 * 2, dtype=np.uint8).reshape(4, 2, 2)
+    buffer = io.BytesIO()
+    np.save(buffer, record, allow_pickle=False)
+    raw = {"choices": [{"routed_experts": base64.b64encode(buffer.getvalue()).decode()}]}
+    (call,) = calls([trace([1, 2, 3], [4, 5], [-.5, -.25], raw_response=raw)], unstamped=0).calls
+    assert call.routed_experts is not None
+    np.testing.assert_array_equal(call.routed_experts, record)
+
+
 FIXTURES = Path(__file__).parent / "fixtures/gateway"
 
 

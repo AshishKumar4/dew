@@ -64,22 +64,25 @@ def _operand_dtype(precision: jax.lax.PrecisionLike):
     return jnp.bfloat16 if precision is BF16 else jnp.float32
 
 
-def _capped(logits, softcap):
-    if softcap is None:
-        return logits
-    cap = jnp.asarray(softcap, jnp.float32)
-    return cap * jnp.tanh(logits / cap)
+def _capped(logits, softcap, temperature: float = 1.0):
+    """Softcapped logits over a sampling temperature, which an engine applies
+    to what the model's head returns."""
+    if softcap is not None:
+        cap = jnp.asarray(softcap, jnp.float32)
+        logits = cap * jnp.tanh(logits / cap)
+    return logits / temperature
 
 
 def head_logits(hidden, head_weight, *, softcap: float | None,
-                precision: PrecisionLike, vocab_major: bool = False) -> jax.Array:
+                precision: PrecisionLike, vocab_major: bool = False,
+                temperature: float = 1.0) -> jax.Array:
     """`hidden @ head_weight` as the model's forward scores it: the states
     against the `[features, vocab]` head (`[vocab, features]` with
     `vocab_major`), accumulated in fp32, softcapped when the backbone caps;
     `[..., vocab]` fp32. The product follows the states' dtype
     (`dew.nn.precision.head_product`)."""
     return _capped(head_product('...d,vd->...v' if vocab_major else '...d,dv->...v',
-                                hidden, head_weight, precision), softcap)
+                                hidden, head_weight, precision), softcap, temperature)
 
 
 def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
@@ -100,9 +103,9 @@ class _ChunkTerms(NamedTuple):
 
 def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
                  softcap: float | None, precision: jax.lax.PrecisionLike,
-                 predict: bool) -> _ChunkTerms:
+                 predict: bool, temperature: float) -> _ChunkTerms:
     """One tile's `_ChunkTerms`."""
-    logits = _capped(_tile_logits(hidden, head_chunk, precision), softcap)
+    logits = _capped(_tile_logits(hidden, head_chunk, precision), softcap, temperature)
 
     inside = (targets >= start) & (targets < stop)
     column = jnp.clip(targets - start, 0, stop - start - 1)
@@ -130,7 +133,7 @@ def _over_tiles(carry, count: int, width: int, body: Callable):
 
 
 def _forward(hidden, table, targets, chunks: int, token_tile: int,
-             softcap, precision: jax.lax.PrecisionLike, predict: bool):
+             softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float):
     """Losses, top-1 columns (None unless `predict`) and log partitions, a
     token tile at a time."""
     features = table.shape[1]
@@ -147,7 +150,7 @@ def _forward(hidden, table, targets, chunks: int, token_tile: int,
         def columns(first, carry, count):
             terms = _chunk_terms(
                 states, jax.lax.dynamic_slice_in_dim(table, first, count),
-                picked_targets, first, first + count, softcap, precision, predict)
+                picked_targets, first, first + count, softcap, precision, predict, temperature)
             total = jnp.logaddexp(carry[0], terms.lse)
             target_logit = carry[1] + terms.picked
             if terms.best is None or terms.column is None:
@@ -174,19 +177,19 @@ def _forward(hidden, table, targets, chunks: int, token_tile: int,
 
 
 def _bounded_head_impl(hidden, table, targets, chunks: int, tile: tuple[int, int],
-                       softcap, precision: jax.lax.PrecisionLike, predict: bool):
+                       softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float):
     """Run `_forward` behind a backward that recomputes its logits."""
-    return _forward(hidden, table, targets, chunks, tile[0], softcap, precision, predict)
+    return _forward(hidden, table, targets, chunks, tile[0], softcap, precision, predict, temperature)
 
 
-def _bounded_head_fwd(hidden, table, targets, chunks, tile, softcap, precision, predict):
-    outputs = _forward(hidden, table, targets, chunks, tile[0], softcap, precision, predict)
+def _bounded_head_fwd(hidden, table, targets, chunks, tile, softcap, precision, predict, temperature):
+    outputs = _forward(hidden, table, targets, chunks, tile[0], softcap, precision, predict, temperature)
     # The residuals are the inputs and one float32 per token. Everything the
     # backward needs beyond them is a recomputed tile.
     return outputs, (hidden, table, targets, outputs[2], softcap)
 
 
-def _bounded_head_bwd(chunks, tile, precision, predict, residuals, cotangents):
+def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, cotangents):
     """Pull the cotangents back through logits recomputed one tile at a time.
 
     The outer loop walks vocabulary tiles carrying `(d_states, d_table,
@@ -224,7 +227,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, residuals, cotangents):
             token_partition = jax.lax.dynamic_slice_in_dim(d_partition, start, size)
 
             def project(states, matrix, cap):
-                return _capped(_tile_logits(states, matrix, precision), cap)
+                return _capped(_tile_logits(states, matrix, precision), cap, temperature)
 
             logits, pullback = jax.vjp(project, states, matrix, softcap)
             # log Z is the whole row's, so a tile's share of the softmax needs
@@ -263,7 +266,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, residuals, cotangents):
 
 # `jax.custom_vjp` is generic in its return type, and a `functools.partial`
 # decorator loses that binding, so it is built by hand.
-_bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(3, 4, 6, 7))
+_bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(3, 4, 6, 7, 8))
 _bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
 
 
@@ -272,7 +275,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                           precision: PrecisionLike = None,
                           tile: tuple[int, int] = (1024, 8192),
                           vocab_major: bool = False,
-                          predict: bool = True):
+                          predict: bool = True, temperature: float = 1.0):
     """Per-token cross entropy of `hidden @ head_weight`, its top-1 column
     and its log partition.
 
@@ -302,7 +305,8 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     block: the forward walks tokens in the first, the backward walks both and
     holds nothing wider, so it is the only knob on the backward's
     temporaries. The default is measured; a tile wider than the input is one
-    tile.
+    tile. `temperature` divides the capped logits (`head_logits`), which
+    scores the draws of a sampler at that temperature.
     """
     features = head_weight.shape[1 if vocab_major else 0]
     if hidden.shape[-1] != features:
@@ -320,4 +324,69 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     table = head_weight if vocab_major else head_weight.T
     return _bounded_head(hidden, table, targets, chunks, tile, cap,
                          BF16 if rounds_to_bf16(hidden.dtype, precision) else precision,
-                         predict)
+                         predict, float(temperature))
+
+
+SUPPORT_BLOCK = 1 << 15
+"""Kept ids one rematerialized step of `support_log_probs` scores, over all rows."""
+
+
+def support_log_probs(hidden, head_weight, targets, support_ids, support_columns, *,
+                      temperature: float = 1.0, softcap: float | None = None,
+                      precision: PrecisionLike = None):
+    """Each target's log-probability renormalized over its recorded sampling support.
+
+    Keep-sampling-mask (DeepSeek-V3.2 section 3.1; slime 5bae5bb `loss.py`
+    `_build_topp_keep_mask` masks the tempered logits outside the rollout's
+    top-p set to -inf before its log-softmax): a target drawn by a top-k or
+    top-p sampler scores `l_t - logsumexp_{v in S} l_v` with `l` the capped
+    logits over `temperature`, the engine's filtered log-probability.
+
+    `hidden` is `[B, S, features]` target states and `targets` `[B, S]` ids.
+    The support is ragged within each row: `support_ids` `[B, C]` holds a
+    row's kept ids back to back and `support_columns` `[B, C]` the column of
+    the target each belongs to, both -1 on padding, so the arrays shard with
+    their rows. Only those columns of the head are scored, `SUPPORT_BLOCK`
+    entries at a time and rematerialized in the backward pass. Returns the log-probs,
+    `-inf` for a target outside its support, and whether each target had one;
+    a target with none scores 0.0 here.
+    """
+    table = head_weight.T
+    width = targets.shape[1]
+    kept = support_ids.shape[1]
+    block = max(1, min(kept, SUPPORT_BLOCK // targets.shape[0]))
+    blocks = -(-kept // block)
+    pad = blocks * block - kept
+    ids = jnp.pad(support_ids, ((0, 0), (0, pad)), constant_values=-1)
+    columns = jnp.pad(support_columns, ((0, 0), (0, pad)), constant_values=-1)
+
+    @jax.checkpoint
+    def chunk(args):
+        chosen, owner = args
+        state = jnp.take_along_axis(hidden, jnp.maximum(owner, 0)[..., None], axis=1)
+        # The full head's product (`head_product`), over the kept rows only.
+        return _capped(head_product('bcd,bcd->bc', state, table[jnp.maximum(chosen, 0)], precision),
+                       softcap, temperature)
+
+    pieces = (ids.reshape(-1, blocks, block).swapaxes(0, 1), columns.reshape(-1, blocks, block).swapaxes(0, 1))
+    logits = jax.lax.map(chunk, pieces).swapaxes(0, 1).reshape(ids.shape)
+    labels = jnp.take_along_axis(targets, jnp.maximum(columns, 0), axis=1)
+
+    def row(logits, ids, columns, labels):
+        real = columns >= 0
+        segment = jnp.where(real, columns, width)
+        peak = jax.ops.segment_max(jnp.where(real, jax.lax.stop_gradient(logits), -jnp.inf),
+                                   segment, num_segments=width + 1)
+        present = jnp.isfinite(peak)
+        peak = jnp.where(present, peak, 0.0)
+        # Padding exponentiates -inf, so no overflowed entry reaches the backward.
+        mass = jax.ops.segment_sum(jnp.exp(jnp.where(real, logits - peak[segment], -jnp.inf)),
+                                   segment, num_segments=width + 1)[:width]
+        log_z = jnp.log(jnp.where(present[:width], mass, 1.0)) + peak[:width]
+        match = real & (ids == labels)
+        inside = jax.ops.segment_max(match.astype(jnp.int32), segment, num_segments=width + 1)[:width] > 0
+        target = jax.ops.segment_sum(jnp.where(match, logits, 0.0), segment, num_segments=width + 1)[:width]
+        filtered = jnp.where(present[:width], jnp.where(inside, target - log_z, -jnp.inf), 0.0)
+        return filtered, present[:width]
+
+    return jax.vmap(row)(logits, ids, columns, labels)

@@ -114,6 +114,30 @@ def test_a_multi_turn_session_keeps_each_calls_version_and_packs_into_one_chain(
     np.testing.assert_array_equal(batch["versions"][0][batch["response_mask"][0] > 0], [0, 0, 1, 1, 2, 2])
 
 
+def test_every_call_of_a_multi_turn_session_carries_its_draws_engine_records():
+    """Routing and the sampling support come from each draw, not the episode,
+    so a multi-turn session replays what the engine routed and kept."""
+    from dataclasses import replace
+
+    from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, SUPPORT_KEY
+
+    class Recording(Server):
+        def submit(self, prompt, max_new_tokens, *, seed):
+            draw = super().submit(prompt, max_new_tokens, seed=seed).result()
+            done = Future()
+            done.set_result(replace(draw, routed_experts=np.full((len(prompt) + 1, 2, 1), len(prompt), np.uint8),
+                                    support=((5, 6), (EOS,))))
+            return done
+
+    episodes = source(Recording(), factory([], []))
+    session = episodes.submit(Task("3"), 1, version=0)[0].result(timeout=10)
+    episodes.close()
+    assert [int(call.routed_experts[0, 0, 0]) for call in session.calls] == [2, 5, 8]
+    assert all(call.support == ((5, 6), (EOS,)) for call in session.calls)
+    batch = pack([session], 16, support_capacity=16)
+    assert ROUTED_EXPERTS_KEY in batch and (batch[SUPPORT_KEY] >= 0).sum() == 9
+
+
 @pytest.mark.parametrize("fail, detail", [("raise", "ConnectionError: sandbox went away"),
                                           ("report", "container exited")])
 def test_an_environment_failure_is_an_unscored_infra_error(fail, detail):
@@ -200,6 +224,28 @@ def test_the_prompt_source_scores_decoded_text_without_eos_and_masks_the_budget_
     assert long.submit(task, 1, version=0)[0].result(timeout=10).status == Status.TRUNCATED
     prompts.close()
     long.close()
+
+
+def test_the_prompt_sources_calls_carry_the_draws_routing_into_the_packed_batch():
+    from dataclasses import replace
+
+    from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, pack
+
+    class Routed(Server):
+        def submit(self, prompt, max_new_tokens, *, seed):
+            future = super().submit(prompt, max_new_tokens, seed=seed)
+            draw = future.result()
+            routed = np.full((len(draw.prompt) + len(draw.tokens) - 1, 2, 1), 3, np.uint8)
+            done = Future()
+            done.set_result(replace(draw, routed_experts=routed))
+            return done
+
+    [task] = prompt_tasks(prompt_batch())
+    prompts = PromptSource(Routed(), lambda *_: 1.0, decode=str, max_new_tokens=4)
+    sessions = [future.result(timeout=10) for future in prompts.submit(task, 2, version=0)]
+    prompts.close()
+    batch = pack(sessions, 8)
+    assert (batch[ROUTED_EXPERTS_KEY][:, :3] == 3).all()
 
 
 def test_a_failed_draw_or_reward_is_an_infra_error():

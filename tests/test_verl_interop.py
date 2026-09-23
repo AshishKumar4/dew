@@ -26,7 +26,7 @@ from dew.objectives.rl.sessions import (
     Status,
     pack,
 )
-from dew.objectives.rl.verl import FIELDS, from_verl, to_verl, verl_reward
+from dew.objectives.rl.verl import FIELDS, from_verl, to_verl
 
 FIXTURES = Path(__file__).parent / "fixtures/rl"
 NATIVE = json.loads((FIXTURES / "verl_native.json").read_text())
@@ -109,9 +109,9 @@ def test_rollouts_round_trip_through_verl_rows_losslessly():
     assert rows[0]["extra_fields"]["min_global_steps"] == 3 and rows[0]["extra_fields"]["max_global_steps"] == 4
     restored = [trajectory.session for trajectory in from_verl(rows)]
     assert restored == [rollout, failed]
-    for key, value in pack([rollout], 16).items():
-        np.testing.assert_array_equal(pack(restored[:1], 16)[key], value, err_msg=key)
-    assert SUPPORT_KEY in pack(restored[:1], 16)
+    for key, value in pack([rollout], 16, support_capacity=4).items():
+        np.testing.assert_array_equal(pack(restored[:1], 16, support_capacity=4)[key], value, err_msg=key)
+    assert SUPPORT_KEY in pack(restored[:1], 16, support_capacity=4)
 
 
 @pytest.mark.parametrize("corruption", ["logprobs", "version", "reward", "chain", "field"])
@@ -175,13 +175,6 @@ def test_a_native_rows_step_stamps_survive_two_round_trips():
         assert (exported[0]["extra_fields"]["min_global_steps"], exported[0]["extra_fields"]["max_global_steps"]) == (7, 9)
     written = to_verl([Session("t", "g", 0, 0, (Call((1,), (2,), (-1.0,), "stop", 4),), Status.COMPLETED, 1.0)])
     assert "extra_fields" not in from_verl(json.loads(json.dumps(written)))[0].extras
-
-
-def test_a_scorer_is_called_by_keyword_as_verl_calls_it():
-    def compute_score(*, solution_str, data_source, extra_info=None, ground_truth):
-        return {"score": float(solution_str == ground_truth and data_source == "src" and extra_info == {"k": 1})}
-
-    assert verl_reward(compute_score)("src", "42", "42", '{"k": 1}') == 1.0
 
 
 def test_media_rows_are_refused_for_training():

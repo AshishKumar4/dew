@@ -110,11 +110,93 @@ def test_listed_ids_that_disagree_with_the_likelihoods_are_refused():
         server.close()
 
 
+def test_a_routing_server_carries_vllms_routed_experts_into_the_draw():
+    """vLLM's `routed_experts` choice field, base64 `.npy` of `[forwarded ids,
+    layers, top_k]` in its narrowest dtype, reaches the draw unchanged."""
+    import base64
+    import io
+
+    record = np.arange(4 * 2 * 2, dtype=np.uint8).reshape(4, 2, 2)
+    buffer = io.BytesIO()
+    np.save(buffer, record, allow_pickle=False)
+
+    def answer(_):
+        return {**choice("vllm", [3, 5, EOS], [-.5, -1., -.25], "stop"),
+                "routed_experts": base64.b64encode(buffer.getvalue()).decode()}
+
+    completion, _ = engine("vllm", answer)
+    server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed, routing=True)
+    try:
+        draw = server.submit([1, 2], 8, seed=0).result()
+    finally:
+        server.close()
+    assert draw.routed_experts is not None and draw.routed_experts.dtype == np.uint8
+    np.testing.assert_array_equal(draw.routed_experts, record)
+    bare, _ = engine("vllm", lambda _: choice("vllm", [EOS], [0.], "stop"))
+    server = OpenAIRolloutServer(bare, Sampling(eos_id=EOS), pushed, routing=True)
+    try:
+        with pytest.raises(ValueError, match="enable-return-routed-experts"):
+            server.submit([1], 8, seed=0).result()
+    finally:
+        server.close()
+
+
 def test_raw_engine_likelihoods_are_not_taken_for_a_transformed_policy():
     completion, _ = engine("vllm", lambda _: choice("vllm", [EOS], [0.], "stop"))
     with pytest.raises(ValueError, match="processed_logprobs"):
         OpenAIRolloutServer(completion, Sampling(temperature=.7, eos_id=EOS), pushed)
     OpenAIRolloutServer(completion, Sampling(temperature=.7, eos_id=EOS), pushed, processed_logprobs=True).close()
+
+
+def test_vllms_completions_route_refuses_a_filter_for_want_of_its_support():
+    """vLLM reports filtered likelihoods on /v1/completions but not the kept
+    ids, so a top-k or top-p policy goes to the token route instead."""
+    completion, _ = engine("vllm", lambda _: choice("vllm", [EOS], [0.], "stop"))
+    for filtering in (Sampling(top_k=20, eos_id=EOS), Sampling(temperature=.7, top_p=.9, eos_id=EOS)):
+        with pytest.raises(ValueError, match="VLLMGenerateServer"):
+            OpenAIRolloutServer(completion, filtering, pushed, processed_logprobs=True)
+
+
+def test_vllms_token_route_draws_carry_the_kept_ids_and_the_routing(monkeypatch):
+    """`/inference/v1/generate` answers as vLLM 1c0eee9's `GenerateResponse`:
+    token ids, content log-probs, `sampling_mask` and `routed_experts`."""
+    import base64
+    import io
+
+    import httpx
+
+    from dew.inference import VLLMGenerateServer
+
+    record = np.zeros((3, 2, 2), np.uint8)
+    buffer = io.BytesIO()
+    np.save(buffer, record, allow_pickle=False)
+    seen = []
+
+    def post(url, json, timeout):
+        seen.append((url, json))
+        answer = {"choices": [{"index": 0, "finish_reason": "stop", "token_ids": [5, EOS],
+                               "logprobs": {"content": [{"token": "token_id:5", "logprob": -.25},
+                                                        {"token": f"token_id:{EOS}", "logprob": -.5}]},
+                               "sampling_mask": [[5, 6], [EOS]],
+                               "routed_experts": base64.b64encode(buffer.getvalue()).decode()}]}
+        return httpx.Response(200, json=answer)
+
+    monkeypatch.setattr(httpx, "post", post)
+    sampling = Sampling(temperature=.7, top_k=20, top_p=.9, eos_id=EOS)
+    server = VLLMGenerateServer("http://engine:8000/", sampling, pushed, routing=True)
+    try:
+        draw = server.submit([1, 2], 4, seed=3).result()
+    finally:
+        server.close()
+    url, body = seen[0]
+    assert url == "http://engine:8000/inference/v1/generate" and body["token_ids"] == [1, 2]
+    assert {"top_k": 20, "top_p": .9, "max_tokens": 4, "seed": 3,
+            "stop_token_ids": [EOS]}.items() <= body["sampling_params"].items()
+    assert draw.tokens == (5, EOS) and draw.behavior_log_probs == (-.25, -.5) and draw.terminated
+    assert draw.support == ((5, 6), (EOS,))
+    np.testing.assert_array_equal(draw.routed_experts, record)
+    with pytest.raises(ValueError, match="finite top-k"):
+        VLLMGenerateServer("http://engine:8000", Sampling(temperature=.7, top_p=.9, eos_id=EOS), pushed)
 
 
 def test_sglang_serves_a_tempered_policy_but_no_filter():

@@ -201,6 +201,33 @@ class AttentionMetadata:
     key_positions: jax.Array | None = None
     token_ids: jax.Array | None = None
 
+
+@struct.dataclass
+class LayerInputs:
+    """What each decoder layer reads of its own, `[B, S, layers, ...]` leaves.
+
+    The stack slices every leaf on axis 2 the same way, so a scanned run, a
+    run read from a bank one layer at a time and a pipeline stage each hand a
+    layer its own `[B, S, ...]` slice. `embeddings` is Gemma 3n/4's per-layer
+    input signal; `experts` and `routed` are a routing replay's `[..., top_k]`
+    expert ids and coverage (`dew.nn.moe.Routes`), `routed` broadcast over the
+    layer axis.
+    """
+
+    embeddings: jax.Array | None = None
+    experts: jax.Array | None = None
+    routed: jax.Array | None = None
+
+    def span(self, first: int, count: int) -> LayerInputs:
+        """Layers `first` through `first + count - 1`, the axis kept."""
+        return jax.tree.map(lambda leaf: leaf[:, :, first:first + count], self)
+
+    def layer(self, index) -> LayerInputs:
+        """One layer's slice, the axis dropped; `index` may be traced."""
+        return jax.tree.map(
+            lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, 2, keepdims=False), self)
+
+
 def generation_signature(inputs: InputTree, controls: tuple) -> np.ndarray:
     """Digest execution shapes and stable host controls without reading payloads.
 

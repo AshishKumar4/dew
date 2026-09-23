@@ -300,13 +300,16 @@ class MultimodalTransformer(nn.Module):
                       positions=None, segment_ids=None, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None,
                       attention_mask=None, image_groups=None, rotary_positions=None,
-                      audio_indices=None):
+                      audio_indices=None, routed_experts=None, routed=None):
         """Run the decoder over text with the media embeddings spliced in.
 
         `conditioning` holds the towers' payloads and `image_indices` and
         `audio_indices` say which token positions each one replaces. A
         decode step tracks the next position in the `cache` collection,
         because a media span advances a row by more than one token.
+        `routed_experts` and `routed` replay a routing record and pass to the
+        language model unchanged: engines record a row for every placeholder
+        position too, so the `[B, S, layers, top_k]` layout is the text's.
         """
         if self.family == "gemma4":
             placeholder = tokens == self.image_token_id
@@ -336,7 +339,8 @@ class MultimodalTransformer(nn.Module):
         if conditioning is None and self.family != "gemma3n":
             return self.language_model.hidden_states(
                 tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
-                attention_mask=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions)
+                attention_mask=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions,
+                routed_experts=routed_experts, routed=routed)
         fused = self._conditioned_embeddings(tokens, image_indices, conditioning,
                                              train=train, audio_indices=audio_indices)
         decoder_tokens, embeddings = fused.tokens, fused.embeddings
@@ -344,7 +348,7 @@ class MultimodalTransformer(nn.Module):
         return self.language_model.hidden_states(
             decoder_tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=embeddings, embedding_positions=slots, attention_mask=attention_mask,
-            image_groups=image_groups, rotary_positions=rotary_positions)
+            image_groups=image_groups, rotary_positions=rotary_positions, routed_experts=routed_experts, routed=routed)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,

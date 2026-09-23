@@ -43,8 +43,12 @@ from .sessions import (
     OLD_LOG_PROBS_KEY,
     POSITIONS_KEY,
     RESPONSE_MASK_KEY,
+    ROUTED_EXPERTS_KEY,
+    ROUTED_KEY,
     SEGMENT_IDS_KEY,
     SESSION_WEIGHTS_KEY,
+    SUPPORT_COLUMNS_KEY,
+    SUPPORT_KEY,
 )
 
 POLICY_LOSSES = ("ppo", "gspo", "cispo")
@@ -118,6 +122,15 @@ class GRPOObjective(LMObjective):
     compare the detached current policy with behavior, the band only masks,
     and a TIS cap is refused, since the ratio already is current over
     behavior.
+
+    Engine records on a packed batch are replayed when present:
+    `routed_experts`/`routed` make every router use the experts the engine
+    used (R3), and `support_ids`/`support_columns` renormalize each sampled
+    id over the ids its top-k/top-p sampler kept, at `sampling_temperature`
+    (applied after any final softcap), so the policy
+    likelihood compares with a filtered behavior likelihood (DeepSeek-V3.2
+    section 3.1). `sampling_temperature` is the engine's when its reported
+    likelihoods are processed ones; raw ones need 1.0.
     """
 
     _ema_is_reference = True
@@ -127,7 +140,8 @@ class GRPOObjective(LMObjective):
                  dual_clip: float = 3.0, *, policy_loss: str = "ppo", aggregation: str = "token-mean",
                  behavior_importance: float | tuple[float, float] | None = None,
                  sequence_mask: tuple[float, float] | None = None,
-                 geometric_mask: tuple[float, float] | None = None, **kwargs):
+                 geometric_mask: tuple[float, float] | None = None,
+                 sampling_temperature: float = 1.0, **kwargs):
         if beta < 0:
             raise ValueError(f"beta scales the KL penalty, so it is non-negative, got {beta}")
         if "ema_decay" in kwargs:
@@ -161,6 +175,9 @@ class GRPOObjective(LMObjective):
         self.geometric_mask = _band("geometric_mask", geometric_mask)
         self.policy_loss = policy_loss
         self.aggregation = aggregation
+        if not sampling_temperature > 0:
+            raise ValueError(f"sampling_temperature is a positive temperature, got {sampling_temperature}")
+        self.sampling_temperature = sampling_temperature
 
     def packed_log_probs(self, params: Variables, batch) -> jax.Array:
         """Score each packed id given its own chain's prefix, `[rows, width]`.
@@ -180,10 +197,15 @@ class GRPOObjective(LMObjective):
             if jnp.shape(batch[key]) != ids.shape:
                 raise ValueError(f"{key} has shape {jnp.shape(batch[key])}; a packed column has "
                                  f"the shape of {IDS_KEY}, {ids.shape}")
+        routes = (None if ROUTED_EXPERTS_KEY not in batch
+                  else (batch[ROUTED_EXPERTS_KEY], batch.get(ROUTED_KEY)))
         scores = self.token_scores(params, ids, segment_ids=segments,
-                                   positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32))
+                                   positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32), routes=routes)
+        support = (None if SUPPORT_KEY not in batch
+                   else (batch[SUPPORT_KEY], batch[SUPPORT_COLUMNS_KEY]))
+        sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
         scored = jnp.concatenate([jnp.zeros((ids.shape[0], 1), jnp.float32),
-                                  -scores.losses.astype(jnp.float32)], axis=1)
+                                  sampled.astype(jnp.float32)], axis=1)
         return jnp.where(mask != 0, scored, 0.0)
 
     def _terms(self, params, batch) -> _Terms:
