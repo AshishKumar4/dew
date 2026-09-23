@@ -1,6 +1,6 @@
-"""Rollout sources over a `RolloutServer`: in-process environments and single-turn prompts.
+"""Session sources over a `RolloutServer`: in-process environments and single-turn prompts.
 
-Both implement `RolloutSource` for `RolloutScheduler`, drawing every model
+Both implement `SessionSource` for `RolloutScheduler`, drawing every model
 call from a versioned `RolloutServer` (Dew's native server, vLLM or SGLang)
 one request at a time, so turns of different sessions interleave in the
 engine's continuous batch instead of waiting on a lock-step cohort.
@@ -9,7 +9,7 @@ engine's continuous batch instead of waiting on a lock-step cohort.
 `EpisodeRollout` runs, one session per sample on a worker thread, with
 `EpisodeRollout`'s own per-turn limits (`turn_limit`, `step_action`). Each
 turn submits the observation's context and steps the environment with the
-drawn action; the episode becomes a `Rollout` through `rollout_of`, the converter
+drawn action; the episode becomes a `Session` through `session_of`, the converter
 `EpisodeRollout` packs with, so both paths feed one packer. Each call keeps
 the version its request was submitted under, so a session that spans a
 weight push carries both versions. The statuses follow the scheduler's
@@ -51,12 +51,12 @@ from .episodes import (
     EpisodeStatus,
     Observation,
     Transition,
-    rollout_of,
+    session_of,
     step_action,
     turn_limit,
 )
 from .rollout import _texts
-from .rollouts import Call, Rollout, Status, Task
+from .sessions import Call, Session, Status, Task
 
 
 @dataclass(frozen=True)
@@ -121,10 +121,10 @@ class EnvironmentSource:
         self.seed = seed
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dew-episode")
         self._lock = threading.Lock()
-        self._sessions: dict[Future[Rollout], _Session] = {}
+        self._sessions: dict[Future[Session], _Session] = {}
         self._serial = 0
 
-    def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Rollout]]:
+    def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Session]]:
         if not task.id.isdecimal():
             raise ValueError(f"an environment task id is a decimal integer, got {task.id!r}")
         with self._lock:
@@ -141,7 +141,7 @@ class EnvironmentSource:
             futures.append(future)
         return futures
 
-    def cancel(self, futures: Sequence[Future[Rollout]]) -> None:
+    def cancel(self, futures: Sequence[Future[Session]]) -> None:
         """Stop sessions at their next turn; queued ones never start."""
         for future in futures:
             if future.cancel():
@@ -159,7 +159,7 @@ class EnvironmentSource:
         self.cancel(running)
         self._pool.shutdown(wait=True, cancel_futures=True)
 
-    def _forget(self, future: Future[Rollout]) -> None:
+    def _forget(self, future: Future[Session]) -> None:
         with self._lock:
             self._sessions.pop(future, None)
 
@@ -186,7 +186,7 @@ class EnvironmentSource:
             raise _Refused("the server returned a draw for another context")
         return Action(context, draw.tokens, raw, draw.behavior_log_probs, draw.terminated, draw.version, sampling)
 
-    def _run(self, identity: EpisodeId, version: int, session: _Session) -> Rollout:
+    def _run(self, identity: EpisodeId, version: int, session: _Session) -> Session:
         initial: Observation | None = None
         transitions: list[Transition] = []
         pending: Action | None = None
@@ -231,8 +231,8 @@ class EnvironmentSource:
             except Exception as error:
                 episode = replace(episode, status=EpisodeStatus.ERROR, detail=f"verifier: {_failure(error)}")
         if score is None:
-            return rollout_of(episode, group="")
-        rollout = rollout_of(replace(episode, reward=score.reward), group="")
+            return session_of(episode, group="")
+        rollout = session_of(replace(episode, reward=score.reward), group="")
         return replace(rollout, components=dict(score.components),
                        detail="; ".join(part for part in (rollout.detail, score.detail) if part))
 
@@ -256,6 +256,27 @@ def prompt_tasks(batch: Batch) -> list[Task]:
     return tasks
 
 
+@dataclass(frozen=True)
+class _Prompt:
+    """What `prompt_tasks` puts in a task: the prompt ids and the reward's three strings."""
+
+    ids: tuple[int, ...]
+    source: str
+    truth: str
+    info: str
+
+    @classmethod
+    def of(cls, task: Task) -> _Prompt:
+        data = task.data
+        ids, source, truth, info = (data.get(name) for name in ("prompt", "source", "truth", "info"))
+        if (not isinstance(ids, tuple) or not all(type(token) is int for token in ids)
+                or not all(isinstance(text, str) for text in (source, truth, info))):
+            raise TypeError(f"task {task.id!r} is not a prompt_tasks task: it needs integer prompt ids "
+                            "and source, truth and info strings")
+        assert isinstance(source, str) and isinstance(truth, str) and isinstance(info, str)
+        return cls(ids, source, truth, info)
+
+
 class PromptSource:
     """Draw one completion per sample of a `prompt_tasks` task and score its decoded text.
 
@@ -276,16 +297,16 @@ class PromptSource:
         self._serial = 0
         self._lock = threading.Lock()
 
-    def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Rollout]]:
+    def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Session]]:
         del version  # each draw reports the version it was submitted under
         with self._lock:
             serial = self._serial
             self._serial += 1
-        prompt = task.data["prompt"]
-        return [self._scored(task, self.server.submit(prompt, self.max_new_tokens, seed=_seed(self.seed, serial, k)))
+        prompt = _Prompt.of(task)
+        return [self._scored(task, prompt, self.server.submit(prompt.ids, self.max_new_tokens, seed=_seed(self.seed, serial, k)))
                 for k in range(samples)]
 
-    def cancel(self, futures: Sequence[Future[Rollout]]) -> None:
+    def cancel(self, futures: Sequence[Future[Session]]) -> None:
         """Forget the rollouts; their draws finish on the server and are not scored."""
         for future in futures:
             future.cancel()
@@ -294,31 +315,30 @@ class PromptSource:
         """Stop the reward threads; the server belongs to the caller."""
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
-    def _rollout(self, task: Task, drawn: Future[Draw]) -> Rollout:
+    def _rollout(self, task: Task, prompt: _Prompt, drawn: Future[Draw]) -> Session:
         try:
             draw = drawn.result()
         except Exception as error:
-            return Rollout(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, f"draw: {_failure(error)}")
+            return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, f"draw: {_failure(error)}")
         call = Call(draw.prompt, draw.tokens, draw.behavior_log_probs, "stop" if draw.terminated else "length",
                     draw.version)
         status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
         try:
             text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
-            prompt = task.data
-            score = _scored(self.reward(prompt["source"], text, prompt["truth"], prompt["info"]))
+            score = _scored(self.reward(prompt.source, text, prompt.truth, prompt.info))
         except Exception as error:
-            return Rollout(task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}")
-        return Rollout(task.id, "", 0, 0, (call,), status, score.reward, dict(score.components), score.detail)
+            return Session(task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}")
+        return Session(task.id, "", 0, 0, (call,), status, score.reward, dict(score.components), score.detail)
 
-    def _scored(self, task: Task, drawn: Future[Draw]) -> Future[Rollout]:
+    def _scored(self, task: Task, prompt: _Prompt, drawn: Future[Draw]) -> Future[Session]:
         """The draw's future, chained into its reward on a scorer thread."""
-        scored: Future[Rollout] = Future()
+        scored: Future[Session] = Future()
 
         def score() -> None:
             if scored.cancelled():
                 return
             try:
-                rollout = self._rollout(task, drawn)
+                rollout = self._rollout(task, prompt, drawn)
             except BaseException as failure:
                 # Not a failure of the draw or the reward: a broken source, which the scheduler raises.
                 with suppress(InvalidStateError):  # cancelled while scoring

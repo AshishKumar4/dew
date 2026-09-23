@@ -1,6 +1,6 @@
 """Keep agent rollouts in flight and admit complete groups within a staleness bound.
 
-`RolloutScheduler` is the trainer's `Rollout` for any `RolloutSource`: an
+`RolloutScheduler` is the trainer's `Rollout` for any `SessionSource`: an
 in-process environment, a single-turn prompt set, or a harness behind a
 recording gateway. Wrap the task dataset with `scheduler.tasks(dataset)`:
 the wrapped stream registers each task batch as the trainer's prefetch reads
@@ -53,7 +53,7 @@ fixed `[rows, width]` rows; `pack` computes the per-rollout advantages and
 masks. The proximal policy is the trainer's current weights, rescored over
 the packed rows with `GRPOObjective.packed_log_probs` (decoupled PPO, AReaL
 arXiv:2505.24298): sources report behavior likelihoods only, and the
-objective's `behavior_importance_cap` or `behavior_band` weights each token
+objective's `behavior_importance` weights each token
 by proximal over behavior.
 
 One trainer process owns the scheduler; multi-process trainers are refused.
@@ -79,8 +79,16 @@ from dew.objectives.base import Variables
 from dew.training.state import TrainState
 
 from .grpo import GRPOObjective
-from .rollout import OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY
-from .rollouts import Rollout, RolloutSource, Status, Task, pack, rollout_metrics
+from .sessions import (
+    OLD_LOG_PROBS_KEY,
+    RESPONSE_MASK_KEY,
+    Session,
+    SessionSource,
+    Status,
+    Task,
+    pack,
+    session_metrics,
+)
 
 TASK_ID_KEY = "task_id"
 
@@ -106,7 +114,7 @@ class SchedulerRecord:
     (`infra_error`, `cancelled`, `stale`); `cancelled` counts in-flight
     rollouts cancelled as surplus, stale or abandoned; `abandoned` counts
     groups given up after `max_attempts`; `waited` is the seconds the
-    trainer waited. `metrics` is `rollout_metrics` over the admitted
+    trainer waited. `metrics` is `session_metrics` over the admitted
     rollouts and their packed batch: merge ratio, status shares and masked
     shares, mean reward and reward components, submission-to-finish
     latency tail, token lag and proximal-behavior mismatch.
@@ -136,7 +144,7 @@ class _Sample:
     index: int
     attempt: int
     submitted: int
-    future: Future[Rollout]
+    future: Future[Session]
     started: float = field(default_factory=time.perf_counter)
     finished: list[float] = field(default_factory=list)
 
@@ -149,7 +157,7 @@ class _Group:
     task: Task
     label: str
     live: list[_Sample] = field(default_factory=list)
-    done: list[Rollout] = field(default_factory=list)
+    done: list[Session] = field(default_factory=list)
     latencies: list[float] = field(default_factory=list)
     failures: Counter[int] = field(default_factory=Counter)
     abandoned: bool = False
@@ -181,7 +189,7 @@ class RolloutScheduler:
     a `SchedulerRecord` per call.
     """
 
-    def __init__(self, objective: GRPOObjective, source: RolloutSource, weights: Publisher, *,
+    def __init__(self, objective: GRPOObjective, source: SessionSource, weights: Publisher, *,
                  width: int, rows: int, tasks: Callable[[Batch], Sequence[Task]] = task_ids,
                  groups: int = 4, oversample: int = 0, admit: int | None = None,
                  max_lag: int = 1, ahead: int = 1, sync_every: int = 1, max_attempts: int = 3,
@@ -201,8 +209,8 @@ class RolloutScheduler:
             raise ValueError(
                 f"ahead={ahead} and sync_every={sync_every} let a batch fall {ahead + sync_every - 1} "
                 f"updates behind, past max_lag={max_lag}")
-        if max_lag > 0 and objective.behavior_importance_cap is None and objective.behavior_band is None:
-            raise ValueError("stale rollouts need the objective's behavior_importance_cap or behavior_band: "
+        if max_lag > 0 and objective.behavior_importance is None:
+            raise ValueError("stale rollouts need the objective's behavior_importance, a TIS cap or an IcePop band: "
                              "the proximal-to-behavior importance weight is the off-policy correction")
         self.objective, self.source, self.weights, self.tasks_of = objective, source, weights, tasks
         self.width, self.rows, self.groups, self.oversample, self.admit = width, rows, groups, oversample, admit
@@ -331,7 +339,7 @@ class RolloutScheduler:
                 return
             self._replace(group, sample, "timeout", tally)
 
-    def _settle(self, entry: _Entry, group: _Group, sample: _Sample, rollout: Rollout, updates: int,
+    def _settle(self, entry: _Entry, group: _Group, sample: _Sample, rollout: Session, updates: int,
                 tally: _Tally) -> None:
         """Admit one finished rollout into its group, or replace it."""
         if rollout.status in (Status.INFRA_ERROR, Status.CANCELLED):
@@ -407,5 +415,5 @@ class RolloutScheduler:
             oldest = min(versions, default=updates)
             self.log(SchedulerRecord(
                 updates, oldest, updates - oldest, len(admitted), dict(tally.resubmitted), tally.cancelled,
-                tally.abandoned, waited, rollout_metrics(rollouts, packed, latencies=latencies, version=updates)))
+                tally.abandoned, waited, session_metrics(rollouts, packed, latencies=latencies, version=updates)))
         return packed

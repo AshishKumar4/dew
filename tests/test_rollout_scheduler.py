@@ -28,8 +28,8 @@ from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, Observation, Score
-from dew.objectives.rl.rollouts import Call, Rollout, Status, pack
 from dew.objectives.rl.scheduler import RolloutScheduler
+from dew.objectives.rl.sessions import Call, Session, Status, pack
 from dew.sampling import Sampling
 from dew.training import Layout, Trainer
 
@@ -41,8 +41,7 @@ ROWS = 8
 class Objective:
     """The scheduler reads the correction setting and rescores packed rows."""
 
-    behavior_importance_cap = 2.0
-    behavior_band = None
+    behavior_importance = 2.0
 
     def packed_log_probs(self, params, batch):
         return jnp.full(batch["input_ids"].shape, -0.75, jnp.float32) + 0 * params
@@ -70,7 +69,7 @@ def finished(reward=1.0, *versions, status=Status.COMPLETED, components=None):
         calls.append(Call(prompt, (3, EOS), (-.5, -.25), "stop", version))
         prompt = (*prompt, 3, EOS, 4)
     scored = status.trainable or status == Status.TRUNCATED
-    return Rollout("source-task", "source-group", 7, 7, tuple(calls), status,
+    return Session("source-task", "source-group", 7, 7, tuple(calls), status,
                    reward if scored else None, components or {}, "")
 
 
@@ -120,7 +119,7 @@ def scheduler(source, publisher=None, stream=((1, 2), (3, 4), (5, 6)), **options
 def trained(batch):
     """The rollout indices that carry loss mass, and their summed weights."""
     mask = batch["response_mask"] > 0
-    return sorted(set(batch["rollout_index"][mask].tolist())), float(batch["rollout_weights"].sum())
+    return sorted(set(batch["session_index"][mask].tolist())), float(batch["session_weights"].sum())
 
 
 def test_complete_groups_are_packed_and_the_next_batch_is_submitted_ahead():
@@ -134,7 +133,7 @@ def test_complete_groups_are_packed_and_the_next_batch_is_submitted_ahead():
     indices, weight = trained(batch)
     assert indices == [0, 1, 2, 3] and weight == pytest.approx(4.0)
     # Sample rewards 0 and 1 in each group, centred per group.
-    by_rollout = {int(i): float(a) for i, a in zip(batch["rollout_index"][batch["response_mask"] > 0],
+    by_rollout = {int(i): float(a) for i, a in zip(batch["session_index"][batch["response_mask"] > 0],
                                                    batch["advantages"][batch["response_mask"] > 0], strict=True)}
     assert by_rollout == pytest.approx({0: -.5, 1: .5, 2: -.5, 3: .5})
     np.testing.assert_allclose(batch["old_log_probs"], -0.75 * batch["response_mask"])
@@ -386,7 +385,7 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
     width = 48
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=64, dtype="float32")
-    target = GRPOObjective(model, seq_len=width - 1, behavior_importance_cap=2.0)
+    target = GRPOObjective(model, seq_len=width - 1, behavior_importance=2.0)
     params = target.init(jax.random.key(0))
     sampling = Sampling(temperature=1.0, eos_id=STOP)
     server = NativeRolloutServer(Server.from_task(TextGeneration(model, params, None, sampling=sampling),
