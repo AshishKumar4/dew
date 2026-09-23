@@ -39,7 +39,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.nn.attention import LayerNorm, normalized_in_fp32, scaled_dot_product_attention
+from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
@@ -142,7 +142,7 @@ class CLIPEncoderLayer(nn.Module):
     activation: str = "quick_gelu"
 
     def setup(self):
-        norm = functools.partial(nn.LayerNorm, epsilon=self.layer_norm_eps,
+        norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
                                  dtype=self.dtype)
         self.layer_norm1 = norm(name="layer_norm1")
         self.self_attn = CLIPAttention(
@@ -256,7 +256,7 @@ class CLIPVisionTransformer(nn.Module):
             name="patch_embedding")
         self.position_embedding = nn.Embed(patches + 1, self.hidden_size,
                                            dtype=self.dtype, name="position_embedding")
-        norm = functools.partial(nn.LayerNorm, epsilon=self.layer_norm_eps,
+        norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
                                  dtype=self.dtype)
         self.pre_layernorm = norm(name="pre_layernorm")
         self.layers = [
@@ -782,32 +782,6 @@ def _t5_relative_position_bucket(relative_position, bidirectional, num_buckets, 
     return relative_buckets + jnp.where(is_small, relative_position, large)
 
 
-@functools.partial(normalized_in_fp32, static_argnums=(2, 3))
-def t5_normalized(hidden_states, weight, epsilon: float, dtype):
-    """`T5LayerNorm`'s body, rematerialized so the width-shaped fp32
-    activations stay out of the backward pass. The division promotes, so
-    `dtype` of None leaves the result in fp32, which is the dtype the
-    reference returns too."""
-    deviation = jnp.sqrt(jnp.mean(jnp.square(hidden_states.astype(jnp.float32)),
-                                  axis=-1, keepdims=True) + epsilon)
-    normalized = hidden_states / deviation
-    return (weight.astype(normalized.dtype) * normalized).astype(
-        normalized.dtype if dtype is None else dtype)
-
-
-class T5LayerNorm(nn.Module):
-    """T5's norm: RMS over the width, a weight, no mean subtraction and no
-    bias, modeling_t5.py `T5LayerNorm`."""
-    epsilon: float = 1e-6
-    dtype: Dtype | None = None
-
-    @nn.compact
-    def __call__(self, hidden_states):
-        weight = self.param("scale", nn.initializers.ones,
-                            (hidden_states.shape[-1],), jnp.float32)
-        return t5_normalized(hidden_states, weight, self.epsilon, self.dtype)
-
-
 @logical_axes({("q_proj",): ("embed", "heads"), ("k_proj",): ("embed", "kv"), ("v_proj",): ("embed", "kv"), ("out_proj",): ("attention", "embed"), ("rel_bias",): (None, "heads")})
 class T5SelfAttention(nn.Module):
     """Multi-head self-attention with the relative position bias, no causal
@@ -943,15 +917,15 @@ class T5Block(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        self.attn_norm = T5LayerNorm(epsilon=self.layer_norm_epsilon,
-                                     dtype=self.dtype, name="attn_norm")
+        # modeling_t5.py `T5LayerNorm`: RMS with no mean and no bias. With
+        # fp32 weights it scales before any cast.
+        self.attn_norm = RMSNorm(epsilon=self.layer_norm_epsilon, dtype=self.dtype, name="attn_norm")
         self.self_attn = T5SelfAttention(
             self.num_heads, self.head_dim, self.d_model,
             self.has_relative_attention_bias, self.num_buckets,
             self.max_distance, self.dropout_rate,
             dtype=self.dtype, precision=self.precision, name="self_attn")
-        self.mlp_norm = T5LayerNorm(epsilon=self.layer_norm_epsilon,
-                                    dtype=self.dtype, name="mlp_norm")
+        self.mlp_norm = RMSNorm(epsilon=self.layer_norm_epsilon, dtype=self.dtype, name="mlp_norm")
         if self.feed_forward_proj == "relu":
             feedforward = T5DenseReluDense
         elif self.feed_forward_proj == "gated-gelu":
@@ -1002,8 +976,7 @@ class T5EncoderTransformer(nn.Module):
                     self.feed_forward_proj, self.dropout_rate, self.layer_norm_epsilon,
                     dtype=self.dtype, precision=self.precision, name=f"layers_{index}")
             for index in range(self.num_layers)]
-        self.final_norm = T5LayerNorm(epsilon=self.layer_norm_epsilon,
-                                      dtype=self.dtype, name="final_layer_norm")
+        self.final_norm = RMSNorm(epsilon=self.layer_norm_epsilon, dtype=self.dtype, name="final_layer_norm")
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, input_ids, attention_mask=None, train: bool = False):

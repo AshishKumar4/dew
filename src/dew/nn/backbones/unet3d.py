@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import NormalAttention, rotary_freqs
+from ..attention import NormalAttention, RMSNorm, rotary_freqs
 from ..dit import ROPE_THETA
 from ..sharding import logical_axes
 from .unet import Unet, unet_body
@@ -41,7 +41,7 @@ class TemporalBlock(nn.Module):
         h = x.reshape(B, frames, H * W, C)
         h = h.transpose(0, 2, 1, 3).reshape(B * H * W, frames, C)
 
-        h = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(h)
+        h = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(h)
         h = NormalAttention(
             query_dim=C,
             heads=self.heads,

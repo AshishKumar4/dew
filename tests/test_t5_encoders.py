@@ -9,7 +9,7 @@ committed, so the comparison runs in CI without a download.
 Tolerances and the differences actually observed, fp32 on CPU:
 
 - tiny checkpoint (gated-gelu, the v1.1 feed-forward): max |hidden state
-  difference| 1.4e-06 (mean 2.2e-07, median 1.8e-07), tolerance 1e-4, on
+  difference| 1.55e-06 (mean 2.37e-07, median 2.09e-07), tolerance 1e-4, on
   hidden states reaching 3.6. The two rearrangements against the reference
   cost nothing measurable: the query carries sqrt(head_dim) to cancel the
   kernel's 1/sqrt(head_dim), and the gate is `jax.nn.gelu(approximate=True)`,

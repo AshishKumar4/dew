@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import LayerNorm, apply_rotary, rotary_freqs, scaled_dot_product_attention
+from ..attention import LayerNorm, RMSNorm, apply_rotary, rotary_freqs, scaled_dot_product_attention
 from ..dit import (
     ROPE_THETA,
     AdaLNParams,
@@ -96,10 +96,10 @@ class MMDiTBlock(nn.Module):
         self.txt_mlp = mlp("txt_mlp")
 
         if self.qk_norm:
-            self.img_q_norm = nn.RMSNorm(dtype=self.dtype, name="img_q_norm")
-            self.img_k_norm = nn.RMSNorm(dtype=self.dtype, name="img_k_norm")
-            self.txt_q_norm = nn.RMSNorm(dtype=self.dtype, name="txt_q_norm")
-            self.txt_k_norm = nn.RMSNorm(dtype=self.dtype, name="txt_k_norm")
+            self.img_q_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="img_q_norm")
+            self.img_k_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="img_k_norm")
+            self.txt_q_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="txt_q_norm")
+            self.txt_k_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="txt_k_norm")
 
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 

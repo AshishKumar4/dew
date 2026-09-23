@@ -1514,8 +1514,8 @@ class NormalAttention(nn.Module):
         self.value = dense(name="to_v")
 
         if self.qk_norm:
-            self.q_norm = nn.RMSNorm(dtype=self.dtype, name="q_norm")
-            self.k_norm = nn.RMSNorm(dtype=self.dtype, name="k_norm")
+            self.q_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="q_norm")
+            self.k_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="k_norm")
 
         self.proj_attn = nn.DenseGeneral(
             self.query_dim,
@@ -1648,9 +1648,9 @@ class BasicTransformerBlock(nn.Module):
         self.attention2 = attention(name='Attention2')
 
         self.ff = FlaxFeedForward(dim=self.query_dim, dtype=self.dtype, precision=self.precision)
-        self.norm1 = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
-        self.norm2 = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
-        self.norm3 = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
+        self.norm1 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
+        self.norm2 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
+        self.norm3 = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)
 
     @nn.compact
     def __call__(self, hidden_states, context=None):
@@ -1738,7 +1738,7 @@ class TransformerBlock(nn.Module):
         inner_dim = self.heads * self.dim_head
         C = x.shape[-1]
         if self.norm_inputs:
-            x = nn.RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
+            x = RMSNorm(epsilon=self.norm_epsilon, dtype=self.dtype)(x)
         if self.use_projection:
             if self.use_linear_attention:
                 projected_x = nn.Dense(features=inner_dim,

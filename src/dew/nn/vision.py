@@ -170,7 +170,7 @@ class SiglipEncoderLayer(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        norm = functools.partial(nn.LayerNorm, epsilon=self.layer_norm_eps,
+        norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
                                  dtype=self.dtype)
         self.layer_norm1 = norm(name="layer_norm1")
         self.self_attn = CLIPAttention(
@@ -418,7 +418,7 @@ class Llama4VisionEncoderLayer(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        norm = functools.partial(nn.LayerNorm, epsilon=self.layer_norm_eps,
+        norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
                                  dtype=self.dtype)
         self.input_layernorm = norm(name="input_layernorm")
         self.self_attn = Llama4VisionAttention(
@@ -525,7 +525,7 @@ class Llama4VisionTransformer(nn.Module):
         self.positional_embedding = self.param(
             "positional_embedding", nn.initializers.normal(self.hidden_size ** -0.5),
             (grid * grid + 1, self.hidden_size))
-        norm = functools.partial(nn.LayerNorm, epsilon=self.layer_norm_eps,
+        norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
                                  dtype=self.dtype)
         self.layernorm_pre = norm(name="layernorm_pre")
         self.layers = [
@@ -1105,7 +1105,7 @@ class Qwen35VisionBlock(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        norm = functools.partial(nn.LayerNorm, epsilon=1e-6, dtype=self.dtype)
+        norm = functools.partial(LayerNorm, epsilon=1e-6, dtype=self.dtype)
         self.norm1 = norm(name="norm1")
         self.attn = Qwen35VisionAttention(
             self.hidden_size, self.num_heads, dtype=self.dtype,

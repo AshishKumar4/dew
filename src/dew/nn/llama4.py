@@ -14,12 +14,12 @@ import dataclasses
 import functools
 from collections.abc import Callable
 
-import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import (
+    RMSNorm,
     RopeScaling,
     causal_attention_mask,
     chunk_mask,
@@ -35,13 +35,6 @@ from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import apply_rotary_interleave
 from dew.nn.sharding import logical_axes
-
-
-def l2_norm(x, eps: float):
-    """`Llama4TextL2Norm`: RMS-normalised in fp32 with no scale, cast back."""
-    fp32 = x.astype(jnp.float32)
-    return (fp32 * jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
-            ).astype(x.dtype)
 
 
 def temperature_scale(positions, floor_scale: float, attn_scale: float):
@@ -106,6 +99,8 @@ class Llama4Attention(nn.Module):
         self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
         self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
         self.o_proj = dense(self.emb_features, name='o_proj')
+        # `Llama4TextL2Norm`: the weightless RMS norm in fp32, cast back.
+        self.qk_l2_norm = RMSNorm(epsilon=self.norm_eps, with_scale=False)
 
     @nn.compact
     def __call__(self, x, decode: bool = False,
@@ -138,8 +133,7 @@ class Llama4Attention(nn.Module):
                 # The reference norms after rotating; the norm has no scale
                 # and a rotation keeps every pair's length, so the two
                 # orders agree to rounding.
-                query = l2_norm(query, self.norm_eps)
-                key = l2_norm(key, self.norm_eps)
+                query, key = self.qk_l2_norm(query), self.qk_l2_norm(key)
         elif self.attn_temperature_tuning:
             scale = temperature_scale(positions, self.floor_scale, self.attn_scale)
             query = (query * scale[..., :, None, None].astype(query.dtype)
