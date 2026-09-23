@@ -1107,6 +1107,18 @@ def test_decoding_drops_alpha_and_hands_back_rgb():
     np.testing.assert_array_equal(out[0, 0], [30, 20, 10])
 
 
+def test_a_sixteen_bit_png_decodes_to_its_high_byte():
+    """Every record is uint8 whatever depth it was stored at, or a 16-bit
+    one lands in the batch at 256 times the scale of the rest."""
+    bgr = np.random.RandomState(0).randint(0, 65536, (4, 5, 3)).astype(np.uint16)
+    encoded = cv2.imencode(".png", bgr)[1].tobytes()
+
+    out = decode_image(encoded)
+
+    assert out.dtype == np.uint8
+    np.testing.assert_array_equal(out, (bgr[..., ::-1] >> 8).astype(np.uint8))
+
+
 def test_a_truncated_image_raises_rather_than_becoming_an_array():
     """cv2.imdecode hands back None for a half-written jpeg, and None resized
     to the training size would be a black record; the decoder raises a
@@ -1217,6 +1229,27 @@ def test_a_jpeg_decodes_at_the_coarsest_scale_that_still_covers_the_target():
     assert decode_image(encoded, at_least=128).shape[:2] == (200, 300)
     assert decode_image(encoded, at_least=256).shape[:2] == (400, 600)
     assert decode_image(encoded).shape[:2] == (400, 600)
+
+
+def test_a_reduced_decode_keeps_the_orientation_the_pixels_are_stored_in():
+    """cv2 applies a JPEG's EXIF rotation under its reduced colour flags and
+    not under IMREAD_UNCHANGED, so `at_least` used to turn the same bytes
+    sideways. Both ignore it now, as PIL's `Image.open` does."""
+    import io
+
+    import PIL.Image
+
+    image = PIL.Image.fromarray(np.random.RandomState(0).randint(0, 256, (32, 64, 3), np.uint8))
+    exif = image.getexif()
+    exif[0x0112] = 6  # rotate 90 degrees clockwise to display
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", exif=exif.tobytes())
+    encoded = buffer.getvalue()
+
+    with PIL.Image.open(io.BytesIO(encoded)) as stored:
+        width, height = stored.size
+    assert decode_image(encoded).shape[:2] == (height, width)
+    assert decode_image(encoded, at_least=16).shape[:2] == (height // 2, width // 2)
 
 
 # ---------------------------------------------------------------------------------
