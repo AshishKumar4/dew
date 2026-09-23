@@ -263,18 +263,16 @@ class _Prompt:
     ids: tuple[int, ...]
     source: str
     truth: str
-    info: str
+    extra: str
 
     @classmethod
     def of(cls, task: Task) -> _Prompt:
-        data = task.data
-        ids, source, truth, info = (data.get(name) for name in ("prompt", "source", "truth", "info"))
-        if (not isinstance(ids, tuple) or not all(type(token) is int for token in ids)
-                or not all(isinstance(text, str) for text in (source, truth, info))):
-            raise TypeError(f"task {task.id!r} is not a prompt_tasks task: it needs integer prompt ids "
+        ids, source, truth, extra = (task.data.get(name) for name in ("prompt", "source", "truth", "info"))
+        if not (isinstance(ids, tuple) and isinstance(source, str) and isinstance(truth, str)
+                and isinstance(extra, str)):
+            raise TypeError(f"task {task.id!r} is not a prompt_tasks task: it needs prompt ids "
                             "and source, truth and info strings")
-        assert isinstance(source, str) and isinstance(truth, str) and isinstance(info, str)
-        return cls(ids, source, truth, info)
+        return cls(ids, source, truth, extra)
 
 
 class PromptSource:
@@ -287,8 +285,8 @@ class PromptSource:
     future with the exception, so no future is left pending.
     """
 
-    def __init__(self, server: RolloutServer, reward: Callable[[str, str, str, str], float | Score], *, decode: Callable[[Sequence[int]], str],
-                 max_new_tokens: int, scorers: int = 16, seed: int = 0):
+    def __init__(self, server: RolloutServer, reward: Callable[[str, str, str, str], float | Score], *,
+                 decode: Callable[[Sequence[int]], str], max_new_tokens: int, scorers: int = 16, seed: int = 0):
         if type(max_new_tokens) is not int or max_new_tokens < 1:
             raise ValueError("a rollout generates at least one token")
         self.server, self.reward, self.decode, self.max_new_tokens = server, reward, decode, max_new_tokens
@@ -303,7 +301,8 @@ class PromptSource:
             serial = self._serial
             self._serial += 1
         prompt = _Prompt.of(task)
-        return [self._scored(task, prompt, self.server.submit(prompt.ids, self.max_new_tokens, seed=_seed(self.seed, serial, k)))
+        return [self._scored(task, prompt, self.server.submit(prompt.ids, self.max_new_tokens,
+                                                              seed=_seed(self.seed, serial, k)))
                 for k in range(samples)]
 
     def cancel(self, futures: Sequence[Future[Session]]) -> None:
@@ -325,7 +324,7 @@ class PromptSource:
         status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
         try:
             text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
-            score = _scored(self.reward(prompt.source, text, prompt.truth, prompt.info))
+            score = _scored(self.reward(prompt.source, text, prompt.truth, prompt.extra))
         except Exception as error:
             return Session(task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}")
         return Session(task.id, "", 0, 0, (call,), status, score.reward, dict(score.components), score.detail)

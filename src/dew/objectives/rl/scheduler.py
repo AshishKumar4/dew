@@ -56,11 +56,11 @@ Weights are pushed through `weights` when the served version falls
 refuses a `max_lag` below that. Admitted groups are packed by `pack` into
 fixed `[rows, width]` rows; `pack` computes the per-rollout advantages and
 masks. A complete group whose chains do not fit `rows` beside the groups
-admitted before it is cut, never packed into a failing step. The proximal policy is the trainer's current weights, rescored over
-the packed rows with `GRPOObjective.packed_log_probs` (decoupled PPO, AReaL
-arXiv:2505.24298): sources report behavior likelihoods only, and the
-objective's `behavior_importance` weights each token
-by proximal over behavior.
+admitted before it is cut, never packed into a failing step. The proximal
+policy is the trainer's current weights, rescored over the packed rows with
+`GRPOObjective.packed_log_probs` (decoupled PPO, AReaL arXiv:2505.24298):
+sources report behavior likelihoods only, and the objective's
+`behavior_importance` weights each token by proximal over behavior.
 
 One trainer process owns the scheduler; multi-process trainers are refused.
 """
@@ -97,8 +97,6 @@ from .sessions import (
     rows_needed,
     session_metrics,
 )
-
-TASK_ID_KEY = "task_id"
 
 
 class Publisher(Protocol):
@@ -145,7 +143,7 @@ class SchedulerRecord:
 
 def task_ids(batch: Batch) -> list[Task]:
     """One task per integer `task_id` row, named by its decimal id."""
-    ids = local_rows(batch[TASK_ID_KEY])
+    ids = local_rows(batch["task_id"])
     if ids.ndim != 1 or not ids.size or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("task_id must be a nonempty vector of integer task identities")
     return [Task(str(int(value))) for value in ids]
@@ -207,15 +205,15 @@ class RolloutScheduler:
                  width: int, rows: int, tasks: Callable[[Batch], Sequence[Task]] = task_ids,
                  groups: int = 4, oversample: int = 0, admit: int | None = None,
                  max_lag: int = 1, ahead: int = 1, sync_every: int = 1, max_attempts: int = 3,
-                 timeout: float | None = None, estimator: str = "group", truncation: str = "mask", log: Callable[[SchedulerRecord], None] | None = None):
+                 timeout: float | None = None, estimator: str = "group", truncation: str = "mask",
+                 log: Callable[[SchedulerRecord], None] | None = None):
         for name, value, least in (("width", width, 2), ("rows", rows, 1), ("groups", groups, 2),
                                    ("oversample", oversample, 0), ("ahead", ahead, 0),
                                    ("sync_every", sync_every, 1), ("max_lag", max_lag, 0),
                                    ("max_attempts", max_attempts, 1)):
             if type(value) is not int or value < least:
                 raise ValueError(f"{name} must be an integer of at least {least}")
-        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-                                    or not timeout > 0):
+        if timeout is not None and not timeout > 0:
             raise ValueError("timeout must be a positive number of seconds, or None to wait without a deadline")
         check_truncation(truncation)
         if admit is not None and (type(admit) is not int or admit < 1):
@@ -274,8 +272,6 @@ class RolloutScheduler:
         """Submit `(index, attempt)` samples of one group under the served version."""
         version = self.weights.version
         futures = self.source.submit(group.task, len(samples), version=version)
-        if len(futures) != len(samples):
-            raise ValueError(f"the source returned {len(futures)} rollouts for {len(samples)} samples")
         group.live.extend(_Sample(index, attempt, version, future)
                           for (index, attempt), future in zip(samples, futures, strict=True))
 
@@ -323,36 +319,31 @@ class RolloutScheduler:
         A group stops taking rollouts once it is full or abandoned; its
         remaining samples are left for `_admit`'s final cancel.
         """
-        stale = [sample for sample in group.live
-                 if not sample.future.done() and updates - sample.submitted > self.max_lag]
-        if stale:
-            tally.cancelled += len(stale)
-            self._cancel(stale)
-            group.live = [sample for sample in group.live if sample not in stale]
-        for sample in [sample for sample in group.live if sample.future.done()]:
+        now = time.perf_counter()
+        overdue = {}
+        for sample in group.live:
+            if sample.future.done():
+                continue
+            if updates - sample.submitted > self.max_lag:
+                overdue[sample] = "stale"
+            elif self.timeout is not None and now - sample.started >= self.timeout:
+                overdue[sample] = "timeout"
+        if overdue:
+            tally.cancelled += len(overdue)
+            self._cancel(list(overdue))
+            group.live = [sample for sample in group.live if sample not in overdue]
+        finished = [(sample, None) for sample in group.live if sample.future.done()]
+        for sample, cause in [*finished, *overdue.items()]:
             if group.abandoned or len(group.done) >= self.groups:
                 return
+            if cause is not None:
+                self._replace(group, sample, cause, tally)
+                continue
             group.live.remove(sample)
             if sample.future.cancelled():
                 self._replace(group, sample, "cancelled", tally)
             else:
                 self._settle(entry, group, sample, sample.future.result(), updates, tally)
-        for sample in stale:
-            if group.abandoned or len(group.done) >= self.groups:
-                return
-            self._replace(group, sample, "stale", tally)
-        if self.timeout is None:
-            return
-        now = time.perf_counter()
-        expired = [sample for sample in group.live if not sample.future.done() and now - sample.started >= self.timeout]
-        if expired:
-            tally.cancelled += len(expired)
-            self._cancel(expired)
-            group.live = [sample for sample in group.live if sample not in expired]
-        for sample in expired:
-            if group.abandoned or len(group.done) >= self.groups:
-                return
-            self._replace(group, sample, "timeout", tally)
 
     def _settle(self, entry: _Entry, group: _Group, sample: _Sample, rollout: Session, updates: int,
                 tally: _Tally) -> None:
@@ -361,8 +352,6 @@ class RolloutScheduler:
             self._replace(group, sample, rollout.status.value, tally)
             return
         if rollout.status is Status.TRUNCATED and rollout.reward is None and self.truncation == "score":
-            # The policy trains truncations on their score, and none was given:
-            # the verifier did not run, which is the infrastructure's failure.
             self._replace(group, sample, "unscored", tally)
             return
         oldest = min((call.version for call in rollout.calls), default=sample.submitted)
@@ -388,7 +377,6 @@ class RolloutScheduler:
         """
         alone = rows_needed(group.done, self.width, truncation=self.truncation)
         if alone > self.rows:
-            # A configuration error, whatever order the groups finished in.
             raise ValueError(f"one group of task {group.task.id} needs {alone} rows of {self.width} ids, "
                              f"more than rows={self.rows}; size rows for sessions whose calls split into chains")
         admitted = [session for complete in entry.complete for session in complete.done[:self.groups]]
@@ -456,8 +444,8 @@ class RolloutScheduler:
         if self.log is not None:
             versions = [call.version for rollout in rollouts for call in rollout.calls]
             oldest = min(versions, default=updates)
-            self.log(SchedulerRecord(
-                updates, oldest, updates - oldest, len(admitted), dict(tally.resubmitted), tally.cancelled,
-                tally.abandoned, tally.cut, waited, session_metrics(rollouts, packed, latencies=latencies, version=updates,
-                                                       truncation=self.truncation)))
+            metrics = session_metrics(rollouts, packed, latencies=latencies, version=updates,
+                                      truncation=self.truncation)
+            self.log(SchedulerRecord(updates, oldest, updates - oldest, len(admitted), dict(tally.resubmitted),
+                                     tally.cancelled, tally.abandoned, tally.cut, waited, metrics))
         return packed
