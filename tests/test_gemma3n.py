@@ -19,6 +19,7 @@ from flax import linen as nn
 
 from dew.nn.backbones.causal_transformer import BlockWiring, DecoderBlock, GatedMLP
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
+from dew.nn.inputs import LayerInputs
 from dew.nn.mixers import AttentionMixer, MixerContext
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gemma3n"
@@ -115,7 +116,7 @@ def test_zero_altup_scale_still_learns_the_per_layer_residual():
         norm_eps=1e-6, per_layer_input_dim=per_layer_features,
         altup=AltUp(num_inputs=COPIES))
     stream = jnp.linspace(-1, 1, COPIES * features).reshape(COPIES, 1, 1, features)
-    per_layer = jnp.linspace(0.2, 1, per_layer_features).reshape(1, 1, per_layer_features)
+    per_layer = LayerInputs(embeddings=jnp.linspace(0.2, 1, per_layer_features).reshape(1, 1, per_layer_features))
     variables = block.init(jax.random.key(0), stream, per_layer_input=per_layer)
     params = variables["params"]
     params["post_per_layer_input_norm"]["scale"] = jnp.linspace(0.7, 1.3, features)
@@ -138,7 +139,7 @@ def test_zero_altup_scale_still_learns_the_per_layer_residual():
     gate = np.asarray(params["per_layer_input_gate"]["kernel"], dtype=np.float64)
     projection = np.asarray(params["per_layer_projection"]["kernel"], dtype=np.float64)
     weight = np.asarray(params["post_per_layer_input_norm"]["scale"], dtype=np.float64)
-    ple = np.asarray(per_layer[0, 0], dtype=np.float64)
+    ple = np.asarray(per_layer.embeddings[0, 0], dtype=np.float64)
     scaled_jacobian = (0.5 * active[:, None] * gate * ple) @ projection * weight
     expected = np.stack([np.zeros_like(scaled_jacobian)]
                         + [scaled_jacobian.T] * (COPIES - 1))

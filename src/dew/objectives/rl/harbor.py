@@ -60,6 +60,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from dew.inference.clients import decode_routed_experts
 from dew.records import JSON
 
 from .sessions import Call, Session, Status, Task
@@ -242,12 +243,16 @@ def _trace(trace: object, unstamped: int) -> _Trace:
     version = trace.get("weight_version")
     if version is not None and type(version) is not int:
         raise ValueError(f"a trace's weight version is an integer, got {version!r}")
+    choices = raw.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    routed = choice.get("routed_experts")
     likelihoods = trace.get("logprobs") or []
     if not isinstance(likelihoods, list):
         raise ValueError("a trace's log-probabilities are a list")
     call = Call(_ids("prompt ids", prompt), _ids("sampled ids", sampled),
                 tuple(_number("a log-probability", value) for value in likelihoods),
-                str(trace.get("finish_reason")), unstamped if version is None else version)
+                str(trace.get("finish_reason")), unstamped if version is None else version,
+                routed_experts=None if routed is None else decode_routed_experts(routed))
     return _Trace(arrival, call, "")
 
 

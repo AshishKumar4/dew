@@ -22,15 +22,12 @@ they came. No torch or verl import happens in Dew.
 
 from __future__ import annotations
 
-import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Protocol, TypedDict
+from typing import TypedDict
 
 import numpy as np
-
-from dew.records import JSON
 
 from .records import integer, object_record, real, sequence, text
 from .sessions import Call, Session, Status, _chains
@@ -280,29 +277,3 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
         trajectories.append(VerlTrajectory(session, MappingProxyType(extras)))
         cursor += used
     return tuple(trajectories)
-
-
-class VerlScore(Protocol):
-    """verl's reward signature, `verl/utils/reward_score/__init__.py` L19-L27:
-    a score, or a mapping holding `score`."""
-
-    def __call__(self, *, data_source: str, solution_str: str, ground_truth: str,
-                 extra_info: JSON = None) -> float | Mapping[str, float]: ...
-
-
-def verl_reward(compute_score: VerlScore) -> Callable[[str, str, str, str], float]:
-    """Adapt a verl-style reward function to Dew's `Reward`.
-
-    Dew carries `extra_info` as JSON text (`dew.data.prompts`), which verl
-    hands its scorers as a dict; the empty string is verl's missing extra.
-    A mapping result gives its `score`, as verl's reward managers read it.
-    """
-    def reward(data_source: str, completion: str, ground_truth: str, extra_info: str) -> float:
-        context = json.loads(extra_info) if extra_info else None
-        # verl's reward managers pass these four by keyword
-        # (`reward_loop/reward_manager/naive.py` L66-L80).
-        score = compute_score(data_source=data_source, solution_str=completion,
-                              ground_truth=ground_truth, extra_info=context)
-        return float(score["score"] if isinstance(score, Mapping) else score)
-
-    return reward

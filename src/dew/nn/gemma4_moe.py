@@ -18,7 +18,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
-from dew.nn.moe import ExpertMLP, GatedActivation
+from dew.nn.moe import ExpertMLP, GatedActivation, Routes, chosen_experts
 from dew.nn.sharding import logical_axes
 
 
@@ -33,7 +33,7 @@ class Gemma4TextRouter(nn.Module):
     precision: PrecisionLike = None
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, routes: Routes | None = None):
         if not 0 < self.top_k <= self.num_experts:
             raise ValueError(
                 f"top_k selects among the experts, so it is between 1 and "
@@ -46,7 +46,9 @@ class Gemma4TextRouter(nn.Module):
         logits = nn.Dense(self.num_experts, use_bias=False, dtype=self.dtype,
                           precision=self.precision, name='proj')(scaled)
         probabilities = jax.nn.softmax(logits.astype(jnp.float32), axis=-1)
-        weights, indices = jax.lax.top_k(probabilities, self.top_k)
+        indices = chosen_experts(lambda: jax.lax.top_k(probabilities, self.top_k)[1],
+                                 (*probabilities.shape[:-1], self.top_k), routes)
+        weights = jnp.take_along_axis(probabilities, indices, axis=-1)
         weights = weights / jnp.sum(weights, axis=-1, keepdims=True)
         per_expert = self.param('per_expert_scale', nn.initializers.ones,
                                 (self.num_experts,), jnp.float32)
@@ -76,14 +78,14 @@ class Gemma4Experts(nn.Module):
     precision: PrecisionLike = None
 
     @nn.compact
-    def __call__(self, x, mlp_out):
+    def __call__(self, x, mlp_out, routes: Routes | None = None):
         def norm(name: str) -> RMSNorm:
             return RMSNorm(epsilon=self.norm_eps, scale_offset=self.scale_offset,
                            scale_after_cast=self.scale_after_cast, dtype=self.dtype, name=name)
 
         weights, indices = Gemma4TextRouter(
             num_experts=self.num_experts, top_k=self.top_k, norm_eps=self.norm_eps,
-            dtype=self.dtype, precision=self.precision, name='router')(x)
+            dtype=self.dtype, precision=self.precision, name='router')(x, routes)
         routed = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
             out_features=self.out_features, activation=self.activation,

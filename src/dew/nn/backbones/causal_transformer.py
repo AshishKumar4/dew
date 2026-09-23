@@ -52,7 +52,7 @@ from ..hyper_connections import (
     expand_streams,
     mix_streams,
 )
-from ..inputs import AttentionMetadata, PredictionPhase
+from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
 from ..kv_cache import KVCache, is_paged
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..mixers.mamba2 import Mamba2Mixer
@@ -572,8 +572,10 @@ class DecoderBlock(nn.Module):
 
     kv_store threads one dict down the layer stack so a KV-sharing mixer
     reads its provider's keys and values; a mixer without a kv_store keyword
-    fails loudly when a run shares. per_layer_input is the layer's input
-    signal for the per-layer residual, None when the model has none.
+    fails loudly when a run shares. per_layer_input is the layer's slice of
+    `LayerInputs`: its input signal for the per-layer residual, and on a
+    `routed` block the replayed experts its router uses (`dew.nn.moe.Routes`),
+    None when the model reads neither.
 
     altup makes the block take and return Gemma 3n's stack of residual
     copies, `[num_inputs, B, S, D]`: it predicts the copies, runs on the
@@ -615,6 +617,7 @@ class DecoderBlock(nn.Module):
     hash_routed: bool = False  # the feed-forward routes by the token ids the metadata carries
     residual_multiplier: float = 1.0  # each sublayer's output scaled before it joins the residual
     residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
+    routed: bool = False  # the feed-forward, or the parallel branch, routes over experts
     dropout_rate: float = 0.0
     remat: RematPolicy | None = None
     dtype: Dtype | None = None
@@ -733,10 +736,10 @@ class DecoderBlock(nn.Module):
                  kv_store, per_layer_input, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
         if self.hyper_connections is not None:
             return self._forward_streams(x, train, decode, positions, segment_ids,
-                                         kv_store, attention_metadata, prediction_phase)
+                                         kv_store, attention_metadata, prediction_phase, per_layer_input)
         if self.residual_site is not None:
             return self._forward_depth(x, train, decode, positions, segment_ids,
-                                       kv_store, attention_metadata, prediction_phase)
+                                       kv_store, attention_metadata, prediction_phase, per_layer_input)
         altup = self.altup
         predictions = None if altup is None else self.altup_layer.predict(x, train=train)
         if altup is not None and predictions is not None:
@@ -750,32 +753,35 @@ class DecoderBlock(nn.Module):
         if self.laurel_rank is not None:
             x = (x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), x.dtype)
         if self.feedforward is not None:
+            routes = self._routes(per_layer_input)
             hidden = self.mlp(self.post_attention_layernorm(x) if self.wiring.pre_norms else x,
-                              **self._feedforward_inputs(attention_metadata))
+                              **self._feedforward_inputs(attention_metadata),
+                              **({} if self.parallel is not None else routes))
             if self.parallel is not None:
-                hidden = self.moe(x, hidden)
+                hidden = self.moe(x, hidden, **routes)
             if self.wiring.output_norms:
                 hidden = self.mlp_output_norm(hidden)
             hidden = self._scaled_branch(hidden)
             x = x + self.dropout(hidden, deterministic=not train)
         if altup is not None and predictions is not None:
             corrected = self.altup_layer.correct(predictions, x, train=train)
-            if self.per_layer_input_dim and per_layer_input is not None:
+            if self.per_layer_input_dim and per_layer_input is not None and per_layer_input.embeddings is not None:
                 first = corrected[altup.active_idx]
                 if altup.correct_scale:
                     first = self.altup_layer.scale_corrected_output(first)
                 # The per-layer residual lands on the copies past the first,
                 # the active one left as corrected.
-                corrected = corrected.at[1:].add(self._per_layer_residual(first, per_layer_input))
+                corrected = corrected.at[1:].add(self._per_layer_residual(first, per_layer_input.embeddings))
             return corrected
-        if self.per_layer_input_dim and per_layer_input is not None:
-            x = x + self._per_layer_residual(x, per_layer_input)
+        if self.per_layer_input_dim and per_layer_input is not None and per_layer_input.embeddings is not None:
+            x = x + self._per_layer_residual(x, per_layer_input.embeddings)
         if self.wiring.layer_scalar:
             x = x * self.output_scalar.astype(x.dtype)
         return x
 
     def _forward_streams(self, streams, train: bool, decode: bool, positions, segment_ids,
-                         kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
+                         kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary",
+                         per_layer_input: LayerInputs | None = None):
         """The mHC block over `[B, S, hc_mult, D]` (modeling_glm5_next.py:1293-1327)."""
         post, comb, collapsed = self.attn_hc(streams)
         mixed = self._mix(self.input_layernorm(collapsed), decode, positions, segment_ids,
@@ -785,7 +791,7 @@ class DecoderBlock(nn.Module):
             return streams
         post, comb, collapsed = self.ffn_hc(streams)
         hidden = self.mlp(self.post_attention_layernorm(collapsed),
-                          **self._feedforward_inputs(attention_metadata))
+                          **self._feedforward_inputs(attention_metadata), **self._routes(per_layer_input))
         return mix_streams(post, comb, self.dropout(hidden, deterministic=not train), streams)
 
     def _scaled_branch(self, branch):
@@ -794,7 +800,8 @@ class DecoderBlock(nn.Module):
         return scaled(branch, self.residual_multiplier)
 
     def _forward_depth(self, state, train: bool, decode: bool, positions, segment_ids,
-                       kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
+                       kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary",
+                       per_layer_input: LayerInputs | None = None):
         """Kimi K3's block over `[B, S, blocks + 1, D]`
         (`KimiDecoderLayer._forward_attn_residual`, modeling_kimi_linear.py:973-1046).
 
@@ -822,7 +829,7 @@ class DecoderBlock(nn.Module):
         partial = mixed if site.opens else partial + mixed
         if self.feedforward is not None:
             hidden = self.mlp(self.post_attention_layernorm(self.mlp_res(sources(blocks, finished, partial))),
-                              **self._feedforward_inputs(attention_metadata))
+                              **self._feedforward_inputs(attention_metadata), **self._routes(per_layer_input))
             partial = partial + self.dropout(hidden, deterministic=not train)
         return jnp.concatenate([blocks, partial[:, :, None]], axis=2)
 
@@ -845,6 +852,12 @@ class DecoderBlock(nn.Module):
                 "a hash-routed layer selects its experts by the token ids, which the "
                 "model passes down the stack as attention_metadata.token_ids")
         return {"tokens": attention_metadata.token_ids}
+
+    def _routes(self, per_layer_input: LayerInputs | None) -> dict:
+        """The replayed experts for a routed feed-forward, nothing otherwise."""
+        if not self.routed or per_layer_input is None or per_layer_input.experts is None:
+            return {}
+        return {"routes": (per_layer_input.experts, per_layer_input.routed)}
 
     def _per_layer_residual(self, x, per_layer_input):
         """Gemma 3n/4's per-layer residual (modeling_gemma4.py,
@@ -1030,12 +1043,11 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     fetching = banked or any(_on_host(run.variables.get('params', {})) for run in runs)
     if not fetching or train:
         for run, (first, count) in zip(runs, groups, strict=True):
-            inputs = (None if per_layer_input is None
-                      else per_layer_input[:, :, first:first + count, :])
+            inputs = None if per_layer_input is None else per_layer_input.span(first, count)
             if count == 1 and not fetching:
                 x = run(x, train=train, decode=decode, positions=positions,
                         segment_ids=segment_ids, kv_store=kv_store,
-                        per_layer_input=None if inputs is None else inputs[:, :, 0, :],
+                        per_layer_input=None if inputs is None else inputs.layer(0),
                         attention_metadata=attention_metadata)
                 continue
             store = kv_store if count == 1 or specs[first].kv_shared else None
@@ -1055,7 +1067,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
                 step = nn.remat(nn.map_variables(
                     step, True, trans_in_fn=_fetched, init=False, mutable=True))
             if count == 1:
-                x, _ = step(run, x, None if inputs is None else inputs[:, :, 0, :])
+                x, _ = step(run, x, None if inputs is None else inputs.layer(0))
             else:
                 x, _ = nn.scan(step, variable_axes={True: 0}, split_rngs={True: True},
                                in_axes=2, length=count)(run, x, inputs)
@@ -1083,8 +1095,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
 
     staged = first_of(0)
     for index, (run, (first, count)) in enumerate(zip(runs, groups, strict=True)):
-        inputs = (None if per_layer_input is None
-                  else per_layer_input[:, :, first:first + count, :])
+        inputs = None if per_layer_input is None else per_layer_input.span(first, count)
         store = kv_store if count == 1 or specs[first].kv_shared else None
         mutable = [name for name in WRITTEN if run.is_mutable_collection(name)]
 
@@ -1105,8 +1116,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         cached = (run.variables.get('cache') or None) if 'cache' in mutable else None
         if count == 1:
             following = first_of(index + 1)
-            x, changed = layer(staged, cached, x,
-                               None if inputs is None else inputs[:, :, 0, :])
+            x, changed = layer(staged, cached, x, None if inputs is None else inputs.layer(0))
         else:
             banks = {name: run.variables[name] for name in read_only(run)}
             x, changed, following = _prefetched_run(
@@ -1139,8 +1149,7 @@ def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, follo
     def body(carry, index):
         hidden, current, held = carry
         staged = _fetched(_layer_slice(banks, index + 1))
-        per_layer_slice = (None if inputs is None else
-                           jax.lax.dynamic_index_in_dim(inputs, index, 2, keepdims=False))
+        per_layer_slice = None if inputs is None else inputs.layer(index)
         hidden, changed = layer(current, None if held is None else _layer_slice(held, index),
                                 hidden, per_layer_slice)
         if held is not None:
@@ -1151,7 +1160,7 @@ def _prefetched_run(banks, primed, cache, x, inputs, layer, count: int, *, follo
     last = count - 1
     staged = following()
     x, changed = layer(current, None if cache is None else _layer_slice(cache, last), x,
-                       None if inputs is None else inputs[:, :, last, :])
+                       None if inputs is None else inputs.layer(last))
     if cache is not None:
         cache = _layer_written(cache, changed.pop('cache'), last)
     changed = jax.tree.map(
@@ -2128,6 +2137,7 @@ class CausalTransformer(nn.Module):
                                       activation_sparsity=spec.sparsity)),
                 hash_routed=spec.hash_routed,
                 residual_multiplier=self.residual_multiplier,
+                routed=spec.routed,
                 emb_features=self.emb_features,
                 norm_eps=self.norm_eps,
                 scale_offset=self.scale_offset,
@@ -2400,7 +2410,8 @@ class CausalTransformer(nn.Module):
                       positions=None, segment_ids=None,
                       input_embeddings=None, embedding_positions=None,
                       attention_mask=None, image_groups=None, rotary_positions=None,
-                      attention_pairwise_mask=None, attention_key_positions=None):
+                      attention_pairwise_mask=None, attention_key_positions=None,
+                      routed_experts=None, routed=None):
         """The final normalized states and the prediction depth's input.
 
         V4's depth reads the raw residual streams before the collapse head
@@ -2420,6 +2431,13 @@ class CausalTransformer(nn.Module):
         `attention_key_positions` supplies logical [B, keys] coordinates;
         local layers apply their configured window to those coordinates.
         These are call-local cached-read metadata, not sliceable token fields.
+
+        `routed_experts` replays a rollout engine's routing: `[B, S, layers,
+        top_k]` expert ids indexed by decoder layer, dense layers included (the
+        layout vLLM's `routed_experts` and SGLang's `meta_info.routed_experts`
+        return), with `routed`, `[B, S]`, marking the tokens the record covers
+        (None for all). Every sparse layer's router selects its slice
+        (`dew.nn.moe.Routes`).
         """
         if attention_key_positions is not None and attention_pairwise_mask is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask")
@@ -2450,7 +2468,7 @@ class CausalTransformer(nn.Module):
                                             input_embeddings, embedding_positions)
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
-        ple = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
+        ple = self._layer_inputs(tokens, x, routed_experts, routed)
         if self.altup is not None:
             # The embeddings and, rescaled to their magnitude, each projected
             # copy: [num_inputs, B, S, D].
@@ -2633,7 +2651,7 @@ class CausalTransformer(nn.Module):
             held, x, mutable=True, rngs=rngs,
             train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             kv_store={} if self.sharing_layers else None,
-            per_layer_input=None if per_layer_input is None else per_layer_input[:, :, 0, :],
+            per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
             attention_metadata=attention_metadata)[0], self.first_layer_shapes())
         return jnp.result_type(x.dtype, output.dtype)
 
@@ -2741,7 +2759,7 @@ class CausalTransformer(nn.Module):
         x = micro(x, batch_axis)
         per_row = [None if value is None else micro(jnp.asarray(value), 0)
                    for value in (positions, segment_ids)]
-        inputs = None if per_layer_input is None else micro(per_layer_input, 0)
+        inputs = None if per_layer_input is None else jax.tree.map(lambda value: micro(value, 0), per_layer_input)
         metadata = jax.tree.map(lambda value: micro(value, 0), attention_metadata)
         slots = count // stages
         state_io = _on_stage_axis(x.reshape((stages, slots, *x.shape[1:])))
@@ -2781,10 +2799,10 @@ class CausalTransformer(nn.Module):
             stages_in = _on_stage_axis(jnp.where(
                 jax.lax.broadcasted_iota(jnp.int32, shift.shape, 0) == 0, stream, shift))
             ids = jnp.clip(step - stage_ids, 0, count - 1)
-            stage_inputs = (None if inputs is None else _on_stage_axis(jax.vmap(
-                lambda index, stage: jax.lax.dynamic_slice_in_dim(
-                    jax.lax.dynamic_index_in_dim(inputs, index, 0, keepdims=False),
-                    stage * per_stage, per_stage, axis=2))(ids, stage_ids)))
+            stage_inputs = (None if inputs is None else jax.tree.map(_on_stage_axis, jax.vmap(
+                lambda index, stage: jax.tree.map(lambda value: jax.lax.dynamic_slice_in_dim(
+                    jax.lax.dynamic_index_in_dim(value, index, 0, keepdims=False),
+                    stage * per_stage, per_stage, axis=2), inputs))(ids, stage_ids)))
             stage = PipelineStage(block=module.block, specs=module.specs[:per_stage],
                                   groups=view.groups, name='stages')
             run = nn.vmap(call_stage, variable_axes={True: 0}, split_rngs={True: True},
@@ -2804,6 +2822,22 @@ class CausalTransformer(nn.Module):
         order = (np.arange(slots) + (stages - 1) % slots) % slots
         finished = state_io[:, order].reshape((count, *x.shape[1:]))
         return _whole(finished, batch_axis)
+
+    def _layer_inputs(self, tokens, x, routed_experts, routed) -> LayerInputs | None:
+        """The per-layer signal and routing replay the stack slices by layer."""
+        embeddings = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
+        if routed_experts is None:
+            if routed is not None:
+                raise ValueError("routed marks the tokens a routing record covers; pass routed_experts")
+            return None if embeddings is None else LayerInputs(embeddings=embeddings)
+        routed_experts = jnp.asarray(routed_experts)
+        if routed_experts.ndim != 4 or routed_experts.shape[:3] != (*tokens.shape, self.num_layers):
+            raise ValueError(
+                f"routed_experts is [batch, tokens, layers, top_k], {(*tokens.shape, self.num_layers)} "
+                f"leading for this model; got {routed_experts.shape}")
+        coverage = None if routed is None else jnp.broadcast_to(
+            jnp.asarray(routed, bool)[:, :, None], routed_experts.shape[:3])
+        return LayerInputs(embeddings=embeddings, experts=routed_experts, routed=coverage)
 
     def per_layer_inputs(self, tokens, inputs_embeds):
         """Every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).

@@ -175,6 +175,7 @@ class EnvironmentSource:
     def _run(self, task: Task, identity: EpisodeId, version: int, handle: _Handle) -> Session:
         initial: Observation | None = None
         transitions: list[Transition] = []
+        draws: list[Draw] = []
         pending: Action | None = None
         status, detail = EpisodeStatus.RUNNING, ""
         try:
@@ -198,6 +199,7 @@ class EnvironmentSource:
                         status, detail = EpisodeStatus.CANCELLED, "cancelled by the scheduler"
                         break
                     pending = self._action(draw, observation.context)
+                    draws.append(draw)
                     observation = step_action(environment, pending)
                     transitions.append(Transition(pending, observation))
                     pending = None
@@ -215,7 +217,12 @@ class EnvironmentSource:
                 episode = replace(episode, reward=_scored(self.verifier(task, episode)))
             except Exception as error:
                 episode = replace(episode, status=EpisodeStatus.ERROR, detail=f"verifier: {_failure(error)}")
-        return replace(session_of(episode, group=""), task=task.id)
+        session = session_of(episode, group="")
+        # An episode records what the environment saw; the engine records of
+        # each call (routing, sampling support) come from its draw.
+        calls = tuple(replace(call, routed_experts=draw.routed_experts, support=draw.support)
+                      for call, draw in zip(session.calls, draws, strict=True))
+        return replace(session, task=task.id, calls=calls)
 
 
 def prompt_tasks(batch: Batch) -> list[Task]:
@@ -297,7 +304,7 @@ class PromptSource:
         except Exception as error:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, f"draw: {_failure(error)}")
         call = Call(draw.prompt, draw.tokens, draw.behavior_log_probs, "stop" if draw.terminated else "length",
-                    draw.version)
+                    draw.version, routed_experts=draw.routed_experts, support=draw.support)
         status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
         try:
             text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])

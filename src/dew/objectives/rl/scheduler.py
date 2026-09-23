@@ -200,8 +200,9 @@ class RolloutScheduler:
     from its submission; a rollout past it is cancelled and resubmitted as a
     failed attempt. `width` and `rows` fix the packed batch shape;
     `estimator` and `truncation` are `pack`'s advantage family and
-    truncation policy. `log`, when given, receives a `SchedulerRecord` per
-    call.
+    truncation policy, and `support_capacity` its per-row support length,
+    which a filtered-sampling source requires. `log`, when given,
+    receives a `SchedulerRecord` per call.
     """
 
     def __init__(self, objective: GRPOObjective, source: SessionSource, weights: Publisher, *,
@@ -209,7 +210,7 @@ class RolloutScheduler:
                  groups: int = 4, oversample: int = 0, admit: int | None = None,
                  max_lag: int = 1, ahead: int = 1, sync_every: int = 1, max_attempts: int = 3,
                  timeout: float | None = None, estimator: str = "group", truncation: str = "mask",
-                 log: Callable[[SchedulerRecord], None] | None = None):
+                 support_capacity: int | None = None, log: Callable[[SchedulerRecord], None] | None = None):
         for name, value, least in (("width", width, 2), ("rows", rows, 1), ("groups", groups, 2),
                                    ("oversample", oversample, 0), ("ahead", ahead, 0),
                                    ("sync_every", sync_every, 1), ("max_lag", max_lag, 0),
@@ -232,6 +233,7 @@ class RolloutScheduler:
         self.width, self.rows, self.groups, self.oversample, self.admit = width, rows, groups, oversample, admit
         self.max_lag, self.ahead, self.sync_every, self.max_attempts = max_lag, ahead, sync_every, max_attempts
         self.timeout, self.estimator, self.truncation, self.log = timeout, estimator, truncation, log
+        self.support_capacity = support_capacity
         self._lock = threading.Lock()
         self._registered: deque[_Entry] = deque()
         self._serial = 0
@@ -442,7 +444,8 @@ class RolloutScheduler:
         waited = time.perf_counter() - began
         rollouts = [rollout for group in admitted for rollout in group.done[:self.groups]]
         latencies = [latency for group in admitted for latency in group.latencies[:self.groups]]
-        packed = pack(rollouts, self.width, rows=self.rows, estimator=self.estimator, truncation=self.truncation)
+        packed = pack(rollouts, self.width, rows=self.rows, estimator=self.estimator, truncation=self.truncation,
+                      support_capacity=self.support_capacity)
         proximal = np.asarray(self._rescore(state.params, packed), np.float32)
         packed[OLD_LOG_PROBS_KEY] = proximal * packed[RESPONSE_MASK_KEY]
         if self.log is not None:

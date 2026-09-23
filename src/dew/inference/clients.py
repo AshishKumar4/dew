@@ -9,11 +9,15 @@ relabeled as a native raw-policy or behavior-policy likelihood.
 
 from __future__ import annotations
 
+import base64
 import inspect
+import io
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Literal, Protocol
+
+import numpy as np
 
 from dew.records import JSON
 from dew.sampling.text import Sampling
@@ -77,6 +81,8 @@ class Completion:
     asked for `logprobs` with `return_tokens_as_token_ids` in extra_body
     reports both. The log-probabilities are whatever distribution the engine
     was configured to report; this record does not relabel them.
+    `routed_experts` holds each choice's `[forwarded ids, layers, top_k]`
+    expert record when vLLM ran with `--enable-return-routed-experts`.
     """
 
     texts: tuple[str, ...]
@@ -86,6 +92,7 @@ class Completion:
     responses: tuple[OllamaResponse | OpenAIResponse, ...]
     tokens: tuple[tuple[int, ...] | None, ...]
     log_probs: tuple[tuple[float, ...] | None, ...]
+    routed_experts: tuple[np.ndarray | None, ...] = ()
 
 
 def _invoke[T](call: Callable[..., T], fields: Mapping[str, object]) -> T:
@@ -331,6 +338,17 @@ def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None,
     return tuple(rendered_ids), tuple(probabilities)
 
 
+def decode_routed_experts(encoded: object) -> np.ndarray:
+    """vLLM's per-choice `routed_experts`: base64 `.npy` text of `[forwarded ids, layers, top_k]`.
+
+    vLLM 1c0eee9 writes it with `numpy2base64` (`serial_utils.py`) on the
+    completions, chat and token routes alike.
+    """
+    if not isinstance(encoded, str):
+        raise ValueError("routed_experts is vLLM's base64 .npy text")
+    return np.load(io.BytesIO(base64.b64decode(encoded)), allow_pickle=False)
+
+
 def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
     from openai.types import Completion as SDKCompletion
     if not isinstance(response, SDKCompletion):
@@ -339,7 +357,8 @@ def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
     choices = fields.get("choices")
     if not isinstance(choices, list) or len(choices) != expected:
         raise ValueError(f"expected {expected} completion choices")
-    ordered: dict[int, tuple[str, str | None, tuple[int, ...] | None, tuple[float, ...] | None]] = {}
+    ordered: dict[int, tuple[str, str | None, tuple[int, ...] | None, tuple[float, ...] | None,
+                             np.ndarray | None]] = {}
     for choice in choices:
         entry = _object(choice, "completion choice")
         index, text = entry.get("index"), entry.get("text")
@@ -347,7 +366,9 @@ def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
             raise ValueError("choice indices must be a permutation of the expected prompt-choice indices")
         if not isinstance(text, str):
             raise ValueError("each completion choice needs string text")
-        ordered[index] = (text, _reason(entry.get("finish_reason")), *_choice_tokens(entry))
+        routed = entry.get("routed_experts")
+        experts = None if routed is None else decode_routed_experts(routed)
+        ordered[index] = (text, _reason(entry.get("finish_reason")), *_choice_tokens(entry), experts)
     usage = None
     if fields.get("usage") is not None:
         supplied = _object(fields["usage"], "usage")
@@ -357,7 +378,7 @@ def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
     choice = [ordered[index] for index in range(expected)]
     return Completion(tuple(entry[0] for entry in choice), tuple(entry[1] for entry in choice),
                       per_choice, usage, (response,), tuple(entry[2] for entry in choice),
-                      tuple(entry[3] for entry in choice))
+                      tuple(entry[3] for entry in choice), tuple(entry[4] for entry in choice))
 
 
 type TokenRows = Sequence[Sequence[int]]

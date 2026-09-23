@@ -47,7 +47,7 @@ from dew.objectives.base import Variables, thaw
 from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
 
-from .clients import OpenAICompletion
+from .clients import OpenAICompletion, decode_routed_experts
 from .serving import Server
 
 if TYPE_CHECKING:
@@ -64,7 +64,10 @@ class Draw:
     on it. `behavior_log_probs` is the likelihood of each action under the
     distribution that drew it; `raw_log_probs` is the unmodified model's,
     or None when the backend cannot report it. `version` is the policy
-    version the request was submitted under.
+    version the request was submitted under. `routed_experts` is the
+    engine's mixture routing for every id it forwarded and `support` the ids
+    its sampler kept for each drawn token, when asked for
+    (`sessions.Call.routed_experts`, `sessions.Call.support`).
     """
 
     prompt: tuple[int, ...]
@@ -73,6 +76,8 @@ class Draw:
     raw_log_probs: tuple[float, ...] | None
     terminated: bool
     version: int
+    routed_experts: np.ndarray | None = None
+    support: tuple[tuple[int, ...], ...] | None = None
 
     def __post_init__(self) -> None:
         if not self.prompt:
@@ -85,6 +90,8 @@ class Draw:
                 raise ValueError("drawn likelihoods must be finite")
         if self.terminated and not self.tokens:
             raise ValueError("a terminated draw ends on its EOS token")
+        if self.support is not None and len(self.support) != len(self.tokens):
+            raise ValueError("a draw's support holds one set of kept ids per drawn token")
 
     def check_stops(self, stops: tuple[int, ...]) -> Draw:
         """This draw, refused unless it ends on EOS exactly when it terminated and holds no earlier EOS."""
@@ -393,56 +400,14 @@ _RETURN_IDS: dict[str, dict[str, JSON]] = {"vllm": {"return_tokens_as_token_ids"
                                            "sglang": {"return_token_ids": True}}
 
 
-class OpenAIRolloutServer:
-    """Serve rollouts from a vLLM or SGLang OpenAI-compatible completions endpoint.
+class _RequestServer:
+    """The request pool, version and weight sync the HTTP rollout servers share."""
 
-    Each submission is one completion request of token ids, carrying the
-    `Sampling` policy as engine request controls, a seed, one reported
-    log-probability per sampled token and the ids themselves. `workers`
-    requests are in flight at once; the engine batches them. The engine is
-    `completion.provider`.
-
-    The reported log-probabilities are the behavior likelihoods only for
-    some policies. vLLM reports raw model log-probabilities unless it runs
-    with `--logprobs-mode processed_logprobs`, so a transforming policy
-    (temperature other than one, top-k, top-p or min-p) needs
-    `processed_logprobs=True` to say the engine was started that way.
-    SGLang's `/v1/completions` reports the temperature-scaled distribution
-    before its top-k, top-p and min-p filters and has no field for the
-    filtered one, so this server takes any temperature but no filter.
-    (SGLang's native `/generate` reports the filtered likelihood under
-    `return_sampling_mask`, for a finite top-k; that is the route a filtered
-    policy would need.) `SGLANG_RETURN_ORIGINAL_LOGPROB` switches the report
-    to raw log-probabilities and must stay unset.
-
-    SGLang honors a request's seed only under `--enable-deterministic-inference`;
-    otherwise draws are unseeded.
-    """
-
-    def __init__(self, completion: OpenAICompletion, sampling: Sampling, weights: WeightSync, *,
-                 version: int = 0, workers: int = 64, processed_logprobs: bool = False):
-        engine = completion.provider
-        if engine not in _RETURN_IDS:
-            raise ValueError("token rollouts need provider='vllm' or 'sglang': ids, seeds and EOS controls "
-                             "are engine request fields")
+    def __init__(self, sampling: Sampling, weights: WeightSync, version: int, workers: int):
         if sampling.temperature == 0:
             raise ValueError("a rollout samples; greedy decoding gives every group member the same draw")
-        if engine == "vllm" and sampling.transforms() and not processed_logprobs:
-            raise ValueError(
-                "vLLM reports raw log-probabilities by default, which are not the behavior likelihoods "
-                "of a transforming Sampling; start it with --logprobs-mode processed_logprobs and pass "
-                "processed_logprobs=True, or sample at temperature one without filters")
-        if engine == "sglang" and processed_logprobs:
-            raise ValueError("processed_logprobs names a vLLM mode; SGLang's completions route has none")
-        if engine == "sglang" and replace(sampling, temperature=1.0).transforms():
-            raise ValueError("SGLang's /v1/completions reports log-probabilities before top-k, top-p and min-p, "
-                             "which are not the behavior likelihoods of a filtering Sampling, and has no field "
-                             "for the filtered ones (native /generate's return_sampling_mask does); "
-                             "sample without filters")
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive number of concurrent requests")
-        self._completion = completion
-        self._return_ids = _RETURN_IDS[engine]
         self._sampling = sampling
         self._weights = weights
         self._version = version
@@ -460,6 +425,78 @@ class OpenAIRolloutServer:
         return self._pool.submit(self._draw, _prompt(prompt), _budget(max_new_tokens), seed, self._version)
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
+        raise NotImplementedError
+
+    def load(self, variables: Variables, version: int) -> None:
+        self._weights(variables, version)
+        self._version = version
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=True, cancel_futures=True)
+
+
+class OpenAIRolloutServer(_RequestServer):
+    """Serve rollouts from a vLLM or SGLang OpenAI-compatible completions endpoint.
+
+    Each submission is one completion request of token ids, carrying the
+    `Sampling` policy as engine request controls, a seed, one reported
+    log-probability per sampled token and the ids themselves. `workers`
+    requests are in flight at once; the engine batches them. The engine is
+    `completion.provider`.
+
+    The reported log-probabilities are the behavior likelihoods only for
+    some policies. vLLM reports raw model log-probabilities unless it runs
+    with `--logprobs-mode processed_logprobs`, so a transforming policy
+    (temperature other than one) needs `processed_logprobs=True` to say the
+    engine was started that way. A filtering policy (top-k, top-p or min-p)
+    trains on its recorded support, which only vLLM's token route returns
+    (`VLLMGenerateServer`), so vLLM's completions route refuses one.
+    SGLang's `/v1/completions` reports the temperature-scaled distribution
+    before its top-k, top-p and min-p filters and has no field for the
+    filtered one, so this server takes any temperature but no filter.
+    (SGLang's native `/generate` reports the filtered likelihood under
+    `return_sampling_mask`, for a finite top-k; that is the route a filtered
+    policy would need.) `SGLANG_RETURN_ORIGINAL_LOGPROB` switches the report
+    to raw log-probabilities and must stay unset.
+
+    SGLang honors a request's seed only under `--enable-deterministic-inference`;
+    otherwise draws are unseeded.
+
+    `routing=True` records vLLM's routed experts on every draw for routing
+    replay (`dew.nn.moe.Routes`); the engine runs with
+    `--enable-return-routed-experts`.
+    """
+
+    def __init__(self, completion: OpenAICompletion, sampling: Sampling, weights: WeightSync, *,
+                 version: int = 0, workers: int = 64, processed_logprobs: bool = False,
+                 routing: bool = False):
+        engine = completion.provider
+        if engine not in _RETURN_IDS:
+            raise ValueError("token rollouts need provider='vllm' or 'sglang': ids, seeds and EOS controls "
+                             "are engine request fields")
+        if engine == "vllm" and replace(sampling, temperature=1.0).transforms():
+            raise ValueError("a filtering Sampling trains on the kept ids of every draw, which vLLM returns "
+                             "only on its token route; use VLLMGenerateServer")
+        if engine == "vllm" and sampling.transforms() and not processed_logprobs:
+            raise ValueError(
+                "vLLM reports raw log-probabilities by default, which are not the behavior likelihoods "
+                "of a transforming Sampling; start it with --logprobs-mode processed_logprobs and pass "
+                "processed_logprobs=True, or sample at temperature one without filters")
+        if engine == "sglang" and processed_logprobs:
+            raise ValueError("processed_logprobs names a vLLM mode; SGLang's completions route has none")
+        if engine == "sglang" and replace(sampling, temperature=1.0).transforms():
+            raise ValueError("SGLang's /v1/completions reports log-probabilities before top-k, top-p and min-p, "
+                             "which are not the behavior likelihoods of a filtering Sampling, and has no field "
+                             "for the filtered ones (native /generate's return_sampling_mask does); "
+                             "sample without filters")
+        if routing and engine != "vllm":
+            raise ValueError("routing reads vLLM's per-choice routed_experts (--enable-return-routed-experts)")
+        super().__init__(sampling, weights, version, workers)
+        self._completion = completion
+        self._return_ids = _RETURN_IDS[engine]
+        self._routing = routing
+
+    def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
         # The pad id shapes Dew's packed rows; it is not a request field.
         completion = self._completion([list(prompt)], budget, seed=seed, sampling=replace(self._sampling, pad_id=0),
                                       logprobs=0, extra_body=self._return_ids)
@@ -471,11 +508,63 @@ class OpenAIRolloutServer:
         reason = completion.finish_reasons[0]
         if reason != ("stop" if terminated else "length") or (not terminated and len(tokens) != budget):
             raise ValueError(f"finish reason {reason!r} disagrees with {len(tokens)} drawn ids ending {tokens[-1:]}")
-        return Draw(prompt, tokens, probabilities, None, terminated, version).check_stops(stops)
+        routed = completion.routed_experts[0] if completion.routed_experts else None
+        if self._routing and routed is None:
+            raise ValueError("vLLM returned no routed_experts; start it with --enable-return-routed-experts")
+        return Draw(prompt, tokens, probabilities, None, terminated, version,
+                    routed if self._routing else None).check_stops(stops)
 
-    def load(self, variables: Variables, version: int) -> None:
-        self._weights(variables, version)
-        self._version = version
 
-    def close(self) -> None:
-        self._pool.shutdown(wait=True, cancel_futures=True)
+class VLLMGenerateServer(_RequestServer):
+    """Serve rollouts from vLLM's token route, `POST /inference/v1/generate`.
+
+    The one vLLM route that returns, beside the sampled ids and their
+    likelihoods, the ids the sampler kept for each of them
+    (`GenerateResponseChoice.sampling_mask`,
+    `entrypoints/scale_out/token_in_token_out` at 1c0eee9), so a top-k or
+    top-p policy trains on its recorded support (`support_log_probs`). The
+    engine runs with `--enable-scale-out` (or `--tokens-only`),
+    `--return-sampling-mask` (Model Runner V2, no speculative decoding),
+    `--logprobs-mode processed_logprobs`, so the reported likelihoods are the
+    filtered ones, and `--enable-return-routed-experts` when `routing`.
+    vLLM builds the mask only under a finite top-k.
+    """
+
+    def __init__(self, base_url: str, sampling: Sampling, weights: WeightSync, *, version: int = 0,
+                 workers: int = 64, routing: bool = False, timeout: float = 600.0):
+        if sampling.top_k is None:
+            raise ValueError("vLLM returns a sampling mask only under a finite top-k")
+        super().__init__(sampling, weights, version, workers)
+        self._url = base_url.rstrip("/") + "/inference/v1/generate"
+        self._routing = routing
+        self._timeout = timeout
+
+    def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
+        import httpx
+
+        sampling = self._sampling
+        parameters: dict[str, object] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
+                                         "top_k": sampling.top_k, "min_p": sampling.min_p,
+                                         "max_tokens": budget, "seed": seed, "logprobs": 0}
+        if sampling.eos_id is not None:
+            parameters["stop_token_ids"] = list(sampling.stops)
+        response = httpx.post(self._url, json={"token_ids": list(prompt), "sampling_params": parameters},
+                              timeout=self._timeout)
+        if response.status_code != 200:
+            raise RuntimeError(f"/inference/v1/generate answered {response.status_code}: {response.text}")
+        (choice,) = response.json()["choices"]
+        tokens = tuple(choice["token_ids"])
+        probabilities = tuple(float(entry["logprob"]) for entry in choice["logprobs"]["content"])
+        mask = choice.get("sampling_mask")
+        if mask is None:
+            raise ValueError("vLLM returned no sampling_mask; start it with --return-sampling-mask")
+        routed = choice.get("routed_experts")
+        if self._routing and routed is None:
+            raise ValueError("vLLM returned no routed_experts; start it with --enable-return-routed-experts")
+        stops = sampling.stops
+        terminated = bool(tokens) and tokens[-1] in stops
+        if choice["finish_reason"] != ("stop" if terminated else "length"):
+            raise ValueError(f"finish reason {choice['finish_reason']!r} disagrees with the drawn ids")
+        return Draw(prompt, tokens, probabilities, None, terminated, version,
+                    decode_routed_experts(routed) if self._routing else None,
+                    tuple(tuple(kept) for kept in mask)).check_stops(stops)

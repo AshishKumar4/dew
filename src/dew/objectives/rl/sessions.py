@@ -76,6 +76,17 @@ SESSION_WEIGHTS_KEY = "session_weights"
 """On a trainable id, one over its session's trainable-id count; 0 elsewhere.
 Summed over a batch it counts sessions, so `sum(weights * terms)` over
 `sum(weights)` is the mean over sessions of each session's token mean."""
+ROUTED_EXPERTS_KEY = "routed_experts"
+"""`[rows, width, layers, top_k]` expert ids the engine routed each id to, for replay."""
+ROUTED_KEY = "routed"
+"""Where `routed_experts` holds a record; elsewhere the trainer's router chooses."""
+SUPPORT_KEY = "support_ids"
+"""`[rows, capacity]`: each row's kept ids of its filtered sampled ids, back to
+back, padded with -1."""
+SUPPORT_COLUMNS_KEY = "support_columns"
+"""`[rows, capacity]`: for each `support_ids` entry, the column of the sampled
+id whose support it belongs to; -1 on padding. A sampled id with no entry was
+drawn from the whole vocabulary."""
 
 FINISH_REASONS = frozenset({"stop", "tool_calls", "length", "abort"})
 TRUNCATIONS = ("mask", "score", "zero")
@@ -126,6 +137,16 @@ class Call:
     `behavior_log_probs` holds the engine-reported log-probability of each
     sampled id. `version` is the served policy version when the request was
     submitted, the oldest policy that may have produced any of its ids.
+
+    Two engine records are optional. `routed_experts` is the mixture's
+    routing for every id the engine forwarded, `[len(prompt_ids) +
+    len(sampled_ids) - 1, layers, top_k]` expert ids (vLLM's
+    `routed_experts`, SGLang's `meta_info.routed_experts`; the last sampled id
+    is never forwarded), kept in the dtype the engine shipped, which the
+    trainer replays (`dew.nn.moe.Routes`). `support` is, per sampled id, the token ids the
+    sampler's top-k/top-p filters kept (vLLM's `sampling_mask`); the
+    behavior log-probability is then the filtered one, and the trainer
+    renormalizes over the same support. None means no filter.
     """
 
     prompt_ids: tuple[int, ...]
@@ -133,6 +154,8 @@ class Call:
     behavior_log_probs: tuple[float, ...]
     finish_reason: str
     version: int
+    routed_experts: np.ndarray | None = field(default=None, compare=False)
+    support: tuple[tuple[int, ...], ...] | None = None
 
     def __post_init__(self) -> None:
         _token_ids("prompt_ids", self.prompt_ids)
@@ -150,6 +173,25 @@ class Call:
                              f"got {self.finish_reason!r}")
         if type(self.version) is not int or self.version < 0:
             raise ValueError("a call's policy version is a nonnegative integer")
+        if self.routed_experts is not None:
+            routed = np.array(self.routed_experts)
+            forwarded = len(self.prompt_ids) + len(self.sampled_ids) - 1
+            if (routed.ndim != 3 or routed.shape[0] != forwarded
+                    or not np.issubdtype(routed.dtype, np.integer)):
+                raise ValueError(
+                    f"routed_experts is [forwarded ids, layers, top_k] expert ids, "
+                    f"{forwarded} rows for this call; got {routed.dtype} {routed.shape}")
+            if routed.size and routed.min() < 0:
+                raise ValueError("routed_experts holds expert ids, which are nonnegative")
+            routed.setflags(write=False)
+            object.__setattr__(self, "routed_experts", routed)
+        if self.support is not None:
+            if not isinstance(self.support, tuple) or len(self.support) != len(self.sampled_ids):
+                raise ValueError("support holds one tuple of kept ids per sampled id")
+            for kept, token in zip(self.support, self.sampled_ids, strict=True):
+                _token_ids("each support", kept)
+                if token not in kept:
+                    raise ValueError(f"sampled id {token} lies outside its recorded support")
 
 
 @dataclass(frozen=True)
@@ -219,6 +261,15 @@ class _Chain:
     versions: list[int] = field(default_factory=list)
     calls: list[int] = field(default_factory=list)
     """Per token, the call that sampled it, or -1 for a prompt or interstitial id."""
+    members: list[tuple[int, int, int]] = field(default_factory=list)
+    """Each call this chain holds: its index, where its sampled ids start in
+    the chain and how many it sampled, which may be none."""
+    routing: np.ndarray | None = None
+    """The latest recorded call's `routed_experts`. Once a call is appended
+    the chain is exactly that call's ids, so its record row p is chain
+    token p, and it covers every row an earlier call's record did."""
+    supports: list[tuple[int, ...] | None] = field(default_factory=list)
+    """Per token, the ids its sampler kept, or None."""
 
     def extend(self, call: Call, index: int, start: int) -> None:
         """Append `call`'s prompt from `start`, then its sampled ids."""
@@ -231,6 +282,11 @@ class _Chain:
         self.behavior.extend(call.behavior_log_probs)
         self.versions.extend([call.version] * len(call.sampled_ids))
         self.calls.extend([index] * len(call.sampled_ids))
+        self.members.append((index, len(self.tokens) - len(call.sampled_ids), len(call.sampled_ids)))
+        self.supports.extend([None] * tail)
+        self.supports.extend(call.support if call.support is not None else [None] * len(call.sampled_ids))
+        if call.routed_experts is not None:
+            self.routing = call.routed_experts
 
 
 def merges(chain: Sequence[int], call: Call) -> bool:
@@ -366,7 +422,8 @@ def rows_needed(lengths: Sequence[int], width: int) -> int:
 
 
 def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
-         estimator: str = "group", truncation: str = "mask") -> dict[str, np.ndarray]:
+         estimator: str = "group", truncation: str = "mask",
+         support_capacity: int | None = None) -> dict[str, np.ndarray]:
     """Strictly merge each trained session's calls, then pack the chains into `[rows, width]`.
 
     Every array is `[rows, width]` and aligned with `input_ids`: entry t
@@ -378,6 +435,11 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     the batch to a fixed count, refusing chains that need more
     (`rows_needed` over `chain_lengths` counts them). `truncation` decides whether TRUNCATED
     sessions train, as the module docstring describes.
+
+    Calls that recorded `routed_experts` or `support` add the arrays
+    `_engine_records` describes; `support_capacity`, required when any call
+    recorded a support, fixes the per-row length of the support arrays so
+    every batch has one shape and the step compiles once.
     """
     if type(width) is not int or width < 2:
         raise ValueError("a packed row holds at least two ids")
@@ -427,7 +489,65 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
         RESPONSE_MASK_KEY: mask, BEHAVIOR_LOG_PROBS_KEY: behavior, VERSIONS_KEY: versions,
         SESSION_INDEX_KEY: session_index, CALL_INDEX_KEY: call_index,
         ADVANTAGES_KEY: advantage, SESSION_WEIGHTS_KEY: weights,
+        **_engine_records(built, placed, shape, support_capacity),
     }
+
+
+def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
+                    shape: tuple[int, int], support_capacity: int | None) -> dict[str, np.ndarray]:
+    """The packed routing and support arrays, present only when a call recorded them.
+
+    `routed_experts` is `[rows, width, layers, top_k]` in the engines' dtype,
+    with `routed` true where a call's record covers the id. The supports are
+    ragged within each row, as vLLM's `sampling_mask` and slime's
+    `top_p_token_ids` with offsets keep them: row r of `support_ids` holds the
+    kept ids of row r's filtered sampled ids back to back and row r of
+    `support_columns` the column each belongs to, both padded with -1 to
+    `support_capacity`, so the arrays shard with the rows they describe.
+    """
+    records = [chain.routing for chain in built if chain.routing is not None]
+    out: dict[str, np.ndarray] = {}
+    routed = covered = None
+    if records:
+        layout = {record.shape[1:] for record in records}
+        if len(layout) != 1:
+            raise ValueError(f"routed_experts disagree on [layers, top_k] across calls: {sorted(layout)}")
+        routed = np.zeros((*shape, *layout.pop()), np.result_type(*records))
+        covered = np.zeros(shape, bool)
+    kept: list[list[tuple[int, ...]]] = [[] for _ in range(shape[0])]
+    owners: list[list[int]] = [[] for _ in range(shape[0])]
+    for row, numbers in enumerate(placed):
+        start = 0
+        for number in numbers:
+            chain = built[number]
+            if routed is not None and covered is not None and chain.routing is not None:
+                rows_covered = len(chain.routing)
+                routed[row, start:start + rows_covered] = chain.routing
+                covered[row, start:start + rows_covered] = True
+            for position, ids in enumerate(chain.supports):
+                if ids is not None:
+                    kept[row].append(ids)
+                    owners[row].append(start + position)
+            start += len(chain.tokens)
+    if routed is not None and covered is not None:
+        out[ROUTED_EXPERTS_KEY] = routed
+        out[ROUTED_KEY] = covered
+    if any(kept):
+        totals = [sum(len(group) for group in groups) for groups in kept]
+        if support_capacity is None:
+            raise ValueError("recorded supports pack to [rows, support_capacity]; pass a support_capacity "
+                             "(at least top_k times the sampled ids a row holds) so every batch has one shape")
+        if max(totals) > support_capacity:
+            raise ValueError(f"a row's recorded supports keep {max(totals)} ids, "
+                             f"more than support_capacity {support_capacity}")
+        ids = np.full((shape[0], support_capacity), -1, np.int32)
+        columns = np.full((shape[0], support_capacity), -1, np.int32)
+        for row, (groups, total) in enumerate(zip(kept, totals, strict=True)):
+            ids[row, :total] = np.fromiter((token for group in groups for token in group), np.int32, total)
+            columns[row, :total] = np.repeat(np.asarray(owners[row], np.int32), [len(group) for group in groups])
+        out[SUPPORT_KEY] = ids
+        out[SUPPORT_COLUMNS_KEY] = columns
+    return out
 
 
 def sampled_values(batch: Mapping[str, np.ndarray],

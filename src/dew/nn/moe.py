@@ -65,6 +65,48 @@ EXPERT_DISPATCHES = ('global', 'exchange')
 # bit of a denominator above 1e-12.
 WEIGHT_SUM_EPSILON = 1e-20
 
+type Routes = tuple[jax.Array, jax.Array | None]
+"""A routing replay for one layer: `[..., top_k]` expert ids the rollout
+engine used, and `[...]` booleans marking the tokens its record covers (None
+for all of them).
+
+Routing replay (R3, arXiv 2510.11370; verl 12ebe0c `router_replay_patch.py`
+over Megatron's `topk_routing_with_score_function`) trains a mixture on the
+experts the engine used, so a top-k flip between the engine's numerics and
+the trainer's cannot move a token to experts that never produced its sample.
+Only the selection is replayed: the gate weights are gathered from this
+forward's scores, so the router keeps its gradient. A token the record does
+not cover (the last sampled id, padding) keeps the router's own choice, as
+verl's replay mask does. The stack hands each layer its slice of a
+`[B, S, layers, top_k]` record (`CausalTransformer.hidden_states`). The
+sown `indices` are the replayed ones, so a balancing bias counts the experts
+the tokens went to, as Megatron's R3 path in verl does."""
+
+
+def chosen_experts(selected: Callable[[], jax.Array], shape: tuple[int, ...],
+                   routes: Routes | None) -> jax.Array:
+    """The experts a router uses: `selected()`, or the replayed record.
+
+    `shape` is `[..., top_k]`, what the router's own choice has. `selected`
+    is not traced when a record covers every token.
+    """
+    if routes is None:
+        return selected()
+    replayed, covered = routes
+    if replayed.shape != shape:
+        raise ValueError(
+            f"replayed routing is {tuple(replayed.shape)} for {shape[:-1]} "
+            f"tokens choosing {shape[-1]} experts each")
+    if not jnp.issubdtype(replayed.dtype, jnp.integer):
+        raise ValueError(f"replayed routing holds expert ids, got {replayed.dtype}")
+    # Engines ship the ids in the narrowest unsigned type that holds them.
+    replayed = replayed.astype(jnp.int32)
+    if covered is None:
+        return replayed
+    if covered.shape != shape[:-1]:
+        raise ValueError(f"replay coverage is {tuple(covered.shape)} for {shape[:-1]} tokens")
+    return jnp.where(covered[..., None], replayed, selected())
+
 
 @struct.dataclass
 class RouterMoments:
@@ -250,20 +292,11 @@ class Router(nn.Module):
             self.tid2eid = self.variable(
                 'moe', 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
 
-    def __call__(self, x, tokens=None):
+    def __call__(self, x, tokens=None, routes: Routes | None = None):
         logits = self.logits(x)
         scores = self._activated(logits)
-        if self.hash_vocab is not None:
-            if tokens is None:
-                raise ValueError("hash routing selects by the token ids, which the caller passes")
-            indices = self.tid2eid.value[jnp.asarray(tokens)]
-        else:
-            if tokens is not None:
-                raise ValueError("only a hash router reads the token ids")
-            selection = scores if not self.expert_bias else scores + self.bias.value
-            if self.expert_groups > 1:
-                selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
-            _, indices = jax.lax.top_k(selection, self.top_k)
+        indices = chosen_experts(lambda: self._selected(scores, tokens),
+                                 (*scores.shape[:-1], self.top_k), routes)
         # The load each expert took, for the step that balances the bias:
         # written only when a caller opens the 'router' collection, and never
         # into the tree init returns, where it is not a variable.
@@ -278,6 +311,20 @@ class Router(nn.Module):
             weights = weights / (jnp.sum(weights, axis=-1, keepdims=True)
                                  + WEIGHT_SUM_EPSILON)
         return weights * self.routed_scaling_factor, indices
+
+    def _selected(self, scores, tokens):
+        """The experts this router chooses on its own: `[..., top_k]`."""
+        if self.hash_vocab is not None:
+            if tokens is None:
+                raise ValueError("hash routing selects by the token ids, which the caller passes")
+            return self.tid2eid.value[jnp.asarray(tokens)]
+        if tokens is not None:
+            raise ValueError("only a hash router reads the token ids")
+        selection = scores if not self.expert_bias else scores + self.bias.value
+        if self.expert_groups > 1:
+            selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
+        _, indices = jax.lax.top_k(selection, self.top_k)
+        return indices
 
     def logits(self, x):
         """Each token's fp32 gate logit for every expert: `[..., num_experts]`."""
@@ -987,8 +1034,8 @@ class SparseMLP(nn.Module):
                     1, use_bias=False, dtype=self.dtype, precision=self.precision,
                     name='shared_expert_gate', **normal_kernel(self.init_std))
 
-    def __call__(self, x, tokens=None):
-        weights, indices = self.gate(x, tokens)
+    def __call__(self, x, tokens=None, routes: Routes | None = None):
+        weights, indices = self.gate(x, tokens, routes)
         if self.latent_features is None:
             routed = self.experts(x, weights, indices)
         else:

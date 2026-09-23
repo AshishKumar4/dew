@@ -70,7 +70,7 @@ from dew.objectives.base import (
     merge_totals,
     thaw,
 )
-from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
+from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits, support_log_probs
 from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
 
@@ -672,7 +672,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
                      depths: bool = False, roles=None, qk_stats: bool = False,
-                     indexer: bool = False, layers: Sequence[int] = ()):
+                     indexer: bool = False, layers: Sequence[int] = (),
+                     routes: tuple[jax.Array, jax.Array | None] | None = None):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
 
         Returns `Scores`: the losses, the weight of each target, whether each
@@ -687,6 +688,13 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         reads the per-document `positions` for its rotary angles. A chat batch
         carries `roles` for the same rows; with `loss_role` set, only the
         targets whose role matches keep their weight.
+
+        `routes` replays a rollout engine's expert choices: `[B, seq_len + 1,
+        layers, top_k]` ids aligned with `tokens`, and `[B, seq_len + 1]`
+        booleans marking the ids the record covers (None for all). Every
+        router selects those experts instead of its own top-k and still
+        weights them from its scores (`dew.nn.moe.Routes`); the stack slices
+        the record by layer however it runs.
         """
         prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
         tokens = prepared.tokens
@@ -698,12 +706,19 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             raise ValueError("segment_ids must come from either ModelInputs or the packing column")
         packing.update(_packing_of(segment_ids, positions))
         params = thaw(params)
+        replay = {}
+        if routes is not None:
+            # The last id is never forwarded, so its row drops with it.
+            routed, covered = routes
+            replay["routed_experts"] = jnp.asarray(routed)[:, :-1]
+            if covered is not None:
+                replay["routed"] = jnp.asarray(covered, bool)[:, :-1]
         collections = ((["router"] if routing else []) + (["qk"] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
         hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
-                                               packing, layers)
+                                               {**packing, **replay}, layers)
         sown = gathered.get("router", {}) if routing else None
         qk = gathered.get("qk") if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
@@ -821,6 +836,40 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         losses = self.token_scores(params, aligned).losses
         restored, valid = _unpadded(losses, padding)
         return jnp.where(valid, -restored, 0.0)
+
+    def sampled_log_probs(self, params: Variables, scores: Scores, tokens: jax.Array,
+                          support: tuple[jax.Array, jax.Array] | None = None,
+                          temperature: float = 1.0) -> jax.Array:
+        """Each next-token target's likelihood as the sampler that drew it saw it.
+
+        `scores` is `token_scores` over `tokens`, `[B, S + 1]`; the result is
+        `[B, S]`. At unit temperature without `support` that is the raw
+        policy, `-scores.losses`. `temperature` divides the capped logits
+        (`head_logits`). `support` is the per-row ragged `(ids, columns)`
+        pair `sessions.pack` builds, `[B, C]` each, `columns` the column in
+        `tokens` of the id each kept id belongs to; a target with entries is
+        renormalized over them (`support_log_probs`).
+        """
+        log_probs = -scores.losses
+        if temperature == 1.0 and support is None:
+            return log_probs
+        softcap = self.model.final_logit_softcap
+        head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
+        targets = tokens[:, 1:]
+        if temperature != 1.0:
+            losses, _, _ = chunked_cross_entropy(
+                scores.hidden, head, targets, self.head_chunks, softcap=softcap,
+                precision=self.model.precision, predict=False, temperature=temperature)
+            log_probs = -losses
+        if support is not None:
+            ids, columns = (jnp.asarray(value, jnp.int32) for value in support)
+            # The id at column c is the target the state at c - 1 predicts.
+            filtered, present = support_log_probs(
+                scores.hidden, head, targets, ids, jnp.where(columns > 0, columns - 1, -1),
+                temperature=temperature,
+                softcap=softcap, precision=self.model.precision)
+            log_probs = jnp.where(present, filtered, log_probs)
+        return log_probs
 
     def _target_weights(self, targets, segment_ids, dtype, depth: int = 0):
         """Mark with 1 every target that counts.

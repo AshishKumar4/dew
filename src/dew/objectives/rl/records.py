@@ -74,10 +74,9 @@ class EpisodeFields(TypedDict, total=False):
     The keys are the dataclass's own init fields, which
     `tests/test_verl_episodes.py` pins, so a field renamed there is a failing
     test here rather than a key a reader never looks for. The nested records
-    are what `asdict` made of the identity, the observations and the turns,
-    and `to_verl` takes the turns back out of its copy, so this is a dict and
-    not a frozen mapping. Every key is written, and an exporter that drops one
-    is what `total=False` states.
+    are what `asdict` made of the identity, the observations and the turns.
+    Every key is written, and an exporter that drops one is what
+    `total=False` states.
     """
 
     identity: Mapping[str, object]
