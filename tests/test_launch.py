@@ -157,14 +157,15 @@ def test_a_failing_rank_stops_the_pool_and_is_named_with_its_last_lines(tmp_path
     (4, None, None, (4, 1)),
     (8, 2, None, (2, 4)),
     (8, None, 2, (4, 2)),
-    (1, None, None, (1, None)),
+    (1, None, None, (1, 1)),
+    (2, 4, None, (4, None)),
     (0, 4, None, (4, None)),
 ])
 def test_a_pool_splits_the_gpus_of_a_host_between_its_processes(monkeypatch, gpus, processes,
                                                                  devices, expected):
     """Unset, a host runs one process per GPU; a process count alone gets
-    an even share each; a machine with at most one GPU runs one process
-    with all of it; a CPU pool leaves devices alone."""
+    an even share each, and more processes than GPUs share them all; a CPU
+    pool leaves devices alone."""
     from dew.cli import launch
 
     monkeypatch.setattr(launch, "gpu_count", lambda host, visible: gpus)
@@ -214,12 +215,16 @@ SLURM_STEP = {"SLURM_JOB_ID": "77", "SLURM_STEP_NODELIST": "gpu[01-02]", "SLURM_
      "srun --kill-on-bad-exit=1 --export=ALL python train.py"),
     (SLURM_STEP, ("--hosts", "localhost", "--processes-per-host", "1", "--port", "5"),
      "DEW_PROCESS_COUNT=1"),
+    ({**SLURM_STEP, "SLURM_NTASKS": "1", "SLURM_PROCID": "0", "SLURM_LOCALID": "0",
+      "CUDA_VISIBLE_DEVICES": "0,1"}, (), "pool: 2 processes on localhost, 1 GPU each"),
 ])
 def test_where_the_launch_runs_follows_jax_detection_and_names_win(variables, arguments,
                                                                    expected):
     """A Slurm step or an Open MPI rank is already placed and runs the
     program in place, where jax reads the rank; a Slurm allocation outside a
-    step starts srun; named hosts win over any cluster around them."""
+    step starts srun; named hosts win over any cluster around them; a
+    one-task step, as a scheduler's GPU wrapper runs, leaves its GPUs to a
+    pool of the launcher's own."""
     env = {name: value for name, value in ENV.items()
            if not name.startswith(("SLURM_", "OMPI_"))}
     done = launched("--dry-run", *arguments, "--", "python", "train.py",

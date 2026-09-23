@@ -14,7 +14,8 @@ Every node runs the same script. Each copy is one process of a `jax.distributed`
 | A machine with one GPU, or none | One process | `dew launch` |
 | Plain machines, with `--hosts` or `--hostfile` | The same on every host, over ssh | `dew launch` |
 | A Slurm allocation, such as an sbatch script | `srun`, one task per GPU | Slurm's `SLURM_*` variables, read by JAX |
-| A Slurm step or an `mpirun` rank | The program itself, in place | Slurm's or Open MPI's variables, read by JAX |
+| A Slurm step of several tasks, or an `mpirun` rank | The program itself, in place | Slurm's or Open MPI's variables, read by JAX |
+| A Slurm step of one task | One process per GPU of the step | `dew launch` |
 | A Cloud TPU VM worker | The program itself, in place | The TPU metadata server, read by JAX |
 | Anywhere, with `--tpu NAME` | One process on every worker of the TPU, through gcloud | The TPU metadata server, read by JAX |
 
@@ -72,7 +73,7 @@ Run `dew launch` inside the allocation. It starts `srun`, and JAX reads the rank
 sbatch --nodes=2 --gpus-per-node=8 --wrap "dew launch -- /opt/dew/.venv/bin/python recipes/lm/train.py --trainer.multi-host True"
 ```
 
-This runs `srun --kill-on-bad-exit=1 --export=ALL --ntasks-per-node=8 ...`, with the `--env` variables in srun's environment. JAX gives each Slurm task the one GPU at its `SLURM_LOCALID`, so a node runs one task per GPU: `--processes-per-host` when you give it, else the allocation's own `--ntasks-per-node`, else the GPUs Slurm gave the node. One task per node would see a single GPU, so the launcher refuses `--devices-per-process` under Slurm. Inside a step that `srun` already started, `dew launch` runs the program in place.
+This runs `srun --kill-on-bad-exit=1 --export=ALL --ntasks-per-node=8 ...`, with the `--env` variables in srun's environment. JAX gives each Slurm task the one GPU at its `SLURM_LOCALID`, so a node runs one task per GPU: `--processes-per-host` when you give it, else the allocation's own `--ntasks-per-node`, else the GPUs Slurm gave the node. One task per node would see a single GPU, so the launcher refuses `--devices-per-process` under Slurm. Inside a step of several tasks that `srun` already started, `dew launch` runs the program in place. Inside a step of one task, such as a GPU wrapper script that runs its command under `srun`, it starts one process per GPU of the step, as on a plain machine.
 
 ## Launch under Open MPI
 
