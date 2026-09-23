@@ -10,7 +10,9 @@ the traced window's split (compute, exposed collectives, idle on the host,
 idle on input). A row compares Dew's best run with the reference's best, and
 a Dew rate under the reference's is a loss with an owner. A reference that is
 not the strongest setup of its framework, or a comparison not yet measured,
-is listed as such rather than counted.
+is listed as such rather than counted. A row's experiments are runs off
+their framework's default setup, such as an XLA flag Dew does not set: the
+table shows them to price a gap, and the verdict leaves them out.
 
     python tools/reference_runs/scoreboard.py [--evidence DIR] [--out DIR]
 """
@@ -27,56 +29,102 @@ from compare import load, performance
 Side = tuple[str, str, str]
 
 ROWS: list[dict] = [
-    {"path": "dense LM", "model": "Qwen3-0.6B", "gpus": 1, "hardware": "A100-SXM4-40GB (Colab)",
-     "shape": "global batch 4 x 1024 tokens, bf16 compute over fp32 masters, AdamW, 256 steps",
-     "dew": [("dew", "qwen3-1gpu-a100/gated-product-fix/dew-bf16-fix.json",
-              "main 022636f5 + gated-product fix: bf16 head, cuDNN attention")],
-     "reference": [("torch eager", "qwen3-1gpu-a100/torch-autocast.json",
-                    "transformers 5.16.1 + torch 2.11 eager, autocast bf16, SDPA (FlashAttention 2), "
-                    "fused AdamW")],
-     "missing": ["torch.compile (the strongest torch setup) not measured yet",
-                 "MaxText: not installed on the box or Colab"]},
+    {"path": "dense LM", "model": "Qwen3-0.6B", "gpus": 1, "hardware": "A100-SXM4-40GB (Colab), one VM",
+     "shape": "batch 4 x 1024 tokens, bf16 compute over fp32 masters, AdamW, 40 steps (25 timed, 5 profiled)",
+     "dew": [("dew", "qwen3-1gpu-a100/c6-775e68d9/dew-bf16.json", "main 775e68d9: bf16 head, cuDNN attention")],
+     "reference": [("torch.compile", "qwen3-1gpu-a100/c6-775e68d9/torch-autocast-compile.json",
+                    "transformers 5.17.0 + torch 2.11, torch.compile per decoder layer, autocast bf16, SDPA "
+                    "(FlashAttention 2), fused AdamW"),
+                   ("torch eager", "qwen3-1gpu-a100/c6-775e68d9/torch-autocast.json", "the same, eager"),
+                   ("MaxText recipe", "qwen3-1gpu-a100/c6-775e68d9/maxtext-recipe.json",
+                    "MaxText 0.2.4 GPU recipe: minimal_with_context remat, unscanned layers, cuDNN flash, its XLA "
+                    "flags; synthetic tokens"),
+                   ("MaxText default", "qwen3-1gpu-a100/c6-775e68d9/maxtext-default.json",
+                    "MaxText 0.2.4 defaults: full remat, scanned layers, cuDNN flash; synthetic tokens")],
+     "experiments": [("dew, no Triton GEMM", "qwen3-1gpu-a100/c6-775e68d9/dew-bf16-no-triton-gemm.json",
+                      "main 775e68d9 with XLA_FLAGS=--xla_gpu_enable_triton_gemm=false"),
+                     ("dew, MaxText's flags", "qwen3-1gpu-a100/c6-775e68d9/dew-bf16-maxtext-flags.json",
+                      "main 775e68d9 with MaxText's GPU recipe XLA flags")],
+     "owner": "KernelAdoption",
+     "status": "Dew 1.7% slower than torch.compile (162.2 against 159.4 ms/step). Device time +5.6 ms/step: "
+               "attention +4.9 (cuDNN's sm80 flash backward 12.6 ms against FlashAttention 2's 9.6, and 4.7 ms "
+               "of cuDNN's dq-convert, dot_do_o and reduce_head against 2.6) and GEMM +4.7 in XLA's Triton "
+               "gemm fusions. Without Triton GEMM Dew runs 153.2 ms/step, 1.041x torch.compile; "
+               "KernelAdoption is making that flag Dew's default per GPU generation",
+     "missing": []},
     {"path": "dense LM", "model": "Qwen3-0.6B", "gpus": 4, "hardware": "4x RTX 3090 (NVLink pair + PHB pair)",
-     "shape": "global batch 8 x 1024 tokens (2 rows per GPU), bf16 compute over fp32 masters, AdamW",
-     "dew": [("dew data=4", "qwen3-4gpu-3090/main-904bdb46-fix/dew-data-bf16.json", "main 904bdb46 + fix"),
-             ("dew fsdp=4", "qwen3-4gpu-3090/main-904bdb46-fix/dew-fsdp-bf16.json", "main 904bdb46 + fix")],
-     "reference": [("torch DDP", "qwen3-4gpu-3090/torch-ddp-autocast.json",
+     "shape": "global batch 8 x 1024 tokens (2 rows per GPU), bf16 compute over fp32 masters, AdamW, "
+              "the 256-step curve case",
+     "dew": [("dew data=4", "qwen3-4gpu-3090/after-775e68d9/qwen3/dew-data4-bf16.json", "main 775e68d9"),
+             ("dew fsdp=4", "qwen3-4gpu-3090/after-775e68d9/qwen3/dew-fsdp4-bf16.json", "main 775e68d9")],
+     "reference": [("torch.compile DDP", "qwen3-4gpu-3090/after-775e68d9/qwen3/torch-ddp-compile-b8.json",
+                    "DDP, torch.compile per decoder layer, autocast bf16, SDPA, 40 steps"),
+                   ("torch.compile FSDP2", "qwen3-4gpu-3090/after-775e68d9/qwen3/torch-fsdp2-compile-b8.json",
+                    "fully_shard per layer, bf16/fp32-reduce policy, torch.compile per layer, SDPA, 40 steps"),
+                   ("torch DDP", "qwen3-4gpu-3090/torch-ddp-autocast.json",
                     "DDP (bucketed all-reduce overlapped with backward), eager, autocast bf16, SDPA"),
                    ("torch FSDP2", "qwen3-4gpu-3090/torch-fsdp2-bf16.json",
-                    "fully_shard per layer, MixedPrecisionPolicy bf16/fp32 reduce, eager, SDPA")],
-     "owner": "DistTrain",
-     "status": "the chunked head all-gathered every token's hidden state in each tile iteration "
-               "(312 AllGathers/step, 862 ms) and fsdp re-gathered the head table in its loops "
-               "(68/step, 4.3 s); fixed at the source by 0fbe8215, re-measure queued on the box",
-     "missing": ["torch.compile not measured yet", "MaxText: not installed"]},
+                    "fully_shard per layer, MixedPrecisionPolicy bf16/fp32 reduce, eager, SDPA"),
+                   ("MaxText data=4", "qwen3-4gpu-3090/after-775e68d9/qwen3/maxtext-data-b8.json",
+                    "MaxText 0.2.4 GPU recipe, synthetic tokens, 40 steps"),
+                   ("MaxText fsdp=4", "qwen3-4gpu-3090/after-775e68d9/qwen3/maxtext-fsdp-b8.json",
+                    "MaxText 0.2.4 GPU recipe, synthetic tokens, 40 steps")],
+     "missing": []},
+    {"path": "dense LM", "model": "Qwen3-0.6B", "gpus": 4, "hardware": "4x RTX 3090 (NVLink pair + PHB pair)",
+     "shape": "global batch 16 x 1024 tokens (4 rows per GPU; torch in 2 micro-batches, which DDP's memory "
+              "needs), bf16 compute over fp32 masters, AdamW, 40 steps",
+     "dew": [("dew data=4", "qwen3-4gpu-3090/after-775e68d9/qwen3/b16-dew-data4.json", "main 775e68d9"),
+             ("dew fsdp=4", "qwen3-4gpu-3090/after-775e68d9/qwen3/b16-dew-fsdp4.json", "main 775e68d9")],
+     "reference": [("torch.compile DDP", "qwen3-4gpu-3090/after-775e68d9/qwen3/b16-torch-ddp-compile.json",
+                    "DDP, torch.compile per decoder layer, autocast bf16, SDPA"),
+                   ("torch.compile FSDP2", "qwen3-4gpu-3090/after-775e68d9/qwen3/b16-torch-fsdp2-compile.json",
+                    "fully_shard per layer, bf16/fp32-reduce policy, torch.compile per layer, SDPA"),
+                   ("MaxText data=4", "qwen3-4gpu-3090/after-775e68d9/qwen3/maxtext-data-b16.json",
+                    "MaxText 0.2.4 GPU recipe, synthetic tokens"),
+                   ("MaxText fsdp=4", "qwen3-4gpu-3090/after-775e68d9/qwen3/maxtext-fsdp-b16.json",
+                    "MaxText 0.2.4 GPU recipe, synthetic tokens")],
+     "experiments": [("dew data=4, no Triton GEMM",
+                      "qwen3-4gpu-3090/after-775e68d9/qwen3/b16-dew-data4-no-triton-gemm.json",
+                      "main 775e68d9 with XLA_FLAGS=--xla_gpu_enable_triton_gemm=false"),
+                     ("dew fsdp=4, no Triton GEMM",
+                      "qwen3-4gpu-3090/after-775e68d9/qwen3/b16-dew-fsdp4-no-triton-gemm.json",
+                      "main 775e68d9 with XLA_FLAGS=--xla_gpu_enable_triton_gemm=false")],
+     "missing": []},
     {"path": "MoE", "model": "99M Qwen3-MoE shape (8 experts, top 2)", "gpus": 1,
-     "hardware": "A100-SXM4-40GB (Colab)",
-     "shape": "global batch 8 x 1024 tokens, bf16 compute over fp32 masters, AdamW, Switch aux 0.01",
-     "dew": [("dew", "moe-1gpu-a100/dew-bf16.json", "main eab7a2d7")],
-     "reference": [("torch grouped_mm", "moe-1gpu-a100/torch-autocast.json",
-                    "transformers Qwen3MoE, experts grouped_mm (outside autocast: fp32 experts), eager"),
-                   ("torch eager experts", "moe-1gpu-a100/torch-autocast-eager-1.json",
-                    "transformers Qwen3MoE, experts as an F.linear loop under autocast bf16, eager")],
-     "missing": ["torch.compile not measured yet", "MaxText: not installed"]},
+     "hardware": "A100-SXM4-40GB (Colab), one VM",
+     "shape": "global batch 8 x 1024 tokens, bf16 compute over fp32 masters, AdamW, Switch aux 0.01, 40 steps",
+     "dew": [("dew", "moe-1gpu-a100/c6-775e68d9/dew-bf16.json", "main 775e68d9")],
+     "reference": [("torch.compile", "moe-1gpu-a100/c6-775e68d9/torch-autocast-compile.json",
+                    "transformers 5.17.0 Qwen3MoE, experts grouped_mm (fp32 experts outside autocast), "
+                    "torch.compile per decoder layer")],
+     "experiments": [("dew, no Triton GEMM", "moe-1gpu-a100/c6-775e68d9/dew-bf16-no-triton-gemm.json",
+                      "main 775e68d9 with XLA_FLAGS=--xla_gpu_enable_triton_gemm=false")],
+     "missing": ["MaxText: its MoE path on GPU not set up for this shape"]},
     {"path": "MoE", "model": "99M Qwen3-MoE shape (8 experts, top 2)", "gpus": 4,
      "hardware": "4x RTX 3090 (NVLink pair + PHB pair)",
      "shape": "global batch 8 x 1024 tokens (2 rows per GPU), bf16 compute, AdamW, Switch aux 0.01",
-     "dew": [("dew expert=4", "moe-4gpu-3090/dew-expert4-bf16.json", "main 904bdb46 + fix, Layout tolerance 1.0"),
-             ("dew data=4", "moe-4gpu-3090/dew-data4-bf16.json", "main 904bdb46 + fix")],
-     "reference": [("torch DDP", "moe-4gpu-3090/torch-ddp-autocast.json",
+     "dew": [("dew expert=4", "moe-4gpu-3090/after-775e68d9/moe/dew-expert4-bf16.json",
+              "main 775e68d9, Layout tolerance 1.0"),
+             ("dew data=4", "moe-4gpu-3090/after-775e68d9/moe/dew-data4-bf16.json", "main 775e68d9")],
+     "reference": [("torch.compile DDP", "moe-4gpu-3090/after-775e68d9/moe/torch-ddp-compile.json",
+                    "DDP, experts grouped_mm, torch.compile per decoder layer, autocast bf16, 40 steps"),
+                   ("torch DDP", "moe-4gpu-3090/torch-ddp-autocast.json",
                     "DDP, experts grouped_mm, eager, autocast bf16")],
-     "owner": "DistTrain",
-     "status": "the same chunked-head all-gathers (397-408 of 533-543 ms exposed); fixed at the source "
-               "by 0fbe8215, re-measure queued; what remains goes to DistExpert and KernelAdoption",
-     "missing": ["torch.compile not measured yet", "MaxText: not installed"]},
+     "missing": ["MaxText: its MoE path on GPU not set up for this shape"]},
     {"path": "Mamba-2", "model": "mamba2-130m", "gpus": 1, "hardware": "A100-SXM4-40GB (Colab)",
-     "shape": "global batch 4 x 1024 tokens, bf16 compute over fp32 masters, AdamW",
-     "dew": [("dew", "mamba2-1gpu-a100/dew-bf16.json", "main eab7a2d7")],
-     "reference": [("torch (no kernels)", "mamba2-1gpu-a100/torch-autocast.json",
-                    "transformers Mamba2 torch path without mamba_ssm/causal_conv1d, eager, micro-batch 1 x 4")],
-     "weak_reference": "torch ran without the mamba_ssm and causal_conv1d kernels (not installable in that "
-                       "venv); the strongest torch setup uses them",
-     "missing": ["torch with mamba_ssm + causal_conv1d kernels"]},
+     "shape": "global batch 4 x 1024 tokens, bf16 compute over fp32 masters, AdamW, 40 steps",
+     "dew": [("dew", "mamba2-1gpu-a100/c6-775e68d9/dew-bf16.json", "main 775e68d9")],
+     "reference": [("torch + kernels", "mamba2-1gpu-a100/c6-775e68d9/torch-autocast-kernels.json",
+                    "transformers Mamba2 with mamba_ssm (Triton SSD scan) and causal_conv1d, eager, autocast bf16"),
+                   ("torch.compile + kernels", "mamba2-1gpu-a100/c6-775e68d9/torch-autocast-kernels-compile.json",
+                    "the same under torch.compile per layer"),
+                   ("torch (no kernels)", "mamba2-1gpu-a100/compile-ef4b5f08/torch-autocast.json",
+                    "transformers Mamba2 torch path, eager, micro-batch 1 x 4; another A100 VM")],
+     "experiments": [("dew, no Triton GEMM", "mamba2-1gpu-a100/c6-775e68d9/dew-bf16-no-triton-gemm.json",
+                      "main 775e68d9 with XLA_FLAGS=--xla_gpu_enable_triton_gemm=false")],
+     "status": "torch.compile of the kernel-free torch path fails in Inductor (TypeError in Triton codegen, "
+               "torch 2.11)",
+     "missing": []},
     {"path": "DiT diffusion", "model": "SimpleDiT (patch 4, width 384, 8 layers) at 64 px", "gpus": 1,
      "hardware": "A100-SXM4-40GB (Colab)",
      "shape": "batch 64 images, EDM, bf16 compute, AdamW, EMA 0.999, 128 steps",
@@ -85,18 +133,19 @@ ROWS: list[dict] = [
      "owner": "KernelAdoption",
      "status": "Dew 1.8% slower: +0.58 ms/step of convert and concatenate fusions (939 kernels/step "
                "against 867)",
-     "missing": ["torch: diffusers DiT or UNet2D with torch.compile not measured"]},
+     "missing": ["torch: no torch port of this DiT; diffusers' UNet2D is another model"]},
     {"path": "DiT diffusion", "model": "SimpleDiT (patch 4, width 384, 8 layers) at 64 px", "gpus": 4,
      "hardware": "4x RTX 3090 (NVLink pair + PHB pair)",
      "shape": "global batch 64 images, EDM, bf16 compute, AdamW, EMA 0.999, 128 steps",
-     "dew": [("dew data=4", "dit-4gpu-3090/dew-data4-bf16.json", "main 904bdb46 + fix"),
-             ("dew fsdp=4", "dit-4gpu-3090/dew-fsdp4-bf16.json", "main 904bdb46 + fix")],
+     "dew": [("dew data=4", "dit-4gpu-3090/after-775e68d9/dit/dew-data4-bf16.json", "main 775e68d9"),
+             ("dew fsdp=4", "dit-4gpu-3090/after-775e68d9/dit/dew-fsdp4-bf16.json", "main 775e68d9")],
      "reference": [("flaxdiff data=4", "dit-4gpu-3090/flaxdiff-data4-bf16.json", "flaxdiff (JAX)"),
                    ("flaxdiff fsdp=4", "dit-4gpu-3090/flaxdiff-fsdp4-bf16.json", "flaxdiff (JAX)")],
-     "owner": "DistTrain",
-     "status": "fsdp=4 1,967 against flaxdiff's 2,857 images/s: the same compute and collectives, "
-               "15.9 ms/step idle on the host against 5.5 (the step's dispatch); re-measure queued",
-     "missing": ["torch: diffusers DiT or UNet2D under DDP/FSDP2 with torch.compile not measured"]},
+     "experiments": [("dew fsdp=4, collectives in command buffers",
+                      "dit-4gpu-3090/after-775e68d9/dit/dew-fsdp4-bf16-cbcoll.json",
+                      "main 775e68d9 with XLA_FLAGS=--xla_gpu_enable_command_buffer=+COLLECTIVES "
+                      "(DistTrain's A/B)")],
+     "missing": ["torch: no torch port of this DiT"]},
     {"path": "serving", "model": "-", "gpus": 1, "hardware": "-", "shape": "-", "dew": [], "reference": [],
      "missing": ["Dew serving against vLLM and SGLang: DistInference's measurements to be collected here"]},
 ]
@@ -152,7 +201,7 @@ def markdown(board: dict) -> str:
         for row in (r for r in board["rows"] if r["path"] == path):
             lines += [f"**{row['model']}, {row['gpus']} GPU{'s' if row['gpus'] > 1 else ''}, "
                       f"{row['hardware']}**: {row['shape']}. {row['verdict']}.", ""]
-            sides = row["dew"] + row["reference"]
+            sides = row["dew"] + row["reference"] + row["experiments"]
             if sides:
                 lines += ["| run | setup | rate | step ms | MFU % | kernel MFU % | peak GiB | compute ms "
                           "| exposed ms | idle host ms | idle input ms |",
@@ -188,8 +237,8 @@ def main() -> None:
     evidence = Path(args.evidence)
     rows = []
     for spec in ROWS:
-        row = {**spec, "dew": side_rows(evidence, spec["dew"]),
-               "reference": side_rows(evidence, spec["reference"])}
+        row = {**spec, **{key: side_rows(evidence, spec.get(key, []))
+                          for key in ("dew", "reference", "experiments")}}
         row["verdict"] = verdict(row)
         rows.append(row)
     board = {"built": datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M UTC"),
