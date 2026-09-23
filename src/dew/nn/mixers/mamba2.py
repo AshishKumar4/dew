@@ -512,7 +512,7 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
     mixed = jnp.moveaxis(mixed, 2, 1)                       # [B, D, S]
     batch, channels, length = mixed.shape
     history = jnp.zeros((batch, channels, width), mixed.dtype)
-    before = None if segments is None else jnp.broadcast_to(segments[:, :1], (batch, width))
+    forward = None
     if axis is not None:
         if length < width:
             raise ValueError(
@@ -521,12 +521,14 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
         shards = jax.lax.axis_size(axis)
         forward = [(shard, shard + 1) for shard in range(shards - 1)]
         history = jax.lax.ppermute(mixed[..., length - width:], axis, forward)
-        if segments is not None:
-            before = jax.lax.ppermute(segments[:, length - width:], axis, forward)
     if segments is None:
         convolved = causal_conv1d(jnp.concatenate([history, mixed], axis=2), taps, bias=bias)[..., width:]
         starts = None
     else:
+        if forward is None:
+            before = jnp.broadcast_to(segments[:, :1], (batch, width))
+        else:
+            before = jax.lax.ppermute(segments[:, length - width:], axis, forward)
         convolved = document_conv1d(history, mixed, before, segments, taps, bias)
         starts = document_starts(segments, before[:, -1])
     out, _ = scan(convolved, dt, dt_bias, A, D, starts=starts, axis=axis)
