@@ -1979,9 +1979,9 @@ def save_pretrained_decoder(model, variables, directory, *,
 
     `tokenizer` is the vocabulary the weights were trained against, by object
     or by name; `save_export_assets` writes its files beside them, so one call
-    leaves a directory `load_pretrained` reads back with its processor. This is
-    the writer `Pretrained.save` delegates a decoder to, so the two agree on
-    what a complete export contains.
+    leaves a directory `load_pretrained` reads back with its processor.
+    `Pretrained.save` writes a decoder's weights through the same encoder
+    (`Pretrained.export`), so the two leave the same weights behind.
     """
     from dew.interop.safetensors_io import save_hf_layout
 
