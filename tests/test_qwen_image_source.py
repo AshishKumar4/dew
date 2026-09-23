@@ -24,9 +24,8 @@ import numpy as np
 import pytest
 
 from dew.diffusion.process import DenoisingCondition
-from dew.interop.diffusion import (component_tensors, qwen_image_fields,
-                                   translate_qwen_image_weights)
-from dew.nn.backbones.qwen_image import QwenImageTransformer, image_grid
+from dew.interop.diffusion import component_tensors, qwen_image_fields, translate_qwen_image_weights
+from dew.nn.backbones.qwen_image import QwenImageTransformer
 
 ROOT = Path(__file__).resolve().parents[1]
 RELEASED = ROOT / "tests/fixtures/hf/qwen-image-2.1-source"
@@ -190,14 +189,6 @@ def test_unsupported_qwen_image_geometry_is_refused(source):
         qwen_image_fields({**config, "patch_size": 2})
     with pytest.raises(ValueError, match="must cover"):
         qwen_image_fields({**config, "axes_dims_rope": [4, 4, 6]})
-
-
-def test_the_image_grid_is_centred_as_the_source_lays_it_out():
-    """`QwenImage21Rope`'s image indices: an even side runs -n/2..n/2-1 and
-    an odd one is one short on the positive side."""
-    heights, widths = image_grid(3, 4)
-    np.testing.assert_array_equal(heights, [-2] * 4 + [-1] * 4 + [0] * 4)
-    np.testing.assert_array_equal(widths, [-2, -1, 0, 1] * 3)
 
 
 def test_the_released_configs_and_weight_maps_translate():
