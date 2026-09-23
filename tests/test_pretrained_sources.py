@@ -9,6 +9,7 @@ transfer, which is what the selection tests hold onto.
 """
 
 import json
+import os
 import shutil
 from fnmatch import fnmatch
 from pathlib import Path
@@ -399,3 +400,35 @@ def test_a_saved_source_writes_its_config_back_unchanged(tmp_path, name):
 
     assert loaded.model.max_seq_len == 8192
     assert json.loads((tmp_path / "saved" / "config.json").read_text()) == config
+
+
+def test_a_cached_repo_id_loads_offline_when_the_commit_lists_files_never_downloaded(tmp_path):
+    """HF_HUB_OFFLINE=1 with the source in the Hub cache, as a load that
+    fetched only what it reads leaves it: the commit's cached listing names
+    a README the snapshot never downloaded. Offline, huggingface_hub's dry
+    run raises LocalEntryNotFoundError for that file, and the load reads
+    the snapshot it has, pinned or at the cached `main`."""
+    import subprocess
+    import sys
+
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    repo = tmp_path / "hub" / "models--dew--qwen3-tiny"
+    shutil.copytree(FIXTURES / "qwen3-tiny", repo / "snapshots" / commit)
+    listed = {path.name: {"size": path.stat().st_size, "blob_id": f"{index:040x}"}
+              for index, path in enumerate(sorted((repo / "snapshots" / commit).iterdir()))}
+    listed["README.md"] = {"size": 1, "blob_id": "f" * 40}
+    (repo / "trees").mkdir()
+    (repo / "trees" / f"{commit}.json").write_text(json.dumps({"format_version": 1, "files": listed}))
+    (repo / "refs").mkdir()
+    (repo / "refs" / "main").write_text(commit)
+    script = """
+import sys
+from dew.interop import load_pretrained
+for revision in (None, sys.argv[1]):
+    print(load_pretrained("dew/qwen3-tiny", revision=revision, dtype="float32").revision)
+"""
+    run = subprocess.run([sys.executable, "-c", script, commit], capture_output=True, text=True,
+                         env={**os.environ, "HF_HUB_OFFLINE": "1", "HF_HUB_CACHE": str(tmp_path / "hub"),
+                              "JAX_PLATFORMS": "cpu"})
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert run.stdout.split() == [commit, commit]
