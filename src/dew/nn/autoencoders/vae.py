@@ -83,7 +83,7 @@ class FlaxResnetBlock2D(nn.Module):
     def setup(self):
         out_channels = self.in_channels if self.out_channels is None else self.out_channels
 
-        self.norm1 = nn.GroupNorm(num_groups=self.groups, epsilon=1e-6)
+        self.norm1 = nn.GroupNorm(num_groups=self.groups, epsilon=1e-6, dtype=self.dtype)
         self.conv1 = nn.Conv(
             out_channels,
             kernel_size=(3, 3),
@@ -92,7 +92,7 @@ class FlaxResnetBlock2D(nn.Module):
             dtype=self.dtype,
         )
 
-        self.norm2 = nn.GroupNorm(num_groups=self.groups, epsilon=1e-6)
+        self.norm2 = nn.GroupNorm(num_groups=self.groups, epsilon=1e-6, dtype=self.dtype)
         self.dropout_layer = nn.Dropout(self.dropout)
         self.conv2 = nn.Conv(
             out_channels,
@@ -150,7 +150,7 @@ class FlaxAttentionBlock(nn.Module):
 
         dense = partial(nn.Dense, self.channels, dtype=self.dtype)
 
-        self.group_norm = nn.GroupNorm(num_groups=self.num_groups, epsilon=1e-6)
+        self.group_norm = nn.GroupNorm(num_groups=self.num_groups, epsilon=1e-6, dtype=self.dtype)
         self.query, self.key, self.value = dense(), dense(), dense()
         self.proj_attn = dense()
 
@@ -399,7 +399,7 @@ class FlaxEncoder(nn.Module):
 
         # end
         conv_out_channels = 2 * self.out_channels if self.double_z else self.out_channels
-        self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6)
+        self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6, dtype=self.dtype)
         self.conv_out = nn.Conv(
             conv_out_channels,
             kernel_size=(3, 3),
@@ -484,7 +484,7 @@ class FlaxDecoder(nn.Module):
         self.up_blocks = up_blocks
 
         # end
-        self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6)
+        self.conv_norm_out = nn.GroupNorm(num_groups=self.norm_num_groups, epsilon=1e-6, dtype=self.dtype)
         self.conv_out = nn.Conv(
             self.out_channels,
             kernel_size=(3, 3),
