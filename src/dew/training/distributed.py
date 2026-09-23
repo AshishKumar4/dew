@@ -17,9 +17,10 @@ from typing import Iterator
 import jax
 import numpy as np
 from flax import linen as nn
-from jax.experimental import mesh_utils
+from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
+from dew.artifacts import agreed, broadcast_from_process_zero
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
 from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
@@ -512,7 +513,8 @@ def data_partition(mesh: Mesh) -> DataPartition:
     same row shards need the same rows, and the processes fall into groups by
     the rows they hold.
     Each group reads one share, numbered by the first row shard it holds,
-    and every process of the group reads it (`readers`).
+    and every process of the group reads it (`readers`); `reader` is this
+    process's place among them, in process order.
 
     Groups whose rows overlap without being the same rows, which a device
     order built by hand can produce, leave no share each could read whole,
@@ -532,8 +534,9 @@ def data_partition(mesh: Mesh) -> DataPartition:
             f"which overlap without being the same; each group of processes has to "
             f"hold rows no other group holds, so it can read them as its own share")
     mine = frozenset(held[jax.process_index()])
-    return DataPartition(index=groups.index(mine), count=len(groups),
-                         readers=sum(frozenset(rows) == mine for rows in held.values()))
+    readers = sorted(process for process, rows in held.items() if frozenset(rows) == mine)
+    return DataPartition(index=groups.index(mine), count=len(groups), readers=len(readers),
+                         reader=readers.index(jax.process_index()))
 
 
 def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
@@ -570,6 +573,42 @@ def shard_batch(mesh: Mesh, batch: Batch) -> Batch:
             sharding, local, (shape[0] * count, *shape[1:]) if shape else ())
 
     return jax.tree.map(place, batch, batch_shardings(mesh, batch))
+
+
+def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """The batch the first reader of this process's share read, on every reader of it.
+
+    The processes that read one share (`data_partition(mesh).readers`) hand
+    `shard_batch` rows the same devices hold, so their batches must be the
+    same. A source whose reads differ between them, as independent draws
+    from an engine do, reads on the share's first reader alone
+    (`DataPartition.reader` 0). Every process of the pool then calls this
+    on the thread its other collectives run on, as a rollout runs: each
+    first reader's batch, laid out as process 0's is, reaches every
+    process, and each takes its share's. A later reader's `batch` is not
+    read. On a mesh whose shares have one reader each this is `batch`.
+    """
+    partition = data_partition(mesh)
+    if partition.readers == 1:
+        return dict(batch)
+    layout = broadcast_from_process_zero(
+        {name: [list(np.shape(leaf)), str(np.asarray(leaf).dtype)] for name, leaf in batch.items()})
+
+    def held() -> dict[str, np.ndarray]:
+        if partition.reader:
+            return {name: np.zeros(shape, np.dtype(dtype)) for name, (shape, dtype) in layout.items()}
+        mine = {name: np.asarray(leaf) for name, leaf in batch.items()}
+        if {name: [list(leaf.shape), str(leaf.dtype)] for name, leaf in mine.items()} != layout:
+            raise ValueError("the first readers' batches are not laid out alike; every process of a pool "
+                             "hands shard_batch the same tree")
+        return mine
+
+    rows = agreed("first reader batch", held)
+    gathered = multihost_utils.process_allgather(
+        {"share": np.asarray([partition.index, partition.reader], np.int32), **rows})
+    source = next(process for process, (index, reader) in enumerate(gathered["share"].tolist())
+                  if index == partition.index and reader == 0)
+    return {name: np.asarray(gathered[name][source]) for name in layout}
 
 
 class DevicePrefetchIterator:

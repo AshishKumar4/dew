@@ -70,7 +70,11 @@ twice a call. The weight push is one call every process makes, so the
 publisher has to agree on it across the pool. The proximal rescoring runs
 once over the pool's batch, and each process reads its own rows back. A
 process whose admission fails raises on every process at the agreement
-point, rather than leave the others waiting in the rescoring.
+point, rather than leave the others waiting in the rescoring. Where
+several processes read one share, as a tensor or sequence axis across
+processes makes them, the share's first reader alone samples, and the
+others train on the rows it packed (`first_reader_batch`): their devices
+hold the same rows, which independent draws would not give them.
 """
 
 from __future__ import annotations
@@ -86,12 +90,13 @@ from typing import Protocol
 
 import jax
 import numpy as np
+from jax.sharding import Mesh
 
 from dew.artifacts import agreed
 from dew.data.dataset import Batch, DataPartition, Dataset, tapped
 from dew.nn.inputs import local_rows, mesh_of
 from dew.objectives.base import Variables
-from dew.training.distributed import shard_batch
+from dew.training.distributed import first_reader_batch, shard_batch
 from dew.training.state import TrainState
 
 from .grpo import GRPOObjective
@@ -213,7 +218,8 @@ class RolloutScheduler:
     `estimator` and `truncation` are `pack`'s advantage family and
     truncation policy, and `support_capacity` its per-row support length,
     which a filtered-sampling source requires. `log`, when given,
-    receives a `SchedulerRecord` per call, of this process's rollouts.
+    receives a `SchedulerRecord` per call, of this process's rollouts; a
+    share's later readers sample none and log nothing.
     """
 
     def __init__(self, objective: GRPOObjective, source: SessionSource, weights: Publisher, *,
@@ -248,6 +254,7 @@ class RolloutScheduler:
         self._lock = threading.Lock()
         self._registered: deque[_Entry] = deque()
         self._serial = 0
+        self._partition = DataPartition()
         self._rescore = jax.jit(objective.packed_log_probs)
 
     def tasks(self, dataset: Dataset) -> Dataset:
@@ -260,6 +267,7 @@ class RolloutScheduler:
 
         def train(partition: DataPartition) -> Iterator[Batch]:
             self._drop_registered()
+            self._partition = partition
             return opened(partition)
 
         return dataclasses.replace(dataset, train=train)
@@ -438,10 +446,14 @@ class RolloutScheduler:
         self._publish(state, updates)
         rollouts, latencies, groups, tally, waited = agreed(
             "rollout admission", lambda: self._admitted(batch, updates))
+        sampling = self._partition.reader == 0
         packed = pack(rollouts, self.width, rows=self.rows, estimator=self.estimator, truncation=self.truncation,
-                      support_capacity=self.support_capacity)
-        packed[OLD_LOG_PROBS_KEY] = self._proximal(state.params, packed) * packed[RESPONSE_MASK_KEY]
-        if self.log is not None:
+                      support_capacity=self.support_capacity) if sampling else {}
+        mesh = mesh_of(state.params)
+        if mesh is not None:
+            packed = first_reader_batch(mesh, packed)
+        packed[OLD_LOG_PROBS_KEY] = self._proximal(state.params, packed, mesh) * packed[RESPONSE_MASK_KEY]
+        if self.log is not None and sampling:
             versions = [call.version for rollout in rollouts for call in rollout.calls]
             oldest = min(versions, default=updates)
             metrics = session_metrics(rollouts, packed, latencies=latencies, version=updates,
@@ -460,6 +472,8 @@ class RolloutScheduler:
         if tuple(self.tasks_of(batch)) != entry.tasks:
             self._cancel([sample for group in entry.groups for sample in group.live])
             raise ValueError("the trainer's batch is not the next registered task batch")
+        if self._partition.reader:
+            return [], [], 0, _Tally(), 0.0
         for pending in (entry, *upcoming):
             if not pending.groups:
                 self._open(pending)
@@ -471,13 +485,12 @@ class RolloutScheduler:
                 [latency for group in admitted for latency in group.latencies[:self.groups]],
                 len(admitted), tally, waited)
 
-    def _proximal(self, params: Variables, packed: dict[str, np.ndarray]) -> np.ndarray:
+    def _proximal(self, params: Variables, packed: dict[str, np.ndarray], mesh: Mesh | None) -> np.ndarray:
         """The trainer's likelihoods of this process's packed rows, `[rows, width - 1]`.
 
         Over a mesh the rows are placed as the step places the batch, every
         process's rows together, so the rescoring runs once over the pool's
         batch and each process reads its own rows back.
         """
-        mesh = mesh_of(params)
         scored = self._rescore(params, packed if mesh is None else shard_batch(mesh, packed))
         return local_rows(scored).astype(np.float32)
