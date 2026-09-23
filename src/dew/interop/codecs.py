@@ -2,9 +2,9 @@
 
 `source_quantization` reads a config's `quantization_config` into one codec
 and refuses every other format by name. A codec knows which tensors of a
-checkpoint are the parts of one quantized weight, decodes them in float32
-one tensor at a time, and encodes dense weights back into those parts for
-`Pretrained.save`:
+checkpoint are the parts of one quantized weight, decodes them in float32,
+a whole tensor or the block-aligned part of one that an index asks for, and
+encodes dense weights back into those parts for `Pretrained.save`:
 
 - DeepSeek's block-scaled FP8 (`quant_method: fp8`; V3, V3.2 and the
   finegrained FP8 of Qwen3 and MiniMax): `<m>.weight` in float8_e4m3fn
@@ -32,6 +32,7 @@ import math
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
+from typing import Protocol
 
 import jax.numpy as jnp
 import ml_dtypes
@@ -40,6 +41,41 @@ from numpy.typing import ArrayLike, DTypeLike
 
 from dew import records
 from dew.nn.text_encoders import checkpoint_array
+
+Index = tuple[slice, ...]
+"""A region of a decoded tensor, one slice per leading axis, as
+`jax.make_array_from_callback` asks for a shard."""
+
+
+def _hull(index: Index | None, shape: tuple[int, ...],
+          units: tuple[int, ...]) -> tuple[Index, Index, Index]:
+    """Split `index` over a decoded `shape` into the unit-aligned region
+    that covers it: in units, in elements, and `index` within that region.
+
+    A unit is the run of elements one stored scale covers along an axis (a
+    block, a group, or 1), so the region decodes on its own and reads only
+    the bytes it covers. A partial last unit stays partial.
+    """
+    parts = () if index is None else index
+    if len(parts) > len(shape):
+        raise IndexError(f"a {len(parts)}-axis index into a {len(shape)}-axis tensor")
+    covered, span, within = [], [], []
+    for axis, (size, unit) in enumerate(zip(shape, units, strict=True)):
+        chosen = range(*(parts[axis] if axis < len(parts) else slice(None)).indices(size))
+        if not chosen:
+            covered.append(slice(0, 0))
+            span.append(slice(0, 0))
+            within.append(slice(0, 0))
+            continue
+        first, last = min(chosen) // unit, -(-(max(chosen) + 1) // unit)
+        base = first * unit
+        covered.append(slice(first, last))
+        span.append(slice(base, min(last * unit, size)))
+        # A descending slice whose stop falls before the region runs to its start.
+        stop = chosen.stop - base
+        within.append(slice(chosen.start - base, stop if stop >= 0 else None, chosen.step))
+    return tuple(covered), tuple(span), tuple(within)
+
 
 # --------------------------------------------------------------------------
 # E2M1 codes under E8M0 exponents, shared by every FP4 format
@@ -141,7 +177,7 @@ def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike) -> np.ndarray:
     high nibble, and every value is exact in the bf16 it decodes to.
     """
     blocks, scales = _mxfp4_arrays(blocks, scales)
-    return decode_e2m1(blocks.reshape(*scales.shape[:2], -1), scales).swapaxes(1, 2)
+    return decode_e2m1(blocks.reshape(*scales.shape[:2], blocks.shape[2] * blocks.shape[3]), scales).swapaxes(1, 2)
 
 
 def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
@@ -192,11 +228,16 @@ def mxfp4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
         stem for stem in stems if stem not in tensors)
 
 
-def read_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
-    """One original tensor, with a packed weight decoded in FP32 on demand."""
-    if name + '_blocks' in tensors:
-        return dequantize_mxfp4(tensors[name + '_blocks'], tensors[name + '_scales'])
-    return tensors[name]
+def read_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str,
+                      index: Index | None = None) -> np.ndarray:
+    """One original tensor, or the region `index` names; a packed weight
+    decodes in FP32 [expert, input, output] from the groups the region covers."""
+    if name + '_blocks' not in tensors:
+        return tensors[name] if index is None else tensors[name][index]
+    blocks, scales = _mxfp4_arrays(tensors[name + '_blocks'], tensors[name + '_scales'])
+    experts, outputs, groups = scales.shape
+    (expert, group, output), _, within = _hull(index, (experts, groups * GROUP, outputs), (1, GROUP, 1))
+    return dequantize_mxfp4(blocks[expert, output, group], scales[expert, output, group])[within]
 
 
 def unpack_mxfp4(tensors: Mapping[str, np.ndarray], *,
@@ -313,7 +354,7 @@ def quantize_packed_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     underflow = scales == 0
     scales[underflow], exponents[underflow] = 1, 127
     codes = encode_e2m1(groups / scales[..., None] + groups.dtype.type(0))
-    return codes.reshape(*groups.shape[:-2], -1), exponents
+    return codes.reshape(*groups.shape[:-2], groups.shape[-2] * GROUP // 2), exponents
 
 
 def packed_mxfp4_stems(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
@@ -337,11 +378,21 @@ def packed_mxfp4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, .
     return tuple(name for name in tensors if not name.endswith(PACKED_SUFFIXES)) + stems
 
 
-def read_packed_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
-    """One original tensor; a packed Linear's weight decodes to FP32 `[output, input]`."""
+def _read_e2m1(packed: np.ndarray, exponents: np.ndarray, index: Index | None) -> np.ndarray:
+    """The region `index` names of a [rows, input] weight stored as
+    [rows, input / 2] codes under [rows, input / 32] exponents."""
+    covered, span, within = _hull(index, (packed.shape[0], 2 * packed.shape[1]), (1, GROUP))
+    codes = packed[span[0], span[1].start // 2:span[1].stop // 2]
+    return decode_e2m1(codes, exponents[covered])[within]
+
+
+def read_packed_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str,
+                             index: Index | None = None) -> np.ndarray:
+    """One original tensor, or the region `index` names; a packed Linear's
+    weight decodes to FP32 `[output, input]` from the groups the region covers."""
     module = name.removesuffix('.weight')
     if name == module or module + PACKED_SUFFIXES[0] not in tensors:
-        return tensors[name]
+        return tensors[name] if index is None else tensors[name][index]
     packed, scales = tensors[module + PACKED_SUFFIXES[0]], tensors[module + PACKED_SUFFIXES[1]]
     if (packed.dtype != np.uint8 or scales.dtype != np.uint8 or packed.ndim != 2
             or packed.shape[1] % (GROUP // 2)
@@ -349,7 +400,7 @@ def read_packed_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np
         raise ValueError(
             f"{name} packs U8 [output, input / 2] codes beside U8 [output, input / {GROUP}] scales, "
             f"got {packed.dtype} {packed.shape} and {scales.dtype} {scales.shape}")
-    return decode_e2m1(packed, scales)
+    return _read_e2m1(packed, scales, index)
 
 
 def unpack_packed_mxfp4(tensors: Mapping[str, np.ndarray], *,
@@ -465,15 +516,27 @@ def fp8_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
     return tuple(name for name in tensors if not name.endswith(SCALE_SUFFIX))
 
 
-def read_fp8_tensor(tensors: Mapping[str, np.ndarray], name: str, *, block: int) -> np.ndarray:
-    """Return one tensor in its original values, decoding it in FP32 if it is scaled.
+def _read_blocks(weight: np.ndarray, scale: np.ndarray, block: int, index: Index | None) -> np.ndarray:
+    """The region `index` names of a block-scaled [rows, cols] weight."""
+    if weight.ndim != 2:
+        raise ValueError(f"block-scaled dequantization takes a [rows, cols] weight, got {weight.shape}")
+    covered, span, within = _hull(index, weight.shape, (block, block))
+    return dequantize_fp8_blocks(weight[span], scale[covered], block)[within]
+
+
+def read_fp8_tensor(tensors: Mapping[str, np.ndarray], name: str, index: Index | None = None,
+                    *, block: int) -> np.ndarray:
+    """Return one tensor, or the region `index` names, in its original values,
+    a scaled one decoded in FP32 from the blocks the region covers.
 
     Only the requested tensor is decoded, so alias validation never builds an
     FP32 copy of the checkpoint. An unscaled value keeps its stored dtype.
     """
     value = tensors[name]
     scale = tensors.get(name + SCALE_SUFFIX)
-    return value if scale is None else dequantize_fp8_blocks(value, scale, block)
+    if scale is None:
+        return value if index is None else value[index]
+    return _read_blocks(value, scale, block, index)
 
 
 def dequantize_checkpoint(tensors: Mapping[str, np.ndarray], block: int, *,
@@ -602,6 +665,13 @@ def pack_fp8(tensors: Mapping[str, np.ndarray], names: Iterable[str], block: int
 # Dispatch from quantization_config
 # --------------------------------------------------------------------------
 
+class TensorReader(Protocol):
+    """Decodes one source tensor, or the region `index` names, in its original values."""
+
+    def __call__(self, tensors: Mapping[str, np.ndarray], name: str,
+                 index: Index | None = None) -> np.ndarray: ...
+
+
 @dataclass(frozen=True)
 class SourceQuantization:
     """Describes a source format the loader undoes and `Pretrained.save` restores.
@@ -609,15 +679,16 @@ class SourceQuantization:
     `names` reads which tensors arrived quantized off the raw checkpoint,
     before `dequantize` replaces them with dense weights in requested
     storage; `requantize` writes those names back in the format.
-    `tensor_names` and `read` expose original values one tensor at a time,
-    for alias checks, so neither holds an FP32 model.
+    `tensor_names` and `read` expose original values one tensor, or one
+    region of one, at a time, for alias checks and streamed loads, so
+    neither holds an FP32 model.
     """
 
     names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
     dequantize: Callable[[Mapping[str, np.ndarray]], dict[str, np.ndarray]]
     requantize: Callable[[Mapping[str, np.ndarray], tuple[str, ...]], dict[str, np.ndarray]]
     tensor_names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
-    read: Callable[[Mapping[str, np.ndarray], str], np.ndarray]
+    read: TensorReader
 
 
 def _refuse_mlx(config: Mapping[str, object]) -> None:
