@@ -148,7 +148,7 @@ def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
 
 def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbor):
     (tmp_path / "slow").mkdir()
-    gateway, _ = fake_gateway()
+    gateway, asked = fake_gateway()
     source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials")
     try:
         (future,) = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 1, version=0)
@@ -161,6 +161,8 @@ def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbo
     finally:
         source.close()
     assert rollout.status is Status.CANCELLED and time.monotonic() - began < 30
+    # A cancelled session's traces leave the gateway too, not only a scored one's.
+    assert ("DELETE", f"/sessions/slow:{rollout.group}:0") in asked
 
 
 def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
