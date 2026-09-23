@@ -8,6 +8,7 @@ start` arguments and writes a `TrialResult`-shaped `result.json`.
 import json
 import stat
 import sys
+import threading
 import time
 
 import httpx
@@ -160,6 +161,24 @@ def test_a_cancelled_trial_is_interrupted_and_resolves_cancelled(tmp_path, harbo
     finally:
         source.close()
     assert rollout.status is Status.CANCELLED and time.monotonic() - began < 30
+
+
+def test_close_resolves_queued_trials_without_launching_them(tmp_path, harbor):
+    (tmp_path / "slow").mkdir()
+    gateway, _ = fake_gateway()
+    source = HarborSource(gateway, harbor=harbor, model="hosted_vllm/policy", trials=tmp_path / "trials", workers=1)
+    futures = source.submit(Task("slow", {HARBOR_KEY: str(tmp_path / "slow")}), 2, version=0)
+    deadline = time.monotonic() + 30
+    while not list((tmp_path / "trials").glob("*/seen.json")) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    began = time.monotonic()
+    closer = threading.Thread(target=source.close)
+    closer.start()
+    closer.join(20)
+    assert not closer.is_alive() and time.monotonic() - began < 20
+    assert [future.result(timeout=1).status for future in futures] == [Status.CANCELLED, Status.CANCELLED]
+    # The queued sample never started a trial.
+    assert len(list((tmp_path / "trials").glob("*/seen.json"))) == 1
 
 
 def test_a_task_without_a_harbor_directory_is_refused(tmp_path, harbor):
