@@ -54,6 +54,27 @@ class TabulatedVP(DiscreteNoiseScheduler):
         return jnp.floor(self.step_interval(t, t_next) / 2)
 
 
+def _interpolate(x, xp, fp):
+    """`jnp.interp(x, xp, fp)` in its own arithmetic, with the interval found
+    by comparing x against every point of xp.
+
+    jnp.interp finds it by bisection, a loop of log2(len(xp)) steps. Inside
+    `sample`'s scan with one row, XLA rewrites the table reads into dynamic
+    slices whose offsets come out of that loop, and XLA:GPU's
+    DynamicSliceAnnotator (jax 0.11.1) evaluates each offset without running
+    the loop, then fails the whole compile on the unknown value instead of
+    skipping the slice. A grid holds a few dozen points, so comparing against
+    all of them costs nothing and leaves no loop.
+    """
+    x = jnp.asarray(x, jnp.float32)
+    i = jnp.clip(jnp.searchsorted(xp, x, side="right", method="compare_all"), 1, len(xp) - 1)
+    df = fp[i] - fp[i - 1]
+    dx = xp[i] - xp[i - 1]
+    flat = jnp.abs(dx) <= np.spacing(np.finfo(np.float32).eps)
+    f = jnp.where(flat, fp[i - 1], fp[i - 1] + (x - xp[i - 1]) / jnp.where(flat, 1, dx) * df)
+    return jnp.where(x > xp[-1], fp[-1], jnp.where(x < xp[0], fp[0], f))
+
+
 class _PairedGrid:
     """Reads a prepared grid of paired sigmas and model times by coordinate.
 
@@ -65,17 +86,18 @@ class _PairedGrid:
     def __init__(self, sigmas: np.ndarray, model_times: np.ndarray, prior: float):
         self.table = jnp.asarray(sigmas, jnp.float32)
         self.times = jnp.asarray(model_times, jnp.float32)
+        self.rows = jnp.arange(len(sigmas), dtype=jnp.float32)
         self.prior = jnp.asarray(prior, jnp.float32)
         self.T = float(len(sigmas) - 1)
 
     def sigmas(self, t):
-        return jnp.interp(self.T - jnp.asarray(t, jnp.float32), jnp.arange(len(self.table)), self.table)
+        return _interpolate(self.T - jnp.asarray(t, jnp.float32), self.rows, self.table)
 
     def t_of_sigma(self, sigma):
-        return self.T - jnp.interp(jnp.asarray(sigma), self.table[::-1], jnp.arange(len(self.table))[::-1])
+        return self.T - _interpolate(sigma, self.table[::-1], self.rows[::-1])
 
     def model_time(self, t):
-        return jnp.interp(self.T - jnp.asarray(t, jnp.float32), jnp.arange(len(self.times)), self.times)
+        return _interpolate(self.T - jnp.asarray(t, jnp.float32), self.rows, self.times)
 
     def prior_scale(self):
         return self.prior
@@ -114,7 +136,7 @@ class StageSigmaGrid(SigmaGrid):
             np.arange(1, len(sigmas), 2, dtype=np.float32)[::-1].copy())
 
     def t_of_sigma(self, sigma):
-        return self.T - jnp.interp(jnp.asarray(sigma), self.stages, self.stage_positions)
+        return self.T - _interpolate(sigma, self.stages, self.stage_positions)
 
 
 class _UniformGrid(_PairedGrid, NoiseScheduler):

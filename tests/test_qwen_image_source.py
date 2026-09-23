@@ -196,7 +196,9 @@ def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, r
     its 40 default steps, no guidance, the sigmas its call lays out shifted
     by the mu of this latent's token count, and the RGBA decode. Both rows
     walk in one batch, the shorter prompt padded, and each lands on the
-    source's call for its prompt alone."""
+    source's call for its prompt alone. Each prompt also walks alone, the
+    call one image makes, which XLA compiles differently (see the one-row
+    grid walk in test_samplers.py)."""
     pipeline = record["pipeline"]
     task = loaded.text_to_image()
     assert task.steps == pipeline["default_steps"] == 40
@@ -206,10 +208,13 @@ def test_published_qwen_image_pipeline_walk_matches_the_source(loaded, arrays, r
     walked = task(task.prepare(pipeline["prompts"], initial=initial, seed=0),
                   key=jax.random.PRNGKey(0)).host()
     images = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
-    for row in range(len(pipeline["prompts"])):
+    for row, prompt in enumerate(pipeline["prompts"]):
         expected = nhwc(arrays[f"pipeline.latents.{row}"], rows, columns)[0]
         assert relative_gap(np.asarray(walked.latents)[row], expected) < 2e-5
         assert relative_gap(images[row], arrays[f"pipeline.images.{row}"][0]) < 2e-5
+        alone = task(task.prepare([prompt], initial=initial[row:row + 1], seed=0),
+                     key=jax.random.PRNGKey(0)).host()
+        assert relative_gap(np.asarray(alone.latents)[0], expected) < 2e-5
 
 
 def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, record, tmp_path):
