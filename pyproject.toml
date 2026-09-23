@@ -73,6 +73,9 @@ test = [
     "openai>=3.8,<4",
     # tests/test_guided_decoding.py compiles regex and JSON-schema automata with it.
     "outlines-core>=0.2.14",
+    # tests/test_eval_harness.py scores DewLM against lm-eval's own HFLM on the
+    # same weights; HFLM imports accelerate, which the hf extra brings.
+    "lm_eval[hf]>=0.4",
 ]
 # The video specs: moviepy reads the clips and brings ffmpeg (lazy imports in dew.data)
 av = ["moviepy"]
