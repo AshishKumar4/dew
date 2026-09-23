@@ -108,10 +108,19 @@ def main() -> None:
             behavior = [entry[token].logprob for entry, token in zip(output.logprobs, sampled, strict=True)]
             support = [list(map(int, kept)) for kept in output.sampling_mask.token_ids]
             routed = np.asarray(output.routed_experts)
+            # Every decoder layer is indexed, the dense layer 0 by the capture buffer's zeros.
+            forwarded = len(request.prompt_token_ids) + len(sampled) - 1
+            if routed.shape != (forwarded, CONFIG["num_hidden_layers"], CONFIG["num_experts_per_tok"]) or \
+                    routed[:, 0].any() or not routed[:, 1:].any():
+                raise ValueError(f"vLLM's routed_experts is {routed.shape} with layer 0 "
+                                 f"{'set' if routed[:, 0].any() else 'zero'}; the test reads another layout")
             calls.append({"prompt_ids": list(request.prompt_token_ids), "sampled_ids": sampled,
                           "behavior_log_probs": behavior, "support": support,
                           "routed_experts": routed.astype(int).tolist(), "routed_dtype": str(routed.dtype)})
-    record = {"vllm": version("vllm"), "model": MODEL.name, "sampling": SAMPLING, "calls": calls}
+    import torch
+
+    record = {"vllm": version("vllm"), "gpu": torch.cuda.get_device_name(), "model": MODEL.name,
+              "sampling": SAMPLING, "calls": calls}
     references(record)
     OUT.write_text(json.dumps(record) + "\n")
     print(f"wrote {len(calls)} calls to {OUT}")
