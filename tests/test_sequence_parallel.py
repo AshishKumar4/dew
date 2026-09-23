@@ -156,6 +156,10 @@ CALLS = {
     "full": dict(),
     # One learned logit per query head, split with the heads by the exchange.
     "sinks": dict(causal=True, sinks=jax.random.normal(jax.random.key(4), (4,))),
+    # Each row's keys end at its own length; the rows split with the batch.
+    "key_lengths": dict(key_value_seq_lengths=jnp.asarray([16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)),
+    "causal_key_lengths": dict(causal=True, key_value_seq_lengths=jnp.asarray(
+        [16, 9, 3, 1, 12, 16, 5, 7], jnp.int32)),
 }
 
 
@@ -166,7 +170,8 @@ def through(exchange, query, key, value, *, implementation="reference", **call):
     return EXCHANGES[exchange](
         kernel, query, key, value, jax.sharding.get_abstract_mesh().shape["sequence"],
         causal=call.get("causal", False), sliding_window=call.get("sliding_window"),
-        mask=call.get("mask"), bias=call.get("bias"), sinks=call.get("sinks"))
+        mask=call.get("mask"), bias=call.get("bias"), sinks=call.get("sinks"),
+        key_value_seq_lengths=call.get("key_value_seq_lengths"))
 
 
 @pytest.mark.parametrize("exchange", sorted(EXCHANGES))
@@ -190,7 +195,7 @@ HEAD_SPLITS = [MeshSpec(fsdp=2, tensor=2, sequence=2), MeshSpec(fsdp=2, sequence
 
 
 @pytest.mark.parametrize("spec", HEAD_SPLITS, ids=["tensor2_sequence2", "sequence4"])
-@pytest.mark.parametrize("name", ["causal", "packed", "bias", "sinks"])
+@pytest.mark.parametrize("name", ["causal", "packed", "bias", "sinks", "causal_key_lengths"])
 def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec, name):
     """The all-to-all's gradients are its transposes: the query, key and
     value cotangents of a whole-sequence call come back in the split one,

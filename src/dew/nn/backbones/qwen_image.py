@@ -1,12 +1,12 @@
 """Qwen-Image 2.1's transformer, as Diffusers' `QwenImage21Transformer2DModel`
 runs it at commit 6256aa76.
 
-One residual stream carries the text and the image together. The text is the
-vision-language encoder's hidden states, projected through a zero-centred
-RMS norm and a GELU MLP; the image is the latent, one token per latent
-position, projected by one linear. Every block modulates both with scales
-and tanh gates read from one projection of the time embedding that all
-blocks share, attends, and runs a SwiGLU feed-forward.
+One residual stream carries the image and the text together, image first.
+The text is the vision-language encoder's hidden states, projected through a
+zero-centred RMS norm and a GELU MLP; the image is the latent, one token per
+latent position, projected by one linear. Every block modulates both with
+scales and tanh gates read from one projection of the time embedding that
+all blocks share, attends, and runs a SwiGLU feed-forward.
 
 Two things set it apart from the MM-DiT families. Attention is block-causal:
 the text attends causally and the image attends to all of the text and to
@@ -25,6 +25,7 @@ it is batched with.
 
 from __future__ import annotations
 
+import functools
 from typing import Sequence
 
 import jax
@@ -62,18 +63,20 @@ def image_grid(rows: int, columns: int) -> tuple[np.ndarray, np.ndarray]:
 
 def rotary_angles(lengths: jax.Array, text: int, rows: int, columns: int,
                   axes: Sequence[int]) -> jax.Array:
-    """The angle of every channel pair of every token, `[B, text + rows * columns, sum(axes) / 2]`.
+    """The angle of every channel pair of every token, image first,
+    `[B, rows * columns + text, sum(axes) / 2]`.
 
     A text token sits at its index on all three axes. The image's frame axis
     is the row's own text length, and its other two are the centred grid.
     """
     heights, widths = image_grid(rows, columns)
     index = jnp.arange(text, dtype=jnp.float32)
-    frame = jnp.concatenate([jnp.broadcast_to(index, (lengths.shape[0], text)),
-                             jnp.broadcast_to(lengths.astype(jnp.float32)[:, None],
-                                              (lengths.shape[0], rows * columns))], axis=1)
-    height = jnp.concatenate([index, jnp.asarray(heights, jnp.float32)])
-    width = jnp.concatenate([index, jnp.asarray(widths, jnp.float32)])
+    batch = lengths.shape[0]
+    frame = jnp.concatenate([jnp.broadcast_to(lengths.astype(jnp.float32)[:, None],
+                                              (batch, rows * columns)),
+                             jnp.broadcast_to(index, (batch, text))], axis=1)
+    height = jnp.concatenate([jnp.asarray(heights, jnp.float32), index])
+    width = jnp.concatenate([jnp.asarray(widths, jnp.float32), index])
     positions = (frame, jnp.broadcast_to(height, frame.shape), jnp.broadcast_to(width, frame.shape))
     return jnp.concatenate([position[..., None] * jnp.asarray(rope_frequencies(dim))
                             for position, dim in zip(positions, axes, strict=True)], axis=-1)
@@ -83,13 +86,13 @@ def _dense(features: int, name: str, dtype, precision) -> nn.Dense:
     return nn.Dense(features, use_bias=False, dtype=dtype, precision=precision, name=name)
 
 
-def _per_rows(x, values, text: int, apply):
-    """`apply(rows, value)` over the text rows with the time-zero value and
-    over the image rows with the sampled one, as `_select_modulation_rows`
+def _per_rows(x, values, image: int, apply):
+    """`apply(rows, value)` over the image rows with the sampled value and
+    over the text rows with the time-zero one, as `_select_modulation_rows`
     picks them. `values` is that pair, each `[B or 1, width]`."""
     still, sampled = values
-    return jnp.concatenate([apply(x[:, :text], still[:, None]),
-                            apply(x[:, text:], sampled[:, None])], axis=1)
+    return jnp.concatenate([apply(x[:, :image], sampled[:, None]),
+                            apply(x[:, image:], still[:, None])], axis=1)
 
 
 def _scaled(x, scale):
@@ -101,9 +104,18 @@ def _scaled(x, scale):
               | {("attn", "to_out_0"): (None, "embed")})
 class _Attention(nn.Module):
     """`QwenImage21Attention` under the source's exact multi-pass prefill:
-    the text queries attend causally over the text, the image queries over
-    everything, and a padded text key is excluded from both. Queries and
-    keys are RMS normalized per head, then rotated."""
+    the image queries attend over everything and the text queries causally
+    over the text, a padded text key excluded from both. Queries and keys
+    are RMS normalized per head, then rotated.
+
+    The sequence runs image first, so the keys a row's image queries read
+    are a prefix of it and its text queries' keys a prefix of the text. Both
+    calls pass those prefix lengths, which cuDNN applies as its padding mask
+    and skips the padded keys by, where a mask would reach it as a dense
+    additive bias read once per head. Attention does not depend on the order
+    of its keys and every token carries its own rotary position, so this is
+    the source's arithmetic, summed in another order.
+    """
 
     heads: int
     head_dim: int
@@ -117,25 +129,18 @@ class _Attention(nn.Module):
         projected = _dense(self.heads * self.head_dim, name, self.dtype, self.precision)(x)
         return projected.reshape(*x.shape[:2], self.heads, self.head_dim)
 
-    def _attend(self, query, key, value, keys, *, causal: bool):
-        # Spelled out over the queries: the fused kernels take a mask at the
-        # full [B, 1, Q, K] shape rather than broadcasting one row of keys.
-        mask = jnp.broadcast_to(keys[:, None, None, :],
-                                (keys.shape[0], 1, query.shape[1], keys.shape[1]))
-        return scaled_dot_product_attention(
-            query, key, value, implementation=self.attention_impl, precision=self.precision,
-            mask=mask, causal=causal)
-
     @nn.compact
-    def __call__(self, x, cos, sin, valid, text: int):
+    def __call__(self, x, cos, sin, lengths, image: int):
         query = RMSNorm(epsilon=self.eps, dtype=self.dtype, name="norm_q")(self._heads("to_q", x))
         key = RMSNorm(epsilon=self.eps, dtype=self.dtype, name="norm_k")(self._heads("to_k", x))
         value = self._heads("to_v", x)
         query, key = apply_rotary(query, cos, sin), apply_rotary(key, cos, sin)
-        keys = jnp.concatenate([valid, jnp.ones((x.shape[0], x.shape[1] - text), bool)], axis=1)
+        attend = functools.partial(scaled_dot_product_attention,
+                                   implementation=self.attention_impl, precision=self.precision)
         attended = jnp.concatenate([
-            self._attend(query[:, :text], key[:, :text], value[:, :text], valid, causal=True),
-            self._attend(query[:, text:], key, value, keys, causal=False)], axis=1)
+            attend(query[:, :image], key, value, key_value_seq_lengths=image + lengths),
+            attend(query[:, image:], key[:, image:], value[:, image:], causal=True,
+                   key_value_seq_lengths=lengths)], axis=1)
         return _dense(self.features, "to_out_0", self.dtype, self.precision)(
             attended.reshape(*x.shape[:2], self.heads * self.head_dim))
 
@@ -156,17 +161,17 @@ class QwenImageBlock(nn.Module):
     attention_impl: str = "auto"  # an AttentionImpl
 
     @nn.compact
-    def __call__(self, x, modulation, cos, sin, valid, text: int):
+    def __call__(self, x, modulation, cos, sin, lengths, image: int):
         scale, gate, scale_mlp, gate_mlp = modulation
         attended = _Attention(self.heads, self.head_dim, self.features, self.eps,
                               dtype=self.dtype, precision=self.precision,
                               attention_impl=self.attention_impl, name="attn")(
-            _per_rows(_layer_norm(self.dtype)(x), scale, text, _scaled), cos, sin, valid, text)
-        x = x + _per_rows(attended, gate, text, lambda rows, value: jnp.tanh(value) * rows)
+            _per_rows(_layer_norm(self.dtype)(x), scale, image, _scaled), cos, sin, lengths, image)
+        x = x + _per_rows(attended, gate, image, lambda rows, value: jnp.tanh(value) * rows)
         hidden = _SwiGLU(self.features * self.mlp_ratio, self.features, dtype=self.dtype,
                          precision=self.precision, name="img_mlp")(
-            _per_rows(_layer_norm(self.dtype)(x), scale_mlp, text, _scaled))
-        x = x + _per_rows(hidden, gate_mlp, text, lambda rows, value: jnp.tanh(value) * rows)
+            _per_rows(_layer_norm(self.dtype)(x), scale_mlp, image, _scaled))
+        x = x + _per_rows(hidden, gate_mlp, image, lambda rows, value: jnp.tanh(value) * rows)
         if x.dtype == jnp.float16:
             x = jnp.clip(x, -65504, 65504)
         return x
@@ -201,7 +206,9 @@ class QwenImageTransformer(nn.Module):
     product the source reaches by dividing its timestep by a thousand and
     multiplying it back - and a `DenoisingCondition` whose `context` is the
     encoder's text states after the system prompt, right-padded, with `mask`
-    marking the real ones. It returns the prediction at the image's tokens.
+    marking the real ones. Each row's real tokens lead its text, the layout
+    the rotary positions and the attention's key lengths both read. It
+    returns the prediction at the image's tokens.
     """
 
     in_channels: int = 64
@@ -237,14 +244,16 @@ class QwenImageTransformer(nn.Module):
         if x.ndim != 4:
             raise ValueError(f"Qwen-Image takes NHWC latents, got shape {x.shape}")
         batch, rows, columns, _ = x.shape
+        image_tokens = rows * columns
         text = conditioning.context.shape[1]
         valid = (jnp.ones((batch, text), bool) if conditioning.mask is None
                  else jnp.broadcast_to(jnp.asarray(conditioning.mask, bool), (batch, text)))
+        lengths = jnp.sum(valid, axis=1, dtype=jnp.int32)
         image = _dense(self.features, "img_in", self.dtype, self.precision)(
-            x.reshape(batch, rows * columns, x.shape[-1]))
+            x.reshape(batch, image_tokens, x.shape[-1]))
         context = _TextIn(self.features, self.eps, dtype=self.dtype, precision=self.precision,
                           name="txt_in")(conditioning.context)
-        joint = jnp.concatenate([context.astype(image.dtype), image], axis=1)
+        joint = jnp.concatenate([image, context.astype(image.dtype)], axis=1)
 
         # The source embeds one extra row at time zero, which the text rows
         # read under `causal_condition`.
@@ -257,18 +266,19 @@ class QwenImageTransformer(nn.Module):
         still = jnp.split(projected[batch:], 4, axis=-1) if self.causal_condition else sampled
         modulation = tuple(zip(still, sampled, strict=True))
 
-        angles = rotary_angles(jnp.sum(valid, axis=1), text, rows, columns, self.axes_dims_rope)
+        angles = rotary_angles(lengths, text, rows, columns, self.axes_dims_rope)
         cos = jnp.repeat(jnp.cos(angles), 2, axis=-1)[:, :, None].astype(joint.dtype)
         sin = jnp.repeat(jnp.sin(angles), 2, axis=-1)[:, :, None].astype(joint.dtype)
         for index in range(self.num_layers):
             joint = QwenImageBlock(
                 self.features, self.heads, self.head_dim, self.mlp_ratio, self.eps,
                 dtype=self.dtype, precision=self.precision, attention_impl=self.attention_impl,
-                name=f"transformer_blocks_{index}")(joint, modulation, cos, sin, valid, text)
+                name=f"transformer_blocks_{index}")(joint, modulation, cos, sin, lengths,
+                                                     image_tokens)
 
         # Only the image's rows leave; the text's final norm and projection
         # are rows the source computes and its pipeline drops.
-        image = joint[:, text:]
+        image = joint[:, :image_tokens]
         scale = _dense(self.features, "norm_out_linear", self.dtype, self.precision)(
             nn.silu(embedded))
         image = _scaled(_layer_norm(self.dtype)(image), scale[:, None])

@@ -75,6 +75,58 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal,
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
+def key_length_call(implementation, query, key, value, lengths, **kwargs):
+    """The output and the three input gradients of one call that ends each
+    row's keys at `lengths`, either as lengths or as the mask they mean."""
+    if kwargs.pop("as_mask", False):
+        kwargs["mask"] = (jnp.arange(key.shape[1]) < lengths[:, None])[:, None, None, :]
+    else:
+        kwargs["key_value_seq_lengths"] = lengths
+    return value_and_grads(implementation, query, key, value, **kwargs)
+
+
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_key_lengths_attend_as_the_mask_they_mean(implementation, causal):
+    """Row b reads its first lengths[b] keys and no other: the output and
+    every gradient are the call that masks the rest, and what a row's keys
+    past its length hold reaches nothing, its own key and value gradients
+    there included."""
+    query, key, value = (x.astype(jnp.float32) for x in qkv((3, 9, 2, 16)))
+    lengths = jnp.asarray([9, 5, 1], jnp.int32)
+    by_length = key_length_call(implementation, query, key, value, lengths, causal=causal)
+    by_mask = key_length_call(implementation, query, key, value, lengths, causal=causal, as_mask=True)
+    for got, want in zip(by_length, by_mask, strict=True):
+        np.testing.assert_allclose(got, want, atol=1e-6, rtol=1e-6)
+    past = jnp.arange(9)[None, :, None, None] >= lengths[:, None, None, None]
+    moved = key_length_call(implementation, query, jnp.where(past, 3.0, key),
+                            jnp.where(past, -2.0, value), lengths, causal=causal)
+    np.testing.assert_allclose(moved[0], by_length[0], atol=1e-6, rtol=1e-6)
+    for gradient in by_length[2:]:
+        assert not np.asarray(gradient)[np.asarray(past)[:, :, 0, 0]].any()
+
+
+@on_gpu
+@pytest.mark.parametrize("q_len, kv_len, causal", [
+    (1024, 1024 + 77, False),  # the image queries of a joint call over padded text
+    (77, 77, True),            # its text queries, causal over the text alone
+])
+def test_cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal,
+                                                     without_deterministic_ops):
+    """cuDNN reads the lengths as its padding mask, odd lengths included:
+    within two bf16 ulps of the output scale of the xla kernel, forward and
+    backward, as `test_cudnn_trains_odd_lengths_and_agrees_with_xla` bounds
+    the unpadded call."""
+    query, _, _ = qkv((2, q_len, 4, 64))
+    _, key, value = qkv((2, kv_len, 4, 64), seed=1)
+    lengths = jnp.asarray([kv_len, kv_len - 40], jnp.int32)
+    fused = key_length_call('cudnn', query, key, value, lengths, causal=causal)
+    reference = key_length_call('xla', query, key, value, lengths, causal=causal)
+    for got, want in zip(fused, reference, strict=True):
+        assert got.shape == want.shape
+        assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+
 def test_flags_are_appended_to_what_the_environment_already_carries(monkeypatch):
     """The test suite itself sets a flag, and a run's own flags have to add to
     it, not replace it."""
