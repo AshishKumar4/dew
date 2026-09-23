@@ -42,6 +42,9 @@ TINY = {"num_hidden_layers": 2, "hidden_size": 64, "num_attention_heads": 4,
         "intermediate_size": 256, "vocab_size": 256, "max_position_embeddings": 64}
 LOGITS = 6e-7
 LOSS = 1e-6
+GRADIENT = 1.7e-6
+"""Twice the worst leaf's max |Δgrad| over its max |grad| measured on CPU,
+8.3e-7 at the first layer's post-attention norm bias."""
 
 
 @pytest.fixture(scope="module")
@@ -70,10 +73,11 @@ def torch_logits(model, ids) -> np.ndarray:
         return model(torch.from_numpy(np.asarray(ids, np.int64))).logits.float().numpy()
 
 
-def objective_loss(objective, variables, tokens) -> float:
+def objective_loss(objective, variables, tokens, *, scalar: bool = False):
     stats, _ = objective.loss(variables, {"text": tokens},
                               Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
-    return float(objective.reduce_loss(stats)[0])
+    loss = objective.reduce_loss(stats)[0]
+    return loss if scalar else float(loss)
 
 
 def test_the_logits_and_the_objective_loss_are_transformers(source, loaded, tokens):
@@ -87,6 +91,22 @@ def test_the_logits_and_the_objective_loss_are_transformers(source, loaded, toke
     with torch.no_grad():
         expected = float(model(ids, labels=ids).loss)
     assert abs(objective_loss(objective, loaded.variables, tokens) - expected) <= LOSS
+
+
+def test_the_gradients_are_transformers(source, loaded, tokens):
+    """jax.grad of LMObjective's loss is torch autograd of transformers' own
+    loss, leaf for leaf, so every path to the head and the embedding trains."""
+    _, model = source
+    objective = LMObjective(loaded.model, seq_len=SEQ, ema_decay=None, pretrained=loaded.variables)
+    ids = torch.from_numpy(tokens.astype(np.int64))
+    model.zero_grad()
+    model(ids, labels=ids).loss.backward()
+    grads = jax.grad(lambda params: objective_loss(objective, {**loaded.variables, "params": params}, tokens,
+                                                   scalar=True))(
+        {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()})
+    for name, parameter in model.named_parameters():
+        expected = parameter.grad.numpy()
+        assert np.abs(np.asarray(grads[name]) - expected).max() <= GRADIENT * np.abs(expected).max(), name
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="a device allocation shows on a GPU's allocator")
