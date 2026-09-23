@@ -293,9 +293,10 @@ TINY_LM = {"vocab_size": 64, "emb_features": 16, "num_layers": 1, "num_heads": 2
 
 
 def composite_case(tool, architecture: str, **changes):
-    """The cpu-smoke preset's case for one composite, resized by `changes`."""
+    """The cpu-smoke preset's case for one composite, in fp32 as the preset
+    runs it, resized by `changes`."""
     (case,) = [c for c in tool.cpu_smoke_cases() if c.architecture == architecture]
-    return dataclasses.replace(case, **changes)
+    return dataclasses.replace(case, **{"dtype": "float32", **changes})
 
 
 def parameter_movement(tool, case, steps: int = 2):
@@ -515,7 +516,7 @@ def test_step_benchmark_table_shows_each_column_in_its_unit():
     parameter count with separators, and a value the backend did not report
     as n/a."""
     tool = load("benchmark_step")
-    row = {"architecture": "simple_dit", "batch_size": 8, "fsdp_size": 1, "expert_size": 1,
+    row = {"architecture": "simple_dit", "batch_size": 8, "mesh": {"fsdp": 2, "tensor": 2},
            "params": 1234567, "ms_per_step": 5.55, "p10_ms": 3.9, "p50_ms": 4.2,
            "p90_ms": 4.4, "samples_per_sec": 1435.7, "flops_per_step": 2.5e9,
            "utilization": 0.4321, "peak_device_bytes": 3 * 2 ** 30}
@@ -523,6 +524,6 @@ def test_step_benchmark_table_shows_each_column_in_its_unit():
     table = tool.format_table([row, {**row, "utilization": None, "peak_device_bytes": None}])
 
     lines = table.splitlines()
-    assert lines[2].split() == ["simple_dit", "8", "1", "1", "1,234,567", "5.5", "3.9", "4.2",
-                                "4.4", "1435.7", "2.5", "43.2", "3.00"]
+    assert lines[2].split() == ["simple_dit", "8", "fsdp2-tensor2", "1,234,567", "5.5", "3.9",
+                                "4.2", "4.4", "1435.7", "2.5", "43.2", "3.00"]
     assert lines[3].split()[-2:] == ["n/a", "n/a"]
