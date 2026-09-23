@@ -208,6 +208,13 @@ def test_train_rlvr_smoke_commits_every_update_one_behind(tmp_path):
     assert summary["updates"] == 2 and summary["max_lag"] == 1
 
 
+def test_train_rlvr_smoke_trains_through_multi_turn_environments(tmp_path):
+    """`--turns 2` trains through EnvironmentSource: both updates commit, one behind."""
+    smoke("train_rlvr", tmp_path, "--turns", "2")
+    summary = json.loads((tmp_path / "rewards.json").read_text())
+    assert summary["updates"] == 2 and summary["max_lag"] == 1
+
+
 def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):
     """The evaluation report of a run the script trains first: the perplexity
     `evaluate` scores over the held-out split, a greedy continuation, and a

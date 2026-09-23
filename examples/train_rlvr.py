@@ -26,31 +26,44 @@ objective's importance cap corrects for it. A completion that runs out of
 `--new-tokens` is still scored and trained on (`truncation="score"`): a
 closed code block followed by cut-off prose can pass every test.
 
+`--turns N` gives each task up to N attempts through an `EnvironmentSource`,
+Dew's in-process multi-turn session source. An attempt that fails a test
+gets back how many of the three it passed and tries again; the reward is the
+last attempt's. The report is appended as plain text after the model's own
+turn, so every attempt extends the ids before it and a session packs as one
+chain. A harness would render it as a user turn with the chat template
+instead, and `tools/audit_template.py` tells whether that stays append-only.
+
 The run prints one line per update and writes `rewards.json` to `--out`
 with the per-update reward, policy version and lag, the mean reward of the
 first and last `--window` updates, and the seconds each weight push took.
 
     JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --out /tmp/rlvr-smoke
+    JAX_PLATFORMS=cpu python examples/train_rlvr.py --smoke --turns 2 --out /tmp/rlvr-smoke-turns
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import random
 import shutil
 import subprocess
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import httpx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import tyro
 
-from dew.data import Loading, tokenizer_for
+from dew.data import Dataset, Loading, tokenizer_for
+from dew.data.chat import Conversation, load_tokenizer, render_prompt
 from dew.data.prompts import Prompts
 from dew.inference import (
     NativeRolloutServer,
@@ -65,7 +78,11 @@ from dew.interop import load_pretrained
 from dew.objectives.rl import (
     CodeReward,
     ContainerRunner,
+    EnvironmentSource,
+    Episode,
+    EpisodeStatus,
     GRPOObjective,
+    Observation,
     ProcessRunner,
     PromptSource,
     RolloutScheduler,
@@ -73,9 +90,13 @@ from dew.objectives.rl import (
     SandboxLimits,
     SchedulerRecord,
     prompt_tasks,
+    task_ids,
 )
 from dew.sampling import Sampling
 from dew.training import Trainer
+
+FEEDBACK_TOKENS = 32
+"""The longest test report a failed attempt gets back, in ids."""
 
 SMOKE_MODEL = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/qwen2-tiny"
 
@@ -131,6 +152,8 @@ class Config:
     learning_rate: float = 2e-6
     max_lag: int = 1
     tasks: int = 2048
+    turns: int = 1
+    """Attempts per task; above one, a failed program's test count comes back and the model tries again."""
     window: int = 10
     """Updates averaged at each end of the run for the reward comparison."""
     runner: str = "process"
@@ -148,6 +171,35 @@ class Config:
     """Two updates of the committed tiny Qwen2 on CPU, native backend."""
 
 
+def rollout_width(config: Config) -> int:
+    """The ids one session's chain holds: the prompt, every attempt and the report after each failed one."""
+    return config.prompt_tokens + config.turns * config.new_tokens + (config.turns - 1) * FEEDBACK_TOKENS
+
+
+def tests_passed(reward: CodeReward, words, cases: str, action) -> float:
+    """The fraction of `cases` the program in an attempt passes, its EOS excluded."""
+    return reward("code", words.decode(action.tokens[:len(action.tokens) - int(action.terminated)]), cases, "")
+
+
+class Attempts:
+    """One task's attempts at a program: a failing one hears how many tests passed and tries again."""
+
+    def __init__(self, prompt: tuple[int, ...], cases: str, reward: CodeReward, words):
+        self.prompt, self.cases, self.reward, self.words = prompt, cases, reward, words
+
+    def reset(self) -> Observation:
+        return Observation(self.prompt)
+
+    def step(self, action) -> Observation:
+        passed = tests_passed(self.reward, self.words, self.cases, action)
+        if passed == 1.0:
+            return Observation((), EpisodeStatus.COMPLETED, "every test passes")
+        report = self.words.tokenizer.encode(
+            f"\n\nThat program passed {round(3 * passed)} of 3 tests. Reply with one corrected ```python "
+            "code block.\n", add_special_tokens=False)[:FEEDBACK_TOKENS]
+        return Observation(action.context + action.tokens + tuple(report))
+
+
 def engine_context(config: Config) -> int:
     """The context window the engine is started with: the rollout width, and SGLang's reserve on top.
 
@@ -157,7 +209,7 @@ def engine_context(config: Config) -> int:
     and end with a "length" the rollout refuses. vLLM's `--max-model-len`
     admits the full width.
     """
-    width = config.prompt_tokens + config.new_tokens
+    width = rollout_width(config)
     return width + 6 if config.backend == "sglang" else width
 
 
@@ -208,17 +260,19 @@ def main(config: Config) -> dict:
                          prompt_tokens=56, new_tokens=8, tasks=8, window=1)
     config.out.mkdir(parents=True, exist_ok=True)
     tokenizer = str(SMOKE_MODEL.parents[0] / "diffusion-gemma-workflow") if config.smoke else config.model
-    width = config.prompt_tokens + config.new_tokens
+    width = rollout_width(config)
     # The server rounds its cache up to a power-of-two shape bucket, and an
     # engine refuses a context past the export's; the model's context covers both.
     context = next(bucket for bucket in SHAPE_BUCKETS if bucket >= engine_context(config))
     source = load_pretrained(config.model, dtype="float32" if config.smoke else "bfloat16",
                              param_dtype="float32", max_seq_len=context)
     stock = source.text_generation().sampling
+    words = tokenizer_for(tokenizer)
+    # An attempt ends on EOS; the committed tiny Qwen2 names none, its tokenizer does.
+    eos = stock.eos_id if stock.eos_id is not None else words.eos_id
     # Temperature one without filters: the engine's reported likelihoods are
     # then the behavior policy's, on either backend.
-    sampling = Sampling(temperature=1.0, eos_id=stock.eos_id, pad_id=stock.pad_id)
-    words = tokenizer_for(tokenizer)
+    sampling = Sampling(temperature=1.0, eos_id=eos, pad_id=stock.pad_id)
 
     objective = GRPOObjective(source.model, width - 1, pretrained=source.variables,
                               behavior_importance=2.0, epsilon_high=0.28)
@@ -266,16 +320,45 @@ def main(config: Config) -> dict:
         raise ValueError(f"runner is process or container, got {config.runner!r}")
     runner = ProcessRunner() if config.runner == "process" else ContainerRunner(config.image)
     fleet = SandboxFleet(runner, limits=limits, workers=max(os.cpu_count() or 1, 4))
-    prompts = PromptSource(server, CodeReward(fleet), decode=words.decode, max_new_tokens=config.new_tokens,
-                           seed=config.seed)
-    # One chain per completion at most, each within the prompt and response width.
-    rollout = RolloutScheduler(objective, prompts, server, width=width, rows=config.prompts * config.groups,
-                               tasks=prompt_tasks, groups=config.groups, max_lag=config.max_lag,
-                               ahead=config.max_lag, truncation="score", log=log)
-    data = Prompts(tokenizer=tokenizer, records=records(config.tasks, config.seed),
-                   max_prompt_len=config.prompt_tokens, pad_id=sampling.pad_id, val_batches=None,
-                   loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
-                   seed=config.seed).load(batch=config.prompts)
+    reward = CodeReward(fleet)
+    rows = records(config.tasks, config.seed)
+    if config.turns == 1:
+        sessions = PromptSource(server, reward, decode=words.decode, max_new_tokens=config.new_tokens,
+                                seed=config.seed)
+        tasks = prompt_tasks
+        data = Prompts(tokenizer=tokenizer, records=rows, max_prompt_len=config.prompt_tokens,
+                       pad_id=sampling.pad_id, val_batches=None,
+                       loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
+                       seed=config.seed).load(batch=config.prompts)
+    else:
+        template = load_tokenizer(tokenizer)
+        attempts = []
+        for number, row in enumerate(map(json.loads, rows)):
+            where = f"task {number}"
+            prompt = tuple(render_prompt(template, Conversation.parse(row["prompt"], None, where), where))
+            attempts.append((prompt, row["ground_truth"]))
+
+        def verify(episode: Episode) -> float:
+            """The last attempt's score; a session cut off before its first attempt scores zero."""
+            if not episode.transitions:
+                return 0.0
+            return tests_passed(reward, words, attempts[episode.identity.task][1], episode.transitions[-1].action)
+
+        sessions = EnvironmentSource(
+            server, lambda identity: nullcontext(Attempts(*attempts[identity.task], reward, words)), verify,
+            max_prompt_tokens=width - config.new_tokens, max_new_tokens=config.new_tokens,
+            max_turns=config.turns, workers=config.prompts * config.groups * (config.max_lag + 1), seed=config.seed)
+        tasks = task_ids
+
+        def task_batches():
+            for step in itertools.count():
+                yield {"task_id": ((np.arange(config.prompts) + step * config.prompts) % config.tasks).astype(np.int32)}
+
+        data = Dataset(train=task_batches, val=None, records=None, batch=config.prompts)
+    # Every session packs as one chain within the width.
+    rollout = RolloutScheduler(objective, sessions, server, width=width, rows=config.prompts * config.groups,
+                               tasks=tasks, groups=config.groups,
+                               max_lag=config.max_lag, ahead=config.max_lag, truncation="score", log=log)
     optimizer = optax.chain(optax.clip_by_global_norm(1.0),
                             optax.adamw(config.learning_rate, b2=0.99, weight_decay=0.0))
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed), rollout=rollout)
@@ -284,7 +367,7 @@ def main(config: Config) -> dict:
         state = trainer.fit(rollout.tasks(data), steps=config.steps, log_every=1)
     finally:
         rollout.close()
-        prompts.close()
+        sessions.close()
         server.close()
         fleet.close()
         if remote is not None:
