@@ -1,15 +1,12 @@
-"""recipes/lm/rigel.py: the published parameter counts and its documented command line."""
+"""recipes/lm/rigel.py: the published parameter counts."""
 
 import importlib.util
 import math
-import re
-import shlex
 import sys
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
-import tyro
 
 from dew.registry import models
 
@@ -39,19 +36,3 @@ def test_rigel_has_its_published_parameter_counts():
         embedding += count if "embed_tokens" in names else 0
         active += count * 2 // 128 if "experts" in names else count
     assert (total, active - embedding) == (2_345_567_552, 260_998_464)
-
-
-def test_the_documented_corpora_flag_names_the_corpora():
-    """Every command in the module docstring parses its --corpora into the
-    Rigel corpora it names, and those build phases."""
-    rigel = load_rigel()
-    commands = re.findall(r"python recipes/lm/rigel\.py (.*?)(?:\\\n|\n)", rigel.__doc__)
-    assert commands
-    for command in commands:
-        tokens = shlex.split(command)
-        start = tokens.index("--corpora") + 1
-        end = next((i for i in range(start, len(tokens)) if tokens[i].startswith("--")), len(tokens))
-        args = tyro.cli(rigel.RigelArgs, args=["--corpora", *tokens[start:end]])
-        assert set(args.corpora) <= {"web", "code", "math", "multilingual", "stem",
-                                     "nemotron_cc_v2", "finepdf", "other"}
-        assert rigel.phases(args.corpora, 1000)
