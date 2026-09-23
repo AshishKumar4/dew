@@ -89,9 +89,31 @@ Hybrid sharding keeps a full copy of the parameters and optimizer state on every
 - The all-to-all follows DeepSpeed Ulysses. Each device trades its slice of the positions for a slice of the attention heads, attends the whole sequence for those heads and trades back. No device ever holds a whole key or value tensor. Causal masks, sliding windows, packed-document masks and the TPU splash kernel work as they do on one device. Grouped key and value heads are repeated only as far as the split needs.
 - The gather keeps the queries split and gathers the whole keys and values on every device. It takes any head count and any key length. A causal or masked call reorders its queries so every device gets the same work, which needs the sequence length to divide by twice `sequence`.
 
-A call runs the all-to-all when three things hold: its query heads divide by `tensor` times `sequence`, its query and key lengths both divide by `sequence`, and it moves fewer bytes. Counted per device in units of sequence length times head width times (N-1)/N, with H query heads and K key heads per tensor shard, the all-to-all sends 2(H + K')/N, where K' is K repeated as far as the split needs. The gather sends 2K, plus 2H/N when it reorders a causal or masked call. At H=32, K=8, N=2 that is 20 against 8 without a mask and 24 with one, so causal attention exchanges heads and unmasked grouped-query attention gathers. Joint text-and-image attention over an odd length, cross attention to a 77-token context, and head counts the split does not divide all take the gather. `dew.nn.attention.all_to_all_moves_less` holds the rule.
+A call runs the all-to-all when its query heads divide by `tensor` times `sequence` and its query and key lengths both divide by `sequence`. Where both exchanges can run, a causal, windowed or masked call takes the all-to-all. Its kernel sees whole sequences and the causal flag, and cuDNN and splash skip the masked blocks. The gather hands its kernel a mask for its reordered rows, which cuDNN runs as a dense bias over every logit. A call with no mask does the same work either way and takes the exchange that sends fewer bytes. Counted per device in units of sequence length times head width times (N-1)/N, with H query heads and K key heads per tensor shard, the all-to-all sends 2(H + K')/N, where K' is K repeated as far as the split needs, and the gather sends 2K. At H=32, K=8, N=2 that is 40 against 16, so unmasked grouped-query attention gathers. Joint text-and-image attention over an odd length, cross attention to a 77-token context, and head counts the split does not divide all take the gather. `dew.nn.attention.sequence_parallel_attention` holds the rule.
 
-Keep the sequence axis inside a node. Both exchanges run once per attention layer in the forward and the backward pass. `replicas` keeps it inside a granule for you.
+Measured on 4x RTX 3090 (NV4 pair + PHB pair, cross-socket), one host, bf16, forward and backward of one attention call with 16 query heads, 8 key heads and head width 128, split two ways, in milliseconds. Each pair's columns come from one run, its one-GPU column on the pair's first GPU:
+
+| Causal, tokens | NVLink pair: one GPU | NVLink pair: all-to-all | PCIe pair: one GPU | PCIe pair: all-to-all | PCIe pair: gather |
+|---|---|---|---|---|---|
+| 8,192 | 18.1 | 12.0 | 16.0 | 18.5 | 37.2 |
+| 16,384 | 62.3 | 41.2 | 61.9 | 46.5 | 103.7 |
+| 32,768 | 245.9 | 130.4 | 244.3 | 150.1 | 350.1 |
+| 65,536 | | 503.0 | | 541.8 | 1302.4 |
+
+With 4 key heads of width 64, Rigel's attention, the gather took 2.4 to 3.9 times as long as the all-to-all on the PCIe pair over the same lengths. Unmasked, the two exchanges came within 17% of each other at 4,096 to 32,768 tokens on the NVLink pair, and the byte count picked the faster one in ten of twelve shapes, missing by at most 6%.
+
+Two other designs were timed against the all-to-all on the same pairs, and Dew ships neither. A zigzag ring on cuDNN, timed with the kernels an exact one runs, passes key and value blocks around the devices while each attends its queries to the block it holds. Two head groups cut the all-to-all in two, so one group's exchange can run beside the other group's kernel. Each time below is relative to the all-to-all's, for the causal call of the table above:
+
+| Tokens | Ring, NVLink pair | Ring, PCIe pair | Two head groups, NVLink pair | Two head groups, PCIe pair |
+|---|---|---|---|---|
+| 8,192 | 1.46 | 1.79 | 0.95 | 0.84 |
+| 16,384 | 1.20 | 1.45 | 0.98 | 0.90 |
+| 32,768 | 1.11 | 1.32 | 1.09 | 0.97 |
+| 65,536 | 1.04 | 1.17 | 1.00 | 0.98 |
+
+With Rigel's attention the ring took 1.02 to 1.79 times as long and two head groups 0.91 to 1.10 times; four head groups did no better than two. The ring lost at every length. The head groups gained up to 16%, on the PCIe pair at lengths one GPU trains, and came within 3% faster to 9% slower at 32,768 and 65,536 tokens.
+
+Keep the sequence axis on the fastest links. Both exchanges run once per attention layer in the forward and the backward pass, and again when the layer is recomputed. On the 3090s the all-to-all moved 19.5 GB/s per device over the NVLink pair and 6.3 GB/s across the sockets, 64 MiB a device, and NCCL runs the PCIe pair through host memory as it runs the sockets. On the PCIe pair a 32,768-token Qwen3-0.6B-shaped training step split two ways took 7.6 s, 1.25 s of it an all-to-all that no computation overlapped. `build_mesh` puts the `sequence` axis last, on neighbouring devices, and `replicas` keeps it inside a granule.
 
 ## Rehearse on one machine
 
