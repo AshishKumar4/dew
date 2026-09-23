@@ -214,34 +214,28 @@ class DewLM(TemplateLM):
         """Return each pair's summed continuation log-probability, and whether
         greedy decoding of the context would have produced the continuation.
 
-        A continuation of at most `max_length` ids is `HFLM`'s row: context
-        and continuation joined, the last `max_length + 1` ids kept, so the
-        forward reads `max_length` ids and the continuation's targets are the
-        row's last ones. `HFLM` refuses a longer continuation; here it is
-        scored in consecutive blocks of `max_length` targets, each block the
-        end of such a row over the ids before it, so every target is still
-        read once. A continuation with no ids of its own is refused, as
-        `HFLM` refuses it: scored, it would be probability 1 and greedy, and
-        win every multiple-choice comparison it is in.
+        Each pair is `HFLM`'s row: context and continuation joined, the last
+        `max_length + 1` ids kept, so the forward reads `max_length` ids and
+        the continuation's targets are the row's last ones. As `HFLM` does,
+        a continuation longer than `max_length` is refused, since no row
+        could hold it with any of its context, and a continuation with no
+        ids of its own is refused: scored, it would be probability 1 and
+        greedy, and win every multiple-choice comparison it is in.
         """
         del disable_tqdm, kwargs
         rows: list[list[int]] = []
-        widths: list[int] = []
-        owners: list[int] = []
-        for owner, (strings, context, continuation) in enumerate(requests):
+        for strings, context, continuation in requests:
+            named = repr(strings[1]) if strings is not None else "a continuation"
             if not continuation:
-                named = repr(strings[1]) if strings is not None else "a continuation"
                 raise ValueError(
                     f"{named} adds no token to its context, so there is nothing to score; "
                     f"the tokenizer read the pair as {len(context)} ids")
-            whole = [*context, *continuation]
-            for start in range(len(context), len(whole), self.max_length):
-                end = min(start + self.max_length, len(whole))
-                rows.append(whole[:end][-(self.max_length + 1):])
-                widths.append(end - start)
-                owners.append(owner)
-        totals = [0.0] * len(requests)
-        greedy = [True] * len(requests)
+            if len(continuation) > self.max_length:
+                raise ValueError(
+                    f"{named} is {len(continuation)} ids, longer than this model's "
+                    f"{self.max_length}-id window; lm-eval's HFLM refuses it too")
+            rows.append([*context, *continuation][-(self.max_length + 1):])
+        answers: list[tuple[float, bool]] = []
         for batch in _batches(len(rows), self.batch_size):
             tokens = _padded([rows[index] for index in batch])
             probabilities, argmax = _scored(self.task.model, self.task.variables,
@@ -249,10 +243,10 @@ class DewLM(TemplateLM):
             values, matched = np.asarray(probabilities), np.asarray(argmax)
             for offset, index in enumerate(batch):
                 end = len(rows[index]) - 1
-                start = end - widths[index]
-                totals[owners[index]] += float(values[offset, start:end].sum())
-                greedy[owners[index]] &= bool(matched[offset, start:end].all())
-        return list(zip(totals, greedy, strict=True))
+                start = end - len(requests[index][2])
+                answers.append((float(values[offset, start:end].sum()),
+                                bool(matched[offset, start:end].all())))
+        return answers
 
     def loglikelihood_rolling(self, requests: list[Instance],
                               disable_tqdm: bool = False) -> list[float]:
