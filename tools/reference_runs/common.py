@@ -232,12 +232,11 @@ def trim_trace(kernels: Sequence[tuple[str, int, int, int]], path: str | Path) -
     return path
 
 
-def git_head(path: str | Path) -> str | None:
-    try:
-        return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True,
-                              text=True, check=True).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        return None
+def git_head(path: str | Path) -> str:
+    """The commit a record was measured at; a record without one cannot be
+    traced, so a checkout git cannot read fails the run."""
+    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True,
+                          text=True, check=True).stdout.strip()
 
 
 def host() -> dict:
