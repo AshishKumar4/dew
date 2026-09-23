@@ -25,6 +25,7 @@ from jax.experimental import checkify
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.objectives.base import Variables
 from dew.sampling.decoding import StepState
+from dew.sampling.guided import Grammar
 
 
 @struct.dataclass
@@ -236,35 +237,46 @@ class Sample:
     Continuations of a prompt share its prefill and run one after another, so
     decode memory does not grow with `n` and a routed-expert forward sees the
     same batch as a single continuation.
+
+    `grammar` holds every draw to a regex or JSON schema
+    (`dew.sampling.guided`). Each row carries its automaton state through
+    the loop; before a draw the tokens the state forbids score -inf, ahead
+    of the transform chain, so the chain filters and samples inside the
+    language, and the raw likelihood stays the model's own.
     """
+
+    grammar: Grammar | None = None
 
     def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
                  stopping: Callable[[StepState, jax.Array], jax.Array],
                  budget: int, n: int) -> Draws:
         return continuations(start, n, lambda drawn: _sample_rows(
-            state, drawn, ops, transform, stopping, budget))
+            state, drawn, ops, transform, stopping, budget, self.grammar))
 
 
 def _sample_rows(state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
                  stopping: Callable[[StepState, jax.Array], jax.Array],
-                 budget: int) -> Draws:
-    """The fixed-trip decode scan from one prefilled state."""
+                 budget: int, grammar: Grammar | None = None) -> Draws:
+    """The fixed-trip decode scan from one prefilled state, guided when a grammar is given."""
 
     def step(carry, _):
-        state, step_state, terminated = carry
+        state, step_state, terminated, automaton = carry
         active = step_state.active
-        token, behavior, raw = draw(step_state, state.logits, transform)
+        chain = transform if grammar is None else grammar.guiding(transform, automaton)
+        token, behavior, raw = draw(step_state, state.logits, chain)
         committed = step_state.commit(token, active)
         stopped = active & stopping(committed, token)
         following = ops.advance(state, token, active)
         carry = (following, dataclasses.replace(committed, active=active & ~stopped),
-                 terminated | stopped)
+                 terminated | stopped,
+                 None if grammar is None else grammar.advanced(automaton, token, active))
         return carry, (token, active, jnp.where(active, behavior, 0.0), jnp.where(active, raw, 0.0))
 
-    initial = (state, start, jnp.zeros(start.rows, bool))
-    (_, _, terminated), columns = lax.scan(step, initial, None, length=budget)
+    initial = (state, start, jnp.zeros(start.rows, bool),
+               None if grammar is None else grammar.start(start.rows))
+    (_, _, terminated, _), columns = lax.scan(step, initial, None, length=budget)
     tokens, valid, behavior, raw = (jnp.swapaxes(value, 0, 1) for value in columns)
     return Draws(tokens, valid, behavior, raw, terminated)
 

@@ -704,7 +704,8 @@ class ExponentialDecayLengthPenalty:
 
     The reference measures from `start_index + prompt_width`, which is the
     generated count used here, and adds `|score| * (factor ** index - 1)` so a
-    negative score also rises.
+    negative score also rises. A removed EOS (-inf, a grammar's mask) stays
+    removed.
     """
 
     start: int = struct.field(pytree_node=False, default=0)
@@ -718,7 +719,7 @@ class ExponentialDecayLengthPenalty:
         index = jnp.maximum(state.step - self.start, 0)
         growth = jnp.where(state.step > self.start, self.factor ** index.astype(jnp.float32) - 1.0, 0.0)
         selected = _membership(self.eos, logits.shape[-1])[None, :]
-        return logits + jnp.where(selected, jnp.abs(logits) * growth[:, None], 0.0)
+        return logits + jnp.where(selected & jnp.isfinite(logits), jnp.abs(logits) * growth[:, None], 0.0)
 
 
 @struct.dataclass

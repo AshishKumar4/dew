@@ -12,8 +12,10 @@ import numpy as np
 import pytest
 
 from dew.inference import RunProcessor, TextGeneration
-from dew.inference.serving import Server
+from dew.inference.pages import Pages
+from dew.inference.serving import PagedRows, Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kv_cache import KVCache
 from dew.sampling import Sampling
 
 VOCAB = 13
@@ -175,3 +177,124 @@ def test_a_request_over_the_capacity_is_refused_as_the_task_refuses_it():
     with pytest.raises(ValueError, match="one continuation"):
         Server.from_task(bound.__class__(bound.model, bound.variables, bound.processor,
                                          sampling=bound.sampling, n=2), slots=2, capacity=64)
+
+
+def served_alongside(bound, **options):
+    """Every prompt submitted at once, plus the longest again once it is done,
+    through a server with `options`; returns the server and the tickets."""
+    server = Server.from_task(bound, slots=4, capacity=128, admission=2, **options)
+    tickets = [server.submit(prompt, budget, seed=index)
+               for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server.run()
+    tickets.append(server.submit(PROMPTS[2], BUDGETS[2], seed=2))
+    server.run()
+    return server, tickets
+
+
+@pytest.mark.parametrize("options", [
+    {"kv_cache": KVCache(page_size=16, pages=12)},
+    {"kv_cache": KVCache(page_size=16, pages=12), "chunk": 2},
+    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True},
+], ids=["paged", "chunked", "prefix"])
+def test_a_paged_server_draws_what_each_request_draws_alone(options):
+    """A pool of 12 pages holds fewer tokens than the 4 x 128 slots the dense
+    server reserves, a prompt prefilled two or three tokens a step
+    attends to its earlier pieces through the page table, and a repeated
+    prompt starts from the page its first run published. None of it
+    changes a greedy draw: every row is the lone task call's."""
+    bound = task()
+    alone = [bound(prompt, budget, seed=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server, tickets = served_alongside(bound, **options)
+    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), lone)
+    # "1234567" keeps its last token to prefill: one full page of four is shared.
+    assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
+
+
+def test_a_full_pool_queues_a_request_until_a_row_gives_pages_back():
+    """Three pages of sixteen hold one request of prompt and budget at a time:
+    the second waits in the queue, not in a slot, and draws what it draws
+    alone once the first returns its pages."""
+    bound = task()
+    server = Server.from_task(bound, slots=2, capacity=128, kv_cache=KVCache(page_size=16, pages=3))
+    first = server.submit("1234567", 30, seed=0)
+    second = server.submit("98", 30, seed=1)
+    server.step()
+    assert server.occupancy == 1 and server.queued == 1
+    server.run()
+    assert first.result().text == bound("1234567", 30, seed=0).text
+    assert second.result().text == bound("98", 30, seed=1).text
+    with pytest.raises(ValueError, match="pool holds 3"):
+        server.submit("1234567", 60, seed=0)
+
+
+def test_chunks_and_prefix_sharing_need_a_paged_cache():
+    with pytest.raises(ValueError, match="paged cache"):
+        Server.from_task(task(), slots=2, capacity=128, chunk=4)
+
+
+def test_a_paged_server_refuses_a_model_whose_layers_kept_a_dense_cache():
+    """A paged server moves rows by their page tables; a cache without any
+    means the layout did not reach the layers, and serving it would hold a
+    dense slots x capacity cache instead of the bounded pool."""
+    bound = task()
+    dense = Server.from_task(bound, slots=2, capacity=128)
+    with pytest.raises(ValueError, match="did not take the paged layout"):
+        PagedRows(Pages(8, 16, prefix_cache=False), None, 8).check(dense.cache)
+
+
+def test_a_released_prefix_page_is_shared_until_the_free_pages_run_out():
+    """The ledger shares a full prompt page by the hash of everything up to
+    its end, keeps it after its row leaves, and reclaims it only when a
+    request needs more pages than are free, oldest release first."""
+    pages = Pages(4, 2, prefix_cache=True)
+    prompt = np.array([1, 2, 3, 4, 5])
+    first, hit = pages.reserve(prompt, 6)
+    assert hit == 0 and len(first) == 3
+    pages.publish(prompt, first)
+    pages.release(first)
+    assert pages.available == 4
+    # Same first four tokens: two pages shared, the last token still prefilled.
+    again, hit = pages.reserve(np.array([1, 2, 3, 4, 9]), 6)
+    assert hit == 4 and again[:2] == first[:2]
+    pages.release(again)
+    # A different first page shares nothing, even where later tokens agree.
+    other, hit = pages.reserve(np.array([7, 2, 3, 4, 5]), 8)
+    assert hit == 0 and len(other) == 4
+    pages.release(other)
+    assert pages.reserve(np.array([1, 2, 3, 4, 5]), 6)[1] == 0
+
+
+def test_reclaiming_a_released_chain_takes_its_tail_before_its_head():
+    """A shared prefix loses its last page first under memory pressure, so
+    the head that every later prompt starts with stays reachable."""
+    pages = Pages(3, 2, prefix_cache=True)
+    prompt = np.array([1, 2, 3, 4, 5])
+    chain, _ = pages.reserve(prompt, 6)
+    pages.publish(prompt, chain)
+    pages.release(chain)
+    # Two pages are needed and one is free: the one reclaimed is the tail.
+    taken, _ = pages.reserve(np.array([9, 9, 9]), 4)
+    assert taken == [chain[2], chain[1]]
+    pages.release(taken)
+    again, hit = pages.reserve(np.array([1, 2, 7, 7, 7]), 6)
+    assert hit == 2 and again[0] == chain[0]
+
+
+def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote():
+    """A cached prompt page holds keys the old weights computed; after a
+    reload the same prompt prefills again and draws what the new weights
+    draw alone."""
+    bound = task()
+    server = Server.from_task(bound, slots=2, capacity=128, kv_cache=KVCache(page_size=4, pages=40),
+                              prefix_cache=True)
+    server.submit("1234567", 8, seed=0)
+    server.run()
+    other = bound.variables.copy({"params": jax.tree.map(lambda leaf: leaf * 1.5, bound.variables["params"])})
+    server.reload(other)
+    hits = server.prefix_hits
+    ticket = server.submit("1234567", 8, seed=0)
+    server.run()
+    assert server.prefix_hits == hits
+    assert ticket.result().text == bound.bind(other)("1234567", 8, seed=0).text

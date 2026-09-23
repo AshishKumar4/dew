@@ -25,6 +25,7 @@ from .solvers import (
     Solver,
     UniPC,
 )
+from .guided import Grammar
 from .strategies import Beam, Sample, Speculative, Strategy
 from .text import Generation, Sampling, generate
 
@@ -49,6 +50,7 @@ __all__ = [
     "FlowTrajectory",
     "GaussianTransition",
     "Generation",
+    "Grammar",
     "Heun",
     "LogitsTransform",
     "MultiStepDPM",
