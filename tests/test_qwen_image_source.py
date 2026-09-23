@@ -127,6 +127,43 @@ def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
     assert relative_gap(unmasked[1], nhwc(arrays["padded.output"], rows, columns)[1]) > 1e-3
 
 
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a cuda device")
+def test_cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops):
+    """The fused kernel runs both of the block's attention calls over a
+    padded prompt, forward and backward, and computes what xla computes.
+
+    bf16 and a head width of 64 are what cuDNN takes; the fixture cases'
+    width of 12 sends 'auto' to xla. The text is odd-length, so both calls
+    also take the kernel's own odd-length padding. cuDNN once refused the
+    key-padding mask this model passed (a [B, 1, 1, K] bool), which only a
+    run through the kernel shows. The bound is two bf16 ulps (2**-7 each)
+    of each array's scale: the two kernels round the same products in a
+    different order, and two layers carry that into the output and the
+    gradients. Observed 1.1 ulps on an RTX 4080."""
+    model = QwenImageTransformer(in_channels=4, out_channels=4, num_layers=2, heads=2, head_dim=64,
+                                 context_in_dim=16, axes_dims_rope=(16, 24, 24), dtype=jnp.bfloat16,
+                                 attention_impl="cudnn")
+    keys = jax.random.split(jax.random.PRNGKey(0), 4)
+    latent = jax.random.normal(keys[0], (2, 4, 6, 4))
+    context = jax.random.normal(keys[1], (2, 25, 16))
+    condition = DenoisingCondition(context, mask=jnp.arange(25)[None] < jnp.asarray([[25], [13]]))
+    times = jnp.asarray([731.0, 42.0])
+    params = model.init(keys[2], latent, times, condition)["params"]
+    probe = jax.random.normal(keys[3], (2, 4, 6, 4))
+
+    def pullback(implementation):
+        def forward(params, latent, context):
+            return model.clone(attention_impl=implementation).apply(
+                {"params": params}, latent, times, DenoisingCondition(context, mask=condition.mask))
+        output, vjp = jax.vjp(forward, params, latent, context)
+        return [output, *jax.tree.leaves(vjp(probe.astype(output.dtype)))]
+
+    fused, reference = jax.jit(lambda: pullback("cudnn"))(), jax.jit(lambda: pullback("xla"))()
+    for got, want in zip(fused, reference, strict=True):
+        got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
+        assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+
 def test_every_declared_qwen_image_tensor_is_mapped(source):
     """Every stored tensor lands in the tree and writes back bit for bit; a
     name the class does not declare, a bias included, is refused."""
