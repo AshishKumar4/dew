@@ -167,7 +167,7 @@ def test_a_pool_splits_the_gpus_of_a_host_between_its_processes(monkeypatch, gpu
     with all of it; a CPU pool leaves devices alone."""
     from dew.cli import launch
 
-    monkeypatch.setattr(launch, "gpu_count", lambda host: gpus)
+    monkeypatch.setattr(launch, "gpu_count", lambda host, visible: gpus)
     monkeypatch.delenv("JAX_PLATFORMS", raising=False)
     plan = launch.Launch(command=("python",), processes_per_host=processes,
                          devices_per_process=devices)
@@ -177,7 +177,7 @@ def test_a_pool_splits_the_gpus_of_a_host_between_its_processes(monkeypatch, gpu
 def test_a_share_of_gpus_that_does_not_divide_is_refused_and_cpu_pools_ignore_gpus(monkeypatch):
     from dew.cli import launch
 
-    monkeypatch.setattr(launch, "gpu_count", lambda host: 8)
+    monkeypatch.setattr(launch, "gpu_count", lambda host, visible: 8)
     with pytest.raises(ValueError, match="do not split"):
         launch.Launch(command=("python",), processes_per_host=3).layout("localhost")
     rehearsal = launch.Launch(command=("python",), processes_per_host=4,

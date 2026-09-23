@@ -247,9 +247,12 @@ class Launch:
         processes, devices = self.processes_per_host, self.devices_per_process
         if processes is not None and (devices is not None or processes == 1):
             return processes, devices
-        platforms = self.extra_env().get("JAX_PLATFORMS", os.environ.get("JAX_PLATFORMS", ""))
+        # What the pool's processes will see: the --env values, and on this
+        # machine the launcher's own environment, which ssh does not carry.
+        env = {**(os.environ if first_host in LOCAL_HOSTS else {}), **self.extra_env()}
+        platforms = env.get("JAX_PLATFORMS", "")
         on_gpu = not platforms or any(name in platforms for name in ("cuda", "gpu"))
-        gpus = gpu_count(first_host) if on_gpu else 0
+        gpus = gpu_count(first_host, env.get("CUDA_VISIBLE_DEVICES")) if on_gpu else 0
         if processes is None:
             processes = max(1, gpus // (devices or 1))
         if devices is None and gpus > 1 and processes > 1:
@@ -344,31 +347,38 @@ def detected_cluster() -> Cluster | None:
     return None
 
 
-def _count_gpus(listing: str) -> int:
-    """GPUs in `nvidia-smi -L` output, whose MIG lines are indented."""
-    return sum(line.startswith("GPU ") for line in listing.splitlines())
+def _listed_gpus(argv: Sequence[str]) -> int:
+    """GPUs in the `nvidia-smi -L` output of `argv`, whose MIG lines are
+    indented; none when it fails or nvidia-smi is not there."""
+    try:
+        found = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except FileNotFoundError:
+        return 0
+    if found.returncode != 0:
+        return 0
+    return sum(line.startswith("GPU ") for line in found.stdout.splitlines())
+
+
+def _visible_gpus(visible: str) -> int:
+    return sum(1 for device in visible.split(",") if device.strip())
 
 
 def local_gpu_count() -> int:
     """GPUs this process may use: CUDA_VISIBLE_DEVICES when it is set,
     since jax numbers only those, else every GPU nvidia-smi lists."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    return _listed_gpus(("nvidia-smi", "-L")) if visible is None else _visible_gpus(visible)
+
+
+def gpu_count(host: str, visible: str | None) -> int:
+    """GPUs a pool process on `host` may use: those `visible` lists when
+    the pool sets CUDA_VISIBLE_DEVICES itself, else what `host` shows,
+    asked over ssh when it is another machine."""
     if visible is not None:
-        return sum(1 for device in visible.split(",") if device.strip())
-    try:
-        found = subprocess.run(("nvidia-smi", "-L"), capture_output=True, text=True, timeout=60)
-    except FileNotFoundError:
-        return 0
-    return _count_gpus(found.stdout) if found.returncode == 0 else 0
-
-
-def gpu_count(host: str) -> int:
-    """GPUs on `host`; another host is asked over ssh."""
+        return _visible_gpus(visible)
     if host in LOCAL_HOSTS:
         return local_gpu_count()
-    found = subprocess.run(("ssh", "-o", "BatchMode=yes", host, "nvidia-smi -L"),
-                           capture_output=True, text=True, timeout=60)
-    return _count_gpus(found.stdout) if found.returncode == 0 else 0
+    return _listed_gpus(("ssh", "-o", "BatchMode=yes", host, "nvidia-smi -L"))
 
 
 def free_port(host: str) -> int:
