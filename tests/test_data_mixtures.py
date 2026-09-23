@@ -1032,3 +1032,14 @@ def test_a_checkpoint_at_a_phase_boundary_names_the_finished_phase(tmp_path):
     for changed in (phased_packed(first, second, (first, 3), (second, None)),
                     phased_packed(first, second, (first, 5), (both, None))):
         changed.load(batch=4).train().set_state(state)
+
+
+def test_one_corpus_starts_past_its_offset_as_a_mixed_one_does():
+    """`corpora_dataset` owns how a list of corpora streams, the offset a
+    phase gives a recurring corpus included, for one corpus as for several."""
+    from dew.data.providers import corpora_dataset
+    whole = taken(corpora_dataset([Corpus("wiki", Indexed(1, 40), 1.0)], None, [], batch=4, seed=0,
+                                  loading=READ, val_batches=None).train(), 4)
+    later = taken(corpora_dataset([Corpus("wiki", Indexed(1, 40), 1.0, offset=8)], None, [], batch=4,
+                                  seed=0, loading=READ, val_batches=None).train(), 2)
+    assert later == whole[2:]

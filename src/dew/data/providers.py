@@ -111,7 +111,7 @@ def corpora_dataset(train: Sequence[Corpus], held: Sequence[Corpus] | None,
     rows = local_batch(batch)
     if len(train) == 1:
         stream = train_stream(train[0].source, operations, batch=rows, seed=seed,
-                              loading=loading)
+                              loading=loading, offset=train[0].offset)
         pass_records = counted(train[0].source, records, train[0].name)
     else:
         if records is not None:
@@ -145,34 +145,27 @@ def phased_dataset(phases: Sequence[tuple[Sequence[Corpus], int | None]],
     A pass is the first phase's; `held` is validated as `corpora_dataset`
     validates it.
     """
-    rows = local_batch(batch)
     streams = []
     read: dict[str, int] = {}
-    start = 0
-    for corpora, until in phases:
+    start, first = 0, None
+    for index, (corpora, until) in enumerate(phases):
         corpora = [dataclasses.replace(corpus, offset=read.get(corpus.name, 0))
                    for corpus in corpora]
-        stream = (train_stream(corpora[0].source, operations, batch=rows, seed=seed,
-                               loading=loading, offset=corpora[0].offset)
-                  if len(corpora) == 1 else
-                  mixed_stream(corpora, operations, batch=rows, seed=seed, loading=loading))
+        phase = corpora_dataset(corpora, held if index == 0 else None, operations, batch=batch,
+                                seed=seed, loading=loading, val_batches=val_batches)
+        first = first or phase
         end = None if until is None else until * batch
-        streams.append((stream, end))
+        streams.append((phase.train, end))
         if end is not None:
             taken = ((end - start,) if len(corpora) == 1
                      else mixed_counts(corpora, end - start))
             for corpus, count in zip(corpora, taken, strict=True):
                 read[corpus.name] = corpus.offset + count
             start = end
-    first = phases[0][0]
-    records = counted(first[0].source, None, first[0].name) if len(first) == 1 else mixed_records(first)
-    validation = None
-    if held is not None:
-        ordered = held[0].source if len(held) == 1 else mixture(held, None)
-        validation = bounded(validation_pass(ordered, operations, batch=rows, seed=seed,
-                                             loading=loading), val_batches)
-    return Dataset(train=phased(streams, loading=loading), val=validation, records=records,
+    assert first is not None
+    return Dataset(train=phased(streams, loading=loading), val=first.val, records=first.records,
                    batch=batch)
+
 
 class Preprocessing(pygrain.RandomMapTransform):
     """`preprocess` as the grain transformation that runs inside the workers."""
