@@ -99,9 +99,9 @@ class AsyncRollout:
 
     def __init__(self, objective: GRPOObjective, server: RolloutServer, reward: Reward, *,
                  decode: Callable[[Sequence[int]], str], groups: int = 4, max_new_tokens: int = 32,
-                 max_lag: int = 1, ahead: int = 1, sync_every: int = 1, sample: str = "group",
+                 max_lag: int = 1, ahead: int = 1, sync_every: int = 1, estimator: str = "group",
                  scorers: int = 16, log: Callable[[RolloutRecord], None] | None = None):
-        check_rollout(groups, max_new_tokens, sample)
+        check_rollout(groups, max_new_tokens, estimator)
         for name, value, least in (("ahead", ahead, 0), ("sync_every", sync_every, 1), ("max_lag", max_lag, 0)):
             if type(value) is not int or value < least:
                 raise ValueError(f"{name} must be an integer of at least {least}")
@@ -113,7 +113,7 @@ class AsyncRollout:
             raise ValueError("stale rollouts need the objective's behavior_importance_cap: "
                              "the proximal-to-behavior importance weight is the off-policy correction")
         self.objective, self.server, self.reward, self.decode = objective, server, reward, decode
-        self.groups, self.max_new_tokens, self.sample = groups, max_new_tokens, sample
+        self.groups, self.max_new_tokens, self.estimator = groups, max_new_tokens, estimator
         self.max_lag, self.ahead, self.sync_every, self.log = max_lag, ahead, sync_every, log
         self._scorers = ThreadPoolExecutor(max_workers=scorers, thread_name_prefix="dew-reward")
         self._lock = threading.Lock()
@@ -242,7 +242,7 @@ class AsyncRollout:
                 raw.append(None if draw.raw_log_probs is None else tuple(draw.raw_log_probs))
                 rewards[row, group] = value
         packed, _ = completion_rows(entry.prompts, entry.lengths, sampled, lengths, terminated, behavior,
-                                    rewards, versions, self.sample)
+                                    rewards, versions, self.estimator)
         if lag > 0 or any(values is None for values in raw):
             packed[OLD_LOG_PROBS_KEY] = np.asarray(self._rescore(state.params, packed), np.float32)
         else:

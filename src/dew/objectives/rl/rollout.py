@@ -15,7 +15,7 @@ from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.sampling.text import Sampling
 
 from ..lm import LMObjective
-from .rollouts import OLD_LOG_PROBS_KEY, Call, Rollout, Status, pack, sampled_values
+from .rollouts import OLD_LOG_PROBS_KEY, Call, Rollout, Status, check_estimator, pack, sampled_values
 
 type Reward = Callable[[str, str, str, str], float]
 """Score ``(data_source, completion, ground_truth, extra_info)``."""
@@ -45,19 +45,18 @@ def prompt_rows(batch, seq_len: int, max_new_tokens: int
     return prompts, prompt_lengths, sources, truths, infos
 
 
-def check_rollout(groups: int, max_new_tokens: int, sample: str) -> None:
+def check_rollout(groups: int, max_new_tokens: int, estimator: str) -> None:
     """Refuse a group, budget or advantage family no GRPO rollout can use."""
     if type(groups) is not int or groups < 2:
         raise ValueError(f"groups is {groups}: an advantage needs at least two completions")
     if type(max_new_tokens) is not int or max_new_tokens < 1:
         raise ValueError("a rollout generates at least one token")
-    if sample not in ("group", "rloo"):
-        raise ValueError("the advantage families are 'group' and 'rloo'")
+    check_estimator(estimator)
 
 
 def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np.ndarray,
                     lengths: np.ndarray, terminated: np.ndarray, behavior: np.ndarray,
-                    rewards: np.ndarray, versions: np.ndarray, sample: str) -> tuple[dict[str, np.ndarray],
+                    rewards: np.ndarray, versions: np.ndarray, estimator: str) -> tuple[dict[str, np.ndarray],
                                                                                    list[Rollout]]:
     """Pack `[rows, groups, ...]` completions as one-call rollouts through `pack`.
 
@@ -65,7 +64,7 @@ def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np
     tokens each; `sampled` and `behavior` are `[rows, groups, R]` with
     `lengths` valid actions per draw, `terminated` whether each stopped at
     EOS; `rewards` and `versions` are `[rows, groups]`. Each prompt's group
-    is advantaged by the `sample` family. The batch is `rows * groups` rows
+    is advantaged by the `estimator` family. The batch is `rows * groups` rows
     of `width + R` ids, the packed layout every GRPO batch has; the rollouts
     come back so a caller can place per-call values with `sampled_values`.
     """
@@ -81,7 +80,7 @@ def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np
                         "stop" if bool(terminated[row, group]) else "length", int(versions[row, group]))
             rollouts.append(Rollout(str(row), "", group, 0, (call,), Status.COMPLETED,
                                     float(rewards[row, group])))
-    return pack(rollouts, width + budget, rows=rows * groups, estimator=sample), rollouts
+    return pack(rollouts, width + budget, rows=rows * groups, estimator=estimator), rollouts
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,11 +99,11 @@ class SampledRollout:
     decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids)
     groups: int = 4
     max_new_tokens: int = 32
-    sample: str = "group"
+    estimator: str = "group"
     sampling: Sampling = Sampling()
 
     def __post_init__(self) -> None:
-        check_rollout(self.groups, self.max_new_tokens, self.sample)
+        check_rollout(self.groups, self.max_new_tokens, self.estimator)
 
     def _prepared(self, batch, key: jax.Array):
         """Validate one prompt batch and build the inputs generation reads.
@@ -163,7 +162,7 @@ class SampledRollout:
             for row in range(rows)], np.float32)
         versions = np.full((rows, self.groups), int(state.updates), np.int32)
         packed, _ = completion_rows(prompts, prompt_lengths, sampled, lengths, terminated, behavior,
-                                    rewards, versions, self.sample)
+                                    rewards, versions, self.estimator)
         packed[OLD_LOG_PROBS_KEY] = sampled_values(
             packed, lambda index, _: raw[index // self.groups, index % self.groups,
                                          :int(lengths[index // self.groups, index % self.groups])].tolist())
