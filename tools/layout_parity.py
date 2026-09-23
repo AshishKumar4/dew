@@ -291,7 +291,9 @@ def floor(case, batch, reference, reference_loss: float) -> tuple[dict[str, floa
 def exact(case, reference_gradient) -> dict[str, float]:
     """Each leaf's distance, relative to the fp64 gradient, of the fp32
     reference's step one from the same step in fp64: the model built with no
-    dtype of its own, on the same variables widened to fp64."""
+    dtype of its own, on the reference's own initial variables widened to
+    fp64. The trainer draws those from its key's first split, so they come
+    from the trainer, not from the objective's `init` on the key itself."""
     import benchmark_step as bench
     import jax
     import jax.numpy as jnp
@@ -299,11 +301,11 @@ def exact(case, reference_gradient) -> dict[str, float]:
     from dew.objectives.base import Step, scalar_loss
     from dew.registry import models
 
-    variables = jax.jit(bench.build_objective(case).init)(jax.random.key(0))
+    state = jax.jit(_trainer(case, {}, one_device=True).initial_state)()
     wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
-                        if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, variables)
+                        if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, state.params)
     objective = bench.lm_objective(case, models.build(case.architecture, **case.config, dtype=None))
-    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+    step = Step(step=state.step, key=state.key, ema=None)
 
     def loss(params, batch):
         return scalar_loss(objective, {**wide, "params": params}, batch, step)[0]
