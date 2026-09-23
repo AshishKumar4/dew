@@ -7,6 +7,7 @@ cross jit, while optional captions and decoded text remain host metadata.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import sys
@@ -193,6 +194,15 @@ class PeerFailure(RuntimeError):
     """Another rank failed at a phase agreement this rank passed."""
 
 
+AGREEMENT_PATIENCE_SECONDS = 24 * 3600
+"""How long ranks that reached an agreement wait on the host for the rest.
+
+Host work before an agreement, such as process 0 uploading the final
+checkpoint, can take hours; the pool bounds device executions, not this."""
+
+_agreements = itertools.count()
+
+
 def agree_process_phase(error: BaseException | None, *, phase: str,
                         available: bool = True) -> int:
     """Propagate host errors, then count ranks declaring availability.
@@ -203,6 +213,12 @@ def agree_process_phase(error: BaseException | None, *, phase: str,
     So a failing rank first publishes its error (`publish_failure`), which
     ends the pool within `FAILURE_GRACE_SECONDS` unless the agreement
     completes and withdraws it. Errors take priority over unavailable input.
+
+    The ranks meet on the host, at a coordination-service barrier, before
+    the device collectives that carry the outcome. A rank still busy on its
+    host keeps the others waiting there rather than inside an execution,
+    which the pool's bound (`dew.training.runtime.EXECUTION_TIMEOUT`) would
+    end.
     """
     if jax.process_count() == 1:
         if error is not None:
@@ -210,6 +226,8 @@ def agree_process_phase(error: BaseException | None, *, phase: str,
         return int(available)
     published = error is not None and publish_failure(error, f"phase {phase}")
     status = 2 if error is not None else int(available)
+    _client().wait_at_barrier(f"dew/agreement/{next(_agreements)}",
+                              int(AGREEMENT_PATIENCE_SECONDS * 1000))
     statuses = np.asarray(multihost_utils.process_allgather(np.asarray(status, np.int32))).reshape(-1)
     failed = np.flatnonzero(statuses == 2)
     if not failed.size:
