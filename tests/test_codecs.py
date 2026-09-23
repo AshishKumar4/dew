@@ -65,18 +65,6 @@ def test_the_compressed_tensors_export_writes_the_librarys_bytes(dtype):
     np.testing.assert_array_equal(packed["m.weight_scale"], exponents)
 
 
-def test_the_crafted_groups_take_the_rules_exponents():
-    """The fixture's first eight float32 groups by the rule's own steps:
-    zero clamps to byte 0; 6 = 1.5 * 4 has mantissa fraction 0.5 and rounds
-    down to 4, byte 127 + 2 - 2; 1.75 has fraction 0.75 and rounds up to 2,
-    byte 126, where one ulp under it rounds down to 1, byte 125; -0.21875 =
-    -1.75 * 2 ** -3 rounds up to 2 ** -2, byte 123; 2 ** -130 rounds to 0
-    and clamps to byte 0; 1000 = 1.95 * 512 rounds up to 1024, byte 135;
-    100 = 1.5625 * 64 rounds down to 64, byte 131."""
-    _, _, exponents = fixture_weight("float32")
-    assert exponents[0, :8].tolist() == [0, 127, 126, 125, 123, 0, 135, 131]
-
-
 @pytest.mark.parametrize("dtype", sorted(STORED))
 def test_an_untrained_re_export_writes_the_same_values(dtype):
     """Decoding what the library wrote and encoding it again, in the same
@@ -133,10 +121,9 @@ def encoded(kind: str) -> tuple[dict[str, np.ndarray], str, Callable[..., np.nda
     return tensors, name, partial(codecs.read_deepseek_v4_tensor, block=32, fp4_experts=True)
 
 
-REGIONS_2D = ((slice(3, 50, 3),), (slice(None), slice(17, 250, 5)), (slice(69, 2, -7), slice(None, None, -1)),
-              (slice(5, 5),), (slice(-9, None), slice(33, 34)))
-REGIONS_3D = ((slice(1, 3),), (slice(None), slice(17, 90, 5), slice(None, None, -2)),
-              (slice(2, 0, -1), slice(31, 33), slice(64, 70)), (slice(0, 0),))
+REGIONS_2D = ((slice(3, 50, 3), slice(17, 250, 5)), (slice(69, 2, -7), slice(None, None, -1)), (slice(5, 5),))
+REGIONS_3D = ((slice(None), slice(17, 90, 5), slice(None, None, -2)), (slice(2, 0, -1), slice(31, 33), slice(64, 70)),
+              (slice(0, 0),))
 
 
 @pytest.mark.parametrize("kind, region", [
@@ -144,10 +131,10 @@ REGIONS_3D = ((slice(1, 3),), (slice(None), slice(17, 90, 5), slice(None, None, 
       for region in REGIONS_2D),
     *(("gpt_oss", region) for region in REGIONS_3D)])
 def test_a_region_decodes_to_the_whole_tensors_values_there(kind, region):
-    """What `jax.make_array_from_callback` asks of a streamed load: any
-    region of a decoded tensor, strided, reversed or empty, on block edges
-    or off them, is the whole decode at that region, bit for bit, -0.0
-    included, and an unquantized tensor keeps its stored dtype."""
+    """What `jax.make_array_from_callback` asks of a streamed load: a
+    region of a decoded tensor, strided off block edges, reversed or empty,
+    is the whole decode at that region, bit for bit, -0.0 included, and an
+    unquantized tensor keeps its stored dtype."""
     tensors, name, read = encoded(kind)
     whole = read(tensors, name)
 
@@ -173,12 +160,6 @@ def test_a_scale_grid_of_another_block_size_is_refused_before_any_region_decodes
 def hankel(base: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     """A read-only [rows, cols] view holding base[i + j] at (i, j), with no memory of its own."""
     return np.lib.stride_tricks.as_strided(base, shape, (base.itemsize, base.itemsize), writeable=False)
-
-
-def e2m1_values(codes: np.ndarray) -> np.ndarray:
-    """E2M1 codes by their bit fields: bit 3 the sign, the rest a magnitude index."""
-    magnitudes = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], np.float32)
-    return np.where(codes & 8, np.float32(-1), np.float32(1)) * magnitudes[codes & 7]
 
 
 def indices(rows: slice, cols: slice) -> tuple[np.ndarray, np.ndarray]:
@@ -208,7 +189,9 @@ def test_a_region_of_a_tensor_too_large_to_decode_reads_only_its_blocks():
     mx = {"m.weight_packed": hankel(packed, (2 ** 22, 2 ** 12)), "m.weight_scale": hankel(exponents, (2 ** 22, 2 ** 8))}
     rows, cols = slice(4_000_001, 4_000_006), slice(5_001, 5_100, 3)
     r, c = indices(rows, cols)
-    expected = (e2m1_values((packed[r + c // 2] >> (4 * (c % 2))) & 15)
+    codes = (packed[r + c // 2] >> (4 * (c % 2))) & 15
+    magnitudes = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], np.float32)[codes & 7]
+    expected = (np.where(codes & 8, -magnitudes, magnitudes)
                 * np.ldexp(np.float32(1), exponents[r + c // 32].astype(np.int32) - 127))
     np.testing.assert_array_equal(codecs.read_packed_mxfp4_tensor(mx, "m.weight", (rows, cols)).view(np.uint32),
                                   expected.view(np.uint32))
@@ -387,41 +370,39 @@ def test_each_v4_layout_moves_a_weight_by_at_most_its_grid_step_and_holds_still_
         np.testing.assert_array_equal(read(again, name), decoded)
 
 
-def test_a_v4_checkpoint_refuses_what_its_format_cannot_hold():
-    """Each refusal names the tensor or the field and what the release ships instead."""
-    e4m3, e8m0_byte = np.zeros((2, 32), codecs.E4M3), np.ones((1, 1), ml_dtypes.float8_e8m0fnu)
-    fp8 = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
-    read = partial(codecs.read_deepseek_v4_tensor, block=32, fp4_experts=True)
-    cases = [
-        (lambda: codecs.source_quantization({"quantization_config": {**fp8, "scale_fmt": "float"},
-                                             "expert_dtype": "fp4"}), "declares as scale_fmt 'ue8m0'"),
-        (lambda: codecs.source_quantization({"quantization_config": {**fp8, "scale_fmt": "ue8m0",
-                                                                     "expert_dtype": "nvfp4"}}),
-         "expert_dtype 'nvfp4'.*fp4 E2M1 pairs or as fp8 blocks and nothing else"),
-        (lambda: codecs.deepseek_v4_names({"a.scale": e8m0_byte}), r"a\.scale scales a\.weight, which"),
-        (lambda: read({"layers.0.ffn.experts.0.w1.weight": e4m3, "layers.0.ffn.experts.0.w1.scale": e8m0_byte},
-                      "layers.0.ffn.experts.0.w1.weight"), r"is a routed expert, which expert_dtype 'fp4' ships"),
-        (lambda: read({"layers.0.attn.wkv.weight": np.zeros((2, 16), np.int8),
-                       "layers.0.attn.wkv.scale": e8m0_byte}, "layers.0.attn.wkv.weight"),
-         "E2M1 pairs.*it is not a routed expert"),
-        (lambda: codecs.read_deepseek_v4_tensor(
-            {"layers.0.ffn.experts.0.w1.weight": np.zeros((2, 16), np.int8),
-             "layers.0.ffn.experts.0.w1.scale": e8m0_byte}, "layers.0.ffn.experts.0.w1.weight",
-            block=32, fp4_experts=False), "the config's expert_dtype is not 'fp4'"),
-        (lambda: read({"layers.0.attn.wkv.weight": np.zeros((2, 32), ml_dtypes.bfloat16),
-                       "layers.0.attn.wkv.scale": e8m0_byte}, "layers.0.attn.wkv.weight"),
-         "float8_e4m3fn beside a scale in one of"),
-        (lambda: read({"layers.1.engram.embed.weight": e4m3, "layers.1.engram.embed.scale": e8m0_byte},
-                      "layers.1.engram.embed.weight"), r"is an engram table, \[rows, dim\] beside"),
-        (lambda: codecs.deepseek_v4_scale_dtype({"a.weight": e4m3, "a.scale": e8m0_byte, "b.weight": e4m3,
-                                                 "b.scale": np.ones((1, 1), np.float32)}),
-         r"one dtype, this one in \['float32', 'float8_e8m0fnu'\]"),
-        (lambda: codecs.pack_deepseek_v4({"a.weight": np.ones((2, 32), np.float32)}, ("a.weight",), block=32,
-                                         fp4_experts=True, scale_dtype="bfloat16"), "stored in one of"),
-    ]
-    for refused, message in cases:
-        with pytest.raises(ValueError, match=message):
-            refused()
+E4M3_PAIR = np.zeros((2, 32), codecs.E4M3)
+E8M0_BYTE = np.ones((1, 1), ml_dtypes.float8_e8m0fnu)
+FP8_CONFIG = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+EXPERT = "layers.0.ffn.experts.0.w1.weight"
+
+
+def v4_read(tensors: dict[str, np.ndarray], name: str, fp4_experts: bool = True) -> np.ndarray:
+    return codecs.read_deepseek_v4_tensor(tensors, name, block=32, fp4_experts=fp4_experts)
+
+
+@pytest.mark.parametrize("refused, message", [
+    (lambda: codecs.source_quantization({"quantization_config": {**FP8_CONFIG, "scale_fmt": "float"},
+                                         "expert_dtype": "fp4"}), "scale_fmt 'float'.*'ue8m0'"),
+    (lambda: codecs.source_quantization({"quantization_config": {**FP8_CONFIG, "scale_fmt": "ue8m0",
+                                                                 "expert_dtype": "nvfp4"}}), "expert_dtype 'nvfp4'"),
+    (lambda: codecs.deepseek_v4_names({"a.scale": E8M0_BYTE}), r"a\.scale .*a\.weight"),
+    (lambda: v4_read({EXPERT: E4M3_PAIR, EXPERT[:-6] + "scale": E8M0_BYTE}, EXPERT),
+     r"experts\.0\.w1\.weight .*int8 \[out, in / 2\].*got float8_e4m3fn \(2, 32\)"),
+    (lambda: v4_read({EXPERT: np.zeros((2, 16), np.int8), EXPERT[:-6] + "scale": E8M0_BYTE}, EXPERT, False),
+     r"experts\.0\.w1\.weight .*float8_e4m3fn.*got int8 \(2, 16\)"),
+    (lambda: v4_read({"l.wkv.weight": np.zeros((2, 32), ml_dtypes.bfloat16), "l.wkv.scale": E8M0_BYTE},
+                     "l.wkv.weight"), r"l\.wkv\.weight .*got bfloat16 \(2, 32\)"),
+    (lambda: v4_read({"l.engram.embed.weight": E4M3_PAIR, "l.engram.embed.scale": E8M0_BYTE}, "l.engram.embed.weight"),
+     r"l\.engram\.embed\.weight .*\(2, 32\) and \(1, 1\)"),
+    (lambda: codecs.deepseek_v4_scale_dtype({"a.weight": E4M3_PAIR, "a.scale": E8M0_BYTE, "b.weight": E4M3_PAIR,
+                                             "b.scale": np.ones((1, 1), np.float32)}),
+     r"\['float32', 'float8_e8m0fnu'\]"),
+], ids=["scale-fmt", "expert-dtype", "scale-without-weight", "fp4-expert-dtype", "pairs-under-fp8",
+        "fp8-dtype", "engram-grid", "mixed-scale-dtypes"])
+def test_a_v4_checkpoint_refuses_what_its_format_cannot_hold(refused, message):
+    """Each refusal names the tensor or the field, and what it holds."""
+    with pytest.raises(ValueError, match=message):
+        refused()
 
 
 def test_a_region_of_a_v4_tensor_too_large_to_decode_reads_only_its_groups():

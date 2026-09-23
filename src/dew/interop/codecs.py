@@ -137,11 +137,13 @@ def decode_e2m1(packed: ArrayLike, exponents: ArrayLike) -> np.ndarray:
 def encode_e2m1(quotients: np.ndarray) -> np.ndarray:
     """Values already over their group's scale, [..., n], to packed codes [..., n / 2].
 
-    Each saturates at +-6 and rounds to the nearest E2M1 value, ties to
-    even; a negative that rounds to zero keeps its sign (code 8). The even
-    element goes in the low nibble.
+    Each rounds to the nearest E2M1 value, ties to even, and a negative that
+    rounds to zero keeps its sign (code 8). float4_e2m1fn has no infinity
+    and saturates beyond +-6 (measured, ml_dtypes 0.6), the clamp every
+    rule here applies before its cast. The even element goes in the low
+    nibble.
     """
-    codes = np.clip(quotients, -6, 6).astype(ml_dtypes.float4_e2m1fn).view(np.uint8)
+    codes = quotients.astype(ml_dtypes.float4_e2m1fn).view(np.uint8)
     return codes[..., 0::2] | (codes[..., 1::2] << 4)
 
 
@@ -700,11 +702,6 @@ V4_FP4_AMAX_FLOOR = 6 * 2.0 ** -126
 """The release's floor on an FP4 group's amax, which keeps its scale at
 least 2 ** -126 (E8M0 byte 1)."""
 
-V4Layout = Literal['blocks', 'rows', 'fp4']
-"""How a DeepSeek-V4 `.scale` covers its weight: one per block of an FP8
-Linear, one per `block` values of an engram table's row, or one per 32
-inputs of an FP4 routed expert."""
-
 _V4_EXPERT = re.compile(r'\.experts\.\d+\.w[123]\.weight$')
 """A routed expert's projection, `layers.N.ffn.experts.E.w1` or under `mtp.N`."""
 
@@ -712,35 +709,11 @@ _V4_ENGRAM = '.engram.embed.weight'
 """V4.1's n-gram hash table, `layers.N.engram.embed.weight`."""
 
 
-def deepseek_v4_format(quantization: Mapping[str, object],
-                       config: Mapping[str, object]) -> tuple[int, bool]:
-    """Return the block size and whether routed experts are FP4, from a
-    DeepSeek-V4 config.
-
-    `fp8_format`'s blocks, with ue8m0 scales, the only kind an E8M0 `.scale`
-    holds. `expert_dtype` sits in quantization_config (V4.1) or beside it
-    (V4): 'fp4' ships routed experts as E2M1 pairs (inference/model.py
-    `Linear` under float4_e2m1fn_x2), 'fp8' or null as FP8 blocks like every
-    other Linear (the Base releases).
-    """
-    block, ue8m0 = fp8_format(quantization)
-    if not ue8m0:
-        raise ValueError(
-            f"quantization_config declares expert_dtype, DeepSeek-V4's `.scale` storage, with "
-            f"scale_fmt {quantization.get('scale_fmt')!r}; those scales are powers of two, which "
-            f"the release declares as scale_fmt 'ue8m0'")
-    experts = quantization.get('expert_dtype', config.get('expert_dtype'))
-    if experts not in ('fp4', 'fp8', None):
-        raise ValueError(
-            f"expert_dtype {experts!r}: DeepSeek-V4 ships routed experts as fp4 E2M1 pairs "
-            f"or as fp8 blocks and nothing else")
-    return block, experts == 'fp4'
-
-
-def deepseek_v4_layout(name: str, fp4_experts: bool) -> V4Layout:
+def deepseek_v4_layout(name: str, fp4_experts: bool) -> Literal['blocks', 'rows', 'fp4']:
     """How the `.scale` beside `name` covers it, as inference/model.py builds
-    the module: an FP4 `Linear` for a routed expert under expert_dtype
-    'fp4', `ParallelEngramEmbedding` for an engram table, an FP8 `Linear`
+    the module: one per 32 inputs of an FP4 `Linear` for a routed expert
+    under expert_dtype 'fp4', one per `block` values of a row of
+    `ParallelEngramEmbedding`'s table, one per block of an FP8 `Linear`
     otherwise."""
     if fp4_experts and _V4_EXPERT.search(name):
         return 'fp4'
@@ -778,36 +751,6 @@ def deepseek_v4_scale_dtype(tensors: Mapping[str, np.ndarray]) -> str | None:
     return stored[0] if stored else None
 
 
-def _check_v4(name: str, layout: V4Layout, weight: np.ndarray, scale: np.ndarray, block: int) -> None:
-    """Refuse a DeepSeek-V4 pair whose dtypes or shapes are not its layout's."""
-    partner = name.removesuffix('.weight') + V4_SCALE_SUFFIX
-    packed = weight.dtype in _CODE_DTYPES
-    if layout == 'fp4':
-        if (not packed or weight.ndim != 2 or scale.dtype != ml_dtypes.float8_e8m0fnu
-                or 2 * weight.shape[1] % GROUP
-                or scale.shape != (weight.shape[0], 2 * weight.shape[1] // GROUP)):
-            raise ValueError(
-                f"{name} is a routed expert, which expert_dtype 'fp4' ships as int8 [out, in / 2] "
-                f"E2M1 pairs beside a float8_e8m0fnu [out, in / {GROUP}] {partner}, got "
-                f"{weight.dtype} {weight.shape} and {scale.dtype} {scale.shape}")
-        return
-    if packed:
-        reason = ("the config's expert_dtype is not 'fp4'" if _V4_EXPERT.search(name)
-                  else "it is not a routed expert")
-        raise ValueError(
-            f"{name} arrives as {weight.dtype} E2M1 pairs, which DeepSeek-V4 ships for routed "
-            f"experts under expert_dtype 'fp4' alone, and {reason}")
-    if weight.dtype != E4M3 or weight.ndim != 2 or scale.dtype.name not in V4_SCALE_DTYPES:
-        raise ValueError(
-            f"{name} and {partner} are a DeepSeek-V4 FP8 weight, float8_e4m3fn beside a scale in "
-            f"one of {list(V4_SCALE_DTYPES)}, got {weight.dtype} {weight.shape} and {scale.dtype}")
-    if layout == 'rows' and (weight.shape[1] % block
-                             or scale.shape != (weight.shape[0], weight.shape[1] // block)):
-        raise ValueError(
-            f"{name} is an engram table, [rows, dim] beside a [rows, dim / {block}] {partner}, "
-            f"got {weight.shape} and {scale.shape}")
-
-
 def read_deepseek_v4_tensor(tensors: Mapping[str, np.ndarray], name: str, index: Index | None = None,
                             *, block: int, fp4_experts: bool) -> np.ndarray:
     """One tensor, or the region `index` names, in its original values; a
@@ -827,12 +770,25 @@ def read_deepseek_v4_tensor(tensors: Mapping[str, np.ndarray], name: str, index:
     scale = tensors.get(module + V4_SCALE_SUFFIX) if module != name else None
     if scale is None:
         return value if index is None else value[index]
-    layout = deepseek_v4_layout(name, fp4_experts)
-    _check_v4(name, layout, value, scale, block)
+    partner, layout = module + V4_SCALE_SUFFIX, deepseek_v4_layout(name, fp4_experts)
     if layout == 'fp4':
+        if (value.dtype not in _CODE_DTYPES or value.ndim != 2 or scale.dtype != ml_dtypes.float8_e8m0fnu
+                or scale.shape != (value.shape[0], 2 * value.shape[1] // GROUP) or 2 * value.shape[1] % GROUP):
+            raise ValueError(
+                f"{name} is a routed expert, which expert_dtype 'fp4' ships as int8 [out, in / 2] E2M1 "
+                f"pairs beside a float8_e8m0fnu [out, in / {GROUP}] {partner}, got {value.dtype} "
+                f"{value.shape} and {scale.dtype} {scale.shape}")
         return _read_e2m1(value, scale, index)
+    if value.dtype != E4M3 or value.ndim != 2 or scale.dtype.name not in V4_SCALE_DTYPES:
+        raise ValueError(
+            f"{name} and {partner} are an FP8 weight, float8_e4m3fn beside a scale in one of "
+            f"{list(V4_SCALE_DTYPES)}, got {value.dtype} {value.shape} and {scale.dtype}; DeepSeek-V4 "
+            f"ships E2M1 pairs for routed experts alone, under expert_dtype 'fp4'")
     if layout == 'blocks':
         return _read_blocks(value, scale, block, index)
+    if value.shape[1] % block or scale.shape != (value.shape[0], value.shape[1] // block):
+        raise ValueError(f"{name} is an engram table, [rows, dim] beside a [rows, dim / {block}] "
+                         f"{partner}, got {value.shape} and {scale.shape}")
     covered, span, within = _hull(index, value.shape, (1, block))
     rows = value[span].astype(np.float32).reshape(*scale[covered].shape, block)
     rows *= scale[covered].astype(np.float32)[..., None]
@@ -902,9 +858,6 @@ def pack_deepseek_v4(tensors: Mapping[str, np.ndarray], names: Iterable[str], *,
     among the tensors.
     """
     stored = np.dtype(scale_dtype or V4_SCALE_DTYPES[0])
-    if stored.name not in V4_SCALE_DTYPES:
-        raise ValueError(f"a DeepSeek-V4 FP8 `.scale` is stored in one of {list(V4_SCALE_DTYPES)}, "
-                         f"not {stored.name}")
     out = dict(tensors)
     for name in names:
         if name not in out:
@@ -998,7 +951,20 @@ def source_quantization(config: Mapping[str, object], *, param_dtype: str = "flo
         raise ValueError(f"quantization_config must be an object, got {quantization!r}")
     method = quantization.get("quant_method")
     if method == "fp8" and ("expert_dtype" in quantization or "expert_dtype" in config):
-        block, fp4_experts = deepseek_v4_format(quantization, config)
+        # `fp8_format`'s blocks under ue8m0 scales, the only kind an E8M0
+        # `.scale` holds. expert_dtype 'fp4' ships routed experts as E2M1
+        # pairs (inference/model.py `Linear` under float4_e2m1fn_x2), 'fp8' or
+        # null as FP8 blocks like every other Linear (the Base releases).
+        block, ue8m0 = fp8_format(quantization)
+        experts = quantization.get("expert_dtype", config.get("expert_dtype"))
+        if not ue8m0:
+            raise ValueError(
+                f"quantization_config declares expert_dtype, DeepSeek-V4's `.scale` storage, with scale_fmt "
+                f"{quantization.get('scale_fmt')!r}; those scales are powers of two, scale_fmt 'ue8m0'")
+        if experts not in ("fp4", "fp8", None):
+            raise ValueError(f"expert_dtype {experts!r}: DeepSeek-V4 ships routed experts as fp4 E2M1 "
+                             f"pairs or as fp8 blocks and nothing else")
+        fp4_experts = experts == "fp4"
         return SourceQuantization(
             deepseek_v4_names,
             partial(unpack_deepseek_v4, block=block, fp4_experts=fp4_experts, param_dtype=param_dtype),
