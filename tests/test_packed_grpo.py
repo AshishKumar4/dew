@@ -169,3 +169,25 @@ def test_one_behavior_importance_option_takes_a_cap_or_a_band():
         GRPOObjective(_model(), WIDTH - 1, behavior_importance=0.0)
     with pytest.raises(ValueError, match="0 < low <= high"):
         GRPOObjective(_model(), WIDTH - 1, behavior_importance=(5.0, 0.5))
+
+
+def test_the_loss_never_holds_the_logits_of_the_whole_batch():
+    """GRPO scores through the chunked head: a large vocabulary adds tiles to
+    the loss and gradient's temporaries, never a [rows, width, vocab] tensor."""
+    vocab, rows, width = 65536, 8, 64
+    model = CausalTransformer(vocab_size=vocab, emb_features=16, num_layers=1, num_heads=2,
+                              mlp_features=32, max_seq_len=width, dtype="float32", attention_impl="xla")
+    objective = GRPOObjective(model, width - 1)
+    params = jax.eval_shape(objective.init, jax.random.key(0))
+    batch = {name: jax.ShapeDtypeStruct((rows, width), dtype) for name, dtype in (
+        (IDS_KEY, jnp.int32), (SEGMENT_IDS_KEY, jnp.int32), (POSITIONS_KEY, jnp.int32),
+        (RESPONSE_MASK_KEY, jnp.float32), (BEHAVIOR_LOG_PROBS_KEY, jnp.float32),
+        (OLD_LOG_PROBS_KEY, jnp.float32), (ADVANTAGES_KEY, jnp.float32))}
+    step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
+
+    def loss(params, batch):
+        return mean_loss(objective.loss(params, batch, step)[0])[0]
+
+    compiled = jax.jit(jax.value_and_grad(loss)).lower(params, batch).compile()
+    logits = rows * width * vocab * 4
+    assert compiled.memory_analysis().temp_size_in_bytes < logits / 2
