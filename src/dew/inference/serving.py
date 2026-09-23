@@ -69,6 +69,7 @@ from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.typing import ArrayLike
 
+from dew.inference.pages import Pages
 from dew.inference.tasks import (
     Processor,
     Request,
@@ -79,7 +80,6 @@ from dew.inference.tasks import (
     _prepared,
     _sized,
 )
-from dew.inference.pages import Pages
 from dew.nn.inputs import ModelInputs, mesh_of, request_key
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, VALIDITY, KVCache, filled_slots, is_paged, leaf_name
 from dew.objectives.base import Variables
@@ -96,6 +96,7 @@ from dew.sampling.text import (
     prediction_depths,
     resolve,
 )
+
 
 @runtime_checkable
 class Layered(Protocol):

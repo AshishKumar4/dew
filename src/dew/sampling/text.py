@@ -262,11 +262,7 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     where each row's prompt resumes; None allocates an empty one.
     """
     batch, width = inputs.tokens.shape
-    if cache is None:
-        cache = model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]
-        if ops.depths:
-            drafting = model.apply(params, batch, method="init_mtp_cache", mutable=["cache"])[1]["cache"]
-            cache = unflatten_dict({**flatten_dict(dict(cache)), **flatten_dict(dict(drafting))})
+    held = _empty_cache(model, params, batch, ops.depths) if cache is None else cache
     exposed = isinstance(model, Exposing)
     selective = isinstance(model, Selective)
     # An unpadded prompt carries no validity field, and its last real token is
@@ -277,7 +273,7 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     rows, slot = jnp.arange(batch), jnp.maximum(last, 0)
     scored = (inputs.tokens, slot) if selective else (inputs.tokens,)
     answer, updated = model.apply(
-        {**params, "cache": cache}, *scored, decode=True,
+        {**params, "cache": held}, *scored, decode=True,
         mutable=["cache", "embeddings"], rngs=None,
         method=("states_and_logits_at" if selective else
                 "states_and_logits" if exposed else None), capture_intermediates=False,
@@ -305,6 +301,15 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     if ops.depths and width > 1 and states is not None and prepared:
         state = _seeded_depths(ops, state, states, prepared[0], real, logical, batch, width)
     return state, last >= 0
+
+
+def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int) -> Variables:
+    """A zeroed decode cache for `batch` rows, with the prediction depths' own beside it."""
+    cache = model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]
+    if depths:
+        drafting = model.apply(params, batch, method="init_mtp_cache", mutable=["cache"])[1]["cache"]
+        cache = unflatten_dict({**flatten_dict(dict(cache)), **flatten_dict(dict(drafting))})
+    return cache
 
 
 def _seeded_depths(ops: DecodeOps, state: DecoderState, states: jax.Array,

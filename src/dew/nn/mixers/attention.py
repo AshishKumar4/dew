@@ -33,7 +33,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.kv_cache import KVCache, rotated, write_cache
+from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, mla_rope_freqs
 from dew.nn.sharding import logical_axes
@@ -419,12 +419,7 @@ class CausalSelfAttention(nn.Module):
         elif append is not None:
             key, value = append(key, value)
             query = append.query(query)
-            valid = self.get_variable("cache", "cache_valid")
-            cursor = causal_attention_mask(positions, key.shape[-3], key_valid=valid)
-            # The paged kernel attends each row's filled slots, which is `cursor`
-            # and nothing narrower: a layer that narrows it builds its own mask.
-            mask = (cursor if self.sliding_window is None else
-                    causal_attention_mask(positions, key.shape[-3], self.sliding_window, key_valid=valid))
+            cursor, mask = self._decode_masks(positions, key.shape[-3])
             causal = False
             if kv_store is not None and self.kv_store_key is not None:
                 kv_store[self.kv_store_key] = (key, value, positions)
@@ -445,8 +440,8 @@ class CausalSelfAttention(nn.Module):
             # image groups add to it there.
             if not decode or self.bidirectional_images:
                 mask = self._metadata_mask(attention_metadata, positions, B, S, key.shape[-3], decode)
-            if segment_ids is not None and not decode:
-                mask = mask & document_mask(segment_ids)[:, None]
+                if segment_ids is not None and not decode:
+                    mask = mask & document_mask(segment_ids)[:, None]
             causal, window = False, None
             implementation = masked
         if attention_metadata is not None and attention_metadata.pairwise_mask is not None:
@@ -483,14 +478,10 @@ class CausalSelfAttention(nn.Module):
         if sowing:
             self.sow("qk", "max_logits", max_attention_logits(
                 query, key, causal=causal, sliding_window=window, mask=mask))
+        # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
         if (append is not None and mask is cursor and S == 1 and sinks is None and not sowing
                 and self.attention_impl in ('auto', 'tpu') and append.store.kernel()):
-            # The Pallas paged kernel reads the pool through the page table; the
-            # gathered keys above go unread and XLA drops the gather. A chunk,
-            # window or metadata mask replaces `cursor`, and keeps the gather.
-            attention = checkpoint_name(append.store.decode(
-                query[:, 0], self.get_variable("cache", "cache_index"), self.attn_logit_softcap)[:, None],
-                'context')
+            attention = self._paged(append, query)
         else:
             attention = checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.dtype, precision=self.precision,
@@ -499,6 +490,26 @@ class CausalSelfAttention(nn.Module):
                 sliding_window=window, mask=mask, sinks=sinks,
                 softcap=self.attn_logit_softcap), 'context')
         return self._output(attention, gate, B, S)
+
+    def _decode_masks(self, positions, key_length: int) -> tuple[jax.Array, jax.Array]:
+        """The cursor mask over the cache's filled slots, and the layer's decode mask.
+
+        They are the same array exactly when the layer narrows nothing, which
+        is when the paged kernel, attending every filled slot, may stand in
+        for the mask; a window builds a mask of its own.
+        """
+        valid = self.get_variable("cache", "cache_valid")
+        cursor = causal_attention_mask(positions, key_length, key_valid=valid)
+        if self.sliding_window is None:
+            return cursor, cursor
+        return cursor, causal_attention_mask(positions, key_length, self.sliding_window, key_valid=valid)
+
+    def _paged(self, append: Append, query: jax.Array) -> jax.Array:
+        """One decode step through the Pallas paged kernel, which reads the pool
+        through the page table; the gathered keys go unread and XLA drops the gather."""
+        return checkpoint_name(append.store.decode(
+            query[:, 0], self.get_variable("cache", "cache_index"), self.attn_logit_softcap)[:, None],
+            'context')
 
     def _runs_local(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
         """Whether this call runs `local_attention`, which never builds the
