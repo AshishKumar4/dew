@@ -3,9 +3,13 @@
 PSNR and SSIM are checked against their closed forms and against the
 properties they exist to report (degradation ordering, shape handling).
 The Frechet distance itself is checked against closed forms that need no
-weights; the end-to-end InceptionV3 path downloads the FID checkpoint and is
-network-marked, apart from the offline case, which reads the drawn
-sixteenth-width extractor committed under tests/fixtures/inception. The CLIP metrics build on the tiny checkpoint under
+weights and against pytorch-fid's on its own statistics. The end-to-end
+InceptionV3 path downloads the FID checkpoint and is network-marked: it is
+held to pytorch-fid's features and distance on the published weights
+(tests/fixtures/inception/pytorch_fid_reference.npz, written by
+tools/pytorch_fid_reference.py). The offline case reads the drawn
+sixteenth-width extractor committed under tests/fixtures/inception. The CLIP
+metrics build on the tiny checkpoint under
 tests/fixtures/clip and score against the cosines of the reference's own
 embeddings.
 """
@@ -61,6 +65,57 @@ def test_frechet_distance_of_a_scaled_covariance_matches_the_closed_form():
         8 * (1 - np.sqrt(1.5)) ** 2, abs=1e-6)
     assert frechet_distance(mu, identity, mu, identity * 4.0) == pytest.approx(
         8 * (1 - 2.0) ** 2, abs=1e-6)
+
+
+PYTORCH_FID = Path(__file__).resolve().parent / "fixtures" / "inception" / "pytorch_fid_reference.npz"
+
+
+def pytorch_fid_reference():
+    """pytorch-fid 0.3.0's features and FID on its published weights, written by
+    tools/pytorch_fid_reference.py: set "a" at 64x64 (upsampled to 299) and
+    set "b" scored at 400x400 (downsampled), with the arrays both sides read."""
+    reference = np.load(PYTORCH_FID)
+    upscale = int(reference["upscale_b"])
+    scored_b = np.repeat(np.repeat(reference["images_b"], upscale, axis=1), upscale, axis=2)
+    return reference, reference["images_a"], scored_b
+
+
+def test_frechet_distance_equals_pytorch_fids_on_the_same_statistics():
+    """The distance alone, on the statistics of pytorch-fid's own features:
+    both take scipy's `sqrtm` of the covariance product and nudge the
+    diagonal when it is singular, so the two numbers are one (observed equal
+    to the bit; the bound leaves room for a different scipy)."""
+    reference, _, _ = pytorch_fid_reference()
+    stats = [(features.astype(np.float64).mean(axis=0),
+              np.cov(features.astype(np.float64), rowvar=False))
+             for features in (reference["features_a"], reference["features_b"])]
+    assert frechet_distance(*stats[0], *stats[1]) == pytest.approx(float(reference["fid"]), rel=1e-9)
+
+
+@pytest.mark.network
+def test_the_extractor_gives_pytorch_fids_features_and_distance_on_the_published_weights():
+    """The converted jax-fid checkpoint against pytorch-fid on the weights both
+    come from, through each side's own input path (uint8 to [-1, 1], bilinear
+    to 299x299 with no antialiasing).
+
+    Features: fp32 convolutions summed in a different order by torch and XLA
+    differ at the last bits; observed 5.7e-06 at most on features up to 3.7,
+    so 1e-4 absolute is the float32 bound, and a wrong pool, norm or resize
+    moves features by 1e-2 and more (an antialiased downsample moved set "b"
+    by up to 0.55 and FID from 195.789 to 182.878). Distance: observed
+    195.788897 against pytorch-fid's 195.788855, 2.2e-07 relative; eight
+    images a set leave rank-7 covariances, whose square root amplifies the
+    feature bits, so the bound is 1e-5 relative."""
+    from dew.eval.fid import _get_activations
+    from dew.inputs import unit_range
+
+    reference, images_a, images_b = pytorch_fid_reference()
+    extract = _get_activations(None)
+    np.testing.assert_allclose(np.asarray(extract(unit_range(images_a))), reference["features_a"],
+                               rtol=0, atol=1e-4)
+    np.testing.assert_allclose(np.asarray(extract(unit_range(images_b))), reference["features_b"],
+                               rtol=0, atol=1e-4)
+    assert fid(images_a, images_b) == pytest.approx(float(reference["fid"]), rel=1e-5)
 
 
 @pytest.mark.network

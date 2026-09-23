@@ -28,7 +28,7 @@ _log = logging.getLogger(__name__)
 
 # Two FID values are comparable only when the features behind them and the
 # population counts agree, so every distance is logged with this line.
-FEATURES = "FID InceptionV3 pool3, bilinear 299x299, [-1, 1]"
+FEATURES = "FID InceptionV3 pool3, bilinear 299x299 without antialiasing, [-1, 1]"
 
 
 def _features(weights: str | None) -> str:
@@ -164,8 +164,13 @@ def _get_activations(weights: str | None = None):
 
     @jax.jit
     def activations(images):
-        # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048]
-        resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear')
+        # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048].
+        # pytorch-fid resizes with F.interpolate(bilinear, align_corners=False),
+        # half-pixel centres and no antialiasing; jax.image.resize antialiases
+        # a downsample unless told not to, which moved pool3 features by up to
+        # 0.55 against pytorch-fid on images larger than 299.
+        resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear',
+                                   antialias=False)
         features = model.apply(variables, resized)
         assert isinstance(features, jax.Array)
         return features.reshape(features.shape[0], -1)
