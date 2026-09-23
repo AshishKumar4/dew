@@ -530,23 +530,25 @@ def _clip_path(hf_name: str) -> tuple[str, ...] | None:
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
+def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32") -> np.dtype:
+    """The dtype one stored array is kept in: `param_dtype` for a floating
+    payload, its own for an integer or boolean one."""
+    dtype = resolve_dtype(param_dtype)
+    if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
+        raise ValueError(
+            f"param_dtype {param_dtype!r} must name floating parameter storage"
+        )
+    return np.dtype(dtype) if jnp.issubdtype(stored, jnp.floating) else stored
+
+
 def checkpoint_array(tensor, param_dtype: str = "float32") -> np.ndarray:
     """One stored floating array in the requested precision, without an FP32
     array intermediate. Integer and boolean payloads retain their native dtype.
     Callers choose FP32 for frozen state rather than applying parameter
     precision to an entire variables tree.
     """
-    dtype = resolve_dtype(param_dtype)
-    if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
-        raise ValueError(
-            f"param_dtype {param_dtype!r} must name floating parameter storage"
-        )
     leaf = np.asarray(tensor)
-    return (
-        leaf.astype(dtype, copy=False)
-        if jnp.issubdtype(leaf.dtype, jnp.floating)
-        else leaf
-    )
+    return leaf.astype(checkpoint_dtype(leaf.dtype, param_dtype), copy=False)
 
 
 def checkpoint_leaf(

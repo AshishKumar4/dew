@@ -148,10 +148,8 @@ from deepseek_v4_reference import (  # noqa: E402
     write_deepseek_v4_mtp_reference,
 )
 from gpt_oss_reference import tiny_gpt_oss  # noqa: E402
-from hf_reference import (  # noqa: E402
-    BATCH, DEEPSEEK_YARN, FIXTURES, LENGTH, reference_logits, scatter_weights,
-    write_released_config, write_tiny,
-)
+from hf_reference import DEEPSEEK_YARN, FIXTURES, write_released_config, write_tiny  # noqa: E402
+from dew.interop.verify import BATCH, LENGTH, reference_logits, scatter_weights
 from moe_reference import expert_tensors  # noqa: E402
 from qwen_mtp_reference import QwenMTP  # noqa: E402
 

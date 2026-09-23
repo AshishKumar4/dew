@@ -22,6 +22,7 @@ raises a ValueError naming it.
 
 import dataclasses
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass, field
 from functools import partial
@@ -42,8 +43,9 @@ import numpy as np
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop import mamba2
+from dew.interop import mamba2, pickles
 from dew.interop.safetensors_io import read_file, read_weights, weight_files
+from dew.interop.streaming import LazyTree, SourceLeaf, materialize
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture, RematPolicy
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
@@ -56,7 +58,7 @@ from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 from dew.nn.moe import GatedActivation, Situ
-from dew.nn.text_encoders import ParamTree, checkpoint_array
+from dew.nn.text_encoders import checkpoint_dtype
 from dew.objectives.base import Variables
 from dew.registry import from_record
 
@@ -112,7 +114,7 @@ _IGNORED_FIELDS = {
     'max_window_layers', 'mlp_bias', 'output_attentions',
     'output_hidden_states', 'pad_token_id', 'pretraining_tp',
     'problem_type', 'return_dict', 'use_cache', 'use_sliding_window',
-    'torch_dtype', 'transformers_version',
+    'torch_dtype', 'transformers_version', 'unk_token_id',
 }
 
 # Read by the codec rather than by any family: `codecs.source_quantization`
@@ -571,7 +573,8 @@ def _at_base(scaling: Ramp | None, theta: float) -> Ramp | None:
 
 
 def _rope(hf_config: Mapping[str, object], used: set,
-          yarn_max_pos: int | None = None) -> _Ropes:
+          yarn_max_pos: int | None = None, *, local: bool = True,
+          local_default: float | None = None) -> _Ropes:
     """Read the rope of any of the three HF spellings.
 
     Flat rope_theta with rope_scaling beside it, gemma3 text configs with
@@ -580,9 +583,17 @@ def _rope(hf_config: Mapping[str, object], used: set,
     rope and its sliding_attention entry the sliding kind's, base and ramp
     alike (OLMo 3 puts its rope_scaling on full_attention alone,
     configuration_olmo3.py:110-113). `yarn_max_pos` opts the caller's
-    family into the YaRN ramp, as `_rope_entry` describes.
+    family into the YaRN ramp, as `_rope_entry` describes. `local` says
+    whether the family's reference reads `rope_local_base_freq` (Gemma 3's
+    legacy spelling); where it does not, the field is left unread.
+    `local_default` is the sliding layers' base the family's config class
+    keeps when a flat spelling states only `rope_theta`: Gemma3TextConfig
+    rotates them at 10000 and Olmo3Config at 500000 whatever rope_theta says,
+    since the flat field moves onto the full-attention entry alone.
     """
-    used.update(('rope_theta', 'rope_local_base_freq', 'rope_parameters', 'rope_scaling'))
+    used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
+    if local:
+        used.add('rope_local_base_freq')
     rope_parameters = hf_config.get('rope_parameters')
 
     if isinstance(rope_parameters, Mapping) and 'rope_theta' not in rope_parameters:
@@ -591,10 +602,10 @@ def _rope(hf_config: Mapping[str, object], used: set,
         sliding = _rope_entry(rope_parameters.get('sliding_attention'),
                               'rope_parameters.sliding_attention', yarn_max_pos)
         theta = full.theta or 10000.0
-        local = sliding.theta or theta
+        sliding_theta = sliding.theta or theta
         full_ramp = _at_base(full.scaling, theta)
-        sliding_ramp = _at_base(sliding.scaling, local)
-        return _Ropes(theta, full_ramp, None if local == theta else local,
+        sliding_ramp = _at_base(sliding.scaling, sliding_theta)
+        return _Ropes(theta, full_ramp, None if sliding_theta == theta else sliding_theta,
                       None if sliding_ramp == full_ramp else sliding_ramp,
                       full_only=full.scaling is not None and sliding.scaling is None)
 
@@ -610,9 +621,10 @@ def _rope(hf_config: Mapping[str, object], used: set,
             scaling = rope.scaling or scaling
     if theta is None:
         theta = records.number(hf_config.get('rope_theta', 10000.0), 'rope_theta')
-    local = hf_config.get('rope_local_base_freq')
-    return _Ropes(theta, _at_base(scaling, theta),
-                  None if local is None else records.number(local, 'rope_local_base_freq'))
+    stated = hf_config.get('rope_local_base_freq') if local else None
+    if stated is None:
+        return _Ropes(theta, _at_base(scaling, theta), None if local_default == theta else local_default)
+    return _Ropes(theta, _at_base(scaling, theta), records.number(stated, 'rope_local_base_freq'))
 
 
 def _specified_layer_types(hf_config: Mapping[str, object], used: set[str],
@@ -720,17 +732,39 @@ def _mlp_features(hf_config: Mapping[str, object]) -> int | tuple[int, ...]:
     return records.integer(stated, 'intermediate_size')
 
 
+_OPTIONAL_FIELDS = frozenset({'layer_types', 'sliding_window', 'rope_local_base_freq', 'attention_bias'})
+"""Fields `_base_config` reads for a family whose reference reads them."""
+
+
+def _neutral(field: str, value: object) -> bool:
+    """Whether `value` for `field` computes what leaving the field out computes."""
+    if field == 'layer_types' and isinstance(value, (list, tuple)):
+        return all(layer == 'full_attention' for layer in value)
+    return value is None or value is False
+
+
 def _base_config(hf_config: Mapping[str, object], used: set[str], *,
                  layer_types: tuple[str, ...] | None = None,
                  rope: _Ropes | None = None,
                  qk_norm: bool = False, scale_after_cast: bool = True,
-                 tie_embeddings: bool = False) -> DecoderFields:
+                 tie_embeddings: bool = False,
+                 reads: frozenset[str] = _OPTIONAL_FIELDS) -> DecoderFields:
     """Read the projection geometry and decoder fields every family shares.
 
     A ramp both kinds share is the model's; a ramp the full layers alone
     carry (OLMo 3's spelling) lands on the full kind, because a kind's None
     rides the model's value and cannot turn a ramp off.
+
+    `reads` names the `_OPTIONAL_FIELDS` the family's reference reads.
+    LlamaConfig, for one, declares neither layer_types nor sliding_window,
+    and LlamaAttention attends every key, so a Llama config that states a
+    window is refused rather than read as one transformers never applies.
+    An unread field at the value it would compute anyway (a null window,
+    attention_bias false, every layer full) is accepted.
     """
+    for unread in _OPTIONAL_FIELDS - reads:
+        if unread in hf_config and _neutral(unread, hf_config[unread]):
+            used.add(unread)
     hidden = records.integer(hf_config['hidden_size'], 'hidden_size')
     heads = records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
     kv_heads = hf_config.get('num_key_value_heads')
@@ -745,11 +779,15 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
         _refuse(f"hidden_act {activation!r}",
                 f"the gated MLP supports {sorted(_ACTIVATIONS)}")
 
-    ropes = _rope(hf_config, used) if rope is None else rope
+    ropes = _rope(hf_config, used, local='rope_local_base_freq' in reads) if rope is None else rope
     rope_theta, rope_local_theta = ropes.theta, ropes.local_theta
-    layer_types = _specified_layer_types(hf_config, used, layer_types)
-    stated_window = hf_config.get('sliding_window')
-    used.add('sliding_window')
+    if 'layer_types' in reads:
+        layer_types = _specified_layer_types(hf_config, used, layer_types)
+    elif layer_types is None:
+        layer_types = ('full_attention',) * records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    stated_window = hf_config.get('sliding_window') if 'sliding_window' in reads else None
+    if 'sliding_window' in reads:
+        used.add('sliding_window')
     if 'sliding_attention' in layer_types and stated_window is None:
         _refuse("layer_types with sliding attention",
                 "sliding_window is not set, so the window has no size")
@@ -780,7 +818,7 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
         # modeling_gemma4.py:197-215, modeling_qwen3_5.py:732-737).
         'scale_after_cast': scale_after_cast,
         'qk_norm': qk_norm,
-        'attention_bias': bool(hf_config.get('attention_bias', False)),
+        'attention_bias': 'attention_bias' in reads and bool(hf_config.get('attention_bias', False)),
         # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
         # others do not, so a config that omits the field (gemma-3-1b-pt
         # does) takes its family's default.
@@ -788,7 +826,9 @@ def _base_config(hf_config: Mapping[str, object], used: set[str], *,
             'tie_word_embeddings', tie_embeddings)),
     }
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
-                 'rms_norm_eps', 'attention_bias', 'tie_word_embeddings'))
+                 'rms_norm_eps', 'tie_word_embeddings'))
+    if 'attention_bias' in reads:
+        used.add('attention_bias')
 
     # A ramp lands under the field whose record it is: `rope_scaling` reads
     # the llama3 ramp over the plain frequencies, `yarn` replaces them.
@@ -844,8 +884,17 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     if model_type not in _FAMILIES:
         _refuse(f"model_type {model_type!r}",
                 f"expected one of {', '.join(repr(name) for name in _FAMILIES)}")
-    family = _FAMILIES[records.text(model_type, 'model_type')]
+    config, unknown = _translated(hf_config, _FAMILIES[records.text(model_type, 'model_type')])
+    if unknown:
+        _refuse(f"config fields {sorted(unknown)}",
+                "CausalTransformer has no counterpart, so translating them "
+                "would silently change the model")
+    return config
 
+
+def _translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> tuple[DecoderFields, set[str]]:
+    """Translate a config as `family` reads it, returning the fields nothing read."""
+    model_type = hf_config.get('model_type')
     # Gemma 4 spells the flag 'vision' for its image tokens alone, and the
     # text decoder is causal (configuration_gemma4.py, only 'all' clears
     # is_causal). True and 'all' change what the decoder computes. The masked
@@ -865,11 +914,7 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
 
     unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(model_type, hf_config)
                - {key for key in hf_config if str(key).startswith('_')})
-    if unknown:
-        _refuse(f"config fields {sorted(unknown)}",
-                "CausalTransformer has no counterpart, so translating them "
-                "would silently change the model")
-    return config
+    return config, unknown
 
 
 def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
@@ -1316,6 +1361,7 @@ def translate_wrapper_weights(
     record: WrapperFields,
     *,
     param_dtype: str = "float32",
+    lazy: bool = False,
 ) -> Variables:
     """Map wrapper weights into language, tower, projector and audio trees.
 
@@ -1328,6 +1374,8 @@ def translate_wrapper_weights(
     tower routes `audio_tower` and `embed_audio` too, and a Qwen 3.5 record
     routes the `mtp.` prediction layers a wrapper keeps outside its language
     model. A prefix outside those raises ValueError with the tensor name.
+    `lazy` leaves the language model's leaves unread (`translate_weights`);
+    the towers and projectors are small and read whole.
     """
     tower_kind = _kind_name(record, "tower")
     projector_kind = _kind_name(record, "projector")
@@ -1342,7 +1390,7 @@ def translate_wrapper_weights(
     audio_projector_tensors = tables["audio_projector"]
     variables = {
         "language_model": translate_weights(
-            text_tensors, record["text"], param_dtype=param_dtype
+            text_tensors, record["text"], param_dtype=param_dtype, lazy=lazy
         ),
         "tower": _wrapper_tower_variables(tower_kind, tower_tensors, param_dtype),
         "projector": {
@@ -1566,7 +1614,7 @@ def _v4_attention_leaf(tail: list[str]) -> tuple[str, ...] | None:
     return None
 
 
-def _stack_experts(params: ParamTree) -> None:
+def _stack_experts(params: LazyTree) -> None:
     """Stack per-expert `experts/K/projection` dicts into `[E, ...]` leaves.
 
     A checkpoint names one tensor per expert while the tree keeps one leaf
@@ -1595,16 +1643,20 @@ def _stack_experts(params: ParamTree) -> None:
                 != list(range(len(indices)))):
             raise ValueError(
                 f"{layer} experts {indices} are not a dense 0..E-1 run")
-        stacked = {}
-        for projection in experts[indices[0]]:
-            leaves = [np.ascontiguousarray(experts[index][projection]['kernel'])
-                      for index in indices]
-            shapes = {leaf.shape for leaf in leaves}
-            if len(shapes) != 1:
-                raise ValueError(
-                    f"{layer} experts disagree on {projection}: "
-                    f"{sorted(shapes)}")
-            stacked[projection] = {'kernel': np.stack(leaves)}
+        stacked: LazyTree = {}
+        first = experts[indices[0]]
+        if not isinstance(first, dict):
+            raise ValueError(f"{layer} expert {indices[0]} is a tensor, not projections")
+        for projection in first:
+            leaves = []
+            for index in indices:
+                expert = experts[index]
+                node = expert.get(projection) if isinstance(expert, dict) else None
+                leaf = node.get('kernel') if isinstance(node, dict) else None
+                if not isinstance(leaf, SourceLeaf):
+                    raise ValueError(f"{layer} expert {index} has no {projection} kernel")
+                leaves.append(leaf)
+            stacked[projection] = {'kernel': SourceLeaf.stack(leaves, f"{layer} experts' {projection}")}
         mlp['experts'] = stacked
 
 
@@ -1614,6 +1666,7 @@ def translate_weights(
     model_type: str | None = None,
     *,
     param_dtype: str = "float32",
+    lazy: bool = False,
 ) -> Variables:
     """Map HF tensors into a CausalTransformer tree. Parameters default to FP32.
 
@@ -1634,6 +1687,10 @@ def translate_weights(
     dtype. Router and frozen state remain FP32; integer indices retain their
     native dtype. Conversion happens per leaf before its layout copy.
 
+    With `lazy` every leaf is a `SourceLeaf` over the stored tensors, read
+    only when it is placed (`dew.interop.streaming`); otherwise each is read
+    whole here.
+
     `model_type` names the source's own family where the caller read it off
     a config.json. Without it the family comes from the record, which is
     what the backbone would be built from and so cannot tell two families
@@ -1648,17 +1705,17 @@ def translate_weights(
 
     # params is always a collection, mapped tensors or not. A checkpoint
     # whose every tensor maps to nothing is an empty tree.
-    params: ParamTree = {}
-    variables: ParamTree = {'params': params}
+    params: LazyTree = {}
+    variables: LazyTree = {'params': params}
     for name, tensor in family.prepare_weights(hf_tensors).items():
         path = family.weight_path(name, config)
         if path is None:
             continue
-        leaf = checkpoint_array(tensor, param_dtype if path[0] == "params" else "float32")
+        stored = np.asarray(tensor)
+        dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32")
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
-        if path[-1] == 'kernel' and leaf.ndim == 2:
-            leaf = np.ascontiguousarray(leaf.T)
+        leaf = SourceLeaf((stored,), dtype, transposed=path[-1] == 'kernel' and stored.ndim == 2)
         node = variables
         for key in path[:-1]:
             child = node.setdefault(key, {})
@@ -1667,7 +1724,7 @@ def translate_weights(
             node = child
         node[path[-1]] = leaf
     _stack_experts(params)
-    return variables
+    return variables if lazy else materialize(variables)
 
 
 def translate_denoiser_weights(
@@ -1710,35 +1767,39 @@ def _read_shard(path: Path) -> dict[str, np.ndarray]:
 
 def _load_shards(directory: Path) -> dict[str, np.ndarray]:
     """Read a checkpoint directory's weights, mapped in their stored dtype:
-    the shards its index names, or its one model.safetensors."""
+    the shards its index names, or its one model.safetensors. A directory
+    with transformers' PyTorch pickles instead reads their safetensors
+    conversion (`pickles.converted`)."""
     files = {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
-    if not weight_files(files, "", lambda name: json.loads((directory / name).read_text())):
+
+    def read(name: str) -> records.JSON:
+        return json.loads((directory / name).read_text())
+
+    if weight_files(files, "", read):
+        return read_weights(directory)
+    pickled = weight_files(files, "", read, stems=pickles.STEMS, suffix=pickles.SUFFIX)
+    if not pickled:
         raise FileNotFoundError(_missing_weights(str(directory), files))
-    return read_weights(directory)
+    return read_weights(pickles.converted(directory, pickled))
 
 
 _PICKLES = (".bin", ".pt", ".pth")
 
+_log = logging.getLogger(__name__)
 
-def _missing_weights(source: str, files: Collection[str], conversion: str | None = None) -> str:
-    """Say what a source without safetensors weights ships instead, and what loads.
 
-    `conversion` is the revision of SFconvertbot's safetensors pull request
-    for the commit, which is what a PyTorch-pickle repo loads from.
-    """
+def _missing_weights(source: str, files: Collection[str]) -> str:
+    """Say what a source without safetensors weights or transformers'
+    PyTorch pickles ships instead, and what loads."""
     gguf = sorted(name for name in files if name.endswith(".gguf"))
-    pickles = sorted(name for name in files if "/" not in name and name.endswith(_PICKLES))
-    if pickles:
-        found = f"{source} ships PyTorch pickles ({', '.join(pickles[:3])}), which Dew does not unpickle"
-        if conversion is not None:
-            return (f"{found}; SFconvertbot's safetensors conversion of this commit is at revision "
-                    f"{conversion!r}: load it with revision={conversion!r}")
-        return (f"{found}; convert them to safetensors (the Hub's safetensors/convert space opens "
-                "that conversion as a pull request whose refs/pr/N revision then loads)")
+    pickled = sorted(name for name in files if "/" not in name and name.endswith(_PICKLES))
+    if pickled:
+        return (f"{source} ships PyTorch pickles ({', '.join(pickled[:3])}) but no pytorch_model.bin or "
+                "pytorch_model.bin.index.json, the names Dew converts; save the state dict under one of "
+                f"those, or convert the repo to safetensors at {pickles.CONVERT_SPACE}")
     if gguf:
-        return (f"{source} ships GGUF files ({', '.join(gguf[:3])}{', ...' if len(gguf) > 3 else ''}), "
-                "which Dew does not read; load the safetensors repo they were quantized from "
-                "(the model card's base_model)")
+        return (f"{source} ships GGUF files ({', '.join(gguf)}); load one with "
+                f"load_pretrained(..., gguf_file={gguf[0]!r})")
     return f"{source} has no model.safetensors or model.safetensors.index.json"
 
 
@@ -1800,7 +1861,9 @@ def _snapshot(name_or_dir: str, revision: str | None, *,
     those download, at the commit the first fetch resolved. Other formats of
     the same weights beside them (Mistral's consolidated.safetensors,
     diffusers' fp16 variants and root single-file checkpoints) stay on the
-    Hub.
+    Hub. A commit with only transformers' PyTorch pickles resolves to
+    SFconvertbot's safetensors pull request on it where one is open, and
+    otherwise downloads the pickles, which `_load_shards` converts.
     """
     if os.path.isdir(name_or_dir):
         return Path(name_or_dir)
@@ -1811,20 +1874,27 @@ def _snapshot(name_or_dir: str, revision: str | None, *,
     if weights is False:
         return directory
     files = _repo_files(name_or_dir, directory)
+
+    def read(name: str) -> records.JSON:
+        return json.loads((directory / name).read_text())
+
     selected = [name for folder in (("",) if weights is True else weights)
-                for name in weight_files(files, folder,
-                                         lambda name: json.loads((directory / name).read_text()))]
+                for name in weight_files(files, folder, read)]
     if weights is True and not selected:
         from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
 
-        source = f"{name_or_dir} at {directory.name}"
+        selected = list(weight_files(files, "", read, stems=pickles.STEMS, suffix=pickles.SUFFIX))
+        if not selected:
+            raise FileNotFoundError(_missing_weights(f"{name_or_dir} at {directory.name}", files))
         try:
-            conversion = (_conversion_revision(name_or_dir, directory.name)
-                          if any("/" not in name and name.endswith(_PICKLES) for name in files) else None)
-        except (HfHubHTTPError, OfflineModeIsEnabled) as error:
-            # The lookup only improves the message; its failure is chained.
-            raise FileNotFoundError(_missing_weights(source, files)) from error
-        raise FileNotFoundError(_missing_weights(source, files, conversion))
+            conversion = _conversion_revision(name_or_dir, directory.name)
+        except (HfHubHTTPError, OfflineModeIsEnabled):
+            # Offline or unreachable, the Hub offers no conversion and the pickles load.
+            conversion = None
+        if conversion is not None:
+            _log.warning("%s at %s ships PyTorch pickles; loading SFconvertbot's safetensors conversion of "
+                         "that commit at revision %s", name_or_dir, directory.name, conversion)
+            return _snapshot(name_or_dir, conversion)
     if selected:
         snapshot_download(name_or_dir, revision=directory.name, allow_patterns=selected)
     return directory
@@ -1910,6 +1980,7 @@ def save_pretrained_decoder(model, variables, directory, *,
             f"save_pretrained_decoder takes a CausalTransformer, got {type(model).__name__}")
     config = _export_config(model)
     hf_tensors = export_decoder_weights(model, variables, config)
+    _refuse_lossy_export(model, config)
 
     save_hf_layout(hf_tensors, config, directory)
     save_export_assets(directory, tokenizer=tokenizer, generation_config=generation_config)
@@ -2040,6 +2111,11 @@ def _export_config(model) -> Mapping[str, object]:
         config['layer_types'] = list(types)
     sliding = model.kind_of('sliding_attention') if 'sliding_attention' in types else None
     local_theta = None if sliding is None or sliding.rope_theta == model.rope_theta else sliding.rope_theta
+    # Gemma3TextConfig and Olmo3Config give an unstated sliding base their
+    # own default rather than rope_theta (`_rope`'s local_default), so a
+    # sliding model of theirs states both bases.
+    if sliding is not None and family.export_model_type in ('gemma3_text', 'olmo3'):
+        local_theta = sliding.rope_theta or model.rope_theta
     if local_theta is not None:
         if sandwich:
             config['rope_parameters'] = {
@@ -2094,6 +2170,54 @@ def _export_config(model) -> Mapping[str, object]:
         config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
     config.update(exported)
     return {key: value for key, value in config.items() if value is not None or key == 'pad_token_id'}
+
+
+_RUNTIME_FIELDS = frozenset({
+    'parent', 'name', 'dtype', 'precision', 'attention_impl', 'kv_cache', 'remat', 'scan_layers',
+    'bank_layers', 'dropout_rate', 'max_seq_len', 'mask_token_id', 'layer_scalar', 'scale_after_cast'})
+"""CausalTransformer fields that say how a model runs or trains, not what it
+computes. `layer_scalar` is whether Gemma 4's scalars train; either way the
+forward multiplies by them. `scale_after_cast` orders a norm's scale and its
+cast to the compute dtype, which are the same product in fp32."""
+
+_RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
+    'num_kv_heads': lambda model: model.kv_heads,
+    'head_dim': lambda model: model.features_per_head,
+    'layer_types': lambda model: model.per_layer_types,
+    'kinds': lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
+    'partial_rotary_factor': lambda model: model.partial_rotary_factor or 1.0,
+    'per_layer_input_vocab': lambda model: model.per_layer_input_vocab or model.vocab_size,
+}
+"""Fields whose None stands for a value the forward derives, spelled out."""
+
+
+def _refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) -> None:
+    """Refuse an exported config that reads back as a different computation.
+
+    The config is translated again by the family it names, which is the
+    reading the parity fixtures hold to transformers. A field the family's
+    config does not carry comes back at the backbone default instead of the
+    model's value, and the export would load in transformers, and here, as
+    another model. The differing fields are named.
+    """
+    try:
+        rebuilt = from_record(CausalTransformer, {**translate_config(config), 'dtype': model.dtype})
+    except (ValueError, KeyError) as error:
+        raise ValueError(f"the {config['model_type']} config written for this model does not read back: "
+                         f"{error}") from error
+    def computed(held: CausalTransformer, name: str) -> object:
+        resolve = _RESOLVED.get(name)
+        return getattr(held, name) if resolve is None else resolve(held)
+
+    lost = sorted(declared.name for declared in dataclasses.fields(model)
+                  if declared.name not in _RUNTIME_FIELDS
+                  and computed(model, declared.name) != computed(rebuilt, declared.name))
+    if lost:
+        raise ValueError(
+            f"{lost} would not survive an export as {config['model_type']}: its config reads back "
+            f"{ {name: computed(rebuilt, name) for name in lost} } where this model has "
+            f"{ {name: computed(model, name) for name in lost} }, so transformers would compute "
+            "another model; no exported family carries this computation")
 
 
 def _hf_name(dew_name: str, config: Mapping[str, object]) -> str | None:
@@ -2266,7 +2390,13 @@ from dew.interop.families.kimi import (
     _kimi_linear_path,
     _kimi_linear_prepare,
 )
-from dew.interop.families.llama import _mistral_config, _mixtral_config, _mixtral_path
+from dew.interop.families.llama import (
+    _llama_config,
+    _ministral_config,
+    _mistral_config,
+    _mixtral_config,
+    _mixtral_path,
+)
 from dew.interop.families.llama4 import _llama4_config, _llama4_export, _llama4_path, _llama4_prepare
 from dew.interop.families.masked_diffusion import (
     _diffusion_gemma_export,
@@ -2433,15 +2563,20 @@ _FAMILY_ENTRIES = (
     DecoderFamily(('mixtral',), _mixtral_config, lambda fields: fields.get('mixture') is not None,
                   'mixtral', 'MixtralForCausalLM', lambda model: {},
                   weight_path=_mixtral_path, preserve_source_layout=True),
+    # MistralConfig has no layer_types: its window is on every layer.
     DecoderFamily(('mistral',), _mistral_config, _every_layer_windowed,
-                  'mistral', 'MistralForCausalLM', lambda model: {}, preserve_source_layout=False),
+                  'mistral', 'MistralForCausalLM', lambda model: {'layer_types': None},
+                  preserve_source_layout=False),
     DecoderFamily(('mamba2',), mamba2.config_from_hf,
                   lambda fields: isinstance(_mixer_value(fields), Mamba2Mixer),
                   'mamba2', 'Mamba2ForCausalLM', lambda model: {},
                   weight_path=mamba2.weight_path, export_path=mamba2.export_path,
                   preserve_source_layout=True,
                   tied_head_names=('lm_head.weight', 'backbone.embeddings.weight')),
-    DecoderFamily(('llama',), _base_config, lambda fields: True,
+    DecoderFamily(('ministral',), _ministral_config,
+                  lambda fields: 'sliding_attention' in (fields.get('layer_types') or ()),
+                  'ministral', 'MinistralForCausalLM', lambda model: {}, preserve_source_layout=False),
+    DecoderFamily(('llama',), _llama_config, lambda fields: True,
                   'llama', 'LlamaForCausalLM', lambda model: {}, preserve_source_layout=False),
 )
 _FAMILIES = {name: family for family in _FAMILY_ENTRIES for name in family.model_types}

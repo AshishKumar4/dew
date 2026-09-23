@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.interop.codecs import dequantize_mxfp4, mxfp4_stems, pack_mxfp4, quantize_mxfp4, unpack_mxfp4
+from dew.interop.codecs import MXFP4, dequantize_mxfp4, quantize_mxfp4
 from dew.nn.gpt_oss import GptOssMLP
 
 FIXTURES = Path(__file__).parent / "fixtures" / "gpt_oss"
@@ -233,19 +233,19 @@ def test_pack_mxfp4_writes_back_the_recorded_stems_and_nothing_else():
                  "model.layers.0.mlp.router.weight": np.eye(3, dtype=np.float32),
                  "model.embed_tokens.weight": np.eye(4, dtype=np.float32)}
     tensors = {f"{stem}_blocks": blocks, f"{stem}_scales": scales, **untouched}
-    assert mxfp4_stems(tensors) == (stem,)
+    assert MXFP4.names(tensors) == (stem,)
 
-    unpacked = unpack_mxfp4(tensors)
+    unpacked = MXFP4.dequantize(tensors)
     assert set(unpacked) == {stem, *untouched}
-    packed = pack_mxfp4(unpacked, (stem,))
+    packed = MXFP4.requantize(unpacked, (stem,))
     assert set(packed) == set(tensors)
     for name, value in untouched.items():
         assert packed[name] is value
     np.testing.assert_array_equal(
         released_decode(packed[f"{stem}_blocks"], packed[f"{stem}_scales"]), unpacked[stem])
 
-    with pytest.raises(ValueError, match="not among the tensors to write back"):
-        pack_mxfp4({name: value for name, value in unpacked.items() if name != stem}, (stem,))
+    with pytest.raises(ValueError, match="is not among the tensors to write"):
+        MXFP4.requantize({name: value for name, value in unpacked.items() if name != stem}, (stem,))
     with pytest.raises(ValueError, match=r"holds no .*_scales"):
-        mxfp4_stems({name: value for name, value in tensors.items()
+        MXFP4.names({name: value for name, value in tensors.items()
                      if not name.endswith("_scales")})

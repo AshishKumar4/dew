@@ -18,6 +18,9 @@ from dew.interop.hf_decoders import (
     _specified_layer_types,
 )
 
+_SLIDING_THETA = 500000.0
+"""Olmo3Config's rope_theta default, which a flat config leaves on the sliding entry."""
+
 
 def _olmo3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read an OLMo 3 config into `CausalTransformer` fields.
@@ -33,15 +36,18 @@ def _olmo3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     its own (modeling_olmo3.py:277-291). A ramp is therefore a kind's, not the
     model's. A flat `rope_scaling` belongs to the full-attention layers alone,
     where the reference moves it (configuration_olmo3.py:110-113): the released
-    7B checkpoints put a YaRN there and the sliding layers rotate plainly at
-    rope_theta.
+    7B checkpoints put a YaRN there and the sliding layers rotate plainly.
+    A flat `rope_theta` moves there too, so the sliding layers of a flat
+    config rotate at the class's own base, `_SLIDING_THETA`, whatever
+    rope_theta says (500000 in both on the released 7B).
     """
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     layer_types = _specified_layer_types(hf_config, used, tuple(
         'sliding_attention' if (index + 1) % 4 else 'full_attention'
         for index in range(layers)))
     ropes = _rope(hf_config, used, records.integer(hf_config.get(
-        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
+        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
+        local=False, local_default=_SLIDING_THETA)
     if ropes.scaling is not None and not isinstance(hf_config.get('rope_parameters'), Mapping):
         ropes = dataclasses.replace(ropes, full_only=True)
     config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types,

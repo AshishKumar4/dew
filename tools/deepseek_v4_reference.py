@@ -288,7 +288,8 @@ def write_deepseek_v4_config(name: str, repo: str) -> None:
     goes unread.
     """
     from huggingface_hub import model_info
-    from hf_reference import FIXTURES, reference_logits
+    from hf_reference import FIXTURES
+    from dew.interop.verify import reference_logits
 
     directory = FIXTURES / name
     saved = json.loads((directory / "config.json").read_text())

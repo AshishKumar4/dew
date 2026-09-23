@@ -135,7 +135,7 @@ def test_a_tensor_in_two_shards_is_refused_by_name(tmp_path):
     safetensors_numpy.save_file({"model.norm.weight": np.zeros(2, np.float32)}, str(tmp_path / "b.safetensors"))
     write_index(tmp_path, {"model.norm.weight": "a.safetensors", "model.embed_tokens.weight": "b.safetensors"})
 
-    with pytest.raises(ValueError, match="'model.norm.weight' is stored in both a.safetensors and b.safetensors"):
+    with pytest.raises(ValueError, match=r"'model\.norm\.weight' is stored in both a\.safetensors and b\.safetensors"):
         hf_decoders._load_shards(tmp_path)
 
 
@@ -196,33 +196,45 @@ def conversion(monkeypatch):
     return parents
 
 
-def test_a_pickle_repo_names_the_safetensors_conversion_that_loads(hub, conversion):
-    hub("mamba2-130m-ssm")
-
-    with pytest.raises(FileNotFoundError, match=r"pytorch_model\.bin.*revision='refs/pr/1'"):
-        pretrained.load_pretrained("state-spaces/mamba2-130m")
+MAMBA2_130M_CONVERSION = "ea6060f68a4289e9c06f80effa896629ba519216"
+"""The commit of SFconvertbot's refs/pr/1 on state-spaces/mamba2-130m."""
 
 
-def test_a_conversion_of_another_commit_is_not_offered(hub, conversion):
+def test_a_pickle_repo_loads_sfconvertbots_conversion_of_its_commit(hub, conversion, monkeypatch, tmp_path, caplog):
+    """state-spaces/mamba2-130m ships only pytorch_model.bin; refs/pr/1 on
+    that commit adds model.safetensors, and only that file downloads."""
+    import huggingface_hub
+
+    main = hub("mamba2-130m-ssm")
+    pull = FakeHub(FIXTURES / "mamba2-130m-ssm", tmp_path / "pull")
+    pull.commit, pull.files = MAMBA2_130M_CONVERSION, [*main.files, "model.safetensors"]
+    pull.snapshot = tmp_path / "pull" / "snapshots" / MAMBA2_130M_CONVERSION
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id, *, revision=None, **kwargs: (
+        pull if revision in ("refs/pr/1", MAMBA2_130M_CONVERSION) else main)(repo_id, revision=revision, **kwargs))
+
+    with caplog.at_level("WARNING"):
+        directory = hf_decoders._snapshot("state-spaces/mamba2-130m", None)
+
+    assert directory == pull.snapshot
+    assert (main.fetched, pull.fetched) == ([], ["model.safetensors"])
+    assert "refs/pr/1" in caplog.text
+
+
+def test_without_a_conversion_of_its_commit_a_pickle_repo_fetches_its_pickles(hub, conversion):
     """transformers' rule: the pull request's parent is the commit loaded."""
-    hub("mamba2-130m-ssm")
+    fake = hub("mamba2-130m-ssm")
     conversion["refs/pr/1"] = "0" * 40
 
-    with pytest.raises(FileNotFoundError, match="convert them to safetensors") as error:
-        pretrained.load_pretrained("state-spaces/mamba2-130m")
-    assert "refs/pr/1" not in str(error.value)
+    assert hf_decoders._snapshot("state-spaces/mamba2-130m", None) == fake.snapshot
+    assert fake.fetched == ["pytorch_model.bin"]
 
 
-@pytest.mark.network
-def test_the_hub_lists_the_mamba2_130m_conversion():
-    with pytest.raises(FileNotFoundError, match=r"revision='refs/pr/1'"):
-        hf_decoders._snapshot("state-spaces/mamba2-130m", "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49")
-
-
-def test_a_gguf_repo_is_named_as_gguf_before_any_weight_downloads(hub):
+def test_a_gguf_repo_names_its_files_and_the_gguf_file_that_loads_one(hub):
     fake = hub("qwen3-4b-gguf")
 
-    with pytest.raises(FileNotFoundError, match=r"GGUF files \(Qwen3-4B-BF16\.gguf, .*base_model"):
+    with pytest.raises(FileNotFoundError, match=(
+            r"GGUF files \(Qwen3-4B-BF16\.gguf, .*, Qwen3-4B-UD-Q8_K_XL\.gguf\); "
+            r"load one with load_pretrained\(\.\.\., gguf_file='Qwen3-4B-BF16\.gguf'\)")):
         pretrained.load_pretrained("unsloth/Qwen3-4B-GGUF")
     assert fake.fetched == []
 

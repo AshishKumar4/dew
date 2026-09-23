@@ -24,7 +24,7 @@ from safetensors.numpy import load_file
 from scipy.special import log_softmax
 
 from dew.interop import load_pretrained
-from dew.interop.codecs import decode_e2m1, packed_mxfp4_tensor_names, quantize_packed_mxfp4
+from dew.interop.codecs import PACKED_MXFP4, decode_e2m1, quantize_packed_mxfp4
 from dew.interop.hf_decoders import _FAMILIES, _flatten, translate_config
 from dew.nn.inputs import ModelInputs
 from dew.nn.moe import Situ
@@ -88,7 +88,7 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
             decoded[name.removesuffix("_packed")] = (shape[0], 2 * shape[1])
         elif not name.endswith(".weight_scale"):
             decoded[name] = tuple(shape)
-    assert set(packed_mxfp4_tensor_names(dict.fromkeys(tensors))) == set(decoded)
+    assert set(PACKED_MXFP4.tensor_names(dict.fromkeys(tensors))) == set(decoded)
     prepared = family.prepare_weights({name: np.broadcast_to(np.float32(0), shape) for name, shape in decoded.items()})
     placed, experts, towers = {}, {}, 0
     for name, value in prepared.items():

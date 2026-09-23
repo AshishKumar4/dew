@@ -485,12 +485,12 @@ def test_mxfp4_source_reexports_the_trained_experts_and_preserves_float_tensors(
     from safetensors.numpy import load_file
     from transformers.integrations.mxfp4 import convert_moe_packed_tensors
 
-    from dew.interop.codecs import pack_mxfp4
+    from dew.interop.codecs import MXFP4
 
     source = FIXTURES / "gpt-oss-tiny"
     tensors = load_file(str(source / "model.safetensors"))
     stems = tuple(name for name in tensors if name.endswith((".experts.gate_up_proj", ".experts.down_proj")))
-    packed = pack_mxfp4(tensors, stems)
+    packed = MXFP4.requantize(tensors, stems)
     config = json.loads((source / "config.json").read_text())
     config["quantization_config"] = {"quant_method": "mxfp4"}
     directory = tmp_path / "source"
@@ -574,20 +574,20 @@ def test_the_latent_norms_keep_the_reference_epsilon(name, tmp_path):
 
 @pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
 def test_codec_parameter_storage_follows_fp32_dequantization(kind):
-    from dew.interop.codecs import dequantize_checkpoint, pack_fp8, pack_mxfp4, unpack_mxfp4
+    from dew.interop.codecs import MXFP4, dequantize_checkpoint, fp8_blocks
 
     weight = (np.arange(15, dtype=np.float32).reshape(3, 5) - 7) / 11 if kind == "fp8" else (
         np.arange(2 * 64 * 48, dtype=np.float32).reshape(2, 64, 48) % 13 - 6) / 7
     source = {"weight": weight, "state": np.asarray([.1234567], np.float32),
               "indices": np.asarray([0, 255], np.uint8)}
     if kind == "fp8":
-        packed = pack_fp8(source, ("weight",), block=2, ue8m0=False)
+        packed = fp8_blocks(2, ue8m0=False).requantize(source, ("weight",))
         masters = dequantize_checkpoint(packed, block=2)
         native = dequantize_checkpoint(packed, block=2, param_dtype="bfloat16")
     else:
-        packed = pack_mxfp4(source, ("weight",))
-        masters = unpack_mxfp4(packed)
-        native = unpack_mxfp4(packed, param_dtype="bfloat16")
+        packed = MXFP4.requantize(source, ("weight",))
+        masters = MXFP4.dequantize(packed)
+        native = MXFP4.dequantize(packed, param_dtype="bfloat16")
     assert masters["weight"].dtype == np.float32
     assert native["weight"].dtype == ml_dtypes.bfloat16
     np.testing.assert_array_equal(native["weight"], masters["weight"].astype(ml_dtypes.bfloat16))
@@ -598,7 +598,7 @@ def test_codec_parameter_storage_follows_fp32_dequantization(kind):
 
 @pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
 def test_codec_rejects_integer_parameter_storage(kind):
-    from dew.interop.codecs import dequantize_checkpoint, pack_mxfp4, unpack_mxfp4
+    from dew.interop.codecs import MXFP4, dequantize_checkpoint
 
     if kind == "fp8":
         packed = {"weight": np.ones((1, 1), np.float32),
@@ -606,28 +606,28 @@ def test_codec_rejects_integer_parameter_storage(kind):
         with pytest.raises(ValueError, match="int32"):
             dequantize_checkpoint(packed, 1, param_dtype="int32")
     else:
-        packed = pack_mxfp4({"weight": np.full((1, 32, 2), 1.5, np.float32)}, ("weight",))
+        packed = MXFP4.requantize({"weight": np.full((1, 32, 2), 1.5, np.float32)}, ("weight",))
         with pytest.raises(ValueError, match="int32"):
-            unpack_mxfp4(packed, param_dtype="int32")
+            MXFP4.dequantize(packed, param_dtype="int32")
 
 
 @pytest.mark.parametrize("kind", ["fp8", "mxfp4"])
 def test_public_quantized_load_obeys_parameter_storage(tmp_path, kind):
     from test_interop import assert_parameter_storage
 
-    from dew.interop.codecs import pack_fp8, pack_mxfp4
+    from dew.interop.codecs import MXFP4, fp8_blocks
 
     fixture = FIXTURES / ("deepseek-v3-tiny" if kind == "fp8" else "gpt-oss-tiny")
     tensors = tool.source_tensors(fixture)
     config = json.loads((fixture / "config.json").read_text())
     if kind == "fp8":
-        packed = pack_fp8(tensors, ("model.layers.0.self_attn.o_proj.weight",), block=128, ue8m0=False)
+        packed = fp8_blocks(128, ue8m0=False).requantize(tensors, ("model.layers.0.self_attn.o_proj.weight",))
         config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3",
                                          "weight_block_size": [128, 128]}
     else:
         stems = tuple(name for name in tensors if name.endswith(
             (".experts.gate_up_proj", ".experts.down_proj")))
-        packed = pack_mxfp4(tensors, stems)
+        packed = MXFP4.requantize(tensors, stems)
         config["quantization_config"] = {"quant_method": "mxfp4"}
     directory = tmp_path / "quantized"
     save_hf_layout(packed, config, directory)
