@@ -27,10 +27,12 @@ from .precision import precision_names, rounded_to
 from .rope import apply_rotary
 from .sharding import (
     HEADS,
+    KV_HEADS,
     SEQUENCE_AXIS,
-    TENSOR_AXIS,
     constrain,
     logical_axes,
+    logical_spec,
+    mesh_axes,
     row_axes,
     sequence_shards,
 )
@@ -497,8 +499,8 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     same work either way, and takes the exchange that sends fewer bytes.
     """
     mesh = jax.sharding.get_abstract_mesh()
-    tensor = (mesh.shape[TENSOR_AXIS]
-              if TENSOR_AXIS in mesh.axis_names and TENSOR_AXIS not in mesh.manual_axes else 1)
+    tensor = math.prod(mesh.shape[axis]
+                       for axis in mesh_axes(_entry(logical_spec(HEADS, query.shape), 2)))
     heads, kv_heads = query.shape[-2], key.shape[-2]
     masked = causal or sliding_window is not None or mask is not None
     exchangeable = (heads % (tensor * shards) == 0
@@ -541,15 +543,16 @@ def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int) -
     return 2 * (local_heads + repeated) / shards < 2 * gathered
 
 
-def _broadcast_spec(x, batch: int, heads: int, query_len: int, rows, head_entry, query_entry):
+def _entry(spec: P, dimension: int):
+    """What `spec` names for `dimension`: a spec leaves off trailing whole ones."""
+    return spec[dimension] if dimension < len(spec) else None
+
+
+def _four_dimensional(x):
     """A mask or a bias `[.., Q, K]` broadcastable to `[B, H, Q, K]`, as four
-    dimensions, with the spec a sequence exchange hands it in: its rows,
-    heads and query rows split as the exchange splits the query's, where it
-    has them, and a broadcast dimension whole."""
-    x = x.reshape((1,) * (4 - x.ndim) + x.shape)
-    return x, P(rows if x.shape[0] == batch else None,
-                head_entry if x.shape[1] == heads else None,
-                query_entry if x.shape[2] == query_len else None, None)
+    dimensions; a broadcast dimension of 1 divides by no mesh axis, so the
+    rule table leaves it whole."""
+    return x.reshape((1,) * (4 - x.ndim) + x.shape)
 
 
 def _manual_map(local, in_specs, out_specs):
@@ -605,11 +608,9 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     shards, the way GSPMD replicates a dimension it cannot split.
     """
     mesh = jax.sharding.get_abstract_mesh()
-    usable = [axis for axis in mesh.axis_names
-              if axis not in mesh.manual_axes and mesh.shape[axis] > 1]
-    batch, _, heads, _ = query.shape
-    rows = row_axes(batch) or None
-    tensor = (TENSOR_AXIS,) if TENSOR_AXIS in usable else ()
+    heads = query.shape[2]
+    queries = logical_spec(HEADS, query.shape)
+    tensor = mesh_axes(_entry(queries, 2))
     split = shards * math.prod(mesh.shape[axis] for axis in tensor)
     if heads % split or query.shape[1] % shards or key.shape[1] % shards:
         raise ValueError(
@@ -620,15 +621,23 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
             "length; `sequence_parallel_attention` picks it for such a call.")
     kv_heads = math.lcm(key.shape[-2], split)
     key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    keys = logical_spec(KV_HEADS, key.shape)
 
-    head_entry = (*tensor, SEQUENCE_AXIS)
-    in_rows = P(rows, SEQUENCE_AXIS, tensor or None, None)
-    extras = {name: _broadcast_spec(x, batch, heads, query.shape[1], rows, head_entry, None)
-              for name, x in (('mask', mask), ('bias', bias)) if x is not None}
+    # After the all-to-all a shard holds its tensor shard's heads split again
+    # over the sequence axis; a mask, a bias or sinks with a head dimension
+    # arrive split the same way, their query and key dimensions whole.
+    exchanged_heads = (*tensor, SEQUENCE_AXIS)
+    extras = {}
+    for name, x in (('mask', mask), ('bias', bias)):
+        if x is not None:
+            x = _four_dimensional(x)
+            extras[name] = (x, P(row_axes(x.shape[0]),
+                                 exchanged_heads if x.shape[1] == heads else None))
     if sinks is not None:
-        extras['sinks'] = (sinks, P(head_entry))
+        extras['sinks'] = (sinks, P(exchanged_heads))
     if key_value_seq_lengths is not None:
-        extras['key_value_seq_lengths'] = (key_value_seq_lengths, P(rows))
+        extras['key_value_seq_lengths'] = (key_value_seq_lengths, logical_spec(
+            ("activation_batch",), key_value_seq_lengths.shape))
     names = tuple(extras)
 
     def local(query, key, value, *arrays):
@@ -641,7 +650,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
         return jax.lax.all_to_all(out, SEQUENCE_AXIS, 1, 2, tiled=True)
 
     exchanged = _manual_map(
-        local, (in_rows,) * 3 + tuple(spec for _, spec in extras.values()), in_rows)
+        local, (queries, keys, keys) + tuple(spec for _, spec in extras.values()), queries)
     return exchanged(query, key, value, *(x for x, _ in extras.values()))
 
 
@@ -669,16 +678,12 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     equal work on every row and keeps its order. Key lengths count the
     whole keys, which neither order moves.
     """
-    mesh = jax.sharding.get_abstract_mesh()
-    batch, q_len, heads, _ = query.shape
-    kv_len = key.shape[-3]
-    rows = row_axes(batch) or None
-    tensor = (TENSOR_AXIS,) if (TENSOR_AXIS in mesh.axis_names
-                                and TENSOR_AXIS not in mesh.manual_axes
-                                and mesh.shape[TENSOR_AXIS] > 1
-                                and heads % mesh.shape[TENSOR_AXIS] == 0) else ()
+    q_len, kv_len = query.shape[1], key.shape[1]
+    tensor = mesh_axes(_entry(logical_spec(HEADS, query.shape), 2))
     if tensor:
-        kv_heads = math.lcm(key.shape[-2], mesh.shape[TENSOR_AXIS])
+        # Each tensor shard's query heads beside the key heads they read.
+        kv_heads = math.lcm(key.shape[-2], math.prod(
+            jax.sharding.get_abstract_mesh().shape[axis] for axis in tensor))
         key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
 
     reordered = causal or sliding_window is not None or mask is not None
@@ -695,24 +700,27 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
             structural = causal_attention_mask(
                 stripe(jnp.arange(q_len), shards, axis=0), kv_len, sliding_window)
             mask = structural if mask is None else jnp.logical_and(mask, structural)
-        padding = 0
     else:
         padding = -q_len % shards
         query = _pad_rows(query, padding)
         if bias is not None and bias.ndim >= 2 and bias.shape[-2] == q_len:
             bias = jnp.pad(bias, ((0, 0),) * (bias.ndim - 2) + ((0, padding), (0, 0)))
 
-    gathered = kv_len % shards == 0
-    heads_entry = tensor or None
-    queries = P(rows, SEQUENCE_AXIS, heads_entry, None)
-    keys = P(rows, SEQUENCE_AXIS if gathered else None, heads_entry, None)
-    extras = {name: _broadcast_spec(x, batch, heads, q_len + padding, rows, heads_entry,
-                                    SEQUENCE_AXIS)
-              for name, x in (('mask', mask), ('bias', bias)) if x is not None}
+    # A key length the shards do not divide takes no sequence axis, and
+    # arrives whole instead of gathered.
+    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
+    gathered = SEQUENCE_AXIS in mesh_axes(_entry(keys, 1))
+    extras = {}
+    for name, x in (('mask', mask), ('bias', bias)):
+        if x is not None:
+            x = _four_dimensional(x)
+            extras[name] = (x, logical_spec(
+                ("activation_batch", "activation_heads", "activation_length", None), x.shape))
     if sinks is not None:
-        extras['sinks'] = (sinks, P(heads_entry))
+        extras['sinks'] = (sinks, logical_spec(("activation_heads",), sinks.shape))
     if key_value_seq_lengths is not None:
-        extras['key_value_seq_lengths'] = (key_value_seq_lengths, P(rows))
+        extras['key_value_seq_lengths'] = (key_value_seq_lengths, logical_spec(
+            ("activation_batch",), key_value_seq_lengths.shape))
     names = tuple(extras)
 
     def local(query, key, value, *arrays):
