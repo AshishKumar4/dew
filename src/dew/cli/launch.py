@@ -219,7 +219,7 @@ class Launch:
             # --gpus-per-node reads `[type:]count`, several types separated by commas.
             tasks = (sum(int(part.rsplit(":", 1)[-1]) for part in per_node.split(","))
                      if per_node else local_gpu_count()) or None
-        argv = ["srun", "--kill-on-bad-exit=1", "--export=ALL"]
+        argv = ["srun", "--kill-on-bad-exit=1", "--export=ALL", "--label"]
         if tasks is not None:
             argv.append(f"--ntasks-per-node={tasks}")
         emit(f"slurm allocation {os.environ['SLURM_JOB_ID']}: starting the program with srun")
