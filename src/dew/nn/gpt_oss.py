@@ -11,21 +11,15 @@ from flax import linen as nn
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.moe import (
-    Routes,
-    chosen_experts,
-    expert_dispatch,
-    expert_projection,
-    gather_expert_bias,
-    grouped_matmul_kernel,
-)
+from dew.nn.moe import Routes, chosen_experts, expert_dispatch, expert_projection, gather_expert_bias
 from dew.nn.sharding import logical_axes
 
 
 class GptOssExperts(nn.Module):
     """Interleaved gate/up matrices with the reference's clamped 1.702 SwiGLU.
 
-    `implementation` names the grouped matmul, as `moe.expert_projection` takes it.
+    `implementation` names the grouped matmul, as `moe.expert_projection` takes it;
+    `dispatch` and `capacity_factor` move the tokens, as `moe.expert_dispatch` takes them.
     """
 
     hidden_size: int
@@ -33,6 +27,7 @@ class GptOssExperts(nn.Module):
     num_local_experts: int
     implementation: str = 'auto'
     dispatch: str = 'global'
+    capacity_factor: float | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -53,13 +48,11 @@ class GptOssExperts(nn.Module):
         compute_dtype = canonicalize_dtype(x, gate_up, gate_bias, down, down_bias, dtype=self.dtype)
         if weights.shape != indices.shape:
             raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
-        chosen = grouped_matmul_kernel(self.implementation, compute_dtype,
-                                       (x.dtype, gate_up.dtype, down.dtype), self.precision)
         slots = expert_dispatch(
             functools.partial(self._project, dtype=compute_dtype), x.astype(compute_dtype), indices,
             (gate_up, gate_bias, down, down_bias), num_experts=self.num_local_experts,
             dispatch=self.dispatch, output_dtype=compute_dtype, initializing=self.is_initializing(),
-            split_rows=chosen == 'pallas')
+            capacity_factor=self.capacity_factor)
         return jnp.sum(slots * weights[..., None], axis=-2)
 
     def _project(self, tokens: jax.Array, sizes: jax.Array, expert_ids: jax.Array,
@@ -77,14 +70,18 @@ class GptOssExperts(nn.Module):
         return output + gather_expert_bias(down_bias, expert_ids, dtype)
 
 
-@logical_axes({("router",): ("embed", "exp")}, heuristic=(
-    ("experts", "gate_up_proj"), ("experts", "gate_up_proj_bias"),
-    ("experts", "down_proj"), ("experts", "down_proj_bias")))
+@logical_axes({
+    ("router",): ("embed", "exp"),
+    ("experts", "gate_up_proj"): ("exp", "embed", "mlp"),
+    ("experts", "gate_up_proj_bias"): ("exp", "mlp"),
+    ("experts", "down_proj"): ("exp", "mlp", "embed"),
+    ("experts", "down_proj_bias"): ("exp", "embed"),
+})
 class GptOssMLP(nn.Module):
     """Softmax over the selected biased logits, then the selected expert sum.
 
-    The experts retain the reference's fused parameter leaves. Those leaves
-    have different matrix axes, so their placement uses the shape heuristic.
+    The experts keep the reference's fused leaves, stacked on the expert
+    dimension the expert mesh axis splits, like `moe.SparseMLP`'s.
     """
 
     hidden_size: int
@@ -93,6 +90,7 @@ class GptOssMLP(nn.Module):
     num_experts_per_tok: int
     implementation: str = 'auto'
     dispatch: str = 'global'
+    capacity_factor: float | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -106,5 +104,6 @@ class GptOssMLP(nn.Module):
         weights = jax.nn.softmax(top_logits, axis=-1)
         return GptOssExperts(
             self.hidden_size, self.intermediate_size, self.num_local_experts,
-            implementation=self.implementation, dispatch=self.dispatch, dtype=self.dtype,
+            implementation=self.implementation, dispatch=self.dispatch,
+            capacity_factor=self.capacity_factor, dtype=self.dtype,
             precision=self.precision, name="experts")(x, weights, indices)

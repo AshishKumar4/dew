@@ -41,11 +41,10 @@ from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
 from .blocks import normal_kernel
-from .inputs import BATCH_AXES
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
 from .precision import rounded_operand, rounded_to
-from .sharding import EXPERT_AXIS, FSDP_AXIS, SEQUENCE_AXIS, logical_axes
+from .sharding import EXPERT_AXIS, FSDP_AXIS, axis_rules, logical_axes, logical_spec, mesh_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -661,12 +660,44 @@ class ExpertLinear(nn.Module):
             tokens, self.kernel, group_sizes, self.dtype, self.implementation, self.precision))
 
 
+def capacity_positions(indices: jax.Array, num_experts: int,
+                       capacity_factor: float) -> tuple[jax.Array, int]:
+    """Each routed slot's place in its expert's queue, and how many places a
+    queue keeps.
+
+    `indices` is `[..., length, top_k]`: every leading row is one sequence of
+    `length` tokens (a rank-two routing is one sequence). A sequence queues
+    its slots at each expert in token order; a token's choices are distinct
+    experts, so they never compete for one queue. Each queue keeps
+    `capacity` places, MaxText's `expert_capacity_per_batch`
+    (`maxtext layers/moe.py` `generate_masks`): `max(ceil(length * top_k /
+    num_experts) * capacity_factor, capacity_factor)`, truncated.
+
+    Counting within a sequence is what makes the dropped slots a property of
+    the batch rather than of its placement: data, expert, fsdp and tensor
+    split whole rows, and the count runs over the whole row whatever splits
+    its positions.
+    """
+    *_, length, top_k = indices.shape
+    capacity = int(max(math.ceil(length * top_k / num_experts) * capacity_factor,
+                       capacity_factor))
+    flat = indices.reshape(-1, length * top_k)
+    order = jnp.argsort(flat, axis=-1, stable=True)
+    queued = jnp.take_along_axis(flat, order, axis=-1)
+    counts = jax.vmap(functools.partial(jnp.bincount, length=num_experts))(flat)
+    starts = jnp.cumsum(counts, axis=-1) - counts
+    places = jnp.arange(length * top_k) - jnp.take_along_axis(starts, queued, axis=-1)
+    rows = jnp.arange(flat.shape[0])[:, None]
+    positions = jnp.zeros_like(flat).at[rows, order].set(places, unique_indices=True)
+    return positions.reshape(indices.shape), capacity
+
+
 def expert_dispatch[Parameters](
         project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
         x: jax.Array, indices: jax.Array, parameters: Parameters, *,
         num_experts: int, dispatch: str, output_dtype: Dtype,
         input_weights: jax.Array | None = None, initializing: bool = False,
-        split_rows: bool = False) -> jax.Array:
+        capacity_factor: float | None = None) -> jax.Array:
     """Run every routed token through its expert, and return the slots in
     token order.
 
@@ -674,104 +705,151 @@ def expert_dispatch[Parameters](
     expert ids and the expert-major parameters, and returns rows of the same
     width. The caller owns the activation, the biases and the output
     weights; `input_weights` scales each expert's input instead, as Llama 4
-    does.
+    does. `x` is `[batch, length, width]` or `[tokens, width]`.
 
-    `dispatch='global'` sorts and gathers locally. `'exchange'` runs `shards`
-    rounds of all-to-all over the expert mesh axis, each carrying one
-    capacity-sized buffer per shard, so no expert capacity drops tokens.
-    Expert ids are local to their owner under exchange, and the padding that
-    fills a round is discarded before the return exchange.
+    `dispatch='global'` sorts and gathers the tokens where they are: on a
+    mesh, inside a `shard_map` that holds them where the residual stream
+    does (`activation_batch`, `activation_length`), so each device routes
+    its own rows through every expert and a layout computes each token once,
+    and `project` sees device-local rows, as the Pallas kernels need
+    (MaxText's `sparse_matmul_route_and_compute` has the same structure).
 
-    `split_rows` runs either dispatch inside a `shard_map` over every token
-    mesh axis (`dew.nn.inputs.BATCH_AXES` and the sequence axis) that splits
-    anything, so `project` sees each device's own rows, as the Pallas
-    kernels need; MaxText's `sparse_matmul_route_and_compute` has the same
-    structure. The parameters enter replicated over those axes and at least
-    fp32, so the transpose sums the per-device kernel gradients in fp32 and
-    a bf16 master rounds once, after the sum. `project` then has to name its
-    compute dtype rather than infer it from the parameters.
+    `'exchange'` is expert parallelism, in the same `shard_map` with the
+    expert axis manual: each device sorts its own slots by the expert shard
+    that owns them and trades buckets of them with its peers in
+    `all_to_all` rounds (`_exchange_shard`), keeping every selected slot. A
+    device's experts enter it alone, split as the `exp` rule splits them.
+    Rows the batch axes do not divide are padded until they do, so every
+    shard sends tokens of its own.
+
+    `capacity_factor` drops instead, as GShard and MaxText do: each
+    sequence keeps `capacity_positions`' count of slots per expert, in
+    token order, and a dropped slot contributes nothing. Both dispatches
+    drop the same slots whatever the placement, and the exchange then needs
+    exactly one round, whose buckets hold what a device's sequences can
+    keep.
+
+    The parameters take part in at least fp32, so the gradient a device
+    computes for them is summed with its peers' and over the rounds in fp32
+    and meets the master dtype once, after the sum: the same arithmetic on
+    one device and on any mesh.
     """
     if dispatch not in EXPERT_DISPATCHES:
         raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {dispatch!r}")
     if indices.shape[:-1] != x.shape[:-1] or (
             input_weights is not None and input_weights.shape != indices.shape):
         raise ValueError(f"routing {indices.shape} does not describe tokens {x.shape}")
-    tokens = x.reshape(-1, x.shape[-1])
-    top_k = indices.shape[-1]
+    if capacity_factor is not None and not capacity_factor > 0:
+        raise ValueError(f"capacity_factor scales each expert's share of a sequence, so it is "
+                         f"positive, got {capacity_factor}; None keeps every slot")
     mesh = jax.sharding.get_abstract_mesh()
     shards = mesh.shape.get(EXPERT_AXIS, 1)
     if dispatch == 'exchange' and not initializing and (
             shards <= 1 or num_experts % shards):
         raise ValueError("exchange dispatch needs an expert mesh axis greater than one "
                          "that divides num_experts")
-    flat_indices = indices.reshape(-1, top_k)
-    flat_weights = None if input_weights is None else input_weights.reshape(-1, top_k)
-    exchanging = dispatch == 'exchange' and not initializing and tokens.shape[0] > 0
-    row_axes = tuple(
-        name for name in (*BATCH_AXES, SEQUENCE_AXIS)
-        if split_rows and not initializing and name in mesh.axis_names
-        and name not in mesh.manual_axes and mesh.shape[name] > 1
-        and not (exchanging and name == EXPERT_AXIS))
-    row_devices = math.prod(mesh.shape[name] for name in row_axes)
-
-    def sorted_locally(tokens: jax.Array, indices: jax.Array, parameters: Parameters,
-                       input_weights: jax.Array | None) -> jax.Array:
-        experts = indices.ravel()
-        order = jnp.argsort(experts)
-        grouped = tokens[order // top_k]
+    capacity = None
+    if capacity_factor is not None:
+        positions, capacity = capacity_positions(indices, num_experts, capacity_factor)
+        # A dropped slot takes the sentinel id past the last expert, which
+        # no group counts and no bucket sends.
+        indices = jnp.where(positions < capacity, indices, num_experts)
+    parameters = _widened(parameters)
+    exchanging = dispatch == 'exchange' and not initializing and x.size > 0
+    if not exchanging and (initializing or mesh.empty):
+        return _sorted_locally(project, x, indices, parameters, input_weights,
+                               num_experts=num_experts)
+    rows = x.shape[0]
+    if exchanging:
+        # Each expert shard sends tokens of its own, so the rows split over
+        # every axis the table's first batch rule names, padded to a whole
+        # share of them; padding routes to the sentinel.
+        first_rule = next(axes for name, axes in axis_rules() if name == 'activation_batch')
+        share = math.prod(mesh.shape[axis] for axis in mesh_axes(first_rule)
+                          if axis in mesh.axis_names and axis not in mesh.manual_axes)
+        padding = ((0, -rows % share),)
+        x = jnp.pad(x, padding + ((0, 0),) * (x.ndim - 1))
+        routed = padding + ((0, 0),) * (indices.ndim - 1)
+        indices = jnp.pad(indices, routed, constant_values=num_experts)
         if input_weights is not None:
-            grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
-        projected = project(grouped, jnp.bincount(experts, length=num_experts),
-                            experts[order], parameters)
-        return projected[jnp.argsort(order)]
-
-    if not exchanging:
-        if row_axes and tokens.shape[0] % row_devices == 0:
-            rows = P(row_axes)
-            combined = jax.shard_map(
-                sorted_locally, mesh=mesh, axis_names=set(row_axes),
-                in_specs=(rows, rows, P(), None if flat_weights is None else rows),
-                out_specs=rows, check_vma=False)(tokens, flat_indices, _widened(parameters),
-                                                 flat_weights)
-        else:
-            combined = sorted_locally(tokens, flat_indices, parameters, flat_weights)
-        return combined.reshape(*indices.shape, x.shape[-1])
-
-    exchange_axes = (EXPERT_AXIS, *row_axes)
+            input_weights = jnp.pad(input_weights, routed)
+    positions_axes = ('activation_batch', 'activation_length')[:x.ndim - 1]
+    tokens = logical_spec((*positions_axes, 'activation_embed'), x.shape)
+    routing = logical_spec((*positions_axes, None), indices.shape)
+    manual = {axis for entry in tokens for axis in mesh_axes(entry)}
+    if exchanging:
+        if EXPERT_AXIS not in manual:
+            raise ValueError("exchange dispatch splits the token rows over the expert axis, "
+                             "and the rule table's activation_batch does not name it")
+        body = functools.partial(_exchange_shard, project, num_experts=num_experts,
+                                 shards=shards, output_dtype=output_dtype, capacity=capacity)
+        experts = jax.tree.map(
+            lambda leaf: logical_spec(('exp', *(None,) * (leaf.ndim - 1)), leaf.shape), parameters)
+    else:
+        body = functools.partial(_sorted_locally, project, num_experts=num_experts)
+        experts = jax.tree.map(lambda _: P(), parameters)
     # The kernels carry no manual-axis type, so this map does not check them;
     # MaxText hosts its gmm the same way.
-    local = jax.shard_map(
-        functools.partial(_exchange_shard, project, num_experts=num_experts, shards=shards,
-                          output_dtype=output_dtype),
-        mesh=mesh, axis_names=set(exchange_axes),
-        in_specs=(P(exchange_axes), P(exchange_axes), P(EXPERT_AXIS),
-                  None if input_weights is None else P(exchange_axes)),
-        out_specs=P(exchange_axes), check_vma=False)
+    return jax.shard_map(
+        body, mesh=mesh, axis_names=manual,
+        in_specs=(tokens, routing, experts, None if input_weights is None else routing),
+        out_specs=P(*routing, None), check_vma=False)(
+            x, indices, parameters, input_weights)[:rows]
 
-    # Sentinel assignments from token-axis padding never enter send counts.
-    padding = -tokens.shape[0] % (shards * row_devices)
-    token_indices = jnp.pad(flat_indices, ((0, padding), (0, 0)), constant_values=num_experts)
-    padded_weights = (None if flat_weights is None else
-                      jnp.pad(flat_weights, ((0, padding), (0, 0))))
-    combined = local(jnp.pad(tokens, ((0, padding), (0, 0))), token_indices,
-                     _widened(parameters) if row_axes else parameters, padded_weights)
-    return combined[:tokens.shape[0]].reshape(*indices.shape, x.shape[-1])
+
+def _sorted_locally[Parameters](
+        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
+        x: jax.Array, indices: jax.Array, parameters: Parameters,
+        input_weights: jax.Array | None, *, num_experts: int) -> jax.Array:
+    """Project every slot of `x`'s tokens where they are: sort the slots by
+    expert, gather their token rows and put the results back in slot order.
+    A dropped slot's sentinel id sorts last, outside every group, and its
+    row comes back zero."""
+    top_k = indices.shape[-1]
+    tokens = x.reshape(-1, x.shape[-1])
+    experts = indices.ravel()
+    order = jnp.argsort(experts)
+    grouped = tokens[order // top_k]
+    if input_weights is not None:
+        grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
+    projected = project(grouped, jnp.bincount(experts, length=num_experts),
+                        experts[order], parameters)
+    projected = jnp.where((experts[order] < num_experts)[:, None], projected, 0)
+    return projected[jnp.argsort(order)].reshape(*indices.shape, x.shape[-1])
 
 
 def _exchange_shard[Parameters](
         project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
-        tokens: jax.Array, indices: jax.Array, parameters: Parameters,
+        x: jax.Array, indices: jax.Array, parameters: Parameters,
         input_weights: jax.Array | None, *, num_experts: int, shards: int,
-        output_dtype: Dtype) -> jax.Array:
-    """Run one expert shard's share of `expert_dispatch`'s exchange, inside
-    its shard_map.
+        output_dtype: Dtype, capacity: int | None) -> jax.Array:
+    """Run one device's share of `expert_dispatch`'s exchange, inside its
+    shard_map.
 
-    Every shard sorts its own rows by expert, cuts them into buckets of
-    `capacity` per destination, and runs `rounds` exchanges. `rounds` is
-    the mesh-wide maximum, so every shard runs the same number.
+    The device sorts its own slots by expert and sends each destination
+    shard one bucket of them in a first round. Dropless, that bucket is the
+    device's balanced share, its slots divided by the shards, and what a
+    skewed routing leaves over follows in later rounds of the same size:
+    the expert axis's maximum count, so every peer runs the same number, out
+    of the most a routing of every slot to one shard can need. Under a
+    capacity, a sequence keeps `capacity` slots per expert, so the first
+    round's bucket holds what the device's sequences (or parts of one,
+    where positions are split) can keep for one peer's experts, and no slot
+    is left over.
+
+    The first round's intermediates are kept for the backward pass like any
+    layer's. The later rounds run in a scan, checkpointed so that it keeps
+    none of theirs and recomputes each one it ran; a scan's cond stacks its
+    residuals per iteration, so the later rounds are as few as the bucket
+    size allows.
     """
     top_k = indices.shape[-1]
+    tokens = x.reshape(-1, x.shape[-1])
     slots, per_shard = indices.size, num_experts // shards
+    if capacity is None:
+        first = -(-slots // shards)
+    else:
+        first = min(slots, math.prod(indices.shape[:-2]) * per_shard * capacity)
     order = jnp.argsort(indices.ravel())
     experts = indices.ravel()[order]
     grouped = tokens[order // top_k]
@@ -779,19 +857,16 @@ def _exchange_shard[Parameters](
         grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
     sizes = jnp.bincount(experts // per_shard, length=shards + 1)[:shards]
     starts = jnp.cumsum(sizes) - sizes
-    capacity = (slots + shards - 1) // shards
-    rounds = jax.lax.pmax(jnp.max((sizes + capacity - 1) // capacity), EXPERT_AXIS)
-    lanes = jnp.arange(capacity)
 
-    @jax.checkpoint
-    def exchange_round(iteration: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """Send one bucket to each shard, project it there, bring it back.
+    def exchange_round(offset: jax.Array | int) -> tuple[jax.Array, jax.Array]:
+        """Send each shard its `first` slots from `offset` on, project them
+        there, and bring them back.
 
         Returns the returned rows and the local address each one belongs
         at. Padding addresses land past the end, so the caller's
         scatter drops them.
         """
-        offsets = iteration * capacity + lanes
+        offsets = offset + jnp.arange(first)
         valid = offsets[None, :] < sizes[:, None]
         addresses = starts[:, None] + offsets
         send = jnp.where(valid[..., None], grouped[jnp.minimum(addresses, slots - 1)], 0)
@@ -805,37 +880,42 @@ def _exchange_shard[Parameters](
         computed = project(received[permutation], groups, received_ids[permutation], parameters)[
             jnp.argsort(permutation)]
         computed = jnp.where((received_ids < per_shard)[:, None], computed, 0)
-        returned = jax.lax.all_to_all(computed.reshape(shards, capacity, -1),
+        returned = jax.lax.all_to_all(computed.reshape(shards, first, -1),
                                      EXPERT_AXIS, 0, 0, tiled=True)
         # Only padding has an out-of-bounds address; every real slot has
         # one unique writer across all rounds.
         return returned, jnp.where(valid, addresses, slots)
 
-    def step(out: jax.Array, iteration: jax.Array) -> tuple[jax.Array, None]:
-        """Scan one round into the output rows; the carry is those rows.
+    returned, addresses = exchange_round(0)
+    combined = jnp.zeros((slots, tokens.shape[-1]), output_dtype).at[addresses].set(
+        returned, mode='drop')
+    if capacity is None and slots > first:
+        rounds = -(-(slots - first) // first)
+        needed = jax.lax.pmax(jnp.max(-(-jnp.maximum(sizes - first, 0) // first)), EXPERT_AXIS)
+        later = jax.checkpoint(exchange_round)
 
-        The scan always runs `shards` iterations so its length is
-        static, and the rounds past `rounds` keep the carry unchanged.
-        """
-        def active(out: jax.Array) -> jax.Array:
-            returned, addresses = exchange_round(iteration)
-            return out.at[addresses].set(returned, mode='drop')
-        return jax.lax.cond(iteration < rounds, active, lambda out: out, out), None
+        def step(out: jax.Array, iteration: jax.Array) -> tuple[jax.Array, None]:
+            """Scan one later round into the output rows; the carry is
+            those rows. The scan's length is static, and the rounds past
+            `needed` keep the carry unchanged."""
+            def active(out: jax.Array) -> jax.Array:
+                returned, addresses = later((iteration + 1) * first)
+                return out.at[addresses].set(returned, mode='drop')
+            return jax.lax.cond(iteration < needed, active, lambda out: out, out), None
 
-    combined, _ = jax.lax.scan(step, jnp.zeros((slots, tokens.shape[-1]), output_dtype),
-                               jnp.arange(shards))
+        combined, _ = jax.lax.scan(step, combined, jnp.arange(rounds))
     return combined[jnp.argsort(order)].reshape(*indices.shape, tokens.shape[-1])
 
 
 def _widened[Tree](parameters: Tree) -> Tree:
-    """Floating parameters at least fp32, so a cotangent summed across a
-    `shard_map` boundary is summed before its master dtype rounds it."""
+    """Floating parameters at least fp32, so a cotangent summed across
+    devices or over the exchange's rounds is summed before its master dtype
+    rounds it."""
     def widen(leaf):
         if jnp.issubdtype(leaf.dtype, jnp.floating):
             return leaf.astype(jnp.promote_types(leaf.dtype, jnp.float32))
         return leaf
     return jax.tree.map(widen, parameters)
-
 
 
 class ExpertMLP(nn.Module):
@@ -851,11 +931,12 @@ class ExpertMLP(nn.Module):
     `dispatch='global'` retains that path. `'exchange'` opts into all-to-all
     rounds on an expert mesh axis that divides the expert count. Each round
     uses a local-slot-sized message buffer and later rounds keep excess
-    assignments. No expert capacity drops tokens. Initialisation creates the
-    same parameters without requiring a mesh. The projections run through
-    `expert_projection`, whose precision contract is the same under both
-    dispatches, so a routed layer computes the same forward, gradients and
-    tangents whichever moves the tokens.
+    assignments, so no slot is dropped unless `capacity_factor` asks for it
+    (`expert_dispatch`). Initialisation creates the same parameters without
+    requiring a mesh. The projections run through `expert_projection`, whose
+    precision contract is the same under both dispatches, so a routed layer
+    computes the same forward, gradients and tangents whichever moves the
+    tokens.
 
     The sum over a token's experts runs in fp32, because that is the dtype the
     router weights are computed in, and the result rejoins the residual stream
@@ -878,6 +959,7 @@ class ExpertMLP(nn.Module):
     activation: GatedActivation = 'swiglu'
     implementation: str = 'auto'
     dispatch: str = 'global'
+    capacity_factor: float | None = None
     swiglu_limit: float | None = None
     scale_inputs: bool = False
     init_std: float | None = None  # gate/up normal std; None: per-expert lecun normal
@@ -933,15 +1015,12 @@ class ExpertMLP(nn.Module):
         # One compute dtype for all three projections, named rather than
         # inferred inside the dispatch, where the parameters may be widened.
         compute = canonicalize_dtype(x, *kernels, dtype=self.dtype)
-        chosen = grouped_matmul_kernel(self.implementation, compute,
-                                       (x.dtype, *(kernel.dtype for kernel in kernels)),
-                                       self.precision)
         slots = expert_dispatch(
             functools.partial(self._project, dtype=compute), x, indices, kernels,
             num_experts=self.num_experts, dispatch=self.dispatch,
             initializing=self.is_initializing(), output_dtype=compute,
             input_weights=weights if self.scale_inputs else None,
-            split_rows=chosen == 'pallas')
+            capacity_factor=self.capacity_factor)
         return self._combine(slots, weights)
 
 
@@ -993,6 +1072,7 @@ class SparseMLP(nn.Module):
     activation: GatedActivation = 'swiglu'
     implementation: str = 'auto'
     dispatch: str = 'global'
+    capacity_factor: float | None = None
     score_function: str = 'softmax'
     normalize_weights: bool = True
     routed_scaling_factor: float = 1.0
@@ -1032,6 +1112,7 @@ class SparseMLP(nn.Module):
             num_experts=self.num_experts, hidden_features=self.hidden_features,
             out_features=width, activation=self.activation,
             implementation=self.implementation, dispatch=self.dispatch,
+            capacity_factor=self.capacity_factor,
             swiglu_limit=self.swiglu_limit,
             scale_inputs=self.scale_inputs,
             init_std=self.init_std, output_init_std=self.output_init_std,
