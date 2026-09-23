@@ -11,11 +11,11 @@ convert pair under jit, and the quantization silently does not happen.
 import jax
 import jax.numpy as jnp
 
-E4M3_MAX = 448.0
-E2M1_MAX = 6.0
+_E4M3_MAX = float(jnp.finfo(jnp.float8_e4m3fn).max)
+_E2M1_MAX = float(jnp.finfo(jnp.float4_e2m1fn).max)
 
 
-def power_of_two_ceil(value):
+def _power_of_two_ceil(value):
     """2 ** ceil(log2(value)) off the fp32 bits, as the kernels' fast_round_scale
     computes it (kernel.py:22-37)."""
     bits = jax.lax.bitcast_convert_type(value.astype(jnp.float32), jnp.int32)
@@ -35,15 +35,11 @@ def _round(values, mantissa: int, lowest: int):
     return jnp.round(values / quantum) * quantum
 
 
-def round_e4m3fn(values):
+def _round_e4m3fn(values):
     """Round fp32 values within +-448 to E4M3FN, ties to even (`_round`).
-
-    Not `astype(float8_e4m3fn)`: XLA GPU's default xla_allow_excess_precision
-    deletes an f32 -> f8 -> f32 convert pair under jit, so the rounding would
-    silently not happen. Nor `jax.lax.reduce_precision(x, 4, 3)`, which
-    models IEEE-style e4m3 with infinities and a largest finite 240, not the
-    FN format whose largest finite is 448.
-    """
+    Not `jax.lax.reduce_precision(x, 4, 3)`, which models IEEE-style e4m3
+    with infinities and a largest finite 240, not the FN format whose
+    largest finite is 448."""
     return _round(values, 3, -6)
 
 
@@ -70,8 +66,8 @@ def fake_quant_fp8(x, block: int):
     ceiling power of two of amax / 448, value clamped to +-448 and rounded."""
     blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
     amax = jnp.maximum(jnp.max(jnp.abs(blocks), -1, keepdims=True), 1e-4)
-    scale = power_of_two_ceil(amax * jnp.float32(1 / E4M3_MAX))
-    rounded = round_e4m3fn(jnp.clip(blocks / scale, -E4M3_MAX, E4M3_MAX))
+    scale = _power_of_two_ceil(amax * jnp.float32(1 / _E4M3_MAX))
+    rounded = _round_e4m3fn(jnp.clip(blocks / scale, -_E4M3_MAX, _E4M3_MAX))
     return _straight_through(x, (rounded * scale).reshape(x.shape))
 
 
@@ -84,9 +80,9 @@ def fake_quant_fp4(x, block: int, e4m3_scale: bool):
     amax = jnp.max(jnp.abs(blocks), -1, keepdims=True)
     if e4m3_scale:
         # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
-        scale = round_e4m3fn(jnp.minimum(jnp.maximum(amax, E2M1_MAX * 2 ** -9) / E2M1_MAX, E4M3_MAX))
+        scale = _round_e4m3fn(jnp.minimum(jnp.maximum(amax, _E2M1_MAX * 2 ** -9) / _E2M1_MAX, _E4M3_MAX))
     else:
-        scale = power_of_two_ceil(
-            jnp.maximum(amax, E2M1_MAX * 2 ** -126) * jnp.float32(1 / E2M1_MAX))
-    rounded = _e2m1(jnp.clip(blocks / scale, -E2M1_MAX, E2M1_MAX))
+        scale = _power_of_two_ceil(
+            jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
+    rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
     return _straight_through(x, (rounded * scale).reshape(x.shape))

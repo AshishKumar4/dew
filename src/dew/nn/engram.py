@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -38,34 +39,14 @@ from flax.typing import Dtype, PrecisionLike
 
 from .sharding import logical_axes
 
-DEAD = -1
+_DEAD = -1
 """A compressed id no n-gram reaches across (engram.py:130)."""
 _LIMB = 8
 _LIMBS = 8
 
 
 def _is_prime(n: int) -> bool:
-    """Deterministic Miller-Rabin for every n below 3.3e24."""
-    if n < 2:
-        return False
-    small = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41)
-    for p in small:
-        if n % p == 0:
-            return n == p
-    d, r = n - 1, 0
-    while d % 2 == 0:
-        d, r = d // 2, r + 1
-    for a in small:
-        x = pow(a, d, n)
-        if x in (1, n - 1):
-            continue
-        for _ in range(r - 1):
-            x = x * x % n
-            if x == n - 1:
-                break
-        else:
-            return False
-    return True
+    return n > 1 and all(n % d for d in range(2, math.isqrt(n) + 1))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -199,27 +180,27 @@ def _modulo(limbs, prime):
     return remainder
 
 
-def lookback(compressed, valid, positions, size: int, history=None):
+def _lookback(compressed, valid, positions, size: int, history=None):
     """Each position's compressed id and its `size - 1` predecessors.
 
-    `compressed` `[B, S]` int32 (DEAD for a dead token), `valid` `[B, S]` the
+    `compressed` `[B, S]` int32 (_DEAD for a dead token), `valid` `[B, S]` the
     tokens that are part of the sequence (padding is skipped, not dead),
     `positions` `[B, S]` their sequence positions, `history` `[B, size - 1]`
-    the ids before this call, nearest last, DEAD where none. Returns
+    the ids before this call, nearest last, _DEAD where none. Returns
     `([B, S, size] ids, [B, S, size] blocked, [B, size - 1] new history)`.
     """
     batch = compressed.shape[0]
     if history is None:
-        history = jnp.full((batch, size - 1), DEAD, jnp.int32)
+        history = jnp.full((batch, size - 1), _DEAD, jnp.int32)
     # The valid tokens packed to the front, after the history they follow.
     order = jnp.argsort(~valid, axis=1, stable=True)
     packed = jnp.concatenate(
-        [history, jnp.take_along_axis(jnp.where(valid, compressed, DEAD), order, axis=1)], axis=1)
+        [history, jnp.take_along_axis(jnp.where(valid, compressed, _DEAD), order, axis=1)], axis=1)
     rank = jnp.cumsum(valid, axis=1) - 1 + (size - 1)
     shifts = jnp.arange(size)
     at = rank[..., None] - shifts
     ids = jnp.take_along_axis(packed[:, None, :], jnp.maximum(at, 0), axis=2)
-    dead = (at < 0) | (ids == DEAD) | (positions[..., None] < shifts)
+    dead = (at < 0) | (ids == _DEAD) | (positions[..., None] < shifts)
     blocked = jnp.cumsum(dead, axis=-1) > 0
     count = jnp.sum(valid, axis=1)
     tail = jnp.arange(size - 1) + count[:, None]
@@ -252,21 +233,21 @@ class EngramHashes(nn.Module):
                               lambda: jnp.arange(vocab, dtype=jnp.int32) % spec.compressed_vocab_size).value
         compressed = jnp.take(table, tokens, axis=0)
         if media is not None:
-            compressed = jnp.where(media, DEAD, compressed)
+            compressed = jnp.where(media, _DEAD, compressed)
         valid = jnp.ones(tokens.shape, bool) if valid is None else jnp.asarray(valid, bool)
         size = spec.max_ngram_size
         history = held = None
         allocated = False
         if decode:
             allocated = self.has_variable('cache', 'history')
-            held = self.variable('cache', 'history', jnp.full, (tokens.shape[0], size - 1), DEAD, jnp.int32)
+            held = self.variable('cache', 'history', jnp.full, (tokens.shape[0], size - 1), _DEAD, jnp.int32)
             history = held.value
             if positions is None:
                 # The history knows where a row starts; a call's positions do not.
                 positions = jnp.full(tokens.shape, size, jnp.int32)
         elif positions is None:
             positions = jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0)
-        ids, blocked, history = lookback(compressed, valid, jnp.asarray(positions), size, history)
+        ids, blocked, history = _lookback(compressed, valid, jnp.asarray(positions), size, history)
         if held is not None and allocated:
             held.value = history
         return spec.hash_ids(ids, blocked, table[spec.pad_token_id])

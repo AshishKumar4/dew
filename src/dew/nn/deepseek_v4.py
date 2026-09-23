@@ -35,7 +35,7 @@ and so are the selections (section 2.3.1): a Full layer computes both and
 its selection, a Reindex layer rescores the latest keys with its own
 queries, and a Reuse layer attends the latest selection over the latest
 entries (v41:613-763). What a layer publishes goes into the kv_store the
-block threads down the stack, under the `CSA2_*` names. The first Full layer
+block threads down the stack, under the `_CSA2_*` names. The first Full layer
 of the decoder also builds a candidate pool of the best-scoring blocks,
 within which the later Reindex layers search (section 2.3.2, v41:583-610).
 The query is not normed per head (v41:770-772), and quantization-aware
@@ -76,10 +76,10 @@ from dew.nn.sparse_selection import candidate_pool, selection_mask, top_k_keys, 
 
 COMPRESSORS = ('csa', 'hca', 'csa2')
 CANDIDATES = ('source', 'restrict')
-CSA2_ENTRIES = 'csa2_entries'
-CSA2_INDEX_KEYS = 'csa2_index_keys'
-CSA2_SELECTED = 'csa2_selected'
-CSA2_CANDIDATES = 'csa2_candidates'
+_CSA2_ENTRIES = 'csa2_entries'
+_CSA2_INDEX_KEYS = 'csa2_index_keys'
+_CSA2_SELECTED = 'csa2_selected'
+_CSA2_CANDIDATES = 'csa2_candidates'
 """The kv_store names a CSA2 layer publishes under: the latest Full layer's
 rotated entries and index keys, the latest selection and the candidate
 pool's entries. One name each, since every layer reads the latest (section
@@ -379,10 +379,10 @@ class IndexScorer(nn.Module):
     def __call__(self, query, keys, x):
         weights = nn.Dense(self.n_heads, use_bias=False, dtype=self.dtype,
                            precision=self.precision, name='weights_proj')(x)
-        return index_scores(query, keys, weights, self.precision)
+        return _index_scores(query, keys, weights, self.precision)
 
 
-def index_scores(query, keys, weights, precision=None):
+def _index_scores(query, keys, weights, precision=None):
     """`sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)` in fp32,
     over keys `[B, T, D]` every query shares or `[B, S, T, D]` per query."""
     heads, width = query.shape[-2:]
@@ -476,7 +476,6 @@ class Csa2Indexer(nn.Module):
     n_heads: int
     head_dim: int
     rope_dim: int
-    top_k: int
     owns_keys: bool
     quantized: bool
     norm_eps: float
@@ -510,7 +509,7 @@ class Csa2Indexer(nn.Module):
         batch, length, _ = x.shape
         query = rotate_trailing(
             self.wq_b(q_resid).reshape(batch, length, self.n_heads, self.head_dim), cos, sin)
-        return index_scores(self._fp4(query), jax.lax.stop_gradient(keys), self.weights_proj(x),
+        return _index_scores(self._fp4(query), jax.lax.stop_gradient(keys), self.weights_proj(x),
                             self.precision)
 
 
@@ -643,7 +642,7 @@ class DeepseekV4Attention(nn.Module):
         self.o_b_proj = dense(self.emb_features, name='o_b_proj')
         self.sinks = self.param('sinks', nn.initializers.zeros, (self.num_heads,), jnp.float32)
         if self.compressor == 'csa2':
-            rate, index = self.csa2_geometry()
+            rate, index = self._csa2_geometry()
             if not self.kv_shared and not self.reindex:
                 self.compress = CompressedEntries(
                     width=self.head_dim, rate=rate, overlap=False,
@@ -654,7 +653,7 @@ class DeepseekV4Attention(nn.Module):
             if not self.kv_shared:
                 self.indexer = Csa2Indexer(
                     n_heads=index[1], head_dim=index[2], rope_dim=self.rope_dim,
-                    top_k=index[0], owns_keys=not self.reindex, quantized=self.kv_qat,
+                    owns_keys=not self.reindex, quantized=self.kv_qat,
                     norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision, name='indexer')
         elif self.compressor is not None and self.compress_rate is not None:
             self.compress = Compressor(
@@ -664,7 +663,7 @@ class DeepseekV4Attention(nn.Module):
                 index_head_dim=self.index_head_dim, index_topk=self.index_topk,
                 dtype=self.dtype, precision=self.precision, name='compressor')
 
-    def csa2_geometry(self) -> tuple[int, tuple[int, int, int]]:
+    def _csa2_geometry(self) -> tuple[int, tuple[int, int, int]]:
         """A CSA2 layer's rate and its indexer's (top_k, heads, head width),
         which setup has already required."""
         rate, index = self.compress_rate, (self.index_topk, self.index_n_heads, self.index_head_dim)
@@ -681,12 +680,12 @@ class DeepseekV4Attention(nn.Module):
         it reads the keys of whichever layer last published; Dew does not
         reproduce that."""
         if self.kv_shared:
-            return (_published(kv_store, CSA2_ENTRIES, 'Reuse'),
-                    _published(kv_store, CSA2_SELECTED, 'Reuse'))
-        rate, (top_k, _, index_head_dim) = self.csa2_geometry()
+            return (_published(kv_store, _CSA2_ENTRIES, 'Reuse'),
+                    _published(kv_store, _CSA2_SELECTED, 'Reuse'))
+        rate, (top_k, _, index_head_dim) = self._csa2_geometry()
         if self.reindex:
-            entries = _published(kv_store, CSA2_ENTRIES, 'Reindex')
-            keys = _published(kv_store, CSA2_INDEX_KEYS, 'Reindex')
+            entries = _published(kv_store, _CSA2_ENTRIES, 'Reindex')
+            keys = _published(kv_store, _CSA2_INDEX_KEYS, 'Reindex')
         elif cache is None:
             entries, latents = self.compress.entries_and_latents(x)
             windows = jnp.arange(latents.shape[1])
@@ -707,7 +706,7 @@ class DeepseekV4Attention(nn.Module):
         if self.candidates == 'restrict':
             # A Reindex layer scores the pool's entries alone, their keys
             # gathered per query (section 2.3.2): O(pool), not O(entries).
-            pool = _published(kv_store, CSA2_CANDIDATES, 'Reindex')
+            pool = _published(kv_store, _CSA2_CANDIDATES, 'Reindex')
             held = jnp.maximum(pool, 0)
             scores = self.indexer.scores(x, q_resid, keys[jnp.arange(x.shape[0])[:, None, None], held],
                                          cos, sin)
@@ -718,14 +717,14 @@ class DeepseekV4Attention(nn.Module):
             scores = self.indexer.scores(x, q_resid, keys, cos, sin)
             if (self.candidates == 'source' and self.candidate_blocks and self.candidate_block_size
                     and kv_store is not None):
-                kv_store[CSA2_CANDIDATES] = candidate_pool(
+                kv_store[_CSA2_CANDIDATES] = candidate_pool(
                     scores, visible, self.candidate_blocks, self.candidate_block_size)
             selected = top_k_keys(scores, visible, top_k)
         if kv_store is not None:
             if not self.reindex:
-                kv_store[CSA2_ENTRIES] = entries
-                kv_store[CSA2_INDEX_KEYS] = keys
-            kv_store[CSA2_SELECTED] = selected
+                kv_store[_CSA2_ENTRIES] = entries
+                kv_store[_CSA2_INDEX_KEYS] = keys
+            kv_store[_CSA2_SELECTED] = selected
         return entries, selected
 
     @nn.compact
@@ -847,17 +846,15 @@ class DSparkAttention(DeepseekV4Attention):
     @nn.compact
     def __call__(self, x, decode: bool = False, positions=None, segment_ids=None,
                  kv_store=None, attention_metadata: AttentionMetadata | None = None):
-        if self.compressor is not None:
-            raise ValueError("the DSpark drafter's layers are sliding layers")
-        main = None if kv_store is None else kv_store.get(DRAFT_CONTEXT)
+        store = {} if kv_store is None else kv_store
+        main = store.get(DRAFT_CONTEXT)
         batch = x.shape[0]
         if decode:
             cached_key = self.variable('cache', 'cached_key', jnp.zeros,
                                        (batch, self.max_seq_len, self.head_dim), x.dtype)
             if main is not None:
-                assert kv_store is not None
                 slots, allocated = _cache_positions(self, batch, main.shape[1], self.max_seq_len,
-                                                    kv_store.get(DRAFT_VALID))
+                                                    store.get(DRAFT_VALID))
                 if allocated:
                     cached_key.value = write_cache(cached_key.value, self._window_keys(
                         main, *rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn)), slots)

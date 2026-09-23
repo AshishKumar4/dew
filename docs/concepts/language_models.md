@@ -273,6 +273,7 @@ Each family's processor emits what its reference implementation expects:
 - Gemma 4 emits padded patch streams with 2D patch positions. It expands video placeholders, which the decoder maps to the pad embedding.
 - Qwen 3.5 packs patches channel first, then time, with a grid per image. The loader derives the spatial rotary coordinates that the reference's `get_rope_index` computes.
 - Gemma 3n uses the MobileNet-v5 encoder. It embeds its hard vision and audio vocabulary ranges through the multimodal embedders and keeps placeholder ids for its per-layer inputs while masking the hard ranges, on both training and decode steps.
+- DeepSeek-V4.1 ships no processor. Its release resizes and pads each image in its own `inference/image_processor.py`, and Dew does not reproduce that script, so the caller builds the inputs it writes. `pixel_values` is `[B, images, 3, H, W]`, normalized to [-1, 1], with H and W multiples of the patch size. Each image fills `rows * (columns + 1) + 2` positions of `image_token_id`, where rows and columns count the aligner's `downsample_ratio` squares over the patch grid. `image_indices` numbers those positions in reading order.
 
 Audio clips carry a mask that is True for valid frames. Gemma 4 inserts one placeholder per encoded frame. Gemma 3n inserts a fixed `audio_soft_tokens_per_image` per clip and fills the remaining slots with the embedder's padding token.
 

@@ -31,12 +31,9 @@ from dew.interop.hf_decoders import (
     _yarn_record,
 )
 from dew.nn import vision as vision_nn
-from dew.nn.dspark import DSpark
 
-# DeepSeek-V4.1-Flash (arXiv 2609.19969). There is no transformers class: the
-# release's inference/model.py is the reference (cited v41:line at the
-# revision tools/deepseek_v41_reference.py pins), and its config.json nests
-# the text model's fields under text_config beside a vision tower.
+# The release's config.json nests the text model's fields under text_config
+# beside a vision tower.
 _V41_TEXT_TYPE = 'deepseek_v41_text'
 # The text fields the release ships that no computation reads here: storage
 # hints and the attention-shape spellings V4.1 fixes (one KV head, no bias).
@@ -46,7 +43,8 @@ _V41_TEXT_INERT = frozenset((
 
 
 def _v41_modes(text: Mapping[str, object], layers: int) -> tuple[tuple[int, ...], tuple[str, ...]]:
-    """Every layer's compress ratio and CSA2 mode (section 2.3.1, v41:653-661).
+    """Every compress ratio, the DSpark stages' trailing ones included, and
+    every layer's CSA2 mode (section 2.3.1, v41:653-661).
 
     A layer in both source lists is Full, in the index list alone Reindex,
     and in neither Reuse; a KV source outside the index list would attend
@@ -86,7 +84,7 @@ def _v41_modes(text: Mapping[str, object], layers: int) -> tuple[tuple[int, ...]
     extra = sorted((kv_sources | index_sources) - set(range(layers)))
     if extra:
         _refuse(f"source layers {extra}", f"the model has {layers} layers")
-    return tuple(ratios[:layers]), tuple(modes)
+    return tuple(ratios), tuple(modes)
 
 
 def _int_list(record: Mapping[str, object], field: str) -> tuple[int, ...]:
@@ -99,14 +97,14 @@ def _int_list(record: Mapping[str, object], field: str) -> tuple[int, ...]:
 def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read a text-only DeepSeek-V4.1 config into `CausalTransformer` fields
     (`_v41_decoder`); a bundle with its ViT is the wrapper
-    (`deepseek_v41_wrapper`)."""
+    (`_deepseek_v41_wrapper`)."""
     if hf_config.get('vision_config') is not None:
         _refuse('vision_config', "a DeepSeek-V4.1 bundle with its ViT is a multimodal wrapper, "
                 "which translate_wrapper_config reads")
     return _v41_decoder(hf_config, used, media_bias=False)
 
 
-def deepseek_v41_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+def _deepseek_v41_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
     """Read a DeepSeek-V4.1 bundle: the decoder with its routers' image-span
     bias, the ViT and the aligner (v41:1215-1222)."""
     text = _v41_decoder(hf_config, used, media_bias=True)
@@ -173,7 +171,7 @@ def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias:
         'rope_head_dim': rope_width, 'compressor': None, 'compress_rate': None,
         'query_norm': False, 'kv_qat': True}
     seen.update(('q_lora_rank', 'o_groups', 'o_lora_rank'))
-    kinds, layer_types, shared = _v41_kinds(text, layers, ratios, modes, mixer, {
+    kinds, layer_types, shared = _v41_kinds(text, layers, ratios[:layers], modes, mixer, {
         'window': window, 'rope_theta': compress_theta, 'yarn': ramp}, index, seen)
     moe = _record_int(text, 'moe_intermediate_size')
     base_used: set[str] = set()
@@ -277,10 +275,7 @@ def _v41_dspark(text: Mapping[str, object], layers: int, ratios, seen: set[str])
     block = _record_int(text, 'dspark_block_size', 0)
     if not stages or not block:
         return None
-    ratio_list = text['compress_ratios']
-    assert isinstance(ratio_list, (list, tuple))
-    tail = list(ratio_list)[layers:layers + stages]
-    if tail != [0] * stages:
+    if ratios[layers:layers + stages] != (0,) * stages:
         _refuse('compress_ratios', "the DSpark stages are sliding layers, one trailing 0 each")
     return {'stages': stages, 'block_size': block,
             'noise_token_id': _record_int(text, 'dspark_noise_token_id'),
@@ -339,6 +334,14 @@ _DEEPSEEK_V41_NAMES = (
 )
 _V41_TRUNK = {'embed.weight': 'model.embed_tokens.weight', 'norm.weight': 'model.norm.weight',
               'head.weight': 'lm_head.weight'}
+# A DSpark stage's own leaves beside its block, under `mtp.{stage}.`.
+_DSPARK_LEAVES: dict[str, tuple[str, ...]] = {
+    'main_proj.weight': ('main_proj', 'kernel'), 'main_norm.weight': ('main_norm', 'scale'),
+    'norm.weight': ('norm', 'scale'), 'markov_head.embed.weight': ('markov_embed',),
+    'markov_head.head.weight': ('markov_head',), 'confidence_head.proj.weight': ('confidence', 'kernel')}
+_ENGRAM_LEAVES: dict[str, tuple[str, ...]] = {
+    'embed.weight': ('embed', 'embedding'), 'wkv.weight': ('wkv', 'kernel'),
+    'q_weight': ('q_weight',), 'k_weight': ('k_weight',)}
 
 
 def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -347,32 +350,21 @@ def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ..
     if name.startswith('mtp.'):
         parts = name.split('.')
         dspark = config.get('dspark')
-        stages = (0 if dspark is None else dspark['stages'] if isinstance(dspark, Mapping)
-                  else dspark.stages if isinstance(dspark, DSpark) else 0)
+        stages = dspark['stages'] if isinstance(dspark, Mapping) else 0
         if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) >= stages:
             raise ValueError(f"{name} names an undeclared DSpark stage")
         stage, tail = f'dspark_{parts[1]}', '.'.join(parts[2:])
-        own_leaves: dict[str, tuple[str, ...]] = {'main_proj.weight': ('main_proj', 'kernel'), 'main_norm.weight': ('main_norm', 'scale'),
-               'norm.weight': ('norm', 'scale'), 'markov_head.embed.weight': ('markov_embed',),
-               'markov_head.head.weight': ('markov_head',),
-               'confidence_head.proj.weight': ('confidence', 'kernel')}
-        own = own_leaves.get(tail)
-        if own is not None:
-            return ('params', stage, *own)
+        if tail in _DSPARK_LEAVES:
+            return ('params', stage, *_DSPARK_LEAVES[tail])
         path = _deepseek_v41_path('layers.0.' + tail, config)
-        if path is None:
-            return None
-        return (path[0], stage, 'block', *path[2:])
+        return None if path is None else (path[0], stage, 'block', *path[2:])
     name = _V41_TRUNK.get(name, name)
     parts = name.split('.')
     if len(parts) >= 4 and parts[0] == 'layers' and parts[1].isdigit() and parts[2] == 'engram':
         leaf = '.'.join(parts[3:])
-        engram_leaves: dict[str, tuple[str, ...]] = {'embed.weight': ('embed', 'embedding'), 'wkv.weight': ('wkv', 'kernel'),
-                  'q_weight': ('q_weight',), 'k_weight': ('k_weight',)}
-        engram = engram_leaves.get(leaf)
-        if engram is None:
+        if leaf not in _ENGRAM_LEAVES:
             raise ValueError(f"unknown tensor name {name!r}")
-        return ('params', f'layers_{parts[1]}', 'engram', *engram)
+        return ('params', f'layers_{parts[1]}', 'engram', *_ENGRAM_LEAVES[leaf])
     if not (len(parts) >= 3 and parts[0] == 'layers' and parts[1].isdigit()):
         return _dew_path(name, config)
     tail = '.' + '.'.join(parts[2:])
@@ -382,28 +374,22 @@ def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ..
 
 
 def _deepseek_v41_constants(directory, record: Mapping[str, object]) -> Mapping[str, object]:
-    """The engram hashes' token map, which the tokenizer defines rather than
-    a tensor (`engram_token_map`); nothing for a config without engram."""
-    if record.get('engram') is None:
-        return {}
-    return {'engram_hashes': {'token_map': engram_token_map(directory, record)}}
-
-
-def engram_token_map(directory, record: Mapping[str, object]) -> np.ndarray:
-    """The compressed vocabulary V4.1's engram hashes over, read off the
-    tokenizer the checkpoint ships (engram.py:17-55, :136-146).
+    """The engram hashes' token map: the compressed vocabulary V4.1's engram
+    hashes over, read off the tokenizer the checkpoint ships (engram.py:17-55,
+    :136-146); nothing for a config without engram.
 
     Every hash multiplier derives from the compressed vocabulary's size, so a
     tokenizer that compresses to another size than the config states would
     hash every n-gram elsewhere; it is refused. Ids past the tokenizer's
     length, which no text reaches, map to the pad token's compressed id.
     """
+    engram = record.get('engram')
+    if not isinstance(engram, Mapping):
+        return {}
     from transformers import AutoTokenizer
 
     from dew.nn.engram import compressed_token_map
 
-    engram = record['engram']
-    assert isinstance(engram, Mapping)
     try:
         tokenizer = AutoTokenizer.from_pretrained(str(directory), local_files_only=True)
     except (OSError, ValueError) as error:
@@ -418,4 +404,4 @@ def engram_token_map(directory, record: Mapping[str, object]) -> np.ndarray:
     if len(lookup) > vocab:
         _refuse('tokenizer', f"it has {len(lookup)} tokens for a vocabulary of {vocab}")
     pad = lookup[_record_int(engram, 'pad_token_id')]
-    return np.concatenate([lookup, np.full(vocab - len(lookup), pad, np.int32)])
+    return {'engram_hashes': {'token_map': np.concatenate([lookup, np.full(vocab - len(lookup), pad, np.int32)])}}
