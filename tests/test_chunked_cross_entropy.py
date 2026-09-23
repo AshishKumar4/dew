@@ -34,8 +34,12 @@ CHUNKS = [1, 2, 4, 8]
 
 
 def reference(hidden, head, targets, softcap=None):
-    """The full-vocabulary path: one big logits tensor, optax's cross entropy."""
-    logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head)
+    """The full-vocabulary path: one big logits tensor, optax's cross entropy.
+    bf16 states are bf16 compute, which multiplies the head rounded to bf16."""
+    if hidden.dtype == jnp.bfloat16:
+        head = head.astype(jnp.bfloat16).astype(jnp.float32)
+    logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head,
+                        precision=jax.lax.Precision.HIGHEST)
     if softcap is not None:
         cap = jnp.asarray(softcap, jnp.float32)
         logits = cap * jnp.tanh(logits / cap)
@@ -185,13 +189,13 @@ def small_model(**overrides):
     return CausalTransformer(**{**config, **overrides})
 
 
-@pytest.mark.parametrize("bf16_head", [False, True])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("tie_embeddings", [True, False])
 @pytest.mark.parametrize("chunks", [4, 8])
-def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embeddings, bf16_head):
-    """Real bf16 hidden states and a real head, tied and untied, with the
-    model's head multiplying as the chunked loss does in both head modes."""
-    model = small_model(tie_embeddings=tie_embeddings, bf16_head=bf16_head)
+def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embeddings, dtype):
+    """Real hidden states and a real head, tied and untied: the model's head
+    multiplies as the chunked loss does under bf16 and fp32 compute."""
+    model = small_model(tie_embeddings=tie_embeddings, dtype=dtype)
     rng = jax.random.PRNGKey(0)
     ids = jax.random.randint(rng, (2, 12), 0, 97)
     variables = model.init(rng, ids)
@@ -203,10 +207,9 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
     hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
     head = model.apply(variables, variables['params'],
                        method=CausalTransformer.head_weight)
-    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks,
-                                                 bf16=bf16_head)
+    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
 
-    assert hidden.dtype == jnp.bfloat16
+    assert hidden.dtype == dtype
     assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
     assert jnp.array_equal(predicted, jnp.argmax(logits, axis=-1))
 

@@ -23,7 +23,7 @@ import jax.numpy as jnp
 from dew.artifacts import TokenScores
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.objectives.base import Aux, Mean, Variables, mean_loss
-from dew.objectives.lm.chunked import bf16_head, chunked_cross_entropy
+from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
 from dew.rl.surrogate import (
@@ -331,7 +331,7 @@ class GRPOObjective(LMObjective):
         losses, _, _ = chunked_cross_entropy(
             hidden, head, aligned[:, 1:], self.head_chunks,
             softcap=self.model.final_logit_softcap,
-            precision=self.model.precision, predict=False, bf16=bf16_head(self.model))
+            precision=self.model.precision, predict=False)
         losses, valid = _unpadded(losses, padding)
         return TokenScores(losses=losses, weights=valid.astype(losses.dtype))
 

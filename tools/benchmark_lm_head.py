@@ -7,9 +7,9 @@ The variants are baseline (one full-vocabulary logits tensor), stored (the
 Python vocabulary loop holding its tiles), remat (that loop under
 `jax.checkpoint`) and bounded (the shipped recomputing custom VJP), each with
 an optional chunk count after the name (`bounded8`; 4 when absent) and the
-suffixes -noacc, which drops the top-1 prediction to price the metric,
--fp32, which keeps the states in fp32, and -bf16, which multiplies the head
-as bf16 (`CausalTransformer.bf16_head`). The table is held `[vocab, features]`,
+suffixes -noacc, which drops the top-1 prediction to price the metric, and
+-fp32, which keeps the states in fp32 (and so the head's product fp32; bf16
+states multiply it as bf16). The table is held `[vocab, features]`,
 the layout `embed_tokens.embedding` has, so the transpose the loss needs is
 inside the measurement and not hidden by the setup.
 
@@ -53,7 +53,6 @@ class Variant:
     chunks: int
     accuracy: bool
     states_dtype: jnp.dtype
-    bf16: bool = False
     softcap: float | None = None
     z_loss: float = 0.0
     tile: tuple[int, int] = DEFAULT_TILE
@@ -88,7 +87,7 @@ def baseline(states, table, targets, variant: Variant):
 def bounded(states, table, targets, variant: Variant):
     losses, predicted, log_z = chunked_cross_entropy(
         states, table.T, targets, variant.chunks, softcap=variant.softcap,
-        tile=variant.tile, predict=variant.accuracy, bf16=variant.bf16
+        tile=variant.tile, predict=variant.accuracy
     )
     return finish(losses, predicted, log_z, targets, variant)
 
@@ -142,7 +141,7 @@ HEADS: dict[str, Head] = {
     "remat": retained,
     "bounded": bounded,
 }
-SUFFIXES = ("noacc", "fp32", "bf16")
+SUFFIXES = ("noacc", "fp32")
 
 
 def parse_variant(text: str) -> Variant:
@@ -161,7 +160,6 @@ def parse_variant(text: str) -> Variant:
         int(base[len(head) :] or "4"),
         accuracy="noacc" not in suffixes,
         states_dtype=jnp.dtype(jnp.float32 if "fp32" in suffixes else jnp.bfloat16),
-        bf16="bf16" in suffixes,
     )
 
 

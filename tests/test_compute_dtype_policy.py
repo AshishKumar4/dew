@@ -110,27 +110,7 @@ LOGITS = ("causal_transformer", "diffusion_gemma", "multimodal_transformer")
 # the table is empty and the parametrization covers all of them.
 FIXTURES: dict[str, str] = {}
 
-# The families whose loss reads a vocabulary head. dew multiplies that head in
-# fp32 whatever the compute dtype is, and says so where it is tested:
-# test_causal_transformer.py::test_the_tied_head_multiplies_in_fp32_under_bf16_compute
-# ("casting both to bf16 before the einsum, then up, is a different number,
-# and the loss the optimizer sees is the fp32 one") and
-# tests/test_chunked_cross_entropy.py's reference(), which upcasts the bf16
-# states on purpose. Measured on the operand cast this budget asks for: the
-# chunked loss moves 1.91e-06 -> 2.19e-02 against a 2.42e-04 tolerance and the
-# tied head 0 -> 4.80e-03 against atol 1e-06. So these cases carry their head's
-# FLOPs and fail until that contract is changed deliberately, which is a
-# numerics decision and not this file's to take; strict, so the day the head
-# multiplies bf16 this says so rather than passing quietly.
-FP32_HEAD = ("causal_transformer", "diffusion_gemma", "multimodal_transformer")
-HEAD_REASON = ("the vocabulary head multiplies fp32 by contract "
-               "(test_the_tied_head_multiplies_in_fp32_under_bf16_compute)")
-
-FAMILIES = [
-    pytest.param(family, marks=pytest.mark.xfail(strict=True, reason=HEAD_REASON))
-    if family in FP32_HEAD else family
-    for family in sorted(models)
-]
+FAMILIES = sorted(models)
 
 
 @dataclass(frozen=True)
@@ -367,21 +347,12 @@ def lm_loss_and_grad(rng):
     return jax.value_and_grad(loss), variables
 
 
-@pytest.mark.xfail(strict=True, reason=HEAD_REASON)
 def test_the_lm_head_multiplies_bf16_states(rng):
-    """The vocabulary head is the widest matmul a language model runs, and
-    `dew.objectives.lm.chunked.head_logits` casts the states to fp32 before it
-    (chunked.py:63), so both operands of that dot are fp32 and it runs at half
-    rate - 7.66% of a dense step, 7.96% of the MoE step (audit finding 7).
-    fp32 accumulation is what the head needs for an exact logsumexp, and
-    `preferred_element_type=jnp.float32` already asks for it; the operand cast
-    is the separate thing, and this fails until it goes.
-
-    It has not gone: the same operands are what the model's own head
-    multiplies, and dew states in `FP32_HEAD` above why that head is fp32 on
-    both sides. Dropping the cast here alone would also make the chunked loss
-    disagree with the full pass it is checked against.
-    """
+    """The vocabulary head is the widest matmul a language model runs: 7.66%
+    of a dense step and 7.96% of the MoE step on the RTX 4080 while both its
+    operands were fp32 (audit finding 7). Under bf16 compute it multiplies
+    bf16 by bf16 and accumulates in fp32, forward and backward, which is
+    all an exact logsumexp needs."""
     value_and_grad, variables = lm_loss_and_grad(rng)
     found = matmuls(matmul_text(value_and_grad, variables))
     large = [matmul for matmul in found if matmul.fp32 and matmul.flops > LARGE]

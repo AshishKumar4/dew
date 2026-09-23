@@ -152,8 +152,6 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> benchmar
         if args is not None:
             mixture["implementation"] = args.implementation
         config = {**decoder(12, 768, 12, 2048), "mixture": mixture}
-    if args is not None and args.bf16_head:
-        config["bf16_head"] = True
     return benchmark_step.Case("causal_transformer", config, dtype="bfloat16",
                                batch_size=batch, seq_len=SEQUENCE)
 
@@ -181,7 +179,7 @@ def step(args: argparse.Namespace) -> dict[str, object]:
         step_ms = (time.perf_counter() - start) / args.steps * 1e3
         losses.append(float(loss))
     return {"path": args.path, "batch": args.batch, "implementation": args.implementation,
-            "state_dtype": args.state_dtype, "bf16_head": args.bf16_head, "ms_per_step": step_ms,
+            "state_dtype": args.state_dtype, "ms_per_step": step_ms,
             "compile_seconds": compile_seconds, "loss_after_warmup": losses[0],
             "loss_last": losses[-1]}
 
@@ -201,7 +199,6 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--batch", type=int, required=True)
     run.add_argument("--implementation", default="auto")
     run.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32")
-    run.add_argument("--bf16-head", action="store_true")
     run.add_argument("--steps", type=int, default=30)
     args = parser.parse_args(argv)
     result = {"projection": projection, "adam": adam, "step": step}[args.mode](args)
