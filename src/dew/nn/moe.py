@@ -45,6 +45,7 @@ from .precision import rounded_operand
 from .precision import precision_names, rounded_operand
 from .sharding import EXPERT_AXIS, logical_axes
 from .inputs import BATCH_AXES
+from .kernels.generation import device_generation
 from .kernels.grouped_matmul import gpu_runs, grouped_projection, ragged_dot_runs
 from .precision import rounded_operand
 from .sharding import EXPERT_AXIS, SEQUENCE_AXIS, logical_axes
@@ -324,9 +325,14 @@ class Router(nn.Module):
 # docs/performance.md. On sm80 (A100) and sm89 (L4, RTX 4080) that is JAX's
 # own Pallas kernels (`dew.nn.kernels.grouped_matmul`), 5x to 61x faster than
 # XLA, which runs ragged_dot there as a product over every expert. On a TPU
-# v5e and v6e it is XLA's ragged_dot. Every generation not listed is
-# unmeasured and runs 'xla': sm75 cannot compile the kernels, and sm90 and
-# sm120 have no measurement yet.
+# v5e and v6e it is XLA's ragged_dot: the one kernel that beats it at 8
+# experts, tokamax's mosaic_tpu_v2 with its own VJP (1.11x-1.38x), needs
+# tokamax installed beside Dew, and tokamax 0.0.14 pins typeguard==2.13.3
+# where tyro needs >=4 (and its flax.nnx import fails on jax 0.11.2), so it
+# cannot be a declared dependency; at 128 experts XLA wins outright. Every
+# generation not listed runs 'xla': sm75 cannot compile the kernels, and
+# sm86 [inferred from sm80/sm89], sm90 and sm120 [no hardware] are
+# unmeasured.
 GROUPED_MATMUL_BY_GENERATION = {'sm80': 'pallas', 'sm89': 'pallas', 'v5e': 'xla', 'v6e': 'xla'}
 
 # The kernel 'tokamax' names, per generation. tokamax's own dispatch tries its
@@ -337,24 +343,6 @@ GROUPED_MATMUL_BY_GENERATION = {'sm80': 'pallas', 'sm89': 'pallas', 'v5e': 'xla'
 # sm89. Unmeasured generations run tokamax's 'xla'.
 TOKAMAX_KERNEL_BY_GENERATION = {'sm80': 'triton', 'sm89': 'triton',
                                 'v5e': 'mosaic_tpu_v2', 'v6e': 'mosaic_tpu_v2'}
-
-# `device_kind` of the TPU generations Dew names.
-TPU_GENERATIONS = {'TPU v4': 'v4', 'TPU v5 lite': 'v5e', 'TPU v5': 'v5p', 'TPU v5p': 'v5p',
-                   'TPU v6 lite': 'v6e'}
-
-
-def device_generation() -> str:
-    """The default device's hardware generation, as the kernel tables key it:
-    'sm89' for a GPU of compute capability 8.9, 'v6e' for a TPU v6e, and the
-    backend's name for anything else."""
-    device = jax.devices()[0]
-    if device.platform == 'gpu' and getattr(device, 'compute_capability', None):
-        return 'sm' + device.compute_capability.replace('.', '')
-    if device.platform == 'tpu':
-        kind = device.device_kind or 'tpu'
-        return TPU_GENERATIONS.get(kind, kind)
-    return device.platform
-
 
 def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
                           precision: PrecisionLike) -> str:

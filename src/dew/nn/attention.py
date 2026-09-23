@@ -21,6 +21,7 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
+from .kernels.generation import bf16_dot_runs
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import precision_names
 from .rope import apply_rotary
@@ -662,8 +663,9 @@ CUDNN_MAX_HEAD_DIM = 128
 def cudnn_runs(query, softcap=None) -> bool:
     """Report whether cudnn's fused kernel takes this query.
 
-    It needs a gpu backend, one of cudnn's two dtypes, a head dimension it
-    tiles, and no logit softcap, which no fused kernel applies. Only 'auto'
+    It needs a gpu of sm80 or later (cuDNN refuses bf16 and fp16 below it:
+    "SDPA FP16/BF16 requires SM80"), one of cudnn's two dtypes, a head
+    dimension it tiles, and no logit softcap, which no fused kernel applies. Only 'auto'
     asks this; an explicit 'cudnn' refuses by name instead.
 
     A run under `--xla_gpu_deterministic_ops` is excluded as well. Under
@@ -676,7 +678,7 @@ def cudnn_runs(query, softcap=None) -> bool:
     query alone and holds for the whole call.
     """
     head_dim = query.shape[-1]
-    return (jax.default_backend() == 'gpu' and query.dtype in CUDNN_DTYPES
+    return (jax.default_backend() == 'gpu' and bf16_dot_runs() and query.dtype in CUDNN_DTYPES
             and head_dim % 8 == 0 and head_dim <= CUDNN_MAX_HEAD_DIM
             and softcap is None and not deterministic_ops_requested())
 
@@ -962,14 +964,21 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     """The concrete kernel an `AttentionImpl` names for this call.
 
     Only 'auto' chooses, against the call's shapes and this machine's
-    backend: the reference path when the call asks for arithmetic no fused
-    kernel performs (`reference_only`), else cudnn where `cudnn_runs` and the
-    call has no sinks, the tpu kernel where `tpu_runs`, and xla anywhere
-    else. Any other name is returned as it is, so an explicit kernel still
-    refuses what it cannot honour by name.
+    backend (both 'auto' and 'xla' take the reference path for bf16 on a
+    GPU older than sm80, where jax.nn's xla kernel cannot run): the
+    reference path when the call asks for arithmetic no fused kernel
+    performs (`reference_only`), else cudnn where `cudnn_runs` and the call
+    has no sinks, the tpu kernel where `tpu_runs`, and xla anywhere else.
+    Any other name is returned as it is, so an explicit kernel still refuses
+    what it cannot honour by name.
     """
     if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'tpu'):
         raise ValueError(f"Unknown attention implementation: {implementation}")
+    if implementation in ('auto', 'xla') and query.dtype == jnp.bfloat16 and not bf16_dot_runs():
+        # jax.nn's xla attention names the BF16_BF16_F32 algorithm, which a
+        # GPU older than sm80 rejects at run time, past jax's own fallback;
+        # the reference path multiplies at the caller's precision.
+        return 'reference'
     if implementation != 'auto':
         return implementation
     if reference_only(query, dtype, precision, force_fp32_for_softmax):
@@ -999,6 +1008,9 @@ def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, prec
     """
     if implementation == 'auto' and reference_only(query, dtype, precision,
                                                    force_fp32_for_softmax):
+        return 'reference'
+    if (implementation in ('auto', 'cudnn', 'xla') and query.dtype == jnp.bfloat16
+            and not bf16_dot_runs()):
         return 'reference'
     return 'xla' if implementation in ('auto', 'cudnn') else implementation
 
