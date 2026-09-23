@@ -36,10 +36,12 @@ Precision policies:
 
 import argparse
 import contextlib
+import dataclasses
 import json
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -154,10 +156,16 @@ def bf16_residual(model) -> None:
     rotary.register_forward_pre_hook(lambda module, args: (args[0].float(), *args[1:]))
 
 
-def router_probe(model, tokens: torch.Tensor, active: int, autocast) -> tuple[list, list]:
+def autocast(precision: str):
+    """The forward's context: bf16 autocast for the autocast policies."""
+    return (torch.autocast("cuda", dtype=torch.bfloat16) if precision.startswith("autocast")
+            else contextlib.nullcontext())
+
+
+def router_probe(model, tokens: torch.Tensor, active: int, precision: str) -> tuple[list, list]:
     """Each routed layer's share of top-k slots per expert, and its mean
     router entropy, over one fixed batch at the current weights."""
-    with torch.no_grad(), autocast():
+    with torch.no_grad(), autocast(precision):
         outputs = model(input_ids=tokens[:, :-1], output_router_logits=True)
     loads, entropies = [], []
     for logits in outputs.router_logits:
@@ -169,8 +177,18 @@ def router_probe(model, tokens: torch.Tensor, active: int, autocast) -> tuple[li
     return loads, entropies
 
 
-def main() -> None:
-    args = arguments()
+@dataclasses.dataclass
+class Ranks:
+    """Where this process runs: its rank among `world` and its GPU."""
+
+    rank: int
+    world: int
+    device: torch.device
+    distributed: bool
+
+
+def ranks(args: argparse.Namespace) -> Ranks:
+    """The process group, this process's GPU, and the precision flags."""
     distributed = args.parallel != "single"
     if distributed:
         dist.init_process_group("nccl")
@@ -179,19 +197,41 @@ def main() -> None:
     else:
         rank, world, local = 0, 1, 0
     torch.cuda.set_device(local)
-    device = torch.device("cuda", local)
     if args.precision == "fp32":
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
     if args.precision == "fsdp-bf16" and args.parallel != "fsdp2":
         raise ValueError("fsdp-bf16 is FSDP2's mixed-precision policy; run it with --parallel fsdp2")
+    return Ranks(rank, world, torch.device("cuda", local), distributed)
 
+
+@dataclasses.dataclass
+class Run:
+    """The model, wrapped for its parallelism, its optimizer, the recorded
+    windows and how a step splits them over ranks and micro-batches."""
+
+    model: Any
+    network: Any
+    optimizer: torch.optim.Optimizer
+    windows: np.ndarray
+    order: np.ndarray
+    seq: int
+    total: int
+    schedule_steps: int
+    share: int
+    micro: int
+    accumulation: int
+    active: int  # experts a token takes; 0 without the balance loss
+
+
+def build(args: argparse.Namespace, place: Ranks) -> Run:
     from transformers import AutoConfig, AutoModelForCausalLM
+
     config = AutoConfig.from_pretrained(args.model)
     extra = {} if config.model_type == "mamba2" else {"attn_implementation": args.attention}
     if args.experts is not None:
         extra["experts_implementation"] = args.experts
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, **extra).to(device)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32, **extra).to(place.device)
     model.config.use_cache = False
     model.train()
     if args.precision == "autocast-bf16-residual":
@@ -202,23 +242,21 @@ def main() -> None:
 
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]
-    seq = windows.shape[1] - 1
     # The schedule decays over every epoch; --steps only stops the run early,
     # so a short run steps exactly as the first steps of the full one.
     schedule_steps = steps_for(order, args.batch)
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
-    if args.batch % world:
-        raise ValueError(f"{args.batch} rows do not split over {world} ranks")
-    share = args.batch // world
+    if args.batch % place.world:
+        raise ValueError(f"{args.batch} rows do not split over {place.world} ranks")
+    share = args.batch // place.world
     micro = args.micro_batch or share
     if share % micro:
         raise ValueError(f"a rank's {share} rows do not split into micro-batches of {micro}")
-    accumulation = share // micro
 
     network = model
     if args.parallel == "ddp":
         from torch.nn.parallel import DistributedDataParallel
-        network = DistributedDataParallel(model, device_ids=[local], gradient_as_bucket_view=True)
+        network = DistributedDataParallel(model, device_ids=[place.device.index], gradient_as_bucket_view=True)
     elif args.parallel == "fsdp2":
         from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
         policy = (MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
@@ -228,43 +266,97 @@ def main() -> None:
         fully_shard(model, mp_policy=policy)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr_peak, betas=(args.b1, args.b2),
                                   eps=args.eps, weight_decay=args.weight_decay, fused=True)
+    return Run(model, network, optimizer, windows, order, windows.shape[1] - 1, total, schedule_steps,
+               share, micro, share // micro, model.config.num_experts_per_tok if routed else 0)
 
-    def autocast():
-        return (torch.autocast("cuda", dtype=torch.bfloat16) if args.precision.startswith("autocast")
+
+def train_step(args: argparse.Namespace, place: Ranks, run: Run, step: int
+               ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One optimizer step on this rank's rows of step `step`, over its
+    micro-batches: the mean cross entropy, the pre-clip gradient norm and the
+    weighted balance loss."""
+    rows = window_rows(run.order, step, args.batch)[place.rank * run.share:(place.rank + 1) * run.share]
+    tokens = torch.from_numpy(run.windows[rows].astype(np.int64)).pin_memory().to(place.device, non_blocking=True)
+    step_loss = torch.zeros((), device=place.device)
+    step_aux = torch.zeros((), device=place.device)
+    routed = run.active > 0
+    for index in range(run.accumulation):
+        chunk = tokens[index * run.micro:(index + 1) * run.micro]
+        last = index == run.accumulation - 1
+        sync = (run.network.no_sync() if args.parallel == "ddp" and not last
                 else contextlib.nullcontext())
+        if args.parallel == "fsdp2":
+            run.model.set_requires_gradient_sync(last)
+        with sync:
+            with autocast(args.precision):
+                outputs = run.network(input_ids=chunk[:, :-1], output_router_logits=routed) if routed \
+                    else run.network(input_ids=chunk[:, :-1])
+                logits = outputs.logits.float()
+                loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), chunk[:, 1:].reshape(-1))
+                objective = loss
+                if routed:
+                    aux = args.router_aux * moe_aux(outputs.router_logits, run.active, place.distributed)
+                    objective = loss + aux
+                    step_aux += aux.detach() / run.accumulation
+            (objective / run.accumulation).backward()
+        step_loss += loss.detach() / run.accumulation
+    norm = torch.nn.utils.clip_grad_norm_(run.model.parameters(), args.clip)
+    if hasattr(norm, "full_tensor"):
+        norm = norm.full_tensor()
+    run.optimizer.step()
+    run.optimizer.zero_grad(set_to_none=True)
+    return step_loss, norm.detach(), step_aux
 
-    def rate(step: int) -> float:
-        return warmup_cosine(step, init=args.lr_init, peak=args.lr_peak, warmup=args.warmup,
-                             decay_steps=schedule_steps, end=args.lr_end)
 
+@dataclasses.dataclass
+class Curves:
+    """What every step left, the timed window and whether the tail was traced."""
+
+    losses: list
+    norms: list
+    rates: list
+    auxes: list
+    probes: list
+    window_seconds: float
+    timed_steps: int
+    step_seconds: list
+    traced: bool
+
+
+def trace_directory(args: argparse.Namespace) -> Path:
+    return Path(args.trace_dir or Path(args.out).with_suffix("")).resolve()
+
+
+def train(args: argparse.Namespace, place: Ranks, run: Run) -> Curves:
+    """Every step in the recorded order: timed from `timing_warmup` to the
+    profiled tail, which is traced, with the router probes' time taken out."""
     losses, norms, rates, auxes = [], [], [], []
-    events = [torch.cuda.Event(enable_timing=True) for _ in range(total + 1)]
-    profile_from = total - args.profile_steps if args.profile_steps else total
-    trace_dir = Path(args.trace_dir or Path(args.out).with_suffix("")).resolve()
+    events = [torch.cuda.Event(enable_timing=True) for _ in range(run.total + 1)]
+    profile_from = run.total - args.profile_steps if args.profile_steps else run.total
     profiler = None
-    active = model.config.num_experts_per_tok if routed else 0
-    probe_rows = torch.from_numpy(windows[:args.probe_rows].astype(np.int64)).to(device)
+    probe_rows = torch.from_numpy(run.windows[:args.probe_rows].astype(np.int64)).to(place.device)
     probes, probed_steps, probe_seconds = [], set(), 0.0
 
     def probe(step: int) -> float:
-        torch.cuda.synchronize(device)
+        torch.cuda.synchronize(place.device)
         start = time.perf_counter()
-        loads, entropies = router_probe(model, probe_rows, active, autocast)
+        loads, entropies = router_probe(run.model, probe_rows, run.active, args.precision)
         probes.append({"step": step, "load": loads, "entropy": entropies})
-        torch.cuda.synchronize(device)
+        torch.cuda.synchronize(place.device)
         return time.perf_counter() - start
 
-    torch.cuda.reset_peak_memory_stats(device)
-    torch.cuda.synchronize(device)
-    for step in range(total):
+    torch.cuda.reset_peak_memory_stats(place.device)
+    torch.cuda.synchronize(place.device)
+    window_start = window_end = None
+    for step in range(run.total):
         if step == profile_from:
-            torch.cuda.synchronize(device)
+            torch.cuda.synchronize(place.device)
             window_end = time.perf_counter()
             profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                           torch.profiler.ProfilerActivity.CUDA])
             profiler.__enter__()
         if step == args.timing_warmup:
-            torch.cuda.synchronize(device)
+            torch.cuda.synchronize(place.device)
             window_start = time.perf_counter()
         if args.probe_every and step % args.probe_every == 0:
             spent = probe(step)
@@ -272,121 +364,116 @@ def main() -> None:
                 probe_seconds += spent
                 probed_steps.add(step - 1)
         events[step].record()
-        lr = rate(step)
-        for group in optimizer.param_groups:
+        lr = warmup_cosine(step, init=args.lr_init, peak=args.lr_peak, warmup=args.warmup,
+                           decay_steps=run.schedule_steps, end=args.lr_end)
+        for group in run.optimizer.param_groups:
             group["lr"] = lr
-        rows = window_rows(order, step, args.batch)[rank * share:(rank + 1) * share]
-        tokens = torch.from_numpy(windows[rows].astype(np.int64)).pin_memory().to(device, non_blocking=True)
-        step_loss = torch.zeros((), device=device)
-        step_aux = torch.zeros((), device=device)
-        for index in range(accumulation):
-            chunk = tokens[index * micro:(index + 1) * micro]
-            last = index == accumulation - 1
-            sync = (network.no_sync() if args.parallel == "ddp" and not last
-                    else contextlib.nullcontext())
-            if args.parallel == "fsdp2":
-                model.set_requires_gradient_sync(last)
-            with sync:
-                with autocast():
-                    outputs = network(input_ids=chunk[:, :-1], output_router_logits=routed) if routed \
-                        else network(input_ids=chunk[:, :-1])
-                    logits = outputs.logits.float()
-                    loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), chunk[:, 1:].reshape(-1))
-                    objective = loss
-                    if routed:
-                        aux = args.router_aux * moe_aux(outputs.router_logits, active, distributed)
-                        objective = loss + aux
-                        step_aux += aux.detach() / accumulation
-                (objective / accumulation).backward()
-            step_loss += loss.detach() / accumulation
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-        if hasattr(norm, "full_tensor"):
-            norm = norm.full_tensor()
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        losses.append(step_loss)
-        norms.append(norm.detach())
+        loss, norm, aux = train_step(args, place, run, step)
+        losses.append(loss)
+        norms.append(norm)
         rates.append(lr)
-        auxes.append(step_aux)
-    events[total].record()
-    torch.cuda.synchronize(device)
+        auxes.append(aux)
+    events[run.total].record()
+    torch.cuda.synchronize(place.device)
     end = time.perf_counter()
     if profiler is None:
         window_end = end
     else:
         profiler.__exit__(None, None, None)
+        trace_dir = trace_directory(args)
         trace_dir.mkdir(parents=True, exist_ok=True)
-        profiler.export_chrome_trace(str(trace_dir / f"rank{rank}.json"))
-        if distributed:
+        profiler.export_chrome_trace(str(trace_dir / f"rank{place.rank}.json"))
+        if place.distributed:
             dist.barrier()
     if args.probe_every:
-        probe(total)
-
-    loss_vector = torch.stack(losses)
-    if distributed:
-        dist.all_reduce(loss_vector, op=dist.ReduceOp.AVG)
-    peak = torch.tensor([torch.cuda.max_memory_allocated(device), torch.cuda.max_memory_reserved(device)],
-                        device=device, dtype=torch.float64)
-    peaks = [peak]
-    if distributed:
-        peaks = [torch.zeros_like(peak) for _ in range(world)]
-        dist.all_gather(peaks, peak)
-    if rank != 0:
-        dist.destroy_process_group()
-        return
-
+        probe(run.total)
     step_seconds = [events[i].elapsed_time(events[i + 1]) / 1e3
                     for i in range(args.timing_warmup, profile_from) if i not in probed_steps]
-    tokens_per_step = args.batch * seq
-    timed = throughput(window_end - window_start - probe_seconds, profile_from - args.timing_warmup,
-                       tokens_per_step, step_seconds)
+    return Curves(losses, norms, rates, auxes, probes, window_end - window_start - probe_seconds,
+                  profile_from - args.timing_warmup, step_seconds, profiler is not None)
+
+
+def record(args: argparse.Namespace, place: Ranks, run: Run, curves: Curves) -> dict | None:
+    """The ranks' mean losses and every rank's memory peak, gathered by all
+    of them; rank 0's record of the run, None on the others."""
+    loss_vector = torch.stack(curves.losses)
+    if place.distributed:
+        dist.all_reduce(loss_vector, op=dist.ReduceOp.AVG)
+    peak = torch.tensor([torch.cuda.max_memory_allocated(place.device), torch.cuda.max_memory_reserved(place.device)],
+                        device=place.device, dtype=torch.float64)
+    peaks = [peak]
+    if place.distributed:
+        peaks = [torch.zeros_like(peak) for _ in range(place.world)]
+        dist.all_gather(peaks, peak)
+    if place.rank != 0:
+        return None
+
+    timed = throughput(curves.window_seconds, curves.timed_steps, args.batch * run.seq, curves.step_seconds)
     hf_config = json.loads(Path(args.model, "config.json").read_text())
-    flops_token = train_flops_per_token(hf_config, seq)
-    device_name = torch.cuda.get_device_name(device)
+    flops_token = train_flops_per_token(hf_config, run.seq)
+    device_name = torch.cuda.get_device_name(place.device)
     peak_rate = peak_flops(device_name)
-    record = {
+    routed = run.active > 0
+    return {
         "framework": "torch",
         "precision": args.precision,
         "parallel": args.parallel,
-        "world": world,
-        "config": {**vars(args), "total_steps": total, "schedule_steps": schedule_steps, "seq": seq,
-                   "accumulation": accumulation, "micro_batch": micro,
+        "world": place.world,
+        "config": {**vars(args), "total_steps": run.total, "schedule_steps": run.schedule_steps, "seq": run.seq,
+                   "accumulation": run.accumulation, "micro_batch": run.micro,
                    "data_sha256": sha256(args.data), "model_type": hf_config["model_type"],
                    "optimizer": "torch.optim.AdamW(fused=True)",
                    "schedule": "optax warmup_cosine_decay_schedule (common.warmup_cosine)",
-                   "attention_implementation": model.config._attn_implementation,
-                   "experts_implementation": getattr(model.config, "_experts_implementation", None)},
+                   "attention_implementation": run.model.config._attn_implementation,
+                   "experts_implementation": getattr(run.model.config, "_experts_implementation", None)},
         "versions": {"torch": torch.__version__, "transformers": __import__("transformers").__version__,
                      "cuda": torch.version.cuda, "cudnn": torch.backends.cudnn.version()},
         "device": device_name,
         "host": host(),
         "loss": loss_vector.cpu().tolist(),
-        "grad_norm": torch.stack(norms).cpu().tolist(),
-        "lr": rates,
-        **({"aux_loss": torch.stack(auxes).cpu().tolist(), "router_probe": probes} if routed else {}),
+        "grad_norm": torch.stack(curves.norms).cpu().tolist(),
+        "lr": curves.rates,
+        **({"aux_loss": torch.stack(curves.auxes).cpu().tolist(), "router_probe": curves.probes}
+           if routed else {}),
         "throughput": timed,
         "flops_per_token": flops_token,
-        "mfu": None if peak_rate is None else flops_token * timed["tokens_per_s"] / (peak_rate * world),
+        "mfu": None if peak_rate is None else flops_token * timed["tokens_per_s"] / (peak_rate * place.world),
         "memory": {"peak_allocated_bytes": [int(p[0]) for p in peaks],
                    "peak_reserved_bytes": [int(p[1]) for p in peaks]},
     }
-    if profiler is not None:
-        write_record(args.out, record)
-        kernels = []
-        for index in range(world):
-            raw = trace_dir / f"rank{index}.json"
-            kernels.extend((name, start, end, index) for name, start, end, _ in chrome_trace_kernels(raw))
-            raw.unlink()
-        try:
-            record["profile"] = kernel_summary(kernels, args.profile_steps)
-            record["profile"]["kernels"] = str(trim_trace(kernels, trace_dir / "kernels.json.gz"))
-        except ValueError as error:
-            record["profile"] = {"error": str(error)}
-    write_record(args.out, record)
-    print(json.dumps({"first_loss": record["loss"][0], "last_loss": record["loss"][-1],
-                      "tokens_per_s": timed["tokens_per_s"], "mfu": record["mfu"],
-                      "peak_gib": max(record["memory"]["peak_allocated_bytes"]) / 2**30}, indent=1))
-    if distributed:
+
+
+def attach_profile(args: argparse.Namespace, place: Ranks, result: dict) -> None:
+    """Every rank's traced kernels summarised, the raw traces replaced by
+    their trimmed kernel rows."""
+    trace_dir = trace_directory(args)
+    kernels = []
+    for index in range(place.world):
+        raw = trace_dir / f"rank{index}.json"
+        kernels.extend((name, start, end, index) for name, start, end, _ in chrome_trace_kernels(raw))
+        raw.unlink()
+    try:
+        result["profile"] = kernel_summary(kernels, args.profile_steps)
+        result["profile"]["kernels"] = str(trim_trace(kernels, trace_dir / "kernels.json.gz"))
+    except ValueError as error:
+        result["profile"] = {"error": str(error)}
+
+
+def main() -> None:
+    args = arguments()
+    place = ranks(args)
+    run = build(args, place)
+    curves = train(args, place, run)
+    result = record(args, place, run, curves)
+    if result is not None:
+        if curves.traced:
+            write_record(args.out, result)
+            attach_profile(args, place, result)
+        write_record(args.out, result)
+        print(json.dumps({"first_loss": result["loss"][0], "last_loss": result["loss"][-1],
+                          "tokens_per_s": result["throughput"]["tokens_per_s"], "mfu": result["mfu"],
+                          "peak_gib": max(result["memory"]["peak_allocated_bytes"]) / 2**30}, indent=1))
+    if place.distributed:
         dist.destroy_process_group()
 
 
