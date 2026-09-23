@@ -98,9 +98,6 @@ _E2M1_BYTES = np.stack((E2M1[np.arange(256) & 15], E2M1[np.arange(256) >> 4]), a
 _CODE_DTYPES = (np.dtype(np.uint8), np.dtype(np.int8))
 """Packed E2M1 pairs: U8 in GPT OSS and compressed-tensors, I8 in DeepSeek-V4."""
 
-_EXPONENT_DTYPES = (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu))
-"""E8M0 exponent bytes: U8, or F8_E8M0 in DeepSeek-V4."""
-
 
 def _bytes(array: ArrayLike, dtypes: tuple[np.dtype, ...]) -> np.ndarray:
     """`array`'s bytes as uint8, if it is stored in one of `dtypes`."""
@@ -115,7 +112,8 @@ def e8m0_scales(exponents: ArrayLike) -> np.ndarray:
     """The float32 scale 2 ** (b - 127) of each E8M0 exponent byte b,
     uint8 or float8_e8m0fnu: exact down to byte 0's subnormal 2 ** -127,
     and NaN for byte 255, as float8_e8m0fnu reads."""
-    return _bytes(exponents, _EXPONENT_DTYPES).view(ml_dtypes.float8_e8m0fnu).astype(np.float32)
+    stored = _bytes(exponents, (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu)))
+    return stored.view(ml_dtypes.float8_e8m0fnu).astype(np.float32)
 
 
 def decode_e2m1(packed: ArrayLike, exponents: ArrayLike) -> np.ndarray:
@@ -698,15 +696,8 @@ V4_SCALE_DTYPES = ('float8_e8m0fnu', 'float32')
 in V4-Flash, V4-Pro and V4.1-Flash, float32 powers of two in V4-Flash-Base
 and V4-Pro-Base. The config says neither, so the loader records which."""
 
-V4_FP4_AMAX_FLOOR = 6 * 2.0 ** -126
-"""The release's floor on an FP4 group's amax, which keeps its scale at
-least 2 ** -126 (E8M0 byte 1)."""
-
 _V4_EXPERT = re.compile(r'\.experts\.\d+\.w[123]\.weight$')
 """A routed expert's projection, `layers.N.ffn.experts.E.w1` or under `mtp.N`."""
-
-_V4_ENGRAM = '.engram.embed.weight'
-"""V4.1's n-gram hash table, `layers.N.engram.embed.weight`."""
 
 
 def deepseek_v4_layout(name: str, fp4_experts: bool) -> Literal['blocks', 'rows', 'fp4']:
@@ -717,7 +708,7 @@ def deepseek_v4_layout(name: str, fp4_experts: bool) -> Literal['blocks', 'rows'
     otherwise."""
     if fp4_experts and _V4_EXPERT.search(name):
         return 'fp4'
-    return 'rows' if name.endswith(_V4_ENGRAM) else 'blocks'
+    return 'rows' if name.endswith('.engram.embed.weight') else 'blocks'
 
 
 def deepseek_v4_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
@@ -820,7 +811,7 @@ def quantize_deepseek_v4_fp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]
     nearest E2M1 value, ties to even. An all-zero group takes byte 1.
     """
     groups = _float_groups(weight, "DeepSeek-V4 FP4", ml_dtypes.bfloat16).astype(np.float32)
-    amax = np.maximum(np.abs(groups).max(-1), np.float32(V4_FP4_AMAX_FLOOR))
+    amax = np.maximum(np.abs(groups).max(-1), np.float32(6 * 2.0 ** -126))
     bits = (amax * np.float32(1 / 6)).view(np.uint32)
     exponents = ((bits >> 23) + ((bits & 0x007fffff) != 0)).astype(np.uint8)
     codes = encode_e2m1(groups / e8m0_scales(exponents)[..., None])
