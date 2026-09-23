@@ -30,7 +30,8 @@ ids and SGLang's prompt ids; SGLang's sampled ids
   `AGENT_ERROR` with that score;
 - the agent ran out of time, context or output budget, the harness hit its
   own step limit, or the last call stopped at its length limit:
-  `TRUNCATED`, masked rather than scored;
+  `TRUNCATED`, with the verifier's reward when it ran; the scheduler's
+  `truncation` policy decides whether it trains;
 - anything else: a sandbox, gateway, engine or verifier failure, a trace
   without ids or likelihoods, an aborted call, or a session with no call:
   `INFRA_ERROR`, which the scheduler retries and never trains on.
@@ -193,9 +194,10 @@ def _number(name: str, value: JSON) -> float:
 
 
 def _ids(name: str, values: JSON) -> tuple[int, ...]:
-    if not isinstance(values, list) or not all(type(value) is int for value in values):
+    ids = tuple(value for value in values if type(value) is int) if isinstance(values, list) else ()
+    if not isinstance(values, list) or len(ids) != len(values):
         raise ValueError(f"the trace's {name} are not a list of token ids")
-    return tuple(value for value in values if type(value) is int)
+    return ids
 
 
 @dataclass(frozen=True)
