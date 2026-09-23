@@ -626,9 +626,8 @@ class EpisodeRollout:
                     for index, episode in enumerate(episodes)]
         rows = len(episodes) * self.max_turns if self.rows is None else self.rows
         batch = pack(rollouts, self.max_prompt_tokens + self.max_new_tokens, rows=rows)
-        sources = {id(rollout): episode for rollout, episode in zip(rollouts, episodes, strict=True)}
         batch[OLD_LOG_PROBS_KEY] = sampled_values(
-            batch, rollouts, lambda rollout, number: sources[id(rollout)].transitions[number].action.raw_log_probs)
+            batch, lambda index, number: episodes[index].transitions[number].action.raw_log_probs)
         return batch
 
 
