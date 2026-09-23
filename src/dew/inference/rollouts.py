@@ -32,7 +32,7 @@ import math
 import os
 import shutil
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -265,16 +265,9 @@ class SafetensorsReload:
     rollback re-reads the same directory, so the replica then serves
     whatever that directory holds.
 
-    `gateway`, when set, is a recording gateway's root (rllm-model-gateway):
-    once every replica serves `v`, `POST /admin/weight_version
-    {"weight_version": v}` makes it stamp `v` on the calls it records from
-    then on. The gateway reads its stamp when a request arrives, so the
-    stamp must never run ahead of any replica: a call routed to a replica
-    still on `v - 1` would claim weights it was not sampled from. Stamping
-    after the whole set has moved is conservative instead: a call submitted
-    between a replica's resume and the stamp is recorded as `v - 1`, older
-    than the weights that served it. A push with any failed replica leaves
-    the stamp where it was.
+    A push with any failed replica raises and names the replicas that did
+    not take `v`. `Publication` wraps a push with the version it serves and
+    the stamp a recording gateway needs.
 
     A multi-process trainer calls the push on every process. The pool
     gathers the served tree to host memory on every process
@@ -288,7 +281,6 @@ class SafetensorsReload:
     directory: Path
     engines: tuple[str, ...]
     engine: Literal["vllm", "sglang"]
-    gateway: str | None = None
     dtype: str = "bfloat16"
     timeout: float = 600.0
 
@@ -323,21 +315,13 @@ class SafetensorsReload:
         agreed("weight publication", lambda: self._publish(version) if jax.process_index() == 0 else None)
 
     def _publish(self, version: int) -> None:
-        import httpx
-
         with ThreadPoolExecutor(max_workers=len(self.engines), thread_name_prefix="dew-weight-push") as pool:
             pushes = [(root, pool.submit(self._replica, root, version)) for root in self.engines]
             failures = [(root, push.exception()) for root, push in pushes if push.exception() is not None]
         if failures:
             raise RuntimeError(f"version {version} reached {len(self.engines) - len(failures)} of "
-                               f"{len(self.engines)} replicas; the gateway keeps its stamp. "
+                               f"{len(self.engines)} replicas: "
                                + "; ".join(f"{root}: {failure}" for root, failure in failures))
-        if self.gateway is not None:
-            response = httpx.post(self.gateway.rstrip("/") + "/admin/weight_version",
-                                  json={"weight_version": version}, timeout=self.timeout)
-            if response.status_code != 200 or response.json().get("weight_version") != version:
-                raise RuntimeError(f"the gateway refused version {version}: "
-                                   f"{response.status_code} {response.text}")
 
     def _replica(self, root: str, version: int) -> None:
         import httpx
@@ -370,6 +354,47 @@ class WeightSync(Protocol):
     """Make the engines serve `variables` as policy `version`."""
 
     def __call__(self, variables: Variables, version: int) -> None: ...
+
+
+class Publication:
+    """An engine fleet's publication as a versioned publisher: `load` pushes, stamps, then moves `version`.
+
+    `weights` is the push (`SafetensorsReload`, or any `WeightSync`) and
+    `stamp`, when set, records a version wherever calls are labelled with
+    one, such as a recording gateway (`dew.objectives.rl.harbor.Gateway.stamp`).
+    The stamp runs once every replica serves the new version and never
+    before: a gateway stamps each call when its request arrives, so a stamp
+    ahead of any replica would claim weights the call was not sampled from,
+    while one behind them only overstates its lag. A push or stamp that
+    fails raises and leaves `version` where it was.
+
+    Construction stamps `version`, the version the engines were launched
+    on, so a gateway left at a higher stamp by an earlier run cannot label
+    this run's first calls with weights it has not served. Every process of
+    a multi-process trainer calls `load`; process 0 stamps.
+    """
+
+    def __init__(self, weights: WeightSync, *, version: int = 0, stamp: Callable[[int], None] | None = None):
+        if type(version) is not int or version < 0:
+            raise ValueError("a published policy version is a nonnegative integer")
+        self._weights = weights
+        self._stamp = stamp
+        self._stamped(version)
+        self._version = version
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    def load(self, variables: Variables, version: int) -> None:
+        self._weights(variables, version)
+        self._stamped(version)
+        self._version = version
+
+    def _stamped(self, version: int) -> None:
+        stamp = self._stamp
+        if stamp is not None:
+            agreed("version stamp", lambda: stamp(version) if jax.process_index() == 0 else None)
 
 
 # The request field that makes each engine return the sampled ids themselves.

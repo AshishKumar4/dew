@@ -27,7 +27,7 @@ import pytest
 openai = pytest.importorskip("openai", reason="optional inference-clients extra")
 import httpx2
 
-from dew.inference import OpenAICompletion, OpenAIRolloutServer, SafetensorsReload
+from dew.inference import OpenAICompletion, OpenAIRolloutServer, Publication, SafetensorsReload
 from dew.interop import load_pretrained
 from dew.sampling import Sampling
 
@@ -183,8 +183,7 @@ class Engine(BaseHTTPRequestHandler):
     it reset, and `/update_weight_version` answers `{"success": true}`. Like
     SGLang v0.5.20, a weight update answers `success` in its body, with 400
     when it fails, and flushes the radix cache unless the request says
-    otherwise. Like rllm-model-gateway, `/admin/weight_version` answers the
-    stamp it now holds. The server's `failure` makes the reset or update
+    otherwise. The server's `failure` makes the reset or update
     fail: "status" with an error status, "body" with 200 and `success: false`.
     Every replica is its own server, so each keeps its own record.
     """
@@ -294,17 +293,21 @@ def test_an_sglang_push_loads_the_directory_stamps_and_flushes_in_one_call(tmp_p
 
 
 @pytest.mark.parametrize("provider", ["vllm", "sglang"])
-def test_the_gateway_is_stamped_only_after_every_replica_serves_the_version(tmp_path, replicas, provider):
+def test_a_publication_stamps_only_after_every_replica_serves_the_version(tmp_path, replicas, provider):
     source = load_pretrained(FIXTURE, dtype="float32")
-    first, second, gateway = replicas(3)
-    publish = SafetensorsReload(source, tmp_path / "served", (first.url, second.url), provider, gateway=gateway.url)
-    publish(source.variables, 1)
-    assert gateway.seen == [("/admin/weight_version", "", {"weight_version": 1})]
+    first, second = replicas(2)
+    stamps = []
+    publication = Publication(SafetensorsReload(source, tmp_path / "served", (first.url, second.url), provider),
+                              version=3, stamp=stamps.append)
+    # The launch version is stamped before anything is submitted, over whatever an earlier run left.
+    assert stamps == [3] and publication.version == 3
+    publication.load(source.variables, 4)
+    assert stamps == [3, 4] and publication.version == 4
     second.failure = "body"
-    with pytest.raises(RuntimeError, match=f"version 2 reached 1 of 2 replicas.*{second.url}"):
-        publish(source.variables, 2)
-    # One replica did not take version 2, so no call may be stamped with it.
-    assert gateway.seen == [("/admin/weight_version", "", {"weight_version": 1})]
+    with pytest.raises(RuntimeError, match=f"version 5 reached 1 of 2 replicas.*{second.url}"):
+        publication.load(source.variables, 5)
+    # One replica did not take version 5, so no call may be stamped with it and the served version stays.
+    assert stamps == [3, 4] and publication.version == 4
     # The replica that took it finished its whole sequence.
     assert paths(first)[-1] == ("/resume" if provider == "vllm" else "/update_weights_from_disk")
 

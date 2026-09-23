@@ -158,6 +158,20 @@ def fake_gateway():
                    client=httpx.Client(transport=httpx.MockTransport(network))), asked
 
 
+def test_the_gateway_stamp_is_checked():
+    asked = []
+
+    def network(request):
+        asked.append(json.loads(request.content))
+        return httpx.Response(200, json={"weight_version": 7 if len(asked) == 1 else 6})
+
+    gateway = Gateway("http://gateway", client=httpx.Client(transport=httpx.MockTransport(network)))
+    gateway.stamp(7)
+    with pytest.raises(RuntimeError, match="refused version 8"):
+        gateway.stamp(8)
+    assert asked == [{"weight_version": 7}, {"weight_version": 8}]
+
+
 def test_each_sample_is_its_own_trial_and_gateway_session(tmp_path, harbor):
     (tmp_path / "task").mkdir()
     gateway, asked = fake_gateway()

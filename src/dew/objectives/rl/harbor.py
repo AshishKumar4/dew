@@ -132,6 +132,12 @@ class Gateway:
         response.raise_for_status()
         return response.json()
 
+    def stamp(self, version: int) -> None:
+        """Make the gateway label the calls it records from now on with `version` (a `Publication` stamp)."""
+        response = self._client.post(f"{self.url}/admin/weight_version", json={"weight_version": version})
+        if response.status_code != 200 or response.json().get("weight_version") != version:
+            raise RuntimeError(f"the gateway refused version {version}: {response.status_code} {response.text}")
+
     def forget(self, session: str) -> None:
         self._client.delete(f"{self.url}/sessions/{session}").raise_for_status()
 
