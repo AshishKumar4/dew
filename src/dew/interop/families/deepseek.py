@@ -16,6 +16,8 @@ import numpy as np
 
 from dew import records
 from dew.interop.hf_decoders import (
+    _SERIALIZED_ENCODER_FIELDS,
+    _SERIALIZED_TEXT_FIELDS,
     DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
     HyperConnectionsFields,
@@ -27,6 +29,7 @@ from dew.interop.hf_decoders import (
     _record_float,
     _record_int,
     _refuse,
+    _refuse_encoder_fields,
     _rope_theta,
     _Ropes,
     _yarn_record,
@@ -304,28 +307,6 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
 # this wrapper does not carry.
 _KIMI_K25_TEXT = ('kimi_k2', 'deepseek_v3')
 
-# moonshotai/Kimi-K2.5's text_config was serialized by transformers 4.56.2,
-# which wrote every PreTrainedConfig attribute. 5.16.1's DeepseekV3Config
-# reads none of these off a decoder config: the first group is decoding
-# policy, which no forward pass consults, and the second is metadata.
-_KIMI_K25_TEXT_SERIALIZED = frozenset({
-    'bad_words_ids', 'begin_suppress_tokens', 'decoder_start_token_id',
-    'diversity_penalty', 'do_sample', 'early_stopping',
-    'encoder_no_repeat_ngram_size', 'exponential_decay_length_penalty',
-    'forced_bos_token_id', 'forced_eos_token_id', 'length_penalty',
-    'max_length', 'min_length', 'no_repeat_ngram_size', 'num_beam_groups',
-    'num_beams', 'num_return_sequences', 'output_scores',
-    'remove_invalid_values', 'repetition_penalty', 'return_dict_in_generate',
-    'sep_token_id', 'suppress_tokens', 'temperature', 'top_k', 'top_p',
-    'typical_p',
-    'finetuning_task', 'is_decoder', 'prefix', 'task_specific_params',
-    'tf_legacy_loss', 'tokenizer_class', 'torchscript', 'use_bfloat16',
-})
-# The four the same serialization carries that would name another model if
-# they were set, so they are read by value rather than accepted by name.
-_KIMI_K25_TEXT_ENCODER = ('add_cross_attention', 'cross_attention_hidden_size',
-                          'tie_encoder_decoder', 'pruned_heads')
-
 
 def _kimi_k25_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read a Kimi K2.5 config into `CausalTransformer` fields.
@@ -358,11 +339,7 @@ def _kimi_k25_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
         _refuse(f"text_config model_type {model_type!r}",
                 "a Kimi K2.5 wrapper's decoder is Kimi K2's, which the "
                 f"reference reads as one of {', '.join(map(repr, _KIMI_K25_TEXT))}")
-    for key in _KIMI_K25_TEXT_ENCODER:
-        if text.get(key):
-            _refuse(f"text_config {key}={text[key]!r}",
-                    "the decoder has no cross attention, no encoder to tie "
-                    "against and no pruned heads")
+    _refuse_encoder_fields(text)
     tied = hf_config.get('tie_word_embeddings', True)
     if not isinstance(tied, bool):
         _refuse(f"tie_word_embeddings {tied!r}", "the wrapper head takes a boolean tying policy")
@@ -376,7 +353,7 @@ def _kimi_k25_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
                  'vision_start_token_id', 'vision_end_token_id',
                  'use_unified_vision_chunk', 'video_placeholder', 'ignore_index'))
     nested = {key: value for key, value in text.items()
-              if key not in _KIMI_K25_TEXT_SERIALIZED and key not in _KIMI_K25_TEXT_ENCODER}
+              if key not in _SERIALIZED_TEXT_FIELDS and key not in _SERIALIZED_ENCODER_FIELDS}
     config = translate_config({**nested, 'model_type': model_type, 'tie_word_embeddings': tied})
     placeholders = []
     for key, default in (('image_token_id', 163605), ('video_token_id', 163840)):

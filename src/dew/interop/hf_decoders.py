@@ -121,6 +121,28 @@ _IGNORED_FIELDS = {
 # storage as `expert_dtype` beside its quantization_config.
 _CODEC_FIELDS = frozenset({'quantization_config', 'expert_dtype'})
 
+# A wrapper's text_config serialized by transformers 4.56.2 carries every
+# PreTrainedConfig attribute (moonshotai/Kimi-K2.5 and moonshotai/Kimi-K3).
+# Past `_IGNORED_FIELDS`, the first group is decoding policy, which no
+# forward pass consults, and the second is metadata.
+_SERIALIZED_TEXT_FIELDS = frozenset({
+    'bad_words_ids', 'begin_suppress_tokens', 'decoder_start_token_id',
+    'diversity_penalty', 'do_sample', 'early_stopping',
+    'encoder_no_repeat_ngram_size', 'exponential_decay_length_penalty',
+    'forced_bos_token_id', 'forced_eos_token_id', 'length_penalty',
+    'max_length', 'min_length', 'no_repeat_ngram_size', 'num_beam_groups',
+    'num_beams', 'num_return_sequences', 'output_scores',
+    'remove_invalid_values', 'repetition_penalty', 'return_dict_in_generate',
+    'sep_token_id', 'suppress_tokens', 'temperature', 'top_k', 'top_p',
+    'typical_p',
+    'finetuning_task', 'is_decoder', 'prefix', 'task_specific_params',
+    'tf_legacy_loss', 'tokenizer_class', 'torchscript', 'use_bfloat16',
+})
+# The four the same serialization carries that would name another model if
+# they were set, so they are read by value rather than accepted by name.
+_SERIALIZED_ENCODER_FIELDS = ('add_cross_attention', 'cross_attention_hidden_size',
+                              'tie_encoder_decoder', 'pruned_heads')
+
 
 def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
     return True
@@ -176,6 +198,14 @@ def _inert(model_type: object, hf_config: Mapping[str, object]) -> set[str]:
 
 def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
+
+
+def _refuse_encoder_fields(text: Mapping[str, object]) -> None:
+    """Refuse a serialized text_config whose `_SERIALIZED_ENCODER_FIELDS` are set."""
+    for key in _SERIALIZED_ENCODER_FIELDS:
+        if text.get(key):
+            _refuse(f"text_config {key}={text[key]!r}",
+                    "the decoder has no cross attention, no encoder to tie against and no pruned heads")
 
 
 def _fixed_fields(model: CausalTransformer, fixed: Mapping[str, object], message: str) -> None:
