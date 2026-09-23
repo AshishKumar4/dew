@@ -1734,10 +1734,6 @@ class _QwenImageText:
     """Qwen-Image's Qwen3-VL text encoder, which `QwenImageConditioner` runs
     over its pipeline's chat template, padded to the call's token budget."""
 
-    def components(self, index: Mapping[str, object]) -> tuple[str, ...]:
-        """The one text component a Qwen-Image directory holds."""
-        return ("text_encoder",)
-
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: int, *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None
@@ -2174,8 +2170,7 @@ def load_qwen_image_conditioner(checkpoint: str, *, dtype: str | None = "bfloat1
     if not isinstance(denoiser.text, _QwenImageText):
         raise ValueError(f"{checkpoint} is not a Qwen-Image checkpoint")
     if params is None:
-        directory = decoders._snapshot(checkpoint, directory.name,
-                                       weights=denoiser.text.components(index))
+        directory = decoders._snapshot(checkpoint, directory.name, weights=("text_encoder",))
     encoder, _, _ = _qwen_image_conditioning(
         directory, index, compute, denoiser.sample_size * 16, tokens=tokens,
         param_dtype=param_dtype, attention_impl=attention_impl, params=params)
