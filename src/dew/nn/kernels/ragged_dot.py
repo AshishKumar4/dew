@@ -19,8 +19,9 @@
 -> [g, k, n]`. They are the body of `jax/_src/lax/pallas_lowerings/gpu/
 ragged_dot.py` in the jax-v0.11.2 source tree (tag jax-v0.11.2, 32544801;
 license header above), which no jax wheel ships: `DEFAULT_BLOCK_M` through
-`_hyperparam_selection_rule`, restyled to this tree's lint gate, with two
-lines of logic changed and marked `# Dew:`: tgmm's output cast, and gmm's
+`_hyperparam_selection_rule`, restyled to this tree's lint gate and moved
+from `jax._src` imports to their public equivalents, with two lines of logic
+changed and marked `# Dew:`: tgmm's output cast, and gmm's
 zeroing when every group is empty. The file's `ragged_dot_general`
 adapter is left out: Dew calls the kernels itself, through
 `dew.nn.moe.expert_projection`'s custom VJP, the way MaxText calls megablox.
@@ -37,14 +38,13 @@ import typing
 from functools import partial
 from types import SimpleNamespace
 
+import jax
+import jax.numpy as jnp
 import numpy as np
-from jax._src import api, core, tree_util
-from jax._src.lax import lax
-from jax._src.lax.control_flow import loops
-from jax._src.numpy import array_creation, lax_numpy as jnp, reductions
-from jax._src.typing import Array, DTypeLike
+from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
+from jax.typing import DTypeLike
 
 DEFAULT_BLOCK_M = 64
 DEFAULT_BLOCK_N = 64
@@ -82,16 +82,16 @@ class GMMGroupLookupMetadata(typing.NamedTuple):
   """Metadata for splitting large groups into smaller chunks for ragged_dot,
   trans_ragged_dot doesn't use this."""
 
-  group_sizes: Array  # the regular group sizes
-  group_offsets: Array  # the group offsets
-  row_it2group: Array  # mapping between the first grid dim and group id
-  row_it2it_in_group: Array  # mapping between the first grid dim and which
+  group_sizes: jax.Array  # the regular group sizes
+  group_offsets: jax.Array  # the group offsets
+  row_it2group: jax.Array  # mapping between the first grid dim and group id
+  row_it2it_in_group: jax.Array  # mapping between the first grid dim and which
                                  # chunk in the group we're computing
-  total_row_its: Array       # first grid dim upper bound / number of chunks
+  total_row_its: jax.Array       # first grid dim upper bound / number of chunks
 
 
 def _make_gmm_group_metadata(
-  group_sizes: Array, m: int, chunk_m: int
+  group_sizes: jax.Array, m: int, chunk_m: int
 ) -> GMMGroupLookupMetadata:
   """Split large groups into chunks to let several SMs work on one group. For
   ragged_dot, not trans_ragged_dot."""
@@ -103,26 +103,26 @@ def _make_gmm_group_metadata(
 
   # temporary variables to ragged concat group metadata into a single flat
   # vector via 2D shifted construction + reduce
-  _blocks_offset = reductions.cumsum(blocks_per_group) - blocks_per_group
+  _blocks_offset = jnp.cumsum(blocks_per_group) - blocks_per_group
   _blocks_upper_bound = (m + chunk_m - 1) // chunk_m + g
   _group_iota = arange(_blocks_upper_bound)[None, :] - _blocks_offset[:, None]
   _group_write_mask = (_group_iota >= 0) & (
     _group_iota < blocks_per_group[:, None]
   )
 
-  row_it2group = reductions.sum(
+  row_it2group = jnp.sum(
       jnp.where(_group_write_mask, arange(g)[:, None], 0), 0, dtype=np.int32
   )  # block row i to group id
-  row_it2it_in_group = reductions.sum(
+  row_it2it_in_group = jnp.sum(
       jnp.where(_group_write_mask, _group_iota, 0), 0, dtype=np.int32
   )  # block row i to within group chunk
 
   return GMMGroupLookupMetadata(
       group_sizes=group_sizes,
-      group_offsets=reductions.cumsum(group_sizes) - group_sizes,
+      group_offsets=jnp.cumsum(group_sizes) - group_sizes,
       row_it2group=row_it2group,
       row_it2it_in_group=row_it2it_in_group,
-      total_row_its=reductions.sum(blocks_per_group, dtype=np.int32),
+      total_row_its=jnp.sum(blocks_per_group, dtype=np.int32),
   )
 
 
@@ -143,7 +143,7 @@ def _gpu_ragged_dot_kernel(
 ):
   i, j = pl.program_id(0), pl.program_id(1)
   pid = SimpleNamespace(i=i, j=j, gi=group_metadata_ref.row_it2group[i])
-  size = tree_util.tree_map(partial(np.array, dtype=np.int32), size)
+  size = jax.tree.map(partial(np.array, dtype=np.int32), size)
 
   local_inc = chunk_m * group_metadata_ref.row_it2it_in_group[pid.i]
   valid = pid.i < group_metadata_ref.total_row_its[...]
@@ -186,14 +186,14 @@ def _gpu_ragged_dot_kernel(
       )
       return acc + xA.astype(acc_dtype)
 
-    acc = array_creation.zeros((block.m, block.n), dtype=acc_dtype)
-    acc = loops.fori_loop(0, cdiv(size.k, block.k), inner_compute, acc)
+    acc = jnp.zeros((block.m, block.n), dtype=acc_dtype)
+    acc = lax.fori_loop(0, cdiv(size.k, block.k), inner_compute, acc)
     acc = acc.astype(y_ref.dtype)
     mask = lhs_rows_mask[:, None] & rhs_cols_mask[None, :]
     plgpu.store(y_ref.at[lhs_rows_idx, rhs_cols_idx], acc, mask=mask)
     return
 
-  loops.fori_loop(0, cdiv(group_sz, block.m), outer_compute, None)
+  lax.fori_loop(0, cdiv(group_sz, block.m), outer_compute, None)
 
   # zero out memory past sum(group_sizes) if we're the last kernel along m
   last_offset = (
@@ -214,17 +214,17 @@ def _gpu_ragged_dot_kernel(
       row_mask = (last_offset + i * block.m + arange(block.m)) < size.m
       window = (pl.ds(last_offset + i * block.m, block.m), pl.ds(0, block.n))
       mask = row_mask[:, None] & col_mask[None, :]
-      zero = array_creation.zeros((block.m, block.n), dtype=y_ref.dtype)
+      zero = jnp.zeros((block.m, block.n), dtype=y_ref.dtype)
       plgpu.store(y_ref.at[*window], zero, mask=mask)
 
-    loops.fori_loop(0, cdiv(size.m - last_offset, block.m), set_zero, None)
+    lax.fori_loop(0, cdiv(size.m - last_offset, block.m), set_zero, None)
 
 
-@api.jit(static_argnums=list(range(3, 14)))
+@jax.jit(static_argnums=list(range(3, 14)))
 def gmm(
-  x: Array,  # [m, k]
-  A: Array,  # [g, k, n]
-  group_sizes: Array,  # [g]
+  x: jax.Array,  # [m, k]
+  A: jax.Array,  # [g, k, n]
+  group_sizes: jax.Array,  # [g]
   block_m: int = DEFAULT_BLOCK_M,
   block_k: int = DEFAULT_BLOCK_K,
   block_n: int = DEFAULT_BLOCK_N,
@@ -236,7 +236,7 @@ def gmm(
   num_stages: int | None = None,
   chunk_m: int = CHUNK_M,
   out_dtype: DTypeLike | None = None,
-) -> Array:
+) -> jax.Array:
   """Compute grouped matmul on GPU via a Pallas lowering."""
 
   msg = "This gmm kernel only supports either (m, k) x (g, k, n) -> (m, n) "
@@ -269,12 +269,12 @@ def gmm(
   in_specs = [
     pl.BlockSpec((size.m, size.k), lambda i, j: (0, 0)),
     A_spec,
-    tree_util.tree_map(
+    jax.tree.map(
       lambda x: pl.BlockSpec(x.shape, lambda *args: (0,) * x.ndim),
       group_metadata,
     ),
   ]
-  out_shape = core.ShapeDtypeStruct(
+  out_shape = jax.ShapeDtypeStruct(
     (size.m, size.n), dtype=out_dtype or x.dtype)
   out_specs = pl.BlockSpec((size.m, block_n), lambda i, j: (0, j))
   grid_upper_bound = (size.m + chunk_m - 1) // chunk_m + size.g
@@ -286,7 +286,7 @@ def gmm(
     "trans_rhs": trans_rhs,
     "chunk_m": chunk_m,
   }
-  with api.named_scope("pallas_triton_ragged_dot"):
+  with jax.named_scope("pallas_triton_ragged_dot"):
     return pl.pallas_call(
       partial(
         _gpu_ragged_dot_kernel, size=size, block=block_sizes,
@@ -321,7 +321,7 @@ def _tgmm_ragged_dot_kernel(
   assert A_bar_ref.shape == (block.k, block.n)
   pid =  SimpleNamespace(gi=pl.program_id(0), r=pl.program_id(1),
                          c=pl.program_id(2))
-  size = tree_util.tree_map(partial(np.array, dtype=np.int32), size)
+  size = jax.tree.map(partial(np.array, dtype=np.int32), size)
   group_sz = group_sizes_ref[pid.gi]
   compute_dtype = compute_dtype if compute_dtype is not None else x_ref.dtype
 
@@ -351,8 +351,8 @@ def _tgmm_ragged_dot_kernel(
           x, y, dimension_numbers=dim_nums, preferred_element_type=acc_dtype
       ).astype(acc.dtype)
 
-    acc = array_creation.zeros((block.k, block.n), dtype=acc_dtype)
-    acc = loops.fori_loop(0, cdiv(group_sz, block.m), inner_compute, acc)
+    acc = jnp.zeros((block.k, block.n), dtype=acc_dtype)
+    acc = lax.fori_loop(0, cdiv(group_sz, block.m), inner_compute, acc)
     # Dew: upstream casts to y_ref's dtype, the second input's, which fails
     # to store whenever out_dtype differs from it (bf16 inputs, fp32 grad).
     acc = acc.astype(A_bar_ref.dtype)
@@ -363,15 +363,15 @@ def _tgmm_ragged_dot_kernel(
   def _():
     rmask = (pid.r * block.k + arange(block.k)) < size.k
     cmask = (pid.c * block.n + arange(block.n)) < size.n
-    plgpu.store(A_bar_ref, array_creation.zeros_like(A_bar_ref),
+    plgpu.store(A_bar_ref, jnp.zeros_like(A_bar_ref),
                 mask=rmask[:, None] & cmask[None, :])
 
 
-@api.jit(static_argnums=list(range(3, 13)))
+@jax.jit(static_argnums=list(range(3, 13)))
 def tgmm(
-  x: Array,  # [m, k]
-  y: Array,  # [m, n]
-  group_sizes: Array,  # [g]
+  x: jax.Array,  # [m, k]
+  y: jax.Array,  # [m, n]
+  group_sizes: jax.Array,  # [g]
   block_m: int = DEFAULT_BLOCK_M,  # shape[0] of A_i tile (block_m, block_n)
   block_n: int = DEFAULT_BLOCK_N,  # shape[1] of A_i tile (block_m, block_n)
   block_k: int = DEFAULT_BLOCK_K,  # how many rows in the acc loop over block_m
@@ -382,7 +382,7 @@ def tgmm(
   num_stages: int | None = None,
   chunk_m: int = CHUNK_M,
   out_dtype: DTypeLike | None = None,
-) -> Array:
+) -> jax.Array:
   """Compute grouped matmul on GPU via a Pallas lowering."""
   del chunk_m
   msg = "This tgmm kernel only supports (m, k) x (m, n) -> (g, k, n), but got "
@@ -399,7 +399,7 @@ def tgmm(
     for b, s in zip([block_m, block_k, block_n], [size.m, size.k, size.n], strict=True)
   )
 
-  group_offsets = reductions.cumsum(group_sizes) - group_sizes
+  group_offsets = jnp.cumsum(group_sizes) - group_sizes
   in_specs = [
     pl.BlockSpec((size.m, block_k), lambda i, r, c: (0, r)),
     pl.BlockSpec((size.m, block_n), lambda i, r, c: (0, c)),
@@ -407,14 +407,14 @@ def tgmm(
     pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
   ]
 
-  out_shape = core.ShapeDtypeStruct(
+  out_shape = jax.ShapeDtypeStruct(
     (size.g, size.k, size.n), dtype=out_dtype or x.dtype)
   out_specs = pl.BlockSpec((None, block_k, block_n), lambda i, r, c: (i, r, c))
   grid = (size.g, pl.cdiv(size.k, block_k), pl.cdiv(size.n, block_n))
 
   block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
   dtype_spec = {"compute_dtype": compute_dtype, "acc_dtype": acc_dtype}
-  with api.named_scope("tgmm_ragged_dot"):
+  with jax.named_scope("tgmm_ragged_dot"):
     return pl.pallas_call(
       partial(_tgmm_ragged_dot_kernel, size=size, block=block_sizes,
               **dtype_spec),  # pyrefly: ignore[bad-argument-type]
