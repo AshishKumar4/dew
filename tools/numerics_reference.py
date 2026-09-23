@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Write the float64 and bfloat16 reference fixtures and the transformers
-`generate` fixtures that tests/test_numerics_reference.py checks against.
+`generate` fixtures that tests/test_bf16_reference.py,
+tests/test_generate_reference.py and tests/test_block_diffusion.py check
+against.
 
 Everything runs under torch and transformers 5.16.1 on CPU, against the
 checkpoints already committed under tests/fixtures/hf, so no fixture weight
@@ -28,6 +30,12 @@ What lands, beside each fixture's own files:
   denoiser forwards in its reference.npz (`bare`, `conditioned`,
   `image_logits`), and in diffusion-gemma-denoise-tiny for `ref_bare` and
   `ref_conditioned`.
+- tests/fixtures/attention_bf16.npz: one head of 512 queries over 512 keys
+  of width 64, logits of standard deviation 0.5, through transformers'
+  `eager_attention_forward` (the fp32 softmax every decoder's eager path
+  runs) in bfloat16 and in float64. Inputs and the bf16 output are stored
+  as bfloat16 bit patterns (uint16), the float64 output as float32, which
+  is exact far below any bf16 difference.
 - generate.npz in llama-tiny, qwen3-tiny, gemma3-tiny, mixtral-tiny and
   deepseek-v3-tiny: three left-padded prompts of different lengths, then
   `GenerationMixin.generate` from them in fp32 with a cache, once greedy
@@ -101,8 +109,6 @@ def write_decoder(name: str) -> None:
     same(name, logits(decoder(name, torch.float32), ids).astype(np.float32),
          np.load(directory / "logits.npy"), f64)
     bf16 = logits(decoder(name, torch.bfloat16), ids).astype(np.float32)
-    if name == "mamba2-tiny":
-        same(f"{name} bf16", bf16, np.load(directory / "logits_bf16.npy"), f64)
     np.savez(directory / "numerics.npz", f64=f64, bf16=bf16)
     report(name, np.load(directory / "logits.npy"), bf16, f64)
 
@@ -293,6 +299,30 @@ def report_generation(name: str, path: str, fp32: np.ndarray, f64: np.ndarray,
         raise SystemExit(f"{name}: the fp32 greedy path leaves the float64 argmax")
 
 
+def bits(values: torch.Tensor) -> np.ndarray:
+    return values.to(torch.bfloat16).contiguous().view(torch.int16).numpy().view(np.uint16)
+
+
+def write_attention() -> None:
+    from types import SimpleNamespace
+
+    from transformers.models.llama.modeling_llama import eager_attention_forward
+
+    rng = np.random.RandomState(0)
+    width = 64
+    # [batch, heads, length, width]; q.k / sqrt(width) has standard deviation 0.5
+    q, k, v = (torch.from_numpy(rng.randn(1, 1, 512, width)).to(torch.bfloat16) for _ in range(3))
+    k = (k.to(torch.float64) * 0.5).to(torch.bfloat16)
+    module = SimpleNamespace(num_key_value_groups=1, training=False)
+
+    def attend(dtype):
+        out, _ = eager_attention_forward(module, q.to(dtype), k.to(dtype), v.to(dtype), None,
+                                         scaling=width ** -0.5)
+        return out
+    np.savez(FIXTURES.parent / "attention_bf16.npz", q=bits(q), k=bits(k), v=bits(v),
+             bf16=bits(attend(torch.bfloat16)), f64=attend(torch.float64).to(torch.float32).numpy())
+
+
 def main() -> None:
     if transformers.__version__ != "5.16.1":
         raise SystemExit(f"the fixtures pin transformers 5.16.1, got {transformers.__version__}")
@@ -302,6 +332,7 @@ def main() -> None:
     write_denoiser()
     for name in GENERATORS:
         write_generation(name)
+    write_attention()
 
 
 if __name__ == "__main__":
