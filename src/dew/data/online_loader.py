@@ -138,7 +138,7 @@ def prepare_image(pixels: np.ndarray, size: int, min_size: int) -> np.ndarray | 
     """`pixels` fitted into a `size` square, or None when the image is not
     worth training on.
 
-    Kept are RGB images at least `min_size` on their shorter side, at most
+    Kept are images at least `min_size` on their shorter side, at most
     `MAX_ASPECT` times as long as wide, and not a single flat colour. The
     longer side is resized to `size`, area interpolation down and cubic up,
     and the rest is padded to the square, centred, on white.

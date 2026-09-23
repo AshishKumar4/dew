@@ -6,6 +6,8 @@ These run inside grain's workers, so the device only ever sees ready tensors.
 
 from typing import Protocol, runtime_checkable
 
+from .text import load_tokenizer
+
 
 @runtime_checkable
 class Sampled(Protocol):
@@ -26,7 +28,6 @@ class AutoTextTokenizer:
     """
 
     def __init__(self, tensor_type="np", modelname="openai/clip-vit-large-patch14"):
-        from .text import load_tokenizer
         self.tokenizer = load_tokenizer(modelname)
         self.tensor_type = tensor_type
 

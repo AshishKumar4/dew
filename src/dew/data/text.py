@@ -26,8 +26,7 @@ def load_tokenizer(name: str, *, revision: str | None = None,
     """The HF tokenizer of a hub repo or local directory, loaded once per process.
 
     Every Dew path that needs an HF tokenizer loads it here, so one name at
-    one revision is one object however many readers share it. Grain workers
-    unpickle only the name and load their own copy on their first record.
+    one revision is one object however many readers share it.
     """
     key = (name, revision, local_files_only)
     held = _loaded.get(key)

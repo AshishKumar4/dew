@@ -417,6 +417,10 @@ class HFImages(ImageDataset):
     everything else `datasets.load_dataset` takes, the same value the `hf`
     provider holds, so a dataset behind a config name, a revision, its own
     `data_files` or a token is read here too.
+
+    Its images arrive decoded by `datasets` rather than by `decode_image`,
+    so a JPEG's EXIF orientation is applied, where `decode_image` keeps the
+    stored one.
     """
 
     name: str = ""
