@@ -16,7 +16,7 @@ import httpx
 import pytest
 
 from dew.objectives.rl.harbor import HARBOR_KEY, Gateway, HarborSource, calls, outcome
-from dew.objectives.rl.rollouts import Call, Status, Task
+from dew.objectives.rl.sessions import Call, Status, Task
 
 
 def trace(prompt, sampled, logprobs, reason="stop", *, started=0.0, version=None, **extra):

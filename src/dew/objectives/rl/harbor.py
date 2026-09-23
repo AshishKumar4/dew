@@ -1,4 +1,4 @@
-"""Harbor trials as a rollout source, each model call recorded by rllm-model-gateway.
+"""Harbor trials as a session source, each model call recorded by rllm-model-gateway.
 
 `HarborSource` runs one Harbor trial per sample: Harbor starts the task's
 sandbox, installs and runs the harness (mini-swe-agent by default), then
@@ -61,7 +61,7 @@ from typing import TYPE_CHECKING
 
 from dew.records import JSON
 
-from .rollouts import Call, Rollout, Status, Task
+from .sessions import Call, Session, Status, Task
 
 if TYPE_CHECKING:
     import httpx
@@ -86,7 +86,7 @@ _SESSION = re.compile(r"[A-Za-z0-9._:/-]+")
 
 
 class Gateway:
-    """The parts of an rllm-model-gateway a rollout source reads.
+    """The parts of an rllm-model-gateway a session source reads.
 
     `url` is the gateway's root as Dew reaches it; `sandbox_url` is where the
     sandboxes reach it, which is what a harness's base URL is built from.
@@ -288,7 +288,7 @@ def outcome(result: JSON, records: tuple[Call, ...], *, errors: Sequence[str] = 
 
 
 class HarborSource:
-    """A `RolloutSource` that runs each sample as one Harbor trial behind a recording gateway.
+    """A `SessionSource` that runs each sample as one Harbor trial behind a recording gateway.
 
     `harbor` is the Harbor executable (in its own environment), `agent` and
     `model` its `--agent` and `--model`, and `trials` the directory trials
@@ -301,7 +301,7 @@ class HarborSource:
     mini-swe-agent does.
 
     Sessions are named `{task}:{group}:{sample}`, where `group` is unique to
-    one `submit` across runs. Every future resolves to a `Rollout`: a
+    one `submit` across runs. Every future resolves to a `Session`: a
     failure of Harbor, the sandbox, the gateway or the engine is an
     `INFRA_ERROR` rollout, not an exception, and a cancelled trial is a
     `CANCELLED` one. `attempt` is always 0: a retry is a fresh `submit`,
@@ -326,21 +326,21 @@ class HarborSource:
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dew-harbor-trial")
         self._lock = threading.Lock()
         # One record per submitted, unresolved future, queued or running; a done-callback drops it.
-        self._records: dict[Future[Rollout], _Trial] = {}
+        self._records: dict[Future[Session], _Trial] = {}
         # Trials run in their own process groups, so an interrupted trainer does not reach them: on
         # interpreter exit or collection, every live trial's group is killed.
         weakref.finalize(self, _kill_all, self._records, self._lock)
 
-    def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Rollout]]:
+    def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Session]]:
         if type(samples) is not int or samples < 1:
             raise ValueError("a submission runs at least one sample")
         directory = task.data.get(HARBOR_KEY)
         if not isinstance(directory, (str, os.PathLike)) or not Path(directory).is_dir():
             raise ValueError(f"task {task.id!r} names no Harbor task directory under data[{HARBOR_KEY!r}]")
         group = f"{self._run}-{next(self._serial)}"
-        futures: list[Future[Rollout]] = []
+        futures: list[Future[Session]] = []
         for sample in range(samples):
-            future: Future[Rollout] = Future()
+            future: Future[Session] = Future()
             with self._lock:
                 self._records[future] = _Trial()
             future.add_done_callback(self._forget_record)
@@ -348,11 +348,11 @@ class HarborSource:
             self._pool.submit(self._trial, future, task, Path(directory), group, sample, version)
         return futures
 
-    def _forget_record(self, future: Future[Rollout]) -> None:
+    def _forget_record(self, future: Future[Session]) -> None:
         with self._lock:
             self._records.pop(future, None)
 
-    def cancel(self, futures: Sequence[Future[Rollout]]) -> None:
+    def cancel(self, futures: Sequence[Future[Session]]) -> None:
         """Interrupt the named trials; Harbor tears their sandboxes down, and each resolves `CANCELLED`."""
         with self._lock:
             for future in futures:
@@ -381,14 +381,14 @@ class HarborSource:
         self.cancel(pending)
         self._pool.shutdown(wait=True, cancel_futures=False)
 
-    def _trial(self, future: Future[Rollout], task: Task, directory: Path, group: str, sample: int,
+    def _trial(self, future: Future[Session], task: Task, directory: Path, group: str, sample: int,
                version: int) -> None:
         session = f"{task.id}:{group}:{sample}"
         name = f"dew-{group}-{sample}"
 
-        def rollout(status: Status, records: tuple[Call, ...] = (), reward: float | None = None,
-                    components: Mapping[str, float] | None = None, detail: str = "") -> Rollout:
-            return Rollout(task.id, group, sample, 0, records, status, reward, components or {}, detail)
+        def ended(status: Status, records: tuple[Call, ...] = (), reward: float | None = None,
+                    components: Mapping[str, float] | None = None, detail: str = "") -> Session:
+            return Session(task.id, group, sample, 0, records, status, reward, components or {}, detail)
 
         try:
             with self._lock:
@@ -403,14 +403,14 @@ class HarborSource:
                 record.process = process
             if process is None:
                 # Resolved outside the lock: the future's done-callback takes it.
-                future.set_result(rollout(Status.CANCELLED))
+                future.set_result(ended(Status.CANCELLED))
                 return
             log, _ = process.communicate()
             with self._lock:
                 record.process = None
                 cancelled = record.cancelled
             try:
-                future.set_result(self._verdict(rollout, session, self._trials / name, log, process.returncode,
+                future.set_result(self._verdict(ended, session, self._trials / name, log, process.returncode,
                                                 cancelled, version))
             finally:
                 # The session's traces leave the gateway on every exit path; the future already has its verdict.
@@ -422,22 +422,22 @@ class HarborSource:
             if not future.done():
                 future.set_exception(error)
 
-    def _verdict(self, rollout: Callable[..., Rollout], session: str, trial: Path, log: str, returncode: int,
-                 cancelled: bool, version: int) -> Rollout:
+    def _verdict(self, ended: Callable[..., Session], session: str, trial: Path, log: str, returncode: int,
+                 cancelled: bool, version: int) -> Session:
         try:
             recorded = calls(self._gateway.traces(session), unstamped=version)
         except Exception as error:
-            return rollout(Status.CANCELLED if cancelled else Status.INFRA_ERROR,
+            return ended(Status.CANCELLED if cancelled else Status.INFRA_ERROR,
                            detail=f"{trial}: unusable gateway traces: {error}")
         records = recorded.calls
         if cancelled:
-            return rollout(Status.CANCELLED, records, detail=str(trial))
+            return ended(Status.CANCELLED, records, detail=str(trial))
         if not (trial / "result.json").is_file():
-            return rollout(Status.INFRA_ERROR, records, detail=f"harbor exited {returncode} with no result: {log[-2000:]}")
+            return ended(Status.INFRA_ERROR, records, detail=f"harbor exited {returncode} with no result: {log[-2000:]}")
         status, reward, components, detail = outcome(
             json.loads((trial / "result.json").read_text()), records, errors=recorded.errors,
             harness_exit=_harness_exit(trial), reward_key=self._reward_key)
-        return rollout(status, records, reward, components, f"{trial}: {detail}".rstrip(": "))
+        return ended(status, records, reward, components, f"{trial}: {detail}".rstrip(": "))
 
 
 @dataclass
@@ -453,7 +453,7 @@ def _signal(process: subprocess.Popen[str], sent: signal.Signals) -> None:
         os.killpg(process.pid, sent)
 
 
-def _kill_all(records: dict[Future[Rollout], _Trial], lock: threading.Lock) -> None:
+def _kill_all(records: dict[Future[Session], _Trial], lock: threading.Lock) -> None:
     with lock:
         for record in records.values():
             if record.process is not None and record.process.poll() is None:
