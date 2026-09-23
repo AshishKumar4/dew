@@ -32,6 +32,7 @@ import numpy as np
 import PIL.Image
 
 from .dataset import CAPTION, Batch
+from .images import decode_image
 from .sources.hf import _STREAMING_HINT, _hf_datasets
 
 if TYPE_CHECKING:
@@ -123,16 +124,22 @@ def fetch_bytes(url: str, timeout: float, retries: int) -> bytes | None:
 
 
 def decode_pixels(blob: bytes) -> np.ndarray | None:
-    """`blob` as the array PIL decodes it to, or None when it is no image.
+    """`blob` as RGB uint8 by `images.decode_image`, the decoder every image
+    dataset uses, or None when it is no image.
 
-    The bytes are whatever the open internet returned. PIL reports a bad
-    file as OSError, SyntaxError, ValueError, its own DecompressionBombError
-    or a struct.error depending on which header is broken, so the except here
-    covers all of them.
+    The bytes are whatever the open internet returned. PIL reads the header
+    first because it refuses a decompression bomb from the header alone,
+    where cv2 would decode up to 2**30 pixels; it reports a bad header as
+    OSError, SyntaxError, ValueError, its own DecompressionBombError or a
+    struct.error depending on which is broken. cv2 then hands back None for
+    pixels it cannot decode, which `decode_image` raises as ValueError, and
+    raises cv2.error itself for a buffer it refuses.
     """
     try:
-        return np.asarray(PIL.Image.open(io.BytesIO(blob)))
-    except (OSError, SyntaxError, ValueError, struct.error) as error:
+        with PIL.Image.open(io.BytesIO(blob)):
+            pass
+        return decode_image(blob)
+    except (OSError, SyntaxError, ValueError, struct.error, cv2.error) as error:
         _log.debug("undecodable image of %d bytes: %s", len(blob), error)
         return None
 
@@ -146,8 +153,6 @@ def prepare_image(pixels: np.ndarray, size: int, min_size: int) -> np.ndarray | 
     longer side is resized to `size`, area interpolation down and cubic up,
     and the rest is padded to the square, centred, on white.
     """
-    if pixels.ndim != 3 or pixels.shape[2] != 3:
-        return None
     height, width = pixels.shape[:2]
     longer, shorter = max(height, width), min(height, width)
     if shorter < min_size or longer > MAX_ASPECT * shorter:
