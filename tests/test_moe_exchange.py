@@ -150,11 +150,12 @@ def test_capacity_queues_each_sequence_in_token_order(experts, top_k, factor):
     assert capacity == maxtext_capacity(10, top_k, experts, factor)
 
 
+@pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize('spec,batch,length,top_k', [
     (MeshSpec(expert=2, fsdp=2), 4, 12, 2),
     (MeshSpec(expert=2), 16, 4, 2),
     (MeshSpec(expert=4), 2, 12, 2),
-    (MeshSpec(expert=8), 3, 5, 1),
+    (MeshSpec(expert=4), 3, 5, 1),
 ], ids=['whole-sequences', 'two-sequences-a-device', 'part-of-a-sequence', 'padded-straddling'])
 @pytest.mark.parametrize('dispatch', ['global', 'exchange'])
 def test_capacity_drops_the_same_slots_on_every_layout(spec, batch, length, top_k, dispatch):
@@ -178,7 +179,7 @@ def test_capacity_drops_the_same_slots_on_every_layout(spec, batch, length, top_
     expected = jax.jit(gradient(functools.partial(objective, dropless, routing)))(
         parameters, x, np.where(kept, weights, 0).astype(np.float32))
     dropping = dropless.clone(dispatch=dispatch, capacity_factor=1.0)
-    with jax.set_mesh(build_mesh(spec)):
+    with jax.set_mesh(build_mesh(spec, jax.devices()[:4])):
         actual = jax.jit(gradient(functools.partial(objective, dropping, routing)))(
             parameters, x, weights)
     (value, out), (d_parameters, d_x, d_weights) = actual

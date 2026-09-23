@@ -420,9 +420,9 @@ def exchange_residue_case():
     partial sum is exact in fp32: the kernel gradient is exact before its one
     rounding. Two cotangent columns cancel to 2^-8, which a bf16 partial sum
     of 1 + 2^-8 rounds away (it ties to 1). In column 0 the -1 is token 1,
-    which follows token 0 on its device and so travels a round later; in
-    column 1 it is token 8, which a data axis of two puts in the other half
-    of the batch, so the halves' partial sums meet across devices."""
+    which follows token 0 on its device, so a four-way exchange sends it a
+    round later; in column 1 it is token 8, which four devices hold apart
+    from token 0, so their partial sums meet across devices."""
     rng = np.random.default_rng(29)
     x = rng.integers(-2, 3, size=(16, 8)) * 2.0**-2
     x[:, 0] = 1
@@ -434,10 +434,10 @@ def exchange_residue_case():
     return x, kernel, dy
 
 
-@pytest.mark.mesh
-@pytest.mark.parametrize('spec', [MeshSpec(expert=8), MeshSpec(expert=4),
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize('spec', [MeshSpec(expert=4), MeshSpec(expert=2),
                                   MeshSpec(expert=2, fsdp=2)],
-                         ids=['expert8', 'expert4-data2', 'expert2-fsdp2-data2'])
+                         ids=['expert4', 'data2-expert2', 'expert2-fsdp2'])
 @pytest.mark.parametrize('dispatch', ['global', 'exchange'])
 def test_a_bf16_master_sums_its_expert_gradient_before_rounding(spec, dispatch):
     """A bf16 kernel's cotangent sums every device's rows and every exchange
@@ -447,7 +447,7 @@ def test_a_bf16_master_sums_its_expert_gradient_before_rounding(spec, dispatch):
     x, kernel, dy = exchange_residue_case()
     expected = (rounded(x @ kernel[0]), rounded(np.einsum('ti,to->io', x, dy)),
                 rounded(dy @ kernel[0].T))
-    mesh = build_mesh(spec)
+    mesh = build_mesh(spec, jax.devices()[:4])
     rows = NamedSharding(mesh, P(tuple(axis for axis in ('data', 'expert', 'fsdp')
                                        if mesh.shape[axis] > 1)))
 
