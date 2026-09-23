@@ -154,12 +154,16 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
 
 
 def _gradient(state):
+    """The gradient the optimizer was handed, whole on every process. A
+    one-device reference's leaves are already whole where they are, and
+    gathering those would stack every process's copy."""
     import jax
     import numpy as np
     from jax.experimental import multihost_utils
 
     return jax.tree.map(
-        lambda leaf: np.asarray(multihost_utils.process_allgather(leaf, tiled=True)),
+        lambda leaf: np.asarray(leaf if leaf.is_fully_addressable
+                                else multihost_utils.process_allgather(leaf, tiled=True)),
         state.opt_state[0]["gradient"])
 
 
