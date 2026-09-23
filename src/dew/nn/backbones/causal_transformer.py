@@ -2361,20 +2361,25 @@ class CausalTransformer(nn.Module):
         return self.embed_tokens(lookup)
 
     def scaled_embeddings(self, x):
-        """Token embeddings `x` times sqrt(emb_features) when `embedding_scale`
-        is set, as Gemma scales them; `x` unchanged otherwise.
+        """Token embeddings `x` as the first layer reads them: times
+        sqrt(emb_features) when `embedding_scale` is set, as Gemma scales
+        them, then times `embedding_multiplier`, as lm-engine and
+        GraniteMoeHybrid scale them. The decoder's forward, the multimodal
+        wrapper and the Qwen-Image conditioner all scale here.
 
         Gemma casts embed_scale to the embedding weight dtype
         (modeling_gemma3.py:117). The token lookup holds that table in fp32
         and returns the compute dtype, so the factor keeps its fp32 value and
         only the product rounds with the activations. A factor rounded to
         bf16 would be 34.0 at hidden 1152, where sqrt(1152) is
-        33.94112549695428.
+        33.94112549695428. lm-engine multiplies the looked-up states
+        (`hidden_states * m_emb`, mixins/dense/base.py at 45b6b57b) in fp32
+        opmath, which `scaled` keeps.
         """
-        if not self.embedding_scale:
-            return x
-        scaled = x * jnp.asarray(math.sqrt(self.emb_features), self.embed_tokens.embedding.dtype)
-        return scaled.astype(x.dtype)
+        if self.embedding_scale:
+            x = (x * jnp.asarray(math.sqrt(self.emb_features),
+                                 self.embed_tokens.embedding.dtype)).astype(x.dtype)
+        return scaled(x, self.embedding_multiplier)
 
     def init_mtp_cache(self, batch_size: int):
         """Allocate prediction-layer caches independently of the trunk cache."""
@@ -2431,11 +2436,8 @@ class CausalTransformer(nn.Module):
                                   pairwise_mask=attention_pairwise_mask,
                                   key_positions=attention_key_positions,
                                   token_ids=tokens if self.hash_layers else None))
-        x = self.scaled_embeddings(self.token_embeddings(tokens))
-        # lm-engine multiplies the looked-up states (`hidden_states * m_emb`,
-        # mixins/dense/base.py at 45b6b57b), in fp32 opmath.
-        x = scaled(x, self.embedding_multiplier)
-        x = self._scatter_inputs(x, tokens, input_embeddings, embedding_positions)
+        x = self._scatter_inputs(self.scaled_embeddings(self.token_embeddings(tokens)), tokens,
+                                 input_embeddings, embedding_positions)
         # A prediction depth reads the embeddings `mtp_hidden_states` pairs
         # with, which are the unscaled ones with any media replacement already
         # in place. A decoder that fused another encoder's outputs cannot

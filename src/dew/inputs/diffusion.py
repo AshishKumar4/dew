@@ -329,11 +329,12 @@ def _residual_states(decoder, ids):
     """The last decoder layer's output, before the final norm.
 
     `QwenImage21Pipeline` reads `hidden_states[-1]` with the norm hooked out,
-    since that is what the transformer was trained on. The decoders this
-    reads embed their tokens unscaled and run one residual stream.
+    since that is what the transformer was trained on. The layers read the
+    embeddings the decoder's forward gives them, scaled by its own
+    `scaled_embeddings`; the decoders this reads run one residual stream.
     """
-    return decoder.stack(decoder.token_embeddings(ids), train=False, decode=False,
-                         positions=None, segment_ids=None, per_layer_input=None)
+    return decoder.stack(decoder.scaled_embeddings(decoder.token_embeddings(ids)), train=False,
+                         decode=False, positions=None, segment_ids=None, per_layer_input=None)
 
 
 @encoders("qwen_image_text")
