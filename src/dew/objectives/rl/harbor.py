@@ -268,8 +268,10 @@ def calls(traces: Sequence[JSON], *, unstamped: int) -> Recorded:
 
 
 # How vLLM 0.30.0 ("This model's maximum context length is ...") and SGLang 0.5.20 ("The input (N
-# tokens) is longer than the model's context length (M tokens).") word a prompt past the context length.
-_OVERFLOW = re.compile(r"maximum context length|longer than the model's context length", re.IGNORECASE)
+# tokens) is longer than the model's context length (M tokens).") word a prompt past the context length;
+# vLLM's input processor, which token-id prompts reach, says "... is longer than the maximum model length of M".
+_OVERFLOW = re.compile(r"maximum context length|longer than the model's context length"
+                       r"|longer than the maximum model length", re.IGNORECASE)
 
 
 def _reward(rewards: Mapping[str, float], key: str) -> float:
