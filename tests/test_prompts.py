@@ -87,7 +87,7 @@ def test_non_string_reward_columns_travel_as_json():
 
 def test_a_string_prompt_encodes_on_its_own():
     """Plain text is tokenized as it is: no chat template, no special tokens."""
-    from dew.data.chat import load_tokenizer
+    from dew.data.text import load_tokenizer
 
     rows = source({"prompt": "hi"})
 
@@ -100,7 +100,7 @@ def test_a_string_prompt_encodes_on_its_own():
 
 
 def test_messages_render_with_the_generation_prompt():
-    from dew.data.chat import load_tokenizer
+    from dew.data.text import load_tokenizer
 
     conversation = [{"role": "user", "content": "hi"}]
     rows = source({"prompt": conversation}, width=64)

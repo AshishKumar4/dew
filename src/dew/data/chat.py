@@ -27,9 +27,7 @@ Tool-call fields and message metadata reach the template unchanged.
 from __future__ import annotations
 
 import dataclasses
-import functools
 import json
-import threading
 from collections.abc import Iterator, Mapping, Sequence
 from enum import Enum
 from pathlib import Path, PurePath
@@ -53,6 +51,7 @@ from .dataset import (
 )
 from .rows import parquet_names, parquet_rows
 from .sources.hf import HFOptions, HubOptions
+from .text import load_tokenizer
 from .tokens import PackedWindows, bounded
 
 if TYPE_CHECKING:
@@ -493,25 +492,6 @@ def _turn_end(full: Sequence[int], following: Sequence[int], agreed: int, role: 
             f"tokenizer {where!r} renders message {position} ({role.name.lower()}) "
             "to no tokens; the template does not read this role or content")
     return end
-
-
-_tokenizer_lock = threading.Lock()
-
-
-@functools.cache
-def load_tokenizer(path: str) -> PreTrainedTokenizerBase:
-    """The chat template's tokenizer, loaded once per process.
-
-    The render map runs inside grain workers, which unpickle only the path,
-    so each worker loads its own copy on its first record. The lock
-    serializes that first import, because transformers swaps in its lazy
-    module object while it initializes and two threads importing it together
-    can catch it half built. The prompt source shares this cache.
-    """
-    with _tokenizer_lock:
-        from transformers import AutoTokenizer
-
-        return AutoTokenizer.from_pretrained(path)
 
 
 def _conversation_column(names: Sequence[str], column: str, where: str) -> str:

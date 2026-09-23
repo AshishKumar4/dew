@@ -25,9 +25,10 @@ import numpy as np
 
 from dew.registry import datasets
 
-from .chat import Conversation, load_tokenizer, render_prompt
+from .chat import Conversation, render_prompt
 from .dataset import Batch, Dataset, DatasetSpec, Tokenize
 from .rows import json_records, parquet_names, parquet_rows, row_dataset
+from .text import load_tokenizer
 
 PROMPT_KEY = "prompt"
 """Batch key the prompts pipeline left-pads `[B, max_prompt_len]` ids under."""

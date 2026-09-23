@@ -2012,8 +2012,7 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
     encoder, a Flux directory's second one; `tokens` is the sequence budget
     the pipeline pads to.
     """
-    from transformers import AutoTokenizer
-
+    from dew.data.text import load_tokenizer
     from dew.interop import diffusion
     from dew.nn.text_encoders import T5EncoderTransformer, _t5_path, t5_embedding, translate_t5_config
 
@@ -2025,8 +2024,7 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
         t5_embedding(tensors)
         params, layouts = diffusion.record_layouts(
             component, tensors, _t5_path, ("encoders", "conditioning", component), param_dtype=param_dtype)
-    tokenizer = AutoTokenizer.from_pretrained(
-        directory / ("tokenizer" + component.removeprefix("text_encoder")))
+    tokenizer = load_tokenizer(str(directory / ("tokenizer" + component.removeprefix("text_encoder"))))
     return T5Segment(tower, tokenizer, component, tokens), params, layouts, config
 
 
@@ -2163,8 +2161,8 @@ def _source_processor(directory: Path, config: Mapping[str, object], record: Map
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
         return Processor(reference, config, record, model.vocab_size)
     if (directory / "tokenizer_config.json").exists():
-        from transformers import AutoTokenizer
-        return Processor(AutoTokenizer.from_pretrained(str(directory), local_files_only=True),
+        from dew.data.text import load_tokenizer
+        return Processor(load_tokenizer(str(directory), local_files_only=True),
                          config, record, model.vocab_size)
     return None
 

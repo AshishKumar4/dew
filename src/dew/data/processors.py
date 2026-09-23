@@ -26,8 +26,8 @@ class AutoTextTokenizer:
     """
 
     def __init__(self, tensor_type="np", modelname="openai/clip-vit-large-patch14"):
-        from transformers import AutoTokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(modelname)
+        from .text import load_tokenizer
+        self.tokenizer = load_tokenizer(modelname)
         self.tensor_type = tensor_type
 
     def __call__(self, inputs):
