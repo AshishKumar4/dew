@@ -8,6 +8,7 @@ did. A fit on each of the sim-mesh topologies trains the same losses:
 sharding moves values, never changes them.
 """
 
+import math
 import re
 
 import jax
@@ -402,3 +403,16 @@ def test_tensor_parallelism_keeps_every_projection_weight_in_place():
                 if op == "all-gather" for shape in shapes]
 
     assert not projections & set(gathered), gathered
+
+
+def test_a_pipeline_moves_no_microbatch_between_the_batch_shards():
+    """The pipeline cuts the batch into microbatches. Cut into runs of
+    consecutive rows, each microbatch sat in one fsdp shard of the rows, so
+    GSPMD all-gathered the whole batch's hidden states to split every
+    microbatch over the shards again. Strided, each keeps its rows where
+    they are."""
+    hidden = BATCH * SEQ_LEN * 32
+    moved = [shape for op, shapes in collectives(MeshSpec(fsdp=2, stage=2, microbatches=4), tiny())
+             if op in ("all-gather", "all-to-all") for shape in shapes]
+
+    assert not [shape for shape in moved if math.prod(shape) >= hidden], moved

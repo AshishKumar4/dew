@@ -1382,16 +1382,21 @@ def _stage_sharding(ndim: int) -> NamedSharding:
 
 
 def _microbatched(value, axis: int, count: int):
-    """`[.., rows, ..]` as `[count, .., rows / count, ..]`: the batch axis cut
-    into `count` microbatches of consecutive rows, in order."""
+    """`[.., rows, ..]` as `[count, .., rows / count, ..]`: microbatch m takes
+    rows m, m + count, m + 2 * count, ...
+
+    A batch splits over its devices in blocks of consecutive rows. Strided,
+    each microbatch keeps a share of every block where the block is, as long
+    as `count` divides a block; cut into consecutive runs, each microbatch
+    would sit in one block and move to the devices of every other."""
     shape = value.shape
-    split = value.reshape((*shape[:axis], count, shape[axis] // count, *shape[axis + 1:]))
-    return jnp.moveaxis(split, axis, 0)
+    split = value.reshape((*shape[:axis], shape[axis] // count, count, *shape[axis + 1:]))
+    return jnp.moveaxis(split, axis + 1, 0)
 
 
 def _whole(value, axis: int):
-    """The batch `_microbatched` cut, back in one piece."""
-    moved = jnp.moveaxis(value, 0, axis)
+    """The batch `_microbatched` cut, back in one piece and in its order."""
+    moved = jnp.moveaxis(value, 0, axis + 1)
     shape = moved.shape
     return moved.reshape((*shape[:axis], shape[axis] * shape[axis + 1], *shape[axis + 2:]))
 
