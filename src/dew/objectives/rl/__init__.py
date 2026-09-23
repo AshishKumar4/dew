@@ -33,7 +33,7 @@ from .ppo import PPOObjective, PPORollout, ValueHead
 from .preference import DPOObjective
 from .rollout import Reward, SampledRollout
 from .sandbox import SandboxLimits, SubprocessEnvironment
-from .scheduler import Publisher, RolloutScheduler, SchedulerRecord, task_ids
+from .scheduler import Publisher, RolloutScheduler, SchedulerRecord
 from .sessions import (
                        ADVANTAGES_KEY,
                        IDS_KEY,
@@ -108,5 +108,4 @@ __all__ = [
                        "pack",
                        "prompt_tasks",
                        "session_of",
-                       "task_ids",
 ]
