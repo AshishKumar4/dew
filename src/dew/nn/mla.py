@@ -640,17 +640,15 @@ class MultiHeadLatentAttention(nn.Module):
         return apply_rotary(part, freqs_cos, freqs_sin)
 
     def _rotated(self, q_rot, rot, positions):
-        if not self.rotary:
-            return q_rot, rot, None, None
-        return self._rotated_at(q_rot, rot, positions)
-
-    def _rotated_at(self, q_rot, rot, positions):
         """Rotate the query's and the latent's rope heads at `positions`.
 
         Returns the rotated pair and the angles, which the indexer rotates
         its own keys with. The decoupled rope head is shared by every query
-        head, so it rotates with a head axis added and taken away again.
+        head, so it rotates with a head axis added and taken away again. A
+        layer without `rotary` returns the heads as they are and no angles.
         """
+        if not self.rotary:
+            return q_rot, rot, None, None
         freqs_cos, freqs_sin = mla_rope_freqs(
             positions, self.qk_rope_head_dim, self.rope_theta, self.yarn)
         return (self._rotate(q_rot, freqs_cos, freqs_sin),
@@ -768,8 +766,8 @@ class MultiHeadLatentAttention(nn.Module):
                 if self.sparse:
                     selection = self._select(index_scores, keep, kv_store)
                     if self._attends_sparsely(selection, length):
-                        return self._sparse_attention(
-                            x, q_pass, q_rot, latent, rot, selection, index_scores)
+                        return self._output(self._sparse_attention(
+                            q_pass, q_rot, latent, rot, selection, index_scores), x)
                     keep = selection_mask(selection, length)
                     mask, causal = keep[:, None], False
                 if (index_scores is not None and not self.is_initializing()
@@ -844,8 +842,9 @@ class MultiHeadLatentAttention(nn.Module):
             index_scores, query, key, index_keep,
             1.0 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)))
 
-    def _sparse_attention(self, x, q_pass, q_rot, latent, rot, selection, index_scores):
-        """Attend the selection in the latent space (`sparse_latent_attention`).
+    def _sparse_attention(self, q_pass, q_rot, latent, rot, selection, index_scores):
+        """Attend the selection in the latent space (`sparse_latent_attention`):
+        the heads' context, `[B, S, H, v_head_dim]`.
 
         `kv_b_proj` applied to the identity is its matrix as the layer
         computes it, dtype policy and any deterministic interceptor's branch
@@ -864,14 +863,14 @@ class MultiHeadLatentAttention(nn.Module):
             key, _ = self._expand(latent, rot)
             self._sow_indexer_kl(index_scores, selection_mask(selection, latent.shape[1]),
                                  self._scaled_query(q_pass, q_rot), key)
-        attention = sparse_latent_attention(
+        return sparse_latent_attention(
             q_pass * scale if scale != 1.0 else q_pass,
             q_rot * scale if scale != 1.0 else q_rot,
             latent, rot, key_weight, value_weight, selection,
             scale=1.0 / math.sqrt(nope + self.qk_rope_head_dim), precision=self.precision)
-        return self._output(attention, x)
 
     def _output(self, attention, x):
+        """o_proj over the heads' context, gated by `x` under `output_gate`."""
         batch, length = attention.shape[:2]
         context = checkpoint_name(attention, 'context').reshape(batch, length, self.num_heads * self.v_head_dim)
         if self.output_gate:
