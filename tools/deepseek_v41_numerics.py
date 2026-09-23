@@ -175,17 +175,39 @@ def input_noise(ours: np.ndarray, theirs: np.ndarray) -> np.ndarray:
     return np.abs(ours - theirs) / np.where(amax > 0, amax, np.inf)
 
 
-def dew_rows(record: Captured, theirs: np.ndarray) -> np.ndarray:
-    """Dew's top-k rows laid out as the reference's, with the lowest float
-    Dew's top-k gives a forbidden key read as the reference's -inf; refused
-    where the two allow different keys."""
-    ours = padded(record.rows, theirs.shape[1], np.nan)
-    if ours.shape != theirs.shape:
-        raise ValueError(f"Dew ranks {ours.shape} where the reference ranked {theirs.shape}")
-    ours = np.where(ours <= np.finfo(np.float32).min / 2, -np.inf, ours)
+def candidates(rows: np.ndarray, picks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Each top-k row's finite scores in key order, NaN after them, and
+    which of those its picks name; a pick of a forbidden key names none."""
+    finite = np.isfinite(rows)
+    order = np.argsort(~finite, axis=1, kind="stable")
+    compact = np.where(np.take_along_axis(finite, order, 1), np.take_along_axis(rows, order, 1), np.nan)
+    rank = np.where(finite, np.cumsum(finite, 1) - 1, -1)
+    named = np.where(picks >= 0, np.take_along_axis(rank, np.maximum(picks, 0), 1), -1)
+    chosen = np.zeros(rows.shape, bool)
+    row, slot = np.nonzero(named >= 0)
+    chosen[row, named[row, slot]] = True
+    return compact, chosen
+
+
+def selections(record: Captured, reference, prefix: str):
+    """Dew's and the reference's top-k calls of one forward, each as
+    `candidates` reads it: `(ours, our picks, theirs, their picks)`.
+
+    Dew scores a Reindex layer's candidate pool alone, where the reference
+    scores the whole row with every key outside it at -inf, and Dew's top-k
+    gives a forbidden key the lowest float; both keep the same keys in the
+    same order, so the calls compare by their finite scores. Refused where
+    the two keep different keys."""
+    theirs, their_picks = reference[f"{prefix}selection_rows"], reference[f"{prefix}selection_picks"]
+    rows = padded(record.rows, theirs.shape[1], np.nan)
+    if rows.shape != theirs.shape:
+        raise ValueError(f"Dew ranks {rows.shape} where the reference ranked {theirs.shape}")
+    rows = np.where(rows <= np.finfo(np.float32).min / 2, -np.inf, rows)
+    ours, our_picks = candidates(rows, padded(record.picks, their_picks.shape[1], -1))
+    theirs, their_picks = candidates(theirs, their_picks)
     if np.any(np.isfinite(ours) != np.isfinite(theirs)):
-        raise ValueError("Dew's top-k and the reference's allow different keys")
-    return ours
+        raise ValueError("Dew's top-k and the reference's keep different keys")
+    return ours, our_picks, theirs, their_picks
 
 
 def row_noise(ours: np.ndarray, theirs: np.ndarray, scale: np.ndarray) -> np.ndarray:
@@ -210,9 +232,9 @@ def noise() -> dict[str, float]:
         for site, blocks in record.blocks.items():
             measured[f"{prefix}{site}"] = float(np.max(input_noise(
                 np.concatenate(blocks), reference[f"{prefix}{site}_in"])))
-        theirs = reference[f"{prefix}selection_rows"]
+        ours, _, theirs, _ = selections(record, reference, prefix)
         measured[f"{prefix}selection"] = float(np.max(row_noise(
-            dew_rows(record, theirs), theirs, reference[f"{prefix}selection_scale"])))
+            ours, theirs, reference[f"{prefix}selection_scale"])))
     return measured
 
 

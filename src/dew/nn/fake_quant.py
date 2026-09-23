@@ -13,7 +13,6 @@ import jax.numpy as jnp
 
 E4M3_MAX = 448.0
 E2M1_MAX = 6.0
-_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
 def power_of_two_ceil(value):
@@ -24,21 +23,34 @@ def power_of_two_ceil(value):
     return jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
 
 
+def _round(values, mantissa: int, lowest: int):
+    """Round fp32 values to a float format of `mantissa` bits whose smallest
+    normal exponent is `lowest`, ties to even, by arithmetic: the quantum is
+    the power of two of the value's binade less the mantissa bits, floored
+    at the subnormal spacing; dividing by it is exact, and `round` ties to
+    the even multiple, the one whose last mantissa bit is 0."""
+    bits = jax.lax.bitcast_convert_type(values.astype(jnp.float32), jnp.int32)
+    exponent = jnp.maximum(((bits >> 23) & 0xFF) - 127, lowest) - mantissa
+    quantum = jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
+    return jnp.round(values / quantum) * quantum
+
+
 def round_e4m3fn(values):
-    """Round fp32 values within +-448 to E4M3FN, ties to even, by arithmetic.
+    """Round fp32 values within +-448 to E4M3FN, ties to even (`_round`).
 
     Not `astype(float8_e4m3fn)`: XLA GPU's default xla_allow_excess_precision
     deletes an f32 -> f8 -> f32 convert pair under jit, so the rounding would
     silently not happen. Nor `jax.lax.reduce_precision(x, 4, 3)`, which
     models IEEE-style e4m3 with infinities and a largest finite 240, not the
-    FN format whose largest finite is 448. The quantum is the power of two
-    of the value's binade less three mantissa bits, floored at the subnormal
-    spacing 2**-9; dividing by it is exact and `round` ties to even.
+    FN format whose largest finite is 448.
     """
-    bits = jax.lax.bitcast_convert_type(values.astype(jnp.float32), jnp.int32)
-    exponent = jnp.maximum(((bits >> 23) & 0xFF) - 127, -6) - 3
-    quantum = jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
-    return jnp.round(values / quantum) * quantum
+    return _round(values, 3, -6)
+
+
+def _e2m1(values):
+    """Round fp32 values within +-6 to E2M1, ties to even (`_round`); IEEE-style
+    e2m1 would stop at 3 where E2M1 reaches 6, so reduce_precision cannot."""
+    return _round(values, 1, 0)
 
 
 def _straight_through(x, rounded):
@@ -61,19 +73,6 @@ def fake_quant_fp8(x, block: int):
     scale = power_of_two_ceil(amax * jnp.float32(1 / E4M3_MAX))
     rounded = round_e4m3fn(jnp.clip(blocks / scale, -E4M3_MAX, E4M3_MAX))
     return _straight_through(x, (rounded * scale).reshape(x.shape))
-
-
-def _e2m1(values):
-    """Round values within +-6 to E2M1, ties to the even neighbour."""
-    grid = jnp.asarray(_E2M1, jnp.float32)
-    magnitude = jnp.abs(values)
-    upper = jnp.clip(jnp.searchsorted(grid, magnitude, side='left'), 1, len(_E2M1) - 1)
-    lower = upper - 1
-    below, above = grid[lower], grid[upper]
-    odd = (lower % 2) == 1
-    take_above = (above - magnitude < magnitude - below) | (
-        (above - magnitude == magnitude - below) & odd)
-    return jnp.copysign(jnp.where(take_above, above, below), values)
 
 
 def fake_quant_fp4(x, block: int, e4m3_scale: bool):
