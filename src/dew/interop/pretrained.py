@@ -794,7 +794,7 @@ def _wrapper_layouts(tensors, record, variables):
                   "deepseek_v41": vision.deepseek_v41_vision_path}[tower_kind]
     tower_prefix = decoders._WRAPPER_TOWER_PREFIX[tower_kind]
     projector_prefix = decoders._WRAPPER_PROJECTOR_PREFIX[projector_kind]
-    unprefixed = record["text_model_type"] == "deepseek_v41"
+    bundled = decoders._bundled(record["model_type"])
     audio_encoder = None
     if record["audio"] is not None:
         audio_encoder = tower_from_record(record["audio"])
@@ -833,11 +833,11 @@ def _wrapper_layouts(tensors, record, variables):
             if path[-1] == "kernel":
                 # Kernels store [*window, in, out]; the source keeps [out, in, *window].
                 transpose = {2: (1, 0), 3: (2, 1, 0), 4: (3, 2, 0, 1)}[tensor.ndim]
-        elif unprefixed and bare in decoders._V41_SPAN:
+        elif bundled is not None and bare in bundled.wrapper_projector_names:
             paths = (("params", "projector", *vision.projector_weight_path(projector_kind, bare)),)
-        elif bare.startswith(("language_model.", "mtp.")) or bare == "lm_head.weight" or unprefixed:
+        elif bare.startswith(("language_model.", "mtp.")) or bare == "lm_head.weight" or bundled is not None:
             tail = bare.removeprefix("language_model.")
-            text_name = (tail if unprefixed or tail.startswith(("model.", "lm_head.", "mtp."))
+            text_name = (tail if bundled is not None or tail.startswith(("model.", "lm_head.", "mtp."))
                          else "model." + tail)
             layout = _language_layout(name, text_name, tensor, record["text"],
                                       record["text_model_type"], variables,
@@ -2509,14 +2509,14 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
     elif "text_config" in config and (family not in decoders._FAMILIES or (
-            family == "deepseek_v41" and config.get("vision_config") is not None)):
+            decoders._bundled(family) is not None and config.get("vision_config") is not None)):
         # A wrapper repo carries its decoder under text_config. Where the
         # wrapper's own model_type is a registered decoder family, its
         # towers have no counterpart and its text half is the model, so it
         # takes the decoder branch below and its translator reads the
         # nested config; `translate_config` refuses the rest by the same
-        # rule. DeepSeek-V4.1 registers its decoder under the bundle's own
-        # type, and a bundle that names its ViT loads whole.
+        # rule. A family that reads its own bundle (`DecoderFamily.wrapper`)
+        # loads one naming a vision_config whole.
         record = decoders.translate_wrapper_config(config)
         text_fields = _wrapper_text_fields(config, record, max_seq_len)
         text: decoders.DecoderFields = {**text_fields, **precision_fields(
