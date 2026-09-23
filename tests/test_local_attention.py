@@ -228,7 +228,8 @@ def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_determini
     as a bias: finite everywhere, padding rows included, and as close to a
     float64 oracle as the xla band is."""
     batch, length, heads, kv_heads, width, window = 1, 1024, 8, 2, 64, 256
-    lengths = [300, 200, 380]  # then 144 rows of padding, segment 0
+    # Three documents fill 880 of 1024 rows; the rest is padding, segment 0.
+    lengths = [300, 200, 380]
     segments = np.concatenate([np.repeat(np.arange(1, 4), lengths),
                                np.zeros(length - sum(lengths), int)])[None]
     segment_ids = jnp.asarray(segments, jnp.int32)
