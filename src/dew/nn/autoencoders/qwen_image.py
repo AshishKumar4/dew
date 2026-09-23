@@ -36,7 +36,7 @@ from flax.typing import Dtype
 from dew.objectives.base import Variables
 
 from .api import AutoEncoder
-from .kl import diagonal_gaussian, posterior_latent
+from .kl import posterior_latent
 from .vae import FlaxDownsample2D, FlaxUpsample2D
 
 if TYPE_CHECKING:
@@ -281,10 +281,6 @@ class QwenImageVAE(nn.Module):
         self.post_quant_conv = _conv(self.latent_channels, 1, self.dtype, None)
         self.decoder = _Decoder(self.decoder_base_dim, self.image_channels, self.dim_mult, self.num_res_blocks,
                                 self.temporal_downsample[::-1], self.dtype)
-
-    def posterior(self, x):
-        """The posterior's mean and standard deviation for pixels `x`."""
-        return diagonal_gaussian(self.quant_conv(self.encoder(x)))
 
     def encode(self, x, key=None):
         """The posterior mean, or a draw from it when `key` is given."""
