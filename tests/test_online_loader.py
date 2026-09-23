@@ -29,7 +29,6 @@ import PIL.Image
 import pytest
 
 from dew.data import Loading, online_loader
-from dew.data.images import decode_image
 from dew.data.online_loader import Fetch, ImageStream
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -211,26 +210,25 @@ def test_a_decompression_bomb_decodes_to_nothing():
     assert online_loader.decode_pixels(blob) is None
 
 
+def _on_white(rgba: np.ndarray) -> np.ndarray:
+    """img2dataset's alpha matting: c * a / 255 + 255 - a, rounded, in float64."""
+    alpha = rgba[..., 3:].astype(np.float64)
+    return np.rint(rgba[..., :3] * alpha / 255 + 255 - alpha).astype(np.uint8)
+
 
 @pytest.mark.parametrize("pixels", [
     pytest.param(np.random.RandomState(0).randint(0, 256, (48, 40), np.uint8), id="grayscale"),
     pytest.param(np.random.RandomState(0).randint(0, 256, (48, 40, 4), np.uint8), id="rgba"),
 ])
-def test_a_fetched_image_decodes_as_the_image_datasets_decode_it(pixels):
-    """One decoder for both paths. PIL's own array of a grayscale or RGBA PNG
-    is 2-D or 4-channel, which the online path used to drop as not RGB while
-    the dataset path kept the same bytes as RGB; both now give PIL's RGB
-    conversion, alpha dropped rather than composited."""
-    blob = _png(pixels)
-    rgb = np.asarray(PIL.Image.open(io.BytesIO(blob)).convert("RGB"))
+def test_a_fetched_grey_or_transparent_image_is_kept_as_rgb(pixels):
+    """Grey is replicated and transparency composited onto white."""
+    expected = np.repeat(pixels[..., None], 3, axis=-1) if pixels.ndim == 2 else _on_white(pixels)
 
-    fetched = online_loader.decode_pixels(blob)
+    fetched = online_loader.decode_pixels(_png(pixels))
 
     assert fetched is not None
-    np.testing.assert_array_equal(fetched, rgb)
-    np.testing.assert_array_equal(fetched, decode_image(blob))
+    np.testing.assert_array_equal(fetched, expected)
     assert online_loader.prepare_image(fetched, size=64, min_size=32) is not None
-
 
 
 @pytest.mark.parametrize("pixels", [
