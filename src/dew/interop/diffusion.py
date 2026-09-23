@@ -716,9 +716,6 @@ def write_flax_component(directory: Path, component: str, tensors: Mapping[str, 
 
 def save_source(source, values, destination: Path) -> None:
     """Write a native diffusion bundle back to its published directory layout."""
-    import shutil
-
-    from dew.inputs.diffusion import QwenImageConditioner
     from dew.interop.safetensors_io import write_file
     destination.mkdir(parents=True, exist_ok=True)
     config = dict(source.config)
@@ -743,19 +740,4 @@ def save_source(source, values, destination: Path) -> None:
         declared = index.get(component)
         if isinstance(declared, (list, tuple)) and len(declared) == 2 and isinstance(declared[1], str) and declared[1].startswith("Flax"):
             write_flax_component(destination, component, tensors)
-    encoder = source.inputs.conditions["conditioning"].encoder
-    if isinstance(encoder, QwenImageConditioner):
-        # The processor is read, never trained: its files go out as they came.
-        shutil.copytree(Path(source.source) / "processor", destination / "processor",
-                        dirs_exist_ok=True)
-        return
-    for name, tokenizer in zip(encoder.names, encoder.tokenizers, strict=True):
-        folder = destination / ("tokenizer" + name.removeprefix("text_encoder"))
-        tokenizer.save_pretrained(folder)
-        # A CLIP tokenizer's own vocabulary and merges beside its config.
-        tokenizer.backend_tokenizer.model.save(str(folder))
-    if encoder.t5 is not None:
-        # The T5 tokenizer ships one file, which `save_pretrained` writes, in
-        # the slot its own family keeps it.
-        encoder.t5.tokenizer.save_pretrained(
-            destination / ("tokenizer" + encoder.t5.name.removeprefix("text_encoder")))
+    source.inputs.conditions["conditioning"].encoder.save_assets(destination)
