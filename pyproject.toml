@@ -15,7 +15,7 @@ dependencies = [
     # flax.nnx on jax 0.11.2 (jax.experimental.hijax's HiPrim; qwix imports
     # nnx): fixed in flax 01854da1, after 0.12.9, the latest release. Return
     # to a release floor once one ships.
-    "flax @ git+https://github.com/google/flax@4f42ed069731c83ef27fccb0cc42647684f80109",
+    "flax @ https://github.com/google/flax/archive/4f42ed069731c83ef27fccb0cc42647684f80109.tar.gz",
     "jax>=0.11.2",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
