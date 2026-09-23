@@ -401,12 +401,10 @@ class QwenImageAutoencoder(AutoEncoder):
     latent normalization, `(z - latents_mean) / latents_std` on the way out
     and `z * latents_std + latents_mean` on the way in."""
 
-    def __init__(self, checkpoint: str, *, model: QwenImageVAE, params: Variables,
-                 latents_mean: Sequence[float], latents_std: Sequence[float], dtype: Dtype):
-        self.checkpoint = checkpoint
+    def __init__(self, *, model: QwenImageVAE, params: Variables,
+                 latents_mean: Sequence[float], latents_std: Sequence[float]):
         self.model = model
         self.params = params
-        self.dtype = dtype
         self.latents_mean = np.asarray(latents_mean, np.float32)
         self.latents_std = np.asarray(latents_std, np.float32)
         expected = (model.latent_channels,)
@@ -466,7 +464,6 @@ def load_qwen_image_vae(directory: Path, compute, *, param_dtype: str = "float32
         extra = sorted(key for key in held if key not in wanted)
         raise ValueError(f"The published VAE does not fill QwenImageVAE: missing or reshaped {missing}, "
                          f"unexpected {extra}")
-    autoencoder = QwenImageAutoencoder(str(directory), model=model, params=params,
-                                       latents_mean=config["latents_mean"], latents_std=config["latents_std"],
-                                       dtype=compute)
+    autoencoder = QwenImageAutoencoder(model=model, params=params, latents_mean=config["latents_mean"],
+                                       latents_std=config["latents_std"])
     return autoencoder, params, layouts, config

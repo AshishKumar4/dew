@@ -227,6 +227,5 @@ def test_an_unsupported_config_is_refused(source, change):
 def test_mismatched_latent_statistics_are_refused(loaded):
     autoencoder, params, _, config = loaded
     with pytest.raises(ValueError, match="latent channel"):
-        QwenImageAutoencoder("tiny", model=autoencoder.model, params=params,
-                             latents_mean=config["latents_mean"][:-1], latents_std=config["latents_std"],
-                             dtype=jnp.float32)
+        QwenImageAutoencoder(model=autoencoder.model, params=params,
+                             latents_mean=config["latents_mean"][:-1], latents_std=config["latents_std"])
