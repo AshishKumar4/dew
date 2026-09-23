@@ -44,17 +44,8 @@ from .causal_transformer import GatedMLP
 from .flux import apply_rotary
 from .sd3 import _layer_norm
 
-ROPE_THETA = 10000
 
-
-def rope_frequencies(dim: int) -> np.ndarray:
-    """`QwenImage21Rope.rope_params`' inverse frequencies, in its float32
-    arithmetic: one per channel pair of the axis."""
-    exponent = np.arange(0, dim, 2).astype(np.float32) / np.float32(dim)
-    return (np.float32(1.0) / np.power(np.float32(ROPE_THETA), exponent)).astype(np.float32)
-
-
-def image_grid(rows: int, columns: int) -> tuple[np.ndarray, np.ndarray]:
+def _image_grid(rows: int, columns: int) -> tuple[np.ndarray, np.ndarray]:
     """The height and width indices of one image block, row-major and
     centred on zero: `-(n - n // 2)` up to `n // 2 - 1` along each side."""
     heights = np.arange(-(rows - rows // 2), rows // 2)
@@ -62,15 +53,17 @@ def image_grid(rows: int, columns: int) -> tuple[np.ndarray, np.ndarray]:
     return np.repeat(heights, columns), np.tile(widths, rows)
 
 
-def rotary_angles(lengths: jax.Array, text: int, rows: int, columns: int,
-                  axes: Sequence[int]) -> jax.Array:
+def _rotary_angles(lengths: jax.Array, text: int, rows: int, columns: int,
+                   axes: Sequence[int]) -> jax.Array:
     """The angle of every channel pair of every token, image first,
     `[B, rows * columns + text, sum(axes) / 2]`.
 
     A text token sits at its index on all three axes. The image's frame axis
     is the row's own text length, and its other two are the centred grid.
+    Each axis turns at `QwenImage21Rope.rope_params`' inverse frequencies,
+    theta 10000 in its float32 arithmetic.
     """
-    heights, widths = image_grid(rows, columns)
+    heights, widths = _image_grid(rows, columns)
     index = jnp.arange(text, dtype=jnp.float32)
     batch = lengths.shape[0]
     frame = jnp.concatenate([jnp.broadcast_to(lengths.astype(jnp.float32)[:, None],
@@ -79,8 +72,10 @@ def rotary_angles(lengths: jax.Array, text: int, rows: int, columns: int,
     height = jnp.concatenate([jnp.asarray(heights, jnp.float32), index])
     width = jnp.concatenate([jnp.asarray(widths, jnp.float32), index])
     positions = (frame, jnp.broadcast_to(height, frame.shape), jnp.broadcast_to(width, frame.shape))
-    return jnp.concatenate([position[..., None] * jnp.asarray(rope_frequencies(dim))
-                            for position, dim in zip(positions, axes, strict=True)], axis=-1)
+    return jnp.concatenate([
+        position[..., None] * jnp.asarray(np.float32(1.0) / np.power(
+            np.float32(10000), np.arange(0, dim, 2).astype(np.float32) / np.float32(dim)))
+        for position, dim in zip(positions, axes, strict=True)], axis=-1)
 
 
 def _dense(features: int, name: str, dtype, precision) -> nn.Dense:
@@ -146,7 +141,7 @@ class _Attention(nn.Module):
             attended.reshape(*x.shape[:2], self.heads * self.head_dim))
 
 
-class QwenImageBlock(nn.Module):
+class _Block(nn.Module):
     """One single-stream block, holding no modulation of its own: the
     model's shared projection hands every block the same scales and gates."""
 
@@ -251,11 +246,11 @@ class QwenImageTransformer(nn.Module):
         still = jnp.split(projected[batch:], 4, axis=-1) if self.causal_condition else sampled
         modulation = tuple(zip(still, sampled, strict=True))
 
-        angles = rotary_angles(lengths, text, rows, columns, self.axes_dims_rope)
+        angles = _rotary_angles(lengths, text, rows, columns, self.axes_dims_rope)
         cos = jnp.repeat(jnp.cos(angles), 2, axis=-1)[:, :, None].astype(joint.dtype)
         sin = jnp.repeat(jnp.sin(angles), 2, axis=-1)[:, :, None].astype(joint.dtype)
         for index in range(self.num_layers):
-            joint = QwenImageBlock(
+            joint = _Block(
                 self.features, self.heads, self.head_dim, self.mlp_ratio, self.eps,
                 dtype=self.dtype, precision=self.precision, attention_impl=self.attention_impl,
                 name=f"transformer_blocks_{index}")(joint, modulation, cos, sin, lengths,
@@ -287,5 +282,4 @@ class _TextIn(nn.Module):
         return _dense(self.features, "out_layer", self.dtype, self.precision)(x)
 
 
-__all__ = ["QwenImageBlock", "QwenImageTransformer", "image_grid", "rope_frequencies",
-           "rotary_angles"]
+__all__ = ["QwenImageTransformer"]
