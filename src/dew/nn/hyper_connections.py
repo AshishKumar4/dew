@@ -34,11 +34,11 @@ record's `head` names.
 DeepSeek-V4.1 runs Single-Pass mHC (arXiv 2609.19969, section 2.4.1, eq. 6):
 a sublayer collapses the streams by the `pre` the previous site computed,
 not its own, so a block's attention reads the previous block's feed-forward
-`pre` and its feed-forward the attention's; the stack's first sublayer reads
-the first stream alone, and the final norm reads the collapse by the last
-site's `pre` (V4.1 inference/model.py:968-994, :1159-1163, :1268). `head`
-'carried' names that schedule: the stack carries `(streams, pre)` and there
-is no head of its own.
+`pre` and its feed-forward the attention's, and the stack's first sublayer
+reads the first stream alone (V4.1 inference/model.py:968-994, :1159-1163).
+The record's `single_pass` names that schedule, under which the stack
+carries `Carried(streams, pre)`; its final norm reads the collapse by the
+last site's `pre` (:1268), the head 'carried'.
 
 Parameter names are the checkpoints': `fn` `[(2 + H) H, H D]` in the
 torch Linear's `[out, in]` layout (the release stores it as a raw tensor,
@@ -50,6 +50,7 @@ under `hc_head`.
 from __future__ import annotations
 
 import dataclasses
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -63,18 +64,20 @@ HEADS = ('mean', 'weighted', 'carried')
 
 @dataclasses.dataclass(frozen=True)
 class HyperConnections:
-    """Holds the stream count, the Sinkhorn floor and iterations, and the head.
+    """Holds the stream count, the Sinkhorn floor and iterations, the head
+    and the schedule.
 
     A model names this on `hyper_connections`. The field names are the
     references' own config fields. `head` picks what collapses the streams
-    before the final norm, and 'carried' also shifts every sublayer's
-    collapse one site back (Single-Pass mHC, the module doc).
+    before the final norm; 'carried' is the last site's `pre`, which only
+    the `single_pass` schedule carries (the module doc).
     """
 
     hc_mult: int = 4
     hc_eps: float = 1e-6
     hc_sinkhorn_iters: int = 20
     head: str = 'mean'
+    single_pass: bool = False
 
     def __post_init__(self):
         if self.hc_mult < 1:
@@ -84,6 +87,17 @@ class HyperConnections:
                 f"hc_sinkhorn_iters counts Sinkhorn normalisations from one, got {self.hc_sinkhorn_iters}")
         if self.head not in HEADS:
             raise ValueError(f"head collapses the streams, one of {HEADS}, got {self.head!r}")
+        if self.head == 'carried' and not self.single_pass:
+            raise ValueError("the carried head collapses by the pre the Single-Pass schedule "
+                             "carries, so it needs single_pass")
+
+
+class Carried(NamedTuple):
+    """Single-Pass mHC's residual: the streams `[B, S, H, D]` and the fp32
+    `pre` `[B, S, H]` the next sublayer collapses them by."""
+
+    streams: jax.Array
+    pre: jax.Array
 
 
 def expand_streams(x, hc_mult: int):
@@ -184,18 +198,15 @@ class HyperHead(nn.Module):
             streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(jnp.float32),
             self.norm_eps)
         pre = nn.sigmoid(flat @ fn.T * scale + base) + self.spec.hc_eps
-        return jnp.sum(pre[..., None] * streams.astype(jnp.float32), axis=2).astype(streams.dtype)
+        return collapse_by(pre, streams)
 
 
 def collapse_streams(streams, head: HyperHead | None):
     """Collapse the streams to the one vector the final norm reads.
 
     Without a head that is their mean (modeling_glm5_next.py:301-302), and
-    with one it is the head's weighted sum. Single-Pass mHC's carried
-    `(streams, pre)` collapses by that `pre`.
+    with one it is the head's weighted sum.
     """
-    if isinstance(streams, tuple):
-        return collapse_by(streams[1], streams[0])
     if head is None:
         return jnp.mean(streams, axis=2)
     return head(streams)

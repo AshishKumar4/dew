@@ -36,7 +36,6 @@ from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import Composition, DiffusionConditioner, QwenImageConditioner, T5Segment
 from dew.interop import gguf, hf_decoders as decoders, mamba2, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
-from dew.interop.families.deepseek_v41 import engram_token_map
 from dew.interop.streaming import SourceLeaf
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
@@ -2537,10 +2536,11 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
         model = models.build("causal_transformer", built)
         variables = decoders.translate_weights(tensors, record, family, param_dtype=param_dtype, lazy=streaming)
-        if record.get("engram") is not None:
-            # Derived from the tokenizer, not stored: the export writes none back.
-            variables = {**variables, "constants": {**variables.get("constants", {}), "engram_hashes": {
-                "token_map": engram_token_map(directory, record)}}}
+        entry = decoders._FAMILIES[family]
+        derived = entry.constants(directory, record)
+        if derived:
+            # Derived beside the tensors, not stored: the export writes none back.
+            variables = {**variables, "constants": {**variables.get("constants", {}), **derived}}
         decoders._check_tree(variables, model)
         # The bindings are what an adapter loader resolves source names
         # through and what a quantized source is written back through, so a
@@ -2548,7 +2548,6 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         # preserve_source_layout and quantization, not by whether bindings
         # exist. A family whose tensors are rewritten before the path map
         # reads them (Gemma 4's prepare) has no raw-name bindings.
-        entry = decoders._FAMILIES[family]
         if entry.preserve_source_layout or entry.prepare_weights is dict:
             bindings = []
             for name, tensor in tensors.items():

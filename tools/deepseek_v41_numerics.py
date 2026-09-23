@@ -75,21 +75,31 @@ def stepped(variables, gradient, rate):
 
 def cached_run(model, variables, ids, prompt):
     """Prefill `prompt` tokens, then one token per step; the prompt's logits,
-    each step's logits, and DSpark's drafts after each step."""
+    each step's logits, and DSpark's drafts after each step over the context
+    each call recorded. Every call is compiled once per shape."""
     rows = ids.shape[0]
     cache = model.apply(variables, rows, method=model.init_cache, mutable=["cache"])[1]
     drafts = model.apply(variables, rows, method=model.init_draft_cache, mutable=["cache"])[1]
-    (hidden, prompt_logits), cache = model.apply(
-        {**variables, **cache}, ids[:, :prompt], decode=True, method=model.states_and_logits, mutable=["cache"])
-    _, drafts = model.apply({**variables, **drafts}, hidden, None, method=model.draft, mutable=["cache"])
+
+    @jax.jit
+    def step(cache, tokens):
+        (_, logits), updated = model.apply(
+            {**variables, **cache}, tokens, decode=True, method=model.states_and_logits,
+            mutable=["cache", "prediction_inputs"])
+        context = model.apply(variables, updated["prediction_inputs"], method=model.draft_context)
+        return logits, {"cache": updated["cache"]}, context
+
+    @jax.jit
+    def draft(drafts, context, tokens):
+        return model.apply({**variables, **drafts}, context, tokens, method=model.draft, mutable=["cache"])
+
+    prompt_logits, cache, context = step(cache, ids[:, :prompt])
+    _, drafts = draft(drafts, context, None)
     steps, drafted = [], []
     for position in range(prompt, ids.shape[1]):
-        (hidden, logits), cache = model.apply(
-            {**variables, **cache}, ids[:, position:position + 1], decode=True,
-            method=model.states_and_logits, mutable=["cache"])
+        logits, cache, context = step(cache, ids[:, position:position + 1])
         steps.append(np.asarray(logits[:, 0]))
-        out, drafts = model.apply({**variables, **drafts}, hidden, jnp.argmax(logits[:, -1], -1),
-                                  method=model.draft, mutable=["cache"])
+        out, drafts = draft(drafts, context, jnp.argmax(logits[:, -1], -1))
         drafted.append([np.asarray(value) for value in out])
     return np.asarray(prompt_logits), np.stack(steps, 1), [np.stack(value, 1) for value in zip(*drafted, strict=True)]
 

@@ -40,6 +40,7 @@ from dew.registry import from_record, models
 from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention, ResidualSite, sources
 from ..blocks import TokenEmbedding, normal_kernel
+from ..deepseek_v4 import DeepseekV4Mixer
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
@@ -47,6 +48,7 @@ from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..hyper_connections import (
+    Carried,
     HyperConnection,
     HyperConnections,
     HyperHead,
@@ -624,20 +626,21 @@ class DecoderBlock(nn.Module):
     residual streams, `[B, S, hc_mult, D]`: each sublayer reads the collapse
     its site's mapping chooses and writes back into every stream over the
     Sinkhorn-mixed residual (`dew.nn.hyper_connections`), the plain pre-norm
-    block otherwise (modeling_glm5_next.py:1293-1327).
+    block otherwise (modeling_glm5_next.py:1293-1327). Under the Single-Pass
+    schedule the block takes and returns `Carried(streams, pre)`, each
+    sublayer collapsing by the `pre` the site before it computed.
 
     residual_site makes the block take and return Kimi K3's depth state,
     `[B, S, blocks + 1, D]`: the finished blocks and the partial sum
     (`dew.nn.attention_residuals`). Each sublayer reads the softmax mixture
     of the finished blocks and the partial its site holds, as a plain
     pre-norm block reads the residual, and adds its output to the partial.
-    block otherwise (modeling_glm5_next.py:1293-1327). Under Single-Pass mHC
-    (head 'carried') the block takes and returns `(streams, pre)`, each
-    sublayer collapsing by the `pre` the site before it computed.
 
     engram writes the layer's n-gram lookup into the streams before anything
     else reads them (V4.1 inference/model.py:1261-1263); `engram_index` is
-    which of the metadata's `engram_ids` it reads.
+    which of the metadata's `engram_ids` it reads. A DSpark target layer
+    (`prediction_slot`) sows the mean of the streams its attention reads as
+    `prediction_inputs/draft_context` (:1264-1266).
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module] | None
@@ -833,65 +836,51 @@ class DecoderBlock(nn.Module):
             x = x * self.output_scalar.astype(x.dtype)
         return x
 
-    def _forward_streams(self, streams, train: bool, decode: bool, positions, segment_ids,
+    def _forward_streams(self, residual, train: bool, decode: bool, positions, segment_ids,
                          kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary",
                          per_layer_input: LayerInputs | None = None):
-        """The mHC block over `[B, S, hc_mult, D]` (modeling_glm5_next.py:1293-1327)."""
-        carried = self.hyper_connections is not None and self.hyper_connections.head == 'carried'
-        pre, extra = None, ()
-        if carried:
-            streams, pre, *extra = streams
+        """The mHC block over `[B, S, hc_mult, D]` (modeling_glm5_next.py:1293-1327),
+        each sublayer collapsing by its own site's `pre`, or under the
+        Single-Pass schedule by the one the site before it computed and
+        handing its own on (V4.1 inference/model.py:968-994)."""
+        spec = self.hyper_connections
+        assert spec is not None
+        streams, carried = residual if spec.single_pass else (residual, None)
         if self.engram is not None:
             if attention_metadata is None or attention_metadata.engram_ids is None:
                 raise ValueError("an engram layer reads the bucket ids the model hashes into "
                                  "attention_metadata.engram_ids")
             streams = self.engram_layer(
                 streams, attention_metadata.engram_ids[:, :, self.engram_index])
-        if self.prediction_slot is not None:
+        if (self.prediction_slot is not None and not self.is_initializing()
+                and self.is_mutable_collection('prediction_inputs')):
             # DSpark reads each target layer's attention input, after its
             # engram, averaged over the streams (V4.1 inference/model.py:1264-1266).
-            if not extra:
-                raise ValueError("a DSpark target layer records into the stack's carried "
-                                 "prediction states, which the model enters with the streams")
-            extra = (extra[0].at[:, :, self.prediction_slot].set(
-                jnp.mean(streams, axis=2).astype(extra[0].dtype)),)
-        if carried:
-            return (*self._forward_single_pass(streams, pre, train, decode, positions, segment_ids,
-                                               kv_store, attention_metadata, prediction_phase), *extra)
-        post, comb, collapsed = self.attn_hc(constrain(streams, STREAMS))
+            mean = jnp.mean(streams, axis=2)
+            self.sow('prediction_inputs', 'draft_context', mean,
+                     reduce_fn=lambda _, value: value, init_fn=lambda: mean)
+        streams = constrain(streams, STREAMS)
+        attn_pre, post, comb = self.attn_hc.mapping(streams)
+        collapsed = collapse_by(attn_pre if carried is None else carried, streams)
         mixed = self._mix(self.input_layernorm(collapsed), decode, positions, segment_ids,
                           kv_store, attention_metadata, prediction_phase)
         streams = constrain(
             mix_streams(post, comb, self.dropout(mixed, deterministic=not train), streams), STREAMS)
-        if self.feedforward is None:
-            return streams
-        post, comb, collapsed = self.ffn_hc(streams)
-        hidden = self.mlp(self.post_attention_layernorm(collapsed),
-                          **self._feedforward_inputs(attention_metadata), **self._routes(per_layer_input))
-        return constrain(
-            mix_streams(post, comb, self.dropout(hidden, deterministic=not train), streams), STREAMS)
+        handed = attn_pre
+        if self.feedforward is not None:
+            ffn_pre, post, comb = self.ffn_hc.mapping(streams)
+            collapsed = collapse_by(ffn_pre if carried is None else attn_pre, streams)
+            hidden = self.mlp(self.post_attention_layernorm(collapsed),
+                              **self._feedforward_inputs(attention_metadata), **self._routes(per_layer_input))
+            streams = constrain(
+                mix_streams(post, comb, self.dropout(hidden, deterministic=not train), streams), STREAMS)
+            handed = ffn_pre
+        return streams if carried is None else Carried(streams, handed)
 
     def _scaled_branch(self, branch):
         """A sublayer's output times `residual_multiplier` (lm-engine's
         m_residual, GraniteMoeHybrid's residual_multiplier), in its own dtype."""
         return scaled(branch, self.residual_multiplier)
-    def _forward_single_pass(self, streams, pre, train: bool, decode: bool, positions, segment_ids,
-                             kv_store, attention_metadata, prediction_phase="ordinary"):
-        """Single-Pass mHC (V4.1 inference/model.py:968-994): each site's own
-        `pre` is handed on, and the sublayer collapses by the one before."""
-        attn_pre, post, comb = self.attn_hc.mapping(streams)
-        mixed = self.self_attn(self.input_layernorm(collapse_by(pre, streams)),
-                               decode=decode, positions=positions, segment_ids=segment_ids,
-                               **({} if kv_store is None else {"kv_store": kv_store}),
-                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
-                               **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
-        streams = mix_streams(post, comb, self.dropout(mixed, deterministic=not train), streams)
-        if self.feedforward is None:
-            return streams, attn_pre
-        ffn_pre, post, comb = self.ffn_hc.mapping(streams)
-        hidden = self.mlp(self.post_attention_layernorm(collapse_by(attn_pre, streams)),
-                          **self._feedforward_inputs(attention_metadata))
-        return mix_streams(post, comb, self.dropout(hidden, deterministic=not train), streams), ffn_pre
 
     def _forward_depth(self, state, train: bool, decode: bool, positions, segment_ids,
                        kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary",
@@ -1671,8 +1660,9 @@ class CausalTransformer(nn.Module):
     tokenizer and a fresh model starts as the identity."""
     dspark: DSpark | None = None
     """DeepSeek-V4.1's block drafter (`dew.nn.dspark`): its stages are
-    decoder blocks of `mtp_layer_type`'s kind, and the stack records the
-    stream means its target layers read. None is a model without one."""
+    decoder blocks attending with its `layer_type` kind's V4 attention as a
+    `DSparkAttention`, and its target layers sow the stream means it reads
+    (`draft_context`). None is a model without one."""
     swiglu_limit: float | None = None      # GLM-5.3-Flash's clamp before every gated MLP's activation
     activation_sparsity_pattern: tuple[float, ...] | None = None  # Gemma 3n's gaussian top-k, one fraction per layer
     mask_token_id: int | None = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
@@ -1952,6 +1942,8 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"layer_types has {len(types)} entries for {self.num_layers} layers")
         prediction_kinds = {self.mtp_layer_type} if self.num_nextn_predict_layers and self.mtp_layer_type else set()
+        if self.dspark is not None:
+            prediction_kinds.add(self.dspark.layer_type)
         unnamed = sorted(set(self.kinds or {}) - set(types) - prediction_kinds)
         if unnamed:
             raise ValueError(
@@ -2091,17 +2083,19 @@ class CausalTransformer(nn.Module):
                 raise ValueError(f"engram layers {outside} are outside the {self.num_layers} layers")
         hc = self.hyper_connections
         if self.dspark is not None:
-            if hc is None or hc.head != 'carried' or self.mixture is None:
+            # The stages are V4.1's Single-Pass blocks (v41:1100-1156); a
+            # drafter for another trunk's residual is not built here.
+            if hc is None or not hc.single_pass or self.mixture is None:
                 raise ValueError("the DSpark drafter chains Single-Pass mHC blocks over routed "
-                                 "experts, as the trunk it drafts for does")
+                                 "experts, as the V4.1 trunk it drafts for does")
             outside = sorted(set(self.dspark.target_layers) - set(range(self.num_layers)))
             if outside:
                 raise ValueError(f"DSpark target layers {outside} are outside the {self.num_layers} layers")
             if self.num_nextn_predict_layers:
                 raise ValueError("a model drafts with DSpark or with MTP depths, not both")
-        if hc is not None and hc.head == 'carried' and (self.altup is not None or self.mtp_hyper_connections):
+        if hc is not None and hc.single_pass and self.mtp_hyper_connections:
             raise ValueError("Single-Pass mHC carries the next sublayer's collapse beside the "
-                             "streams, which no altup stack or stream prediction depth reads")
+                             "streams, which no stream prediction depth reads")
         if self.swiglu_limit is not None and self.swiglu_limit <= 0:
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is positive, "
@@ -2343,11 +2337,17 @@ class CausalTransformer(nn.Module):
             for depth in range(self.num_nextn_predict_layers)]
         if self.dspark is not None:
             assert routed is not None
+            layer_type = self.dspark.layer_type
+            drafting = kinds[layer_type].mixer or mixer_spec
+            if not isinstance(drafting, DeepseekV4Mixer):
+                raise ValueError(f"DSpark's stages attend with V4 attention, and kind {layer_type!r} "
+                                 f"builds {type(drafting).__name__}")
+            drafter = drafting.drafter(self.mixer_context(kinds[layer_type], layer_type, kv_shared=False))
             stages = self.dspark.stages
             self.dspark_stages = [
                 DSparkStage(
                     block=functools.partial(
-                        DecoderBlock, mixer=mtp_mixer,
+                        DecoderBlock, mixer=drafter,
                         feedforward=functools.partial(routed, num_experts=self.dspark.experts,
                                                       top_k=self.dspark.top_k),
                         emb_features=self.emb_features, norm_eps=self.norm_eps,
@@ -2404,8 +2404,10 @@ class CausalTransformer(nn.Module):
                                attention_pairwise_mask=attention_pairwise_mask,
                                attention_key_positions=attention_key_positions)
         if self.is_initializing() and self.dspark is not None:
-            # Reach the drafter's parameters, as the depths' below.
-            self.draft(jnp.asarray(prediction)[:, -1:], tokens[:, -1], decode=False)
+            # Reach the drafter's parameters, as the depths' below, over a
+            # context of the width its first stage projects.
+            width = len(self.dspark.target_layers) * self.emb_features
+            self.draft(jnp.zeros((tokens.shape[0], 1, width), x.dtype), tokens[:, -1], decode=False)
         if self.is_initializing() and self.mtp:
             # Flax creates a parameter where a call first reaches it, and the
             # main forward never enters the prediction depths. Reaching them
@@ -2564,23 +2566,32 @@ class CausalTransformer(nn.Module):
                                  self.embed_tokens.embedding.dtype)).astype(x.dtype)
         return scaled(x, self.embedding_multiplier)
 
-    def draft(self, hidden, tokens, *, decode: bool = True, key=None, temperature: float = 0.0):
+    def draft(self, context, tokens, *, decode: bool = True, key=None, temperature: float = 0.0):
         """DSpark's draft after each row's last context position.
 
-        `hidden` is the context `states_and_logits` returns for this model
-        (the target layers' stream means), `tokens` `[B]` the tokens drawn
-        after it. Returns `(ids [B, block + 1], logits [B, block, vocab],
-        confidence [B, block])` (`dew.nn.dspark.draft`). Cached, call
-        `init_draft_cache` first, pass the prompt's context with `tokens`
-        None to seed the windows, then one position's context per step.
+        `context` `[B, M, targets * D]` is what `draft_context` assembles
+        from a forward's sown `prediction_inputs` (the target layers' stream
+        means), `tokens` `[B]` the tokens drawn after it. Returns `(ids [B,
+        block + 1], logits [B, block, vocab], confidence [B, block])`
+        (`dew.nn.dspark.draft`). Cached, call `init_draft_cache` first, pass
+        the prompt's context with `tokens` None to seed the windows, then
+        one position's context per step.
         """
         if self.dspark is None:
             raise ValueError("this model has no DSpark drafter")
         hc = self.hyper_connections
         assert hc is not None
         return dspark_draft(self.dspark_stages, self.dspark, self.token_embeddings, self._logits,
-                            hc.hc_mult, hidden, tokens, decode=decode, key=key,
+                            hc.hc_mult, context, tokens, decode=decode, key=key,
                             temperature=temperature)
+
+    def draft_context(self, prediction_inputs: Mapping) -> jax.Array:
+        """DSpark's context `[B, S, targets * D]` from the `prediction_inputs`
+        a forward sows when the caller makes them mutable: each target
+        layer's stream mean, concatenated in `target_layers` order."""
+        assert self.dspark is not None
+        return jnp.concatenate([prediction_inputs[f'layers_{layer}']['draft_context']
+                                for layer in self.dspark.target_layers], axis=-1)
 
     def init_draft_cache(self, batch_size: int):
         """Allocate the drafter's window caches, apart from the trunk's."""
@@ -2678,17 +2689,13 @@ class CausalTransformer(nn.Module):
             # The embeddings and, rescaled to their magnitude, each projected
             # copy: [num_inputs, B, S, D].
             x = jnp.stack([x] + [rescale_to(project(x), x) for project in self.altup_projections])
-        hc = self.hyper_connections
+        hc, depth = self.hyper_connections, self.attention_residuals
         if hc is not None:
             # The embeddings copied into every residual stream: [B, S, hc_mult, D].
             x = expand_streams(x, hc.hc_mult)
-            if hc.head == 'carried':
-                x = (x, first_stream(x))
-                if self.dspark is not None:
-                    targets = len(self.dspark.target_layers)
-                    x = (*x, jnp.zeros((*x[0].shape[:2], targets, self.emb_features), x[0].dtype))
-        depth = self.attention_residuals
-        if depth is not None:
+            if hc.single_pass:
+                x = Carried(x, first_stream(x))
+        elif depth is not None:
             # The embeddings as the first partial sum after empty blocks: [B, S, blocks + 1, D].
             x = jnp.pad(x[:, :, None], ((0, 0), (0, 0), (depth.blocks(self.num_layers), 0), (0, 0)))
         x = self.stack(x, train=train, decode=decode, positions=positions,
@@ -2701,8 +2708,12 @@ class CausalTransformer(nn.Module):
                                for project, copy in zip(self.altup_unembed_projections, x[1:], strict=True)]
             x = jnp.mean(jnp.stack(copies), axis=0)
         streams = x
-        if hc is not None:
-            x = collapse_streams(x, self.hc_head if hc.head == 'weighted' else None)
+        if hc is not None and hc.head == 'carried':
+            assert isinstance(x, Carried)
+            x = collapse_by(x.pre, x.streams)
+        elif hc is not None:
+            x = collapse_streams(x.streams if isinstance(x, Carried) else x,
+                                 self.hc_head if hc.head == 'weighted' else None)
         if depth is not None:
             # Every block is finished after the last layer, so the whole state,
             # the blocks and the last partial, is what the output site mixes
@@ -2715,12 +2726,6 @@ class CausalTransformer(nn.Module):
             # lm-engine's logits * (1 / m_width) does.
             hidden = hidden.astype(jnp.float32) / jnp.float32(self.logits_scaling)
         prediction = hidden if self.mtp_hyper_connections is None else streams
-        if self.dspark is not None:
-            # The drafter's context: each target layer's stream mean, concatenated.
-            # Under DSpark the stack returns (streams, pre, target means).
-            assert isinstance(streams, tuple) and len(streams) == 3
-            means = jnp.asarray(streams[2])
-            prediction = means.reshape(*means.shape[:2], -1)
         if (self.mtp_hyper_connections is not None and not self.is_initializing()
                 and self.is_mutable_collection('prediction_inputs')):
             self.sow('prediction_inputs', 'states', prediction,
@@ -2767,6 +2772,10 @@ class CausalTransformer(nn.Module):
                     f"layer, which a store already banked by run cannot be reshaped "
                     f"into; {list(banked)} arrived banked. Place the weights per layer "
                     f"for a pipeline, or run the stack whole")
+            if isinstance(x, Carried):
+                raise ValueError(
+                    "Single-Pass mHC carries each sublayer's collapse beside the streams, "
+                    "which the pipeline's microbatch buffers do not hold; run the stack whole")
             count = self.stage_layers(stages)
             batch_axis = 1 if self.altup is not None else 0
             rows, count_microbatches = x.shape[batch_axis], microbatches()
@@ -2775,10 +2784,6 @@ class CausalTransformer(nn.Module):
                     f"a batch of {rows} rows over {stages} stages needs a microbatch "
                     f"count that divides the rows and is a multiple of the stages, "
                     f"got {count_microbatches}")
-            if isinstance(x, tuple):
-                raise ValueError(
-                    "Single-Pass mHC carries each sublayer's collapse beside the streams, "
-                    "which the pipeline's microbatch buffers do not hold; run the stack whole")
             view = StackView(
                 scan_groups(self.specs[:count], self.bank_layers) if self.scan_layers
                 else tuple((index, 1) for index in range(count)),
@@ -2790,7 +2795,7 @@ class CausalTransformer(nn.Module):
             x, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         # A carried collapse stays fp32, as the reference keeps it.
-        x = (x[0].astype(dtype), *x[1:]) if isinstance(x, tuple) else x.astype(dtype)
+        x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
         run = nn.map_variables(type(self)._stacked, True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
         return run(self, view, x, train, decode, positions, segment_ids, per_layer_input, attention_metadata)
@@ -2869,14 +2874,14 @@ class CausalTransformer(nn.Module):
         layer, scope = self.layers[0], self.layers[0].scope
         assert scope is not None
         rngs = {name: jax.random.key(0) for name in scope.rngs}
-        streams = x[0] if isinstance(x, tuple) else x
+        streams = x.streams if isinstance(x, Carried) else x
         output = jax.eval_shape(lambda held: layer.apply(
             held, x, mutable=True, rngs=rngs,
             train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             kv_store={} if self.sharing_layers else None,
             per_layer_input=None if per_layer_input is None else per_layer_input.layer(0),
             attention_metadata=attention_metadata)[0], self.first_layer_shapes())
-        output = output[0] if isinstance(output, tuple) else output
+        output = output.streams if isinstance(output, Carried) else output
         return jnp.result_type(streams.dtype, output.dtype)
 
     def first_layer_shapes(self) -> dict:
