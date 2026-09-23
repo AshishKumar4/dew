@@ -72,7 +72,7 @@ from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_inv_freq
 from dew.nn.sharding import logical_axes
-from dew.nn.sparse_selection import candidate_pool, top_k_keys
+from dew.nn.sparse_selection import candidate_pool, selection_mask, top_k_keys, top_k_selection
 
 COMPRESSORS = ('csa', 'hca', 'csa2')
 CANDIDATES = ('source', 'restrict')
@@ -81,8 +81,11 @@ CSA2_INDEX_KEYS = 'csa2_index_keys'
 CSA2_SELECTED = 'csa2_selected'
 CSA2_CANDIDATES = 'csa2_candidates'
 """The kv_store names a CSA2 layer publishes under: the latest Full layer's
-rotated entries and index keys, the latest selection and the candidate pool.
-One name each, since every layer reads the latest (section 2.3.1)."""
+rotated entries and index keys, the latest selection and the candidate
+pool's entries. One name each, since every layer reads the latest (section
+2.3.1)."""
+
+
 def rope_freqs(positions, rope_dim: int, theta: float, yarn: YarnScaling | None):
     """cos/sin per pair over the rope width, `[..., rope_dim // 2]`.
 
@@ -327,34 +330,37 @@ class CompressedEntries(nn.Module):
         """Append closed windows to the rotated-entry cache; allocation writes none.
 
         Returns the cache, the latents this call closed and the window each
-        one is (-1 for none). The incomplete window stays in the cache.
+        one is (-1 for none). The incomplete window stays in the cache; a
+        window of one token closes with the token, so at rate 1 every valid
+        token is an entry at once, with no buffer and no scan.
         """
         kv, gate = self._projections(x)
         if gate is None:
-            gate = jnp.zeros_like(kv)
-        elif self.position_bias:
-            gate = gate + self.bias[jnp.maximum(slots, 0) % self.rate].astype(gate.dtype)
-        shape = (x.shape[0], self.rate, kv.shape[-1])
-        buffer_kv = self.variable('cache', 'buffer_kv', jnp.zeros, shape, kv.dtype)
-        buffer_gate = self.variable('cache', 'buffer_gate', jnp.zeros, shape, gate.dtype)
-        prior = None
-        overlap_kv = overlap_gate = None
-        if self.overlap:
-            overlap_kv = self.variable('cache', 'overlap_kv', jnp.zeros,
-                                       (x.shape[0], self.rate, self.width), kv.dtype)
-            overlap_gate = self.variable('cache', 'overlap_gate', jnp.full,
-                                         (x.shape[0], self.rate, self.width), -jnp.inf, gate.dtype)
-            prior = (overlap_kv.value, overlap_gate.value)
-        pooled, emitted, buffered, prior = append_windows(
-            kv, gate, slots, (buffer_kv.value, buffer_gate.value), prior, self.rate, self.width)
-        latents = self._normed(pooled, x.dtype)
+            latents, emitted = self.kv_norm(kv), slots
+        else:
+            if self.position_bias:
+                gate = gate + self.bias[jnp.maximum(slots, 0) % self.rate].astype(gate.dtype)
+            shape = (x.shape[0], self.rate, kv.shape[-1])
+            buffer_kv = self.variable('cache', 'buffer_kv', jnp.zeros, shape, kv.dtype)
+            buffer_gate = self.variable('cache', 'buffer_gate', jnp.zeros, shape, gate.dtype)
+            prior = overlap = None
+            if self.overlap:
+                overlap = (self.variable('cache', 'overlap_kv', jnp.zeros,
+                                         (x.shape[0], self.rate, self.width), kv.dtype),
+                           self.variable('cache', 'overlap_gate', jnp.full,
+                                         (x.shape[0], self.rate, self.width), -jnp.inf, gate.dtype))
+                prior = (overlap[0].value, overlap[1].value)
+            pooled, emitted, buffered, prior = append_windows(
+                kv, gate, slots, (buffer_kv.value, buffer_gate.value), prior, self.rate, self.width)
+            if write:
+                buffer_kv.value, buffer_gate.value = buffered
+                if overlap is not None and prior is not None:
+                    overlap[0].value, overlap[1].value = prior
+            latents = self._normed(pooled, x.dtype)
         entries = self.variable('cache', 'compressed', jnp.zeros,
                                 (x.shape[0], capacity // self.rate, self.width), latents.dtype)
         if write:
-            buffer_kv.value, buffer_gate.value = buffered
             entries.value = write_cache(entries.value, self._stored(latents, emitted), emitted)
-            if overlap_kv is not None and overlap_gate is not None and prior is not None:
-                overlap_kv.value, overlap_gate.value = prior
         return entries.value, latents, emitted
 
 
@@ -377,9 +383,11 @@ class IndexScorer(nn.Module):
 
 
 def index_scores(query, keys, weights, precision=None):
-    """`sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)` in fp32."""
+    """`sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)` in fp32,
+    over keys `[B, T, D]` every query shares or `[B, S, T, D]` per query."""
     heads, width = query.shape[-2:]
-    scores = jnp.maximum(jnp.einsum('bshd,btd->bsht', query.astype(jnp.float32),
+    shared = 'bshd,btd->bsht' if keys.ndim == 3 else 'bshd,bstd->bsht'
+    scores = jnp.maximum(jnp.einsum(shared, query.astype(jnp.float32),
                                     keys.astype(jnp.float32), precision=precision), 0) * width ** -0.5
     return jnp.einsum('bsht,bsh->bst', scores, weights.astype(jnp.float32) * heads ** -0.5,
                       precision=precision)
@@ -690,15 +698,23 @@ class DeepseekV4Attention(nn.Module):
             keys = held.value
         visible = entries_visible(positions, entries.shape[1], rate)
         visible = jnp.broadcast_to(visible, (x.shape[0], *visible.shape[1:]))
-        scores = self.indexer.scores(x, q_resid, keys, cos, sin)
-        keep = visible
-        if self.candidates == 'source' and self.candidate_blocks and self.candidate_block_size:
-            pool = candidate_pool(scores, visible, self.candidate_blocks, self.candidate_block_size)
-            if kv_store is not None:
-                kv_store[CSA2_CANDIDATES] = pool
-        elif self.candidates == 'restrict':
-            keep = visible & _published(kv_store, CSA2_CANDIDATES, 'Reindex')
-        selected = top_k_keys(scores, keep, top_k)
+        if self.candidates == 'restrict':
+            # A Reindex layer scores the pool's entries alone, their keys
+            # gathered per query (section 2.3.2): O(pool), not O(entries).
+            pool = _published(kv_store, CSA2_CANDIDATES, 'Reindex')
+            held = jnp.maximum(pool, 0)
+            scores = self.indexer.scores(x, q_resid, keys[jnp.arange(x.shape[0])[:, None, None], held],
+                                         cos, sin)
+            picks = top_k_selection(scores, (pool >= 0) & jnp.take_along_axis(visible, held, -1), top_k)
+            chosen = jnp.where(picks >= 0, jnp.take_along_axis(pool, jnp.maximum(picks, 0), -1), -1)
+            selected = selection_mask(chosen, entries.shape[1])
+        else:
+            scores = self.indexer.scores(x, q_resid, keys, cos, sin)
+            if (self.candidates == 'source' and self.candidate_blocks and self.candidate_block_size
+                    and kv_store is not None):
+                kv_store[CSA2_CANDIDATES] = candidate_pool(
+                    scores, visible, self.candidate_blocks, self.candidate_block_size)
+            selected = top_k_keys(scores, visible, top_k)
         if kv_store is not None:
             if not self.reindex:
                 kv_store[CSA2_ENTRIES] = entries

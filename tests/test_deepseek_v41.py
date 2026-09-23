@@ -37,11 +37,10 @@ from dew.sampling import Sampling, generate
 from tools.deepseek_v41_numerics import (
     cached_run,
     captured,
-    dew_rows,
     input_noise,
     loss_and_gradient,
-    padded,
     row_noise,
+    selections,
     stepped,
     unquantized,
 )
@@ -140,15 +139,9 @@ def test_every_rounding_and_selection_meets_the_reference_within_the_noise(sourc
             explained = ((reference[f"{prefix}{site}_margin"] < noise[site])
                          | (reference[f"{prefix}{site}_scale_margin"][:, None] < noise[site]))
             assert not np.any((rounded != reference[f"{prefix}{site}_out"]) & ~explained), site
-        theirs = reference[f"{prefix}selection_rows"]
-        ours = dew_rows(record, theirs)
+        ours, our_picks, theirs, their_picks = selections(record, reference, prefix)
         assert np.max(row_noise(ours, theirs, reference[f"{prefix}selection_scale"])) <= noise["selection"]
-        columns = np.arange(theirs.shape[1])
-        picked = [np.any(picks[:, :, None] == columns, 1) for picks in (
-            padded(record.picks, reference[f"{prefix}selection_picks"].shape[1], -1),
-            reference[f"{prefix}selection_picks"])]
-        # Picks among forbidden keys (-inf) or past a row's width name nothing.
-        moved = np.any((picked[0] != picked[1]) & (theirs > -np.inf), -1)
+        moved = np.any(our_picks != their_picks, -1)
         assert not np.any(moved & (reference[f"{prefix}selection_margin"] >= noise["selection"]))
 
 
