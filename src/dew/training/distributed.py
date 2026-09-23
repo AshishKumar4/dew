@@ -140,6 +140,11 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
     serves every topology without a flag. Axes are Auto so GSPMD infers the
     collectives.
 
+    `devices` names the devices and their order on one slice: the mesh
+    takes them row-major over `MESH_AXES`, so the last axes hold
+    neighbouring entries. Unset is every device, in the order
+    `jax.make_mesh` gives the platform's topology.
+
     `spec.replicas` above 1 builds the mesh the way MaxText builds a
     multislice one, through `mesh_utils.create_hybrid_device_mesh`: the
     data axis takes `replicas` groups of granules as its outer factor, and
@@ -147,6 +152,7 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
     of more than one granule splits fsdp across them, the one axis whose
     traffic, a gather and a reduce-scatter per layer, tolerates it.
     """
+    named = devices is not None
     devices = list(devices) if devices is not None else jax.devices()
     sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence * spec.stage
     if (spec.fsdp < 1 or spec.expert < 1 or spec.tensor < 1
@@ -157,9 +163,15 @@ def build_mesh(spec: MeshSpec = MeshSpec(), devices: list | None = None) -> Mesh
             f"{spec.stage} must be a positive divisor of device count {len(devices)}")
     shape = (len(devices) // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence,
              spec.stage)
-    # `jax.make_mesh` lays out one slice; devices on several, every GPU host
-    # its own, take the hybrid layout even as one replica.
+    # `jax.make_mesh` lays one slice out by the platform's topology, which on
+    # GPU is the devices sorted by id whatever order they came in; a list the
+    # caller names is the layout itself, filled in its own order. Devices on
+    # several slices, every GPU host its own, take the hybrid layout even as
+    # one replica.
     if spec.replicas == 1 and len({_slice(device) for device in devices}) == 1:
+        if named:
+            return Mesh(np.asarray(devices).reshape(shape), MESH_AXES,
+                        axis_types=(AxisType.Auto,) * 6)
         return jax.make_mesh(shape, MESH_AXES, devices=devices, axis_types=(AxisType.Auto,) * 6)
     return Mesh(hybrid_devices(spec, shape, devices), MESH_AXES, axis_types=(AxisType.Auto,) * 6)
 
