@@ -250,3 +250,11 @@ def test_a_non_number_reward_or_likelihood_is_a_value_error(value):
             Session("t", "g", 0, 0, (), Status.CANCELLED, value)
     with pytest.raises(ValueError):
         Call((1,), (2,), (value,), "stop", 0)
+
+
+@pytest.mark.parametrize("value", [np.int64(1), np.int32(0), np.float32(-0.5), 2])
+def test_numpy_and_python_numbers_are_accepted_as_rewards_and_likelihoods(value):
+    session = Session("t", "g", 0, 0, (), Status.COMPLETED, value)
+    assert type(session.reward) is float and session.reward == float(value)
+    call = Call((1,), (2,), (value,), "stop", 0)
+    assert type(call.behavior_log_probs[0]) is float
