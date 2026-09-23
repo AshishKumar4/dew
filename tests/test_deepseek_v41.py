@@ -11,7 +11,10 @@ Dew's own calls may round or select differently only where the recorded
 margin sits within the fp32 noise between the two (source.json's `noise`).
 
 TOLERANCE is twice the largest distance from the reference that
-`tools/deepseek_v41_numerics.py residuals` measures on CPU and on GPU.
+`tools/deepseek_v41_numerics.py residuals` measures on CPU and on GPU. Its
+`fp64` mode runs both sides widened to fp64, where they agree to 1e-13 on
+every output, so each distance is fp32 rounding; one SGD step amplifies it,
+as the reference's own fp32 update already lies 1.3e-4 from its fp64 one.
 """
 
 import dataclasses

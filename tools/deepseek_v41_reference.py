@@ -59,6 +59,7 @@ inference code, and the paper leave unnamed.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import importlib.util
 import json
@@ -180,10 +181,13 @@ def tokenizer():
     return AutoTokenizer.from_pretrained(TOKENIZER)
 
 
-def build(model_module, engram_module, args, seed: int):
-    """The toy Transformer in fp32 with its weights drawn, and its dense state dict."""
+def build(model_module, engram_module, args, seed: int, widen: bool = False):
+    """The toy Transformer in fp32, or fp64 when `widen`, with its fp32
+    weights drawn. `float` and `double` leave the complex rotary tables as
+    they were built."""
     torch.manual_seed(seed)
-    net = model_module.Transformer(args, tokenizer()).float()
+    net = model_module.Transformer(args, tokenizer())
+    net = net.double() if widen else net.float()
     generator = torch.Generator().manual_seed(seed)
     for name, tensor in net.named_parameters():
         tensor.requires_grad_(requires_grad=False)
@@ -204,14 +208,15 @@ def _full_head(head, x, full_logits=True):
 
 
 def draw(name: str, shape, generator) -> torch.Tensor:
-    """One parameter's toy values: every weight scaled to its fan-in, norms
-    near one, and the mHC, sink and routing tensors in their trained ranges."""
+    """One parameter's toy values in fp32: every weight scaled to its fan-in,
+    norms near one, and the mHC, sink and routing tensors in their trained
+    ranges."""
     def normal(std):
-        return torch.randn(tuple(shape), generator=generator) * std
+        return torch.randn(tuple(shape), generator=generator, dtype=torch.float32) * std
 
     leaf = name.rsplit(".", 1)[-1]
     if name.endswith("engram.embed.scale"):
-        return torch.ones(tuple(shape))
+        return torch.ones(tuple(shape), dtype=torch.float32)
     if "norm" in name.rsplit(".", 2)[-2] or leaf in ("q_weight", "k_weight"):
         return 1 + normal(0.1)
     if leaf == "attn_sink":
@@ -221,7 +226,7 @@ def draw(name: str, shape, generator) -> torch.Tensor:
     if leaf in ("hc_attn_base", "hc_ffn_base"):
         return normal(0.5)
     if leaf in ("hc_attn_scale", "hc_ffn_scale"):
-        return 0.5 + torch.rand(tuple(shape), generator=generator)
+        return 0.5 + torch.rand(tuple(shape), generator=generator, dtype=torch.float32)
     if name.endswith("gate.bias"):
         return normal(0.1)
     if leaf in ("image_start", "image_end", "image_newline"):
@@ -570,6 +575,53 @@ def search(first: int, count: int):
     print(json.dumps({"best": best}), flush=True)
 
 
+@contextlib.contextmanager
+def widened(model_module):
+    """The reference in fp64: the default dtype, and every fp32 pin of
+    model.py and the stand-ins widened, which are their `.float()` casts, the
+    MoE accumulator's and the first pre-mix's float32 (model.py:893, :1161)
+    and the rotary tables' float32 frequencies (:376, :384), rebuilt."""
+    float_, zeros_like, new_zeros, arange = (torch.Tensor.float, torch.zeros_like,
+                                             torch.Tensor.new_zeros, torch.arange)
+
+    def wide(dtype):
+        return torch.float64 if dtype == torch.float32 else dtype
+
+    torch.Tensor.float = lambda self, *args, **kwargs: self.double()
+    torch.zeros_like = lambda x, *args, dtype=None, **kwargs: zeros_like(x, *args, dtype=wide(dtype), **kwargs)
+    torch.Tensor.new_zeros = lambda self, *size, dtype=None, **kwargs: new_zeros(
+        self, *size, dtype=wide(dtype), **kwargs)
+    torch.arange = lambda *args, dtype=None, **kwargs: arange(*args, dtype=wide(dtype), **kwargs)
+    default = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    model_module.precompute_freqs_cis.cache_clear()
+    try:
+        yield
+    finally:
+        torch.Tensor.float, torch.zeros_like, torch.Tensor.new_zeros, torch.arange = (
+            float_, zeros_like, new_zeros, arange)
+        torch.set_default_dtype(default)
+        model_module.precompute_freqs_cis.cache_clear()
+
+
+def widened_outputs(seed: int) -> dict[str, np.ndarray]:
+    """The plain forward, loss, update and cached run of `run`, in fp64
+    (`widened`) over the fixture's fp32 weights, for
+    `tools/deepseek_v41_numerics.py fp64` to hold Dew's fp64 run to."""
+    model_module, engram_module = import_reference()
+    set_quantizers(model_module, enabled=False)
+    args = model_args(model_module, engram_module)
+    ids = torch.randint(3, args.vocab_size - 1, (2, LENGTH), generator=torch.Generator().manual_seed(seed + 1))
+    with widened(model_module):
+        net = build(model_module, engram_module, args, seed, widen=True)
+        logits, loss, gradients = trained(net, ids)
+        outputs = {"input_ids": ids.numpy().astype(np.int32), "logits": logits.numpy(),
+                   "loss": np.float64(loss.item()), "updated_logits": stepped(net, gradients, ids)}
+        with torch.no_grad():
+            outputs.update(cached(net, ids))
+    return outputs
+
+
 def official_kernels():
     """The release's tilelang kernels (inference/kernel.py at the pinned
     revision), under a name of their own beside the stand-in `kernel`."""
@@ -775,6 +827,7 @@ def main():
     parser.add_argument("--seed", type=int, default=SEED, help="the fixture's seed, or the first searched")
     parser.add_argument("--check-kernels", action="store_true",
                         help="compare the torch stand-ins with the tilelang kernels on CUDA")
+    parser.add_argument("--fp64", type=Path, help="write the seed's plain outputs in fp64 here")
     options = parser.parse_args()
     torch.set_default_dtype(torch.float32)
     # One thread keeps every reduction in one order, so a rerun writes the
@@ -782,6 +835,8 @@ def main():
     torch.set_num_threads(1)
     if options.check_kernels:
         check_kernels()
+    elif options.fp64 is not None:
+        np.savez(options.fp64, **widened_outputs(options.seed))
     elif options.search:
         search(options.seed, options.search)
     else:
