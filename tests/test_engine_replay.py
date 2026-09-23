@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop.pretrained import load_pretrained
 from dew.objectives.rl.grpo import GRPOObjective
@@ -47,22 +48,24 @@ def test_the_record_decodes_to_the_models_layers():
         assert not routed[:, 0].any() and routed[:, 1:].any()
 
 
-def test_packed_scoring_reproduces_the_engines_filtered_likelihoods():
+def test_packed_scoring_computes_the_engines_filtered_likelihoods():
     """With the engine's routing replayed and each id renormalized over the
-    support vLLM kept, Dew's fp32 likelihoods match vLLM's bf16 processed
-    ones up to vLLM's rounding: unbiased, 0.015 mean and 0.054 worst on the
-    recorded fixture. The tempered full-vocabulary likelihood misses by
-    about 1."""
+    support vLLM kept at its temperature, Dew's fp32 likelihoods are as
+    close to transformers' float64 ones as transformers' own fp32 run
+    (`reference_error`); the record's references were computed on its
+    routing. The tempered full-vocabulary likelihood misses by far more."""
     grpo, variables = objective()
     _, batch = engine_batch()
-    scored = np.asarray(grpo.packed_log_probs(variables, batch))
     sampled = batch["response_mask"] != 0
-    behavior = batch["behavior_log_probs"][sampled]
-    error = scored[sampled] - behavior
-    assert np.abs(error).mean() < 0.03 and np.abs(error).max() < 0.1 and abs(error.mean()) < 0.005
+    # Each session is one call, whose sampled ids sit in row-major order.
+    order = np.argsort(batch["session_index"][sampled], kind="stable")
+    reference, truth = (np.concatenate([call["reference"][name] for call in RECORD["calls"]])
+                        for name in ("float32", "float64"))
+    scored = np.asarray(grpo.packed_log_probs(variables, batch))[sampled][order]
+    assert_as_exact_as_the_reference(scored, reference, truth, "filtered log-probs")
     unfiltered = {key: value for key, value in batch.items() if key not in ("support_ids", "support_columns")}
-    raw = np.asarray(grpo.packed_log_probs(variables, unfiltered))[sampled]
-    assert np.abs(raw - behavior).max() > 0.5
+    raw = np.asarray(grpo.packed_log_probs(variables, unfiltered))[sampled][order]
+    assert np.abs(raw - truth).max() > 0.5
 
 
 def test_the_trainer_routes_every_token_as_the_record_says():
