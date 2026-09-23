@@ -13,7 +13,6 @@ have to be the reference's.
 import dataclasses
 import json
 import os
-import socket
 import subprocess
 import sys
 import time
@@ -36,13 +35,7 @@ WORKER = Path(__file__).with_name("distribution_worker.py")
 TOLERANCE = 1e-5
 
 
-def free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
-def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.CompletedProcess:
+def start(*arguments: str, devices: int) -> subprocess.Popen:
     """`dew launch` on this machine with `devices` devices a process: simulated
     CPU devices, or on a GPU run that many GPUs of the machine's own."""
     import jax
@@ -53,10 +46,13 @@ def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.Co
     else:
         env["JAX_PLATFORMS"] = "cpu"
         placement = ["--env", f"XLA_FLAGS=--xla_force_host_platform_device_count={devices}"]
-    process = subprocess.Popen(
-        [sys.executable, "-m", "dew.cli.main", "launch", "--port", str(free_port()), *placement,
-         *arguments],
+    return subprocess.Popen(
+        [sys.executable, "-m", "dew.cli.main", "launch", *placement, *arguments],
         cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def finished(process: subprocess.Popen, timeout: float = 600) -> subprocess.CompletedProcess:
+    """A started launch once it has ended, stopping it after `timeout` seconds."""
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -66,6 +62,10 @@ def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.Co
         stdout, stderr = process.communicate(timeout=60)
         pytest.fail(f"the pool was still running after {timeout}s\n{stdout}{stderr}")
     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+
+
+def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.CompletedProcess:
+    return finished(start(*arguments, devices=devices), timeout)
 
 
 def train(tmp_path: Path, mesh: dict, processes: int, devices: int = 8) -> dict:
@@ -321,6 +321,58 @@ def test_a_rank_whose_data_fails_mid_fit_stops_the_pool(tmp_path):
     assert done.returncode != 0, done.stdout + done.stderr
     assert "injected failure reading batch 3" in done.stdout, done.stdout
     assert time.monotonic() - started < 180, done.stdout + done.stderr
+
+
+@pytest.mark.mesh(devices=2)
+def test_two_pools_on_one_machine_take_a_free_port_each():
+    """Two pools start together on one machine with no port named. Each
+    coordinator listens on a port that was free when its launch began, where
+    a fixed default had the second pool's rank dial the first pool's
+    coordinator and fail."""
+    program = ("from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "import time\n"
+               "time.sleep(20)\n")
+    pools = [start("--", sys.executable, "-c", program, devices=1) for _ in range(2)]
+    for done in [finished(pool, timeout=300) for pool in pools]:
+        assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_gpu_pool_compiles_without_the_persistent_cache(tmp_path):
+    """JAX keys a cached executable by a topology serialization that differs
+    between the processes of one GPU pool, so on a second run some ranks load
+    a step that the others compile, and that compile waits for every rank for
+    ever: on the box, ranks 0 and 1 hit and ranks 2 and 3 missed one shared
+    cache. A GPU pool runs twice over a shared cache directory and leaves
+    nothing in it."""
+    import jax
+
+    if jax.default_backend() != "gpu":
+        pytest.skip("the cache key differs between GPU processes only")
+    cache = tmp_path / "cache"
+    program = ("import sys\n"
+               "from dew.training.runtime import prepare_process\n"
+               "prepare_process(compilation_cache_dir=sys.argv[1])\n"
+               "import jax, jax.numpy as jnp, numpy as np\n"
+               "from jax.sharding import NamedSharding, PartitionSpec\n"
+               "from dew.training import MeshSpec, build_mesh\n"
+               "rows = NamedSharding(build_mesh(MeshSpec(fsdp=jax.device_count())), PartitionSpec('fsdp'))\n"
+               "weights = [jnp.asarray(np.random.default_rng(i).standard_normal((1024, 1024)) / 32,"
+               " jnp.bfloat16) for i in range(4)]\n"
+               "def loss(x):\n"
+               "    for weight in weights:\n"
+               "        x = jax.nn.gelu(x @ weight)\n"
+               "    return (x.astype(jnp.float32) ** 2).mean()\n"
+               "x = jax.device_put(jnp.ones((jax.device_count() * 512, 1024), jnp.bfloat16), rows)\n"
+               "print('gradient', float(jax.jit(jax.grad(loss))(x).astype(jnp.float32).sum()))\n")
+    for run in ("first", "second"):
+        started = time.monotonic()
+        done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
+                      str(cache), devices=1, timeout=300)
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert time.monotonic() - started < 120, (run, done.stdout)
+    assert not [path for path in cache.rglob("*") if path.is_file()]
 
 
 @pytest.mark.mesh(devices=2)
