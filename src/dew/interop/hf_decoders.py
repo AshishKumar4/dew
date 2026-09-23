@@ -316,6 +316,31 @@ class AltUpFields(TypedDict, total=False):
     correct_scale: bool
 
 
+class EngramFields(TypedDict):
+    """Describes one `dew.nn.engram.Engram`, by its dataclass fields."""
+
+    layer_ids: tuple[int, ...]
+    num_embeddings: tuple[int, ...]
+    max_ngram_size: int
+    vocab_size: int
+    n_heads: int
+    head_dim: int
+    compressed_vocab_size: int
+    pad_token_id: int
+
+
+class DSparkFields(TypedDict):
+    """Describes one `dew.nn.dspark.DSpark`, by its dataclass fields."""
+
+    stages: int
+    block_size: int
+    noise_token_id: int
+    target_layers: tuple[int, ...]
+    markov_rank: int
+    experts: int
+    top_k: int
+
+
 class HyperConnectionsFields(TypedDict, total=False):
     """Describes one `HyperConnections`: how many residual streams a layer
     reads and writes, and how they collapse."""
@@ -418,8 +443,8 @@ class DecoderFields(TypedDict, total=False):
     laurel_rank: int | None
     hyper_connections: HyperConnectionsFields | None
     attention_residuals: AttentionResidualsFields | None
-    engram: Mapping[str, object] | None
-    dspark: Mapping[str, object] | None
+    engram: EngramFields | None
+    dspark: DSparkFields | None
     swiglu_limit: float | None
     activation_sparsity_pattern: tuple[float, ...] | None
     mask_token_id: int | None

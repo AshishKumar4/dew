@@ -17,6 +17,8 @@ from dew.interop.families.deepseek import _V4_SCORES
 from dew.interop.hf_decoders import (
     DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
+    DSparkFields,
+    EngramFields,
     KindFields,
     _base_config,
     _dew_path,
@@ -26,6 +28,7 @@ from dew.interop.hf_decoders import (
     _Ropes,
     _yarn_record,
 )
+from dew.nn.dspark import DSpark
 
 # DeepSeek-V4.1-Flash (arXiv 2609.19969). There is no transformers class: the
 # release's inference/model.py is the reference (cited v41:line at the
@@ -73,7 +76,7 @@ def _v41_modes(text: Mapping[str, object], layers: int) -> tuple[tuple[int, ...]
             latest_kv = layer
         if mode != 'reuse':
             latest_index = layer
-        elif latest_index is None or latest_index < latest_kv:
+        elif latest_index is None or latest_kv is None or latest_index < latest_kv:
             _refuse(f"layer {layer}", "a Reuse layer attends the selection made over the "
                     "entries it reads, and none was made since they were")
         modes.append(mode)
@@ -171,7 +174,7 @@ def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
             role = 'source'
         elif mode == 'reindex' and 0 <= candidate < layer:
             role = 'restrict'
-        record = {'window': window, 'rope_theta': compress_theta, 'yarn': ramp,
+        record: KindFields = {'window': window, 'rope_theta': compress_theta, 'yarn': ramp,
                   'mixer': {**mixer, 'compressor': 'csa2', 'compress_rate': rate, **index,
                             'reindex': mode == 'reindex', 'candidates': role,
                             **(pool if role else {})}}
@@ -227,7 +230,7 @@ def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
     return config
 
 
-def _v41_dspark(text: Mapping[str, object], layers: int, ratios, seen: set[str]) -> Mapping[str, object] | None:
+def _v41_dspark(text: Mapping[str, object], layers: int, ratios, seen: set[str]) -> DSparkFields | None:
     """The DSpark drafter record (section 2.4.3, v41:129-136), or None when the
     config names no stages. Its stages attend a sliding window (v41:1034)."""
     fields = ('num_nextn_predict_layers', 'dspark_block_size', 'dspark_noise_token_id',
@@ -238,7 +241,9 @@ def _v41_dspark(text: Mapping[str, object], layers: int, ratios, seen: set[str])
     block = _record_int(text, 'dspark_block_size', 0)
     if not stages or not block:
         return None
-    tail = list(text['compress_ratios'])[layers:layers + stages]
+    ratio_list = text['compress_ratios']
+    assert isinstance(ratio_list, (list, tuple))
+    tail = list(ratio_list)[layers:layers + stages]
     if tail != [0] * stages:
         _refuse('compress_ratios', "the DSpark stages are sliding layers, one trailing 0 each")
     return {'stages': stages, 'block_size': block,
@@ -251,7 +256,7 @@ def _v41_dspark(text: Mapping[str, object], layers: int, ratios, seen: set[str])
                                  _record_int(text, 'num_experts_per_tok'))}
 
 
-def _v41_engram(text: Mapping[str, object], seen: set[str]) -> Mapping[str, object] | None:
+def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | None:
     """The engram record (section 2.4.2, v41:106-115), or None without layers."""
     fields = ('engram_layer_ids', 'engram_num_embeddings', 'engram_max_ngram_size',
               'engram_vocab_size', 'engram_n_heads', 'engram_head_dim',
@@ -310,14 +315,16 @@ def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ..
     if name.startswith('mtp.'):
         parts = name.split('.')
         dspark = config.get('dspark')
-        stages = 0 if dspark is None else (dspark['stages'] if isinstance(dspark, Mapping) else dspark.stages)
+        stages = (0 if dspark is None else dspark['stages'] if isinstance(dspark, Mapping)
+                  else dspark.stages if isinstance(dspark, DSpark) else 0)
         if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) >= stages:
             raise ValueError(f"{name} names an undeclared DSpark stage")
         stage, tail = f'dspark_{parts[1]}', '.'.join(parts[2:])
-        own = {'main_proj.weight': ('main_proj', 'kernel'), 'main_norm.weight': ('main_norm', 'scale'),
+        own_leaves: dict[str, tuple[str, ...]] = {'main_proj.weight': ('main_proj', 'kernel'), 'main_norm.weight': ('main_norm', 'scale'),
                'norm.weight': ('norm', 'scale'), 'markov_head.embed.weight': ('markov_embed',),
                'markov_head.head.weight': ('markov_head',),
-               'confidence_head.proj.weight': ('confidence', 'kernel')}.get(tail)
+               'confidence_head.proj.weight': ('confidence', 'kernel')}
+        own = own_leaves.get(tail)
         if own is not None:
             return ('params', stage, *own)
         path = _deepseek_v41_path('layers.0.' + tail, config)
@@ -328,8 +335,9 @@ def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ..
     parts = name.split('.')
     if len(parts) >= 4 and parts[0] == 'layers' and parts[1].isdigit() and parts[2] == 'engram':
         leaf = '.'.join(parts[3:])
-        engram = {'embed.weight': ('embed',), 'wkv.weight': ('wkv', 'kernel'),
-                  'q_weight': ('q_weight',), 'k_weight': ('k_weight',)}.get(leaf)
+        engram_leaves: dict[str, tuple[str, ...]] = {'embed.weight': ('embed',), 'wkv.weight': ('wkv', 'kernel'),
+                  'q_weight': ('q_weight',), 'k_weight': ('k_weight',)}
+        engram = engram_leaves.get(leaf)
         if engram is None:
             raise ValueError(f"unknown tensor name {name!r}")
         return ('params', f'layers_{parts[1]}', 'engram', *engram)

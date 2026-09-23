@@ -2405,7 +2405,7 @@ class CausalTransformer(nn.Module):
                                attention_key_positions=attention_key_positions)
         if self.is_initializing() and self.dspark is not None:
             # Reach the drafter's parameters, as the depths' below.
-            self.draft(prediction[:, -1:], tokens[:, -1], decode=False)
+            self.draft(jnp.asarray(prediction)[:, -1:], tokens[:, -1], decode=False)
         if self.is_initializing() and self.mtp:
             # Flax creates a parameter where a call first reaches it, and the
             # main forward never enters the prediction depths. Reaching them
@@ -2717,7 +2717,10 @@ class CausalTransformer(nn.Module):
         prediction = hidden if self.mtp_hyper_connections is None else streams
         if self.dspark is not None:
             # The drafter's context: each target layer's stream mean, concatenated.
-            prediction = streams[2].reshape(*streams[2].shape[:2], -1)
+            # Under DSpark the stack returns (streams, pre, target means).
+            assert isinstance(streams, tuple) and len(streams) == 3
+            means = jnp.asarray(streams[2])
+            prediction = means.reshape(*means.shape[:2], -1)
         if (self.mtp_hyper_connections is not None and not self.is_initializing()
                 and self.is_mutable_collection('prediction_inputs')):
             self.sow('prediction_inputs', 'states', prediction,
