@@ -33,6 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
+from dew import records
 from dew.objectives.base import Variables
 
 from .api import AutoEncoder
@@ -303,21 +304,6 @@ class QwenImageVAEFields(TypedDict):
     image_channels: int
 
 
-def _integer(config: Mapping[str, object], key: str) -> int:
-    found = config.get(key)
-    if not isinstance(found, int) or isinstance(found, bool) or found < 1:
-        raise ValueError(f"The Qwen-Image VAE config's {key} must be a positive integer, got {found!r}")
-    return found
-
-
-def _sequence(config: Mapping[str, object], key: str, kind: type) -> tuple:
-    found = config.get(key)
-    if not isinstance(found, Sequence) or isinstance(found, str) or not all(
-            isinstance(entry, kind) for entry in found):
-        raise ValueError(f"The Qwen-Image VAE config's {key} must be a list of {kind.__name__}, got {found!r}")
-    return tuple(found)
-
-
 def qwen_image_vae_fields(config: Mapping[str, object]) -> QwenImageVAEFields:
     """Read an `AutoencoderKLQwenImage21` config into `QwenImageVAE` fields.
 
@@ -336,15 +322,19 @@ def qwen_image_vae_fields(config: Mapping[str, object]) -> QwenImageVAEFields:
     if config.get("patch_size") is not None:
         raise ValueError(f"The Qwen-Image VAE's patchified layout is not implemented, got "
                          f"patch_size {config.get('patch_size')!r}")
-    base_dim = _integer(config, "base_dim")
-    decoder_base_dim = base_dim if config.get("decoder_base_dim") is None else _integer(config, "decoder_base_dim")
-    dim_mult = _sequence(config, "dim_mult", int)
-    temporal = _sequence(config, "temperal_downsample", bool)
+    base_dim = records.integer(config.get("base_dim"), "base_dim")
+    decoder_base_dim = (base_dim if config.get("decoder_base_dim") is None
+                        else records.integer(config["decoder_base_dim"], "decoder_base_dim"))
+    dim_mult = records.integers(config.get("dim_mult"), "dim_mult")
+    halving = config.get("temperal_downsample")
+    if not isinstance(halving, (list, tuple)):
+        raise ValueError(f"temperal_downsample={halving!r}: this field is a list of flags")
+    temporal = tuple(records.boolean(halves_time, "temperal_downsample") for halves_time in halving)
     if not dim_mult or len(temporal) != len(dim_mult) - 1:
         raise ValueError(f"temperal_downsample needs one flag per downsampling level of dim_mult {dim_mult}, "
                          f"got {temporal}")
-    image_channels = _integer(config, "in_channels")
-    if _integer(config, "out_channels") != image_channels:
+    image_channels = records.integer(config.get("in_channels"), "in_channels")
+    if records.integer(config.get("out_channels"), "out_channels") != image_channels:
         raise ValueError("The Qwen-Image VAE must reconstruct its input channels: in_channels "
                          f"{image_channels} against out_channels {config.get('out_channels')}")
     spatial = config.get("scale_factor_spatial")
@@ -364,8 +354,9 @@ def qwen_image_vae_fields(config: Mapping[str, object]) -> QwenImageVAEFields:
             raise ValueError(f"Decoder level {index} cannot duplicate {decoder[index]} channels into "
                              f"{decoder[index + 1]}")
     return QwenImageVAEFields(base_dim=base_dim, decoder_base_dim=decoder_base_dim,
-                              latent_channels=_integer(config, "z_dim"), dim_mult=dim_mult,
-                              num_res_blocks=_integer(config, "num_res_blocks"),
+                              latent_channels=records.integer(config.get("z_dim"), "z_dim"),
+                              dim_mult=dim_mult,
+                              num_res_blocks=records.integer(config.get("num_res_blocks"), "num_res_blocks"),
                               temporal_downsample=temporal, image_channels=image_channels)
 
 
