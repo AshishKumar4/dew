@@ -638,3 +638,47 @@ A packed batch with a sliding window has no fused-kernel flag on a GPU before Ho
 | 65536 | out of memory | 316.7 ms, 2.38 GiB |
 
 Against a float64 oracle at 2048 tokens the output error is 2.7e-3 relative and the gradients 3.3e-3 to 6.6e-3, the same as the xla path's. A dense `[S, S]` document mask on cuDNN is faster at 32768 tokens on an RTX 4080 (63.7 against 78.1 ms) but grows with the square of the length and ran out of memory at 65536, so the band is the path.
+
+## Expert parallelism on 4x RTX 3090, 2026-09-23
+
+The box: four RTX 3090s on one host. GPU0 and GPU1 are joined by NVLink (NV4), GPU2 and GPU3 share a PCIe host bridge, and every other pair crosses the two sockets. jax 0.11.2, bf16 compute, the Pallas grouped matmul, `tools/benchmark_step.py` with 12 timed steps after 3 warmup and 3 traced. Each row's attribution is benchmark_step's reading of its trace, in milliseconds per device per step: compute kernels, each collective, and the communication no compute kernel overlapped. The model is a `causal_transformer` of 8 layers, width 1024, 16 heads and vocabulary 50304, with 32 experts of width 1024 and top-4 routing on every layer, at 4096 tokens a device (batch 16 of 1024 on four GPUs, 8 on two).
+
+The links first, as JAX collectives of 128 MB of bf16 a device: `all_to_all` moves 33.4 GB/s over the NVLink pair, 6.9 over the PCIe pair and 6.7 across the sockets, and `all_gather` and `psum` follow (31.0, 5.8, 5.8 and 33.4, 5.7, 6.3). The PCIe pair is no faster than a cross-socket pair, so GPU0 and GPU1 are the only fast pair on this box.
+
+| mesh | expert axis joins | dispatch | ms/step | tokens/s | compute | exposed comm | all-to-all | all-gather | reduce-scatter | all-reduce | peak GiB |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| fsdp 4 | - | global | 904.0 | 17562 | 199.1 | 725.1 | 0 | 373.7 | 375.1 | 0.5 | 7.9 |
+| expert 4 | 0123 | global | 925.5 | 17113 | 179.2 | 774.6 | 0 | 341.5 | 335.1 | 98.0 | 8.9 |
+| expert 4 | 0123 | exchange | 634.0 | 26232 | 272.4 | 352.1 | 271.1 | 0 | 0 | 99.5 | 13.5 |
+| expert 4 | 0123 | exchange, capacity 1.25 | 550.6 | 28829 | 163.6 | 422.2 | 253.8 | 0 | 0 | 168.3 | 9.3 |
+| expert 2 x fsdp 2 | 02, 13 | exchange | 788.1 | 20916 | 248.6 | 537.4 | 281.3 | 97.7 | 102.2 | 58.9 | 10.5 |
+| expert 2 x fsdp 2 | 01, 23 | exchange | 800.3 | 20598 | 247.8 | 544.5 | 109.2 | 203.7 | 212.3 | 22.2 | 10.5 |
+| data 2 x expert 2 | 01, 23 | exchange | 753.8 | 21912 | 252.1 | 501.9 | 118.1 | 0 | 0 | 421.6 | 14.0 |
+| data 2 x expert 2 | 02, 13 | exchange | 702.9 | 24176 | 254.6 | 442.0 | 211.8 | 0 | 0 | 306.1 | 14.0 |
+
+One pair at a time, `MeshSpec(expert=2)` at the same 4096 tokens a device:
+
+| pair | dispatch | ms/step | compute | exposed comm | all-to-all | all-gather | reduce-scatter | all-reduce |
+|---|---|---|---|---|---|---|---|---|
+| GPU0-1, NVLink | exchange | 295.8 | 245.6 | 46.9 | 40.7 | 0 | 0 | 17.8 |
+| GPU0-1, NVLink | exchange, capacity 1.25 | 212.3 | 179.9 | 27.3 | 21.3 | 0 | 0 | 25.5 |
+| GPU0-1, NVLink | global | 298.8 | 190.4 | 103.2 | 0 | 44.7 | 46.9 | 11.7 |
+| GPU2-3, PCIe | exchange | 456.2 | 240.6 | 214.4 | 169.9 | 0 | 0 | 80.1 |
+| GPU2-3, PCIe | exchange, capacity 1.25 | 332.4 | 175.5 | 162.7 | 100.4 | 0 | 0 | 81.2 |
+| GPU2-3, PCIe | global | 780.4 | 188.0 | 710.4 | 0 | 309.5 | 312.4 | 88.5 |
+| GPU0-2, cross-socket | exchange | 454.9 | 241.4 | 210.3 | 172.6 | 0 | 0 | 73.7 |
+| GPU0-2, cross-socket | global | 795.5 | 188.0 | 620.9 | 0 | 279.9 | 273.8 | 67.2 |
+
+What the traces say:
+
+- The exchange beats the global dispatch wherever the link is slow: 1.46x on four GPUs, 1.71x on the PCIe pair and 1.75x across the sockets. On the NVLink pair the two tie, because the global dispatch's expert all-gather and gradient reduce-scatter cost 92 ms there, against 622 ms on the PCIe pair.
+- Communication is mostly exposed. Four-way exchange spends 272 ms computing and 352 ms waiting on collectives that no compute overlaps, most of it the all-to-all. Capacity 1.25 bounds the buckets and drops the later rounds, which takes the step to 550.6 ms.
+- Placement. Under data x expert the gradient all-reduce over the data axis moves more bytes than the token exchange, so the expert axis belongs across the sockets and the data axis on the pairs: 702.9 ms against 753.8. Under expert x fsdp the two placements tie (788.1 against 800.3), since fsdp's all-gather and reduce-scatter trade places with the all-to-all.
+
+Changes, each measured before and after in one hold:
+
+- Expert parameters enter the dispatch's `shard_map` in their stored shards and are gathered inside it, so their gradient is reduce-scattered rather than all-reduced whole. fsdp 4 goes from 1157.1 to 904.0 ms, where a 614 ms all-reduce becomes a 375 ms reduce-scatter; expert 2 x fsdp 2 goes from 856.0 to 788.1 ms.
+- The exchange's first round runs outside the checkpointed scan that holds the later rounds, so the backward keeps its intermediates instead of recomputing them: expert 4 goes from 705.9 to 634.0 ms, and compute from 307.0 to 272.4.
+- The exchange gathers each bucket's rows through the sort's index and scatters what returns straight to its slots, two row copies fewer a round. On the NVLink pair, dropless goes from 300.5 to 295.8 ms and capacity 1.25 from 218.5 to 212.3, with peak memory from 14.1 to 13.7 GiB and 12.6 to 12.0.
+
+One bf16 `ExpertMLP` layer under `MeshSpec(fsdp=2)` on the NVLink pair (8192 tokens, 32 experts, top 4), forward plus backward: the Pallas kernels inside the dispatch's map take 26.2 ms (Pallas under main's older row map took 25.1), and `jax.lax.ragged_dot` inside the map takes 271.9 ms with 6.5 GiB of temporaries, since XLA runs it as a product over every expert. The same layer through the global path outside any map, where main's selector had sent fsdp-only meshes to XLA, ran out of memory on the 24 GiB cards.
