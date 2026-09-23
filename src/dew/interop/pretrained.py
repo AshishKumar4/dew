@@ -1748,9 +1748,8 @@ class _QwenImageText:
                                         params=params)
 
     def unconditional(self, index: Mapping[str, object]) -> dict:
-        """The empty negative prompt, encoded through the same template and
-        never zeroed."""
-        return {"text": "", "negative": True, "zero": False}
+        """The empty prompt, encoded through the same template."""
+        return {"text": ""}
 
 
 @dataclass(frozen=True)
