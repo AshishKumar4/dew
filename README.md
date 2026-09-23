@@ -348,7 +348,7 @@ all-visible attention mask: `LlamaForCausalLM` for LLaDA and
 
 ### Pretrained diffusion and quantized checkpoints
 
-`load_pretrained` reads SD, SDXL, SD3, and Flux pipeline directories.
+`load_pretrained` reads SD, SDXL, SD3, Flux, and Qwen-Image 2.1 pipeline directories.
 SD and SDXL include img2img, inpainting, and the SDXL refiner.
 
 For supported FP8 and MXFP4 checkpoints, `Pretrained.save` requantizes trained
