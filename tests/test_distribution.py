@@ -254,33 +254,58 @@ def test_replicas_in_a_process_outside_any_pool_are_refused_by_granule():
         build_mesh(MeshSpec(fsdp=4, replicas=2))
 
 
+def stepping_pool(rank_one: str, *, execution_timeout: str | None = None) -> str:
+    """A program that steps a reduction over every device of the pool, where
+    rank 1 runs the statement `rank_one` before its fourth step.
+    `execution_timeout` shortens the pool's bound on one execution."""
+    shortened = ("import dew.training.runtime as runtime\n"
+                 f"runtime.EXECUTION_TIMEOUT = {execution_timeout!r}\n") if execution_timeout else ""
+    return (shortened
+            + "import threading\n"
+            "from dew.training.runtime import prepare_process\n"
+            "prepare_process()\n"
+            "import jax, numpy as np\n"
+            "from jax.sharding import NamedSharding, PartitionSpec\n"
+            "from dew.training import MeshSpec, build_mesh\n"
+            "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
+            "rows = NamedSharding(mesh, PartitionSpec('fsdp'))\n"
+            "whole = np.ones((jax.device_count() * 256, 256), np.float32)\n"
+            "x = jax.make_array_from_callback(whole.shape, rows, lambda index: whole[index])\n"
+            "step = jax.jit(lambda x: x / x.sum(), out_shardings=rows)\n"
+            "for index in range(100000):\n"
+            "    if index == 3 and jax.process_index() == 1:\n"
+            f"        {rank_one}\n"
+            "    x = step(x)\n"
+            "    x.block_until_ready()\n")
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_rank_that_raises_between_collectives_stops_the_pool():
     """Rank 1 raises before its fourth step while rank 0 is inside that
     step's reduction, waiting for a partner that is gone, which no backend
     times out on its own for minutes. The launch stops rank 0 and returns
     rank 1's failure within a bound."""
-    program = ("from dew.training.runtime import prepare_process\n"
-               "prepare_process()\n"
-               "import jax, numpy as np\n"
-               "from jax.sharding import NamedSharding, PartitionSpec\n"
-               "from dew.training import MeshSpec, build_mesh\n"
-               "mesh = build_mesh(MeshSpec(fsdp=jax.device_count()))\n"
-               "rows = NamedSharding(mesh, PartitionSpec('fsdp'))\n"
-               "whole = np.ones((jax.device_count() * 256, 256), np.float32)\n"
-               "x = jax.make_array_from_callback(whole.shape, rows, lambda index: whole[index])\n"
-               "step = jax.jit(lambda x: x / x.sum(), out_shardings=rows)\n"
-               "for index in range(100000):\n"
-               "    if index == 3 and jax.process_index() == 1:\n"
-               "        raise RuntimeError('injected failure')\n"
-               "    x = step(x)\n"
-               "    x.block_until_ready()\n")
     started = time.monotonic()
-    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
-                  devices=1, timeout=600)
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c",
+                  stepping_pool("raise RuntimeError('injected failure')"), devices=1, timeout=600)
     assert done.returncode == 1, done.stdout + done.stderr
     assert "RuntimeError: injected failure" in done.stdout
     assert time.monotonic() - started < 120, done.stdout + done.stderr
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_rank_that_stalls_between_collectives_ends_the_pool():
+    """Rank 1 stops before its fourth step without failing, as a rank blocked
+    on a read, or on a compile that waits for its peers, does. Rank 0 waits
+    inside that step's reduction. Every process stays alive and none fails,
+    so only a bound on one execution can end the pool: rank 0's runs past
+    the pool's execution timeout, shortened here, and the launch ends."""
+    started = time.monotonic()
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c",
+                  stepping_pool("threading.Event().wait()", execution_timeout="20s"),
+                  devices=1, timeout=600)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert time.monotonic() - started < 150, done.stdout + done.stderr
 
 
 @pytest.mark.mesh(devices=2)
