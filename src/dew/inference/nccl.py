@@ -89,7 +89,7 @@ class _Library:
                       ctypes.c_void_p, ctypes.c_void_p]
         self.nccl.ncclAllReduce.argtypes = collective
         self.nccl.ncclBroadcast.argtypes = collective
-        self.nccl.ncclCommDestroy.argtypes = [ctypes.c_void_p]
+        self.nccl.ncclCommAbort.argtypes = [ctypes.c_void_p]
         device = ctypes.c_int()
         self._driver(self.cuda.cuInit(0))
         self._driver(self.cuda.cuDeviceGet(ctypes.byref(device), ordinal))
@@ -131,8 +131,9 @@ class _Library:
         self.current()
         self._driver(self.cuda.cuStreamSynchronize(None))
 
-    def close(self, comm: ctypes.c_void_p) -> None:
-        self._checked(self.nccl.ncclCommDestroy(comm))
+    def abort(self, comm: ctypes.c_void_p) -> None:
+        """Free `comm` without waiting for its peers or its operations."""
+        self._checked(self.nccl.ncclCommAbort(comm))
 
 
 def _post(root: str, path: str, body: JSON, timeout: float, *, reports: bool = False) -> None:
@@ -207,10 +208,18 @@ class NCCLPush:
         self.timings["total"] = time.perf_counter() - began
 
     def close(self) -> None:
-        """Destroy the groups this side opened; a later push opens them again."""
+        """Tear down the groups this side opened; a later push opens them again.
+
+        Every group is aborted, not destroyed: NCCL's destroy finalizes the
+        group, which waits on the engine's side, and an engine keeps its side
+        open until it exits (the sender waited out jax.distributed's 300 s
+        shutdown barrier on 4x RTX 3090). A push that failed closes too: a
+        group whose broadcast failed, or whose replica did, cannot carry the
+        next version.
+        """
         if self._library is not None:
             for comm in self._groups.values():
-                self._library.close(comm)
+                self._library.abort(comm)
         self._groups.clear()
 
     def _push(self, served: Variables, target: SingleDeviceSharding, ordinal: int, version: int) -> None:
@@ -240,10 +249,14 @@ class NCCLPush:
             receiver.start()
         try:
             self._broadcast(library, target, tensors)
+        except BaseException:
+            self.close()
+            raise
         finally:
             for receiver in receivers:
                 receiver.join()
         if failures:
+            self.close()
             raise RuntimeError(f"version {version} did not reach every replica") from failures[0]
         for root in self.engines:
             _post(root, "/finish_weight_update", {"weight_version": str(version)}, self.timeout)
@@ -280,7 +293,7 @@ class NCCLPush:
             library.synchronize()
             joining.join()
             if failures:
-                library.close(comm)
+                library.abort(comm)
                 raise RuntimeError(f"{root} did not open the weight-transfer group") from failures[0]
             self._groups[root] = comm
         return library
