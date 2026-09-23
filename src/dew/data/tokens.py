@@ -345,8 +345,9 @@ class PackedTokens(DatasetSpec):
 
     `phases` switches what a run reads at step boundaries instead: each
     `DataPhase` names a corpus or mixture and the step it ends before, the
-    last running on, and each phase starts its own order at its own first
-    window (`dew.data.dataset.PhasedStream`). A resume checks the phases the
+    last running on, and each phase's mixture continues every corpus's
+    shuffled order where the earlier phases left it, so no window repeats
+    before its corpus's epoch ends (`dew.data.providers.phased_dataset`). A resume checks the phases the
     run has read and accepts phases appended or moved past its step, so a run
     of one mixture continues into a phase list that begins with it. `path`
     is then unset, and validation reads the first phase's held-out split.
