@@ -74,6 +74,14 @@ def result(exception=None, rewards=None):
     (result("ApiConnectionClosedError", {"reward": 0}), (STOP,), None, Status.INFRA_ERROR, 0.0),
     (result("RewardFileNotFoundError"), (STOP,), None, Status.INFRA_ERROR, None),
     (result(rewards={"tests": 1, "style": 0}), (STOP,), None, Status.INFRA_ERROR, None),
+    # The harness's model client gave up (litellm exception names, recorded by mini-swe-agent as its
+    # exit status) and Harbor saw only a nonzero exit: an infrastructure fault, not a scored failure.
+    *[(result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), name, Status.INFRA_ERROR, 0.0)
+      for name in ("APIConnectionError", "APIError", "InternalServerError", "ServiceUnavailableError",
+                   "Timeout", "RateLimitError", "BadGatewayError")],
+    (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), "ContextWindowExceededError",
+     Status.TRUNCATED, 0.0),
+    (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), "RepeatedFormatError", Status.AGENT_ERROR, 0.0),
 ])
 def test_a_trial_is_scored_masked_or_retried_by_how_it_ended(trial, records, exit, status, reward):
     classified = outcome(trial, records, harness_exit=exit)
