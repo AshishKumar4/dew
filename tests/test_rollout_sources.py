@@ -1,4 +1,4 @@
-"""Rollout sources over a rollout server: in-process environments and single-turn prompts.
+"""Session sources over a rollout server: in-process environments and single-turn prompts.
 
 The server is scripted: each draw is fixed ids at the version it was
 submitted under, and a held draw waits for the test. The checks: a
@@ -20,7 +20,7 @@ import pytest
 
 from dew.inference import Draw
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
-from dew.objectives.rl.rollouts import Status, Task, pack
+from dew.objectives.rl.sessions import Status, Task, pack
 from dew.objectives.rl.sources import EnvironmentSource, PromptSource, Score, prompt_tasks
 from dew.sampling import Sampling
 
@@ -223,7 +223,7 @@ def test_a_failed_draw_or_reward_is_an_infra_error():
 
 
 def test_a_prompt_source_failure_outside_the_reward_resolves_the_future_instead_of_hanging():
-    # A bool reward passes the verifier's finiteness check but no Rollout accepts it.
+    # A bool reward passes the verifier's finiteness check but no Session accepts it.
     [task] = prompt_tasks(prompt_batch())
     prompts = PromptSource(Server(), lambda *_: Score(True), decode=str, max_new_tokens=4)
     future = prompts.submit(task, 1, version=0)[0]
