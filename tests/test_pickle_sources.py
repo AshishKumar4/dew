@@ -95,6 +95,13 @@ def test_without_torch_a_pickle_checkpoint_is_refused_naming_the_extra(tmp_path,
 
 
 
+def test_a_pickle_directory_without_a_config_is_refused_before_it_converts(tmp_path, cache):
+    (tmp_path / "pytorch_model.bin").write_bytes(b"not read")
+    with pytest.raises(FileNotFoundError, match=r"no config\.json"):
+        load_pretrained(tmp_path)
+    assert not cache.exists()
+
+
 @pytest.mark.network
 def test_mamba2_130ms_pickle_converts_to_its_safetensors_conversions_weights(cache, monkeypatch):
     """Both routes on state-spaces/mamba2-130m's main commit: SFconvertbot's

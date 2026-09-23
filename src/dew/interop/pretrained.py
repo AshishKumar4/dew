@@ -2447,9 +2447,13 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         config, tensors = gguf.read(gguf_path)
     else:
         if not (directory / "config.json").is_file():
-            # A GGUF or pickle repo often ships no config.json; the weights read
-            # says what it ships instead.
-            decoders._load_shards(decoders._snapshot(str(name_or_dir), directory.name))
+            # Refused before any weight downloads or converts; a GGUF repo
+            # often ships none, and says which argument reads it.
+            files = (decoders._repo_files(str(name_or_dir), directory) if commit is not None else
+                     {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()})
+            shipped = decoders._missing_weights(str(name_or_dir), files)
+            raise FileNotFoundError(f"{name_or_dir} has no config.json, which says what model its weights "
+                                    f"are; {shipped}")
         with open(directory / "config.json") as handle:
             config = json.load(handle)
     # mamba_ssm's own format reads as the transformers port it converts to.
