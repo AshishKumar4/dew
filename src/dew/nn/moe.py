@@ -325,11 +325,9 @@ class Router(nn.Module):
 # docs/performance.md. On sm80 (A100) and sm89 (L4, RTX 4080) that is JAX's
 # own Pallas kernels (`dew.nn.kernels.grouped_matmul`), 5x to 61x faster than
 # XLA, which runs ragged_dot there as a product over every expert. On a TPU
-# v5e and v6e it is XLA's ragged_dot: the one kernel that beats it at 8
-# experts, tokamax's mosaic_tpu_v2 with its own VJP (1.11x-1.38x), needs
-# tokamax installed beside Dew, and tokamax 0.0.14 pins typeguard==2.13.3
-# where tyro needs >=4 (and its flax.nnx import fails on jax 0.11.2), so it
-# cannot be a declared dependency; at 128 experts XLA wins outright. Every
+# v5e and v6e it is XLA's ragged_dot; the one kernel that beats it at 8
+# experts (tokamax's mosaic_tpu_v2, 1.11x-1.38x) cannot be a dependency:
+# tokamax 0.0.14 pins typeguard==2.13.3 where tyro needs >=4. Every
 # generation not listed runs 'xla': sm75 cannot compile the kernels, and
 # sm86 [inferred from sm80/sm89], sm90 and sm120 [no hardware] are
 # unmeasured.
@@ -343,6 +341,7 @@ GROUPED_MATMUL_BY_GENERATION = {'sm80': 'pallas', 'sm89': 'pallas', 'v5e': 'xla'
 # sm89. Unmeasured generations run tokamax's 'xla'.
 TOKAMAX_KERNEL_BY_GENERATION = {'sm80': 'triton', 'sm89': 'triton',
                                 'v5e': 'mosaic_tpu_v2', 'v6e': 'mosaic_tpu_v2'}
+
 
 def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
                           precision: PrecisionLike) -> str:

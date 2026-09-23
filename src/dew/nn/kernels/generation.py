@@ -36,18 +36,12 @@ def device_generation() -> str:
     return device.platform
 
 
-def sm_version(generation: str) -> int | None:
-    """89 for 'sm89', None for anything that is not a GPU generation."""
-    digits = generation[2:]
-    return int(digits) if generation.startswith('sm') and digits.isdigit() else None
-
-
-def bf16_dot_runs(generation: str | None = None) -> bool:
-    """Whether `generation` (the default device's when None) multiplies bf16
-    operands into an fp32 sum as one dot algorithm, BF16_BF16_F32: every TPU
-    and CPU, and a GPU from `BF16_GPU` on."""
-    version = sm_version(device_generation() if generation is None else generation)
-    return version is None or version >= BF16_GPU
+def bf16_dot_runs() -> bool:
+    """Whether the default device multiplies bf16 operands into an fp32 sum
+    as one dot algorithm, BF16_BF16_F32: every TPU and CPU, and a GPU from
+    `BF16_GPU` on."""
+    generation = device_generation()
+    return not generation.startswith('sm') or int(generation[2:]) >= BF16_GPU
 
 
 # jax 0.11.2 deprecates the Pallas Triton backend and warns at every
@@ -59,13 +53,11 @@ TRITON_DEPRECATION = (r"The Pallas Triton backend is deprecated and will be remo
 
 
 def triton_runs() -> bool:
-    """The one eligibility rule for Dew's Pallas GPU (Triton) kernels: this
-    process holds a GPU of compute capability 8.0 or later, the bound JAX's
-    own Pallas lowerings apply (`_backend_supports_triton`). A T4 fails to
-    compile them ("Triton support is only enabled for cc>=8.0")."""
-    return any(device.platform == 'gpu'
-               and int(device.compute_capability.replace('.', '')) >= BF16_GPU
-               for device in jax.devices())
+    """The one eligibility rule for Dew's Pallas GPU (Triton) kernels: a GPU
+    of compute capability 8.0 or later, the bound JAX's own Pallas lowerings
+    apply (`_backend_supports_triton`). A T4 fails to compile them ("Triton
+    support is only enabled for cc>=8.0")."""
+    return jax.default_backend() == 'gpu' and bf16_dot_runs()
 
 
 @functools.cache
