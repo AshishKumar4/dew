@@ -31,6 +31,15 @@ modeling_glm5_next.py:298-302) and V4 a learned collapse of the same shape
 as `pre` (`DeepseekV4HyperHead`, modeling_deepseek_v4.py:946-962), which the
 record's `head` names.
 
+DeepSeek-V4.1 runs Single-Pass mHC (arXiv 2609.19969, section 2.4.1, eq. 6):
+a sublayer collapses the streams by the `pre` the previous site computed,
+not its own, so a block's attention reads the previous block's feed-forward
+`pre` and its feed-forward the attention's; the stack's first sublayer reads
+the first stream alone, and the final norm reads the collapse by the last
+site's `pre` (V4.1 inference/model.py:968-994, :1159-1163, :1268). `head`
+'carried' names that schedule: the stack carries `(streams, pre)` and there
+is no head of its own.
+
 Parameter names are the checkpoints': `fn` `[(2 + H) H, H D]` in the
 torch Linear's `[out, in]` layout (the release stores it as a raw tensor,
 not a Linear), `base` `[(2 + H) H]` and `scale` `[3]` under the block's
@@ -49,7 +58,7 @@ from flax import linen as nn
 from .attention import unweighted_rmsnorm
 from .sharding import logical_axes
 
-HEADS = ('mean', 'weighted')
+HEADS = ('mean', 'weighted', 'carried')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -58,7 +67,8 @@ class HyperConnections:
 
     A model names this on `hyper_connections`. The field names are the
     references' own config fields. `head` picks what collapses the streams
-    before the final norm.
+    before the final norm, and 'carried' also shifts every sublayer's
+    collapse one site back (Single-Pass mHC, the module doc).
     """
 
     hc_mult: int = 4
@@ -118,8 +128,13 @@ class HyperConnection(nn.Module):
     emb_features: int
     norm_eps: float = 1e-5
 
-    @nn.compact
     def __call__(self, streams):
+        pre, post, comb = self.mapping(streams)
+        return post, comb, collapse_by(pre, streams)
+
+    @nn.compact
+    def mapping(self, streams):
+        """The site's `(pre, post, comb)` over the streams, all fp32."""
         hc = self.spec.hc_mult
         mix = (2 + hc) * hc
         fn = self.param('fn', nn.initializers.normal(0.02), (mix, hc * self.emb_features), jnp.float32)
@@ -134,8 +149,18 @@ class HyperConnection(nn.Module):
         logits = mixes[..., 2 * hc:].reshape(*mixes.shape[:-1], hc, hc) * scale[2] + base[2 * hc:].reshape(hc, hc)
         comb = sinkhorn(jax.nn.softmax(logits, axis=-1) + self.spec.hc_eps,
                         self.spec.hc_sinkhorn_iters, self.spec.hc_eps)
-        collapsed = jnp.sum(pre[..., None] * streams.astype(jnp.float32), axis=2).astype(streams.dtype)
-        return post, comb, collapsed
+        return pre, post, comb
+
+
+def collapse_by(pre, streams):
+    """`sum_h pre[h] streams[h]` in fp32, back in the streams' dtype."""
+    return jnp.sum(pre[..., None] * streams.astype(jnp.float32), axis=2).astype(streams.dtype)
+
+
+def first_stream(streams):
+    """The `pre` Single-Pass mHC's first sublayer collapses by: the first
+    stream alone (V4.1 inference/model.py:1159-1163), fp32 `[B, S, H]`."""
+    return jnp.zeros(streams.shape[:3], jnp.float32).at[..., 0].set(1.0)
 
 
 class HyperHead(nn.Module):
@@ -166,8 +191,11 @@ def collapse_streams(streams, head: HyperHead | None):
     """Collapse the streams to the one vector the final norm reads.
 
     Without a head that is their mean (modeling_glm5_next.py:301-302), and
-    with one it is the head's weighted sum.
+    with one it is the head's weighted sum. Single-Pass mHC's carried
+    `(streams, pre)` collapses by that `pre`.
     """
+    if isinstance(streams, tuple):
+        return collapse_by(streams[1], streams[0])
     if head is None:
         return jnp.mean(streams, axis=2)
     return head(streams)
