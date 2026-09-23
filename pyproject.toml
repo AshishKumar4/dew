@@ -74,8 +74,9 @@ test = [
     # tests/test_guided_decoding.py compiles regex and JSON-schema automata with it.
     "outlines-core>=0.2.14",
     # tests/test_eval_harness.py scores DewLM against lm-eval's own HFLM on the
-    # same weights; HFLM imports accelerate, which the hf extra brings.
-    "lm_eval[hf]>=0.4.3",
+    # same weights, and its tolerances were measured against this release;
+    # HFLM imports accelerate, which the hf extra brings.
+    "lm_eval[hf]==0.4.13",
 ]
 # The video specs: moviepy reads the clips and brings ffmpeg (lazy imports in dew.data)
 av = ["moviepy"]
@@ -93,8 +94,10 @@ hpo = ["optuna"]
 # Online URL-streaming loader (HF datasets-backed)
 streaming = ["datasets"]
 # lm-evaluation-harness task suites through dew.eval.harness.DewLM, which
-# subclasses TemplateLM and reads its prefix_token_id; both first appear in 0.4.3.
-eval-harness = ["lm_eval>=0.4.3"]
+# subclasses TemplateLM. Before 0.4.10, TemplateLM keeps the BOS that DewLM's
+# tokenizer puts at the start of an empty-context continuation, and scores it
+# as part of that continuation.
+eval-harness = ["lm_eval>=0.4.10"]
 # Prepared TFDS ArrayRecords; dataset preparation has its own environment.
 tfds = ["tensorflow-datasets>=4.9.10"]
 # Flax <-> safetensors conversion (dew.interop)
