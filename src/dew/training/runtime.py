@@ -8,6 +8,7 @@ main().
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import resource
 from datetime import datetime
@@ -102,8 +103,9 @@ def prepare_process(wandb: Wandb | None = None,
                 raise
         else:
             # XLA reads its flags when the backend opens, which the first
-            # line below does.
-            if xla_flag("xla_gpu_execution_terminate_timeout") is None:
+            # line below does. The watchdog is the CUDA plugin's, and a TPU
+            # host's libtpu need not know its flag.
+            if cuda_plugin() and xla_flag("xla_gpu_execution_terminate_timeout") is None:
                 apply_xla_flags(f"--xla_gpu_execution_terminate_timeout={EXECUTION_TIMEOUT}")
             print(f"Joined the JAX process pool: process {jax.process_index()} "
                   f"of {jax.process_count()}")
@@ -126,6 +128,14 @@ def prepare_process(wandb: Wandb | None = None,
         from dew.training.host import companion_mesh
         companion_mesh(build_mesh())
     print(f"Number of devices: {jax.device_count()}")
+
+
+def cuda_plugin() -> bool:
+    """Whether JAX's CUDA plugin is installed, the one reader of XLA's GPU
+    flags; asked before the backend opens, which no other question can be."""
+    return (importlib.util.find_spec("jax_plugins") is not None
+            and any(importlib.util.find_spec(f"jax_plugins.xla_cuda{major}") is not None
+                    for major in (12, 13)))
 
 
 def run_timestamp() -> str:
