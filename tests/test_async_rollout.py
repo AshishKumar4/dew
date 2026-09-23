@@ -23,7 +23,7 @@ from dew.data import Dataset
 from dew.inference import Draw, NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.rl import POLICY_VERSION_KEY, AsyncRollout, GRPOObjective
+from dew.objectives.rl import AsyncRollout, GRPOObjective
 from dew.sampling import Sampling
 from dew.training import Layout, Trainer
 
@@ -105,6 +105,18 @@ def decode(ids):
     return " ".join(str(token) for token in ids)
 
 
+def sampled(out, name):
+    """Each draw's sampled values of column `name`, in draw order."""
+    mask = out["response_mask"] != 0
+    return [np.asarray(out[name])[mask & (out["rollout_index"] == index)]
+            for index in range(int(out["rollout_index"].max()) + 1)]
+
+
+def versions(out):
+    """The version each draw was submitted under, in draw order."""
+    return np.asarray([values[0] for values in sampled(out, "versions")], np.int32)
+
+
 def rollout_over(server, **options):
     target = objective()
     params = target.init(jax.random.key(0))
@@ -123,21 +135,22 @@ def test_a_batch_one_update_old_trains_with_its_version_and_rescored_old_likelih
     fresh = rollout(State(params, 0), first, jax.random.key(1))
     # The second batch was submitted during the first call, under version 0.
     assert [version for _, version in server.submitted] == [0] * 8
-    np.testing.assert_array_equal(fresh[POLICY_VERSION_KEY], np.zeros(4, np.int32))
+    np.testing.assert_array_equal(versions(fresh), np.zeros(4, np.int32))
     # Lag zero with the server's raw likelihoods: those are the old policy.
-    np.testing.assert_allclose(fresh["old_log_probs"][:, :3], np.tile([-.4, -.2, -.1], (4, 1)))
-    np.testing.assert_allclose(fresh["behavior_log_probs"][:, :3], np.tile([-.5, -.25, -.125], (4, 1)))
+    for old, behavior in zip(sampled(fresh, "old_log_probs"), sampled(fresh, "behavior_log_probs"), strict=True):
+        np.testing.assert_allclose(old[:3], [-.4, -.2, -.1])
+        np.testing.assert_allclose(behavior[:3], [-.5, -.25, -.125])
 
     stale = rollout(State(params, 1), second, jax.random.key(2))
     assert server.loads == [1]
-    np.testing.assert_array_equal(stale[POLICY_VERSION_KEY], np.zeros(4, np.int32))
+    np.testing.assert_array_equal(versions(stale), np.zeros(4, np.int32))
     assert records[-1].lag == 1 and records[-1].redrawn == 0
     # One update behind, the old policy is the trainer's own, rescored.
-    rescored = rollout.objective.per_token_log_probs(
-        params, stale["input_ids"], left_padding=WIDTH - stale["prompt_length"])[:, WIDTH - 1:WIDTH - 1 + BUDGET]
-    np.testing.assert_allclose(stale["old_log_probs"], np.asarray(rescored) * stale["response_mask"], rtol=1e-6)
-    assert not np.allclose(stale["old_log_probs"][:, :3], np.tile([-.4, -.2, -.1], (4, 1)))
-    np.testing.assert_allclose(stale["behavior_log_probs"][:, :3], np.tile([-.5, -.25, -.125], (4, 1)))
+    rescored = rollout.objective.packed_log_probs(params, stale)
+    np.testing.assert_allclose(stale["old_log_probs"], np.asarray(rescored), rtol=1e-6)
+    for old, behavior in zip(sampled(stale, "old_log_probs"), sampled(stale, "behavior_log_probs"), strict=True):
+        assert not np.allclose(old[:3], [-.4, -.2, -.1])
+        np.testing.assert_allclose(behavior[:3], [-.5, -.25, -.125])
 
 
 def test_a_batch_past_max_lag_is_drawn_again_under_pushed_weights():
@@ -150,7 +163,7 @@ def test_a_batch_past_max_lag_is_drawn_again_under_pushed_weights():
     # resume or several accumulated commits: its version-0 draws are 3 behind.
     out = rollout(State(params, 3), second, jax.random.key(2))
     assert records[-1].version == 3 and records[-1].lag == 0 and records[-1].redrawn == 1
-    np.testing.assert_array_equal(out[POLICY_VERSION_KEY], np.full(4, 3, np.int32))
+    np.testing.assert_array_equal(versions(out), np.full(4, 3, np.int32))
 
 
 def test_a_stalled_push_is_caught_at_consumption():
@@ -168,7 +181,7 @@ def test_a_stalled_push_is_caught_at_consumption():
     rollout(State(params, 0), first, jax.random.key(1))
     out = rollout(State(params, 2), second, jax.random.key(2))
     assert records[-1].redrawn == 1 and records[-1].lag == 0
-    assert np.all(2 - out[POLICY_VERSION_KEY] <= 1)
+    assert np.all(2 - versions(out) <= 1)
 
 
 @pytest.mark.parametrize("options, message", [
@@ -287,7 +300,7 @@ def test_a_stale_batch_is_redrawn_without_waiting_on_its_failed_draws():
     rollout(State(params, 0), first, jax.random.key(1))
     out = rollout(State(params, 3), second, jax.random.key(2))
     assert records[-1].redrawn == 1
-    np.testing.assert_array_equal(out[POLICY_VERSION_KEY], np.full(4, 3, np.int32))
+    np.testing.assert_array_equal(versions(out), np.full(4, 3, np.int32))
 
 
 def test_each_row_carries_the_version_its_draw_reports():
@@ -304,5 +317,5 @@ def test_each_row_carries_the_version_its_draw_reports():
 
     rollout, stream, params, records = rollout_over(Stamping(), max_lag=1, ahead=1)
     out = rollout(State(params, 1), next(stream), jax.random.key(1))
-    np.testing.assert_array_equal(out[POLICY_VERSION_KEY], [1, 0, 1, 0])
+    np.testing.assert_array_equal(versions(out), [1, 0, 1, 0])
     assert records[-1].version == 0 and records[-1].lag == 1

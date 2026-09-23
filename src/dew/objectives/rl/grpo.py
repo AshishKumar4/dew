@@ -2,15 +2,11 @@
 
 A `GRPOObjective` is an `LMObjective` whose loss is the section 6
 composition from `dew.rl`: a clipped policy surrogate plus `beta` times the
-k3 KL against the frozen reference. It reads one of two batch layouts.
-
-- The windowed layout `SampledRollout` builds: each row
-  is `[left-padded prompt | response]`, and `old_log_probs`, `advantages`
-  and `response_mask` are response-width.
-- The packed layout `rollouts.pack` builds: rows of strictly merged chains
-  with `text_segment_ids` and `text_positions`, every column `[rows, width]`
-  and aligned with `input_ids`. `behavior_log_probs` stands in for
-  `old_log_probs` when no proximal rescoring supplied one.
+k3 KL against the frozen reference. It reads the one batch layout
+`rollouts.pack` builds, which every rollout in Dew produces: rows of strictly
+merged chains with `text_segment_ids` and `text_positions`, every column
+`[rows, width]` and aligned with `input_ids`. `behavior_log_probs` stands in
+for `old_log_probs` when no proximal rescoring supplied one.
 
 The reference is the objective's own frozen tree, `step.ema` at unit decay,
 rescored only when `beta` is positive. Validation scores the prompts' own
@@ -40,26 +36,33 @@ from dew.rl.surrogate import (
 
 from ..lm import LMObjective
 from ..lm.objective import _shift_rows, _unpadded
-from .rollout import ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY
-from .rollouts import POSITIONS_KEY, ROLLOUT_WEIGHTS_KEY, SEGMENT_IDS_KEY
+from .rollouts import (
+    ADVANTAGES_KEY,
+    BEHAVIOR_LOG_PROBS_KEY,
+    IDS_KEY,
+    OLD_LOG_PROBS_KEY,
+    POSITIONS_KEY,
+    RESPONSE_MASK_KEY,
+    ROLLOUT_WEIGHTS_KEY,
+    SEGMENT_IDS_KEY,
+)
 
 POLICY_LOSSES = ("ppo", "gspo", "cispo")
 AGGREGATIONS = ("token-mean", "rollout-mean")
 
 
 class _Terms(NamedTuple):
-    """The loss's inputs on one grid, target-aligned: current, proximal and
-    behavior log-probabilities, advantages, the trainable mask, chain ids
-    (None on a windowed row, which is one sequence), the packed per-rollout
-    weights (None when the batch carries none) and how to rescore the
-    reference."""
+    """The loss's inputs on the packed grid, aligned with `input_ids`: current,
+    old and behavior log-probabilities, advantages, the trainable mask, chain
+    ids, the per-rollout weights when the batch carries them, and whether the
+    old policy was rescored rather than standing in for behavior."""
 
     policy: jax.Array
     old: jax.Array
-    behavior: jax.Array | None
+    behavior: jax.Array
     advantages: jax.Array
     mask: jax.Array
-    segments: jax.Array | None
+    segments: jax.Array
     rollout_weights: jax.Array | None
     proximal: bool
 
@@ -153,47 +156,6 @@ class GRPOObjective(LMObjective):
         self.policy_loss = policy_loss
         self.aggregation = aggregation
 
-    def _window(self, batch):
-        """Validate the rollout batch and locate its response slice.
-
-        Returns the concatenation, where the response starts and how wide
-        it is. Position p of the concatenation predicts token p + 1, so
-        the response starts one before the prompt width.
-        """
-        try:
-            ids = jnp.asarray(batch[IDS_KEY])
-        except KeyError:
-            raise ValueError(
-                f"a GRPO batch carries {IDS_KEY} with the prompt concatenation; "
-                f"the batch has {sorted(batch)}") from None
-        for key in (OLD_LOG_PROBS_KEY, ADVANTAGES_KEY, RESPONSE_MASK_KEY):
-            if key not in batch:
-                raise ValueError(
-                    f"a GRPO batch carries {key} from the rollout; "
-                    f"the batch has {sorted(batch)}")
-        old = jnp.asarray(batch[OLD_LOG_PROBS_KEY])
-        if old.shape != jnp.asarray(batch[ADVANTAGES_KEY]).shape:
-            raise ValueError(
-                f"{OLD_LOG_PROBS_KEY} {tuple(old.shape)} and {ADVANTAGES_KEY} "
-                f"{tuple(jnp.asarray(batch[ADVANTAGES_KEY]).shape)} share one shape: "
-                "one term per response token")
-        if old.shape != jnp.asarray(batch[RESPONSE_MASK_KEY]).shape:
-            raise ValueError(
-                f"{OLD_LOG_PROBS_KEY} {tuple(old.shape)} and {RESPONSE_MASK_KEY} "
-                f"{tuple(jnp.asarray(batch[RESPONSE_MASK_KEY]).shape)} share one shape: "
-                "one term per response token")
-        if ids.shape[1] != self.seq_len + 1:
-            raise ValueError(
-                f"a {self.seq_len}-token context needs {self.seq_len + 1} ids per row, "
-                f"got {ids.shape[1]}")
-        if old.shape[1] >= ids.shape[1]:
-            raise ValueError(
-                f"the response is {old.shape[1]} tokens wide for a {ids.shape[1]}-wide "
-                "concatenation; the rollout sizes the objective one below prompt "
-                "plus response")
-        start = ids.shape[1] - old.shape[1] - 1
-        return ids, start, old.shape[1]
-
     def packed_log_probs(self, params: Variables, batch) -> jax.Array:
         """Score each packed id given its own chain's prefix, `[rows, width]`.
 
@@ -218,57 +180,28 @@ class GRPOObjective(LMObjective):
                                   -scores.losses.astype(jnp.float32)], axis=1)
         return jnp.where(mask != 0, scored, 0.0)
 
-    def _packed_terms(self, params, batch) -> _Terms:
+    def _terms(self, params, batch) -> _Terms:
         """Read a packed batch onto its own `[rows, width]` grid.
 
-        The proximal policy is `old_log_probs` when a rescoring or the
-        sampler supplied it, and the recorded behavior otherwise, so one of
-        the two is required.
+        The old policy is `old_log_probs` when a rescoring or the sampler
+        supplied it, and the recorded behavior otherwise.
         """
-        if ADVANTAGES_KEY not in batch:
-            raise ValueError(f"a packed GRPO batch carries {ADVANTAGES_KEY}; the batch has {sorted(batch)}")
-        if OLD_LOG_PROBS_KEY not in batch and BEHAVIOR_LOG_PROBS_KEY not in batch:
-            raise ValueError(f"a packed GRPO batch carries {BEHAVIOR_LOG_PROBS_KEY} or {OLD_LOG_PROBS_KEY}; "
-                             f"the batch has {sorted(batch)}")
+        for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY):
+            if key not in batch:
+                raise ValueError(f"a GRPO batch carries {key} from pack; the batch has {sorted(batch)}")
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY], jnp.float32)
         for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY, ROLLOUT_WEIGHTS_KEY):
             if key in batch and jnp.shape(batch[key]) != mask.shape:
                 raise ValueError(f"{key} has shape {jnp.shape(batch[key])}; a packed column has "
                                  f"the shape of {IDS_KEY}, {mask.shape}")
-        behavior = (jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], jnp.float32)
-                    if BEHAVIOR_LOG_PROBS_KEY in batch else None)
+        behavior = jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], jnp.float32)
         proximal = OLD_LOG_PROBS_KEY in batch
         old = jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32) if proximal else behavior
-        assert old is not None
         weights = batch.get(ROLLOUT_WEIGHTS_KEY)
         return _Terms(self.packed_log_probs(params, batch), old, behavior,
                       jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32), mask,
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
                       None if weights is None else jnp.asarray(weights, jnp.float32), proximal)
-
-    def _windowed_terms(self, params, batch) -> _Terms:
-        """Read a windowed batch onto its response slice."""
-        ids, start, width = self._window(batch)
-        behavior = None
-        if BEHAVIOR_LOG_PROBS_KEY in batch:
-            behavior = jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], jnp.float32)
-            if behavior.shape != jnp.shape(batch[OLD_LOG_PROBS_KEY]):
-                raise ValueError("behavior_log_probs must have the same shape as old_log_probs")
-        padding = (None if LENGTH_KEY not in batch else
-                   start + 1 - jnp.asarray(batch[LENGTH_KEY], jnp.int32))
-        policy = self.per_token_log_probs(params, ids, left_padding=padding)[:, start:start + width]
-        return _Terms(policy, jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32), behavior,
-                      jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32),
-                      jnp.asarray(batch[RESPONSE_MASK_KEY]), None, None, proximal=True)
-
-    def _reference(self, params, batch) -> jax.Array:
-        """The frozen reference's log-probabilities on the loss's grid."""
-        if SEGMENT_IDS_KEY in batch:
-            return self.packed_log_probs(params, batch)
-        ids, start, width = self._window(batch)
-        padding = (None if LENGTH_KEY not in batch else
-                   start + 1 - jnp.asarray(batch[LENGTH_KEY], jnp.int32))
-        return self.per_token_log_probs(params, ids, left_padding=padding)[:, start:start + width]
 
     def loss(self, params, batch, step):
         """Score the policy surrogate over the trainable tokens, plus the KL to the reference.
@@ -276,11 +209,8 @@ class GRPOObjective(LMObjective):
         The policy is rescored from the rollout's own ids, so every term
         reads the tokens that were actually drawn.
         """
-        terms = (self._packed_terms if SEGMENT_IDS_KEY in batch else self._windowed_terms)(params, batch)
+        terms = self._terms(params, batch)
         mask = terms.mask
-        corrected = (self.behavior_importance_cap, self.behavior_band, self.sequence_mask, self.geometric_mask)
-        if any(option is not None for option in corrected) and terms.behavior is None:
-            raise ValueError("behavior corrections require recorded behavior_log_probs")
         if self.behavior_importance_cap is not None and not terms.proximal:
             raise ValueError(
                 "without old_log_probs the ratio is already current over behavior, so a TIS cap "
@@ -295,7 +225,6 @@ class GRPOObjective(LMObjective):
         for name, band, geometric in (("sequence", self.sequence_mask, False),
                                       ("geometric", self.geometric_mask, True)):
             if band is not None:
-                assert terms.behavior is not None
                 rejected = sequence_rejection_mask(proximal, terms.behavior, mask, *band,
                                                    geometric=geometric, segments=terms.segments)
                 metrics[f"masked/{name}"] = _fraction(1 - rejected, mask)
@@ -303,21 +232,20 @@ class GRPOObjective(LMObjective):
         # Weights and diagnostics read every trainable token, as verl's do;
         # rejection reaches the loss through `effective` alone.
         importance = None
-        if terms.behavior is not None:
-            if self.behavior_importance_cap is not None:
-                importance = behavior_importance_weights(proximal, terms.behavior, mask,
-                                                         self.behavior_importance_cap)
-            elif self.behavior_band is not None:
-                importance = behavior_band_weights(proximal, terms.behavior, mask, *self.behavior_band)
-                metrics["masked/band"] = _fraction(importance == 0, mask)
-            cap = (self.behavior_importance_cap if self.behavior_band is None else self.behavior_band[1])
-            mismatch = mismatch_metrics(proximal, terms.behavior, mask, importance, cap)
-            metrics.update({f"mismatch/{key}": value for key, value in mismatch.items()})
-            if importance is not None and not terms.proximal:
-                # The ratio already carries current over behavior, so the band
-                # acts as a keep mask and applies no weight.
-                keep = keep * (importance != 0)
-                importance = None
+        if self.behavior_importance_cap is not None:
+            importance = behavior_importance_weights(proximal, terms.behavior, mask,
+                                                     self.behavior_importance_cap)
+        elif self.behavior_band is not None:
+            importance = behavior_band_weights(proximal, terms.behavior, mask, *self.behavior_band)
+            metrics["masked/band"] = _fraction(importance == 0, mask)
+        cap = (self.behavior_importance_cap if self.behavior_band is None else self.behavior_band[1])
+        mismatch = mismatch_metrics(proximal, terms.behavior, mask, importance, cap)
+        metrics.update({f"mismatch/{key}": value for key, value in mismatch.items()})
+        if importance is not None and not terms.proximal:
+            # The ratio already carries current over behavior, so the band
+            # acts as a keep mask and applies no weight.
+            keep = keep * (importance != 0)
+            importance = None
         effective = mask * keep
         per_token, aux = self._policy_terms(terms, effective)
         if importance is not None:
@@ -332,7 +260,7 @@ class GRPOObjective(LMObjective):
                 raise ValueError(
                     "the KL term reads step.ema, but the objective keeps no EMA; "
                     "a GRPO run with beta above zero always freezes one")
-            kl_terms = k3_kl(terms.policy, self._reference(step.ema, batch))
+            kl_terms = k3_kl(terms.policy, self.packed_log_probs(step.ema, batch))
             kl = Mean(jnp.sum(jnp.where(weights != 0, kl_terms, 0) * weights), mass)
             metrics["kl"], _ = mean_loss(kl)
             return Mean(pg.total + self.beta * kl.total, mass), Aux[Variables](metrics)
@@ -357,19 +285,15 @@ class GRPOObjective(LMObjective):
         """Each token's share of the loss mass under the chosen aggregation.
 
         Token-mean weighs every kept token 1. Rollout-mean weighs it one
-        over its rollout's trainable count: the packed batch's own
-        `rollout_weights` (rejected sequences drop out of the numerator and
-        the mass alike), or the kept count of its row on a windowed batch.
+        over its rollout's trainable count, the batch's own `rollout_weights`;
+        rejected sequences drop out of the numerator and the mass alike.
         """
         effective = effective.astype(jnp.float32)
         if self.aggregation == "token-mean":
             return effective
-        if terms.rollout_weights is not None:
-            return terms.rollout_weights * keep * (effective != 0)
-        if terms.segments is not None:
-            raise ValueError("rollout-mean on a packed batch needs rollout_weights from pack")
-        counts = jnp.sum(effective, axis=-1, keepdims=True)
-        return effective / jnp.clip(counts, min=1.0)
+        if terms.rollout_weights is None:
+            raise ValueError(f"rollout-mean aggregation reads {ROLLOUT_WEIGHTS_KEY} from pack")
+        return terms.rollout_weights * keep * (effective != 0)
 
     def evaluate(self, params, batch, step):
         """Score the prompts' perplexity under the policy.

@@ -109,10 +109,10 @@ def test_other_objectives_keep_large_abstract_support_floating(kind):
             batch = {"text": jax.ShapeDtypeStruct((2**30, 4), jnp.int32)}
         else:
             objective = GRPOObjective(model, 4, head_chunks=1)
-            batch = {name: jax.ShapeDtypeStruct((2**30, 2), jnp.float32)
-                     for name in ("old_log_probs", "advantages")}
-            batch["response_mask"] = jax.ShapeDtypeStruct((2**30, 2), jnp.int32)
-            batch["input_ids"] = jax.ShapeDtypeStruct((2**30, 5), jnp.int32)
+            batch = {name: jax.ShapeDtypeStruct((2**30, 5), jnp.float32)
+                     for name in ("old_log_probs", "behavior_log_probs", "advantages", "response_mask")}
+            for name in ("input_ids", "text_segment_ids", "text_positions"):
+                batch[name] = jax.ShapeDtypeStruct((2**30, 5), jnp.int32)
     key = jax.random.key(0)
     variables = objective.init(key)
     stats, _ = jax.eval_shape(objective.loss, variables, batch, Step(jnp.array(0), key, variables))

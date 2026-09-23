@@ -126,18 +126,25 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
 
     rollout = SampledRollout(objective, reward, groups=2, max_new_tokens=4,
                              sampling=Sampling(temperature=0, eos_id=eos, pad_id=12))
-    result = rollout(SimpleNamespace(params=params), batch, jax.random.key(1))
-    np.testing.assert_array_equal(result["response_mask"][:2], [[1, 0, 0, 0]] * 2)
-    np.testing.assert_array_equal(result["input_ids"][:2, 4:], [[eos, 12, 12, 12]] * 2)
-    np.testing.assert_array_equal(result["behavior_log_probs"], np.zeros((4, 4)))
+    result = rollout(SimpleNamespace(params=params, updates=0), batch, jax.random.key(1))
     assert seen[:2] == [("a", "", "1", "")] * 2
-    for row, (_, text, _, _) in enumerate(seen):
+    for index, (_, text, _, _) in enumerate(seen):
+        where = result["rollout_index"] == index
+        chain = result["input_ids"][where]
+        mask = result["response_mask"][where] != 0
+        width = int(batch["prompt_length"][index // 2])
+        np.testing.assert_array_equal(chain[:width], batch["prompt"][index // 2, 4 - width:])
+        assert not mask[:width].any() and mask[width:].all()
         # The mask counts EOS as an action; the reward text stops before it.
-        drawn = int(result["response_mask"][row].sum())
-        count = drawn - int(result["input_ids"][row, 4 + drawn - 1] == eos)
-        assert text == " ".join(str(token) for token in result["input_ids"][row, 4:4 + count])
-    assert np.all(result["old_log_probs"][:2, 1:] == 0)
-    assert np.all(result["old_log_probs"][:2, 0] < 0)
+        actions = chain[width:]
+        count = len(actions) - int(actions[-1] == eos)
+        assert text == " ".join(str(token) for token in actions[:count])
+        np.testing.assert_array_equal(result["behavior_log_probs"][where], 0)
+        old = result["old_log_probs"][where]
+        assert np.all(old[~mask] == 0) and np.all(old[mask] < 0)
+    for index in (0, 1):
+        actions = result["input_ids"][(result["rollout_index"] == index) & (result["response_mask"] != 0)]
+        np.testing.assert_array_equal(actions, [eos])
 
 
 @pytest.mark.parametrize("kind", ["attention", "recurrent"])
@@ -169,13 +176,11 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
              for name, value in prompts().items()}
     run_key = jax.random.split(key)[1]
     rollout_key = jax.random.fold_in(jax.random.fold_in(run_key, 0), 1)
-    rolled = rollout(SimpleNamespace(params=params), batch, rollout_key)
+    rolled = rollout(SimpleNamespace(params=params, updates=0), batch, rollout_key)
     assert np.any(rolled["advantages"] != 0)
     assert np.max(np.abs(rolled["old_log_probs"] - rolled["behavior_log_probs"])) > 0.1
     def raw_policy_loss(p):
-        policy = objective.per_token_log_probs(
-            p, jnp.asarray(rolled["input_ids"]),
-            left_padding=4 - jnp.asarray(rolled["prompt_length"]))[:, 3:]
+        policy = objective.packed_log_probs(p, rolled)
         return clipped_surrogate(
             policy - jnp.asarray(rolled["old_log_probs"]),
             jnp.asarray(rolled["advantages"]), jnp.asarray(rolled["response_mask"]))[0]

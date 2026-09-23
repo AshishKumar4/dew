@@ -29,8 +29,7 @@ from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
 
-from .rollout import OLD_LOG_PROBS_KEY
-from .rollouts import Call, Rollout, Status, pack, sampled_values
+from .rollouts import OLD_LOG_PROBS_KEY, Call, Rollout, Status, pack, sampled_values
 
 if TYPE_CHECKING:
     from .journal import EpisodeJournal, JournalRun

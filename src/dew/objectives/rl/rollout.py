@@ -12,27 +12,13 @@ import numpy as np
 from dew.artifacts import agree_process_phase
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.rl import group_advantage, rloo_advantage
 from dew.sampling.text import Sampling
 
 from ..lm import LMObjective
+from .rollouts import OLD_LOG_PROBS_KEY, Call, Rollout, Status, pack, sampled_values
 
 type Reward = Callable[[str, str, str, str], float]
 """Score ``(data_source, completion, ground_truth, extra_info)``."""
-
-IDS_KEY = "input_ids"
-RESPONSE_MASK_KEY = "response_mask"
-OLD_LOG_PROBS_KEY = "old_log_probs"
-"""Raw model-policy log-probabilities recorded before the training update.
-
-GRPO's PPO ratio compares current raw policy to this old raw policy. These
-values do not describe the behavior distribution after temperature/top-k.
-"""
-BEHAVIOR_LOG_PROBS_KEY = "behavior_log_probs"
-"""Actual sampling log-probabilities, including temperature/top-k and greedy selection."""
-ADVANTAGES_KEY = "advantages"
-REWARDS_KEY = "rewards"
-
 
 def _texts(rows: np.ndarray) -> list[str]:
     """Decode fixed-width UTF-8 byte rows stored as int32."""
@@ -69,44 +55,44 @@ def check_rollout(groups: int, max_new_tokens: int, sample: str) -> None:
         raise ValueError("the advantage families are 'group' and 'rloo'")
 
 
-def grouped_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np.ndarray,
-                 lengths: np.ndarray, raw: np.ndarray, behavior: np.ndarray,
-                 rewards: np.ndarray, sample: str) -> dict[str, np.ndarray]:
-    """Pack `[rows, groups, ...]` draws and their rewards as GRPO rows.
+def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np.ndarray,
+                    lengths: np.ndarray, terminated: np.ndarray, behavior: np.ndarray,
+                    rewards: np.ndarray, versions: np.ndarray, sample: str) -> tuple[dict[str, np.ndarray],
+                                                                                   list[Rollout]]:
+    """Pack `[rows, groups, ...]` completions as one-call rollouts through `pack`.
 
     `prompts` is `[rows, width]` left-padded ids with `prompt_lengths` real
-    tokens each; `sampled`, `raw` and `behavior` are `[rows, groups, R]`
-    with `lengths` valid actions per draw; `rewards` is `[rows, groups]`.
-    Each prompt's group is advantaged by the `sample` family and stays
-    contiguous in the output.
+    tokens each; `sampled` and `behavior` are `[rows, groups, R]` with
+    `lengths` valid actions per draw, `terminated` whether each stopped at
+    EOS; `rewards` and `versions` are `[rows, groups]`. Each prompt's group
+    is advantaged by the `sample` family. The batch is `rows * groups` rows
+    of `width + R` ids, the packed layout every GRPO batch has; the rollouts
+    come back so a caller can place per-call values with `sampled_values`.
     """
     rows, groups, budget = sampled.shape
     width = prompts.shape[1]
-    flat = jnp.asarray(rewards.reshape(-1))
-    advantages = np.asarray(
-        group_advantage(flat, groups) if sample == "group" else rloo_advantage(flat, groups), np.float32)
-    mask = np.arange(budget)[None, None, :] < lengths[..., None]
-    full = np.concatenate([np.broadcast_to(prompts[:, None, :], (rows, groups, width)), sampled], axis=-1)
-    return {
-        IDS_KEY: full.reshape(-1, full.shape[-1]),
-        RESPONSE_MASK_KEY: mask.reshape(-1, budget).astype(np.float32),
-        OLD_LOG_PROBS_KEY: raw.reshape(-1, budget),
-        BEHAVIOR_LOG_PROBS_KEY: behavior.reshape(-1, budget),
-        ADVANTAGES_KEY: np.broadcast_to(advantages[:, None], (rows * groups, budget)),
-        REWARDS_KEY: np.asarray(rewards, np.float32).reshape(-1),
-        LENGTH_KEY: np.repeat(prompt_lengths, groups),
-    }
-
-
+    rollouts = []
+    for row in range(rows):
+        prompt = tuple(int(token) for token in prompts[row, width - int(prompt_lengths[row]):])
+        for group in range(groups):
+            count = int(lengths[row, group])
+            call = Call(prompt, tuple(int(token) for token in sampled[row, group, :count]),
+                        tuple(float(value) for value in behavior[row, group, :count]),
+                        "stop" if bool(terminated[row, group]) else "length", int(versions[row, group]))
+            rollouts.append(Rollout(str(row), "", group, 0, (call,), Status.COMPLETED,
+                                    float(rewards[row, group])))
+    return pack(rollouts, width + budget, rows=rows * groups, estimator=sample), rollouts
 
 
 @dataclasses.dataclass(frozen=True)
 class SampledRollout:
-    """Draw G completions per prompt, in prompt-major group order.
+    """Draw G completions per prompt and pack them as one-call rollouts.
 
     EOS is a valid action in the response mask but excluded from reward text.
-    Output rectangles preserve the input prompt width and configured response
-    budget. Likelihoods come from the cached model at each sampled action.
+    The batch is `pack`'s layout, `prompts * groups` rows of the prompt
+    width plus the response budget. Every completion is scored, truncated or
+    not. `old_log_probs` holds the raw likelihoods the cached model recorded
+    at each sampled action, and `behavior_log_probs` the sampling ones.
     """
 
     objective: LMObjective
@@ -175,4 +161,10 @@ class SampledRollout:
                          :int(lengths[row, group]) - int(terminated[row, group])].tolist()),
                          truths[row], infos[row]) for group in range(self.groups)]
             for row in range(rows)], np.float32)
-        return grouped_rows(prompts, prompt_lengths, sampled, lengths, raw, behavior, rewards, self.sample)
+        versions = np.full((rows, self.groups), int(state.updates), np.int32)
+        packed, _ = completion_rows(prompts, prompt_lengths, sampled, lengths, terminated, behavior,
+                                    rewards, versions, self.sample)
+        packed[OLD_LOG_PROBS_KEY] = sampled_values(
+            packed, lambda index, _: raw[index // self.groups, index % self.groups,
+                                         :int(lengths[index // self.groups, index % self.groups])].tolist())
+        return packed

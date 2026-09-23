@@ -41,8 +41,18 @@ import numpy as np
 
 from dew.rl import group_advantage, rloo_advantage
 
-from .rollout import ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY
+IDS_KEY = "input_ids"
+RESPONSE_MASK_KEY = "response_mask"
+"""1 on every sampled id of a trainable rollout, the tokens that carry loss mass."""
+OLD_LOG_PROBS_KEY = "old_log_probs"
+"""The proximal policy's log-probabilities, recorded or rescored before the update.
 
+GRPO's PPO ratio compares the current raw policy with this one. When a batch
+carries none, the behavior log-probabilities stand in.
+"""
+BEHAVIOR_LOG_PROBS_KEY = "behavior_log_probs"
+"""Actual sampling log-probabilities, including temperature/top-k and greedy selection."""
+ADVANTAGES_KEY = "advantages"
 SEGMENT_IDS_KEY = "text_segment_ids"
 """Which chain of its row each token belongs to, from 1; 0 is padding."""
 POSITIONS_KEY = "text_positions"

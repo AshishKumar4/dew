@@ -12,8 +12,8 @@ trainer's: a resumed run re-reads and resubmits whatever was in flight.
 
 Every draw carries the policy version its request was submitted under
 (`RolloutServer.version`, the trainer's `updates` count when the weights were
-pushed), and each row carries its draw's version under `policy_version`. The
-lag of a batch is the trainer's `updates` minus its oldest row's version.
+pushed), and each sampled id carries its draw's version under `versions`. The
+lag of a batch is the trainer's `updates` minus its oldest draw's version.
 Weights are pushed when the served version falls `sync_every` updates behind,
 so a batch is at most `ahead + sync_every - 1` updates stale, and
 construction refuses a `max_lag` below that. At consumption, a batch
@@ -44,24 +44,14 @@ import jax
 import numpy as np
 
 from dew.data.dataset import Batch, Dataset, tapped
-from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
+from dew.data.prompts import PROMPT_KEY
 from dew.inference.rollouts import Draw, RolloutServer
 from dew.nn.inputs import local_rows
 from dew.training.state import TrainState
 
 from .grpo import GRPOObjective
-from .rollout import (
-    IDS_KEY,
-    OLD_LOG_PROBS_KEY,
-    RESPONSE_MASK_KEY,
-    Reward,
-    check_rollout,
-    grouped_rows,
-    prompt_rows,
-)
-
-POLICY_VERSION_KEY = "policy_version"
-"""Per row, the policy version the row's draw was submitted under."""
+from .rollout import Reward, check_rollout, completion_rows, prompt_rows
+from .rollouts import OLD_LOG_PROBS_KEY, sampled_values
 
 
 @dataclass(frozen=True)
@@ -129,8 +119,7 @@ class AsyncRollout:
         self._lock = threading.Lock()
         self._registered: deque[_Entry] = deque()
         self._serial = 0
-        self._rescore = jax.jit(lambda params, ids, padding: objective.per_token_log_probs(
-            params, ids, left_padding=padding))
+        self._rescore = jax.jit(objective.packed_log_probs)
 
     def prompts(self, dataset: Dataset) -> Dataset:
         """`dataset` with a training stream that registers each batch ahead of the step."""
@@ -224,22 +213,22 @@ class AsyncRollout:
         if updates - oldest > self.max_lag:
             raise RuntimeError(f"a draw reports version {oldest}, {updates - oldest} updates behind; "
                                f"max_lag is {self.max_lag}")
-        packed = self._packed(state, entry, scored, updates - oldest)
-        packed[POLICY_VERSION_KEY] = versions.reshape(-1)
+        packed = self._packed(state, entry, scored, versions, updates - oldest)
         if self.log is not None:
             self.log(RolloutRecord(updates, oldest, updates - oldest,
                                    float(np.mean([[value for _, value in row] for row in scored])), redrawn, waited))
         return packed
 
-    def _packed(self, state: TrainState, entry: _Entry, scored: list[list[Scored]], lag: int) -> dict[str, np.ndarray]:
+    def _packed(self, state: TrainState, entry: _Entry, scored: list[list[Scored]], versions: np.ndarray,
+                lag: int) -> dict[str, np.ndarray]:
         rows, width = entry.prompts.shape
         budget, pad = self.max_new_tokens, self.server.sampling.pad_id
         sampled = np.full((rows, self.groups, budget), pad, np.int32)
         lengths = np.zeros((rows, self.groups), np.int32)
+        terminated = np.zeros((rows, self.groups), bool)
         behavior = np.zeros((rows, self.groups, budget), np.float32)
-        raw = np.zeros_like(behavior)
+        raw: list[tuple[float, ...] | None] = []
         rewards = np.zeros((rows, self.groups), np.float32)
-        reported = True
         for row in range(rows):
             prompt = tuple(entry.prompts[row, width - int(entry.lengths[row]):].tolist())
             for group, (draw, value) in enumerate(scored[row]):
@@ -248,16 +237,14 @@ class AsyncRollout:
                     raise ValueError("the server returned a draw for another prompt or past the budget")
                 sampled[row, group, :count] = draw.tokens
                 lengths[row, group] = count
+                terminated[row, group] = draw.terminated
                 behavior[row, group, :count] = draw.behavior_log_probs
-                if draw.raw_log_probs is None:
-                    reported = False
-                else:
-                    raw[row, group, :count] = draw.raw_log_probs
+                raw.append(None if draw.raw_log_probs is None else tuple(draw.raw_log_probs))
                 rewards[row, group] = value
-        packed = grouped_rows(entry.prompts, entry.lengths, sampled, lengths, raw, behavior, rewards, self.sample)
-        if lag > 0 or not reported:
-            ids = packed[IDS_KEY]
-            padding = width - packed[LENGTH_KEY].astype(np.int32)
-            proximal = np.asarray(self._rescore(state.params, ids, padding))[:, width - 1:width - 1 + budget]
-            packed[OLD_LOG_PROBS_KEY] = (proximal * packed[RESPONSE_MASK_KEY]).astype(np.float32)
+        packed, _ = completion_rows(entry.prompts, entry.lengths, sampled, lengths, terminated, behavior,
+                                    rewards, versions, self.sample)
+        if lag > 0 or any(values is None for values in raw):
+            packed[OLD_LOG_PROBS_KEY] = np.asarray(self._rescore(state.params, packed), np.float32)
+        else:
+            packed[OLD_LOG_PROBS_KEY] = sampled_values(packed, lambda index, _: raw[index] or ())
         return packed

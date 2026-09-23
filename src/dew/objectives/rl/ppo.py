@@ -26,8 +26,15 @@ from dew.training.state import TrainState
 
 from .episodes import EpisodeInference, EpisodeRollout
 from .grpo import GRPOObjective
-from .rollout import ADVANTAGES_KEY, IDS_KEY, RESPONSE_MASK_KEY
-from .rollouts import CALL_INDEX_KEY, POSITIONS_KEY, ROLLOUT_INDEX_KEY, SEGMENT_IDS_KEY
+from .rollouts import (
+    ADVANTAGES_KEY,
+    CALL_INDEX_KEY,
+    IDS_KEY,
+    POSITIONS_KEY,
+    RESPONSE_MASK_KEY,
+    ROLLOUT_INDEX_KEY,
+    SEGMENT_IDS_KEY,
+)
 
 OLD_VALUES_KEY = "old_values"
 RETURNS_KEY = "returns"

@@ -23,12 +23,15 @@ from flax import linen as nn
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.rl import GRPOObjective
-from dew.objectives.rl.rollout import (
+from dew.objectives.rl.rollout import SampledRollout
+from dew.objectives.rl.rollouts import (
     ADVANTAGES_KEY,
+    BEHAVIOR_LOG_PROBS_KEY,
     IDS_KEY,
     OLD_LOG_PROBS_KEY,
+    POSITIONS_KEY,
     RESPONSE_MASK_KEY,
-    SampledRollout,
+    SEGMENT_IDS_KEY,
 )
 from dew.rl import clipped_surrogate, k3_kl, token_log_ratio, token_mean
 from dew.sampling import Sampling
@@ -141,7 +144,7 @@ class TinyHead(nn.Module):
         self.lm_head = nn.Dense(self.vocab_size, use_bias=False)
 
     @nn.compact
-    def hidden_states(self, tokens, train: bool = False):
+    def hidden_states(self, tokens, train: bool = False, segment_ids=None, positions=None):
         x = nn.Embed(self.vocab_size, 8)(tokens)
         h = nn.LayerNorm()(x)
         return nn.LayerNorm()(x + nn.Dense(8)(nn.gelu(nn.Dense(16)(h))))
@@ -161,18 +164,22 @@ class TinyHead(nn.Module):
 
 
 def rollout_batch(seed=0):
-    """Two full concatenations with response-width terms, as the
-    `SampledRollout` packs them."""
+    """Two packed rows, one chain each, the last RESPONSE_WIDTH ids sampled,
+    with a short second response."""
     rng = np.random.RandomState(seed)
     width = PROMPT_WIDTH + RESPONSE_WIDTH
     ids = rng.randint(0, VOCAB, (ROWS, width)).astype(np.int32)
-    terms = rng.normal(-0.5, 0.5, (ROWS, RESPONSE_WIDTH)).astype(np.float32)
-    advantages = rng.normal(0, 1, (ROWS, RESPONSE_WIDTH)).astype(np.float32)
-    mask = np.ones((ROWS, RESPONSE_WIDTH), np.float32)
-    mask[1, 2:] = 0
+    mask = np.zeros((ROWS, width), np.float32)
+    mask[:, PROMPT_WIDTH:] = 1
+    mask[1, -1] = 0
+    terms = np.where(mask != 0, rng.normal(-0.5, 0.5, (ROWS, width)), 0).astype(np.float32)
+    advantages = np.where(mask != 0, rng.normal(0, 1, (ROWS, width)), 0).astype(np.float32)
     return {
         IDS_KEY: jnp.asarray(ids),
+        SEGMENT_IDS_KEY: jnp.ones((ROWS, width), jnp.int32),
+        POSITIONS_KEY: jnp.tile(jnp.arange(width, dtype=jnp.int32), (ROWS, 1)),
         OLD_LOG_PROBS_KEY: jnp.asarray(terms),
+        BEHAVIOR_LOG_PROBS_KEY: jnp.asarray(terms),
         ADVANTAGES_KEY: jnp.asarray(advantages),
         RESPONSE_MASK_KEY: jnp.asarray(mask),
     }
@@ -180,8 +187,8 @@ def rollout_batch(seed=0):
 
 def test_the_loss_reads_the_rolled_out_batch():
     """The objective's loss is the composition over the batch's own terms:
-    current log-probabilities sliced out of the concatenation, ratio against
-    the stored old ones, surrogate and KL masked alike."""
+    current log-probabilities scored along each chain, ratio against the
+    stored old ones, surrogate and KL masked alike."""
     objective = GRPOObjective(TinyHead(vocab_size=VOCAB),
                               PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
     params = objective.init(jax.random.key(0))
@@ -193,17 +200,16 @@ def test_the_loss_reads_the_rolled_out_batch():
 
     ids = np.asarray(batch[IDS_KEY])
     start = PROMPT_WIDTH - 1
-    policy = np.asarray(objective.per_token_log_probs(params, ids))[:, start:start + 3]
-    ref = np.asarray(objective.per_token_log_probs(frozen, ids))[:, start:start + 3]
-    old = np.asarray(batch[OLD_LOG_PROBS_KEY])
-    advantages = np.asarray(batch[ADVANTAGES_KEY])
-    mask = np.asarray(batch[RESPONSE_MASK_KEY])
+    policy = np.asarray(objective.per_token_log_probs(params, ids))[:, start:]
+    ref = np.asarray(objective.per_token_log_probs(frozen, ids))[:, start:]
+    old = np.asarray(batch[OLD_LOG_PROBS_KEY])[:, PROMPT_WIDTH:]
+    advantages = np.asarray(batch[ADVANTAGES_KEY])[:, PROMPT_WIDTH:]
+    mask = np.asarray(batch[RESPONSE_MASK_KEY])[:, PROMPT_WIDTH:]
     ratio = token_log_ratio(jnp.asarray(policy), jnp.asarray(old))
     pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
     kl = token_mean(k3_kl(jnp.asarray(policy), jnp.asarray(ref)), jnp.asarray(mask))
     assert float(loss) == pytest.approx(float(pg + 0.01 * kl), rel=1e-5)
-    assert set(aux.metrics) == {"pg", "actor/pg_clipfrac", "actor/ppo_kl",
-                                "actor/pg_clipfrac_lower", "kl"}
+    assert {"pg", "actor/pg_clipfrac", "actor/ppo_kl", "actor/pg_clipfrac_lower", "kl"} <= set(aux.metrics)
 
 
 def test_zero_beta_leaves_the_reference_unread():
@@ -245,22 +251,20 @@ def test_a_misshapen_batch_is_refused():
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
     batch = rollout_batch()
 
-    bare = {IDS_KEY: batch[IDS_KEY]}
-    with pytest.raises(ValueError, match="old_log_probs"):
-        scalar_loss(objective, params, bare, step)
+    windowed = {key: value for key, value in batch.items() if key != SEGMENT_IDS_KEY}
+    with pytest.raises(ValueError, match=SEGMENT_IDS_KEY):
+        scalar_loss(objective, params, windowed, step)
 
-    narrow = dict(batch, **{IDS_KEY: batch[IDS_KEY][:, :5]})
+    unscored = {key: value for key, value in batch.items() if key != BEHAVIOR_LOG_PROBS_KEY}
+    with pytest.raises(ValueError, match=BEHAVIOR_LOG_PROBS_KEY):
+        scalar_loss(objective, params, unscored, step)
+
+    narrow = {key: value[:, :5] for key, value in batch.items()}
     with pytest.raises(ValueError, match="8 ids per row"):
         scalar_loss(objective, params, narrow, step)
 
-    wide = dict(batch, **{OLD_LOG_PROBS_KEY: jnp.zeros((ROWS, 9), jnp.float32),
-                          ADVANTAGES_KEY: jnp.zeros((ROWS, 9), jnp.float32),
-                          RESPONSE_MASK_KEY: jnp.zeros((ROWS, 9), jnp.float32)})
-    with pytest.raises(ValueError, match="concatenation"):
-        scalar_loss(objective, params, wide, step)
-
     ragged = dict(batch, **{ADVANTAGES_KEY: jnp.zeros((ROWS, 2), jnp.float32)})
-    with pytest.raises(ValueError, match="one term per response token"):
+    with pytest.raises(ValueError, match="shape"):
         scalar_loss(objective, params, ragged, step)
 
 
@@ -306,7 +310,7 @@ def test_the_rollout_batch_feeds_the_objective():
         TRUTH_KEY: np.stack([pad("1"), pad("2")]),
         INFO_KEY: np.stack([pad(""), pad("")]),
     }
-    state = SimpleNamespace(params=params)
+    state = SimpleNamespace(params=params, updates=0)
     rollout = SampledRollout(objective, lambda *args: 1.0, groups=2,
                              max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=0.0))
     rolled = rollout(state, batch, jax.random.key(1))
