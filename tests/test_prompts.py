@@ -129,7 +129,7 @@ def test_template_variables_reach_the_chat_template():
     assert plain != thinking, "the variable matters for this template"
     spec = Prompts(tokenizer=TOKENIZER, records=records({"prompt": conversation}), max_prompt_len=64,
                    val_batches=None, loading=Loading(workers=0), thinking=False)
-    batch = next(spec.load(batch=1).train())
+    batch = next(spec.load(batch=1).train(DataPartition()))
     assert [int(token) for token in batch[PROMPT_KEY][0, 64 - int(batch[LENGTH_KEY][0]):]] == plain
 
 
