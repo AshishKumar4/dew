@@ -212,9 +212,9 @@ SLURM_STEP = {"SLURM_JOB_ID": "77", "SLURM_STEP_NODELIST": "gpu[01-02]", "SLURM_
       "OMPI_COMM_WORLD_RANK": "2", "OMPI_COMM_WORLD_LOCAL_RANK": "2"},
      (), "ompi: process 2 of 4, placed by the cluster"),
     ({"SLURM_JOB_ID": "77", "SLURM_NTASKS_PER_NODE": "8"}, (),
-     "srun --kill-on-bad-exit=1 --export=ALL python train.py"),
+     "srun --kill-on-bad-exit=1 --export=ALL --label python train.py"),
     ({"SLURM_JOB_ID": "77", "SLURM_GPUS_PER_NODE": "a100:8"}, (),
-     "srun --kill-on-bad-exit=1 --export=ALL --ntasks-per-node=8 python train.py"),
+     "srun --kill-on-bad-exit=1 --export=ALL --label --ntasks-per-node=8 python train.py"),
     (SLURM_STEP, ("--hosts", "localhost", "--processes-per-host", "1", "--port", "5"),
      "DEW_PROCESS_COUNT=1"),
     ({**SLURM_STEP, "SLURM_NTASKS": "1", "SLURM_PROCID": "0", "SLURM_LOCALID": "0",
@@ -259,7 +259,7 @@ def test_srun_runs_a_task_per_gpu_and_receives_values_with_commas_whole(tmp_path
                     env=fake_srun(tmp_path))
     assert done.returncode == 0, done.stderr
     assert (tmp_path / "argv").read_text().split() == [
-        "--kill-on-bad-exit=1", "--export=ALL", "--ntasks-per-node=4", "python", "train.py"]
+        "--kill-on-bad-exit=1", "--export=ALL", "--label", "--ntasks-per-node=4", "python", "train.py"]
     assert (tmp_path / "env").read_text() == "--a=1,--b=2"
 
 
