@@ -113,8 +113,12 @@ def model_fields(config: LmRunConfig, vocab_size: int, max_seq_len: int) -> dict
 
 def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
                     max_seq_len: int, meta: dict):
-    """The decoder a --pretrained run continues, its variables and the fields
-    it was built from.
+    """The decoder a --pretrained run continues, its variables, the fields
+    it was built from and the reference it was read at.
+
+    `pretrained` is a local directory, a Hub repo or `repo@revision`; the
+    reference returned pins a Hub repo to the commit it resolved to, so the
+    run.json that records it names those exact weights.
 
     The checkpoint decides every architecture field, so the only thing
     --model.config may still say is how far the KV cache reaches. The fields
@@ -124,7 +128,7 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
     trained with: continuing pretraining on ids from another vocabulary trains
     the embedding table against noise.
     """
-    from dew.interop import load_pretrained as load_checkpoint
+    from dew.interop import load_pretrained as load_checkpoint, split_revision
 
     overridden = sorted(set(model_config.config) - {"max_seq_len"})
     if overridden:
@@ -137,11 +141,12 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
         raise ValueError(
             f"--model.config max_seq_len is {context!r}; the context a checkpoint "
             f"is reloaded at is a number of tokens")
+    name, revision = split_revision(pretrained)
     loaded = load_checkpoint(
-        pretrained, dtype=model_config.dtype, attention_impl=model_config.attention_impl,
-        max_seq_len=context)
+        name, dtype=model_config.dtype, attention_impl=model_config.attention_impl,
+        max_seq_len=context, revision=revision)
     model, variables, fields = loaded.model, loaded.variables, loaded.model_config
-    expected = checkpoint_tokenizer(pretrained)
+    expected = checkpoint_tokenizer(loaded.source, name)
     if meta["tokenizer"] != expected:
         raise ValueError(
             f"the token files were written with {meta['tokenizer']}, and "
@@ -154,22 +159,24 @@ def load_pretrained(pretrained: str, model_config: ModelConfig, vocab_size: int,
         raise ValueError(
             f"{pretrained} has room for {model.vocab_size} ids and the "
             f"token files use {vocab_size}")
-    return model, variables, fields
+    reference = name if loaded.revision is None else f"{name}@{loaded.revision}"
+    return model, variables, fields, reference
 
 
-def checkpoint_tokenizer(pretrained: str) -> str:
-    """The tokenizer name a checkpoint expects its ids to come from.
+def checkpoint_tokenizer(directory: Path, name: str) -> str:
+    """The tokenizer name the checkpoint in `directory`, read as `name`,
+    expects its ids to come from.
 
-    A hub repo is its own tokenizer's name. A directory written by
-    save_pretrained_decoder records the name it was exported with, since the
-    path it happens to sit at says nothing.
+    A checkpoint written by save_pretrained_decoder records the name it was
+    exported with, since the path or repo it happens to sit at says nothing;
+    any other hub repo is its own tokenizer's name.
     """
-    generation_config = Path(pretrained) / "generation_config.json"
+    generation_config = directory / "generation_config.json"
     if generation_config.is_file():
         recorded = json.loads(generation_config.read_text()).get("tokenizer_name")
         if recorded:
             return recorded
-    return pretrained
+    return name
 
 
 def build_samples(config: LmRunConfig) -> Samples | None:
@@ -269,8 +276,10 @@ def main(config: LmRunConfig) -> TrainState:
         fields = model_fields(config, vocab_size, context)
         model = models.build(config.model.architecture, **fields)
     else:
-        model, pretrained, fields = load_pretrained(
+        model, pretrained, fields, reference = load_pretrained(
             config.pretrained, config.model, vocab_size, context, meta)
+        # run.json names the commit the weights were read at.
+        config = replace(config, pretrained=reference)
     # run.json records the resolved model as
     # built, vocabulary and context included, so `dew.pipeline` rebuilds it.
     settings = config.model.precision_settings()
