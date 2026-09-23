@@ -464,29 +464,38 @@ class Cosine(ScheduleBase):
             end_value=self.end)
 
 
+@dataclasses.dataclass(frozen=True)
+class PowerTail:
+    """A power schedule's linear tail: from the law's rate at `start` to
+    `end` at step `steps` (None: the run's end)."""
+
+    start: int
+    steps: int | None = None
+    end: float = 0.0
+
+
 @schedules("power")
 @dataclasses.dataclass(frozen=True)
 class Power(ScheduleBase):
     """lm-engine's power scheduler, `power_schedule`: warmup, then
-    min(peak, a * (step * c) ** b), and from `decay_start` a linear tail to
-    `end` at `decay_steps` (None: the run's end). lm-engine's examples take
-    `a` = 4 * batch size and `c` = tokens per step."""
+    min(peak, a * (step * c) ** b), and with a `tail` a linear decay after
+    the law (Rigel's last 29%). lm-engine's examples take `a` = 4 * batch
+    size and `c` = tokens per step."""
 
     peak: float
     warmup_steps: int
     a: float
     b: float = -0.51
     c: float = 1.0
-    decay_start: int | None = None
-    decay_steps: int | None = None
-    end: float = 0.0
+    tail: PowerTail | None = None
 
     def schedule(self, steps: int) -> optax.Schedule:
+        tail = self.tail
+        if tail is None:
+            return power_schedule(self.peak, self.warmup_steps, self.a, self.b, self.c)
         return power_schedule(
-            self.peak, self.warmup_steps, self.a, self.b, self.c, decay_start=self.decay_start,
-            decay_end=(None if self.decay_start is None
-                       else steps if self.decay_steps is None else self.decay_steps),
-            end_value=self.end)
+            self.peak, self.warmup_steps, self.a, self.b, self.c, decay_start=tail.start,
+            decay_end=steps if tail.steps is None else tail.steps, end_value=tail.end)
 
 
 @schedules("linear")
