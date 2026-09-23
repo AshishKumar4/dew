@@ -298,6 +298,18 @@ def test_a_resumed_stream_cancels_the_old_in_flight_rollouts_and_resubmits_under
     assert set(batch["versions"][batch["response_mask"] > 0].tolist()) == {5}
 
 
+def test_engines_serving_weights_newer_than_the_restored_clock_are_pushed_back():
+    # A fit re-run in the same process restores update 5 while the engines
+    # still serve the version pushed at update 10.
+    publisher = Publisher(version=10)
+    source = Scripted(lambda task, submission, sample, version: finished(float(sample), version))
+    rollout, data, records = scheduler(source, publisher, ahead=0)
+    batch = rollout(State(5), next(iter(data.train())), None)
+    assert publisher.loads == [5] and source.submitted == [("1", 2, 5), ("2", 2, 5)]
+    assert records[-1].lag == 0
+    assert set(batch["versions"][batch["response_mask"] > 0].tolist()) == {5}
+
+
 def test_a_source_that_raises_stops_the_batch_and_cancels_its_work():
     source = Scripted(lambda task, submission, sample, version: ValueError("broken source") if task == "1"
                       else None)
