@@ -48,7 +48,6 @@ import glob
 import io
 import json
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -82,6 +81,9 @@ from dew.telemetry.instrumentation import model_flops_utilization
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
 from dew.training.distributed import DevicePrefetchIterator, data_partition
 from dew.training.runtime import prepare_process
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from trace_window import kernel_category, length, union, window_split
 
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
 # of the model should not spend its first minute downloading a text tower, and
@@ -765,34 +767,6 @@ def parameter_count(params) -> int:
     return int(sum(np.prod(leaf.shape, dtype=np.int64) for leaf in jax.tree.leaves(params)))
 
 
-# A kernel's category from the tokens of its name, first match wins: XLA
-# names its fusions after the ops they hold (`loop_convert_fusion`,
-# `input_add_reduce_fusion`, `gemm_fusion_dot`), cuDNN and cuBLAS after the
-# kernel family. Whole tokens, not substrings, so `convert` is not `conv`.
-KERNEL_CATEGORIES = (
-    ("attention", ("sdpa", "fmha", "flash")),
-    ("conv", ("conv", "fprop", "dgrad", "wgrad", "implicit")),
-    ("gemm", ("gemm", "cublas", "cutlass", "nvjet", "xmma", "matmul", "dot")),
-    ("reduce", ("reduce",)),
-    ("convert", ("convert",)),
-    ("copy", ("memcpy", "memset", "copy", "transpose", "concatenate", "gather",
-              "scatter", "slice", "pad", "broadcast", "select", "dynamic")),
-    ("elementwise", ("fusion",)),
-)
-
-
-def kernel_category(name: str) -> str:
-    lowered = name.lower()
-    if "cudnn::fusion" in lowered:
-        # cuDNN's helpers around its flash kernel (dO.O, dQ rearrangement).
-        return "attention"
-    tokens = set(re.split(r"[^a-z0-9]+", lowered))
-    for category, needles in KERNEL_CATEGORIES:
-        if tokens & set(needles):
-            return category
-    return "other"
-
-
 def device_timeline(directory: str, steps: int) -> dict[str, Any]:
     """What the device did during the traced `steps`, from the newest trace
     under `directory`.
@@ -811,23 +785,14 @@ def device_timeline(directory: str, steps: int) -> dict[str, Any]:
     for plane in ProfileData.from_file(traces[-1]).planes:
         if not plane.name.startswith("/device:"):
             continue
-        for line in plane.lines:
-            for event in line.events:
-                kernels.append((event.name, event.start_ns, event.end_ns))
+        kernels.extend((event.name, event.start_ns, event.end_ns)
+                       for line in plane.lines for event in line.events)
     if not kernels:
         raise ValueError(
             f"the trace under {directory} holds no device kernels: the profiler "
             "saw no accelerator, and a CPU run has no device timeline to read")
-    kernels.sort(key=lambda kernel: kernel[1])
-    busy, current_start, current_end = 0, kernels[0][1], kernels[0][2]
-    for _, start, end in kernels[1:]:
-        if start > current_end:
-            busy += current_end - current_start
-            current_start, current_end = start, end
-        else:
-            current_end = max(current_end, end)
-    busy += current_end - current_start
-    window = current_end - kernels[0][1]
+    spans = union([(start, end) for _, start, end in kernels])
+    busy, window = length(spans), spans[-1][1] - spans[0][0]
     by_category: dict[str, float] = {}
     by_name: dict[str, float] = {}
     for name, start, end in kernels:
@@ -848,45 +813,14 @@ def device_timeline(directory: str, steps: int) -> dict[str, Any]:
     }
 
 
-# NCCL names its kernels after the collective it runs:
-# `ncclDevKernel_AllGather_RING_LL`, `ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL`,
-# `ncclDevKernel_SendRecv` (collective-permute and all-to-all), and the same
-# with `ncclKernel_` before NCCL 2.19.
-COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast", "Reduce")
-
-
-def _union(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    merged: list[tuple[int, int]] = []
-    for start, end in sorted(intervals):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    return merged
-
-
-def _overlap(first: list[tuple[int, int]], second: list[tuple[int, int]]) -> int:
-    """Nanoseconds two disjoint, sorted interval lists share."""
-    shared, i, j = 0, 0, 0
-    while i < len(first) and j < len(second):
-        start, end = max(first[i][0], second[j][0]), min(first[i][1], second[j][1])
-        shared += max(0, end - start)
-        if first[i][1] < second[j][1]:
-            i += 1
-        else:
-            j += 1
-    return shared
-
-
 def communication(directory: str, steps: int) -> dict[str, Any]:
-    """Each device's traced window split into compute, every collective, and
-    the communication no compute kernel overlapped, averaged over the devices.
+    """Each device's traced window split by `trace_window.window_split` into
+    compute, every collective, the communication no compute kernel
+    overlapped, and idle time ended by a host-to-device copy (input) or by
+    anything else (host), averaged over the devices.
 
-    A kernel is a collective when NCCL runs it, and anything else is compute.
     Only the stream lines are read, since the derived lines (`XLA Ops`,
-    `XLA Modules`) repeat the same time under the program's names. A
-    collective's kernel spans its wait for the slowest peer as well as the
-    transfer, so the times include the skew between devices.
+    `XLA Modules`) repeat the same time under the program's names.
     `exposed_communication_ms_per_step` is the collective time no compute
     kernel on the same device ran beside: what overlap did not hide.
     """
@@ -906,22 +840,10 @@ def communication(directory: str, steps: int) -> dict[str, Any]:
     if not devices:
         raise ValueError(f"the trace under {directory} holds no device kernels")
 
-    def length(intervals: list[tuple[int, int]]) -> int:
-        return sum(end - start for start, end in intervals)
-
     totals: dict[str, float] = {}
     for events in devices:
-        compute = _union([(start, end) for name, start, end in events if "nccl" not in name.lower()])
-        collectives = [(name, start, end) for name, start, end in events if "nccl" in name.lower()]
-        every = _union([(start, end) for _, start, end in collectives])
-        window = max(end for _, _, end in events) - min(start for _, start, _ in events)
-        figures = {"window": window, "compute": length(compute),
-                   "communication": length(every),
-                   "exposed_communication": length(every) - _overlap(every, compute)}
-        for kind in COLLECTIVES:
-            figures[kind] = length(_union([
-                (start, end) for name, start, end in collectives
-                if f"_{kind.lower()}_" in f"_{name.lower()}_".replace("(", "_")]))
+        figures = window_split(events)
+        figures.pop("busy")  # device_timeline's, over every device
         for key, value in figures.items():
             totals[key] = totals.get(key, 0.0) + value
     per_step = 1e-6 / steps / len(devices)
@@ -1114,7 +1036,8 @@ def run(config: BenchmarkConfig) -> list[Row]:
             print(f"  per device: compute {row['compute_ms_per_step']:.2f}, communication "
                   f"{row['communication_ms_per_step']:.2f}, exposed "
                   f"{row['exposed_communication_ms_per_step']:.2f} ms/step "
-                  f"({row['exposed_communication_percent']:.1f}% of the window)")
+                  f"({row['exposed_communication_percent']:.1f}% of the window), idle on the host "
+                  f"{row['idle_host_ms_per_step']:.2f}, on input {row['idle_input_ms_per_step']:.2f}")
         if config.json_out:
             # A GPU sweep is minutes of compilation per case; rewriting the
             # file as each case lands means an interrupted sweep still keeps

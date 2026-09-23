@@ -149,13 +149,18 @@ def performance(records: dict[str, dict]) -> dict:
             "kernels_per_step": profile.get("kernels_per_step"),
             "categories": profile.get("kernel_ms_by_category", {}),
             "top_kernels": profile.get("top_kernels", [])[:10],
+            "split": {key: profile.get(f"{key}_ms_per_step") for key in
+                      ("compute", "communication", "exposed_communication", "idle_host", "idle_input")},
+            "compute_percent": profile.get("compute_busy_percent"),
         }
         row = rows[name]
-        # The MFU the kernels alone reach: the same FLOPs over the device's
-        # busy time rather than the wall clock, so the gap between the two
-        # is time the device sat idle between kernels.
-        row["busy_mfu"] = (None if None in (row["mfu"], row["step_ms"], row["busy_ms"])
-                           else row["mfu"] * row["step_ms"] / row["busy_ms"])
+        # Kernel efficiency: the same FLOPs over the time compute kernels ran
+        # rather than the wall clock, so the gap to MFU is time spent in
+        # exposed collectives or idle, and what is left below the peak is the
+        # kernels' own.
+        compute = row["split"]["compute"]
+        row["compute_mfu"] = (None if None in (row["mfu"], row["step_ms"], compute) or not compute
+                              else row["mfu"] * row["step_ms"] / compute)
     return rows
 
 
@@ -270,16 +275,29 @@ def main() -> None:
     report["performance"] = rows
     print("\nthroughput, from each side's own timed window and profile")
     print(f"  {'run':<12} {'side':<8} {'precision':<10} {'parallel':<9} {'tok/s':>8} {'ms/step':>8} "
-          f"{'MFU%':>6} {'busyMFU%':>8} {'peak GiB':>9} {'busy ms':>8} {'busy%':>6} {'kern/step':>9}")
+          f"{'MFU%':>6} {'kernMFU%':>8} {'peak GiB':>9} {'busy ms':>8} {'busy%':>6} {'kern/step':>9}")
     for name, row in rows.items():
         def cell(value, fmt):
             return format(value, fmt) if value is not None else "-"
         print(f"  {name:<12} {row['framework']:<8} {row['precision']:<10} {row['parallel']:<9} "
               f"{cell(row['rate'], '8.0f')} {cell(row['step_ms'], '8.1f')} "
               f"{cell(None if row['mfu'] is None else 100 * row['mfu'], '6.1f')} "
-              f"{cell(None if row['busy_mfu'] is None else 100 * row['busy_mfu'], '8.1f')} "
+              f"{cell(None if row['compute_mfu'] is None else 100 * row['compute_mfu'], '8.1f')} "
               f"{row['peak_gib']:>9.2f} {cell(row['busy_ms'], '8.1f')} {cell(row['busy_percent'], '6.1f')} "
               f"{cell(row['kernels_per_step'], '9.0f')}")
+    print("\n  the profiled window per device-step, ms: compute kernels, NCCL beside no compute kernel "
+          "(exposed) and beside one (overlapped), gaps ended by a host-to-device copy (input) or anything "
+          "else (host)")
+    print(f"  {'run':<12} {'window':>8} {'compute':>8} {'exposed':>8} {'overlap':>8} {'idle host':>9} "
+          f"{'idle input':>10} {'compute%':>8}")
+    for name, row in rows.items():
+        split = row["split"]
+        if split["compute"] is None:
+            continue
+        overlapped = split["communication"] - split["exposed_communication"]
+        print(f"  {name:<12} {row['window_ms']:>8.1f} {split['compute']:>8.1f} "
+              f"{split['exposed_communication']:>8.1f} {overlapped:>8.1f} {split['idle_host']:>9.1f} "
+              f"{split['idle_input']:>10.1f} {row['compute_percent']:>8.1f}")
     pairs = [tuple(item.split("=", 1)) for item in args.pair] or [(name, "reference") for name in runs]
     for left, right in pairs:
         if not rows[left]["categories"] or not rows[right]["categories"]:
