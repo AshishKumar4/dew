@@ -672,11 +672,51 @@ class Corpus:
     `weight` is a share of the step and not a record count, so the mixture
     holds its proportions whatever the corpora's lengths are. A small corpus
     comes round again while a large one is still on its first pass.
+
+    `offset` is how many records of the corpus's endless training order
+    earlier phases of the run already read (`PhasedStream`); the corpus
+    starts past them, so a phase continues the order rather than replaying
+    its head. Zero for a run of one order.
     """
 
     name: str
     source: Records
     weight: float
+    offset: int = 0
+
+
+def _endless(source: Records, seed: int, offset: int) -> pygrain.MapDataset[Batch]:
+    """`source` reshuffled from `seed` every epoch, endlessly, past its first
+    `offset` records."""
+    order = pygrain.MapDataset.source(source).seed(seed).shuffle(seed).repeat(None)
+    return order[offset:] if offset else order
+
+
+def _described(corpus: Corpus) -> str:
+    """`corpus` as a saved position names it: its source, and where in its
+    order the run starts it."""
+    start = f", from record {corpus.offset}" if corpus.offset else ""
+    return f"{describe(corpus.source)}, {len(corpus.source)} records{start}"
+
+
+def mixed_counts(corpora: Sequence[Corpus], records: int) -> tuple[int, ...]:
+    """How many of the first `records` records of `mixture(corpora, seed)`
+    each corpus supplies, for any seed.
+
+    This is grain's own selection read in closed form: weights scaled to
+    integers against the smallest (`_float_to_int_proportions`) and the count
+    of dataset i in the first k + 1 elements peeled off one proportion at a
+    time (`_dataset_and_key_of_next_element`, mix.py at grain 0.2).
+    """
+    shares = _shares(corpora)
+    scale = 100 / min(shares)
+    proportions = [int(share * scale) for share in shares]
+    counts, remaining, left = [], sum(proportions), records
+    for proportion in proportions:
+        rest = left * (remaining - proportion) // remaining
+        counts.append(left - rest)
+        left, remaining = rest, remaining - proportion
+    return tuple(counts)
 
 
 def _shares(corpora: Sequence[Corpus]) -> tuple[float, ...]:
@@ -732,8 +772,11 @@ def mixture(corpora: Sequence[Corpus], seed: int | None) -> pygrain.MapDataset[B
     shares = _shares(corpora)
 
     def order(corpus: Corpus) -> pygrain.MapDataset[Batch]:
-        records = pygrain.MapDataset.source(corpus.source)
-        return records if seed is None else records.shuffle(seed).repeat(None)
+        if seed is not None:
+            return _endless(corpus.source, seed, corpus.offset)
+        if corpus.offset:
+            raise ValueError("an ordered pass reads each corpus from its first record")
+        return pygrain.MapDataset.source(corpus.source)
 
     return pygrain.MapDataset.mix([order(corpus) for corpus in corpora], list(shares))
 
@@ -1156,8 +1199,8 @@ def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
 
 
 def train_stream(source: Records, operations: Sequence[pygrain.Transformation], *,
-                 batch: int, seed: int,
-                 loading: Loading) -> Callable[[], Iterator[Batch]]:
+                 batch: int, seed: int, loading: Loading,
+                 offset: int = 0) -> Callable[[], Iterator[Batch]]:
     """An endless shuffled stream over `source`, batched per process.
 
     `batch` is this process's share of a step, so the global batch behind it
@@ -1170,12 +1213,14 @@ def train_stream(source: Records, operations: Sequence[pygrain.Transformation], 
     `operations` run behind the order and ahead of the slice. They therefore
     run inside the workers, a record's rng is keyed by its place in the
     endless stream, and what a record becomes depends on neither count.
+
+    `offset` starts the order past the records earlier phases read.
     """
-    order = f"{describe(source)}, {len(source)} records reshuffled from seed {seed}"
+    start = f", from record {offset}" if offset else ""
+    order = f"{describe(source)}, {len(source)} records reshuffled from seed {seed}{start}"
 
     def records() -> pygrain.MapDataset[Batch]:
-        reshuffled = pygrain.MapDataset.source(source).seed(seed)
-        return reshuffled.shuffle(seed).repeat(None).apply(list(operations))
+        return _endless(source, seed, offset).apply(list(operations))
 
     return _global_stream(records, order, batch=batch, loading=loading)
 
@@ -1194,8 +1239,7 @@ def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transfo
     """
     shares = _shares(corpora)
     order = "mixture reshuffled from seed {} of [{}]".format(seed, ", ".join(
-        f"{corpus.name} at {share:.6g}: {describe(corpus.source)}, "
-        f"{len(corpus.source)} records"
+        f"{corpus.name} at {share:.6g}: {_described(corpus)}"
         for corpus, share in zip(corpora, shares, strict=True)))
 
     def records() -> pygrain.MapDataset[Batch]:
