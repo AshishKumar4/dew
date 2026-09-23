@@ -141,6 +141,15 @@ Two coverage gaps are open. The card is shared with other work in this session, 
 | PyTorch | compile, reference | 18.19 | 18.17 / 18.18 / 18.20 | 880 | 35.5 | 36.5% | 34.7% | 94.9% | 1,201 | 0.72 |
 | PyTorch | max-autotune, reference | 16.96 | 16.95 / 16.95 / 16.96 | 943 | 38.1 | 39.1% | 37.2% | 99.0% | 1,188 | 0.46 |
 
+The row above predates the fix that keeps the UNet's norms in bf16 (the norms used to return fp32 against their fp32 scales). The local RTX 4080 was no longer available, so the rerun, on 2026-09-23, was done on a Colab NVIDIA L4 (driver 580.82.07, JAX 0.11.1, Flax 0.12.9). It alternated `fac32af3` (before the fix) and `refactor/norm-stack` (after), each in a fresh process, using `tools/benchmark_step.py --architectures unet --attention-impl reference --warmup 20 --steps 100`. These are L4 numbers and cannot be compared with the 4080 table.
+
+| Dew tree | ms/step, runs 1 and 2 | p50 ms, runs 1 and 2 | peak GiB |
+|---|---:|---:|---:|
+| `fac32af3`, norms promote to fp32 | 25.17, 25.74 | 27.80, 28.70 | 0.68 |
+| `refactor/norm-stack`, norms in bf16 | 25.71, 26.14 | 28.60, 29.10 | 0.68 |
+
+The fix made the step 0.4 to 0.5 ms slower (about 2%) in paired runs, while the time drifted up by a similar amount between the two rounds. Peak memory is unchanged. The fix is for dtype correctness, not speed: compiled temp bytes of the same bf16 step fell on CPU (1785.7 to 1627.7 MiB with group norms) and stayed flat on the 4080 (235.4 to 235.3 MiB).
+
 ### SimpleDiT, 64 px, patch 4, batch 16
 
 | framework | variant | ms/step | p10 / p50 / p90 ms | tokens/s | analytic TFLOP/s | MFU spec | MFU measured | GPU busy | kernels/step | peak GiB |
