@@ -2277,6 +2277,22 @@ class CausalTransformer(nn.Module):
             lookup = jnp.where(tokens == token_id, 0, lookup)
         return self.embed_tokens(lookup)
 
+    def scaled_embeddings(self, x):
+        """Token embeddings `x` times sqrt(emb_features) when `embedding_scale`
+        is set, as Gemma scales them; `x` unchanged otherwise.
+
+        Gemma casts embed_scale to the embedding weight dtype
+        (modeling_gemma3.py:117). The token lookup holds that table in fp32
+        and returns the compute dtype, so the factor keeps its fp32 value and
+        only the product rounds with the activations. A factor rounded to
+        bf16 would be 34.0 at hidden 1152, where sqrt(1152) is
+        33.94112549695428.
+        """
+        if not self.embedding_scale:
+            return x
+        scaled = x * jnp.asarray(math.sqrt(self.emb_features), self.embed_tokens.embedding.dtype)
+        return scaled.astype(x.dtype)
+
     def init_mtp_cache(self, batch_size: int):
         """Allocate prediction-layer caches independently of the trunk cache."""
         shape = ((batch_size, 1, self.emb_features) if self.mtp_hyper_connections is None else
@@ -2332,17 +2348,7 @@ class CausalTransformer(nn.Module):
                                   pairwise_mask=attention_pairwise_mask,
                                   key_positions=attention_key_positions,
                                   token_ids=tokens if self.hash_layers else None))
-        x = self.token_embeddings(tokens)
-        if self.embedding_scale:
-            # Gemma casts embed_scale to the embedding weight dtype
-            # (modeling_gemma3.py:117). The token lookup holds that table in
-            # fp32 and returns the compute dtype, so the factor keeps its
-            # fp32 value and only the product rounds with the activations.
-            # A factor rounded to bf16 would be 34.0 at hidden 1152, where
-            # sqrt(1152) is 33.94112549695428.
-            gemma = x * jnp.asarray(math.sqrt(self.emb_features),
-                                     self.embed_tokens.embedding.dtype)
-            x = gemma.astype(x.dtype)
+        x = self.scaled_embeddings(self.token_embeddings(tokens))
         # lm-engine multiplies the looked-up states (`hidden_states * m_emb`,
         # mixins/dense/base.py at 45b6b57b), in fp32 opmath.
         x = scaled(x, self.embedding_multiplier)
