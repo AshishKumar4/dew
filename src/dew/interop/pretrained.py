@@ -2150,14 +2150,20 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
     if storage is None:
         raise ValueError("param_dtype must select floating parameter storage")
     param_dtype = storage
-    directory = decoders._snapshot(str(name_or_dir), revision)
+    directory = decoders._snapshot(str(name_or_dir), revision, weights=False)
     if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
         # A latent diffusion pipeline is a directory of components with no
         # model of its own; a decoder that also ships a pipeline index for its
         # sampler (DiffusionGemma) is loaded as the decoder its config names.
         with open(directory / "model_index.json") as handle:
-            return _load_diffusion_source(directory, json.load(handle), dtype=dtype,
-                                          attention_impl=attention_impl, param_dtype=param_dtype)
+            index = json.load(handle)
+        # The metadata fetch returns its commit directory, so the weights
+        # come from that commit even if the requested branch moves.
+        directory = decoders._snapshot(str(name_or_dir), directory.name, weights=tuple(
+            name for name in index if _present(index, name)))
+        return _load_diffusion_source(directory, index, dtype=dtype,
+                                      attention_impl=attention_impl, param_dtype=param_dtype)
+    directory = decoders._snapshot(str(name_or_dir), directory.name)
     with open(directory / "config.json") as handle:
         config = json.load(handle)
     text_config = config.get("text_config")

@@ -43,7 +43,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop import mamba2
-from dew.interop.safetensors_io import read_file
+from dew.interop.safetensors_io import read_file, read_weights, weight_files
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture, RematPolicy
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
@@ -1580,40 +1580,63 @@ def _read_shard(path: Path) -> dict[str, np.ndarray]:
 
 
 def _load_shards(directory: Path) -> dict[str, np.ndarray]:
-    """Read every tensor of a checkpoint directory, mapped in its stored dtype."""
-    shards = sorted(directory.glob("*.safetensors"))
-    if not shards:
-        raise FileNotFoundError(f"no *.safetensors under {directory}")
-    tensors: dict[str, np.ndarray] = {}
-    for shard in shards:
-        tensors.update(_read_shard(shard))
-    return tensors
+    """Read a checkpoint directory's weights, mapped in their stored dtype:
+    the shards its index names, or its one model.safetensors."""
+    return read_weights(directory)
+
+
+_METADATA_PATTERNS = ["*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]
+"""Configs, indexes, tokenizer and chat-template files: everything a load reads but weights."""
+
+
+def _repo_files(name: str, directory: Path) -> set[str]:
+    """Every file of the snapshot's commit, by repo-relative name.
+
+    A dry run lists the Hub tree the metadata fetch has just cached. Offline
+    it cannot, and the cache is then all a load can read anyway, so the
+    snapshot directory's own files are the listing.
+    """
+    from huggingface_hub import snapshot_download
+    from huggingface_hub.errors import DryRunError
+
+    try:
+        return {entry.filename for entry in snapshot_download(name, revision=directory.name, dry_run=True)}
+    except DryRunError:
+        return {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
 
 
 def _snapshot(name_or_dir: str, revision: str | None, *,
               weights: bool | tuple[str, ...] = True) -> Path:
-    """Resolve a snapshot with all, no, or named components' weight shards."""
+    """Resolve a snapshot with the root's (True), no (False) or the named
+    components' weights.
+
+    A local directory is returned as it is. From the Hub the metadata comes
+    first, then `weight_files` picks, from the commit's listing and the
+    indexes just fetched, the exact files that hold the weights, and only
+    those download, at the commit the first fetch resolved. Other formats of
+    the same weights beside them (Mistral's consolidated.safetensors,
+    diffusers' fp16 variants and root single-file checkpoints) stay on the
+    Hub.
+    """
     if os.path.isdir(name_or_dir):
         return Path(name_or_dir)
     from huggingface_hub import snapshot_download
 
-    weight_patterns = (["*.safetensors"] if weights else []) if isinstance(weights, bool) else [
-        f"{component}/*.safetensors" for component in weights]
-
-    return Path(
-        snapshot_download(
-            name_or_dir,
-            revision=revision,
-            allow_patterns=[
-                *weight_patterns,
-                "*.json",
-                "*.txt",
-                "*.model",
-                "*.tiktoken",
-                "*.jinja",
-            ],
-        )
-    )
+    directory = Path(snapshot_download(name_or_dir, revision=revision,
+                                       allow_patterns=_METADATA_PATTERNS))
+    if weights is False:
+        return directory
+    files = _repo_files(name_or_dir, directory)
+    selected = [name for folder in (("",) if weights is True else weights)
+                for name in weight_files(files, folder,
+                                         lambda name: json.loads((directory / name).read_text()))]
+    if weights is True and not selected:
+        raise FileNotFoundError(
+            f"{name_or_dir} at {directory.name} has no model.safetensors or "
+            f"model.safetensors.index.json")
+    if selected:
+        snapshot_download(name_or_dir, revision=directory.name, allow_patterns=selected)
+    return directory
 
 
 class ExportTokenizer(Protocol):

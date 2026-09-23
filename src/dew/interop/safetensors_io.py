@@ -14,13 +14,14 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Collection, Mapping
 
 import jax
 import ml_dtypes
 import numpy as np
 
 from dew.nn.text_encoders import ParamTree
+from dew.records import JSON
 
 SEPARATOR = "/"
 WEIGHTS_FILE = "model.safetensors"
@@ -208,6 +209,79 @@ def _header(filename: str) -> dict:
     return header
 
 
+WEIGHT_STEMS = ("diffusion_pytorch_model", "model")
+"""The weights file stems of a diffusers model and a transformers model."""
+
+
+def weight_files(files: Collection[str], folder: str,
+                 read_json: Callable[[str], JSON]) -> tuple[str, ...]:
+    """Return the safetensors files that hold one checkpoint folder's weights.
+
+    `files` are the repo-relative names a directory or a Hub listing holds,
+    `folder` the component ('' for the root) and `read_json` reads one of
+    those names. A `<stem>.safetensors.index.json` names its shards in
+    `weight_map`, and those are the weights, as vLLM reads them
+    (`filter_duplicate_safetensors_files`, weight_utils.py @d110c2f) and
+    transformers does; otherwise `<stem>.safetensors` is. Anything else
+    beside them is another format of the same weights and is never read:
+    Mistral's `consolidated.safetensors`, a root single-file checkpoint, or
+    a precision variant. A variant (`model.fp16.safetensors`,
+    `model.safetensors.index.fp16.json`) is the name diffusers'
+    `variant_compatible_siblings` (pipelines/pipeline_loading_utils.py:205,
+    diffusers 0.34.0) leaves out of a load with `variant=None`; that module
+    imports torch, so its rule is restated here rather than called.
+    Returns () when the folder holds no safetensors weights.
+    """
+    prefix = f"{folder}/" if folder else ""
+    for stem in WEIGHT_STEMS:
+        index = f"{prefix}{stem}.safetensors.index.json"
+        if index in files:
+            record = read_json(index)
+            weight_map = record.get("weight_map") if isinstance(record, dict) else None
+            shards = ([shard for shard in weight_map.values() if isinstance(shard, str)]
+                      if isinstance(weight_map, dict) else [])
+            if not isinstance(weight_map, dict) or len(shards) != len(weight_map):
+                raise ValueError(f"{index} has no weight_map of tensor names to shard files")
+            return tuple(sorted({prefix + shard for shard in shards}))
+        single = f"{prefix}{stem}.safetensors"
+        if single in files:
+            return (single,)
+    return ()
+
+
+def _listing(folder: Path) -> set[str]:
+    return {entry.name for entry in folder.iterdir() if entry.is_file()} if folder.is_dir() else set()
+
+
+def _json_reader(folder: Path) -> Callable[[str], JSON]:
+    return lambda name: json.loads((folder / name).read_text())
+
+
+def read_weights(folder) -> dict[str, np.ndarray]:
+    """Read one checkpoint folder's weights, as `weight_files` selects them.
+
+    A tensor stored in two of the selected shards raises a ValueError naming
+    it and both files, where a merge would keep whichever came last.
+    Raises FileNotFoundError when the folder holds no safetensors weights.
+    """
+    folder = Path(folder)
+    selected = weight_files(_listing(folder), "", _json_reader(folder))
+    if not selected:
+        raise FileNotFoundError(
+            f"no safetensors weights in {folder}: expected "
+            + " or ".join(f"{stem}.safetensors (or its .index.json)" for stem in WEIGHT_STEMS))
+    tensors: dict[str, np.ndarray] = {}
+    owner: dict[str, str] = {}
+    for shard in selected:
+        values, _ = read_file(folder / shard)
+        for name, value in values.items():
+            if name in owner:
+                raise ValueError(f"tensor {name!r} is stored in both {owner[name]} and {shard} under {folder}")
+            owner[name] = shard
+            tensors[name] = value
+    return tensors
+
+
 def layer_bytes(directory) -> int:
     """How many bytes a checkpoint's numbered layers hold, from the headers alone.
 
@@ -216,18 +290,14 @@ def layer_bytes(directory) -> int:
     limit that must be set before the JAX backend starts. This reads only
     the headers of the shards `directory` holds, so a launcher can size the
     limit before importing anything that starts a backend. The weights are
-    `model.safetensors` or the shards its index names, in `directory` and
+    the files `weight_files` selects, in `directory` and
     in each component directory of a pipeline; layers are the tensors named
     under `layers.<n>.`, as Hugging Face layouts name them.
     """
     directory = Path(directory)
     shards: list[Path] = []
     for root in (directory, *sorted(child for child in directory.iterdir() if child.is_dir())):
-        index = root / "model.safetensors.index.json"
-        if index.is_file():
-            shards.extend(sorted({root / name for name in json.loads(index.read_text())["weight_map"].values()}))
-        elif (root / "model.safetensors").is_file():
-            shards.append(root / "model.safetensors")
+        shards.extend(root / name for name in weight_files(_listing(root), "", _json_reader(root)))
     total = 0
     for shard in shards:
         for name, entry in _header(os.fspath(shard)).items():

@@ -203,6 +203,7 @@ def test_conditioner_rebuild_uses_supplied_weights_without_reading_any_source_sh
     assert isinstance(encoder, DiffusionConditioner)
     tokens = encoder.tokenize(["a red bird"])
     from fnmatch import fnmatch
+    from types import SimpleNamespace
 
     import huggingface_hub
 
@@ -212,7 +213,10 @@ def test_conditioner_rebuild_uses_supplied_weights_without_reading_any_source_sh
         selected.add(encoder.t5.name)
     supplied = False
 
-    def snapshot(repo_id, *, revision=None, allow_patterns):
+    def snapshot(repo_id, *, revision=None, allow_patterns=None, dry_run=False):
+        if dry_run:
+            return [SimpleNamespace(filename=path.relative_to(directory).as_posix())
+                    for path in directory.rglob("*") if path.is_file()]
         # Model the Hub storage boundary: forbidden weight files cannot be
         # transferred even if the caller would never open them afterward.
         for source_file in directory.rglob("*"):
