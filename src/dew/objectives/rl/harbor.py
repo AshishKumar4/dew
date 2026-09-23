@@ -235,7 +235,8 @@ def calls(traces: Sequence[JSON], *, unstamped: int) -> Recorded:
     checked.sort(key=lambda entry: entry[0])
     records, errors = [], []
     for _, trace, raw in checked:
-        error = raw.get("error")
+        # vLLM answers {"error": {"message": ...}}; SGLang {"object": "error", "message": ...}.
+        error = raw.get("error") or (raw.get("message") if raw.get("object") == "error" else None)
         if error:
             errors.append(str(_object(error).get("message", error)))
             continue
@@ -263,8 +264,9 @@ def calls(traces: Sequence[JSON], *, unstamped: int) -> Recorded:
     return Recorded(tuple(records), tuple(errors))
 
 
-# How vLLM 0.30.0 (renderers/params.py) and SGLang 0.5.20 word a prompt past the context length.
-_OVERFLOW = re.compile(r"maximum context length|exceeds the maximum allowed length|context length", re.IGNORECASE)
+# How vLLM 0.30.0 ("This model's maximum context length is ...") and SGLang 0.5.20 ("The input (N
+# tokens) is longer than the model's context length (M tokens).") word a prompt past the context length.
+_OVERFLOW = re.compile(r"maximum context length|longer than the model's context length", re.IGNORECASE)
 
 
 def _reward(rewards: Mapping[str, float], key: str) -> float:

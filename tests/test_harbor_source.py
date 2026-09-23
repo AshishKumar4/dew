@@ -84,6 +84,18 @@ BROKEN = {**trace([], [], None, None), "raw_response": {"error": {"message": "En
                                                  "code": 500}}}
 
 
+@pytest.mark.parametrize("engine", ["sglang", "vllm"])
+def test_a_live_session_and_overflow_through_the_gateway(engine):
+    # Captured live on a Colab L4 (Qwen2.5-0.5B-Instruct, rllm-model-gateway 3b40c37): a three-turn tool session,
+    # and a prompt past the context length, which SGLang 0.5.20 and vLLM 0.30.0 refuse in different shapes.
+    session = calls(json.loads((FIXTURES / f"{engine}_session_traces.json").read_text()), unstamped=0)
+    assert len(session.calls) == 3 and not session.errors
+    assert session.calls[0].finish_reason == "tool_calls"
+    overflow = calls([json.loads((FIXTURES / f"{engine}_overflow_trace.json").read_text())], unstamped=0)
+    assert overflow.calls == () and len(overflow.errors) == 1
+    assert outcome(result(rewards={"reward": 0}), session.calls, errors=overflow.errors)[0] is Status.TRUNCATED
+
+
 def test_engine_errors_are_events_not_calls():
     overflow = json.loads((FIXTURES / "vllm_overflow_trace.json").read_text())
     recorded = calls([trace([1, 2], [3], [-.5]), {**overflow, "timestamp": 9.0, "latency_ms": 10.0}], unstamped=0)
