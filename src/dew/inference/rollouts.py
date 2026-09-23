@@ -43,12 +43,15 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.objectives.base import Variables, thaw
+from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
 
 from .clients import OpenAICompletion
 from .serving import Server
 
 if TYPE_CHECKING:
+    import httpx
+
     from dew.interop.pretrained import Pretrained
 
 
@@ -232,24 +235,29 @@ class SafetensorsReload:
     files, which is the directory the engine was launched on. Files are
     staged beside `directory` and moved in with `os.replace`, so the engine
     never reads a half-written file. `base_url` is the engine's root, not
-    its `/v1` API. Any reload call answering other than 200 fails the push.
+    its `/v1` API. A reload call fails the push when it answers other than
+    200, or when its body carries `success` that is not true: both engines
+    report some failures as a 200 with `{"success": false}`.
 
-    vLLM (`engine="vllm"`) reloads through its development endpoints
-    (`VLLM_SERVER_DEV_MODE=1`): `POST /collective_rpc {"method":
-    "reload_weights"}`, which reloads from the served directory, then `POST
-    /reset_prefix_cache?reset_running_requests=true`. That reset preempts
-    running requests and recomputes them, so no cached prefix outlives the
-    weights that computed it; without the flag vLLM answers 200 and skips the
-    reset whenever a request holds KV blocks.
+    vLLM (`engine="vllm"`, checked against v0.30.0) reloads through its
+    development endpoints (`VLLM_SERVER_DEV_MODE=1`): `POST /pause?mode=wait`,
+    which lets in-flight requests finish and schedules no new ones, `POST
+    /collective_rpc {"method": "reload_weights"}`, which reloads from the
+    served directory, `POST /reset_prefix_cache`, which must answer
+    `{"success": true}` so no cached prefix outlives the weights that
+    computed it, and `POST /resume`. In-flight draws therefore finish wholly
+    on the old weights. A push that fails after the pause leaves the engine
+    paused, so no draw is sampled from weights the push may have half
+    loaded; the next push that succeeds resumes it.
 
-    SGLang (`engine="sglang"`) reloads with one call, `POST
-    /update_weights_from_disk {"model_path": directory, "flush_cache": true}`.
-    SGLang admits it only once every in-flight request has finished, holds
-    new requests until it returns, and flushes the radix cache before
+    SGLang (`engine="sglang"`, checked against v0.5.20) reloads with one call,
+    `POST /update_weights_from_disk {"model_path": directory, "flush_cache":
+    true}`. SGLang admits it only once every in-flight request has finished,
+    holds new requests until it returns, and flushes the radix cache before
     answering, so in-flight draws finish wholly on the old weights and no
-    prefix computed by them survives. A load that fails answers 400; SGLang's
-    rollback re-reads the same directory, so the engine then serves whatever
-    that directory holds.
+    prefix computed by them survives. A load that fails answers 400 with
+    `success: false`; SGLang's rollback re-reads the same directory, so the
+    engine then serves whatever that directory holds.
     """
 
     source: Pretrained
@@ -279,16 +287,25 @@ class SafetensorsReload:
 
         self.write(variables)
         root = self.base_url.rstrip("/")
+        # (path, JSON body, whether the answer must say {"success": true})
         if self.engine == "vllm":
-            calls = (("/collective_rpc", {"method": "reload_weights"}),
-                     ("/reset_prefix_cache?reset_running_requests=true", None))
+            calls = (("/pause?mode=wait", None, False), ("/collective_rpc", {"method": "reload_weights"}, False),
+                     ("/reset_prefix_cache", None, True), ("/resume", None, False))
         else:
             calls = (("/update_weights_from_disk", {"model_path": str(Path(self.directory).resolve()),
-                                                    "flush_cache": True, "abort_all_requests": False}),)
-        for path, body in calls:
+                                                    "flush_cache": True, "abort_all_requests": False}, True),)
+        for path, body, reports in calls:
             response = httpx.post(root + path, json=body, timeout=self.timeout)
-            if response.status_code != 200:
+            if response.status_code != 200 or (reports and not _succeeded(response)):
                 raise RuntimeError(f"{path.split('?')[0]} answered {response.status_code}: {response.text}")
+
+
+def _succeeded(response: httpx.Response) -> bool:
+    """Whether the answer is a JSON object whose `success` is true."""
+    if not response.headers.get("content-type", "").startswith("application/json"):
+        return False
+    answer = response.json()
+    return isinstance(answer, dict) and answer.get("success") is True
 
 
 class WeightSync(Protocol):
@@ -296,7 +313,8 @@ class WeightSync(Protocol):
 
 
 # The request field that makes each engine return the sampled ids themselves.
-_RETURN_IDS = {"vllm": {"return_tokens_as_token_ids": True}, "sglang": {"return_token_ids": True}}
+_RETURN_IDS: dict[str, dict[str, JSON]] = {"vllm": {"return_tokens_as_token_ids": True},
+                                           "sglang": {"return_token_ids": True}}
 
 
 class OpenAIRolloutServer:
@@ -312,11 +330,14 @@ class OpenAIRolloutServer:
     some policies. vLLM reports raw model log-probabilities unless it runs
     with `--logprobs-mode processed_logprobs`, so a transforming policy
     (temperature other than one, top-k, top-p or min-p) needs
-    `processed_logprobs=True` to say the engine was started that way. SGLang
-    reports the temperature-scaled distribution before its top-k, top-p and
-    min-p filters, and has no mode that reports the filtered one, so it
-    serves any temperature but no filter. Its `SGLANG_RETURN_ORIGINAL_LOGPROB`
-    switches the report to raw log-probabilities and must stay unset.
+    `processed_logprobs=True` to say the engine was started that way.
+    SGLang's `/v1/completions` reports the temperature-scaled distribution
+    before its top-k, top-p and min-p filters and has no field for the
+    filtered one, so this server takes any temperature but no filter.
+    (SGLang's native `/generate` reports the filtered likelihood under
+    `return_sampling_mask`, for a finite top-k; that is the route a filtered
+    policy would need.) `SGLANG_RETURN_ORIGINAL_LOGPROB` switches the report
+    to raw log-probabilities and must stay unset.
 
     SGLang honors a request's seed only under `--enable-deterministic-inference`;
     otherwise draws are unseeded.
@@ -336,10 +357,12 @@ class OpenAIRolloutServer:
                 "of a transforming Sampling; start it with --logprobs-mode processed_logprobs and pass "
                 "processed_logprobs=True, or sample at temperature one without filters")
         if engine == "sglang" and processed_logprobs:
-            raise ValueError("processed_logprobs names a vLLM mode; SGLang has none")
+            raise ValueError("processed_logprobs names a vLLM mode; SGLang's completions route has none")
         if engine == "sglang" and replace(sampling, temperature=1.0).transforms():
-            raise ValueError("SGLang reports log-probabilities before top-k, top-p and min-p, which are not "
-                             "the behavior likelihoods of a filtering Sampling; sample without filters")
+            raise ValueError("SGLang's /v1/completions reports log-probabilities before top-k, top-p and min-p, "
+                             "which are not the behavior likelihoods of a filtering Sampling, and has no field "
+                             "for the filtered ones (native /generate's return_sampling_mask does); "
+                             "sample without filters")
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive number of concurrent requests")
         self._completion = completion
