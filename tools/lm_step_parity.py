@@ -11,7 +11,9 @@ Usage:
       --out /tmp/lm-head/losses-<name>.json
 
 --precision sets `model.precision`; unset is XLA's default, which uses TF32
-for fp32 matmuls on an Ampere or later card.
+for fp32 matmuls on an Ampere or later card. --bf16-head multiplies the
+vocabulary head as bf16 (`CausalTransformer.bf16_head`); comparing a run
+with it against one without is the loss parity docs/performance.md reports.
 """
 
 import argparse
@@ -43,18 +45,18 @@ class Record:
 
 
 def run(config: dict[str, int], batch: int, seq: int, steps: int,
-        precision: str | None = None) -> Record:
+        precision: str | None = None, bf16_head: bool = False) -> Record:
     fields = with_precision("causal_transformer", config,
                             dtype="bfloat16", attention_impl="reference")
     if precision is not None:
         fields["precision"] = precision
+    fields["bf16_head"] = bf16_head
     model = models.build("causal_transformer", **fields)
-    trainer = Trainer(LMObjective(model, seq, token_accuracy=True), optax.adam(1e-4),
+    trainer = Trainer(LMObjective(model, seq), optax.adam(1e-4),
                       key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
                       checkpoints=None, tracker=None)
     abstract = jax.eval_shape(trainer.initial_state)
     state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
-    
 
     # The benchmark's fixed batch, byte for byte the same on both sides.
     generator = np.random.default_rng(0)
@@ -78,9 +80,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--out", required=True)
     parser.add_argument("--precision", default=None,
                         help="model.precision; unset is XLA's default")
+    parser.add_argument("--bf16-head", action="store_true",
+                        help="multiply the vocabulary head as bf16")
     args = parser.parse_args(argv)
 
-    record = run(CONFIG, BATCH, SEQ, args.steps, args.precision)
+    record = run(CONFIG, BATCH, SEQ, args.steps, args.precision, args.bf16_head)
     with open(args.out, "w") as handle:
         json.dump(asdict(record), handle, indent=2)
     print(json.dumps({"first": record.losses[0], "last": record.losses[-1],

@@ -531,7 +531,8 @@ def lm_objective(case: Case, model) -> LMObjective:
     return LMObjective(model, case.seq_len, head_chunks=case.head_chunks)
 
 
-def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
+def build_trainer(case: Case, attention_impl: str = 'auto',
+                  optimizer: optax.GradientTransformation | None = None) -> Trainer:
     """The trainer a recipe would build for this case, minus the tracker and the
     checkpoints.
 
@@ -595,7 +596,7 @@ def build_trainer(case: Case, attention_impl: str = 'auto') -> Trainer:
         objective = DiffusionObjective(model, process, inputs)
 
     return Trainer(
-        objective, optax.adam(1e-4), key=jax.random.key(0),
+        objective, optimizer or optax.adam(1e-4), key=jax.random.key(0),
         mesh=MeshSpec(fsdp=case.fsdp_size, expert=case.expert_size),
         layout=Layout(min_shard=case.fsdp_min_param_size),
         checkpoints=None, tracker=None)
