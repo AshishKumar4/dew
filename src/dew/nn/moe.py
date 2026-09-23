@@ -746,9 +746,6 @@ def expert_dispatch[Parameters](
     if indices.shape[:-1] != x.shape[:-1] or (
             input_weights is not None and input_weights.shape != indices.shape):
         raise ValueError(f"routing {indices.shape} does not describe tokens {x.shape}")
-    if capacity_factor is not None and not capacity_factor > 0:
-        raise ValueError(f"capacity_factor scales each expert's share of a sequence, so it is "
-                         f"positive, got {capacity_factor}; None keeps every slot")
     mesh = jax.sharding.get_abstract_mesh()
     shards = mesh.shape.get(EXPERT_AXIS, 1)
     if dispatch == 'exchange' and not initializing and (
