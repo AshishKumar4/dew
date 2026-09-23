@@ -118,9 +118,13 @@ class _Attention(nn.Module):
         return projected.reshape(*x.shape[:2], self.heads, self.head_dim)
 
     def _attend(self, query, key, value, keys, *, causal: bool):
+        # Spelled out over the queries: the fused kernels take a mask at the
+        # full [B, 1, Q, K] shape rather than broadcasting one row of keys.
+        mask = jnp.broadcast_to(keys[:, None, None, :],
+                                (keys.shape[0], 1, query.shape[1], keys.shape[1]))
         return scaled_dot_product_attention(
             query, key, value, implementation=self.attention_impl, precision=self.precision,
-            mask=keys[:, None, None, :], causal=causal)
+            mask=mask, causal=causal)
 
     @nn.compact
     def __call__(self, x, cos, sin, valid, text: int):
