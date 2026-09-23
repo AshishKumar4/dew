@@ -2687,27 +2687,9 @@ class CausalTransformer(nn.Module):
         and a router with a media bias selects for them by it; the rest
         ignore it.
         """
-        if attention_key_positions is not None and attention_pairwise_mask is None:
-            raise ValueError("attention_key_positions requires attention_pairwise_mask")
-        if attention_pairwise_mask is not None:
-            kinds = [self.mixer] + [kind.mixer for kind in (self.kinds or {}).values()]
-            if any(kind is not None and not isinstance(kind, AttentionMixer) for kind in kinds):
-                raise ValueError("explicit pairwise masks require ordinary attention mixers")
-        if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
-            media_mask = None
-        engram_ids = (None if self.engram is None
-                      else self.engram_hashes(tokens, attention_mask, positions, decode, media_mask))
-        attention_metadata = (None if attention_mask is None and image_groups is None
-                              and rotary_positions is None and attention_pairwise_mask is None
-                              and attention_key_positions is None and not self.hash_layers
-                              and engram_ids is None and media_mask is None
-                              else AttentionMetadata(
-                                  valid=attention_mask, image_groups=image_groups,
-                                  rotary_positions=rotary_positions,
-                                  pairwise_mask=attention_pairwise_mask,
-                                  key_positions=attention_key_positions,
-                                  token_ids=tokens if self.hash_layers else None,
-                                  engram_ids=engram_ids, media=media_mask))
+        attention_metadata = self._attention_metadata(
+            tokens, decode, positions, attention_mask, image_groups, rotary_positions,
+            attention_pairwise_mask, attention_key_positions, media_mask)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
         # splits the rows or the positions.
@@ -2772,6 +2754,33 @@ class CausalTransformer(nn.Module):
             self.sow('prediction_inputs', 'states', prediction,
                      reduce_fn=lambda _, value: value, init_fn=lambda: None)
         return hidden, prediction
+
+    def _attention_metadata(self, tokens, decode: bool, positions, attention_mask, image_groups,
+                            rotary_positions, pairwise_mask, key_positions,
+                            media_mask) -> AttentionMetadata | None:
+        """What the layers read beside the residual, None for a call that
+        carries none of it: the masks and positions `hidden_and_mtp_inputs`
+        takes, the token ids a hash router selects by, the engram layers'
+        bucket ids, and the media mask, which only a model with engram or a
+        router with a media bias reads."""
+        if key_positions is not None and pairwise_mask is None:
+            raise ValueError("attention_key_positions requires attention_pairwise_mask")
+        if pairwise_mask is not None:
+            kinds = [self.mixer] + [kind.mixer for kind in (self.kinds or {}).values()]
+            if any(kind is not None and not isinstance(kind, AttentionMixer) for kind in kinds):
+                raise ValueError("explicit pairwise masks require ordinary attention mixers")
+        if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
+            media_mask = None
+        engram_ids = (None if self.engram is None
+                      else self.engram_hashes(tokens, attention_mask, positions, decode, media_mask))
+        if (attention_mask is None and image_groups is None and rotary_positions is None
+                and pairwise_mask is None and key_positions is None and not self.hash_layers
+                and engram_ids is None and media_mask is None):
+            return None
+        return AttentionMetadata(
+            valid=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions,
+            pairwise_mask=pairwise_mask, key_positions=key_positions,
+            token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask)
 
     def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
               per_layer_input, attention_metadata=None):
