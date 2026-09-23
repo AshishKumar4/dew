@@ -211,6 +211,22 @@ def test_two_gpu_hosts_split_the_data_axis_unless_asked_otherwise():
         crossing(MeshSpec(tensor=8))
 
 
+@pytest.mark.mesh(devices=4)
+def test_a_named_device_list_is_laid_out_in_its_own_order():
+    """A caller naming the devices chooses which share an axis, as
+    benchmark_step's device_order puts a size-2 axis across or along an
+    NVLink pair. jax.make_mesh sorts GPU devices by id, which built the same
+    mesh for every order of four GPUs."""
+    import jax
+
+    from dew.training import build_mesh
+
+    first, second, third, fourth = jax.devices()[:4]
+    order = [first, third, second, fourth]
+    mesh = build_mesh(MeshSpec(fsdp=2, tensor=2), order)
+    assert list(mesh.devices.flat) == order
+
+
 def test_replicas_in_a_process_outside_any_pool_are_refused_by_granule():
     """A process that never joined a pool has CPU devices without a
     `slice_index`; it is one granule, so replicas are refused by the same
