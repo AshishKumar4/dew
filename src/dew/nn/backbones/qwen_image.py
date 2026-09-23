@@ -166,11 +166,12 @@ class QwenImageBlock(nn.Module):
         attended = _Attention(self.heads, self.head_dim, self.features, self.eps,
                               dtype=self.dtype, precision=self.precision,
                               attention_impl=self.attention_impl, name="attn")(
-            _per_rows(_layer_norm(self.dtype)(x), scale, image, _scaled), cos, sin, lengths, image)
+            _per_rows(_layer_norm(self.dtype, self.eps)(x), scale, image, _scaled),
+            cos, sin, lengths, image)
         x = x + _per_rows(attended, gate, image, lambda rows, value: jnp.tanh(value) * rows)
         hidden = _SwiGLU(self.features * self.mlp_ratio, self.features, dtype=self.dtype,
                          precision=self.precision, name="img_mlp")(
-            _per_rows(_layer_norm(self.dtype)(x), scale_mlp, image, _scaled))
+            _per_rows(_layer_norm(self.dtype, self.eps)(x), scale_mlp, image, _scaled))
         x = x + _per_rows(hidden, gate_mlp, image, lambda rows, value: jnp.tanh(value) * rows)
         if x.dtype == jnp.float16:
             x = jnp.clip(x, -65504, 65504)
@@ -281,7 +282,7 @@ class QwenImageTransformer(nn.Module):
         image = joint[:, :image_tokens]
         scale = _dense(self.features, "norm_out_linear", self.dtype, self.precision)(
             nn.silu(embedded))
-        image = _scaled(_layer_norm(self.dtype)(image), scale[:, None])
+        image = _scaled(_layer_norm(self.dtype, self.eps)(image), scale[:, None])
         output = _dense(self.out_channels, "proj_out", self.dtype, self.precision)(image)
         return output.reshape(batch, rows, columns, self.out_channels)
 

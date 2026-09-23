@@ -70,6 +70,9 @@ CASES: dict[str, Case] = {
     "odd": Case(grid=(3, 4)),
     "padded": Case(lengths=(9, 5)),
     "acausal": Case(dict(causal_condition=False), lengths=(8, 6)),
+    # The config's eps reaches every norm the source builds from it: the
+    # block and output LayerNorms as well as the RMS norms.
+    "eps": Case(dict(eps=1e-2)),
 }
 
 

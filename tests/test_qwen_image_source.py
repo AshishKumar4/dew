@@ -29,7 +29,7 @@ from dew.interop.diffusion import (component_tensors, qwen_image_fields,
 from dew.nn.backbones.qwen_image import QwenImageTransformer, image_grid
 
 ROOT = Path(__file__).resolve().parents[1]
-CASES = ("square", "rect", "odd", "padded", "acausal")
+CASES = ("square", "rect", "odd", "padded", "acausal", "eps")
 
 
 @pytest.fixture(scope="module")
