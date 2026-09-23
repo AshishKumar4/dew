@@ -319,19 +319,24 @@ class Router(nn.Module):
 
 
 # The grouped matmul 'auto' runs, per hardware generation (`device_generation`):
-# the measured winner at lm-moe's shape (8192 rows, 768 -> 2048, 8 experts,
-# bf16), numbers in docs/performance.md. On sm89 (L4, RTX 4080) that is
-# JAX's own Pallas kernels (`dew.nn.kernels.grouped_matmul`), where XLA runs
-# ragged_dot as a product over every expert; on a TPU v6e it is XLA's
-# ragged_dot, within 5% of the best kernel measured there. Every generation
-# not listed is unmeasured and runs 'xla'.
-GROUPED_MATMUL_BY_GENERATION = {'sm89': 'pallas', 'v6e': 'xla'}
+# the measured winner, forward plus backward, at lm-moe's shape (8192 rows,
+# 768 -> 2048, 8 experts, bf16) and at 128 experts; numbers in
+# docs/performance.md. On sm80 (A100) and sm89 (L4, RTX 4080) that is JAX's
+# own Pallas kernels (`dew.nn.kernels.grouped_matmul`), 5x to 61x faster than
+# XLA, which runs ragged_dot there as a product over every expert. On a TPU
+# v5e and v6e it is XLA's ragged_dot. Every generation not listed is
+# unmeasured and runs 'xla': sm75 cannot compile the kernels, and sm90 and
+# sm120 have no measurement yet.
+GROUPED_MATMUL_BY_GENERATION = {'sm80': 'pallas', 'sm89': 'pallas', 'v5e': 'xla', 'v6e': 'xla'}
 
 # The kernel 'tokamax' names, per generation. tokamax's own dispatch tries its
-# Mosaic kernel first: on a TPU that is the v1 kernel, 13x slower than XLA on
-# a v6e, and on sm89 a Mosaic GPU config that exceeds shared memory and
-# raises. Unmeasured generations run tokamax's 'xla'.
-TOKAMAX_KERNEL_BY_GENERATION = {'sm89': 'triton', 'v6e': 'mosaic_tpu_v2'}
+# Mosaic kernel first: on a TPU that is the v1 kernel, 4x to 13x slower than
+# XLA, and on sm89 a Mosaic GPU config that exceeds shared memory and raises.
+# Only the forward runs on tokamax (`expert_projection` differentiates on
+# XLA): its Triton backward faults (CUDA_ERROR_ILLEGAL_ADDRESS) on sm80 and
+# sm89. Unmeasured generations run tokamax's 'xla'.
+TOKAMAX_KERNEL_BY_GENERATION = {'sm80': 'triton', 'sm89': 'triton',
+                                'v5e': 'mosaic_tpu_v2', 'v6e': 'mosaic_tpu_v2'}
 
 # `device_kind` of the TPU generations Dew names.
 TPU_GENERATIONS = {'TPU v4': 'v4', 'TPU v5 lite': 'v5e', 'TPU v5': 'v5p', 'TPU v5p': 'v5p',

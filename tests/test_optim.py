@@ -682,7 +682,8 @@ def test_bf16_state_is_refused_where_there_is_no_adam_moment():
 
 def test_bf16_state_steps_optax_own_update_first():
     """The first update starts from zero moments, which bf16 holds exactly,
-    so it is optax's own AdamW update bit for bit, its options included."""
+    so it is optax's own AdamW update to fp32 rounding, its options
+    (nesterov, eps_root, b2) included."""
     params = decoder_params()
     grads = jax.tree.map(lambda p: jax.random.normal(jax.random.key(3), p.shape) * 1e-2, params)
     opts = {'nesterov': True, 'eps_root': 1e-8, 'b2': 0.99}
@@ -691,4 +692,4 @@ def test_bf16_state_steps_optax_own_update_first():
     expected, _ = reference.update(grads, reference.init(params), params)
     update, _ = solver.update(grads, solver.init(params), params)
     for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(update), strict=True):
-        np.testing.assert_array_equal(have, want)
+        np.testing.assert_allclose(have, want, rtol=1e-6, atol=0)

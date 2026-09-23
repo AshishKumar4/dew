@@ -142,7 +142,7 @@ class OptimConfig:
     clip_grads: float = 0.0
     state_dtype: Literal["float32", "bfloat16"] = "float32"
     """Adam's moments in memory. bfloat16 stores both stochastically rounded
-    (`dew.training.optim.bf16_adam_state`), for adam and adamw
+    (`dew.training.optim.bf16_moments`), for adam and adamw
     only: half the optimizer state and less of the update's memory traffic."""
 
 
