@@ -61,6 +61,18 @@ This writes `train.bin`, `val.bin` and `meta.json`. The binary files hold token 
 
 The vocabulary loss runs in float32. The head's product follows the compute dtype, as torch autocast and MaxText run it: under bf16 compute the states and the head multiply as bf16 and sum in float32, backward included, 1.6x faster on an L4 and an RTX 4080 than fp32 operands; an fp32 model multiplies in fp32 ([performance](../performance.md#kernel-choices-per-generation-2026-09-22)). The step reports `ce`, `perplexity` and `token_accuracy`. `token_accuracy=False` on `LMObjective`, `--no-token-accuracy` on the recipe, drops the accuracy and the pass over every logit it costs: 0.77 ms of the head's 8.0 ms on a TPU v6e. `head_chunks` sets how many vocabulary slices the loss scores; the default is four. Chunking can lower peak memory, but it adds work, and the backend compiler may rewrite it. How much memory it saves depends on the vocabulary size, sequence length, batch size and the compiled executable. There is no fixed saving.
 
+With bf16 compute, Dew keeps the residual stream and every norm and sublayer output in bf16, each rounded where transformers rounds a bf16 tensor, as MaxText and Megatron (with `fp32_residual_connection=False`) do; `torch.autocast` instead keeps the residual stream and the norms in float32 and rounds at each matmul's input. The torch run with Dew's rounding points is autocast with the embedding output and every RMSNorm output cast to bf16 and the rotary table left in float32 (`tools/reference_runs/torch_lm.py --precision autocast-bf16-residual`). At those rounding points the first step's loss depends on the attention kernel as much as on the framework. On the first batch of a Qwen3-0.6B fine-tune (4 x 1024 tokens, one A100, `tools/reference_runs/step0_attention.py`):
+
+| Run | Attention kernel | First-step loss minus float32 | Final hidden states, relative distance from torch's FlashAttention 2 run |
+|---|---|---|---|
+| torch | FlashAttention 2 | -1.60e-4 | 0 |
+| torch | cuDNN | +8.17e-4 | 1.42e-2 |
+| torch | math | -1.40e-4 | 1.42e-2 |
+| Dew | cuDNN | +1.09e-3 | 1.38e-2 |
+| Dew | XLA | +1.10e-3 | 1.40e-2 |
+
+Plain `torch.autocast` with FlashAttention 2 sits at +4.9e-4. Over 256 steps of the same fine-tune, every 32-step window of Dew's loss and gradient norm stays within twice the distance from float32 of the torch run at Dew's rounding points, or twice that run's run-to-run spread where the spread is larger.
+
 `LMObjective` keeps an EMA copy by default. Use `state.params` for the live variables and `state.averaged` when you want the moving-average copy. Evaluation reads the averaged variables when the objective keeps them. With `ema_decay=None` there is no copy: `state.ema` is `None`, `state.averaged` raises, and previews and evaluation read the live variables. A checkpoint written with one of these settings does not restore into the other.
 
 To measure validation perplexity, pass a validation iterator and set `eval_every`, as shown in [evaluation and tracking](../guides/evaluation.md). With a tracker, `Samples` sets up one generated preview per event. That preview is separate from teacher-forced scoring of the complete batch.
