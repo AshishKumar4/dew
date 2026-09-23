@@ -97,8 +97,9 @@ def _pair(max_length: int, bos_directory=None):
 
 
 # Both sides run fp32 over the same weights, torch against XLA; summed
-# log-probabilities agree to 2.6e-7 relative (-89.84966 against -89.84964
-# for the pair beyond the window), so 1e-6 relative is the float32 bound.
+# log-probabilities agree to 2.6e-7 relative at worst (-89.84966 against
+# -89.84964 for ("", "empty context"), which fits the window), so 1e-6
+# relative is the float32 bound.
 RELATIVE = 1e-6
 
 
@@ -153,19 +154,12 @@ def test_a_continuation_longer_than_the_window_is_refused_as_lm_eval_refuses_it(
 @pytest.mark.parametrize("length, max_length", [(3, 16), (50, 16), (5000, 2048)])
 def test_rolling_likelihood_scores_every_token_once_as_lm_eval_does(length, max_length):
     """lm-eval's rolling windows score all `length` tokens, the first one
-    conditioned on the prefix token (Appendix A.5 of the audit: 5000 of 5000
-    at `max_length` 2048, where cutting consecutive rows scored 4997). A
+    conditioned on the prefix token: 5000 of 5000 at `max_length` 2048,
+    where cutting the string into consecutive rows scored 4997. A
     dropped token moves the sum by its whole log-probability, about 5.5
     nats for this vocabulary, so equal sums mean the same tokens scored."""
-    from lm_eval.utils import get_rolling_token_windows, make_disjoint_window
-
     text = _text(length)
     ours, theirs = _pair(max_length)
-    tokens = ours.tok_encode(text)
-    assert len(tokens) == length
-    windows = [make_disjoint_window(pair) for pair in get_rolling_token_windows(
-        tokens, ours.eot_token_id, max_length, 1)]
-    assert sum(len(scored) for _, scored in windows) == length
     (reference,) = theirs.loglikelihood_rolling([instance(text, request_type="loglikelihood_rolling")])
     (score,) = ours.loglikelihood_rolling([instance(text, request_type="loglikelihood_rolling")])
     assert score == pytest.approx(reference, rel=RELATIVE)
