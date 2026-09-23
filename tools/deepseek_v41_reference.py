@@ -650,13 +650,17 @@ def widened_outputs(seed: int) -> dict[str, np.ndarray]:
 
 
 def write_truth(seed: int):
-    """reference_f64.npz beside the fixture (`widened_outputs`), after a
-    count of the roundings and picks that differ from the fixture's."""
+    """reference_f64.npz beside the fixture (`widened_outputs`), refused
+    where a recorded rounding, pick or draft differs from the fixture's: the
+    tests take every decision from Dew's own float64 run, which is the
+    reference's only where the fixture decided as float64 does."""
     truth, fixture = widened_outputs(seed), np.load(FIXTURE / "reference.npz")
     differ = {name: int(np.sum(truth[name].astype(np.float32) != fixture[name]) if name.endswith("_out")
                         else np.sum(truth[name] != fixture[name]))
               for name in truth if name.endswith(("_out", "_picks", "draft_ids"))}
     print(json.dumps({"differing": differ}))
+    if any(differ.values()):
+        raise SystemExit(f"the float64 run decides otherwise than seed {seed}'s fixture")
     np.savez(FIXTURE / "reference_f64.npz", **{name: value for name, value in truth.items()
                                                if not name.endswith(("_out", "_picks", "draft_ids"))})
 

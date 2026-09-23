@@ -200,7 +200,7 @@ def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
             entry = jnp.sum(window_key * weights, axis=1)
             at = jnp.where(closed, count, -1)[:, None]
             values = write_cache(values, entry[:, None], at)
-            indices = write_cache(indices[..., None], (position // rate)[:, None, None], at)[..., 0]
+            indices = write_cache(indices[..., None], (position // rate).astype(indices.dtype)[:, None, None], at)[..., 0]
             if old is not None:
                 old = tuple(jnp.where(closed[:, None, None], current[..., :width], before)
                             for current, before in zip(buffered, old, strict=True))
