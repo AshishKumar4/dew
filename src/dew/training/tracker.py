@@ -25,8 +25,15 @@ from typing import TYPE_CHECKING, Protocol, TextIO
 import jax
 import numpy as np
 
-from dew.artifacts import Artifact, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
-from dew.inputs import uint8_pixels
+from dew.artifacts import (
+    Artifact,
+    ImageGrid,
+    Representations,
+    TextSamples,
+    TokenScores,
+    VideoGrid,
+    uint8_pixels,
+)
 from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value
 
 if TYPE_CHECKING:

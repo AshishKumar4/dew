@@ -20,8 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import ArrayLike
 
-from dew.artifacts import ImageGrid
-from dew.inputs import uint8_pixels
+from dew.artifacts import ImageGrid, uint8_pixels
 from dew.objectives.base import Batch
 from dew.registry import metrics
 

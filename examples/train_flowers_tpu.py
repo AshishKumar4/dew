@@ -32,12 +32,12 @@ import tyro
 from PIL import Image
 
 import dew
+from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import ArrayRecordImages, Loading, OxfordFlowers
 from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.eval import clip_score, fid
-from dew.inputs import uint8_pixels
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun

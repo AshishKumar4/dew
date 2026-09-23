@@ -12,9 +12,10 @@ import optax
 import tyro
 from PIL import Image
 
+from dew.artifacts import uint8_pixels
 from dew.data import OxfordFlowers
 from dew.diffusion import presets
-from dew.inputs import CLIPText, Condition, Field, InputSpec, uint8_pixels
+from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.interop import save_hf_layout
 from dew.objectives.diffusion import DiffusionObjective
 from dew.registry import models

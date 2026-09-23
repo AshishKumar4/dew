@@ -18,9 +18,9 @@ import optax
 import tyro
 
 from dew import Checkpoints, Field, InputSpec, Trainer, metrics, models
+from dew.artifacts import uint8_pixels
 from dew.data import Dataset, Loading, PreferencePairs, TokenWindows
 from dew.diffusion.presets import Flow
-from dew.inputs import uint8_pixels
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
