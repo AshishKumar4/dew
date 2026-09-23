@@ -109,19 +109,17 @@ def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     straight-through tangent: the rounding is the forward's, and a gradient
     through it keeps its dtype and is never rounded a second time.
 
-    `jax.lax.reduce_precision` rounds to nearest even at `dtype`'s exponent
-    and mantissa widths, the value a cast to `dtype` and back gives, as one
-    op: XLA's GPU default `xla_allow_excess_precision` may delete a cast
-    round trip under jit, and then nothing would round.
+    The rounding is the cast itself, subnormals included, which
+    `jax.lax.reduce_precision` flushes for float16. The barrier around the
+    narrow value keeps XLA's GPU default `xla_allow_excess_precision` from
+    deleting the round trip under jit, and it is kept where `dtype` is `x`'s
+    own so XLA cannot carry an operand wider into the fusion that reads it.
+    Formats are compared, not widths: float16 and bfloat16 are both two
+    bytes and each loses bits in the other.
     """
-    # The barrier holds the value in `x`'s dtype: under excess precision XLA
-    # may otherwise carry a bf16 operand wider inside the fusion that reads
-    # it, which changes a bf16 product with where the fusion boundary falls.
-    if jnp.dtype(dtype).itemsize >= jnp.dtype(x.dtype).itemsize:
+    if jnp.dtype(dtype) == jnp.dtype(x.dtype):
         return jax.lax.optimization_barrier(x)
-    widths = jnp.finfo(dtype)
-    return jax.lax.optimization_barrier(
-        jax.lax.reduce_precision(x, exponent_bits=widths.nexp, mantissa_bits=widths.nmant))
+    return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
 
 
 @rounded_operand.defjvp
