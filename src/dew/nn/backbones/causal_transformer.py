@@ -176,8 +176,9 @@ class LayerSpec:
     kv_shared: bool
     """The layer reads its keys and values from an earlier layer's."""
     provider: int | None
-    """The layer's own index when a later layer reads its keys and values; such
-    a layer runs unrolled, since what it stashes leaves the stack's loop."""
+    """The layer's own index when a later layer reads what it leaves in the
+    kv_store, its keys and values or a CSA2 layer's publications; such a
+    layer runs unrolled, since what it stashes leaves the stack's loop."""
     residual_site: ResidualSite | None
     """The layer's place among Kimi K3's blocks of attention residuals, None
     without them. It differs at every block boundary, so a scanned run never
@@ -1657,7 +1658,8 @@ class CausalTransformer(nn.Module):
     gate their table rows into the residual streams before their attention.
     The tokenizer's compressed vocabulary is the `constants` collection's
     `engram_hashes/token_map`, which a loaded checkpoint derives from its
-    tokenizer and a fresh model starts as the identity."""
+    tokenizer and a fresh model fills with each id modulo the compressed
+    vocabulary's size."""
     dspark: DSpark | None = None
     """DeepSeek-V4.1's block drafter (`dew.nn.dspark`): its stages are
     decoder blocks attending with its `layer_type` kind's V4 attention as a
@@ -2235,6 +2237,12 @@ class CausalTransformer(nn.Module):
         # context.
         mixer_spec = self.mixer if self.mixer is not None else AttentionMixer()
         providers = set(sharing.values())
+
+        def provides(index: int, layer_type: str) -> bool:
+            mixer = kinds[layer_type].mixer or mixer_spec
+            return index in providers or (isinstance(mixer, DeepseekV4Mixer)
+                                          and mixer.publishes(index in sharing))
+
         specs = tuple(
             LayerSpec(
                 layer_type=layer_type,
@@ -2245,7 +2253,7 @@ class CausalTransformer(nn.Module):
                        else widths[index]),
                 sparsity=0.0 if sparsity is None else sparsity[index],
                 kv_shared=index in sharing,
-                provider=index if index in providers else None,
+                provider=index if provides(index, layer_type) else None,
                 residual_site=(None if self.attention_residuals is None
                                else self.attention_residuals.site(index)),
                 engram=(None if self.engram is None or index not in self.engram.layer_ids

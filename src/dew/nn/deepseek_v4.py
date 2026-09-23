@@ -673,7 +673,13 @@ class DeepseekV4Attention(nn.Module):
 
     def _csa2(self, x, q_resid, positions, cos, sin, cache, kv_store):
         """CSA2's entries `[B, T, head_dim]` and the ones each query attends
-        `[B, S, T]`, by the layer's mode (section 2.3.1, v41:722-763)."""
+        `[B, S, T]`, by the layer's mode (section 2.3.1, v41:722-763).
+
+        A Full layer publishes its index keys on every call. The release
+        republishes them only when one of the layer's groups closes
+        (v41:537-548), so in a call where none does, a Reindex layer after
+        it reads the keys of whichever layer last published; Dew does not
+        reproduce that."""
         if self.kv_shared:
             return (_published(kv_store, CSA2_ENTRIES, 'Reuse'),
                     _published(kv_store, CSA2_SELECTED, 'Reuse'))
@@ -926,6 +932,12 @@ class DeepseekV4Mixer(MixerBase):
         if self.compressor is not None:
             raise ValueError("a DSpark stage attends a sliding window: its kind has no compressor")
         return self._built(DSparkAttention, ctx)
+    def publishes(self, kv_shared: bool) -> bool:
+        """Whether a layer of this kind leaves what later layers read in the
+        kv_store: a CSA2 Full layer its entries, index keys and selection, a
+        Reindex layer its selection."""
+        return self.compressor == 'csa2' and (self.reindex or not kv_shared)
+
 
     def _built(self, attention: type[DeepseekV4Attention], ctx: MixerContext) -> Callable[..., nn.Module]:
         if not ctx.causal:

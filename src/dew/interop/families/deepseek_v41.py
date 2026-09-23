@@ -210,7 +210,7 @@ def _deepseek_v41_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
                  'norm_topk_prob': norm_topk,
                  'scaling': _record_float(text, 'routed_scaling_factor', 1.0),
                  'shared_features': moe, 'expert_features': moe},
-        swiglu_limit=_record_float(text, 'swiglu_limit', 10.0) or None,
+        swiglu_limit=_record_float(text, 'swiglu_limit', 0.0) or None,
         hyper_connections={'hc_mult': _record_int(text, 'hc_mult', 4),
                            'hc_eps': _record_float(text, 'hc_eps', 1e-6),
                            'hc_sinkhorn_iters': _record_int(text, 'hc_sinkhorn_iters', 20),

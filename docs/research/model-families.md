@@ -63,13 +63,14 @@ code. Checked against the source on 2026-09-22:
   `tools/*_reference.py` scripts.
 - Dew translates these `model_type` values from a Hugging Face config
   (`_FAMILY_ENTRIES`, `src/dew/interop/hf_decoders.py`): `deepseek_v2`,
-  `deepseek_v3`, `deepseek_v32`, `deepseek_v4`, `diffusion_gemma_text`,
-  `dream`, `gemma`, `gemma2`, `gemma3_text`, `gemma3n_text`, `gemma4_text`,
-  `glm4_moe`, `glm5_next_text`, `glm_moe_dsa`, `gpt_oss`, `kimi_k2`,
-  `kimi_k25`, `kimi_k3`, `kimi_linear`, `llada`, `llama`, `llama4_text`,
-  `mamba2`, `mistral`, `mixtral`, `olmo3`, `qwen2`, `qwen3`, `qwen3_moe`,
-  `qwen3_next`, `qwen3_5_text` and `qwen3_5_moe_text`. The MiniMax families,
-  `nemotron_h`, `qwen4_exp` and `llada2_moe` are not in that list.
+  `deepseek_v3`, `deepseek_v32`, `deepseek_v4`, `deepseek_v41`,
+  `diffusion_gemma_text`, `dream`, `gemma`, `gemma2`, `gemma3_text`,
+  `gemma3n_text`, `gemma4_text`, `glm4_moe`, `glm5_next_text`, `glm_moe_dsa`,
+  `gpt_oss`, `kimi_k2`, `kimi_k25`, `kimi_k3`, `kimi_linear`, `llada`, `llama`,
+  `llama4_text`, `mamba2`, `mistral`, `mixtral`, `olmo3`, `qwen2`, `qwen3`,
+  `qwen3_moe`, `qwen3_next`, `qwen3_5_text` and `qwen3_5_moe_text`. The
+  MiniMax families, `nemotron_h`, `qwen4_exp` and `llada2_moe` are not in
+  that list.
 
 ## How this was checked
 

@@ -32,7 +32,7 @@ from dew.interop.hf_decoders import _FAMILIES, _flatten, translate_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
-from dew.registry import models
+from dew.registry import models, with_precision
 from dew.sampling import Sampling, generate
 from tools.deepseek_v41_numerics import (
     cached_run,
@@ -339,3 +339,49 @@ def test_the_quantization_aware_cache_and_drafter_match_the_reference(source):
     DSpark's window keys included."""
     loaded, _, reference = source
     cached_matches(loaded.model, loaded.variables, reference, "qat_")
+
+
+def test_left_padding_changes_no_row(source):
+    """Rows of different lengths in one batch, the shorter padded on the
+    left: engram's look-back packs each row's valid tokens (its argsort
+    path), and CSA2's windows, entries and index keys follow each row's own
+    positions. The full row still decodes the reference's greedy ids, and
+    the padded one what it decodes alone."""
+    loaded, plain, reference = source
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    steps, pad = reference["generated"].shape[1], 3
+
+    def greedy(inputs):
+        return np.asarray(generate(plain, loaded.variables, inputs, steps, key=jax.random.key(1),
+                                   sampling=Sampling(temperature=0)).tokens)[:, -steps:]
+
+    tokens = jnp.stack([ids[0, :prompt], jnp.pad(ids[1, :prompt - pad], (pad, 0))])
+    valid = jnp.arange(prompt)[None] >= jnp.asarray([[0], [pad]])
+    batched = greedy(ModelInputs(tokens, {"attention_mask": valid}))
+    np.testing.assert_array_equal(batched[0], reference["generated"][0])
+    np.testing.assert_array_equal(batched[1], greedy(ModelInputs(ids[1:, :prompt - pad]))[0])
+
+
+def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():
+    """Two Reindex layers of one kind in a row stay two runs of one under
+    scan_layers, so the Reuse layer after them attends the second one's
+    selection, as it does unrolled; scanned together, their publications
+    would stay inside the loop."""
+    config = json.loads((TINY / "config.json").read_text())
+    text = config["text_config"]
+    config = {**config, "text_config": {**text, "index_source_layer_ids": [2, 4, 6, 7, 8, 10]}}
+    fields = with_precision("causal_transformer", translate_config(config), dtype="float32",
+                            attention_impl="reference")
+    ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
+    unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
+                         for scan in (False, True))
+    variables = unrolled.init(jax.random.key(0), ids)
+    np.testing.assert_allclose(scanned.apply(variables, ids), unrolled.apply(variables, ids),
+                               atol=TOLERANCE["logits"], rtol=0)
+
+
+def test_a_config_without_swiglu_limit_clamps_nothing():
+    """The release's ModelArgs default is 0.0, no clamp (v41 model.py:70)."""
+    config = json.loads((TINY / "config.json").read_text())
+    text = {key: value for key, value in config["text_config"].items() if key != "swiglu_limit"}
+    assert translate_config({**config, "text_config": text})["swiglu_limit"] is None
