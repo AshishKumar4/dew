@@ -1,4 +1,5 @@
-"""Read and write DeepSeek's block-scaled FP8 weights.
+"""Read and write quantized checkpoint weights: DeepSeek's block-scaled FP8
+and compressed-tensors' MXFP4.
 
 A quantized linear's `weight` is float8_e4m3fn [out, in] and its partner
 `weight_scale_inv` is float32 [ceil(out / 128), ceil(in / 128)], one scale
@@ -31,16 +32,28 @@ it to NaN where torch saturates. A weight that is not finite is refused by
 name rather than written as a block of NaN. The 1e-4 floor keeps every
 scale a float32 normal, and the arithmetic is NumPy's on a host copy, clear
 of XLA's flush-to-zero on CPU.
+
+compressed-tensors' `mxfp4-pack-quantized` format, which Kimi K3 ships its
+routed experts in, stores each torch Linear as `<module>.weight_packed`
+`[output, input / 2]` beside `<module>.weight_scale` `[output, input / 32]`:
+low-nibble-first E2M1 codes and bias-127 E8M0 exponents over groups of 32
+inputs (`pack_fp4_to_uint8`, `unpack_fp4_from_uint8` and
+`decompress_mx_scale` of compressed-tensors 0.17.1). Those are GPT OSS's
+codes and scales in another layout, one output row per block row, so they
+decode through `dew.nn.gpt_oss.dequantize_mxfp4`.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 
 import ml_dtypes
 import numpy as np
 from numpy.typing import ArrayLike
+
+from dew import records
+from dew.nn.gpt_oss import GROUP, dequantize_mxfp4, quantize_mxfp4
 
 BLOCK = 128
 """DeepSeek's weight_block_size, [128, 128]."""
@@ -229,3 +242,114 @@ def pack_fp8(tensors: Mapping[str, np.ndarray], names: Iterable[str], block: int
                 f"{name} would overwrite it")
         out[name], out[partner] = quantize_fp8_blocks(out[name], block, ue8m0=ue8m0)
     return out
+
+
+PACKED_MXFP4_WEIGHTS = {'num_bits': 4, 'type': 'float', 'strategy': 'group', 'group_size': GROUP,
+                        'symmetric': True, 'dynamic': False, 'scale_dtype': 'torch.uint8',
+                        'actorder': None, 'block_structure': None, 'zp_dtype': None}
+"""compressed-tensors' MXFP4 weight scheme (`QuantizationArgs` of the one config
+group moonshotai/Kimi-K3 declares at f831ab6): the fields that change what the
+codes mean, each with the one value the packed layout below reads."""
+
+PACKED_SUFFIXES = ('.weight_packed', '.weight_scale')
+"""compressed-tensors' `mxfp4-pack-quantized` pair beside a Linear's module name."""
+
+
+def packed_mxfp4_format(quantization: Mapping[str, object]) -> None:
+    """Refuse a compressed-tensors config whose tensors are not MXFP4 packed weights.
+
+    Weights alone are quantized, as groups of 32 inputs under one E8M0
+    exponent; activations and the KV cache stay in the compute dtype.
+    """
+    if quantization.get('format') != 'mxfp4-pack-quantized':
+        raise ValueError(f"compressed-tensors format {quantization.get('format')!r}: this loader reads "
+                         "mxfp4-pack-quantized weights and nothing else")
+    if quantization.get('quantization_status', 'compressed') != 'compressed':
+        raise ValueError("compressed-tensors quantization_status must be 'compressed'")
+    if quantization.get('kv_cache_scheme') is not None:
+        raise ValueError("compressed-tensors kv_cache_scheme quantizes the cache, which this loader does not")
+    groups = quantization.get('config_groups')
+    if not isinstance(groups, Mapping) or not groups:
+        raise ValueError("compressed-tensors config_groups must name the quantized weights")
+    for name, group in groups.items():
+        group = records.record(group, f'config_groups.{name}')
+        if group.get('format', 'mxfp4-pack-quantized') != 'mxfp4-pack-quantized':
+            raise ValueError(f"config_groups.{name}.format must be mxfp4-pack-quantized")
+        for side in ('input_activations', 'output_activations'):
+            if group.get(side) is not None:
+                raise ValueError(f"config_groups.{name}.{side} quantizes activations, which this loader does not")
+        weights = records.record(group.get('weights'), f'config_groups.{name}.weights')
+        wrong = sorted(key for key, value in PACKED_MXFP4_WEIGHTS.items() if weights.get(key, value) != value)
+        if wrong:
+            raise ValueError(f"config_groups.{name}.weights {wrong} differ from MXFP4's "
+                             f"{ {key: PACKED_MXFP4_WEIGHTS[key] for key in wrong} }")
+
+
+def packed_mxfp4_stems(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """The `<module>.weight` names a checkpoint ships as a compressed-tensors
+    MXFP4 pair, sorted. Half a pair, or a pair beside a dense weight of the
+    same name, is refused: the checkpoint would hold one weight twice or not at all."""
+    modules = sorted({name.removesuffix(suffix) for name in tensors
+                      for suffix in PACKED_SUFFIXES if name.endswith(suffix)})
+    for module in modules:
+        for suffix in PACKED_SUFFIXES:
+            if module + suffix not in tensors:
+                raise ValueError(f"{module}.weight arrives MXFP4 packed and the checkpoint holds no {module}{suffix}")
+        if module + '.weight' in tensors:
+            raise ValueError(f"{module}.weight arrives both dense and MXFP4 packed")
+    return tuple(module + '.weight' for module in modules)
+
+
+def packed_mxfp4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """Decoded names: every unpaired tensor, then each packed Linear's weight."""
+    stems = packed_mxfp4_stems(tensors)
+    return tuple(name for name in tensors if not name.endswith(PACKED_SUFFIXES)) + stems
+
+
+def read_packed_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
+    """One original tensor; a packed Linear's weight decodes to FP32 `[output, input]`."""
+    module = name.removesuffix('.weight')
+    if name == module or module + PACKED_SUFFIXES[0] not in tensors:
+        return tensors[name]
+    packed, scales = np.asarray(tensors[module + PACKED_SUFFIXES[0]]), np.asarray(tensors[module + PACKED_SUFFIXES[1]])
+    if (packed.ndim != 2 or packed.shape[1] % (GROUP // 2)
+            or scales.shape != (packed.shape[0], packed.shape[1] // (GROUP // 2))):
+        raise ValueError(
+            f"{name} packs [output, input / 2] codes beside [output, input / {GROUP}] scales, "
+            f"got {packed.shape} and {scales.shape}")
+    blocks = packed.reshape(1, packed.shape[0], -1, GROUP // 2)
+    return dequantize_mxfp4(blocks, scales[None])[0].T
+
+
+def unpack_packed_mxfp4(tensors: Mapping[str, np.ndarray], *,
+                        param_dtype: str = "float32") -> dict[str, np.ndarray]:
+    """Decode each compressed-tensors pair in FP32 into its Linear's `.weight`,
+    retained in param_dtype. Every other tensor remains untouched."""
+    from dew.nn.text_encoders import checkpoint_array
+
+    unpacked = dict(tensors)
+    for stem in packed_mxfp4_stems(tensors):
+        unpacked[stem] = checkpoint_array(read_packed_mxfp4_tensor(unpacked, stem), param_dtype)
+        for suffix in PACKED_SUFFIXES:
+            unpacked.pop(stem.removesuffix('.weight') + suffix)
+    return unpacked
+
+
+def pack_packed_mxfp4(tensors: Mapping[str, np.ndarray],
+                      stems: Collection[str]) -> dict[str, np.ndarray]:
+    """Replace each named `<module>.weight` `[output, input]` with the
+    compressed-tensors pair `quantize_mxfp4` encodes it to. Only the stems a
+    source shipped packed (`packed_mxfp4_stems`); a named stem the tensors no
+    longer hold is refused, since the config would still promise its codes."""
+    packed = dict(tensors)
+    for stem in stems:
+        if stem not in packed:
+            raise ValueError(f"{stem} arrived MXFP4 packed and is not among the tensors to write back")
+        weight = np.asarray(packed.pop(stem))
+        if weight.ndim != 2:
+            raise ValueError(f"{stem} packs a Linear's [output, input] weight, got {weight.shape}")
+        blocks, scales = quantize_mxfp4(weight.T[None])
+        module = stem.removesuffix('.weight')
+        packed[module + PACKED_SUFFIXES[0]] = blocks[0].reshape(weight.shape[0], -1)
+        packed[module + PACKED_SUFFIXES[1]] = scales[0]
+    return packed
