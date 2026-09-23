@@ -23,9 +23,9 @@ Tolerances and the differences actually observed, fp32 on CPU:
   `A dt` gradient of magnitude 49, which is 3.3e-07 of it and under three fp32
   ulps. Tolerance 2e-5. Against the same scan in float64 both paths sit
   8.0e-06 from it on that gradient and 2.0e-06 on the output; the final state
-  2.8e-07 (kernel) and 2.1e-07 (XLA). `test_the_kernel_and_the_xla_scan_round_alike`
-  asserts that neither is more than twice the other's distance for every one
-  of them.
+  2.8e-07 (kernel) and 2.1e-07 (XLA). `test_the_kernel_is_as_exact_as_the_xla_scan`
+  asserts the kernel is never more than twice the XLA path's distance, for
+  every one of them.
 - document resets (`RESET_DECAY` in `A dt`) : output 1.9e-06, final state
   4.8e-07, gradients at most 5.7e-06 on gradients of magnitude up to 49,
   and no NaN from the finite reset in the segment-sum matmul.
@@ -180,11 +180,14 @@ def test_the_kernel_computes_the_xla_scan_across_document_resets(reference, plat
 
 
 @pytest.mark.parametrize("platform", KERNELS)
-def test_the_kernel_and_the_xla_scan_round_alike(reference, platform, in_float64):
+def test_the_kernel_is_as_exact_as_the_xla_scan(reference, platform, in_float64):
     """What separates the two at fp32 is rounding. Both sum each chunk's
     decays over their own ranges rather than subtracting cumulative sums, so
-    each sits within fp32 rounding of the same scan in float64, and neither
-    lands more than twice as far from it as the other."""
+    the kernel sits within fp32 rounding of the same scan in float64 as the
+    XLA path does: never more than twice as far from it. Which of the two
+    lands closer on a given leaf depends on the backend's summation order
+    (the final state: 2.8e-07 against 2.1e-07 on CPU, 1.8e-07 against
+    3.7e-07 under CUDA)."""
     operands = scan_operands(reference, 128)
     exact = [jnp.asarray(t, jnp.float64) for t in operands]
     truth, truth_final = xla_chunk_scan(*exact)
@@ -201,7 +204,7 @@ def test_the_kernel_and_the_xla_scan_round_alike(reference, platform, in_float64
                   strict=True)]
     for name, mine, theirs, want in pairs:
         kernel, xla = largest(mine, want), largest(theirs, want)
-        assert kernel <= 2 * xla and xla <= 2 * kernel, name
+        assert kernel <= 2 * xla, (name, kernel, xla)
 
 
 def mixer_operands(shape, seed: int = 0):
