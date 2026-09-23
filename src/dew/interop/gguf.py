@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING
 import ml_dtypes
 import numpy as np
 
+from dew import records
+
 if TYPE_CHECKING:
     from gguf import GGUFReader, ReaderTensor
     from transformers import PreTrainedTokenizerFast
@@ -43,6 +45,12 @@ _LAYER_NAMES = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "sel
 Qwen3ForCausalLM hold. transformers resolves a GGUF name by asking gguf-py's
 table for each name in the torch model's state dict; these names stand in
 for that state dict, and the same table answers."""
+
+
+_HEAD_WIDTHS = frozenset({"rope.dimension_count", "attention.key_length", "attention.value_length"})
+"""Keys the table drops or maps to head_dim that are inert at the head width:
+a rotary over part of each head, or keys and values wider or narrower than
+it, would compute another model."""
 
 
 def _parse(reader: GGUFReader, key: str) -> object:
@@ -64,10 +72,13 @@ def _config(reader: GGUFReader) -> tuple[str, dict[str, object]]:
     its tokenizer's length. transformers then builds the model from the
     config class over those fields, so the class's defaults belong to the
     file's config too (Qwen3's head_dim 128 is one no metadata key states);
-    `to_diff_dict` is config.json's own form of the result.
+    `to_diff_dict` is config.json's own form of the result. An
+    architecture key the table does not read (llama.cpp's
+    `rope.scaling.*`, for one) is refused, not dropped as transformers drops it.
     """
     from transformers import AutoConfig
     from transformers.integrations.ggml import GGUF_CONFIG_DEFAULTS_MAPPING
+    from transformers.modeling_gguf_pytorch_utils import GGUF_TO_TRANSFORMERS_MAPPING
 
     stated = _parse(reader, "general.architecture") if "general.architecture" in reader.fields else None
     if stated not in _ARCHITECTURES:
@@ -83,6 +94,19 @@ def _config(reader: GGUFReader) -> tuple[str, dict[str, object]]:
     if "vocab_size" not in fields and "tokenizer.ggml.tokens" in reader.fields:
         fields["vocab_size"] = len(reader.fields["tokenizer.ggml.tokens"].data)
     config = AutoConfig.for_model(architecture, **fields).to_diff_dict()
+    table = GGUF_TO_TRANSFORMERS_MAPPING["config"][architecture]
+    head_dim = config.get("head_dim") or records.integer(config["hidden_size"], "hidden_size") // records.integer(
+        config["num_attention_heads"], "num_attention_heads")
+    for key in reader.fields:
+        name = key.removeprefix(f"{architecture}.")
+        if name == key or (table.get(name, -1) is not None and name in table):
+            continue
+        if name in _HEAD_WIDTHS and _parse(reader, key) == head_dim:
+            continue
+        raise ValueError(
+            f"GGUF metadata {key}={_parse(reader, key)!r} changes the model and transformers' GGUF table "
+            f"does not read it, so the model would load without it; load the safetensors repo the file "
+            "was quantized from (the model card's base_model)")
     return architecture, config
 
 

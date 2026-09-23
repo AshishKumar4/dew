@@ -104,7 +104,7 @@ def byte_tokens() -> list[str]:
 
 
 def write_gguf(path, architecture: str, qtype, tensors: dict[str, np.ndarray],
-               rng: np.random.Generator, *, extra: tuple[str, ...] = ()) -> None:
+               rng: np.random.Generator, *, extra: tuple[str, ...] = (), scaling: float | None = None) -> None:
     """Write `tensors` as llama.cpp would: metadata, a byte-level BPE vocabulary, and
     every matrix in `qtype` (norms and biases stay F32, as llama.cpp keeps them)."""
     writer = gguf.GGUFWriter(str(path), architecture)
@@ -117,6 +117,9 @@ def write_gguf(path, architecture: str, qtype, tensors: dict[str, np.ndarray],
     writer.add_layer_norm_rms_eps(1e-6)
     writer.add_rope_freq_base(10000.0)
     writer.add_vocab_size(VOCAB)
+    if scaling is not None:
+        writer.add_rope_scaling_type(gguf.RopeScalingType.LINEAR)
+        writer.add_rope_scaling_factor(scaling)
     if architecture == "llama":
         writer.add_rope_dimension_count(HIDDEN // HEADS)
     if architecture == "qwen3":
@@ -247,6 +250,17 @@ print(np.asarray(loaded.processor("Hello, GGUF").tokens).tolist()[0])
                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert run.returncode == 0, run.stderr[-1500:]
     assert run.stdout.split("\n")[-2] == str(expected)
+
+
+def test_metadata_the_table_does_not_read_is_refused(tmp_path):
+    """llama.cpp writes a linear or YaRN rope scaling under `rope.scaling.*`,
+    which transformers' table drops; the model would rotate unscaled."""
+    rng = np.random.default_rng(0)
+    write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.F32, hf_tensors("llama", rng), rng,
+               scaling=4.0)
+
+    with pytest.raises(ValueError, match=r"llama\.rope\.scaling\.type='linear'.*base_model"):
+        dew_gguf.read(tmp_path / "model.gguf")
 
 
 def test_a_tensor_with_no_hf_name_is_refused(tmp_path):
