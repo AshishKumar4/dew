@@ -79,8 +79,10 @@ class Launch:
     order, through JAX_LOCAL_DEVICE_IDS. Unset leaves every process every
     local device, which is right for one process per host. Not for
     `--slurm`, where jax assigns one GPU per task itself."""
-    port: int = 43217
-    """The coordinator's port on process 0's host."""
+    port: Count = None
+    """The coordinator's port on process 0's host; unset takes one that is
+    free there when the launch starts, so two pools on one machine never
+    share a coordinator."""
     coordinator: Address = None
     """The address the other hosts reach process 0's host at; unset takes
     the first host, or this machine's name when that is localhost and other
@@ -127,7 +129,7 @@ class Launch:
         host = self.coordinator or self.hosts[0]
         if host in LOCAL_HOSTS and any(name not in LOCAL_HOSTS for name in self.hosts):
             host = socket.getfqdn()
-        return f"{host}:{self.port}"
+        return f"{host}:{self.port if self.port is not None else free_port(self.hosts[0])}"
 
     def pool(self) -> list[Process]:
         """Every process, in rank order: host by host, then within a host."""
@@ -185,6 +187,23 @@ class Launch:
                 emit(f"{prefix} {shlex.join(process.argv)}" if local else shlex.join(process.argv))
             return 0
         return supervise(processes, self.cwd)
+
+
+def free_port(host: str) -> int:
+    """A TCP port nothing listens on at `host` now: port 0 bound there, which
+    has the kernel pick one, and released. Another host is asked over ssh,
+    with the python3 its shell finds."""
+    if host in LOCAL_HOSTS:
+        with socket.socket() as probe:
+            probe.bind(("", 0))
+            return probe.getsockname()[1]
+    probe = "import socket; s = socket.socket(); s.bind(('', 0)); print(s.getsockname()[1])"
+    found = subprocess.run(("ssh", "-o", "BatchMode=yes", host, f"python3 -c {shlex.quote(probe)}"),
+                           capture_output=True, text=True, timeout=60)
+    if found.returncode != 0 or not found.stdout.strip().isdigit():
+        raise ValueError(f"no free port found on {host} with python3 over ssh: "
+                         f"{found.stderr.strip()[-300:]}; name one with --port")
+    return int(found.stdout)
 
 
 def _relay(rank: int, stream: TextIO, out: TextIO, lock: threading.Lock) -> None:
