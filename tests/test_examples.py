@@ -201,18 +201,61 @@ def test_train_rlvr_starts_sglang_with_room_for_a_prompt_at_the_window_and_its_f
 def test_train_rlvr_smoke_commits_every_update_one_behind(tmp_path):
     """The smoke's completions all run out of their eight tokens, so a run
     that masked truncations would commit nothing and never push. The
-    example scores them, as AsyncRollout did: both updates commit, and the
-    second trains on draws submitted one update earlier."""
+    example scores them: both updates commit, and the second trains on
+    draws submitted one update earlier."""
     smoke("train_rlvr", tmp_path)
     summary = json.loads((tmp_path / "rewards.json").read_text())
     assert summary["updates"] == 2 and summary["max_lag"] == 1
 
 
-def test_train_rlvr_smoke_trains_through_multi_turn_environments(tmp_path):
-    """`--turns 2` trains through EnvironmentSource: both updates commit, one behind."""
+def test_train_rlvr_turns_smoke_trains_through_environment_source(tmp_path):
+    """`--turns 2` runs its sessions through EnvironmentSource and commits both updates, one behind.
+    The tiny model's attempts end on the token budget, so the feedback path
+    is the next test's."""
     smoke("train_rlvr", tmp_path, "--turns", "2")
     summary = json.loads((tmp_path / "rewards.json").read_text())
     assert summary["updates"] == 2 and summary["max_lag"] == 1
+
+
+def test_train_rlvr_turns_feed_a_failed_attempt_back_and_run_each_program_once():
+    """The example's own Attempts and verifier through EnvironmentSource, on a
+    server that draws a failing program and then a passing one: the second
+    call's prompt extends the first call's ids with the test report, both pack
+    into one chain, and each program runs once."""
+    from concurrent.futures import Future
+
+    from dew.inference import Draw
+    from dew.objectives.rl import Status, Task, pack
+    from dew.sampling import Sampling
+
+    example = load_example("train_rlvr")
+    eos, failing, passing = 9, (5, 5), (6, 6)
+    runs = []
+
+    class Server:
+        sampling = Sampling(temperature=1.0, eos_id=eos)
+        version = 0
+
+        def submit(self, prompt, max_new_tokens, *, seed):
+            program = failing if not runs else passing
+            future = Future()
+            future.set_result(Draw(tuple(prompt), (*program, eos), (-.5,) * 3, None, True, 0))
+            return future
+
+    def reward(source, completion, cases, info):
+        runs.append(completion)
+        return 1.0 if completion == "6 6" else 1 / 3
+
+    config = example.Config(prompt_tokens=8, new_tokens=4, turns=2, prompts=1, groups=1)
+    source = example.attempts_source(Server(), reward, lambda ids: " ".join(map(str, ids)),
+                                     lambda text: [7, 7], config)
+    session = source.submit(Task("t", {"prompt": (1, 2), "truth": "cases"}), 1, version=0)[0].result(timeout=10)
+    source.close()
+    assert session.status == Status.COMPLETED and session.reward == 1.0
+    first, second = session.calls
+    assert second.prompt_ids == (*first.prompt_ids, *first.sampled_ids, 7, 7)
+    assert pack([session], 32)["text_segment_ids"].max() == 1
+    assert runs == ["5 5", "6 6"]
 
 
 def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):
