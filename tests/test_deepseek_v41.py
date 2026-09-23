@@ -191,14 +191,23 @@ def test_the_engram_hash_is_the_releases_int64_arithmetic():
     np.testing.assert_array_equal(ids, np.concatenate(expected, -1) + offsets)
 
 
-def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
+@pytest.fixture(scope="module")
+def released():
+    """The released config, its fields, the model they build and its tree's shapes."""
+    config = json.loads((RELEASED / "config.json").read_text())
+    fields = translate_config(config)
+    model = models.build("causal_transformer", **fields)
+    shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
+    return config, fields, model, shapes
+
+
+def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree(released):
     """The pinned weight index's 96085 tensors, their FP8/FP4 `.scale`
     partners aside, map onto the tree the released config builds, and
     together they cover it; the vision tower, its aligner, the image span
     embeddings and the routers' image-token bias are the vision half, which
     the text model retains by name."""
-    config = json.loads((RELEASED / "config.json").read_text())
-    fields = translate_config(config)
+    config, fields, model, shapes = released
     family = _FAMILIES["deepseek_v41"]
     text = config["text_config"]
     names = []
@@ -224,12 +233,25 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
     bound = {tuple(part for index, part in enumerate(path)
                    if not (index and path[index - 1] == 'experts' and part.isdigit()))
              for path in bound}
-    model = models.build("causal_transformer", **fields)
-    shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     tree = {tuple(name.split(".")) for name in _flatten(dict(shapes))}
     tree.discard(("constants", "engram_hashes", "token_map"))
     assert bound == tree
     assert model.num_layers == 40 and model.dspark.stages == 3 and model.mixture.experts == 384
+
+
+def test_every_matrix_of_the_released_tree_shards_by_a_declared_rule(released):
+    """No weight of two or more axes is left to the shape heuristic unasked:
+    the engram tables alone hold 384M rows a layer, which shard as a
+    vocabulary's do."""
+    from dew.nn.sharding import declared_axes, is_heuristic
+
+    *_, shapes = released
+    uncovered = [jax.tree_util.keystr(path) for path, leaf in jax.tree_util.tree_flatten_with_path(shapes)[0]
+                 if leaf.ndim >= 2 and declared_axes(path, leaf.ndim) is None and not is_heuristic(path)]
+    assert uncovered == []
+    engram = [declared_axes(path, leaf.ndim) for path, leaf in jax.tree_util.tree_flatten_with_path(shapes)[0]
+              if jax.tree_util.keystr(path).endswith("['engram']['embed']['embedding']")]
+    assert engram == [("vocab", None)] * 2
 
 
 def test_the_forward_matches_the_reference(source):
