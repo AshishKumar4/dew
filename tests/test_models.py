@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from flax.traverse_util import flatten_dict
 
 from dew.nn.attention import LayerNorm, Stage
 from dew.nn.backbones.dit import SimpleDiT
@@ -49,6 +50,28 @@ def test_a_bf16_dit_predicts_in_fp32(rng):
     out = model.apply(params, x, temb, textcontext)
     assert out.dtype == jnp.float32
     assert not jnp.array_equal(out, out.astype(jnp.bfloat16).astype(jnp.float32))
+
+
+@pytest.mark.parametrize("norm_groups", [8, 0], ids=["group_norm", "rms_norm"])
+def test_a_bf16_unet_keeps_its_activations_in_bf16(rng, norm_groups):
+    """With fp32 parameters and a bf16 compute dtype, every image-shaped
+    activation the Unet produces is bf16, the norms' outputs included. A norm
+    that leaves its dtype to promotion returns fp32 against its fp32 scale,
+    and the activation and convolution after it then read fp32 activations
+    the step keeps for the backward pass."""
+    stage = Stage(heads=2, dtype=jnp.bfloat16, force_fp32_for_softmax=True)
+    model = Unet(output_channels=3, emb_features=32, feature_depths=(16, 32),
+                 attention_configs=(None, stage), num_res_blocks=1, norm_groups=norm_groups,
+                 dtype=jnp.bfloat16)
+    x = jax.random.normal(rng, (2, 16, 16, 3), jnp.bfloat16)
+    temb = jnp.ones((2,))
+    params = model.init(rng, x, temb)
+    _, state = model.apply(params, x, temb, capture_intermediates=True)
+    activations = {"/".join(path): leaf.dtype
+                   for path, outputs in flatten_dict(state["intermediates"]).items()
+                   for leaf in outputs if leaf.ndim == 4}
+    assert any(path.endswith("norm1/__call__") for path in activations)
+    assert {path: dtype for path, dtype in activations.items() if dtype != jnp.bfloat16} == {}
 
 
 @pytest.mark.parametrize("architecture, extra", [

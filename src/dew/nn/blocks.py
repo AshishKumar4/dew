@@ -9,6 +9,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from .attention import RMSNorm
 from .sharding import logical_axes
 
 
@@ -131,9 +132,9 @@ class ResidualBlock(nn.Module):
 
     def setup(self):
         if self.norm_groups > 0:
-            norm = partial(nn.GroupNorm, self.norm_groups, epsilon=self.norm_epsilon)
+            norm = partial(nn.GroupNorm, self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype)
         else:
-            norm = partial(nn.RMSNorm, epsilon=self.norm_epsilon)
+            norm = partial(RMSNorm, epsilon=self.norm_epsilon, dtype=self.dtype)
         self.norm1 = norm()
         self.norm2 = norm()
 
