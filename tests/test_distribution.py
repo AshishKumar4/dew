@@ -275,6 +275,26 @@ def stepping_pool(rank_one: str, *, execution_timeout: str | None = None) -> str
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_rank_whose_backend_fails_to_open_after_joining_ends_the_pool():
+    """Rank 1 joins the pool and then cannot open its backend, as a GPU with
+    no memory left fails to, while rank 0 waits two minutes for its devices'
+    topology. Rank 1 has to leave at once, not wait in jax.distributed's
+    shutdown barrier for the peer that waits for it, so the launch ends with
+    its error within a bound."""
+    program = ("import os\n"
+               "if os.environ['DEW_PROCESS_ID'] == '1':\n"
+               "    os.environ['JAX_PLATFORMS'] = 'nosuchplatform'\n"
+               "from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n")
+    started = time.monotonic()
+    done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program,
+                  devices=1, timeout=600)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "nosuchplatform" in done.stdout, done.stdout
+    assert time.monotonic() - started < 60, done.stdout + done.stderr
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_rank_that_raises_between_collectives_stops_the_pool():
     """Rank 1 raises before its fourth step while rank 0 is inside that
     step's reduction, waiting for a partner that is gone, which no backend
