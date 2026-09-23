@@ -38,9 +38,7 @@ from uuid import uuid4
 
 import numpy as np
 
-from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.inference.rollouts import Draw, RolloutServer
-from dew.nn.inputs import local_rows
 from dew.objectives.base import Batch
 
 from .episodes import (
@@ -55,7 +53,7 @@ from .episodes import (
     step_action,
     turn_limit,
 )
-from .rollout import _texts
+from .rollout import prompt_rows
 from .sessions import Call, Session, Status, Task
 
 
@@ -242,12 +240,8 @@ def prompt_tasks(batch: Batch) -> list[Task]:
 
     The id is a digest of the prompt ids; groups, not ids, keep repeats apart.
     """
-    prompts, lengths = local_rows(batch[PROMPT_KEY]), local_rows(batch[LENGTH_KEY])
-    sources, truths, infos = (_texts(local_rows(batch[name])) for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
+    prompts, lengths, sources, truths, infos = prompt_rows(batch)
     rows, width = prompts.shape
-    if (lengths.shape != (rows,) or not np.issubdtype(lengths.dtype, np.integer)
-            or np.any(lengths < 1) or np.any(lengths > width)):
-        raise ValueError("prompt_length must contain one valid integer length per row")
     tasks = []
     for row in range(rows):
         ids = tuple(int(token) for token in prompts[row, width - int(lengths[row]):])
