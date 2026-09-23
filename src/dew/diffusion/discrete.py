@@ -199,7 +199,9 @@ class DiscreteDenoiser:
         logits = self.model.apply(self.params, x_t, **fields, rngs=None, mutable=False,
                                   capture_intermediates=False, method=None)
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
-        logits = logits.at[..., self.process.mask_id].set(-jnp.inf)
+        # Normalized in fp32, as `token_log_probs` does: the reveal draws its
+        # categorical from these, and a bf16 log partition would quantize it.
+        logits = logits.astype(jnp.float32).at[..., self.process.mask_id].set(-jnp.inf)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         masked = self.masked(x_t)
         filled = jnp.where(masked, jnp.argmax(log_probs, axis=-1), x_t)
