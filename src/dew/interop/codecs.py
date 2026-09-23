@@ -488,29 +488,34 @@ def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
     return block[0], scale_fmt == 'ue8m0'
 
 
+def _check_grid(weight: np.ndarray, scale_inv: np.ndarray, block: int) -> None:
+    """Refuse scales that are not one per block of a [rows, cols] weight,
+    [ceil(rows / block), ceil(cols / block)]."""
+    if weight.ndim != 2 or scale_inv.ndim != 2:
+        raise ValueError(
+            f"block-scaled dequantization takes a [rows, cols] weight and its "
+            f"[row blocks, col blocks] scales, got shapes {weight.shape} and "
+            f"{scale_inv.shape}")
+    blocks = (math.ceil(weight.shape[0] / block), math.ceil(weight.shape[1] / block))
+    if scale_inv.shape != blocks:
+        raise ValueError(
+            f"a {weight.shape} weight in {block} x {block} blocks takes a "
+            f"{blocks} scale, got {scale_inv.shape}")
+
+
 def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
                           block: int = BLOCK) -> np.ndarray:
     """Return float32(weight[i, j]) * float32(scale_inv[i // block, j // block]).
 
     `weight` may be in any float dtype, `scale_inv` float32 or E8M0.
     """
-    if weight.ndim != 2 or scale_inv.ndim != 2:
-        raise ValueError(
-            f"block-scaled dequantization takes a [rows, cols] weight and its "
-            f"[row blocks, col blocks] scales, got shapes {weight.shape} and "
-            f"{scale_inv.shape}")
-    rows, cols = weight.shape
-    blocks = (math.ceil(rows / block), math.ceil(cols / block))
-    if scale_inv.shape != blocks:
-        raise ValueError(
-            f"a {weight.shape} weight in {block} x {block} blocks takes a "
-            f"{blocks} scale, got {scale_inv.shape}")
+    _check_grid(weight, scale_inv, block)
     # Scaled one block row at a time, so no scale array of the weight's size
     # is ever built.
     out = weight.astype(np.float32)
     scales = scale_inv.astype(np.float32)
-    for index in range(blocks[0]):
-        out[index * block:(index + 1) * block] *= np.repeat(scales[index], block)[:cols]
+    for index in range(scales.shape[0]):
+        out[index * block:(index + 1) * block] *= np.repeat(scales[index], block)[:weight.shape[1]]
     return out
 
 
@@ -523,9 +528,10 @@ def fp8_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
 
 
 def _read_blocks(weight: np.ndarray, scale: np.ndarray, block: int, index: Index | None) -> np.ndarray:
-    """The region `index` names of a block-scaled [rows, cols] weight."""
-    if weight.ndim != 2:
-        raise ValueError(f"block-scaled dequantization takes a [rows, cols] weight, got {weight.shape}")
+    """The region `index` names of a block-scaled [rows, cols] weight. The
+    whole scale grid is checked first: a grid of other blocks can fit the
+    region it covers."""
+    _check_grid(weight, scale, block)
     covered, span, within = _hull(index, weight.shape, (block, block))
     return dequantize_fp8_blocks(weight[span], scale[covered], block)[within]
 
