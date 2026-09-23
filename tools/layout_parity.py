@@ -7,12 +7,14 @@ and runs the trainer's own compiled step. The optimizer is `stash` before
 adam, so the gradient the step handed the optimizer is kept whole and
 compared leaf by leaf.
 
-A layout changes the order of the sums over rows and tokens and nothing
-else, so its error is held to the reference's own deviation under that kind
-of change: the batch with its rows permuted, and pooled from 2 and 4
-accumulated slices, which is the per-device shapes and partial sums a split
-batch computes. The floor is taken per leaf, and a layout `works` when every
-leaf is within `FLOOR_FACTOR` of it and the loss within as much of its own.
+A layout changes the order of the sums over rows, tokens and split widths
+and nothing else, so its error is held to the reference's own deviation
+under that kind of change: the batch with its rows in PERMUTATIONS orders,
+and pooled from 2 and 4 accumulated slices of consecutive rows and of
+strided rows, which is the per-device shapes and partial sums a split batch
+or a pipeline's microbatches compute. The floor is the largest deviation per
+leaf, and a layout `works` when every leaf is within `FLOOR_FACTOR` of it
+and the loss within as much of its own.
 
 An objective that draws noise per row (a DiT's diffusion) draws other noise
 for permuted or pooled rows, so neither is a reassociation of its step. Its
@@ -47,7 +49,7 @@ import tyro
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 FLOOR_FACTOR = 4.0
-PERMUTATIONS = 4
+PERMUTATIONS = 16
 
 LAYOUTS: dict[str, dict[str, int]] = {
     "data4": {},
@@ -126,18 +128,12 @@ def reordered(batch, seed: int):
     return jax.tree.map(lambda leaf: np.asarray(leaf)[order], batch)
 
 
-def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False,
-            accumulation: int = 1) -> tuple[list[float], Any, dict[str, Any]]:
-    """The losses of `steps` steps on the layout `fields` names, step one's
-    gradient gathered whole, and what the compiler says of the step.
-
-    `accumulation` above one pools that many consecutive slices of the batch
-    into one update on one device: the batch split, laid out in time."""
+def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumulation: int = 1):
+    """The trainer of `case` on the layout `fields` names, or on this
+    process's first device, stashing each gradient the optimizer is handed."""
     import benchmark_step as bench
     import jax
-    import numpy as np
     import optax
-    from jax.experimental import multihost_utils
 
     from dew.training import Layout, MeshSpec, Trainer, build_mesh
 
@@ -147,22 +143,58 @@ def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool
                       accumulation=accumulation, checkpoints=None, tracker=None)
     if one_device:
         trainer.device_mesh = build_mesh(MeshSpec(), [jax.local_devices()[0]])
+    return trainer
+
+
+def _gradient(state):
+    import jax
+    import numpy as np
+    from jax.experimental import multihost_utils
+
+    return jax.tree.map(
+        lambda leaf: np.asarray(multihost_utils.process_allgather(leaf, tiled=True)),
+        state.opt_state[0]["gradient"])
+
+
+def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False
+            ) -> tuple[list[float], Any, dict[str, Any]]:
+    """The losses of `steps` steps on the layout `fields` names, step one's
+    gradient gathered whole, and what the compiler says of the step."""
+    trainer = _trainer(case, fields, one_device=one_device)
     state, _, _ = trainer.place()
-    rows = len(jax.tree.leaves(batch)[0]) // accumulation
-    slices = [placed(jax.tree.map(lambda leaf: np.asarray(leaf)[i * rows:(i + 1) * rows], batch),
-                     trainer.device_mesh) for i in range(accumulation)]
-    step = trainer.compile(state, slices[0])
+    data = placed(batch, trainer.device_mesh)
+    step = trainer.compile(state, data)
     losses, gradient = [], None
-    for index in range(steps if accumulation == 1 else accumulation):
-        state, loss, _, _, _ = step(state, slices[index % accumulation])
+    for _ in range(steps):
+        state, loss, _, _, _ = step(state, data)
         losses.append(float(loss))
-        if gradient is None and (accumulation == 1 or index == accumulation - 1):
-            gradient = jax.tree.map(
-                lambda leaf: np.asarray(multihost_utils.process_allgather(leaf, tiled=True)),
-                state.opt_state[0]["gradient"])
+        gradient = _gradient(state) if gradient is None else gradient
     compiled = {"flops_per_device": trainer.flops_per_step,
                 "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()}}
     return losses, gradient, compiled
+
+
+def pooled(case, batches, pieces: int) -> list[tuple[float, Any]]:
+    """Step one's loss and gradient on one device for each batch, each pooled
+    from `pieces` consecutive slices of its rows by accumulation, from one
+    initial state through one compiled step."""
+    import jax
+    import numpy as np
+
+    trainer = _trainer(case, {}, one_device=True, accumulation=pieces)
+    step, results = None, []
+    for batch in batches:
+        state, _, _ = trainer.place()
+        rows = len(jax.tree.leaves(batch)[0]) // pieces
+        slices = [placed(jax.tree.map(lambda leaf: np.asarray(leaf)[i * rows:(i + 1) * rows], batch),
+                         trainer.device_mesh) for i in range(pieces)]
+        step = trainer.compile(state, slices[0]) if step is None else step
+        losses = []
+        for data in slices:
+            state, loss, _, _, _ = step(state, data)
+            losses.append(float(loss))
+        results.append((float(np.mean(losses)), _gradient(state)))
+    return results
 
 
 def leaf_errors(reference, other) -> dict[str, float]:
@@ -180,23 +212,31 @@ def leaf_errors(reference, other) -> dict[str, float]:
     return errors
 
 
+def strided(batch, pieces: int):
+    """The batch with rows m, m + pieces, m + 2 * pieces, ... gathered into
+    its m-th consecutive slice: a pipeline's microbatch m."""
+    import jax
+    import numpy as np
+
+    rows = len(jax.tree.leaves(batch)[0])
+    order = np.concatenate([np.arange(start, rows, pieces) for start in range(pieces)])
+    return jax.tree.map(lambda leaf: np.asarray(leaf)[order], batch)
+
+
 def floor(case, batch, reference, reference_loss: float) -> tuple[dict[str, float], float]:
     """Per leaf, the largest deviation of the reference from itself under a
     reassociation of the batch's sums, and the same of the step-one loss."""
     if not case.is_lm:
         losses, gradient, _ = trained(case, {}, batch, steps=1)
         return leaf_errors(reference, gradient), abs(losses[0] - reference_loss)
+    runs = pooled(case, [reordered(batch, seed) for seed in range(PERMUTATIONS)], 1)
+    loss = max(abs(moved - reference_loss) for moved, _ in runs)
+    for pieces in (2, 4):
+        runs += pooled(case, [batch, strided(batch, pieces)], pieces)
     leaves: dict[str, float] = {}
-    loss = 0.0
-    for seed in range(PERMUTATIONS):
-        moved, gradient, _ = trained(case, {}, reordered(batch, seed), steps=1, one_device=True)
-        loss = max(loss, abs(moved[0] - reference_loss))
+    for _, gradient in runs:
         for leaf, error in leaf_errors(reference, gradient).items():
             leaves[leaf] = max(leaves.get(leaf, 0.0), error)
-    for pieces in (2, 4):
-        _, gradient, _ = trained(case, {}, batch, steps=1, one_device=True, accumulation=pieces)
-        for leaf, error in leaf_errors(reference, gradient).items():
-            leaves[leaf] = max(leaves[leaf], error)
     return leaves, loss
 
 
