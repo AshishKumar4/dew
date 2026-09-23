@@ -56,9 +56,9 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.sharding import PartitionSpec as P
 
+from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
-from dew.nn.blocks import normal_kernel
 from dew.nn.linear import _masked_conv1d, causal_conv1d, document_conv1d, document_starts
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.sharding import SEQUENCE_AXIS, logical_axes, row_axes, sequence_shards
