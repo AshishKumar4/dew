@@ -1,7 +1,7 @@
 """Mix tokens with S5 state-space layers and a 2D state fusion convolution.
 
-The S5 layer is a diagonal SSM run by `associative_scan` under a HiPPO
-init. The fusion convolution is Spatial-Mamba's, and the two together are
+The S5 layer is a diagonal SSM run by `associative_scan` from the S4D-Lin
+poles. The fusion convolution is Spatial-Mamba's, and the two together are
 the SSM mixer of `ModulatedBlock`.
 """
 
@@ -15,14 +15,15 @@ from .sharding import logical_axes
 
 
 def hippo_log_a_real_init(key, shape, dtype=jnp.float32):
-    """HiPPO-diag init: A_real_n = -(n + 0.5), stored as log of the negative."""
-    state_dim = shape[0]
-    n = jnp.arange(state_dim, dtype=dtype)
-    return jnp.log(n + 0.5).astype(dtype)
+    """S4D-Lin real part: A_real_n = -1/2 for every state, stored as the log
+    of its negative (Gu, Gupta, Goel and Re, "On the Parameterization and
+    Initialization of Diagonal State Space Models", 2022, section 4; S5's
+    HiPPO-N poles share the same real part, Smith et al. 2023, section 4.1)."""
+    return jnp.full(shape, jnp.log(0.5), dtype)
 
 
 def hippo_a_imag_init(key, shape, dtype=jnp.float32):
-    """HiPPO-diag init: A_imag_n = pi * n."""
+    """S4D-Lin imaginary part: A_imag_n = pi * n."""
     state_dim = shape[0]
     n = jnp.arange(state_dim, dtype=dtype)
     return (jnp.pi * n).astype(dtype)
@@ -57,7 +58,7 @@ class S5Layer(nn.Module):
         B, S, F = u.shape
         assert self.features == F, f"S5Layer built for {self.features} features, got {F}"
 
-        # A: diagonal complex state matrix, HiPPO init, parameterized as
+        # A: diagonal complex state matrix, S4D-Lin init, parameterized as
         # log of the negative real part for stability
         log_A_real = self.param(
             'log_A_real',
