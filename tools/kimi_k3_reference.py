@@ -7,9 +7,12 @@ layers call fla-core's Triton kernels (chunk_kda, fused_recurrent_kda,
 ShortConvolution, FusedRMSNormGated), so this runs on a CUDA device, in fp32,
 with TRITON_F32_DEFAULT=ieee for every dot that leaves its precision unset
 and IEEE forced on the one that sets it (the third item below). The routed
-experts are encoded by compressed-tensors' own MXFP4 compressor and the
-reference computes with its own decompression of them, so the packed file
-and the logits describe one model.
+experts are encoded by compressed-tensors' MXFP4 compressor over the scales
+its `generate_mx_scales` gives each group's largest magnitude, and the
+reference computes with the library's own decompression of them, so the
+packed file and the logits describe one model. Those are the scales the
+library's `calculate_qparams` takes, less its clamp to [0, 255], which only
+an all-zero group reaches; the fixture has none.
 
 Environment (~/.cache/dew/reference-venvs/kimi-k3): torch 2.8.0+cu128,
 transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1.
