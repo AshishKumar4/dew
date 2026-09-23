@@ -470,7 +470,12 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
         for process in processes:
             child = subprocess.Popen(
                 process.argv, cwd=cwd if process.local else None,
-                env={**os.environ, **process.env} if process.local else None,
+                # Unbuffered, so a local Python rank's prints reach the relay
+                # when they happen and in order with its warnings; a remote
+                # rank writes to the terminal ssh -tt gives it, which Python
+                # line-buffers already.
+                env={"PYTHONUNBUFFERED": "1", **os.environ, **process.env} if process.local
+                else None,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", start_new_session=True)
             running.append(child)
