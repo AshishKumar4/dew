@@ -17,7 +17,7 @@ infrastructure failure, retried and never scored; a context, token or turn
 limit truncates; only COMPLETED and TRUNCATED sessions reach the verifier.
 
 `PromptSource` is the single-turn case: one call per sample, scored on
-decoded text by a `Reward` on scorer threads as each draw finishes, so
+decoded text by a reward on scorer threads as each draw finishes, so
 verification overlaps generation.
 
 Verifiers return a float or a `Score` whose `components` travel with the
@@ -52,7 +52,7 @@ from .episodes import (
     Transition,
     rollout_of,
 )
-from .rollout import Reward, _texts
+from .rollout import _texts
 from .rollouts import Call, Rollout, Status, Task
 
 
@@ -257,12 +257,14 @@ def prompt_tasks(batch: Batch) -> list[Task]:
 class PromptSource:
     """Draw one completion per sample of a `prompt_tasks` task and score its decoded text.
 
-    `reward` scores the completion with EOS excluded, on `scorers` threads.
-    A draw that ends on its token budget is TRUNCATED and scored for the
-    record only; a failed draw or reward is an infrastructure failure.
+    `reward` scores the completion with EOS excluded, on `scorers` threads,
+    returning a float or a `Score`. A draw that ends on its token budget is
+    TRUNCATED and still scored; a failed draw or reward is an
+    infrastructure failure. Anything else that fails resolves the rollout's
+    future with the exception, so no future is left pending.
     """
 
-    def __init__(self, server: RolloutServer, reward: Reward, *, decode: Callable[[Sequence[int]], str],
+    def __init__(self, server: RolloutServer, reward: Callable[[str, str, str, str], float | Score], *, decode: Callable[[Sequence[int]], str],
                  max_new_tokens: int, scorers: int = 16, seed: int = 0):
         if type(max_new_tokens) is not int or max_new_tokens < 1:
             raise ValueError("a rollout generates at least one token")
@@ -313,8 +315,15 @@ class PromptSource:
         def score() -> None:
             if scored.cancelled():
                 return
+            try:
+                rollout = self._rollout(task, drawn)
+            except BaseException as failure:
+                # Not a failure of the draw or the reward: a broken source, which the scheduler raises.
+                with suppress(InvalidStateError):  # cancelled while scoring
+                    scored.set_exception(failure)
+                return
             with suppress(InvalidStateError):  # cancelled while scoring
-                scored.set_result(self._rollout(task, drawn))
+                scored.set_result(rollout)
 
         def chained(_: Future[Draw]) -> None:
             try:

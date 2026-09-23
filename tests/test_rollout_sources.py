@@ -220,3 +220,13 @@ def test_a_failed_draw_or_reward_is_an_infra_error():
     assert rollout.status == Status.INFRA_ERROR and "non-finite" in rollout.detail
     drawn.close()
     scored.close()
+
+
+def test_a_prompt_source_failure_outside_the_reward_resolves_the_future_instead_of_hanging():
+    # A bool reward passes the verifier's finiteness check but no Rollout accepts it.
+    [task] = prompt_tasks(prompt_batch())
+    prompts = PromptSource(Server(), lambda *_: Score(True), decode=str, max_new_tokens=4)
+    future = prompts.submit(task, 1, version=0)[0]
+    with pytest.raises(ValueError, match="finite number"):
+        future.result(timeout=10)
+    prompts.close()
