@@ -87,11 +87,19 @@ def test_every_published_tensor_is_mapped_and_exports_bit_identical(source, load
         assert written.tobytes() == published.tobytes(), layout.name
 
 
+def posterior(model, params, image):
+    """The posterior's mean and standard deviation, split from the encoder's
+    moments as `posterior_latent` splits them."""
+    moments = model.apply({"params": params}, image, method=lambda vae, x: vae.quant_conv(vae.encoder(x)))
+    mean, log_variance = jnp.split(moments, 2, axis=-1)
+    return mean, jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+
+
 def test_the_posterior_matches_the_source(loaded, reference):
     autoencoder, params, _, _ = loaded
     model = autoencoder.model
     image = channels_last(reference["image"])
-    mean, std = model.apply({"params": params}, image, method=model.posterior)
+    mean, std = posterior(model, params, image)
     assert mean.shape == (2, 2, 3, 8)
     gaps = {"mean": scaled_gap(mean, channels_last(reference["mean"])),
             "std": scaled_gap(std, channels_last(reference["std"]))}
@@ -106,7 +114,7 @@ def test_a_sampled_latent_is_the_mean_plus_std_times_the_draw(loaded, reference)
     model = autoencoder.model
     image = channels_last(reference["image"])
     key = jax.random.key(7)
-    mean, std = model.apply({"params": params}, image, method=model.posterior)
+    mean, std = posterior(model, params, image)
     sampled = model.apply({"params": params}, image, key, method=model.encode)
     expected = mean + std * jax.random.normal(key, mean.shape, mean.dtype)
     assert scaled_gap(sampled, expected) < 1e-6
@@ -131,7 +139,7 @@ def test_encoder_gradients_match_the_source(loaded, reference):
     probe_std = channels_last(reference["probe_std"])
 
     def objective(params, image):
-        mean, std = model.apply({"params": params}, image, method=model.posterior)
+        mean, std = posterior(model, params, image)
         return jnp.sum(mean * probe_mean) + jnp.sum(std * probe_std)
 
     grad_params, grad_image = jax.grad(objective, argnums=(0, 1))(params, channels_last(reference["image"]))
