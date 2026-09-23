@@ -33,6 +33,8 @@ The same command runs in one process or under `dew launch`, where the global
 batch is placed from every process alike:
 
     python tools/layout_parity.py --models dense --layouts data4,fsdp4,tensor4
+    python tools/layout_parity.py --models moe --layouts expert4,data2_expert2,expert2_fsdp2 \\
+        --mixture '{"experts": 32, "top_k": 8, "dispatch": "exchange"}'
     dew launch --processes-per-host 4 --devices-per-process 1 -- \\
         python tools/layout_parity.py --models dense,dit --out parity.json
 
@@ -70,6 +72,7 @@ LAYOUTS: dict[str, dict[str, int]] = {
     "fsdp2_tensor2": {"fsdp": 2, "tensor": 2},
     "replicas2_fsdp2": {"fsdp": 2, "replicas": 2},
     "data2_expert2": {"expert": 2},
+    "expert2_fsdp2": {"expert": 2, "fsdp": 2},
     "fsdp2_sequence2": {"fsdp": 2, "sequence": 2},
     "tensor2_sequence2": {"tensor": 2, "sequence": 2},
     "stage2_fsdp2": {"fsdp": 2, "stage": 2, "microbatches": 4},
@@ -350,8 +353,8 @@ def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
 
 
 def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int, anchor: bool,
-        speak: Callable[[str], None], keep: Callable[[list[dict[str, Any]]], None]
-        ) -> list[dict[str, Any]]:
+        mixture: dict[str, Any], speak: Callable[[str], None],
+        keep: Callable[[list[dict[str, Any]]], None]) -> list[dict[str, Any]]:
     """Every layout of every model, one row each, `keep` handed the rows so
     far after each. A reference and a layout run as agreed phases: a failure
     on one process fails that row on every process, or, where the others
@@ -366,6 +369,11 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
     rows = []
     for model in models:
         case = dataclasses.replace(zoo()[model], dtype=dtype)
+        if mixture:
+            if "mixture" not in case.config:
+                raise ValueError(f"{model} has no mixture for --mixture to change")
+            case = dataclasses.replace(case, config={
+                **case.config, "mixture": {**case.config["mixture"], **mixture}})
         batch = bench.global_batch(case)
         try:
             ref_losses, ref_gradient, ref_compiled = agreed(
@@ -390,7 +398,8 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
             continue
         speak(f"[{model}] reference losses {ref_losses}, largest floor {floors[widest]:.2e} at {widest}")
         for name in layouts:
-            row: dict[str, Any] = {"model": model, "layout": name, "processes": jax.process_count(),
+            row: dict[str, Any] = {"model": model, "mixture": case.config.get("mixture"),
+                                   "layout": name, "processes": jax.process_count(),
                                    "reference_losses": ref_losses}
             started = time.perf_counter()
             try:
@@ -421,7 +430,10 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
 def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] = ("dense",),
          layouts: Annotated[tuple[str, ...], tyro.conf.arg(help="LAYOUTS names")] = tuple(LAYOUTS),
          dtype: str = "float32", steps: int = 3, anchor: bool = False,
-         out: Path | None = None) -> None:
+         out: Path | None = None,
+         mixture: Annotated[str, tyro.conf.arg(
+             help="JSON merged into each model's mixture, e.g. '{\"dispatch\": \"exchange\"}'")] = "{}",
+         ) -> None:
     """Run the layouts of each model against one device; see the module docstring."""
     from dew.training.runtime import prepare_process
 
@@ -436,7 +448,7 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
         if speaker and out is not None:
             out.write_text(json.dumps(rows, indent=1))
 
-    rows = run(models, layouts, dtype=dtype, steps=steps, anchor=anchor,
+    rows = run(models, layouts, dtype=dtype, steps=steps, anchor=anchor, mixture=json.loads(mixture),
                speak=lambda line: print(line, flush=True) if speaker else None, keep=keep)
     if any(row["status"] != "works" for row in rows):
         raise SystemExit(1)
