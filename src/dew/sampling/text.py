@@ -32,7 +32,7 @@ from jax.experimental import checkify, multihost_utils
 from jax.typing import ArrayLike
 
 from dew.artifacts import agreed
-from dew.nn.backbones.causal_transformer import gather_cache_rows
+from dew.nn.backbones.causal_transformer import Mixture, gather_cache_rows
 from dew.nn.inputs import (
     ArrayT,
     ModelInputs,
@@ -44,6 +44,7 @@ from dew.nn.inputs import (
     mesh_of,
     request_key,
 )
+from dew.nn.kv_cache import Layered, refuse_unassigned
 from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
@@ -124,6 +125,14 @@ class Predicting(Protocol):
 
     @property
     def num_nextn_predict_layers(self) -> int: ...
+
+
+@runtime_checkable
+class Routed(Protocol):
+    """A decoder whose sparse layers declare how tokens reach their experts, as `CausalTransformer` does."""
+
+    @property
+    def mixture(self) -> Mixture | None: ...
 
 
 @dataclass(frozen=True)
@@ -345,6 +354,26 @@ def _seeded_depths(ops: DecodeOps, state: DecoderState, states: jax.Array,
 def prediction_depths(model: nn.Module) -> int:
     """How many multi-token prediction depths the model declares; none unless it is `Predicting`."""
     return model.num_nextn_predict_layers if isinstance(model, Predicting) else 0
+
+
+def _refuse_exchange(model: nn.Module) -> None:
+    """Refuse a model whose sparse layers exchange tokens between expert shards.
+
+    The decode loop carries each draw's device checks into the next step's
+    model call, where the exchange runs a `shard_map`, and jax's checkify
+    cannot carry a live check into one (jax-ml/jax#40907). A
+    `dew.inference.serving.Server` step runs the model before it draws, so it
+    serves the exchange; `dispatch='global'` computes the same layer. This
+    refusal goes once a jax release carries the fix.
+    """
+    mixture = model.mixture if isinstance(model, Routed) else None
+    if mixture is not None and mixture.dispatch == "exchange":
+        raise ValueError(
+            "generation cannot run dispatch='exchange' until jax fixes jax-ml/jax#40907: checkify, "
+            "which carries each draw's device checks into the next step's model call, fails on a "
+            "check that reaches a shard_map. Serve the model with dew.inference.serving.Server, or "
+            "generate with model.clone(mixture=dataclasses.replace(model.mixture, dispatch='global')), "
+            "the same layer")
 
 
 def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -> DecodeOps:
@@ -613,6 +642,7 @@ def _request(model: nn.Module, params: Variables,
     conditioning = {name: local_rows(value, host=False) for name, value in canonical.conditioning.items()}
     if "params" not in params:
         raise ValueError("generate takes the full variables dict ({'params': ...})")
+    _refuse_exchange(model)
     prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling, n)
     components = resolve(sampling, logits, stopping, strategy)
     controls = (max_new_tokens, n, sampling.pad_id) + ((_digest(components),) if pooled else ())
@@ -737,6 +767,9 @@ def generate(model: nn.Module, params: Variables,
     if processes > 1:
         prepared = _agreed_request(prepared, processes, controls)
     plan = RowPlan.over(mesh, prepared.tokens.shape[0])
+    capacity = model.max_seq_len if isinstance(model, Bounded) else None
+    if isinstance(model, Layered) and capacity is not None:
+        refuse_unassigned(model.kv_cache, plan.count, capacity)
     padded = _padded(plan, prepared)
     failure, output = _compiled(plan.sharding)(model, params, plan.place(padded),
                                                plan.keys(random_key), max_new_tokens, sampling.pad_id, n,

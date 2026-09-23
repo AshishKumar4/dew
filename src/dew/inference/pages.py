@@ -55,22 +55,30 @@ class Pages:
         """Pages a new request can take: free ones and cached ones no row holds."""
         return len(self._free) + len(self._cached)
 
-    def reserve(self, prompt: np.ndarray, total: int) -> tuple[list[int], int] | None:
-        """Pages for a row that will hold `total` tokens of which `prompt` comes first.
+    def shared(self, prompt: np.ndarray) -> list[int]:
+        """The cached pages that hold `prompt`'s leading full pages, in order.
 
-        Returns the row's pages and how many leading prompt tokens they
-        already hold, or None when the pool cannot cover the row; then
-        nothing changes. The last prompt token is always prefilled, since its
-        logits score the first draw.
+        The last prompt token is never covered, since its logits score the
+        first draw and have to be computed.
         """
-        needed = -(-total // self.size)
-        shared: list[int] = []
+        pages: list[int] = []
         if self.prefix_cache:
             for digest in prefix_hashes(prompt, self.size, (len(prompt) - 1) // self.size):
                 page = self._by_hash.get(digest)
                 if page is None:
                     break
-                shared.append(page)
+                pages.append(page)
+        return pages
+
+    def reserve(self, prompt: np.ndarray, total: int) -> tuple[list[int], int] | None:
+        """Pages for a row that will hold `total` tokens of which `prompt` comes first.
+
+        Returns the row's pages and how many leading prompt tokens they
+        already hold, or None when the pool cannot cover the row; then
+        nothing changes.
+        """
+        needed = -(-total // self.size)
+        shared = self.shared(prompt)
         reclaimable = len(self._free) + sum(page not in shared for page in self._cached)
         if needed - len(shared) > reclaimable:
             return None

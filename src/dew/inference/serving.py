@@ -48,18 +48,31 @@ a prompt prefix an earlier request wrote (`prefix_cache`). A policy with a
 grammar (`strategies.Sample(grammar)`) carries each row's automaton state
 beside its cache. `DenseRows` and `PagedRows` are the two host sides of a
 cache, `Dense` and `Paged` what the step program does with an admission.
+
+Over weights placed on a mesh the server runs one program over every
+device, its state placed through the rule table that places the weights
+(`dew.nn.sharding.DEFAULT_RULES`). The slots split as a batch's rows do
+(`activation_batch`: the data, expert and fsdp axes), so each group of
+devices holds its own rows, its rows' dense cache or its part of the page
+pool (`pages`), and draws for them; a request is seated in the group with
+room for it. Tensor parallelism splits the heads, the mlp and the
+vocabulary of every row a group holds; the cache keeps its heads where the
+key and value projections leave them and the logits their vocabulary. Every
+write of a row's state is mapped over the groups, so none of it crosses a
+group.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
+import math
 import time
 from collections import deque
 from collections.abc import Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -67,6 +80,7 @@ import numpy as np
 from flax import linen as nn, struct
 from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew.inference.pages import Pages
@@ -81,7 +95,19 @@ from dew.inference.tasks import (
     _sized,
 )
 from dew.nn.inputs import ModelInputs, mesh_of, request_key
-from dew.nn.kv_cache import CURSOR, POOLED, TABLE, VALIDITY, KVCache, filled_slots, is_paged, leaf_name
+from dew.nn.kv_cache import (
+    CURSOR,
+    POOLED,
+    TABLE,
+    VALIDITY,
+    KVCache,
+    Layered,
+    filled_slots,
+    grouped,
+    is_paged,
+    leaf_name,
+)
+from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, row_axes
 from dew.objectives.base import Variables
 from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState, Stopping
@@ -97,17 +123,20 @@ from dew.sampling.text import (
     resolve,
 )
 
-
-@runtime_checkable
-class Layered(Protocol):
-    """A model that declares its decode cache's layout, as `CausalTransformer` does."""
-
-    @property
-    def kv_cache(self) -> KVCache: ...
-
-
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""
+
+
+def _row_axes(mesh: Mesh) -> tuple[str, ...]:
+    """The axes of `mesh` that split the slots: `row_axes` of a row count
+    every axis divides, so each axis `activation_batch` takes splits them."""
+    with jax.set_mesh(mesh):
+        return row_axes(mesh.size)
+
+
+def _row_groups(mesh: Mesh | None) -> int:
+    """How many groups of rows a server over `mesh` keeps, one per share of the slots."""
+    return 1 if mesh is None else math.prod(mesh.shape[axis] for axis in _row_axes(mesh))
 
 
 @struct.dataclass
@@ -115,7 +144,10 @@ class Slots:
     """The device state of every slot.
 
     `decoder` holds the model's cache, `[slots, capacity, ...]` per leaf, and
-    the logits scoring each row's next draw. `tokens` and `valid` are the
+    logits per row. A drawing row's cache holds every token but its last
+    draw, which the next step feeds before it draws (`_advanced`), and its
+    logits are the ones that draw came from; a row seated this step holds
+    its prompt, whose logits score its first draw. `tokens` and `valid` are the
     `StepState` buffer the transforms and criteria read, `[slots, 2 *
     capacity]`: a row's prompt sits right-aligned in the first half and its
     draws start at `capacity`, so `prompt_width` is the capacity for every
@@ -192,32 +224,38 @@ def _opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capaci
                  jnp.zeros((slots,), jnp.int32))
 
 
-def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array) -> jax.Array:
-    """`incoming`'s rows written into `resident` at `rows`.
+def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array, groups: int) -> jax.Array:
+    """`incoming`'s rows written into `resident` at `rows`, group by group.
+
+    The slots fall into `groups` equal groups in order, and so do the
+    incoming rows; `rows` counts from the start of each row's own group,
+    and a row at the group's size is dropped. Mapped over the groups, the
+    group is a batch dimension of the scatter, which GSPMD splits wherever
+    the slots split, with no collective (`dew.nn.kv_cache.write_cache`).
 
     A cache leaf from a prefill over a cache of the prompt's width is
     narrower than the resident leaf on its slot axis, the one axis whose
     size the model's `max_seq_len` sets; it lands in the first slots of
-    its rows. Every other leaf is the same shape row for row. A row past
-    the last slot is dropped.
+    its rows. Every other leaf is the same shape row for row.
     """
-    narrow = [axis for axis in range(1, incoming.ndim) if incoming.shape[axis] != resident.shape[axis]]
-    if not narrow:
-        return resident.at[rows].set(incoming, mode="drop")
-    axis, = narrow
-    window = tuple(slice(None) if index != axis else slice(0, incoming.shape[axis])
-                   for index in range(1, incoming.ndim))
-    return resident.at[(rows, *window)].set(incoming, mode="drop")
+    window = tuple(slice(0, incoming.shape[axis]) if incoming.shape[axis] != resident.shape[axis]
+                   else slice(None) for axis in range(1, incoming.ndim))
+
+    def place(resident: jax.Array, incoming: jax.Array, rows: jax.Array) -> jax.Array:
+        return resident.at[(rows, *window)].set(incoming, mode="drop")
+
+    return jax.vmap(place)(*(grouped(leaf, 0, groups) for leaf in (resident, incoming, rows))
+                           ).reshape(resident.shape)
 
 
-def _seated(state: Slots, decoder: DecoderState, real: jax.Array, admission: Admission) -> Slots:
+def _seated(state: Slots, decoder: DecoderState, real: jax.Array, admission: Admission, groups: int) -> Slots:
     """`state` with the prefilled cache, and the rows whose prompt ended seated to draw."""
     capacity = state.tokens.shape[1] // 2
-    finished = jnp.where(admission.final, admission.slots, state.step.shape[0])
+    finished = jnp.where(admission.final, admission.slots, state.step.shape[0] // groups)
     padding = ((0, 0), (0, capacity))
 
     def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
-        return resident.at[finished].set(incoming, mode="drop")
+        return _placed(resident, incoming, finished, groups)
 
     fresh = jnp.zeros_like(admission.slots)
     return Slots(decoder,
@@ -230,7 +268,9 @@ def _seated(state: Slots, decoder: DecoderState, real: jax.Array, admission: Adm
 
 @dataclasses.dataclass(frozen=True)
 class Dense:
-    """Admission over a dense cache: whole prompts, each into its own rows."""
+    """Admission over a dense cache: whole prompts, each into its own rows, in `groups` groups."""
+
+    groups: int = 1
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
                   admission: Admission) -> tuple[DecoderState, jax.Array]:
@@ -248,15 +288,19 @@ class Dense:
         fresh, real = _prefill(narrow, params, admission.prompts,
                                _operations(narrow, params, pad_id, prediction_depths(narrow)))
         rows = admission.slots
-        cache = jax.tree.map(lambda leaf: leaf.at[rows].set(jnp.zeros_like(leaf[:1]), mode="drop")
-                             if leaf.dtype == bool else leaf, state.decoder.cache)
+        cache = jax.tree.map(
+            lambda leaf: _placed(leaf, jnp.zeros((rows.shape[0], *leaf.shape[1:]), bool), rows, self.groups)
+            if leaf.dtype == bool else leaf, state.decoder.cache)
         decoder = dataclasses.replace(state.decoder, cache=cache)
-        return jax.tree.map(lambda resident, incoming: _placed(resident, incoming, rows), decoder, fresh), real
+        return jax.tree.map(lambda resident, incoming: _placed(resident, incoming, rows, self.groups),
+                            decoder, fresh), real
 
 
 @dataclasses.dataclass(frozen=True)
 class Paged:
-    """Admission over a paged cache: prompt pieces, each continuing its row."""
+    """Admission over a paged cache: prompt pieces, each continuing its row, in `groups` groups."""
+
+    groups: int = 1
 
     def prefilled(self, model: nn.Module, params: Variables, pad_id: int, state: Slots,
                   admission: Admission) -> tuple[DecoderState, jax.Array]:
@@ -286,7 +330,7 @@ class Paged:
                    updated: jax.Array) -> jax.Array:
             if leaf_name(path) in POOLED:
                 return updated
-            return resident.at[admission.slots].set(updated, mode="drop")
+            return _placed(resident, updated, admission.slots, self.groups)
 
         return jax.tree_util.tree_map_with_path(merged, state.decoder, fresh), real
 
@@ -298,27 +342,37 @@ Placement = Dense | Paged
 def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Placement, state: Slots,
               admission: Admission | None, transforms: tuple[LogitsTransform, ...],
               stopping: tuple[Stopping, ...], grammar: Grammar | None) -> tuple[Slots, Draws]:
-    """One iteration: admit, then every active row draws and feeds its token.
+    """One iteration: admit, feed every drawing row its last draw, then every active row draws.
 
     This is `strategies._sample_rows`'s step over rows that carry their own
     budget, so a row that stops or spends its budget goes inactive while the
     rest keep drawing; an inactive row's cache is not written. A grammar
-    guides the draws as `strategies.Sample` does.
+    guides the draws as `strategies.Sample` does. The step runs the model
+    before it draws, so no device check comes before the model call: jax's
+    checkify cannot carry a check into a shard_map (jax-ml/jax#40907), and a
+    model on a mesh runs its expert dispatch in one. A token is therefore fed
+    in the step after the one that drew it, and a row that feeds nothing,
+    one seated this step, keeps the logits its prompt left.
     """
     if admission is not None:
-        state = _seated(state, *placement.prefilled(model, params, pad_id, state, admission), admission)
+        state = _seated(state, *placement.prefilled(model, params, pad_id, state, admission), admission,
+                        placement.groups)
     ops = _operations(model, params, pad_id, prediction_depths(model))
     capacity = state.tokens.shape[1] // 2
+    fed = state.active & (state.step > 0)
+    last = jnp.take_along_axis(state.tokens, (capacity + state.step - 1)[:, None], axis=1)[:, 0]
+    advanced = ops.advance(state.decoder, last, fed)
+    decoder = dataclasses.replace(advanced, logits=jnp.where(fed[:, None], advanced.logits,
+                                                             state.decoder.logits))
     view = StepState(state.tokens, state.valid, state.step, state.active,
                      jax.random.wrap_key_data(state.keys), prompt_width=capacity)
     chain = decoding.chain(transforms)
-    token, behavior, raw = draw(view, state.decoder.logits,
+    token, behavior, raw = draw(view, decoder.logits,
                                 chain if grammar is None else grammar.guiding(chain, state.automaton))
     committed = view.commit(token, state.active)
     stopped = state.active & decoding.criterion(stopping)(committed, token)
-    following = ops.advance(state.decoder, token, state.active)
     drawn = state.active
-    return (Slots(following, committed.tokens, committed.valid, committed.step, state.budget,
+    return (Slots(decoder, committed.tokens, committed.valid, committed.step, state.budget,
                   drawn & ~stopped & (committed.step < state.budget), state.keys,
                   state.automaton if grammar is None else grammar.advanced(state.automaton, token, drawn)),
             Draws(token, drawn, stopped, jnp.where(drawn, behavior, 0.0), jnp.where(drawn, raw, 0.0)))
@@ -351,16 +405,18 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
              resident: Slots, carried: Slots,
              admission: Admission | None, transforms: tuple[LogitsTransform, ...],
              stopping: tuple[Stopping, ...], grammar: Grammar | None
-             ) -> tuple[checkify.Error, tuple[Slots, Draws]]:
+             ) -> tuple[checkify.Error, tuple[Slots, Slots, Draws]]:
     """Run `_advanced` over a split state, carrying its device checks as a value.
 
     `text._checked` carries them the same way. The host throws the error when
-    it reads the draws, one step later.
+    it reads the draws, one step later. The state comes back split as it went
+    in, so the host passes the halves straight to the next step.
     """
 
     def run(params, resident, carried, admission, transforms, stopping, grammar):
-        return _advanced(model, params, pad_id, placement, _joined(resident, carried), admission,
-                         transforms, stopping, grammar)
+        state, draws = _advanced(model, params, pad_id, placement, _joined(resident, carried), admission,
+                                 transforms, stopping, grammar)
+        return *_split(state), draws
 
     return checkify.checkify(run, errors=checkify.user_checks)(
         params, resident, carried, admission, transforms, stopping, grammar)
@@ -369,21 +425,57 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
 Formats = Slots
 """A `Slots` whose leaves are `Format`s: the resident layout of each leaf."""
 
-def _compiled(resident: Formats, carried: Formats) -> jax.stages.Wrapped:
+
+def _state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
+    """Where each leaf of the resident state lives: `state` with a sharding at every leaf.
+
+    Every leaf holds one row per slot on axis zero (`activation_batch`),
+    except a paged cache's pool, `[kv_heads, pages, page_size, ...]`, whose
+    `pages` split over the same axes, one part per group of rows. Keys,
+    values and their scales keep their heads where the key and value
+    projections leave them (`activation_kv`), and the logits their
+    vocabulary (`activation_vocab`). `state` is abstract: only its shapes
+    are read.
+    """
+    if mesh is None:
+        device = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+        return jax.tree.map(lambda _: device, state)
+    paged = is_paged(state.decoder.cache)
+
+    def placed(leaf: jax.ShapeDtypeStruct | jax.Array, *names: str | None) -> NamedSharding:
+        axes = (*names, *(None,) * (leaf.ndim - len(names)))
+        return NamedSharding(mesh, logical_spec(axes, leaf.shape, mesh=mesh))
+
+    def cached(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.ShapeDtypeStruct | jax.Array) -> NamedSharding:
+        if leaf_name(path) not in POOLED:
+            return placed(leaf, "activation_batch")
+        if paged:
+            return placed(leaf, "activation_kv", "pages")
+        return placed(leaf, "activation_batch", None, "activation_kv")
+
+    rows = jax.tree.map(lambda leaf: placed(leaf, "activation_batch"), state)
+    return rows.replace(decoder=rows.decoder.replace(
+        cache=jax.tree_util.tree_map_with_path(cached, state.decoder.cache),
+        logits=placed(state.decoder.logits, "activation_batch", "activation_vocab")))
+
+
+def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None) -> jax.stages.Wrapped:
     """Compile the step program over a state split into resident and carried halves.
 
     The matrix half is donated so XLA updates the cache in place instead of
-    copying it. The step sets no XLA flag of its own; pass XLA_FLAGS to change
-    the backend's defaults. See docs/performance.md for the measurements.
+    copying it. `rows` places every leaf of an admission, whose rows come
+    group by group, the way the slots are placed; None leaves them where they
+    are. The step sets no XLA flag of its own; pass XLA_FLAGS to change the
+    backend's defaults. See docs/performance.md for the measurements.
     """
     return jax.jit(_stepped, static_argnums=(0, 2, 3), donate_argnums=(4,),
-                   in_shardings=(None, resident, carried, None, None, None, None),
-                   out_shardings=(None, (_joined(resident, carried), None)))
+                   in_shardings=(None, resident, carried, rows, None, None, None),
+                   out_shardings=(None, (resident, carried, None)))
 
 
 def _resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, state: Slots,
-                      transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
-                      grammar: Grammar | None) -> Formats:
+                      shardings: Slots, rows: NamedSharding | None, transforms: tuple[LogitsTransform, ...],
+                      stopping: tuple[Stopping, ...], grammar: Grammar | None) -> Formats:
     """Choose the memory layout the resident state keeps, by asking XLA for it.
 
     The attention dot reads the cached keys and values with the slot axis
@@ -391,15 +483,19 @@ def _resident_formats(model: nn.Module, params: Variables, pad_id: int, placemen
     given, which would transpose the whole cache twice per layer. So the
     decode-only step is compiled once with layouts left to XLA, and the
     output formats it chose become the format every step takes and returns.
-    `state` is abstract: choosing the layout allocates nothing.
+    `state` is abstract: choosing the layout allocates nothing. `shardings`
+    places each leaf (`_state_shardings`).
     """
-    device = jax.sharding.SingleDeviceSharding(jax.devices()[0])
     resident, carried = _split(state)
-    program = _compiled(*(jax.tree.map(lambda leaf: Format(Layout.AUTO, device), half)
-                          for half in (resident, carried)))
+
+    def automatic(half: Slots) -> Formats:
+        return jax.tree.map(lambda leaf, sharding: None if leaf is None else Format(Layout.AUTO, sharding),
+                            half, shardings, is_leaf=lambda leaf: leaf is None)
+
+    program = _compiled(automatic(resident), automatic(carried), rows)
     compiled = program.lower(model, params, pad_id, placement, resident, carried, None, transforms,
                              stopping, grammar).compile()
-    return compiled.output_formats[1][0]
+    return _joined(*compiled.output_formats[1][:2])
 
 
 def _opened_in(formats: Formats) -> jax.stages.Wrapped:
@@ -407,32 +503,35 @@ def _opened_in(formats: Formats) -> jax.stages.Wrapped:
     return jax.jit(_opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
 
 
-_PROGRAMS: dict[tuple[tuple[Format, ...], str], jax.stages.Wrapped] = {}
+_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None], jax.stages.Wrapped] = {}
 """One step program per resident layout; see `_program`."""
 
 
-def _program(formats: Formats) -> jax.stages.Wrapped:
+def _program(formats: Formats, rows: NamedSharding | None) -> jax.stages.Wrapped:
     """`_compiled` over `formats`, once per layout: one compile per (model,
     admission shape) serves every server that keeps its state in the same
     layout. The formats tree holds the cache mapping and is not hashable
     itself, so its leaves and its structure's text key the programs."""
     leaves, structure = jax.tree_util.tree_flatten(formats)
-    key = (tuple(leaves), str(structure))
+    key = (tuple(leaves), str(structure), rows)
     program = _PROGRAMS.get(key)
     if program is None:
-        program = _PROGRAMS[key] = _compiled(*_split(formats))
+        program = _PROGRAMS[key] = _compiled(*_split(formats), rows)
     return program
 
 
 class Ticket(Future):
     """A submitted request's future `Generation`, with when it was
-    submitted, admitted to a slot and finished, in `time.perf_counter`
-    seconds; `admitted` and `finished` are None until they happen."""
+    submitted, admitted to a slot, when its first token reached the host
+    and when it finished, in `time.perf_counter` seconds; `admitted`,
+    `first` and `finished` are None until they happen. `first` less
+    `submitted` is the time to first token."""
 
     def __init__(self) -> None:
         super().__init__()
         self.submitted = time.perf_counter()
         self.admitted: float | None = None
+        self.first: float | None = None
         self.finished: float | None = None
 
 
@@ -450,19 +549,32 @@ class _Row:
     pages: list[int] = field(default_factory=list)
     prefilled: int = 0
     """Prompt tokens the cache holds for the row: shared prefix pages and pieces run."""
+    group: int = 0
+    """The group of slots the row is seated in, whose part of a paged pool its pages are."""
+
+
+def _seated_in(group: int, free: list[list[int]], taken: list[int], row: _Row) -> tuple[int, _Row]:
+    """Seat `row` in `group`'s next free slot."""
+    row.group = group
+    slot = free[group][taken[group]]
+    taken[group] += 1
+    return slot, row
 
 
 class DenseRows:
     """The host side of a dense cache: every slot owns `capacity` cache slots.
 
-    A queued request takes the next free slot, up to `admission` a step,
-    and prefills its whole prompt in one piece.
+    A queued request takes a free slot in the group with the most of them,
+    up to `admission` a step in each group, and prefills its whole prompt
+    in one piece.
     """
 
-    placement = Dense()
     chunk = None
     width = 0
     """Pages in a row's table: a dense row has none."""
+
+    def __init__(self, groups: int = 1) -> None:
+        self.placement = Dense(groups)
 
     def check(self, cache: Variables) -> None:
         if is_paged(cache):
@@ -471,8 +583,18 @@ class DenseRows:
     def refuse(self, length: int, budget: int) -> None:
         """The capacity check `_validated` makes covers a dense row."""
 
-    def seat(self, queue: deque[_Row], free: list[int], admission: int) -> list[tuple[int, _Row]]:
-        return [(slot, queue.popleft()) for slot in free[:min(admission, len(queue))]]
+    def seat(self, queue: deque[_Row], free: list[list[int]], admission: int) -> list[tuple[int, _Row]]:
+        """Seat queued requests in order; `free` is each group's free slots."""
+        seated: list[tuple[int, _Row]] = []
+        taken = [0] * len(free)
+        while queue:
+            open_groups = [group for group, slots in enumerate(free)
+                           if taken[group] < min(admission, len(slots))]
+            if not open_groups:
+                break
+            group = max(open_groups, key=lambda group: len(free[group]) - taken[group])
+            seated.append(_seated_in(group, free, taken, queue.popleft()))
+        return seated
 
     def table(self, row: _Row) -> list[int]:
         return []
@@ -488,21 +610,22 @@ class DenseRows:
 
 
 class PagedRows:
-    """The host side of a paged cache: `Pages` hands a pool out to the rows.
+    """The host side of a paged cache: one `Pages` ledger per group hands out its part of the pool.
 
-    A request is seated once the pool holds its prompt and its whole
+    A request is seated once a group's part holds its prompt and its whole
     budget, counting the prefix pages it shares, so a running row never
-    waits for a page. A prompt prefills in pieces of at most `chunk` tokens,
+    waits for a page. Of the groups with a free slot it takes the one
+    holding the longest cached prefix of its prompt, then the one with the
+    most pages free. A prompt prefills in pieces of at most `chunk` tokens,
     one piece a step.
     """
 
-    placement = Paged()
-
-    def __init__(self, pages: Pages, chunk: int | None, width: int) -> None:
+    def __init__(self, pages: list[Pages], chunk: int | None, width: int) -> None:
         self.pages = pages
         self.chunk = chunk
         self.width = width
         """Pages in a row's table, capacity over the page size."""
+        self.placement = Paged(len(pages))
 
     def check(self, cache: Variables) -> None:
         """Every cached leaf has to be one of paged attention's.
@@ -522,20 +645,30 @@ class PagedRows:
                                  f"{jax.tree_util.keystr(path)} is not")
 
     def refuse(self, length: int, budget: int) -> None:
-        needed = -(-(length + budget) // self.pages.size)
-        if needed > self.pages.count:
-            raise ValueError(f"the request needs {needed} pages; the pool holds {self.pages.count}")
+        part = self.pages[0]
+        needed = -(-(length + budget) // part.size)
+        if needed > part.count:
+            where = "" if len(self.pages) == 1 else f" in each of its {len(self.pages)} groups"
+            raise ValueError(f"the request needs {needed} pages; the pool holds {part.count}{where}")
 
-    def seat(self, queue: deque[_Row], free: list[int], admission: int) -> list[tuple[int, _Row]]:
+    def seat(self, queue: deque[_Row], free: list[list[int]], admission: int) -> list[tuple[int, _Row]]:
+        """Seat queued requests in order while some group's part of the pool covers the next one."""
         seated: list[tuple[int, _Row]] = []
-        while len(seated) < len(free) and queue:
+        taken = [0] * len(free)
+        while queue:
             row = queue[0]
-            reserved = self.pages.reserve(row.prompt, len(row.prompt) + row.budget)
-            if reserved is None:
+            open_groups = sorted((group for group, slots in enumerate(free) if taken[group] < len(slots)),
+                                 key=lambda group: (len(self.pages[group].shared(row.prompt)),
+                                                    self.pages[group].available), reverse=True)
+            for group in open_groups:
+                reserved = self.pages[group].reserve(row.prompt, len(row.prompt) + row.budget)
+                if reserved is not None:
+                    row.pages, row.prefilled = reserved
+                    break
+            else:
                 break
             queue.popleft()
-            row.pages, row.prefilled = reserved
-            seated.append((free[len(seated)], row))
+            seated.append(_seated_in(group, free, taken, row))
         return seated
 
     def table(self, row: _Row) -> list[int]:
@@ -543,13 +676,14 @@ class PagedRows:
 
     def prefilled(self, row: _Row) -> None:
         """The row's prompt keys are written by the step this admission joins."""
-        self.pages.publish(row.prompt, row.pages)
+        self.pages[row.group].publish(row.prompt, row.pages)
 
     def release(self, row: _Row) -> None:
-        self.pages.release(row.pages)
+        self.pages[row.group].release(row.pages)
 
     def reloaded(self) -> None:
-        self.pages.forget()
+        for part in self.pages:
+            part.forget()
 
 
 Rows = DenseRows | PagedRows
@@ -562,7 +696,8 @@ class Server:
     cache slots each; `admission` bounds the prompts one step prefills. A
     request whose prompt and budget do not fit the capacity is refused at
     `submit`, with the error `TextGeneration` raises for a request over the
-    model's context.
+    model's context. Over a mesh both counts split evenly over the groups
+    of rows, and so do the pages of a paged pool.
     """
 
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,
@@ -573,6 +708,11 @@ class Server:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
             raise ValueError("admission must be between one and the slot count")
+        self.mesh = mesh_of(variables)
+        self.groups = _row_groups(self.mesh)
+        if slots % self.groups or admission % self.groups:
+            raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
+                             f"{self.groups} groups the mesh splits rows into")
         self.model = model
         self.variables = variables
         self.processor = processor
@@ -593,16 +733,24 @@ class Server:
         self.grammar = grammar
         self.prefix_hits = 0
         """Prompt tokens served from shared prefix pages instead of prefilled."""
-        shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
-                                                  capacity=capacity), variables)
-        rows.check(shapes.decoder.cache)
-        if isinstance(rows, PagedRows) and prediction_depths(model):
-            raise ValueError("a paged server runs no prediction depths; their cache is seeded "
-                             "over the whole prompt at once")
-        formats = _resident_formats(model, variables, self.pad_id, rows.placement, shapes, transforms,
-                                    stopping, grammar)
-        self._step = _program(formats)
-        self._state: Slots = _opened_in(formats)(model, variables, self.pad_id, slots, capacity)
+        self._admitted = None if self.mesh is None else NamedSharding(self.mesh, P(_row_axes(self.mesh) or None))
+        with self._context():
+            shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
+                                                      capacity=capacity), variables)
+            rows.check(shapes.decoder.cache)
+            if isinstance(rows, PagedRows) and prediction_depths(model):
+                raise ValueError("a paged server runs no prediction depths; their cache is seeded "
+                                 "over the whole prompt at once")
+            formats = _resident_formats(model, variables, self.pad_id, rows.placement, shapes,
+                                        _state_shardings(self.mesh, shapes), self._admitted, transforms,
+                                        stopping, grammar)
+            self._step = _program(formats, self._admitted)
+            self._resident, self._carried = _split(
+                _opened_in(formats)(model, variables, self.pad_id, slots, capacity))
+
+    def _context(self) -> contextlib.AbstractContextManager[None]:
+        """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it."""
+        return contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh)
 
     @classmethod
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
@@ -623,10 +771,27 @@ class Server:
         of at most that many tokens, one piece a step, so a long prompt
         does not stall the rows decoding beside it, and `prefix_cache`
         shares the pages of a prompt prefix an earlier request computed.
+
+        Weights placed on a mesh are served on it: the slots, the admission
+        and the pages split over the mesh's row axes, which have to divide
+        them. Admission defaults to the largest multiple of the group count
+        up to eight. A mesh with a stage or a sequence axis above one, or
+        one over several processes, is refused.
         """
         mesh = mesh_of(task.variables)
-        if mesh is not None and mesh.size > 1:
-            raise ValueError("a server runs over one device's weights; it does not split rows over a mesh")
+        if mesh is not None:
+            if mesh.shape[STAGE_AXIS] > 1:
+                raise ValueError("a server decodes through the whole layer stack every step; the stage axis "
+                                 "runs the stack as the training pipeline, which the decoder refuses to decode "
+                                 "through (one token a step leaves no microbatches to pipeline). Serve on a "
+                                 "mesh with stage=1")
+            if mesh.shape[SEQUENCE_AXIS] > 1:
+                raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
+                                 "and a decoder refuses to decode under a sequence axis, which splits a "
+                                 "sequence's positions. Serve on a mesh with sequence=1")
+            if not NamedSharding(mesh, P()).is_fully_addressable:
+                raise ValueError("a server schedules its rows from one process; a mesh over several "
+                                 "processes would need them to agree on every step's admission")
         if task.n != 1:
             raise ValueError("a served request draws one continuation; submit a prompt once per draw")
         transforms, stopping, strategy = resolve(task.sampling, task.logits, task.stopping, task.strategy)
@@ -648,26 +813,28 @@ class Server:
                 raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
             model = model.clone(kv_cache=kv_cache)
         layout = model.kv_cache if isinstance(model, Layered) else KVCache()
+        groups = _row_groups(mesh)
         rows: Rows
         if layout.page_size is None:
             if chunk is not None or prefix_cache:
                 raise ValueError("chunked prefill and prefix caching run over a paged cache; "
                                  "serve with kv_cache=KVCache(page_size=...)")
-            rows = DenseRows()
+            rows = DenseRows(groups)
         else:
             count = slots * (rounded // layout.page_size) if layout.pages is None else layout.pages
-            rows = PagedRows(Pages(count, layout.page_size, prefix_cache=prefix_cache), chunk,
-                             rounded // layout.page_size)
+            model = model.clone(kv_cache=dataclasses.replace(layout, pages=count, groups=groups))
+            rows = PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache)
+                              for _ in range(groups)], chunk, rounded // layout.page_size)
         return cls(model, task.variables, task.processor, sampling=task.sampling,
                    transforms=transforms, stopping=stopping, grammar=strategy.grammar, rows=rows,
                    slots=slots, capacity=rounded,
-                   admission=min(slots, 8) if admission is None else admission,
+                   admission=max(groups, min(slots, 8) // groups * groups) if admission is None else admission,
                    default_budget=task.max_new_tokens)
 
     @property
     def cache(self) -> Variables:
         """The resident cache, updated in place by every step."""
-        return self._state.decoder.cache
+        return _joined(self._resident, self._carried).decoder.cache
 
     @property
     def occupancy(self) -> int:
@@ -755,9 +922,10 @@ class Server:
         if self._failed is not None:
             raise RuntimeError("the server stopped after a device check failed") from self._failed
         admission = self._admit()
-        error, (self._state, draws) = self._step(self.model, self.variables, self.pad_id, self.rows.placement,
-                                                 *_split(self._state), admission, self.transforms,
-                                                 self.stopping, self.grammar)
+        with self._context():
+            error, (self._resident, self._carried, draws) = self._step(
+                self.model, self.variables, self.pad_id, self.rows.placement, self._resident, self._carried,
+                admission, self.transforms, self.stopping, self.grammar)
         self.steps += 1
         self._settle()
         self._pending = (error, draws)
@@ -789,38 +957,47 @@ class Server:
     def _admit(self) -> Admission | None:
         """Seat queued requests in free slots, then pick this step's prompt pieces.
 
-        Rows still prefilling send their next piece, oldest first,
-        `admission` of them a step; a piece is the rest of the prompt, or at
-        most `chunk` tokens when the rows prefill in pieces.
+        Rows still prefilling send their next piece, oldest first, each
+        group's share of `admission` a step; a piece is the rest of the
+        prompt, or at most `chunk` tokens when the rows prefill in pieces.
+        The admission's rows come group by group, as the slots do, and each
+        names its slot within its group.
         """
         now = time.perf_counter()
-        free = [slot for slot in range(self.slots) if slot not in self._rows]
-        for slot, row in self.rows.seat(self._queue, free, self.admission):
+        size, share = self.slots // self.groups, self.admission // self.groups
+        free = [[slot for slot in range(group * size, (group + 1) * size) if slot not in self._rows]
+                for group in range(self.groups)]
+        for slot, row in self.rows.seat(self._queue, free, share):
             self.prefix_hits += row.prefilled
             row.ticket.admitted = now
             self._rows[slot] = row
-        pending = [(slot, row) for slot, row in self._rows.items()
-                   if row.prefilled < len(row.prompt)][:self.admission]
-        if not pending:
+        pending: list[list[tuple[int, _Row]]] = [[] for _ in range(self.groups)]
+        for slot, row in self._rows.items():
+            waiting = pending[slot // size]
+            if row.prefilled < len(row.prompt) and len(waiting) < share:
+                waiting.append((slot, row))
+        chosen = [(group * share + index, slot, row) for group, waiting in enumerate(pending)
+                  for index, (slot, row) in enumerate(waiting)]
+        if not chosen:
             return None
-        width = _bucket(max(len(row.prompt) - row.prefilled for _, row in pending), 64)
+        width = _bucket(max(len(row.prompt) - row.prefilled for _, _, row in chosen), 64)
         width = width if self.rows.chunk is None else min(width, self.rows.chunk)
         count, capacity = self.admission, self.capacity
         tokens = np.zeros((count, width), np.int32)
         valid = np.zeros((count, width), bool)
-        slots = np.full((count,), self.slots, np.int32)
+        slots = np.full((count,), size, np.int32)
         budgets = np.zeros((count,), np.int32)
-        keys = np.zeros((count, *pending[0][1].keys.shape), pending[0][1].keys.dtype)
+        keys = np.zeros((count, *chosen[0][2].keys.shape), chosen[0][2].keys.dtype)
         tables = np.zeros((count, self.rows.width), np.int32)
         cursors = np.zeros((count,), np.int32)
         final = np.zeros((count,), bool)
         history = np.zeros((count, capacity), np.int32)
         history_valid = np.zeros((count, capacity), bool)
-        for index, (slot, row) in enumerate(pending):
+        for index, slot, row in chosen:
             piece = row.prompt[row.prefilled:row.prefilled + width]
             tokens[index, width - len(piece):] = piece
             valid[index, width - len(piece):] = True
-            slots[index], budgets[index], keys[index] = slot, row.budget, row.keys
+            slots[index], budgets[index], keys[index] = slot % size, row.budget, row.keys
             table = self.rows.table(row)
             tables[index, :len(table)] = table
             cursors[index] = row.prefilled
@@ -830,10 +1007,9 @@ class Server:
             history_valid[index, capacity - len(row.prompt):] = True
             if final[index]:
                 self.rows.prefilled(row)
-        return Admission(ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(valid)}),
-                         jnp.asarray(slots), jnp.asarray(budgets), jnp.asarray(keys), jnp.asarray(tables),
-                         jnp.asarray(cursors), jnp.asarray(final), jnp.asarray(history),
-                         jnp.asarray(history_valid))
+        placed = jax.device_put([tokens, valid, slots, budgets, keys, tables, cursors, final, history,
+                                 history_valid], self._admitted)
+        return Admission(ModelInputs(placed[0], {"attention_mask": placed[1]}), *placed[2:])
 
     def _settle(self) -> None:
         """Read the previous step's draws into their rows; resolve the rows that ended."""
@@ -846,9 +1022,12 @@ class Server:
         except BaseException as failure:
             self._fail(failure)
             raise
+        now = time.perf_counter()
         for slot, row in list(self._rows.items()):
             if not draws.drawn[slot]:
                 continue
+            if not row.tokens:
+                row.ticket.first = now
             row.tokens.append(int(draws.token[slot]))
             row.behavior.append(float(draws.behavior[slot]))
             row.raw.append(float(draws.raw[slot]))
