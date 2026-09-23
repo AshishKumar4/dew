@@ -249,12 +249,21 @@ compute dtype. Non-parameter state retains its declared precision.
 | GLM floating-point checkpoints | `glm4_moe` |
 | DeepSeek floating-point checkpoints | `deepseek_v2`, `deepseek_v3`, `deepseek_v32` |
 | Kimi K2 | `kimi_k2` |
+| Kimi K3 text, MXFP4 routed experts | `kimi_k3` |
 | Llama 4 text | `llama4_text` |
 
 Kimi K2 keeps its own model type, vocabulary, RoPE settings, and routing widths
 when exported. Small fixtures cover loading, a `Trainer` update, export, and
 reference reload. Their [source record](tests/fixtures/hf/kimi-k2-tiny/source.json)
 pins the released configuration.
+
+Kimi K3 loads its text decoder from the vision wrapper: KDA and NoPE MLA
+layers, Attention Residuals over blocks of layers, latent routed experts with
+SiTU, and the routed experts' compressed-tensors MXFP4, which export writes
+back in the same format. The tower tensors are kept and written back unchanged.
+A tiny fixture from the released remote code covers parity, an update, export
+and greedy decoding; the [source record](tests/fixtures/hf/kimi-k3-source/source.json)
+lists every released tensor's shape.
 
 ### Native multimodal models
 
