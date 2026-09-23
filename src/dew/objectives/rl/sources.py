@@ -6,9 +6,10 @@ one request at a time, so turns of different sessions interleave in the
 engine's continuous batch instead of waiting on a lock-step cohort.
 
 `EnvironmentSource` runs the in-process `Environment` protocol that
-`EpisodeRollout` runs, one session per sample on a worker thread. Each turn
-submits the observation's context and steps the environment with the drawn
-action; the episode becomes a `Rollout` through `rollout_of`, the converter
+`EpisodeRollout` runs, one session per sample on a worker thread, with
+`EpisodeRollout`'s own per-turn limits (`turn_limit`, `step_action`). Each
+turn submits the observation's context and steps the environment with the
+drawn action; the episode becomes a `Rollout` through `rollout_of`, the converter
 `EpisodeRollout` packs with, so both paths feed one packer. Each call keeps
 the version its request was submitted under, so a session that spans a
 weight push carries both versions. The statuses follow the scheduler's
@@ -51,6 +52,8 @@ from .episodes import (
     Observation,
     Transition,
     rollout_of,
+    step_action,
+    turn_limit,
 )
 from .rollout import _texts
 from .rollouts import Call, Rollout, Status, Task
@@ -198,11 +201,10 @@ class EnvironmentSource:
                     status, detail = observation.status, observation.detail
                     if status != EpisodeStatus.RUNNING:
                         break
-                    if turn == self.max_turns:
-                        status, detail = EpisodeStatus.TRUNCATED, "episode turn limit reached"
-                        break
-                    if len(observation.context) > self.max_prompt_tokens:
-                        status, detail = EpisodeStatus.TRUNCATED, "next context exceeds max_prompt_tokens"
+                    limit = turn_limit(observation, turn, max_turns=self.max_turns,
+                                       max_prompt_tokens=self.max_prompt_tokens)
+                    if limit is not None:
+                        status, detail = limit.status, limit.detail
                         break
                     draw = self._draw(observation.context, _seed(self.seed, identity.attempt,
                                                                  identity.sample, turn), session)
@@ -210,10 +212,7 @@ class EnvironmentSource:
                         status, detail = EpisodeStatus.CANCELLED, "cancelled by the scheduler"
                         break
                     pending = self._action(draw, observation.context)
-                    if pending.terminated:
-                        observation = environment.step(pending)
-                    else:
-                        observation = Observation((), EpisodeStatus.TRUNCATED, "model turn reached its token limit")
+                    observation = step_action(environment, pending)
                     transitions.append(Transition(pending, observation))
                     pending = None
         except _Refused:
