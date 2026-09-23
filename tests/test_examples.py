@@ -33,9 +33,10 @@ def smoke(name, out, *arguments, offline=True):
     the suite's eight simulated devices: a smoke run is a single-device run,
     and `HF_HUB_OFFLINE` keeps a fixture path from becoming a download. A
     harness suite reads its documents from the Hub, so that one run asks for
-    the network and carries the marker.
+    the network and carries the marker. No smoke reaches a paid endpoint, so
+    none is handed the caller's OpenAI key.
     """
-    environment = {**os.environ,
+    environment = {**{key: value for key, value in os.environ.items() if key != "OPENAI_API_KEY"},
                    "PYTHONPATH": str(REPO_ROOT / "src"),
                    "JAX_PLATFORMS": "cpu",
                    "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
@@ -199,16 +200,21 @@ def test_train_rlvr_starts_sglang_with_room_for_a_prompt_at_the_window_and_its_f
 
 def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):
     """The evaluation report of a run the script trains first: the perplexity
-    `evaluate` scores over the held-out split, a greedy continuation, and the
-    clean skip both client extras get when their SDK is not installed."""
+    `evaluate` scores over the held-out split, a greedy continuation, and a
+    served comparison that neither SDK can reach. An installed SDK reports
+    the endpoint unreachable, an absent one is skipped, and neither needs an
+    OpenAI key, which the smoke's environment does not carry."""
     smoke("evaluate_and_serve", tmp_path,
           "--openai-base-url", "http://127.0.0.1:1/v1", "--ollama-host", "http://127.0.0.1:1")
 
     report = json.loads((tmp_path / "report.json").read_text())
     assert report["perplexity"]["val/perplexity"] > 0
     assert len(report["greedy"]) == 8
+    for sdk, answer in report["served"].items():
+        installed = importlib.util.find_spec(sdk) is not None
+        assert answer.startswith("unreachable: http://127.0.0.1:1" if installed
+                                 else f"skipped: pip install {sdk}"), (sdk, answer)
     assert set(report["served"]) == {"openai", "ollama"}
-    assert all(answer.startswith("skipped: pip install") for answer in report["served"].values())
 
 
 def test_evaluate_and_serve_smoke_scores_a_diffusion_run_it_is_pointed_at(tmp_path):
