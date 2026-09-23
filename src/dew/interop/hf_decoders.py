@@ -1986,8 +1986,8 @@ def save_pretrained_decoder(model, variables, directory, *,
         raise ValueError(
             f"save_pretrained_decoder takes a CausalTransformer, got {type(model).__name__}")
     config = _export_config(model)
-    hf_tensors = export_decoder_weights(model, variables, config)
     _refuse_lossy_export(model, config)
+    hf_tensors = export_decoder_weights(model, variables, config)
 
     save_hf_layout(hf_tensors, config, directory)
     save_export_assets(directory, tokenizer=tokenizer, generation_config=generation_config)
@@ -2209,7 +2209,11 @@ def _refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object])
     """
     try:
         rebuilt = from_record(CausalTransformer, {**translate_config(config), 'dtype': model.dtype})
-    except (ValueError, KeyError) as error:
+    except KeyError as error:
+        raise ValueError(f"the {config['model_type']} config written for this model lacks {error}, which "
+                         f"that family reads: this model's computation (its mixer or experts) has no "
+                         f"exported config; no exported family carries it") from error
+    except ValueError as error:
         raise ValueError(f"the {config['model_type']} config written for this model does not read back: "
                          f"{error}") from error
     def computed(held: CausalTransformer, name: str) -> object:
