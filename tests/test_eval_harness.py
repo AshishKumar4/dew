@@ -42,10 +42,16 @@ def adapter(run):
     return DewLM(TextGeneration.from_run(str(run)), batch_size=2)
 
 
-def _byte_tokenizer():
+BOS = 1
+"""The byte `\\x01` doubles as BOS in the BOS-vocabulary case; no test text holds it."""
+
+
+def _byte_tokenizer(bos: bool):
     """Dew's `ByteTokenizer` as a transformers tokenizer: one id per utf-8 byte,
-    id = byte value, EOS 255, no BOS, which is what `HFLM` needs to be handed."""
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    id = byte value, EOS 255, which is what `HFLM` needs to be handed. With
+    `bos`, every encoding starts with BOS, as Llama, Mistral and Gemma
+    vocabularies do, and `HFLM` conditions first tokens on it."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
     from transformers import PreTrainedTokenizerFast
     from transformers.convert_slow_tokenizer import bytes_to_unicode
 
@@ -54,28 +60,39 @@ def _byte_tokenizer():
     tokenizer = Tokenizer(models.BPE(vocab=vocabulary, merges=[]))
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
     tokenizer.decoder = decoders.ByteLevel()
-    return PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token=symbols[255])
+    if not bos:
+        return PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token=symbols[255])
+    tokenizer.post_processor = processors.TemplateProcessing(
+        single=f"{symbols[BOS]} $A", special_tokens=[(symbols[BOS], BOS)])
+    return PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token=symbols[255],
+                                   bos_token=symbols[BOS])
 
 
-def _pair(max_length: int):
+def _pair(max_length: int, bos_directory=None):
     """The same weights behind `DewLM` and behind lm-eval's `HFLM`, both
-    scoring windows of `max_length` ids."""
+    scoring windows of `max_length` ids. With `bos_directory`, both read the
+    BOS vocabulary: Dew as the run's `HFTokenizer` over the saved files."""
     import torch
     from lm_eval.models.huggingface import HFLM
     from transformers import LlamaForCausalLM
 
-    from dew.data.text import ByteTokenizer
+    from dew.data.text import ByteTokenizer, HFTokenizer
     from dew.inference.pipeline import RunProcessor
     from dew.interop.pretrained import load_pretrained
     from dew.sampling import Sampling
 
+    reference = _byte_tokenizer(bos_directory is not None)
+    if bos_directory is None:
+        run_tokenizer = ByteTokenizer()
+    else:
+        reference.save_pretrained(str(bos_directory))
+        run_tokenizer = HFTokenizer(str(bos_directory), local_files_only=True)
     loaded = load_pretrained(LLAMA, dtype="float32", attention_impl="reference",
                              max_seq_len=max_length)
-    ours = DewLM(TextGeneration(loaded.model, loaded.variables, RunProcessor(ByteTokenizer()),
+    ours = DewLM(TextGeneration(loaded.model, loaded.variables, RunProcessor(run_tokenizer),
                                 sampling=Sampling(eos_id=255)), batch_size=2)
     model = LlamaForCausalLM.from_pretrained(LLAMA, dtype=torch.float32).eval()
-    theirs = HFLM(pretrained=model, tokenizer=_byte_tokenizer(), max_length=max_length,
-                  batch_size=2)
+    theirs = HFLM(pretrained=model, tokenizer=reference, max_length=max_length, batch_size=2)
     return ours, theirs
 
 
@@ -103,6 +120,22 @@ def test_loglikelihood_equals_lm_evals_own_model_on_the_same_weights():
     for (score, greedy), (reference, reference_greedy) in zip(got, expected, strict=True):
         assert score == pytest.approx(reference, rel=RELATIVE)
         assert greedy == reference_greedy
+
+
+def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_path):
+    """`HFLM.prefix_token_id` is the tokenizer's BOS when it has one. An empty
+    context and a rolling window's first token are conditioned on it, so a
+    BOS vocabulary is scored after BOS, not after EOS."""
+    ours, theirs = _pair(16, tmp_path)
+    assert ours.prefix_token_id == theirs.prefix_token_id == BOS
+    requests = [instance("", "empty context"), instance("the ", "quick")]
+    for (score, greedy), (reference, reference_greedy) in zip(
+            ours.loglikelihood(requests), theirs.loglikelihood(requests), strict=True):
+        assert score == pytest.approx(reference, rel=RELATIVE)
+        assert greedy == reference_greedy
+    text = [instance(_text(40), request_type="loglikelihood_rolling")]
+    assert ours.loglikelihood_rolling(text) == pytest.approx(theirs.loglikelihood_rolling(text),
+                                                             rel=RELATIVE)
 
 
 def test_a_continuation_longer_than_the_window_is_scored_in_lm_evals_rolling_windows():

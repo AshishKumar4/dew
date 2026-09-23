@@ -41,6 +41,7 @@ class ByteTokenizer:
     def __init__(self):
         self.vocab_size = 256
         self.eos_id = 255
+        self.bos_id = None
 
     def encode(self, text: str) -> list[int]:
         return list(text.encode("utf-8"))
@@ -85,6 +86,14 @@ class HFTokenizer:
     @property
     def eos_id(self) -> int:
         return self.tokenizer.eos_token_id
+
+    @property
+    def bos_id(self) -> int | None:
+        """The id the tokenizer starts a sequence with, or None where it has none."""
+        bos = self.tokenizer.bos_token_id
+        if bos is None or isinstance(bos, int):
+            return bos
+        raise TypeError(f"{self.name} names a bos_token_id that is not one id: {bos!r}")
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text)

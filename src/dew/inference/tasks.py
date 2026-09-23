@@ -70,6 +70,9 @@ class Processor(Protocol):
 
     def decode(self, tokens: ArrayLike) -> list[str]: ...
 
+    @property
+    def bos_id(self) -> int | None: ...
+
 
 def _prepared(processor: Processor | None, request: Request, *, images: Media | None) -> ModelInputs:
     """Turn a request into `ModelInputs`, tokenizing text through `processor`.

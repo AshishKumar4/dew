@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, NamedTuple, Protocol, TypedDict, Unpack
+from typing import TYPE_CHECKING, Literal, NamedTuple, Protocol, TypedDict, Unpack
 
 import jax
 import jax.numpy as jnp
@@ -59,6 +59,9 @@ from dew.sampling.guidance import CFG
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 
 class ProcessorCall(TypedDict, total=False):
@@ -167,6 +170,8 @@ class Processor:
     config: Mapping[str, object]
     record: Mapping[str, object]
     vocab_size: int
+    bos_id: int | None = None
+    """The id the source's tokenizer starts a sequence with, or None where it has none."""
 
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
                  audio: Media | None = None, videos: Media | None = None,
@@ -2153,12 +2158,21 @@ def _source_processor(directory: Path, config: Mapping[str, object], record: Map
         from transformers import AutoProcessor
         options = {"backend": "pil"} if config.get("model_type") == "gemma3" else {}
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
-        return Processor(reference, config, record, model.vocab_size)
+        return Processor(reference, config, record, model.vocab_size,
+                         _bos_id(reference.tokenizer))
     if (directory / "tokenizer_config.json").exists():
         from transformers import AutoTokenizer
-        return Processor(AutoTokenizer.from_pretrained(str(directory), local_files_only=True),
-                         config, record, model.vocab_size)
+        tokenizer = AutoTokenizer.from_pretrained(str(directory), local_files_only=True)
+        return Processor(tokenizer, config, record, model.vocab_size, _bos_id(tokenizer))
     return None
+
+
+def _bos_id(tokenizer: PreTrainedTokenizerBase) -> int | None:
+    """A tokenizer's `bos_token_id` as one id, or None where it has no BOS."""
+    bos = tokenizer.bos_token_id
+    if bos is None or isinstance(bos, int):
+        return bos
+    raise TypeError(f"the source's bos_token_id is not one id: {bos!r}")
 
 
 def split_revision(source: str) -> tuple[str, str | None]:
