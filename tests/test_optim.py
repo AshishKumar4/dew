@@ -617,3 +617,16 @@ def test_a_parameter_no_group_claims_is_refused():
     params = decoder_params()["params"]
     with pytest.raises(ValueError, match="matches no param group"):
         build_optimizer(config, steps=1).init(params)
+
+
+def test_a_power_schedules_tail_is_one_record_that_ends_where_it_says():
+    """The law up to the tail's start, then a straight line to the tail's end
+    rate at its last step (the run's end unless it names its own)."""
+    from dew.training.optim import Power, PowerTail
+    law = Power(peak=1.0, warmup_steps=2, a=0.5, b=-0.5)
+    tailed = Power(peak=1.0, warmup_steps=2, a=0.5, b=-0.5, tail=PowerTail(start=6, end=0.01))
+    np.testing.assert_allclose(tailed.schedule(10)(5), law.schedule(10)(5), rtol=1e-6)
+    np.testing.assert_allclose(tailed.schedule(10)(10), 0.01, rtol=1e-6)
+    np.testing.assert_allclose(tailed.schedule(10)(8), (law.schedule(10)(6) + 0.01) / 2, rtol=1e-5)
+    early = Power(peak=1.0, warmup_steps=2, a=0.5, b=-0.5, tail=PowerTail(start=6, steps=8))
+    np.testing.assert_allclose(early.schedule(10)(8), 0.0, atol=1e-7)
