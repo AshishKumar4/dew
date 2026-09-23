@@ -162,15 +162,18 @@ def harbor(tmp_path):
     return executable
 
 
-def fake_gateway(unhealthy_checks=0):
+def fake_gateway(unhealthy_checks=0, unreachable_models=0):
     """A gateway whose every session recorded one call sampling [10 + sample].
 
     Its one worker is dead for the first `unhealthy_checks` health reads, like rllm-model-gateway
     started beside an engine still loading: its health loop marks the worker dead, and until the
-    next check revives it every proxied call answers a traceless 500.
+    next check revives it every proxied call answers a traceless 500. Before its first probe the
+    gateway reports the worker healthy whatever its state; `unreachable_models` makes the first
+    proxied `GET /v1/models` answers that 500, like an engine that is not listening yet.
     """
     asked = []
     checks = [0]
+    listings = [0]
 
     def network(request):
         asked.append((request.method, request.url.path))
@@ -179,6 +182,11 @@ def fake_gateway(unhealthy_checks=0):
             healthy = int(checks[0] > unhealthy_checks)
             return httpx.Response(200, json={"workers": [{"url": "http://engine", "healthy": bool(healthy)}],
                                              "healthy": healthy, "total": 1})
+        if request.url.path == "/v1/models":
+            listings[0] += 1
+            if listings[0] <= unreachable_models:
+                return httpx.Response(500, text="Internal Server Error")
+            return httpx.Response(200, json={"object": "list", "data": [{"id": "policy"}]})
         if request.method == "DELETE":
             return httpx.Response(200, json={"deleted": 1})
         session = request.url.path.removeprefix("/sessions/").removesuffix("/traces")
@@ -292,8 +300,21 @@ def test_the_first_submission_waits_for_a_healthy_gateway_worker(tmp_path, harbo
         source.close()
     # No trial started until the gateway reported a healthy worker, and it asked only once per source.
     assert asked.count(("GET", "/health/workers")) == 4
-    assert asked.index(("GET", "/health/workers"), 3) < next(
+    assert asked.index(("GET", "/v1/models")) < next(
         index for index, entry in enumerate(asked) if entry[1].endswith("/traces"))
+
+
+def test_a_gateway_that_reports_healthy_before_its_engine_listens_is_waited_for(tmp_path, harbor):
+    (tmp_path / "task").mkdir()
+    gateway, asked = fake_gateway(unreachable_models=3)
+    source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials", ready_poll=0.01)
+    try:
+        (future,) = source.submit(Task("hello", {HARBOR_KEY: str(tmp_path / "task")}), 1, version=0)
+        assert future.result(timeout=60).status is Status.COMPLETED
+    finally:
+        source.close()
+    # The model listing went through the gateway to the engine and answered before any trial ran.
+    assert asked.count(("GET", "/v1/models")) == 4
 
 
 def test_a_gateway_with_no_healthy_worker_refuses_the_submission(tmp_path, harbor):
