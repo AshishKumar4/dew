@@ -61,6 +61,7 @@ from dew.nn.moe import GatedActivation, Situ
 from dew.nn.text_encoders import checkpoint_dtype
 from dew.objectives.base import Variables
 from dew.registry import from_record
+from dew.telemetry.instrumentation import dew_cache_dir
 
 GENERATION_CONFIG_FILE = "generation_config.json"
 
@@ -1886,11 +1887,17 @@ def _snapshot(name_or_dir: str, revision: str | None, *,
         selected = list(weight_files(files, "", read, stems=pickles.STEMS, suffix=pickles.SUFFIX))
         if not selected:
             raise FileNotFoundError(_missing_weights(f"{name_or_dir} at {directory.name}", files))
+        # The conversion a lookup found is recorded, so the same load offline
+        # reads the conversion it cached rather than pickles it never fetched.
+        record = Path(dew_cache_dir()) / "conversions" / name_or_dir / directory.name
         try:
             conversion = _conversion_revision(name_or_dir, directory.name)
         except (HfHubHTTPError, OfflineModeIsEnabled):
-            # Offline or unreachable, the Hub offers no conversion and the pickles load.
-            conversion = None
+            conversion = record.read_text() if record.is_file() else None
+        else:
+            if conversion is not None:
+                record.parent.mkdir(parents=True, exist_ok=True)
+                record.write_text(conversion)
         if conversion is not None:
             _log.warning("%s at %s ships PyTorch pickles; loading SFconvertbot's safetensors conversion of "
                          "that commit at revision %s", name_or_dir, directory.name, conversion)
