@@ -54,9 +54,9 @@ code. Checked against the source on 2026-09-22:
   only the product (`causal_transformer.py:2225-2234`). The bf16 difference from
   Gemma described under Gemma 3 is gone.
 - `tie_embeddings` still defaults to `True` (`causal_transformer.py:1412`).
-- DeepSeek's block-scaled FP8 weights load through
-  `src/dew/interop/quantized.py`, and gpt-oss's MXFP4 weights through
-  `src/dew/nn/gpt_oss.py` and `src/dew/interop/families/gpt_oss.py:38`.
+- DeepSeek's block-scaled FP8 weights, DeepSeek-V4's `.scale` storage and
+  gpt-oss's and compressed-tensors' MXFP4 weights load through
+  `src/dew/interop/codecs.py`.
 - torch is in the `test` extra (`pyproject.toml:42-46`) and installed in the
   venv. Reference fixtures live under `tests/fixtures/` (for example `hf`,
   `moe`, `mla`, `gpt_oss`, `linear_attention`, `mamba2`), written by the
