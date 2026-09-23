@@ -157,6 +157,19 @@ def test_a_region_decodes_to_the_whole_tensors_values_there(kind, region):
     np.testing.assert_array_equal(part.view(np.uint32), whole[region].view(np.uint32))
 
 
+@pytest.mark.parametrize("region", [None, (slice(0, 3), slice(200, 300))])
+def test_a_scale_grid_of_another_block_size_is_refused_before_any_region_decodes(region):
+    """A [512, 4096] weight whose [16, 128] scales are 32 x 32 blocks, read
+    as 128 x 128: the region's first [1, 1] of that grid fits the region,
+    so only the whole grid tells the checkpoint from its config."""
+    weight, scale = np.zeros((512, 4096), codecs.E4M3), np.ones((16, 128), np.float32)
+    with pytest.raises(ValueError, match=r"takes a \(4, 32\) scale, got \(16, 128\)"):
+        codecs.read_fp8_tensor({"w": weight, "w_scale_inv": scale}, "w", region, block=128)
+    with pytest.raises(ValueError, match=r"takes a \(4, 32\) scale, got \(16, 128\)"):
+        codecs.read_deepseek_v4_tensor({"l.wkv.weight": weight, "l.wkv.scale": scale}, "l.wkv.weight", region,
+                                       block=128, fp4_experts=True)
+
+
 def hankel(base: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     """A read-only [rows, cols] view holding base[i + j] at (i, j), with no memory of its own."""
     return np.lib.stride_tricks.as_strided(base, shape, (base.itemsize, base.itemsize), writeable=False)
