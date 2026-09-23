@@ -43,8 +43,25 @@ def main() -> None:
     trainer, rollout = native.build_ppo()
     state = trainer.initial_state()
     episodes = rollout.episodes.collect(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
-    batch = rollout.episodes.tensors(episodes)
-    values = np.asarray(rollout.objective.values(state.params, batch))
+    # verl reads one left-padded [prompt | response] row per call; rebuild that
+    # layout from the actions and read Dew's packed critic values into it.
+    packed = rollout.episodes.project(episodes)
+    packed_values = np.asarray(rollout.objective.values(state.params, packed))
+    turns, width = native.TURNS, native.PROMPT + native.RESPONSE
+    batch = {"input_ids": np.zeros((len(episodes) * turns, width), np.int32),
+             "response_mask": np.zeros((len(episodes) * turns, native.RESPONSE), np.float32)}
+    batch["old_log_probs"] = np.zeros_like(batch["response_mask"])
+    values = np.zeros_like(batch["response_mask"])
+    for index, episode in enumerate(episodes):
+        for turn, transition in enumerate(episode.transitions):
+            action, row = transition.action, index * turns + turn
+            count = len(action.tokens)
+            batch["input_ids"][row, native.PROMPT - len(action.context):native.PROMPT] = action.context
+            batch["input_ids"][row, native.PROMPT:native.PROMPT + count] = action.tokens
+            batch["response_mask"][row, :count] = 1
+            batch["old_log_probs"][row, :count] = action.raw_log_probs
+            where = (packed["rollout_index"] == index) & (packed["call_index"] == turn)
+            values[row, :count] = packed_values[where]
     token_mask = batch["response_mask"].reshape(len(episodes), -1)
     episode_rewards = np.zeros_like(token_mask)
     for row, episode in enumerate(episodes):

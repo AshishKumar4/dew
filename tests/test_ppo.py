@@ -20,6 +20,7 @@ from test_tool_episodes import (
     VOCAB,
     Harness,
     ToolPolicy,
+    per_call,
     verify,
 )
 
@@ -35,7 +36,7 @@ FIXTURE = Path(__file__).parent / "fixtures/rl/ppo.npz"
 
 class TokenFeatures(nn.Module):
     @nn.compact
-    def hidden_states(self, tokens, train=False, *, attention_mask=None):
+    def hidden_states(self, tokens, train=False, *, segment_ids=None, positions=None):
         scale = self.param("scale", nn.initializers.ones, (VOCAB,))
         return jax.nn.one_hot(tokens, VOCAB) * scale
 
@@ -79,12 +80,19 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
     trainer, rollout = build_ppo()
     state = trainer.initial_state()
     batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    episodes = rollout.episodes.collect(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
     with np.load(FIXTURE) as reference:
+        # The fixture holds verl's GAE in the old one-row-per-call layout,
+        # whose unsupported slots carry the recursion's neighbouring values.
+        actions = per_call(batch, "response_mask", episodes) != 0
         for name in (OLD_VALUES_KEY, RETURNS_KEY, "advantages"):
-            np.testing.assert_allclose(batch[name], reference[f"episode_{name}"], atol=2e-6)
+            np.testing.assert_allclose(per_call(batch, name, episodes)[actions],
+                                       reference[f"episode_{name}"][actions], atol=2e-6)
     critic = state.params["params"]["critic"]
     table = np.asarray(critic["backbone"]["scale"]) * np.asarray(critic["value"]["kernel"])[:, 0]
-    expected = table[batch["input_ids"][:, PROMPT - 1:PROMPT + RESPONSE - 1]] + np.asarray(critic["value"]["bias"])[0]
+    previous = np.concatenate([np.zeros_like(batch["input_ids"][:, :1]), batch["input_ids"][:, :-1]], axis=1)
+    expected = np.where(batch["response_mask"] != 0,
+                        table[previous] + np.asarray(critic["value"]["bias"])[0], 0)
     np.testing.assert_allclose(batch[OLD_VALUES_KEY], expected, atol=1e-7)
     changed = {**batch, RETURNS_KEY: batch[RETURNS_KEY] + .25}
     info = Step(jnp.array(0), jax.random.key(1), None)
