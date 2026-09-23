@@ -177,6 +177,9 @@ class Case:
     head_chunks: int | None = None
     """For language models, the vocabulary slices the loss scores a batch in;
     None is the objective's own default."""
+    objective: dict[str, object] = field(default_factory=dict)
+    """For language models, further `LMObjective` keywords, such as the
+    balance terms `aux_loss_alpha` and `balance_rate`."""
     fsdp_min_param_size: int = 2 ** 16
 
     @property
@@ -584,10 +587,9 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
 
 def lm_objective(case: Case, model) -> LMObjective:
     """Next-token cross entropy over the case's rows, with its own head
-    chunking where it names one."""
-    if case.head_chunks is None:
-        return LMObjective(model, case.seq_len)
-    return LMObjective(model, case.seq_len, head_chunks=case.head_chunks)
+    chunking where it names one and its further objective keywords."""
+    chunks = {} if case.head_chunks is None else {"head_chunks": case.head_chunks}
+    return LMObjective(model, case.seq_len, **chunks, **case.objective)
 
 
 def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
