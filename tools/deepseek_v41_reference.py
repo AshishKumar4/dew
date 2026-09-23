@@ -15,8 +15,8 @@ Run it in its own environment, never the project's:
         tools/deepseek_v41_reference.py [--search N | --check-kernels]
 
 `--check-kernels` compares the stand-ins with the release's tilelang kernels
-on a CUDA GPU (`check_kernels`). `--search N` scores N seeds from `--seed`
-(`search`); SEED is the best of the first 119.
+on a CUDA GPU (`check_kernels`). `--search N` ranks N seeds from `--seed` by
+what fp32 noise can reach in them (`search`); SEED is the first of 119.
 
 It writes tests/fixtures/hf/deepseek-v41-tiny: the release's config.json
 spelling at toy width, a model.safetensors under the release's tensor names,
@@ -32,15 +32,28 @@ the tokenizer the engram hash reads, source.json and reference.npz with
     generated                  greedy ids after the prefill
     draft_ids, draft_logits,   DSpark's forward_spec at every decode step
     draft_confidence
-    qat_logits                 the full forward with the quantizers on
+    selection_{rows,picks,margin,scale}
+                               every top-k of the forward in call order: its
+                               scored rows (NaN past a row's width), sorted
+                               picks (-1 past k), and `selection_margins`
+    qat_*                      the same with the quantizers on: the forward,
+                               loss, update (read through the plain forward),
+                               cached run and top-k calls
+    qat_{window,entries,index}_{in,out,margin,flip,scale_margin}
+                               every quantizer call of that forward in call
+                               order: the blocks it read and wrote and their
+                               `quantizer_margins`
 
-every output but the last with the quantizers off (`run` says why).
-source.json records the smallest rounding and top-k margins each met.
+source.json records NOISE and what it can reach at the seed (`Record.assess`).
 
-The model's two fp32 departures from the bf16 release are stated where they
-happen: the engram lookup keeps the model's dtype where the release casts
-to its bf16 (model.py:320), and every quantizer passes its gradient
-straight through (the paper's QAT, section 2.4.4).
+Where the reference departs from the release, it says so where it happens:
+the engram lookup keeps the model's dtype where the release casts to its
+bf16 (model.py:320); Indexer.forward publishes its keys on every call, where
+the release publishes them only when a group of entries closes
+(`_publishing_indexer`); the sparse_attn stand-in keeps its probabilities in
+fp32 where the kernel rounds them to bf16 (`check_kernels`); and every
+quantizer passes its gradient straight through, an estimator the release,
+inference code, and the paper leave unnamed.
 """
 
 from __future__ import annotations
@@ -63,7 +76,7 @@ CODE = ("inference/model.py", "inference/engram.py", "inference/vision.py",
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "hf" / "deepseek-v41-tiny"
 TOKENIZER = ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-tools"
-SEED = 81
+SEED = 106
 
 # DeepSeek-V4.1-Flash at toy width, one entry per ModelArgs field the release
 # sets (inference/config.json). The released stack is two sliding layers, 18
@@ -101,8 +114,10 @@ TINY = dict(
     dspark_markov_rank=16, dspark_n_routed_experts=4, dspark_n_activated_experts=2,
 )
 LENGTH = 16
-PROMPT = 8
-LEARNING_RATE = 0.05
+# Odd, so a ratio-2 window opened in the prefill closes in the decode.
+PROMPT = 7
+# A power of two, so one step moves a weight alike in fp32 and in fp64.
+LEARNING_RATE = 2 ** -4
 
 
 def reference_code() -> Path:
@@ -250,113 +265,176 @@ def draft(net, ids, main_hidden, start_pos):
     return type(net).forward_spec.__wrapped__(net, ids, main_hidden, start_pos)
 
 
-class Margins:
-    """The smallest distance from a rounding or a selection boundary that the
-    reference met, so the fixture can be held to a JAX port at fp32 noise.
-
-    Quantization, per site (the FP8 window keys, the FP4 compressed entries,
-    the FP4 index queries and keys): a scaled value's distance to the nearest
-    midpoint between two representable values, over the spacing there, and
-    each scale's distance to its own rounding step. Selection: every top-k's
-    gap between its k-th and (k+1)-th finite value, over the values' scale.
-    """
-
-    def __init__(self, prefix: str = ""):
-        self.prefix = prefix
-        self.values: dict[str, float] = {}
-
-    def note(self, key, value):
-        value = float(value)
-        if np.isfinite(value):
-            key = self.prefix + key
-            self.values[key] = min(self.values.get(key, np.inf), value)
-
-
-MARGINS: Margins | None = None
+# The fp32 noise between Dew's and the reference's inputs to a rounding or a
+# selection, twice the largest that `tools/deepseek_v41_numerics.py noise`
+# measures over the fixture on CPU and on GPU: a quantizer's input over its
+# block's amax (which bounds the relative noise on its scale's quotient as
+# well), a top-k row over its largest finite magnitude. A value closer than
+# this to where its rounding or selection changes may round or select
+# differently in the two.
+NOISE = {"window": 4.0e-6, "entries": 3.9e-6, "index": 4.1e-6, "selection": 1.2e-4}
+BLOCKS = {"window": 32, "entries": 16, "index": 32}
 E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+E4M3_GRID = torch.unique(torch.arange(0, 127, dtype=torch.uint8).view(torch.float8_e4m3fn).float())
 
 
-def _grid_margin(scaled: torch.Tensor, grid: torch.Tensor) -> float:
-    magnitude = scaled.detach().abs().flatten().float()
-    midpoints = (grid[1:] + grid[:-1]) / 2
-    spacing = grid[1:] - grid[:-1]
-    distance = (magnitude[:, None] - midpoints[None]).abs() / spacing[None]
-    return float(distance.min()) if distance.numel() else np.inf
+class Record:
+    """Every quantizer call's input and output blocks with their margins,
+    and every top-k's scored rows with their picks and margins, in call
+    order, under the site's or `selection`'s name."""
+
+    def __init__(self):
+        self.calls: dict[str, list[dict[str, torch.Tensor]]] = {}
+
+    def add(self, kind: str, **arrays: torch.Tensor):
+        self.calls.setdefault(kind, []).append(arrays)
+
+    def joined(self, kind: str, name: str) -> torch.Tensor:
+        """One array of every call's `name`, rows padded to the widest with
+        NaN (scores) or -1 (picks)."""
+        parts = [call[name] for call in self.calls[kind]]
+        if parts[0].ndim == 1:
+            return torch.cat(parts)
+        width = max(part.size(-1) for part in parts)
+        fill = float("nan") if parts[0].is_floating_point() else -1
+        return torch.cat([torch.nn.functional.pad(part, (0, width - part.size(-1)), value=fill)
+                          for part in parts])
+
+    def arrays(self, prefix: str) -> dict[str, np.ndarray]:
+        return {f"{prefix}{kind}_{name}": self.joined(kind, name).numpy()
+                for kind, calls in self.calls.items() for name in calls[0]}
+
+    def assess(self) -> dict:
+        """What the noise can reach: `at_risk` counts the scales and picks
+        within NOISE of where they change (either moves a whole block or the
+        entries a query attends), and `hazard` is the largest rounding step,
+        over its block's amax, among the elements within NOISE of a
+        boundary. `closest` is each kind's smallest margin over its NOISE."""
+        at_risk, hazard, closest = 0, 0.0, {}
+        for kind in self.calls:
+            bound = NOISE[kind]
+            if kind == "selection":
+                margin = self.joined(kind, "margin")
+                at_risk += int((margin < bound).sum())
+                closest[kind] = float(margin.min() / bound)
+                continue
+            scale_margin = self.joined(kind, "scale_margin")
+            margin, flip = self.joined(kind, "margin").flatten(), self.joined(kind, "flip").flatten()
+            reachable = margin < bound
+            at_risk += int((scale_margin < bound).sum())
+            hazard = max(hazard, float(flip[reachable].max()) if reachable.any() else 0.0)
+            closest[f"{kind}_scale"] = float(scale_margin.min() / bound)
+            closest[kind] = float(margin.min() / bound)
+        return {"at_risk": at_risk, "hazard": hazard, "closest": closest}
 
 
-def _e4m3_grid() -> torch.Tensor:
-    codes = torch.arange(0, 127, dtype=torch.uint8).view(torch.float8_e4m3fn).float()
-    return torch.unique(codes[torch.isfinite(codes)])
+RECORDS: list[Record] = []
 
 
-def _log2_margin(quotient: torch.Tensor) -> float:
-    exponent = torch.log2(quotient.double())
-    return float((exponent - exponent.round()).abs().min())
+def _boundary_distance(values: torch.Tensor, grid: torch.Tensor):
+    """Each value's distance to the nearest midpoint of two neighbouring grid
+    values, where a round to nearest changes, and those two values' spacing."""
+    midpoints = (grid[1:] + grid[:-1]).double() / 2
+    spacing = (grid[1:] - grid[:-1]).double()
+    nearest = (values[..., None] - midpoints).abs().argmin(-1)
+    return (values - midpoints[nearest]).abs(), spacing[nearest]
 
 
-def _power_of_two_floor(value: torch.Tensor) -> torch.Tensor:
-    return torch.exp2(torch.floor(torch.log2(value.double()))).float()
+def quantizer_margins(site: str, x: torch.Tensor) -> dict[str, torch.Tensor]:
+    """How far one quantizer call's input sits from where its rounding
+    changes, in the stand-in's arithmetic (`window` FP8 over 32, `entries`
+    FP4 over 16 under E4M3 scales, `index` FP4 over 32 under power-of-two
+    scales): per element, the distance to the nearest rounding boundary
+    (`margin`) and the step a crossing moves the value by (`flip`), both
+    over the block's amax, which is the scale fp32 noise on the input lives
+    at; per block, the scale's quotient's relative distance to where the
+    scale steps (`scale_margin`), infinite where the amax floor holds it."""
+    kernels = importlib.import_module("tools.deepseek_v41_kernels")
+    blocks = x.detach().float().reshape(-1, BLOCKS[site])
+    amax = blocks.abs().amax(-1, keepdim=True)
+    if site == "window":
+        quotient, floor = kernels.fp8_quotient(amax), 1e-4
+        scale, grid, bound = kernels.fp8_scale(amax, power_of_two=True), E4M3_GRID, kernels.FP8_MAX
+    else:
+        e4m3 = site == "entries"
+        quotient = kernels.fp4_quotient(amax, e4m3)
+        floor = kernels.FP4_MAX * (2 ** -9 if e4m3 else 2 ** -126)
+        scale, grid, bound = kernels.fp4_scale(amax, e4m3), E2M1_GRID, kernels.FP4_MAX
+    quotient = quotient.double()[:, 0]
+    if site == "entries":
+        step_distance = _boundary_distance(quotient, E4M3_GRID)[0]
+    else:
+        step_distance = (quotient - torch.exp2(torch.log2(quotient).round())).abs()
+    scale_margin = torch.where(amax[:, 0] > floor, step_distance / quotient, torch.inf)
+    scaled = (blocks / scale).clamp(-bound, bound).abs().double()
+    distance, spacing = _boundary_distance(scaled, grid)
+    relative = torch.where(amax > 0, scale.double() / amax.double(), torch.inf)
+    return {"margin": distance * relative, "flip": spacing * relative, "scale_margin": scale_margin}
+
+
+def selection_margins(rows: torch.Tensor, k: int) -> dict[str, torch.Tensor]:
+    """Each top-k row's largest finite magnitude (`scale`) and the gap
+    between its k-th and (k+1)-th values over it (`margin`), infinite where
+    either is not finite or the row holds k values or fewer."""
+    finite = torch.isfinite(rows)
+    scale = rows.masked_fill(~finite, 0).abs().amax(-1).clamp_min(1e-6)
+    margin = torch.full_like(scale, torch.inf)
+    if k < rows.size(-1):
+        ordered = rows.sort(dim=-1, descending=True).values
+        kth, after = ordered[:, k - 1], ordered[:, k]
+        margin = torch.where(torch.isfinite(kth) & torch.isfinite(after), (kth - after) / scale, margin)
+    return {"margin": margin, "scale": scale}
+
+
+def _probed(site: str, x: torch.Tensor, quantize):
+    """One quantizer call, recorded with its margins in every active record."""
+    before = x.detach().float().reshape(-1, BLOCKS[site]).clone()
+    margins = quantizer_margins(site, before) if RECORDS else {}
+    out = quantize()
+    for record in RECORDS:
+        record.add(site, **{"in": before, "out": out.detach().float().reshape(-1, BLOCKS[site]).clone()},
+                   **margins)
+    return out
 
 
 def set_quantizers(model_module, *, enabled: bool):
-    """Point model.py's imported quantizers at the kernels, wrapped to report
-    their margins, or at the identity: the fixture's architecture outputs run
-    without quantization, its `qat_logits` with it (see `run`)."""
+    """Point model.py's imported quantizers at the kernels, wrapped to record
+    their calls, or at the identity: the fixture's architecture outputs run
+    without quantization, its `qat_*` with it (see `run`)."""
     kernels = sys.modules["kernel"]
     if not enabled:
         model_module.act_quant = lambda x, *args, **kwargs: x
         model_module.fp4_act_quant = lambda x, *args, **kwargs: x
         return
-    e4m3 = _e4m3_grid()
 
     def act_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, inplace=False):
-        if MARGINS is not None:
-            blocks = x.detach().float().unflatten(-1, (-1, block_size))
-            quotient = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4) * torch.tensor(
-                1 / 448, dtype=torch.float32)
-            MARGINS.note("window_scale", _log2_margin(quotient))
-            scale = kernels._power_of_two_ceil(quotient)
-            MARGINS.note("window", _grid_margin((blocks / scale).clamp(-448, 448), e4m3))
-        return kernels.act_quant(x, block_size, scale_fmt, scale_dtype, inplace)
+        assert block_size == BLOCKS["window"]
+        return _probed("window", x, lambda: kernels.act_quant(x, block_size, scale_fmt, scale_dtype, inplace))
 
     def fp4_act_quant(x, block_size=32, inplace=False, scale_dtype=torch.float8_e8m0fnu):
-        if MARGINS is not None:
-            blocks = x.detach().float().unflatten(-1, (-1, block_size))
-            amax = blocks.abs().amax(-1, keepdim=True)
-            if scale_dtype == torch.float8_e4m3fn:
-                site = "entries"
-                quotient = amax.clamp_min(6 * 2 ** -9) / 6
-                MARGINS.note("entries_scale",
-                             _grid_margin(quotient / _power_of_two_floor(quotient), e4m3[e4m3 >= 1]))
-                scale = quotient.to(torch.float8_e4m3fn).float()
-            else:
-                site = "index"
-                quotient = amax.clamp_min(6 * 2 ** -126) * torch.tensor(1 / 6, dtype=torch.float32)
-                MARGINS.note("index_scale", _log2_margin(quotient))
-                scale = kernels._power_of_two_ceil(quotient)
-            MARGINS.note(site, _grid_margin((blocks / scale).clamp(-6, 6), E2M1_GRID))
-        return kernels.fp4_act_quant(x, block_size, inplace, scale_dtype)
+        site = "entries" if scale_dtype == torch.float8_e4m3fn else "index"
+        assert block_size == BLOCKS[site]
+        return _probed(site, x, lambda: kernels.fp4_act_quant(x, block_size, inplace, scale_dtype))
 
     model_module.act_quant, model_module.fp4_act_quant = act_quant, fp4_act_quant
 
 
 def install_selection_probe():
-    """Wrap torch.Tensor.topk to report every selection's margin."""
+    """Wrap torch.Tensor.topk to record every selection: its scored rows, its
+    sorted picks and their margins."""
     topk = torch.Tensor.topk
     if getattr(topk, "probed", False):
         return
 
     def probe_topk(self, k, dim=-1, largest=True, sorted=True):
-        if MARGINS is not None and k < self.size(dim):
-            ordered = self.detach().float().sort(dim=dim, descending=True).values
-            kth = ordered.narrow(dim, k - 1, 1)
-            after = ordered.narrow(dim, k, 1)
-            finite = torch.isfinite(kth) & torch.isfinite(after)
-            if finite.any():
-                scale = ordered.masked_fill(~torch.isfinite(ordered), 0).abs().amax(
-                    dim, keepdim=True).clamp_min(1e-6)
-                MARGINS.note("selection", ((kth - after) / scale)[finite].min())
-        return topk(self, k, dim=dim, largest=largest, sorted=sorted)
+        result = topk(self, k, dim=dim, largest=largest, sorted=sorted)
+        if RECORDS:
+            rows = self.detach().float().movedim(dim, -1)
+            rows = rows.reshape(-1, rows.size(-1)).clone()
+            picks = result.indices.movedim(dim, -1).reshape(-1, k).sort(dim=-1).values.int()
+            for record in RECORDS:
+                record.add("selection", rows=rows, picks=picks, **selection_margins(rows, k))
+        return result
 
     probe_topk.probed = True
     torch.Tensor.topk = probe_topk
@@ -367,66 +445,99 @@ def cross_entropy(logits, ids):
         logits[:, :-1].reshape(-1, logits.size(-1)), ids[:, 1:].reshape(-1))
 
 
-def run(seed: int, measure: bool):
-    """Every reference output for one seed, and the margins it met.
+def trained(net, ids):
+    """The forward under autograd, its loss and every trainable parameter's
+    gradient, the parameters' own gradients cleared after."""
+    reset(net)
+    _, logits, _ = forward(net, ids)
+    loss = cross_entropy(logits, ids)
+    loss.backward()
+    gradients = {}
+    for name, parameter in net.named_parameters():
+        if parameter.requires_grad:
+            gradients[name] = (torch.zeros_like(parameter) if parameter.grad is None
+                               else parameter.grad.detach().clone())
+            parameter.grad = None
+    return logits.detach(), loss.detach(), gradients
+
+
+def stepped(net, gradients, ids) -> np.ndarray:
+    """The forward's logits one SGD step along `gradients` away, the
+    weights restored after."""
+    parameters = {name: p for name, p in net.named_parameters() if name in gradients}
+    held = {name: p.detach().clone() for name, p in parameters.items()}
+    with torch.no_grad():
+        for name, parameter in parameters.items():
+            parameter.sub_(LEARNING_RATE * gradients[name])
+        reset(net)
+        _, logits, _ = forward(net, ids)
+        for name, parameter in parameters.items():
+            parameter.copy_(held[name])
+    return logits.numpy()
+
+
+def cached(net, ids) -> dict[str, np.ndarray]:
+    """The prefill of the first PROMPT tokens, the teacher-forced steps after
+    it and DSpark's draft after each."""
+    decode_logits, draft_ids, draft_logits, draft_confidence = [], [], [], []
+    reset(net)
+    next_ids, prompt_logits, main_hidden = forward(net, ids[:, :PROMPT])
+    draft(net, next_ids[:, -1], main_hidden, 0)
+    for position in range(PROMPT, LENGTH):
+        next_ids, step_logits, main_hidden = forward(net, ids[:, position:position + 1], position)
+        decode_logits.append(step_logits[:, 0])
+        drafted = draft(net, next_ids[:, -1], main_hidden, position)
+        draft_ids.append(drafted[0])
+        draft_logits.append(drafted[1])
+        draft_confidence.append(drafted[2])
+    return {"prompt_logits": prompt_logits.numpy(),
+            "decode_logits": torch.stack(decode_logits, 1).numpy(),
+            "draft_ids": torch.stack(draft_ids, 1).numpy().astype(np.int32),
+            "draft_logits": torch.stack(draft_logits, 1).numpy(),
+            "draft_confidence": torch.stack(draft_confidence, 1).numpy()}
+
+
+def run(seed: int):
+    """Every reference output for one seed, and what the noise can reach in
+    it (`Record.assess`).
 
     The architecture outputs (the forward, the update, the cached decode,
-    greedy generation and DSpark's drafts) run with the quantizers off: a
-    fake-quantizer's rounding turns fp32 noise between two frameworks into
-    whole steps wherever a value sits near a rounding boundary, and across
-    every forward here some value always does. `qat_logits` runs the one
-    full forward with them on, for a seed whose margins keep that forward
-    clear of every boundary; the quantizers themselves are compared bit for
-    bit elsewhere (tests/test_deepseek_v41.py).
+    greedy generation and DSpark's drafts) run with the quantizers off, and
+    the `qat_*` outputs repeat the forward, the update and the cached run
+    with them on. A rounding or a selection turns fp32 noise between two
+    frameworks into a whole step wherever a value sits within that noise of
+    where it changes, so both forwards record every quantizer and top-k
+    call with its margins: a port is held to each call it makes, and a
+    difference from a recorded output is allowed only where the recorded
+    margin sits within NOISE (tests/test_deepseek_v41.py).
     """
-    global MARGINS
     model_module, engram_module = import_reference()
     install_selection_probe()
     args = model_args(model_module, engram_module)
     net = build(model_module, engram_module, args, seed)
     generator = torch.Generator().manual_seed(seed + 1)
     ids = torch.randint(3, args.vocab_size - 1, (2, LENGTH), generator=generator)
-    margins = {}
+    outputs = {"input_ids": ids.numpy().astype(np.int32), "learning_rate": np.float32(LEARNING_RATE),
+               "decode_prompt": np.int32(PROMPT)}
+    state = {name: p.detach().clone() for name, p in net.named_parameters() if p.requires_grad}
+    every = Record()
 
-    set_quantizers(model_module, enabled=True)
-    MARGINS = Margins("qat_") if measure else None
+    gradients = {}
+    for prefix, quantized in (("qat_", True), ("", False)):
+        set_quantizers(model_module, enabled=quantized)
+        recorded = Record()
+        RECORDS[:] = [every, recorded]
+        logits, loss, gradients[prefix] = trained(net, ids)
+        outputs.update(recorded.arrays(prefix), **{f"{prefix}logits": logits.numpy(),
+                                                   f"{prefix}loss": np.float32(loss.item())})
+        RECORDS[:] = [every]
+        with torch.no_grad():
+            outputs.update({f"{prefix}{name}": value for name, value in cached(net, ids).items()})
+    # Both updates are read through the forward without quantization, so
+    # they compare the gradients alone.
+    for prefix, gradient in gradients.items():
+        outputs[f"{prefix}updated_logits"] = stepped(net, gradient, ids)
     with torch.no_grad():
-        reset(net)
-        _, qat_logits, _ = forward(net, ids)
-    if MARGINS is not None:
-        margins.update(MARGINS.values)
-
-    set_quantizers(model_module, enabled=False)
-    MARGINS = Margins() if measure else None
-    reset(net)
-    _, logits, _ = forward(net, ids)
-    loss = cross_entropy(logits, ids)
-    loss.backward()
-    parameters = {name: p for name, p in net.named_parameters() if p.requires_grad}
-    gradients = {name: (torch.zeros_like(p) if p.grad is None else p.grad.detach().clone())
-                 for name, p in parameters.items()}
-    state = {name: p.detach().clone() for name, p in parameters.items()}
-
-    with torch.no_grad():
-        for name, p in parameters.items():
-            p.sub_(LEARNING_RATE * gradients[name])
-        reset(net)
-        _, updated, _ = forward(net, ids)
-        for name, p in parameters.items():
-            p.copy_(state[name])
-
-        decode_logits, draft_ids, draft_logits, draft_confidence = [], [], [], []
-        reset(net)
-        next_ids, prompt_logits, main_hidden = forward(net, ids[:, :PROMPT])
-        draft(net, next_ids[:, -1], main_hidden, 0)
-        for position in range(PROMPT, LENGTH):
-            next_ids, step_logits, main_hidden = forward(net, ids[:, position:position + 1], position)
-            decode_logits.append(step_logits[:, 0])
-            drafted = draft(net, next_ids[:, -1], main_hidden, position)
-            draft_ids.append(drafted[0])
-            draft_logits.append(drafted[1])
-            draft_confidence.append(drafted[2])
-
         reset(net)
         generated = []
         next_ids, _, _ = forward(net, ids[:, :PROMPT])
@@ -435,52 +546,26 @@ def run(seed: int, measure: bool):
             generated.append(token)
             next_ids, _, _ = forward(net, token[:, None], position)
             token = next_ids[:, -1]
-    if MARGINS is not None:
-        margins.update(MARGINS.values)
-    MARGINS = None
-    outputs = {
-        "input_ids": ids.numpy().astype(np.int32),
-        "logits": logits.detach().numpy(),
-        "qat_logits": qat_logits.numpy(),
-        "loss": np.float32(loss.item()),
-        "learning_rate": np.float32(LEARNING_RATE),
-        "updated_logits": updated.numpy(),
-        "decode_prompt": np.int32(PROMPT),
-        "prompt_logits": prompt_logits.numpy(),
-        "decode_logits": torch.stack(decode_logits, 1).numpy(),
-        "generated": torch.stack(generated, 1).numpy().astype(np.int32),
-        "draft_ids": torch.stack(draft_ids, 1).numpy().astype(np.int32),
-        "draft_logits": torch.stack(draft_logits, 1).numpy(),
-        "draft_confidence": torch.stack(draft_confidence, 1).numpy(),
-    }
-    return net, state, outputs, margins, gradients
+    outputs["generated"] = torch.stack(generated, 1).numpy().astype(np.int32)
+    RECORDS.clear()
+    return net, state, outputs, every.assess()
 
 
-# The fp32 noise a margin has to clear, in its own units: a value that sits
-# closer than this to a rounding or selection boundary can round or select
-# differently in two fp32 implementations of the same arithmetic.
-NOISE = {"qat_window": 2e-5, "qat_entries": 2e-5, "qat_index": 5e-6, "qat_selection": 2e-3,
-         "selection": 5e-5}
-SCALE_NOISE = 1e-4
-
-
-def score(margins: dict[str, float]) -> float:
-    """The smallest margin over the noise it has to clear (NOISE, and
-    SCALE_NOISE for every `*_scale` margin); a seed scoring 1 or more keeps
-    every quantizer and selection of the fixture clear of fp32 noise."""
-    return min(value / (SCALE_NOISE if key.endswith("_scale") else NOISE[key])
-               for key, value in margins.items())
+def rank(assessment: dict) -> tuple[int, float]:
+    """A seed's order: fewest scales and picks within the noise of where they
+    change, then the smallest rounding step the noise can reach."""
+    return assessment["at_risk"], assessment["hazard"]
 
 
 def search(first: int, count: int):
-    """Report every seed's margins and `score`, one JSON line each, then the
-    seed that scores highest. SEED is that seed over `--seed 0 --search 119`."""
+    """Report what the noise can reach at every seed, one JSON line each,
+    then the seed `rank` puts first. SEED is that seed over `--seed 0
+    --search 119`."""
     best = None
     for seed in range(first, first + count):
-        *_, margins, _ = run(seed, measure=True)
-        line = {"seed": seed, "score": score(margins), **margins}
+        line = {"seed": seed, **run(seed)[3]}
         print(json.dumps(line), flush=True)
-        if best is None or line["score"] > best["score"]:
+        if best is None or rank(line) < rank(best):
             best = line
     print(json.dumps({"best": best}), flush=True)
 
@@ -543,9 +628,10 @@ def check_kernels():
             failures.append(name)
 
     quantizers = {
-        "act_quant fp8/32 ue8m0": lambda k, x: k.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu, True),
-        "fp4_act_quant fp4/16 e4m3": lambda k, x: k.fp4_act_quant(x, 16, True, torch.float8_e4m3fn),
-        "fp4_act_quant fp4/32 e8m0": lambda k, x: k.fp4_act_quant(x, 32, True),
+        "act_quant fp8/32 ue8m0": lambda k, x: k.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu, inplace=True),
+        "fp4_act_quant fp4/16 e4m3": lambda k, x: k.fp4_act_quant(x, 16, inplace=True,
+                                                                  scale_dtype=torch.float8_e4m3fn),
+        "fp4_act_quant fp4/32 e8m0": lambda k, x: k.fp4_act_quant(x, 32, inplace=True),
     }
     magnitudes = (1e-6, 1e-4, 1e-2, 0.3, 3.0, 40.0, 3e2, 3e3, 3e4)
     blocks = []
@@ -656,7 +742,7 @@ def config_json(args) -> dict:
 def write(seed: int):
     from safetensors.torch import save_file
 
-    net, state, outputs, margins, _ = run(seed, measure=True)
+    net, state, outputs, assessment = run(seed)
     FIXTURE.mkdir(parents=True, exist_ok=True)
     args = model_args(importlib.import_module("model"), importlib.import_module("engram"))
     assert args.engram_num_embeddings == tuple(
@@ -670,26 +756,30 @@ def write(seed: int):
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(TOKENIZER / name, FIXTURE / name)
     np.savez(FIXTURE / "reference.npz", **outputs)
-    print(json.dumps({"seed": seed, **margins}))
+    print(json.dumps({"seed": seed, **assessment}))
     import transformers
 
     (FIXTURE / "source.json").write_text(json.dumps({
         "released": {"repo": REPO, "revision": DEEPSEEK_V41_REVISION, "code": list(CODE)},
         "kernels": "tools/deepseek_v41_kernels.py",
         "torch": torch.__version__, "transformers": transformers.__version__,
-        "seed": seed, "margins": margins, "tool": "tools/deepseek_v41_reference.py",
+        "seed": seed, "noise": NOISE, "reach": assessment,
+        "tool": "tools/deepseek_v41_reference.py",
     }, indent=1) + "\n")
     print(f"{FIXTURE}: {len(tensors)} tensors, loss {outputs['loss']:.6f}")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--search", type=int, default=0, help="score the margins of this many seeds")
+    parser.add_argument("--search", type=int, default=0, help="rank this many seeds")
     parser.add_argument("--seed", type=int, default=SEED, help="the fixture's seed, or the first searched")
     parser.add_argument("--check-kernels", action="store_true",
                         help="compare the torch stand-ins with the tilelang kernels on CUDA")
     options = parser.parse_args()
     torch.set_default_dtype(torch.float32)
+    # One thread keeps every reduction in one order, so a rerun writes the
+    # same bits.
+    torch.set_num_threads(1)
     if options.check_kernels:
         check_kernels()
     elif options.search:

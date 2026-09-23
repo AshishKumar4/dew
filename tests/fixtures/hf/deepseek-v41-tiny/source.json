@@ -12,16 +12,25 @@
  "kernels": "tools/deepseek_v41_kernels.py",
  "torch": "2.10.0+cu128",
  "transformers": "5.17.0",
- "seed": 81,
- "margins": {
-  "qat_window_scale": 0.00025361070844631683,
-  "qat_window": 4.291534423828125e-05,
-  "qat_selection": 0.001449228497222066,
-  "qat_index_scale": 0.0008964389763840286,
-  "qat_index": 2.5987625122070312e-05,
-  "qat_entries_scale": 0.007000923156738281,
-  "qat_entries": 0.000418931245803833,
-  "selection": 3.659988215076737e-05
+ "seed": 106,
+ "noise": {
+  "window": 4e-06,
+  "entries": 3.9e-06,
+  "index": 4.1e-06,
+  "selection": 0.00012
+ },
+ "reach": {
+  "at_risk": 0,
+  "hazard": 0.12577903730292672,
+  "closest": {
+   "window_scale": 324.4832139017633,
+   "window": 0.0412688577188823,
+   "selection": 1.1683990955352783,
+   "index_scale": 7.676156807879962,
+   "index": 0.0753148147088591,
+   "entries_scale": 90.86378092377846,
+   "entries": 0.44302049278451083
+  }
  },
  "tool": "tools/deepseek_v41_reference.py"
 }

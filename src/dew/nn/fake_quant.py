@@ -42,12 +42,14 @@ def round_e4m3fn(values):
 
 
 def _straight_through(x, rounded):
-    """`rounded` forward and the identity's gradient backward. Written as
-    `rounded + (x - x)` so the forward value is `rounded` exactly in any
-    dtype: `x + (rounded - x)` re-rounds in bf16 wherever the quantizer
-    clamped far from `x`. The estimator is Dew's choice; the release is
-    inference code and the paper names none."""
-    return jax.lax.stop_gradient(rounded.astype(x.dtype)) + (x - jax.lax.stop_gradient(x))
+    """`rounded` forward, bit for bit in any dtype, and the identity's
+    gradient backward. `stop_gradient(x) - x` is +0, and subtracting +0
+    leaves every value as it is, a negative zero included, which the
+    kernels keep; adding it would turn -0 into +0, and `x + (rounded - x)`
+    re-rounds in bf16 wherever the quantizer clamped far from `x`. The
+    estimator is Dew's choice; the release is inference code and the paper
+    names none."""
+    return jax.lax.stop_gradient(rounded.astype(x.dtype)) - (jax.lax.stop_gradient(x) - x)
 
 
 def fake_quant_fp8(x, block: int):

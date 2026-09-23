@@ -2,16 +2,16 @@
 
 deepseek-v41-tiny comes from tools/deepseek_v41_reference.py: the release's
 inference/model.py at dba1be0a (DeepSeek-V4.1-Flash) run in fp32 over the
-torch stand-ins for its kernels, which match the tilelang kernels bit for bit
-on a GPU (the tool's docstring). The architecture outputs are taken with the
-quantizers off, since across that many forwards some value always sits
-within fp32 noise of a rounding boundary; `qat_logits` is the one forward
-with them on, at a seed whose margins keep it clear of every boundary.
+torch stand-ins for its kernels, whose quantizers match the tilelang kernels
+bit for bit on bf16 input (`--check-kernels`). The architecture outputs are
+taken with the quantizers off and repeated with them on (`qat_*`). Every
+quantizer and top-k call of the reference's forward is recorded with its
+margins: Dew's quantizers are held bit for bit to each recorded call, and
+Dew's own calls may round or select differently only where the recorded
+margin sits within the fp32 noise between the two (source.json's `noise`).
 
-Observed on CPU in fp32, tolerance 1e-4: logits 8.0e-6 without and 5.4e-6
-with quantization-aware rounding, prefill 3.9e-6 and teacher-forced decode
-5.4e-6, DSpark draft logits 5.7e-6 and confidence 8.7e-6 with identical
-draft ids, greedy ids exact.
+TOLERANCE is twice the largest distance from the reference that
+`tools/deepseek_v41_numerics.py residuals` measures on CPU and on GPU.
 """
 
 import dataclasses
@@ -29,23 +29,36 @@ from dew.interop.hf_decoders import _FAMILIES, _flatten, translate_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Step
-from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling import Sampling, generate
+from tools.deepseek_v41_numerics import (
+    cached_run,
+    captured,
+    dew_rows,
+    input_noise,
+    loss_and_gradient,
+    padded,
+    row_noise,
+    stepped,
+    unquantized,
+)
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "deepseek-v41-tiny"
 RELEASED = ROOT / "deepseek-v41-flash"
-TOLERANCE = 1e-4
+TOLERANCE = {
+    "logits": 1e-5, "loss": 4e-6, "updated_logits": 4e-4, "prompt_logits": 1e-5,
+    "decode_logits": 1e-5, "draft_logits": 1e-5, "draft_confidence": 1.6e-5,
+    "qat_logits": 8e-6, "qat_loss": 1e-6, "qat_updated_logits": 1.5e-3, "qat_prompt_logits": 2.5e-5,
+    "qat_decode_logits": 7e-6, "qat_draft_logits": 4e-6, "qat_draft_confidence": 6.2e-6,
+}
 
 
-def unquantized(model):
-    """The model with its quantization-aware rounding off, as the reference's
-    architecture outputs were taken."""
-    kinds = {name: dataclasses.replace(kind, mixer=dataclasses.replace(kind.mixer, kv_qat=False))
-             for name, kind in model.kinds.items()}
-    return model.clone(kinds=flax.core.freeze(kinds))
+@pytest.fixture(scope="module", autouse=True)
+def fp32_matmuls():
+    """The reference multiplies in fp32, where a GPU's default is TF32."""
+    with jax.default_matmul_precision("highest"):
+        yield
 
 
 @pytest.fixture(scope="module")
@@ -54,17 +67,19 @@ def source():
     return loaded, unquantized(loaded.model), np.load(TINY / "reference.npz")
 
 
-def close(actual, expected):
+def close(actual, reference, name: str):
+    """`actual` within TOLERANCE[name] of the reference's `name`, its argmax
+    exact."""
     actual = np.asarray(actual)
-    np.testing.assert_allclose(actual, expected, atol=TOLERANCE, rtol=0)
-    np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
+    np.testing.assert_allclose(actual, reference[name], atol=TOLERANCE[name], rtol=0, err_msg=name)
+    np.testing.assert_array_equal(actual.argmax(-1), reference[name].argmax(-1), err_msg=name)
 
 
 def test_the_quantizers_round_as_the_release_kernels():
     """FP8 over 32 channels under power-of-two scales, FP4 over 16 under E4M3
     scales and over 32 under power-of-two scales, bit for bit against the
-    kernels' torch stand-ins, ties, all-zero blocks and saturation included,
-    compiled, on whichever backend runs the test."""
+    kernels' torch stand-ins (signed zeros included), ties, all-zero blocks
+    and saturation included, compiled, on whichever backend runs the test."""
     torch = pytest.importorskip("torch")
     from tools import deepseek_v41_kernels as kernels
 
@@ -76,13 +91,62 @@ def test_the_quantizers_round_as_the_release_kernels():
     x = np.concatenate([*blocks, np.stack([ties, -ties])]).astype(np.float32)
     x[3, :32] = 0
     for jax_quant, torch_quant in (
-            (lambda v: fake_quant_fp8(v, 32), lambda v: kernels.act_quant(v, 32, "ue8m0", None, True)),
+            (lambda v: fake_quant_fp8(v, 32), lambda v: kernels.act_quant(v, 32, "ue8m0", None, inplace=True)),
             (lambda v: fake_quant_fp4(v, 16, True),
-             lambda v: kernels.fp4_act_quant(v, 16, True, torch.float8_e4m3fn)),
-            (lambda v: fake_quant_fp4(v, 32, False), lambda v: kernels.fp4_act_quant(v, 32, True))):
+             lambda v: kernels.fp4_act_quant(v, 16, inplace=True, scale_dtype=torch.float8_e4m3fn)),
+            (lambda v: fake_quant_fp4(v, 32, False), lambda v: kernels.fp4_act_quant(v, 32, inplace=True))):
         expected = torch_quant(torch.from_numpy(x.copy())).numpy()
         # under jit, where XLA GPU would delete a convert-pair rounding
-        np.testing.assert_array_equal(np.asarray(jax.jit(jax_quant)(jnp.asarray(x))), expected)
+        actual = np.asarray(jax.jit(jax_quant)(jnp.asarray(x)))
+        np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+
+
+QUANTIZERS = {"window": lambda v: fake_quant_fp8(v, 32), "entries": lambda v: fake_quant_fp4(v, 16, True),
+              "index": lambda v: fake_quant_fp4(v, 32, False)}
+
+
+def test_the_quantizers_round_every_call_the_reference_made(source):
+    """Every quantizer call of the reference's quantization-aware forward,
+    fed the input it recorded, gives the output it recorded bit for bit:
+    the rounding is held to the release on the values the model meets,
+    whatever margins the fixture's seed left them."""
+    _, _, reference = source
+    for site, quantize in QUANTIZERS.items():
+        actual = np.asarray(jax.jit(quantize)(jnp.asarray(reference[f"qat_{site}_in"])))
+        np.testing.assert_array_equal(actual.view(np.uint32), reference[f"qat_{site}_out"].view(np.uint32),
+                                      err_msg=site)
+
+
+def test_every_rounding_and_selection_meets_the_reference_within_the_noise(source):
+    """Dew's quantization-aware and plain forwards hand every quantizer and
+    top-k call the input the reference recorded for it, to within the fp32
+    noise between the two (source.json's `noise`, which
+    tools/deepseek_v41_numerics.py measures), and a rounded value or a pick
+    differs from the recorded one only where the reference had it within
+    that noise of where it changes. No seed's margins enter."""
+    loaded, plain, reference = source
+    noise = json.loads((TINY / "source.json").read_text())["noise"]
+    ids = jnp.asarray(reference["input_ids"])
+    for prefix, model in (("qat_", loaded.model), ("", plain)):
+        record = captured(model, loaded.variables, ids)
+        assert set(record.blocks) == ({*QUANTIZERS} if prefix else set())
+        for site, blocks in record.blocks.items():
+            ours = np.concatenate(blocks)
+            assert np.max(input_noise(ours, reference[f"{prefix}{site}_in"])) <= noise[site], site
+            rounded = np.asarray(jax.jit(QUANTIZERS[site])(jnp.asarray(ours)))
+            explained = ((reference[f"{prefix}{site}_margin"] < noise[site])
+                         | (reference[f"{prefix}{site}_scale_margin"][:, None] < noise[site]))
+            assert not np.any((rounded != reference[f"{prefix}{site}_out"]) & ~explained), site
+        theirs = reference[f"{prefix}selection_rows"]
+        ours = dew_rows(record, theirs)
+        assert np.max(row_noise(ours, theirs, reference[f"{prefix}selection_scale"])) <= noise["selection"]
+        columns = np.arange(theirs.shape[1])
+        picked = [np.any(picks[:, :, None] == columns, 1) for picks in (
+            padded(record.picks, reference[f"{prefix}selection_picks"].shape[1], -1),
+            reference[f"{prefix}selection_picks"])]
+        # Picks among forbidden keys (-inf) or past a row's width name nothing.
+        moved = np.any((picked[0] != picked[1]) & (theirs > -np.inf), -1)
+        assert not np.any(moved & (reference[f"{prefix}selection_margin"] >= noise["selection"]))
 
 
 def test_the_quantizers_pass_their_gradient_straight_through():
@@ -168,13 +232,25 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
 def test_the_forward_matches_the_reference(source):
     loaded, plain, reference = source
     ids = jnp.asarray(reference["input_ids"])
-    close(jax.jit(plain.apply)(loaded.variables, ids), reference["logits"])
+    close(jax.jit(plain.apply)(loaded.variables, ids), reference, "logits")
 
 
 def test_the_quantization_aware_forward_matches_the_reference(source):
     loaded, _, reference = source
     ids = jnp.asarray(reference["input_ids"])
-    close(jax.jit(loaded.model.apply)(loaded.variables, ids), reference["qat_logits"])
+    close(jax.jit(loaded.model.apply)(loaded.variables, ids), reference, "qat_logits")
+
+
+def test_the_quantization_aware_loss_and_gradient_match_the_reference(source):
+    """The loss through every quantizer, and one SGD step along its gradient,
+    which passes each quantizer straight through, read back through the
+    forward without quantization, so the step compares the gradient alone."""
+    loaded, plain, reference = source
+    ids = jnp.asarray(reference["input_ids"])
+    value, gradient = loss_and_gradient(loaded.model, loaded.variables, ids)
+    np.testing.assert_allclose(value, reference["qat_loss"], atol=TOLERANCE["qat_loss"], rtol=0)
+    variables = stepped(loaded.variables, gradient, reference["learning_rate"])
+    close(jax.jit(plain.apply)(variables, ids), reference, "qat_updated_logits")
 
 
 def test_the_candidate_pool_decides_the_logits(source):
@@ -188,7 +264,8 @@ def test_the_candidate_pool_decides_the_logits(source):
             kinds["csa2_ratio_1_reindex"].mixer, candidates=None, candidate_blocks=None,
             candidate_block_size=None))
     unpooled = plain.clone(kinds=flax.core.freeze(kinds))
-    assert np.max(np.abs(np.asarray(unpooled.apply(loaded.variables, ids)) - reference["logits"])) > TOLERANCE
+    moved = np.max(np.abs(np.asarray(unpooled.apply(loaded.variables, ids)) - reference["logits"]))
+    assert moved > TOLERANCE["logits"]
 
 
 def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
@@ -197,27 +274,18 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
     bit for bit, and greedy decoding after the fixture's prompt."""
     loaded, plain, reference = source
     ids = jnp.asarray(reference["input_ids"])
-    inputs = ModelInputs(ids)
-    objective = LMObjective(plain, ids.shape[1] - 1, pretrained=loaded.variables, ema_decay=None)
-    step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
-
-    def loss(params):
-        statistics, _ = objective.loss({**loaded.variables, "params": params}, {"text": inputs}, step)
-        return objective.reduce_loss(statistics)[0]
-
-    value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
-    np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
+    value, gradient = loss_and_gradient(plain, loaded.variables, ids)
+    np.testing.assert_allclose(value, reference["loss"], atol=TOLERANCE["loss"], rtol=0)
     indexer = [np.max(np.abs(leaf)) for path, leaf in _flatten(gradient).items() if ".indexer." in f".{path}."]
     assert indexer and max(indexer) == 0
-    variables = {**loaded.variables, "params": jax.tree.map(
-        lambda weight, grad: weight - reference["learning_rate"] * grad, loaded.variables["params"], gradient)}
+    variables = stepped(loaded.variables, gradient, reference["learning_rate"])
     loaded.save(tmp_path, variables=variables)
     restored = load_pretrained(tmp_path, dtype="float32", attention_impl="reference")
     held, again = _flatten(variables), _flatten(restored.variables)
     assert held.keys() == again.keys()
     for name, leaf in again.items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]), err_msg=name)
-    close(unquantized(restored.model).apply(restored.variables, ids), reference["updated_logits"])
+    close(unquantized(restored.model).apply(restored.variables, ids), reference, "updated_logits")
     prompt = int(reference["decode_prompt"])
     generated = generate(plain, loaded.variables, ModelInputs(ids[:, :prompt]),
                          reference["generated"].shape[1], key=jax.random.key(1),
@@ -226,25 +294,16 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
                                   reference["generated"])
 
 
-def cached_run(model, variables, ids, prompt):
-    """Prefill `prompt` tokens, then one token per step; the prompt's logits,
-    each step's logits, and DSpark's drafts after each step."""
-    rows = ids.shape[0]
-    cache = model.apply(variables, rows, method=model.init_cache, mutable=["cache"])[1]
-    drafts = model.apply(variables, rows, method=model.init_draft_cache, mutable=["cache"])[1]
-    (hidden, prompt_logits), cache = model.apply(
-        {**variables, **cache}, ids[:, :prompt], decode=True, method=model.states_and_logits, mutable=["cache"])
-    _, drafts = model.apply({**variables, **drafts}, hidden, None, method=model.draft, mutable=["cache"])
-    steps, drafted = [], []
-    for position in range(prompt, ids.shape[1]):
-        (hidden, logits), cache = model.apply(
-            {**variables, **cache}, ids[:, position:position + 1], decode=True,
-            method=model.states_and_logits, mutable=["cache"])
-        steps.append(np.asarray(logits[:, 0]))
-        out, drafts = model.apply({**variables, **drafts}, hidden, jnp.argmax(logits[:, -1], -1),
-                                  method=model.draft, mutable=["cache"])
-        drafted.append([np.asarray(value) for value in out])
-    return np.asarray(prompt_logits), np.stack(steps, 1), [np.stack(value, 1) for value in zip(*drafted, strict=True)]
+def cached_matches(model, variables, reference, prefix: str):
+    ids = jnp.asarray(reference["input_ids"])
+    prompt_logits, steps, (draft_ids, draft_logits, confidence) = cached_run(
+        model, variables, ids, int(reference["decode_prompt"]))
+    close(prompt_logits, reference, f"{prefix}prompt_logits")
+    close(steps, reference, f"{prefix}decode_logits")
+    close(draft_logits, reference, f"{prefix}draft_logits")
+    name = f"{prefix}draft_confidence"
+    np.testing.assert_allclose(confidence, reference[name], atol=TOLERANCE[name], rtol=0)
+    np.testing.assert_array_equal(draft_ids, reference[f"{prefix}draft_ids"])
 
 
 def test_the_decode_cache_and_the_drafter_match_the_reference(source):
@@ -253,11 +312,12 @@ def test_the_decode_cache_and_the_drafter_match_the_reference(source):
     selections and candidate pool, and the engram history; DSpark's windows
     seed on the prompt and draft after every step."""
     loaded, plain, reference = source
-    ids = jnp.asarray(reference["input_ids"])
-    prompt_logits, steps, (draft_ids, draft_logits, confidence) = cached_run(
-        plain, loaded.variables, ids, int(reference["decode_prompt"]))
-    close(prompt_logits, reference["prompt_logits"])
-    close(steps, reference["decode_logits"])
-    close(draft_logits, reference["draft_logits"])
-    np.testing.assert_allclose(confidence, reference["draft_confidence"], atol=TOLERANCE, rtol=0)
-    np.testing.assert_array_equal(draft_ids, reference["draft_ids"])
+    cached_matches(plain, loaded.variables, reference, "")
+
+
+def test_the_quantization_aware_cache_and_drafter_match_the_reference(source):
+    """The same cached run with the cache rounded as the release stores it:
+    each window key, entry and index key rounded where the cache takes it,
+    DSpark's window keys included."""
+    loaded, _, reference = source
+    cached_matches(loaded.model, loaded.variables, reference, "qat_")
