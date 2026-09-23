@@ -82,9 +82,31 @@ _SESSION = re.compile(r"[A-Za-z0-9._:/-]+")
 class Gateway:
     """The parts of an rllm-model-gateway a rollout source reads.
 
-    `url` is the gateway's root as Dew reaches it; `sandbox_url` is the same
-    gateway as the sandboxes reach it (a Docker bridge address, a cluster
-    service name), which is what a harness's base URL is built from.
+    `url` is the gateway's root as Dew reaches it; `sandbox_url` is where the
+    sandboxes reach it, which is what a harness's base URL is built from.
+
+    rllm-model-gateway (3b40c37) has no authentication, and one port serves
+    the model proxy beside `GET /sessions`, every session's traces, `POST
+    /traces/query`, session deletes, `POST /admin/workers` and `POST
+    /admin/weight_version`. A sandbox runs the policy's own commands, so a
+    policy that reaches that port can read its group members' transcripts,
+    reset the version stamp the staleness bound reads, or register a worker
+    that returns fabricated ids and likelihoods. Therefore:
+
+    - `url` is on an interface only Dew reaches (bind the gateway to
+      loopback or a private trainer network);
+    - `sandbox_url` is a reverse proxy in front of it that forwards only
+      `POST /sessions/<session>/v1/chat/completions` (nginx `location ~
+      ^/sessions/[^/]+/v1/chat/completions$`) and answers 403 to everything
+      else, on its own address;
+    - the task's agent phase allows that address and nothing else: Harbor's
+      `[agent] network_mode = "allowlist"` with `allowed_hosts` naming the
+      proxy, or `--allow-agent-host`, on a provider that supports allowlists
+      (Harbor's `tasks/network-policy` page; Docker needs nftables `fib`
+      support), and `[verifier] network_mode = "no-network"`. Harbor's
+      allowlist filters by host, not path, which is why the proxy is needed.
+
+    `sandbox_url` defaults to `url` only for trusted harnesses and tests.
     """
 
     def __init__(self, url: str, *, sandbox_url: str | None = None, timeout: float = 30.0,
