@@ -186,7 +186,9 @@ class PPORollout:
     wherever the packer placed them. Tool observations and padding have no
     support. The terminal verifier reward lands on the last action with zero
     tail bootstrap, matching the pinned verl GAE input convention; truncated
-    episodes are masked by the packer and take no targets.
+    episodes are masked by the packer and take no targets; a cohort with no
+    trainable token at all returns zero targets and zero mass, while a single
+    trainable token, whose whitening is undefined, is refused.
     """
 
     objective: PPOObjective
@@ -264,6 +266,10 @@ class PPORollout:
         count = np.asarray(min(2, np.count_nonzero(projected[RESPONSE_MASK_KEY])), np.int32)
         if jax.process_count() > 1:
             count = np.sum(multihost_utils.process_allgather(count))
+        if int(count) == 0:
+            # Every episode was masked (truncated): zero mass, so the step makes no update.
+            zeros = np.zeros(projected[IDS_KEY].shape, np.float32)
+            return {**projected, OLD_VALUES_KEY: zeros, ADVANTAGES_KEY: zeros, RETURNS_KEY: zeros}
         if int(count) < 2:
             raise ValueError("PPO GAE whitening requires at least two action tokens globally")
         mesh = mesh_of(state.params)
