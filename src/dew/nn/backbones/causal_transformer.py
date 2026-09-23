@@ -744,7 +744,7 @@ class DecoderBlock(nn.Module):
         return out
 
     def _forward(self, x, train: bool, decode: bool, positions, segment_ids,
-                 kv_store, per_layer_input, attention_metadata, prediction_phase="ordinary"):
+                 kv_store, per_layer_input, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
         if self.hyper_connections is not None:
             return self._forward_streams(x, train, decode, positions, segment_ids,
                                          kv_store, attention_metadata, prediction_phase)
@@ -756,11 +756,7 @@ class DecoderBlock(nn.Module):
         if altup is not None and predictions is not None:
             x = predictions[altup.active_idx]
         normed = self.input_layernorm(x) if self.wiring.pre_norms else x
-        mixed = self.self_attn(normed,
-                               decode=decode, positions=positions, segment_ids=segment_ids,
-                               **({} if kv_store is None else {"kv_store": kv_store}),
-                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
-                               **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
+        mixed = self._mix(normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase)
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         mixed = self._scaled_branch(mixed)
@@ -793,14 +789,11 @@ class DecoderBlock(nn.Module):
         return x
 
     def _forward_streams(self, streams, train: bool, decode: bool, positions, segment_ids,
-                         kv_store, attention_metadata, prediction_phase="ordinary"):
+                         kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
         """The mHC block over `[B, S, hc_mult, D]` (modeling_glm5_next.py:1293-1327)."""
         post, comb, collapsed = self.attn_hc(streams)
-        mixed = self.self_attn(self.input_layernorm(collapsed),
-                               decode=decode, positions=positions, segment_ids=segment_ids,
-                               **({} if kv_store is None else {"kv_store": kv_store}),
-                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
-                               **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
+        mixed = self._mix(self.input_layernorm(collapsed), decode, positions, segment_ids,
+                          kv_store, attention_metadata, prediction_phase)
         streams = mix_streams(post, comb, self.dropout(mixed, deterministic=not train), streams)
         if self.feedforward is None:
             return streams
@@ -814,7 +807,7 @@ class DecoderBlock(nn.Module):
         m_residual, GraniteMoeHybrid's residual_multiplier), in its own dtype."""
         return scaled(branch, self.residual_multiplier)
     def _forward_depth(self, state, train: bool, decode: bool, positions, segment_ids,
-                       kv_store, attention_metadata, prediction_phase="ordinary"):
+                       kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary"):
         """Kimi K3's block over `[B, S, blocks + 1, D]`
         (`KimiDecoderLayer._forward_attn_residual`, modeling_kimi_linear.py:973-1046).
 
@@ -836,11 +829,8 @@ class DecoderBlock(nn.Module):
         if site.opens:
             blocks = blocks.at[:, :, finished].set(partial)
             finished += 1
-        mixed = self.self_attn(self.input_layernorm(read),
-                               decode=decode, positions=positions, segment_ids=segment_ids,
-                               **({} if kv_store is None else {"kv_store": kv_store}),
-                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
-                               **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
+        mixed = self._mix(self.input_layernorm(read), decode, positions, segment_ids,
+                          kv_store, attention_metadata, prediction_phase)
         mixed = self.dropout(mixed, deterministic=not train)
         partial = mixed if site.opens else partial + mixed
         if self.feedforward is not None:
@@ -848,6 +838,16 @@ class DecoderBlock(nn.Module):
                               **self._feedforward_inputs(attention_metadata))
             partial = partial + self.dropout(hidden, deterministic=not train)
         return jnp.concatenate([blocks, partial[:, :, None]], axis=2)
+
+    def _mix(self, x, decode: bool, positions, segment_ids, kv_store, attention_metadata,
+             prediction_phase: PredictionPhase):
+        """The token mixer over `x`. The store, the metadata and a prediction
+        phase other than ordinary reach it only when the call carries them,
+        since a mixer with no use for one does not take it."""
+        return self.self_attn(x, decode=decode, positions=positions, segment_ids=segment_ids,
+                              **({} if kv_store is None else {"kv_store": kv_store}),
+                              **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
+                              **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
 
     def _feedforward_inputs(self, attention_metadata) -> dict:
         """The token ids for a hash-routed feed-forward, nothing for the rest."""
