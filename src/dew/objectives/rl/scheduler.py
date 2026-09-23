@@ -62,7 +62,15 @@ policy is the trainer's current weights, rescored over the packed rows with
 sources report behavior likelihoods only, and the objective's
 `behavior_importance` weights each token by proximal over behavior.
 
-One trainer process owns the scheduler; multi-process trainers are refused.
+Every process of a multi-process trainer runs its own scheduler, over the
+task rows its data stream reads and on its own source, and packs its own
+`rows`: the step's batch is every process's rows together, sharded as the
+trainer shards any batch, and no rollout crosses a process. The pool meets
+twice a call. The weight push is one call every process makes, so the
+publisher has to agree on it across the pool. The proximal rescoring runs
+once over the pool's batch, and each process reads its own rows back. A
+process whose admission fails raises on every process at the agreement
+point, rather than leave the others waiting in the rescoring.
 """
 
 from __future__ import annotations
@@ -79,9 +87,11 @@ from typing import Protocol
 import jax
 import numpy as np
 
+from dew.artifacts import agreed
 from dew.data.dataset import Batch, DataPartition, Dataset, tapped
-from dew.nn.inputs import local_rows
+from dew.nn.inputs import local_rows, mesh_of
 from dew.objectives.base import Variables
+from dew.training.distributed import shard_batch
 from dew.training.state import TrainState
 
 from .grpo import GRPOObjective
@@ -198,11 +208,12 @@ class RolloutScheduler:
     `tasks` turns one registered batch into its tasks (`task_ids` for
     integer `task_id` rows). `timeout` is each rollout's deadline in seconds
     from its submission; a rollout past it is cancelled and resubmitted as a
-    failed attempt. `width` and `rows` fix the packed batch shape;
+    failed attempt. `width` and `rows` fix the packed batch shape, `rows`
+    for this process's share of a multi-process trainer's batch;
     `estimator` and `truncation` are `pack`'s advantage family and
     truncation policy, and `support_capacity` its per-row support length,
     which a filtered-sampling source requires. `log`, when given,
-    receives a `SchedulerRecord` per call.
+    receives a `SchedulerRecord` per call, of this process's rollouts.
     """
 
     def __init__(self, objective: GRPOObjective, source: SessionSource, weights: Publisher, *,
@@ -423,10 +434,24 @@ class RolloutScheduler:
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> dict[str, np.ndarray]:
         del key  # sources own their sampling seeds
-        if jax.process_count() != 1:
-            raise ValueError("RolloutScheduler coordinates one trainer process")
         updates = int(state.updates)
         self._publish(state, updates)
+        rollouts, latencies, groups, tally, waited = agreed(
+            "rollout admission", lambda: self._admitted(batch, updates))
+        packed = pack(rollouts, self.width, rows=self.rows, estimator=self.estimator, truncation=self.truncation,
+                      support_capacity=self.support_capacity)
+        packed[OLD_LOG_PROBS_KEY] = self._proximal(state.params, packed) * packed[RESPONSE_MASK_KEY]
+        if self.log is not None:
+            versions = [call.version for rollout in rollouts for call in rollout.calls]
+            oldest = min(versions, default=updates)
+            metrics = session_metrics(rollouts, packed, latencies=latencies, version=updates,
+                                      truncation=self.truncation)
+            self.log(SchedulerRecord(updates, oldest, updates - oldest, groups, dict(tally.resubmitted),
+                                     tally.cancelled, tally.abandoned, tally.cut, waited, metrics))
+        return packed
+
+    def _admitted(self, batch: Batch, updates: int) -> tuple[list[Session], list[float], int, _Tally, float]:
+        """This process's admitted rollouts for `batch`, their latencies, the group count, the tally and the wait."""
         with self._lock:
             if not self._registered:
                 raise ValueError("a RolloutScheduler batch comes from the stream of RolloutScheduler.tasks(dataset)")
@@ -442,17 +467,17 @@ class RolloutScheduler:
         began = time.perf_counter()
         admitted = self._admit(entry, updates, tally)
         waited = time.perf_counter() - began
-        rollouts = [rollout for group in admitted for rollout in group.done[:self.groups]]
-        latencies = [latency for group in admitted for latency in group.latencies[:self.groups]]
-        packed = pack(rollouts, self.width, rows=self.rows, estimator=self.estimator, truncation=self.truncation,
-                      support_capacity=self.support_capacity)
-        proximal = np.asarray(self._rescore(state.params, packed), np.float32)
-        packed[OLD_LOG_PROBS_KEY] = proximal * packed[RESPONSE_MASK_KEY]
-        if self.log is not None:
-            versions = [call.version for rollout in rollouts for call in rollout.calls]
-            oldest = min(versions, default=updates)
-            metrics = session_metrics(rollouts, packed, latencies=latencies, version=updates,
-                                      truncation=self.truncation)
-            self.log(SchedulerRecord(updates, oldest, updates - oldest, len(admitted), dict(tally.resubmitted),
-                                     tally.cancelled, tally.abandoned, tally.cut, waited, metrics))
-        return packed
+        return ([rollout for group in admitted for rollout in group.done[:self.groups]],
+                [latency for group in admitted for latency in group.latencies[:self.groups]],
+                len(admitted), tally, waited)
+
+    def _proximal(self, params: Variables, packed: dict[str, np.ndarray]) -> np.ndarray:
+        """The trainer's likelihoods of this process's packed rows, `[rows, width - 1]`.
+
+        Over a mesh the rows are placed as the step places the batch, every
+        process's rows together, so the rescoring runs once over the pool's
+        batch and each process reads its own rows back.
+        """
+        mesh = mesh_of(params)
+        scored = self._rescore(params, packed if mesh is None else shard_batch(mesh, packed))
+        return local_rows(scored).astype(np.float32)
