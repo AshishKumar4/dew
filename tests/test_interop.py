@@ -162,6 +162,45 @@ def test_float8_payloads_are_mapped_without_numpy_dtype_conversion(tmp_path):
         assert actual.tobytes() == expected.tobytes()
 
 
+def raw_safetensors(path, entries):
+    """Write a safetensors file byte for byte, for the dtype tags no NumPy writer emits."""
+    header, payload = {}, b""
+    for name, (tag, shape, data) in entries.items():
+        header[name] = {"dtype": tag, "shape": list(shape),
+                        "data_offsets": [len(payload), len(payload) + len(data)]}
+        payload += data
+    encoded = json.dumps(header).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    path.write_bytes(len(encoded).to_bytes(8, "little") + encoded + payload)
+
+
+def test_block_scale_exponents_and_packed_fp4_are_mapped_as_stored(tmp_path):
+    """DeepSeek-V4's shards carry F8_E8M0 scales and F4 experts (the header of
+    DeepSeek-V4-Flash shard 5). An E8M0 byte is the exponent 2**(b - 127); an
+    F4 tensor of n elements is n / 2 bytes, returned as that byte view, the
+    way PyTorch writes a float4_e2m1fn_x2 [1, 2] as F4 [1, 4]."""
+    path = tmp_path / "v4.safetensors"
+    raw_safetensors(path, {"w.scale": ("F8_E8M0", (3,), bytes([127, 128, 120])),
+                           "w": ("F4", (1, 4), bytes([0x21, 0x43]))})
+
+    tensors, _ = read_file(path)
+
+    scale = tensors["w.scale"]
+    assert scale.dtype == ml_dtypes.float8_e8m0fnu
+    np.testing.assert_array_equal(scale.astype(np.float32), [1.0, 2.0, 2.0 ** -7])
+    packed = tensors["w"]
+    assert packed.dtype == np.uint8 and packed.shape == (1, 2)
+    assert packed.tobytes() == bytes([0x21, 0x43]) and isinstance(packed.base, np.memmap)
+
+
+def test_an_fp4_tensor_with_an_odd_last_axis_is_refused_by_name(tmp_path):
+    path = tmp_path / "odd.safetensors"
+    raw_safetensors(path, {"w": ("F4", (2, 3), bytes(3))})
+
+    with pytest.raises(ValueError, match="'w'.*F4 with shape \\(2, 3\\)"):
+        read_file(path)
+
+
 def test_the_arrays_are_read_only_views_of_the_file(tmp_path):
     """The map outlives the reader context, and the arrays refuse writes."""
     path = tmp_path / "model.safetensors"

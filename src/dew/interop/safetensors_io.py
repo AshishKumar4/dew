@@ -48,7 +48,20 @@ _STORED_DTYPES = {
     "F8_E5M2": np.dtype(ml_dtypes.float8_e5m2),
     "F8_E4M3FNUZ": np.dtype(ml_dtypes.float8_e4m3fnuz),
     "F8_E5M2FNUZ": np.dtype(ml_dtypes.float8_e5m2fnuz),
+    # The block-scale exponents of MX formats and DeepSeek-V4's `.scale`
+    # tensors: one unsigned power-of-two exponent per byte.
+    "F8_E8M0": np.dtype(ml_dtypes.float8_e8m0fnu),
 }
+
+PACKED_F4 = "F4"
+"""safetensors' 4-bit float (e2m1), two elements per byte.
+
+Its header states the element shape, and PyTorch writes a
+`float4_e2m1fn_x2` tensor of shape [..., n] as F4 [..., 2n] over n bytes.
+NumPy has no sub-byte dtype, so `read_file` returns such a tensor as that
+byte view: uint8 with the last axis halved. Which nibble holds which element
+is the producing codec's convention; safetensors fixes only the byte count.
+"""
 
 
 def _safetensors():
@@ -230,7 +243,8 @@ def read_file(path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
 
     One read-only memory map backs every array, so the tensors stay file
     backed after the reader closes and arrive in their stored dtype -
-    bfloat16 included. Anything that wants float32 asks for it.
+    bfloat16 and the FP8 formats included, and F4 as its `PACKED_F4` byte
+    view. Anything that wants float32 asks for it.
     """
     filename = os.fspath(path)
     tensors: dict[str, np.ndarray] = {}
@@ -247,12 +261,19 @@ def read_file(path) -> tuple[dict[str, np.ndarray], dict[str, str]]:
             view = reader.get_slice(name)
             shape = tuple(view.get_shape())
             tag = view.get_dtype()
-            try:
-                dtype = _STORED_DTYPES[tag]
-            except KeyError as error:
-                raise ValueError(
-                    f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}"
-                ) from error
+            if tag == PACKED_F4:
+                if not shape or shape[-1] % 2:
+                    raise ValueError(
+                        f"tensor {name!r} in {filename} is F4 with shape {shape}; two "
+                        "elements share a byte, so its last axis is even")
+                shape, dtype = (*shape[:-1], shape[-1] // 2), np.dtype(np.uint8)
+            else:
+                try:
+                    dtype = _STORED_DTYPES[tag]
+                except KeyError as error:
+                    raise ValueError(
+                        f"tensor {name!r} in {filename} uses unsupported stored dtype {tag!r}"
+                    ) from error
             offset = offsets.get(name)
             if offset is None:
                 raise ValueError(f"tensor {name!r} in {filename} has no header entry")
