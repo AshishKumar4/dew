@@ -682,3 +682,22 @@ Changes, each measured before and after in one hold:
 - The exchange gathers each bucket's rows through the sort's index and scatters what returns straight to its slots, two row copies fewer a round. On the NVLink pair, dropless goes from 300.5 to 295.8 ms and capacity 1.25 from 218.5 to 212.3, with peak memory from 14.1 to 13.7 GiB and 12.6 to 12.0.
 
 One bf16 `ExpertMLP` layer under `MeshSpec(fsdp=2)` on the NVLink pair (8192 tokens, 32 experts, top 4), forward plus backward: the Pallas kernels inside the dispatch's map take 26.2 ms (Pallas under main's older row map took 25.1), and `jax.lax.ragged_dot` inside the map takes 271.9 ms with 6.5 GiB of temporaries, since XLA runs it as a product over every expert. The same layer through the global path outside any map, where main's selector had sent fsdp-only meshes to XLA, ran out of memory on the 24 GiB cards.
+
+### Rematerialization: the trainer's ladder
+
+A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory (`dew.training.trainer.step_fits`, the executable's arguments, outputs and temporaries against the device's `bytes_limit`): a decoder from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. Each rung is slower and smaller, so the first that fits is the fastest that runs. Forward plus backward plus AdamW, bf16 compute, 10 timed steps, `tools/benchmark_kernels.py step --remat`:
+
+| device | model, batch x tokens | none | minimal / dots | full |
+|---|---|---|---|---|
+| L4 | 359.8M decoder, 4 x 1024 | 334.7 ms, 9.93 GiB | 356.4 ms, 8.00 GiB | 401.3 ms, 6.29 GiB |
+| L4 | 359.8M decoder, 8 x 1024 | 676.3 ms, 13.39 GiB | 719.6 ms, 10.00 GiB | 815.9 ms, 6.57 GiB |
+| L4 | 359.8M decoder, 16 x 1024 | out of memory | out of memory | 1671.1 ms, 7.22 GiB |
+| L4 | 321.8M MoE decoder, 4 x 1024 | 213.2 ms, 8.15 GiB | 235.4 ms, 6.54 GiB | 251.7 ms, 6.13 GiB |
+| L4 | 321.8M MoE decoder, 8 x 1024 | 396.0 ms, 10.33 GiB | 420.1 ms, 7.82 GiB | 454.5 ms, 6.69 GiB |
+| L4 | DiT-L/2, 16 x 64x64 | out of memory | out of memory | 1377.8 ms, 8.81 GiB |
+| L4 | DiT-L/2, 32 x 64x64 | out of memory | out of memory | 2671.8 ms, 10.16 GiB |
+| RTX 3090 | 359.8M decoder, 4 x 1024 | 225.2 ms, 9.70 GiB | 237.9 ms, 7.67 GiB | 270.0 ms, 6.06 GiB |
+| RTX 3090 | 359.8M decoder, 8 x 1024 | 420.9 ms, 13.16 GiB | 438.3 ms, 9.77 GiB | 505.1 ms, 6.33 GiB |
+| RTX 3090 | 321.8M MoE decoder, 4 x 1024 | 126.5 ms, 7.82 GiB | 133.6 ms, 6.26 GiB | 150.2 ms, 6.02 GiB |
+
+`'minimal'` costs 3-11% over no recomputation and `'full'` 17-24%, so a model that fits runs without either. The L4 rows are jax 0.11.2 on Colab (2026-09-23), the RTX 3090 rows one GPU of the box.
