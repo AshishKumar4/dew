@@ -70,7 +70,7 @@ class ScheduledScores(Objective):
 def test_event_step_and_objective_schedule_have_separate_meanings():
     objective = ScheduledScores()
     batch = {"x": np.ones((8, 1), np.float32)}
-    result = evaluate(objective, objective.init(jax.random.key(0)), lambda: iter([batch]),
+    result = evaluate(objective, objective.init(jax.random.key(0)), lambda partition: iter([batch]),
                       key=jax.random.key(9), step=7, schedule_step=2, metrics=(perplexity(),))
     assert result.step == 7
     assert result.scores["val/perplexity"] == pytest.approx(np.exp(2))
@@ -82,7 +82,7 @@ def test_preview_only_closes_first_batch_and_no_consumers_never_open_source():
     objective = ScheduledScores()
     closed = []
 
-    def source():
+    def source(partition):
         try:
             yield {"x": np.ones((8, 1), np.float32)}
             raise AssertionError("preview-only evaluation read beyond the first batch")
@@ -92,7 +92,7 @@ def test_preview_only_closes_first_batch_and_no_consumers_never_open_source():
     result = evaluate(objective, {}, source, key=jax.random.key(0), preview=True)
     assert result.coordinated_batches == 1 and closed == [True]
 
-    def unopened():
+    def unopened(partition):
         raise AssertionError("an evaluation without consumers opened a source")
 
     empty = evaluate(objective, {}, unopened, key=jax.random.key(0))

@@ -232,30 +232,31 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
 
         agreed("iterator construction", open_source)
         assert iterator is not None and mesh is not None
-        # The objective scores under the mesh, as the step trains under it:
-        # the model's placements and its sequence and stage splits read it.
-        with jax.set_mesh(mesh):
-            while True:
-                batch, available = _next_batch(iterator, scored)
-                if available != jax.process_count():
-                    uneven = available > 0
-                    batch = None
-                    break
-                assert batch is not None
-                batch, rows = _placed_batch(mesh, batch, scored)
-                records += rows
-                produced = None
-                if metrics:
+        while True:
+            batch, available = _next_batch(iterator, scored)
+            if available != jax.process_count():
+                uneven = available > 0
+                batch = None
+                break
+            assert batch is not None
+            batch, rows = _placed_batch(mesh, batch, scored)
+            records += rows
+            produced = None
+            if metrics:
+                # The objective scores under the mesh, as the step trains
+                # under it: the model's placements and its sequence and stage
+                # splits read it. A preview decodes, which neither split does.
+                with jax.set_mesh(mesh):
                     produced = _scored_batch(objective, variables, batch, context, scored,
                                              metrics=metrics, summaries=summaries,
                                              score_key=score_key, root=root)
-                if scored == 0 and preview_enabled:
-                    previews = _previewed(objective, variables, batch, context,
-                                          preview_key=preview_key, scored=produced, root=root)
-                produced = batch = None
-                scored += 1
-                if not metrics:
-                    break
+            if scored == 0 and preview_enabled:
+                previews = _previewed(objective, variables, batch, context,
+                                      preview_key=preview_key, scored=produced, root=root)
+            produced = batch = None
+            scored += 1
+            if not metrics:
+                break
         if scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
     finally:

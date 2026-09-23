@@ -397,8 +397,8 @@ def run_case(case: Case, tmp_path, fsdp):
     source = batches(case, encoder)
 
     class Data:
-        train = staticmethod(source)
-        val = staticmethod(lambda: (batch for batch in [next(source())]))
+        train = staticmethod(lambda partition: source())
+        val = staticmethod(lambda partition: (batch for batch in [next(source())]))
         batch = BATCH
 
     state = trainer.fit(Data(), steps=2, log_every=1, eval_every=1,

@@ -1171,7 +1171,10 @@ class Trainer(Generic[Loss, Effects]):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)
         assert params is not None, "evaluation always has model variables"
-        with self._traced_on(mesh):
+        # The rules and the microbatch count; `evaluate` scores under the mesh
+        # itself, and previews decode outside it.
+        with (pipeline_microbatches(self.mesh.microbatches),
+              nn.logical_axis_rules(self.layout.axis_rules)):
             evaluation = evaluate(
                 self.objective, params, dataset.val, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep,

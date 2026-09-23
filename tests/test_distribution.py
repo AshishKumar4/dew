@@ -22,6 +22,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from dew.nn.sharding import MESH_AXES
 from dew.training import MeshSpec
 from dew.training.distributed import hybrid_devices
 
@@ -174,6 +175,40 @@ def test_more_replicas_than_hosts_are_refused(tmp_path):
                   "--mesh", json.dumps({"fsdp": 4, "replicas": 2}), devices=8)
     assert done.returncode != 0
     assert "replicas 2 must divide both the 1 granules" in done.stdout
+
+
+@dataclasses.dataclass(frozen=True)
+class StandIn:
+    """What the mesh builders read of a GPU device on one of two hosts, each
+    host its own slice, as XLA numbers GPU slices per boot."""
+    id: int
+    process_index: int
+    slice_index: int
+    platform: str = "gpu"
+    device_kind: str = "NVIDIA GeForce RTX 3090"
+
+
+def crossing(spec: MeshSpec) -> list[str]:
+    """The axes of `spec`'s device grid over two hosts of four GPUs whose
+    groups span both hosts."""
+    sharded = spec.fsdp * spec.expert * spec.tensor * spec.sequence * spec.stage
+    shape = (8 // sharded, spec.expert, spec.fsdp, spec.tensor, spec.sequence, spec.stage)
+    grid = hybrid_devices(spec, shape, [StandIn(index, index // 4, index // 4) for index in range(8)])
+    hosts = np.vectorize(lambda device: device.slice_index)(grid)
+    return [name for axis, name in enumerate(MESH_AXES)
+            if len(set(np.moveaxis(hosts, axis, -1).reshape(-1, hosts.shape[axis])[0])) > 1]
+
+
+def test_two_gpu_hosts_split_the_data_axis_unless_asked_otherwise():
+    """Every GPU host is its own slice. Without replicas the hosts take the
+    data axis where it divides, and fsdp only where it does not; before,
+    plain data parallelism and a tensor mesh were refused on two hosts."""
+    assert crossing(MeshSpec()) == ["data"]
+    assert crossing(MeshSpec(tensor=4)) == ["data"]
+    assert crossing(MeshSpec(fsdp=2, tensor=2)) == ["data"]
+    assert crossing(MeshSpec(fsdp=8)) == ["fsdp"]
+    with pytest.raises(ValueError, match="only the fsdp axis may cross"):
+        crossing(MeshSpec(tensor=8))
 
 
 def test_replicas_in_a_process_outside_any_pool_are_refused_by_granule():
