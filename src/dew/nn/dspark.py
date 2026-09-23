@@ -26,13 +26,12 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable
 
-import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .attention import RMSNorm
-from .deepseek_v4 import DRAFT_CONTEXT
+from .deepseek_v4 import DRAFT_CONTEXT, DRAFT_VALID
 from .hyper_connections import Carried, collapse_by, expand_streams, first_stream
 from .sharding import logical_axes
 
@@ -106,14 +105,15 @@ class DSparkStage(nn.Module):
         """The drafter's context off the concatenated target states (v41:1130)."""
         return self.main_norm(self.main_proj(hidden))
 
-    def __call__(self, carry, context, decode: bool):
-        return self.layer(carry, decode=decode, kv_store={DRAFT_CONTEXT: context})
+    def __call__(self, carry, store, decode: bool):
+        return self.layer(carry, decode=decode, kv_store=store)
 
-    def seed(self, context):
+    def seed(self, store):
         """Append the context to this stage's window cache, drafting nothing
         (the release's prefill, v41:1044-1052, :1123-1125)."""
+        context = store[DRAFT_CONTEXT]
         empty = jnp.zeros((context.shape[0], 0, context.shape[-1]), context.dtype)
-        self.layer.self_attn(empty, decode=True, kv_store={DRAFT_CONTEXT: context})
+        self.layer.self_attn(empty, decode=True, kv_store=store)
 
     def head(self, carry: Carried):
         """The collapsed pre-norm state and the normed one the head scores."""
@@ -133,28 +133,34 @@ class DSparkStage(nn.Module):
 
 
 def draft(stages, spec: DSpark, embed: Callable, logits_of: Callable, hc_mult: int,
-          states, tokens, *, decode: bool, key=None, temperature: float = 0.0):
+          states, tokens, *, decode: bool, valid=None, choose: Callable | None = None):
     """One drafting pass (Transformer.forward_spec, v41:1274-1282).
 
     `states` `[B, M, targets * D]` is the target's recorded context up to
-    the position the block drafts after, `tokens` `[B]` the token drawn
-    there. Returns the drafted ids `[B, block_size + 1]` (the drawn token
-    first), their logits `[B, block_size, vocab]` with the Markov bias
-    added, and each position's confidence `[B, block_size]`. Draws are
-    greedy unless a `key` and a positive `temperature` are given. `tokens`
-    None only seeds the cached windows.
+    the position the block drafts after, and `valid` `[B, M]` which of its
+    positions are real; `tokens` `[B]` is the token drawn there. Returns the
+    drafted ids `[B, block_size + 1]` (the drawn token first), their logits
+    `[B, block_size, vocab]` with the Markov bias added, and each
+    position's confidence `[B, block_size]`. `choose(index, logits)` draws
+    the token after block position `index` from its biased logits `[B,
+    vocab]`, greedily when None. Cached, `tokens` None only appends the
+    context to the windows, and `states` None drafts after what they hold.
     """
-    context = stages[0].context(states)
+    store = {}
+    if states is not None:
+        store[DRAFT_CONTEXT] = stages[0].context(states)
+        if valid is not None:
+            store[DRAFT_VALID] = valid
     if tokens is None:
         for stage in stages:
-            stage.seed(context)
+            stage.seed(store)
         return None
     block = jnp.full((tokens.shape[0], spec.block_size), spec.noise_token_id, jnp.int32)
     block = block.at[:, 0].set(tokens)
     streams = expand_streams(embed(block), hc_mult)
     carry = Carried(streams, first_stream(streams))
     for stage in stages:
-        carry = stage(carry, context, decode)
+        carry = stage(carry, store, decode)
     last = stages[-1]
     hidden_state, normed = last.head(carry)
     logits = logits_of(normed)
@@ -162,11 +168,7 @@ def draft(stages, spec: DSpark, embed: Callable, logits_of: Callable, hc_mult: i
     for index in range(spec.block_size):
         bias, embedded = last.markov(drafted[-1])
         step = logits[:, index] + bias
-        if key is None or temperature <= 0:
-            chosen = jnp.argmax(step, axis=-1)
-        else:
-            key, sub = jax.random.split(key)
-            chosen = jax.random.categorical(sub, step / temperature, axis=-1)
+        chosen = jnp.argmax(step, axis=-1) if choose is None else choose(index, step)
         drafted.append(chosen.astype(jnp.int32))
         embeds.append(embedded)
         scored.append(step)

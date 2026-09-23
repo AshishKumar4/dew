@@ -33,6 +33,7 @@ from jax.typing import ArrayLike
 
 from dew.artifacts import agreed
 from dew.nn.backbones.causal_transformer import Mixture, gather_cache_rows
+from dew.nn.dspark import DSpark
 from dew.nn.inputs import (
     ArrayT,
     ModelInputs,
@@ -133,6 +134,16 @@ class Routed(Protocol):
 
     @property
     def mixture(self) -> Mixture | None: ...
+
+
+@runtime_checkable
+class BlockDrafting(Protocol):
+    """A decoder that may carry a block drafter: DeepSeek-V4.1's DSpark,
+    which drafts a whole block per pass from the context its target layers
+    record instead of chaining prediction depths."""
+
+    @property
+    def dspark(self) -> DSpark | None: ...
 
 
 @dataclass(frozen=True)
@@ -265,13 +276,14 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     over the prompt: each depth reads the target's hidden state at one
     position with the token at the next, at that token's own position, which
     is the history a checkpoint's predictor was trained behind. A depth left
-    empty would draft the first block from nothing.
+    empty would draft the first block from nothing. A block drafter's
+    windows take the context of every real prompt position.
 
     `cache` continues a cache the caller already holds, whose cursors say
     where each row's prompt resumes; None allocates an empty one.
     """
     batch, width = inputs.tokens.shape
-    held = _empty_cache(model, params, batch, ops.depths) if cache is None else cache
+    held = _empty_cache(model, params, batch, ops) if cache is None else cache
     exposed = isinstance(model, Exposing)
     selective = isinstance(model, Selective)
     # An unpadded prompt carries no validity field, and its last real token is
@@ -283,11 +295,13 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     scored = (inputs.tokens, slot) if selective else (inputs.tokens,)
     answer, updated = model.apply(
         {**params, "cache": held}, *scored, decode=True,
-        mutable=["cache", "embeddings"], rngs=None,
+        mutable=["cache", "embeddings", *_recorded(ops)], rngs=None,
         method=("states_and_logits_at" if selective else
                 "states_and_logits" if exposed else None), capture_intermediates=False,
         **inputs.kwargs())
     states, logits = answer if exposed or selective else (None, answer)
+    if ops.record is not None:
+        states = _context(model, params, updated)
     drawn = logits if selective else logits[rows, slot]
     supplied = inputs.token_fields.get("positions")
     rotary = inputs.token_fields.get("rotary_positions")
@@ -309,16 +323,29 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
         state = dataclasses.replace(state, drafts=(states[rows, slot],) * (ops.depths - 1))
     if ops.depths and width > 1 and states is not None and prepared:
         state = _seeded_depths(ops, state, states, prepared[0], real, logical, batch, width)
+    if ops.record is not None and states is not None:
+        state = ops.record(state, states, real)
     return state, last >= 0
 
 
-def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int) -> Variables:
-    """A zeroed decode cache for `batch` rows, with the prediction depths' own beside it."""
-    cache = model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]
-    if depths:
-        drafting = model.apply(params, batch, method="init_mtp_cache", mutable=["cache"])[1]["cache"]
-        cache = unflatten_dict({**flatten_dict(dict(cache)), **flatten_dict(dict(drafting))})
-    return cache
+def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps) -> Variables:
+    """A zeroed decode cache for `batch` rows, with the drafter's own beside it."""
+    cache = flatten_dict(dict(model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]))
+    for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
+        cache.update(flatten_dict(dict(model.apply(params, batch, method=method, mutable=["cache"])[1]["cache"])))
+    return unflatten_dict(cache)
+
+
+def _recorded(ops: DecodeOps) -> list[str]:
+    """The collections a forward opens so a block drafter can read its context."""
+    return ["prediction_inputs"] if ops.record is not None else []
+
+
+def _context(model: nn.Module, params: Variables, updated: Mapping) -> jax.Array:
+    """The block drafter's context `[B, S, targets * D]` a forward recorded."""
+    context = model.apply(params, updated["prediction_inputs"], method="draft_context")
+    assert isinstance(context, jax.Array)
+    return context
 
 
 def _seeded_depths(ops: DecodeOps, state: DecoderState, states: jax.Array,
@@ -380,9 +407,12 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
     """The model operations a strategy may run, bound to these weights.
 
     Parameters stay unmapped: every operation reads the same tree, and only
-    the cache moves with the rows.
+    the cache moves with the rows. A model with a block drafter hands its
+    drafter's context back as the states `verify` returns.
     """
     exposed = isinstance(model, Exposing)
+    blocks = _block_drafting(model, params) if isinstance(model, BlockDrafting) and model.dspark else None
+    recorded = [] if blocks is None else ["prediction_inputs"]
 
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array
             ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
@@ -391,10 +421,12 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
                      {"positions": state.positions[:, None] + jnp.arange(width)[None, :]})
         answer, updated = model.apply(
             {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
-            decode=True, attention_mask=valid, mutable=["cache"], rngs=None,
+            decode=True, attention_mask=valid, mutable=["cache", *recorded], rngs=None,
             method="states_and_logits" if exposed else None,
             capture_intermediates=False, **positions)
         states, logits = answer if exposed else (None, answer)
+        if blocks is not None:
+            states = _context(model, params, updated)
         moved = (None if state.positions is None else
                  state.positions + jnp.sum(valid, axis=1, dtype=state.positions.dtype))
         return (dataclasses.replace(state, cache=updated["cache"], logits=logits[:, -1],
@@ -413,6 +445,8 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
                          dataclasses.replace(state, cache={})),
             cache=gather_cache_rows(state.cache, rows))
 
+    if blocks is not None:
+        return DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1])
     if not depths or not exposed:
         return DecodeOps(advance, reindex, run)
     return DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths)
@@ -446,6 +480,27 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
         return prepared
 
     return propose, embed
+
+
+def _block_drafting(model: nn.Module, params: Variables):
+    """The `(record, draft)` pair a block drafter runs with.
+
+    `record` appends the context of a stretch's real positions to the
+    drafter's windows; `draft` drafts the block after what they hold from
+    each row's drawn token, handing each position's logits to `choose`,
+    which draws the next token.
+    """
+    def record(state: DecoderState, context: jax.Array, valid: jax.Array) -> DecoderState:
+        _, updated = model.apply({**params, "cache": state.cache}, context, None, valid=valid,
+                                 method="draft", mutable=["cache"])
+        return dataclasses.replace(state, cache=updated["cache"])
+
+    def draft(state: DecoderState, tokens: jax.Array,
+              choose: Callable[[int, jax.Array], jax.Array]) -> None:
+        model.apply({**params, "cache": state.cache}, None, tokens, choose=choose,
+                    method="draft", mutable=["cache"])
+
+    return record, draft
 
 
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
