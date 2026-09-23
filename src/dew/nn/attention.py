@@ -1467,8 +1467,12 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
     one [B, H, Q, K] float array of zeros and the dtype's minimum, added to
     the logits. Only causality is a flag it takes. That array is the whole
     rectangle, which is what splash exists to avoid, so this path runs only
-    for the calls `tpu_attention` names. The 1/sqrt(d) scale is the kernel's
-    own `sm_scale` here.
+    for the calls `tpu_attention` names.
+
+    The 1/sqrt(d) goes onto the query, as on splash, and the kernel's
+    `sm_scale` stays 1: the kernel adds `ab` to the logits before it
+    multiplies by `sm_scale` (flash_attention.py:402-409), which would scale
+    T5's position bias along with them.
     """
     from jax.experimental.pallas.ops.tpu.flash_attention import flash_attention
 
@@ -1476,7 +1480,7 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
     key = repeat_kv_heads(key, heads)
     value = repeat_kv_heads(value, heads)
     # pallas wants [B, H, S, D]
-    q = jnp.moveaxis(query, -2, -3)
+    q = jnp.moveaxis(query, -2, -3) * jnp.asarray(1.0 / math.sqrt(query.shape[-1]), query.dtype)
     k = jnp.moveaxis(key, -2, -3)
     v = jnp.moveaxis(value, -2, -3)
     combined = None
@@ -1493,8 +1497,7 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
             (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
         combined = seated if combined is None else combined + seated
     return jnp.moveaxis(
-        flash_attention(q, k, v, ab=combined, causal=causal,
-                        sm_scale=1.0 / math.sqrt(query.shape[-1])), -3, -2)
+        flash_attention(q, k, v, ab=combined, causal=causal), -3, -2)
 
 
 @logical_axes({

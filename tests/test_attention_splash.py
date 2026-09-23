@@ -10,9 +10,10 @@ Mosaic instead, because the interpreter is exactly what `jax.default_backend()
 is not worth running; `tools/qualify_splash.py` is that run plus a timing.
 
 The reference is `attention_impl 'reference'`, the einsum and softmax path,
-run in fp32 on the same inputs. fp32 holds to a few parts in a million and
-bf16 to two ulps of the output scale, which is the distance the cudnn parity
-in tests/test_kernels.py pins between two correct kernels.
+run in fp32 at HIGHEST precision on the same inputs. Off a TPU fp32 holds to
+a few parts in a million; bf16, and fp32 on a TPU, hold to two ulps of the
+output scale, which is the distance the cudnn parity in tests/test_kernels.py
+pins between two correct kernels.
 """
 
 import jax
@@ -50,7 +51,14 @@ on_tpu = pytest.mark.skipif(jax.default_backend() != 'tpu',
 # the logits and the probabilities to bf16 as written, which alone moves a
 # query gradient by 2% of its scale (2^-5.5), outside the bound, while splash
 # sits at 2^-8 from the fp32 attention on both backends.
-TOLERANCE = {jnp.bfloat16: 2. ** -6, jnp.float32: 2. ** -18}
+#
+# On a TPU Mosaic runs splash's fp32 matmuls as bf16 passes, the way XLA's
+# DEFAULT precision runs its own, so fp32 there gets the bf16 bound. On one v6e
+# at 2048 keys the kernel sat at most 8.7e-3 (2^-6.8) of each array's scale
+# from this reference, forward and in every gradient, where XLA's own fp32
+# attention at DEFAULT precision sat at most 7.0e-3.
+TOLERANCE = {jnp.bfloat16: 2. ** -6,
+             jnp.float32: 2. ** -6 if jax.default_backend() == 'tpu' else 2. ** -18}
 
 
 def qkv(shape, dtype, seed=0, kv_shape=None):
@@ -71,9 +79,12 @@ def value_and_grads(implementation, query, key, value, **kwargs):
 
 
 def reference(query, key, value, **kwargs):
-    """The reference attention of these inputs, computed in fp32."""
+    """The reference attention of these inputs, computed in fp32.
+
+    HIGHEST keeps a TPU's fp32 matmuls at fp32, where DEFAULT runs them on
+    bf16 passes; XLA:CPU computes fp32 either way."""
     return value_and_grads('reference', *(x.astype(jnp.float32) for x in (query, key, value)),
-                           **kwargs)
+                           precision=jax.lax.Precision.HIGHEST, **kwargs)
 
 
 def assert_agrees(splash, reference, dtype):
@@ -131,6 +142,18 @@ def test_the_mosaic_kernel_agrees_at_a_length_only_a_tpu_affords(dtype):
     query, key, value = qkv((1, 2048, 8, 128), dtype)
     assert_agrees(value_and_grads('tpu', query, key, value, causal=True),
                   reference(query, key, value, causal=True), dtype)
+
+
+@on_tpu
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_the_flash_fallback_adds_the_bias_to_the_scaled_logits(dtype):
+    """A bias keeps an explicit 'tpu' off splash, onto the flash kernel,
+    which adds its `ab` before multiplying by `sm_scale`. T5's position bias
+    joins the logits after the 1/sqrt(d) scale, as the reference adds it."""
+    query, key, value = qkv((2, 1024, 4, 128), dtype)
+    bias = 0.5 * jax.random.normal(jax.random.PRNGKey(5), (1, 4, 1024, 1024), jnp.float32)
+    assert_agrees(value_and_grads('tpu', query, key, value, bias=bias.astype(dtype), causal=True),
+                  reference(query, key, value, bias=bias, causal=True), dtype)
 
 
 def segment_mask(lengths, length):
