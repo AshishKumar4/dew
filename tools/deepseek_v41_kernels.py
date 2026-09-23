@@ -26,7 +26,7 @@ FP4_MAX = 6.0
 def _power_of_two_ceil(value: torch.Tensor) -> torch.Tensor:
     """`fast_round_scale` (kernel.py:22-37): 2 ** ceil(log2(value)) read off the
     fp32 exponent and mantissa bits, exact for every normal fp32."""
-    bits = value.float().view(torch.int32)
+    bits = value.to(torch.float32).view(torch.int32)
     exponent = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).to(torch.int32)
     return ((exponent + 127) << 23).view(torch.float32)
 
@@ -104,7 +104,7 @@ _E2M1_ODD = torch.tensor([False, True, False, True, False, True, False, True])
 def e2m1(values: torch.Tensor) -> torch.Tensor:
     """Round fp32 values within +-6 to the nearest E2M1 value, ties to even,
     which the kernel's cvt.rn to float4_e2m1fn does."""
-    grid = _E2M1.to(values.device)
+    grid = _E2M1.to(values.device, values.dtype)
     magnitude = values.abs()
     upper = torch.bucketize(magnitude, grid).clamp(1, len(grid) - 1)
     lower = upper - 1

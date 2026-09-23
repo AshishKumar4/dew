@@ -1,29 +1,31 @@
 """What Dew's DeepSeek-V4.1 comparisons with the release's reference rest on.
 
 tests/test_deepseek_v41.py holds Dew to tests/fixtures/hf/deepseek-v41-tiny,
-which tools/deepseek_v41_reference.py writes from the release's own code.
-Each mode measures one thing, on the backend JAX picks:
+which tools/deepseek_v41_reference.py writes from the release's own code,
+with its float64 truth (reference_f64.npz, `--fp64`). Each mode measures
+one thing, on the backend JAX picks:
 
     PYTHONPATH=src:. python tools/deepseek_v41_numerics.py residuals
 
-every compared output's largest distance from the reference in fp32;
+every compared output's and every quantizer input's and top-k row's RMS
+distance from the float64 truth, Dew's beside the reference's, whose
+ratio tests/reference_error.py bounds;
 
     PYTHONPATH=src:. python tools/deepseek_v41_numerics.py noise
 
 how far Dew's inputs to each rounding and selection sit from the ones the
 reference recorded, in the units of its margins (a quantizer's input over
 its block's amax, a top-k row over its largest finite magnitude), which the
-reference tool's NOISE bounds at twice the largest over CPU and GPU;
+reference tool's NOISE, its seed rank's estimate, takes twice the largest of;
 
-    PYTHONPATH=. <reference venv>/bin/python tools/deepseek_v41_reference.py --fp64 /tmp/v41-fp64.npz
-    PYTHONPATH=src:. python tools/deepseek_v41_numerics.py fp64 /tmp/v41-fp64.npz
+    PYTHONPATH=src:. python tools/deepseek_v41_numerics.py fp64
 
-the plain outputs again with both sides widened to fp64, every fp32 pin
+the plain outputs with Dew widened to fp64 as the truth is, every fp32 pin
 included, where two implementations of the same arithmetic agree to fp64
-rounding: what remains of `residuals` in fp32 is rounding.
+rounding: what remains in fp32 is rounding.
 
 The tests share `unquantized`, `loss_and_gradient`, `stepped`,
-`cached_run`, `captured` and the noise measures from here.
+`cached_run`, `captured`, `selections` and the vision bundle from here.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from tests.reference_error import distance
 
 TINY = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf" / "deepseek-v41-tiny"
 
@@ -247,6 +250,15 @@ def selections(record: Captured, reference, prefix: str):
     return ours, our_picks, theirs, their_picks
 
 
+def scores(record: Captured, reference, truth, prefix: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Every finite top-k score of one forward's calls, Dew's, the
+    reference's and the float64 truth's, in the same order (`selections`)."""
+    ours, _, theirs, _ = selections(record, reference, prefix)
+    wide = candidates(truth[f"{prefix}selection_rows"], reference[f"{prefix}selection_picks"])[0]
+    finite = np.isfinite(theirs)
+    return ours[finite], theirs[finite], wide[finite]
+
+
 def row_noise(ours: np.ndarray, theirs: np.ndarray, scale: np.ndarray) -> np.ndarray:
     """Each finite top-k score's distance from the reference's over the
     row's recorded scale."""
@@ -275,31 +287,28 @@ def noise() -> dict[str, float]:
     return measured
 
 
-def distances(model, variables, reference, prefix: str, fixture) -> dict[str, float]:
-    """How far one run's outputs lie from the reference's `prefix` ones: the
-    forward, the loss, the update (read through the forward without
-    quantization) and the cached run with its drafts, each as its largest
-    absolute difference, the draft ids as the count that differ. `fixture`
-    supplies the ids, the update's rate and the prompt length."""
+def outputs(model, variables, fixture, prefix: str) -> dict[str, np.ndarray]:
+    """One run's outputs under the reference's `prefix` names: the forward,
+    the loss, the update (read through the forward without quantization)
+    and the cached run with its drafts. `fixture` supplies the ids, the
+    update's rate and the prompt length."""
     ids = jnp.asarray(fixture["input_ids"])
-    plain = unquantized(model)
-
-    def apart(name, actual):
-        return float(np.max(np.abs(np.asarray(actual) - reference[prefix + name])))
-
     value, gradient = loss_and_gradient(model, variables, ids)
     moved = stepped(variables, gradient, fixture["learning_rate"])
     prompt_logits, steps, (draft_ids, draft_logits, confidence) = cached_run(
         model, variables, ids, int(fixture["decode_prompt"]))
-    return {prefix + name: value for name, value in {
-        "logits": apart("logits", jax.jit(model.apply)(variables, ids)),
-        "loss": apart("loss", value),
-        "updated_logits": apart("updated_logits", jax.jit(plain.apply)(moved, ids)),
-        "prompt_logits": apart("prompt_logits", prompt_logits),
-        "decode_logits": apart("decode_logits", steps),
-        "draft_logits": apart("draft_logits", draft_logits),
-        "draft_confidence": apart("draft_confidence", confidence),
-        "draft_ids": float(np.sum(draft_ids != reference[prefix + "draft_ids"]))}.items()}
+    return {prefix + name: np.asarray(value) for name, value in {
+        "logits": jax.jit(model.apply)(variables, ids), "loss": value,
+        "updated_logits": jax.jit(unquantized(model).apply)(moved, ids),
+        "prompt_logits": prompt_logits, "decode_logits": steps, "draft_logits": draft_logits,
+        "draft_confidence": confidence, "draft_ids": draft_ids}.items()}
+
+
+def apart(ours, reference, truth) -> dict[str, float]:
+    """Dew's and the reference's RMS distances from the float64 truth and
+    their ratio (tests/reference_error.py)."""
+    dew, theirs = distance(ours, truth), distance(reference, truth)
+    return {"dew": dew, "reference": theirs, "ratio": dew / theirs}
 
 
 def vision_bundle(directory: Path) -> Path:
@@ -338,36 +347,43 @@ def vision_run(model, variables, reference) -> tuple[jax.Array, jax.Array, np.nd
     return span[0], prompt_logits, np.stack(steps, 1)
 
 
-def residuals() -> dict[str, float]:
-    """Every output the tests compare, as its distance from the reference's,
-    and for each quantizer site the count of recorded values its compiled
-    quantizer does not reproduce bit for bit."""
+def residuals() -> dict[str, object]:
+    """Every output the tests compare, every quantizer input and every top-k
+    row, as Dew's and the reference's RMS distances from the float64 truth
+    (`apart`); the draft ids as the count that differ, and each quantizer
+    site as the count of recorded values its compiled quantizer does not
+    reproduce bit for bit."""
     loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
-    reference = np.load(TINY / "reference.npz")
-    measured = {f"qat_{site}_mismatches": float(np.sum(
+    reference, truth = np.load(TINY / "reference.npz"), np.load(TINY / "reference_f64.npz")
+    ids = jnp.asarray(reference["input_ids"])
+    measured: dict[str, object] = {f"qat_{site}_mismatches": int(np.sum(
         np.asarray(jax.jit(quantize)(jnp.asarray(reference[f"qat_{site}_in"]))).view(np.uint32)
         != reference[f"qat_{site}_out"].view(np.uint32))) for site, quantize in QUANTIZERS.items()}
-    measured.update(distances(unquantized(loaded.model), loaded.variables, reference, "", reference))
-    measured.update(distances(loaded.model, loaded.variables, reference, "qat_", reference))
+    for prefix, model in (("", unquantized(loaded.model)), ("qat_", loaded.model)):
+        for name, value in outputs(model, loaded.variables, reference, prefix).items():
+            measured[name] = (int(np.sum(value != reference[name])) if name.endswith("draft_ids")
+                              else apart(value, reference[name], truth[name]))
+        record = captured(model, loaded.variables, ids, recorded_outputs(reference, prefix))
+        for site, blocks in record.blocks.items():
+            measured[f"{prefix}{site}_in"] = apart(np.concatenate(blocks), reference[f"{prefix}{site}_in"],
+                                                   truth[f"{prefix}{site}_in"])
+        measured[f"{prefix}selection_rows"] = apart(*scores(record, reference, truth, prefix))
     vision = np.load(TINY / "vision.npz")
     with tempfile.TemporaryDirectory() as directory:
         bundle = load_pretrained(vision_bundle(Path(directory)), dtype="float32", attention_impl="reference")
     for name, value in zip(("vision_span", "vision_prompt_logits", "vision_decode_logits"),
                            vision_run(bundle.model, bundle.variables, vision), strict=True):
-        measured[name] = float(np.max(np.abs(np.asarray(value) - vision[name])))
+        measured[name] = apart(np.asarray(value), vision[name], truth[name])
     return measured
 
 
-def fp64(path: Path) -> dict[str, float]:
-    """The plain outputs' distances from the reference's widened run
-    (`tools/deepseek_v41_reference.py --fp64`), Dew widened alike: the
-    fixture's fp32 weights in fp64, the model's dtype fp64 and every fp32
-    pin Dew names as `jnp.float32` (the rotary tables, the norms, the
-    softmaxes, the mHC mixing, the pooling, the router and the engram gate)
-    read as fp64 while the model traces. Beside them, `reference_fp32_*` is
-    the reference's own fp32 output's distance from its fp64 one: how far
-    fp32 rounding alone moves each output."""
-    fixture, widened = np.load(TINY / "reference.npz"), np.load(path)
+def fp64() -> dict[str, float]:
+    """The plain outputs' largest distances from the float64 truth with Dew
+    widened alike: the fixture's fp32 weights in fp64, the model's dtype
+    fp64 and every fp32 pin Dew names as `jnp.float32` (the rotary tables,
+    the norms, the softmaxes, the mHC mixing, the pooling, the router and
+    the engram gate) read as fp64 while the model traces."""
+    fixture, truth = np.load(TINY / "reference.npz"), np.load(TINY / "reference_f64.npz")
     with jax.enable_x64(new_val=True):
         loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
         variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
@@ -375,25 +391,20 @@ def fp64(path: Path) -> dict[str, float]:
         single = jnp.float32
         jnp.float32 = jnp.float64
         try:
-            model = unquantized(loaded.model).clone(dtype=jnp.float64)
-            measured = distances(model, variables, widened, "", fixture)
+            measured = outputs(unquantized(loaded.model).clone(dtype=jnp.float64), variables, fixture, "")
         finally:
             jnp.float32 = single
-    return {**measured, **{f"reference_fp32_{name}": float(np.max(np.abs(fixture[name] - widened[name])))
-                           for name in measured if name != "draft_ids"}}
+    return {name: float(np.sum(value != fixture[name]) if name == "draft_ids"
+                        else np.max(np.abs(value - truth[name]))) for name, value in measured.items()}
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("measure", choices=("residuals", "noise", "fp64"))
-    parser.add_argument("widened", nargs="?", type=Path, help="fp64: the reference's --fp64 output")
-    options = parser.parse_args()
+    measure = {"residuals": residuals, "noise": noise, "fp64": fp64}[parser.parse_args().measure]
     # The reference multiplies in fp32, where a GPU's default is TF32.
     with jax.default_matmul_precision("highest"):
-        if options.measure == "fp64":
-            measured = fp64(options.widened)
-        else:
-            measured = residuals() if options.measure == "residuals" else noise()
+        measured = measure()
     sys.stdout.write(json.dumps({"backend": jax.default_backend(), **measured}, indent=1) + "\n")
 
 

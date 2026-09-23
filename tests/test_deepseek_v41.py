@@ -4,19 +4,15 @@ deepseek-v41-tiny comes from tools/deepseek_v41_reference.py: the release's
 inference/model.py at dba1be0a (DeepSeek-V4.1-Flash) run in fp32 over the
 torch stand-ins for its kernels, whose quantizers match the tilelang kernels
 bit for bit on bf16 input (`--check-kernels`). The architecture outputs are
-taken with the quantizers off and repeated with them on (`qat_*`). Every
-quantizer and top-k call of the reference's forward is recorded with its
-margins: Dew's quantizers are held bit for bit to each recorded call, and
-Dew's own calls may round or select differently only where the recorded
-margin sits within the fp32 noise between the two (source.json's `noise`).
-
-TOLERANCE is twice the largest distance from the reference that
-`tools/deepseek_v41_numerics.py residuals` measures on CPU, and for the
-vision outputs twice the larger of CPU and an RTX 4080; the whole file
-passes on the RTX 4080. Its `fp64` mode runs both sides widened to fp64,
-where they agree to 1e-13 on every output, so each distance is fp32
-rounding; one SGD step amplifies it, as the reference's own fp32 update
-already lies 1.3e-4 from its fp64 one.
+taken with the quantizers off and repeated with them on (`qat_*`), and every
+quantizer and top-k call of both forwards is recorded. reference_f64.npz is
+the same run widened to fp64 (`--fp64`), the truth Dew and the reference are
+both measured from by tests/reference_error.py's rule: Dew's RMS distance
+from it at most FACTOR times the reference's own, for every output and for
+the inputs of every quantizer and top-k call. Dew's quantizers are held bit
+for bit to each recorded call. `tools/deepseek_v41_numerics.py residuals`
+reports every ratio, and its `fp64` mode shows Dew widened alike agrees with
+the truth to 1e-13, so what the rule measures is fp32 rounding.
 """
 
 import dataclasses
@@ -29,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
+from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
 from dew.interop import load_pretrained
 from dew.interop.hf_decoders import (
@@ -47,11 +44,9 @@ from tools.deepseek_v41_numerics import (
     QUANTIZERS,
     cached_run,
     captured,
-    input_noise,
     loss_and_gradient,
     recorded_outputs,
-    row_noise,
-    selections,
+    scores,
     stepped,
     unquantized,
     vision_bundle,
@@ -61,13 +56,7 @@ from tools.deepseek_v41_numerics import (
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 TINY = ROOT / "deepseek-v41-tiny"
 RELEASED = ROOT / "deepseek-v41-flash"
-TOLERANCE = {
-    "logits": 1e-5, "loss": 4e-6, "updated_logits": 4e-4, "prompt_logits": 1e-5,
-    "decode_logits": 1e-5, "draft_logits": 1e-5, "draft_confidence": 1.6e-5,
-    "qat_logits": 8e-6, "qat_loss": 1e-6, "qat_updated_logits": 1.5e-3, "qat_prompt_logits": 2.5e-5,
-    "qat_decode_logits": 7e-6, "qat_draft_logits": 4e-6, "qat_draft_confidence": 6.2e-6,
-    "vision_span": 1.9e-6, "vision_prompt_logits": 2.7e-5, "vision_decode_logits": 6.4e-6,
-}
+TRUTH = np.load(TINY / "reference_f64.npz")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -84,11 +73,31 @@ def source():
 
 
 def close(actual, reference, name: str):
-    """`actual` within TOLERANCE[name] of the reference's `name`, its argmax
-    exact."""
+    """`actual` as exact as the reference's `name`, both measured from the
+    float64 truth, its argmax the reference's."""
     actual = np.asarray(actual)
-    np.testing.assert_allclose(actual, reference[name], atol=TOLERANCE[name], rtol=0, err_msg=name)
+    assert_as_exact_as_the_reference(actual, reference[name], TRUTH[name], name)
     np.testing.assert_array_equal(actual.argmax(-1), reference[name].argmax(-1), err_msg=name)
+
+
+def loss_close(value, prefix: str):
+    """The loss within reach of the logits' rule: it is the mean of each
+    position's cross entropy, whose gradient in that position's logits has
+    norm at most sqrt(2), so logits RMS `r` from the float64 truth move it at
+    most sqrt(2 V) r, and the rule holds the logits to FACTOR times the
+    reference's own `r`; one fp32 spacing of the loss covers its own sum."""
+    reference = np.load(TINY / "reference.npz")
+    loss, logits = reference[f"{prefix}loss"], reference[f"{prefix}logits"]
+    bound = np.sqrt(2 * logits.shape[-1]) * FACTOR * rounding(f"{prefix}logits") + np.spacing(loss)
+    assert abs(float(value) - float(TRUTH[f"{prefix}loss"])) <= bound, f"{prefix}loss"
+
+
+def rounding(name: str) -> float:
+    """The reference's own RMS distance from the float64 truth for `name`:
+    the fp32 rounding two runs of one computation may each carry FACTOR
+    times of."""
+    return distance(np.load(TINY / "vision.npz")[name] if name.startswith("vision_")
+                    else np.load(TINY / "reference.npz")[name], TRUTH[name])
 
 
 def test_the_quantizers_round_as_the_release_kernels():
@@ -129,32 +138,20 @@ def test_the_quantizers_round_every_call_the_reference_made(source):
                                       err_msg=site)
 
 
-def test_every_rounding_and_selection_meets_the_reference_within_the_noise(source):
+def test_every_quantizer_and_top_k_input_is_as_exact_as_the_reference(source):
     """Dew's quantization-aware and plain forwards hand every quantizer and
-    top-k call the input the reference recorded for it, to within the fp32
-    noise between the two (source.json's `noise`, which
-    tools/deepseek_v41_numerics.py measures), and a rounded value or a pick
-    differs from the recorded one only where the reference had it within
-    that noise of where it changes. Each quantizer passes on the recorded
-    output, so one rounding the other way within the noise moves nothing
-    after it. No seed's margins enter."""
+    top-k call its input as exactly as the reference does, both measured
+    from the float64 truth. Each quantizer passes on the recorded output, so
+    a value that rounds the other way cannot move what later calls read."""
     loaded, plain, reference = source
-    noise = json.loads((TINY / "source.json").read_text())["noise"]
     ids = jnp.asarray(reference["input_ids"])
     for prefix, model in (("qat_", loaded.model), ("", plain)):
         record = captured(model, loaded.variables, ids, recorded_outputs(reference, prefix))
         assert set(record.blocks) == ({*QUANTIZERS} if prefix else set())
         for site, blocks in record.blocks.items():
-            ours = np.concatenate(blocks)
-            assert np.max(input_noise(ours, reference[f"{prefix}{site}_in"])) <= noise[site], site
-            rounded = np.asarray(jax.jit(QUANTIZERS[site])(jnp.asarray(ours)))
-            explained = ((reference[f"{prefix}{site}_margin"] < noise[site])
-                         | (reference[f"{prefix}{site}_scale_margin"][:, None] < noise[site]))
-            assert not np.any((rounded != reference[f"{prefix}{site}_out"]) & ~explained), site
-        ours, our_picks, theirs, their_picks = selections(record, reference, prefix)
-        assert np.max(row_noise(ours, theirs, reference[f"{prefix}selection_scale"])) <= noise["selection"]
-        moved = np.any(our_picks != their_picks, -1)
-        assert not np.any(moved & (reference[f"{prefix}selection_margin"] >= noise["selection"]))
+            name = f"{prefix}{site}_in"
+            assert_as_exact_as_the_reference(np.concatenate(blocks), reference[name], TRUTH[name], name)
+        assert_as_exact_as_the_reference(*scores(record, reference, TRUTH, prefix), f"{prefix}selection_rows")
 
 
 def test_the_quantizers_pass_their_gradient_straight_through():
@@ -288,14 +285,15 @@ def test_the_quantization_aware_loss_and_gradient_match_the_reference(source):
     loaded, plain, reference = source
     ids = jnp.asarray(reference["input_ids"])
     value, gradient = loss_and_gradient(loaded.model, loaded.variables, ids)
-    np.testing.assert_allclose(value, reference["qat_loss"], atol=TOLERANCE["qat_loss"], rtol=0)
+    loss_close(value, "qat_")
     variables = stepped(loaded.variables, gradient, reference["learning_rate"])
     close(jax.jit(plain.apply)(variables, ids), reference, "qat_updated_logits")
 
 
 def test_the_candidate_pool_decides_the_logits(source):
     """Dropping the pool's restriction on the Reindex layers moves the logits
-    past the tolerance, so the fixture exercises the hierarchical indexer."""
+    further from the float64 truth than rounding can, so the fixture
+    exercises the hierarchical indexer."""
     loaded, plain, reference = source
     ids = jnp.asarray(reference["input_ids"])
     kinds = dict(plain.kinds)
@@ -304,8 +302,7 @@ def test_the_candidate_pool_decides_the_logits(source):
             kinds["csa2_ratio_1_reindex"].mixer, candidates=None, candidate_blocks=None,
             candidate_block_size=None))
     unpooled = plain.clone(kinds=flax.core.freeze(kinds))
-    moved = np.max(np.abs(np.asarray(unpooled.apply(loaded.variables, ids)) - reference["logits"]))
-    assert moved > TOLERANCE["logits"]
+    assert distance(unpooled.apply(loaded.variables, ids), TRUTH["logits"]) > FACTOR * rounding("logits")
 
 
 def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
@@ -315,7 +312,7 @@ def test_the_update_exports_and_decodes_as_the_reference(source, tmp_path):
     loaded, plain, reference = source
     ids = jnp.asarray(reference["input_ids"])
     value, gradient = loss_and_gradient(plain, loaded.variables, ids)
-    np.testing.assert_allclose(value, reference["loss"], atol=TOLERANCE["loss"], rtol=0)
+    loss_close(value, "")
     indexer = [np.max(np.abs(leaf)) for path, leaf in _flatten(gradient).items() if ".indexer." in f".{path}."]
     assert indexer and max(indexer) == 0
     variables = stepped(loaded.variables, gradient, reference["learning_rate"])
@@ -342,7 +339,7 @@ def cached_matches(model, variables, reference, prefix: str):
     close(steps, reference, f"{prefix}decode_logits")
     close(draft_logits, reference, f"{prefix}draft_logits")
     name = f"{prefix}draft_confidence"
-    np.testing.assert_allclose(confidence, reference[name], atol=TOLERANCE[name], rtol=0)
+    assert_as_exact_as_the_reference(confidence, reference[name], TRUTH[name], name)
     np.testing.assert_array_equal(draft_ids, reference[f"{prefix}draft_ids"])
 
 
@@ -403,7 +400,8 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
     """After a prefill and a verified stretch whose rows keep different
     counts, the block the decode ops draft is the one the drafter drafts
     uncached over each row's real history: the prompt's and the stretch's
-    context reach its windows at their own positions."""
+    context reach its windows at their own positions. Two runs each within
+    FACTOR of the reference's rounding lie within twice that of each other."""
     from dew.sampling.text import _operations, _prefill
 
     loaded, plain, reference = source
@@ -429,15 +427,15 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
         whole = plain.apply(loaded.variables, sown["prediction_inputs"], method="draft_context")
         _, logits, _ = plain.apply(loaded.variables, whole, drawn[row:row + 1], decode=False,
                                    method="draft")
-        np.testing.assert_allclose(jnp.stack(scored, 1)[row], np.asarray(logits)[0],
-                                   atol=TOLERANCE["draft_logits"], rtol=0)
+        assert distance(jnp.stack(scored, 1)[row], logits[0]) <= 2 * FACTOR * rounding("draft_logits")
 
 
 def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():
     """Two Reindex layers of one kind in a row stay two runs of one under
     scan_layers, so the Reuse layer after them attends the second one's
-    selection, as it does unrolled; scanned together, their publications
-    would stay inside the loop."""
+    selection, as it does unrolled, to within twice the fixture logits' fp32
+    rounding; scanned together, their publications would stay inside the
+    loop."""
     config = json.loads((TINY / "config.json").read_text())
     text = config["text_config"]
     config = {**config, "text_config": {**text, "index_source_layer_ids": [2, 4, 6, 7, 8, 10]}}
@@ -447,8 +445,7 @@ def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers()
     unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
                          for scan in (False, True))
     variables = unrolled.init(jax.random.key(0), ids)
-    np.testing.assert_allclose(scanned.apply(variables, ids), unrolled.apply(variables, ids),
-                               atol=TOLERANCE["logits"], rtol=0)
+    assert distance(scanned.apply(variables, ids), unrolled.apply(variables, ids)) <= 2 * FACTOR * rounding("logits")
 
 
 def test_a_config_without_swiglu_limit_clamps_nothing():
@@ -467,22 +464,23 @@ def test_the_vision_half_matches_the_reference(tmp_path):
     reference = np.load(TINY / "vision.npz")
     loaded = load_pretrained(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
     span, prompt_logits, steps = vision_run(loaded.model, loaded.variables, reference)
-    np.testing.assert_allclose(span, reference["vision_span"], atol=TOLERANCE["vision_span"], rtol=0)
+    assert_as_exact_as_the_reference(span, reference["vision_span"], TRUTH["vision_span"], "vision_span")
     close(prompt_logits, reference, "vision_prompt_logits")
     close(steps, reference, "vision_decode_logits")
 
 
 def test_the_image_bias_and_the_dead_image_positions_decide_the_prefill(tmp_path):
     """Routing the image span by the text bias moves the prefill's logits
-    past the tolerance, and the image positions change the n-gram ids of the
-    text after them, so the fixture exercises both."""
+    further from the float64 truth than rounding can, and the image
+    positions change the n-gram ids of the text after them, so the fixture
+    exercises both."""
     reference = np.load(TINY / "vision.npz")
     loaded = load_pretrained(vision_bundle(tmp_path), dtype="float32", attention_impl="reference")
     routers = flatten_dict(loaded.variables["moe"])
     routers.update({path: routers[(*path[:-1], "e_score_correction_bias")]
                     for path in routers if path[-1] == "media_bias"})
     _, moved, _ = vision_run(loaded.model, {**loaded.variables, "moe": unflatten_dict(routers)}, reference)
-    assert np.max(np.abs(np.asarray(moved) - reference["vision_prompt_logits"])) > TOLERANCE["vision_prompt_logits"]
+    assert distance(moved, TRUTH["vision_prompt_logits"]) > FACTOR * rounding("vision_prompt_logits")
     ids = jnp.asarray(reference["input_ids"])
     media = jnp.asarray(reference["token_types"] >= 0)
     language = {collection: tree["language_model"] for collection, tree in loaded.variables.items()}
