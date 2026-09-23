@@ -5,7 +5,7 @@ its tensors under llama.cpp's names, most of them quantized in blocks. This
 module turns one into what `load_pretrained` reads from a safetensors repo:
 the config.json dict, and tensors under the HF names in HF layout.
 Everything after that, family translation included, is the safetensors path;
-the tokenizer is transformers' own (`AutoTokenizer` with `gguf_file=`).
+the tokenizer is transformers' own conversion of the one the file carries.
 
 Upstream first. `gguf` (gguf-py) reads the file, dequantizes every block
 format and holds the HF-to-GGUF tensor-name table. transformers holds the
@@ -27,6 +27,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     from gguf import GGUFReader, ReaderTensor
+    from transformers import PreTrainedTokenizerFast
 
 _ARCHITECTURES = ("llama", "qwen2", "qwen3")
 """The GGUF architectures read here. Each is a Llama-convention dense decoder
@@ -67,7 +68,6 @@ def _config(reader: GGUFReader) -> tuple[str, dict[str, object]]:
     """
     from transformers import AutoConfig
     from transformers.integrations.ggml import GGUF_CONFIG_DEFAULTS_MAPPING
-    from transformers.modeling_gguf_pytorch_utils import GGUF_TO_TRANSFORMERS_MAPPING
 
     stated = _parse(reader, "general.architecture") if "general.architecture" in reader.fields else None
     if stated not in _ARCHITECTURES:
@@ -78,15 +78,42 @@ def _config(reader: GGUFReader) -> tuple[str, dict[str, object]]:
     architecture = str(stated)
     fields: dict[str, object] = {
         "tie_word_embeddings": all(tensor.name != "output.weight" for tensor in reader.tensors),
-        **GGUF_CONFIG_DEFAULTS_MAPPING.get(architecture, {})}
-    for key in reader.fields:
-        prefix, _, name = key.partition(".")
-        renamed = GGUF_TO_TRANSFORMERS_MAPPING["config"].get(prefix, {}).get(name)
-        if renamed is not None and renamed != -1 and renamed != "model_type":
-            fields[renamed] = _parse(reader, key)
+        **GGUF_CONFIG_DEFAULTS_MAPPING.get(architecture, {}), **_mapped(reader, "config")}
+    fields.pop("model_type", None)
     if "vocab_size" not in fields and "tokenizer.ggml.tokens" in reader.fields:
         fields["vocab_size"] = len(reader.fields["tokenizer.ggml.tokens"].data)
-    return architecture, AutoConfig.for_model(architecture, **fields).to_diff_dict()
+    config = AutoConfig.for_model(architecture, **fields).to_diff_dict()
+    return architecture, config
+
+
+def _mapped(reader: GGUFReader, section: str) -> dict[str, object]:
+    """The file's metadata under transformers' names for one section of
+    GGUF_TO_TRANSFORMERS_MAPPING ('config', 'tokenizer' or 'tokenizer_config')."""
+    from transformers.modeling_gguf_pytorch_utils import GGUF_TO_TRANSFORMERS_MAPPING
+
+    table = GGUF_TO_TRANSFORMERS_MAPPING[section]
+    mapped: dict[str, object] = {}
+    for key in reader.fields:
+        prefix, _, name = key.partition(".")
+        renamed = table.get(prefix, {}).get(name)
+        if renamed is not None and renamed != -1:
+            mapped[renamed] = _parse(reader, key)
+    return mapped
+
+
+def tokenizer(path: str | os.PathLike[str]) -> PreTrainedTokenizerFast:
+    """The tokenizer a GGUF file carries, built as transformers builds it
+    (`TokenizersBackend` with `gguf_file`) from the same metadata, without
+    torch: transformers' own route reads it through `load_gguf_checkpoint`,
+    which refuses to run without torch."""
+    from gguf import GGUFReader
+    from transformers import PreTrainedTokenizerFast
+    from transformers.integrations.ggml import convert_gguf_tokenizer
+
+    reader = GGUFReader(path)
+    architecture, _ = _config(reader)
+    backend, extra = convert_gguf_tokenizer(architecture, _mapped(reader, "tokenizer"))
+    return PreTrainedTokenizerFast(tokenizer_object=backend, **_mapped(reader, "tokenizer_config"), **extra)
 
 
 def _hf_names(architecture: str, layers: int) -> dict[str, str]:

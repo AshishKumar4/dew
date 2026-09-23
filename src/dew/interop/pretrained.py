@@ -2296,7 +2296,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoders.WrapperFields,
 
 
 def _source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
-                      model: nn.Module) -> Processor | None:
+                      model: nn.Module, gguf_path: Path | None = None) -> Processor | None:
     """Build the host preprocessing a source ships, or None where it ships none.
 
     Only a model with towers reads images or audio, and only through the
@@ -2312,9 +2312,12 @@ def _source_processor(directory: Path, config: Mapping[str, object], record: Map
         options = {"backend": "pil"} if config.get("model_type") == "gemma3" else {}
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
         return Processor(reference, config, record, model.vocab_size)
-    if (directory / "tokenizer_config.json").exists():
+    if (directory / "tokenizer_config.json").exists() or gguf_path is not None:
         from dew.data.text import load_tokenizer
-        tokenizer = load_tokenizer(str(directory), local_files_only=True)
+        # A GGUF repo ships none; the file carries its tokenizer.
+        tokenizer = (gguf.tokenizer(gguf_path) if gguf_path is not None
+                     and not (directory / "tokenizer_config.json").exists()
+                     else load_tokenizer(str(directory), local_files_only=True))
         if not _hosts(tokenizer):
             raise TypeError(f"the tokenizer in {directory} lacks a host processor operation")
         return Processor(tokenizer, config, record, model.vocab_size)
@@ -2439,8 +2442,9 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
                                         param_dtype=param_dtype)
         return replace(loaded, variables=placed(loaded.variables), revision=commit)
     tensors = None
-    if gguf_file is not None:
-        config, tensors = gguf.read(gguf.resolve(name_or_dir, directory, gguf_file))
+    gguf_path = None if gguf_file is None else gguf.resolve(name_or_dir, directory, gguf_file)
+    if gguf_path is not None:
+        config, tensors = gguf.read(gguf_path)
     else:
         if not (directory / "config.json").is_file():
             # A GGUF or pickle repo often ships no config.json; the weights read
@@ -2545,13 +2549,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
                 else:
                     bindings.append(binding)
             layouts = tuple(bindings)
-    processor = _source_processor(directory, config, record, model)
-    if processor is None and gguf_file is not None:
-        # transformers converts the tokenizer the file carries.
-        from transformers import AutoTokenizer
-        processor = Processor(AutoTokenizer.from_pretrained(str(directory), gguf_file=gguf_file,
-                                                            local_files_only=True),
-                              config, record, model.vocab_size)
+    processor = _source_processor(directory, config, record, model, gguf_path)
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
     def policy_read() -> None:
