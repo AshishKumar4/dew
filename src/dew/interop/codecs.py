@@ -2,9 +2,9 @@
 
 `source_quantization` reads a config's `quantization_config` into one codec
 and refuses every other format by name. A codec knows which tensors of a
-checkpoint are the parts of one quantized weight, decodes them in float32,
-a whole tensor or the block-aligned part of one that an index asks for, and
-encodes dense weights back into those parts for `Pretrained.save`:
+checkpoint are the parts of one quantized weight, decodes them in float32
+one tensor at a time, and encodes dense weights back into those parts for
+`Pretrained.save`:
 
 - DeepSeek's block-scaled FP8 (`quant_method: fp8`; V3, V3.2 and the
   finegrained FP8 of Qwen3 and MiniMax): `<m>.weight` in float8_e4m3fn
@@ -37,7 +37,7 @@ import re
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
-from typing import Literal, Protocol
+from typing import Literal
 
 import jax.numpy as jnp
 import ml_dtypes
@@ -46,41 +46,6 @@ from numpy.typing import ArrayLike, DTypeLike
 
 from dew import records
 from dew.nn.text_encoders import checkpoint_array
-
-Index = tuple[slice, ...]
-"""A region of a decoded tensor, one slice per leading axis, as
-`jax.make_array_from_callback` asks for a shard."""
-
-
-def _hull(index: Index | None, shape: tuple[int, ...],
-          units: tuple[int, ...]) -> tuple[Index, Index, Index]:
-    """Split `index` over a decoded `shape` into the unit-aligned region
-    that covers it: in units, in elements, and `index` within that region.
-
-    A unit is the run of elements one stored scale covers along an axis (a
-    block, a group, or 1), so the region decodes on its own and reads only
-    the bytes it covers. A partial last unit stays partial.
-    """
-    parts = () if index is None else index
-    if len(parts) > len(shape):
-        raise IndexError(f"a {len(parts)}-axis index into a {len(shape)}-axis tensor")
-    covered, span, within = [], [], []
-    for axis, (size, unit) in enumerate(zip(shape, units, strict=True)):
-        chosen = range(*(parts[axis] if axis < len(parts) else slice(None)).indices(size))
-        if not chosen:
-            covered.append(slice(0, 0))
-            span.append(slice(0, 0))
-            within.append(slice(0, 0))
-            continue
-        first, last = min(chosen) // unit, -(-(max(chosen) + 1) // unit)
-        base = first * unit
-        covered.append(slice(first, last))
-        span.append(slice(base, min(last * unit, size)))
-        # A descending slice whose stop falls before the region runs to its start.
-        stop = chosen.stop - base
-        within.append(slice(chosen.start - base, stop if stop >= 0 else None, chosen.step))
-    return tuple(covered), tuple(span), tuple(within)
-
 
 # --------------------------------------------------------------------------
 # E2M1 codes under E8M0 exponents, shared by every FP4 format
@@ -234,16 +199,11 @@ def mxfp4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
         stem for stem in stems if stem not in tensors)
 
 
-def read_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str,
-                      index: Index | None = None) -> np.ndarray:
-    """One original tensor, or the region `index` names; a packed weight
-    decodes in FP32 [expert, input, output] from the groups the region covers."""
-    if name + '_blocks' not in tensors:
-        return tensors[name] if index is None else tensors[name][index]
-    blocks, scales = _mxfp4_arrays(tensors[name + '_blocks'], tensors[name + '_scales'])
-    experts, outputs, groups = scales.shape
-    (expert, group, output), _, within = _hull(index, (experts, groups * GROUP, outputs), (1, GROUP, 1))
-    return dequantize_mxfp4(blocks[expert, output, group], scales[expert, output, group])[within]
+def read_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
+    """One original tensor, with a packed weight decoded in FP32 on demand."""
+    if name + '_blocks' in tensors:
+        return dequantize_mxfp4(tensors[name + '_blocks'], tensors[name + '_scales'])
+    return tensors[name]
 
 
 def unpack_mxfp4(tensors: Mapping[str, np.ndarray], *,
@@ -384,21 +344,11 @@ def packed_mxfp4_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, .
     return tuple(name for name in tensors if not name.endswith(PACKED_SUFFIXES)) + stems
 
 
-def _read_e2m1(packed: np.ndarray, exponents: np.ndarray, index: Index | None) -> np.ndarray:
-    """The region `index` names of a [rows, input] weight stored as
-    [rows, input / 2] codes under [rows, input / 32] exponents."""
-    covered, span, within = _hull(index, (packed.shape[0], 2 * packed.shape[1]), (1, GROUP))
-    codes = packed[span[0], span[1].start // 2:span[1].stop // 2]
-    return decode_e2m1(codes, exponents[covered])[within]
-
-
-def read_packed_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str,
-                             index: Index | None = None) -> np.ndarray:
-    """One original tensor, or the region `index` names; a packed Linear's
-    weight decodes to FP32 `[output, input]` from the groups the region covers."""
+def read_packed_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
+    """One original tensor; a packed Linear's weight decodes to FP32 `[output, input]`."""
     module = name.removesuffix('.weight')
     if name == module or module + PACKED_SUFFIXES[0] not in tensors:
-        return tensors[name] if index is None else tensors[name][index]
+        return tensors[name]
     packed, scales = tensors[module + PACKED_SUFFIXES[0]], tensors[module + PACKED_SUFFIXES[1]]
     if (packed.dtype != np.uint8 or scales.dtype != np.uint8 or packed.ndim != 2
             or packed.shape[1] % (GROUP // 2)
@@ -406,7 +356,7 @@ def read_packed_mxfp4_tensor(tensors: Mapping[str, np.ndarray], name: str,
         raise ValueError(
             f"{name} packs U8 [output, input / 2] codes beside U8 [output, input / {GROUP}] scales, "
             f"got {packed.dtype} {packed.shape} and {scales.dtype} {scales.shape}")
-    return _read_e2m1(packed, scales, index)
+    return decode_e2m1(packed, scales)
 
 
 def unpack_packed_mxfp4(tensors: Mapping[str, np.ndarray], *,
@@ -488,34 +438,29 @@ def fp8_format(quantization: Mapping[str, object]) -> tuple[int, bool]:
     return block[0], scale_fmt == 'ue8m0'
 
 
-def _check_grid(weight: np.ndarray, scale_inv: np.ndarray, block: int) -> None:
-    """Refuse scales that are not one per block of a [rows, cols] weight,
-    [ceil(rows / block), ceil(cols / block)]."""
-    if weight.ndim != 2 or scale_inv.ndim != 2:
-        raise ValueError(
-            f"block-scaled dequantization takes a [rows, cols] weight and its "
-            f"[row blocks, col blocks] scales, got shapes {weight.shape} and "
-            f"{scale_inv.shape}")
-    blocks = (math.ceil(weight.shape[0] / block), math.ceil(weight.shape[1] / block))
-    if scale_inv.shape != blocks:
-        raise ValueError(
-            f"a {weight.shape} weight in {block} x {block} blocks takes a "
-            f"{blocks} scale, got {scale_inv.shape}")
-
-
 def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
                           block: int = BLOCK) -> np.ndarray:
     """Return float32(weight[i, j]) * float32(scale_inv[i // block, j // block]).
 
     `weight` may be in any float dtype, `scale_inv` float32 or E8M0.
     """
-    _check_grid(weight, scale_inv, block)
+    if weight.ndim != 2 or scale_inv.ndim != 2:
+        raise ValueError(
+            f"block-scaled dequantization takes a [rows, cols] weight and its "
+            f"[row blocks, col blocks] scales, got shapes {weight.shape} and "
+            f"{scale_inv.shape}")
+    rows, cols = weight.shape
+    blocks = (math.ceil(rows / block), math.ceil(cols / block))
+    if scale_inv.shape != blocks:
+        raise ValueError(
+            f"a {weight.shape} weight in {block} x {block} blocks takes a "
+            f"{blocks} scale, got {scale_inv.shape}")
     # Scaled one block row at a time, so no scale array of the weight's size
     # is ever built.
     out = weight.astype(np.float32)
     scales = scale_inv.astype(np.float32)
-    for index in range(scales.shape[0]):
-        out[index * block:(index + 1) * block] *= np.repeat(scales[index], block)[:weight.shape[1]]
+    for index in range(blocks[0]):
+        out[index * block:(index + 1) * block] *= np.repeat(scales[index], block)[:cols]
     return out
 
 
@@ -527,28 +472,15 @@ def fp8_tensor_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
     return tuple(name for name in tensors if not name.endswith(SCALE_SUFFIX))
 
 
-def _read_blocks(weight: np.ndarray, scale: np.ndarray, block: int, index: Index | None) -> np.ndarray:
-    """The region `index` names of a block-scaled [rows, cols] weight. The
-    whole scale grid is checked first: a grid of other blocks can fit the
-    region it covers."""
-    _check_grid(weight, scale, block)
-    covered, span, within = _hull(index, weight.shape, (block, block))
-    return dequantize_fp8_blocks(weight[span], scale[covered], block)[within]
-
-
-def read_fp8_tensor(tensors: Mapping[str, np.ndarray], name: str, index: Index | None = None,
-                    *, block: int) -> np.ndarray:
-    """Return one tensor, or the region `index` names, in its original values,
-    a scaled one decoded in FP32 from the blocks the region covers.
+def read_fp8_tensor(tensors: Mapping[str, np.ndarray], name: str, *, block: int) -> np.ndarray:
+    """Return one tensor in its original values, decoding it in FP32 if it is scaled.
 
     Only the requested tensor is decoded, so alias validation never builds an
     FP32 copy of the checkpoint. An unscaled value keeps its stored dtype.
     """
     value = tensors[name]
     scale = tensors.get(name + SCALE_SUFFIX)
-    if scale is None:
-        return value if index is None else value[index]
-    return _read_blocks(value, scale, block, index)
+    return value if scale is None else dequantize_fp8_blocks(value, scale, block)
 
 
 def dequantize_checkpoint(tensors: Mapping[str, np.ndarray], block: int, *,
@@ -742,10 +674,9 @@ def deepseek_v4_scale_dtype(tensors: Mapping[str, np.ndarray]) -> str | None:
     return stored[0] if stored else None
 
 
-def read_deepseek_v4_tensor(tensors: Mapping[str, np.ndarray], name: str, index: Index | None = None,
-                            *, block: int, fp4_experts: bool) -> np.ndarray:
-    """One tensor, or the region `index` names, in its original values; a
-    scaled weight decodes in FP32 from the blocks or groups the region covers.
+def read_deepseek_v4_tensor(tensors: Mapping[str, np.ndarray], name: str, *, block: int,
+                            fp4_experts: bool) -> np.ndarray:
+    """One tensor in its original values, a scaled weight decoded in FP32.
 
     The release's own dequantization: an FP8 Linear is float32(weight) *
     float32(scale) per block (convert.py on `wo_a`), an engram row is
@@ -760,7 +691,7 @@ def read_deepseek_v4_tensor(tensors: Mapping[str, np.ndarray], name: str, index:
     module = name.removesuffix('.weight')
     scale = tensors.get(module + V4_SCALE_SUFFIX) if module != name else None
     if scale is None:
-        return value if index is None else value[index]
+        return value
     partner, layout = module + V4_SCALE_SUFFIX, deepseek_v4_layout(name, fp4_experts)
     if layout == 'fp4':
         if (value.dtype not in _CODE_DTYPES or value.ndim != 2 or scale.dtype != ml_dtypes.float8_e8m0fnu
@@ -769,21 +700,20 @@ def read_deepseek_v4_tensor(tensors: Mapping[str, np.ndarray], name: str, index:
                 f"{name} is a routed expert, which expert_dtype 'fp4' ships as int8 [out, in / 2] E2M1 "
                 f"pairs beside a float8_e8m0fnu [out, in / {GROUP}] {partner}, got {value.dtype} "
                 f"{value.shape} and {scale.dtype} {scale.shape}")
-        return _read_e2m1(value, scale, index)
+        return decode_e2m1(value, scale)
     if value.dtype != E4M3 or value.ndim != 2 or scale.dtype.name not in V4_SCALE_DTYPES:
         raise ValueError(
             f"{name} and {partner} are an FP8 weight, float8_e4m3fn beside a scale in one of "
             f"{list(V4_SCALE_DTYPES)}, got {value.dtype} {value.shape} and {scale.dtype}; DeepSeek-V4 "
             f"ships E2M1 pairs for routed experts alone, under expert_dtype 'fp4'")
     if layout == 'blocks':
-        return _read_blocks(value, scale, block, index)
+        return dequantize_fp8_blocks(value, scale, block)
     if value.shape[1] % block or scale.shape != (value.shape[0], value.shape[1] // block):
         raise ValueError(f"{name} is an engram table, [rows, dim] beside a [rows, dim / {block}] "
                          f"{partner}, got {value.shape} and {scale.shape}")
-    covered, span, within = _hull(index, value.shape, (1, block))
-    rows = value[span].astype(np.float32).reshape(*scale[covered].shape, block)
-    rows *= scale[covered].astype(np.float32)[..., None]
-    return rows.reshape(rows.shape[0], rows.shape[1] * block)[within]
+    rows = value.astype(np.float32).reshape(value.shape[0], value.shape[1] // block, block)
+    rows *= scale.astype(np.float32)[..., None]
+    return rows.reshape(value.shape)
 
 
 def unpack_deepseek_v4(tensors: Mapping[str, np.ndarray], *, block: int, fp4_experts: bool,
@@ -871,13 +801,6 @@ def pack_deepseek_v4(tensors: Mapping[str, np.ndarray], names: Iterable[str], *,
 # Dispatch from quantization_config
 # --------------------------------------------------------------------------
 
-class TensorReader(Protocol):
-    """Decodes one source tensor, or the region `index` names, in its original values."""
-
-    def __call__(self, tensors: Mapping[str, np.ndarray], name: str,
-                 index: Index | None = None) -> np.ndarray: ...
-
-
 def _one_scale_dtype(tensors: Mapping[str, np.ndarray]) -> None:
     """A format whose scales have one dtype records none."""
 
@@ -889,18 +812,18 @@ class SourceQuantization:
     `names` reads which tensors arrived quantized off the raw checkpoint,
     before `dequantize` replaces them with dense weights in requested
     storage; `requantize` writes those names back in the format.
-    `tensor_names` and `read` expose original values one tensor, or one
-    region of one, at a time, for alias checks and streamed loads, so
-    neither holds an FP32 model. `scale_dtype` reads the dtype a source
-    stored its scales in where the format leaves that to the checkpoint
-    (DeepSeek-V4), for `source_quantization` to write back.
+    `tensor_names` and `read` expose original values one tensor at a time,
+    for alias checks; `read` decodes on demand rather than holding an FP32
+    model. `scale_dtype` reads the dtype a source stored its scales in where
+    the format leaves that to the checkpoint (DeepSeek-V4), for
+    `source_quantization` to write back.
     """
 
     names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
     dequantize: Callable[[Mapping[str, np.ndarray]], dict[str, np.ndarray]]
     requantize: Callable[[Mapping[str, np.ndarray], tuple[str, ...]], dict[str, np.ndarray]]
     tensor_names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
-    read: TensorReader
+    read: Callable[[Mapping[str, np.ndarray], str], np.ndarray]
     scale_dtype: Callable[[Mapping[str, np.ndarray]], str | None] = _one_scale_dtype
 
 
