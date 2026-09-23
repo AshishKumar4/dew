@@ -139,7 +139,10 @@ class Gateway:
         return traces
 
     def ready(self, timeout: float, *, poll: float = 2.0) -> None:
-        """Wait until the gateway routes to at least one healthy worker, or raise after `timeout` seconds.
+        """Wait until the gateway routes to a healthy worker that answers, or raise after `timeout` seconds.
+
+        Ready means `/health/workers` counts a healthy worker and `GET /v1/models`, proxied through
+        the gateway to an engine, answers 200.
 
         rllm-model-gateway marks a worker dead after three failed health checks, as happens to an
         engine still loading when the gateway starts, and until a later check revives it every
@@ -156,7 +159,12 @@ class Gateway:
                 health = _object(response.json()) if response.status_code == 200 else {}
                 seen = f"{response.status_code} {response.text[:500]}"
                 if isinstance(healthy := health.get("healthy"), int) and healthy > 0:
-                    return
+                    # The gateway calls a worker healthy until its first probe fails, so also see the
+                    # engine answer through it; a request without a session leaves no trace.
+                    listing = self._client.get(f"{self.url}/v1/models")
+                    seen = f"GET /v1/models: {listing.status_code} {listing.text[:500]}"
+                    if listing.status_code == 200:
+                        return
             except (httpx.HTTPError, ValueError) as error:
                 seen = f"{type(error).__name__}: {error}"
             if time.monotonic() >= deadline:
