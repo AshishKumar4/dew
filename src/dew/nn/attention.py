@@ -1100,8 +1100,9 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     every kernel takes. Everything
     else runs banded: the queries in blocks of the span, each against its
     own block and the one before, which holds every key a query of the
-    block may read, under a `[W, 2W]` mask per block. The xla kernel's
-    logits are then `[S, 2W]` per head where a dense mask costs `[S, S]`.
+    block may read, under a `[W, 2W]` mask per block, on cudnn as a bias
+    where cudnn runs and on xla otherwise. The logits are then `[S, 2W]` per
+    head where a dense mask costs `[S, S]`.
     Banding pads the sequence to whole spans, so a sequence of at most two
     spans, where `[S, S]` is no larger than `[S, 2W]`, takes the dense
     call instead.
@@ -1120,14 +1121,20 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
-    masked = kernel_for_materialized_mask(
+    resolved = resolve_implementation(
+        implementation, query, key, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
+        causal=True, sliding_window=window)
+    # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
+    # its additive bias where cudnn runs. On an RTX 4080, packed (5
+    # documents) at window 4096, 16 heads of 64 over 4, forward plus
+    # backward: 32768 tokens 78.1 ms in 1.19 GiB of temporaries and 65536
+    # tokens 152.8 ms in 2.38 GiB on cudnn, where xla ran out of memory
+    # from 8192 (docs/performance.md).
+    masked = 'cudnn' if resolved == 'cudnn' else kernel_for_materialized_mask(
         implementation, query, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax)
     if window is not None and valid is None:
-        resolved = resolve_implementation(
-            implementation, query, key, dtype=dtype, precision=precision,
-            force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-            causal=True, sliding_window=window)
         # An explicit 'tpu' at a length splash cannot tile would reach the
         # flash kernel, whose default 128-row blocks must divide the length
         # (flash_attention.py:113-128, 1707-1715), so it would raise there.
