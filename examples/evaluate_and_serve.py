@@ -42,6 +42,7 @@ from dew.config import ModelConfig, OptimConfig, TrainerConfig
 from dew.data import Loading, TokenWindows
 from dew.eval import clip_score, fid
 from dew.inference import TextGeneration, TextToImage
+from dew.inputs import uint8_pixels
 from dew.objectives.lm import LMObjective, LMRunConfig
 from dew.registry import metrics
 from dew.sampling import Sampling
@@ -164,7 +165,7 @@ def harness(task: TextGeneration, config: Config) -> dict[str, float]:
 def draw(pipe: TextToImage, config: Config, *, seed: int) -> np.ndarray:
     """The prompts sampled once, as the uint8 images both metrics read."""
     drawn = pipe(list(config.image_prompts), steps=config.image_steps, seed=seed).host().images
-    return np.clip(np.rint((drawn + 1.0) * 127.5), 0, 255).astype(np.uint8)
+    return uint8_pixels(drawn)
 
 
 def image_metrics(config: Config) -> dict[str, float]:

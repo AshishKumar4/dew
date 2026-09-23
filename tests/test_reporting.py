@@ -54,9 +54,25 @@ def test_all_builtin_previews_have_local_representations(tmp_path):
     assert {e['type'] for e in entries} == {
         'ImageGrid', 'VideoGrid', 'TextSamples', 'Representations', 'TokenScores'}
     image = Image.open(next(tmp_path.glob('*.png')))
-    assert image.size == (8, 8) and np.asarray(image)[0, 0].tolist() == [127, 127, 127]
+    assert image.size == (8, 8) and np.asarray(image)[0, 0].tolist() == [128, 128, 128]
     payloads = [json.loads(p.read_text()) for p in tmp_path.glob('*.json')]
     assert {'prompt': '', 'texts': ['text'], 'tokens': [[1, 2]]} in payloads
+
+
+def test_an_image_preview_holds_the_pixels_the_image_metrics_score(tmp_path):
+    """Every [-1, 1] value lands on its nearest level and out-of-range
+    samples clip: the bytes a tracker writes are the bytes `clip_score` and
+    `fid` read, not a level darker where truncation would drop the fraction.
+    Zero is 127.5 exactly, which rounds half to even (the 128 above)."""
+    levels = np.array([0, 1, 2, 127, 128, 200, 254, 255, 0, 255], np.float32)
+    offsets = np.array([0.0, 0.4, -0.4, 0.45, 0.3, 0.45, -0.45, -0.3, 0.0, 0.0], np.float32)
+    values = (levels + offsets) / 127.5 - 1.0
+    values[-2:] = (-1.5, 1.5)
+    images = np.broadcast_to(values[None, None, :, None], (1, 1, 10, 3)).astype(np.float32)
+    with LocalTracker(tmp_path) as tracker:
+        tracker.artifact(ImageGrid(images, ('levels',)), 1)
+    written = np.asarray(Image.open(next(tmp_path.glob('*.png'))))[0, :, 0]
+    assert written.tolist() == levels.astype(int).tolist()
 
 
 def test_fanout_continues_to_local_sink_and_context_preserves_primary(tmp_path):

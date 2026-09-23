@@ -37,6 +37,7 @@ from dew.data import ArrayRecordImages, Loading, OxfordFlowers
 from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.eval import clip_score, fid
+from dew.inputs import uint8_pixels
 from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
@@ -164,7 +165,7 @@ def held_out(run: DiffusionRunConfig) -> np.ndarray:
 
 def grid(images: np.ndarray, path: Path) -> None:
     """The sampled rows side by side as one PNG."""
-    pixels = np.clip(np.rint((images + 1.0) * 127.5), 0, 255).astype(np.uint8)
+    pixels = uint8_pixels(images)
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(np.concatenate(list(pixels), axis=1)).save(path)
 
@@ -188,7 +189,7 @@ def main(config: Config) -> Path:
                  sampler=Heun(), seed=1).host().images
     grid(drawn, config.out / "samples.png")
 
-    generated = np.clip(np.rint((drawn + 1.0) * 127.5), 0, 255).astype(np.uint8)
+    generated = uint8_pixels(drawn)
     report = {"clip_score": clip_score(generated, list(PROMPTS), modelname=config.clip_model),
               "fid": fid(generated, held_out(run), weights=config.inception_weights)}
     (config.out / "eval.json").write_text(json.dumps(report, indent=2))

@@ -14,7 +14,7 @@ from PIL import Image
 
 from dew.data import OxfordFlowers
 from dew.diffusion import presets
-from dew.inputs import CLIPText, Condition, Field, InputSpec
+from dew.inputs import CLIPText, Condition, Field, InputSpec, uint8_pixels
 from dew.interop import save_hf_layout
 from dew.objectives.diffusion import DiffusionObjective
 from dew.registry import models
@@ -66,7 +66,7 @@ def main(config: Config, data=None, inputs=None):
     # the trainer's mesh, prompts split over it, and host() reads the rows back.
     pipe = objective.pipeline(state)
     images = pipe(list(config.prompts), steps=50, guidance=3.0, sampler=Heun(), seed=1).host().images
-    pixels = np.clip(np.round((images + 1.0) * 127.5), 0, 255).astype(np.uint8)
+    pixels = uint8_pixels(images)
     grid = np.concatenate(list(pixels), axis=1)
     config.out.mkdir(parents=True, exist_ok=True)
     Image.fromarray(grid).save(config.out / "samples.png")

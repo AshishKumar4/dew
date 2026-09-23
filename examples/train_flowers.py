@@ -16,6 +16,7 @@ from PIL import Image
 from dew import Checkpoints, Field, InputSpec, Trainer, sample
 from dew.data import Loading, OxfordFlowers
 from dew.diffusion.presets import EDM
+from dew.inputs import uint8_pixels
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling import Heun
@@ -73,7 +74,7 @@ def main(config: Config):
         solver=Heun(),
         key=jax.random.key(2),
     )
-    pixels = np.clip(np.rint((np.asarray(images) + 1) * 127.5), 0, 255).astype(np.uint8)
+    pixels = uint8_pixels(images)
     grid = np.concatenate(tuple(pixels), axis=1)
     config.output.mkdir(parents=True, exist_ok=True)
     Image.fromarray(grid).save(config.output / "samples.png")

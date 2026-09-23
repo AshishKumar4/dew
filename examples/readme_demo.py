@@ -20,6 +20,7 @@ import tyro
 from dew import Checkpoints, Field, InputSpec, Trainer, metrics, models
 from dew.data import Dataset, Loading, PreferencePairs, TokenWindows
 from dew.diffusion.presets import Flow
+from dew.inputs import uint8_pixels
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -126,7 +127,7 @@ def flow_images(out: Path):
         raise RuntimeError("the diffusion objective draws a preview on every event")
     generated = np.asarray(preview.images)
     np.save(out / "flow-preview.npy", generated)
-    pixels = np.round((generated + 1) * 127.5).clip(0, 255).astype(np.uint8)
+    pixels = uint8_pixels(generated)
     grid = np.concatenate(list(pixels), axis=1)
     # PPM is a standard RGB image format; no image library is needed to write it.
     header = f"P6\n{grid.shape[1]} {grid.shape[0]}\n255\n".encode("ascii")
