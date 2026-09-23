@@ -1,7 +1,5 @@
 # Domain sweep for Dew
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Measured 2026-09-02, 17:55 to 20:40 UTC. 348 stem and TLD combinations were checked. Every
 registration fact comes from the registry's own RDAP or port-43 WHOIS server, chosen from the IANA
 bootstrap file or the IANA root zone database. No aggregator and no registrar search box was used to

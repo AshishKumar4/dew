@@ -1,7 +1,5 @@
 # Plan and run on Cloud TPUs
 
-> An AI assistant maintains this document. It is presented as-is.
-
 A Cloud TPU slice is a set of accelerator devices attached to one or more worker VMs. In a multi-worker training job, every worker runs the same program, and all of them join one JAX process pool. Dew's `dew-tpu` command wraps `gcloud`, SSH, and rsync. It creates a slice, installs the environment on each worker, and starts a recipe on all of them.
 
 Every resource command on this page carries `--dry-run`, which prints the commands `dew-tpu` would run. A dry run creates no cloud resources and connects to no workers. A dry run that succeeds does not check your cloud permissions, capacity, networking, TPU execution, or distributed training.

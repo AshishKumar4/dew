@@ -1,7 +1,5 @@
 # Train an image diffusion model
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This guide assumes you have done the [first training run](../getting-started.md), know how image tensors are laid out, and know the idea of predicting a clean signal from a noisy input. It walks through Dew's diffusion configuration with a small flow-matching run. You do not need to download any data or model.
 
 ## Train on synthetic images

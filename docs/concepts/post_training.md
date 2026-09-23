@@ -1,7 +1,5 @@
 # Post-training
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Post-training changes how a model behaves after pretraining. In supervised fine-tuning (SFT), you supply example answers. In direct preference optimization (DPO), you supply a preferred and a rejected answer to the same prompt. In group-relative policy optimization (GRPO), the language model generates answers and your reward function scores them. Proximal policy optimization (PPO) also learns a critic that estimates future rewards. Flow-GRPO scores samples from a rectified-flow model.
 
 Dew runs all of these objectives on the same `Trainer`. Their batches carry different kinds of supervision. Read [language models](language_models.md) for next-token prediction and [objectives](objectives.md) for how models, objectives and the trainer fit together. The first full example below trains a tiny DPO model without downloading a tokenizer, a dataset or a pretrained checkpoint.

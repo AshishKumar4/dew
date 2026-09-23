@@ -1,7 +1,5 @@
 # Post-training in Dew: SFT, DPO and online RL on one trainer
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Built through wave 6. The current Flow-GRPO usage is in [the post-training guide](../concepts/post_training.md#flow-grpo). The earlier sections record the language post-training implementation as it was when those waves landed.
 
 Correction (2026-09-22): I checked this record against current source. The sketch below still matches the constructors (`src/dew/objectives/lm/objective.py:431-450`, `src/dew/objectives/rl/preference.py:39`, `src/dew/objectives/rl/grpo.py:58`, `src/dew/training/trainer.py:188-203`). Where a section no longer matches, a dated note at the end of that section says what changed.

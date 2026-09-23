@@ -1,7 +1,5 @@
 # The API: one registry, one objective, one trainer
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This page records the original API design and how it was built. The statistics-first C01/C02 cutover replaced its scalar-loss, MultiSteps, mutable-router and checkpoint-field examples. For contracts you can run, read the [current core API](../reference/core-api.md) and the [objective guide](../concepts/objectives.md).
 
 Design record, 2026-09-03. The code blocks are design sketches, not runnable code. The examples and ticket states below describe the revisions they cite.

@@ -1,7 +1,5 @@
 # Contributing
 
-> An AI assistant maintains this document. It is presented as-is.
-
 Dew is small on purpose. Every line has to earn its place. These rules apply to people and to agents alike, and a review checks each one.
 
 ## Design

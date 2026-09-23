@@ -1,7 +1,5 @@
 # Run a training recipe
 
-> An AI assistant maintains this document. It is presented as-is.
-
 A recipe is a Python script that builds a model, loads data, picks an objective, and calls `Trainer.fit`. Use a recipe when you want to start a run from the command line and keep its configuration on disk. Use the [getting-started tutorial](getting-started.md) when you want to put those pieces together yourself in Python.
 
 The repository has recipes for language models (LM), diffusion, and JEPA. Their command-line flags come from typed configuration objects, so all three follow the same structure. This page starts with a complete language-model run on your own machine. It makes its own tiny corpus and trains from random initialization, so it downloads no data and no model weights.

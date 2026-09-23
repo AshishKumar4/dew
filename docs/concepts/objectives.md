@@ -1,7 +1,5 @@
 # Writing a custom objective
 
-> An AI assistant maintains this document. It is presented as-is.
-
 This page assumes you have run [the first training example](../getting-started.md) and know Flax Linen's `init` and `apply` methods. An `Objective` says how to initialize a variables tree, how to compute a loss and, optionally, how to evaluate a batch. `Trainer` differentiates the loss, applies the optimizer and manages the training state.
 
 ## Initialization
