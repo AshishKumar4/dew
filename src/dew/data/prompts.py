@@ -77,7 +77,8 @@ def _text(value: object) -> str:
             f"a reward column holds text or a JSON value, got {value!r}") from None
 
 
-def _prompt_ids(tokenizer: str, prompt: object, tools: object, origin: str) -> list[int]:
+def _prompt_ids(tokenizer: str, prompt: object, tools: object, origin: str,
+                thinking: bool | None) -> list[int]:
     """Encodes a prompt, retaining structured messages until text rendering.
 
     A row's prompt is a string, a list of token ids, or the messages of a
@@ -98,7 +99,7 @@ def _prompt_ids(tokenizer: str, prompt: object, tools: object, origin: str) -> l
         ids = [token for token in prompt if isinstance(token, int)]
         if len(ids) != len(prompt):
             conversation = Conversation.parse(prompt, tools, origin)
-            ids = render_prompt(load_tokenizer(tokenizer), conversation, origin)
+            ids = render_prompt(load_tokenizer(tokenizer), conversation, origin, thinking)
         elif tools is not None:
             raise ValueError(f"{origin}: tools require chat messages, not pretokenized ids")
     else:
@@ -133,7 +134,8 @@ class PromptSource:
     """
 
     def __init__(self, rows: Sequence[object], origin: str,
-                 tokenizer: str, max_prompt_len: int, pad_id: int):
+                 tokenizer: str, max_prompt_len: int, pad_id: int,
+                 thinking: bool | None = None):
         if max_prompt_len < 1:
             raise ValueError(
                 f"max_prompt_len is {max_prompt_len}: prompts need at least one token")
@@ -160,6 +162,7 @@ class PromptSource:
         self._rows = normalized
         self._origin = origin
         self._tokenizer = tokenizer
+        self._thinking = thinking
         self._window = max_prompt_len
         self._pad_id = pad_id
         self._info_width = max(
@@ -169,7 +172,7 @@ class PromptSource:
 
     @classmethod
     def from_parquet(cls, path: str, tokenizer: str, max_prompt_len: int,
-                     pad_id: int) -> PromptSource:
+                     pad_id: int, thinking: bool | None = None) -> PromptSource:
         """The parquet file's rows.
 
         `prompt` is required; the reward columns ride along when present.
@@ -178,19 +181,22 @@ class PromptSource:
         if "prompt" not in names:
             raise ValueError(
                 f"{path}: the prompt column is required, the file has {names}")
-        return cls(parquet_rows(path, FIELDS, names), path, tokenizer, max_prompt_len, pad_id)
+        return cls(parquet_rows(path, FIELDS, names), path, tokenizer, max_prompt_len, pad_id, thinking)
 
     @classmethod
     def from_records(cls, records: tuple[str, ...], tokenizer: str,
-                     max_prompt_len: int, pad_id: int) -> PromptSource:
+                     max_prompt_len: int, pad_id: int,
+                     thinking: bool | None = None) -> PromptSource:
         """In-memory rows as JSON, for tests and small sweeps."""
         rows = json_records(records)
         return cls(rows, f"{len(rows)} in-memory records", tokenizer,
-                   max_prompt_len, pad_id)
+                   max_prompt_len, pad_id, thinking)
 
     def __repr__(self) -> str:
+        # A saved position compares this; the switch renders other ids, so it counts when set.
+        thinking = "" if self._thinking is None else f", thinking={self._thinking!r}"
         return (f"{self.__class__.__name__}(origin={self._origin!r}, "
-                f"tokenizer={self._tokenizer!r})")
+                f"tokenizer={self._tokenizer!r}{thinking})")
 
     def __len__(self) -> int:
         return len(self._rows)
@@ -198,7 +204,7 @@ class PromptSource:
     def __getitem__(self, index: int) -> Batch:
         row = self._rows[index]
         ids = _prompt_ids(self._tokenizer, row.prompt, row.tools,
-                          f"{self._origin} row {index}")[-self._window:]
+                          f"{self._origin} row {index}", self._thinking)[-self._window:]
         prompt = np.full(self._window, self._pad_id, np.int32)
         prompt[self._window - len(ids):] = ids
         return {
@@ -223,7 +229,8 @@ class Prompts(DatasetSpec):
     An optional `tools` column holds schemas as a list or JSON string for
     chat prompts. Schemas are rendered into prompt tokens and never copied
     into the device batch. `val_path` is a second parquet file scored as one
-    pass; None trains without validation.
+    pass; None trains without validation. `thinking` sets a reasoning
+    template's `enable_thinking` (Qwen3's switch); None keeps its default.
     """
 
     tokenizer: str
@@ -233,6 +240,7 @@ class Prompts(DatasetSpec):
     max_prompt_len: int = 128
     pad_id: int = 0
     val_batches: int | None = 4
+    thinking: bool | None = None
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         self.uncaptioned(tokenize)
@@ -240,6 +248,6 @@ class Prompts(DatasetSpec):
             self, batch=batch, path=self.path, records=self.records,
             val_path=self.val_path, val_batches=self.val_batches,
             from_parquet=lambda path: PromptSource.from_parquet(
-                path, self.tokenizer, self.max_prompt_len, self.pad_id),
+                path, self.tokenizer, self.max_prompt_len, self.pad_id, self.thinking),
             from_records=lambda records: PromptSource.from_records(
-                tuple(records), self.tokenizer, self.max_prompt_len, self.pad_id))
+                tuple(records), self.tokenizer, self.max_prompt_len, self.pad_id, self.thinking))

@@ -27,6 +27,7 @@ Tool-call fields and message metadata reach the template unchanged.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 from collections.abc import Iterator, Mapping, Sequence
 from enum import Enum
@@ -350,8 +351,12 @@ class Conversation:
 
 
 def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[str, object]],
-               generation_prompt: bool, where: str) -> list[int]:
+               generation_prompt: bool, where: str, thinking: bool | None = None) -> list[int]:
     """Renders `rows`, the messages' template dicts, to token ids.
+
+    `thinking` sets a reasoning template's `enable_thinking` variable
+    (Qwen3's switch); None leaves the template's default, and templates
+    without the variable ignore it.
 
     A template that refuses the messages, or reads a key they lack, fails
     here with `where` and the template's own message.
@@ -361,9 +366,10 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
     `content`, so the honest type has no spelling the checker accepts.
     """
     try:
-        rendered = tokenizer.apply_chat_template(
-            rows, tools=[dict(tool) for tool in tools] or None, tokenize=True,
-            return_dict=False, add_generation_prompt=generation_prompt)
+        render = functools.partial(
+            tokenizer.apply_chat_template, rows, tools=[dict(tool) for tool in tools] or None,
+            tokenize=True, return_dict=False, add_generation_prompt=generation_prompt)
+        rendered = render() if thinking is None else render(enable_thinking=thinking)
     except (TemplateError, TypeError) as exc:
         raise ValueError(f"{where}: the chat template refused the conversation: {exc}") from exc
     if not isinstance(rendered, list):
@@ -381,14 +387,15 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
 
 
 def render_prompt(tokenizer: PreTrainedTokenizerBase, conversation: Conversation,
-                  where: str) -> list[int]:
+                  where: str, thinking: bool | None = None) -> list[int]:
     """Tokenizes a text conversation with the next assistant header.
 
     SFT and prompt sampling use the same message conversion and tool schemas.
     All-text parts concatenate in order; nontext parts require a processor.
+    `thinking` is `_token_ids`'s.
     """
     return _token_ids(tokenizer, conversation.text_rows(where), conversation.tools,
-                      generation_prompt=True, where=where)
+                      generation_prompt=True, where=where, thinking=thinking)
 
 
 def _agreement(rendered: Sequence[int], full: Sequence[int]) -> int:

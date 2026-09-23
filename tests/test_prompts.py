@@ -117,6 +117,22 @@ def test_messages_render_with_the_generation_prompt():
     assert ids == prompted
 
 
+def test_template_variables_reach_the_chat_template():
+    """Qwen3's `enable_thinking=False` closes an empty think block after the generation prompt."""
+    from dew.data.text import load_tokenizer
+
+    conversation = [{"role": "user", "content": "hi"}]
+    render = load_tokenizer(TOKENIZER).apply_chat_template
+    thinking = list(render(conversation, tokenize=True, return_dict=False, add_generation_prompt=True))
+    plain = list(render(conversation, tokenize=True, return_dict=False, add_generation_prompt=True,
+                        enable_thinking=False))
+    assert plain != thinking, "the variable matters for this template"
+    spec = Prompts(tokenizer=TOKENIZER, records=records({"prompt": conversation}), max_prompt_len=64,
+                   val_batches=None, loading=Loading(workers=0), thinking=False)
+    batch = next(spec.load(batch=1).train())
+    assert [int(token) for token in batch[PROMPT_KEY][0, 64 - int(batch[LENGTH_KEY][0]):]] == plain
+
+
 def test_a_row_without_a_prompt_is_refused():
     with pytest.raises(ValueError, match="without a prompt"):
         source({"data_source": "rule"})
