@@ -63,14 +63,14 @@ def model_config(width: int = 1024) -> dict:
     return {
         "emb_features": width, "num_layers": LAYERS, "num_heads": heads,
         "num_kv_heads": max(heads // 4, 1), "head_dim": 64,
-        "qk_norm": False, "attention_bias": False, "nope": True,
-        "exclusive_self_attention": True, "tie_embeddings": True, "mlp": "swiglu",
+        "qk_norm": False, "attention_bias": False, "tie_embeddings": True, "mlp": "swiglu",
         "layer_types": ["mamba", "mamba", "mamba", "attention"] * (LAYERS // 4),
         "kinds": {
             "mamba": {"mixer": {"kind": "mamba2", "num_heads": 2 * width // 64, "head_dim": 64,
                                 "state_size": 128, "n_groups": 1, "conv_kernel": 4,
                                 "chunk_size": 256, "use_conv_bias": True}},
-            "attention": {"window": 4096},
+            "attention": {"window": 4096, "mixer": {"kind": "attention", "nope": True,
+                                                     "exclusive_self_attention": True}},
         },
         "mixture": {"experts": 128, "top_k": 2, "expert_features": width // 8},
         "embedding_multiplier": 12.0, "residual_multiplier": 0.22,
