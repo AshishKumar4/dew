@@ -198,6 +198,16 @@ def test_train_rlvr_starts_sglang_with_room_for_a_prompt_at_the_window_and_its_f
     assert min(new_tokens, context - 2 - config.prompt_tokens) == new_tokens
 
 
+def test_train_rlvr_smoke_commits_every_update_one_behind(tmp_path):
+    """The smoke's completions all run out of their eight tokens, so a run
+    that masked truncations would commit nothing and never push. The
+    example scores them, as AsyncRollout did: both updates commit, and the
+    second trains on draws submitted one update earlier."""
+    smoke("train_rlvr", tmp_path)
+    summary = json.loads((tmp_path / "rewards.json").read_text())
+    assert summary["updates"] == 2 and summary["max_lag"] == 1
+
+
 def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):
     """The evaluation report of a run the script trains first: the perplexity
     `evaluate` scores over the held-out split, a greedy continuation, and a

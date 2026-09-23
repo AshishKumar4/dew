@@ -23,7 +23,8 @@ endpoints, `VLLM_SERVER_DEV_MODE=1`; SGLang's `/update_weights_from_disk`).
 environments. A `RolloutScheduler` over a `PromptSource` draws one batch
 ahead of the update, so each batch is at most one update stale; the GRPO
 objective's importance cap corrects for it. A completion that runs out of
-`--new-tokens` is truncated and masked, not scored.
+`--new-tokens` is still scored and trained on (`truncation="score"`): a
+closed code block followed by cut-off prose can pass every test.
 
 The run prints one line per update and writes `rewards.json` to `--out`
 with the per-update reward, policy version and lag, the mean reward of the
@@ -270,7 +271,7 @@ def main(config: Config) -> dict:
     # One chain per completion at most, each within the prompt and response width.
     rollout = RolloutScheduler(objective, prompts, server, width=width, rows=config.prompts * config.groups,
                                tasks=prompt_tasks, groups=config.groups, max_lag=config.max_lag,
-                               ahead=config.max_lag, log=log)
+                               ahead=config.max_lag, truncation="score", log=log)
     data = Prompts(tokenizer=tokenizer, records=records(config.tasks, config.seed),
                    max_prompt_len=config.prompt_tokens, pad_id=sampling.pad_id, val_batches=None,
                    loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),

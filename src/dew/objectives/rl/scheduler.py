@@ -17,8 +17,10 @@ scheduler's own group id, sample index and attempt, so a resubmitted sample
 rejoins its group. Admission is per rollout, by status:
 
 - COMPLETED and AGENT_ERROR are admitted; the verifier scored them.
-- TRUNCATED is admitted and `pack` masks it: a context, turn or token limit
-  says nothing about the task.
+- TRUNCATED is admitted and trains as `truncation` says: `mask` (the
+  default, for agentic context, turn and wall-clock limits), `score` on its
+  verifier reward (single-turn RLVR), or `zero` (a length penalty); see
+  `dew.objectives.rl.sessions`.
 - INFRA_ERROR and CANCELLED are never scored. The sample is submitted again
   under the served weights, up to `max_attempts` failures per sample, after
   which the group is abandoned rather than trained incomplete.
@@ -86,6 +88,7 @@ from .sessions import (
     SessionSource,
     Status,
     Task,
+    check_truncation,
     pack,
     session_metrics,
 )
@@ -185,15 +188,16 @@ class RolloutScheduler:
     integer `task_id` rows). `timeout` is each rollout's deadline in seconds
     from its submission; a rollout past it is cancelled and resubmitted as a
     failed attempt. `width` and `rows` fix the packed batch shape;
-    `estimator` is `pack`'s advantage family. `log`, when given, receives
-    a `SchedulerRecord` per call.
+    `estimator` and `truncation` are `pack`'s advantage family and
+    truncation policy. `log`, when given, receives a `SchedulerRecord` per
+    call.
     """
 
     def __init__(self, objective: GRPOObjective, source: SessionSource, weights: Publisher, *,
                  width: int, rows: int, tasks: Callable[[Batch], Sequence[Task]] = task_ids,
                  groups: int = 4, oversample: int = 0, admit: int | None = None,
                  max_lag: int = 1, ahead: int = 1, sync_every: int = 1, max_attempts: int = 3,
-                 timeout: float | None = None, estimator: str = "group", log: Callable[[SchedulerRecord], None] | None = None):
+                 timeout: float | None = None, estimator: str = "group", truncation: str = "mask", log: Callable[[SchedulerRecord], None] | None = None):
         for name, value, least in (("width", width, 2), ("rows", rows, 1), ("groups", groups, 2),
                                    ("oversample", oversample, 0), ("ahead", ahead, 0),
                                    ("sync_every", sync_every, 1), ("max_lag", max_lag, 0),
@@ -203,6 +207,7 @@ class RolloutScheduler:
         if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
                                     or not timeout > 0):
             raise ValueError("timeout must be a positive number of seconds, or None to wait without a deadline")
+        check_truncation(truncation)
         if admit is not None and (type(admit) is not int or admit < 1):
             raise ValueError("admit must be a positive number of groups, or None to admit every task")
         if ahead + sync_every - 1 > max_lag:
@@ -215,7 +220,7 @@ class RolloutScheduler:
         self.objective, self.source, self.weights, self.tasks_of = objective, source, weights, tasks
         self.width, self.rows, self.groups, self.oversample, self.admit = width, rows, groups, oversample, admit
         self.max_lag, self.ahead, self.sync_every, self.max_attempts = max_lag, ahead, sync_every, max_attempts
-        self.timeout, self.estimator, self.log = timeout, estimator, log
+        self.timeout, self.estimator, self.truncation, self.log = timeout, estimator, truncation, log
         self._lock = threading.Lock()
         self._registered: deque[_Entry] = deque()
         self._serial = 0
@@ -407,7 +412,7 @@ class RolloutScheduler:
         waited = time.perf_counter() - began
         rollouts = [rollout for group in admitted for rollout in group.done[:self.groups]]
         latencies = [latency for group in admitted for latency in group.latencies[:self.groups]]
-        packed = pack(rollouts, self.width, rows=self.rows, estimator=self.estimator)
+        packed = pack(rollouts, self.width, rows=self.rows, estimator=self.estimator, truncation=self.truncation)
         proximal = np.asarray(self._rescore(state.params, packed), np.float32)
         packed[OLD_LOG_PROBS_KEY] = proximal * packed[RESPONSE_MASK_KEY]
         if self.log is not None:
@@ -415,5 +420,6 @@ class RolloutScheduler:
             oldest = min(versions, default=updates)
             self.log(SchedulerRecord(
                 updates, oldest, updates - oldest, len(admitted), dict(tally.resubmitted), tally.cancelled,
-                tally.abandoned, waited, session_metrics(rollouts, packed, latencies=latencies, version=updates)))
+                tally.abandoned, waited, session_metrics(rollouts, packed, latencies=latencies, version=updates,
+                                                       truncation=self.truncation)))
         return packed
