@@ -1992,8 +1992,8 @@ class CausalTransformer(nn.Module):
         self.embed_tokens = TokenEmbedding(
             num_embeddings=self.vocab_size, features=self.emb_features,
             dtype=self.dtype, name='embed_tokens',
-            **({} if self.initializer_range is None else
-               {"embedding_init": nn.initializers.normal(self.initializer_range)}))
+            embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
+                            else nn.initializers.normal(self.initializer_range)))
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a

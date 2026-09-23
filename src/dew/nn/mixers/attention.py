@@ -398,6 +398,7 @@ class CausalSelfAttention(nn.Module):
         rotary_positions = positions if logical_positions is None else logical_positions
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             rotary_positions = attention_metadata.rotary_positions
+        freqs_cos = freqs_sin = None
         if self.nope:
             # NoPE rotates nothing; the query still carries the logit scale
             # the checkpoint asks for, which apply_rotary folds in otherwise.
@@ -413,7 +414,7 @@ class CausalSelfAttention(nn.Module):
                        else self.attention_scale * math.sqrt(self.head_dim)))
         own_value = value
         if not self.kv_shared:
-            if not self.nope:
+            if freqs_cos is not None and freqs_sin is not None:
                 key = apply_rotary(key, freqs_cos, freqs_sin)
             if kv_store is not None and self.kv_store_key is not None:
                 # Post-norm, post-rope, the same tensors the reference hands
