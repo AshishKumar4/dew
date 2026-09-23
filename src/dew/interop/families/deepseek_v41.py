@@ -10,20 +10,21 @@ pins.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import TypedDict
 
 import numpy as np
 
-from dew.interop.families.deepseek import _V4_SCORES
+from dew.interop.families.deepseek import _V4_SCORES, _deepseek_v4_prepare
 from dew.interop.hf_decoders import (
     _NO_AUDIO,
     DEFAULT_MAX_SEQ_LEN,
+    DecoderFamily,
     DecoderFields,
-    DSparkFields,
-    EngramFields,
     KindFields,
     WrapperFields,
     _base_config,
     _dew_path,
+    _kind_mixers,
     _record_float,
     _record_int,
     _refuse,
@@ -31,6 +32,7 @@ from dew.interop.hf_decoders import (
     _yarn_record,
 )
 from dew.nn import vision as vision_nn
+from dew.nn.deepseek_v4 import DeepseekV4Mixer
 
 # The release's config.json nests the text model's fields under text_config
 # beside a vision tower.
@@ -40,6 +42,32 @@ _V41_TEXT_TYPE = 'deepseek_v41_text'
 _V41_TEXT_INERT = frozenset((
     'model_type', 'attention_dropout', 'initializer_range', 'use_cache', 'hidden_act',
     'num_key_value_heads', 'attention_bias', 'topk_method', 'max_position_embeddings'))
+
+
+class EngramFields(TypedDict):
+    """Describes one `dew.nn.engram.Engram`, by its dataclass fields."""
+
+    layer_ids: tuple[int, ...]
+    num_embeddings: tuple[int, ...]
+    max_ngram_size: int
+    vocab_size: int
+    n_heads: int
+    head_dim: int
+    compressed_vocab_size: int
+    pad_token_id: int
+
+
+class DSparkFields(TypedDict):
+    """Describes one `dew.nn.dspark.DSpark`, by its dataclass fields."""
+
+    stages: int
+    block_size: int
+    noise_token_id: int
+    target_layers: tuple[int, ...]
+    markov_rank: int
+    experts: int
+    top_k: int
+    layer_type: str
 
 
 def _v41_modes(text: Mapping[str, object], layers: int) -> tuple[tuple[int, ...], tuple[str, ...]]:
@@ -405,3 +433,18 @@ def _deepseek_v41_constants(directory, record: Mapping[str, object]) -> Mapping[
         _refuse('tokenizer', f"it has {len(lookup)} tokens for a vocabulary of {vocab}")
     pad = lookup[_record_int(engram, 'pad_token_id')]
     return {'engram_hashes': {'token_map': np.concatenate([lookup, np.full(vocab - len(lookup), pad, np.int32)])}}
+
+
+# V4.1 is V4's block under CSA2's compressor, which names the family; the
+# hub's table registers it.
+DEEPSEEK_V41 = DecoderFamily(
+    ('deepseek_v41',), _deepseek_v41_config,
+    lambda fields: any(isinstance(mixer, DeepseekV4Mixer) and mixer.compressor == 'csa2'
+                       for mixer in _kind_mixers(fields)),
+    'deepseek_v41', 'DeepseekV41ForCausalLM', lambda model: {},
+    weight_path=_deepseek_v41_path, prepare_weights=_deepseek_v4_prepare,
+    preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight'),
+    constants=_deepseek_v41_constants, wrapper=_deepseek_v41_wrapper,
+    # The image span's learned vectors sit at the top level, beside the
+    # aligner (model.py:1201-1222).
+    wrapper_projector_names=('image_start', 'image_newline', 'image_end'))

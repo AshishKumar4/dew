@@ -29,6 +29,7 @@ from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import (
+    TYPE_CHECKING,
     Callable,
     Collection,
     Literal,
@@ -48,6 +49,9 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.interop import mamba2, pickles
 from dew.interop.safetensors_io import read_weights, weight_files
+
+if TYPE_CHECKING:
+    from dew.interop.families.deepseek_v41 import DSparkFields, EngramFields
 from dew.interop.streaming import LazyTree, SourceLeaf, materialize
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture, RematPolicy
@@ -317,36 +321,9 @@ class AltUpFields(TypedDict, total=False):
     correct_scale: bool
 
 
-class EngramFields(TypedDict):
-    """Describes one `dew.nn.engram.Engram`, by its dataclass fields."""
-
-    layer_ids: tuple[int, ...]
-    num_embeddings: tuple[int, ...]
-    max_ngram_size: int
-    vocab_size: int
-    n_heads: int
-    head_dim: int
-    compressed_vocab_size: int
-    pad_token_id: int
-
-
-class DSparkFields(TypedDict):
-    """Describes one `dew.nn.dspark.DSpark`, by its dataclass fields."""
-
-    stages: int
-    block_size: int
-    noise_token_id: int
-    target_layers: tuple[int, ...]
-    markov_rank: int
-    experts: int
-    top_k: int
-    layer_type: str
-
-
 class HyperConnectionsFields(TypedDict, total=False):
     """Describes one `HyperConnections`: how many residual streams a layer
-    reads and writes, how they collapse, and whether each sublayer collapses
-    by the previous site's `pre`."""
+    reads and writes, and how they collapse."""
 
     hc_mult: int
     hc_eps: float
@@ -447,8 +424,8 @@ class DecoderFields(TypedDict, total=False):
     laurel_rank: int | None
     hyper_connections: HyperConnectionsFields | None
     attention_residuals: AttentionResidualsFields | None
-    engram: EngramFields | None
-    dspark: DSparkFields | None
+    engram: "EngramFields | None"
+    dspark: "DSparkFields | None"
     swiglu_limit: float | None
     activation_sparsity_pattern: tuple[float, ...] | None
     mask_token_id: int | None
@@ -1160,8 +1137,7 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     """Translate a multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, qwen3_5 and gemma3n bundles translate, and a
-    bundle a decoder family reads itself (`DecoderFamily.wrapper`). Records
+    gemma3, llama4, gemma4, qwen3_5, gemma3n and decoder-family bundles translate. Records
     retain the decoder, tower, projector, image token ID and token count, and
     for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
     audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 3n's
@@ -1193,54 +1169,6 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     return record
 
 
-# Each tower kind's params map. Gemma 4 is absent because its map returns
-# whole collections rather than one params tree.
-_WRAPPER_TOWER_PARAMS = {
-    "siglip": vision_nn.translate_siglip_vision_weights,
-    "llama4": vision_nn.translate_llama4_vision_weights,
-    "qwen3_5": vision_nn.translate_qwen35_vision_weights,
-    "gemma3n": vision_nn.translate_gemma3n_vision_weights,
-    "deepseek_v41": vision_nn.translate_deepseek_v41_vision_weights,
-}
-
-_WRAPPER_PROJECTOR_WEIGHTS = {
-    "gemma": vision_nn.translate_gemma_projector_weights,
-    "llama4": vision_nn.translate_llama4_projector_weights,
-    "gemma4": vision_nn.translate_gemma4_projector_weights,
-    "qwen3_5": vision_nn.translate_qwen35_projector_weights,
-    "gemma3n": vision_nn.translate_gemma3n_projector_weights,
-    "deepseek_v41": vision_nn.translate_deepseek_v41_projector_weights,
-}
-
-
-def _wrapper_tower_variables(
-    kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
-) -> Variables:
-    """Return one vision tower's variables, in the requested storage."""
-    if kind == "gemma4":
-        return vision_nn.translate_gemma4_vision_weights(hf_tensors, param_dtype=param_dtype)
-    translate = _WRAPPER_TOWER_PARAMS.get(kind)
-    if translate is None:
-        raise ValueError(f"tower kind {kind!r} has no weight map here")
-    return {"params": translate(hf_tensors, param_dtype=param_dtype)}
-
-
-def _wrapper_projector_weights(
-    kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
-) -> Variables:
-    """Return the projector tensors for one projector kind, in the requested storage."""
-    translate = _WRAPPER_PROJECTOR_WEIGHTS.get(kind)
-    if translate is None:
-        raise ValueError(f"projector kind {kind!r} has no weight map here")
-    return translate(hf_tensors, param_dtype=param_dtype)
-
-
-_WRAPPER_TOWER_PREFIX = {"siglip": "vision_tower.", "llama4": "vision_model.",
-                         "gemma4": "vision_tower.", "qwen3_5": "visual.",
-                         "gemma3n": "vision_tower.", "deepseek_v41": "vision."}
-_WRAPPER_PROJECTOR_PREFIX = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
-                             "gemma4": "embed_vision.", "qwen3_5": "visual.merger.",
-                             "gemma3n": "embed_vision.", "deepseek_v41": "aligner."}
 # Gemma 3n and Gemma 4 nest their audio encoder and embedder beside the vision ones.
 _WRAPPER_AUDIO_PREFIX = "audio_tower."
 _WRAPPER_AUDIO_PROJECTOR_PREFIX = "embed_audio."
@@ -1250,8 +1178,8 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], 
     """Route source names once, checking any names that claim one local leaf.
     The table retains names, not decoded arrays, so read can be a codec accessor.
     """
-    tower_prefix = _WRAPPER_TOWER_PREFIX[record["tower"]["kind"]]
-    projector_prefix = _WRAPPER_PROJECTOR_PREFIX[record["projector"]["kind"]]
+    tower_prefix = vision_nn.TOWER_PREFIX[record["tower"]["kind"]]
+    projector_prefix = vision_nn.PROJECTOR_PREFIX[record["projector"]["kind"]]
     audio = record.get("audio")
     bundled = _bundled(record["model_type"])
     sources: dict[str, dict[str, str]] = {name: {} for name in (
@@ -1432,9 +1360,9 @@ def translate_wrapper_weights(
         "language_model": translate_weights(
             text_tensors, record["text"], param_dtype=param_dtype, lazy=lazy
         ),
-        "tower": _wrapper_tower_variables(tower_kind, tower_tensors, param_dtype),
+        "tower": vision_nn.tower_variables(tower_kind, tower_tensors, param_dtype),
         "projector": {
-            "params": _wrapper_projector_weights(
+            "params": vision_nn.projector_variables(
                 projector_kind, projector_tensors, param_dtype
             )
         },
@@ -1444,7 +1372,7 @@ def translate_wrapper_weights(
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError(f"audio tower kind {audio['kind']!r} has no weight map here")
         variables["audio_tower"] = audio_nn.audio_weights(audio_tensors, encoder, param_dtype=param_dtype)
-        variables["audio_projector"] = {"params": _wrapper_projector_weights(
+        variables["audio_projector"] = {"params": vision_nn.projector_variables(
             _kind_name(record, "audio_projector"), audio_projector_tensors, param_dtype)}
     return variables
 
@@ -1500,10 +1428,9 @@ _V4_MODULES = ('compressor', 'indexer', 'scorer')
 _V4_TENSORS = ('sinks', 'position_bias')
 _V4_HC = ('fn', 'base', 'scale')
 _V4_HEAD = ('hc_fn', 'hc_base', 'hc_scale')
-# The router state a training step moves (DeepSeek-V4.1 adds a second bias,
-# for image spans), beside the frozen table a hash router selects by; none is
-# a parameter, so each lands where `Router` keeps it
-# (modeling_deepseek_v4.py:1033, :1062).
+# The router state a training step moves (V4.1's image-span bias too), beside
+# the frozen table a hash router selects by; none is a parameter, so each
+# lands where `Router` keeps it (modeling_deepseek_v4.py:1033, :1062).
 _MOE_STATE = ('e_score_correction_bias', 'media_bias', 'tid2eid')
 
 
@@ -2335,26 +2262,27 @@ class DecoderFamily:
     """Suffixes of the 1-D source tensors a checkpoint stores longer than their
     leaf, zeros past it: Kimi K3's KDA `A_log`. `prepare_weights` checks and
     trims the tail; export writes the zeros back (`WeightLayout.padded`)."""
-    constants: Callable[[Path, Mapping[str, object]], Mapping[str, object]] = (
-        lambda directory, record: {})
-    """The `constants` collection's entries a family derives from the source
-    directory beside its tensors: DeepSeek-V4.1's engram token map, which
-    its tokenizer defines."""
+    constants: Callable[[Path, Mapping[str, object]], Mapping[str, object]] = lambda directory, record: {}
+    """The `constants` entries a family derives from its source directory beside
+    the tensors (`with_constants`), which no export writes back: V4.1's engram token map."""
     wrapper: Callable[[Mapping[str, object], set[str]], WrapperFields] | None = None
-    """Reads a multimodal bundle released under the family's own model_type:
-    a config of that type naming a vision_config loads whole through it. The
-    bundle keeps the decoder's tensors under their own names, unprefixed,
-    and `wrapper_projector_names` at its top level."""
+    """Reads a media bundle released under the family's own model_type, which
+    keeps the decoder's tensors unprefixed and `wrapper_projector_names` beside them."""
     wrapper_projector_names: tuple[str, ...] = ()
-    """The projector's tensors a bundle keeps at its top level, beside the
-    decoder's."""
 
 
 def _bundled(model_type: str) -> DecoderFamily | None:
-    """The family that reads the bundle released under `model_type`
-    (`DecoderFamily.wrapper`), or None."""
+    """The family that reads the media bundle released under `model_type`, or None."""
     family = _FAMILIES.get(model_type)
     return family if family is not None and family.wrapper is not None else None
+
+
+def _bundles(config: Mapping[str, object]) -> bool:
+    """Whether a source config is a media bundle its own decoder family reads
+    whole (`DecoderFamily.wrapper`): one that names its vision_config."""
+    model_type = config.get("model_type")
+    return (isinstance(model_type, str) and _bundled(model_type) is not None
+            and config.get("vision_config") is not None)
 
 
 def _kind_mixers(fields: DecoderFields) -> list[MixerBase]:
@@ -2423,12 +2351,7 @@ from dew.interop.families.deepseek import (
     _kimi_k25_config,
     _kimi_k25_path,
 )
-from dew.interop.families.deepseek_v41 import (
-    _deepseek_v41_config,
-    _deepseek_v41_constants,
-    _deepseek_v41_path,
-    _deepseek_v41_wrapper,
-)
+from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
 from dew.interop.families.gemma import (
     _gemma2_config,
     _gemma2_export,
@@ -2545,17 +2468,7 @@ _FAMILY_ENTRIES = (
                                   and mixer.index_rope_interleave),
                   'glm_moe_dsa', 'GlmMoeDsaForCausalLM', lambda model: {},
                   weight_path=_glm4_moe_path, preserve_source_layout=True),
-    # V4.1 is V4's block under CSA2's compressor, which names the family.
-    DecoderFamily(('deepseek_v41',), _deepseek_v41_config,
-                  lambda fields: any(isinstance(mixer, DeepseekV4Mixer) and mixer.compressor == 'csa2'
-                                     for mixer in _kind_mixers(fields)),
-                  'deepseek_v41', 'DeepseekV41ForCausalLM', lambda model: {},
-                  weight_path=_deepseek_v41_path, prepare_weights=_deepseek_v4_prepare,
-                  preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight'),
-                  constants=_deepseek_v41_constants, wrapper=_deepseek_v41_wrapper,
-                  # The image span's learned vectors sit at the top level,
-                  # beside the aligner (model.py:1201-1222).
-                  wrapper_projector_names=('image_start', 'image_newline', 'image_end')),
+    DEEPSEEK_V41,
     # V4's block is nothing another family builds: the mixer kind names its
     # window, its compressor and its grouped output projection at once.
     DecoderFamily(('deepseek_v4',), _deepseek_v4_config,
@@ -2690,3 +2603,10 @@ def _family_for_config(config: DecoderFields) -> DecoderFamily:
 def _family_for_model(model: CausalTransformer) -> DecoderFamily:
     return _family_of(DecoderFields(**{field.name: getattr(model, field.name)
                                        for field in dataclasses.fields(model)}))
+
+
+def with_constants(variables: Variables, record: DecoderFields, directory: Path) -> Variables:
+    """`variables` beside the `constants` entries the record's family derives
+    from the source directory (`DecoderFamily.constants`)."""
+    derived = _family_for_config(record).constants(directory, record)
+    return {**variables, "constants": {**variables.get("constants", {}), **derived}} if derived else variables

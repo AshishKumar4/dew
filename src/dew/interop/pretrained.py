@@ -788,12 +788,9 @@ def _wrapper_layouts(tensors, record, variables):
 
     tower_kind = record["tower"]["kind"]
     projector_kind = record["projector"]["kind"]
-    tower_path: Callable[[str], tuple[str, ...] | None] = {"siglip": vision.siglip_vision_path, "llama4": vision.llama4_vision_path,
-                  "gemma4": vision.gemma4_vision_path, "qwen3_5": vision.qwen35_vision_path,
-                  "gemma3n": vision.gemma3n_vision_path,
-                  "deepseek_v41": vision.deepseek_v41_vision_path}[tower_kind]
-    tower_prefix = decoders._WRAPPER_TOWER_PREFIX[tower_kind]
-    projector_prefix = decoders._WRAPPER_PROJECTOR_PREFIX[projector_kind]
+    tower_path = vision.TOWER_PATHS[tower_kind]
+    tower_prefix = vision.TOWER_PREFIX[tower_kind]
+    projector_prefix = vision.PROJECTOR_PREFIX[projector_kind]
     bundled = decoders._bundled(record["model_type"])
     audio_encoder = None
     if record["audio"] is not None:
@@ -807,7 +804,7 @@ def _wrapper_layouts(tensors, record, variables):
         paths: tuple[tuple[str, ...], ...] = ()
         transpose = None
         concatenate = None
-        if bare.startswith(projector_prefix):
+        if bare.startswith(projector_prefix) or (bundled is not None and bare in bundled.wrapper_projector_names):
             tail = bare.removeprefix(projector_prefix)
             path = vision.projector_weight_path(projector_kind, tail)
             paths = (("params", "projector", *path),)
@@ -833,12 +830,9 @@ def _wrapper_layouts(tensors, record, variables):
             if path[-1] == "kernel":
                 # Kernels store [*window, in, out]; the source keeps [out, in, *window].
                 transpose = {2: (1, 0), 3: (2, 1, 0), 4: (3, 2, 0, 1)}[tensor.ndim]
-        elif bundled is not None and bare in bundled.wrapper_projector_names:
-            paths = (("params", "projector", *vision.projector_weight_path(projector_kind, bare)),)
         elif bare.startswith(("language_model.", "mtp.")) or bare == "lm_head.weight" or bundled is not None:
             tail = bare.removeprefix("language_model.")
-            text_name = (tail if bundled is not None or tail.startswith(("model.", "lm_head.", "mtp."))
-                         else "model." + tail)
+            text_name = tail if bundled is not None or tail.startswith(("model.", "lm_head.", "mtp.")) else "model." + tail
             layout = _language_layout(name, text_name, tensor, record["text"],
                                       record["text_model_type"], variables,
                                       "language_model")
@@ -2508,15 +2502,12 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         record = config
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
-    elif "text_config" in config and (family not in decoders._FAMILIES or (
-            decoders._bundled(family) is not None and config.get("vision_config") is not None)):
-        # A wrapper repo carries its decoder under text_config. Where the
-        # wrapper's own model_type is a registered decoder family, its
-        # towers have no counterpart and its text half is the model, so it
-        # takes the decoder branch below and its translator reads the
-        # nested config; `translate_config` refuses the rest by the same
-        # rule. A family that reads its own bundle (`DecoderFamily.wrapper`)
-        # loads one naming a vision_config whole.
+    elif "text_config" in config and (family not in decoders._FAMILIES or decoders._bundles(config)):
+        # A wrapper repo carries its decoder under text_config. Where its
+        # model_type is a registered decoder family, its towers have no
+        # counterpart and the text half, read from the nested config, is the
+        # model, unless the family reads its media bundle whole
+        # (`DecoderFamily.wrapper`); `translate_config` refuses the rest.
         record = decoders.translate_wrapper_config(config)
         text_fields = _wrapper_text_fields(config, record, max_seq_len)
         text: decoders.DecoderFields = {**text_fields, **precision_fields(
@@ -2528,10 +2519,8 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             raise TypeError("causal_transformer registry entry must build CausalTransformer")
         model = _wrapper_model(config, record, language_model, dtype=dtype)
         parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=streaming)
-        derived = decoders._family_for_config(record["text"]).constants(directory, record["text"])
-        if derived:
-            parts = {**parts, "language_model": {**parts["language_model"], "constants": {**derived}}}
-        variables = _native_variables(parts)
+        variables = _native_variables({**parts, "language_model": decoders.with_constants(
+            parts["language_model"], record["text"], directory)})
         layouts, retained = _wrapper_layouts(tensors, record, variables)
     else:
         if verified is None:
@@ -2545,12 +2534,8 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             record["max_seq_len"] = max_seq_len
         built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
         model = models.build("causal_transformer", built)
-        variables = decoders.translate_weights(tensors, record, family, param_dtype=param_dtype, lazy=streaming)
-        entry = decoders._FAMILIES[family]
-        derived = entry.constants(directory, record)
-        if derived:
-            # Derived beside the tensors, not stored: the export writes none back.
-            variables = {**variables, "constants": {**variables.get("constants", {}), **derived}}
+        variables = decoders.with_constants(decoders.translate_weights(
+            tensors, record, family, param_dtype=param_dtype, lazy=streaming), record, directory)
         decoders._check_tree(variables, model)
         # The bindings are what an adapter loader resolves source names
         # through and what a quantized source is written back through, so a
@@ -2558,6 +2543,7 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         # preserve_source_layout and quantization, not by whether bindings
         # exist. A family whose tensors are rewritten before the path map
         # reads them (Gemma 4's prepare) has no raw-name bindings.
+        entry = decoders._FAMILIES[family]
         if entry.preserve_source_layout or entry.prepare_weights is dict:
             bindings = []
             for name, tensor in tensors.items():
