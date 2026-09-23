@@ -155,8 +155,6 @@ def _check_terms(decoder: CausalTransformer | MultimodalTransformer | None, *,
         raise ValueError(
             f"router_z_loss weights the routers' squared log partitions, so it is "
             f"finite and nonnegative, got {router_z_loss}; 0 adds nothing")
-    if router_z_loss and (decoder is None or decoder.mixture is None):
-        raise ValueError("router_z_loss needs a model with a mixture")
 
 
 def _check_indexer(model: nn.Module, indexer: IndexerTraining,
@@ -984,6 +982,10 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             statistics, reported["aux_loss"] = self._router_statistics(prediction, routing, alpha)
         if self.router_z_loss:
             router_z = router_z_terms(routing, self.router_z_loss)
+            if not router_z:
+                raise ValueError(
+                    "router_z_loss needs routers that sow their gate's log partition "
+                    "(dew.nn.moe.Router); this model's routers sow none")
             statistics = (LMStatistics(prediction, (), (), router_z) if isinstance(statistics, Mean)
                           else statistics.replace(router_z=router_z))
             reported["router_z_loss"] = sum(mean_loss(term)[0] for term in router_z)
