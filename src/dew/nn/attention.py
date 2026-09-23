@@ -650,7 +650,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
         return jax.lax.all_to_all(out, SEQUENCE_AXIS, 1, 2, tiled=True)
 
     exchanged = _manual_map(
-        local, (queries, keys, keys) + tuple(spec for _, spec in extras.values()), queries)
+        local, (queries, keys, keys, *(spec for _, spec in extras.values())), queries)
     return exchanged(query, key, value, *(x for x, _ in extras.values()))
 
 
@@ -733,7 +733,7 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
                       key_value_seq_lengths=given.get('key_value_seq_lengths'))
 
     attended = _manual_map(
-        local, (queries, keys, keys) + tuple(spec for _, spec in extras.values()), queries)
+        local, (queries, keys, keys, *(spec for _, spec in extras.values())), queries)
     out = attended(query, key, value, *(x for x, _ in extras.values()))
     return unstripe(out, shards) if reordered else out[:, :q_len]
 
@@ -1132,14 +1132,16 @@ def _blocks(x, block: int, blocks: int):
     return x.reshape(x.shape[0], blocks, block, *x.shape[2:])
 
 
-def _banded(x):
+def _banded(x, before=None):
     """Each block of `[B, n, W, ...]` behind the block before it: `[B, n, 2W, ...]`.
 
-    The first block's predecessor is zeros, whose rows are negative and so
-    outside every query's causal reach.
+    `before` `[B, 1, W, ...]` is the block before the first: under a sequence
+    axis, the previous shard's last `W` rows. None is zeros, whose rows are
+    negative and so outside every query's causal reach.
     """
-    previous = jnp.pad(x[:, :-1], [(0, 0), (1, 0)] + [(0, 0)] * (x.ndim - 2))
-    return jnp.concatenate([previous, x], axis=2)
+    if before is None:
+        before = jnp.zeros_like(x[:, :1])
+    return jnp.concatenate([jnp.concatenate([before, x[:, :-1]], axis=1), x], axis=2)
 
 
 def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
@@ -1182,14 +1184,14 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     assert span is not None
     if span < 1:
         raise ValueError(f"a local span is a positive number of keys, got {span}")
-    batch, length = query.shape[0], query.shape[1]
+    length = query.shape[1]
     if key.shape[1] != length:
         raise ValueError(
             f"local attention is self-attention: {length} queries against "
             f"{key.shape[1]} keys")
     kernel = functools.partial(
         attention_kernel, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
+        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap)
     resolved = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
@@ -1214,8 +1216,13 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
                 force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
                 causal=True, sliding_window=window, sinks=sinks, softcap=softcap,
                 segment_ids=segment_ids)
-    flags_only = segment_ids is None and valid is None
-    if length <= 2 * span:
+    shards = sequence_shards()
+    # Under a sequence axis each shard's first block reads the previous
+    # shard's last `span` rows, which only one neighbour holds when a shard's
+    # slice is at least that long. A wider span takes the dense call, whose
+    # mask the sequence exchange carries.
+    halo = length % shards == 0 and length // shards >= span
+    if length <= 2 * span or not halo:
         places = jnp.arange(length) if positions is None else positions
         mask = (None if chunk is None or (positions is None and length <= chunk)
                 else chunk_mask(places, places, chunk))
@@ -1231,9 +1238,98 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         return scaled_dot_product_attention(
             query, key, value, dtype=dtype, precision=precision,
             force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
-            causal=mask is None, mask=mask, sinks=sinks, softcap=softcap)
+            causal=mask is None, sliding_window=window if mask is None else None, mask=mask,
+            sinks=sinks, softcap=softcap)
+    if shards > 1:
+        out = _local_over_sequence(
+            kernel, query, key, value, shards, window=window, chunk=chunk, positions=positions,
+            segment_ids=segment_ids, valid=valid, sinks=sinks, implementation=implementation,
+            masked=masked)
+    else:
+        out = _local_blocks(functools.partial(kernel, sinks=sinks), query, key, value,
+                            window=window, chunk=chunk, positions=positions,
+                            segment_ids=segment_ids, valid=valid,
+                            implementation=implementation, masked=masked)
+    return checkpoint_name(out, 'attention_output')
 
+
+def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chunk, positions,
+                         segment_ids, valid, sinks, implementation, masked):
+    """`_local_blocks` over a sequence the mesh's sequence axis splits, in a
+    `shard_map`: each shard computes its own rows, and its first block reads
+    the previous shard's last `span` keys, values, positions, segment ids and
+    validity, which one `ppermute` hands it; the first shard receives zeros,
+    the rows before the sequence. That halo is all that crosses the
+    interconnect, where gathering the sequence would move all of it.
+    Chunks that start at the shards' boundaries need no halo.
+
+    The heads split over the tensor axis where they divide, the key heads
+    repeated to the least common multiple of their count and the tensor
+    axis, as the exchanges repeat them."""
+    mesh = jax.sharding.get_abstract_mesh()
+    batch, length = query.shape[:2]
+    span = window if window is not None else chunk
+    assert span is not None
+    queries = logical_spec(HEADS, query.shape)
+    tensor = mesh_axes(_entry(queries, 2))
+    if tensor:
+        kv_heads = math.lcm(key.shape[2], math.prod(mesh.shape[axis] for axis in tensor))
+        key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    keys = logical_spec(KV_HEADS, key.shape)
+    fields = {}
+    if positions is not None:
+        fields['positions'] = jnp.broadcast_to(jnp.asarray(positions), (batch, length))
+    if segment_ids is not None:
+        fields['segment_ids'] = segment_ids
+    if valid is not None:
+        fields['valid'] = jnp.asarray(valid, bool)
+    rows = logical_spec(("activation_batch", "activation_length"), (batch, length))
+    specs = [rows] * len(fields)
+    if sinks is not None:
+        fields['sinks'] = sinks
+        specs.append(logical_spec(("activation_heads",), sinks.shape))
+    names = tuple(fields)
+    local_length = length // shards
+    # Chunks that start at every shard's first row stay inside their shard.
+    aligned = chunk is not None and positions is None and local_length % chunk == 0
+
+    def local(query, key, value, *arrays):
+        given = dict(zip(names, arrays, strict=True))
+        forward = [(shard, shard + 1) for shard in range(shards - 1)]
+
+        def last_rows(x):
+            if x is None:
+                return None
+            return jax.lax.ppermute(x[:, local_length - span:], SEQUENCE_AXIS, forward)
+
+        before = None if aligned else tuple(
+            last_rows(x) for x in (key, value, given.get('positions'),
+                                   given.get('segment_ids'), given.get('valid')))
+        return _local_blocks(
+            functools.partial(kernel, sinks=given.get('sinks')), query, key, value,
+            window=window, chunk=chunk, positions=given.get('positions'),
+            segment_ids=given.get('segment_ids'), valid=given.get('valid'),
+            implementation=implementation, masked=masked,
+            offset=jax.lax.axis_index(SEQUENCE_AXIS) * local_length, before=before)
+
+    attended = _manual_map(local, (queries, keys, keys, *specs), queries)
+    return attended(query, key, value, *fields.values())
+
+
+def _local_blocks(kernel, query, key, value, *, window, chunk, positions, segment_ids, valid,
+                  implementation, masked, offset=0, before=None):
+    """`local_attention`'s blocked computation over the `[B, S, ...]` rows it
+    is handed, which start at row `offset` of the sequence.
+
+    `before` holds what the first rows read before them: the previous `span`
+    rows' keys, values, positions, segment ids and validity, each None where
+    the call has none. None is the start of the sequence, where nothing comes
+    before, and chunks start at row multiples from there."""
+    batch, length = query.shape[0], query.shape[1]
+    span = window if window is not None else chunk
+    assert span is not None
     blocks = -(-length // span)
+    flags_only = segment_ids is None and valid is None
 
     def folded(x, width: int):
         return x.reshape(batch * blocks, width, *x.shape[3:])
@@ -1241,7 +1337,11 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     def row_blocks(x):
         return _blocks(jnp.broadcast_to(jnp.asarray(x), (batch, length)), span, blocks)
 
-    if chunk is not None and positions is None:
+    def preceding(index):
+        # The halo field at `index`, as the one block before the first.
+        return None if before is None else before[index][:, None]
+
+    if chunk is not None and positions is None and before is None:
         mask = None
         if not flags_only:
             keep = jnp.ones((batch, blocks, span, span), bool)
@@ -1256,29 +1356,33 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         out = kernel(*(folded(_blocks(x, span, blocks), span) for x in (query, key, value)),
                      implementation=implementation, causal=True, mask=mask)
     else:
-        rows = jnp.arange(blocks * span).reshape(1, blocks, span)
+        rows = offset + jnp.arange(blocks * span).reshape(1, blocks, span)
         key_rows = jnp.concatenate([rows - span, rows], axis=-1)
         keep = ((key_rows[..., None, :] >= 0)
                 & (key_rows[..., None, :] <= rows[..., :, None]))
         if window is not None:
             keep = keep & (rows[..., :, None] - key_rows[..., None, :] < window)
         keep = jnp.broadcast_to(keep, (batch, blocks, span, 2 * span))
-        if chunk is not None:
+        if chunk is not None and positions is None:
+            keep = keep & (rows[..., :, None] // chunk == key_rows[..., None, :] // chunk)
+        elif chunk is not None:
             places = row_blocks(positions) // chunk
-            keep = keep & (places[..., :, None] == _banded(places)[..., None, :])
+            earlier = preceding(2)
+            keep = keep & (places[..., :, None] == _banded(
+                places, None if earlier is None else earlier // chunk)[..., None, :])
         if segment_ids is not None:
             segments = row_blocks(segment_ids)
-            keep = keep & ((segments[..., :, None] == _banded(segments)[..., None, :])
+            keep = keep & ((segments[..., :, None] == _banded(segments, preceding(3))[..., None, :])
                            & (segments[..., :, None] != 0))
         if valid is not None:
-            keep = keep & _banded(row_blocks(jnp.asarray(valid, bool)))[..., None, :]
+            keep = keep & _banded(row_blocks(jnp.asarray(valid, bool)),
+                                  preceding(4))[..., None, :]
         out = kernel(folded(_blocks(query, span, blocks), span),
-                     folded(_banded(_blocks(key, span, blocks)), 2 * span),
-                     folded(_banded(_blocks(value, span, blocks)), 2 * span),
+                     folded(_banded(_blocks(key, span, blocks), preceding(0)), 2 * span),
+                     folded(_banded(_blocks(value, span, blocks), preceding(1)), 2 * span),
                      implementation=masked,
                      mask=keep.reshape(batch * blocks, 1, span, 2 * span))
-    out = out.reshape(batch, blocks * span, *out.shape[2:])[:, :length]
-    return checkpoint_name(out, 'attention_output')
+    return out.reshape(batch, blocks * span, *out.shape[2:])[:, :length]
 
 
 # Splash's tile size. At 512 the forward kernel holds 1 MiB of fp32 logits

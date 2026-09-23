@@ -17,14 +17,15 @@ earlier shards leave, and the proof is the same, the layer's output and
 gradients and a hybrid model's training step against whole sequences.
 """
 
+import functools
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
-
-import functools
 
 from dew.nn.attention import (
     NormalAttention,
@@ -33,6 +34,7 @@ from dew.nn.attention import (
     causal_attention_mask,
     exchanged_heads_attention,
     gathered_keys_attention,
+    local_attention,
     scaled_dot_product_attention,
     stripe,
     unstripe,
@@ -342,6 +344,114 @@ def test_a_shape_the_exchange_cannot_split_is_refused_by_name():
         with pytest.raises(ValueError, match="gathered_keys_attention"):
             jax.jit(lambda q, k, v: through("all_to_all", q, k, v, causal=True))(
                 query, key, value)
+
+
+LOCAL_LENGTH = 32
+
+
+def local_inputs():
+    """Two packed rows of 32 tokens, documents starting at a different column
+    of each, the last three tokens of the second row padding, and positions
+    restarting at every document."""
+    segments = np.ones((2, LOCAL_LENGTH), np.int32)
+    positions = np.zeros((2, LOCAL_LENGTH), np.int32)
+    for row, cut in enumerate((7, 18)):
+        segments[row, cut:] = 2
+        positions[row, :cut] = np.arange(cut)
+        positions[row, cut:] = np.arange(LOCAL_LENGTH - cut)
+    segments[1, -3:] = 0
+    return jnp.asarray(segments), jnp.asarray(positions)
+
+
+LOCAL_CALLS = {
+    "window": dict(window=5),
+    "window_packed": dict(window=5, packed=True),
+    "window_valid_sinks": dict(window=5, valid=True, sinks=True),
+    # Chunks of 4 start at every shard's first row; chunks of 6 straddle them.
+    "chunk_aligned": dict(chunk=4),
+    "chunk_straddling": dict(chunk=6),
+    "chunk_positions": dict(chunk=6, positions=True, packed=True),
+}
+
+
+def local_call(q, k, v, window=None, chunk=None, packed=False, positions=False, valid=False,
+               sinks=False):
+    segments, places = local_inputs()
+    return local_attention(
+        q, k, v, window=window, chunk=chunk, implementation="xla",
+        segment_ids=segments if packed else None, positions=places if positions else None,
+        valid=(segments != 0) if valid else None,
+        sinks=jnp.linspace(-1.0, 1.0, q.shape[2]) if sinks else None)
+
+
+def local_outputs(call, heads: int, kv_heads: int, mesh=None):
+    """`local_call`'s output and its queries', keys' and values' gradients
+    under a random cotangent, on one device or split over `mesh`'s sequence
+    axis, with the compiled program's text. A packed call's padding rows
+    attend nothing, so what a kernel puts there is its own: the cotangent
+    leaves them out, and so does the comparison."""
+    keys = jax.random.split(jax.random.key(0), 4)
+    query = jax.random.normal(keys[0], (2, LOCAL_LENGTH, heads, 8))
+    key, value = (jax.random.normal(k, (2, LOCAL_LENGTH, kv_heads, 8)) for k in keys[1:3])
+    live = np.ones((2, LOCAL_LENGTH, 1, 1), bool)
+    if call.get("packed"):
+        live = np.asarray(local_inputs()[0] != 0)[:, :, None, None]
+    cotangent = jax.random.normal(keys[3], query.shape) * live
+
+    def attend(q, k, v, cotangent):
+        out, pullback = jax.vjp(lambda q, k, v: local_call(q, k, v, **call), q, k, v)
+        return out * live, pullback(cotangent)
+
+    operands = (query, key, value, cotangent)
+    if mesh is None:
+        return jax.jit(attend)(*operands), ""
+    operands = jax.device_put(operands, NamedSharding(mesh, P(None, "sequence")))
+    with jax.set_mesh(mesh):
+        program = jax.jit(attend).lower(*operands).compile()
+        return program(*operands), program.as_text()
+
+
+def assert_close_by_leaf(got, want):
+    """Each leaf within 2e-6 of its largest value: the two runs add the same
+    at most 2 * 6 terms (a window of 5 over two blocks) in another order, a
+    dozen fp32 ulps of the leaf's scale."""
+    for have, expected in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+        expected = np.asarray(expected)
+        np.testing.assert_allclose(np.asarray(have), expected, rtol=0,
+                                   atol=2e-6 * np.max(np.abs(expected)))
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("spec", [MeshSpec(sequence=2), MeshSpec(fsdp=2, sequence=4),
+                                  MeshSpec(tensor=2, sequence=4)],
+                         ids=["sequence2", "fsdp2_sequence4", "tensor2_sequence4"])
+@pytest.mark.parametrize("name", sorted(LOCAL_CALLS))
+def test_local_attention_splits_over_the_sequence_with_one_halo(name, spec):
+    """A window or a chunk no wider than a shard's slice attends each shard's
+    own rows, the first of them reading the previous shard's last rows
+    through one collective-permute; no device gathers the sequence (GSPMD
+    gathered every query and banded key before). The output and the
+    gradients of the queries, keys and values match whole sequences."""
+    call = LOCAL_CALLS[name]
+    whole, _ = local_outputs(call, 4, 2)
+    split, text = local_outputs(call, 4, 2, build_mesh(spec))
+    # An HLO collective names the axes it runs over after the mesh: `{'sequence'}`.
+    over_sequence = [line for line in text.splitlines()
+                     if " all-gather(" in line and re.search(r"\] \{[^}]*'sequence'", line)]
+    assert not over_sequence, over_sequence[:3]
+    assert ("collective-permute" in text) is (name != "chunk_aligned")
+    assert_close_by_leaf(split, whole)
+
+
+@pytest.mark.mesh
+def test_a_window_wider_than_a_shard_takes_the_exchange():
+    """Eight shards of 4 rows cannot hold a window of 5 in one neighbour, so
+    the call runs whole through the sequence exchange, and still matches."""
+    call = dict(window=5, packed=True)
+    whole, _ = local_outputs(call, 8, 8)
+    split, text = local_outputs(call, 8, 8, build_mesh(MeshSpec(sequence=8)))
+    assert "all-to-all" in text
+    assert_close_by_leaf(split, whole)
 
 
 @pytest.mark.mesh
