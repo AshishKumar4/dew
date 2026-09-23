@@ -63,6 +63,13 @@ class TokenArray(Protocol):
     def tolist(self) -> list[int]: ...
 
 
+def _token_row(ids: ArrayLike | Sequence[int]) -> list[int]:
+    values = ids.tolist() if isinstance(ids, TokenArray) else ids
+    if not isinstance(values, Sequence):
+        raise TypeError("decode takes a row of token ids, not one id")
+    return [int(token) for token in values]
+
+
 class ByteTokenizer:
     """Encodes text as one id per utf-8 byte, over a vocabulary of 256.
 
@@ -80,10 +87,7 @@ class ByteTokenizer:
         return list(text.encode("utf-8"))
 
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
-        values = ids.tolist() if isinstance(ids, TokenArray) else ids
-        if not isinstance(values, Sequence):
-            raise TypeError("decode takes a row of token ids, not one id")
-        return bytes(int(token) for token in values).decode("utf-8", errors="replace")
+        return bytes(_token_row(ids)).decode("utf-8", errors="replace")
 
     def __repr__(self):
         return self.__class__.__name__ + "()"
@@ -111,8 +115,12 @@ class HFTokenizer:
         return len(self.tokenizer)
 
     @property
-    def eos_id(self) -> int:
-        return self.tokenizer.eos_token_id
+    def eos_id(self) -> int | None:
+        """The eos token's id, or None for a tokenizer that declares none."""
+        eos = self.tokenizer.eos_token_id
+        if eos is None or isinstance(eos, int):
+            return eos
+        raise TypeError(f"tokenizer {self.name!r} reports eos_token_id {eos!r}, not one id")
 
     @property
     def bos_id(self) -> int | None:
@@ -126,7 +134,8 @@ class HFTokenizer:
         return self.tokenizer.encode(text)
 
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
-        return self.tokenizer.decode(ids.tolist() if isinstance(ids, TokenArray) else ids)
+        # batch_decode of one row is decode's text, typed as one str.
+        return self.tokenizer.batch_decode([_token_row(ids)])[0]
 
     def save_pretrained(self, directory) -> None:
         """Writes this tokenizer's own files into an export directory.
