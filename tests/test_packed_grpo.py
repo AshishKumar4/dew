@@ -127,3 +127,29 @@ def test_packed_log_probs_score_each_id_with_its_own_calls_prefix():
                              for index, number in order])
     np.testing.assert_allclose(placed, expected, atol=1e-5)
     assert (scored[packed[RESPONSE_MASK_KEY] == 0] == 0).all()
+
+
+def test_corrections_without_proximal_log_probs_read_the_current_policy():
+    """verl's bypass mode: with behavior standing in for the old policy, the
+    band and the sequence masks compare the detached current policy with
+    behavior, rather than behavior with itself."""
+    packed = pack(_rollouts(), WIDTH)
+    objective = GRPOObjective(_model(), WIDTH - 1, behavior_band=(0.5, 5.0))
+    params = objective.init(jax.random.key(3))
+    step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
+    policy = np.asarray(objective.packed_log_probs(params, packed))
+    mask = packed[RESPONSE_MASK_KEY] != 0
+    ratio = np.exp(policy - packed[BEHAVIOR_LOG_PROBS_KEY])[mask]
+    outside = float(np.mean((ratio < 0.5) | (ratio > 5.0)))
+    assert 0 < outside < 1, "the fixture puts some tokens outside the band"
+    _, aux = objective.loss(params, packed, step)
+    assert float(aux.metrics["masked/band"]) == pytest.approx(outside)
+    plain, _ = GRPOObjective(_model(), WIDTH - 1).loss(params, packed, step)
+    banded, _ = objective.loss(params, packed, step)
+    assert abs(float(mean_loss(plain)[0]) - float(mean_loss(banded)[0])) > 1e-4
+    geometric = GRPOObjective(_model(), WIDTH - 1, geometric_mask=(0.99, 1.01))
+    _, aux = geometric.loss(params, packed, step)
+    assert float(aux.metrics["masked/geometric"]) == 1.0
+    capped = GRPOObjective(_model(), WIDTH - 1, behavior_importance_cap=2.0)
+    with pytest.raises(ValueError, match="old_log_probs"):
+        capped.loss(params, packed, step)

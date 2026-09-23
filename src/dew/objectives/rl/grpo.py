@@ -281,13 +281,22 @@ class GRPOObjective(LMObjective):
         corrected = (self.behavior_importance_cap, self.behavior_band, self.sequence_mask, self.geometric_mask)
         if any(option is not None for option in corrected) and terms.behavior is None:
             raise ValueError("behavior corrections require recorded behavior_log_probs")
+        if self.behavior_importance_cap is not None and not terms.proximal:
+            raise ValueError(
+                "without old_log_probs the ratio is already current over behavior, so a TIS cap "
+                "would count the correction twice (verl's bypass mode applies no IS weight); "
+                "rescore old_log_probs or drop behavior_importance_cap")
+        # Without a proximal rescoring, behavior stands in for the old policy,
+        # and the corrections compare the detached current policy with behavior,
+        # as verl's compute_policy_loss_bypass_mode does.
+        proximal = terms.old if terms.proximal else jax.lax.stop_gradient(terms.policy)
         metrics: dict[str, jax.Array] = {}
         keep = jnp.ones_like(mask, jnp.float32)
         for name, band, geometric in (("sequence", self.sequence_mask, False),
                                       ("geometric", self.geometric_mask, True)):
             if band is not None:
                 assert terms.behavior is not None
-                rejected = sequence_rejection_mask(terms.old, terms.behavior, mask, *band,
+                rejected = sequence_rejection_mask(proximal, terms.behavior, mask, *band,
                                                    geometric=geometric, segments=terms.segments)
                 metrics[f"masked/{name}"] = _fraction(1 - rejected, mask)
                 keep = keep * rejected
@@ -295,12 +304,17 @@ class GRPOObjective(LMObjective):
         importance = None
         if terms.behavior is not None:
             if self.behavior_importance_cap is not None:
-                importance = behavior_importance_weights(terms.old, terms.behavior, effective,
+                importance = behavior_importance_weights(proximal, terms.behavior, effective,
                                                          self.behavior_importance_cap)
             elif self.behavior_band is not None:
-                importance = behavior_band_weights(terms.old, terms.behavior, effective, *self.behavior_band)
+                importance = behavior_band_weights(proximal, terms.behavior, effective, *self.behavior_band)
                 metrics["masked/band"] = _fraction(importance == 0, effective)
-            proximal = terms.old if terms.proximal else jax.lax.stop_gradient(terms.policy)
+                if not terms.proximal:
+                    # The ratio already carries current over behavior, so the
+                    # band acts as a keep mask and applies no weight.
+                    keep = keep * (importance != 0)
+                    effective = mask * keep
+                    importance = None
             cap = (self.behavior_importance_cap if self.behavior_band is None else self.behavior_band[1])
             mismatch = mismatch_metrics(proximal, terms.behavior, effective, importance, cap)
             metrics.update({f"mismatch/{key}": value for key, value in mismatch.items()})
