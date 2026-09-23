@@ -217,7 +217,7 @@ def main(config: Config) -> dict:
     words = tokenizer_for(tokenizer)
 
     objective = GRPOObjective(source.model, width - 1, pretrained=source.variables,
-                              behavior_importance_cap=2.0, epsilon_high=0.28)
+                              behavior_importance=2.0, epsilon_high=0.28)
     pushes: list[float] = []
     if config.backend == "native":
         served = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating)

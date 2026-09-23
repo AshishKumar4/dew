@@ -20,15 +20,15 @@ import pytest
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step, mean_loss
 from dew.objectives.rl import GRPOObjective
-from dew.objectives.rl.rollouts import (
+from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
     IDS_KEY,
     OLD_LOG_PROBS_KEY,
     POSITIONS_KEY,
     RESPONSE_MASK_KEY,
-    ROLLOUT_WEIGHTS_KEY,
     SEGMENT_IDS_KEY,
+    SESSION_WEIGHTS_KEY,
 )
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "agentic.npz"
@@ -71,7 +71,7 @@ def _batch(reference, rollouts):
         RESPONSE_MASK_KEY: _place(mask), OLD_LOG_PROBS_KEY: _place(reference["old"]),
         BEHAVIOR_LOG_PROBS_KEY: _place(reference["behavior"]),
         ADVANTAGES_KEY: _place(np.repeat(reference["advantages"][:, None], 6, axis=1)),
-        ROLLOUT_WEIGHTS_KEY: _place(weights.astype(np.float32)),
+        SESSION_WEIGHTS_KEY: _place(weights.astype(np.float32)),
     }
 
 
@@ -112,9 +112,9 @@ def _check(reference, name, loss, grad, metrics=None):
 
 
 @pytest.mark.parametrize("policy_loss", ["ppo", "gspo", "cispo"])
-@pytest.mark.parametrize(("aggregation", "suffix"), [("token-mean", "token"), ("rollout-mean", "sequence")])
+@pytest.mark.parametrize(("aggregation", "suffix"), [("token-mean", "token"), ("session-mean", "sequence")])
 def test_each_policy_loss_matches_verl_over_packed_chains(reference, policy_loss, aggregation, suffix):
-    """Rollout-mean with one rollout per chain is verl's seq-mean-token-mean.
+    """Session-mean with one rollout per chain is verl's seq-mean-token-mean.
     Largest observed difference: under 3e-7 on every loss and gradient."""
     loss, grad, metrics = _run(reference, policy_loss=policy_loss, aggregation=aggregation)
     _check(reference, f"{policy_loss}_{suffix}", loss, grad, metrics)
@@ -133,11 +133,11 @@ def test_gspo_pools_each_chain_on_its_own(reference):
 
 def test_token_corrections_match_verl_rollout_correction(reference):
     """TIS caps the proximal/behavior ratio, IcePop zeroes it outside the band."""
-    loss, grad, metrics = _run(reference, behavior_importance_cap=float(reference["tis_cap"]))
+    loss, grad, metrics = _run(reference, behavior_importance=float(reference["tis_cap"]))
     _check(reference, "ppo_tis_token", loss, grad)
     assert metrics["mismatch/ess"] == pytest.approx(float(reference["tis_ess"]), abs=1e-5)
     low, high = (float(value) for value in reference["band"])
-    loss, grad, metrics = _run(reference, behavior_band=(low, high))
+    loss, grad, metrics = _run(reference, behavior_importance=(low, high))
     _check(reference, "ppo_band_token", loss, grad)
     assert metrics["mismatch/ess"] == pytest.approx(float(reference["band_ess"]), abs=1e-5)
     assert metrics["masked/band"] == pytest.approx(float(reference["band_oob"]), abs=1e-6)
@@ -146,7 +146,7 @@ def test_token_corrections_match_verl_rollout_correction(reference):
 
 
 @pytest.mark.parametrize("name", ["sequence", "geometric"])
-@pytest.mark.parametrize(("aggregation", "suffix"), [("token-mean", "token"), ("rollout-mean", "sequence")])
+@pytest.mark.parametrize(("aggregation", "suffix"), [("token-mean", "token"), ("session-mean", "sequence")])
 def test_sequence_masks_match_verl_rejection(reference, name, aggregation, suffix):
     """seq_sum_k1 and seq_mean_k1 reject whole chains; the fixture's bands
     reject rows 1 and 2 for the sum and row 1 alone for the mean."""
@@ -163,7 +163,7 @@ def test_rollout_mean_matches_agent_lightning_per_rollout_mean(reference):
     Lightning divides by the row count where Dew divides by the rollout
     count, a constant factor: 4 rows, 3 rollouts."""
     rollouts = [str(value) for value in reference["rollouts"]]
-    loss, grad, _ = _run(reference, rollouts=rollouts, aggregation="rollout-mean")
+    loss, grad, _ = _run(reference, rollouts=rollouts, aggregation="session-mean")
     factor = len(set(rollouts)) / len(rollouts)
     assert loss * factor == pytest.approx(float(reference["per_rollout_loss"]), abs=TOLERANCE)
     np.testing.assert_allclose(grad * factor * reference["mask"], reference["per_rollout_grad"], atol=TOLERANCE)

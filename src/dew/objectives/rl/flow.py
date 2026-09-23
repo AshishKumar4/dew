@@ -34,7 +34,7 @@ from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition, sampl
 from dew.sampling.guidance import CFG
 from dew.sampling.solvers import Euler, Solver
 
-from .rollouts import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
+from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
 
 REWARDS_KEY = "rewards"
 """Per image, the reward its trajectory scored."""

@@ -14,7 +14,7 @@ import pytest
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step, mean_loss
 from dew.objectives.rl import GRPOObjective
-from dew.objectives.rl.rollouts import (
+from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
     CALL_INDEX_KEY,
@@ -22,10 +22,10 @@ from dew.objectives.rl.rollouts import (
     OLD_LOG_PROBS_KEY,
     POSITIONS_KEY,
     RESPONSE_MASK_KEY,
-    ROLLOUT_INDEX_KEY,
     SEGMENT_IDS_KEY,
+    SESSION_INDEX_KEY,
     Call,
-    Rollout,
+    Session,
     Status,
     advantages,
     pack,
@@ -56,7 +56,7 @@ def _rollouts():
         second = Call(first.prompt_ids + first.sampled_ids + ids(2), ids(3), logps(3), "tool_calls", 0)
         # A rewrite: the third call's history drops the second call's sampled ids.
         third = Call(second.prompt_ids + ids(1), ids(2), logps(2), "stop", 0)
-        rollouts.append(Rollout("t", str(sample // 2), sample, 0, (first, second, third),
+        rollouts.append(Session("t", str(sample // 2), sample, 0, (first, second, third),
                                 Status.COMPLETED, float(sample % 2)))
     return rollouts
 
@@ -115,7 +115,7 @@ def test_packed_log_probs_score_each_id_with_its_own_calls_prefix():
     alone = np.asarray(objective.packed_log_probs(params, unmerged))
     expected = alone[unmerged[RESPONSE_MASK_KEY] != 0]
     order = [(index, number) for index, rollout in enumerate(rollouts) for number in range(len(rollout.calls))]
-    placed = np.concatenate([scored[(packed[ROLLOUT_INDEX_KEY] == index) & (packed[CALL_INDEX_KEY] == number)]
+    placed = np.concatenate([scored[(packed[SESSION_INDEX_KEY] == index) & (packed[CALL_INDEX_KEY] == number)]
                              for index, number in order])
     np.testing.assert_allclose(placed, expected, atol=1e-5)
     assert (scored[packed[RESPONSE_MASK_KEY] == 0] == 0).all()
@@ -126,7 +126,7 @@ def test_corrections_without_proximal_log_probs_read_the_current_policy():
     band and the sequence masks compare the detached current policy with
     behavior, rather than behavior with itself."""
     packed = pack(_rollouts(), WIDTH)
-    objective = GRPOObjective(_model(), WIDTH - 1, behavior_band=(0.5, 5.0))
+    objective = GRPOObjective(_model(), WIDTH - 1, behavior_importance=(0.5, 5.0))
     params = objective.init(jax.random.key(3))
     step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
     policy = np.asarray(objective.packed_log_probs(params, packed))
@@ -142,7 +142,7 @@ def test_corrections_without_proximal_log_probs_read_the_current_policy():
     geometric = GRPOObjective(_model(), WIDTH - 1, geometric_mask=(0.99, 1.01))
     _, aux = geometric.loss(params, packed, step)
     assert float(aux.metrics["masked/geometric"]) == 1.0
-    capped = GRPOObjective(_model(), WIDTH - 1, behavior_importance_cap=2.0)
+    capped = GRPOObjective(_model(), WIDTH - 1, behavior_importance=2.0)
     with pytest.raises(ValueError, match="old_log_probs"):
         capped.loss(params, packed, step)
 
@@ -155,10 +155,17 @@ def test_mismatch_metrics_describe_every_trainable_token_whatever_a_mask_rejects
     params = GRPOObjective(model, WIDTH - 1).init(jax.random.key(3))
     packed[OLD_LOG_PROBS_KEY] = np.asarray(GRPOObjective(model, WIDTH - 1).packed_log_probs(params, packed))
     step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
-    _, open_aux = GRPOObjective(model, WIDTH - 1, behavior_band=(0.5, 5.0)).loss(params, packed, step)
-    _, masked_aux = GRPOObjective(model, WIDTH - 1, behavior_band=(0.5, 5.0),
+    _, open_aux = GRPOObjective(model, WIDTH - 1, behavior_importance=(0.5, 5.0)).loss(params, packed, step)
+    _, masked_aux = GRPOObjective(model, WIDTH - 1, behavior_importance=(0.5, 5.0),
                                   sequence_mask=(0.99, 1.01)).loss(params, packed, step)
     assert float(masked_aux.metrics["masked/sequence"]) == 1.0
     for key in ("mismatch/kl", "mismatch/k3_kl", "mismatch/ess", "masked/band"):
         assert float(masked_aux.metrics[key]) == pytest.approx(float(open_aux.metrics[key]))
     assert float(open_aux.metrics["mismatch/kl"]) > 0.1
+
+
+def test_one_behavior_importance_option_takes_a_cap_or_a_band():
+    with pytest.raises(ValueError, match="positive TIS cap"):
+        GRPOObjective(_model(), WIDTH - 1, behavior_importance=0.0)
+    with pytest.raises(ValueError, match="0 < low <= high"):
+        GRPOObjective(_model(), WIDTH - 1, behavior_importance=(5.0, 0.5))

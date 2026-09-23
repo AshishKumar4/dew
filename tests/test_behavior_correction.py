@@ -44,7 +44,7 @@ def test_correction_is_explicit_and_uses_actual_recorded_behavior():
     state = trainer.initial_state()
     batch = rollout.project(collect(rollout, state))
     corrected = GRPOObjective(trainer.objective.model, PROMPT + RESPONSE - 1,
-                              beta=.05, behavior_importance_cap=2.)
+                              beta=.05, behavior_importance=2.)
     info = Step(state.microstep, jax.random.key(4), state.ema)
 
     ordinary_loss, _ = scalar_loss(trainer.objective, state.params, batch, info)
@@ -78,7 +78,7 @@ def test_corrected_objective_changes_a_real_trainer_update():
     copies = []
     for cap in (None, 2.):
         objective = GRPOObjective(original.objective.model, PROMPT + RESPONSE - 1,
-                                  behavior_importance_cap=cap)
+                                  behavior_importance=cap)
         trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19))
         data = Dataset(train=lambda: itertools.repeat(batch), val=None, records=None,
                        batch=batch["input_ids"].shape[0])

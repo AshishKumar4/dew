@@ -60,7 +60,7 @@ def main() -> None:
             batch["input_ids"][row, native.PROMPT:native.PROMPT + count] = action.tokens
             batch["response_mask"][row, :count] = 1
             batch["old_log_probs"][row, :count] = action.raw_log_probs
-            where = (packed["rollout_index"] == index) & (packed["call_index"] == turn)
+            where = (packed["session_index"] == index) & (packed["call_index"] == turn)
             values[row, :count] = packed_values[where]
     token_mask = batch["response_mask"].reshape(len(episodes), -1)
     episode_rewards = np.zeros_like(token_mask)

@@ -129,7 +129,7 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
     result = rollout(SimpleNamespace(params=params, updates=0), batch, jax.random.key(1))
     assert seen[:2] == [("a", "", "1", "")] * 2
     for index, (_, text, _, _) in enumerate(seen):
-        where = result["rollout_index"] == index
+        where = result["session_index"] == index
         chain = result["input_ids"][where]
         mask = result["response_mask"][where] != 0
         width = int(batch["prompt_length"][index // 2])
@@ -143,7 +143,7 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
         old = result["old_log_probs"][where]
         assert np.all(old[~mask] == 0) and np.all(old[mask] < 0)
     for index in (0, 1):
-        actions = result["input_ids"][(result["rollout_index"] == index) & (result["response_mask"] != 0)]
+        actions = result["input_ids"][(result["session_index"] == index) & (result["response_mask"] != 0)]
         np.testing.assert_array_equal(actions, [eos])
 
 

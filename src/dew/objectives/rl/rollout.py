@@ -15,7 +15,7 @@ from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.sampling.text import Sampling
 
 from ..lm import LMObjective
-from .rollouts import OLD_LOG_PROBS_KEY, Call, Rollout, Status, check_estimator, pack, sampled_values
+from .sessions import OLD_LOG_PROBS_KEY, Call, Session, Status, check_estimator, pack, sampled_values
 
 type Reward = Callable[[str, str, str, str], float]
 """Score ``(data_source, completion, ground_truth, extra_info)``."""
@@ -57,7 +57,7 @@ def check_rollout(groups: int, max_new_tokens: int, estimator: str) -> None:
 def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np.ndarray,
                     lengths: np.ndarray, terminated: np.ndarray, behavior: np.ndarray,
                     rewards: np.ndarray, versions: np.ndarray, estimator: str) -> tuple[dict[str, np.ndarray],
-                                                                                   list[Rollout]]:
+                                                                                   list[Session]]:
     """Pack `[rows, groups, ...]` completions as one-call rollouts through `pack`.
 
     `prompts` is `[rows, width]` left-padded ids with `prompt_lengths` real
@@ -78,7 +78,7 @@ def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np
             call = Call(prompt, tuple(int(token) for token in sampled[row, group, :count]),
                         tuple(float(value) for value in behavior[row, group, :count]),
                         "stop" if bool(terminated[row, group]) else "length", int(versions[row, group]))
-            rollouts.append(Rollout(str(row), "", group, 0, (call,), Status.COMPLETED,
+            rollouts.append(Session(str(row), "", group, 0, (call,), Status.COMPLETED,
                                     float(rewards[row, group])))
     return pack(rollouts, width + budget, rows=rows * groups, estimator=estimator), rollouts
 

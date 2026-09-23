@@ -41,7 +41,7 @@ def model():
 
 
 def objective():
-    return GRPOObjective(model(), seq_len=WIDTH + BUDGET - 1, behavior_importance_cap=2.0)
+    return GRPOObjective(model(), seq_len=WIDTH + BUDGET - 1, behavior_importance=2.0)
 
 
 def prompt_batch(first, rows=2):
@@ -108,8 +108,8 @@ def decode(ids):
 def sampled(out, name):
     """Each draw's sampled values of column `name`, in draw order."""
     mask = out["response_mask"] != 0
-    return [np.asarray(out[name])[mask & (out["rollout_index"] == index)]
-            for index in range(int(out["rollout_index"].max()) + 1)]
+    return [np.asarray(out[name])[mask & (out["session_index"] == index)]
+            for index in range(int(out["session_index"].max()) + 1)]
 
 
 def versions(out):
@@ -195,7 +195,7 @@ def test_a_schedule_that_could_exceed_the_bound_is_refused(options, message):
 
 
 def test_stale_rollouts_without_the_importance_correction_are_refused():
-    with pytest.raises(ValueError, match="behavior_importance_cap"):
+    with pytest.raises(ValueError, match="behavior_importance"):
         AsyncRollout(GRPOObjective(model(), seq_len=WIDTH + BUDGET - 1), Recording(), first_token_reward,
                      decode=decode, max_lag=1)
 

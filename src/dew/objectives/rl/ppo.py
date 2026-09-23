@@ -26,14 +26,14 @@ from dew.training.state import TrainState
 
 from .episodes import EpisodeInference, EpisodeRollout
 from .grpo import GRPOObjective
-from .rollouts import (
+from .sessions import (
     ADVANTAGES_KEY,
     CALL_INDEX_KEY,
     IDS_KEY,
     POSITIONS_KEY,
     RESPONSE_MASK_KEY,
-    ROLLOUT_INDEX_KEY,
     SEGMENT_IDS_KEY,
+    SESSION_INDEX_KEY,
 )
 
 OLD_VALUES_KEY = "old_values"
@@ -221,7 +221,7 @@ class PPORollout:
         reads an episode's actions across its chains and rows.
         """
         mask = np.asarray(batch[RESPONSE_MASK_KEY]).reshape(-1) != 0
-        owner = np.asarray(batch[ROLLOUT_INDEX_KEY]).reshape(-1)
+        owner = np.asarray(batch[SESSION_INDEX_KEY]).reshape(-1)
         call = np.asarray(batch[CALL_INDEX_KEY]).reshape(-1).astype(np.int64)
         order = np.full((count, self.episodes.max_turns * self.episodes.max_new_tokens), -1, np.int64)
         where = np.flatnonzero(mask)

@@ -996,7 +996,7 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
     def completions(report):
         """Each completion's chain and columns, in rollout order: packing
         places chains per rank, so rows are compared through their chains."""
-        index = np.asarray(report["rollout_index"])
+        index = np.asarray(report["session_index"])
         return [{name: np.asarray(report[name])[index == number]
                  for name in ("input_ids", "response_mask", "old_log_probs", "behavior_log_probs")}
                 for number in range(int(index.max()) + 1)]
