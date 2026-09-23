@@ -90,6 +90,21 @@ def train_flops_per_token(config: Mapping, seq: int) -> float:
     return 6.0 * matmul + 12.0 * layers * heads * head_dim * seq
 
 
+def dit_train_flops_per_image(model: Mapping, height: int, width: int, channels: int = 3) -> float:
+    """Model FLOPs of one trained image through the SimpleDiT: 6 per
+    multiply-add of every per-token matmul (patch in and out, q/k/v/o, the
+    MLP) and of the attention scores and values over the image's patches.
+    The per-image conditioning path (time embedding, adaLN modulation) is
+    one row per image and is left out."""
+    patch, width_features = model["patch_size"], model["emb_features"]
+    tokens = (height // patch) * (width // patch)
+    per_token = model["num_layers"] * (
+        4 * width_features ** 2 + 2 * model["mlp_ratio"] * width_features ** 2
+        + 2 * tokens * width_features)
+    per_token += 2 * patch * patch * channels * width_features
+    return 6.0 * per_token * tokens
+
+
 def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> dict:
     """Per-step device time from `(name, start_ns, end_ns, device)` kernel
     records of `steps` traced steps.

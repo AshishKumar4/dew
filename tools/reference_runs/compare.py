@@ -139,7 +139,8 @@ def performance(records: dict[str, dict]) -> dict:
         rows[name] = {
             "framework": record["framework"], "precision": record["precision"],
             "parallel": record["parallel"], "world": record["world"],
-            "rate": timed.get("tokens_per_s"),
+            "unit": "images" if "images_per_s" in timed else "tokens",
+            "rate": timed.get("images_per_s", timed.get("tokens_per_s")),
             "step_ms": timed.get("step_ms_mean"),
             "mfu": record.get("mfu"),
             "peak_gib": max(record["memory"]["peak_allocated_bytes"]) / 2 ** 30,
@@ -273,8 +274,9 @@ def main() -> None:
 
     rows = performance(everything)
     report["performance"] = rows
+    unit = "img/s" if rows["truth"]["unit"] == "images" else "tok/s"
     print("\nthroughput, from each side's own timed window and profile")
-    print(f"  {'run':<12} {'side':<8} {'precision':<10} {'parallel':<9} {'tok/s':>8} {'ms/step':>8} "
+    print(f"  {'run':<12} {'side':<8} {'precision':<10} {'parallel':<9} {unit:>8} {'ms/step':>8} "
           f"{'MFU%':>6} {'kernMFU%':>8} {'peak GiB':>9} {'busy ms':>8} {'busy%':>6} {'kern/step':>9}")
     for name, row in rows.items():
         def cell(value, fmt):
