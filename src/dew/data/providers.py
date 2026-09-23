@@ -52,6 +52,7 @@ from .dataset import (
     Records,
     Tokenize,
     local_batch,
+    mixed_counts,
     mixed_records,
     mixed_stream,
     mixture,
@@ -135,18 +136,34 @@ def phased_dataset(phases: Sequence[tuple[Sequence[Corpus], int | None]],
     """The batches of one corpus or mixture per phase, each phase ending at a
     step of `batch` records (None for the last).
 
-    Each phase streams as `corpora_dataset` streams it, from its own record
-    zero, and `PhasedStream` switches at the boundaries and resumes onto an
-    extended or re-planned phase list. A pass is the first phase's; `held`
-    is validated as `corpora_dataset` validates it.
+    Each phase streams as `corpora_dataset` streams it, and `PhasedStream`
+    switches at the boundaries and resumes onto an extended or re-planned
+    phase list. A corpus that recurs continues its own order where the
+    earlier phases left it: the mixture's selection is deterministic, so the
+    records each phase took from it are counted (`mixed_counts`) and the next
+    phase starts it past them, and no record repeats before its epoch ends.
+    A pass is the first phase's; `held` is validated as `corpora_dataset`
+    validates it.
     """
     rows = local_batch(batch)
     streams = []
+    read: dict[str, int] = {}
+    start = 0
     for corpora, until in phases:
-        stream = (train_stream(corpora[0].source, operations, batch=rows, seed=seed, loading=loading)
+        corpora = [dataclasses.replace(corpus, offset=read.get(corpus.name, 0))
+                   for corpus in corpora]
+        stream = (train_stream(corpora[0].source, operations, batch=rows, seed=seed,
+                               loading=loading, offset=corpora[0].offset)
                   if len(corpora) == 1 else
                   mixed_stream(corpora, operations, batch=rows, seed=seed, loading=loading))
-        streams.append((stream, None if until is None else until * batch))
+        end = None if until is None else until * batch
+        streams.append((stream, end))
+        if end is not None:
+            taken = ((end - start,) if len(corpora) == 1
+                     else mixed_counts(corpora, end - start))
+            for corpus, count in zip(corpora, taken, strict=True):
+                read[corpus.name] = corpus.offset + count
+            start = end
     first = phases[0][0]
     records = counted(first[0].source, None, first[0].name) if len(first) == 1 else mixed_records(first)
     validation = None

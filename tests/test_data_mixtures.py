@@ -16,6 +16,7 @@ both from JAX on every open, so a fake count exercises the real slicing.
 real checkpoint between them.
 """
 
+import dataclasses
 import itertools
 import json
 from pathlib import Path
@@ -484,10 +485,9 @@ def phased_packed(first: str, second: str, *phases: tuple[object, int | None]) -
                         seq_len=8, val_batches=None, packing_bins=2, loading=READ)
 
 
-def test_phases_switch_the_mixture_at_a_step_and_start_its_own_order(tmp_path):
+def test_phases_switch_the_mixture_at_a_step(tmp_path):
     """Rigel's curriculum: three steps of the first corpus alone, then both
-    at equal shares, the second phase reading its mixture from that
-    mixture's own first window, as a run of it alone would."""
+    at equal shares, every step of the second phase half of each."""
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     both = {first: 1.0, second: 1.0}
     spec = phased_packed(first, second, (first, 3), (both, None))
@@ -495,8 +495,17 @@ def test_phases_switch_the_mixture_at_a_step_and_start_its_own_order(tmp_path):
     steps = packed_rows(spec.load(batch=4).train(), 7)
 
     assert all(corpus_of(row) == 0 for step in steps[:3] for row in step)
-    alone = PackedTokens(path=both, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
-    assert steps[3:] == packed_rows(alone.load(batch=4).train(), 4)
+    assert all([corpus_of(row) for row in step].count(1) == 2 for step in steps[3:])
+
+
+def test_mixed_counts_is_grains_own_selection():
+    """The closed form counts what `MapDataset.mix` hands out, prefix by prefix."""
+    from dew.data.dataset import mixed_counts
+    corpora = [Corpus(name, Indexed(tag, 50), weight)
+               for name, tag, weight in (("a", 1, 71), ("b", 2, 20), ("c", 3, 9))]
+    drawn = [int(mixture(corpora, 0)[index]["id"]) // 1000 for index in range(400)]
+    for prefix in (1, 7, 100, 399, 400):
+        assert mixed_counts(corpora, prefix) == tuple(drawn[:prefix].count(tag) for tag in (1, 2, 3))
 
 
 def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(monkeypatch, tmp_path):
@@ -986,3 +995,26 @@ def test_the_log_tick_reports_the_records_a_ramped_interval_read():
     assert step == 6 and read == 4 * 8 + 2 * 16
     assert scalars["train/samples_per_sec"] == pytest.approx(
         read / (scalars["train/step_time_ms"] * 6 / 1000), rel=1e-6)
+
+
+def test_a_corpus_that_recurs_across_phases_continues_its_order_and_repeats_nothing():
+    """The reviewer's three-corpus case at Rigel-like shares: a corpus read
+    in phase 0 and again in phases 1 and 2 picks up where the earlier phases
+    left it, so no record of it repeats before its epoch ends, and each phase
+    still reads its own mixture at its own shares."""
+    from dew.data.providers import phased_dataset
+    web, code, math = (Corpus(name, Indexed(tag, 1000), 1.0)
+                       for name, tag in (("web", 1), ("code", 2), ("math", 3)))
+    phases = [([dataclasses.replace(web, weight=71), dataclasses.replace(code, weight=20),
+                dataclasses.replace(math, weight=9)], 10),
+              ([dataclasses.replace(web, weight=15), dataclasses.replace(code, weight=85)], 20),
+              ([dataclasses.replace(web, weight=57), dataclasses.replace(code, weight=18),
+                dataclasses.replace(math, weight=25)], None)]
+    dataset = phased_dataset(phases, None, [], batch=8, seed=0, loading=READ, val_batches=None)
+    steps = taken(dataset.train(), 30)
+    by_phase = [[value for step in steps[start:end] for value in step]
+                for start, end in ((0, 10), (10, 20), (20, 30))]
+    for tag in (1, 2, 3):
+        read = [value for phase in by_phase for value in phase if value // 1000 == tag]
+        assert len(read) == len(set(read)), f"corpus {tag} repeated a record within its epoch"
+    assert abs(sum(value // 1000 == 2 for value in by_phase[1]) - 68) <= 1
