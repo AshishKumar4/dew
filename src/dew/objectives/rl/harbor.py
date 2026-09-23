@@ -50,6 +50,7 @@ import threading
 import uuid
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -207,8 +208,8 @@ class HarborSource:
         self._serial = itertools.count()
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="dew-harbor-trial")
         self._lock = threading.Lock()
-        self._running: dict[Future[Rollout], subprocess.Popen[str]] = {}
-        self._cancelled: set[Future[Rollout]] = set()
+        # One record per submitted, unresolved future, queued or running; a done-callback drops it.
+        self._records: dict[Future[Rollout], _Trial] = {}
 
     def submit(self, task: Task, samples: int, *, version: int) -> list[Future[Rollout]]:
         if type(samples) is not int or samples < 1:
@@ -220,21 +221,34 @@ class HarborSource:
         futures: list[Future[Rollout]] = []
         for sample in range(samples):
             future: Future[Rollout] = Future()
+            with self._lock:
+                self._records[future] = _Trial()
+            future.add_done_callback(self._forget_record)
             futures.append(future)
             self._pool.submit(self._trial, future, task, Path(directory), group, sample, version)
         return futures
 
+    def _forget_record(self, future: Future[Rollout]) -> None:
+        with self._lock:
+            self._records.pop(future, None)
+
     def cancel(self, futures: Sequence[Future[Rollout]]) -> None:
         """Interrupt the named trials; Harbor tears their sandboxes down, and each resolves `CANCELLED`."""
         with self._lock:
-            self._cancelled.update(futures)
-            running = [self._running[future] for future in futures if future in self._running]
+            running = []
+            for future in futures:
+                record = self._records.get(future)
+                if record is not None:
+                    record.cancelled = True
+                    if record.process is not None:
+                        running.append(record.process)
         for process in running:
             os.killpg(process.pid, signal.SIGINT)
 
     def close(self) -> None:
+        """Cancel every unresolved trial, queued or running, and wait for the running ones to tear down."""
         with self._lock:
-            pending = list(self._running)
+            pending = list(self._records)
         self.cancel(pending)
         self._pool.shutdown(wait=True, cancel_futures=False)
 
@@ -249,21 +263,23 @@ class HarborSource:
 
         try:
             with self._lock:
-                if future in self._cancelled:
-                    future.set_result(rollout(Status.CANCELLED))
-                    return
-                process = subprocess.Popen(
+                record = self._records[future]
+                process = None if record.cancelled else subprocess.Popen(
                     [*self._command, "-p", os.fspath(directory), "--trial-name", name,
                      "--trials-dir", os.fspath(self._trials),
                      *itertools.chain.from_iterable(("--ae", f"{key}={value}") for key, value in
                                                     {**self._environment,
                                                      "OPENAI_BASE_URL": self._gateway.session(session)}.items())],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
-                self._running[future] = process
+                record.process = process
+            if process is None:
+                # Resolved outside the lock: the future's done-callback takes it.
+                future.set_result(rollout(Status.CANCELLED))
+                return
             log, _ = process.communicate()
             with self._lock:
-                del self._running[future]
-                cancelled = future in self._cancelled
+                record.process = None
+                cancelled = record.cancelled
             trial = self._trials / name
             try:
                 records = calls(self._gateway.traces(session), unstamped=version)
@@ -286,6 +302,14 @@ class HarborSource:
         except BaseException as error:
             if not future.done():
                 future.set_exception(error)
+
+
+@dataclass
+class _Trial:
+    """What `cancel` needs of one submitted sample: whether it was cancelled and its running Harbor."""
+
+    cancelled: bool = False
+    process: subprocess.Popen[str] | None = None
 
 
 def _harness_exit(trial: Path) -> str | None:
