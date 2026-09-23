@@ -57,9 +57,12 @@ from ..kv_cache import KVCache, is_paged
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
+from ..mla import INDEXER_COLLECTION, YarnScaling
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, Situ, SparseMLP, gated_product
-from ..precision import scaled
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..precision import head_dot_general, head_product
+from ..precision import head_dot_general, head_product, scaled
+from ..precision import scaled
 from ..rope import RopeScaling, YarnScaling
 from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
 
@@ -2215,12 +2218,9 @@ class CausalTransformer(nn.Module):
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
                 features=self.vocab_size, use_bias=False, dtype=jnp.float32,
-                precision=self.precision, name='lm_head',
-                **normal_kernel(self.initializer_range))
-                dot_general=head_dot_general(self.dtype, self.precision), name='lm_head')
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision) if self.bf16_head else None,
-                name='lm_head')
+                name='lm_head', **normal_kernel(self.initializer_range))
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None,
