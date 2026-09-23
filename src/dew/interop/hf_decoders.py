@@ -110,6 +110,58 @@ _IGNORED_FIELDS = {
 _CODEC_FIELDS = frozenset({'quantization_config'})
 
 
+def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
+    return True
+
+
+# Fields released configs carry that the pinned reference (transformers
+# 5.16.1) neither declares on the family's config class nor reads in its
+# modeling, so the reference computes the same model whatever they hold.
+# Each predicate accepts the values that agree with what the reference
+# computes; any other value describes a different model and is refused by
+# name. The None entry holds the fields no family's reference reads. A field
+# in neither place is still refused as unknown.
+# tests/test_pretrained_sources.py checks every entry against the installed
+# reference config classes.
+_INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, object]], bool]]] = {
+    # transformers.js's loading hints (SmolLM2-*-Instruct).
+    None: {'transformers.js_config': _any_value},
+    # nanotron's training flags, which SmolLM2 retains.
+    'llama': {'is_llama_config': _any_value, 'rope_interleaved': _any_value},
+    # Qwen2.5's text configs state the multimodal rotary off; on, it is a
+    # Qwen2-VL rotary the qwen2 reference never applies.
+    'qwen2': {'use_mrope': lambda key, hf_config: hf_config[key] is False},
+    # The published HF ports carry mamba_ssm's own fields. The reference
+    # normalizes with MambaRMSNormGated alone and gates before it
+    # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False,
+    # mamba_ssm's default; Mamba-Codestral's true is a stale default no
+    # implementation of that checkpoint reads), derives the inner width as
+    # expand * hidden_size (:374), and the time-step init fields only seed
+    # dt_bias at initialization.
+    'mamba2': {
+        'rms_norm': lambda key, hf_config: hf_config[key] is True,
+        'norm_before_gate': _any_value,
+        'intermediate_size': lambda key, hf_config: hf_config[key] == (
+            records.integer(hf_config.get('expand', 2), 'expand')
+            * records.integer(hf_config.get('hidden_size', 4096), 'hidden_size')),
+        'time_step_init_scheme': _any_value,
+        'time_step_scale': _any_value,
+    },
+}
+
+
+def _inert(model_type: object, hf_config: Mapping[str, object]) -> set[str]:
+    """Return the `_INERT_FIELDS` a config carries, refusing a value that is not inert."""
+    rules = {**_INERT_FIELDS[None], **_INERT_FIELDS.get(model_type if isinstance(model_type, str) else None, {})}
+    present = set(rules) & set(hf_config)
+    for key in sorted(present):
+        if not rules[key](key, hf_config):
+            _refuse(f"{key}={hf_config[key]!r}",
+                    f"the {model_type} reference does not read {key} and computes the model "
+                    "another value states")
+    return present
+
+
 def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
 
@@ -733,13 +785,9 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
         _refuse("mlp_bias=True", "the gated MLP is bias-free")
 
     used = {'model_type', 'use_bidirectional_attention', 'mlp_bias', 'num_hidden_layers'}
-    if model_type == "llama":
-        # SmolLM2 retains these training fields; Transformers 5.16.1 Llama does not read them.
-        used.update(("is_llama_config", "rope_interleaved"))
-
     config = family.translate_config(hf_config, used)
 
-    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS
+    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(model_type, hf_config)
                - {key for key in hf_config if str(key).startswith('_')})
     if unknown:
         _refuse(f"config fields {sorted(unknown)}",
@@ -980,7 +1028,7 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     else:
         _refuse(f"model_type {model_type!r}",
                 "no supported multimodal wrapper is registered for this model")
-    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS
+    unknown = (set(hf_config) - used - _IGNORED_FIELDS - _CODEC_FIELDS - _inert(model_type, hf_config)
                - {key for key in hf_config if str(key).startswith("_")})
     if unknown:
         _refuse(f"config fields {sorted(unknown)}",

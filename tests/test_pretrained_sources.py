@@ -258,3 +258,63 @@ def test_a_format_the_codec_cannot_read_is_still_refused_on_the_same_config():
 
     with pytest.raises(ValueError, match="quant_method 'awq'"):
         pretrained._source_quantization(config)
+
+
+@pytest.mark.parametrize("name, inert", [
+    ("qwen2.5-0.5b", {"use_mrope"}),
+    ("smollm2-135m-instruct", {"transformers.js_config", "is_llama_config", "rope_interleaved"}),
+    # Bare `Infinity` in time_step_limit, plus rms_norm.
+    ("mamba2-130m-hf", {"rms_norm"}),
+    # Plus the rest of mamba_ssm's fields.
+    ("mamba-codestral-7b", {"rms_norm", "norm_before_gate", "intermediate_size",
+                            "time_step_init_scheme", "time_step_scale"}),
+])
+def test_a_config_whose_extra_fields_the_reference_ignores_translates(name, inert):
+    config = fixture_config(name)
+
+    hf_decoders.translate_config(config)
+
+    assert inert <= set(config)
+    assert hf_decoders._inert(config["model_type"], config) == inert
+
+
+def test_mamba2s_open_time_step_bound_reads_as_infinity():
+    record = hf_decoders.translate_config(fixture_config("mamba2-130m-hf"))
+
+    assert record["mixer"].time_step_limit == (0.0, float("inf"))
+
+
+@pytest.mark.parametrize("name, field, value", [
+    ("qwen2.5-0.5b", "use_mrope", True),
+    ("mamba2-130m-hf", "rms_norm", False),
+    ("mamba-codestral-7b", "intermediate_size", 4096),
+])
+def test_an_inert_field_holding_another_model_is_refused_by_name(name, field, value):
+    config = {**fixture_config(name), field: value}
+
+    with pytest.raises(ValueError, match=f"^{field}={value!r} is not expressible"):
+        hf_decoders.translate_config(config)
+
+
+def test_a_field_outside_the_inert_policy_is_still_refused_by_name():
+    config = {**fixture_config("smollm2-135m-instruct"), "residual_multiplier": 0.22}
+
+    with pytest.raises(ValueError, match=r"config fields \['residual_multiplier'\] is not expressible"):
+        hf_decoders.translate_config(config)
+
+
+def test_every_inert_field_is_one_the_reference_config_class_does_not_declare():
+    """The policy's premise, against the installed reference: the family's
+    config class (and PreTrainedConfig, for the fields every family shares)
+    declares none of them, so transformers keeps them as bare attributes
+    that its modeling code never reads."""
+    transformers = pytest.importorskip("transformers")
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    def declared(cls):
+        return {name for klass in cls.__mro__ for name in getattr(klass, "__annotations__", {})}
+
+    assert {"expand", "time_step_limit"} <= declared(CONFIG_MAPPING["mamba2"])
+    for model_type, fields in hf_decoders._INERT_FIELDS.items():
+        cls = transformers.PreTrainedConfig if model_type is None else CONFIG_MAPPING[model_type]
+        assert not set(fields) & declared(cls), (model_type, set(fields) & declared(cls))
