@@ -624,3 +624,17 @@ KernelMatrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell 
 On the RTX 4080 the Triton kernel ran 6x to 12x slower than XLA wherever it compiled (chunk 64, width 32: 1.39 against 0.22 ms; at batch 8 and 16 heads, 22.7 against 2.2 ms), and every chunk of 128 or 256 asked for 131 to 590 KB of shared memory. The scan takes the kernel on TPU only.
 
 On an A100, ReferenceRuns measured the fp32 head at 38 ms a step, 21% of a Qwen3-0.6B bf16 fine-tune's busy time, as TF32 GEMMs that torch autocast runs in bf16; that and the rows above made the bf16 product the default.
+
+### Packed sliding-window attention on GPU: `local_attention`
+
+A packed batch with a sliding window has no fused-kernel flag on a GPU before Hopper: `jax.nn.dot_product_attention` takes no segment ids beside `local_window_size`, cuDNN's packed layout (`q_offsets`) raises "Packed layout requires a GPU with at least Hopper architecture" on sm89, and JAX's Pallas GPU `mha` takes segment ids but no window (and was 4-9% off in the gradient at this shape). `local_attention` therefore builds its `[W, 2W]` band mask and, where cuDNN runs, hands it to cuDNN as the additive bias; elsewhere xla takes it. Colab L4, jax 0.11.2, bf16, 16 query heads of 64 over 4 key heads, window 4096, 5 packed documents, forward plus backward (`~/.cache/dew/verification-evidence/packed-window/bench.py`):
+
+| tokens | before (band on xla) | after (band on cuDNN) |
+|---|---|---|
+| 2048, window 512 | 6.15 ms, 0.32 GiB | 1.37 ms, 0.05 GiB |
+| 8192 | out of memory (10.0 GiB requested) | 40.0 ms, 0.24 GiB |
+| 16384 | out of memory | 76.9 ms, 0.60 GiB |
+| 32768 | out of memory | 156.5 ms, 1.19 GiB |
+| 65536 | out of memory | 316.7 ms, 2.38 GiB |
+
+Against a float64 oracle at 2048 tokens the output error is 2.7e-3 relative and the gradients 3.3e-3 to 6.6e-3, the same as the xla path's. A dense `[S, S]` document mask on cuDNN is faster at 32768 tokens on an RTX 4080 (63.7 against 78.1 ms) but grows with the square of the length and ran out of memory at 65536, so the band is the path.

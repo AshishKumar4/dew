@@ -1126,11 +1126,10 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
         causal=True, sliding_window=window)
     # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
-    # its additive bias where cudnn runs. On an RTX 4080, packed (5
-    # documents) at window 4096, 16 heads of 64 over 4, forward plus
-    # backward: 32768 tokens 78.1 ms in 1.19 GiB of temporaries and 65536
-    # tokens 152.8 ms in 2.38 GiB on cudnn, where xla ran out of memory
-    # from 8192 (docs/performance.md).
+    # its additive bias where cudnn runs. On an L4, packed (5 documents) at
+    # window 4096, 16 heads of 64 over 4, forward plus backward: 16384
+    # tokens 76.9 ms in 0.60 GiB of temporaries, 65536 tokens 316.7 ms in
+    # 2.38 GiB, where xla asked for 10.0 GiB at 8192 (docs/performance.md).
     masked = 'cudnn' if resolved == 'cudnn' else kernel_for_materialized_mask(
         implementation, query, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax)
