@@ -790,9 +790,11 @@ def _wrapper_layouts(tensors, record, variables):
     projector_kind = record["projector"]["kind"]
     tower_path: Callable[[str], tuple[str, ...] | None] = {"siglip": vision.siglip_vision_path, "llama4": vision.llama4_vision_path,
                   "gemma4": vision.gemma4_vision_path, "qwen3_5": vision.qwen35_vision_path,
-                  "gemma3n": vision.gemma3n_vision_path}[tower_kind]
+                  "gemma3n": vision.gemma3n_vision_path,
+                  "deepseek_v41": vision.deepseek_v41_vision_path}[tower_kind]
     tower_prefix = decoders._WRAPPER_TOWER_PREFIX[tower_kind]
     projector_prefix = decoders._WRAPPER_PROJECTOR_PREFIX[projector_kind]
+    unprefixed = record["text_model_type"] == "deepseek_v41"
     audio_encoder = None
     if record["audio"] is not None:
         audio_encoder = tower_from_record(record["audio"])
@@ -831,9 +833,12 @@ def _wrapper_layouts(tensors, record, variables):
             if path[-1] == "kernel":
                 # Kernels store [*window, in, out]; the source keeps [out, in, *window].
                 transpose = {2: (1, 0), 3: (2, 1, 0), 4: (3, 2, 0, 1)}[tensor.ndim]
-        elif bare.startswith(("language_model.", "mtp.")) or bare == "lm_head.weight":
+        elif unprefixed and bare in decoders._V41_SPAN:
+            paths = (("params", "projector", *vision.projector_weight_path(projector_kind, bare)),)
+        elif bare.startswith(("language_model.", "mtp.")) or bare == "lm_head.weight" or unprefixed:
             tail = bare.removeprefix("language_model.")
-            text_name = tail if tail.startswith(("model.", "lm_head.", "mtp.")) else "model." + tail
+            text_name = (tail if unprefixed or tail.startswith(("model.", "lm_head.", "mtp."))
+                         else "model." + tail)
             layout = _language_layout(name, text_name, tensor, record["text"],
                                       record["text_model_type"], variables,
                                       "language_model")
@@ -2503,13 +2508,15 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         record = config
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
-    elif "text_config" in config and family not in decoders._FAMILIES:
+    elif "text_config" in config and (family not in decoders._FAMILIES or (
+            family == "deepseek_v41" and config.get("vision_config") is not None)):
         # A wrapper repo carries its decoder under text_config. Where the
         # wrapper's own model_type is a registered decoder family, its
         # towers have no counterpart and its text half is the model, so it
         # takes the decoder branch below and its translator reads the
         # nested config; `translate_config` refuses the rest by the same
-        # rule.
+        # rule. DeepSeek-V4.1 registers its decoder under the bundle's own
+        # type, and a bundle that names its ViT loads whole.
         record = decoders.translate_wrapper_config(config)
         text_fields = _wrapper_text_fields(config, record, max_seq_len)
         text: decoders.DecoderFields = {**text_fields, **precision_fields(
@@ -2520,8 +2527,11 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         if not isinstance(language_model, CausalTransformer):
             raise TypeError("causal_transformer registry entry must build CausalTransformer")
         model = _wrapper_model(config, record, language_model, dtype=dtype)
-        variables = _native_variables(decoders.translate_wrapper_weights(
-            tensors, record, param_dtype=param_dtype, lazy=streaming))
+        parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=streaming)
+        derived = decoders._family_for_config(record["text"]).constants(directory, record["text"])
+        if derived:
+            parts = {**parts, "language_model": {**parts["language_model"], "constants": {**derived}}}
+        variables = _native_variables(parts)
         layouts, retained = _wrapper_layouts(tensors, record, variables)
     else:
         if verified is None:

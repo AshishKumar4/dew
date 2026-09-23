@@ -31,7 +31,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import shutil
 import sys
+import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 import flax
@@ -40,11 +43,20 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.interop import load_pretrained
+from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 
 TINY = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf" / "deepseek-v41-tiny"
+
+
+# The release's three quantizer sites: FP8 over 32 channels under
+# power-of-two scales, FP4 over 16 under E4M3 scales, FP4 over 32 under
+# power-of-two scales.
+QUANTIZERS = {"window": lambda v: fake_quant_fp8(v, 32),
+              "entries": lambda v: fake_quant_fp4(v, 16, e4m3_scale=True),
+              "index": lambda v: fake_quant_fp4(v, 32, e4m3_scale=False)}
 
 
 def unquantized(model):
@@ -114,18 +126,31 @@ class Captured:
     picks: list[np.ndarray] = dataclasses.field(default_factory=list)
 
 
-def captured(model, variables, ids) -> Captured:
+def captured(model, variables, ids, forced: Mapping[str, np.ndarray] | None = None) -> Captured:
     """One compiled forward with every quantizer input and every top-k's rows
     and picks recorded in call order.
 
     Wrappers stand in for the quantizers `dew.nn.deepseek_v4` calls and for
     `jax.lax.top_k` while the forward traces, hand their operands to the
     host through ordered callbacks and call the originals; they are removed
-    again after."""
+    again after. `forced` holds each site's recorded outputs in call order
+    for the quantizers to return in place of their own rounding, so a value
+    that rounds the other way within the noise cannot move what the
+    forward's later calls read."""
     from dew.nn import deepseek_v4
 
     record = Captured()
     fp8, fp4, top_k = deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k
+    taken = dict.fromkeys(forced or (), 0)
+
+    def rounded(site: str, x, block: int, own):
+        """`own` rounding, or the next `forced` rows of the site in its place."""
+        if forced is None:
+            return own()
+        rows = x.size // block
+        held = forced[site][taken[site]:taken[site] + rows]
+        taken[site] += rows
+        return jnp.asarray(held.reshape(x.shape), x.dtype)
 
     def keep(site: str, block: int):
         def store(x):
@@ -139,11 +164,12 @@ def captured(model, variables, ids) -> Captured:
 
     def window(x, block):
         jax.debug.callback(keep("window", block), x, ordered=True)
-        return fp8(x, block)
+        return rounded("window", x, block, lambda: fp8(x, block))
 
     def fourbit(x, block, e4m3_scale):
-        jax.debug.callback(keep("entries" if e4m3_scale else "index", block), x, ordered=True)
-        return fp4(x, block, e4m3_scale)
+        site = "entries" if e4m3_scale else "index"
+        jax.debug.callback(keep(site, block), x, ordered=True)
+        return rounded(site, x, block, lambda: fp4(x, block, e4m3_scale))
 
     def ranked(values, k, **kwargs):
         out = top_k(values, k, **kwargs)
@@ -156,7 +182,18 @@ def captured(model, variables, ids) -> Captured:
         jax.effects_barrier()
     finally:
         deepseek_v4.fake_quant_fp8, deepseek_v4.fake_quant_fp4, jax.lax.top_k = fp8, fp4, top_k
+    for site, count in taken.items():
+        if count != len(forced[site]):
+            raise ValueError(f"the forward rounds {count} {site} blocks where the reference rounded "
+                             f"{len(forced[site])}")
     return record
+
+
+def recorded_outputs(reference, prefix: str) -> dict[str, np.ndarray]:
+    """The reference's quantizer outputs of one forward, per site in call
+    order, for `captured` to force."""
+    return {site: reference[f"{prefix}{site}_out"] for site in ("window", "entries", "index")
+            if f"{prefix}{site}_out" in reference}
 
 
 def padded(parts: list[np.ndarray], width: int, fill) -> np.ndarray:
@@ -228,7 +265,7 @@ def noise() -> dict[str, float]:
     ids = jnp.asarray(reference["input_ids"])
     measured = {}
     for prefix, model in (("qat_", loaded.model), ("", unquantized(loaded.model))):
-        record = captured(model, loaded.variables, ids)
+        record = captured(model, loaded.variables, ids, recorded_outputs(reference, prefix))
         for site, blocks in record.blocks.items():
             measured[f"{prefix}{site}"] = float(np.max(input_noise(
                 np.concatenate(blocks), reference[f"{prefix}{site}_in"])))
@@ -265,12 +302,60 @@ def distances(model, variables, reference, prefix: str, fixture) -> dict[str, fl
         "draft_ids": float(np.sum(draft_ids != reference[prefix + "draft_ids"]))}.items()}
 
 
+def vision_bundle(directory: Path) -> Path:
+    """The fixture with its vision half in `directory` as the release ships a
+    bundle: vision_config inside config.json, one safetensors file."""
+    from safetensors.numpy import load_file, save_file
+
+    for name in ("tokenizer.json", "tokenizer_config.json", "generation_config.json"):
+        shutil.copy(TINY / name, directory / name)
+    config = json.loads((TINY / "config.json").read_text())
+    config["vision_config"] = json.loads((TINY / "vision_config.json").read_text())
+    (directory / "config.json").write_text(json.dumps(config))
+    save_file({**load_file(TINY / "model.safetensors"), **load_file(TINY / "vision.safetensors")},
+              directory / "model.safetensors")
+    return directory
+
+
+def vision_run(model, variables, reference) -> tuple[jax.Array, jax.Array, np.ndarray]:
+    """The span the fixture's image fills, the prefill's logits with it and
+    the text steps' after it, with the quantizers off as the reference ran."""
+    model = model.clone(language_model=unquantized(model.language_model))
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    media = reference["token_types"] >= 0
+    image_indices = jnp.asarray(np.where(media, np.cumsum(media, -1) - 1, -1))
+    conditioning = {"pixel_values": jnp.asarray(reference["pixels"])[None, None]}
+    span = model.apply(variables, conditioning, method=lambda module, held: module.conditioner(held))
+    cache = model.apply(variables, ids.shape[0], method=model.init_cache, mutable=["cache"])[1]
+    prompt_logits, cache = model.apply(
+        {**variables, **cache}, ids[:, :prompt], decode=True, image_indices=image_indices[:, :prompt],
+        conditioning=conditioning, mutable=["cache"])
+    steps = []
+    for position in range(prompt, ids.shape[1]):
+        logits, cache = model.apply({**variables, **cache}, ids[:, position:position + 1],
+                                    decode=True, mutable=["cache"])
+        steps.append(np.asarray(logits[:, 0]))
+    return span[0], prompt_logits, np.stack(steps, 1)
+
+
 def residuals() -> dict[str, float]:
-    """Every output the tests compare, as its distance from the reference's."""
+    """Every output the tests compare, as its distance from the reference's,
+    and for each quantizer site the count of recorded values its compiled
+    quantizer does not reproduce bit for bit."""
     loaded = load_pretrained(TINY, dtype="float32", attention_impl="reference")
     reference = np.load(TINY / "reference.npz")
-    return {**distances(unquantized(loaded.model), loaded.variables, reference, "", reference),
-            **distances(loaded.model, loaded.variables, reference, "qat_", reference)}
+    measured = {f"qat_{site}_mismatches": float(np.sum(
+        np.asarray(jax.jit(quantize)(jnp.asarray(reference[f"qat_{site}_in"]))).view(np.uint32)
+        != reference[f"qat_{site}_out"].view(np.uint32))) for site, quantize in QUANTIZERS.items()}
+    measured.update(distances(unquantized(loaded.model), loaded.variables, reference, "", reference))
+    measured.update(distances(loaded.model, loaded.variables, reference, "qat_", reference))
+    vision = np.load(TINY / "vision.npz")
+    with tempfile.TemporaryDirectory() as directory:
+        bundle = load_pretrained(vision_bundle(Path(directory)), dtype="float32", attention_impl="reference")
+    for name, value in zip(("vision_span", "vision_prompt_logits", "vision_decode_logits"),
+                           vision_run(bundle.model, bundle.variables, vision), strict=True):
+        measured[name] = float(np.max(np.abs(np.asarray(value) - vision[name])))
+    return measured
 
 
 def fp64(path: Path) -> dict[str, float]:

@@ -224,6 +224,11 @@ class Router(nn.Module):
     bias (the checkpoint's persistent buffer), and the learned gate still
     weights them, gathered from the scores the same way. The caller passes
     the token ids; the table is never written by training.
+
+    `media_bias` is DeepSeek-V4.1's second balancing bias, which selects for
+    the tokens of an image span in place of `expert_bias` (the release's
+    `bias_vl`, model.py:807-820); the caller passes the `media` mask. It sits
+    in the `moe` collection beside the other and nothing here writes it.
     """
     num_experts: int
     in_features: int
@@ -235,6 +240,7 @@ class Router(nn.Module):
     groups_per_token: int = 1
     group_score: str = 'top2'
     expert_bias: bool = False
+    media_bias: bool = False
     hash_vocab: int | None = None
     init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
@@ -283,6 +289,8 @@ class Router(nn.Module):
             self.bias = self.variable(
                 'moe', 'e_score_correction_bias', jnp.zeros,
                 (self.num_experts,), jnp.float32)
+        if self.media_bias:
+            self.bias_vl = self.variable('moe', 'media_bias', jnp.zeros, (self.num_experts,), jnp.float32)
         if self.hash_vocab is not None:
             if self.expert_bias or self.expert_groups > 1:
                 raise ValueError(
@@ -291,10 +299,10 @@ class Router(nn.Module):
             self.tid2eid = self.variable(
                 'moe', 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
 
-    def __call__(self, x, tokens=None, routes: Routes | None = None):
+    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None):
         logits = self.logits(x)
         scores = self._activated(logits)
-        indices = chosen_experts(lambda: self._selected(scores, tokens),
+        indices = chosen_experts(lambda: self._selected(scores, tokens, media),
                                  (*scores.shape[:-1], self.top_k), routes)
         # The load each expert took, for the step that balances the bias:
         # written only when a caller opens the 'router' collection, and never
@@ -311,7 +319,7 @@ class Router(nn.Module):
                                  + WEIGHT_SUM_EPSILON)
         return weights * self.routed_scaling_factor, indices
 
-    def _selected(self, scores, tokens):
+    def _selected(self, scores, tokens, media):
         """The experts this router chooses on its own: `[..., top_k]`."""
         if self.hash_vocab is not None:
             if tokens is None:
@@ -320,6 +328,8 @@ class Router(nn.Module):
         if tokens is not None:
             raise ValueError("only a hash router reads the token ids")
         selection = scores if not self.expert_bias else scores + self.bias.value
+        if media is not None:
+            selection = jnp.where(media[..., None], scores + self.bias_vl.value, selection)
         if self.expert_groups > 1:
             selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
         _, indices = jax.lax.top_k(selection, self.top_k)
@@ -1110,6 +1120,7 @@ class SparseMLP(nn.Module):
     groups_per_token: int = 1
     group_score: str = 'top2'
     expert_bias: bool = False
+    media_bias: bool = False
     hash_vocab: int | None = None
     swiglu_limit: float | None = None
     scale_inputs: bool = False
@@ -1135,6 +1146,7 @@ class SparseMLP(nn.Module):
                            groups_per_token=self.groups_per_token,
                            group_score=self.group_score,
                            expert_bias=self.expert_bias,
+                           media_bias=self.media_bias,
                            hash_vocab=self.hash_vocab, init_std=self.init_std,
                            precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features
@@ -1162,8 +1174,8 @@ class SparseMLP(nn.Module):
                     1, use_bias=False, dtype=self.dtype, precision=self.precision,
                     name='shared_expert_gate', **normal_kernel(self.init_std))
 
-    def __call__(self, x, tokens=None, routes: Routes | None = None):
-        weights, indices = self.gate(x, tokens, routes)
+    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None):
+        weights, indices = self.gate(x, tokens, media, routes)
         if self.latent_features is None:
             routed = self.experts(x, weights, indices)
         else:

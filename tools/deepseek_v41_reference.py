@@ -96,24 +96,24 @@ SEED = 106
 # of its ramp move one. The indexer keeps 4 of up to 16 entries per query
 # and the candidate pool of 3 blocks of 2 is smaller than a 16-token context
 # and no smaller than the 4 kept, the release's invariant (2048 * 8 >= 512).
-TINY = dict(
-    max_batch_size=2, max_seq_len=32, temperature=0.0, dtype="bf16", expert_dtype=None,
-    vocab_size=384, dim=64, moe_inter_dim=32, n_layers=12, n_mtp_layers=3, n_heads=4,
-    n_routed_experts=8, n_shared_experts=1, n_activated_experts=2, score_func="sqrtsoftplus",
-    route_scale=1.5, swiglu_limit=2.0, q_lora_rank=16, head_dim=32, rope_head_dim=8,
-    norm_eps=1e-20, o_groups=2, o_lora_rank=8, window_size=4,
-    compress_ratios=(0, 0, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 0),
-    kv_source_layers=(2, 4, 6), index_source_layers=(2, 4, 6, 8, 10),
-    compress_rope_theta=160000.0, original_seq_len=65536, rope_theta=10000.0,
-    rope_factor=16, beta_fast=32, beta_slow=1,
-    index_n_heads=8, index_head_dim=32, index_topk=4,
-    candidate_source_layer=6, candidate_topk_blocks=3, candidate_block_size=2,
-    hc_mult=4, hc_sinkhorn_iters=20, hc_eps=1e-6,
-    engram_layer_ids=(1, 4), engram_max_ngram_size=4, engram_vocab_size=50,
-    engram_n_heads=2, engram_head_dim=32, engram_pad_id=2,
-    dspark_block_size=5, dspark_noise_token_id=383, dspark_target_layer_ids=(9, 10, 11),
-    dspark_markov_rank=16, dspark_n_routed_experts=4, dspark_n_activated_experts=2,
-)
+TINY = {
+    "max_batch_size": 2, "max_seq_len": 32, "temperature": 0.0, "dtype": "bf16", "expert_dtype": None,
+    "vocab_size": 384, "dim": 64, "moe_inter_dim": 32, "n_layers": 12, "n_mtp_layers": 3, "n_heads": 4,
+    "n_routed_experts": 8, "n_shared_experts": 1, "n_activated_experts": 2, "score_func": "sqrtsoftplus",
+    "route_scale": 1.5, "swiglu_limit": 2.0, "q_lora_rank": 16, "head_dim": 32, "rope_head_dim": 8,
+    "norm_eps": 1e-20, "o_groups": 2, "o_lora_rank": 8, "window_size": 4,
+    "compress_ratios": (0, 0, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0, 0),
+    "kv_source_layers": (2, 4, 6), "index_source_layers": (2, 4, 6, 8, 10),
+    "compress_rope_theta": 160000.0, "original_seq_len": 65536, "rope_theta": 10000.0,
+    "rope_factor": 16, "beta_fast": 32, "beta_slow": 1,
+    "index_n_heads": 8, "index_head_dim": 32, "index_topk": 4,
+    "candidate_source_layer": 6, "candidate_topk_blocks": 3, "candidate_block_size": 2,
+    "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1e-6,
+    "engram_layer_ids": (1, 4), "engram_max_ngram_size": 4, "engram_vocab_size": 50,
+    "engram_n_heads": 2, "engram_head_dim": 32, "engram_pad_id": 2,
+    "dspark_block_size": 5, "dspark_noise_token_id": 383, "dspark_target_layer_ids": (9, 10, 11),
+    "dspark_markov_rank": 16, "dspark_n_routed_experts": 4, "dspark_n_activated_experts": 2,
+}
 LENGTH = 16
 # Odd, so a ratio-2 window opened in the prefill closes in the decode.
 PROMPT = 7
@@ -184,14 +184,17 @@ def tokenizer():
 def build(model_module, engram_module, args, seed: int, widen: bool = False):
     """The toy Transformer in fp32, or fp64 when `widen`, with its fp32
     weights drawn. `float` and `double` leave the complex rotary tables as
-    they were built."""
+    they were built. The vision half draws from a generator of its own, so
+    the decoder's weights are the same with it or without."""
     torch.manual_seed(seed)
     net = model_module.Transformer(args, tokenizer())
     net = net.double() if widen else net.float()
     generator = torch.Generator().manual_seed(seed)
+    media = torch.Generator().manual_seed(seed + 2)
     for name, tensor in net.named_parameters():
         tensor.requires_grad_(requires_grad=False)
-        tensor.copy_(draw(name, tensor.shape, generator))
+        vision = name.startswith(("vision.", "aligner.", "image_")) or name.endswith(".bias_vl")
+        tensor.copy_(draw(name, tensor.shape, media if vision else generator))
         # The engram table's dequantization scales are storage, held at one
         # over the dense table the fixture ships; they take no step.
         tensor.requires_grad_(not name.endswith("engram.embed.scale"))
@@ -217,6 +220,8 @@ def draw(name: str, shape, generator) -> torch.Tensor:
     leaf = name.rsplit(".", 1)[-1]
     if name.endswith("engram.embed.scale"):
         return torch.ones(tuple(shape), dtype=torch.float32)
+    if leaf in ("image_start", "image_end", "image_newline"):
+        return normal(1.0)
     if "norm" in name.rsplit(".", 2)[-2] or leaf in ("q_weight", "k_weight"):
         return 1 + normal(0.1)
     if leaf == "attn_sink":
@@ -229,7 +234,8 @@ def draw(name: str, shape, generator) -> torch.Tensor:
         return 0.5 + torch.rand(tuple(shape), generator=generator, dtype=torch.float32)
     if name.endswith("gate.bias"):
         return normal(0.1)
-    if leaf in ("image_start", "image_end", "image_newline"):
+    if name.endswith("gate.bias_vl"):
+        # Wide enough that an image span routes to other experts than text.
         return normal(1.0)
     if name == "embed.weight" or name.endswith("markov_head.embed.weight") or ".embed.weight" in name:
         return normal(1.0)
@@ -787,8 +793,78 @@ def config_json(args) -> dict:
     return {
         "architectures": ["DeepseekV41ForCausalLM"], "model_type": "deepseek_v41",
         "dtype": "float32", "bos_token_id": 0, "eos_token_id": 1, "pad_token_id": 2,
-        "image_token_id": 382, "text_config": text,
+        "image_token_id": IMAGE_TOKEN_ID, "text_config": text,
     }
+
+
+# The ViT at toy width. A 3 x 5 patch grid pads to whole 2 x 2 squares, 2 x 3
+# of them, whose span is 2 * (3 + 1) + 2 = 10 positions; two text tokens
+# before it, one after, and three decode steps fill LENGTH.
+VISION = {"vision_n_layers": 2, "vision_dim": 32, "vision_n_heads": 2, "vision_inter_dim": 48,
+          "vision_patch_size": 4, "vision_downsample_ratio": 2}
+GRID = (3, 5)
+IMAGE_START_AT = 2
+# Below the toy vocabulary, where the release's own id would not fit.
+IMAGE_TOKEN_ID = 382
+
+
+def vision_config_json(args) -> dict:
+    """The release's vision_config for the toy arguments."""
+    return {"model_type": "deepseek_v41_vision", "num_hidden_layers": args.vision_n_layers,
+            "hidden_size": args.vision_dim, "num_attention_heads": args.vision_n_heads,
+            "intermediate_size": args.vision_inter_dim, "patch_size": args.vision_patch_size,
+            "rope_theta": args.vision_rope_theta, "downsample_ratio": args.vision_downsample_ratio,
+            "max_image_tokens": args.vision_max_n_token, "min_pixels": args.vision_min_pixels,
+            "max_wh_ratio": args.vision_max_wh_ratio}
+
+
+def write_vision(seed: int):
+    """The vision half beside the fixture: vision.safetensors (the ViT, the
+    aligner, the span vectors and every router's image bias, under the
+    release's names), vision_config.json, and vision.npz with one image
+    prompt through Transformer.forward (model.py:1241-1272), the quantizers
+    off: its pixels, ids and token types, the span the image fills
+    (merge_image_embeddings), the prefill's logits and three teacher-forced
+    text steps after it."""
+    from safetensors.torch import save_file
+
+    model_module, engram_module = import_reference()
+    processor = importlib.import_module("image_processor")
+    set_quantizers(model_module, enabled=False)
+    args = model_args(model_module, engram_module)
+    for field, value in VISION.items():
+        setattr(args, field, value)
+    net = build(model_module, engram_module, args, seed)
+    generator = torch.Generator().manual_seed(seed + 3)
+    patch = args.vision_patch_size
+    pixels = torch.randn(3, GRID[0] * patch, GRID[1] * patch, generator=generator)
+    patches = pixels.reshape(3, GRID[0], patch, GRID[1], patch).permute(1, 3, 0, 2, 4).reshape(-1, 3, patch, patch)
+    ratio = args.vision_downsample_ratio
+    types = processor.image_token_types(-(-GRID[0] // ratio), -(-GRID[1] // ratio))
+    text = torch.randint(3, IMAGE_TOKEN_ID, (1, LENGTH - types.numel()), generator=generator)
+    start = IMAGE_START_AT
+    ids = torch.cat([text[:, :start], torch.full((1, types.numel()), IMAGE_TOKEN_ID), text[:, start:]], 1)
+    token_types = torch.full(ids.shape, processor.TEXT)
+    token_types[0, start:start + types.numel()] = types
+    prompt = start + types.numel() + 1
+    image = processor.ImageInput(start, patches, GRID[0], GRID[1], types)
+    with torch.no_grad():
+        reset(net)
+        embedded = net.embed(ids[:, :prompt])
+        net.merge_image_embeddings([[image]], embedded)
+        _, prompt_logits, _ = type(net).forward.__wrapped__(
+            net, ids[:, :prompt], 0, [[image]], token_types[:, :prompt])
+        steps = [forward(net, ids[:, position:position + 1], position)[1][:, 0]
+                 for position in range(prompt, LENGTH)]
+    tensors = {name: tensor.detach().contiguous() for name, tensor in net.named_parameters()
+               if name.startswith(("vision.", "aligner.", "image_")) or name.endswith(".bias_vl")}
+    save_file(tensors, FIXTURE / "vision.safetensors", metadata={"format": "pt"})
+    (FIXTURE / "vision_config.json").write_text(json.dumps(vision_config_json(args), indent=1) + "\n")
+    np.savez(FIXTURE / "vision.npz", pixels=pixels.numpy(), input_ids=ids.numpy().astype(np.int32),
+             token_types=token_types.numpy().astype(np.int32), decode_prompt=np.int32(prompt),
+             vision_span=embedded[0, start:start + types.numel()].numpy(),
+             vision_prompt_logits=prompt_logits.numpy(), vision_decode_logits=torch.stack(steps, 1).numpy())
+    print(f"{FIXTURE}: {len(tensors)} vision tensors, a {types.numel()}-position span")
 
 
 def write(seed: int):
@@ -828,6 +904,7 @@ def main():
     parser.add_argument("--check-kernels", action="store_true",
                         help="compare the torch stand-ins with the tilelang kernels on CUDA")
     parser.add_argument("--fp64", type=Path, help="write the seed's plain outputs in fp64 here")
+    parser.add_argument("--vision", action="store_true", help="write the vision half beside the fixture")
     options = parser.parse_args()
     torch.set_default_dtype(torch.float32)
     # One thread keeps every reduction in one order, so a rerun writes the
@@ -837,6 +914,8 @@ def main():
         check_kernels()
     elif options.fp64 is not None:
         np.savez(options.fp64, **widened_outputs(options.seed))
+    elif options.vision:
+        write_vision(options.seed)
     elif options.search:
         search(options.seed, options.search)
     else:
