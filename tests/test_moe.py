@@ -26,17 +26,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-
-from dew.objectives.base import scalar_loss
-
-# Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
-pytestmark = pytest.mark.mesh
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, GatedMLP, Mixture
 from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
-from dew.objectives.base import Step
+from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
@@ -765,6 +760,7 @@ def expert_specs(expert_size, fsdp_size, num_experts=8, min_shard_size=TINY_SHAR
     return mesh, jax.tree.map(lambda sharding: sharding.spec, shardings)["params"]
 
 
+@pytest.mark.mesh
 @pytest.mark.parametrize("expert_size,fsdp_size", [(1, 8), (2, 4), (4, 2)])
 def test_the_expert_dimension_takes_the_expert_axis(expert_size, fsdp_size):
     """Eight experts over one, two and four expert shards. The expert axis
@@ -780,6 +776,7 @@ def test_the_expert_dimension_takes_the_expert_axis(expert_size, fsdp_size):
         P('fsdp', 'expert') if expert_size > 1 else P('fsdp'))
 
 
+@pytest.mark.mesh
 def test_the_expert_axis_shards_experts_without_an_fsdp_axis():
     """Expert parallelism alone: with fsdp at one there is still a dimension
     to split, which the old two-axis rule replicated."""
@@ -789,6 +786,7 @@ def test_the_expert_axis_shards_experts_without_an_fsdp_axis():
     assert specs["experts"]["down_proj"]["kernel"] == P('expert')
 
 
+@pytest.mark.mesh
 def test_an_expert_count_the_axis_cannot_split_keeps_the_widths_sharded():
     """Six experts over four shards divides nothing, so the expert name is
     dropped and the parameter still shards on the dimension that can."""
@@ -797,6 +795,7 @@ def test_an_expert_count_the_axis_cannot_split_keeps_the_widths_sharded():
     assert specs["experts"]["gate_proj"]["kernel"] == P(None, None, 'fsdp')
 
 
+@pytest.mark.mesh
 @pytest.mark.parametrize("expert_size,fsdp_size", [(1, 8), (2, 4), (4, 2)])
 def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
         expert_size, fsdp_size):
@@ -819,6 +818,7 @@ def test_every_expert_parallel_layout_stays_inside_the_sharding_tolerance(
     layout.check(variables["params"], shardings["params"], mesh)
 
 
+@pytest.mark.mesh
 def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
     """Expert parallelism splits the experts alone, so a model whose experts
     are a fifth of it runs mostly replicated. The check has to see that,
@@ -836,11 +836,13 @@ def test_a_mostly_dense_model_on_expert_only_parallelism_is_rejected():
         layout.check(variables["params"], shardings["params"], mesh)
 
 
+@pytest.mark.mesh
 def test_build_mesh_rejects_an_expert_size_the_devices_cannot_hold():
     with pytest.raises(ValueError, match="expert 4"):
         build_mesh(MeshSpec(fsdp=4, expert=4))
 
 
+@pytest.mark.mesh
 def test_the_batch_is_split_over_the_expert_axis_too():
     """Expert parallelism must not cost data parallelism: every device holds a
     slice of the batch whichever axis it sits on."""
@@ -909,6 +911,7 @@ def run_losses(trainer, steps):
     return [entry["train/loss"] for entry in tracker.scalars if "train/loss" in entry]
 
 
+@pytest.mark.mesh
 def test_the_expert_shards_train_the_same_model():
     """Fifty steps of the same sparse decoder at the same seed, with the
     experts on one shard and on four. Expert parallelism moves where the
@@ -926,6 +929,7 @@ def test_the_expert_shards_train_the_same_model():
     assert difference < 1e-6, difference
 
 
+@pytest.mark.mesh
 def test_the_experts_are_really_split_across_the_expert_axis():
     state = moe_trainer(expert_size=4, fsdp_size=2).fit(Data(token_batches), steps=0)
     experts = state.params["params"]["layers_1"]["mlp"]["experts"]
@@ -941,6 +945,7 @@ def test_the_experts_are_really_split_across_the_expert_axis():
 # The balancing bias through Aux.variables
 # --------------------------------------------------------------------------
 
+@pytest.mark.mesh
 def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
     """The aux-loss-free balancing end to end: the routers sow their loads,
     the loss reports them and hands the bias update back through
@@ -973,6 +978,7 @@ def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
     assert "moe" not in state.opt_state[0].mu
 
 
+@pytest.mark.mesh
 def test_balancing_needs_a_router_with_a_bias():
     trainer = moe_trainer(1, 2)
     trainer.objective.balance_rate = 0.01
@@ -982,6 +988,7 @@ def test_balancing_needs_a_router_with_a_bias():
                                Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None))
 
 
+@pytest.mark.mesh
 def test_the_balancing_bias_is_one_replicated_value_across_every_shard():
     """The bias is state every device reads, and its update counts tokens
     over the whole global batch, not over a device's slice.
