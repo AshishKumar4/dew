@@ -610,3 +610,17 @@ KernelMatrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell 
 | fused-weight SwiGLU (tokamax `xla` formulation, one contraction for gate and up) | every GPU | 1.47x (A100), 1.47x (L4), 1.55x (RTX 4080), 1.21x (T4) over two XLA matmuls; no gain on TPU | a change to the MLP's parameter layout. |
 | tokamax `xla` head plus cross entropy | sm89 speed | 73.0 ms (L4) and 36.8 ms (RTX 4080), 1.55x and 1.58x over Dew's chunked head | tokamax dependency, and it holds 1.6-3.2 GiB where the chunked head holds 131-355 MiB. |
 | JAX's Pallas GPU `paged_attention` | sm80 and later, decode | 1.75-1.84x (A100), 1.85-2.1x (L4), 2.1-2.8x (RTX 4080) over the XLA gather | a decode-path change; on TPU the XLA gather wins at batch 8 and up to 2k context. |
+
+### The Mamba-2 SSD scan: `ssd_kernel_runs`
+
+`tools/benchmark_ssd.py`, forward plus backward, batch 1, 8 heads of 64, state 128, jax 0.11.2:
+
+| device | chunk | length | XLA | Pallas kernel |
+|---|---|---|---|---|
+| TPU v6e | 256 | 4096 | 0.915 ms | 0.634 ms |
+| TPU v6e | 256 | 16384 | 4.505 ms | 1.911 ms |
+| TPU v6e | 256 | 65536 | 17.245 ms | 7.122 ms |
+| TPU v6e | 128 | 4096 | 0.632 ms | 0.705 ms |
+| RTX 4080 | 256 | 4096 to 65536 | 2.28 to 33.63 ms | does not compile: 590 KB of shared memory asked, 101 KB available |
+
+On the RTX 4080 the Triton kernel ran 6x to 12x slower than XLA wherever it compiled (chunk 64, width 32: 1.39 against 0.22 ms; at batch 8 and 16 heads, 22.7 against 2.2 ms), and every chunk of 128 or 256 asked for 131 to 590 KB of shared memory. The scan takes the kernel on TPU only.

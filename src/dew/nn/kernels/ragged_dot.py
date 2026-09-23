@@ -442,7 +442,3 @@ def _hyperparam_selection_rule(dtype: np.dtype):
     tile_k, tile_n = tile_m // 2, tile_m
   return {"block_m": tile_m, "block_k": tile_k, "block_n": tile_n}
 
-
-def block_sizes(dtype) -> dict[str, int]:
-  """The tile the vendored rule picks for operands of `dtype`."""
-  return _hyperparam_selection_rule(np.dtype(dtype))

@@ -62,13 +62,6 @@ def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ..
 BF16 = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
 
 
-def head_precision(dtype, precision: PrecisionLike, bf16: bool) -> jax.lax.PrecisionLike:
-    """The precision the head multiplies at: the bf16 algorithm when `bf16`
-    asks for it and bf16 compute at the default precision allows it, the
-    caller's otherwise."""
-    return BF16 if bf16 and rounds_to_bf16(dtype, precision) else precision
-
-
 def bf16_head(model: nn.Module) -> bool:
     """Whether `model`'s vocabulary head multiplies as bf16
     (`CausalTransformer.bf16_head`), read through the wrappers that hold a
@@ -247,8 +240,10 @@ def _bounded_head_bwd(chunks, tile, precision, predict, residuals, cotangents):
             token_loss = jax.lax.dynamic_slice_in_dim(d_loss, start, size)
             token_partition = jax.lax.dynamic_slice_in_dim(d_partition, start, size)
 
-            logits, cap_pullback = jax.vjp(
-                _capped, _tile_logits(states, matrix, precision), softcap)
+            def project(states, matrix, cap):
+                return _capped(_tile_logits(states, matrix, precision), cap)
+
+            logits, pullback = jax.vjp(project, states, matrix, softcap)
             # log Z is the whole row's, so a tile's share of the softmax needs
             # no renormalisation, and a target outside the tile one-hots to
             # zero rather than to a wrapped column.
@@ -258,11 +253,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, residuals, cotangents):
                 dtype=jnp.float32)
             d_logits = ((token_loss + token_partition)[:, None] * probabilities
                         - token_loss[:, None] * selected)
-            d_raw, cap_tile = cap_pullback(d_logits)
-            states_tile = jnp.einsum('tv,vd->td', d_raw, matrix, precision=precision,
-                                     preferred_element_type=jnp.float32)
-            matrix_tile = jnp.einsum('tv,td->vd', d_raw, states, precision=precision,
-                                     preferred_element_type=jnp.float32)
+            states_tile, matrix_tile, cap_tile = pullback(d_logits)
             prior = jax.lax.dynamic_slice_in_dim(d_states, start, size)
             d_states = jax.lax.dynamic_update_slice_in_dim(
                 d_states, prior + states_tile, start, axis=0)
@@ -346,4 +337,5 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     cap = None if softcap is None else jnp.asarray(softcap, jnp.float32)
     table = head_weight if vocab_major else head_weight.T
     return _bounded_head(hidden, table, targets, chunks, tile, cap,
-                         head_precision(hidden.dtype, precision, bf16), predict)
+                         BF16 if bf16 and rounds_to_bf16(hidden.dtype, precision) else precision,
+                         predict)

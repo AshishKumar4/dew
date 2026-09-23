@@ -63,14 +63,14 @@ def ragged_dot_runs(compute: Dtype, operands: tuple[Dtype, ...],
 def _gmm(tokens, kernel, sizes, out_dtype, *, trans_rhs: bool, interpret: bool):
     compute = tokens.dtype
     return ragged_dot.gmm(tokens, kernel.astype(compute), sizes,
-                          **ragged_dot.block_sizes(compute), trans_rhs=trans_rhs,
+                          **ragged_dot._hyperparam_selection_rule(np.dtype(compute)), trans_rhs=trans_rhs,
                           interpret=interpret, compute_dtype=compute, out_dtype=out_dtype)
 
 
 def _tgmm(tokens, cotangent, sizes, out_dtype, *, interpret: bool):
     compute = tokens.dtype
     return ragged_dot.tgmm(tokens, cotangent.astype(compute), sizes,
-                           **ragged_dot.block_sizes(compute), interpret=interpret,
+                           **ragged_dot._hyperparam_selection_rule(np.dtype(compute)), interpret=interpret,
                            compute_dtype=compute, out_dtype=out_dtype)
 
 
