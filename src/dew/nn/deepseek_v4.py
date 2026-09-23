@@ -95,8 +95,29 @@ def _power_of_two_ceil(value):
     return jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
 
 
+def round_e4m3fn(values):
+    """Round fp32 values within +-448 to E4M3FN, ties to even, by arithmetic.
+
+    Not `astype(float8_e4m3fn)`: XLA GPU's default xla_allow_excess_precision
+    deletes an f32 -> f8 -> f32 convert pair under jit, so the rounding would
+    silently not happen. Nor `jax.lax.reduce_precision(x, 4, 3)`, which
+    models IEEE-style e4m3 with infinities and a largest finite 240, not the
+    FN format whose largest finite is 448. The quantum is the power of two
+    of the value's binade less three mantissa bits, floored at the subnormal
+    spacing 2**-9; dividing by it is exact and `round` ties to even.
+    """
+    bits = jax.lax.bitcast_convert_type(values.astype(jnp.float32), jnp.int32)
+    exponent = jnp.maximum(((bits >> 23) & 0xFF) - 127, -6) - 3
+    quantum = jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
+    return jnp.round(values / quantum) * quantum
+
+
 def _straight_through(x, rounded):
-    return x + jax.lax.stop_gradient(rounded.astype(x.dtype) - x)
+    """`rounded` forward and the identity's gradient backward. The sum runs
+    in fp32, where `x + (rounded - x)` is exact, so a bf16 `x` gets the
+    rounded value itself and not a bf16 re-rounding of the correction."""
+    wide = x.astype(jnp.float32)
+    return (wide + jax.lax.stop_gradient(rounded.astype(jnp.float32) - wide)).astype(x.dtype)
 
 
 def fake_quant_fp8(x, block: int):
@@ -106,8 +127,8 @@ def fake_quant_fp8(x, block: int):
     blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
     amax = jnp.maximum(jnp.max(jnp.abs(blocks), -1, keepdims=True), 1e-4)
     scale = _power_of_two_ceil(amax * jnp.float32(1 / E4M3_MAX))
-    rounded = jnp.clip(blocks / scale, -E4M3_MAX, E4M3_MAX).astype(jnp.float8_e4m3fn)
-    return _straight_through(x, (rounded.astype(jnp.float32) * scale).reshape(x.shape))
+    rounded = round_e4m3fn(jnp.clip(blocks / scale, -E4M3_MAX, E4M3_MAX))
+    return _straight_through(x, (rounded * scale).reshape(x.shape))
 
 
 def _e2m1(values):
@@ -132,8 +153,7 @@ def fake_quant_fp4(x, block: int, e4m3_scale: bool):
     amax = jnp.max(jnp.abs(blocks), -1, keepdims=True)
     if e4m3_scale:
         # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
-        scale = jnp.minimum(jnp.maximum(amax, E2M1_MAX * 2 ** -9) / E2M1_MAX, E4M3_MAX).astype(
-            jnp.float8_e4m3fn).astype(jnp.float32)
+        scale = round_e4m3fn(jnp.minimum(jnp.maximum(amax, E2M1_MAX * 2 ** -9) / E2M1_MAX, E4M3_MAX))
     else:
         scale = _power_of_two_ceil(
             jnp.maximum(amax, E2M1_MAX * 2 ** -126) * jnp.float32(1 / E2M1_MAX))

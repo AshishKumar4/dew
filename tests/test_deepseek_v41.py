@@ -63,7 +63,8 @@ def close(actual, expected):
 def test_the_quantizers_round_as_the_release_kernels():
     """FP8 over 32 channels under power-of-two scales, FP4 over 16 under E4M3
     scales and over 32 under power-of-two scales, bit for bit against the
-    kernels' torch stand-ins, ties, all-zero blocks and saturation included."""
+    kernels' torch stand-ins, ties, all-zero blocks and saturation included,
+    compiled, on whichever backend runs the test."""
     torch = pytest.importorskip("torch")
     from tools import deepseek_v41_kernels as kernels
 
@@ -80,7 +81,8 @@ def test_the_quantizers_round_as_the_release_kernels():
              lambda v: kernels.fp4_act_quant(v, 16, True, torch.float8_e4m3fn)),
             (lambda v: fake_quant_fp4(v, 32, False), lambda v: kernels.fp4_act_quant(v, 32, True))):
         expected = torch_quant(torch.from_numpy(x.copy())).numpy()
-        np.testing.assert_array_equal(np.asarray(jax_quant(jnp.asarray(x))), expected)
+        # under jit, where XLA GPU would delete a convert-pair rounding
+        np.testing.assert_array_equal(np.asarray(jax.jit(jax_quant)(jnp.asarray(x))), expected)
 
 
 def test_the_quantizers_pass_their_gradient_straight_through():
