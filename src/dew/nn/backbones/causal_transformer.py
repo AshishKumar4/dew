@@ -37,7 +37,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.registry import from_record, models
 
-from ..attention import RMSNorm, RopeScaling
+from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention, ResidualSite, expand_blocks, sources
 from ..blocks import TokenEmbedding, normal_kernel
 from ..dsa_kpool import KPoolSparseAttentionMixer
@@ -56,9 +56,10 @@ from ..inputs import AttentionMetadata, PredictionPhase
 from ..kv_cache import KVCache, is_paged
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..mixers.mamba2 import Mamba2Mixer
-from ..mla import INDEXER_COLLECTION, YarnScaling
+from ..mla import INDEXER_COLLECTION
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, Situ, SparseMLP, check_gated_activation
 from ..precision import scaled
+from ..rope import RopeScaling, YarnScaling
 from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
 
 
@@ -1451,7 +1452,7 @@ class CausalTransformer(nn.Module):
     head dims and passes the rest through; a windowed kind rotates whole.
     `partial_rotary_type` names which published convention the fraction
     follows, because the two rotate different angles:
-    `dew.nn.attention.rotary_freqs` documents both. Interleaved mRoPE
+    `dew.nn.rope.rotary_freqs` documents both. Interleaved mRoPE
     (Qwen3.5's mrope_section) is this same rotation for text. With one
     position per token the three grids' angles are equal and the interleave
     reads the same value from each, so text-only input reduces to this

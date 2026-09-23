@@ -27,15 +27,8 @@ from dew.interop.hf_decoders import _yarn_record, translate_weights
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import mixers
-from dew.nn.mla import (
-    MLAMixer,
-    MultiHeadLatentAttention,
-    YarnScaling,
-    mla_rope_freqs,
-    yarn_attention_factor,
-    yarn_inv_freq,
-    yarn_query_scale,
-)
+from dew.nn.mla import MLAMixer, MultiHeadLatentAttention
+from dew.nn.rope import YarnScaling, yarn_attention_factor, yarn_inv_freq, yarn_query_scale, yarn_rope_freqs
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -120,7 +113,7 @@ def test_yarn_matches_the_reference_derivation():
         rtol=1e-6, atol=1e-7)
     assert yarn_attention_factor(yarn) == pytest.approx(
         float(tensors["attention_scaling"]), rel=1e-6)
-    cos, sin = mla_rope_freqs(
+    cos, sin = yarn_rope_freqs(
         jnp.arange(CONFIG["length"]), 8, 10000.0, yarn)
     half = tensors["cos"].shape[-1] // 2
     # The reference batches identical position rows; the first row compares.

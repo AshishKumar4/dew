@@ -207,7 +207,7 @@ def _kind_name(record: Mapping[str, object], section: str) -> str:
 
 class Llama3Ramp(TypedDict):
     """Describes Llama 3.1's frequency ramp, under the reference's own field names.
-    `dew.nn.attention.RopeScaling` is built from these keys."""
+    `dew.nn.rope.RopeScaling` is built from these keys."""
 
     rope_type: Literal['llama3']
     factor: float
@@ -218,7 +218,7 @@ class Llama3Ramp(TypedDict):
 
 class YarnRamp(TypedDict):
     """Describes a YaRN frequency table, under the reference's own field names.
-    `dew.nn.mla.YarnScaling` is built from these keys."""
+    `dew.nn.rope.YarnScaling` is built from these keys."""
 
     rope_type: Literal['yarn']
     rope_theta: float

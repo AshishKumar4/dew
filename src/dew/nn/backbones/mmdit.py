@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import LayerNorm, RMSNorm, apply_rotary, rotary_freqs, scaled_dot_product_attention
+from ..attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from ..dit import (
     ROPE_THETA,
     AdaLNParams,
@@ -25,6 +25,7 @@ from ..dit import (
     remat_block,
     rope_for_scan,
 )
+from ..rope import apply_rotary, rotary_freqs
 from ..sharding import logical_axes
 
 

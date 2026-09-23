@@ -53,7 +53,7 @@ def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
     modeling_rope_utils.py:755-757 lets the entry's value win). The reference
     reads it as a rope of int(head_dim * factor) dims
     (modeling_qwen3_5.py:117-124), the 'default' convention of
-    `dew.nn.attention.rotary_freqs`.
+    `dew.nn.rope.rotary_freqs`.
 
     mrope_section and mrope_interleaved describe how the three grids of an
     image share the rotated pairs. With one position per token every grid has

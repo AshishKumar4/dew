@@ -330,7 +330,7 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
     from transformers import Qwen3Config
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-    from dew.nn.mla import YarnScaling, yarn_attention_factor, yarn_inv_freq
+    from dew.nn.rope import YarnScaling, yarn_attention_factor, yarn_inv_freq
 
     released = fixture_config("deepseek-r1-0528-qwen3-8b")
     record = hf_decoders.translate_config(released)

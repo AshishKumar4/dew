@@ -20,20 +20,18 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import (
     RMSNorm,
-    RopeScaling,
     causal_attention_mask,
     chunk_mask,
     document_mask,
     kernel_for_materialized_mask,
     local_attention,
     open_kv_cache,
-    rotary_freqs,
     scaled_dot_product_attention,
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
-from dew.nn.mla import apply_rotary_interleave
+from dew.nn.rope import RopeScaling, apply_rotary_interleave, rotary_freqs
 from dew.nn.sharding import logical_axes
 
 

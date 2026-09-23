@@ -171,9 +171,9 @@ split-on-trailing-comma = false
 "src/dew/data/online_loader.py" = ["T201"]
 # Four modules import at the bottom on purpose. The mixer hub imports each
 # kind module after the base class those modules subclass; `mla` imports the
-# hub back after the YarnScaling ramp the hub reads, so either import order
-# resolves; `dew.inputs` imports its diffusion conditioner after the
-# Condition it registers against; and the decoder hub imports the family
+# hub back after the indexer name and cache `dsa_kpool` reads, so either
+# import order resolves; `dew.inputs` imports its diffusion conditioner after
+# the Condition it registers against; and the decoder hub imports the family
 # modules after the shared readers they call, which is the same order.
 # Each says so where the import stands.
 "src/dew/nn/mixers/__init__.py" = ["E402"]

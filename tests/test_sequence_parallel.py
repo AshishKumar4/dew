@@ -36,12 +36,12 @@ from dew.nn.attention import (
     causal_attention_mask,
     exchanged_heads_attention,
     gathered_keys_attention,
-    rotary_freqs,
     scaled_dot_product_attention,
     stripe,
     unstripe,
 )
 from dew.nn.mixers.mamba2 import Mamba2
+from dew.nn.rope import rotary_freqs
 from dew.telemetry.instrumentation import compiled_flops
 from dew.objectives.lm import LMObjective
 from dew.registry import models

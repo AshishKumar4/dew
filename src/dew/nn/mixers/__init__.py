@@ -24,8 +24,8 @@ from collections.abc import Callable, Mapping
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import RopeScaling
 from dew.nn.kv_cache import KVCache
+from dew.nn.rope import RopeScaling, YarnScaling
 from dew.registry import mixers
 
 
@@ -73,15 +73,12 @@ class MixerContext:
     o_proj_bias: bool | None = None
     attention_scale: float | None = None
     attention_sinks: bool = False
-    # `mla` arrives with the kind modules at the foot of this file, which
-    # is late enough because `from __future__ import annotations` defers
-    # this name until something resolves it.
-    yarn: mla.YarnScaling | None = None
+    yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None
     partial_rotary_factor: float | None = None
     partial_rotary_type: str = 'proportional'
     """Which convention the partial rotary follows, 'proportional' (Gemma 4)
-    or 'default' (Qwen3.5); `dew.nn.attention.rotary_freqs` cites both."""
+    or 'default' (Qwen3.5); `dew.nn.rope.rotary_freqs` cites both."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
@@ -158,7 +155,7 @@ from .. import (
     dsa_kpool,  # noqa: F401  (registers the kind)
     kda,  # noqa: F401  (registers the kind)
     llama4,  # noqa: F401  (registers the kind)
-    mla,  # registers the kind, and names the YarnScaling above
+    mla,  # noqa: F401  (registers the kind)
 )
 from . import (
     gated_delta_net,  # noqa: F401  (registers the kind)
