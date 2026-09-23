@@ -19,6 +19,7 @@ import pytest
 
 from dew.nn.attention import (
     SPLASH_LANES,
+    SPLASH_MIN_LENGTH,
     attention_kernel,
     cudnn_runs,
     scaled_dot_product_attention,
@@ -259,7 +260,7 @@ def test_tpu_runs_needs_the_tpu_backend(monkeypatch):
     """Everything else the predicate reads holds; only the backend says no,
     because the interpreter that runs splash elsewhere is far slower than the
     XLA attention 'auto' falls back to."""
-    query, key, _ = qkv((2, SPLASH_LANES, 8, 128))
+    query, key, _ = qkv((2, SPLASH_MIN_LENGTH, 8, 128))
     assert not tpu_runs(query, key)
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
     assert tpu_runs(query, key)
@@ -277,6 +278,18 @@ def test_auto_stays_on_xla_where_the_mesh_splits_the_sequence(tpu_backend):
     assert tpu_runs(query, key)
     with jax.set_mesh(build_mesh(MeshSpec(fsdp=4, sequence=2))):
         assert not tpu_runs(query, key)
+
+
+def test_auto_stays_on_xla_below_the_length_splash_measured_faster(tpu_backend):
+    """On a v6e XLA's attention trains faster than splash below
+    `SPLASH_MIN_LENGTH` keys, so 'auto' keeps a sequence one lane short of it
+    on xla, while an explicit 'tpu' still gets splash."""
+    query, key, value = qkv((2, SPLASH_MIN_LENGTH - SPLASH_LANES, 8, 128))
+    assert not tpu_runs(query, key, causal=True)
+    assert kernel_chosen(query, key, value, implementation='auto', causal=True) == set()
+    assert kernel_chosen(query, key, value, implementation='tpu', causal=True) == {'splash'}
+    query, key, value = qkv((2, SPLASH_MIN_LENGTH, 8, 128))
+    assert kernel_chosen(query, key, value, implementation='auto', causal=True) == {'splash'}
 
 
 @pytest.mark.parametrize("extra", [

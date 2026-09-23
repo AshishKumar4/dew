@@ -1303,16 +1303,30 @@ SPLASH_DTYPES = (jnp.bfloat16, jnp.float32)
 # device memory that grows with the batch. 4 Mi cells is a 16-head 512x512.
 SPLASH_DENSE_MASK_CELLS = 1 << 22
 
+# The shortest sequence 'auto' hands splash, from tools/qualify_splash.py on
+# one v6e (jax 0.11.1, bf16, 16 query heads over 8 key heads of width 128,
+# 16384 tokens a step, causal). A training step, forward and backward, costs
+# splash 4.78 ms against XLA's 1.68 ms at 128 keys and 3.24 ms against 2.62 ms
+# at 256, then 2.57 against 4.64 at 512, 5.85 against 17.80 at 2048 and 28.9
+# against 144.2 at 16384, with 397 MiB of temporaries against 3180 MiB at
+# 2048. Width 64 crosses at the same length (2.59 against 4.06 ms at 512).
+# Gemma's softcap, GPT-OSS's sinks and packed segment ids cost splash at most
+# 16% more than the plain causal call at every length from 512 to 16384, and a
+# 1024-key window over packed rows less, while XLA's cost for each grows with
+# its [B, H, S, S] logits (all rows in the commit that set this).
+SPLASH_MIN_LENGTH = 512
+
 
 def tpu_runs(query, key, *, causal=False, sliding_window=None, mask=None, bias=None) -> bool:
     """Report whether splash takes this call.
 
     It needs a tpu backend, one of the two dtypes a TPU matmul reads,
-    sequence lengths its mask blocking can tile, a mask it can describe, and
-    no bias. A softcap, sinks and packed segment ids are arguments of the
-    kernel itself, so none of them is read here. Only 'auto' asks this,
-    after `cudnn_runs`; an explicit 'tpu' sends the calls this turns down
-    to the older pallas flash kernel instead.
+    sequence lengths its mask blocking can tile and at least
+    `SPLASH_MIN_LENGTH`, below which XLA's attention measured faster, a mask
+    it can describe, and no bias. A softcap, sinks and packed segment ids
+    are arguments of the kernel itself, so none of them is read here. Only
+    'auto' asks this, after `cudnn_runs`; an explicit 'tpu' sends the calls
+    this turns down to the older pallas flash kernel instead.
 
     The head width is not read, because splash does not constrain it. The
     kernel pads the value width to a whole number of lanes and slices the
@@ -1336,7 +1350,7 @@ def tpu_runs(query, key, *, causal=False, sliding_window=None, mask=None, bias=N
     if sequence_shards() > 1 or bias is not None:
         return False
     q_len, kv_len = query.shape[-3], key.shape[-3]
-    if q_len % SPLASH_LANES or kv_len % SPLASH_LANES:
+    if q_len % SPLASH_LANES or kv_len % SPLASH_LANES or min(q_len, kv_len) < SPLASH_MIN_LENGTH:
         return False
     return splash_mask_descriptor(
         q_len, kv_len, query.shape[-2], causal, sliding_window, mask) is not None
