@@ -184,13 +184,13 @@ class CLIPText(_TextTower):
     def from_pretrained(cls, checkpoint: str = DEFAULT_MODEL, *, dtype=None,
                         revision: str | None = None, param_dtype: str = "float32",
                         params: Variables | None = None) -> CLIPText:
-        from transformers import AutoTokenizer
+        from dew.data.text import load_tokenizer
 
         dtype = resolve_dtype(dtype)
         model = CLIPTextModel.from_pretrained(
             checkpoint, dtype=dtype, revision=revision, param_dtype=param_dtype, variables=params)
         return cls(checkpoint=checkpoint, transformer=model.transformer, params=model.variables,
-                   tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
+                   tokenizer=load_tokenizer(checkpoint, revision=revision),
                    dtype=dtype, param_dtype=param_dtype, revision=revision)
 
     @property
@@ -218,13 +218,13 @@ class T5Text(_TextTower):
                         revision: str | None = None,
                         max_length: int = 256, param_dtype: str = "float32",
                         params: Variables | None = None) -> T5Text:
-        from transformers import AutoTokenizer
+        from dew.data.text import load_tokenizer
 
         dtype = resolve_dtype(dtype)
         model = T5EncoderModel.from_pretrained(
             checkpoint, dtype=dtype, revision=revision, param_dtype=param_dtype, variables=params)
         return cls(checkpoint=checkpoint, transformer=model.transformer, params=model.variables,
-                   tokenizer=AutoTokenizer.from_pretrained(checkpoint, revision=revision),
+                   tokenizer=load_tokenizer(checkpoint, revision=revision),
                    max_length=max_length, dtype=dtype, param_dtype=param_dtype, revision=revision)
 
     @property

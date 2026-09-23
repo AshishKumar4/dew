@@ -1,6 +1,6 @@
 """Tokenizers for language-model data: utf-8 bytes, or any HF tokenizer.
 
-`import dew.data` stays cheap. Neither class imports `transformers` at module
+`import dew.data` stays cheap. Nothing here imports `transformers` at module
 scope, and ByteTokenizer needs nothing but numpy. HFTokenizer loads its
 tokenizer on first use, so a host without the hub cache still imports
 `dew.data.text` (and everything that re-exports it) fine.
@@ -8,11 +8,44 @@ tokenizer on first use, so a host without the hub cache still imports
 
 from __future__ import annotations
 
+import functools
+import threading
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from jax.typing import ArrayLike
+    from transformers import PreTrainedTokenizerBase
+
+
+_load_lock = threading.Lock()
+
+
+# The return stays as transformers types it, unannotated, because the
+# typed PreTrainedTokenizerBase signatures (list[dict[str, str]] chat
+# messages, save_pretrained's tuple) do not satisfy interop's HostProcessor,
+# which `interop.pretrained` hands a loaded tokenizer as.
+def load_tokenizer(name: str, *, revision: str | None = None, local_files_only: bool = False):
+    """The HF tokenizer of a hub repo or local directory, loaded once per process.
+
+    Every Dew path that needs an HF tokenizer loads it here, so one name at
+    one revision is one object however many readers share it. Grain workers
+    unpickle only the name and load their own copy on their first record.
+    """
+    return _loaded(name, revision, local_files_only)
+
+
+# Positional, because functools.cache keys `f(x)` and `f(x, flag=False)` apart.
+@functools.cache
+def _loaded(name: str, revision: str | None, local_files_only: bool):
+    # The lock serializes the first import: transformers swaps in its lazy
+    # module object while it initializes, and two threads importing it
+    # together can catch it half built.
+    with _load_lock:
+        from transformers import AutoTokenizer
+
+        return AutoTokenizer.from_pretrained(
+            name, revision=revision, local_files_only=local_files_only)
 
 
 @runtime_checkable
@@ -66,16 +99,10 @@ class HFTokenizer:
     def __init__(self, name: str, *, local_files_only: bool = False):
         self.name = name
         self.local_files_only = local_files_only
-        self._tokenizer = None
 
     @property
-    def tokenizer(self):
-        if self._tokenizer is None:
-            from transformers import AutoTokenizer
-
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                self.name, local_files_only=self.local_files_only)
-        return self._tokenizer
+    def tokenizer(self) -> PreTrainedTokenizerBase:
+        return load_tokenizer(self.name, local_files_only=self.local_files_only)
 
     @property
     def vocab_size(self) -> int:
