@@ -11,7 +11,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from .attention import RMSNorm
 from .conv import Conv
-from .sharding import logical_axes
+from .sharding import constrain, logical_axes
 
 
 def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
@@ -26,20 +26,51 @@ def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
     return {} if default is None else {"kernel_init": default}
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(2,))
+def table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
+    """`table[ids]` in `dtype`, the table's rows gathered before the cast so
+    the gradient accumulates in the table's dtype: casting the table first
+    would scatter-add repeated tokens' cotangents in bf16."""
+    return jnp.take(table, ids, axis=0).astype(dtype)
+
+
+def _table_rows_forward(table: jax.Array, ids: jax.Array, dtype: Dtype):
+    return table_rows(table, ids, dtype), (table, ids)
+
+
+def _table_rows_backward(dtype: Dtype, residuals: tuple[jax.Array, jax.Array],
+                         cotangent: jax.Array) -> tuple[jax.Array, None]:
+    del dtype
+    table, ids = residuals
+    # The gradient adds each token's cotangent to its row. Under a batch
+    # split GSPMD scattered each device's tokens into a table-sized buffer
+    # and summed the buffers across devices: a table's worth of traffic
+    # decided by the rows. Where the rows are the smaller, every device
+    # gathers all of them, in the compute dtype, and scatters them itself,
+    # into its copy of the table or its shard of the vocabulary, and the
+    # gradient needs no sum.
+    if cotangent.size * cotangent.dtype.itemsize < table.size * table.dtype.itemsize:
+        cotangent = constrain(cotangent, (None,) * cotangent.ndim)
+        ids = constrain(ids, (None,) * ids.ndim)
+    return jnp.zeros_like(table).at[ids].add(cotangent.astype(table.dtype)), None
+
+
+table_rows.defvjp(_table_rows_forward, _table_rows_backward)
+
+
 class TokenEmbedding(nn.Embed):
     """Token lookup with cotangent accumulation in the parameter dtype."""
 
     def __call__(self, inputs: jax.Array) -> jax.Array:
         if not jnp.issubdtype(inputs.dtype, jnp.integer):
             raise ValueError("Input type must be an integer or unsigned integer.")
-        # Casting the table before gathering makes its transpose scatter-add
-        # in the compute dtype, losing repeated-token contributions in bf16.
-        values = (jnp.broadcast_to(self.embedding, (*inputs.shape, self.features))
-                  if self.num_embeddings == 1 else jnp.take(self.embedding, inputs, axis=0))
-        promoted, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
-        if promoted is None:
-            raise ValueError("Embedding dtype promotion must return an array")
-        return promoted
+        if self.num_embeddings == 1:
+            values = jnp.broadcast_to(self.embedding, (*inputs.shape, self.features))
+            promoted, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
+            if promoted is None:
+                raise ValueError("Embedding dtype promotion must return an array")
+            return promoted
+        return table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
 
 
 class FourierEmbedding(nn.Module):
