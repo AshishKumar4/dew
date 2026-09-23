@@ -2362,11 +2362,10 @@ from dew.interop.families.deepseek import (
     _deepseek_v4_config,
     _deepseek_v4_path,
     _deepseek_v4_prepare,
-    _deepseek_v41_config,
-    _deepseek_v41_path,
     _kimi_k25_config,
     _kimi_k25_path,
 )
+from dew.interop.families.deepseek_v41 import _deepseek_v41_config, _deepseek_v41_path
 from dew.interop.families.gemma import (
     _gemma2_config,
     _gemma2_export,
