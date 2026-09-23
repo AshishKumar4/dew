@@ -18,8 +18,10 @@ axes are the matrix.
 
 from __future__ import annotations
 
+import dataclasses
+import fnmatch
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import jax
@@ -312,28 +314,184 @@ OPTIMIZER_MAP = {
 }
 
 
-def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransformation:
-    """Build the solver a config describes, with its schedule and clipping.
+@dataclasses.dataclass(frozen=True)
+class ParamGroup:
+    """Parameters the optimizer moves at their own learning rate and decay.
 
-    `steps` is the run's length, which a cosine schedule decays over unless
-    the config names its own."""
-    learning_rate = config.learning_rate
+    `patterns` are `fnmatch` patterns over a parameter's path, its dict keys
+    joined by '/' (`layers_3/self_attn/q_proj/kernel`); `*` crosses '/'. A
+    parameter joins the first group of `OptimConfig.param_groups` a pattern
+    of which it matches, lm-engine's rule (optimization/params_group.py at
+    45b6b57b), and one that matches none raises. The group's learning rate
+    is the schedule's times `learning_rate_multiplier`; `weight_decay`
+    replaces the config's, None keeping it.
+    """
+
+    name: str
+    patterns: tuple[str, ...]
+    learning_rate_multiplier: float = 1.0
+    weight_decay: float | None = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "patterns", tuple(self.patterns))
+        if not self.patterns:
+            raise ValueError(f"param group {self.name!r} matches no pattern")
+        if self.learning_rate_multiplier <= 0:
+            raise ValueError(
+                f"param group {self.name!r} scales the learning rate by a positive "
+                f"number, got {self.learning_rate_multiplier}")
+
+
+NO_DECAY_PATTERNS = ("*/bias", "*/scale", "*norm/weight", "*/dt_bias")
+"""What lm-engine's `no_weight_decay` group holds (configs/param-groups/
+mup.yml at 45b6b57b): biases, every norm's weight (an RMSNorm keeps `scale`
+here, Mamba-2's gated norm `weight`) and Mamba-2's `dt_bias`."""
+
+
+def mup_param_groups(width_multiplier: float) -> tuple[ParamGroup, ...]:
+    """lm-engine's muP parameter groups (configs/param-groups/mup.yml at
+    45b6b57b), in its order: norms, biases and `dt_bias` without weight
+    decay at the base rate; the token embeddings at the base rate with decay;
+    everything else, the router, `A_log`, `D` and the conv taps included, at
+    the base rate divided by `width_multiplier` (lm-engine's m_width, the
+    model's `logits_scaling`)."""
+    return (
+        ParamGroup("no_weight_decay", NO_DECAY_PATTERNS, weight_decay=0.0),
+        ParamGroup("normal", ("*embed_tokens/*",)),
+        ParamGroup("mup", ("*",), learning_rate_multiplier=1 / width_multiplier),
+    )
+
+
+def param_labels(groups: Sequence[ParamGroup]):
+    """The `optax.multi_transform` labeller: each leaf's first matching group."""
+    def labels(params):
+        def label(path: jax.tree_util.KeyPath, _) -> str:
+            name = "/".join(_dict_names(path))
+            for group in groups:
+                if any(fnmatch.fnmatchcase(name, pattern) for pattern in group.patterns):
+                    return group.name
+            raise ValueError(
+                f"parameter {name} matches no param group's patterns; add a "
+                f"catch-all group, patterns=('*',), if that is intended")
+        return jax.tree_util.tree_map_with_path(label, params)
+    return labels
+
+
+def power_schedule(peak: float, warmup_steps: int, a: float, b: float, c: float = 1.0,
+                   decay_start: int | None = None, decay_end: int | None = None,
+                   end_value: float = 0.0) -> optax.Schedule:
+    """lm-engine's power scheduler (optimization/lr_scheduler/power.py at
+    45b6b57b) with an optional linear tail.
+
+    Past the warmup the rate is `min(peak, a * (step * c) ** b)`: the power
+    law of the batch size and step, arXiv 2408.13359, capped at `peak` (the
+    optimizer's own rate there). The warmup rises linearly from zero to that
+    value at `warmup_steps`. `decay_start` set follows the law to that step
+    and then decays linearly to `end_value` at `decay_end`, which is how
+    Rigel ends its run; lm-engine's scheduler has no tail.
+    """
+    def law(step):
+        return jnp.minimum(peak, a * (jnp.asarray(step, jnp.float32) * c) ** b)
+
+    warm = min(peak, a * (warmup_steps * c) ** b) if warmup_steps else peak
+    pieces = [optax.linear_schedule(0.0, warm, warmup_steps)] if warmup_steps else []
+    pieces.append(lambda count: law(count + warmup_steps))
+    boundaries = [warmup_steps] if warmup_steps else []
+    if decay_start is not None:
+        if decay_end is None or not warmup_steps <= decay_start < decay_end:
+            raise ValueError(
+                f"the linear tail runs from decay_start past the warmup to a later "
+                f"decay_end, got {decay_start} to {decay_end} after {warmup_steps} warmup steps")
+        pieces.append(optax.linear_schedule(float(law(decay_start)), end_value,
+                                            decay_end - decay_start))
+        boundaries.append(decay_start)
+    return optax.join_schedules(pieces, boundaries) if boundaries else pieces[0]
+
+
+def linear_schedule(peak: float, warmup_steps: int, decay_start: int | None,
+                    decay_end: int, end_value: float = 0.0) -> optax.Schedule:
+    """lm-engine's linear scheduler (lr_scheduler/linear.py at 45b6b57b): from
+    zero to `peak` over the warmup, constant to `decay_start` (None: the
+    warmup's end), then linear to `end_value` at `decay_end`."""
+    start = warmup_steps if decay_start is None else decay_start
+    if not warmup_steps <= start < decay_end:
+        raise ValueError(
+            f"the linear decay runs from past the warmup to a later step, got "
+            f"{start} to {decay_end} after {warmup_steps} warmup steps")
+    return optax.join_schedules([
+        optax.linear_schedule(0.0, peak, warmup_steps),
+        optax.constant_schedule(peak),
+        optax.linear_schedule(peak, end_value, decay_end - start),
+    ], [warmup_steps, start])
+
+
+def _scaled(learning_rate, multiplier: float):
+    if multiplier == 1.0:
+        return learning_rate
+    if callable(learning_rate):
+        return lambda count: multiplier * learning_rate(count)
+    return multiplier * learning_rate
+
+
+def learning_rate_schedule(config: OptimConfig, steps: int):
+    """The rate `config` names: a number, or a schedule of the update count.
+
+    `steps` is the run's length, where a schedule ends unless
+    `learning_rate_decay_steps` names its own end."""
+    end = steps if config.learning_rate_decay_steps is None else config.learning_rate_decay_steps
     if config.learning_rate_schedule == 'cosine':
-        decay_steps = (steps if config.learning_rate_decay_steps is None
-                       else config.learning_rate_decay_steps)
-        learning_rate = optax.warmup_cosine_decay_schedule(
-            init_value=learning_rate, peak_value=config.learning_rate_peak,
+        return optax.warmup_cosine_decay_schedule(
+            init_value=config.learning_rate, peak_value=config.learning_rate_peak,
             warmup_steps=config.learning_rate_warmup_steps,
-            decay_steps=decay_steps,
+            decay_steps=end,
             end_value=config.learning_rate_end,
         )
+    if config.learning_rate_schedule == 'power':
+        return power_schedule(
+            config.learning_rate_peak, config.learning_rate_warmup_steps,
+            config.power_a, config.power_b, config.power_c,
+            decay_start=config.learning_rate_decay_start,
+            decay_end=None if config.learning_rate_decay_start is None else end,
+            end_value=config.learning_rate_end)
+    if config.learning_rate_schedule == 'linear':
+        return linear_schedule(config.learning_rate_peak, config.learning_rate_warmup_steps,
+                               config.learning_rate_decay_start, end,
+                               end_value=config.learning_rate_end)
+    return config.learning_rate
+
+
+def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransformation:
+    """Build the solver a config describes, with its schedule, parameter
+    groups and clipping.
+
+    `steps` is the run's length, which a schedule decays over unless the
+    config names its own end. `param_groups` runs one solver per group under
+    `optax.multi_transform`, each on the schedule times its multiplier and
+    with its own weight decay; the global-norm clip still reads every
+    gradient together, before the groups split them."""
+    learning_rate = learning_rate_schedule(config, steps)
     opts = dict(config.optimizer_opts)
     if config.weight_decay is not None:
         opts['weight_decay'] = config.weight_decay
         if config.optimizer in ('muon', 'muonclip'):
             # Muon's weight_decay does not cover the AdamW group's norm scales.
             opts.setdefault('adam_weight_decay', config.weight_decay)
-    solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
+    if config.param_groups:
+        names = [group.name for group in config.param_groups]
+        if len(set(names)) != len(names):
+            raise ValueError(f"param group names repeat: {names}")
+        solvers = {}
+        for group in config.param_groups:
+            group_opts = dict(opts)
+            if group.weight_decay is not None:
+                group_opts['weight_decay'] = group.weight_decay
+                if config.optimizer in ('muon', 'muonclip'):
+                    group_opts['adam_weight_decay'] = group.weight_decay
+            solvers[group.name] = OPTIMIZER_MAP[config.optimizer](
+                _scaled(learning_rate, group.learning_rate_multiplier), **group_opts)
+        solver = optax.multi_transform(solvers, param_labels(config.param_groups))
+    else:
+        solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
 
     if config.clip_grads > 0:
         solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)

@@ -45,7 +45,7 @@ from dew.registry import REGISTRIES, _declared_type, datasets, models, with_prec
 from dew.telemetry.instrumentation import default_compilation_cache_dir
 from dew.telemetry.records import RunRecord, json_value, packages_installed
 from dew.training.distributed import Layout, MeshSpec
-from dew.training.optim import build_optimizer
+from dew.training.optim import ParamGroup, build_optimizer
 from dew.training.quantization import Quantization, quantize
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
@@ -124,13 +124,32 @@ class OptimConfig:
     optimizer: Literal["adam", "adamw", "lamb", "muon", "muonclip"] = "adamw"
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
     learning_rate: float = 2.7e-4
-    learning_rate_schedule: Literal["cosine"] | None = None
+    """The constant rate when no schedule is named, and cosine's starting rate."""
+    learning_rate_schedule: Literal["cosine", "power", "linear"] | None = None
+    """cosine: warmup to the peak, cosine to the end. power: lm-engine's power
+    scheduler, warmup then min(peak, power_a * (step * power_c) ** power_b),
+    with a linear tail to the end from `learning_rate_decay_start` when set.
+    linear: lm-engine's linear scheduler, warmup, constant to
+    `learning_rate_decay_start`, linear to the end (`dew.training.optim`)."""
     learning_rate_peak: float = 3e-4
     learning_rate_end: float = 2e-4
     learning_rate_warmup_steps: int = 10000
     learning_rate_decay_steps: int | None = None
-    """Optimizer updates the cosine decays over; unset uses the training step target."""
+    """The update a schedule ends at; unset uses the training step target."""
+    learning_rate_decay_start: int | None = None
+    """Where power's linear tail and linear's decay begin."""
+    power_a: float = 1.0
+    """The power law's coefficient, lm-engine's `a` (4 * batch size in its
+    examples)."""
+    power_b: float = -0.51
+    """The power law's exponent, lm-engine's `b`."""
+    power_c: float = 1.0
+    """What a step counts for in the law, lm-engine's `c` (tokens per step)."""
     weight_decay: float | None = None
+    param_groups: tuple[ParamGroup, ...] = ()
+    """Per-group learning-rate multipliers and weight decay, first match wins;
+    empty moves every parameter alike. `dew.training.optim.mup_param_groups`
+    is lm-engine's muP split."""
     clip_grads: float = 0.0
 
 
