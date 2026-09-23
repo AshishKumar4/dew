@@ -26,6 +26,7 @@ preview hook writes text from a fixed prompt once per event.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -981,14 +982,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         if alpha is not None:
             statistics, reported["aux_loss"] = self._router_statistics(prediction, routing, alpha)
         if self.router_z_loss:
-            router_z = router_z_terms(routing, self.router_z_loss)
+            router_z = router_z_terms(routing or {}, self.router_z_loss)
             if not router_z:
                 raise ValueError(
                     "router_z_loss needs routers that sow their gate's log partition "
                     "(dew.nn.moe.Router); this model's routers sow none")
             statistics = (LMStatistics(prediction, (), (), router_z) if isinstance(statistics, Mean)
-                          else statistics.replace(router_z=router_z))
-            reported["router_z_loss"] = sum(mean_loss(term)[0] for term in router_z)
+                          else dataclasses.replace(statistics, router_z=router_z))
+            reported["router_z_loss"] = jnp.sum(jnp.stack([mean_loss(term)[0] for term in router_z]))
         effects = None
         if rate is not None:
             effects, load = self._router_load(params, routing)

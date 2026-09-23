@@ -426,11 +426,12 @@ def linear_schedule(peak: float, warmup_steps: int, decay_start: int | None,
     ], [warmup_steps, start])
 
 
-def _scaled(learning_rate, multiplier: float):
+def _scaled(learning_rate: float | optax.Schedule, multiplier: float) -> float | optax.Schedule:
     if multiplier == 1.0:
         return learning_rate
     if callable(learning_rate):
-        return lambda count: multiplier * learning_rate(count)
+        schedule = learning_rate
+        return lambda count: multiplier * schedule(count)
     return multiplier * learning_rate
 
 

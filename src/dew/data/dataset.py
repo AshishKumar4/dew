@@ -988,12 +988,13 @@ class PhasedStream:
     def __init__(self, phases: Sequence[tuple[Callable[[], GlobalStream], int | None]],
                  stop_seconds: float):
         ends = [end for _, end in phases]
-        if not phases or ends[-1] is not None or None in ends[:-1]:
+        bounded = [end for end in ends[:-1] if end is not None]
+        if not phases or ends[-1] is not None or len(bounded) != len(ends) - 1:
             raise ValueError("every phase but the last ends at a record count; the last runs on")
-        if any(later <= earlier for earlier, later in itertools.pairwise([0, *ends[:-1]])):
-            raise ValueError(f"phase ends must increase from above zero, got {ends[:-1]}")
+        if any(later <= earlier for earlier, later in itertools.pairwise([0, *bounded])):
+            raise ValueError(f"phase ends must increase from above zero, got {bounded}")
         self._streams = [open_stream() for open_stream, _ in phases]
-        self._ends = tuple(ends[:-1])
+        self._ends: tuple[int, ...] = tuple(bounded)
         self._records = 0
         self._current: int | None = None
         self.stop_seconds = stop_seconds
