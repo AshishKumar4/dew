@@ -509,11 +509,15 @@ class Trainer(Generic[Loss, Effects]):
     def _loss_shape(self, state: TrainState, batch: Batch):
         # Shapes and dtypes only: a resident frozen leaf sits in another
         # memory space than the moving ones, and the loss the realization
-        # runs reads a snapshot in one space.
+        # runs reads a snapshot in one space. The step's key is drawn inside
+        # the trace, so an abstract state compiles a step as a placed one does.
         params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.params)
-        step_info = Step(state.microstep, jax.random.fold_in(state.key, state.step),
-                    with_ema(params, state.ema))
-        return jax.eval_shape(self.objective.loss, params, batch, step_info)
+
+        def loss(params, batch, microstep, key, step, ema):
+            return self.objective.loss(
+                params, batch, Step(microstep, jax.random.fold_in(key, step), with_ema(params, ema)))
+
+        return jax.eval_shape(loss, params, batch, state.microstep, state.key, state.step, state.ema)
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, shape_only=False):
         if self.accumulation == 1 or self.step is not None or state.accumulation is not None:
