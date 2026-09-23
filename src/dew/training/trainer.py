@@ -32,7 +32,7 @@ from termcolor import colored
 from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
-from dew.nn.sharding import pipeline_microbatches
+from dew.nn.sharding import STAGE_AXIS, Schedule, pipeline_microbatches
 from dew.objectives.base import (
     FROZEN,
     Aux,
@@ -570,14 +570,14 @@ class Trainer(Generic[Loss, Effects]):
         return Transaction(self.objective, self.optimizer, self.accumulation, shapes).step()
 
     @contextlib.contextmanager
-    def _traced_on(self, mesh: Mesh) -> Iterator[None]:
+    def _traced_on(self, mesh: Mesh) -> Iterator[Schedule]:
         """What a traced step reads from context: the mesh, the pipeline's
         microbatch count, and the layout's rules, which place the activations
         the model constrains (`dew.nn.sharding.constrain`) as they place the
         parameters."""
-        with (jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches),
+        with (jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches) as schedule,
               nn.logical_axis_rules(self.layout.axis_rules)):
-            yield
+            yield schedule
 
     def compile(self, state: TrainState, batch: Batch) -> CompiledStep:
         """Compile a transaction over state and one already-produced global batch.
@@ -600,8 +600,14 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             return self._compile_host(state, batch)
         mesh = self.device_mesh
-        with self._traced_on(mesh):
+        with self._traced_on(mesh) as schedule:
             shapes = None if self.step is not None else self._loss_shape(state, batch)
+            if shapes is not None and mesh.shape[STAGE_AXIS] > 1 and not schedule.pipelined:
+                raise ValueError(
+                    f"the stage axis of {mesh.shape[STAGE_AXIS]} holds a pipeline's stages of "
+                    f"a decoder's layer stack, and {type(self.objective).__name__}'s model runs "
+                    f"no pipeline, so every stage would compute the whole step; give those "
+                    f"devices to the data or fsdp axis")
             prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
             body = self.step(self.objective, self.optimizer) if self.step is not None else self._default_step(shapes)
             shardings = self.shardings(prepared)

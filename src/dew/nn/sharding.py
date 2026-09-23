@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import dataclasses
 import fnmatch
 import math
 from collections.abc import Iterable, Iterator, Mapping
@@ -158,8 +159,18 @@ DECLARED: dict[Suffix, LogicalAxes] = {}
 HEURISTIC: set[Suffix] = set()
 """Runs of name patterns whose parameters take the shape heuristic on purpose."""
 
-_MICROBATCHES: contextvars.ContextVar[int | None] = contextvars.ContextVar(
-    'pipeline_microbatches', default=None)
+@dataclasses.dataclass
+class Schedule:
+    """The microbatch count a step feeds the stage axis, and whether a model
+    in the step ran a pipeline over it, which `microbatches` notes as the
+    pipeline reads the count."""
+
+    count: int | None
+    pipelined: bool = False
+
+
+_SCHEDULE: contextvars.ContextVar[Schedule | None] = contextvars.ContextVar(
+    'pipeline_schedule', default=None)
 
 
 def pipeline_stages() -> int:
@@ -175,21 +186,27 @@ def pipeline_stages() -> int:
 
 
 @contextlib.contextmanager
-def pipeline_microbatches(count: int | None) -> Iterator[None]:
+def pipeline_microbatches(count: int | None) -> Iterator[Schedule]:
     """How many microbatches a step feeds the stage axis, for the model that
     traces inside. None leaves one microbatch per stage, the smallest schedule
-    a pipeline runs."""
-    token = _MICROBATCHES.set(count)
+    a pipeline runs. The schedule yielded says, once the step has traced,
+    whether a pipeline ran."""
+    schedule = Schedule(count)
+    token = _SCHEDULE.set(schedule)
     try:
-        yield
+        yield schedule
     finally:
-        _MICROBATCHES.reset(token)
+        _SCHEDULE.reset(token)
 
 
 def microbatches() -> int:
-    """The microbatch count in context, or one per stage of the mesh in context."""
-    count = _MICROBATCHES.get()
-    return pipeline_stages() if count is None else count
+    """The microbatch count in context, or one per stage of the mesh in
+    context. A pipeline reads it as it runs."""
+    schedule = _SCHEDULE.get()
+    if schedule is None:
+        return pipeline_stages()
+    schedule.pipelined = True
+    return pipeline_stages() if schedule.count is None else schedule.count
 
 
 def sequence_shards() -> int:
