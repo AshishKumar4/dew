@@ -7,9 +7,8 @@ one leaf: the stored tensors it comes from (memory-mapped views), whether
 their trailing pair of axes swaps (torch Linear `[out, in]` to Dense
 `[in, out]`), whether they stack onto a leading expert axis, and the dtype
 the leaf is kept in. `read(index)` builds only the part a device asks for,
-so `jax.make_array_from_callback` lands each leaf straight on its sharding
-and a process holds at most one device shard of it on the host
-(`dew.training.host.place_leaf`).
+and `dew.training.host.place_leaf` puts each part on its device before it
+reads the next, so a process holds one device shard of one leaf at a time.
 """
 from __future__ import annotations
 
