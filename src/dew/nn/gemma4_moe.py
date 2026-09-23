@@ -18,7 +18,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
-from dew.nn.moe import ExpertMLP, Situ
+from dew.nn.moe import ExpertMLP, GatedActivation
 from dew.nn.sharding import logical_axes
 
 
@@ -66,7 +66,7 @@ class Gemma4Experts(nn.Module):
     top_k: int
     hidden_features: int
     out_features: int
-    activation: str | Situ = 'geglu'
+    activation: GatedActivation = 'geglu'
     implementation: str = 'xla'
     dispatch: str = 'global'
     norm_eps: float = 1e-6
