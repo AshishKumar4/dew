@@ -60,9 +60,14 @@ class LmRunConfig(LMRunConfig):
             raise ValueError("block_diffusion requires data:token-windows, not packed documents")
 
 
-def token_directories(path: str | Mapping[str, float] | None) -> list[Path]:
+def read_corpora(data: TokenSpec) -> str | list[str] | None:
+    """What the run reads: --data.path, or every corpus the phases name."""
+    return data.corpora if isinstance(data, PackedTokens) and data.phases else data.path
+
+
+def token_directories(path: str | Mapping[str, float] | list[str] | None) -> list[Path]:
     """The directories tools/tokenize_text.py wrote, which --data.path names:
-    one, or each corpus of a weighted mixture."""
+    one, or each corpus of a weighted mixture or of the phases."""
     if not path:
         raise ValueError("--data.path is the token directory tools/tokenize_text.py wrote")
     directories = [Path(path)] if isinstance(path, str) else [Path(name) for name in sorted(path)]
@@ -74,7 +79,7 @@ def token_directories(path: str | Mapping[str, float] | None) -> list[Path]:
     return directories
 
 
-def token_meta(path: str | Mapping[str, float] | None) -> dict:
+def token_meta(path: str | Mapping[str, float] | list[str] | None) -> dict:
     """The tokenizer and vocabulary the token files were written with.
 
     A mixture's corpora feed one embedding table, so they have to record
@@ -195,7 +200,7 @@ def run_summary(config: LmRunConfig, fields: Mapping[str, object]) -> dict:
     return {
         **fields,
         "architecture": config.model.architecture,
-        "dataset": config.data.path,
+        "dataset": read_corpora(config.data),
         "sequence_length": config.data.seq_len,
         "tokenizer": config.tokenizer,
         "batch_size": config.trainer.batch_size,
@@ -252,7 +257,7 @@ def main(config: LmRunConfig) -> TrainState:
                     config.trainer.xla_flags, config.trainer.compilation_cache_dir,
                     layout=config.trainer.layout)
 
-    meta = token_meta(config.data.path)
+    meta = token_meta(read_corpora(config.data))
     if config.tokenizer != meta['tokenizer']:
         # Decoding with a different tokenizer than the ids were written with
         # produces text that says nothing about the model.
@@ -288,12 +293,12 @@ def main(config: LmRunConfig) -> TrainState:
         resolved["max_seq_len"] = model.max_seq_len
     config = replace(config, model=replace(config.model, config=resolved))
     name = config.trainer.name or (
-        f"{config.objective}-{'+'.join(d.name for d in token_directories(config.data.path))}/"
+        f"{config.objective}-{'+'.join(d.name for d in token_directories(read_corpora(config.data)))}/"
         f"seq-{config.data.seq_len}/"
         f"lr-{config.optim.learning_rate}/"
         f"date-{run_timestamp()}")
     summary = {"model": fields, "arguments": run_summary(config, fields),
-               "dataset": {"path": config.data.path, "records": data.records,
+               "dataset": {"path": read_corpora(config.data), "records": data.records,
                            "tokens": meta.get("train_tokens")}}
     validation = (metrics.perplexity(),)
     if config.objective == "masked_diffusion":
@@ -309,6 +314,9 @@ def main(config: LmRunConfig) -> TrainState:
         samples=samples,
         pretrained=pretrained,
         balance_rate=config.balance_rate,
+        aux_loss_alpha=config.aux_loss_alpha,
+        seq_aux=config.seq_aux,
+        router_z_loss=config.router_z_loss,
         mtp_weight=config.mtp_weight,
         indexer=config.indexer,
         qk_stats=config.optim.optimizer == "muonclip",
