@@ -15,6 +15,7 @@ The entry lives there rather than here so that one table names every family.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -68,15 +69,19 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
     # forward reads at fp32.
     read.update(("time_step_rank", "time_step_min", "time_step_max", "time_step_floor",
                  "residual_in_fp32", "rescale_prenorm_residual", "time_step_limit", "layer_norm_epsilon"))
-    # The reference leaves the upper bound open by default, and a file that
-    # states one writes it as the {"__float__": "Infinity"} record `records`
-    # reads; the default is this module's own value and is not read from one.
+    # The reference leaves the upper bound open by default. transformers
+    # 5.x writes an infinite bound as the {"__float__": "Infinity"} record
+    # `records` reads, and every published port (AntonV/mamba2-130m-hf,
+    # Mamba-Codestral-7B) writes JSON's bare `Infinity`, which json.loads
+    # (and so transformers) reads as float('inf'); the default is this
+    # module's own value and is not read from one.
     lower, upper = 0.0, float("inf")
     if "time_step_limit" in hf_config:
         limit = hf_config["time_step_limit"]
         if not isinstance(limit, (list, tuple)) or len(limit) != 2:
             raise ValueError(f"time_step_limit is a (lower, upper) pair, got {limit!r}")
-        lower, upper = (records.number(bound, "time_step_limit") for bound in limit)
+        lower, upper = (math.inf if isinstance(bound, float) and bound == math.inf
+                        else records.number(bound, "time_step_limit") for bound in limit)
     mixer = Mamba2Mixer(
         num_heads=heads, head_dim=head_dim,
         state_size=integer("state_size", 128),
