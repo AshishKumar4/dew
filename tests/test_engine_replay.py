@@ -45,8 +45,8 @@ def test_packed_scoring_computes_the_engines_filtered_likelihoods(objective):
     """With the engine's routing replayed and each id renormalized over the
     support vLLM kept at its temperature, Dew's fp32 likelihoods are as
     close to transformers' float64 ones as transformers' own fp32 run
-    (`reference_error`); the record's references were computed on its
-    routing. The tempered full-vocabulary likelihood misses by far more."""
+    (`reference_error`), and vLLM's reported ones as transformers' bf16 run
+    on the record's routing: both tie the scored likelihood to the engine's. The tempered full-vocabulary likelihood misses by far more."""
     grpo, variables = objective
     _, batch = engine_batch()
     sampled = batch["response_mask"] != 0
@@ -56,6 +56,11 @@ def test_packed_scoring_computes_the_engines_filtered_likelihoods(objective):
                         for name in ("float32", "float64"))
     scored = np.asarray(grpo.packed_log_probs(variables, batch))[sampled][order]
     assert_as_exact_as_the_reference(scored, reference, truth, "filtered log-probs")
+    # The engine leg: vLLM's bf16 behavior likelihoods are as close to the
+    # truth as transformers' bf16 run on the record's routing.
+    engine = np.asarray(batch["behavior_log_probs"])[sampled][order]
+    bf16 = np.concatenate([call["reference"]["bfloat16"] for call in RECORD["calls"]])
+    assert_as_exact_as_the_reference(engine, bf16, truth, "vLLM's behavior log-probs")
     unfiltered = {key: value for key, value in batch.items() if key not in ("support_ids", "support_columns")}
     raw = np.asarray(grpo.packed_log_probs(variables, unfiltered))[sampled][order]
     assert np.abs(raw - truth).max() > 0.5
