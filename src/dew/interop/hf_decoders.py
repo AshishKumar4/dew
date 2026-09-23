@@ -1628,7 +1628,7 @@ def _stack_experts(params: LazyTree) -> None:
     # An MTP depth's block routes like the layer before it.
     for depth, block in params.items():
         nested = block.get('block') if isinstance(block, dict) else None
-        if depth.startswith('mtp_') and isinstance(nested, dict):
+        if depth.startswith(('mtp_', 'dspark_')) and isinstance(nested, dict):
             blocks.append((depth, nested))
     for layer, block in blocks:
         mlp = block.get('mlp')
@@ -2360,6 +2360,8 @@ from dew.interop.families.deepseek import (
     _deepseek_v4_config,
     _deepseek_v4_path,
     _deepseek_v4_prepare,
+    _deepseek_v41_config,
+    _deepseek_v41_path,
     _kimi_k25_config,
     _kimi_k25_path,
 )
@@ -2479,6 +2481,13 @@ _FAMILY_ENTRIES = (
                                   and mixer.index_rope_interleave),
                   'glm_moe_dsa', 'GlmMoeDsaForCausalLM', lambda model: {},
                   weight_path=_glm4_moe_path, preserve_source_layout=True),
+    # V4.1 is V4's block under CSA2's compressor, which names the family.
+    DecoderFamily(('deepseek_v41',), _deepseek_v41_config,
+                  lambda fields: any(isinstance(mixer, DeepseekV4Mixer) and mixer.compressor == 'csa2'
+                                     for mixer in _kind_mixers(fields)),
+                  'deepseek_v41', 'DeepseekV41ForCausalLM', lambda model: {},
+                  weight_path=_deepseek_v41_path, prepare_weights=_deepseek_v4_prepare,
+                  preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight')),
     # V4's block is nothing another family builds: the mixer kind names its
     # window, its compressor and its grouped output projection at once.
     DecoderFamily(('deepseek_v4',), _deepseek_v4_config,
