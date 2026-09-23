@@ -56,8 +56,7 @@ def check_rollout(groups: int, max_new_tokens: int, estimator: str) -> None:
 
 def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np.ndarray,
                     lengths: np.ndarray, terminated: np.ndarray, behavior: np.ndarray,
-                    rewards: np.ndarray, versions: np.ndarray, estimator: str) -> tuple[dict[str, np.ndarray],
-                                                                                   list[Session]]:
+                    rewards: np.ndarray, versions: np.ndarray, estimator: str) -> dict[str, np.ndarray]:
     """Pack `[rows, groups, ...]` completions as one-call rollouts through `pack`.
 
     `prompts` is `[rows, width]` left-padded ids with `prompt_lengths` real
@@ -65,8 +64,9 @@ def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np
     `lengths` valid actions per draw, `terminated` whether each stopped at
     EOS; `rewards` and `versions` are `[rows, groups]`. Each prompt's group
     is advantaged by the `estimator` family. The batch is `rows * groups` rows
-    of `width + R` ids, the packed layout every GRPO batch has; the rollouts
-    come back so a caller can place per-call values with `sampled_values`.
+    of `width + R` ids, the packed layout every GRPO batch has; session
+    `row * groups + group` is that draw, which is what `sampled_values`
+    hands its callback.
     """
     rows, groups, budget = sampled.shape
     width = prompts.shape[1]
@@ -80,7 +80,7 @@ def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np
                         "stop" if bool(terminated[row, group]) else "length", int(versions[row, group]))
             rollouts.append(Session(str(row), "", group, 0, (call,), Status.COMPLETED,
                                     float(rewards[row, group])))
-    return pack(rollouts, width + budget, rows=rows * groups, estimator=estimator), rollouts
+    return pack(rollouts, width + budget, rows=rows * groups, estimator=estimator)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -161,7 +161,7 @@ class SampledRollout:
                          truths[row], infos[row]) for group in range(self.groups)]
             for row in range(rows)], np.float32)
         versions = np.full((rows, self.groups), int(state.updates), np.int32)
-        packed, _ = completion_rows(prompts, prompt_lengths, sampled, lengths, terminated, behavior,
+        packed = completion_rows(prompts, prompt_lengths, sampled, lengths, terminated, behavior,
                                     rewards, versions, self.estimator)
         packed[OLD_LOG_PROBS_KEY] = sampled_values(
             packed, lambda index, _: raw[index // self.groups, index % self.groups,

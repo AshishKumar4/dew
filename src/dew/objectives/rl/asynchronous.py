@@ -241,7 +241,7 @@ class AsyncRollout:
                 behavior[row, group, :count] = draw.behavior_log_probs
                 raw.append(None if draw.raw_log_probs is None else tuple(draw.raw_log_probs))
                 rewards[row, group] = value
-        packed, _ = completion_rows(entry.prompts, entry.lengths, sampled, lengths, terminated, behavior,
+        packed = completion_rows(entry.prompts, entry.lengths, sampled, lengths, terminated, behavior,
                                     rewards, versions, self.estimator)
         if lag > 0 or any(values is None for values in raw):
             packed[OLD_LOG_PROBS_KEY] = np.asarray(self._rescore(state.params, packed), np.float32)
