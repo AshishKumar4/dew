@@ -298,7 +298,10 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
                 decoders._check_tree(variables, model)
             except ValueError as error:
                 raise _refuse(model_type, f"its tensors do not fill the convention's model ({error})") from error
-            actual = np.asarray(model.apply(variables, ids))
+            # `_ROUNDING` was measured at fp32 matmul precision; a GPU's
+            # default runs fp32 matmuls in TF32, which alone misses it.
+            with jax.default_matmul_precision("highest"):
+                actual = np.asarray(model.apply(variables, ids))
     error = float(np.abs(actual - expected).max())
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     bound = float(2 * _ROUNDING * np.finfo(np.float32).eps * layers * np.abs(expected).max())
