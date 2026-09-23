@@ -52,7 +52,8 @@ Weights are pushed through `weights` when the served version falls
 `ahead + sync_every - 1` updates stale at consumption, and construction
 refuses a `max_lag` below that. Admitted groups are packed by `pack` into
 fixed `[rows, width]` rows; `pack` computes the per-rollout advantages and
-masks. The proximal policy is the trainer's current weights, rescored over
+masks. A complete group whose chains do not fit `rows` beside the groups
+admitted before it is cut, never packed into a failing step. The proximal policy is the trainer's current weights, rescored over
 the packed rows with `GRPOObjective.packed_log_probs` (decoupled PPO, AReaL
 arXiv:2505.24298): sources report behavior likelihoods only, and the
 objective's `behavior_importance` weights each token
@@ -90,6 +91,7 @@ from .sessions import (
     Task,
     check_truncation,
     pack,
+    rows_needed,
     session_metrics,
 )
 
@@ -116,7 +118,9 @@ class SchedulerRecord:
     admitted groups; `resubmitted` counts resubmissions by cause
     (`infra_error`, `cancelled`, `stale`); `cancelled` counts in-flight
     rollouts cancelled as surplus, stale or abandoned; `abandoned` counts
-    groups given up after `max_attempts`; `waited` is the seconds the
+    groups given up after `max_attempts`; `cut` counts complete groups
+    left out because their chains did not fit the batch's `rows`, beside
+    the groups admitted before them; `waited` is the seconds the
     trainer waited. `metrics` is `session_metrics` over the admitted
     rollouts and their packed batch: merge ratio, status shares and masked
     shares, mean reward and reward components, submission-to-finish
@@ -130,6 +134,7 @@ class SchedulerRecord:
     resubmitted: Mapping[str, int]
     cancelled: int
     abandoned: int
+    cut: int
     waited: float
     metrics: Mapping[str, float]
 
@@ -179,6 +184,7 @@ class _Tally:
     resubmitted: Counter[str] = field(default_factory=Counter)
     cancelled: int = 0
     abandoned: int = 0
+    cut: int = 0
 
 
 class RolloutScheduler:
@@ -360,7 +366,26 @@ class RolloutScheduler:
         finished = sample.finished[0] if sample.finished else time.perf_counter()
         group.latencies.append(finished - sample.started)
         if len(group.done) == self.groups:
+            self._fit(entry, group, tally)
+
+    def _fit(self, entry: _Entry, group: _Group, tally: _Tally) -> None:
+        """Admit a complete group when its chains fit `rows` beside those admitted before it; cut it otherwise.
+
+        A session whose calls do not extend each other packs as one chain
+        per call, so the rows a group needs are known only once it is done.
+        """
+        admitted = [session for complete in entry.complete for session in complete.done[:self.groups]]
+        needed = rows_needed([*admitted, *group.done], self.width, truncation=self.truncation)
+        if needed <= self.rows:
             entry.complete.append(group)
+            return
+        if not entry.complete:
+            raise ValueError(f"one group of task {group.task.id} needs {needed} rows of {self.width} ids, "
+                             f"more than rows={self.rows}; size rows for sessions whose calls split into chains")
+        tally.cut += 1
+        tally.cancelled += len(group.live)
+        self._cancel(group.live)
+        group.live.clear()
 
     def _admit(self, entry: _Entry, updates: int, tally: _Tally) -> list[_Group]:
         """Wait for the entry's first `admit` complete groups, then cancel the rest."""
@@ -420,6 +445,6 @@ class RolloutScheduler:
             oldest = min(versions, default=updates)
             self.log(SchedulerRecord(
                 updates, oldest, updates - oldest, len(admitted), dict(tally.resubmitted), tally.cancelled,
-                tally.abandoned, waited, session_metrics(rollouts, packed, latencies=latencies, version=updates,
+                tally.abandoned, tally.cut, waited, session_metrics(rollouts, packed, latencies=latencies, version=updates,
                                                        truncation=self.truncation)))
         return packed
