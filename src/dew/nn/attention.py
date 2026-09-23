@@ -125,6 +125,14 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
     return mask
 
 
+def with_key_lengths(mask: jax.Array | None, lengths: jax.Array, key_length: int) -> jax.Array:
+    """`mask` narrowed to each row's first `lengths[b]` keys, `[B, 1, 1, K]`
+    where there was no mask. This is the mask a `key_value_seq_lengths`
+    call means on the paths whose kernel takes no lengths."""
+    kept = (jnp.arange(key_length) < lengths[:, None])[:, None, None, :]
+    return kept if mask is None else jnp.logical_and(mask, kept)
+
+
 def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = False,
                          sliding_window: int | None = None,
                          mask: jax.Array | None = None,
@@ -388,7 +396,8 @@ def widen_value_heads(query, value):
     return jnp.pad(value, ((0, 0),) * (value.ndim - 1) + ((0, width - v_width),))
 
 
-def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
+def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
+                    key_value_seq_lengths=None):
     """Run jax's cudnn flash attention over any sequence length.
 
     cudnn's kernel has no backward pass for an odd query or key length; jax
@@ -396,8 +405,10 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
     are odd, as is every concatenated text-plus-image sequence. One zero row
     of padding makes the length even. A padded query row's output is sliced
     off and a padded key is hidden by the kernel's own padding mask
-    (key_value_seq_lengths), so every real query attends to the keys it had.
-    tests/test_kernels.py pins the equality with the xla path.
+    (key_value_seq_lengths): the caller's lengths, which never reach past
+    the real keys, or else the real length. So every real query attends to
+    the keys it had. tests/test_kernels.py pins the equality with the xla
+    path.
     """
     q_len, kv_len = query.shape[-3], key.shape[-3]
     q_pad, kv_pad = q_len % 2, kv_len % 2
@@ -411,7 +422,9 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window):
                            constant_values=fill)
         mask = None if mask is None else pad_tail(mask, fill=False)
         bias = None if bias is None else pad_tail(bias, 0)
-    kv_lengths = None if kv_pad == 0 else jnp.full(key.shape[:1], kv_len, jnp.int32)
+    kv_lengths = key_value_seq_lengths
+    if kv_lengths is None and kv_pad:
+        kv_lengths = jnp.full(key.shape[:1], kv_len, jnp.int32)
     # A left window of l means the l+1 most recent keys on both the xla and
     # the cudnn path, which is the window this function counts.
     out = jax.nn.dot_product_attention(
@@ -460,7 +473,7 @@ def unstripe(x, shards: int, axis: int = 1):
 
 
 def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causal,
-                                sliding_window, mask, bias, sinks):
+                                sliding_window, mask, bias, sinks, key_value_seq_lengths=None):
     """Run `kernel` over a sequence the mesh's sequence axis splits.
 
     Two exchanges are exact for every call they take, and they differ in
@@ -484,7 +497,8 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
                                                      reordered=reordered)
            else gathered_keys_attention)
     return run(kernel, query, key, value, shards, causal=causal,
-               sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks)
+               sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks,
+               key_value_seq_lengths=key_value_seq_lengths)
 
 
 def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int, *,
@@ -521,7 +535,7 @@ def all_to_all_moves_less(heads: int, kv_heads: int, tensor: int, shards: int, *
 
 
 def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
-                              sliding_window, mask, bias, sinks):
+                              sliding_window, mask, bias, sinks, key_value_seq_lengths=None):
     """DeepSpeed Ulysses: trade a slice of the sequence for a slice of the heads.
 
     Each shard holds S/n rows of every head. One all-to-all per operand over
@@ -543,7 +557,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     heads beside the key heads they read. A mask or bias with a head
     dimension is split with the heads, and its query and key dimensions
     arrive whole, as the kernel reads them. Learned sinks split with the
-    heads they belong to.
+    heads they belong to, and key lengths with the rows they count.
 
     Batch rows split over every batch axis that still divides them, in mesh
     order; a batch too small for the rest is attended alike on those axes'
@@ -580,6 +594,8 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     extras = {name: whole_rows(x) for name, x in (('mask', mask), ('bias', bias)) if x is not None}
     if sinks is not None:
         extras['sinks'] = (sinks, P(head_entry))
+    if key_value_seq_lengths is not None:
+        extras['key_value_seq_lengths'] = (key_value_seq_lengths, P(row_entry))
     names = tuple(extras)
 
     def local(query, key, value, *arrays):
@@ -587,7 +603,8 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
                              for x in (query, key, value))
         given = dict(zip(names, arrays, strict=True))
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
-                     mask=given.get('mask'), bias=given.get('bias'), sinks=given.get('sinks'))
+                     mask=given.get('mask'), bias=given.get('bias'), sinks=given.get('sinks'),
+                     key_value_seq_lengths=given.get('key_value_seq_lengths'))
         return jax.lax.all_to_all(out, SEQUENCE_AXIS, 1, 2, tiled=True)
 
     # Every axis the context leaves automatic goes manual here, those the
@@ -608,7 +625,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
 
 
 def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
-                            sliding_window, mask, bias, sinks):
+                            sliding_window, mask, bias, sinks, key_value_seq_lengths=None):
     """Run `kernel` with the queries split along the mesh's sequence axis.
 
     The keys and values are gathered whole once. Batch rows stay split over
@@ -623,7 +640,8 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     mask and the caller's rotary angles exact under the reorder. Under the
     reorder the kernels see that mask and not their causal flag, because a
     striped row's position is no longer its index. A call with no mask has
-    equal work on every row and keeps its order.
+    equal work on every row and keeps its order. Key lengths count the
+    whole keys, which neither order moves.
     """
     mesh = jax.sharding.get_abstract_mesh()
     rows = tuple(axis for axis in mesh.axis_names
@@ -635,7 +653,8 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     key, value = constrain(key, whole), constrain(value, whole)
     if not (causal or sliding_window is not None or mask is not None):
         return constrain(kernel(query, key, value, causal=False, sliding_window=None,
-                                mask=None, bias=bias, sinks=sinks), split)
+                                mask=None, bias=bias, sinks=sinks,
+                                key_value_seq_lengths=key_value_seq_lengths), split)
 
     q_len, kv_len = query.shape[-3], key.shape[-3]
     query = constrain(stripe(query, shards), split)
@@ -652,7 +671,7 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
             stripe(jnp.arange(q_len), shards, axis=0), kv_len, sliding_window)
         mask = structural if mask is None else jnp.logical_and(mask, structural)
     out = kernel(query, key, value, causal=False, sliding_window=None, mask=mask, bias=bias,
-                 sinks=sinks)
+                 sinks=sinks, key_value_seq_lengths=key_value_seq_lengths)
     return constrain(unstripe(constrain(out, split), shards), split)
 
 
@@ -729,7 +748,8 @@ def softcapped_attention(query, key, value, softcap: float, dtype=None, precisio
 def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  force_fp32_for_softmax=True, implementation='auto',
                                  causal=False, sliding_window=None, mask=None, bias=None,
-                                 sinks=None, softcap=None, segment_ids=None):
+                                 sinks=None, softcap=None, segment_ids=None,
+                                 key_value_seq_lengths=None):
     """Attend over [B, S, H, D] queries, keys and values.
 
     Picks the kernel `implementation` names and returns [B, S, H, Dv]. The
@@ -757,6 +777,15 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     with 0 as padding (`document_mask`); splash reads the ids, and every
     other kernel reads the document mask built from them.
 
+    `key_value_seq_lengths` is a `[B]` count of the keys each row attends:
+    row b reads keys 0..lengths[b]-1 and none after, which is how a
+    right-padded sequence excludes its padding. cuDNN takes it as its
+    padding mask and skips the padded keys, xla builds the mask from it, and
+    the other paths read it as `with_key_lengths` spells it out. A mask that
+    only ends each row's keys early costs cuDNN a dense additive bias read
+    once per head, so a caller whose valid keys lead the sequence passes the
+    lengths instead.
+
     Under a mesh whose sequence axis is above one, the call runs through
     `sequence_parallel_attention`.
 
@@ -783,10 +812,12 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     if shards > 1:
         out = sequence_parallel_attention(
             kernel, query, key, value, shards, causal=causal,
-            sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks)
+            sliding_window=sliding_window, mask=mask, bias=bias, sinks=sinks,
+            key_value_seq_lengths=key_value_seq_lengths)
     else:
         out = kernel(query, key, value, causal=causal, sliding_window=sliding_window,
-                     mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids)
+                     mask=mask, bias=bias, sinks=sinks, segment_ids=segment_ids,
+                     key_value_seq_lengths=key_value_seq_lengths)
     return checkpoint_name(out, 'attention_output')
 
 
@@ -825,14 +856,15 @@ def refuse_reference_only_arguments(implementation, query, dtype, precision,
 
 
 def fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
-                    softcap, sinks, segment_ids):
+                    softcap, sinks, segment_ids, key_value_seq_lengths):
     """Run the fused kernel `implementation` names, at the query's head width.
 
     Every fused kernel runs one head width for the keys and the values, so a
     narrower value rides in padded and its own columns come back out. The
     widths a caller passes are static, so this costs no runtime branch.
     A softcap, sinks and segment ids reach only 'tpu'; `attention_kernel`
-    runs them elsewhere on its own paths.
+    runs them elsewhere on its own paths. `key_value_seq_lengths` goes to
+    the cudnn and xla kernels as lengths and to 'tpu' as the mask it means.
     """
     v_head_dim = value.shape[-1]
     if v_head_dim != query.shape[-1]:
@@ -850,15 +882,19 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 f"cudnn attention needs a head dimension that is a multiple of 8 "
                 f"and at most {CUDNN_MAX_HEAD_DIM}, got {head_dim}; use attention_impl "
                 "'xla' for this shape.")
-        out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window)
+        out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
+                              key_value_seq_lengths)
     elif implementation == 'xla':
         # A left window of l means the l+1 most recent keys on both the xla and
         # the cudnn path, which is the window this function counts.
         out = jax.nn.dot_product_attention(
             query, key, value, bias=bias, mask=mask, is_causal=causal,
+            key_value_seq_lengths=key_value_seq_lengths,
             local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
             implementation='xla')
     elif implementation == 'tpu':
+        if key_value_seq_lengths is not None:
+            mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
         out = tpu_attention(query, key, value, bias, mask, causal, sliding_window,
                             softcap=softcap, sinks=sinks, segment_ids=segment_ids,
                             interpret=jax.default_backend() != 'tpu')
@@ -870,7 +906,7 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
 def attention_kernel(query, key, value, dtype=None, precision=None,
                      force_fp32_for_softmax=True, implementation='auto',
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
-                     softcap=None, segment_ids=None):
+                     softcap=None, segment_ids=None, key_value_seq_lengths=None):
     """Dispatch one whole-sequence attention call to the kernel it names.
 
     'auto' resolves here, against this call's shapes and this machine's
@@ -878,7 +914,9 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     Anywhere else the segment ids become the document mask, and sinks and a
     softcap run their own XLA paths, because `jax.nn.dot_product_attention`
     has neither argument. What is left goes to `fused_attention`, after the
-    arguments it cannot honour raise.
+    arguments it cannot honour raise. Key lengths reach the cudnn and xla
+    kernels as they are; every other path reads them as the mask they mean,
+    which splash cannot describe, so 'auto' never picks 'tpu' for them.
     """
     if sliding_window is not None and sliding_window < 1:
         raise ValueError(f"sliding_window must be positive, got {sliding_window}")
@@ -886,12 +924,16 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         raise ValueError(
             "attention sinks and a logit softcap have no reference that "
             "combines them, so no path takes both")
+    lengths = (None if key_value_seq_lengths is None
+               else jnp.asarray(key_value_seq_lengths, jnp.int32))
+    masked = mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3])
     implementation = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-        causal=causal, sliding_window=sliding_window, mask=mask, bias=bias)
+        causal=causal, sliding_window=sliding_window, mask=masked, bias=bias)
     if segment_ids is not None and implementation != 'tpu':
         mask = with_documents(mask, segment_ids)
+        masked = with_documents(masked, segment_ids)
         # cuDNN would take the document mask as an additive bias
         # (`kernel_for_materialized_mask`), so a packed call runs on xla.
         if implementation == 'cudnn':
@@ -900,7 +942,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         if implementation not in ('reference', 'xla'):
             raise ValueError(f"attention implementation '{implementation}' cannot honor sinks")
         mask = combined_attention_mask(
-            query.shape[-3], key.shape[-3], causal, sliding_window, mask)
+            query.shape[-3], key.shape[-3], causal, sliding_window, masked)
         return attention_with_sinks(
             query, key, value, sinks, mask=mask, bias=bias, dtype=dtype,
             precision=precision, force_fp32_for_softmax=force_fp32_for_softmax)
@@ -924,7 +966,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         key = repeat_kv_heads(key, heads)
         value = repeat_kv_heads(value, heads)
         mask = combined_attention_mask(
-            query.shape[-3], key.shape[-3], causal, sliding_window, mask)
+            query.shape[-3], key.shape[-3], causal, sliding_window, masked)
         if softcap is not None:
             return softcapped_attention(
                 query, key, value, softcap, dtype=dtype, precision=precision,
@@ -943,7 +985,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         implementation, query, dtype, precision, force_fp32_for_softmax)
     return fused_attention(query, key, value, bias, mask, causal, sliding_window,
                            implementation, softcap=softcap, sinks=sinks,
-                           segment_ids=segment_ids)
+                           segment_ids=segment_ids, key_value_seq_lengths=lengths)
 
 
 def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
