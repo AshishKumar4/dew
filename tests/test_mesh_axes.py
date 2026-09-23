@@ -441,3 +441,24 @@ def test_the_causal_convs_taps_gradient_under_a_partly_replicated_batch():
             jax.device_put(x, rows), taps, jax.device_put(cotangent, rows))
 
     np.testing.assert_allclose(split, alone, rtol=1e-6)
+
+
+def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused():
+    """A DiT has no layer stack to pipeline: on a stage axis of two every
+    stage computed the whole step, twice the work for the same result, and
+    the run said nothing. The step refuses it when it traces."""
+    from dew.diffusion import presets
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.diffusion import DiffusionObjective
+
+    objective = DiffusionObjective(
+        SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=4, mlp_ratio=2),
+        presets.Flow()(), InputSpec(Field("image", (8, 8, 3))), guidance=None, steps=2)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
+                      mesh=MeshSpec(fsdp=2, stage=2), layout=Layout(min_shard=TINY_SHARD),
+                      checkpoints=None, tracker=None)
+    state, _, _ = trainer.place()
+    batch = shard_batch(trainer.device_mesh, {"image": np.zeros((BATCH, 8, 8, 3), np.float32)})
+
+    with pytest.raises(ValueError, match="runs no pipeline, so every stage would compute"):
+        trainer.compile(state, batch)
