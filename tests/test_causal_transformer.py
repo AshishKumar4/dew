@@ -990,3 +990,18 @@ def test_lm_engine_init_draws_each_matrix_at_its_std():
                       (layer["mlp"]["experts"]["down_proj"]["kernel"], 0.01 / 2)):
         np.testing.assert_allclose(float(jnp.std(leaf)), std, rtol=0.1)
     np.testing.assert_array_equal(layer["input_layernorm"]["scale"], 1.0)
+
+
+def test_an_xsa_nope_mup_model_decodes_what_its_full_forward_scores(rng):
+    """Prefill and token-by-token decode read the same logits as one forward
+    for a Rigel-style layer: XSA subtracts the new token's own value while
+    decoding, no rotation reads the cache slot, and the multipliers and the
+    logit division apply on both paths."""
+    model = tiny(qk_norm=False, nope=True, exclusive_self_attention=True,
+                 embedding_multiplier=12.0, residual_multiplier=0.22, logits_scaling=4.0,
+                 initializer_range=0.1, depth_scaled_init=True)
+    ids = tokens(rng, length=10)
+    params = model.init(rng, ids)
+    full = model.apply(params, ids)
+    stepped = decode_logits(model, params, ids[:, :4], ids[:, 4:])
+    np.testing.assert_allclose(stepped, full[:, 3:], rtol=1e-4, atol=1e-5)
