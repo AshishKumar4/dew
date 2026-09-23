@@ -65,6 +65,8 @@ def main() -> None:
     parser.add_argument("--mesh", required=True,
                         help="MeshSpec fields as JSON, e.g. '{\"fsdp\": 4, \"replicas\": 2}'")
     parser.add_argument("--steps", type=int, default=3)
+    parser.add_argument("--fail-at", type=int, default=None,
+                        help="process 1's loader raises when asked for this batch (0-based)")
     args = parser.parse_args()
 
     from dew.training.runtime import prepare_process
@@ -83,11 +85,16 @@ def main() -> None:
 
     def share(partition):
         """A loader's share: the rows of one packed batch this partition's
-        readers read, whole in every other dimension, for ever."""
+        readers read, whole in every other dimension, for ever; or on
+        process 1 with --fail-at, until that batch."""
         rows = partition.rows(BATCH)
         mine = {name: leaf[partition.index * rows:(partition.index + 1) * rows]
                 for name, leaf in packed_batch().items()}
+        read = 0
         while True:
+            if read == args.fail_at and jax.process_index() == 1:
+                raise RuntimeError(f"injected failure reading batch {read}")
+            read += 1
             yield mine
 
     model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2,
