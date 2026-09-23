@@ -895,7 +895,7 @@ def test_the_tied_head_multiplies_in_fp32_under_bf16_compute(rng):
 
 def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
     """Gemma scales in fp32 and casts the product; Llama and Qwen3 cast the
-    normalized activations and scale in bf16 (modeling_qwen3.py:61-64). The
+    normalized activations, then scale (modeling_qwen3.py:61-64). The
     two agree at fp32 and differ under bf16, and the HF translation picks per
     family."""
     from dew.interop.hf_decoders import translate_config
@@ -920,6 +920,39 @@ def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
     gemma_config = {**base, "model_type": "gemma3_text", "head_dim": 8, "hidden_activation": "gelu_pytorch_tanh",
                     "query_pre_attn_scalar": 8, "sliding_window": 4}
     assert translate_config(gemma_config)["scale_after_cast"] is False
+
+
+def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradient():
+    """Qwen3RMSNorm rounds the normalized activations to bf16, then multiplies
+    by its weight: in fp32 for an fp32 master, and the next layer reads the
+    product in bf16. Under jit XLA drops a narrowing cast that a widening one
+    follows, and a bf16 product would reduce the weight's gradient in bf16
+    (1e-2 relative). The oracle is NumPy: the fp32 normalization, rounded to
+    bf16, times the fp32 weight in fp32, rounded to bf16; the gradient of
+    sum(out * c) is sum over rows of c * round(y) in float64, which an fp32
+    reduction over 64 rows meets to about 1e-7."""
+    from dew.nn.attention import RMSNorm
+
+    x = (jax.random.normal(jax.random.key(0), (64, 512)) * 3).astype(jnp.bfloat16)
+    weight = 1.0 + 0.1 * jax.random.normal(jax.random.key(1), (512,), jnp.float32)
+    # The cotangent of a bf16 output is bf16, so c holds bf16 values.
+    c = jax.random.normal(jax.random.key(2), (64, 512)).astype(jnp.bfloat16).astype(jnp.float32)
+    norm = RMSNorm(epsilon=1e-6, scale_after_cast=True, dtype=jnp.bfloat16)
+
+    x32 = np.asarray(x, np.float32)
+    inverse = np.float32(1) / np.sqrt(np.mean(np.square(x32), -1, keepdims=True) + np.float32(1e-6))
+    rounded = (x32 * inverse).astype(jnp.bfloat16).astype(np.float32)
+    expected = (rounded * np.asarray(weight)).astype(jnp.bfloat16)
+    expected_grad = np.sum(np.asarray(c, np.float64) * rounded, axis=0)
+
+    def loss(weight):
+        return jnp.sum(norm.apply({"params": {"scale": weight}}, x).astype(jnp.float32) * c)
+
+    out = jax.jit(norm.apply)({"params": {"scale": weight}}, x)
+    assert out.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(np.asarray(out), expected)
+    grad = np.asarray(jax.jit(jax.grad(loss))(weight), np.float64)
+    assert np.max(np.abs(grad - expected_grad)) <= 1e-5 * np.max(np.abs(expected_grad))
 
 
 def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head():

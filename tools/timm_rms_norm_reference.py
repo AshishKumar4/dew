@@ -3,9 +3,9 @@
 
 `timm.layers.fast_norm.rms_norm2d` is the norm every RmsNorm2d in
 Gemma 3n's MobileNet-v5 runs on CPU. A bf16 tower (`tower.bfloat16()`)
-computes it with the input, the square, the mean, the inverse root and both
-products in bf16, and the weight rounded to bf16. The fixture holds a fixed
-input and fp32 weight with the bf16 output, all NHWC.
+computes it with the input, the weight, the square, the mean, the inverse
+root and both products in bf16. The fixture holds a fixed input, the bf16
+weight and the bf16 output, all NHWC.
 
 Run with timm 1.0.29 and Torch 2.14.0 CPU:
   python tools/timm_rms_norm_reference.py --out tests/fixtures/gemma3n/rms_norm2d_bf16.npz
@@ -29,8 +29,10 @@ def main():
     pixels = (rng.standard_normal((2, 256, 4, 4)) * 3).astype(np.float32)
     weight = (1 + 0.1 * rng.standard_normal(256)).astype(np.float32)
     inputs = torch.from_numpy(pixels).bfloat16()
-    output = rms_norm2d(inputs, [256], torch.from_numpy(weight).bfloat16(), 1e-6)
-    np.savez(args.out, inputs=inputs.float().permute(0, 2, 3, 1).numpy(), weight=weight,
+    # The bf16 tower's weight; a bf16 checkpoint holds the same values.
+    weight = torch.from_numpy(weight).bfloat16()
+    output = rms_norm2d(inputs, [256], weight, 1e-6)
+    np.savez(args.out, inputs=inputs.float().permute(0, 2, 3, 1).numpy(), weight=weight.float().numpy(),
              output=output.float().permute(0, 2, 3, 1).numpy(), timm=timm.__version__,
              torch=torch.__version__)
 
