@@ -36,7 +36,7 @@ from dew.inputs.diffusion import Composition, DiffusionConditioner, T5Segment
 from dew.interop import hf_decoders as decoders
 from dew.interop.codecs import source_quantization
 from dew.nn import audio as audio_nn
-from dew.nn.autoencoders import AutoEncoder, StableDiffusionVAE
+from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
@@ -1599,11 +1599,13 @@ def _source_decoding(config: Mapping[str, object], generation_config: Mapping[st
 
 class _Call(NamedTuple):
     """Holds one pinned pipeline's own `__call__` policy, read from Diffusers
-    0.34.0: the family it belongs to, the steps and guidance scale it
-    defaults to, whether that scale guides two branches or is the value the
-    model embeds, and the text sequence budget it pads its T5 tower to."""
+    0.34.0 (Qwen-Image 2.1 from 6256aa76): the family it belongs to, the
+    steps and guidance scale it defaults to, whether that scale guides two
+    branches or is the value the model embeds, and the text sequence budget
+    it pads its T5 tower to. Qwen-Image's pipeline pads to the longest prompt
+    of a call, so its budget is the prompt window Dew pads each row to."""
 
-    family: Literal["sd", "sdxl", "sd3", "flux"]
+    family: Literal["sd", "sdxl", "sd3", "flux", "qwen_image"]
     steps: int
     guidance: float
     guided: bool
@@ -1624,6 +1626,8 @@ _PIPELINE_POLICY: Mapping[str, _Call] = MappingProxyType({
     "StableDiffusionXLInpaintPipeline": _Call("sdxl", 50, 7.5, guided=True),
     "StableDiffusion3Pipeline": _Call("sd3", 28, 7.0, guided=True, sequence=256),
     "FluxPipeline": _Call("flux", 28, 3.5, guided=False, sequence=512),
+    # `true_cfg_scale` defaults to 1.0: the release samples unguided.
+    "QwenImage21Pipeline": _Call("qwen_image", 40, 1.0, guided=True, sequence=512),
     "FlaxStableDiffusionPipeline": _Call("sd", 50, 7.5, guided=True),
     "FlaxStableDiffusionImg2ImgPipeline": _Call("sd", 50, 7.5, guided=True),
     "FlaxStableDiffusionInpaintPipeline": _Call("sd", 50, 7.5, guided=True),
@@ -1686,7 +1690,7 @@ class _Denoiser:
     weights: Callable[[str], tuple[Variables, tuple[WeightLayout, ...]]]
     built: Mapping[str, object]
     config: Mapping[str, object]
-    composition: Composition
+    composition: Composition | Literal["qwen_image"]
     towers: tuple[str, ...]
     patch: int
     latent_input: int
@@ -1717,11 +1721,12 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
     autoencoder, vae_params, vae_layouts, vae_config = _diffusion_vae(directory, compute, param_dtype=param_dtype)
     encoder, text_layouts, components = _conditioning(
         directory, index, denoiser, policy, compute,
-        denoiser.sample_size * autoencoder.downscale_factor, param_dtype=param_dtype)
+        denoiser.sample_size * autoencoder.downscale_factor, param_dtype=param_dtype,
+        attention_impl=attention_impl)
     components.update({denoiser.component: denoiser.config, "vae": vae_config})
     height, width = encoder.height, encoder.width
     inpaint = denoiser.latent_input == autoencoder.latent_channels * 2 + 1
-    inputs = InputSpec(Field("image", (height, width, 3)),
+    inputs = InputSpec(Field("image", (height, width, records.integer(vae_config["in_channels"], "in_channels"))),
                        {"conditioning": Condition(encoder, unconditional=_unconditional(
                            denoiser.composition, index))},
                        mask=Field("mask", (height, width, 1)) if inpaint else None)
@@ -1748,8 +1753,12 @@ def _load_diffusion_source(directory: Path, index: Mapping[str, object], *, dtyp
 
 def _conditioning(directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
                   policy: _Call, compute, size: int, *, param_dtype: str,
-                  params: Variables | None = None):
+                  attention_impl: str = "auto", params: Variables | None = None):
     """Construct the published text composition from metadata and either weight source."""
+    if denoiser.composition == "qwen_image":
+        return _qwen_image_conditioning(directory, index, compute, size, tokens=policy.sequence,
+                                        param_dtype=param_dtype, attention_impl=attention_impl,
+                                        params=params)
     names = tuple(name for name in denoiser.towers if _present(index, name))
     if not names:
         raise ValueError("A latent diffusion source needs at least one text encoder")
@@ -1789,6 +1798,9 @@ def load_diffusion_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16
         index = json.load(handle)
     denoiser = (_transformer_denoiser if (directory / "transformer" / "config.json").is_file()
                 else _unet_denoiser)(directory, dtype=dtype, attention_impl=attention_impl)
+    if denoiser.composition == "qwen_image":
+        raise ValueError(f"{checkpoint} conditions through its Qwen3-VL encoder; "
+                         "build it with QwenImageConditioner.from_pretrained")
     if params is None:
         names = tuple(name for name in (*denoiser.towers, denoiser.t5_tower)
                       if name is not None and _present(index, name))
@@ -1838,6 +1850,8 @@ def _transformer_denoiser(directory: Path, *, dtype: str | None, attention_impl:
         return _sd3_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     if published == "FluxTransformer2DModel":
         return _flux_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
+    if published == "QwenImage21Transformer2DModel":
+        return _qwen_image_denoiser(config, directory, dtype=dtype, attention_impl=attention_impl)
     raise ValueError(f"Native diffusion does not implement the published transformer "
                      f"{published!r}")
 
@@ -1899,6 +1913,36 @@ def _flux_denoiser(config: dict, directory: Path, *, dtype: str | None, attentio
         origin="linspace", embeds_guidance=fields["guidance_embeds"], t5_tower="text_encoder_2")
 
 
+def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
+                         attention_impl: str) -> _Denoiser:
+    """Build Qwen-Image 2.1's transformer: one stream over the Qwen3-VL
+    encoder's prompt states and the latent, one token per position.
+
+    The class declares no sample size; its pipeline renders at
+    `output_resolution` 1024 pixels, 64 latent positions through the VAE's
+    16x, which a directory overrides with its own geometry. It starts from
+    the sigmas its pipeline hands the scheduler.
+    """
+    from dew.interop import diffusion
+    from dew.nn.backbones.qwen_image import QwenImageTransformer
+
+    fields = diffusion.qwen_image_fields(config, dtype=dtype, attention_impl=attention_impl)
+    model = QwenImageTransformer(**fields)
+
+    def weights(param_dtype: str) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, layouts = diffusion.translate_qwen_image_weights(
+            diffusion.component_tensors(directory, "transformer"), param_dtype=param_dtype)
+        return {"params": params}, layouts
+
+    built = {"name": "qwen_image_transformer",
+             "fields": {**fields, "dtype": dtype, "axes_dims_rope": list(fields["axes_dims_rope"])}}
+    return _Denoiser(
+        component="transformer", model=model, weights=weights, built=built, config=config,
+        composition="qwen_image", towers=("text_encoder",), patch=1,
+        latent_input=fields["in_channels"], sample_size=64,
+        context_width=fields["context_in_dim"], pipeline="QwenImage21Pipeline", origin="linspace")
+
+
 def _component_config(directory: Path, name: str) -> dict:
     """Read one published component's own config file."""
     file = "scheduler_config.json" if name == "scheduler" else "config.json"
@@ -1913,13 +1957,16 @@ def _present(index: Mapping[str, object], name: str) -> bool:
 
 
 def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32"
-                   ) -> tuple[StableDiffusionVAE, Variables, tuple[WeightLayout, ...], dict]:
+                   ) -> tuple[AutoEncoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build the published autoencoder, its parameters and their source layouts."""
     from dew.interop import diffusion
     from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
     from dew.nn.autoencoders.vae import _vae_path
 
     config = _component_config(directory, "vae")
+    if config.get("_class_name") == "AutoencoderKLQwenImage21":
+        from dew.nn.autoencoders.qwen_image import load_qwen_image_vae
+        return load_qwen_image_vae(directory, compute, param_dtype=param_dtype)
     model = AutoencoderKL(
         channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
         image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],
@@ -1983,6 +2030,109 @@ def _t5_tower(directory: Path, compute, component: str, tokens: int, *, param_dt
             component, tensors, _t5_path, ("encoders", "conditioning", component), param_dtype=param_dtype)
     tokenizer = load_tokenizer(str(directory / ("tokenizer" + component.removeprefix("text_encoder"))))
     return T5Segment(tower, tokenizer, component, tokens), params, layouts, config
+
+
+def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
+    """The Qwen3-VL encoder's text_config as the Qwen3 decoder it computes for a prompt.
+
+    Qwen-Image encodes its text-to-image prompt with no image, and a
+    text-only row puts all three of Qwen3-VL's rotary axes at the token's
+    position, so the sections of `mrope_section` - interleaved or not -
+    rotate every channel pair at that one position: the plain rotary table.
+    The rest of the text_config is Qwen3's, down to the per-head query and
+    key norms, and the Qwen3 translator reads and checks it.
+    """
+    if config.get("model_type") != "qwen3_vl":
+        raise ValueError(f"Qwen-Image's text encoder is a qwen3_vl model, not {config.get('model_type')!r}")
+    text = dict(records.record(config["text_config"], "text_config"))
+    if text.get("model_type") != "qwen3_vl_text":
+        raise ValueError(f"A qwen3_vl text_config is qwen3_vl_text, not {text.get('model_type')!r}")
+    half = records.integer(text["head_dim"], "head_dim") // 2
+    for key in ("rope_parameters", "rope_scaling"):
+        entry = text.get(key)
+        if isinstance(entry, Mapping):
+            entry = dict(entry)
+            section = records.integers(entry.pop("mrope_section"), "mrope_section")
+            records.boolean(entry.pop("mrope_interleaved", False), "mrope_interleaved")
+            if sum(section) != half:
+                raise ValueError(f"mrope_section {section} must cover the {half} channel pairs")
+            text[key] = entry
+    return {**text, "model_type": "qwen3",
+            "tie_word_embeddings": records.boolean(config.get("tie_word_embeddings", False),
+                                                   "tie_word_embeddings")}
+
+
+def _qwen_text_path(record: decoders.DecoderFields):
+    """Map a Qwen3-VL checkpoint's tensors: its language model as the Qwen3
+    decoder's, its head too, and its vision tower held as stored, which the
+    text-to-image prompt never reads and an export writes back."""
+    family = decoders._FAMILIES["qwen3"]
+
+    def path(name: str) -> tuple[str, ...] | None:
+        if name.startswith("model.language_model."):
+            return family.weight_path("model." + name.removeprefix("model.language_model."), record)
+        if name == "lm_head.weight":
+            return family.weight_path(name, record)
+        if name.startswith("model.visual."):
+            # One flat leaf per stored tensor: these are carried, not run,
+            # so no module path, and no sharding rule, reads them.
+            return ("visual", name.removeprefix("model.visual."))
+        raise ValueError(f"unknown tensor name {name!r}")
+    return path
+
+
+def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compute, size: int, *,
+                             tokens: int, param_dtype: str, attention_impl: str,
+                             params: Variables | None = None):
+    """Build Qwen-Image's conditioner: the Qwen3-VL language model, its
+    processor's tokenizer and chat template, the parameters and their layouts."""
+    from transformers import AutoTokenizer
+
+    from dew.inputs.diffusion import QwenImageConditioner
+    from dew.interop import diffusion
+
+    config = _component_config(directory, "text_encoder")
+    record = decoders.translate_config(_qwen_vl_text_config(config))
+    built = with_precision("causal_transformer", record, dtype=dtype_name(compute),
+                           attention_impl=attention_impl)
+    decoder = models.build("causal_transformer", built)
+    if not isinstance(decoder, CausalTransformer):
+        raise TypeError("causal_transformer registry entry must build CausalTransformer")
+    layouts: tuple[WeightLayout, ...] = ()
+    if params is None:
+        tower, layouts = diffusion.record_layouts(
+            "text_encoder", diffusion.component_tensors(directory, "text_encoder"),
+            _qwen_text_path(record), ("encoders", "conditioning", "text_encoder"),
+            param_dtype=param_dtype)
+        params = {"text_encoder": tower}
+    height, width = index.get("dew_height", size), index.get("dew_width", size)
+    if type(height) is not int or type(width) is not int or height < 1 or width < 1:
+        raise ValueError("Image geometry must contain positive integer dimensions")
+    encoder = QwenImageConditioner(
+        decoder, AutoTokenizer.from_pretrained(directory / "processor"), params, str(directory),
+        height, width, tokens=tokens, param_dtype=param_dtype)
+    return encoder, layouts, {"text_encoder": config}
+
+
+def load_qwen_image_conditioner(checkpoint: str, *, dtype: str | None = "bfloat16",
+                                param_dtype: str = "float32", revision: str | None = None,
+                                attention_impl: str = "auto", tokens: int = 512,
+                                params: Variables | None = None):
+    """Load Qwen-Image's text conditioning, or bind supplied parameters using metadata only."""
+    compute = resolve_dtype(dtype)
+    resolve_dtype(param_dtype)
+    directory = decoders._snapshot(checkpoint, revision, weights=False)
+    with open(directory / "model_index.json") as handle:
+        index = json.load(handle)
+    denoiser = _transformer_denoiser(directory, dtype=dtype, attention_impl=attention_impl)
+    if denoiser.composition != "qwen_image":
+        raise ValueError(f"{checkpoint} is not a Qwen-Image checkpoint")
+    if params is None:
+        directory = decoders._snapshot(checkpoint, directory.name, weights=("text_encoder",))
+    encoder, _, _ = _qwen_image_conditioning(
+        directory, index, compute, denoiser.sample_size * 16, tokens=tokens,
+        param_dtype=param_dtype, attention_impl=attention_impl, params=params)
+    return encoder
 
 
 def _unconditional(composition: str, index: Mapping[str, object]) -> dict:

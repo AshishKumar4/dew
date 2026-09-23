@@ -109,7 +109,7 @@ class _Attention(nn.Module):
         qkv = _conv(3 * channels, 1, self.dtype, "to_qkv")(normalized)
         query, key, value = jnp.split(qkv.reshape(batch, height * width, 1, 3 * channels), 3, axis=-1)
         attended = jax.nn.dot_product_attention(query, key, value).reshape(batch, height, width, channels)
-        return _conv(channels, 1, self.dtype, "proj")(attended) + x
+        return _conv(channels, 1, self.dtype, "attention_out")(attended) + x
 
 
 class _MidBlock(nn.Module):
@@ -394,7 +394,9 @@ def qwen_image_vae_path(name: str, ndim: int) -> tuple[str, ...]:
     """
     if _NAME.fullmatch(name) is None:
         raise ValueError(f"{name!r} is not an AutoencoderKLQwenImage21 tensor")
-    parts = name.replace("resample.1", "resample.conv").split(".")
+    # The attention's output conv is `proj` in the source; a bare `proj`
+    # names the sharded feed-forward projections elsewhere in Dew.
+    parts = name.replace("resample.1", "resample.conv").replace(".proj.", ".attention_out.").split(".")
     leaf = parts.pop()
     if ndim not in _LEAF_RANK[leaf]:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, _LEAF_RANK[leaf]))}")
