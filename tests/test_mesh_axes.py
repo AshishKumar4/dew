@@ -460,6 +460,25 @@ def test_the_token_lookups_gradient_sums_no_table_under_data_parallelism():
     assert summed < gradients - table // 2, (summed, gradients, table)
 
 
+@pytest.mark.mesh(devices=4)
+def test_a_vocabulary_split_head_keeps_its_table_where_it_is():
+    """fsdp splits the tied table's vocabulary over the devices that split
+    the tokens. The loss gathered the table whole onto every device and
+    reduce-scattered its gradient, twice the table's bytes a step, where the
+    batch's 128 states are a thirty-second of its 4096 rows: each device
+    now scores every token against its own rows, and the table and its
+    gradient stay where they are: what moves is the other weights' shards and
+    the tokens', well under the table's bytes. Measured in bytes, since the
+    GPU compiler combines collectives into buffers of its own."""
+    model = models.build(
+        "causal_transformer", vocab_size=4096, emb_features=32, num_layers=1,
+        num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
+    table = 4096 * 32 * 4
+    moved = collective_bytes(MeshSpec(fsdp=4), model, {"all-gather", "reduce-scatter", "all-reduce"})
+
+    assert moved < table // 2, (moved, table)
+
+
 def test_tensor_parallelism_keeps_every_projection_weight_in_place():
     """Megatron's split computes each projection on the shard of the weight a
     device holds and sums the row-parallel outputs; it never gathers a
