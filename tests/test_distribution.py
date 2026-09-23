@@ -156,6 +156,16 @@ def test_more_replicas_than_hosts_are_refused(tmp_path):
     assert "replicas 2 must divide both the 1 granules" in done.stdout
 
 
+def test_replicas_in_a_process_outside_any_pool_are_refused_by_granule():
+    """A process that never joined a pool has CPU devices without a
+    `slice_index`; it is one granule, so replicas are refused by the same
+    rule, not by the missing attribute."""
+    from dew.training import build_mesh
+
+    with pytest.raises(ValueError, match="replicas 2 must divide both the 1 granules"):
+        build_mesh(MeshSpec(fsdp=4, replicas=2))
+
+
 def test_a_failed_process_stops_the_pool_with_its_exit_code():
     """Rank 1 exits 3 while rank 0 would wait ten minutes, as a process
     stuck in a collective with a dead peer does. The launch returns 3 within
