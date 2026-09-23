@@ -38,7 +38,7 @@ class LMRunConfig(RunConfig):
     data: DataSpec = dataclasses.field(default_factory=TokenWindows)
     optim: OptimConfig = dataclasses.field(
         default_factory=lambda: OptimConfig(
-            learning_rate=6e-4, learning_rate_peak=6e-4, learning_rate_end=6e-5,
+            learning_rate=6e-4,
             weight_decay=0.1, clip_grads=1.0))
     tokenizer: str = "byte"
     """What the ids were written with: 'byte', or an HF tokenizer name."""

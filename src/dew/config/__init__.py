@@ -16,8 +16,10 @@ class does not have, or one the file lacks, raises.
 """
 
 import dataclasses
+import functools
 import hashlib
 import json
+import operator
 import os
 import re
 import sys
@@ -42,11 +44,11 @@ from dew.lora import LoRA, attach
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON
-from dew.registry import REGISTRIES, _declared_type, datasets, models, with_precision
+from dew.registry import REGISTRIES, _declared_type, datasets, models, schedules, with_precision
 from dew.telemetry.instrumentation import default_compilation_cache_dir
 from dew.telemetry.records import RunRecord, json_value, packages_installed
 from dew.training.distributed import Layout, MeshSpec
-from dew.training.optim import ParamGroup, build_optimizer
+from dew.training.optim import ParamGroup, ScheduleBase, build_optimizer
 from dew.training.quantization import Quantization, quantize
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Trackers, WandbTracker
@@ -71,8 +73,10 @@ if TYPE_CHECKING:
     # type checker cannot read a variable in a type expression. Both get what
     # they need: the base class statically, the union at runtime.
     type DataSpec = DatasetSpec
+    type ScheduleSpec = ScheduleBase
 else:
     DataSpec = datasets.union
+    ScheduleSpec = schedules.union
 
 
 @dataclasses.dataclass(frozen=True)
@@ -125,27 +129,11 @@ class OptimConfig:
     optimizer: Literal["adam", "adamw", "lamb", "muon", "muonclip"] = "adamw"
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
     learning_rate: float = 2.7e-4
-    """The constant rate when no schedule is named, and cosine's starting rate."""
-    learning_rate_schedule: Literal["cosine", "power", "linear"] | None = None
-    """cosine: warmup to the peak, cosine to the end. power: lm-engine's power
-    scheduler, warmup then min(peak, power_a * (step * power_c) ** power_b),
-    with a linear tail to the end from `learning_rate_decay_start` when set.
-    linear: lm-engine's linear scheduler, warmup, constant to
-    `learning_rate_decay_start`, linear to the end (`dew.training.optim`)."""
-    learning_rate_peak: float = 3e-4
-    learning_rate_end: float = 2e-4
-    learning_rate_warmup_steps: int = 10000
-    learning_rate_decay_steps: int | None = None
-    """The update a schedule ends at; unset uses the training step target."""
-    learning_rate_decay_start: int | None = None
-    """Where power's linear tail and linear's decay begin."""
-    power_a: float = 1.0
-    """The power law's coefficient, lm-engine's `a` (4 * batch size in its
-    examples)."""
-    power_b: float = -0.51
-    """The power law's exponent, lm-engine's `b`."""
-    power_c: float = 1.0
-    """What a step counts for in the law, lm-engine's `c` (tokens per step)."""
+    """The constant rate, when no schedule is named."""
+    schedule: ScheduleSpec | None = None
+    """The learning-rate schedule, one typed record per kind
+    (`dew.training.optim`): cosine, power (lm-engine's power law with an
+    optional linear tail) or linear; each holds only its own fields."""
     weight_decay: float | None = None
     param_groups: Annotated[tuple[ParamGroup, ...], json_list_argument(ParamGroup)] = ()
     """Per-group learning-rate multipliers and weight decay, first match wins;
@@ -443,9 +431,14 @@ def _rebuild(annotation: registry.Annotation, value: registry.Configured) -> reg
         return _instantiate(annotation, _fields(annotation, value))
     if typing.get_origin(annotation) in (typing.Union, types.UnionType):
         inner = [m for m in typing.get_args(annotation) if m is not type(None)]
-        if value is None or len(inner) != 1:
+        if value is None:
             return value
-        return _rebuild(inner[0], value)
+        if len(inner) == 1:
+            return _rebuild(inner[0], value)
+        # An optional registry union (a schedule or None) rebuilds through
+        # its registry; any other union holds a JSON value as it is.
+        members = functools.reduce(operator.or_, inner)
+        return _rebuild(members, value) if _registry_for(members) is not None else value
     if typing.get_origin(annotation) in _MAPPINGS and isinstance(value, Mapping):
         # A mapping's own annotation names its keys and its values, and the
         # record carries neither: JSON keys are strings and JSON values are

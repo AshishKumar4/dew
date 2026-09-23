@@ -148,7 +148,7 @@ def train_and_export(root: Path) -> Path:
         "--trainer.checkpoint-dir", str(root / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--model.dtype", "float32", "--sample-tokens", "0", "--ema-decay", "None",
-        "--optim.learning-rate", "3e-3", "--optim.learning-rate-warmup-steps", "50",
+        "--optim.learning-rate", "3e-3",
         "--model.config", json.dumps(FIELDS)])
     state = recipe.main(config)
     assert int(state.step) == STEPS

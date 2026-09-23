@@ -39,7 +39,7 @@ class JepaRunConfig(RunConfig):
         default_factory=lambda: ModelConfig("jepa_encoder", dict(DEFAULT_ENCODER_CONFIG)))
     optim: OptimConfig = field(
         default_factory=lambda: OptimConfig(
-            learning_rate=1e-3, learning_rate_peak=1.5e-3, learning_rate_end=1e-6))
+            learning_rate=1e-3))
     predictor: JsonDict = field(default_factory=dict)
     """Predictor kwargs, over the encoder's shared ones."""
     num_target_blocks: int = 4

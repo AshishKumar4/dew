@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from dew.nn.vision import ProjectorBase, TowerBase
     from dew.objectives.base import Metric, Objective
     from dew.sampling.solvers import Solver
+    from dew.training.optim import ScheduleBase
 
 T = TypeVar("T", bound=Callable[..., Any])
 M = TypeVar("M", bound=Callable[..., Any])
@@ -481,11 +482,13 @@ objectives: Registry[type[Objective], Objective] = Registry("objective")
 mixers: Registry[type[MixerBase], MixerBase] = Registry("mixer", record="kind")
 towers: Registry[type[TowerBase], TowerBase] = Registry("tower", record="kind")
 projectors: Registry[type[ProjectorBase], ProjectorBase] = Registry("projector", record="kind")
+schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule", record="kind")
 
 # Core records nest their fields under a name; model component records inline
 # their fields beside a kind discriminator read by the component's constructor.
 REGISTRIES = (models, presets, samplers, datasets, encoders, metrics, objectives,
-              mixers, towers, projectors)
+              mixers, towers, projectors, schedules)
 
 __all__ = ["REGISTRIES", "Registry", "datasets", "dtype_name", "encoders", "metrics", "mixers", "models",
-           "objectives", "presets", "projectors", "resolve_dtype", "samplers", "towers", "with_precision"]
+           "objectives", "presets", "projectors", "resolve_dtype", "samplers", "schedules", "towers",
+           "with_precision"]

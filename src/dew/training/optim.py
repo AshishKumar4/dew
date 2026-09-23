@@ -29,6 +29,7 @@ import jax.numpy as jnp
 import optax
 
 from dew.nn.sharding import LogicalAxes, declared_axes
+from dew.registry import schedules
 
 if TYPE_CHECKING:
     from dew.config import OptimConfig
@@ -433,31 +434,83 @@ def _scaled(learning_rate, multiplier: float):
     return multiplier * learning_rate
 
 
-def learning_rate_schedule(config: OptimConfig, steps: int):
-    """The rate `config` names: a number, or a schedule of the update count.
+class ScheduleBase:
+    """One learning-rate schedule's record: its own fields and its optax
+    schedule. Registered under `dew.registry.schedules`, so a run's record
+    names its kind and holds no field another schedule reads."""
 
-    `steps` is the run's length, where a schedule ends unless
-    `learning_rate_decay_steps` names its own end."""
-    end = steps if config.learning_rate_decay_steps is None else config.learning_rate_decay_steps
-    if config.learning_rate_schedule == 'cosine':
+    def schedule(self, steps: int) -> optax.Schedule:
+        """The rate at each update of a `steps`-update run."""
+        raise NotImplementedError
+
+
+@schedules("cosine")
+@dataclasses.dataclass(frozen=True)
+class Cosine(ScheduleBase):
+    """Linear warmup from `init` to `peak`, cosine to `end` at `decay_steps`
+    (None: the run's end); `optax.warmup_cosine_decay_schedule`."""
+
+    peak: float
+    warmup_steps: int = 10000
+    end: float = 0.0
+    init: float = 0.0
+    decay_steps: int | None = None
+
+    def schedule(self, steps: int) -> optax.Schedule:
         return optax.warmup_cosine_decay_schedule(
-            init_value=config.learning_rate, peak_value=config.learning_rate_peak,
-            warmup_steps=config.learning_rate_warmup_steps,
-            decay_steps=end,
-            end_value=config.learning_rate_end,
-        )
-    if config.learning_rate_schedule == 'power':
+            init_value=self.init, peak_value=self.peak, warmup_steps=self.warmup_steps,
+            decay_steps=steps if self.decay_steps is None else self.decay_steps,
+            end_value=self.end)
+
+
+@schedules("power")
+@dataclasses.dataclass(frozen=True)
+class Power(ScheduleBase):
+    """lm-engine's power scheduler, `power_schedule`: warmup, then
+    min(peak, a * (step * c) ** b), and from `decay_start` a linear tail to
+    `end` at `decay_steps` (None: the run's end). lm-engine's examples take
+    `a` = 4 * batch size and `c` = tokens per step."""
+
+    peak: float
+    warmup_steps: int
+    a: float
+    b: float = -0.51
+    c: float = 1.0
+    decay_start: int | None = None
+    decay_steps: int | None = None
+    end: float = 0.0
+
+    def schedule(self, steps: int) -> optax.Schedule:
         return power_schedule(
-            config.learning_rate_peak, config.learning_rate_warmup_steps,
-            config.power_a, config.power_b, config.power_c,
-            decay_start=config.learning_rate_decay_start,
-            decay_end=None if config.learning_rate_decay_start is None else end,
-            end_value=config.learning_rate_end)
-    if config.learning_rate_schedule == 'linear':
-        return linear_schedule(config.learning_rate_peak, config.learning_rate_warmup_steps,
-                               config.learning_rate_decay_start, end,
-                               end_value=config.learning_rate_end)
-    return config.learning_rate
+            self.peak, self.warmup_steps, self.a, self.b, self.c, decay_start=self.decay_start,
+            decay_end=(None if self.decay_start is None
+                       else steps if self.decay_steps is None else self.decay_steps),
+            end_value=self.end)
+
+
+@schedules("linear")
+@dataclasses.dataclass(frozen=True)
+class Linear(ScheduleBase):
+    """lm-engine's linear scheduler, `linear_schedule`: warmup to `peak`,
+    constant to `decay_start` (None: the warmup's end), linear to `end` at
+    `decay_steps` (None: the run's end)."""
+
+    peak: float
+    warmup_steps: int = 0
+    decay_start: int | None = None
+    decay_steps: int | None = None
+    end: float = 0.0
+
+    def schedule(self, steps: int) -> optax.Schedule:
+        return linear_schedule(self.peak, self.warmup_steps, self.decay_start,
+                               steps if self.decay_steps is None else self.decay_steps,
+                               end_value=self.end)
+
+
+def learning_rate_schedule(config: OptimConfig, steps: int):
+    """The rate `config` names: its schedule over a `steps`-update run, or
+    the constant `learning_rate` when it names none."""
+    return config.learning_rate if config.schedule is None else config.schedule.schedule(steps)
 
 
 def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransformation:
