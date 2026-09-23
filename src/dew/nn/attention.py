@@ -958,6 +958,13 @@ def reference_only(query, dtype, precision, force_fp32_for_softmax) -> bool:
             or (dtype is not None and jnp.dtype(dtype) != query.dtype))
 
 
+def _bf16_dot_missing(query) -> bool:
+    """A bf16 query on a GPU backend older than sm80, where jax.nn's xla
+    attention cannot run."""
+    return (query.dtype == jnp.bfloat16 and jax.default_backend() == 'gpu'
+            and not bf16_dot_runs())
+
+
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
                            force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
                            sliding_window=None, mask=None, bias=None) -> str:
@@ -974,7 +981,7 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     """
     if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'tpu'):
         raise ValueError(f"Unknown attention implementation: {implementation}")
-    if implementation in ('auto', 'xla') and query.dtype == jnp.bfloat16 and not bf16_dot_runs():
+    if implementation in ('auto', 'xla') and _bf16_dot_missing(query):
         # jax.nn's xla attention names the BF16_BF16_F32 algorithm, which a
         # GPU older than sm80 rejects at run time, past jax's own fallback;
         # the reference path multiplies at the caller's precision.
@@ -1009,8 +1016,7 @@ def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, prec
     if implementation == 'auto' and reference_only(query, dtype, precision,
                                                    force_fp32_for_softmax):
         return 'reference'
-    if (implementation in ('auto', 'cudnn', 'xla') and query.dtype == jnp.bfloat16
-            and not bf16_dot_runs()):
+    if implementation in ('auto', 'cudnn', 'xla') and _bf16_dot_missing(query):
         return 'reference'
     return 'xla' if implementation in ('auto', 'cudnn') else implementation
 
