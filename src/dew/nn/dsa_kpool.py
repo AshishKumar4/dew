@@ -52,6 +52,7 @@ from .attention import (
     scaled_dot_product_attention,
 )
 from .inputs import AttentionMetadata, PredictionPhase
+from .kv_cache import KVCache
 from .mixers import MixerBase, MixerContext, mixers
 from .mla import INDEXER, open_expanded_cache
 from .sharding import logical_axes
@@ -418,6 +419,7 @@ class KPoolSparseAttentionMixer(MixerBase):
             "partial_rotary_factor": ctx.partial_rotary_factor,
             "kv_shared": ctx.kv_shared,
             "output_gate": ctx.output_gate,
+            "kv_cache": ctx.kv_cache != KVCache(),
         }
         asked = sorted(name for name, value in unsupported.items() if value)
         if asked:

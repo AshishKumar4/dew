@@ -25,6 +25,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RopeScaling
+from dew.nn.kv_cache import KVCache
 from dew.registry import mixers
 
 
@@ -85,6 +86,8 @@ class MixerContext:
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
     force_fp32_for_softmax: bool = True
+    kv_cache: KVCache = KVCache()
+    """The decode cache's storage layout (`dew.nn.kv_cache`)."""
     output_gate: bool = False
     """The attention's output gate (Qwen3.5's attn_output_gate), where the
     kind's projection doubles its query and a sigmoid of the second half

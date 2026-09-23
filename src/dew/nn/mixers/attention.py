@@ -33,6 +33,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.inputs import AttentionMetadata
+from dew.nn.kv_cache import KVCache, rotated, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, mla_rope_freqs
 from dew.nn.sharding import logical_axes
@@ -97,6 +98,7 @@ class CausalSelfAttention(nn.Module):
     force_fp32_for_softmax: bool = True
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None
+    kv_cache: KVCache = KVCache()  # the decode cache's storage: dense or paged, full or quantized
 
     def setup(self):
         dense = functools.partial(
@@ -231,12 +233,11 @@ class CausalSelfAttention(nn.Module):
             groups = jnp.full((batch, length), -1, jnp.int32)
         key_groups = groups
         if decode and self.bidirectional_images:
-            from dew.nn.attention import _write_cache
             allocated = self.has_variable("cache", "cached_image_groups")
             stored = self.variable("cache", "cached_image_groups", jnp.full,
                                    (batch, self.max_seq_len), -1, jnp.int32)
             if allocated:
-                stored.value = _write_cache(stored.value, groups, query_slots)
+                stored.value = write_cache(stored.value, groups, query_slots)
             key_groups = stored.value
         if decode:
             valid = self.get_variable("cache", "cache_valid")
@@ -282,7 +283,6 @@ class CausalSelfAttention(nn.Module):
             metadata.valid is not None
             or (self.bidirectional_images and metadata.image_groups is not None))
 
-
     @nn.compact
     def __call__(self, x, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
@@ -327,7 +327,12 @@ class CausalSelfAttention(nn.Module):
                 if not self.kv_shared:
                     positions, append = open_kv_cache(
                         self, key, self.max_seq_len,
-                        valid=None if attention_metadata is None else attention_metadata.valid)
+                        valid=None if attention_metadata is None else attention_metadata.valid,
+                        layout=self.kv_cache)
+            elif self.kv_cache != KVCache():
+                raise ValueError(
+                    "a bidirectional canvas reads its encoder prefix as dense, full-precision "
+                    "keys; it takes the default kv_cache layout")
             elif self.kv_shared or segment_ids is not None:
                 raise ValueError(
                     "a bidirectional canvas over a cache shares no keys across "
@@ -382,6 +387,7 @@ class CausalSelfAttention(nn.Module):
             implementation, query, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax)
         window = None if decode else self.sliding_window
+        cursor = None  # the decode mask the paged kernel stands in for, when this call builds it
         if prefix is not None:
             # Every canvas query reads the same retained encoder keys and all
             # canvas keys (modeling_diffusion_gemma.py:1399-1401). A local
@@ -406,11 +412,19 @@ class CausalSelfAttention(nn.Module):
             # decode mask does.
             mask = causal_attention_mask(positions, kv_len, self.sliding_window)
             causal = False
+            # A quantized provider stashed its keys in the cache's rotation.
+            rotation = self.kv_cache.key_rotation(self.head_dim)
+            if rotation is not None:
+                query = rotated(query, rotation)
         elif append is not None:
             key, value = append(key, value)
-            mask = causal_attention_mask(
-                positions, key.shape[-3], self.sliding_window,
-                key_valid=self.get_variable("cache", "cache_valid"))
+            query = append.query(query)
+            valid = self.get_variable("cache", "cache_valid")
+            cursor = causal_attention_mask(positions, key.shape[-3], key_valid=valid)
+            # The paged kernel attends each row's filled slots, which is `cursor`
+            # and nothing narrower: a layer that narrows it builds its own mask.
+            mask = (cursor if self.sliding_window is None else
+                    causal_attention_mask(positions, key.shape[-3], self.sliding_window, key_valid=valid))
             causal = False
             if kv_store is not None and self.kv_store_key is not None:
                 kv_store[self.kv_store_key] = (key, value, positions)
@@ -427,7 +441,10 @@ class CausalSelfAttention(nn.Module):
             causal, window = False, None
             implementation = masked
         if prefix is None and self._restricts_visibility(attention_metadata, decode):
-            mask = self._metadata_mask(attention_metadata, positions, B, S, key.shape[-3], decode)
+            # A decode step's cache mask already holds the rows' validity; only
+            # image groups add to it there.
+            if not decode or self.bidirectional_images:
+                mask = self._metadata_mask(attention_metadata, positions, B, S, key.shape[-3], decode)
             if segment_ids is not None and not decode:
                 mask = mask & document_mask(segment_ids)[:, None]
             causal, window = False, None
@@ -462,15 +479,25 @@ class CausalSelfAttention(nn.Module):
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
-        if not self.is_initializing() and self.is_mutable_collection("qk"):
+        sowing = not self.is_initializing() and self.is_mutable_collection("qk")
+        if sowing:
             self.sow("qk", "max_logits", max_attention_logits(
                 query, key, causal=causal, sliding_window=window, mask=mask))
-        attention = checkpoint_name(scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=implementation, causal=causal,
-            sliding_window=window, mask=mask, sinks=sinks,
-            softcap=self.attn_logit_softcap), 'context')
+        if (append is not None and mask is cursor and S == 1 and sinks is None and not sowing
+                and self.attention_impl in ('auto', 'tpu') and append.store.kernel()):
+            # The Pallas paged kernel reads the pool through the page table; the
+            # gathered keys above go unread and XLA drops the gather. A chunk,
+            # window or metadata mask replaces `cursor`, and keeps the gather.
+            attention = checkpoint_name(append.store.decode(
+                query[:, 0], self.get_variable("cache", "cache_index"), self.attn_logit_softcap)[:, None],
+                'context')
+        else:
+            attention = checkpoint_name(scaled_dot_product_attention(
+                query, key, value, dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax,
+                implementation=implementation, causal=causal,
+                sliding_window=window, mask=mask, sinks=sinks,
+                softcap=self.attn_logit_softcap), 'context')
         return self._output(attention, gate, B, S)
 
     def _runs_local(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
@@ -553,5 +580,6 @@ class AttentionMixer(MixerBase):
             force_fp32_for_softmax=ctx.force_fp32_for_softmax,
             partial_rotary_factor=ctx.partial_rotary_factor,
             partial_rotary_type=ctx.partial_rotary_type,
+            kv_cache=ctx.kv_cache,
             bidirectional_images=self.bidirectional_images, mrope_section=self.mrope_section)
 

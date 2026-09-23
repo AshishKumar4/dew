@@ -52,6 +52,7 @@ from ..hyper_connections import (
     mix_streams,
 )
 from ..inputs import AttentionMetadata, PredictionPhase
+from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..mla import INDEXER_COLLECTION, YarnScaling
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
@@ -1425,6 +1426,9 @@ class CausalTransformer(nn.Module):
     precision: PrecisionLike = None
     force_fp32_for_softmax: bool = True
     attention_impl: str = "auto"  # an AttentionImpl
+    kv_cache: KVCache = KVCache()
+    """How attention layers store the decode cache: dense or paged, full or
+    quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""
     mixture: Mixture | None = None        # None: every layer is dense
     use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width
     causal: bool = True                      # False: full attention, no cache
@@ -1673,6 +1677,7 @@ class CausalTransformer(nn.Module):
             precision=self.precision,
             attention_impl=self.attention_impl,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
+            kv_cache=self.kv_cache,
             partial_rotary_factor=(None if kind.window is not None
                                    else self.partial_rotary_factor),
             partial_rotary_type=self.partial_rotary_type)
@@ -2725,5 +2730,13 @@ def gather_cache_rows(cache, rows):
     row count. Beam branching and speculative rollback are both this
     operation. Nothing else in the tree depends on the row order, so the
     gathered cache decodes exactly as the rows it came from.
+
+    A paged cache (`dew.nn.kv_cache`) keeps its keys in a pool the rows
+    share through their page tables, so gathered rows would write into each
+    other's pages; it is refused.
     """
+    for path, _ in jax.tree_util.tree_leaves_with_path(cache):
+        if any(getattr(entry, "key", None) == "page_table" for entry in path):
+            raise ValueError("beam search and speculative decoding regroup cache rows, which a "
+                             "paged cache's shared pool cannot do; decode them with a dense cache")
     return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)

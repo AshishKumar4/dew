@@ -40,7 +40,6 @@ from dew.nn.attention import (
     LayerNorm,
     RMSNorm,
     _cache_positions,
-    _write_cache,
     apply_rotary,
     causal_attention_mask,
     document_mask,
@@ -50,6 +49,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.inputs import AttentionMetadata
+from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.sharding import logical_axes
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
 
@@ -206,12 +206,12 @@ def open_latent_cache(module: nn.Module, latent, rot, index_keys, max_seq_len, *
 
     def append(new_latent, new_rot, new_index_keys):
         if allocated:
-            cached_latent.value = _write_cache(cached_latent.value, new_latent, positions)
-            cached_rot.value = _write_cache(cached_rot.value, new_rot, positions)
+            cached_latent.value = write_cache(cached_latent.value, new_latent, positions)
+            cached_rot.value = write_cache(cached_rot.value, new_rot, positions)
             if cached_index is not None:
                 if new_index_keys is None:
                     raise ValueError("the indexer scores, so decode must append its keys")
-                cached_index.value = _write_cache(cached_index.value, new_index_keys, positions)
+                cached_index.value = write_cache(cached_index.value, new_index_keys, positions)
         full_index = None if cached_index is None else cached_index.value
         return cached_latent.value, cached_rot.value, full_index
 
@@ -241,10 +241,10 @@ def open_expanded_cache(module: nn.Module, key, value, index_keys, max_seq_len, 
 
     def append(new_key, new_value, new_index_keys):
         if allocated:
-            cached_key.value = _write_cache(cached_key.value, new_key, positions)
-            cached_value.value = _write_cache(cached_value.value, new_value, positions)
+            cached_key.value = write_cache(cached_key.value, new_key, positions)
+            cached_value.value = write_cache(cached_value.value, new_value, positions)
             if cached_index is not None:
-                cached_index.value = _write_cache(cached_index.value, new_index_keys, positions)
+                cached_index.value = write_cache(cached_index.value, new_index_keys, positions)
         full_index = None if cached_index is None else cached_index.value
         return cached_key.value, cached_value.value, full_index
 
@@ -926,6 +926,7 @@ class MLAMixer(MixerBase):
             "attention_chunk": ctx.attention_chunk,
             "attention_scale": ctx.attention_scale,
             "partial_rotary_factor": ctx.partial_rotary_factor,
+            "kv_cache": ctx.kv_cache != KVCache(),
         }
         asked = sorted(name for name, value in unsupported.items() if value)
         if asked:
