@@ -17,6 +17,7 @@ import pytest
 
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.mixers import AttentionMixer
 from dew.registry import models, with_precision
 
 VOCAB = 37
@@ -953,7 +954,8 @@ def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head
 
 def nope_model(**overrides) -> CausalTransformer:
     return CausalTransformer(vocab_size=32, emb_features=32, num_layers=1, num_heads=4,
-                             num_kv_heads=2, max_seq_len=16, qk_norm=False, nope=True, **overrides)
+                             num_kv_heads=2, max_seq_len=16, qk_norm=False,
+                             mixer=AttentionMixer(nope=True), **overrides)
 
 
 def test_a_nope_layer_reads_no_positions_and_keeps_its_logit_scale():
@@ -997,7 +999,7 @@ def test_an_xsa_nope_mup_model_decodes_what_its_full_forward_scores(rng):
     for a Rigel-style layer: XSA subtracts the new token's own value while
     decoding, no rotation reads the cache slot, and the multipliers and the
     logit division apply on both paths."""
-    model = tiny(qk_norm=False, nope=True, exclusive_self_attention=True,
+    model = tiny(qk_norm=False, mixer=AttentionMixer(nope=True, exclusive_self_attention=True),
                  embedding_multiplier=12.0, residual_multiplier=0.22, logits_scaling=4.0,
                  initializer_range=0.1, depth_scaled_init=True)
     ids = tokens(rng, length=10)
@@ -1005,3 +1007,21 @@ def test_an_xsa_nope_mup_model_decodes_what_its_full_forward_scores(rng):
     full = model.apply(params, ids)
     stepped = decode_logits(model, params, ids[:, :4], ids[:, 4:])
     np.testing.assert_allclose(stepped, full[:, 3:], rtol=1e-4, atol=1e-5)
+
+
+def test_nope_and_xsa_are_the_attention_mixers_own_switches():
+    """Only the grouped-query mixer rotates by rope and subtracts its own
+    value, so the switches live on it and a mixer that cannot honour them
+    cannot be handed them."""
+    from dew.nn.backbones.causal_transformer import LayerKind
+    from dew.nn.mixers import mixer_from_record
+    ids = tokens(jax.random.key(0), length=8)
+    record = {"kind": "attention", "nope": True, "exclusive_self_attention": True}
+    kinded = tiny(qk_norm=False, layer_types=("a", "a"), kinds={"a": LayerKind(mixer=record)})
+    params = kinded.init(jax.random.key(1), ids)
+    plain = tiny(qk_norm=False).apply(params, ids)
+    assert not np.allclose(kinded.apply(params, ids), plain)
+    with pytest.raises((TypeError, ValueError)):
+        mixer_from_record({"kind": "mla", "exclusive_self_attention": True})
+    with pytest.raises(TypeError):
+        tiny(nope=True)

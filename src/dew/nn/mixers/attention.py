@@ -598,11 +598,23 @@ class AttentionMixer(MixerBase):
     """Grouped-query attention with optional image-block masking and M-RoPE.
 
     Geometry, norms and kernel policy come from the decoder context. Image
-    bidirectionality and spatial rotary sections configure this mixer only.
+    bidirectionality, spatial rotary sections, NoPE and exclusive self
+    attention configure this mixer only: a hybrid names them on its
+    attention kind, `{"kind": "attention", "nope": true,
+    "exclusive_self_attention": true}`, and a mixer that does not implement
+    them has no field to take them.
     """
 
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None
+    nope: bool = False
+    """No positional encoding: q and k enter the kernel unrotated and the
+    logits keep their scale (lm-engine's `position_embedding_type="nope"`,
+    Granite 4.0-H)."""
+    exclusive_self_attention: bool = False
+    """XSA (arXiv 2603.09078, lm-engine's `exclusive_self_attention`): each
+    head's output loses its component along the token's own value
+    (`exclusive_self_attention`)."""
 
     def __post_init__(self):
         if self.mrope_section is not None:
@@ -646,8 +658,8 @@ class AttentionMixer(MixerBase):
             partial_rotary_factor=ctx.partial_rotary_factor,
             partial_rotary_type=ctx.partial_rotary_type,
             kv_cache=ctx.kv_cache,
-            nope=ctx.nope,
-            exclusive_self_attention=ctx.exclusive_self_attention,
+            nope=self.nope,
+            exclusive_self_attention=self.exclusive_self_attention,
             init_std=ctx.init_std,
             output_init_std=ctx.output_init_std,
             bidirectional_images=self.bidirectional_images, mrope_section=self.mrope_section)

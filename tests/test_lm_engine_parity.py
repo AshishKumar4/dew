@@ -21,6 +21,7 @@ import pytest
 
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
+from dew.nn.mixers import AttentionMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.moe import global_router_loss, router_moments
 from dew.objectives.lm.objective import _router_scores, router_z_terms
@@ -45,10 +46,11 @@ def hybrid(dtype=jnp.float64) -> CausalTransformer:
     """The fixture's model in Dew's fields."""
     return CausalTransformer(
         vocab_size=64, emb_features=32, num_layers=4, num_heads=4, num_kv_heads=2, head_dim=8,
-        qk_norm=False, nope=True, exclusive_self_attention=True, max_seq_len=64,
+        qk_norm=False, max_seq_len=64,
         layer_types=("mamba", "mamba", "mamba", "attention"),
         kinds={"mamba": LayerKind(mixer=Mamba2Mixer(
-            num_heads=4, head_dim=8, state_size=8, n_groups=1, chunk_size=8))},
+            num_heads=4, head_dim=8, state_size=8, n_groups=1, chunk_size=8)),
+               "attention": LayerKind(mixer=AttentionMixer(nope=True, exclusive_self_attention=True))},
         mixture=Mixture(experts=4, top_k=2, expert_features=8),
         embedding_multiplier=12.0, residual_multiplier=0.22, logits_scaling=4.0,
         dtype=dtype, attention_impl="xla")

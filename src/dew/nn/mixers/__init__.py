@@ -94,12 +94,6 @@ class MixerContext:
     gates the branch. The delta net's own gate activation is a field of its
     kind (qwen4_exp's output_gate_type), which is the only gate a reference
     varies."""
-    nope: bool = False
-    """The kind-resolved NoPE switch: an attention mixer rotates neither q nor
-    k and keeps the logit scale (`LayerKind.nope`)."""
-    exclusive_self_attention: bool = False
-    """XSA: the attention output loses its component along each token's own
-    value before the output projection (arXiv 2603.09078)."""
     init_std: float | None = None
     """The normal std the mixer's projections draw from; None keeps each
     module's own initializer (`CausalTransformer.initializer_range`)."""

@@ -95,9 +95,6 @@ class LayerKind:
     scales its full-attention layers alone (configuration_olmo3.py:110-113),
     so a YaRN ramp is a kind's as much as the model's."""
     head_dim: int | None = None
-    nope: bool | None = None
-    """True: this kind's attention layers rotate neither queries nor keys
-    (NoPE); None rides the model's `nope`."""
     mixer: MixerBase | None = None
     """This kind's mixer value or its record; None is the model's mixer."""
 
@@ -134,7 +131,6 @@ class ResolvedKind:
     rope_scaling: RopeScaling | None
     yarn: YarnScaling | None
     head_dim: int
-    nope: bool
     mixer: MixerBase | None
 
 
@@ -1434,13 +1430,6 @@ class CausalTransformer(nn.Module):
     yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
-    nope: bool = False
-    """No positional encoding on the attention layers of every kind that does
-    not say otherwise (`LayerKind.nope`): Granite 4.0-H and lm-engine's
-    `position_embedding_type="nope"`. Rotary fields stay validated and unused."""
-    exclusive_self_attention: bool = False
-    """XSA on every attention layer (arXiv 2603.09078, lm-engine's
-    `exclusive_self_attention`): `dew.nn.mixers.attention.exclusive_self_attention`."""
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     embedding_multiplier: float = 1.0
     """Token embeddings times this before the first layer: muP's m_emb in
@@ -1622,7 +1611,6 @@ class CausalTransformer(nn.Module):
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
             yarn=self.yarn if kind.yarn is None else kind.yarn,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
-            nope=self.nope if kind.nope is None else kind.nope,
             mixer=kind.mixer)
 
     @property
@@ -1742,8 +1730,6 @@ class CausalTransformer(nn.Module):
             partial_rotary_factor=(None if kind.window is not None
                                    else self.partial_rotary_factor),
             partial_rotary_type=self.partial_rotary_type,
-            nope=kind.nope,
-            exclusive_self_attention=self.exclusive_self_attention,
             init_std=self.init_stds[0],
             output_init_std=self.init_stds[1])
 
