@@ -240,25 +240,25 @@ def test_the_exchange_moves_heads_and_never_gathers_a_key():
     assert "all-to-all" in text and "all-gather" not in text
 
 
-def test_the_byte_count_picks_the_exchange_the_arithmetic_favours():
-    """H=32, K=8, n=2: the all-to-all sends 20 units either way, the gather
-    8 unmasked and 24 causal. One tensor shard of two halves every side."""
-    assert not all_to_all_moves_less(32, 8, 1, 2, reordered=False)
-    assert all_to_all_moves_less(32, 8, 1, 2, reordered=True)
-    # Unmasked multi-head attention sends 4H / n against the gather's 2H:
-    # a tie at two shards, which the gather takes, and the exchange past it.
-    assert not all_to_all_moves_less(8, 8, 1, 2, reordered=False)
-    assert all_to_all_moves_less(8, 8, 1, 4, reordered=False)
-    # A tie goes to the gather: H=4, K=1, n=4 sends 2(4 + 4)/4 = 4 against
-    # 2 + 2 * 4 / 4 = 4.
-    assert not all_to_all_moves_less(4, 1, 1, 4, reordered=True)
-    assert all_to_all_moves_less(32, 8, 2, 2, reordered=True) == all_to_all_moves_less(
-        16, 4, 1, 2, reordered=True)
+def test_the_byte_count_picks_the_exchange_for_a_call_with_no_mask():
+    """H=32, K=8, n=2: the all-to-all sends 40 units, the gather 16. One
+    tensor shard of two halves every side."""
+    assert not all_to_all_moves_less(32, 8, 1, 2)
+    # Multi-head attention sends 4H / n against the gather's 2H: a tie at
+    # two shards, which the gather takes, and the exchange past it.
+    assert not all_to_all_moves_less(8, 8, 1, 2)
+    assert all_to_all_moves_less(8, 8, 1, 4)
+    assert all_to_all_moves_less(32, 8, 2, 2) == all_to_all_moves_less(16, 4, 1, 2)
 
 
 @pytest.mark.mesh
 @pytest.mark.parametrize("case, spec, shape, call, exchanged", [
     ("causal", SPLIT, (BATCH, SEQ_LEN, 4, 2), dict(causal=True), True),
+    # H=4, K=1, n=4: 2(4 + 4)/4 = 4 units against the gather's 2 + 2 * 4/4 = 4.
+    # A masked call takes the all-to-all even at a tie in bytes, whose kernel
+    # skips the masked blocks.
+    ("causal_one_key_head", MeshSpec(fsdp=2, sequence=4), (BATCH, SEQ_LEN, 4, 1),
+     dict(causal=True), True),
     ("unmasked_grouped", SPLIT, (BATCH, SEQ_LEN, 8, 1), dict(), False),
     ("heads_the_split_cannot_divide", MeshSpec(tensor=2, sequence=4),
      (BATCH, SEQ_LEN, 4, 2), dict(causal=True), False),
