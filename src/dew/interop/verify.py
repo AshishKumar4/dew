@@ -120,7 +120,7 @@ def reference_logits(model: PreTrainedModel, ids: np.ndarray) -> np.ndarray:
     return out.logits.to(torch.float32).numpy()
 
 
-def shrink(hf_config: Mapping[str, object]) -> dict[str, object]:
+def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """Return a config with the sizes the convention reads made small and the rest kept.
 
     The layer count stays: a per-layer field the convention does not read

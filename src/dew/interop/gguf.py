@@ -19,6 +19,7 @@ a private method there.
 from __future__ import annotations
 
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -53,16 +54,16 @@ a rotary over part of each head, or keys and values wider or narrower than
 it, would compute another model."""
 
 
-def _parse(reader: GGUFReader, key: str) -> object:
+def _parse(reader: GGUFReader, key: str) -> records.JSON:
     """One metadata value as transformers parses it: a one-element array is its element."""
     from transformers.integrations.ggml import _gguf_parse_value
 
     field = reader.fields[key]
-    values = [_gguf_parse_value(field.parts[index], field.types) for index in field.data]
+    values = [records.json_value(_gguf_parse_value(field.parts[index], field.types), key) for index in field.data]
     return values[0] if len(values) == 1 else values
 
 
-def _config(reader: GGUFReader) -> tuple[str, dict[str, object]]:
+def _config(reader: GGUFReader) -> tuple[str, Mapping[str, object]]:
     """Return the file's architecture and its HF config, as transformers builds it.
 
     `load_gguf_checkpoint`'s rules for these architectures: every key goes
@@ -110,7 +111,7 @@ def _config(reader: GGUFReader) -> tuple[str, dict[str, object]]:
     return architecture, config
 
 
-def _mapped(reader: GGUFReader, section: str) -> dict[str, object]:
+def _mapped(reader: GGUFReader, section: str) -> Mapping[str, object]:
     """The file's metadata under transformers' names for one section of
     GGUF_TO_TRANSFORMERS_MAPPING ('config', 'tokenizer' or 'tokenizer_config')."""
     from transformers.modeling_gguf_pytorch_utils import GGUF_TO_TRANSFORMERS_MAPPING
@@ -177,7 +178,7 @@ def _values(tensor: ReaderTensor) -> np.ndarray:
     return dequantize(tensor.data, tensor.tensor_type).reshape(shape)
 
 
-def read(path: str | os.PathLike[str]) -> tuple[dict[str, object], dict[str, np.ndarray]]:
+def read(path: str | os.PathLike[str]) -> tuple[Mapping[str, object], dict[str, np.ndarray]]:
     """Read one GGUF file as its HF config dict and its tensors under HF names.
 
     F32, F16 and BF16 tensors stay memory mapped in their stored dtype, but
