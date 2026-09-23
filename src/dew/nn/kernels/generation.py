@@ -63,21 +63,9 @@ def triton_runs() -> bool:
     process holds a GPU of compute capability 8.0 or later, the bound JAX's
     own Pallas lowerings apply (`_backend_supports_triton`). A T4 fails to
     compile them ("Triton support is only enabled for cc>=8.0")."""
-    gpus = _gpu_versions()
-    return bool(gpus) and min(gpus) >= BF16_GPU
-
-
-def triton_compiles() -> bool:
-    """`triton_runs`, or no GPU in the process at all: a pallas_call named
-    for 'gpu' on a host without one runs Pallas's interpreter, which any
-    host can. Only a GPU older than sm80 refuses."""
-    gpus = _gpu_versions()
-    return not gpus or min(gpus) >= BF16_GPU
-
-
-def _gpu_versions() -> list[int]:
-    return [int(device.compute_capability.replace('.', ''))
-            for device in jax.devices() if device.platform == 'gpu']
+    return any(device.platform == 'gpu'
+               and int(device.compute_capability.replace('.', '')) >= BF16_GPU
+               for device in jax.devices())
 
 
 @functools.cache

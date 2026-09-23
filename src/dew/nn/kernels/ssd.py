@@ -44,7 +44,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu, triton as plgpu
 
-from .generation import filter_triton_deprecation, triton_compiles
+from .generation import filter_triton_deprecation
 
 _log = logging.getLogger(__name__)
 
@@ -58,16 +58,8 @@ MIN_CHUNK = 64
 work of the carry, so under 64 a program spends more on its own state
 recurrence than on the matmul it exists for and XLA's batched einsum wins."""
 
-GPU_PROGRAM_WORDS = 1 << 16
-"""The fp32 words one CUDA thread block may hold, 256 KiB. That is the
-register file of an SM plus the shared memory a block gets on Ada and Hopper,
-and a program's `[C, C]` segment sums, its `[C, P]` and two `[C, N]` operands
-and its `[P, N]` state have to fit in it. A wider geometry needs the chunk
-sub-tiled into row blocks, which this formulation does not do, so it takes the
-XLA path instead."""
-
 TPU_PROGRAM_WORDS = 1 << 20
-"""The same budget on TPU, 4 MiB. A Mosaic program's operands live in VMEM,
+"""The fp32 words one Mosaic program may hold, 4 MiB. Its operands live in VMEM,
 128 MiB of it per core, so what bounds the window here is the double buffering
 the pipeline runs around it rather than the window itself."""
 
@@ -96,22 +88,28 @@ def _program_words(chunk_size: int, head_dim: int, state_size: int) -> int:
 
 
 def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: str) -> bool:
-    """Whether the SSD kernel takes this geometry: a tpu backend or a gpu the
-    Triton kernels compile for (`dew.nn.kernels.generation.triton_compiles`), a
+    """Whether the SSD kernel is chosen for this geometry: a tpu backend, a
     chunk long enough to pay for a program, three widths that are powers of
-    two so that neither Triton's block padding nor Mosaic's tiling throws
-    lanes away, and a tile inside the backend's per-program budget.
+    two so that Mosaic's tiling throws no lanes away, and a tile inside the
+    per-program budget.
+
+    A GPU is never chosen. On an RTX 4080 (sm89, jax 0.11.2) the Triton
+    kernel ran 6x to 12x slower than the XLA path forward plus backward
+    wherever it compiled (chunk 64: 1.39 against 0.22 ms; at batch 8 and 16
+    heads 22.7 against 2.2 ms), and every chunk of 128 or 256 asked for
+    131 to 590 KB of shared memory against 101 KB (docs/performance.md).
+    `ssd_chunk_scan(..., 'gpu')` still builds it by name, which is how
+    tools/benchmark_ssd.py measures it.
 
     `chunk_ssd` asks this at trace time and takes the XLA path when it says
     no, the way attention's 'auto' asks `cudnn_runs`.
     """
-    if backend not in ('gpu', 'tpu') or (backend == 'gpu' and not triton_compiles()):
+    if backend != 'tpu':
         return False
     widths = (chunk_size, head_dim, state_size)
     if any(width < MIN_WIDTH or width & (width - 1) for width in widths):
         return False
-    budget = GPU_PROGRAM_WORDS if backend == 'gpu' else TPU_PROGRAM_WORDS
-    return chunk_size >= MIN_CHUNK and _program_words(*widths) <= budget
+    return chunk_size >= MIN_CHUNK and _program_words(*widths) <= TPU_PROGRAM_WORDS
 
 
 @functools.cache

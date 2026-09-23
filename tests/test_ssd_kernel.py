@@ -45,7 +45,6 @@ import numpy as np
 import pytest
 
 from dew.nn.kernels.ssd import (
-    GPU_PROGRAM_WORDS,
     MIN_CHUNK,
     MIN_WIDTH,
     TPU_PROGRAM_WORDS,
@@ -315,24 +314,12 @@ def test_the_geometry_decides_the_tpu_kernel(chunk_size, head_dim, state_size, r
     assert ssd_kernel_runs(chunk_size, head_dim, state_size, "tpu") is runs
 
 
-def test_the_gpu_budget_refuses_what_the_tpu_budget_takes():
-    """One program holds the chunk whole, so a 256-wide chunk with a 128-wide
-    state is 608 KiB, past what a thread block has and well inside VMEM."""
+def test_a_gpu_is_never_chosen():
+    """The Triton kernel measured slower than XLA on sm89 wherever it
+    compiled, so a GPU takes the XLA path at every geometry."""
     assert ssd_kernel_runs(256, 64, 128, "tpu")
-    assert not ssd_kernel_runs(256, 64, 128, "gpu")
-    assert ssd_kernel_runs(128, 64, 64, "gpu")
-    assert GPU_PROGRAM_WORDS < TPU_PROGRAM_WORDS
-
-
-def test_a_gpu_older_than_sm80_takes_the_xla_path(monkeypatch):
-    """Triton does not compile below compute capability 8.0; the rule every
-    Dew Triton kernel shares sends such a card to the XLA path."""
-    from dew.nn.kernels import generation
-    monkeypatch.setattr(generation, "_gpu_versions", lambda: [75])
+    assert not ssd_kernel_runs(64, 64, 64, "gpu")
     assert not ssd_kernel_runs(128, 64, 64, "gpu")
-    assert ssd_kernel_runs(256, 64, 128, "tpu")
-    monkeypatch.setattr(generation, "_gpu_versions", lambda: [89])
-    assert ssd_kernel_runs(128, 64, 64, "gpu")
 
 
 def kernels_in(jaxpr) -> int:
@@ -346,7 +333,7 @@ def kernels_in(jaxpr) -> int:
 
 
 @pytest.mark.parametrize(("backend", "chunk_size", "kernels"), [
-    ("cpu", 64, 0), ("gpu", 64, 1), ("tpu", 64, 1),
+    ("cpu", 64, 0), ("gpu", 64, 0), ("tpu", 64, 1),
     ("gpu", 32, 0), ("tpu", 32, 0), ("gpu", 256, 0), ("tpu", 256, 1),
 ])
 def test_the_backend_and_the_chunk_choose_the_scan_at_trace_time(monkeypatch, backend,
@@ -377,9 +364,11 @@ def test_the_choice_is_logged_once_per_geometry(monkeypatch, caplog):
 
 
 def test_the_platform_is_the_backend_the_kernel_runs_on(monkeypatch):
-    on_backend(monkeypatch, "gpu")
-    assert ssd_kernel_platform(128, 64, 64) == "gpu"
+    on_backend(monkeypatch, "tpu")
+    assert ssd_kernel_platform(128, 64, 64) == "tpu"
     assert ssd_kernel_platform(128, 6, 5) is None
+    on_backend(monkeypatch, "gpu")
+    assert ssd_kernel_platform(128, 64, 64) is None
     on_backend(monkeypatch, "cpu")
     assert ssd_kernel_platform(128, 64, 64) is None
 
@@ -403,3 +392,90 @@ def test_the_fixture_geometry_is_the_one_test_mamba2_uses(reference):
     assert x.shape == (2, 70, geometry["num_heads"], geometry["head_dim"])
     assert reference["scan.B"].shape[-1] == geometry["state_size"]
     assert geometry["chunk_size"] == 32
+
+
+# --- compiled on the device ---------------------------------------------------
+
+on_device = pytest.mark.skipif(jax.default_backend() != "tpu",
+                               reason="needs a tpu, the one backend the kernel is chosen on")
+
+
+def stepwise_scan(x_c, b_c, c_c, a_c, state):
+    """The recurrence one step at a time, no chunks: `h_t = exp(a_t) h_{t-1}
+    + x_t b_t^T`, `y_t = h_t c_t`. Written apart from both chunked paths, so
+    in float64 it is an oracle neither of them shares a line with."""
+    chunks, batch, size, heads, width = x_c.shape
+    xs = jnp.swapaxes(x_c, 1, 2).reshape(chunks * size, batch, heads, width)
+    bs = jnp.swapaxes(b_c, 1, 2).reshape(chunks * size, batch, heads, -1)
+    cs = jnp.swapaxes(c_c, 1, 2).reshape(chunks * size, batch, heads, -1)
+    as_ = jnp.moveaxis(a_c, 3, 1).reshape(chunks * size, batch, heads)
+
+    def step(h, inputs):
+        x, b, c, a = inputs
+        h = jnp.exp(a)[..., None, None] * h + x[..., :, None] * b[..., None, :]
+        return h, jnp.einsum('bhpn,bhn->bhp', h, c)
+
+    final, ys = jax.lax.scan(step, state, (xs, bs, cs, as_))
+    y = jnp.swapaxes(ys.reshape(chunks, size, batch, heads, width), 1, 2)
+    return y, final
+
+
+def test_the_stepwise_oracle_is_the_chunked_scan():
+    """The stepwise oracle computes what `xla_chunk_scan` computes: four
+    chunks of 64 in fp32 agree to 1e-5 of the largest value, the bound the
+    kernel is held to through `chunk_ssd` above."""
+    operands = mixer_operands((1, 256, 2, 16, 8, 1))
+    blocked = blocks(*operands[:5], operands[6], chunk_size=64)
+    for want, got in zip(xla_chunk_scan(*blocked), stepwise_scan(*blocked), strict=True):
+        assert largest(want, got) / float(np.max(np.abs(want))) < 1e-5
+
+
+def root_mean_square(value, truth) -> float:
+    return float(np.sqrt(np.mean(np.square(np.asarray(value, np.float64) - np.asarray(truth, np.float64)))))
+
+
+# 1,024 and 4,096 steps at a chunk of 128 over 4 heads of 64 channels and a
+# state of 64: the geometry `tools/benchmark_ssd.py --parity` times, which
+# `ssd_kernel_runs` takes on both backends.
+DEVICE_SHAPES = [pytest.param((1, length, 4, 64, 64, 1), 128, id=f"{length}-steps")
+                 for length in (1024, 4096)]
+
+
+@on_device
+@pytest.mark.parametrize(("shape", "chunk_size"), DEVICE_SHAPES)
+def test_the_compiled_kernel_is_as_exact_as_the_xla_scan(shape, chunk_size, in_float64):
+    """The kernel compiled for the device this process holds, never
+    interpreted, forward and all five gradients, against the XLA path
+    compiled beside it and both against the stepwise recurrence in float64.
+
+    The rule is tests/reference_error.py's: the kernel's RMS distance from
+    float64 at most twice the XLA path's, which is the fp32 rounding (and on
+    a GPU the TF32 the default precision of both paths' matmuls selects)
+    that the two make. The largest difference between the two is recorded
+    in the assertion message rather than bounded: at TF32 it scales with the
+    operands, not with fp32's epsilon."""
+    batch, _, heads, head_dim, state_size, _ = shape
+    assert ssd_kernel_runs(chunk_size, head_dim, state_size, jax.default_backend())
+    platform = jax.default_backend()
+    x, dt, A, B, C, _, state = mixer_operands(shape)
+    operands = blocks(x, dt, A, B, C, state, chunk_size)
+    exact = [jnp.asarray(t, jnp.float64) for t in operands]
+    seeded = cotangents(*xla_chunk_scan(*operands))
+    truth = jax.jit(stepwise_scan)(*exact)
+    truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](
+        tuple(t.astype(jnp.float64) for t in seeded)))(*exact)
+
+    xla = jax.jit(xla_chunk_scan)(*operands)
+    xla_gradients = jax.jit(lambda *o: jax.vjp(xla_chunk_scan, *o)[1](seeded))(*operands)
+    # pallas interprets only for a platform the process holds no device of
+    assert any(device.platform == platform for device in jax.devices())
+    kernel = jax.jit(lambda *o: ssd_chunk_scan(*o, platform))(*operands)
+    kernel_gradients = jax.jit(lambda *o: jax.vjp(lambda *p: ssd_chunk_scan(*p, platform), *o)[1](
+        seeded))(*operands)
+
+    names = ("output", "final", "x", "B", "C", "A dt", "state")
+    for name, mine, theirs, want in zip(names, (*kernel, *kernel_gradients), (*xla, *xla_gradients),
+                                        (*truth, *truth_gradients), strict=True):
+        assert np.all(np.isfinite(np.asarray(mine))), name
+        ours, reference = root_mean_square(mine, want), root_mean_square(theirs, want)
+        assert ours <= 2 * reference, (name, ours, reference, largest(mine, theirs))
