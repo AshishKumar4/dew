@@ -1,4 +1,4 @@
-"""Defaults for dew-tpu, kept in ~/.config/dew/tpu.toml.
+"""Defaults for dew tpu, kept in ~/.config/dew/tpu.toml.
 
 Also holds what an accelerator type implies: runtime version, worker count and
 device count. Everything here is a pure function of strings, so the commands
@@ -40,7 +40,7 @@ UNITS_PER_WORKER = 8
 
 @dataclasses.dataclass(frozen=True)
 class TpuConfig:
-    """The defaults every dew-tpu command falls back to."""
+    """The defaults every dew tpu command falls back to."""
 
     project: str = ""
     zones: tuple[str, ...] = DEFAULT_ZONES
@@ -87,7 +87,7 @@ def dumps(cfg: TpuConfig) -> str:
         f"{field.name} = {_toml(getattr(cfg, field.name))}\n"
         for field in dataclasses.fields(TpuConfig)
     )
-    return "# dew-tpu defaults. Every field has a flag of the same name.\n" + body
+    return "# dew tpu defaults. Every field has a flag of the same name.\n" + body
 
 
 def save(cfg: TpuConfig, path: Path | None = None) -> Path:
@@ -117,7 +117,7 @@ def _zone_cache() -> dict[str, str]:
         return json.loads(path.read_text())
     except ValueError as error:
         raise ValueError(
-            f"{path} is not the JSON zone cache dew-tpu writes ({error}); delete it "
+            f"{path} is not the JSON zone cache dew tpu writes ({error}); delete it "
             "and the next command rebuilds it") from None
 
 

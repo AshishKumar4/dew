@@ -1,10 +1,11 @@
-"""dew: the commands that act on a run directory.
+"""dew: run programs on accelerator clusters and act on run directories.
 
-The second console script beside `dew-tpu`, and it keeps the same rule this
-package states: nothing here imports an array library at import time, so
-`dew --help` answers without loading JAX. A command that needs one imports
-it inside `run`, where the work is.
+dew tpu creates, sets up and reaches Cloud TPUs; `dew tpu --help` lists its commands.
 """
+
+# Nothing here imports an array library at import time, so `dew --help`
+# answers without loading JAX. A command that needs one imports it inside
+# `run_command`, where the work is.
 
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from collections.abc import Sequence
 
 import tyro
 
+from dew.cli import tpu
 from dew.cli.gcloud import emit
 from dew.cli.launch import Launch
 
@@ -49,9 +51,11 @@ COMMANDS = {"export": Export, "launch": Launch}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["tpu"]:
+        return tpu.main(args[1:])
     command = tyro.extras.subcommand_cli_from_dict(
-        COMMANDS, args=list(sys.argv[1:] if argv is None else argv), prog="dew",
-        description=__doc__, config=CONFIG)
+        COMMANDS, args=args, prog="dew", description=__doc__, config=CONFIG)
     return command.run_command()
 
 
