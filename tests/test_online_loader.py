@@ -27,6 +27,7 @@ import PIL.Image
 import pytest
 
 from dew.data import Loading, online_loader
+from dew.data.images import decode_image
 from dew.data.online_loader import Fetch, ImageStream
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -190,8 +191,27 @@ def test_bytes_that_are_no_image_decode_to_nothing():
 
 
 @pytest.mark.parametrize("pixels", [
-    pytest.param(np.full((48, 48), 7, np.uint8), id="grayscale"),
-    pytest.param(np.full((48, 48, 4), 7, np.uint8), id="rgba"),
+    pytest.param(np.random.RandomState(0).randint(0, 256, (48, 40), np.uint8), id="grayscale"),
+    pytest.param(np.random.RandomState(0).randint(0, 256, (48, 40, 4), np.uint8), id="rgba"),
+])
+def test_a_fetched_image_decodes_as_the_image_datasets_decode_it(pixels):
+    """One decoder for both paths. PIL's own array of a grayscale or RGBA PNG
+    is 2-D or 4-channel, which the online path used to drop as not RGB while
+    the dataset path kept the same bytes as RGB; both now give PIL's RGB
+    conversion, alpha dropped rather than composited."""
+    blob = _png(pixels)
+    rgb = np.asarray(PIL.Image.open(io.BytesIO(blob)).convert("RGB"))
+
+    fetched = online_loader.decode_pixels(blob)
+
+    assert fetched is not None
+    np.testing.assert_array_equal(fetched, rgb)
+    np.testing.assert_array_equal(fetched, decode_image(blob))
+    assert online_loader.prepare_image(fetched, size=64, min_size=32) is not None
+
+
+
+@pytest.mark.parametrize("pixels", [
     pytest.param(np.random.RandomState(0).randint(0, 256, (31, 48, 3), np.uint8), id="too_small"),
     pytest.param(np.random.RandomState(0).randint(0, 256, (32, 78, 3), np.uint8), id="too_wide"),
     pytest.param(np.full((48, 48, 3), 200, np.uint8), id="flat"),
