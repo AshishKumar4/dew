@@ -303,6 +303,21 @@ def test_layout_parity_refuses_a_floor_past_its_compute_dtypes_rounding():
         tool.widest_floor({"['layers_23']['layer_scalar']": 2.21}, "bfloat16")
 
 
+def test_layout_parity_judges_a_leaf_below_the_steps_rounding_against_the_whole_gradient():
+    """A gradient whose terms cancel, such as a scale just ahead of a
+    normalisation that undoes it, is rounding noise, and relative to its own
+    norm any two runs differ by 100%. It is measured against the rounding of
+    the whole gradient instead, while a leaf above that keeps its own norm."""
+    tool = load("layout_parity")
+    reference = {"weight": np.full(100, 1.0), "scale": np.array([1e-9])}
+    moved = {"weight": np.full(100, 1.0 + 1e-6), "scale": np.array([-1e-9])}
+
+    errors = tool.leaf_errors(reference, moved, "float32")
+
+    assert errors["['weight']"] == pytest.approx(1e-6, rel=1e-6)
+    assert errors["['scale']"] == pytest.approx(2e-9 / (tool.rounding_limit("float32") * 10), rel=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # tools/benchmark_step.py
 # ---------------------------------------------------------------------------
