@@ -29,6 +29,8 @@ The launcher starts the command on each host over `ssh -o BatchMode=yes`, so pas
 
 Every output line carries its rank, such as `[1] Joined the JAX process pool: process 1 of 2`. When one process exits with an error, the launcher stops the others and exits with that code. Without this, the survivors would wait in a collective for a peer that is gone.
 
+A process of a pool that fails does not wait for its peers. It prints the error, writes it to the coordination service and exits at once, instead of sitting in `jax.distributed`'s shutdown barrier for up to 300 seconds. When a rank fails between steps, for example because its data loader raised, its peers may already be inside the next step's collectives, which no GPU backend times out. The failing rank's error is written before it tries to agree with them, and a watch thread in every process ends the process when a published failure has not been heard at an agreement within 60 seconds. So the whole pool ends within about a minute, under `dew launch`, `srun` or a scheduler alike.
+
 To run one process per GPU instead of one per host:
 
 ```bash
@@ -87,7 +89,17 @@ Keep the sequence axis inside a node. Both exchanges run once per attention laye
 
 ## Rehearse on one machine
 
-Before you book nodes, run the same launch on one machine with CPU devices. This command starts four processes with two CPU devices each, the layout of four hosts with two accelerators, grouped into two replicas of two hosts:
+Before you book nodes, run the same launch on one machine. On a machine with several GPUs, one process per GPU with NCCL on its socket transport (no NVLink, PCIe peer access or shared memory between processes) exercises the paths that run between hosts:
+
+```bash
+dew launch --processes-per-host 4 --devices-per-process 1 \
+    --env NCCL_P2P_DISABLE=1 --env NCCL_SHM_DISABLE=1 \
+    -- python tests/distribution_worker.py --out /tmp/pool.json --mesh '{"fsdp": 2, "replicas": 2}'
+```
+
+To catch code that assumes one filesystem, start each process in a directory of its own, with its own `HOME`, `HF_HOME` and compilation cache. A persistent checkpoint directory then has to stay on storage every process shares. Checkpoints refuse a directory the processes do not share (see [resuming training](checkpoints.md)).
+
+Without GPUs, CPU devices stand in. This command starts four processes with two CPU devices each, the layout of four hosts with two accelerators, grouped into two replicas of two hosts:
 
 ```bash
 JAX_PLATFORMS=cpu dew launch --processes-per-host 4 \
@@ -98,7 +110,9 @@ JAX_PLATFORMS=cpu dew launch --processes-per-host 4 \
 
 `/tmp/pool.json` records the losses and, for every fsdp group, the processes its devices sit on. Hybrid sharding shows `"fsdp_groups": [[0, 1], [0, 1], [2, 3], [2, 3]]`: each fsdp group spans the two hosts of its replica. Without `replicas`, `jax.make_mesh` gives `[[0], [1], [2], [3]]`. Run the worker again as one process with `--env XLA_FLAGS=--xla_force_host_platform_device_count=8` and `--mesh '{"fsdp": 8}'`. The two runs print the same losses to within 1e-6.
 
-`tests/test_distribution.py` runs this comparison for hybrid sharding and for a split sequence across processes, and checks that a failing process stops the pool.
+`tests/test_distribution.py` runs this comparison for hybrid sharding and for a split sequence across processes. It also checks that a failing process stops the pool, including a rank whose loader fails in the middle of `fit`, and that a pool refuses a checkpoint directory its processes do not share. On a GPU run, the tests marked `mesh(devices=2)` take one GPU per process.
+
+`tools/layout_parity.py` runs every layout of every model family against one device, in one process or under `dew launch`. It compares the loss and each gradient leaf against the reference's own deviation when the batch's sums are reordered.
 
 ## What has and has not been run
 
