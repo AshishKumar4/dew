@@ -31,6 +31,7 @@ import math
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
@@ -43,8 +44,8 @@ from dew.objectives.base import Batch
 
 from .episodes import (
     Action,
-    Episode,
     EnvironmentFactory,
+    Episode,
     EpisodeId,
     EpisodeStatus,
     Observation,
@@ -299,8 +300,8 @@ class PromptSource:
         status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
         try:
             text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
-            data = task.data
-            score = _scored(self.reward(data["source"], text, data["truth"], data["info"]))
+            prompt = task.data
+            score = _scored(self.reward(prompt["source"], text, prompt["truth"], prompt["info"]))
         except Exception as error:
             return Rollout(task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}")
         return Rollout(task.id, "", 0, 0, (call,), status, score.reward, dict(score.components), score.detail)
@@ -312,19 +313,15 @@ class PromptSource:
         def score() -> None:
             if scored.cancelled():
                 return
-            try:
+            with suppress(InvalidStateError):  # cancelled while scoring
                 scored.set_result(self._rollout(task, drawn))
-            except InvalidStateError:
-                pass  # cancelled while scoring
 
         def chained(_: Future[Draw]) -> None:
             try:
                 self._scorers.submit(score)
             except RuntimeError as closed:
-                try:
+                with suppress(InvalidStateError):
                     scored.set_exception(closed)
-                except InvalidStateError:
-                    pass
 
         drawn.add_done_callback(chained)
         return scored
