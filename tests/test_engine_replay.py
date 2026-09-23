@@ -65,21 +65,35 @@ def test_packed_scoring_reproduces_the_engines_filtered_likelihoods():
     assert np.abs(raw - behavior).max() > 0.5
 
 
-def test_the_trainer_routes_every_token_as_the_engine_did():
-    """Dew's routing of the engine's ids, sown by the same forward the loss
-    runs, equals vLLM's record on both sparse layers wherever the engine
-    forwarded an id."""
+def test_the_trainer_routes_every_token_as_the_record_says():
+    """The routing Dew's forward sows follows the record it replays. On
+    vLLM's record Dew's own top-k already agrees, so the check also replays
+    a record altered to send every covered id to the two experts Dew ranks
+    last on each sparse layer: the sown routing follows it, and the
+    likelihoods move."""
     grpo, variables = objective()
     _, batch = engine_batch()
     ids = batch["input_ids"]
     packing = {"segment_ids": batch["text_segment_ids"], "positions": batch["text_positions"]}
     covered = batch[ROUTED_KEY][:, :-1]
 
-    def routing(routes, layer):
-        sown = grpo.token_scores(variables, ids, routing=True, routes=routes, **packing).routing
-        return np.sort(np.asarray(sown[f"layers_{layer}"]["mlp"]["gate"]["indices"][0]), -1)
+    def sown(record):
+        routes = None if record is None else (record, batch[ROUTED_KEY])
+        return grpo.token_scores(variables, ids, routing=True, routes=routes, **packing).routing
 
+    native = sown(None)
+    altered = np.array(batch[ROUTED_EXPERTS_KEY])
     for layer in (1, 2):
-        engine = np.sort(batch[ROUTED_EXPERTS_KEY][:, :-1, layer], -1)
-        replayed = routing((batch[ROUTED_EXPERTS_KEY], batch[ROUTED_KEY]), layer)
-        np.testing.assert_array_equal(replayed[covered], engine[covered])
+        scores = np.asarray(native[f"layers_{layer}"]["mlp"]["gate"]["scores"][0])
+        last = np.argsort(scores, axis=-1)[..., :2].astype(altered.dtype)
+        altered[:, :-1, layer] = np.where(covered[..., None], last, altered[:, :-1, layer])
+    for record in (batch[ROUTED_EXPERTS_KEY], altered):
+        routing = sown(record)
+        for layer in (1, 2):
+            chosen = np.sort(np.asarray(routing[f"layers_{layer}"]["mlp"]["gate"]["indices"][0]), -1)
+            np.testing.assert_array_equal(chosen[covered], np.sort(record[:, :-1, layer], -1)[covered])
+    assert not np.array_equal(altered, batch[ROUTED_EXPERTS_KEY])
+    moved = np.asarray(grpo.packed_log_probs(variables, {**batch, ROUTED_EXPERTS_KEY: altered}))
+    kept = np.asarray(grpo.packed_log_probs(variables, batch))
+    sampled = batch["response_mask"] != 0
+    assert np.abs(moved - kept)[sampled].max() > 1e-2
