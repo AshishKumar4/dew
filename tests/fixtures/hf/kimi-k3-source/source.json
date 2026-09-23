@@ -1,0 +1,11 @@
+{
+ "repo": "moonshotai/Kimi-K3",
+ "revision": "f831ab66814297da540d832a5235f8e904f29d06",
+ "tensors": "name -> [safetensors dtype, shape], read from the 96 shard headers of model.safetensors.index.json at that revision",
+ "reference": {
+  "modeling_kimi_linear.py": "f831ab6 (unchanged since c5d1dd4)",
+  "fla-core": "0.5.2",
+  "transformers": "4.56.2",
+  "compressed-tensors": "0.17.1"
+ }
+}
