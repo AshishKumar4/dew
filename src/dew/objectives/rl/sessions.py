@@ -4,9 +4,8 @@ A `Call` is what any recording gateway can supply for one model call: the
 prompt ids the engine read, the ids it sampled, their behavior
 log-probabilities, the finish reason and the policy version served when the
 request was submitted. A `Session` is one harness session: its calls in
-submission order, with the verifier's verdict. A `SessionSource` turns tasks
-into sessions; Harbor runners, Polar clients and the in-process episode
-collector all sit behind it.
+submission order, with the verifier's verdict. Harbor runners, Polar
+clients and the in-process episode collector all produce sessions.
 
 `pack` turns sessions into one fixed-shape training batch. It merges call
 k + 1 into the row of call k only when call k + 1's prompt ids start with
@@ -30,12 +29,10 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
 from numbers import Real
 from types import MappingProxyType
-from typing import Protocol
 
 import jax.numpy as jnp
 import numpy as np
@@ -143,14 +140,6 @@ class Call:
 
 
 @dataclass(frozen=True)
-class Task:
-    """One unit of work a session source runs: an identity and its source-specific payload."""
-
-    id: str
-    data: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
-
-
-@dataclass(frozen=True)
 class Session:
     """One harness session: its calls in submission order and how it ended.
 
@@ -184,19 +173,6 @@ class Session:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"session {name} must be a nonnegative integer")
-
-
-class SessionSource(Protocol):
-    """Anything that turns tasks into sessions.
-
-    `submit` starts `samples` sessions of one task under the served policy
-    `version` and returns one future per session; `cancel` stops sessions
-    whose results are no longer wanted.
-    """
-
-    def submit(self, task: Task, samples: int, *, version: int) -> Sequence[Future[Session]]: ...
-
-    def cancel(self, futures: Sequence[Future[Session]]) -> None: ...
 
 
 @dataclass
@@ -401,61 +377,3 @@ def sampled_values(batch: Mapping[str, np.ndarray],
         flat[where[group]] = given
     return out
 
-
-def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray], *,
-                    source: Callable[[Session], str] | None = None,
-                    latencies: Sequence[float] | None = None,
-                    version: int | None = None) -> dict[str, float]:
-    """Host-side agentic telemetry for one packed batch and the sessions behind it.
-
-    - `merge/calls_per_chain`: trainable calls over packed chains, 1.0 when
-      nothing merged; `pack/fill` is the share of row slots holding ids.
-    - `status/<name>`: share of sessions per status, and
-      `masked/<name>`: share of all sampled ids that status masked.
-    - `reward/mean` over scored sessions, `reward/<source>` per
-      `source(session)`, `reward/component/<name>` per verifier component.
-    - `latency/p50`, `p90`, `p99`, `max` over `latencies`, seconds per session.
-    - `lag/mean`, `lag/max`: `version` minus each trainable id's version.
-
-    Trainer-versus-engine mismatch is the loss's own metric (`mismatch/*`),
-    computed where the proximal policy is known.
-    """
-    metrics: dict[str, float] = {}
-    total = max(len(sessions), 1)
-    sampled = dict.fromkeys(Status, 0)
-    for session in sessions:
-        sampled[session.status] += sum(len(call.sampled_ids) for call in session.calls)
-    everything = max(sum(sampled.values()), 1)
-    for status in Status:
-        metrics[f"status/{status.value}"] = sum(session.status == status for session in sessions) / total
-        if not status.trainable:
-            metrics[f"masked/{status.value}"] = sampled[status] / everything
-    segments = np.asarray(batch[SEGMENT_IDS_KEY])
-    rows = np.arange(segments.shape[0])[:, None] * (segments.shape[1] + 1) + segments
-    chain_count = np.unique(rows[segments > 0]).size
-    calls = sum(len(session.calls) for session in sessions if session.status.trainable)
-    metrics["merge/calls_per_chain"] = calls / chain_count if chain_count else 0.0
-    metrics["pack/fill"] = float(np.mean(segments > 0))
-    scored = [(session, session.reward) for session in sessions
-              if session.status.trainable and session.reward is not None]
-    if scored:
-        metrics["reward/mean"] = float(np.mean([reward for _, reward in scored]))
-        by_source: dict[str, list[float]] = {}
-        components: dict[str, list[float]] = {}
-        for session, reward in scored:
-            if source is not None:
-                by_source.setdefault(source(session), []).append(float(reward))
-            for name, value in session.components.items():
-                components.setdefault(name, []).append(float(value))
-        metrics.update({f"reward/{name}": float(np.mean(values)) for name, values in by_source.items()})
-        metrics.update({f"reward/component/{name}": float(np.mean(values)) for name, values in components.items()})
-    if latencies:
-        seconds = np.asarray(latencies, np.float64)
-        for label, quantile in (("p50", 50), ("p90", 90), ("p99", 99)):
-            metrics[f"latency/{label}"] = float(np.percentile(seconds, quantile))
-        metrics["latency/max"] = float(seconds.max())
-    mask = np.asarray(batch[RESPONSE_MASK_KEY]) != 0
-    if version is not None and mask.any():
-        lag = version - np.asarray(batch[VERSIONS_KEY])[mask]
-        metrics["lag/mean"], metrics["lag/max"] = float(lag.mean()), float(lag.max())
-    return metrics

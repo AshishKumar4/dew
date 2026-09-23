@@ -41,9 +41,7 @@ from .sessions import (
                        RESPONSE_MASK_KEY,
                        Call,
                        Session,
-                       SessionSource,
                        Status,
-                       Task,
                        pack,
 )
 from .verifiers import CodeReward, MathReward, code_block
@@ -92,10 +90,8 @@ __all__ = [
                        "SandboxFleet",
                        "SandboxLimits",
                        "Session",
-                       "SessionSource",
                        "Status",
                        "SubprocessEnvironment",
-                       "Task",
                        "Transition",
                        "ValueHead",
                        "Verdict",
