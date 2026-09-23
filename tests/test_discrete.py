@@ -115,6 +115,29 @@ def test_sample_walks_the_grid_to_a_fully_revealed_row(rng):
     assert jnp.array_equal(out, jnp.broadcast_to(jnp.arange(8) % (VOCAB - 1), (5, 8)))
 
 
+def test_the_denoiser_normalizes_bf16_logits_in_fp32():
+    """The reveal draws from these log probabilities. Against a float64
+    log-softmax of the same bf16 values, fp32 misses by 9.5e-7, within
+    4 * eps32 * max|log p| = 1.4e-5; a bf16 reduction misses by 0.11."""
+    logits = (4 * jax.random.normal(jax.random.key(0), (2, 4, 1024))).astype(jnp.bfloat16)
+
+    class Fixed(nn.Module):
+        @nn.compact
+        def __call__(self, tokens):
+            return logits
+
+    mask = 1023
+    _, log_probs = DiscreteProcess(LogLinear(), mask_id=mask).denoiser(Fixed(), {})(
+        jnp.full((2, 4), mask, jnp.int32), jnp.full((2,), 0.5))
+
+    exact = np.asarray(logits[..., :mask].astype(jnp.float32), np.float64)
+    shifted = exact - exact.max(axis=-1, keepdims=True)
+    expected = shifted - np.log(np.exp(shifted).sum(axis=-1, keepdims=True))
+    assert np.all(np.isneginf(np.asarray(log_probs)[..., mask]))
+    error = np.abs(np.asarray(log_probs[..., :mask], np.float64) - expected).max()
+    assert error <= 4 * float(np.finfo(np.float32).eps) * float(np.abs(expected).max())
+
+
 def test_unmasking_never_emits_the_mask_id(rng):
     """The mask token marks corruption; it is not a token a sample can end
     with, however the model scores it. A model that puts all its mass there
