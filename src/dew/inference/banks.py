@@ -24,7 +24,6 @@ checkpoint too large to hold is not implemented here.
 from __future__ import annotations
 
 import dataclasses
-import functools
 import itertools
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol
@@ -170,21 +169,22 @@ class CheckpointBanks:
     directory: str
     step: int | None = None
     ema: bool = False
+    stored: Variables = dataclasses.field(init=False, repr=False, compare=False)
+    """What the checkpoint at `step` holds, read once, when the source is built."""
 
     def __post_init__(self):
         from dew.checkpoints import Checkpoints
-        if self.step is None:
-            latest = Checkpoints(self.directory).latest
-            if latest is None:
-                raise FileNotFoundError(f"{self.directory} holds no checkpoint")
-            object.__setattr__(self, "step", latest)
+        checkpoints = Checkpoints(self.directory)
+        step = checkpoints.latest if self.step is None else self.step
+        if step is None:
+            raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+        object.__setattr__(self, "step", step)
+        object.__setattr__(self, "stored", checkpoints.stored(step))
 
     def shapes(self) -> Variables:
-        assert self.step is not None
-        stored = _stored(self.directory, self.step)
-        if self.ema and stored.get("ema") is None:
+        if self.ema and self.stored.get("ema") is None:
             raise ValueError("the run keeps no EMA; read the live weights with ema=False")
-        return stored["params"]
+        return self.stored["params"]
 
     def entry(self, placement: Placement) -> Variables:
         return self._restored(placement)
@@ -207,18 +207,11 @@ class CheckpointBanks:
         shapes = narrowed(self.shapes(), placement)
         template = {"params": _typed(shapes, narrowed(placement, shapes))}
         if self.ema:
-            assert self.step is not None
-            averaged = narrowed(_stored(self.directory, self.step)["ema"], placement)
+            averaged = narrowed(self.stored["ema"], placement)
             if averaged:
                 template["ema"] = _typed(averaged, narrowed(placement, averaged))
         values, _ = Checkpoints(self.directory).restore(template, step=self.step)
         return merge(values["params"], values["ema"]) if "ema" in template else values["params"]
-
-
-@functools.cache
-def _stored(directory: str, step: int) -> Variables:
-    from dew.checkpoints import Checkpoints
-    return Checkpoints(directory).stored(step)
 
 
 def narrowed(tree: Mapping, selection: Mapping) -> dict:
