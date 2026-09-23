@@ -48,7 +48,9 @@ refuses a `max_lag` below that. Admitted groups are packed by `pack` into
 fixed `[rows, width]` rows; `pack` computes the per-rollout advantages and
 masks. The proximal policy is the trainer's current weights, rescored over
 the packed rows with `GRPOObjective.packed_log_probs` (decoupled PPO, AReaL
-arXiv:2505.24298): sources report behavior likelihoods only.
+arXiv:2505.24298): sources report behavior likelihoods only, and the
+objective's `behavior_importance_cap` or `behavior_band` weights each token
+by proximal over behavior.
 
 One trainer process owns the scheduler; multi-process trainers are refused.
 """
@@ -183,8 +185,8 @@ class RolloutScheduler:
             raise ValueError(
                 f"ahead={ahead} and sync_every={sync_every} let a batch fall {ahead + sync_every - 1} "
                 f"updates behind, past max_lag={max_lag}")
-        if max_lag > 0 and objective.behavior_importance_cap is None:
-            raise ValueError("stale rollouts need the objective's behavior_importance_cap: "
+        if max_lag > 0 and objective.behavior_importance_cap is None and objective.behavior_band is None:
+            raise ValueError("stale rollouts need the objective's behavior_importance_cap or behavior_band: "
                              "the proximal-to-behavior importance weight is the off-policy correction")
         self.objective, self.source, self.weights, self.tasks_of = objective, source, weights, tasks
         self.width, self.rows, self.groups, self.oversample, self.admit = width, rows, groups, oversample, admit
