@@ -145,6 +145,13 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> benchmar
         return {"vocab_size": VOCAB, "emb_features": width, "num_layers": layers,
                 "num_heads": heads, "mlp_features": mlp, "max_seq_len": SEQUENCE}
 
+    remat = None if args is None else args.remat
+    if path == "dit":
+        # DiT-L/2's width and depth on 64x64 inputs, 1024 tokens a sample.
+        config: dict[str, object] = {"patch_size": 2, "emb_features": 1024, "num_layers": 24,
+                                     "num_heads": 16, "mlp_ratio": 4, "remat": remat != "none"}
+        return benchmark_step.Case("simple_dit", config, dtype="bfloat16", batch_size=batch,
+                                   image_size=64)
     if path == "lm-dense":
         config = decoder(24, 1024, 16, 2816)
     else:
@@ -152,15 +159,24 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> benchmar
         if args is not None:
             mixture["implementation"] = args.implementation
         config = {**decoder(12, 768, 12, 2048), "mixture": mixture}
+    config["remat"] = None if remat in (None, "none") else remat
     return benchmark_step.Case("causal_transformer", config, dtype="bfloat16",
                                batch_size=batch, seq_len=SEQUENCE)
 
 
 def step(args: argparse.Namespace) -> dict[str, object]:
+    if args.path == "dit" and args.remat == "full":
+        # A DiT's remat is a flag for the dots policy; full recomputation is
+        # that block under no policy.
+        import functools
+
+        import dew.nn.backbones.dit as dit
+        dit.remat_block = functools.partial(dit.remat_block, policy=None)
     case = case_for(args.path, args.batch, args)
     trainer = benchmark_step.build_trainer(case, optimizer=build_optimizer(
         OptimConfig(optimizer="adam", learning_rate=1e-4, state_dtype=args.state_dtype), 1000))
-    source = benchmark_step.DevicePrefetchIterator(benchmark_step.batches(case), trainer.device_mesh)
+    source = benchmark_step.DevicePrefetchIterator(
+        benchmark_step.batches(case, trainer.device_mesh), trainer.device_mesh)
     with source:
         abstract = jax.eval_shape(trainer.initial_state)
         state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
@@ -177,9 +193,14 @@ def step(args: argparse.Namespace) -> dict[str, object]:
             state, loss, *_ = compiled(state, next(source))
         loss.block_until_ready()
         step_ms = (time.perf_counter() - start) / args.steps * 1e3
+        if args.trace:
+            with jax.profiler.trace(args.trace):
+                for _ in range(3):
+                    state, loss, *_ = compiled(state, next(source))
+                loss.block_until_ready()
         losses.append(float(loss))
     return {"path": args.path, "batch": args.batch, "implementation": args.implementation,
-            "state_dtype": args.state_dtype, "ms_per_step": step_ms,
+            "state_dtype": args.state_dtype, "remat": args.remat, "ms_per_step": step_ms,
             "compile_seconds": compile_seconds, "loss_after_warmup": losses[0],
             "loss_last": losses[-1]}
 
@@ -195,11 +216,15 @@ def main(argv: list[str] | None = None) -> None:
     update.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32")
     update.add_argument("--repeats", type=int, default=30)
     run = modes.add_parser("step")
-    run.add_argument("--path", choices=("lm-dense", "lm-moe"), required=True)
+    run.add_argument("--path", choices=("lm-dense", "lm-moe", "dit"), required=True)
+    run.add_argument("--remat", default="none",
+                     help="none, full, a REMAT_POLICIES name (decoders) or dots (DiT)")
     run.add_argument("--batch", type=int, required=True)
     run.add_argument("--implementation", default="auto")
     run.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32")
     run.add_argument("--steps", type=int, default=30)
+    run.add_argument("--trace", default=None,
+                     help="a directory for a jax.profiler trace of three steady-state steps")
     args = parser.parse_args(argv)
     result = {"projection": projection, "adam": adam, "step": step}[args.mode](args)
     result.update(device_kind=jax.devices()[0].device_kind, jax=jax.__version__,
