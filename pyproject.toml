@@ -71,6 +71,8 @@ test = [
     # mocked transport; the same pins as the inference-clients extra.
     "ollama>=0.6.2,<0.7",
     "openai>=3.8,<4",
+    # tests/test_guided_decoding.py compiles regex and JSON-schema automata with it.
+    "outlines-core>=0.2.14",
 ]
 # The video specs: moviepy reads the clips and brings ffmpeg (lazy imports in dew.data)
 av = ["moviepy"]
@@ -95,6 +97,8 @@ tfds = ["tensorflow-datasets>=4.9.10"]
 interop = ["safetensors"]
 # Official client transports and native request/result schemas; no model runtime.
 inference-clients = ["ollama>=0.6.2,<0.7", "openai>=3.8,<4"]
+# Guided decoding (dew.sampling.guided): regex and JSON-schema token automata.
+guided = ["outlines-core>=0.2.14"]
 # HF image processors use torchvision on the host; model computation stays JAX.
 vision = ["torchvision>=0.29"]
 

@@ -242,8 +242,8 @@ class Generation(Generic[ArrayT]):
         return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
 
 
-def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps
-             ) -> tuple[DecoderState, jax.Array]:
+def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
+             cache: Variables | None = None) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
     A decoder that scores one position per row runs its head on the slot the
@@ -257,12 +257,16 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
     position with the token at the next, at that token's own position, which
     is the history a checkpoint's predictor was trained behind. A depth left
     empty would draft the first block from nothing.
+
+    `cache` continues a cache the caller already holds, whose cursors say
+    where each row's prompt resumes; None allocates an empty one.
     """
     batch, width = inputs.tokens.shape
-    cache = model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]
-    if ops.depths:
-        drafting = model.apply(params, batch, method="init_mtp_cache", mutable=["cache"])[1]["cache"]
-        cache = unflatten_dict({**flatten_dict(dict(cache)), **flatten_dict(dict(drafting))})
+    if cache is None:
+        cache = model.apply(params, batch, method="init_cache", mutable=["cache"])[1]["cache"]
+        if ops.depths:
+            drafting = model.apply(params, batch, method="init_mtp_cache", mutable=["cache"])[1]["cache"]
+            cache = unflatten_dict({**flatten_dict(dict(cache)), **flatten_dict(dict(drafting))})
     exposed = isinstance(model, Exposing)
     selective = isinstance(model, Selective)
     # An unpadded prompt carries no validity field, and its last real token is
