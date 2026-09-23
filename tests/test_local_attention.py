@@ -259,7 +259,7 @@ def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn():
         out = jnp.einsum("bhqk,bkhd->bqhd", weights, v)
         return jnp.sum(out * cotangent * real[None, :, None, None]), out
 
-    with jax.enable_x64():
+    with jax.enable_x64(True):
         (_, want), wants = jax.value_and_grad(oracle, argnums=(0, 1, 2), has_aux=True)(
             query, key, value)
     (_, got), grads = loss("auto")(query, key, value)
