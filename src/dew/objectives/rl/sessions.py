@@ -33,6 +33,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
+from numbers import Real
 from types import MappingProxyType
 from typing import Protocol
 
@@ -90,14 +91,16 @@ class Status(Enum):
         return self in (Status.COMPLETED, Status.AGENT_ERROR)
 
 
-def _real(value: float | str | None) -> bool:
-    """Whether `value` is a finite number; a bool is a flag, not a score.
+def _finite(message: str, value: object) -> float:
+    """Parse a boundary number: any finite real, numpy's included, as a float.
 
-    Records arrive from gateways and JSON, so anything may land here, and
-    anything that is not a finite number is refused as a ValueError.
+    Records arrive from gateways, JSON and numpy arrays, so anything may land
+    here. A bool is a flag, not a score; it and every non-number, infinity
+    or nan raise a ValueError carrying `message`.
     """
-    return (isinstance(value, (int, float, np.floating)) and not isinstance(value, bool)
-            and math.isfinite(value))
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
+        raise ValueError(f"{message}, got {value!r}")
+    return float(value)
 
 
 def _token_ids(name: str, ids: object) -> None:
@@ -129,8 +132,9 @@ class Call:
         if (not isinstance(self.behavior_log_probs, tuple)
                 or len(self.behavior_log_probs) != len(self.sampled_ids)):
             raise ValueError("a call needs one behavior log-probability per sampled id")
-        if not all(_real(value) for value in self.behavior_log_probs):
-            raise ValueError("behavior log-probabilities must be finite numbers")
+        object.__setattr__(self, "behavior_log_probs", tuple(
+            _finite("behavior log-probabilities must be finite numbers", value)
+            for value in self.behavior_log_probs))
         if self.finish_reason not in FINISH_REASONS:
             raise ValueError(f"finish_reason must be one of {sorted(FINISH_REASONS)}, "
                              f"got {self.finish_reason!r}")
@@ -171,8 +175,9 @@ class Session:
             raise TypeError("session status must be a Status")
         if not isinstance(self.calls, tuple) or not all(isinstance(call, Call) for call in self.calls):
             raise TypeError("session calls must be a tuple of Call records")
-        if self.reward is not None and not _real(self.reward):
-            raise ValueError("a session reward is a finite number or None")
+        if self.reward is not None:
+            object.__setattr__(self, "reward", _finite("a session reward is a finite number or None",
+                                                       self.reward))
         if self.status.trainable and self.reward is None:
             raise ValueError(f"a {self.status.name} session is scored, so it needs a reward")
         for name in ("sample", "attempt"):
