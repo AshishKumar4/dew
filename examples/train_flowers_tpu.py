@@ -41,6 +41,7 @@ from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
 from dew.training import MeshSpec, ProfileWindow, prepare_process
+from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
 
@@ -141,10 +142,9 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         ema_decay=0.9999,
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
         val_metrics=("fid", "clip_score"),
-        optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.01,
-                          learning_rate_schedule="cosine",
-                          learning_rate_peak=config.learning_rate,
-                          learning_rate_warmup_steps=2000),
+        optim=OptimConfig(weight_decay=0.01, schedule=Cosine(
+            peak=config.learning_rate, warmup_steps=2000, init=config.learning_rate,
+            end=2e-4)),
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
                               batch_size=config.batch_size, steps=config.steps,
                               log_every=50, eval_every=2000, checkpoint_every=2000,

@@ -30,6 +30,7 @@ from dew.training.optim import (
     linear_schedule,
     mup_param_groups,
     param_labels,
+    Power,
     power_schedule,
 )
 
@@ -164,8 +165,8 @@ def test_mup_groups_and_adamw_steps_match_lm_engine(reference):
 
     config = OptimConfig(
         optimizer="adamw", optimizer_opts={"b1": 0.9, "b2": 0.95, "eps": 1e-10},
-        learning_rate_schedule="power", learning_rate_peak=0.01, learning_rate_warmup_steps=2,
-        power_a=0.05, power_b=-0.51, power_c=16.0, weight_decay=0.1, param_groups=groups)
+        schedule=Power(peak=0.01, warmup_steps=2, a=0.05, b=-0.51, c=16.0),
+        weight_decay=0.1, param_groups=groups)
     with jax.enable_x64(True):
         solver = build_optimizer(config, steps=3)
         params = tree(params0)

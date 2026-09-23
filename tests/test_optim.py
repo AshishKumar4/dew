@@ -18,7 +18,7 @@ from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.objectives.base import scalar_loss
-from dew.training.optim import build_optimizer, muon_weight_dimension_numbers, scale_by_qk_clip
+from dew.training.optim import Cosine, build_optimizer, muon_weight_dimension_numbers, scale_by_qk_clip
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
 LR = 1e-3
@@ -240,17 +240,14 @@ def test_both_groups_step_with_the_one_schedule():
     """
     params = decoder_params()
     grads = fixed_gradients(params)
-    schedule = dict(learning_rate=1e-4, learning_rate_peak=4e-3,
-                    learning_rate_end=1e-3, learning_rate_schedule='cosine',
-                    learning_rate_warmup_steps=1, learning_rate_decay_steps=4)
-    scheduled = build_optimizer(OptimConfig(optimizer='muon', **schedule),
+    cosine = Cosine(init=1e-4, peak=4e-3, end=1e-3, warmup_steps=1, decay_steps=4)
+    scheduled = build_optimizer(OptimConfig(optimizer='muon', schedule=cosine),
                                 steps=4)
     unscaled = build_optimizer(OptimConfig(optimizer='muon', learning_rate=1.0),
                                steps=4)
     rate = optax.warmup_cosine_decay_schedule(
-        init_value=schedule['learning_rate'], peak_value=schedule['learning_rate_peak'],
-        warmup_steps=schedule['learning_rate_warmup_steps'], decay_steps=4,
-        end_value=schedule['learning_rate_end'])
+        init_value=cosine.init, peak_value=cosine.peak,
+        warmup_steps=cosine.warmup_steps, decay_steps=4, end_value=cosine.end)
 
     scheduled_state, unscaled_state = scheduled.init(params), unscaled.init(params)
     for step in range(5):
