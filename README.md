@@ -214,7 +214,7 @@ Import model classes directly when writing Python: `from dew.nn.backbones import
 
 The DPO and GRPO objectives run on the same trainer as pretraining. `dew.rl` holds PPO's advantage estimators and loss terms as separate functions, so you can build your own policy loop from them.
 
-`attention_impl` selects the attention kernel: `"reference"`, `"xla"`, `"cudnn"`, `"tpu"` (Pallas splash attention), or `"auto"`. With `"auto"`, each trace picks cuDNN on a supported GPU, splash attention on a TPU when the kernel can tile the shapes, and XLA everywhere else. The choice never changes the parameter tree, so a checkpoint trained with one kernel loads with any other.
+`attention_impl` selects the attention kernel: `"reference"`, `"xla"`, `"cudnn"`, `"tpu"` (Pallas splash attention), or `"auto"`. With `"auto"`, each trace picks cuDNN on a supported GPU, splash attention on a TPU when the kernel can tile the shapes and the sequence is at least 512 tokens, and XLA everywhere else. The choice never changes the parameter tree, so a checkpoint trained with one kernel loads with any other.
 
 ## Models
 
