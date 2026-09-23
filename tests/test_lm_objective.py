@@ -193,14 +193,12 @@ def test_a_batch_of_only_padding_does_not_divide_by_zero():
 
 
 def test_aux_reports_perplexity_and_token_accuracy():
-    objective = make_objective(token_accuracy=True)
+    objective = make_objective()
     params = objective.init(jax.random.key(0))
     batch = token_batch()
 
     loss, aux = scalar_loss(objective, params, batch, step_at())
-    unasked = scalar_loss(make_objective(), params, batch, step_at())[1]
 
-    assert set(unasked.metrics) == {"ce", "perplexity"}
     assert set(aux.metrics) == {"ce", "perplexity", "token_accuracy"}
     assert aux.variables is None
     assert float(aux.metrics["ce"]) == pytest.approx(float(loss))
@@ -258,7 +256,7 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
 
 
 def test_padded_tokens_are_left_out_of_the_accuracy_too():
-    objective = make_objective(pad_id=0, token_accuracy=True)
+    objective = make_objective(pad_id=0)
     params = objective.init(jax.random.key(0))
     batch = token_batch(seed=3)
     targets = np.asarray(batch[TEXT_KEY][:, 1:])
@@ -706,7 +704,7 @@ def assistant_batch(every=2, batch=4, seq=SEQ, seed=0):
 def test_loss_role_counts_only_assistant_targets():
     """With loss_role set, the loss is the cross entropy over the targets
     whose role matches, and the reported accuracy counts the same targets."""
-    objective = make_objective(loss_role=Role.ASSISTANT, token_accuracy=True)
+    objective = make_objective(loss_role=Role.ASSISTANT)
     params = objective.init(jax.random.key(0))
     batch = assistant_batch()
     tokens = np.asarray(batch[TEXT_KEY])

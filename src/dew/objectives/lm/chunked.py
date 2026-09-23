@@ -20,13 +20,17 @@ tile runs the head forward and backward in 250 ms holding 1.07 GiB of
 temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
 """
 
-from typing import Callable
+from typing import Callable, NamedTuple
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 from flax.typing import PrecisionLike
 
-from dew.nn.precision import bf16_operand_precision, head_product, rounds_to_bf16
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.multimodal import MultimodalTransformer
+from dew.nn.precision import head_product, rounds_to_bf16
 
 
 def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ...]:
@@ -55,10 +59,31 @@ def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ..
     return bounds
 
 
-def _operand_dtype(hidden, precision: PrecisionLike):
-    """The dtype the head multiplies in: bf16 for bf16 states at the default
-    precision, fp32 otherwise."""
-    return jnp.bfloat16 if rounds_to_bf16(hidden.dtype, precision) else jnp.float32
+BF16 = jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+
+
+def head_precision(dtype, precision: PrecisionLike, bf16: bool) -> jax.lax.PrecisionLike:
+    """The precision the head multiplies at: the bf16 algorithm when `bf16`
+    asks for it and bf16 compute at the default precision allows it, the
+    caller's otherwise."""
+    return BF16 if bf16 and rounds_to_bf16(dtype, precision) else precision
+
+
+def bf16_head(model: nn.Module) -> bool:
+    """Whether `model`'s vocabulary head multiplies as bf16
+    (`CausalTransformer.bf16_head`), read through the wrappers that hold a
+    decoder: a multimodal model's language model, DiffusionGemma's text."""
+    if isinstance(model, MultimodalTransformer):
+        model = model.language_model
+    if isinstance(model, DiffusionGemma):
+        model = model.text
+    return isinstance(model, CausalTransformer) and model.bf16_head
+
+
+def _operand_dtype(precision: jax.lax.PrecisionLike):
+    """The dtype the head's operands take: bf16 under the bf16 algorithm, fp32
+    otherwise."""
+    return jnp.bfloat16 if precision is BF16 else jnp.float32
 
 
 def _capped(logits, softcap):
@@ -69,42 +94,50 @@ def _capped(logits, softcap):
 
 
 def head_logits(hidden, head_weight, *, softcap: float | None,
-                precision: PrecisionLike, vocab_major: bool = False) -> jax.Array:
-    """`hidden @ head_weight` as the model's forward scores it: the states
+                precision: PrecisionLike, vocab_major: bool = False,
+                bf16: bool = False) -> jax.Array:
+    """`hidden @ head_weight` as the model's forward scores it: fp32 states
     against the `[features, vocab]` head (`[vocab, features]` with
-    `vocab_major`), accumulated in fp32, softcapped when the backbone caps;
-    `[..., vocab]` fp32.
-
-    The states' dtype is the compute dtype. bf16 states multiply the head
-    rounded to bf16 on every backend, backward included, and fp32 states the
-    head as stored (`dew.nn.precision.head_product`)."""
+    `vocab_major`) in its stored dtype, accumulated in fp32, softcapped when
+    the backbone caps; `[..., vocab]`. With `bf16`, bf16 states multiply the
+    head as bf16 (`CausalTransformer.bf16_head`,
+    `dew.nn.precision.head_product`)."""
     return _capped(head_product('...d,vd->...v' if vocab_major else '...d,dv->...v',
-                                hidden, head_weight, precision), softcap)
+                                hidden, head_weight, precision, bf16=bf16), softcap)
 
 
-def _tile_logits(states, matrix, precision: PrecisionLike):
+def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
     """Uncapped `[tokens, features] @ [columns, features].T` in fp32, over
     operands already in the dtype the head multiplies in."""
     return jnp.einsum('td,vd->tv', states, matrix.astype(states.dtype),
                       precision=precision, preferred_element_type=jnp.float32)
 
 
+class _ChunkTerms(NamedTuple):
+    """One tile's logsumexp and target logit, and its best logit and column
+    when a prediction is asked for."""
+    lse: jax.Array
+    picked: jax.Array
+    best: jax.Array | None
+    column: jax.Array | None
+
+
 def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
-                 softcap: float | None, precision: PrecisionLike, predict: bool):
-    """One tile's logsumexp, target logit and, when `predict`, best logit and
-    its column."""
+                 softcap: float | None, precision: jax.lax.PrecisionLike,
+                 predict: bool) -> _ChunkTerms:
+    """One tile's `_ChunkTerms`."""
     logits = _capped(_tile_logits(hidden, head_chunk, precision), softcap)
 
     inside = (targets >= start) & (targets < stop)
     column = jnp.clip(targets - start, 0, stop - start - 1)
     picked = jnp.take_along_axis(logits, column[:, None], axis=-1)[:, 0]
-    terms = (jax.nn.logsumexp(logits, axis=-1), jnp.where(inside, picked, 0.0))
+    lse, picked = jax.nn.logsumexp(logits, axis=-1), jnp.where(inside, picked, 0.0)
     if not predict:
-        return terms
+        return _ChunkTerms(lse, picked, None, None)
     # A vocabulary column is int32 whatever the run's default integer width;
     # argmax widens to int64 under x64.
-    return (*terms, jnp.max(logits, axis=-1),
-            jnp.argmax(logits, axis=-1).astype(jnp.int32) + start)
+    return _ChunkTerms(lse, picked, jnp.max(logits, axis=-1),
+                       jnp.argmax(logits, axis=-1).astype(jnp.int32) + start)
 
 
 def _over_tiles(carry, count: int, width: int, body: Callable):
@@ -121,7 +154,7 @@ def _over_tiles(carry, count: int, width: int, body: Callable):
 
 
 def _forward(hidden, table, targets, chunks: int, token_tile: int,
-             softcap, precision: PrecisionLike, predict: bool):
+             softcap, precision: jax.lax.PrecisionLike, predict: bool):
     """Losses, top-1 columns (None unless `predict`) and log partitions, a
     token tile at a time."""
     features = table.shape[1]
@@ -129,7 +162,7 @@ def _forward(hidden, table, targets, chunks: int, token_tile: int,
     labels = targets.reshape(-1)
     bounds = vocabulary_chunks(table.shape[0], chunks)
     width = bounds[0][1]
-    operands = _operand_dtype(hidden, precision)
+    operands = _operand_dtype(precision)
 
     def tokens(start, outputs, size):
         states = jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands)
@@ -139,13 +172,13 @@ def _forward(hidden, table, targets, chunks: int, token_tile: int,
             terms = _chunk_terms(
                 states, jax.lax.dynamic_slice_in_dim(table, first, count),
                 picked_targets, first, first + count, softcap, precision, predict)
-            total = jnp.logaddexp(carry[0], terms[0])
-            target_logit = carry[1] + terms[1]
-            if not predict:
+            total = jnp.logaddexp(carry[0], terms.lse)
+            target_logit = carry[1] + terms.picked
+            if terms.best is None or terms.column is None:
                 return total, target_logit
-            better = terms[2] > carry[2]
-            return (total, target_logit, jnp.where(better, terms[2], carry[2]),
-                    jnp.where(better, terms[3], carry[3]))
+            better = terms.best > carry[2]
+            return (total, target_logit, jnp.where(better, terms.best, carry[2]),
+                    jnp.where(better, terms.column, carry[3]))
 
         initial = (jnp.full((size,), -jnp.inf, jnp.float32), jnp.zeros((size,), jnp.float32))
         if predict:
@@ -165,7 +198,7 @@ def _forward(hidden, table, targets, chunks: int, token_tile: int,
 
 
 def _bounded_head_impl(hidden, table, targets, chunks: int, tile: tuple[int, int],
-                       softcap, precision: PrecisionLike, predict: bool):
+                       softcap, precision: jax.lax.PrecisionLike, predict: bool):
     """Run `_forward` behind a backward that recomputes its logits."""
     return _forward(hidden, table, targets, chunks, tile[0], softcap, precision, predict)
 
@@ -191,8 +224,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, residuals, cotangents):
     # The operands hold the forward's values, widened to fp32 so the logits'
     # cotangent is not rounded here: the bf16 algorithm rounds it inside the
     # product on a backend that has one, as the full pass's backward does.
-    operands = _operand_dtype(hidden, precision)
-    precision = bf16_operand_precision(hidden.dtype, precision)
+    operands = _operand_dtype(precision)
     loss_cotangent, _, partition_cotangent = cotangents
     token_tile, vocab_tile = tile
     features = table.shape[1]
@@ -266,7 +298,8 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                           precision: PrecisionLike = None,
                           tile: tuple[int, int] = (1024, 8192),
                           vocab_major: bool = False,
-                          predict: bool = True):
+                          predict: bool = True,
+                          bf16: bool = False):
     """Per-token cross entropy of `hidden @ head_weight`, its top-1 column
     and its log partition.
 
@@ -274,9 +307,9 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     the `[features, vocab]` head in its stored dtype (each tile upcasts its
     own slice; the products are accumulated in fp32), `targets` the `[...]`
     int32 ids. Returns the per-token losses, the argmax prediction (None
-    when `predict` is False, which skips the argmax: 0.75 ms of a TPU v6e
-    lm-dense step at batch 8) and the row's logsumexp (log Z, which PaLM's z-loss squares), all shaped like
-    `targets`, each of the two float32 outputs carrying its own gradient. The
+    when `predict` is False, which skips the argmax: 0.77 ms of the head's
+    8.0 on a TPU v6e) and the row's logsumexp (log Z, which PaLM's z-loss
+    squares), all shaped like `targets`, each of the two float32 outputs carrying its own gradient. The
     caller owns the weighting and the mean, and with them the padding id.
 
     The backward keeps the head it was given. With `vocab_major` the head
@@ -286,9 +319,10 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     array, a vocabulary-sized copy of a tied table (`head_table` on the
     backbone hands out the stored orientation).
 
-    The states' dtype is the compute dtype: bf16 states multiply the head
-    rounded to bf16 and accumulate in fp32, forward and backward
-    (`head_logits`); fp32 states multiply it as stored.
+    The states are widened to fp32 and multiply the head as stored. With
+    `bf16` (`CausalTransformer.bf16_head`), bf16 states at the default
+    precision multiply the head as bf16 and accumulate in fp32, forward and
+    backward.
 
     `softcap` is the backbone's `final_logit_softcap`. It is elementwise, so
     capping a tile and capping the row agree. `tile` is a `(tokens, columns)`
@@ -311,4 +345,5 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     # held vocabulary-major so a column tile is a row slice.
     cap = None if softcap is None else jnp.asarray(softcap, jnp.float32)
     table = head_weight if vocab_major else head_weight.T
-    return _bounded_head(hidden, table, targets, chunks, tile, cap, precision, predict)
+    return _bounded_head(hidden, table, targets, chunks, tile, cap,
+                         head_precision(hidden.dtype, precision, bf16), predict)

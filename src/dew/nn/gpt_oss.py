@@ -11,7 +11,7 @@ from flax import linen as nn
 from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.moe import expert_dispatch, expert_projection, gather_expert_bias
+from dew.nn.moe import expert_dispatch, expert_projection, gather_expert_bias, grouped_matmul_kernel
 from dew.nn.sharding import logical_axes
 
 
@@ -46,10 +46,13 @@ class GptOssExperts(nn.Module):
         compute_dtype = canonicalize_dtype(x, gate_up, gate_bias, down, down_bias, dtype=self.dtype)
         if weights.shape != indices.shape:
             raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
+        chosen = grouped_matmul_kernel(self.implementation, compute_dtype,
+                                       (x.dtype, gate_up.dtype, down.dtype), self.precision)
         slots = expert_dispatch(
             functools.partial(self._project, dtype=compute_dtype), x.astype(compute_dtype), indices,
             (gate_up, gate_bias, down, down_bias), num_experts=self.num_local_experts,
-            dispatch=self.dispatch, output_dtype=compute_dtype, initializing=self.is_initializing())
+            dispatch=self.dispatch, output_dtype=compute_dtype, initializing=self.is_initializing(),
+            split_rows=chosen == 'pallas')
         return jnp.sum(slots * weights[..., None], axis=-2)
 
     def _project(self, tokens: jax.Array, sizes: jax.Array, expert_ids: jax.Array,

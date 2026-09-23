@@ -34,12 +34,8 @@ CHUNKS = [1, 2, 4, 8]
 
 
 def reference(hidden, head, targets, softcap=None):
-    """The full-vocabulary path: one big logits tensor, optax's cross entropy.
-    bf16 states are bf16 compute, which multiplies the head rounded to bf16."""
-    if hidden.dtype == jnp.bfloat16:
-        head = head.astype(jnp.bfloat16).astype(jnp.float32)
-    logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head,
-                        precision=jax.lax.Precision.HIGHEST)
+    """The full-vocabulary path: one big logits tensor, optax's cross entropy."""
+    logits = jnp.einsum('...d,dv->...v', hidden.astype(jnp.float32), head)
     if softcap is not None:
         cap = jnp.asarray(softcap, jnp.float32)
         logits = cap * jnp.tanh(logits / cap)
@@ -152,7 +148,7 @@ def test_dropping_the_target_term_fails_the_parity_check(monkeypatch):
     expected = reference(hidden, head, targets)[0]
     mutating_chunk_terms(
         monkeypatch,
-        lambda terms, start, stop: (terms[0], jnp.zeros_like(terms[1]), *terms[2:]))
+        lambda terms, start, stop: terms._replace(picked=jnp.zeros_like(terms.picked)))
 
     losses, _, _ = chunked_cross_entropy(hidden, head, targets, 4)
 
@@ -170,10 +166,9 @@ def test_dropping_one_chunk_fails_the_parity_check(monkeypatch, dropped):
         # traced and the tile is dropped by a select: what the loop starts
         # from, a tile that contributes no column.
         dropped_tile = jnp.asarray(start) == skipped[0]
-        chunk_lse, picked, chunk_best, chunk_column = terms
-        return (jnp.where(dropped_tile, -jnp.inf, chunk_lse),
-                jnp.where(dropped_tile, 0.0, picked),
-                jnp.where(dropped_tile, -jnp.inf, chunk_best), chunk_column)
+        return terms._replace(lse=jnp.where(dropped_tile, -jnp.inf, terms.lse),
+                              picked=jnp.where(dropped_tile, 0.0, terms.picked),
+                              best=jnp.where(dropped_tile, -jnp.inf, terms.best))
 
     mutating_chunk_terms(monkeypatch, skip)
 
@@ -405,21 +400,16 @@ def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
     """257 tokens is three tiles; rounding per tile would lose the last ones.
 
     A bf16 head gradient rounds once at the end, which 1e-5 would not admit.
-    The products run at HIGHEST: at the default precision bf16 compute rounds
-    the logits' cotangent to bf16 inside each product, and a cotangent that
-    lands on the other side of a rounding boundary in the recomputed tile
-    moves a cancelling sum by more than this bound, whatever the tiling.
     """
     hidden, head, targets = inputs(vocab=17, features=7, tokens=(257,), dtype=dtype)
     head = head.astype(dtype)
-    precision = jax.lax.Precision.HIGHEST
 
     def full(states, matrix):
-        return jnp.mean(oracle(states, matrix, targets, precision=precision)[0])
+        return jnp.mean(oracle(states, matrix, targets)[0])
 
     def tiled(states, matrix):
-        return jnp.mean(chunked_cross_entropy(
-            states, matrix, targets, 4, tile=RAGGED, precision=precision)[0])
+        return jnp.mean(
+            chunked_cross_entropy(states, matrix, targets, 4, tile=RAGGED)[0])
 
     expected = jax.grad(full, argnums=(0, 1))(hidden, head)
     got = jax.grad(tiled, argnums=(0, 1))(hidden, head)

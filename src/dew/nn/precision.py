@@ -25,19 +25,32 @@ from flax.typing import Dtype, PrecisionLike
 
 
 def precision_names(precision: PrecisionLike) -> frozenset[str]:
-    """The names a `PrecisionLike` spells, upper case and unordered.
+    """The canonical names a `PrecisionLike` spells, unordered.
 
     flax's alias is four shapes at once: None, a string, a
     `jax.lax.Precision`, or a pair of either for the two operands. A reader
     has to take whichever shape the caller wrote, so this reads the union
-    rather than asking each member what it is: the enum carries the name, a
-    string is the name, and the pair is both operands'.
+    rather than asking each member what it is. A string goes through
+    `jax.lax.Precision` itself, so 'tensorfloat32' is 'HIGH' and 'bfloat16'
+    is 'DEFAULT' whichever way a caller spells them; a dot algorithm keeps
+    its own name.
     """
     if precision is None:
         return frozenset()
-    written = (precision,) if isinstance(precision, str | jax.lax.Precision) else precision
-    return frozenset((one.name if isinstance(one, jax.lax.Precision) else one).upper()
+    written = (precision,) if isinstance(
+        precision, str | jax.lax.Precision | jax.lax.DotAlgorithmPreset) else precision
+    return frozenset((jax.lax.Precision(one) if isinstance(one, str) else one).name
                      for one in written if one is not None)
+
+
+def asks_default_precision(precision: PrecisionLike, *, configured: bool = False) -> bool:
+    """Whether `precision` asks for no more than the default. With
+    `configured`, an unset precision reads `jax_default_matmul_precision`,
+    the default a product without one gets."""
+    names = precision_names(precision)
+    if not names and configured:
+        names = precision_names(jax.config.jax_default_matmul_precision)
+    return names <= {'DEFAULT'}
 
 
 def bf16_operand_precision(dtype: Dtype | None,
@@ -47,7 +60,7 @@ def bf16_operand_precision(dtype: Dtype | None,
     A caller that asked for more than the default precision keeps what it
     asked for, and compute in anything but bf16 is left alone.
     """
-    if precision_names(precision) - {'DEFAULT'} or dtype is None:
+    if not asks_default_precision(precision) or dtype is None:
         return precision
     if jnp.dtype(dtype) != jnp.bfloat16:
         return precision
@@ -104,16 +117,23 @@ def rounds_to_bf16(dtype: Dtype | None, precision: PrecisionLike = None) -> bool
     return bf16_operand_precision(dtype, precision) is jax.lax.DotAlgorithmPreset.BF16_BF16_F32
 
 
-def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
-    """A flax layer's `dot_general` for a vocabulary head under compute
-    `dtype`: an fp32 result whose operands are the compute dtype's values.
+def _algorithm_operand(value: jax.Array) -> jax.Array:
+    """`value` as a bf16-algorithm product reads it. GPU and TPU round inside
+    the product, so the value passes as it is and no rounded copy is written;
+    the CPU backend ignores the algorithm, so there it is rounded first."""
+    return jax.lax.platform_dependent(
+        value, cpu=lambda value: jnp.asarray(rounded_operand(value, jnp.bfloat16)),
+        default=lambda value: value)
 
-    Under bf16 compute the head is rounded to bf16 before the product, on
-    every backend (the CPU backend ignores the dot algorithm and would
-    otherwise multiply the stored fp32 head), and the product runs the
-    bf16 algorithm in both directions. The rounding is straight-through,
-    so the head's gradient keeps the master dtype. `dtype` is the model's
-    compute dtype, not the layer's: the layer promotes the states to fp32.
+
+def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
+    """A flax layer's `dot_general` for a bf16 vocabulary head
+    (`CausalTransformer.bf16_head`): an fp32 result whose operands are the
+    bf16 compute dtype's values, in both directions.
+
+    `dtype` is the model's compute dtype, not the layer's: the layer
+    promotes the states to fp32. Under any other compute dtype, or a
+    precision above the default, the product is the layer's own fp32 one.
     """
     resolved = bf16_operand_precision(dtype, precision)
     rounds = rounds_to_bf16(dtype, precision)
@@ -122,7 +142,7 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
                     preferred_element_type=None):
         del precision, preferred_element_type  # this head's policy, not the layer's
         if rounds:
-            rhs = rounded_operand(rhs, jnp.bfloat16)
+            rhs = _algorithm_operand(rhs)
         return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=resolved,
                                    preferred_element_type=jnp.float32)
 
@@ -130,13 +150,16 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
 
 
 def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
-                 precision: PrecisionLike = None) -> jax.Array:
+                 precision: PrecisionLike = None, *, bf16: bool = False) -> jax.Array:
     """`jnp.einsum(subscripts, hidden, head)` as a vocabulary head computes
-    it: fp32 states against the head as stored, or, under bf16 compute (the
-    states' dtype), both rounded to bf16 as `head_dot_general` does, with
-    fp32 accumulation and an fp32 result."""
-    resolved = bf16_operand_precision(hidden.dtype, precision)
-    if rounds_to_bf16(hidden.dtype, precision):
-        head = rounded_operand(head, jnp.bfloat16)
+    it, with fp32 accumulation and an fp32 result.
+
+    By default the states are widened to fp32 and multiply the head as
+    stored. With `bf16` and bf16 states at the default precision, both
+    operands multiply as bf16 (`head_dot_general`'s arithmetic)."""
+    if bf16 and rounds_to_bf16(hidden.dtype, precision):
+        return jnp.einsum(subscripts, hidden.astype(jnp.float32), _algorithm_operand(head),
+                          precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+                          preferred_element_type=jnp.float32)
     return jnp.einsum(subscripts, hidden.astype(jnp.float32), head,
-                      precision=resolved, preferred_element_type=jnp.float32)
+                      precision=precision, preferred_element_type=jnp.float32)

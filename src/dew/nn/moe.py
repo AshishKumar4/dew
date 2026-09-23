@@ -29,12 +29,10 @@ import dataclasses
 import functools
 import importlib
 import math
-import warnings
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn, struct
 from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import Dtype, PrecisionLike
@@ -46,6 +44,10 @@ from .blocks import normal_kernel
 from .precision import rounded_operand
 from .precision import precision_names, rounded_operand
 from .sharding import EXPERT_AXIS, logical_axes
+from .inputs import BATCH_AXES
+from .kernels.grouped_matmul import gpu_runs, grouped_projection, ragged_dot_runs
+from .precision import rounded_operand
+from .sharding import EXPERT_AXIS, SEQUENCE_AXIS, logical_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -319,10 +321,10 @@ class Router(nn.Module):
 # The grouped matmul 'auto' runs, per hardware generation (`device_generation`):
 # the measured winner at lm-moe's shape (8192 rows, 768 -> 2048, 8 experts,
 # bf16), numbers in docs/performance.md. On sm89 (L4, RTX 4080) that is
-# JAX's own Pallas/Triton kernels, where XLA runs ragged_dot as a product over
-# every expert; on a TPU v6e it is XLA's ragged_dot, within 5% of the best
-# kernel measured there. Every generation not listed is unmeasured and runs
-# 'xla'.
+# JAX's own Pallas kernels (`dew.nn.kernels.grouped_matmul`), where XLA runs
+# ragged_dot as a product over every expert; on a TPU v6e it is XLA's
+# ragged_dot, within 5% of the best kernel measured there. Every generation
+# not listed is unmeasured and runs 'xla'.
 GROUPED_MATMUL_BY_GENERATION = {'sm89': 'pallas', 'v6e': 'xla'}
 
 # The kernel 'tokamax' names, per generation. tokamax's own dispatch tries its
@@ -344,20 +346,32 @@ def device_generation() -> str:
     if device.platform == 'gpu' and getattr(device, 'compute_capability', None):
         return 'sm' + device.compute_capability.replace('.', '')
     if device.platform == 'tpu':
-        return TPU_GENERATIONS.get(device.device_kind, device.device_kind)
+        kind = device.device_kind or 'tpu'
+        return TPU_GENERATIONS.get(kind, kind)
     return device.platform
 
 
-def resolve_grouped_matmul(implementation: str) -> str:
-    """The grouped matmul `implementation` names on the default device:
-    itself, or its generation's measured one for 'auto'."""
+def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
+                          precision: PrecisionLike) -> str:
+    """The one choice of grouped matmul: 'xla', 'pallas' or 'tokamax'.
+
+    'auto' takes the hardware generation's measured one
+    (`GROUPED_MATMUL_BY_GENERATION`) and 'xla' on an unmeasured generation.
+    'pallas', named or chosen, needs a GPU the kernels compile for and a
+    product they compute exactly (`ragged_dot_runs`); elsewhere it is 'xla'.
+    `operands` are the dtypes of the input and the kernel as stored.
+    """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(
             f"implementation must be one of {list(GROUPED_MATMULS)}, got "
             f"{implementation!r}")
-    if implementation != 'auto':
-        return implementation
-    return GROUPED_MATMUL_BY_GENERATION.get(device_generation(), 'xla')
+    chosen = (GROUPED_MATMUL_BY_GENERATION.get(device_generation(), 'xla')
+              if implementation == 'auto' else implementation)
+    if chosen != 'pallas':
+        return chosen
+    runs = ragged_dot_runs(compute, operands, precision)
+    placed = gpu_runs() or (implementation == 'pallas' and jax.default_backend() == 'cpu')
+    return 'pallas' if runs and placed else 'xla'
 
 
 def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
@@ -367,29 +381,19 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     `kernel`, `[exp, in, out]`, for rows already sorted by expert.
 
     `group_sizes` is how many leading rows belong to expert 0, then to expert
-    1, and so on, the form every grouped matmul takes. `implementation` picks
-    between them, the seam `dew.nn.attention.scaled_dot_product_attention`
-    has:
-
-    - 'auto': the hardware generation's measured one,
-      `GROUPED_MATMUL_BY_GENERATION`, and 'xla' on an unmeasured one.
-    - 'xla': `jax.lax.ragged_dot`. On a GPU XLA lowers it to a product over
-      every expert.
-    - 'pallas': JAX's own Pallas/Triton `gmm` kernel, vendored in
-      `dew.nn.kernels.ragged_dot`, where `pallas_runs` says it computes the
-      product asked for and no mesh axis splits the call, and 'xla'
-      elsewhere. On a CPU the kernel runs in
-      the Pallas interpreter, which is how the CPU suite checks it; on any
-      other backend 'pallas' is 'xla'.
-    - 'tokamax': `tokamax.ragged_dot`, the same call against tokamax's own
-      kernels (`maxtext layers/moe.py:1633`), the kernel named per
-      generation by `TOKAMAX_KERNEL_BY_GENERATION` and XLA elsewhere.
-
-    This is the raw kernel call. 'pallas' has no differentiation rule here;
-    `expert_projection` adds the precision contract routed experts train
-    under, and the gradients of every implementation.
+    1, and so on. This is the raw call with JAX's own differentiation rules:
+    'tokamax' is `tokamax.ragged_dot` with the kernel named per generation
+    (`TOKAMAX_KERNEL_BY_GENERATION`, XLA elsewhere; `maxtext
+    layers/moe.py:1633`), and every other implementation is
+    `jax.lax.ragged_dot`. The Pallas kernels have no JAX differentiation
+    rule, so they run behind `expert_projection`, which adds the precision
+    contract routed experts train under and the gradients of every
+    implementation.
     """
-    implementation = resolve_grouped_matmul(implementation)
+    if implementation not in GROUPED_MATMULS:
+        raise ValueError(
+            f"implementation must be one of {list(GROUPED_MATMULS)}, got "
+            f"{implementation!r}")
     if implementation == 'tokamax':
         # tokamax is not a dependency (docs/concepts/moe.md), so it is
         # imported at the call.
@@ -398,104 +402,20 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
             tokens, kernel, group_sizes, precision=precision,
             preferred_element_type=preferred_element_type,
             implementation=TOKAMAX_KERNEL_BY_GENERATION.get(device_generation(), 'xla'))
-    if (implementation == 'pallas' and pallas_runs(tokens.dtype, kernel.dtype, precision)
-            and _row_axes(tokens.shape[0]) == ()):
-        return _gmm(tokens, kernel, group_sizes,
-                    preferred_element_type or jnp.result_type(tokens, kernel))
     return jax.lax.ragged_dot(
         tokens, kernel, group_sizes, precision=precision,
         preferred_element_type=preferred_element_type)
 
 
-def pallas_runs(lhs: Dtype, rhs: Dtype, precision: PrecisionLike) -> bool:
-    """Whether the Pallas kernels compute the product asked for, at trace time.
-
-    They multiply in the operands' promoted dtype, accumulate in fp32 and
-    ignore `precision`. With 16-bit operands that is exact products summed in
-    fp32, which is what any precision asks for. With fp32 operands it is
-    TF32 on a GPU, which only the default precision asks for (explicitly or
-    through `jax_default_matmul_precision`), and float64 they do not run.
-    They are Triton kernels: a GPU of compute capability 8.0 or later runs
-    them (JAX 0.11.2 deprecates the backend; see `TRITON_DEPRECATION`), and
-    a CPU interprets them. Under
-    `jax_enable_x64` their group offsets widen to int64 against int32 block
-    indices (the vendored cumsum), so an x64 run is 'xla''s.
-    """
-    if jax.config.jax_enable_x64:
-        return False
-    backend = jax.default_backend()
-    if backend == 'gpu':
-        if tuple(int(part) for part in jax.devices()[0].compute_capability.split('.')) < (8, 0):
-            return False
-    elif backend != 'cpu':
-        return False
-    compute = jnp.promote_types(lhs, rhs)
-    if compute not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
-        if compute != jnp.dtype(jnp.float32):
-            return False
-        asked = precision_names(precision) or precision_names(
-            jax.config.jax_default_matmul_precision)
-        if asked - {'DEFAULT', 'BFLOAT16', 'FASTEST', 'TENSORFLOAT32'}:
-            return False
-    return True
-
-
-def _row_axes(rows: int) -> tuple[str, ...] | None:
-    """The mesh axes a `shard_map` splits the sorted rows over for the
-    kernels, which see local arrays: every axis not already manual with more
-    than one device. None when the rows do not divide among them."""
+def _local(value: jax.Array) -> bool:
+    """Whether the kernels, which see local arrays and carry no manual-axis
+    type, can take `value` where it is traced: no mesh axis outside a
+    `shard_map` splits it, and no `shard_map` that checks varying axes
+    holds it."""
     mesh = jax.sharding.get_abstract_mesh()
-    axes = tuple(name for name in mesh.axis_names
-                 if name not in mesh.manual_axes and mesh.shape[name] > 1)
-    count = math.prod(mesh.shape[name] for name in axes)
-    return axes if rows % count == 0 else None
-
-
-# jax 0.11.2 deprecates the Pallas Triton backend: every Triton pallas_call
-# warns, at lowering, that it will be removed in favour of Mosaic GPU. The
-# grouped matmul keeps these kernels on purpose. The Mosaic GPU grouped
-# matmul JAX ships (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma, which
-# sm_80 and sm_89 do not have (it fails to compile on an RTX 4080), and
-# tokamax's sm80 Mosaic config exceeds an Ada card's shared memory and has no
-# backward. The warning is Dew's to carry until a Mosaic GPU grouped matmul
-# replaces these kernels on sm_90 and later; it is filtered by its exact
-# text once Dew first uses the kernels (`_filter_triton_deprecation`).
-TRITON_DEPRECATION = (r"The Pallas Triton backend is deprecated and will be removed in"
-                      r" a future JAX version\.")
-
-
-@functools.cache
-def _filter_triton_deprecation() -> None:
-    """Ignore `TRITON_DEPRECATION`, once the grouped matmul first uses the
-    kernels: only that message, only as a DeprecationWarning.
-
-    JAX raises it when a pallas_call is lowered, which is when the jit
-    around the whole step compiles, after Dew's call has returned and with no
-    Dew frame on the stack. A filter scoped to the call site cannot see it,
-    so this one lasts for the process, and a process that never runs the
-    kernels never installs it."""
-    warnings.filterwarnings('ignore', message=TRITON_DEPRECATION, category=DeprecationWarning)
-
-
-def _gmm(tokens, kernel, group_sizes, out_dtype, *, trans_rhs: bool = False):
-    from .kernels import ragged_dot
-    compute = jnp.promote_types(tokens.dtype, kernel.dtype)
-    _filter_triton_deprecation()
-    return ragged_dot.gmm(
-        tokens.astype(compute), kernel.astype(compute), group_sizes.astype(jnp.int32),
-        **ragged_dot.block_sizes(compute), trans_rhs=trans_rhs,
-        interpret=jax.default_backend() != 'gpu', compute_dtype=compute,
-        out_dtype=jnp.dtype(out_dtype))
-
-
-def _tgmm(tokens, cotangent, group_sizes, out_dtype):
-    from .kernels import ragged_dot
-    compute = jnp.promote_types(tokens.dtype, cotangent.dtype)
-    _filter_triton_deprecation()
-    return ragged_dot.tgmm(
-        tokens.astype(compute), cotangent.astype(compute), group_sizes.astype(jnp.int32),
-        **ragged_dot.block_sizes(compute), interpret=jax.default_backend() != 'gpu',
-        compute_dtype=compute, out_dtype=jnp.dtype(out_dtype))
+    split = any(mesh.shape[name] > 1 for name in mesh.axis_names
+                if name not in mesh.manual_axes)
+    return not split and not jax.typeof(value).mat.varying
 
 
 def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
@@ -527,28 +447,17 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     'xla' and 'tokamax' hold it in every differentiation mode: the forward
     runs on the chosen kernel and the tangent contractions on
     `jax.lax.ragged_dot`, whose transposes JAX defines. 'pallas' holds it in
-    first-order reverse mode, the way MaxText wires megablox: a custom VJP
-    whose forward is `gmm`, whose input gradient is `gmm` against the
-    transposed kernel and whose kernel gradient is `tgmm`. Its compute
-    dtype's rounding makes the backward exact products summed in fp32 when
-    the compute dtype is 16-bit. Where `pallas_runs` says the kernels would
-    change the product, 'pallas' is 'xla'. Under a mesh, 'pallas' splits the
-    sorted rows over every axis that is not already manual
-    (`_sharded_pallas_projection`), so the kernels see local arrays. Measured against NumPy float64
-    sums of the rounded operands and three Adam steps of the global path on
-    every expert/fsdp layout in tests/test_moe_precision.py.
+    first-order reverse mode (`dew.nn.kernels.grouped_matmul`); a trace the
+    kernels cannot take (`_local`) runs 'xla'. Measured against NumPy
+    float64 sums of the rounded operands and three Adam steps of the global
+    path on every expert/fsdp layout in tests/test_moe_precision.py.
     """
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    axes = _row_axes(x.shape[0])
-    # The kernels accumulate in fp32, so a float64 operand, whose gradient
-    # the contract sums in float64, is 'xla''s.
-    wide = jnp.dtype(jnp.float64) in (jnp.dtype(x.dtype), jnp.dtype(kernel.dtype))
-    if (resolve_grouped_matmul(implementation) == 'pallas' and not wide
-            and pallas_runs(compute, compute, precision) and axes is not None):
-        return _sharded_pallas_projection(x, kernel, group_sizes, compute, axes)
-    if implementation == 'pallas':
-        implementation = 'xla'
-    return _projection(x, kernel, group_sizes, dtype, implementation, precision)
+    chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
+    if chosen == 'pallas' and _local(x) and _local(kernel):
+        return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas')
+    return _projection(x, kernel, group_sizes, dtype,
+                       'xla' if chosen == 'pallas' else chosen, precision)
 
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4, 5))
@@ -566,7 +475,7 @@ def _projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
 def _projection_jvp(dtype: Dtype | None, implementation: str, precision: PrecisionLike,
                     primals: tuple[jax.Array, jax.Array, jax.Array],
                     tangents: tuple[jax.Array, jax.Array, jax.Array]
-                    ) -> tuple[jax.Array, jax.Array]:
+                    ) -> tuple[jax.Array, jax.Array | SymbolicZero]:
     x, kernel, group_sizes = primals
     dx, dkernel, _ = tangents
     output = jnp.asarray(_projection(x, kernel, group_sizes, dtype, implementation, precision))
@@ -593,98 +502,12 @@ def _projection_jvp(dtype: Dtype | None, implementation: str, precision: Precisi
         terms.append(jax.lax.ragged_dot(
             inputs.astype(work), held['kernel'].astype(work), group_sizes, precision=precision,
             preferred_element_type=work))
-    tangent = jax.lax.optimization_barrier(sum(terms[1:], terms[0]).astype(output.dtype))
+    total = terms[0] if len(terms) == 1 else terms[0] + terms[1]
+    tangent = jax.lax.optimization_barrier(total.astype(output.dtype))
     return output, tangent
 
 
 _projection.defjvp(_projection_jvp, symbolic_zeros=True)
-
-
-def _sharded_pallas_projection(x, kernel, group_sizes, compute: Dtype,
-                               axes: tuple[str, ...]) -> jax.Array:
-    """`_pallas_projection` with the sorted rows split over `axes`.
-
-    Each shard multiplies its contiguous block of rows, with the group sizes
-    cut to that block, against the whole kernel. The kernel enters at least
-    fp32, replicated, so shard_map's transpose sums the per-shard kernel
-    gradients in fp32 and the master dtype rounds once, after the sum.
-    """
-    if not axes:
-        return _pallas_projection(x, kernel, group_sizes, compute,
-                                  (_varying_axes(x), _varying_axes(kernel)))
-    work = kernel.astype(jnp.promote_types(kernel.dtype, jnp.float32))
-    rows = x.shape[0] // math.prod(jax.sharding.get_abstract_mesh().shape[name] for name in axes)
-
-    def local(x, kernel, group_sizes):
-        start = jax.lax.axis_index(axes).astype(jnp.int32) * rows
-        ends = jnp.cumsum(group_sizes, dtype=jnp.int32)
-        sizes = jnp.clip(jnp.minimum(ends, start + rows) - jnp.maximum(ends - group_sizes, start), 0)
-        return _pallas_projection(x, kernel, sizes.astype(group_sizes.dtype), compute,
-                                  (_varying_axes(x), _varying_axes(kernel)))
-
-    spread, whole = P(axes), P()
-    mesh = jax.sharding.get_abstract_mesh()
-    explicit = {name for name, kind in zip(mesh.axis_names, mesh.axis_types, strict=True)
-                if kind == jax.sharding.AxisType.Explicit}
-    if explicit:
-        # shard_map takes explicit-axis operands only as its specs place
-        # them; automatic axes it places itself.
-        x = jax.sharding.reshard(x, P(tuple(name for name in axes if name in explicit)))
-        work, group_sizes = jax.sharding.reshard((work, group_sizes), whole)
-    # Pallas outputs carry no varying-axes type, so the check is off. Its
-    # transpose then sums the replicated kernel's per-shard cotangents.
-    return jax.shard_map(local, in_specs=(spread, whole, whole), out_specs=spread,
-                         axis_names=set(axes), check_vma=False)(x, work, group_sizes)
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
-def _pallas_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
-                       dtype: Dtype | None,
-                       varying: tuple[tuple[str, ...], tuple[str, ...]]) -> jax.Array:
-    """`expert_projection` on the Pallas kernels, first-order reverse mode.
-    `varying` is the manual mesh axes `x` and `kernel` vary over."""
-    return _pallas_projection_fwd(x, kernel, group_sizes, dtype, varying)[0]
-
-
-def _pallas_projection_fwd(x, kernel, group_sizes, dtype, varying):
-    del varying
-    inputs, matrix = promote_dtype(x, kernel, dtype=dtype)
-    output = _gmm(inputs, matrix, group_sizes, jnp.promote_types(inputs.dtype, jnp.float32))
-    # The residuals are the rounded operands, the values the forward
-    # multiplied; the dtypes of the originals are what the gradients take.
-    residuals = (inputs, matrix, group_sizes, jnp.zeros((0,), x.dtype),
-                 jnp.zeros((0,), kernel.dtype))
-    return output.astype(inputs.dtype), residuals
-
-
-def _pallas_projection_bwd(dtype, varying, residuals, cotangent):
-    del dtype
-    inputs, matrix, group_sizes, x_like, kernel_like = residuals
-    work = jnp.result_type(inputs.dtype, x_like.dtype, kernel_like.dtype, jnp.float32)
-    # The cotangent is in the compute dtype, so with 16-bit compute both
-    # products multiply values exact in it and sum in fp32: the work-dtype
-    # contraction of the contract, without widening the operands.
-    cotangent = cotangent.astype(inputs.dtype)
-    d_inputs = _gmm(cotangent, matrix, group_sizes, work, trans_rhs=True)
-    d_matrix = _tgmm(inputs, cotangent, group_sizes, work)
-    # A Pallas output carries no manual-axis type, and inside a shard_map a
-    # cotangent has to vary over the axes its primal varies over.
-    x_axes, kernel_axes = varying
-    return (_varying(d_inputs.astype(x_like.dtype), x_axes),
-            _varying(d_matrix.astype(kernel_like.dtype), kernel_axes),
-            np.zeros(group_sizes.shape, jax.dtypes.float0))
-
-
-def _varying(value: jax.Array, axes: tuple[str, ...]) -> jax.Array:
-    return jax.lax.pcast(value, axes, to='varying') if axes else value
-
-
-def _varying_axes(value: jax.Array) -> tuple[str, ...]:
-    return tuple(sorted(jax.typeof(value).mat.varying))
-
-
-
-_pallas_projection.defvjp(_pallas_projection_fwd, _pallas_projection_bwd)
 
 
 @jax.custom_jvp
@@ -780,7 +603,8 @@ def expert_dispatch[Parameters](
         project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
         x: jax.Array, indices: jax.Array, parameters: Parameters, *,
         num_experts: int, dispatch: str, output_dtype: Dtype,
-        input_weights: jax.Array | None = None, initializing: bool = False) -> jax.Array:
+        input_weights: jax.Array | None = None, initializing: bool = False,
+        split_rows: bool = False) -> jax.Array:
     """Run every routed token through its expert, and return the slots in
     token order.
 
@@ -795,6 +619,15 @@ def expert_dispatch[Parameters](
     capacity-sized buffer per shard, so no expert capacity drops tokens.
     Expert ids are local to their owner under exchange, and the padding that
     fills a round is discarded before the return exchange.
+
+    `split_rows` runs either dispatch inside a `shard_map` over every token
+    mesh axis (`dew.nn.inputs.BATCH_AXES` and the sequence axis) that splits
+    anything, so `project` sees each device's own rows, as the Pallas
+    kernels need; MaxText's `sparse_matmul_route_and_compute` has the same
+    structure. The parameters enter replicated over those axes and at least
+    fp32, so the transpose sums the per-device kernel gradients in fp32 and
+    a bf16 master rounds once, after the sum. `project` then has to name its
+    compute dtype rather than infer it from the parameters.
     """
     if dispatch not in EXPERT_DISPATCHES:
         raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {dispatch!r}")
@@ -809,7 +642,18 @@ def expert_dispatch[Parameters](
             shards <= 1 or num_experts % shards):
         raise ValueError("exchange dispatch needs an expert mesh axis greater than one "
                          "that divides num_experts")
-    if dispatch == 'global' or initializing or not tokens.shape[0]:
+    flat_indices = indices.reshape(-1, top_k)
+    flat_weights = None if input_weights is None else input_weights.reshape(-1, top_k)
+    exchanging = dispatch == 'exchange' and not initializing and tokens.shape[0] > 0
+    row_axes = tuple(
+        name for name in (*BATCH_AXES, SEQUENCE_AXIS)
+        if split_rows and not initializing and name in mesh.axis_names
+        and name not in mesh.manual_axes and mesh.shape[name] > 1
+        and not (exchanging and name == EXPERT_AXIS))
+    row_devices = math.prod(mesh.shape[name] for name in row_axes)
+
+    def sorted_locally(tokens: jax.Array, indices: jax.Array, parameters: Parameters,
+                       input_weights: jax.Array | None) -> jax.Array:
         experts = indices.ravel()
         order = jnp.argsort(experts)
         grouped = tokens[order // top_k]
@@ -817,84 +661,118 @@ def expert_dispatch[Parameters](
             grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
         projected = project(grouped, jnp.bincount(experts, length=num_experts),
                             experts[order], parameters)
-        return projected[jnp.argsort(order)].reshape(*indices.shape, x.shape[-1])
+        return projected[jnp.argsort(order)]
 
-    @functools.partial(jax.shard_map, mesh=mesh, axis_names={EXPERT_AXIS},
-                       in_specs=(P(EXPERT_AXIS), P(EXPERT_AXIS), P(EXPERT_AXIS),
-                                 None if input_weights is None else P(EXPERT_AXIS)),
-                       out_specs=P(EXPERT_AXIS))
-    def local(tokens: jax.Array, indices: jax.Array, parameters: Parameters,
-              input_weights: jax.Array | None) -> jax.Array:
-        """Run one expert shard's share of the exchange, inside shard_map.
+    if not exchanging:
+        if row_axes and tokens.shape[0] % row_devices == 0:
+            rows = P(row_axes)
+            combined = jax.shard_map(
+                sorted_locally, mesh=mesh, axis_names=set(row_axes),
+                in_specs=(rows, rows, P(), None if flat_weights is None else rows),
+                out_specs=rows, check_vma=False)(tokens, flat_indices, _widened(parameters),
+                                                 flat_weights)
+        else:
+            combined = sorted_locally(tokens, flat_indices, parameters, flat_weights)
+        return combined.reshape(*indices.shape, x.shape[-1])
 
-        Every shard sorts its own rows by expert, cuts them into buckets of
-        `capacity` per destination, and runs `rounds` exchanges. `rounds` is
-        the mesh-wide maximum, so every shard runs the same number.
-        """
-        slots, per_shard = indices.size, num_experts // shards
-        order = jnp.argsort(indices.ravel())
-        experts = indices.ravel()[order]
-        grouped = tokens[order // top_k]
-        if input_weights is not None:
-            grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
-        sizes = jnp.bincount(experts // per_shard, length=shards + 1)[:shards]
-        starts = jnp.cumsum(sizes) - sizes
-        capacity = (slots + shards - 1) // shards
-        rounds = jax.lax.pmax(jnp.max((sizes + capacity - 1) // capacity), EXPERT_AXIS)
-        lanes = jnp.arange(capacity)
-
-        @jax.checkpoint
-        def exchange_round(iteration: jax.Array) -> tuple[jax.Array, jax.Array]:
-            """Send one bucket to each shard, project it there, bring it back.
-
-            Returns the returned rows and the local address each one belongs
-            at. Padding addresses land past the end, so the caller's
-            scatter drops them.
-            """
-            offsets = iteration * capacity + lanes
-            valid = offsets[None, :] < sizes[:, None]
-            addresses = starts[:, None] + offsets
-            send = jnp.where(valid[..., None], grouped[jnp.minimum(addresses, slots - 1)], 0)
-            ids = jnp.where(valid, experts[jnp.minimum(addresses, slots - 1)] % per_shard,
-                            per_shard)
-            received = jax.lax.all_to_all(send, EXPERT_AXIS, 0, 0, tiled=True).reshape(
-                -1, tokens.shape[-1])
-            received_ids = jax.lax.all_to_all(ids, EXPERT_AXIS, 0, 0, tiled=True).ravel()
-            permutation = jnp.argsort(received_ids)
-            groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
-            computed = project(received[permutation], groups, received_ids[permutation], parameters)[
-                jnp.argsort(permutation)]
-            computed = jnp.where((received_ids < per_shard)[:, None], computed, 0)
-            returned = jax.lax.all_to_all(computed.reshape(shards, capacity, -1),
-                                         EXPERT_AXIS, 0, 0, tiled=True)
-            # Only padding has an out-of-bounds address; every real slot has
-            # one unique writer across all rounds.
-            return returned, jnp.where(valid, addresses, slots)
-
-        def step(out: jax.Array, iteration: jax.Array) -> tuple[jax.Array, None]:
-            """Scan one round into the output rows; the carry is those rows.
-
-            The scan always runs `shards` iterations so its length is
-            static, and the rounds past `rounds` keep the carry unchanged.
-            """
-            def active(out: jax.Array) -> jax.Array:
-                returned, addresses = exchange_round(iteration)
-                return out.at[addresses].set(returned, mode='drop')
-            return jax.lax.cond(iteration < rounds, active, lambda out: out, out), None
-
-        initial = jax.lax.pcast(jnp.zeros((slots, x.shape[-1]), output_dtype),
-                                EXPERT_AXIS, to='varying')
-        combined, _ = jax.lax.scan(step, initial, jnp.arange(shards))
-        return combined[jnp.argsort(order)].reshape(*indices.shape, x.shape[-1])
+    exchange_axes = (EXPERT_AXIS, *row_axes)
+    # The kernels carry no manual-axis type, so this map does not check them;
+    # MaxText hosts its gmm the same way.
+    local = jax.shard_map(
+        functools.partial(_exchange_shard, project, num_experts=num_experts, shards=shards,
+                          output_dtype=output_dtype),
+        mesh=mesh, axis_names=set(exchange_axes),
+        in_specs=(P(exchange_axes), P(exchange_axes), P(EXPERT_AXIS),
+                  None if input_weights is None else P(exchange_axes)),
+        out_specs=P(exchange_axes), check_vma=False)
 
     # Sentinel assignments from token-axis padding never enter send counts.
-    padding = -tokens.shape[0] % shards
-    token_indices = jnp.pad(indices.reshape(-1, top_k), ((0, padding), (0, 0)),
-                            constant_values=num_experts)
-    padded_weights = (None if input_weights is None else
-                      jnp.pad(input_weights.reshape(-1, top_k), ((0, padding), (0, 0))))
-    combined = local(jnp.pad(tokens, ((0, padding), (0, 0))), token_indices, parameters, padded_weights)
+    padding = -tokens.shape[0] % (shards * row_devices)
+    token_indices = jnp.pad(flat_indices, ((0, padding), (0, 0)), constant_values=num_experts)
+    padded_weights = (None if flat_weights is None else
+                      jnp.pad(flat_weights, ((0, padding), (0, 0))))
+    combined = local(jnp.pad(tokens, ((0, padding), (0, 0))), token_indices,
+                     _widened(parameters) if row_axes else parameters, padded_weights)
     return combined[:tokens.shape[0]].reshape(*indices.shape, x.shape[-1])
+
+
+def _exchange_shard[Parameters](
+        project: Callable[[jax.Array, jax.Array, jax.Array, Parameters], jax.Array],
+        tokens: jax.Array, indices: jax.Array, parameters: Parameters,
+        input_weights: jax.Array | None, *, num_experts: int, shards: int,
+        output_dtype: Dtype) -> jax.Array:
+    """Run one expert shard's share of `expert_dispatch`'s exchange, inside
+    its shard_map.
+
+    Every shard sorts its own rows by expert, cuts them into buckets of
+    `capacity` per destination, and runs `rounds` exchanges. `rounds` is
+    the mesh-wide maximum, so every shard runs the same number.
+    """
+    top_k = indices.shape[-1]
+    slots, per_shard = indices.size, num_experts // shards
+    order = jnp.argsort(indices.ravel())
+    experts = indices.ravel()[order]
+    grouped = tokens[order // top_k]
+    if input_weights is not None:
+        grouped = grouped * input_weights.ravel()[order][:, None].astype(grouped.dtype)
+    sizes = jnp.bincount(experts // per_shard, length=shards + 1)[:shards]
+    starts = jnp.cumsum(sizes) - sizes
+    capacity = (slots + shards - 1) // shards
+    rounds = jax.lax.pmax(jnp.max((sizes + capacity - 1) // capacity), EXPERT_AXIS)
+    lanes = jnp.arange(capacity)
+
+    @jax.checkpoint
+    def exchange_round(iteration: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Send one bucket to each shard, project it there, bring it back.
+
+        Returns the returned rows and the local address each one belongs
+        at. Padding addresses land past the end, so the caller's
+        scatter drops them.
+        """
+        offsets = iteration * capacity + lanes
+        valid = offsets[None, :] < sizes[:, None]
+        addresses = starts[:, None] + offsets
+        send = jnp.where(valid[..., None], grouped[jnp.minimum(addresses, slots - 1)], 0)
+        ids = jnp.where(valid, experts[jnp.minimum(addresses, slots - 1)] % per_shard,
+                        per_shard)
+        received = jax.lax.all_to_all(send, EXPERT_AXIS, 0, 0, tiled=True).reshape(
+            -1, tokens.shape[-1])
+        received_ids = jax.lax.all_to_all(ids, EXPERT_AXIS, 0, 0, tiled=True).ravel()
+        permutation = jnp.argsort(received_ids)
+        groups = jnp.bincount(received_ids, length=per_shard + 1)[:per_shard]
+        computed = project(received[permutation], groups, received_ids[permutation], parameters)[
+            jnp.argsort(permutation)]
+        computed = jnp.where((received_ids < per_shard)[:, None], computed, 0)
+        returned = jax.lax.all_to_all(computed.reshape(shards, capacity, -1),
+                                     EXPERT_AXIS, 0, 0, tiled=True)
+        # Only padding has an out-of-bounds address; every real slot has
+        # one unique writer across all rounds.
+        return returned, jnp.where(valid, addresses, slots)
+
+    def step(out: jax.Array, iteration: jax.Array) -> tuple[jax.Array, None]:
+        """Scan one round into the output rows; the carry is those rows.
+
+        The scan always runs `shards` iterations so its length is
+        static, and the rounds past `rounds` keep the carry unchanged.
+        """
+        def active(out: jax.Array) -> jax.Array:
+            returned, addresses = exchange_round(iteration)
+            return out.at[addresses].set(returned, mode='drop')
+        return jax.lax.cond(iteration < rounds, active, lambda out: out, out), None
+
+    combined, _ = jax.lax.scan(step, jnp.zeros((slots, tokens.shape[-1]), output_dtype),
+                               jnp.arange(shards))
+    return combined[jnp.argsort(order)].reshape(*indices.shape, tokens.shape[-1])
+
+
+def _widened[Tree](parameters: Tree) -> Tree:
+    """Floating parameters at least fp32, so a cotangent summed across a
+    `shard_map` boundary is summed before its master dtype rounds it."""
+    def widen(leaf):
+        if jnp.issubdtype(leaf.dtype, jnp.floating):
+            return leaf.astype(jnp.promote_types(leaf.dtype, jnp.float32))
+        return leaf
+    return jax.tree.map(widen, parameters)
 
 
 
@@ -966,10 +844,10 @@ class ExpertMLP(nn.Module):
                                           else self.output_init_std))
 
     def _project(self, tokens: jax.Array, sizes: jax.Array, _expert_ids: jax.Array,
-                 kernels: tuple[jax.Array, jax.Array, jax.Array]) -> jax.Array:
+                 kernels: tuple[jax.Array, jax.Array, jax.Array], *, dtype: Dtype) -> jax.Array:
         def linear(x: jax.Array, kernel: jax.Array) -> jax.Array:
             return jnp.asarray(expert_projection(
-                x, kernel, sizes, self.dtype, self.implementation, self.precision))
+                x, kernel, sizes, dtype, self.implementation, self.precision))
 
         # The same residual names as the dense MLP's, so one remat policy
         # covers both (causal_transformer.RESIDUALS).
@@ -990,11 +868,18 @@ class ExpertMLP(nn.Module):
         if weights.shape != indices.shape:
             raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
         kernels = (self.gate_proj.kernel, self.up_proj.kernel, self.down_proj.kernel)
+        # One compute dtype for all three projections, named rather than
+        # inferred inside the dispatch, where the parameters may be widened.
+        compute = canonicalize_dtype(x, *kernels, dtype=self.dtype)
+        chosen = grouped_matmul_kernel(self.implementation, compute,
+                                       (x.dtype, *(kernel.dtype for kernel in kernels)),
+                                       self.precision)
         slots = expert_dispatch(
-            self._project, x, indices, kernels, num_experts=self.num_experts,
-            dispatch=self.dispatch, initializing=self.is_initializing(),
-            output_dtype=canonicalize_dtype(x, *kernels, dtype=self.dtype),
-            input_weights=weights if self.scale_inputs else None)
+            functools.partial(self._project, dtype=compute), x, indices, kernels,
+            num_experts=self.num_experts, dispatch=self.dispatch,
+            initializing=self.is_initializing(), output_dtype=compute,
+            input_weights=weights if self.scale_inputs else None,
+            split_rows=chosen == 'pallas')
         return self._combine(slots, weights)
 
 

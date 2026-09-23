@@ -678,3 +678,17 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
 def test_bf16_state_is_refused_where_there_is_no_adam_moment():
     with pytest.raises(ValueError, match="state_dtype"):
         build_optimizer(OptimConfig(optimizer='lamb', state_dtype='bfloat16'), steps=10)
+
+
+def test_bf16_state_steps_optax_own_update_first():
+    """The first update starts from zero moments, which bf16 holds exactly,
+    so it is optax's own AdamW update bit for bit, its options included."""
+    params = decoder_params()
+    grads = jax.tree.map(lambda p: jax.random.normal(jax.random.key(3), p.shape) * 1e-2, params)
+    opts = {'nesterov': True, 'eps_root': 1e-8, 'b2': 0.99}
+    reference = optax.adamw(LR, weight_decay=0.1, **opts)
+    solver = bf16_state_adamw(optimizer_opts=opts)
+    expected, _ = reference.update(grads, reference.init(params), params)
+    update, _ = solver.update(grads, solver.init(params), params)
+    for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(update), strict=True):
+        np.testing.assert_array_equal(have, want)

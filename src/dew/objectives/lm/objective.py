@@ -70,7 +70,7 @@ from dew.objectives.base import (
     merge_totals,
     thaw,
 )
-from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
+from dew.objectives.lm.chunked import bf16_head, chunked_cross_entropy, head_logits
 from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
 
@@ -446,6 +446,19 @@ class LMStatistics:
     router_z: tuple[Mean, ...] = ()
 
 
+def _trainable_with(model: nn.Module, indexer: IndexerTraining | None, trainable: PathFilter | None,
+                    terms: Mapping[str, object]) -> PathFilter | None:
+    """The leaves the optimizer moves, once an indexer phase is checked
+    against `trainable` and the main loss's `terms`: the warm-up trains the
+    indexer alone and refuses every term."""
+    if indexer is None:
+        return trainable
+    if trainable is not None:
+        raise ValueError("the indexer's phase decides what trains, so trainable is not taken with it")
+    _check_indexer(model, indexer, terms)
+    return _is_indexer if indexer.phase == "warmup" else None
+
+
 @objectives("lm")
 class LMObjective(Objective[Mean | LMStatistics, Variables]):
     """Train a next-token model: shifted cross entropy, teacher-forced scoring, optional previews."""
@@ -472,7 +485,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         qk_stats: bool = False,
         indexer: IndexerTraining | None = None,
         trainable: PathFilter | None = None,
-        token_accuracy: bool = False,
+        token_accuracy: bool = True,
     ):
         """Build a next-token objective over `model` for `seq_len`-token rows.
 
@@ -548,9 +561,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         adapter's own filter (`dew.lora.LoRA.trainable`) goes here. None
         trains every leaf.
 
-        `token_accuracy` reports the fraction of counted targets the argmax
-        predicts. The argmax is a pass over every logit, 0.75 ms of a TPU v6e
-        lm-dense step at batch 8, so unset skips it and reports no accuracy."""
+        `token_accuracy` reports the argmax accuracy; False skips the pass
+        over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e)."""
         decoder = _decoder(model)
         if decoder is not None and decoder.causal is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")
@@ -582,6 +594,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                                             "mtp_weight": mtp_weight, "loss_role": loss_role,
                                             "z_loss": z_loss or None,
                                             "router_z_loss": router_z_loss or None})
+        self.trainable = _trainable_with(model, indexer, trainable, {
+            "balance_rate": balance_rate, "aux_loss_alpha": aux_loss_alpha,
+            "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None})
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         # The EMA follows what moves; the frozen collection never does.
         self.ema = None if ema_decay is None else EMASpec(
@@ -707,7 +722,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         losses, predicted, log_z = chunked_cross_entropy(
             hidden, head, targets, self.head_chunks,
             softcap=self.model.final_logit_softcap,
-            precision=self.model.precision, predict=self.token_accuracy)
+            precision=self.model.precision, predict=self.token_accuracy,
+            bf16=bf16_head(self.model))
         valid = prepared.token_fields.get("attention_mask")
         weights = self._row_weights(prepared, targets, segment_ids, roles, losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
@@ -733,7 +749,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 depth_losses, _, _ = chunked_cross_entropy(
                     state, head, targets[:, depth:], self.head_chunks,
                     softcap=self.model.final_logit_softcap,
-                    precision=self.model.precision, predict=False)
+                    precision=self.model.precision, predict=False,
+                    bf16=bf16_head(self.model))
                 depth_scores.append((depth_losses, self._depth_weights(
                     targets, segment_ids, valid, roles, losses.dtype, depth)))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
@@ -941,7 +958,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         variables = thaw(params)
         head = self.model.apply(variables, variables["params"], method=type(self.model).head_weight)
         logits = head_logits(scores.hidden, head, softcap=self.model.final_logit_softcap,
-                             precision=self.model.precision)
+                             precision=self.model.precision, bf16=bf16_head(self.model))
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()

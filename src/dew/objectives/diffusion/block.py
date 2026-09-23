@@ -39,7 +39,7 @@ from dew.objectives.base import (
     mean_loss,
     thaw,
 )
-from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
+from dew.objectives.lm.chunked import bf16_head, chunked_cross_entropy, head_logits
 from dew.registry import objectives
 
 if TYPE_CHECKING:
@@ -405,7 +405,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         # before the head and nothing of that pass is kept for the backward.
         first = jax.lax.stop_gradient(head_logits(
             jax.lax.stop_gradient(denoise(zero_logits)), head, softcap=softcap,
-            precision=precision, vocab_major=vocab_major))
+            precision=precision, vocab_major=vocab_major, bf16=bf16_head(self.model)))
         use_sc = jax.random.uniform(sc_key, (tokens.shape[0],)) < self.self_cond_prob
         sc_logits = jnp.where(use_sc[:, None, None], first, zero_logits)
         states = denoise(sc_logits)
@@ -415,11 +415,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             target_mask &= text_slots[:, self.prompt_length:]
         canvas_losses, _, _ = chunked_cross_entropy(
             states, head, response, self.head_chunks, softcap=softcap, precision=precision,
-            vocab_major=vocab_major, predict=False)
+            vocab_major=vocab_major, predict=False, bf16=bf16_head(self.model))
         shifted, encoder_target_mask = self._encoder_targets(batch, tokens, validity, full_valid, text_slots)
         encoder_losses, _, _ = chunked_cross_entropy(
             encoder_states, head, shifted, self.head_chunks, softcap=softcap, precision=precision,
-            vocab_major=vocab_major, predict=False)
+            vocab_major=vocab_major, predict=False, bf16=bf16_head(self.model))
         return canvas_losses, target_mask, encoder_losses, encoder_target_mask
 
     def reduce_loss(self, stats: BlockSFTStatistics):

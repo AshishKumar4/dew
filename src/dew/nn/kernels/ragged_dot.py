@@ -19,8 +19,9 @@
 -> [g, k, n]`. They are the body of `jax/_src/lax/pallas_lowerings/gpu/
 ragged_dot.py` in the jax-v0.11.2 source tree (tag jax-v0.11.2, 32544801;
 license header above), which no jax wheel ships: `DEFAULT_BLOCK_M` through
-`_hyperparam_selection_rule`, with one line changed and marked `# Dew:`
-(tgmm's output cast). The file's `ragged_dot_general`
+`_hyperparam_selection_rule`, restyled to this tree's lint gate, with two
+lines of logic changed and marked `# Dew:`: tgmm's output cast, and gmm's
+zeroing when every group is empty. The file's `ragged_dot_general`
 adapter is left out: Dew calls the kernels itself, through
 `dew.nn.moe.expert_projection`'s custom VJP, the way MaxText calls megablox.
 
@@ -31,24 +32,19 @@ rows past the routed ones are written as zeros. The kernels multiply in
 the GPU's TF32 rate.
 """
 
-from functools import partial
 import math
 import typing
+from functools import partial
 from types import SimpleNamespace
 
-from jax._src import api
-from jax._src import core
-from jax._src import tree_util
+import numpy as np
+from jax._src import api, core, tree_util
 from jax._src.lax import lax
 from jax._src.lax.control_flow import loops
-from jax._src.numpy import array_creation
-from jax._src.numpy import lax_numpy as jnp
-from jax._src.numpy import reductions
+from jax._src.numpy import array_creation, lax_numpy as jnp, reductions
 from jax._src.typing import Array, DTypeLike
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
-import numpy as np
-
 
 DEFAULT_BLOCK_M = 64
 DEFAULT_BLOCK_N = 64
@@ -62,7 +58,10 @@ DEFAULT_BLOCK_K = 64
 # block_m. It solves the problem of large groups or very few groups.
 CHUNK_M = 512  # block size to chunk rows into to increase SM participation for very large groups
 
-cdiv = lambda a, b: (a + b - 1) // b
+def cdiv(a, b):
+  return (a + b - 1) // b
+
+
 arange = partial(jnp.arange, dtype=np.int32)
 
 
@@ -192,7 +191,7 @@ def _gpu_ragged_dot_kernel(
     acc = acc.astype(y_ref.dtype)
     mask = lhs_rows_mask[:, None] & rhs_cols_mask[None, :]
     plgpu.store(y_ref.at[lhs_rows_idx, rhs_cols_idx], acc, mask=mask)
-    return None
+    return
 
   loops.fori_loop(0, cdiv(group_sz, block.m), outer_compute, None)
 
@@ -203,7 +202,9 @@ def _gpu_ragged_dot_kernel(
   )
 
   @pl.when(
-    (pid.i == group_metadata_ref.total_row_its[...] - 1)
+    # Dew: upstream zeroes in the last program that computed rows, which
+    # none is when every group is empty; the first program zeroes then.
+    (pid.i == lax.max(group_metadata_ref.total_row_its[...], np.int32(1)) - 1)
     & (last_offset < size.m)
   )
   def _():
@@ -211,10 +212,10 @@ def _gpu_ragged_dot_kernel(
 
     def set_zero(i, _):
       row_mask = (last_offset + i * block.m + arange(block.m)) < size.m
-      idx = (pl.ds(last_offset + i * block.m, block.m), pl.ds(0, block.n))
+      window = (pl.ds(last_offset + i * block.m, block.m), pl.ds(0, block.n))
       mask = row_mask[:, None] & col_mask[None, :]
       zero = array_creation.zeros((block.m, block.n), dtype=y_ref.dtype)
-      plgpu.store(y_ref.at[*idx], zero, mask=mask)
+      plgpu.store(y_ref.at[*window], zero, mask=mask)
 
     loops.fori_loop(0, cdiv(size.m - last_offset, block.m), set_zero, None)
 
@@ -254,7 +255,7 @@ def gmm(
   # normalize the block sizes for GPU
   block_m, block_k, block_n = (
     pl.next_power_of_2(min(b, s))
-    for b, s in zip([block_m, block_k, block_n], [size.m, size.k, size.n])
+    for b, s in zip([block_m, block_k, block_n], [size.m, size.k, size.n], strict=True)
   )
   block_k, block_n = max(block_k, 16), max(block_n, 16)
 
@@ -279,14 +280,14 @@ def gmm(
   grid_upper_bound = (size.m + chunk_m - 1) // chunk_m + size.g
   grid = (grid_upper_bound, pl.cdiv(size.n, block_n))
   block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
-  other_kws = dict(
-    compute_dtype=compute_dtype,
-    acc_dtype=acc_dtype,
-    trans_rhs=trans_rhs,
-    chunk_m=chunk_m,
-  )
+  other_kws = {
+    "compute_dtype": compute_dtype,
+    "acc_dtype": acc_dtype,
+    "trans_rhs": trans_rhs,
+    "chunk_m": chunk_m,
+  }
   with api.named_scope("pallas_triton_ragged_dot"):
-    out = pl.pallas_call(
+    return pl.pallas_call(
       partial(
         _gpu_ragged_dot_kernel, size=size, block=block_sizes,
         **other_kws  # pyrefly: ignore[bad-argument-type]
@@ -301,7 +302,6 @@ def gmm(
       ),
       name="pallas_triton_ragged_dot",
     )(x, A, group_metadata)
-  return out
 
 
 def _tgmm_ragged_dot_kernel(
@@ -396,7 +396,7 @@ def tgmm(
   # normalize the block sizes for GPU
   block_m, block_k, block_n = (
     max(pl.next_power_of_2(min(b, s)), 16)
-    for b, s in zip([block_m, block_k, block_n], [size.m, size.k, size.n])
+    for b, s in zip([block_m, block_k, block_n], [size.m, size.k, size.n], strict=True)
   )
 
   group_offsets = reductions.cumsum(group_sizes) - group_sizes
@@ -413,9 +413,9 @@ def tgmm(
   grid = (size.g, pl.cdiv(size.k, block_k), pl.cdiv(size.n, block_n))
 
   block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
-  dtype_spec = dict(compute_dtype=compute_dtype, acc_dtype=acc_dtype)
+  dtype_spec = {"compute_dtype": compute_dtype, "acc_dtype": acc_dtype}
   with api.named_scope("tgmm_ragged_dot"):
-    out = pl.pallas_call(
+    return pl.pallas_call(
       partial(_tgmm_ragged_dot_kernel, size=size, block=block_sizes,
               **dtype_spec),  # pyrefly: ignore[bad-argument-type]
       out_shape=out_shape,
@@ -428,20 +428,20 @@ def tgmm(
       ),
       name="tgmm_ragged_dot",
     )(x, y, group_sizes, group_offsets)
-  return out
 
 
-def _hyperparam_selection_rule(dtype: lax.DType):
+def _hyperparam_selection_rule(dtype: np.dtype):
   smem_size = 100 * 1024  # 100 KiB
   ideal_operand_size = smem_size / dtype.itemsize / 4
   tile_m = 2 ** round(math.ceil(math.log2(math.sqrt(ideal_operand_size))))
   tile_k, tile_n = tile_m // 2, tile_m
   while tile_m > 16:
     if tile_m * tile_k * 4 * dtype.itemsize <= smem_size:
-      return dict(block_m=tile_m, block_k=tile_k, block_n=tile_n)
+      return {"block_m": tile_m, "block_k": tile_k, "block_n": tile_n}
     tile_m //= 2
     tile_k, tile_n = tile_m // 2, tile_m
-  return dict(block_m=tile_m, block_k=tile_k, block_n=tile_n)
+  return {"block_m": tile_m, "block_k": tile_k, "block_n": tile_n}
+
 
 def block_sizes(dtype) -> dict[str, int]:
   """The tile the vendored rule picks for operands of `dtype`."""

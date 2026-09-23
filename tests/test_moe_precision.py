@@ -27,6 +27,8 @@ MESH_LAYOUTS = tuple(pytest.param(expert, fsdp, marks=pytest.mark.mesh)
                      for expert, fsdp in ((2, 4), (4, 2), (8, 1)))
 LAYOUTS = (pytest.param(1, 1, id='1-1'), *MESH_LAYOUTS)
 TOLERANCE = 3e-5
+# A mesh whose data axis splits the tokens as well as the expert axis.
+DATA_LAYOUT = pytest.param(2, 2, marks=pytest.mark.mesh, id='2-2-data2')
 
 
 def rounded(value, dtype=ml_dtypes.bfloat16) -> np.ndarray:
@@ -87,25 +89,6 @@ def cases():
 @pytest.mark.parametrize('expert,fsdp', LAYOUTS)
 @pytest.mark.parametrize('rows', [True, False], ids=['rows', 'columns'])
 def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows):
-    rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows, 'xla')
-
-
-@pytest.mark.parametrize('case,master,input_dtype', [
-    ('random', jnp.float32, jnp.bfloat16), ('random', jnp.float32, jnp.float32),
-    ('forward-round-once', jnp.float32, jnp.bfloat16),
-    ('input-gradient-round-once', jnp.float32, jnp.bfloat16)])
-@pytest.mark.parametrize('expert,fsdp', LAYOUTS)
-@pytest.mark.parametrize('rows', [True, False], ids=['rows', 'columns'])
-def test_the_pallas_kernels_round_whole_contractions_once(case, master, input_dtype, expert,
-                                                        fsdp, rows):
-    """The same contract on the Pallas kernels, which a mesh runs on each
-    shard's rows. Without x64: under it 'pallas' is 'xla'. With fp32
-    compute at the suite's HIGHEST default it is 'xla' too, which this also
-    holds to the contract."""
-    rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows, 'pallas')
-
-
-def rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows, implementation):
     """Forward, kernel cotangent and input cotangent against float64 sums of
     the bf16 operands, with the kernel split on either of its dimensions and
     the gradient returned placed or replicated."""
@@ -116,7 +99,7 @@ def rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows
     input_oracle = rounded(grouped(rounded(dy), rounded(kernel).swapaxes(1, 2)), input_dtype)
 
     def loss(kernel, x, dy, sizes):
-        projected = jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, implementation, None))
+        projected = jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None))
         return jnp.sum(projected.astype(jnp.float32) * dy), projected
 
     mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
@@ -133,6 +116,50 @@ def rounds_whole_contractions_once(case, master, input_dtype, expert, fsdp, rows
         np.testing.assert_allclose(np.asarray(y, np.float64), forward, atol=TOLERANCE, rtol=TOLERANCE)
         np.testing.assert_allclose(dk, kernel_oracle, atol=TOLERANCE, rtol=TOLERANCE)
         np.testing.assert_allclose(np.asarray(dx, np.float64), input_oracle, atol=TOLERANCE, rtol=TOLERANCE)
+
+
+@pytest.mark.parametrize('sizes', [
+    np.full(8, 3), np.array([0, 5, 0, 0, 12, 1, 0, 3]), np.array([0, 0, 0, 20, 0, 0, 0, 0]),
+    np.array([0, 3, 3, 3, 3, 3, 3, 3]), np.zeros(8)],
+    ids=['even', 'ragged', 'one-expert', 'fewer-rows', 'all-empty'])
+@pytest.mark.parametrize('input_dtype', [jnp.bfloat16, jnp.float32])
+def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
+    """Forward, input and kernel cotangents of 'pallas' against float64
+    sums of the bf16 operands, on the kernels (interpreted on a CPU): rows
+    past the routed ones, and every row when no expert is routed, come back
+    zero in the output and the input gradient."""
+    rng = np.random.default_rng(88)
+    x = rng.normal(size=(24, 16)).astype(np.float32)
+    kernel = rng.normal(size=(8, 16, 16)).astype(np.float32)
+    dy = rng.normal(size=(24, 16))
+    sizes = sizes.astype(np.int32)
+    ends = np.cumsum(sizes)
+    rows = np.searchsorted(ends, np.arange(24), side='right')
+    routed = np.arange(24) < ends[-1]
+    qx, qk = rounded(x), rounded(kernel)
+    qy = rounded(dy)
+    forward = np.zeros((24, 16))
+    input_oracle = np.zeros((24, 16))
+    kernel_oracle = np.zeros((8, 16, 16))
+    for row in np.flatnonzero(routed):
+        forward[row] = qx[row] @ qk[rows[row]]
+        input_oracle[row] = qy[row] @ qk[rows[row]].T
+        kernel_oracle[rows[row]] += np.outer(qx[row], qy[row])
+
+    def loss(x, kernel):
+        projected = jnp.asarray(expert_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16,
+                                                  'pallas', None))
+        return jnp.sum(projected.astype(jnp.float32) * jnp.asarray(qy, jnp.float32)), projected
+
+    (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(
+        jnp.asarray(x, input_dtype), jnp.asarray(kernel))
+    assert dx.dtype == input_dtype and dk.dtype == jnp.float32
+    np.testing.assert_allclose(np.asarray(y, np.float64), rounded(forward), atol=TOLERANCE,
+                               rtol=TOLERANCE)
+    np.testing.assert_allclose(np.asarray(dx, np.float64), rounded(input_oracle, input_dtype),
+                               atol=TOLERANCE, rtol=TOLERANCE)
+    np.testing.assert_allclose(np.asarray(dk, np.float64), kernel_oracle, atol=TOLERANCE,
+                               rtol=TOLERANCE)
 
 
 @pytest.mark.usefixtures('x64')
@@ -188,7 +215,8 @@ def test_a_projection_differentiates_the_same_law_in_every_direction(
 
 
 @pytest.mark.usefixtures('x64')
-def test_a_tangent_keeps_the_residue_of_a_wider_operand():
+@pytest.mark.parametrize('implementation', ['xla', 'pallas'])
+def test_a_tangent_keeps_the_residue_of_a_wider_operand(implementation):
     """A 2^-30 that only fp64 holds survives the projection's derivatives in
     every mode: implicit promotion, explicit fp64 compute, and both mixed
     orders under bf16 compute. The residue is representable, so these are
@@ -199,7 +227,7 @@ def test_a_tangent_keeps_the_residue_of_a_wider_operand():
     sizes = jnp.asarray([2], jnp.int32)
 
     def inferred(x, kernel):
-        return jnp.asarray(expert_projection(x, kernel, sizes, None, 'xla', None))
+        return jnp.asarray(expert_projection(x, kernel, sizes, None, implementation, None))
 
     y, tangent = jax.jit(lambda x, kernel: jax.jvp(
         inferred, (x, kernel), (jnp.zeros_like(x), jnp.ones_like(kernel))))(x, kernel)
@@ -213,7 +241,7 @@ def test_a_tangent_keeps_the_residue_of_a_wider_operand():
     sizes = jnp.asarray([1], jnp.int32)
 
     def explicit(x, kernel):
-        return jnp.asarray(expert_projection(x, kernel, sizes, jnp.float64, 'xla', None))
+        return jnp.asarray(expert_projection(x, kernel, sizes, jnp.float64, implementation, None))
 
     y, tangent = jax.jit(lambda x, kernel: jax.jvp(
         explicit, (x, kernel), (jnp.ones_like(x), jnp.zeros_like(kernel))))(x, kernel)
@@ -227,7 +255,7 @@ def test_a_tangent_keeps_the_residue_of_a_wider_operand():
 
     def scalar(x, kernel):
         return jnp.asarray(expert_projection(
-            x, kernel, sizes, jnp.bfloat16, 'xla', None)).astype(jnp.float64).sum()
+            x, kernel, sizes, jnp.bfloat16, implementation, None)).astype(jnp.float64).sum()
 
     def mixed(x, kernel, direction):
         forward_reverse = jax.jvp(jax.grad(scalar, (0, 1)), (x, kernel),
@@ -315,15 +343,15 @@ def placed_experts(mesh, activation, skewed, scale_inputs, limit, implementation
 
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
 @pytest.mark.parametrize('skewed,scale_inputs,limit', [(False, False, None), (True, True, .7)])
-@pytest.mark.parametrize('expert,fsdp', MESH_LAYOUTS)
+@pytest.mark.parametrize('expert,fsdp', (*MESH_LAYOUTS, DATA_LAYOUT))
 @pytest.mark.parametrize('implementation', ['xla', 'pallas'])
 def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, scale_inputs, limit,
                                                           expert, fsdp, implementation):
     """Three Adam steps of a bf16 routed layer: outputs, gradients, parameters
     and moments agree between global and exchange dispatch. Observed maxima
-    1.5e-8 random and 6e-8 skewed. On 'pallas' the global dispatch runs the
-    kernels on every device's share of the rows, and the exchange dispatch
-    on every expert shard's rows split again over the fsdp axis."""
+    1.5e-8 random and 6e-8 skewed. 'pallas' runs its kernels (interpreted on
+    a CPU) on every device's own rows, the exchange included on a mesh whose
+    only split axis is the expert one."""
     mesh = build_mesh(MeshSpec(expert=expert, fsdp=fsdp))
     model, parameters, specs, tokens, x, weights, choices = placed_experts(
         mesh, activation, skewed, scale_inputs, limit, implementation)

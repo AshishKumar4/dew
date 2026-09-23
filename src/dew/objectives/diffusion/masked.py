@@ -31,7 +31,7 @@ from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, EMASpec, Mean, Objective, Step, Variables
-from dew.objectives.lm.chunked import chunked_cross_entropy
+from dew.objectives.lm.chunked import bf16_head, chunked_cross_entropy
 from dew.registry import objectives
 from dew.sampling.sample import sample
 
@@ -155,7 +155,8 @@ class MaskedDiffusionObjective(Objective[Mean]):
         head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
         losses, predicted, _ = chunked_cross_entropy(
             hidden, head, tokens, self.head_chunks,
-            softcap=self.model.final_logit_softcap, precision=self.model.precision)
+            softcap=self.model.final_logit_softcap, precision=self.model.precision,
+            bf16=bf16_head(self.model))
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted
 
