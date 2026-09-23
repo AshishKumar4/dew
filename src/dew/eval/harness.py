@@ -209,14 +209,20 @@ class DewLM(TemplateLM):
         row's last ones. `HFLM` refuses a longer continuation; here it is
         scored in consecutive blocks of `max_length` targets, each block the
         end of such a row over the ids before it, so every target is still
-        read once. An empty continuation scores 0 and counts as greedy, as
-        it does there.
+        read once. A continuation with no ids of its own is refused, as
+        `HFLM` refuses it: scored, it would be probability 1 and greedy, and
+        win every multiple-choice comparison it is in.
         """
         del disable_tqdm, kwargs
         rows: list[list[int]] = []
         widths: list[int] = []
         owners: list[int] = []
-        for owner, (_, context, continuation) in enumerate(requests):
+        for owner, (strings, context, continuation) in enumerate(requests):
+            if not continuation:
+                named = repr(strings[1]) if strings is not None else "a continuation"
+                raise ValueError(
+                    f"{named} adds no token to its context, so there is nothing to score; "
+                    f"the tokenizer read the pair as {len(context)} ids")
             whole = [*context, *continuation]
             for start in range(len(context), len(whole), self.max_length):
                 end = min(start + self.max_length, len(whole))

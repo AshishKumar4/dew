@@ -153,6 +153,14 @@ def test_a_batch_scores_every_request_as_it_would_alone_and_keeps_the_order(adap
         [score for score, _ in reversed(together)], rel=RELATIVE)
 
 
+def test_a_continuation_that_adds_no_token_is_refused_not_scored_as_certain(adapter):
+    """lm-eval's HFLM asserts every continuation has ids. Scored, an empty
+    one would be probability 1 and greedy, and win every multiple-choice
+    comparison it is in."""
+    with pytest.raises(ValueError, match="'' adds no token to its context"):
+        adapter.loglikelihood([instance("The sky is", " blue"), instance("The sky is", "")])
+
+
 def test_generate_until_cuts_the_answer_at_the_first_stop_string(adapter):
     """The budget is the request's, and a stop string cuts the decoded text."""
     full, = adapter.generate_until([instance("the ", {"until": [], "max_gen_toks": 4})])
