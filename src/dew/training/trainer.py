@@ -33,6 +33,7 @@ from dew.artifacts import agree_process_phase, agreed
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Checkpointable, Closeable, RampedStream, rows_of
 from dew.nn.kernels.generation import device_generation
+from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer
 from dew.nn.sharding import STAGE_AXIS, Schedule, pipeline_microbatches
 from dew.objectives.base import (
     FROZEN,
@@ -200,6 +201,45 @@ def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
     if any(getattr(mixer, 'keeps_triton_gemm', False) for mixer in mixers):
         return None
     return {'xla_gpu_enable_triton_gemm': False}
+# What a model recomputes in its backward pass when its step does not fit,
+# weakest first. Each rung is slower and holds less: on an NVIDIA L4 (24 GB,
+# jax 0.11.2, bf16) the 359.8M-parameter decoder at 4 x 1024 tokens took
+# 334.7, 356.4 and 401.3 ms at 9.93, 8.00 and 6.29 GiB, and at 16 x 1024
+# only 'full' fits; DiT-L/2 on 64x64 inputs at 16 fits only under 'full'
+# (docs/performance.md). A model's own remat is where it starts: the
+# trainer moves it up one rung at a time until the compiled step fits the
+# devices, and never past a policy the ladder does not name.
+DECODER_REMAT = (None, REMAT_POLICIES['minimal'], REMAT_POLICIES['full'])
+DIFFUSION_REMAT = (False, 'dots', 'full')
+
+
+def step_fits(executable: jax.stages.Compiled, mesh: Mesh) -> bool:
+    """Whether the compiled step's arguments, outputs and temporaries fit
+    the memory of each of `mesh`'s devices, where the backend reports it."""
+    stats = executable.memory_analysis()
+    limits = [(device.memory_stats() or {}).get('bytes_limit') for device in mesh.devices.flat]
+    if stats is None or not all(limits):
+        return True
+    needed = (stats.argument_size_in_bytes + stats.output_size_in_bytes
+              - stats.alias_size_in_bytes + stats.temp_size_in_bytes)
+    return needed <= min(limits)
+
+
+def recompute_more(objective) -> bool:
+    """Move the objective's model one rung up its remat ladder, and say
+    whether there was a rung to move to."""
+    model = getattr(objective, 'model', None)
+    current = getattr(model, 'remat', ...)
+    ladder = (DECODER_REMAT if isinstance(model, CausalTransformer)
+              else DIFFUSION_REMAT if isinstance(current, bool | str) else ())
+    current = 'dots' if current is True else current
+    if current not in ladder or current == ladder[-1]:
+        return False
+    stronger = ladder[ladder.index(current) + 1]
+    print(colored(f"the step does not fit the devices under remat {current!r}; "
+                  f"compiling it again under {stronger!r}", "yellow"), file=sys.stderr)
+    objective.model = model.clone(remat=stronger)
+    return True
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -633,24 +673,29 @@ class Trainer(Generic[Loss, Effects]):
                     f"no pipeline, so every stage would compute the whole step; give those "
                     f"devices to the data or fsdp axis")
             prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
-            body = self.step(self.objective, self.optimizer) if self.step is not None else self._default_step(shapes)
             shardings = self.shardings(prepared)
             replicated = NamedSharding(mesh, P())
-
-            def step(current, batch):
-                # The body sees every field on the device; the out shardings
-                # return the host-resident ones to pinned host memory.
-                advanced, loss, aux = body(self._fetched(current, shardings), batch)
-                return (dataclasses.replace(advanced, step=current.step + 1), loss, aux.metrics,
-                        jnp.isfinite(loss), advanced.microstep > current.microstep)
-
-            jitted = jax.jit(step, in_shardings=(shardings, batch_shardings(mesh, batch)),
-                             out_shardings=(shardings, replicated, replicated, replicated, replicated),
-                             donate_argnums=0)
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
-            self.program = jitted.lower(prepared, batch)
-            self.executable = self.program.compile(step_compiler_options(self.objective))
+            while True:
+                body = (self.step(self.objective, self.optimizer) if self.step is not None
+                        else self._default_step(shapes))
+
+                def step(current, batch, body=body):
+                    # The body sees every field on the device; the out shardings
+                    # return the host-resident ones to pinned host memory.
+                    advanced, loss, aux = body(self._fetched(current, shardings), batch)
+                    return (dataclasses.replace(advanced, step=current.step + 1), loss,
+                            aux.metrics, jnp.isfinite(loss), advanced.microstep > current.microstep)
+
+                jitted = jax.jit(step, in_shardings=(shardings, batch_shardings(mesh, batch)),
+                                 out_shardings=(shardings, replicated, replicated, replicated,
+                                                replicated),
+                                 donate_argnums=0)
+                self.program = jitted.lower(prepared, batch)
+                self.executable = self.program.compile(step_compiler_options(self.objective))
+                if step_fits(self.executable, mesh) or not recompute_more(self.objective):
+                    break
             self.flops_per_step = compiled_flops(self.executable)
 
         def run(current, batch):

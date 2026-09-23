@@ -22,6 +22,7 @@ from ..dit import (
     ConditioningEmbed,
     PatchSequenceEmbed,
     PatchSequenceOutput,
+    RematChoice,
     remat_block,
     rope_for_scan,
 )
@@ -169,7 +170,7 @@ class SimpleMMDiT(nn.Module):
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
     attention_impl: str = "auto"  # an AttentionImpl
-    remat: bool = False
+    remat: RematChoice = False
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
 
@@ -331,7 +332,7 @@ class HierarchicalMMDiT(nn.Module):
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
     attention_impl: str = "auto"  # an AttentionImpl
-    remat: bool = False
+    remat: RematChoice = False
 
     def stage_blocks(self, stage: int, prefix: str) -> list:
         """Build one stage's MMDiT blocks, at that stage's width and heads."""

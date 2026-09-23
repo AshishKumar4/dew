@@ -16,6 +16,7 @@ from ..dit import (
     ModulatedBlock,
     PatchSequenceEmbed,
     PatchSequenceOutput,
+    RematChoice,
     build_block_pattern,
     remat_block,
     rope_for_scan,
@@ -47,7 +48,7 @@ class HybridSSMAttentionDiT(nn.Module):
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
     attention_impl: str = "auto"  # an AttentionImpl
-    remat: bool = False
+    remat: RematChoice = False
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
     block_pattern: Sequence[str] | None = None  # e.g., ['ssm','ssm','ssm','attn']
     ssm_attention_ratio: str = DEFAULT_SSM_RATIO  # "3:1", "1:1", "all-ssm", "all-attn"

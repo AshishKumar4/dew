@@ -10,6 +10,7 @@ from ..dit import (
     ModulatedBlock,
     PatchSequenceEmbed,
     PatchSequenceOutput,
+    RematChoice,
     remat_block,
     rope_for_scan,
 )
@@ -31,7 +32,7 @@ class SimpleDiT(nn.Module):
     norm_epsilon: float = 1e-5
     qk_norm: bool = False
     attention_impl: str = "auto"  # an AttentionImpl
-    remat: bool = False
+    remat: RematChoice = False
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
 
 

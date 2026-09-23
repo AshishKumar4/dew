@@ -62,11 +62,12 @@ def compare_forward_and_backward(plain, remat, params, *inputs):
         assert jnp.allclose(a, b, rtol=1e-3, atol=1e-4)
 
 
+@pytest.mark.parametrize('choice', [True, 'full'])
 @pytest.mark.parametrize('arch', sorted(BUILDERS))
-def test_remat_keeps_parameter_tree_identical(rng, arch):
+def test_remat_keeps_parameter_tree_identical(rng, arch, choice):
     x, temb, ctx = image_inputs(rng)
     plain = BUILDERS[arch](False).init(rng, x, temb, ctx)
-    remat = BUILDERS[arch](True).init(rng, x, temb, ctx)
+    remat = BUILDERS[arch](choice).init(rng, x, temb, ctx)
 
     def paths(tree):
         return [jax.tree_util.keystr(p) for p, _ in jax.tree_util.tree_leaves_with_path(tree)]
@@ -74,10 +75,11 @@ def test_remat_keeps_parameter_tree_identical(rng, arch):
     assert paths(plain) == paths(remat), "remat changed the checkpoint layout"
 
 
+@pytest.mark.parametrize('choice', [True, 'full'])
 @pytest.mark.parametrize('arch', sorted(BUILDERS))
-def test_remat_preserves_outputs_and_gradients(rng, arch):
+def test_remat_preserves_outputs_and_gradients(rng, arch, choice):
     x, temb, ctx = image_inputs(rng)
-    plain, remat = BUILDERS[arch](False), BUILDERS[arch](True)
+    plain, remat = BUILDERS[arch](False), BUILDERS[arch](choice)
     compare_forward_and_backward(plain, remat, plain.init(rng, x, temb, ctx), x, temb, ctx)
 
 
@@ -186,7 +188,8 @@ def test_fused_attention_forward_is_named_as_the_policy_matches_it():
     rename in jax would silently cost a second flash forward per layer rather
     than fail. Read the names off jax's own primitives instead."""
     from jax._src.cudnn.fused_attention_stablehlo import (
-        _dot_product_attention_fwd_p, _dot_product_attention_fwd_p_wrapper,
+        _dot_product_attention_fwd_p,
+        _dot_product_attention_fwd_p_wrapper,
     )
 
     assert {str(_dot_product_attention_fwd_p),
@@ -224,3 +227,28 @@ def test_video_dit_remat_matches():
     remat = VideoDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1,
                      remat=True)
     compare_forward_and_backward(plain, remat, plain.init(rng, x, temb, ctx), x, temb, ctx)
+
+
+def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends():
+    """The trainer's remat ladder, weakest first: a decoder climbs from no
+    recomputation through 'minimal' to 'full', a diffusion backbone from
+    False through 'dots' to 'full', and neither leaves a policy the ladder
+    does not name."""
+    from types import SimpleNamespace
+
+    from dew.nn.backbones.causal_transformer import REMAT_POLICIES, CausalTransformer
+    from dew.training.trainer import recompute_more
+
+    decoder = SimpleNamespace(model=CausalTransformer(
+        vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16, max_seq_len=8))
+    climbed = []
+    while recompute_more(decoder):
+        climbed.append(decoder.model.remat)
+    assert climbed == [REMAT_POLICIES['minimal'], REMAT_POLICIES['full']]
+
+    diffusion = SimpleNamespace(model=BUILDERS['simple_dit'](True))
+    assert recompute_more(diffusion) and diffusion.model.remat == 'full'
+    assert not recompute_more(diffusion)
+
+    custom = SimpleNamespace(model=decoder.model.clone(remat='save_qkv_proj'))
+    assert not recompute_more(custom) and custom.model.remat == REMAT_POLICIES['save_qkv_proj']
