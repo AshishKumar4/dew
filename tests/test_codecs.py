@@ -450,8 +450,12 @@ def v4_release_storage(directory: Path, experts: str, scale_dtype: str) -> tuple
     formulas, dense, under `directory`/dense.
 
     An MX group is 32 inputs and the fixture's experts are 16 wide, so their
-    width goes to 32, their tensors redrawn at the fixture's own spread."""
-    rng = np.random.default_rng(15)
+    width goes to 32, their tensors redrawn at the fixture's own spread.
+    Seed 9 is searched: the stored weights route every token to the same
+    experts in transformers 5.16.1 and in Dew, whose logits then agree to
+    5.7e-6; eight of the first nine seeds leave a routing score tied closely
+    enough that the two break it differently."""
+    rng = np.random.default_rng(9)
     dense = {}
     for name, tensor in read_weights(V4_TINY).items():
         if "experts." in name:
