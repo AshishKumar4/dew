@@ -166,10 +166,8 @@ def _get_activations(weights: str | None = None):
     def activations(images):
         # Inception wants [-1, 1] at 299x299; pool3 output is [B, 1, 1, 2048]
         resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear')
-        features = model.apply(variables, resized, train=False)
-        # apply returns the output alone, since no mutable collections are
-        # asked for.
-        assert not isinstance(features, tuple)
+        features = model.apply(variables, resized)
+        assert isinstance(features, jax.Array)
         return features.reshape(features.shape[0], -1)
 
     return activations
