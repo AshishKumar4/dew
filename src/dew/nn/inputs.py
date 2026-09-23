@@ -191,7 +191,10 @@ class AttentionMetadata:
 
     `token_ids` are the vocabulary ids of the rows, for a layer that routes
     by them (DeepSeek V4's hash router); the model sets them when it has
-    such a layer.
+    such a layer. `engram_ids` are every engram layer's n-gram bucket ids,
+    `[B, S, layers, columns]`, which the model hashes once for the stack
+    (`dew.nn.engram`). `draft_context` is the target model's context a
+    DSpark drafter layer attends beside its draft block (`dew.nn.dspark`).
     """
 
     valid: jax.Array | None = None
@@ -200,6 +203,8 @@ class AttentionMetadata:
     pairwise_mask: jax.Array | None = None
     key_positions: jax.Array | None = None
     token_ids: jax.Array | None = None
+    engram_ids: jax.Array | None = None
+    draft_context: jax.Array | None = None
 
 
 @struct.dataclass
