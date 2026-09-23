@@ -23,6 +23,7 @@ Tolerances and the differences actually observed, fp32 on CPU:
   steps and the parallel logits, of magnitude 3.1
 """
 
+import itertools
 import json
 from pathlib import Path
 
@@ -227,6 +228,43 @@ def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
     assert largest(padded[0], plain[0]) < BOUND
     assert largest(padded[1][valid[1]], closed[0]) < BOUND
     assert not jnp.any(padded[1][~valid[1]])
+
+
+def test_packed_documents_run_as_if_each_ran_alone(reference, geometry):
+    """A row of packed documents computes, for each document, what that
+    document computes alone: neither the SSM state nor the conv's taps
+    cross a segment change. Documents of 20, 2 (shorter than the conv's
+    three-token history) and 48 tokens, the cuts off the chunk grid.
+    Largest observed difference 8.3e-07 on outputs of magnitude up to 2.9;
+    the same row without segment ids, which carries the state and the conv
+    across the cuts, is 2.9 away."""
+    module = layer(geometry)
+    variables = layer_params(reference)
+    hidden = jnp.asarray(reference["layer.hidden"])[:1]
+    cuts = [0, 20, 22, 70]
+    segments = jnp.asarray(np.repeat(np.arange(1, 4), np.diff(cuts))[None], jnp.int32)
+
+    packed = module.apply(variables, hidden, segment_ids=segments)
+    alone = jnp.concatenate([module.apply(variables, hidden[:, start:end])
+                             for start, end in itertools.pairwise(cuts)], axis=1)
+
+    assert largest(packed, alone) < BOUND
+    assert largest(module.apply(variables, hidden), alone) > 1e-1
+
+
+def test_the_chunked_and_recurrent_forms_reset_alike(reference):
+    """Document starts drop the state in both forms, including a start on
+    the first token of a chunk and one inside it. Largest observed
+    difference 1.9e-06 on outputs up to 30 and 2.4e-07 on the state; the
+    scan without the starts is 3.4 away."""
+    x, step, A, B, C, D = operands(reference)
+    starts = jnp.zeros(step.shape[:2], bool).at[0, 32].set(True).at[1, 7].set(True).at[1, 45].set(True)
+    initial = jnp.asarray(reference["scan.initial"])
+    chunked, chunked_final = chunk_ssd(x, step, A, B, C, D, initial, 32, starts=starts)
+    recurrent, recurrent_final = recurrent_ssd(x, step, A, B, C, D, initial, starts=starts)
+    assert largest(chunked, recurrent) < BOUND
+    assert largest(chunked_final, recurrent_final) < BOUND
+    assert largest(chunked, chunk_ssd(x, step, A, B, C, D, initial, 32)[0]) > 1e-1
 
 
 def test_the_kind_builds_from_the_configs_fields():

@@ -78,6 +78,8 @@ The placement helper treats rank-two and rank-three arrays as sequences. It can 
 
 A token window has `seq_len + 1` IDs, and the model reads `seq_len` positions. Check the model length as well as the shape of the batch array. Packed segments, windows and rotary positions must stay aligned.
 
+Mamba-2 layers split the sequence the same way, so a hybrid of Mamba-2 and attention layers trains under `MeshSpec(sequence=N)`. Each device convolves its own slice, reading the last `conv_kernel - 1` tokens of the previous device's slice, and runs its scan from the state the earlier slices leave. It gets that state from one all-gather of every slice's total decay and final state, `[N, batch, heads, head_dim, state_size]` in fp32, then folds them in order. Packed documents reset the state and the convolution at every segment change, including a change that falls on a slice boundary. The sequence must divide by `N`, and each slice needs at least `conv_kernel - 1` tokens. The tensor axis does not split the Mamba-2 scan: every tensor shard runs the scan on the whole width.
+
 Cached autoregressive generation needs `sequence=1`. A mesh that trains with sequence parallelism may still be unable to run the decode cache.
 
 ## Scan layers and use a pipeline
