@@ -350,6 +350,24 @@ def test_a_gateway_that_reports_healthy_before_its_engine_listens_is_waited_for(
     assert asked.count(("GET", "/v1/models")) == 4
 
 
+def test_waiting_for_the_gateway_does_not_block_close_or_cancel(tmp_path, harbor):
+    (tmp_path / "task").mkdir()
+    gateway, _ = fake_gateway(unhealthy_checks=10 ** 9)
+    source = HarborSource(gateway, harbor=harbor, model="m/p", trials=tmp_path / "trials",
+                          ready_timeout=3.0, ready_poll=0.01)
+    waiting = threading.Thread(target=lambda: pytest.raises(RuntimeError, source.submit,
+                                                            Task("hello", {HARBOR_KEY: str(tmp_path / "task")}),
+                                                            1, version=0))
+    waiting.start()
+    time.sleep(0.3)
+    began = time.monotonic()
+    source.cancel([])
+    source.close()
+    # Neither waited out the readiness poll, which holds no lock the source's other calls need.
+    assert time.monotonic() - began < 1.0
+    waiting.join(10)
+
+
 def test_a_gateway_with_no_healthy_worker_refuses_the_submission(tmp_path, harbor):
     (tmp_path / "task").mkdir()
     gateway, _ = fake_gateway(unhealthy_checks=10 ** 9)
