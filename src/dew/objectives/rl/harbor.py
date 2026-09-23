@@ -51,6 +51,7 @@ import re
 import signal
 import subprocess
 import threading
+import time
 import uuid
 import weakref
 from collections.abc import Callable, Mapping, Sequence
@@ -136,6 +137,33 @@ class Gateway:
         if not isinstance(traces, list):
             raise ValueError(f"the gateway's traces are a JSON list, got {type(traces).__name__}")
         return traces
+
+    def ready(self, timeout: float, *, poll: float = 2.0) -> None:
+        """Wait until the gateway routes to at least one healthy worker, or raise after `timeout` seconds.
+
+        rllm-model-gateway marks a worker dead after three failed health checks, as happens to an
+        engine still loading when the gateway starts, and until a later check revives it every
+        proxied call answers a plain-text 500 that leaves no trace. A session submitted then would
+        fail for the gateway's reasons, not the policy's.
+        """
+        import httpx
+
+        url = f"{self.url}/health/workers"
+        deadline, seen = time.monotonic() + timeout, "no answer"
+        while True:
+            try:
+                response = self._client.get(url)
+                health = _object(response.json()) if response.status_code == 200 else {}
+                seen = f"{response.status_code} {response.text[:500]}"
+                if isinstance(healthy := health.get("healthy"), int) and healthy > 0:
+                    return
+            except (httpx.HTTPError, ValueError) as error:
+                seen = f"{type(error).__name__}: {error}"
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"the gateway reported no healthy worker within {timeout:g} s at {url} (last: {seen}); "
+                    "check that the engines are up and registered, or raise ready_timeout")
+            time.sleep(poll)
 
     def stamp(self, version: int) -> None:
         """Make the gateway label the calls it records from now on with `version` (a `Publication` stamp)."""
@@ -306,16 +334,24 @@ class HarborSource:
     `INFRA_ERROR` rollout, not an exception, and a cancelled trial is a
     `CANCELLED` one. `attempt` is always 0: a retry is a fresh `submit`,
     relabelled by the scheduler that owns group identity.
+
+    The first `submit` waits, up to `ready_timeout` seconds, until the gateway
+    reports a healthy worker (`Gateway.ready`), so a source started beside
+    engines that are still loading launches no trial the gateway would answer
+    with a traceless 500.
     """
 
     def __init__(self, gateway: Gateway, *, harbor: str | os.PathLike[str], model: str, trials: os.PathLike[str],
                  agent: str = "mini-swe-agent", environment: Mapping[str, str] | None = None,
-                 arguments: Sequence[str] = (), workers: int = 8, reward_key: str = "reward", grace: float = 60.0):
+                 arguments: Sequence[str] = (), workers: int = 8, reward_key: str = "reward", grace: float = 60.0,
+                 ready_timeout: float = 900.0, ready_poll: float = 2.0):
         if type(workers) is not int or workers < 1:
             raise ValueError("workers must be a positive number of concurrent trials")
         if not grace > 0:
             raise ValueError("grace is a positive number of seconds")
         self._grace = grace
+        self._ready_timeout, self._ready_poll = ready_timeout, ready_poll
+        self._ready = False
         self._gateway = gateway
         self._command = [os.fspath(harbor), "trials", "start", "-a", agent, "-m", model, *arguments]
         self._environment = dict(environment or {})
@@ -337,6 +373,10 @@ class HarborSource:
         directory = task.data.get(HARBOR_KEY)
         if not isinstance(directory, (str, os.PathLike)) or not Path(directory).is_dir():
             raise ValueError(f"task {task.id!r} names no Harbor task directory under data[{HARBOR_KEY!r}]")
+        with self._lock:
+            if not self._ready:
+                self._gateway.ready(self._ready_timeout, poll=self._ready_poll)
+                self._ready = True
         group = f"{self._run}-{next(self._serial)}"
         futures: list[Future[Session]] = []
         for sample in range(samples):
