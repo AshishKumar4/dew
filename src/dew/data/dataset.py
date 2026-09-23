@@ -1028,7 +1028,10 @@ class PhasedStream:
         return batch
 
     def get_state(self) -> bytes:
-        phase = self._phase(self._records)
+        # The phase of the last record read: at a boundary nothing of the next
+        # phase is read yet, so the finished one is still current and a
+        # resume may change what follows it or extend it.
+        phase = bisect.bisect_left(self._ends, self._records)
         return position.encode(position.Global(
             records=self._records, order=self._streams[phase].order,
             completed=tuple((self._streams[index].order, self._ends[index])

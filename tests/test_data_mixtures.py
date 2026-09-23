@@ -1018,3 +1018,17 @@ def test_a_corpus_that_recurs_across_phases_continues_its_order_and_repeats_noth
         read = [value for phase in by_phase for value in phase if value // 1000 == tag]
         assert len(read) == len(set(read)), f"corpus {tag} repeated a record within its epoch"
     assert abs(sum(value // 1000 == 2 for value in by_phase[1]) - 68) <= 1
+
+
+def test_a_checkpoint_at_a_phase_boundary_names_the_finished_phase(tmp_path):
+    """Saved exactly at the switch, nothing of the next phase has been read:
+    a resume may change that phase or extend the finished one."""
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    both = {first: 1.0, second: 1.0}
+    stream = phased_packed(first, second, (first, 3), (both, None)).load(batch=4).train()
+    packed_rows(stream, 3)
+    state = stream.get_state()
+    assert not json.loads(state)["dew_global_position"].get("completed")
+    for changed in (phased_packed(first, second, (first, 3), (second, None)),
+                    phased_packed(first, second, (first, 5), (both, None))):
+        changed.load(batch=4).train().set_state(state)
