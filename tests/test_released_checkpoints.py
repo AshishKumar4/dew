@@ -16,7 +16,7 @@ revisions over the prompts below:
 The last column is the exactness proof, and it says the arithmetic is the
 same arithmetic. Both implementations deliberately pin several operations to
 fp32 whatever the model's compute dtype: the rotary tables
-(`dew.nn.attention.rotary_freqs`, `modeling_llama.py:108-125`), RMSNorm
+(`dew.nn.rope.rotary_freqs`, `modeling_llama.py:108-125`), RMSNorm
 (`dew.nn.attention.RMSNorm`, `modeling_llama.py:62-67`) and the attention
 softmax (`flax/linen/attention.py:143-144`, `modeling_llama.py:208`). Widen
 exactly those on both sides, run the trunk in double, and the two agree to

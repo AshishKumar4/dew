@@ -18,9 +18,10 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
-from .attention import LayerNorm, NormalAttention, rotary_freqs
+from .attention import LayerNorm, NormalAttention
 from .blocks import FourierEmbedding, TimeProjection
 from .precision import fp32_result_dot_general
+from .rope import rotary_freqs
 from .scan_orders import (
     build_2d_sincos_pos_embed,
     hilbert_indices,

@@ -19,8 +19,6 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.attention import (
     RMSNorm,
-    RopeScaling,
-    apply_rotary,
     causal_attention_mask,
     chunk_mask,
     combined_attention_mask,
@@ -28,7 +26,6 @@ from dew.nn.attention import (
     local_attention,
     max_attention_logits,
     open_kv_cache,
-    rotary_freqs,
     scaled_dot_product_attention,
     with_documents,
 )
@@ -36,8 +33,8 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
-from dew.nn.mla import YarnScaling, mla_rope_freqs
 from dew.nn.precision import scaled
+from dew.nn.rope import RopeScaling, YarnScaling, apply_rotary, rotary_freqs, yarn_rope_freqs
 from dew.nn.sharding import logical_axes
 
 
@@ -265,7 +262,7 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(
                 "yarn rotates whole heads at its own frequencies, so it takes "
                 "neither partial_rotary_factor nor rope_scaling")
-        return mla_rope_freqs(rotary_positions, self.head_dim, self.rope_theta, self.yarn)
+        return yarn_rope_freqs(rotary_positions, self.head_dim, self.rope_theta, self.yarn)
 
     def _metadata_mask(self, metadata: AttentionMetadata | None, slots,
                        batch: int, length: int, key_length: int, decode: bool):

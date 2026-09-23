@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import LayerNorm, TransformerBlock, rotary_freqs
+from ..attention import LayerNorm, TransformerBlock
 from ..blocks import FourierEmbedding, TimeProjection
 from ..dit import (
     ROPE_THETA,
@@ -25,6 +25,7 @@ from ..dit import (
     PatchSequenceOutput,
     remat_block,
 )
+from ..rope import rotary_freqs
 from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
 from ..sharding import logical_axes
 

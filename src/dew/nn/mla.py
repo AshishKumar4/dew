@@ -16,12 +16,9 @@ latents, as the V3 reference does; the V3.2 reference caches the expanded
 keys and values instead, so the sparse variant does that too.
 
 The rotary head rotates interleaved pairs (even/odd slices, one frequency
-each), not the rotate-half pairs `apply_rotary` rotates, so the pairwise
-rotation lives here next to its only caller. YaRN scaling, which both
-released DeepSeek configs ask for, reshapes the inverse frequencies and
-multiplies the attention scale; the frequency ramp is the reference's
-`_compute_yarn_parameters` and the scale multiplier its `yarn_apply_mscale`,
-both with `dim` at the rope width, where DeepSeek points `config.head_dim`.
+each), not the rotate-half pairs `apply_rotary` rotates, at the plain or
+YaRN-scaled frequencies both released DeepSeek configs ask for
+(`dew.nn.rope`).
 """
 
 import dataclasses
@@ -40,151 +37,17 @@ from dew.nn.attention import (
     LayerNorm,
     RMSNorm,
     _cache_positions,
-    apply_rotary,
     causal_attention_mask,
     document_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
-    rotary_freqs,
     scaled_dot_product_attention,
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
+from dew.nn.rope import YarnScaling, apply_rotary, apply_rotary_interleave, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import logical_axes
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
-
-
-@dataclasses.dataclass(frozen=True)
-class YarnScaling:
-    """YaRN rope scaling, the reference's `rope_parameters` fields.
-
-    Both released DeepSeek configs carry this spelling (rope_type yarn,
-    factor 40 off 4096 base positions), so the record keeps the reference's
-    names and a translation renames nothing. `rope_theta` repeats the
-    mixer's own base, and the two must agree, so the scaling is configured
-    once (the mscale is applied in the attention as a query pre-scale).
-    """
-
-    rope_type: str = 'yarn'
-    rope_theta: float = 10000.0
-    factor: float = 40.0
-    original_max_position_embeddings: int = 4096
-    beta_fast: float = 32.0
-    beta_slow: float = 1.0
-    mscale: float | None = None
-    mscale_all_dim: float | None = None
-    truncate: bool = True
-    # An explicit cos/sin amplitude, which the reference applies instead of
-    # deriving one; None derives it from factor and the mscales above.
-    attention_factor: float | None = None
-
-
-def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling) -> jax.Array:
-    """YaRN inverse frequencies over the rope width: `[head_dim // 2]`.
-
-    Mirrors `modeling_rope_utils._compute_yarn_parameters` with `dim` at the
-    head dim, as DeepSeek's configs do by pointing `head_dim` at the rope
-    slice. Low dims interpolate towards `1 / (factor * pos_freqs)`,
-    high dims keep extrapolating, and the linear ramp between the correction
-    bounds blends them.
-    """
-    dim = head_dim
-    pairs = dim // 2
-    pos_freqs = theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim)
-    inv_extrapolation = 1.0 / pos_freqs
-    inv_interpolation = 1.0 / (yarn.factor * pos_freqs)
-
-    def correction_dim(rotations: float) -> float:
-        """The dimension seeing `rotations` turns over the original context."""
-        return (dim * math.log(yarn.original_max_position_embeddings
-                               / (rotations * 2 * math.pi))
-                / (2 * math.log(theta)))
-
-    low = correction_dim(yarn.beta_fast)
-    high = correction_dim(yarn.beta_slow)
-    if yarn.truncate:
-        low, high = math.floor(low), math.ceil(high)
-    low, high = max(low, 0), min(high, dim - 1)
-    span = high - low
-    if span == 0:
-        # The reference nudges a degenerate bound to keep the division finite.
-        span = 0.001
-    ramp = jnp.clip((jnp.arange(pairs, dtype=jnp.float32) - low) / span, 0, 1)
-    return inv_interpolation * ramp + inv_extrapolation * (1 - ramp)
-
-def yarn_attention_factor(yarn: YarnScaling) -> float:
-    """The cos/sin multiplier of `_compute_yarn_parameters`.
-
-    Both released configs set mscale and mscale_all_dim to 1.0, so this is
-    1.0 for them; a config that sets them apart rotates at a different
-    amplitude.
-    """
-    if yarn.attention_factor is not None:
-        return float(yarn.attention_factor)
-    def mscale(scale: float, weight: float) -> float:
-        return 1.0 if scale <= 1 else 0.1 * weight * math.log(scale) + 1.0
-
-    if yarn.mscale and yarn.mscale_all_dim:
-        return float(mscale(yarn.factor, yarn.mscale)
-                     / mscale(yarn.factor, yarn.mscale_all_dim))
-    return float(mscale(yarn.factor, 1.0))
-
-
-def yarn_query_scale(yarn: YarnScaling) -> float:
-    """The attention-scale multiplier of `yarn_apply_mscale`, squared.
-
-    The reference folds this into the softmax scale, while dew's kernels
-    scale by `1 / sqrt(head_dim)` themselves, so the query carries the
-    ratio, the same way `attention_scale` does on the standard mixer. For
-    the released configs this is `(0.1 * ln(40) + 1) ** 2`.
-    """
-    if not yarn.mscale_all_dim or yarn.factor <= 1:
-        return 1.0
-    mscale = 0.1 * yarn.mscale_all_dim * math.log(yarn.factor) + 1.0
-    return mscale * mscale
-
-
-def mla_rope_freqs(positions, head_dim: int, theta: float,
-                   yarn: YarnScaling | None):
-    """cos/sin over the rope width, plain or YaRN-scaled: `[P, head_dim // 2]`.
-
-    Plain rope is `rotary_freqs`, the one layout every mixer shares. YaRN
-    replaces the inverse frequencies with the ramp and scales the resulting
-    cos/sin by its attention factor, as the reference's rotary embedding
-    does.
-    """
-    if yarn is None:
-        return rotary_freqs(positions, head_dim, theta)
-    inv_freq = yarn_inv_freq(head_dim, theta, yarn)
-    positions = jnp.asarray(positions, jnp.float32)
-    if positions.ndim == 1:
-        angles = positions[:, None] * inv_freq[None, :]
-    else:
-        angles = positions[:, :, None] * inv_freq[None, None, :]
-    factor = yarn_attention_factor(yarn)
-    return jnp.cos(angles) * factor, jnp.sin(angles) * factor
-
-
-def apply_rotary_interleave(x, freqs_cos, freqs_sin):
-    """Rotate `[B, S, H, D]` heads pairwise, DeepSeek's rope convention.
-
-    Pairs `(x0, x1), (x2, x3), ...` each rotate by one frequency
-    (`modeling_deepseek_v3.apply_rotary_pos_emb_interleave`): the even and
-    odd slices turn against the first half of the cos/sin, and the halves
-    stack real over imaginary without interleaving back. Query and key
-    take the same layout, so the dot product keeps the complex structure.
-    """
-    if freqs_cos.ndim == 3:
-        cos = freqs_cos[:, :, None, :]
-        sin = freqs_sin[:, :, None, :]
-    else:
-        cos = freqs_cos[None, :, None, :]
-        sin = freqs_sin[None, :, None, :]
-    fp32 = x.astype(jnp.float32)
-    even, odd = fp32[..., 0::2], fp32[..., 1::2]
-    out = jnp.concatenate([even * cos - odd * sin, odd * cos + even * sin],
-                          axis=-1)
-    return out.astype(x.dtype)
 
 
 def open_latent_cache(module: nn.Module, latent, rot, index_keys, max_seq_len, *, valid=None):
@@ -649,7 +512,7 @@ class MultiHeadLatentAttention(nn.Module):
         """
         if not self.rotary:
             return q_rot, rot, None, None
-        freqs_cos, freqs_sin = mla_rope_freqs(
+        freqs_cos, freqs_sin = yarn_rope_freqs(
             positions, self.qk_rope_head_dim, self.rope_theta, self.yarn)
         return (self._rotate(q_rot, freqs_cos, freqs_sin),
                 self._rotate(rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :],
@@ -878,9 +741,9 @@ class MultiHeadLatentAttention(nn.Module):
         return checkpoint_name(self.o_proj(context), 'o_proj')
 
 
-# The standard attention mixer reads the YaRN ramp above, so the registry
-# hub imports this module while it imports the hub; the registry side of
-# this module comes after the ramp so either import order resolves.
+# `dsa_kpool` reads the indexer's name and the expanded cache above, and the
+# registry hub imports it while it imports this module; the registry side of
+# this module comes after them so either import order resolves.
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 
 

@@ -429,7 +429,7 @@ def test_the_released_olmo_3_7b_yarn_frequencies_are_the_references():
     from transformers import Olmo3Config
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-    from dew.nn.mla import YarnScaling, yarn_attention_factor, yarn_inv_freq
+    from dew.nn.rope import YarnScaling, yarn_attention_factor, yarn_inv_freq
 
     released = fixture_config("olmo-3-7b")
     reference = Olmo3Config.from_dict(released)
@@ -642,7 +642,7 @@ def test_the_llama3_ramp_matches_the_reference_frequencies(head_dim, theta, ramp
     from transformers import LlamaConfig
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
-    from dew.nn.attention import RopeScaling
+    from dew.nn.rope import RopeScaling
 
     config = LlamaConfig.from_dict(dict(
         hidden_size=head_dim * 4, num_attention_heads=4, head_dim=head_dim,
@@ -1542,7 +1542,7 @@ def test_the_real_qwen35_rotary_rotates_the_dims_the_reference_rotates():
     differ from these by up to 4.7e-01, so a translation that guessed the
     convention would rotate every position by different angles. Largest
     observed cosine difference at 5 positions 6.3e-08."""
-    from dew.nn.attention import rotary_freqs
+    from dew.nn.rope import rotary_freqs
 
     config = translate_config(qwen35_real_config())
     inv_freq = np.load(QWEN35_REAL / "inv_freq.npy")

@@ -23,6 +23,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 from .attention_sinks import attention_with_sinks
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import precision_names
+from .rope import apply_rotary
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, row_axes, sequence_shards
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "tpu"]
@@ -313,136 +314,6 @@ class LayerNorm(nn.Module):
                           self.param_dtype) if self.use_bias else None
         return layer_normalized(x, scale, bias, self.epsilon,
                                 canonicalize_dtype(x, scale, bias, dtype=self.dtype))
-
-
-@dataclasses.dataclass(frozen=True)
-class RopeScaling:
-    """Scales rotary frequencies by Llama 3.1's ramp, under the reference's names.
-
-    `_compute_llama3_parameters` (transformers modeling_rope_utils.py:580)
-    divides a frequency by `factor` when its wavelength exceeds
-    original_max_position_embeddings / low_freq_factor, and leaves it alone
-    below original_max_position_embeddings / high_freq_factor. In between it
-    interpolates linearly on
-    (original_max_position_embeddings / wavelength - low_freq_factor)
-    / (high_freq_factor - low_freq_factor).
-
-    `rope_type` is the record's discriminator and only 'llama3' is this
-    ramp; YaRN is a mixer kind's own value.
-    """
-
-    factor: float
-    low_freq_factor: float
-    high_freq_factor: float
-    original_max_position_embeddings: int
-    rope_type: str = 'llama3'
-
-    def __post_init__(self):
-        if self.rope_type != 'llama3':
-            raise ValueError(
-                f"rope_scaling applies the llama3 ramp, got rope_type {self.rope_type!r}")
-        if self.factor < 1.0:
-            raise ValueError(f"rope_scaling factor is at least 1, got {self.factor}")
-        if self.high_freq_factor <= self.low_freq_factor:
-            raise ValueError(
-                f"rope_scaling needs high_freq_factor above low_freq_factor, got "
-                f"{self.high_freq_factor} and {self.low_freq_factor}")
-        if self.original_max_position_embeddings < 1:
-            raise ValueError(
-                "rope_scaling original_max_position_embeddings is the pretraining "
-                f"context, got {self.original_max_position_embeddings}")
-
-    def apply(self, inv_freq):
-        """Return the scaled inverse frequencies, the reference's arithmetic in fp32."""
-        old_context_len = float(self.original_max_position_embeddings)
-        wavelen = 2 * math.pi / inv_freq
-        divided = jnp.where(wavelen > old_context_len / self.low_freq_factor,
-                            inv_freq / self.factor, inv_freq)
-        smooth = ((old_context_len / wavelen - self.low_freq_factor)
-                  / (self.high_freq_factor - self.low_freq_factor))
-        smoothed = (1 - smooth) * divided / self.factor + smooth * divided
-        medium = jnp.logical_and(wavelen >= old_context_len / self.high_freq_factor,
-                                 wavelen <= old_context_len / self.low_freq_factor)
-        return jnp.where(medium, smoothed, divided)
-
-
-def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
-                 partial_rotary_type: str = 'proportional',
-                 rope_scaling: RopeScaling | None = None):
-    """Return cos and sin of the rotary angles at absolute `positions`: [P, pairs].
-
-    `positions` may be [P] for one sequence, or [B, P] for a packed batch
-    whose documents each restart at 0; the angle axes line up with the
-    trailing [B, S] either way. The angles are computed in fp32, so a token
-    rotates the same in a prefill and in a single decode step.
-
-    `rot_dim` narrows the rotation to the first rot_dim dimensions.
-    `partial_rotary_type` names which published convention that is, because
-    the two rotate different angles:
-
-    - 'proportional' (Gemma 4, modeling_rope_utils.py
-      `_compute_proportional_rope_parameters`): the exponents run over the
-      full head_dim, `theta ** (2i / head_dim)` for the rot_dim // 2 rotated
-      pairs. The rest keep frequency zero, where the rotation is the
-      identity. The output is head_dim // 2 wide.
-    - 'default' (Qwen3.5, modeling_qwen3_5.py:117-124
-      `Qwen3_5TextRotaryEmbedding.compute_default_rope_parameters`): the rope
-      is rot_dim-dimensional, `theta ** (2i / rot_dim)`, and the output is
-      rot_dim // 2 wide. `apply_rotary` passes the trailing dimensions
-      through, the reference's `q_rot, q_pass` split.
-
-    With rot_dim None both are the full rotation and the type is moot.
-    `rope_scaling` is Llama 3.1's ramp over the base frequencies. It applies
-    before a proportional rope pads its zero-frequency tail, as the
-    reference's `dim = head_dim * partial_rotary_factor` does.
-    """
-    if partial_rotary_type not in ('proportional', 'default'):
-        raise ValueError(
-            "partial_rotary_type names the convention of a partial rotary, "
-            f"'proportional' or 'default', got {partial_rotary_type!r}")
-    pairs = head_dim // 2 if rot_dim is None else rot_dim // 2
-    divisor = head_dim if rot_dim is None or partial_rotary_type == 'proportional' else rot_dim
-    inv_freq = 1.0 / (theta ** (jnp.arange(0, 2 * pairs, 2, dtype=jnp.float32) / divisor))
-    if rope_scaling is not None:
-        inv_freq = rope_scaling.apply(inv_freq)
-    if rot_dim is not None and partial_rotary_type == 'proportional':
-        padding = head_dim // 2 - pairs
-        inv_freq = jnp.concatenate([inv_freq, jnp.zeros((padding,), jnp.float32)])
-    positions = jnp.asarray(positions, jnp.float32)
-    if positions.ndim == 1:
-        angles = positions[:, None] * inv_freq[None, :]
-    else:
-        angles = positions[:, :, None] * inv_freq[None, None, :]
-    return jnp.cos(angles), jnp.sin(angles)
-
-
-def apply_rotary(x, freqs_cos, freqs_sin, scale: float | None = None):
-    """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders.
-
-    The freqs are [S, pairs] for one sequence, or [B, S, pairs] when a packed
-    batch restarts positions per document. Freqs narrower than D // 2 rotate
-    the first 2 * pairs dimensions and pass the rest through, which is the
-    sliced partial rotary of `rotary_freqs(partial_rotary_type='default')`.
-    `scale` multiplies the whole head inside the fp32 arithmetic, so a
-    query's attention scale narrows once, with the product.
-    """
-    cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
-    sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
-    if cos.ndim == 3:
-        cos = cos[:, :, None, :]
-        sin = sin[:, :, None, :]
-    else:
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
-    fp32 = x.astype(jnp.float32)
-    rotated_dims = cos.shape[-1]
-    fp32, passed = fp32[..., :rotated_dims], fp32[..., rotated_dims:]
-    x1, x2 = jnp.split(fp32, 2, axis=-1)
-    rotated = jnp.concatenate([-x2, x1], axis=-1)
-    out = fp32 * cos + rotated * sin
-    if passed.shape[-1]:
-        out = jnp.concatenate([out, passed], axis=-1)
-    return (out if scale is None else out * scale).astype(x.dtype)
 
 
 def _cache_positions(module: nn.Module, batch: int, length: int, capacity: int, valid):

@@ -21,8 +21,9 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import LayerNorm, rotary_freqs
+from ..attention import LayerNorm
 from ..dit import ROPE_THETA, ModulatedBlock, PatchSequenceEmbed, build_block_pattern, scan_ordered_pos_embed
+from ..rope import rotary_freqs
 from ..sharding import logical_axes
 
 

@@ -42,13 +42,12 @@ from dew.nn.attention import (
     _cache_positions,
     causal_attention_mask,
     document_mask,
-    rotary_freqs,
     unweighted_rmsnorm,
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
-from dew.nn.mla import YarnScaling, yarn_inv_freq
+from dew.nn.rope import YarnScaling, rotary_freqs, yarn_inv_freq
 from dew.nn.sharding import logical_axes
 from dew.nn.sparse_selection import top_k_keys
 

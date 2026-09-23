@@ -15,8 +15,9 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import NormalAttention, RMSNorm, rotary_freqs
+from ..attention import NormalAttention, RMSNorm
 from ..dit import ROPE_THETA
+from ..rope import rotary_freqs
 from ..sharding import logical_axes
 from .unet import Unet, unet_body
 

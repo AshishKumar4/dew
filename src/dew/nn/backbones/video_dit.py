@@ -16,7 +16,6 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.registry import models
 
-from ..attention import rotary_freqs
 from ..dit import (
     ROPE_THETA,
     ConditioningEmbed,
@@ -26,6 +25,7 @@ from ..dit import (
     remat_block,
     rope_for_scan,
 )
+from ..rope import rotary_freqs
 
 
 @models("video_dit")
