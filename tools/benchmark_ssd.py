@@ -13,7 +13,7 @@ scaling and the `D` skip around it are the same operations on both paths, so
 they would add the same constant to both rows; the transposes the kernel needs
 are inside `ssd_chunk_scan` and are timed with it.
 
-This needs a GPU or a TPU to mean anything. On CPU the kernel runs through
+This needs a TPU to mean anything. On CPU the kernel runs through
 pallas' interpreter, which is orders of magnitude slower than either path and
 is only good for `--parity`, where the row carries the kernel's largest
 difference from the XLA path instead of a time.
@@ -86,10 +86,10 @@ def kernel_platform(config: BenchmarkConfig) -> str:
     """The backend the kernel is built for. A cpu host has no kernel to build,
     so one has to be named and pallas interprets it."""
     platform = config.platform or jax.default_backend()
-    if platform not in ('gpu', 'tpu'):
-        raise ValueError(f"the ssd kernel is written for gpu and tpu, not {platform!r}; "
-                         f"name one with --platform to read it through pallas' "
-                         f"interpreter on this host")
+    if platform != 'tpu':
+        raise ValueError(f"the ssd kernel is written for tpu, not {platform!r}; name it "
+                         f"with --platform tpu to read it through pallas' interpreter "
+                         f"on this host")
     return platform
 
 

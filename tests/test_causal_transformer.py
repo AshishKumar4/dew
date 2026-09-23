@@ -18,7 +18,6 @@ import pytest
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
-from dew.objectives.lm.chunked import head_logits
 from dew.registry import models, with_precision
 
 VOCAB = 37

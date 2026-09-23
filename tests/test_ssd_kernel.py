@@ -57,7 +57,7 @@ from dew.nn.mixers.mamba2 import RESET_DECAY, chunk_ssd, xla_chunk_scan
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 BOUND = 1e-5
 GRADIENT_BOUND = 2e-5
-KERNELS = ("gpu", "tpu")
+KERNELS = ("tpu",)
 
 
 def largest(left, right) -> float:

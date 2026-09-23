@@ -45,9 +45,9 @@ def bf16_dot_runs() -> bool:
 
 
 # jax 0.11.2 deprecates the Pallas Triton backend and warns at every
-# lowering. Dew's Triton kernels (the grouped matmul, the Mamba-2 SSD scan)
-# stay on sm80 to sm89 on purpose: JAX's Mosaic GPU kernels use wgmma, which
-# those cards do not have.
+# lowering. Dew's Triton kernel, the grouped matmul, stays on sm80 to sm89 on
+# purpose: JAX's Mosaic GPU grouped matmul uses wgmma, which those cards do
+# not have.
 TRITON_DEPRECATION = (r"The Pallas Triton backend is deprecated and will be removed in"
                       r" a future JAX version\.")
 
