@@ -38,6 +38,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.registry import models
 
 from ..attention import RMSNorm, RopeScaling
+from ..attention_residuals import AttentionResiduals, DepthAttention, ResidualSite, expand_blocks, sources
 from ..blocks import TokenEmbedding, normal_kernel
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk, rescale_to
@@ -56,7 +57,7 @@ from ..kv_cache import KVCache, is_paged
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION, YarnScaling
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, Situ, SparseMLP, check_gated_activation
 from ..precision import scaled
 from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
 
@@ -162,6 +163,10 @@ class LayerSpec:
     provider: int | None
     """The layer's own index when a later layer reads its keys and values; such
     a layer runs unrolled, since what it stashes leaves the stack's loop."""
+    residual_site: ResidualSite | None
+    """The layer's place among Kimi K3's blocks of attention residuals, None
+    without them. It differs at every block boundary, so a scanned run never
+    crosses one."""
 
 
 def scan_groups(specs: Sequence[LayerSpec],
@@ -285,6 +290,11 @@ class Mixture:
     token table instead of the scores (`DeepseekV4HashRouter`). Their router
     holds `tid2eid` over the vocabulary in place of the balancing bias, and
     the block hands it the token ids.
+
+    `latent_features` is Kimi K3's latent MoE: the routed experts run at that
+    width between a down and an up projection, with the model's RMSNorm on
+    their weighted sum when `latent_norm` is set (`SparseMLP`). None runs
+    them at the model width.
     """
 
     experts: int
@@ -306,6 +316,8 @@ class Mixture:
     implementation: str = 'xla'
     dispatch: str = 'global'
     hash_layers: tuple[int, ...] | None = None
+    latent_features: int | None = None
+    latent_norm: bool = False
 
     def __post_init__(self):
         if self.layers is not None:
@@ -336,6 +348,10 @@ class Mixture:
                 f"{self.shared_features}; 0 is a layer without one")
         if self.shared_gate and not self.shared_features:
             raise ValueError("shared_gate requires shared_features")
+        if self.latent_features is not None and self.latent_features < 1:
+            raise ValueError(f"latent_features is the routed experts' latent width, got {self.latent_features}")
+        if self.latent_norm and self.latent_features is None:
+            raise ValueError("latent_norm norms the latent experts' output, which needs latent_features")
         if self.implementation not in GROUPED_MATMULS:
             raise ValueError(
                 f"implementation is the experts' grouped matmul, one of "
@@ -345,7 +361,7 @@ class Mixture:
         if self.parallel and (
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
-                or self.scale_inputs or self.shared_features):
+                or self.scale_inputs or self.shared_features or self.latent_features is not None):
             raise ValueError(
                 "a parallel mixture routes with Gemma 4's router, which has no "
                 "score function, scaling, groups, balancing bias, input scaling "
@@ -376,7 +392,8 @@ class GatedMLP(nn.Module):
     swiglu_limit is the clamp GLM-5.3-Flash and DeepSeek V4 apply before the
     activation (`Glm5NextTextMLP.forward`, modeling_glm5_next.py:98-104): the
     gate capped at the limit from above and the up projection on both sides.
-    None is the plain gated MLP.
+    None is the plain gated MLP. situ holds the betas of Kimi K3's `'situ'`
+    activation, which transforms both halves (`dew.nn.moe.Situ`).
     """
     hidden_features: int
     out_features: int
@@ -385,13 +402,12 @@ class GatedMLP(nn.Module):
     swiglu_limit: float | None = None
     init_std: float | None = None  # gate/up normal std; None: lecun normal
     output_init_std: float | None = None  # down normal std; None follows init_std
+    situ: Situ | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
-        if self.activation not in ('swiglu', 'geglu', 'geglu_exact'):
-            raise ValueError(
-                f"mlp must be 'swiglu', 'geglu' or 'geglu_exact', got {self.activation!r}")
+        check_gated_activation(self.activation, self.situ)
         if not 0 <= self.activation_sparsity < 1:
             raise ValueError(
                 f"activation_sparsity is the fraction of gate activations dropped, "
@@ -412,6 +428,8 @@ class GatedMLP(nn.Module):
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
+        if self.situ is not None:
+            return checkpoint_name(self.down_proj(self.situ(gate, up)), 'down_proj')
         gate = _gated_activation(self.activation, gate)
         return checkpoint_name(self.down_proj(gate * up), 'down_proj')
 
@@ -582,6 +600,12 @@ class DecoderBlock(nn.Module):
     its site's mapping chooses and writes back into every stream over the
     Sinkhorn-mixed residual (`dew.nn.hyper_connections`), the plain pre-norm
     block otherwise (modeling_glm5_next.py:1293-1327).
+
+    residual_site makes the block take and return Kimi K3's depth state,
+    `[B, S, blocks + 1, D]`: the finished blocks and the partial sum
+    (`dew.nn.attention_residuals`). Each sublayer reads the softmax mixture
+    of the finished blocks and the partial its site holds, as a plain
+    pre-norm block reads the residual, and adds its output to the partial.
     """
     mixer: Callable[..., nn.Module]
     feedforward: Callable[..., nn.Module] | None
@@ -604,6 +628,7 @@ class DecoderBlock(nn.Module):
     hyper_connections: HyperConnections | None = None  # mHC's stack of residual streams
     hash_routed: bool = False  # the feed-forward routes by the token ids the metadata carries
     residual_multiplier: float = 1.0  # each sublayer's output scaled before it joins the residual
+    residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
     dropout_rate: float = 0.0
     remat: RematPolicy | None = None
     dtype: Dtype | None = None
@@ -672,6 +697,19 @@ class DecoderBlock(nn.Module):
                                      emb_features=self.emb_features, norm_eps=self.norm_eps)
             self.attn_hc = site(name='attn_hc')
             self.ffn_hc = site(name='ffn_hc')
+        if self.residual_site is not None:
+            if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
+                    or self.parallel is not None or self.altup is not None
+                    or self.laurel_rank is not None or self.per_layer_input_dim
+                    or self.hyper_connections is not None or self.residual_multiplier != 1.0):
+                raise ValueError(
+                    "attention residuals run Kimi K3's block, a plain pre-norm block whose "
+                    "residual is the depth mixture: no output norms, layer scalar, parallel "
+                    "branch, altup, laurel, per-layer inputs, hyper-connections or residual multiplier")
+            site = functools.partial(DepthAttention, emb_features=self.emb_features, norm_eps=self.norm_eps)
+            self.attention_res = site(name='attention_res')
+            if self.feedforward is not None:
+                self.mlp_res = site(name='mlp_res')
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, x, train: bool = False, decode: bool = False,
@@ -710,6 +748,9 @@ class DecoderBlock(nn.Module):
         if self.hyper_connections is not None:
             return self._forward_streams(x, train, decode, positions, segment_ids,
                                          kv_store, attention_metadata, prediction_phase)
+        if self.residual_site is not None:
+            return self._forward_depth(x, train, decode, positions, segment_ids,
+                                       kv_store, attention_metadata, prediction_phase)
         altup = self.altup
         predictions = None if altup is None else self.altup_layer.predict(x, train=train)
         if altup is not None and predictions is not None:
@@ -772,6 +813,41 @@ class DecoderBlock(nn.Module):
         """A sublayer's output times `residual_multiplier` (lm-engine's
         m_residual, GraniteMoeHybrid's residual_multiplier), in its own dtype."""
         return scaled(branch, self.residual_multiplier)
+    def _forward_depth(self, state, train: bool, decode: bool, positions, segment_ids,
+                       kv_store, attention_metadata, prediction_phase="ordinary"):
+        """Kimi K3's block over `[B, S, blocks + 1, D]`
+        (`KimiDecoderLayer._forward_attn_residual`, modeling_kimi_linear.py:973-1046).
+
+        The attention reads the mixture of the blocks finished before this
+        layer with the partial it received, or that partial alone before any
+        block is finished. A layer that opens a block closes that partial
+        into the next slot, and the attention output starts the new partial.
+        """
+        site = self.residual_site
+        assert site is not None
+        blocks, partial = state[:, :, :-1], state[:, :, -1]
+        finished = site.finished
+        if not finished and self.is_initializing():
+            # Layer 0 carries the site like every layer and never reads it
+            # (the reference skips it on an empty block list, :987-993); the
+            # tree holds it so the checkpoint's tensors have a leaf.
+            self.attention_res(partial[:, :, None])
+        read = partial if not finished else self.attention_res(sources(blocks, finished, partial))
+        if site.opens:
+            blocks = blocks.at[:, :, finished].set(partial)
+            finished += 1
+        mixed = self.self_attn(self.input_layernorm(read),
+                               decode=decode, positions=positions, segment_ids=segment_ids,
+                               **({} if kv_store is None else {"kv_store": kv_store}),
+                               **({} if attention_metadata is None else {"attention_metadata": attention_metadata}),
+                               **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}))
+        mixed = self.dropout(mixed, deterministic=not train)
+        partial = mixed if site.opens else partial + mixed
+        if self.feedforward is not None:
+            hidden = self.mlp(self.post_attention_layernorm(self.mlp_res(sources(blocks, finished, partial))),
+                              **self._feedforward_inputs(attention_metadata))
+            partial = partial + self.dropout(hidden, deterministic=not train)
+        return jnp.concatenate([blocks, partial[:, :, None]], axis=2)
 
     def _feedforward_inputs(self, attention_metadata) -> dict:
         """The token ids for a hash-routed feed-forward, nothing for the rest."""
@@ -1363,6 +1439,13 @@ class CausalTransformer(nn.Module):
     layer without a feed-forward, which is Mamba-2's block of the mixer
     alone.
 
+    `attention_residuals` replaces the running residual with Kimi K3's
+    softmax over finished blocks of layers (`dew.nn.attention_residuals`):
+    the embeddings enter as the first partial sum, every sublayer reads a
+    mixture over depth, and a model-level site mixes the blocks once more
+    before the final norm. `situ` holds the betas of the `'situ'` gated
+    activation every feed-forward then shares (`dew.nn.moe.Situ`).
+
     `partial_rotary_factor` rotates that fraction of an unwindowed kind's
     head dims and passes the rest through; a windowed kind rotates whole.
     `partial_rotary_type` names which published convention the fraction
@@ -1403,7 +1486,7 @@ class CausalTransformer(nn.Module):
     num_heads: int = 8
     num_kv_heads: int | None = None       # None: as many as the query heads
     head_dim: int | None = None           # None: emb_features // num_heads
-    mlp: str = 'swiglu'                      # 'swiglu' | 'geglu' | 'geglu_exact'
+    mlp: str = 'swiglu'                      # 'swiglu' | 'geglu' | 'geglu_exact' | 'situ'
     mlp_features: int | tuple[int, ...] | None = None  # None: four times emb_features; a tuple: one width per layer (Gemma 3n); 0: no feed-forward (Mamba-2)
     max_seq_len: int = 2048
     rope_theta: float = 10000.0              # the base a kind does not override
@@ -1484,7 +1567,9 @@ class CausalTransformer(nn.Module):
     altup: AltUp | None = None             # Gemma 3n's stack of residual copies; None disables
     laurel_rank: int | None = None         # Gemma 3n's learned augmented residual; None disables
     hyper_connections: HyperConnections | None = None  # mHC's stack of residual streams; None disables
+    attention_residuals: AttentionResiduals | None = None  # Kimi K3's block depth mixture; None disables
     swiglu_limit: float | None = None      # GLM-5.3-Flash's clamp before every gated MLP's activation
+    situ: Situ | None = None               # Kimi K3's SiTU betas; set exactly when mlp is 'situ'
     activation_sparsity_pattern: tuple[float, ...] | None = None  # Gemma 3n's gaussian top-k, one fraction per layer
     mask_token_id: int | None = None  # the vocabulary id a masked-diffusion objective corrupts to; None is plain training
     scan_layers: bool = False                 # runs of like layers under flax's scan
@@ -1520,6 +1605,10 @@ class CausalTransformer(nn.Module):
             object.__setattr__(self, "altup", AltUp(**self.altup))
         if isinstance(self.hyper_connections, Mapping):
             object.__setattr__(self, "hyper_connections", HyperConnections(**self.hyper_connections))
+        if isinstance(self.attention_residuals, Mapping):
+            object.__setattr__(self, "attention_residuals", AttentionResiduals(**self.attention_residuals))
+        if isinstance(self.situ, Mapping):
+            object.__setattr__(self, "situ", Situ(**self.situ))
         if isinstance(self.mtp_hyper_connections, Mapping):
             object.__setattr__(self, "mtp_hyper_connections", HyperConnections(**self.mtp_hyper_connections))
         # A value arrives as a record from a config and as itself from code,
@@ -1887,6 +1976,11 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is positive, "
                 f"got {self.swiglu_limit}; None leaves them unclamped")
+        if self.attention_residuals is not None and (
+                self.altup is not None or self.hyper_connections is not None or self.num_nextn_predict_layers):
+            raise ValueError(
+                "attention_residuals carries Kimi K3's depth state through the layers, which "
+                "altup's copies and hyper_connections' streams replace and no prediction depth reads")
         mask = self.mask_token_id
         if mask is not None and (isinstance(mask, bool) or not isinstance(mask, int) or mask < 0):
             raise ValueError(
@@ -1910,7 +2004,7 @@ class CausalTransformer(nn.Module):
         gated_mlp = functools.partial(GatedMLP, out_features=self.emb_features,
                                       activation=self.mlp, swiglu_limit=self.swiglu_limit,
                                       init_std=init_std, output_init_std=output_init_std,
-                                      dtype=self.dtype, precision=self.precision)
+                                      situ=self.situ, dtype=self.dtype, precision=self.precision)
         shared = None if mixture is None or not mixture.shared_features else functools.partial(
             gated_mlp, hidden_features=mixture.shared_features)
         routed = None if mixture is None else functools.partial(
@@ -1933,10 +2027,15 @@ class CausalTransformer(nn.Module):
             expert_bias=mixture.bias,
             scale_inputs=mixture.scale_inputs,
             swiglu_limit=self.swiglu_limit,
+            situ=self.situ,
             shared=shared,
             shared_gate=mixture.shared_gate,
             init_std=init_std,
             output_init_std=output_init_std,
+            latent_features=mixture.latent_features,
+            latent_norm=None if not mixture.latent_norm else functools.partial(
+                RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
+                scale_after_cast=self.scale_after_cast, dtype=self.dtype),
             dtype=self.dtype,
             precision=self.precision)
         parallel = None if mixture is None or not mixture.parallel else functools.partial(
@@ -2025,7 +2124,9 @@ class CausalTransformer(nn.Module):
                        else widths[index]),
                 sparsity=0.0 if sparsity is None else sparsity[index],
                 kv_shared=index in sharing,
-                provider=index if index in providers else None)
+                provider=index if index in providers else None,
+                residual_site=(None if self.attention_residuals is None
+                               else self.attention_residuals.site(index)))
             for index, layer_type in enumerate(types))
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar)
@@ -2053,13 +2154,15 @@ class CausalTransformer(nn.Module):
                 wiring=wiring,
                 per_layer_input_dim=ple or 0,
                 # The per-layer residual gates the way this model's gated
-                # feed-forward does; gpt-oss's clamped swiglu is not one of
-                # the three names that gate shares, so it keeps silu.
-                gate_activation='swiglu' if self.mlp == 'swigluoai' else self.mlp,
+                # feed-forward does; gpt-oss's clamped swiglu and Kimi's
+                # SiTU are not among the three names that gate shares, so
+                # they keep silu.
+                gate_activation='swiglu' if self.mlp in ('swigluoai', 'situ') else self.mlp,
                 parallel=parallel if spec.routed else None,
                 altup=self.altup,
                 laurel_rank=self.laurel_rank,
                 hyper_connections=self.hyper_connections,
+                residual_site=spec.residual_site,
                 dropout_rate=self.dropout_rate,
                 remat=self.remat,
                 dtype=self.dtype,
@@ -2118,6 +2221,9 @@ class CausalTransformer(nn.Module):
         if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
             self.hc_head = HyperHead(spec=self.hyper_connections, emb_features=self.emb_features,
                                      norm_eps=self.norm_eps, name='hc_head')
+        if self.attention_residuals is not None:
+            self.output_res = DepthAttention(emb_features=self.emb_features, norm_eps=self.norm_eps,
+                                             name='output_res')
         self.norm = RMSNorm(
             epsilon=self.norm_eps, scale_offset=self.scale_offset,
             scale_after_cast=self.scale_after_cast, dtype=self.dtype, name='norm')
@@ -2374,6 +2480,12 @@ class CausalTransformer(nn.Module):
         if hc is not None:
             # The embeddings copied into every residual stream: [B, S, hc_mult, D].
             x = expand_streams(x, hc.hc_mult)
+        depth = self.attention_residuals
+        blocks = 0 if depth is None else depth.blocks(self.num_layers)
+        if depth is not None:
+            # The embeddings as the first partial sum, no block finished yet:
+            # [B, S, blocks + 1, D].
+            x = expand_blocks(x, blocks)
         x = self.stack(x, train=train, decode=decode, positions=positions,
                        segment_ids=segment_ids, per_layer_input=ple, attention_metadata=attention_metadata)
         if self.altup is not None:
@@ -2386,6 +2498,11 @@ class CausalTransformer(nn.Module):
         streams = x
         if hc is not None:
             x = collapse_streams(x, self.hc_head if hc.head == 'weighted' else None)
+        if depth is not None:
+            # Every block is finished after the last layer, so the whole state,
+            # the blocks and the last partial, is what the output site mixes
+            # (modeling_kimi_linear.py:1215-1233).
+            x = self.output_res(x)
         hidden = self.norm(x)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in fp32 scores every

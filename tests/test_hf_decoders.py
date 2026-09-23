@@ -108,10 +108,12 @@ import pytest
 from dew.interop import load_pretrained
 from dew.interop import hf_decoders
 from dew.interop.hf_decoders import save_pretrained_decoder, translate_config, translate_weights
+from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind, Mixture
 from dew.nn.gemma3n import AltUp
 from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.moe import Situ
 from dew.registry import models, with_precision
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -139,6 +141,8 @@ def fixture_config(name):
     (hf_decoders.MixtureFields, Mixture),
     (hf_decoders.AltUpFields, AltUp),
     (hf_decoders.HyperConnectionsFields, HyperConnections),
+    (hf_decoders.AttentionResidualsFields, AttentionResiduals),
+    (hf_decoders.SituFields, Situ),
 ])
 def test_a_config_record_names_every_field_of_the_value_it_builds(record, value):
     # `parent` and `name` are flax's binding, not fields a config states.
