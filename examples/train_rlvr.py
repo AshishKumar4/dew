@@ -311,13 +311,13 @@ def main(config: Config) -> dict:
 
         directory = config.out / "served"
         root = f"http://127.0.0.1:{config.port}"
-        reload = SafetensorsReload(source, directory, root, config.backend)
+        reload = SafetensorsReload(source, directory, (root,), config.backend)
         reload.write(source.variables)
         remote = launch_engine(config, directory)
 
-        def push(variables) -> None:
+        def push(variables, version: int) -> None:
             began = time.perf_counter()
-            reload(variables)
+            reload(variables, version)
             pushes.append(time.perf_counter() - began)
 
         # A seeded request is safe to resend, so the SDK's retries cover a
