@@ -30,14 +30,14 @@ def test_calls_follow_submission_order_and_carry_the_gateway_stamp():
     early = trace([1, 2], [3, 4], [-1., -2.], "tool_calls", started=0.0, version=None)
     early["latency_ms"] = 5000.0
     early["timestamp"] = 5.0
-    assert calls([late, early], unstamped=2) == (
+    assert calls([late, early], unstamped=2).calls == (
         Call((1, 2), (3, 4), (-1., -2.), "tool_calls", 2), Call((1, 2, 3, 4, 5), (6, 7), (-.5, -.25), "stop", 3))
 
 
 def test_sglang_ids_are_read_from_the_raw_response():
     # SGLang's chat route lists ids under sglext, which the gateway keeps only in the raw response.
     recorded = trace([], [], [-.5, -.25], raw_response={"sglext": {"input_ids": [1, 2], "output_ids": [[5, 6]]}})
-    assert calls([recorded], unstamped=0) == (Call((1, 2), (5, 6), (-.5, -.25), "stop", 0),)
+    assert calls([recorded], unstamped=0).calls == (Call((1, 2), (5, 6), (-.5, -.25), "stop", 0),)
 
 
 @pytest.mark.parametrize("broken", [
@@ -48,6 +48,28 @@ def test_sglang_ids_are_read_from_the_raw_response():
 def test_a_trace_that_cannot_train_is_refused(broken):
     with pytest.raises(ValueError):
         calls([broken], unstamped=0)
+
+
+# vLLM 0.30.0's reply to a prompt past max-model-len (renderers/params.py), as the gateway records it:
+# no ids, no likelihoods, no finish reason, the error body kept in raw_response.
+OVERFLOW = {"prompt_token_ids": [], "completion_token_ids": [], "logprobs": None, "finish_reason": None,
+            "weight_version": None, "timestamp": 9.0, "latency_ms": 10.0,
+            "raw_response": {"error": {"message": "This model's maximum context length is 2048 tokens. However, "
+                                                  "you requested 16 output tokens and your prompt contains 4012 "
+                                                  "input tokens, for a total of 4028 tokens.",
+                                       "type": "BadRequestError", "param": "input_tokens", "code": 400}}}
+BROKEN = {**OVERFLOW, "raw_response": {"error": {"message": "EngineCore died", "type": "InternalServerError",
+                                                 "code": 500}}}
+
+
+def test_engine_errors_are_events_not_calls():
+    recorded = calls([trace([1, 2], [3], [-.5]), OVERFLOW], unstamped=0)
+    assert recorded.calls == (Call((1, 2), (3,), (-.5,), "stop", 0),) and len(recorded.errors) == 1
+    finished = result(rewards={"reward": 0})
+    # An engine that refused an overflowing prompt truncated the rollout; any other engine error is infra.
+    assert outcome(finished, recorded.calls, errors=recorded.errors)[0] is Status.TRUNCATED
+    broken = calls([trace([1, 2], [3], [-.5]), BROKEN], unstamped=0)
+    assert outcome(finished, broken.calls, errors=broken.errors)[0] is Status.INFRA_ERROR
 
 
 STOP = Call((1,), (2,), (-.5,), "stop", 0)

@@ -116,22 +116,38 @@ def _ids(name: str, values: object) -> tuple[int, ...]:
     return tuple(values)
 
 
-def calls(traces: Sequence[Mapping[str, Any]], *, unstamped: int) -> tuple[Call, ...]:
-    """The gateway's traces of one session as `Call`s, in submission order.
+@dataclass(frozen=True)
+class Recorded:
+    """One session as the gateway recorded it: its model calls, and the engine errors it answered instead."""
+
+    calls: tuple[Call, ...]
+    errors: tuple[str, ...]
+
+
+def calls(traces: Sequence[Mapping[str, Any]], *, unstamped: int) -> Recorded:
+    """The gateway's traces of one session as `Call`s in submission order, and its engine errors.
 
     A trace records its arrival indirectly: `timestamp` is when the answer
     was stored and `latency_ms` how long the engine took, so the calls are
     ordered by their difference. A trace without a version stamp, from a
     gateway no publication has stamped, takes `unstamped`, the version the
     session was submitted under: no later push can have served it anything
-    older. A trace without ids or with one likelihood too few or too many
-    raises `ValueError`; training on it would mean re-tokenizing text.
+    older. The gateway also records an engine's error reply (a prompt past
+    the context length, an engine fault): such a trace carries `error` in its
+    raw response and is an event of the session, returned as its message, not
+    a call. A successful reply without ids or with one likelihood too few or
+    too many raises `ValueError`; training on it would mean re-tokenizing text.
     """
     ordered = sorted(traces, key=lambda trace: float(trace["timestamp"]) - float(trace["latency_ms"]) / 1000)
-    records = []
+    records, errors = [], []
     for trace in ordered:
+        raw = trace.get("raw_response") or {}
+        if raw.get("error"):
+            error = raw["error"]
+            errors.append(str(error.get("message", error) if isinstance(error, Mapping) else error))
+            continue
         prompt, sampled = trace.get("prompt_token_ids") or [], trace.get("completion_token_ids") or []
-        extension = ((trace.get("raw_response") or {}).get("sglext") or {})
+        extension = raw.get("sglext") or {}
         if not prompt and extension.get("input_ids"):
             prompt = extension["input_ids"]
         if not sampled and extension.get("output_ids"):
@@ -142,7 +158,11 @@ def calls(traces: Sequence[Mapping[str, Any]], *, unstamped: int) -> tuple[Call,
         records.append(Call(_ids("prompt ids", prompt), _ids("sampled ids", sampled),
                             tuple(float(value) for value in trace.get("logprobs") or ()),
                             str(trace.get("finish_reason")), unstamped if version is None else int(version)))
-    return tuple(records)
+    return Recorded(tuple(records), tuple(errors))
+
+
+# How vLLM 0.30.0 (renderers/params.py) and SGLang 0.5.20 word a prompt past the context length.
+_OVERFLOW = re.compile(r"maximum context length|exceeds the maximum allowed length|context length", re.IGNORECASE)
 
 
 def _reward(rewards: Mapping[str, float], key: str) -> float:
@@ -153,12 +173,15 @@ def _reward(rewards: Mapping[str, float], key: str) -> float:
     raise ValueError(f"the verifier reported {sorted(rewards)} and no {key!r}")
 
 
-def outcome(result: Mapping[str, Any], records: tuple[Call, ...], *, harness_exit: str | None = None,
-            reward_key: str = "reward") -> tuple[Status, float | None, dict[str, float], str]:
+def outcome(result: Mapping[str, Any], records: tuple[Call, ...], *, errors: Sequence[str] = (),
+            harness_exit: str | None = None, reward_key: str = "reward") -> tuple[Status, float | None, dict[str, float], str]:
     """Status, reward, reward components and failure detail of one finished trial.
 
-    `result` is Harbor's `TrialResult` as JSON, `records` the session's calls
-    and `harness_exit` the harness's own exit status when it reports one.
+    `result` is Harbor's `TrialResult` as JSON, `records` the session's calls,
+    `errors` the engine errors the gateway recorded for it, and `harness_exit`
+    the harness's own exit status when it reports one. An engine that refused
+    an overflowing prompt truncated the rollout; any other engine error makes
+    it infra, even when the harness retried and went on.
     """
     failure = result.get("exception_info") or {}
     kind = failure.get("exception_type")
@@ -168,6 +191,10 @@ def outcome(result: Mapping[str, Any], records: tuple[Call, ...], *, harness_exi
         reward = _reward(rewards, reward_key) if rewards else None
     except ValueError as error:
         return Status.INFRA_ERROR, None, rewards, str(error)
+    if any(_OVERFLOW.search(error) for error in errors):
+        return Status.TRUNCATED, reward, rewards, f"the engine refused a prompt: {errors[0]}"
+    if errors:
+        return Status.INFRA_ERROR, reward, rewards, f"the engine answered an error: {errors[0]}"
     if any(call.finish_reason == "abort" for call in records):
         return Status.INFRA_ERROR, reward, rewards, "the engine aborted a call"
     if (kind in _TRUNCATIONS or harness_exit in _HARNESS_LIMITS
@@ -307,16 +334,17 @@ class HarborSource:
     def _verdict(self, rollout: Callable[..., Rollout], session: str, trial: Path, log: str, returncode: int,
                  cancelled: bool, version: int) -> Rollout:
         try:
-            records = calls(self._gateway.traces(session), unstamped=version)
+            recorded = calls(self._gateway.traces(session), unstamped=version)
         except Exception as error:
             return rollout(Status.CANCELLED if cancelled else Status.INFRA_ERROR,
                            detail=f"{trial}: unusable gateway traces: {error}")
+        records = recorded.calls
         if cancelled:
             return rollout(Status.CANCELLED, records, detail=str(trial))
         if not (trial / "result.json").is_file():
             return rollout(Status.INFRA_ERROR, records, detail=f"harbor exited {returncode} with no result: {log[-2000:]}")
         status, reward, components, detail = outcome(
-            json.loads((trial / "result.json").read_text()), records,
+            json.loads((trial / "result.json").read_text()), records, errors=recorded.errors,
             harness_exit=_harness_exit(trial), reward_key=self._reward_key)
         return rollout(status, records, reward, components, f"{trial}: {detail}".rstrip(": "))
 
