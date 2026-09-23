@@ -62,14 +62,14 @@ code. Checked against the source on 2026-09-22:
   `moe`, `mla`, `gpt_oss`, `linear_attention`, `mamba2`), written by the
   `tools/*_reference.py` scripts.
 - Dew translates these `model_type` values from a Hugging Face config
-  (`_FAMILY_ENTRIES`, `src/dew/interop/hf_decoders.py:2057`): `deepseek_v2`,
+  (`_FAMILY_ENTRIES`, `src/dew/interop/hf_decoders.py`): `deepseek_v2`,
   `deepseek_v3`, `deepseek_v32`, `deepseek_v4`, `diffusion_gemma_text`,
   `dream`, `gemma`, `gemma2`, `gemma3_text`, `gemma3n_text`, `gemma4_text`,
   `glm4_moe`, `glm5_next_text`, `glm_moe_dsa`, `gpt_oss`, `kimi_k2`,
-  `kimi_k25`, `kimi_k3`, `llada`, `llama`, `llama4_text`, `mamba2`, `mistral`, `mixtral`,
-  `olmo3`, `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_next`, `qwen3_5_text` and
-  `qwen3_5_moe_text`. The MiniMax families, `nemotron_h`, `qwen4_exp`,
-  `kimi_linear` and `llada2_moe` are not in that list.
+  `kimi_k25`, `kimi_k3`, `kimi_linear`, `llada`, `llama`, `llama4_text`,
+  `mamba2`, `mistral`, `mixtral`, `olmo3`, `qwen2`, `qwen3`, `qwen3_moe`,
+  `qwen3_next`, `qwen3_5_text` and `qwen3_5_moe_text`. The MiniMax families,
+  `nemotron_h`, `qwen4_exp` and `llada2_moe` are not in that list.
 
 ## How this was checked
 
@@ -694,7 +694,8 @@ Attention Residuals (`attn_res_block_size=12`), 896 latent experts of which
 pointing at `configuration_kimi.KimiLinearConfig` and
 `modeling_kimi.KimiLinearModel`, so it runs from remote code, not from
 transformers 5.16.1 (there is no `models/kimi_linear` directory in this
-venv). Its config gives the layout directly:
+venv); Dew loads it as `kimi_linear` (`src/dew/interop/families/kimi.py`).
+Its config gives the layout directly:
 `linear_attn_config = {'full_attn_layers': [4, 8, 12, 16, 20, 24, 27],
 'head_dim': 128, 'kda_layers': [1,2,3,5,6,7,...,26],
 'num_heads': 32, 'short_conv_kernel_size': 4}`, with `mla_use_nope=True`,
@@ -1424,6 +1425,9 @@ bf16, so the fixture is a CPU test.
   labels "Kimi-style KDA"
   (`TF/models/glm5_next/modeling_glm5_next.py:585`), not through Moonshot's own
   file.
+  (2026-09-23: Dew now loads `kimi_linear` against Moonshot's own
+  `modeling_kimi.py` at e1df551 run with fla-core 0.4.0,
+  `tests/test_kimi_linear.py`.)
 - Whether `src/dew/nn/ssm.py` is close to Mamba2 was not checked; that decides
   whether Nemotron-H is cheap or expensive.
   (2026-09-22: Dew has since gained a separate `mamba2` mixer,

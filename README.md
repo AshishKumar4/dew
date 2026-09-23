@@ -261,7 +261,9 @@ pins the released configuration.
 Kimi K3 loads its text decoder from the vision wrapper: KDA and NoPE MLA
 layers, Attention Residuals over blocks of layers, latent routed experts with
 SiTU, and the routed experts' compressed-tensors MXFP4, which export writes
-back in the same format. The tower tensors are kept and written back unchanged.
+back as the same packed pairs, re-encoding trained experts by the library's
+own rule (`dew.interop.codecs.quantize_packed_mxfp4`). The tower tensors are
+kept and written back unchanged.
 A tiny fixture from the released remote code covers parity, an update, export
 and greedy decoding; the [source record](tests/fixtures/hf/kimi-k3-source/source.json)
 lists every released tensor's shape.
