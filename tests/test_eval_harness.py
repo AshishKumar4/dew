@@ -138,16 +138,16 @@ def test_a_bos_vocabulary_conditions_first_tokens_on_bos_as_lm_eval_does(tmp_pat
                                                              rel=RELATIVE)
 
 
-def test_a_continuation_longer_than_the_window_is_scored_in_lm_evals_rolling_windows():
-    """`HFLM` refuses a continuation longer than its window; the adapter
-    scores it in consecutive blocks, each conditioned on the ids before it.
-    From an empty context those are the rolling windows lm-eval scores the
-    same string with, so the two numbers are one."""
+def test_a_continuation_longer_than_the_window_is_refused_as_lm_eval_refuses_it():
+    """No row of `max_length` ids holds such a continuation with any of its
+    context, so `HFLM` asserts against it and the adapter refuses it rather
+    than score it without the context the request conditions on."""
     ours, theirs = _pair(16)
-    text = _text(50)
-    (reference,) = theirs.loglikelihood_rolling([instance(text, request_type="loglikelihood_rolling")])
-    (score, _), = ours.loglikelihood([instance("", text)])
-    assert score == pytest.approx(reference, rel=RELATIVE)
+    request = [instance("The capital of France is", _text(21))]
+    with pytest.raises(AssertionError):
+        theirs.loglikelihood(request)
+    with pytest.raises(ValueError, match="is 21 ids, longer than this model's 16-id window"):
+        ours.loglikelihood(request)
 
 
 @pytest.mark.parametrize("length, max_length", [(3, 16), (50, 16), (5000, 2048)])
