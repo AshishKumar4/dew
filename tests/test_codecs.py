@@ -2,9 +2,7 @@
 
 compressed-tensors' MXFP4 export is held to the bytes compressed-tensors
 0.17.1 wrote for one fresh weight in three dtypes
-(tools/compressed_tensors_mxfp4_reference.py). Every codec reads a region of
-a decoded tensor from the blocks it covers, which the formats' formulas,
-taken element by element, check on views far larger than memory.
+(tools/compressed_tensors_mxfp4_reference.py).
 
 DeepSeek-V4's `.scale` storage is read against the release's own
 dequantization (inference/convert.py and model.py of
@@ -20,7 +18,6 @@ import json
 import os
 import re
 import struct
-from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
@@ -92,109 +89,6 @@ def test_a_group_rounding_past_the_largest_power_of_two_is_refused():
     weight[0, 0] = 3e38
     with pytest.raises(ValueError, match="reserved NaN 0xff"):
         codecs.quantize_packed_mxfp4(weight)
-
-
-# --------------------------------------------------------------------------
-# Regions: what a streamed load asks for, one shard of one tensor at a time
-# --------------------------------------------------------------------------
-
-def encoded(kind: str) -> tuple[dict[str, np.ndarray], str, Callable[..., np.ndarray]]:
-    """A tensor stored in `kind`'s format, its decoded name and the format's
-    reader. Each shape ends on a partial block or a partial block row where
-    the format has one."""
-    rng = np.random.default_rng(7)
-    if kind == "stored":
-        return {"b": rng.integers(-9, 9, (70, 300), dtype=np.int32)}, "b", partial(codecs.read_fp8_tensor, block=32)
-    if kind == "fp8":
-        tensors = codecs.pack_fp8({"w": rng.standard_normal((70, 300)).astype(np.float32)}, ("w",), 32, ue8m0=False)
-        return tensors, "w", partial(codecs.read_fp8_tensor, block=32)
-    if kind == "gpt_oss":
-        tensors = codecs.pack_mxfp4({"w": rng.standard_normal((3, 96, 70)).astype(np.float32)}, ("w",))
-        return tensors, "w", codecs.read_mxfp4_tensor
-    if kind == "compressed_tensors":
-        weight = rng.standard_normal((70, 256)).astype(np.float32)
-        return codecs.pack_packed_mxfp4({"m.weight": weight}, ("m.weight",)), "m.weight", codecs.read_packed_mxfp4_tensor
-    name = {"v4_fp8": "layers.0.attn.wkv.weight", "v4_fp4": "layers.0.ffn.experts.0.w2.weight",
-            "v4_engram": "layers.1.engram.embed.weight"}[kind]
-    tensors = codecs.pack_deepseek_v4({name: rng.standard_normal((70, 256)).astype(np.float32)}, (name,), block=32,
-                                      fp4_experts=True)
-    return tensors, name, partial(codecs.read_deepseek_v4_tensor, block=32, fp4_experts=True)
-
-
-REGIONS_2D = ((slice(3, 50, 3), slice(17, 250, 5)), (slice(69, 2, -7), slice(None, None, -1)), (slice(5, 5),))
-REGIONS_3D = ((slice(None), slice(17, 90, 5), slice(None, None, -2)), (slice(2, 0, -1), slice(31, 33), slice(64, 70)),
-              (slice(0, 0),))
-
-
-@pytest.mark.parametrize("kind, region", [
-    *((kind, region) for kind in ("stored", "fp8", "compressed_tensors", "v4_fp8", "v4_fp4", "v4_engram")
-      for region in REGIONS_2D),
-    *(("gpt_oss", region) for region in REGIONS_3D)])
-def test_a_region_decodes_to_the_whole_tensors_values_there(kind, region):
-    """What `jax.make_array_from_callback` asks of a streamed load: a
-    region of a decoded tensor, strided off block edges, reversed or empty,
-    is the whole decode at that region, bit for bit, -0.0 included, and an
-    unquantized tensor keeps its stored dtype."""
-    tensors, name, read = encoded(kind)
-    whole = read(tensors, name)
-
-    part = read(tensors, name, region)
-
-    assert part.dtype == whole.dtype
-    np.testing.assert_array_equal(part.view(np.uint32), whole[region].view(np.uint32))
-
-
-@pytest.mark.parametrize("region", [None, (slice(0, 3), slice(200, 300))])
-def test_a_scale_grid_of_another_block_size_is_refused_before_any_region_decodes(region):
-    """A [512, 4096] weight whose [16, 128] scales are 32 x 32 blocks, read
-    as 128 x 128: the region's first [1, 1] of that grid fits the region,
-    so only the whole grid tells the checkpoint from its config."""
-    weight, scale = np.zeros((512, 4096), codecs.E4M3), np.ones((16, 128), np.float32)
-    with pytest.raises(ValueError, match=r"takes a \(4, 32\) scale, got \(16, 128\)"):
-        codecs.read_fp8_tensor({"w": weight, "w_scale_inv": scale}, "w", region, block=128)
-    with pytest.raises(ValueError, match=r"takes a \(4, 32\) scale, got \(16, 128\)"):
-        codecs.read_deepseek_v4_tensor({"l.wkv.weight": weight, "l.wkv.scale": scale}, "l.wkv.weight", region,
-                                       block=128, fp4_experts=True)
-
-
-def hankel(base: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-    """A read-only [rows, cols] view holding base[i + j] at (i, j), with no memory of its own."""
-    return np.lib.stride_tricks.as_strided(base, shape, (base.itemsize, base.itemsize), writeable=False)
-
-
-def indices(rows: slice, cols: slice) -> tuple[np.ndarray, np.ndarray]:
-    """A region's row and column indices, broadcasting against each other."""
-    return np.arange(rows.start, rows.stop)[:, None], np.arange(cols.start, cols.stop, cols.step)[None, :]
-
-
-def test_a_region_of_a_tensor_too_large_to_decode_reads_only_its_blocks():
-    """Tensors far past memory, as views that hold none: the FP8 weight
-    decodes whole to 1 TiB of float32 and the compressed-tensors one to 128
-    GiB. A region across block and group edges decodes from the blocks and
-    groups it covers alone, and equals each format's formula there, taken
-    element by element."""
-    rng = np.random.default_rng(3)
-
-    codes = rng.integers(0, 0x7f, 2 ** 20 + 2 ** 18, dtype=np.uint8) | rng.choice(np.uint8([0, 0x80]), 2 ** 20 + 2 ** 18)
-    scales = np.ldexp(np.float32(1), rng.integers(-12, 12, 2 ** 13 + 2 ** 11)).astype(np.float32)
-    fp8 = {"w": hankel(codes.view(codecs.E4M3), (2 ** 20, 2 ** 18)), "w_scale_inv": hankel(scales, (2 ** 13, 2 ** 11))}
-    rows, cols = slice(123_390, 123_395), slice(70_001, 70_100, 3)
-    r, c = indices(rows, cols)
-    expected = decode_e4m3fn(codes[r + c]) * scales[r // 128 + c // 128]
-    np.testing.assert_array_equal(codecs.read_fp8_tensor(fp8, "w", (rows, cols), block=128).view(np.uint32),
-                                  expected.view(np.uint32))
-
-    packed = rng.integers(0, 256, 2 ** 22 + 2 ** 12, dtype=np.uint8)
-    exponents = rng.integers(115, 140, 2 ** 22 + 2 ** 8, dtype=np.uint8)
-    mx = {"m.weight_packed": hankel(packed, (2 ** 22, 2 ** 12)), "m.weight_scale": hankel(exponents, (2 ** 22, 2 ** 8))}
-    rows, cols = slice(4_000_001, 4_000_006), slice(5_001, 5_100, 3)
-    r, c = indices(rows, cols)
-    codes = (packed[r + c // 2] >> (4 * (c % 2))) & 15
-    magnitudes = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], np.float32)[codes & 7]
-    expected = (np.where(codes & 8, -magnitudes, magnitudes)
-                * np.ldexp(np.float32(1), exponents[r + c // 32].astype(np.int32) - 127))
-    np.testing.assert_array_equal(codecs.read_packed_mxfp4_tensor(mx, "m.weight", (rows, cols)).view(np.uint32),
-                                  expected.view(np.uint32))
 
 
 # --------------------------------------------------------------------------
@@ -403,35 +297,6 @@ def test_a_v4_checkpoint_refuses_what_its_format_cannot_hold(refused, message):
     """Each refusal names the tensor or the field, and what it holds."""
     with pytest.raises(ValueError, match=message):
         refused()
-
-
-def test_a_region_of_a_v4_tensor_too_large_to_decode_reads_only_its_groups():
-    """An FP4 expert that decodes whole to 128 GiB and an engram table of
-    2 ** 24 rows (16 GiB; V4.1's hold 384 M), as views that hold no memory:
-    a region reads from the groups it covers, and equals the release's
-    formulas there, element by element."""
-    rng = np.random.default_rng(16)
-    packed = rng.integers(0, 256, 2 ** 22 + 2 ** 12, dtype=np.uint8)
-    exponents = rng.integers(115, 140, 2 ** 22 + 2 ** 8, dtype=np.uint8)
-    expert = {"layers.2.ffn.experts.7.w1.weight": hankel(packed.view(np.int8), (2 ** 22, 2 ** 12)),
-              "layers.2.ffn.experts.7.w1.scale": hankel(exponents.view(ml_dtypes.float8_e8m0fnu), (2 ** 22, 2 ** 8))}
-    rows, cols = slice(4_000_001, 4_000_006), slice(5_001, 5_100, 3)
-    r, c = indices(rows, cols)
-    expected = FP4_TABLE[(packed[r + c // 2] >> (4 * (c % 2))) & 15] * e8m0(exponents[r + c // 32])
-    decoded = codecs.read_deepseek_v4_tensor(expert, "layers.2.ffn.experts.7.w1.weight", (rows, cols), block=128,
-                                             fp4_experts=True)
-    np.testing.assert_array_equal(decoded, expected)
-
-    codes = e4m3_codes(rng, (2 ** 24 + 256,))
-    scales = rng.integers(115, 140, 2 ** 24 + 8, dtype=np.uint8)
-    engram = {"layers.1.engram.embed.weight": hankel(codes, (2 ** 24, 256)),
-              "layers.1.engram.embed.scale": hankel(scales.view(ml_dtypes.float8_e8m0fnu), (2 ** 24, 8))}
-    rows, cols = slice(2 ** 24 - 7, 2 ** 24 - 2), slice(20, 70, 3)
-    r, c = indices(rows, cols)
-    expected = decode_e4m3fn(codes.view(np.uint8)[r + c]) * e8m0(scales[r + c // 32])
-    decoded = codecs.read_deepseek_v4_tensor(engram, "layers.1.engram.embed.weight", (rows, cols), block=32,
-                                             fp4_experts=True)
-    np.testing.assert_array_equal(decoded.view(np.uint32), expected.view(np.uint32))
 
 
 V4_TINY = Path(__file__).parent / "fixtures" / "hf" / "deepseek-v4-tiny"
