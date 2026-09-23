@@ -1,4 +1,5 @@
 """Canonical nested decoder banks, shared ownership, and selected source reads."""
+import shutil
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -198,6 +199,27 @@ def test_nested_checkpoint_banks_restore_only_selected_leaves_and_partial_ema(tm
     resident = host_banked(model, HeldBanks(expected), layout=DEVICE)
     identical(scores(model, restored, tokens, indices, media),
               scores(model, resident, tokens, indices, media))
+
+
+def test_a_checkpoint_written_again_at_a_path_is_read_as_it_now_is(tmp_path):
+    """A bank source reads the checkpoint that is at its path when it is
+    built. One saved where an earlier run's was deleted, at the same step,
+    has to be read as itself, not with the earlier one's shapes, which is
+    what pytest reusing a deleted test's directory name exposed."""
+    run = tmp_path / "run"
+    zero = jnp.asarray(0, jnp.int32)
+    for kind in ("multimodal", "shared-diffusion"):
+        _, variables, _, _, _ = fixture(kind)
+        state = TrainState(step=zero, microstep=zero, updates=zero, params=variables,
+                           opt_state=(), ema=None, key=jax.random.PRNGKey(0),
+                           scale=None, window_size=jnp.asarray(1, jnp.int32))
+        if run.exists():
+            shutil.rmtree(run)
+        checkpoints = Checkpoints(str(run))
+        checkpoints.save(0, state, None)
+        checkpoints.wait()
+        shapes = CheckpointBanks(str(run)).shapes()
+        assert jax.tree.structure(shapes) == jax.tree.structure(variables), kind
 
 
 def test_a_missing_nested_owner_or_layer_is_rejected_before_entry_transfer():
