@@ -94,13 +94,9 @@ class HostProcessor(Protocol):
 
 
 def _hosts(reference: PreTrainedTokenizerBase) -> TypeGuard[HostProcessor]:
-    """Whether `reference` offers every HostProcessor operation.
-
-    A transformers tokenizer does, but its annotations are narrower than
-    what dew passes (`apply_chat_template` types its messages as
-    `list[dict[str, str]]`, where dew renders tool calls and content parts),
-    so it is admitted by its operations rather than by its signatures.
-    """
+    """Whether `reference` offers every HostProcessor operation, checked by
+    name because a tokenizer's own annotations are narrower than what dew
+    passes (see `data.chat._token_ids`)."""
     return all(callable(getattr(reference, name, None))
                for name in ("__call__", "save_pretrained", "apply_chat_template", "batch_decode"))
 
