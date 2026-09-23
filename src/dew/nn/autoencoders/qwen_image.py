@@ -36,7 +36,7 @@ from flax.typing import Dtype
 from dew import records
 from dew.objectives.base import Variables
 
-from .api import AutoEncoder
+from .api import ModuleAutoEncoder
 from .kl import posterior_latent
 from .vae import FlaxDownsample2D, FlaxUpsample2D
 
@@ -396,32 +396,20 @@ def qwen_image_vae_path(name: str, ndim: int) -> tuple[str, ...]:
     return (*path, "kernel" if leaf == "weight" else leaf)
 
 
-class QwenImageAutoencoder(AutoEncoder):
+class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
     """Native Qwen-Image 2.1 VAE weights and the pipeline's per-channel
     latent normalization, `(z - latents_mean) / latents_std` on the way out
     and `z * latents_std + latents_mean` on the way in."""
 
     def __init__(self, *, model: QwenImageVAE, params: Variables,
                  latents_mean: Sequence[float], latents_std: Sequence[float]):
-        self.model = model
-        self.params = params
+        super().__init__(model, params)
         self.latents_mean = np.asarray(latents_mean, np.float32)
         self.latents_std = np.asarray(latents_std, np.float32)
         expected = (model.latent_channels,)
         if self.latents_mean.shape != expected or self.latents_std.shape != expected:
             raise ValueError(f"latents_mean {self.latents_mean.shape} and latents_std {self.latents_std.shape} "
                              f"must both hold one value per latent channel {expected}")
-        self.encode_single_frame = jax.jit(lambda params, image, key=None: model.apply(
-            {"params": params}, image, key, method=model.encode))
-        self.decode_single_frame = jax.jit(lambda params, latent: model.apply(
-            {"params": params}, latent, method=model.decode))
-
-    def encode_batch(self, params, x, key=None):
-        return self.encode_single_frame(params, x, key)
-
-    def decode_batch(self, params, z):
-        return self.decode_single_frame(params, z)
-
     @property
     def downscale_factor(self) -> int:
         return self.model.downscale_factor
