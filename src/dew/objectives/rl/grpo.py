@@ -25,7 +25,7 @@ from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.objectives.base import Aux, Mean, Variables, mean_loss
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.registry import objectives
-from dew.rl import behavior_importance_weights, k3_kl, sequence_log_ratio, token_log_ratio
+from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
 from dew.rl.surrogate import (
     behavior_band_weights,
     cispo_terms,
@@ -227,7 +227,7 @@ class GRPOObjective(LMObjective):
             if band is not None:
                 rejected = sequence_rejection_mask(proximal, terms.behavior, mask, *band,
                                                    geometric=geometric, segments=terms.segments)
-                metrics[f"masked/{name}"] = _fraction(1 - rejected, mask)
+                metrics[f"masked/{name}"] = masked_mean(1 - rejected, mask)
                 keep = keep * rejected
         # Weights and diagnostics read every trainable token, as verl's do;
         # rejection reaches the loss through `effective` alone.
@@ -237,7 +237,7 @@ class GRPOObjective(LMObjective):
                                                      self.behavior_importance_cap)
         elif self.behavior_band is not None:
             importance = behavior_band_weights(proximal, terms.behavior, mask, *self.behavior_band)
-            metrics["masked/band"] = _fraction(importance == 0, mask)
+            metrics["masked/band"] = masked_mean(importance == 0, mask)
         cap = (self.behavior_importance_cap if self.behavior_band is None else self.behavior_band[1])
         mismatch = mismatch_metrics(proximal, terms.behavior, mask, importance, cap)
         metrics.update({f"mismatch/{key}": value for key, value in mismatch.items()})
@@ -275,7 +275,7 @@ class GRPOObjective(LMObjective):
             ratio = sequence_log_ratio(terms.policy, terms.old, mask, terms.segments)
             per_token, aux = clipped_surrogate_terms(ratio, terms.advantages, mask,
                                                      self.epsilon_low, self.epsilon_high, dual_clip=None)
-            aux["ppo_kl"] = _fraction(-token_log_ratio(terms.policy, terms.old), mask)
+            aux["ppo_kl"] = masked_mean(-token_log_ratio(terms.policy, terms.old), mask)
             return per_token, aux
         return clipped_surrogate_terms(token_log_ratio(terms.policy, terms.old), terms.advantages, mask,
                                        epsilon_low=self.epsilon_low, epsilon_high=self.epsilon_high,
@@ -330,9 +330,3 @@ class GRPOObjective(LMObjective):
         losses, valid = _unpadded(losses, padding)
         return TokenScores(losses=losses, weights=valid.astype(losses.dtype))
 
-
-def _fraction(values: jax.Array, mask: jax.Array) -> jax.Array:
-    """Mean of `values` over the positions `mask` keeps; zero when it keeps none."""
-    keep = jnp.asarray(mask, jnp.float32)
-    return jnp.sum(jnp.where(keep != 0, jnp.asarray(values, jnp.float32), 0) * keep) / jnp.clip(
-        jnp.sum(keep), min=1.0)

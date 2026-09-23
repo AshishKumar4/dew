@@ -51,7 +51,7 @@ class Stage:
     reward: Reward | None = None
     groups: int = 4
     max_new_tokens: int = 32
-    sample: str = "group"
+    estimator: str = "group"
 
     def __post_init__(self) -> None:
         if self.steps < 1:
@@ -127,5 +127,5 @@ class Recipe:
             self.model, stage.data.max_prompt_len + stage.max_new_tokens - 1,
             beta=beta, pretrained=variables)
         rollout = SampledRollout(objective, stage.reward, groups=stage.groups,
-                                 max_new_tokens=stage.max_new_tokens, sample=stage.sample)
+                                 max_new_tokens=stage.max_new_tokens, estimator=stage.estimator)
         return objective, rollout

@@ -252,6 +252,12 @@ def chains(rollout: Rollout, index: int, width: int) -> list[_Chain]:
     return built
 
 
+def check_estimator(estimator: str) -> None:
+    """Refuse an advantage family `advantages` does not compute."""
+    if estimator not in ESTIMATORS:
+        raise ValueError(f"estimator must be one of {ESTIMATORS}, got {estimator!r}")
+
+
 def advantages(rollouts: Sequence[Rollout], estimator: str = "group") -> np.ndarray:
     """One advantage per rollout from the rewards of its `(task, group)`.
 
@@ -259,8 +265,7 @@ def advantages(rollouts: Sequence[Rollout], estimator: str = "group") -> np.ndar
     has no score to compare against, and a group with fewer than two scored
     members has no baseline, so every member there gets zero.
     """
-    if estimator not in ESTIMATORS:
-        raise ValueError(f"estimator must be one of {ESTIMATORS}, got {estimator!r}")
+    check_estimator(estimator)
     members: dict[tuple[str, str], list[int]] = {}
     for index, rollout in enumerate(rollouts):
         if rollout.status.trainable:
@@ -400,8 +405,9 @@ def rollout_metrics(rollouts: Sequence[Rollout], batch: Mapping[str, np.ndarray]
       `source(rollout)`, `reward/component/<name>` per verifier component.
     - `latency/p50`, `p90`, `p99`, `max` over `latencies`, seconds per rollout.
     - `lag/mean`, `lag/max`: `version` minus each trainable id's version.
-    - `mismatch/k3_kl`: mean `r - log r - 1` of proximal over behavior on
-      trainable ids, when the batch carries a proximal rescoring.
+
+    Trainer-versus-engine mismatch is the loss's own metric (`mismatch/*`),
+    computed where the proximal policy is known.
     """
     metrics: dict[str, float] = {}
     total = max(len(rollouts), 1)
@@ -441,8 +447,4 @@ def rollout_metrics(rollouts: Sequence[Rollout], batch: Mapping[str, np.ndarray]
     if version is not None and mask.any():
         lag = version - np.asarray(batch[VERSIONS_KEY])[mask]
         metrics["lag/mean"], metrics["lag/max"] = float(lag.mean()), float(lag.max())
-    if OLD_LOG_PROBS_KEY in batch and mask.any():
-        log_ratio = (np.asarray(batch[OLD_LOG_PROBS_KEY], np.float64)
-                     - np.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], np.float64))[mask]
-        metrics["mismatch/k3_kl"] = float(np.mean(np.exp(log_ratio) - log_ratio - 1))
     return metrics

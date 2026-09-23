@@ -375,13 +375,29 @@ def test_the_mask_stops_after_the_first_stop_token():
     np.testing.assert_array_equal(chain["response_mask"], [0] * PROMPT_WIDTH + [1])
 
 
+def test_the_rollout_names_its_advantage_family_the_way_pack_does():
+    """One estimator name for every producer: Dr.GRPO's centred rewards too."""
+    objective = tiny_objective()
+    params = objective.init(jax.random.key(0))
+    reward = Calls()
+    rollout = SampledRollout(objective, reward, groups=GROUPS, max_new_tokens=NEW_TOKENS,
+                             sampling=Sampling(temperature=0.0), estimator="mean")
+
+    out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
+
+    scores = np.asarray([reward(*seen) for seen in reward.seen[:4]], np.float32)
+    expected = np.asarray(group_advantage(scores, GROUPS, normalise_by_std=False), np.float32)
+    for index, chain in chains(out).items():
+        np.testing.assert_allclose(chain["advantages"], expected[index], rtol=1e-5)
+
+
 def test_rloo_advantages_follow_the_calls():
     """The leave-one-out family flows through the same packer."""
     objective = tiny_objective()
     params = objective.init(jax.random.key(0))
     reward = Calls()
     rollout = SampledRollout(objective, reward, groups=GROUPS, max_new_tokens=NEW_TOKENS,
-                             sampling=Sampling(temperature=0.0), sample="rloo")
+                             sampling=Sampling(temperature=0.0), estimator="rloo")
 
     out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
 
@@ -397,8 +413,8 @@ def test_a_misconfigured_rollout_is_refused():
         SampledRollout(objective, Calls(), groups=1)
     with pytest.raises(ValueError, match="at least one token"):
         SampledRollout(objective, Calls(), max_new_tokens=0)
-    with pytest.raises(ValueError, match="advantage families"):
-        SampledRollout(objective, Calls(), sample="best_of_n")
+    with pytest.raises(ValueError, match="estimator must be one of"):
+        SampledRollout(objective, Calls(), estimator="best_of_n")
 
 
 def test_a_misaligned_objective_is_refused():

@@ -335,7 +335,7 @@ def mismatch_metrics(proximal_log_probs: jax.Array, behavior_log_probs: jax.Arra
     """Trainer-versus-engine diagnostics over the trainable tokens.
 
     verl 12ebe0c `compute_offpolicy_metrics`: `kl` is the direct estimate
-    `mean(log behavior - log proximal)` and `k3_kl` the mean of
+    `masked_mean(log behavior - log proximal, keep)` and `k3_kl` the mean of
     `r - log r - 1` for `r = proximal / behavior`, the quantity prime-rl logs
     as `mismatch_kl`. `ess` is verl's `rollout_is_eff_sample_size`, one over
     the mean square of the applied weights clamped to `[0, cap]` and divided
@@ -346,18 +346,14 @@ def mismatch_metrics(proximal_log_probs: jax.Array, behavior_log_probs: jax.Arra
     behavior = jnp.asarray(behavior_log_probs, jnp.float32)
     log_ratio = proximal - behavior
     keep = mask.astype(jnp.float32)
-    count = jnp.sum(keep)
-
-    def mean(values: jax.Array) -> jax.Array:
-        return jnp.sum(jnp.where(keep != 0, values, 0) * keep) / (count + MEAN_EPS)
-
     if weights is None:
         weights = jnp.exp(jnp.clip(log_ratio, -LOG_RATIO_CLAMP, LOG_RATIO_CLAMP)) * keep
     if cap is not None:
         weights = jnp.clip(weights, 0.0, cap)
-    normalized = weights / (mean(weights) + MEAN_EPS)
-    spread = mean(jnp.square(normalized))
-    return {"kl": mean(behavior - proximal), "k3_kl": mean(jnp.exp(log_ratio) - log_ratio - 1),
+    normalized = weights / (masked_mean(weights, keep) + MEAN_EPS)
+    spread = masked_mean(jnp.square(normalized), keep)
+    return {"kl": masked_mean(behavior - proximal, keep),
+            "k3_kl": masked_mean(jnp.exp(log_ratio) - log_ratio - 1, keep),
             "ess": jnp.where(spread > 0, 1.0 / jnp.where(spread > 0, spread, 1.0), 0.0)}
 
 

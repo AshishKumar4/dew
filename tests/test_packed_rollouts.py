@@ -195,4 +195,5 @@ def test_rollout_metrics_report_merge_masking_reward_latency_and_lag():
     assert metrics["reward/component/tests"] == .5
     assert metrics["latency/max"] == 40.0 and metrics["latency/p50"] == 2.5
     assert metrics["lag/max"] == 2 and metrics["lag/mean"] == pytest.approx((2 + 1 + 1 + 2 + 1) / 5)
-    assert metrics["mismatch/k3_kl"] == pytest.approx(np.exp(.1) - .1 - 1, rel=1e-4)
+    # The loss owns the mismatch metrics, over the same mask its weights read.
+    assert not any(key.startswith("mismatch/") for key in metrics)
