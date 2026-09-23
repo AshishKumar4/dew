@@ -24,7 +24,7 @@ from dew.objectives.base import Aux, Mean, Objective, mean_loss
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
 y = 2 * x + 1
 batch = {"x": x, "y": y}
-data = Dataset(train=lambda: itertools.repeat(batch), val=None,
+data = Dataset(train=lambda partition: itertools.repeat(batch), val=None,
                records=32, batch=32)
 ```
 

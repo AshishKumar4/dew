@@ -404,8 +404,8 @@ from dew.sampling import Sampling, generate
 
 row = np.resize(np.array([1, 2, 3, 4], dtype=np.int32), 17)
 batch = {"text": np.tile(row, (8, 1))}
-data = Dataset(train=lambda: itertools.repeat(batch),
-               val=lambda: iter([batch]), records=8, batch=8)
+data = Dataset(train=lambda partition: itertools.repeat(batch),
+               val=lambda partition: iter([batch]), records=8, batch=8)
 model = models.build("causal_transformer", vocab_size=8, emb_features=32,
                      num_layers=1, num_heads=2, mlp_features=64, max_seq_len=32,
                      dtype=jnp.float32, attention_impl="xla")
@@ -433,7 +433,7 @@ roles = np.full(batch["text"].shape, Role.USER, dtype=np.int8)
 roles[:, 4:] = Role.ASSISTANT
 sft_batch = {**batch, "text_roles": roles}
 sft_data = Dataset(
-    train=lambda: itertools.repeat(sft_batch),
+    train=lambda partition: itertools.repeat(sft_batch),
     val=None,
     records=8,
     batch=8,
@@ -503,7 +503,7 @@ def reward(data_source, completion, ground_truth, extra_info):
 
 
 rl_data = Dataset(
-    train=lambda: itertools.repeat(prompt_batch),
+    train=lambda partition: itertools.repeat(prompt_batch),
     val=None,
     records=8,
     batch=8,
@@ -542,7 +542,7 @@ from dew.objectives.diffusion import MaskedDiffusionObjective
 
 masked_batch = {"text": batch["text"][:, :16]}
 masked_data = Dataset(
-    train=lambda: itertools.repeat(masked_batch),
+    train=lambda partition: itertools.repeat(masked_batch),
     val=None,
     records=8,
     batch=8,
@@ -713,7 +713,7 @@ model = CausalTransformer(
 row = np.resize(np.array([1, 2, 3, 4], np.int32), 17)
 batch = {"text": np.tile(row, (4, 1))}
 stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
-data = Dataset(train=lambda: iter(stream), val=None, records=4, batch=4)
+data = Dataset(train=lambda partition: iter(stream), val=None, records=4, batch=4)
 objective = LMObjective(model, seq_len=16, ema_decay=None)
 checkpoints = Checkpoints("runs/custom-decoder")
 state = Trainer(objective, optax.adamw(0.003), key=jax.random.key(0),
@@ -762,7 +762,7 @@ class Regression(Objective):
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
 batch = {"x": x, "y": 2 * x + 1}
-data = Dataset(train=lambda: itertools.repeat(batch),
+data = Dataset(train=lambda partition: itertools.repeat(batch),
                val=None, records=32, batch=32)
 objective = Regression()
 state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(
@@ -824,8 +824,8 @@ from dew.sampling import Sampling
 row = np.resize(np.array([1, 2, 3, 4], dtype=np.int32), 17)
 batch = {"text": np.tile(row, (8, 1))}
 data = Dataset(
-    train=lambda: itertools.repeat(batch),
-    val=lambda: iter([batch]),
+    train=lambda partition: itertools.repeat(batch),
+    val=lambda partition: iter([batch]),
     records=8,
     batch=8,
 )

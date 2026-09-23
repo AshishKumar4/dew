@@ -10,6 +10,7 @@ import pytest
 from flax import struct
 
 from dew.checkpoints import Checkpoints
+from dew.data import DataPartition
 from dew.objectives import Aux, EMASpec, Mean, Objective, mean_loss, scalar_loss
 from dew.objectives.base import under
 from dew.training import Trainer
@@ -143,7 +144,7 @@ class Stream:
 
 class Data:
     batch = 2 * jax.device_count()
-    def train(self):
+    def train(self, partition):
         return Stream()
 
 
@@ -159,7 +160,7 @@ def test_partial_checkpoint_replays_exact_realized_records(tmp_path, composite, 
     for want, got in zip(jax.tree.leaves(uninterrupted), jax.tree.leaves(resumed), strict=True):
         np.testing.assert_array_equal(got, want)
     class Unused(Data):
-        def train(self):
+        def train(self, partition):
             raise AssertionError("same-target resume opened the data stream")
     same = trainer(composite, checkpoints=checkpoints).fit(Unused(), steps=4)
     assert int(same.step) == 4
@@ -279,7 +280,7 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
     data = batches()
     step = train.compile(initial, data[0])
     prefix, *_ = step(initial, data[0])
-    checkpoints.save_local(1, prefix, b"1")
+    checkpoints.save_local(1, prefix, b"1", share=DataPartition())
     # the step consumes the state
     prefix_params = jax.tree.map(np.asarray, prefix.params)
     final, *_ = step(prefix, data[1])

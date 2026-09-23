@@ -33,7 +33,7 @@ def test_standalone_trained_variables_match_fit_and_return_hosted_previews():
                               mlp_features=32, max_seq_len=16, dtype="float32", attention_impl="xla")
     objective = LMObjective(model, seq_len=4, samples=Samples([1, 2], 2, sampling=Sampling(temperature=0)))
     batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
-    data = Dataset(lambda: iter([batch] * 2), lambda: iter([batch]), records=8, batch=8)
+    data = Dataset(lambda partition: iter([batch] * 2), lambda partition: iter([batch]), records=8, batch=8)
     tracker = Recording()
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker)
     state = trainer.fit(data, steps=2, eval_every=2, log_every=2, metrics=(perplexity(),), preview=True)

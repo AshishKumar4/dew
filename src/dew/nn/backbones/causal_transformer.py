@@ -60,7 +60,15 @@ from ..mla import INDEXER_COLLECTION
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, Situ, SparseMLP, gated_product
 from ..precision import head_dot_general, head_product, scaled
 from ..rope import RopeScaling, YarnScaling
-from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
+from ..sharding import (
+    MLP_HIDDEN,
+    RESIDUAL,
+    STAGE_AXIS,
+    constrain,
+    logical_axes,
+    microbatches,
+    pipeline_stages,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -225,6 +233,9 @@ def group_layers(name: str) -> range | None:
 
 
 INTERMEDIATES = "intermediates"
+
+STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
+"""Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
 """The collection flax's `capture_intermediates` fills."""
 
 
@@ -412,8 +423,10 @@ class GatedMLP(nn.Module):
             self.init_std if self.output_init_std is None else self.output_init_std))
 
     def __call__(self, x):
-        gate = checkpoint_name(self.gate_proj(x), 'gate_proj')
-        up = checkpoint_name(self.up_proj(x), 'up_proj')
+        # Column-parallel under a tensor axis: the hidden width splits and
+        # down_proj's sum returns to the residual placement in the block.
+        gate = checkpoint_name(constrain(self.gate_proj(x), MLP_HIDDEN), 'gate_proj')
+        up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
         if self.swiglu_limit is not None:
             gate = jnp.minimum(gate, self.swiglu_limit)
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
@@ -744,12 +757,16 @@ class DecoderBlock(nn.Module):
         predictions = None if altup is None else self.altup_layer.predict(x, train=train)
         if altup is not None and predictions is not None:
             x = predictions[altup.active_idx]
+        # The residual stream sits where the batch does, before and after
+        # each sublayer: fsdp gathers weights rather than sum partial
+        # products, and a row-parallel projection's sum scatters back.
+        x = constrain(x, RESIDUAL)
         normed = self.input_layernorm(x) if self.wiring.pre_norms else x
         mixed = self._mix(normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase)
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         mixed = self._scaled_branch(mixed)
-        x = x + self.dropout(mixed, deterministic=not train)
+        x = constrain(x + self.dropout(mixed, deterministic=not train), RESIDUAL)
         if self.laurel_rank is not None:
             x = (x + self.laurel(normed)) * jnp.asarray(1 / math.sqrt(2), x.dtype)
         if self.feedforward is not None:
@@ -762,7 +779,7 @@ class DecoderBlock(nn.Module):
             if self.wiring.output_norms:
                 hidden = self.mlp_output_norm(hidden)
             hidden = self._scaled_branch(hidden)
-            x = x + self.dropout(hidden, deterministic=not train)
+            x = constrain(x + self.dropout(hidden, deterministic=not train), RESIDUAL)
         if altup is not None and predictions is not None:
             corrected = self.altup_layer.correct(predictions, x, train=train)
             if self.per_layer_input_dim and per_layer_input is not None and per_layer_input.embeddings is not None:
@@ -783,16 +800,18 @@ class DecoderBlock(nn.Module):
                          kv_store, attention_metadata, prediction_phase: PredictionPhase = "ordinary",
                          per_layer_input: LayerInputs | None = None):
         """The mHC block over `[B, S, hc_mult, D]` (modeling_glm5_next.py:1293-1327)."""
-        post, comb, collapsed = self.attn_hc(streams)
+        post, comb, collapsed = self.attn_hc(constrain(streams, STREAMS))
         mixed = self._mix(self.input_layernorm(collapsed), decode, positions, segment_ids,
                           kv_store, attention_metadata, prediction_phase)
-        streams = mix_streams(post, comb, self.dropout(mixed, deterministic=not train), streams)
+        streams = constrain(
+            mix_streams(post, comb, self.dropout(mixed, deterministic=not train), streams), STREAMS)
         if self.feedforward is None:
             return streams
         post, comb, collapsed = self.ffn_hc(streams)
         hidden = self.mlp(self.post_attention_layernorm(collapsed),
                           **self._feedforward_inputs(attention_metadata), **self._routes(per_layer_input))
-        return mix_streams(post, comb, self.dropout(hidden, deterministic=not train), streams)
+        return constrain(
+            mix_streams(post, comb, self.dropout(hidden, deterministic=not train), streams), STREAMS)
 
     def _scaled_branch(self, branch):
         """A sublayer's output times `residual_multiplier` (lm-engine's
@@ -2454,8 +2473,11 @@ class CausalTransformer(nn.Module):
                                   pairwise_mask=attention_pairwise_mask,
                                   key_positions=attention_key_positions,
                                   token_ids=tokens if self.hash_layers else None))
-        x = self._scatter_inputs(self.scaled_embeddings(self.token_embeddings(tokens)), tokens,
-                                 input_embeddings, embedding_positions)
+        # The stack's entry and exit sit where the batch does, so neither the
+        # lookup nor the head is computed whole on the shards of an axis that
+        # splits the rows or the positions.
+        x = constrain(self._scatter_inputs(self.scaled_embeddings(self.token_embeddings(tokens)), tokens,
+                                           input_embeddings, embedding_positions), RESIDUAL)
         # A prediction depth reads the embeddings `mtp_hidden_states` pairs
         # with, which are the unscaled ones with any media replacement already
         # in place. A decoder that fused another encoder's outputs cannot
@@ -2498,7 +2520,7 @@ class CausalTransformer(nn.Module):
             # the blocks and the last partial, is what the output site mixes
             # (modeling_kimi_linear.py:1215-1233).
             x = self.output_res(x)
-        hidden = self.norm(x)
+        hidden = constrain(self.norm(x), RESIDUAL)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in fp32 scores every
             # head that contracts them, the chunked losses' included, as

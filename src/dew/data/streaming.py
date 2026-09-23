@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
-
-import jax
+from typing import Iterator
 
 from dew.registry import datasets
 
-from .dataset import Dataset, DatasetSpec, Loading, Tokenize, local_batch, tokenized
+from .dataset import Batch, DataPartition, Dataset, DatasetSpec, Loading, Tokenize, tokenized
 
 
 @dataclasses.dataclass(frozen=True)
@@ -17,9 +16,12 @@ class OnlineImages(DatasetSpec):
 
     `sources` name hub datasets or `gs://` directories saved with
     `save_to_disk`, whose rows carry a url and a caption. The rows are
-    concatenated, shuffled once and sharded by JAX process. Each process then
-    walks its shard forever, reshuffling between passes, so nothing is held
-    out and the stream cannot resume mid-epoch.
+    concatenated, shuffled once and sharded by the reader's share. Each
+    reader then walks its shard forever, reshuffling between passes, so
+    nothing is held out and the stream cannot resume mid-epoch. What a share
+    yields is whichever fetches succeed first, so no two processes can read
+    one share alike, and a partition whose shares have several readers is
+    refused.
 
     A row is dropped and counted when its url yields no image, or when the
     image is not RGB, under `min_image_size` on its shorter side, more than
@@ -46,12 +48,18 @@ class OnlineImages(DatasetSpec):
         from .online_loader import ImageStream, load_rows
 
         rows = load_rows(self.sources)
-        per_process = local_batch(batch)
 
-        def stream():
+        def stream(partition: DataPartition) -> Iterator[Batch]:
+            if partition.readers > 1:
+                raise ValueError(
+                    f"{type(self).__name__} yields whichever images its fetches return "
+                    f"first, so the {partition.readers} processes that read share "
+                    f"{partition.index} of {partition.count} would train on different "
+                    f"images as one; lay the mesh out so every process holds rows of "
+                    f"its own (no sequence or stage axis across processes)")
             return ImageStream(
-                rows.shard(num_shards=jax.process_count(), index=jax.process_index()),
-                batch=per_process, size=self.image_size, min_size=self.min_image_size,
+                rows.shard(num_shards=partition.count, index=partition.index),
+                batch=partition.rows(batch), size=self.image_size, min_size=self.min_image_size,
                 workers=self.loading.workers, threads=self.loading.threads,
                 timeout=self.timeout, retries=self.retries,
                 prefetch=self.loading.worker_buffer)

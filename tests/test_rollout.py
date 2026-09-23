@@ -83,12 +83,12 @@ class Data:
         self._train, self._val = train, val
         self.batch, self.records = batch, records
 
-    def train(self):
+    def train(self, partition):
         return self._train()
 
     @property
     def val(self):
-        return self._val
+        return None if self._val is None else lambda partition: self._val()
 
     @property
     def steps_per_epoch(self):

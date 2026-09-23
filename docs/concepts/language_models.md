@@ -20,7 +20,7 @@ from dew.sampling import Sampling, generate
 
 row = np.array([0, 1, 2, 3, 0, 1, 2, 3, 0], dtype=np.int32)
 tokens = np.tile(row, (8, 1))
-data = Dataset(train=lambda: itertools.repeat({"text": tokens}),
+data = Dataset(train=lambda partition: itertools.repeat({"text": tokens}),
                val=None, records=8, batch=8)
 model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
@@ -136,7 +136,7 @@ objective = LMObjective(bundle.model, inputs.tokens.shape[1] - 1,
                         pretrained=bundle.variables, ema_decay=None, pad_id=0)
 rows = 2 * jax.device_count()
 batch = inputs.take_rows(jax.numpy.arange(rows) % 2)
-data = Dataset(train=lambda: iter([{"text": batch}]), val=None, records=rows, batch=rows)
+data = Dataset(train=lambda partition: iter([{"text": batch}]), val=None, records=rows, batch=rows)
 trainer = Trainer(objective, optax.sgd(1e-4), key=jax.random.key(3),
                   mesh=MeshSpec(), layout=Layout(min_shard=2**30))
 state = trainer.fit(data, steps=1, log_every=1)
@@ -216,7 +216,7 @@ training_source = "tests/fixtures/hf/diffusion-gemma-sft"
 training_bundle = load_pretrained(training_source, dtype="float32", attention_impl="xla", max_seq_len=32)
 with np.load(training_source + "/reference.npz") as reference:
     train_tokens = np.tile(reference["tokens"], (jax.device_count(), 1))
-training_data = Dataset(train=lambda: iter([{"text": train_tokens}]), val=None,
+training_data = Dataset(train=lambda partition: iter([{"text": train_tokens}]), val=None,
                         records=len(train_tokens), batch=len(train_tokens))
 block_objective = BlockDiffusionObjective(training_bundle.model, prompt_length=4,
                                          num_canvases=2, pretrained=training_bundle.variables)

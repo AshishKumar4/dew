@@ -3,9 +3,9 @@
 A checkpoint holds `step`, `params`, `opt_state`, `ema`, `key` and, when the
 data iterator can report one, `position`. Metrics, the loss scale and epoch
 counters are the loop's business and are rebuilt on resume. A position is
-either global, and readable by any process count, or one process's own shard
-offset, and readable only by the count that wrote it; `dew.position` is the
-difference and `read_position` acts on it.
+either global, and readable by any partition of the data, or one share's
+own offset, and readable only by a reader of that share; `dew.position` is
+the difference and `read_position` acts on it.
 
 Beside the persistent directory a run may keep a local checkpoint on every
 host, written more often, so a preempted pod resumes from its own disks
@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     import optax
     from flax.training.dynamic_scale import DynamicScale
 
+    from dew.data.dataset import DataPartition
     from dew.training.state import Accumulation, TrainState
 
 # One field of the train state as a checkpoint holds it: a scalar array, a
@@ -84,23 +85,25 @@ def _loss(metrics):
     return metrics['loss']
 
 
-def gather_positions(saved: bytes) -> dict:
+def gather_positions(saved: bytes, share: DataPartition) -> dict:
     """Gather every process's iterator position into the checkpoint's `position` table.
 
     'rows' is a uint8 [process_count, longest] array with one row per
-    process, 'lengths' the unpadded length of each. A process reports the
-    position it holds, and orbax writes a host array from process 0 alone,
-    so the rows are gathered onto every process before a save. The rows
-    differ in length, so the lengths ride along.
+    process, 'lengths' the unpadded length of each, and 'shares' the
+    `[index, count]` of the data share each process read. A process reports
+    the position it holds, and orbax writes a host array from process 0
+    alone, so the rows are gathered onto every process before a save. The
+    rows differ in length, so the lengths ride along.
 
     One row per process whichever kind the position is: a global one is the
     same bytes on every process, and gathering it is what lets `read_position`
-    check that they really do agree before another process count reads it.
+    check that they really do agree before another partition reads it.
     """
     lengths = multihost_utils.process_allgather(np.asarray(len(saved), np.int64))
     row = np.zeros(int(lengths.max()), np.uint8)
     row[:len(saved)] = np.frombuffer(saved, np.uint8)
-    return {'rows': multihost_utils.process_allgather(row), 'lengths': lengths}
+    return {'rows': multihost_utils.process_allgather(row), 'lengths': lengths,
+            'shares': multihost_utils.process_allgather(np.asarray([share.index, share.count], np.int64))}
 
 
 def _row(table: dict, index: int) -> bytes:
@@ -109,41 +112,50 @@ def _row(table: dict, index: int) -> bytes:
     return row[:int(table['lengths'][index])].tobytes()
 
 
-def read_position(table: dict, where: str) -> bytes:
-    """Read the position this run resumes from, out of a saved table.
+def read_position(table: dict, where: str, share: DataPartition) -> bytes:
+    """Read the position the reader of `share` resumes from, out of a saved table.
 
-    A row is this process's own when the counts match. When they differ the
-    saved position has to be a global one, a record count over an order that
-    is the same order at any process count, and then every row is this run's
-    position: `dew.position` is where that promise is written down and
-    `read_position` is where it is taken up. A shard offset has no row a
-    different count can take over, so it is refused with both counts named.
+    A global position is a record count over an order that is the same order
+    at any partition, so every row is every reader's position:
+    `dew.position` is where that promise is written down and `read_position`
+    is where it is taken up. A share's own offset resumes only the readers of
+    that same share, whichever processes they are, and anything else is
+    refused with the shares named. A table written before shares were
+    recorded held one per process, each process reading its own.
     """
     written = len(table['lengths'])
-    if written == jax.process_count():
-        return _row(table, jax.process_index())
     # Row order, not set order: bytes hash differently per interpreter, and
-    # which of the two refusals below a broken checkpoint gets is a diagnostic.
+    # which of the refusals below a broken checkpoint gets is a diagnostic.
     rows = [_row(table, index) for index in range(written)]
-    saved = rows[0]
-    if not position.translates(saved):
+    held = ([(int(index), int(count)) for index, count in np.asarray(table['shares'])]
+            if 'shares' in table else [(process, written) for process in range(written)])
+    if position.translates(rows[0]):
+        if any(row != rows[0] for row in rows[1:]):
+            raise ValueError(
+                f"The checkpoint at {where} holds a global data position that "
+                f"differs between the {_processes(written)} that wrote it. A global "
+                f"position is one place in one order, so those processes read "
+                f"different orders and no single one of their positions is this "
+                f"run's.")
+        return rows[0]
+    mine = [row for row, written_share in zip(rows, held, strict=True)
+            if written_share == (share.index, share.count)]
+    if not mine:
         raise ValueError(
-            f"The checkpoint at {where} holds a data iterator "
-            f"position for each of {_processes(written)} and this run has "
-            f"{_processes(jax.process_count())}. A position is where one "
-            f"process's shard of the data stopped and cannot be translated "
-            f"to another shard count, so resume it on {_processes(written)}; "
-            f"a stream that reads its records globally, as every `train_stream` "
-            f"dataset does, saves a position that resumes on any count.")
-    if any(row != saved for row in rows[1:]):
+            f"The checkpoint at {where} holds data positions for the shares "
+            f"{sorted(set(held))} (index, count), and this reader reads share "
+            f"{share.index} of {share.count}. A position is where one share of "
+            f"the data stopped and cannot be translated to another share, so "
+            f"resume it on a mesh whose processes read those shares; a stream "
+            f"that reads its records globally, as every `train_stream` dataset "
+            f"does, saves a position that resumes on any partition.")
+    if any(row != mine[0] for row in mine[1:]):
         raise ValueError(
-            f"The checkpoint at {where} holds a global data position that "
-            f"differs between the {_processes(written)} that wrote it, and this "
-            f"run has {_processes(jax.process_count())} to hand it to. A global "
-            f"position is one place in one order, so those processes read "
-            f"different orders and no single one of their positions is this "
-            f"run's.")
-    return saved
+            f"The checkpoint at {where} holds positions for share {share.index} "
+            f"of {share.count} that differ between the processes that read it; "
+            f"a share's readers read the same records, so no one of them is "
+            f"where the share stopped.")
+    return mine[0]
 
 
 def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
@@ -337,28 +349,32 @@ class Checkpoints:
         return self.local_path if step == self._local_latest() else self.directory
 
     def save(self, step: int, state: TrainState, saved: bytes | None,
-             metrics: Mapping[str, float] | None = None) -> None:
+             metrics: Mapping[str, float] | None = None, *,
+             share: DataPartition | None = None) -> None:
         """Write `state` under `step`, asynchronously.
 
         Sharded arrays go straight to orbax: gathering them onto the host
         first would serialise the whole state through one process and undo
         the point of an async checkpointer. A stream reports its position as
         JSON bytes, which tensorstore has no dtype for; the raw bytes ride
-        along as uint8 rows instead, one per process, so a global position
-        and a shard offset are stored the same way and told apart on restore.
+        along as uint8 rows instead, one per process beside the data `share`
+        it read, so a global position and a share's offset are stored the
+        same way and told apart on restore. A position without its share is
+        refused, since no reader could be matched to it.
         A write that fails surfaces from `wait`, which is deliberately
         unguarded: a checkpoint that did not land is data loss.
         """
         with region("checkpoint.submit"):
-            self._open().save(step, args=ocp.args.PyTreeSave(self._item(state, saved)),
+            self._open().save(step, args=ocp.args.PyTreeSave(self._item(state, saved, share)),
                               metrics=metrics, force=True)
 
-    def save_local(self, step: int, state: TrainState, saved: bytes | None) -> None:
+    def save_local(self, step: int, state: TrainState, saved: bytes | None, *,
+                   share: DataPartition | None = None) -> None:
         """Write `state` under `step` to this process's local directory,
         asynchronously, in place of the local step before it. The placement
         rides along; a resume onto another one raises before reading shards
         from directories that do not hold them."""
-        state_tree = self._item(state, saved)
+        state_tree = self._item(state, saved, share)
         written = placement(state_tree)
         if saved is not None:
             state_tree['position'] = jax.tree.map(
@@ -369,10 +385,15 @@ class Checkpoints:
                 custom_metadata={'processes': jax.process_count(), 'placement': written})
 
     @staticmethod
-    def _item(state: TrainState, saved: bytes | None) -> dict[str, StateLeaf]:
+    def _item(state: TrainState, saved: bytes | None,
+              share: DataPartition | None) -> dict[str, StateLeaf]:
         state_tree = {name: getattr(state, name) for name in STATE_LEAVES}
         if saved is not None:
-            state_tree['position'] = gather_positions(saved)
+            if share is None:
+                raise ValueError(
+                    "a data position is where one share of the data stopped; save it "
+                    "with the share its stream read (share=DataPartition(...))")
+            state_tree['position'] = gather_positions(saved, share)
         return state_tree
 
     def stored(self, step: int | None = None) -> Variables:
@@ -408,15 +429,16 @@ class Checkpoints:
         return Accumulation(**arrays)
 
     @overload
-    def restore[StateT](self, template: StateT,
-                        step: int | None = None) -> tuple[StateT, bytes | None]: ...
+    def restore[StateT](self, template: StateT, step: int | None = None, *,
+                        share: DataPartition | None = None) -> tuple[StateT, bytes | None]: ...
 
     @overload
-    def restore(self, template: None = None,
-                step: int | None = None) -> tuple[Variables, bytes | None]: ...
+    def restore(self, template: None = None, step: int | None = None, *,
+                share: DataPartition | None = None) -> tuple[Variables, bytes | None]: ...
 
-    def restore(self, template=None, step: int | None = None):
-        """Restore the state at `step` and this process's data position.
+    def restore(self, template=None, step: int | None = None, *,
+                share: DataPartition | None = None):
+        """Restore the state at `step` and the data position of `share`.
 
         `template` is a pytree of `jax.ShapeDtypeStruct` naming the state
         leaves to restore; a leaf's sharding, when set, is where the array is
@@ -426,9 +448,8 @@ class Checkpoints:
         A step that is the local one every process holds is read from the
         local directory, onto the placement it was written with; any other
         step from the persistent one. The data position comes back as the
-        bytes this run's stream resumes from: its own row when the process
-        count is the one that wrote it, and any row of a global position when
-        it is not.
+        bytes the reader of `share` resumes from (`read_position`); without a
+        share, as for a caller that reads weights and no data, it is None.
         """
         local = self._local_latest()
         if step is None:
@@ -485,7 +506,7 @@ class Checkpoints:
                 ) from mismatch
         restored = dict(restored)
         table = restored.pop('position', None)
-        saved = None if table is None else read_position(table, where)
+        saved = None if table is None or share is None else read_position(table, where, share)
         restored = _filled(template, restored, step)
         return restored, saved
 

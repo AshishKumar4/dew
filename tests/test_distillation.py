@@ -259,7 +259,7 @@ class Data:
         self.batch = batch["text"].shape[0]
         self._batch = batch
 
-    def train(self):
+    def train(self, partition):
         while True:
             yield self._batch
 

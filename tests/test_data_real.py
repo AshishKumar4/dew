@@ -20,7 +20,7 @@ import pytest
 
 pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
-from dew.data import Loading, OxfordFlowers
+from dew.data import DataPartition, Loading, OxfordFlowers
 
 pytestmark = pytest.mark.network
 
@@ -49,7 +49,7 @@ def test_train_batches_carry_resized_images_and_labels(flowers):
     assert flowers.records == RECORDS - VAL_RECORDS
     assert flowers.batch == BATCH
 
-    train = flowers.train()
+    train = flowers.train(DataPartition())
     first, second = next(train), next(train)
 
     for batch in (first, second):
@@ -66,9 +66,9 @@ def test_train_batches_carry_resized_images_and_labels(flowers):
 
 def test_validation_reads_different_records_in_a_stable_order(flowers):
     """The val loader must not be a random slice of the training stream."""
-    train_labels = labels_of(next(flowers.train()))
-    val = next(flowers.val())
-    again = next(flowers.val())
+    train_labels = labels_of(next(flowers.train(DataPartition())))
+    val = next(flowers.val(DataPartition()))
+    again = next(flowers.val(DataPartition()))
 
     assert val["image"].shape == (VAL_BATCH, SIZE, SIZE, 3)
     assert val["image"].dtype == np.uint8
@@ -87,7 +87,7 @@ def test_the_validation_pass_reads_the_split_once_and_stops(flowers):
     twice and the pass ran on for good. Two records of Flowers are never the
     same image, so counting distinct rows counts records.
     """
-    rows = [image.tobytes() for batch in itertools.islice(flowers.val(), 8)
+    rows = [image.tobytes() for batch in itertools.islice(flowers.val(DataPartition()), 8)
             for image in batch["image"]]
 
     assert len(rows) == VAL_RECORDS

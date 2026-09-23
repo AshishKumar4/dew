@@ -282,7 +282,7 @@ def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
     objective = config.build()
     plain = config.build()
 
-    state = config.train(objective, Dataset(image_batches(batch), None, None, batch),
+    state = config.train(objective, Dataset(lambda partition: image_batches(batch)(), None, None, batch),
                          name="quantized")
 
     assert int(state.step) == 1
@@ -308,6 +308,6 @@ def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
 
     config = diffusion_run(tmp_path, quantization=Quantization())
     with pytest.raises(ValueError, match="Modelless keeps no `model`"):
-        config.train(Modelless(), Dataset(image_batches(RUN_BATCH), None, None, RUN_BATCH),
+        config.train(Modelless(), Dataset(lambda partition: image_batches(RUN_BATCH)(), None, None, RUN_BATCH),
                      name="quantized")
     assert not (tmp_path / "quantized").exists()

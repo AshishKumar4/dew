@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-from typing import Annotated, Callable, Iterator, Mapping, overload
+from typing import Annotated, Iterator, Mapping, overload
 
 import grain.python as pygrain
 import numpy as np
@@ -32,14 +32,15 @@ from dew.registry import datasets
 from .dataset import (
     Batch,
     Corpus,
+    DataPartition,
     DataPhase,
     Dataset,
     DatasetSpec,
     Forwarding,
+    Reader,
     Tokenize,
     describe,
     json_list_argument,
-    local_batch,
     train_stream,
     validation_pass,
 )
@@ -70,7 +71,7 @@ class _BoundedIterator(Forwarding):
             self._source = None
 
 
-def bounded(stream: Callable[[], Iterator[Batch]], batches: int | None) -> Callable[[], Iterator[Batch]]:
+def bounded(stream: Reader, batches: int | None) -> Reader:
     """`stream` stopped after `batches` batches, or `stream` itself when `batches` is None.
 
     The wrapper forwards close to the source, so a caller that stops early
@@ -81,8 +82,12 @@ def bounded(stream: Callable[[], Iterator[Batch]], batches: int | None) -> Calla
     if batches < 0:
         raise ValueError("validation batch limit must be nonnegative")
     if batches == 0:
-        return lambda: iter(())
-    return lambda: _BoundedIterator(stream(), batches)
+        return lambda partition: iter(())
+
+    def first(partition: DataPartition) -> Iterator[Batch]:
+        return _BoundedIterator(stream(partition), batches)
+
+    return first
 
 
 @datasets("token_windows")
@@ -114,9 +119,9 @@ class TokenWindows(DatasetSpec):
         train = TokenWindowSource(corpus, self.seq_len)
         validation = TokenWindowSource(held_out, self.seq_len)
         return Dataset(
-            train=train_stream(train, [], batch=local_batch(batch),
-                               seed=self.seed, loading=self.loading),
-            val=bounded(validation_pass(validation, [], batch=local_batch(batch), seed=self.seed, loading=self.loading), self.val_batches),
+            train=train_stream(train, [], batch=batch, seed=self.seed, loading=self.loading),
+            val=bounded(validation_pass(validation, [], batch=batch, seed=self.seed,
+                                        loading=self.loading), self.val_batches),
             records=len(train),
             batch=batch,
         )

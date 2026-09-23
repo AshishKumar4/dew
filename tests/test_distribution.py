@@ -49,11 +49,12 @@ def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.Co
         cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout)
 
 
-def train(tmp_path: Path, mesh: dict, processes: int) -> dict:
+def train(tmp_path: Path, mesh: dict, processes: int, devices: int = 8) -> dict:
+    """The worker's record of a pool of `processes` over `devices` CPU devices."""
     out = tmp_path / f"{len(list(tmp_path.iterdir()))}.json"
     done = launch("--processes-per-host", str(processes), "--",
                   sys.executable, str(WORKER), "--out", str(out), "--mesh", json.dumps(mesh),
-                  devices=8 // processes)
+                  devices=devices // processes)
     assert done.returncode == 0, done.stdout + done.stderr
     return json.loads(out.read_text())
 
@@ -147,6 +148,25 @@ def test_context_parallelism_trains_like_whole_sequences_across_hosts(tmp_path, 
     pool = train(tmp_path, {"fsdp": 2, "sequence": 2, "replicas": 2}, processes=2)
     assert pool["fsdp_groups"] == [[0], [0], [1], [1]]
     assert max(abs(a - b) for a, b in zip(pool["losses"], reference["losses"], strict=True)) < TOLERANCE
+
+
+@pytest.mark.parametrize("mesh", [{"fsdp": 2, "stage": 2}, {"fsdp": 2, "sequence": 2}],
+                         ids=["stage", "sequence"])
+def test_processes_that_hold_the_same_rows_read_the_same_share(tmp_path, mesh):
+    """Four processes of one device, with the pipeline's stage axis or a split
+    sequence between them: each pair holds one row shard, so the pair reads
+    one share of the batch and the pool trains the losses one process of
+    four devices trains. Every process reading its own quarter of the rows,
+    as the loaders once did, trained this stage mesh to 4.42, 4.03, 3.91
+    against 4.60, 3.47, 2.87, and fed the sequence mesh a batch of half its
+    rows. A leaf the sequence axis splits is placed from the share whole."""
+    alone = train(tmp_path, mesh, processes=1, devices=4)
+    pool = train(tmp_path, mesh, processes=4, devices=4)
+
+    assert pool["partition"] == {"count": 2, "readers": 2}
+    assert alone["partition"] == {"count": 1, "readers": 1}
+    assert pool["placed_whole"] and alone["placed_whole"]
+    assert max(abs(a - b) for a, b in zip(pool["losses"], alone["losses"], strict=True)) < TOLERANCE
 
 
 def test_more_replicas_than_hosts_are_refused(tmp_path):

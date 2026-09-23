@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
-from dew.data import Loading, PreferencePairs
+from dew.data import DataPartition, Loading, PreferencePairs
 from dew.data.preferences import IDS_KEY, MASK_KEY, PreferenceSource
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.rl import DPOObjective
@@ -346,7 +346,7 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
                            loading=Loading(workers=0)).load(batch=1)
 
     assert data.records == 1
-    batch = next(data.train())
+    batch = next(data.train(DataPartition()))
     np.testing.assert_array_equal(
         np.asarray(batch[IDS_KEY]), [[[1, 2, 3, 4], [1, 2, 5, 0]]])
     np.testing.assert_array_equal(
@@ -362,7 +362,7 @@ def test_varied_rows_pad_to_one_window():
     data = PreferencePairs(records=rows, seq_len=4,
                            loading=Loading(workers=0)).load(batch=2)
 
-    batch = next(data.train())
+    batch = next(data.train(DataPartition()))
 
     ids = np.asarray(batch[IDS_KEY])
     assert ids.shape == (2, 2, 4)

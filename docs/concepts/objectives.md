@@ -102,7 +102,7 @@ class StatefulRegression(Objective):
 
 x = np.arange(32, dtype=np.float32).reshape(8, 4)
 batch = {"x": x, "y": x.mean(axis=1, keepdims=True)}
-data = Dataset(train=lambda: itertools.repeat(batch), val=None, records=8, batch=8)
+data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
 objective = StatefulRegression()
 trainer = Trainer(objective, optax.sgd(0.001), key=jax.random.key(0))
 state = trainer.fit(data, steps=3, log_every=1)

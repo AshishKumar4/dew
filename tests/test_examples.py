@@ -77,8 +77,8 @@ def _batches(batch, classes=None, size=RES):
 
 
 def fake_dataset(batch, classes=None, size=RES):
-    return Dataset(train=_batches(batch, classes, size),
-                   val=lambda: itertools.islice(_batches(batch, classes, size)(), 1),
+    return Dataset(train=lambda partition: _batches(batch, classes, size)(),
+                   val=lambda partition: itertools.islice(_batches(batch, classes, size)(), 1),
                    records=4 * batch, batch=batch)
 
 

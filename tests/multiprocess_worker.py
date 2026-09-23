@@ -156,11 +156,13 @@ def jepa_objective():
 
 
 class Data:
+    """The `Dataset` contract the trainer reads, over readers of a partition."""
+
     def __init__(self, train, val=None, batch=BATCH, records=None):
         self._train, self.val, self.batch, self.records = train, val, batch, records
 
-    def train(self):
-        return self._train()
+    def train(self, partition):
+        return self._train(partition)
 
     @property
     def steps_per_epoch(self):
@@ -187,9 +189,10 @@ def as_numpy(tree):
 def indexed_loader(records: int, batch: int = BATCH):
     """A checkpointable source whose batches say which records they hold.
 
-    Sharded by process, as every grain loader in dew is, so a process's
-    position names its own shard and a resume has to hand it back to that
-    process and no other.
+    Sharded by process, as grain's own loader shards, so a process's position
+    names its own shard and a resume has to hand it back to that process and
+    no other. On the plain data-parallel meshes it runs on, a process's share
+    of the partition is its own shard.
     """
     import grain.python as pygrain
 
@@ -215,7 +218,7 @@ def elastic_loader(records: int, workers: int):
     takes, so what a pool reading it exercises is a position every process
     reports alike and a pool of another size reads back.
     """
-    from dew.data.dataset import Loading as ReadLoading, local_batch, train_stream
+    from dew.data.dataset import Loading as ReadLoading, train_stream
 
     class Indexed:
         """Records that say which they are, in the field the objective reads."""
@@ -229,7 +232,7 @@ def elastic_loader(records: int, workers: int):
         def __getitem__(self, index):
             return {"image": np.full((RES, RES, 3), index, np.uint8)}
 
-    return train_stream(Indexed(), [], batch=local_batch(BATCH), seed=0,
+    return train_stream(Indexed(), [], batch=BATCH, seed=0,
                         loading=ReadLoading(workers=workers, threads=2, read_buffer=8,
                                             worker_buffer=2))
 
@@ -351,13 +354,16 @@ def mode_data(args) -> dict:
     """One pass over the held-out split, which ends by itself."""
     import jax
 
-    from dew.data import TokenWindows, local_batch
+    from dew.data import TokenWindows
+    from dew.training import build_mesh, data_partition
 
     data = TokenWindows(path=args.tokens, seq_len=args.seq_len, val_batches=None,
                         loading=Loading(workers=args.workers, threads=1,
                                         read_buffer=8, worker_buffer=1)).load(batch=BATCH)
+    partition = data_partition(build_mesh())
+    assert data.val is not None
     records, batches = [], 0
-    for batch in data.val():
+    for batch in data.val(partition):
         window = np.asarray(batch["text"])
         # The corpus is a token ramp, so a window's first token names its record.
         records.extend(int(row[0]) // args.seq_len for row in window)
@@ -366,7 +372,7 @@ def mode_data(args) -> dict:
         "process_index": jax.process_index(),
         "records": records,
         "batches": batches,
-        "local_batch_size": local_batch(data.batch),
+        "local_batch_size": partition.rows(data.batch),
         "global_batch_size": data.batch,
         "train_len": data.records,
     }
@@ -375,13 +381,16 @@ def mode_data(args) -> dict:
 def mode_packed(args) -> dict:
     import jax
 
-    from dew.data import PackedTokens, local_batch
+    from dew.data import PackedTokens
+    from dew.training import build_mesh, data_partition
 
     data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=None,
                         loading=Loading(workers=args.workers,
                                         worker_buffer=1)).load(batch=BATCH)
+    partition = data_partition(build_mesh())
+    assert data.val is not None
     documents, windows = set(), 0
-    for batch in data.val():
+    for batch in data.val(partition):
         text = np.asarray(batch["text"])
         # Every document is one token value repeated, so the values in a
         # window name the documents packed into it. Padding and the eos that
@@ -392,7 +401,7 @@ def mode_packed(args) -> dict:
         "process_index": jax.process_index(),
         "documents": sorted(documents),
         "windows": windows,
-        "local_batch_size": local_batch(data.batch),
+        "local_batch_size": partition.rows(data.batch),
     }
 
 
@@ -473,7 +482,7 @@ def mode_packed_fit(args) -> dict:
                                         worker_buffer=1)).load(batch=BATCH)
     seen: list = []
     state = trainer.fit(
-        dataclasses.replace(data, train=lambda: Recording(data.train(), seen)),
+        dataclasses.replace(data, train=lambda partition: Recording(data.train(partition), seen)),
         steps=args.steps, log_every=1, checkpoint_every=args.save_every)
     dump_params(args.out.with_suffix(".npz"), state.params)
     _, final_position = restored_state(trainer)
@@ -569,12 +578,14 @@ def mode_fit(args) -> dict:
         loader = indexed_loader(args.records, rows)
         if args.block_after:
             loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
-        open_train = lambda: iter(loader)
+        open_train = lambda partition: iter(loader)
     val, available = None, None
     scored = []
     evaluate = trainer.objective.evaluate
     trainer.objective.evaluate = lambda *a: scored.append(1) or evaluate(*a)
     if args.tokens:
+        from dew.training.distributed import data_partition
+
         # The packed token split, whose documents are strided over the
         # processes before packing. The objective's evaluation ignores the
         # batch's contents, so the split only has to shard.
@@ -583,7 +594,8 @@ def mode_fit(args) -> dict:
         data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=args.val_steps,
                             loading=Loading(workers=args.workers)).load(batch=BATCH)
         val = data.val
-        available = sum(1 for _ in data.val())
+        assert val is not None
+        available = sum(1 for _ in val(data_partition(trainer.device_mesh)))
     state = trainer.fit(Data(open_train, val=val, records=args.records),
                         steps=args.steps, log_every=1,
                         eval_every=args.steps if args.tokens else None,
@@ -641,7 +653,7 @@ def mode_profile_failure(args) -> dict:
                       profile=ProfileWindow(str(profile_dir), steps=2, warmup=0))
     error = None
     try:
-        trainer.fit(Data(lambda: iter(loader)), steps=args.steps, log_every=1)
+        trainer.fit(Data(lambda partition: iter(loader)), steps=args.steps, log_every=1)
     except BaseException as failure:
         error = failure
     recovered = agree_process_phase(None, phase="after profiling failure")
@@ -715,7 +727,7 @@ def mode_validate(args) -> dict:
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
                       checkpoints=None, tracker=scored)
-    data = Dataset(train=lambda: iter([batch] * args.steps), val=lambda: iter([batch]),
+    data = Dataset(train=lambda partition: iter([batch] * args.steps), val=lambda partition: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
     state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps,
                         metrics=(clip(modelname=tiny), GlobalMean()), preview=True)
@@ -765,7 +777,7 @@ def mode_tracked(args) -> dict:
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
                       checkpoints=None, tracker=Drawing())
-    data = Dataset(train=lambda: iter([batch] * args.steps), val=lambda: iter([batch]),
+    data = Dataset(train=lambda partition: iter([batch] * args.steps), val=lambda partition: iter([batch]),
                    records=BATCH * args.steps, batch=BATCH)
     state = trainer.fit(data, steps=args.steps, log_every=1, eval_every=args.steps, preview=True)
     return {"process_index": jax.process_index(), "drawn": drawn,
@@ -944,7 +956,7 @@ def mode_evaluation_contract(args) -> dict:
     objective = Numerical()
     trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
     state, _, _ = trainer.place()
-    data = Dataset(train=batches, val=validation, records=8, batch=8)
+    data = Dataset(train=lambda partition: batches(), val=lambda partition: validation(), records=8, batch=8)
     results = {}
     for failure in ("normal", "repeat", "untracked", "preview_only", "uneven", "empty",
                     "no_consumer", "mismatch", "duplicates", "metric", "preview", "finalize",
@@ -1008,7 +1020,7 @@ def mode_evaluation_replicas(args) -> dict:
     state, _, _ = trainer.place()
     batch = {"a_metadata": np.asarray(7), "a_python": 9,
              "x": np.arange(3, dtype=np.float32)[:, None]}
-    data = Dataset(train=lambda: iter([batch]), val=lambda: iter([batch]), records=3, batch=3)
+    data = Dataset(train=lambda partition: iter([batch]), val=lambda partition: iter([batch]), records=3, batch=3)
     measured = evaluate(trainer.objective, state.params, data.val, metrics=(Count(),),
                         key=state.key, mesh=trainer.device_mesh).scalars
     unconsumed = evaluate(trainer.objective, state.params, data.val, key=state.key,
@@ -1074,7 +1086,7 @@ def mode_builtin_preview_failures(args) -> dict:
             finally:
                 closed.append(case)
 
-        data = Dataset(train=validation, val=validation, records=6, batch=6)
+        data = Dataset(train=lambda partition: validation(), val=lambda partition: validation(), records=6, batch=6)
         for phase in ("setup", "generation", "preflight"):
             for source in (0, 1):
                 case = f"{kind}-{phase}-{source}"
@@ -1308,7 +1320,7 @@ def mode_rollout(args) -> dict:
     single = None
     if processes == 1:
         single = rolled
-    data = Dataset(train=lambda: iter([local]), val=None, records=rows * processes,
+    data = Dataset(train=lambda partition: iter([local]), val=None, records=rows * processes,
                    batch=rows * processes)
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
     dump_params(args.out.with_suffix(".npz"), final.params["params"])

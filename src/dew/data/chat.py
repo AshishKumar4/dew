@@ -40,16 +40,7 @@ from jinja2 import TemplateError
 
 from dew.registry import datasets
 
-from .dataset import (
-    Batch,
-    Dataset,
-    DatasetSpec,
-    Tokenize,
-    describe,
-    local_batch,
-    train_stream,
-    validation_pass,
-)
+from .dataset import Batch, Dataset, DatasetSpec, Tokenize, describe, train_stream, validation_pass
 from .rows import parquet_names, parquet_rows
 from .sources.hf import HFOptions, HubOptions
 from .text import load_tokenizer
@@ -701,7 +692,7 @@ class ChatMessages(DatasetSpec):
             raise ValueError(
                 "ChatMessages reads a parquet file, a .jsonl file or a hub dataset id: "
                 "--data.path names it")
-        rows, window = local_batch(batch), self.seq_len + 1
+        window = self.seq_len + 1
 
         def packed(path: str, split: str) -> PackedWindows:
             source = ConversationSource(path, column=self.column, split=split,
@@ -716,11 +707,11 @@ class ChatMessages(DatasetSpec):
         validation = None
         if self.val_path is not None:
             scored = packed(self.val_path, self.val_split or self.split)
-            validation = bounded(validation_pass(scored, [], batch=rows, seed=self.seed,
+            validation = bounded(validation_pass(scored, [], batch=batch, seed=self.seed,
                                                  loading=self.loading),
                                  self.val_batches)
         return Dataset(
-            train=train_stream(train, [], batch=rows, seed=self.seed, loading=self.loading),
+            train=train_stream(train, [], batch=batch, seed=self.seed, loading=self.loading),
             val=validation,
             records=len(train),
             batch=batch,

@@ -35,7 +35,7 @@ from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.precision import scaled
 from dew.nn.rope import RopeScaling, YarnScaling, apply_rotary, rotary_freqs, yarn_rope_freqs
-from dew.nn.sharding import logical_axes
+from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
 
 
 def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Array:
@@ -243,7 +243,7 @@ class CausalSelfAttention(nn.Module):
             key = self.k_norm(key)
         if self.v_norm:
             value = self.values_norm(value)
-        return key, value
+        return constrain(key, KV_HEADS), constrain(value, KV_HEADS)
 
     def _rotary_angles(self, rotary_positions):
         """Build the rotary cos and sin this layer rotates its heads by.
@@ -354,6 +354,9 @@ class CausalSelfAttention(nn.Module):
             key, value = self._projected_kv(x, whole)
         if self.qk_norm and not whole:
             query = self.q_norm(query)
+        # Column-parallel under a tensor axis, each shard a run of whole
+        # heads; o_proj's sum returns to the residual placement in the block.
+        query = constrain(query, HEADS)
 
         # The cache slot carries position while decoding, so the rotation and
         # the mask both read it and not the row index of the token. A packed
@@ -587,6 +590,7 @@ class CausalSelfAttention(nn.Module):
             # The branch multiplies by the sigmoid of its gate, then projects
             # (modeling_qwen3_5.py:701, and modeling_qwen4_exp.py:836 the same).
             attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
+        attention = constrain(attention, HEADS)
         return checkpoint_name(
             self.o_proj(attention.reshape(batch, length, self.num_heads * self.head_dim)), 'o_proj')
 

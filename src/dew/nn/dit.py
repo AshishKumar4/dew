@@ -32,7 +32,7 @@ from .scan_orders import (
     zigzag_indices,
     zigzag_patchify,
 )
-from .sharding import logical_axes
+from .sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 from .ssm import BidirectionalS5Layer, S5Layer, SpatialFusionConv
 
 SCAN_ORDERS = ('raster', 'hilbert', 'zigzag')
@@ -403,7 +403,9 @@ class ModulatedBlock(nn.Module):
 
         self.mlp = nn.Sequential([
             nn.Dense(features=hidden_features, dtype=self.dtype, precision=self.precision),
-            nn.gelu,
+            # Column-parallel under a tensor axis; the activation holds the
+            # place so the layers keep their names.
+            lambda hidden: nn.gelu(constrain(hidden, MLP_HIDDEN)),
             nn.Dense(features=self.features, dtype=self.dtype, precision=self.precision),
         ])
         self.dropout = nn.Dropout(rate=self.dropout_rate)
@@ -438,8 +440,10 @@ class ModulatedBlock(nn.Module):
             scale_mlp = shift_mlp = scale_attn = shift_attn = 0.0
             gate_mlp = gate_attn = 1.0
 
-        residual = x
-        x_modulated = self.norm1(x) * (1 + scale_attn) + shift_attn
+        # The token stream sits where the batch does before and after each
+        # sublayer, as the decoder's does.
+        skip = constrain(x, RESIDUAL)
+        x_modulated = self.norm1(skip) * (1 + scale_attn) + shift_attn
         if self.mixer == 'attention':
             mixer_output = self.attention(x_modulated, freqs_cis=freqs_cis)
         else:
@@ -449,20 +453,17 @@ class ModulatedBlock(nn.Module):
         mixer_output = self.dropout(mixer_output, deterministic=not train)
 
         if self.use_gating:
-            x = residual + gate_attn * mixer_output
+            skip = constrain(skip + gate_attn * mixer_output, RESIDUAL)
         else:
-            x = residual + mixer_output
+            skip = constrain(skip + mixer_output, RESIDUAL)
 
-        residual = x
-        x_mlp_modulated = self.norm2(x) * (1 + scale_mlp) + shift_mlp
+        x_mlp_modulated = self.norm2(skip) * (1 + scale_mlp) + shift_mlp
         mlp_output = self.mlp(x_mlp_modulated)
         mlp_output = self.dropout(mlp_output, deterministic=not train)
 
         if self.use_gating:
-            x = residual + gate_mlp * mlp_output
-        else:
-            x = residual + mlp_output
-        return x
+            return constrain(skip + gate_mlp * mlp_output, RESIDUAL)
+        return constrain(skip + mlp_output, RESIDUAL)
 
 
 def rope_for_scan(seq_len: int, head_dim: int, scan_order: str):

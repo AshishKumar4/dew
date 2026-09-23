@@ -9,11 +9,10 @@ which records a step holds, and that the answer does not change when a run
 is killed and resumed, when it is resumed on a different number of
 processes, or when its batch grows.
 
-The process counts are faked here, by pointing `jax.process_index` and
-`jax.process_count` at the shard a real pool would read; the loader takes
-both from JAX on every open, so a fake count exercises the real slicing.
-`tests/test_multiprocess.py` runs the same claims in real processes with a
-real checkpoint between them.
+A pool of processes is its shares here: each reader opens the stream for
+the `DataPartition` a process of that pool would read, which is the whole
+of what a loader learns about the pool. `tests/test_multiprocess.py` runs
+the same claims in real processes with a real checkpoint between them.
 """
 
 import dataclasses
@@ -28,7 +27,7 @@ import pytest
 from flax import linen as nn
 
 import dew.data
-from dew.data import Corpus, DataPhase, Loading, PackedTokens, Ramp, ramped
+from dew.data import Corpus, DataPartition, DataPhase, Loading, PackedTokens, Ramp, ramped
 from dew.data.dataset import CAPTION, Dataset, mixed_records, mixed_stream, mixture, tokenized, train_stream
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
@@ -63,22 +62,15 @@ def taken(stream, batches: int) -> list[list[int]]:
     return ids(itertools.islice(stream, batches))
 
 
-def as_processes(monkeypatch, count: int, index: int) -> None:
-    """Read as process `index` of `count`, the way a pool of that size does."""
-    monkeypatch.setattr(jax, "process_count", lambda: count)
-    monkeypatch.setattr(jax, "process_index", lambda: index)
-
-
-def pooled(monkeypatch, build, processes: int, batches: int, state: bytes | None = None,
+def pooled(build, processes: int, batches: int, state: bytes | None = None,
            rows=ids) -> list:
     """The global batches a pool of `processes` reads, each row where the
-    process that holds it put it: process p owns rows p, p + n, ... of a
-    step, which is how `_batches` slices the order. `build` opens the stream
-    that process reads, and takes its own share off the faked count."""
+    share that holds it put it: share p owns rows p, p + n, ... of a step,
+    which is how `_batches` slices the order. `build` opens the stream a
+    share reads."""
     shards = []
     for index in range(processes):
-        as_processes(monkeypatch, processes, index)
-        stream = build()
+        stream = build(DataPartition(index, processes))
         if state is not None:
             stream.set_state(state)
         shards.append(rows(itertools.islice(stream, batches)))
@@ -102,7 +94,7 @@ def test_every_batch_of_a_mixture_holds_each_corpus_share_of_it():
     """The interleave is proportional per prefix, so the weights hold inside
     a batch and not only over the run: a step of four at 3:1 is three wiki
     records and one code record, every step."""
-    stream = mixed(two_corpora())()
+    stream = mixed(two_corpora())(DataPartition())
 
     batches = taken(stream, 8)
 
@@ -115,7 +107,7 @@ def test_a_small_corpus_of_a_mixture_comes_round_while_a_large_one_is_read_once(
     """Weights are shares of a step, not of the data: the corpora are cycled
     before they are mixed, so eight code records at a quarter of the batch
     are read again long before the forty wiki records are through."""
-    stream = mixed(two_corpora())()
+    stream = mixed(two_corpora())(DataPartition())
 
     seen = [value for step in taken(stream, 10) for value in step]
 
@@ -126,48 +118,46 @@ def test_a_small_corpus_of_a_mixture_comes_round_while_a_large_one_is_read_once(
 
 
 def test_a_mixture_is_the_same_order_from_the_same_seed_and_another_from_another():
-    first = taken(mixed(two_corpora())(), 5)
+    first = taken(mixed(two_corpora())(DataPartition()), 5)
 
-    assert taken(mixed(two_corpora())(), 5) == first
-    assert taken(mixed(two_corpora(), seed=1)(), 5) != first
+    assert taken(mixed(two_corpora())(DataPartition()), 5) == first
+    assert taken(mixed(two_corpora(), seed=1)(DataPartition()), 5) != first
 
 
 def test_a_mixture_resumes_on_the_batch_after_the_one_it_saved():
     """A kill at step k and a restart reads batches k + 1 on, records and
     corpora alike, out of one saved record count."""
-    stream = mixed(two_corpora())()
+    stream = mixed(two_corpora())(DataPartition())
     taken(stream, 3)
     state = stream.get_state()
     rest = taken(stream, 4)
 
-    resumed = mixed(two_corpora())()
+    resumed = mixed(two_corpora())(DataPartition())
     resumed.set_state(state)
 
     assert taken(resumed, 4) == rest
     assert json.loads(state)["dew_global_position"]["records"] == 12
 
 
-def test_a_mixtures_position_resumes_on_another_process_count(monkeypatch):
+def test_a_mixtures_position_resumes_on_another_process_count():
     """The mixing runs ahead of the shard, so global batch k is the same
     records at any process count and the count two processes saved is where
     one process or four carry on."""
-    corpora = two_corpora()
-    # The global batch is eight whatever the count; each process reads its
-    # own share of it, as `local_batch` divides it.
-    build = lambda: mixed(corpora, batch=8 // jax.process_count())()  # noqa: E731
-    whole = pooled(monkeypatch, build, 1, 6)
+    # The global batch is eight whatever the count; each share reads its
+    # part of it.
+    build = mixed(two_corpora(), batch=8)
+    whole = pooled(build, 1, 6)
 
-    assert pooled(monkeypatch, build, 2, 6) == whole
-    assert pooled(monkeypatch, build, 4, 6) == whole
+    assert pooled(build, 2, 6) == whole
+    assert pooled(build, 4, 6) == whole
 
-    as_processes(monkeypatch, 2, 0)
-    stopped = build()
+    stopped = build(DataPartition(0, 2))
     taken(stopped, 2)
     state = stopped.get_state()
 
     assert json.loads(state)["dew_global_position"]["records"] == 16
     for processes in (1, 4):
-        assert pooled(monkeypatch, build, processes, 4, state) == whole[2:]
+        assert pooled(build, processes, 4, state) == whole[2:]
 
 
 def test_a_mixtures_pass_is_the_records_every_corpus_has_been_read_in():
@@ -236,7 +226,7 @@ def test_load_reads_a_weighted_mixture_of_two_datasets(two_splits):
 
     assert data.records == 54 and data.batch == 4
     assert data.steps_per_epoch == 13
-    stream = data.train()
+    stream = data.train(DataPartition())
     try:
         batches = taken(stream, 6)
     finally:
@@ -255,7 +245,7 @@ def test_load_scores_a_mixture_on_the_same_held_out_records_every_pass(two_split
                          val_split="train", preprocess=just_index, loading=READ)
 
     assert data.val is not None
-    first, second = ids(data.val()), ids(data.val())
+    first, second = ids(data.val(DataPartition())), ids(data.val(DataPartition()))
 
     assert len(first) == 8, "a pass runs until the first split would repeat"
     scored = [value for step in first for value in step]
@@ -273,7 +263,7 @@ def test_a_mixture_written_in_either_order_is_the_same_run(two_splits):
     other = dew.data.load({f"hf/{small}": 0.25, f"hf/{big}": 0.75}, batch=4,
                           preprocess=just_index, loading=READ)
 
-    left, right = first.train(), other.train()
+    left, right = first.train(DataPartition()), other.train(DataPartition())
     try:
         assert left.get_state() == right.get_state()
         assert taken(left, 3) == taken(right, 3)
@@ -287,7 +277,7 @@ def test_a_single_source_load_is_unchanged_by_the_mixture_route(two_splits):
     checkpoint written before the mixtures landed still resumes."""
     big, _ = two_splits
     data = dew.data.load(f"hf/{big}", batch=4, preprocess=just_index, loading=READ)
-    stream = data.train()
+    stream = data.train(DataPartition())
     try:
         order = json.loads(stream.get_state())["dew_global_position"]["order"]
         assert data.records == 40
@@ -351,62 +341,55 @@ def packed_rows(stream, batches: int) -> list[list[tuple[int, ...]]]:
     return windows_of(itertools.islice(stream, batches))
 
 
-def test_a_packed_step_is_the_same_windows_at_every_process_count(monkeypatch, tmp_path):
+def test_a_packed_step_is_the_same_windows_at_every_process_count(tmp_path):
     """The packing is planned over the whole corpus ahead of the shard, so
     global batch k holds the same windows in the same places however many
     processes read it. Packed behind the shard, as the loader once was, each
     process packed its own documents and no two counts agreed."""
     corpus = packed_corpus(tmp_path / "corpus")
-    open_stream = lambda: PackedTokens(  # noqa: E731  one line, read once
-        path=corpus, seq_len=8, val_batches=None, packing_bins=2,
-        loading=READ).load(batch=4).train()
+    open_stream = PackedTokens(path=corpus, seq_len=8, val_batches=None, packing_bins=2,
+                               loading=READ).load(batch=4).train
 
-    whole = pooled(monkeypatch, open_stream, 1, 5, rows=windows_of)
+    whole = pooled(open_stream, 1, 5, rows=windows_of)
 
     assert whole[0], "the loader produced no windows"
-    assert pooled(monkeypatch, open_stream, 2, 5, rows=windows_of) == whole
-    assert pooled(monkeypatch, open_stream, 4, 5, rows=windows_of) == whole
+    assert pooled(open_stream, 2, 5, rows=windows_of) == whole
+    assert pooled(open_stream, 4, 5, rows=windows_of) == whole
 
 
-def test_a_packed_position_written_by_two_processes_resumes_on_one(monkeypatch, tmp_path):
+def test_a_packed_position_written_by_two_processes_resumes_on_one(tmp_path):
     """The packed stream's position is a global window count, so the two
     processes that stopped at step two hand one process, or four, the steps
     the run would have taken next."""
     corpus = packed_corpus(tmp_path / "corpus")
-    open_stream = lambda: PackedTokens(  # noqa: E731  one line, read once
-        path=corpus, seq_len=8, val_batches=None, packing_bins=2,
-        loading=READ).load(batch=4).train()
-    whole = pooled(monkeypatch, open_stream, 1, 6, rows=windows_of)
+    open_stream = PackedTokens(path=corpus, seq_len=8, val_batches=None, packing_bins=2,
+                               loading=READ).load(batch=4).train
+    whole = pooled(open_stream, 1, 6, rows=windows_of)
 
-    as_processes(monkeypatch, 2, 1)
-    stopped = open_stream()
+    stopped = open_stream(DataPartition(1, 2))
     packed_rows(stopped, 2)
     state = stopped.get_state()
 
     assert json.loads(state)["dew_global_position"]["records"] == 8
     for processes in (1, 2, 4):
-        assert pooled(monkeypatch, open_stream, processes, 4, state,
-                      rows=windows_of) == whole[2:]
+        assert pooled(open_stream, processes, 4, state, rows=windows_of) == whole[2:]
 
 
-def test_a_packed_pass_covers_every_document_once_at_every_process_count(monkeypatch,
-                                                                         tmp_path):
+def test_a_packed_pass_covers_every_document_once_at_every_process_count(tmp_path):
     """A validation pass over the plan is the same windows in the same order
     for every count, and the processes of a pool cover the split between
     them without overlapping."""
     corpus = packed_corpus(tmp_path / "corpus", documents=24)
-    pass_over = lambda: PackedTokens(  # noqa: E731  one line, read once
-        path=corpus, seq_len=8, val_batches=None, packing_bins=2,
-        loading=READ).load(batch=4).val()
-
-    as_processes(monkeypatch, 1, 0)
-    whole = [row for batch in pass_over() for row in windows_of([batch])[0]]
+    pass_over = PackedTokens(path=corpus, seq_len=8, val_batches=None, packing_bins=2,
+                             loading=READ).load(batch=4).val
+    assert pass_over is not None
+    whole = [row for batch in pass_over(DataPartition()) for row in windows_of([batch])[0]]
 
     for processes in (2, 4):
         shards = []
         for index in range(processes):
-            as_processes(monkeypatch, processes, index)
-            shards.append([row for batch in pass_over() for row in windows_of([batch])[0]])
+            shards.append([row for batch in pass_over(DataPartition(index, processes))
+                           for row in windows_of([batch])[0]])
         assert sum(len(shard) for shard in shards) == len(whole)
         assert sorted(row for shard in shards for row in shard) == sorted(whole)
 
@@ -434,25 +417,23 @@ def test_weighted_packed_corpora_fill_every_step_at_their_shares(tmp_path):
     each corpus's share of its windows to within one, the contract grain's
     `MapDataset.mix` keeps. At 3:1 a batch of four is three and one."""
     spec, _, _ = weighted_packed(tmp_path, (3.0, 1.0))
-    rows = [row for batch in packed_rows(spec.load(batch=4).train(), 12) for row in batch]
+    rows = [row for batch in packed_rows(spec.load(batch=4).train(DataPartition()), 12) for row in batch]
     drawn = [corpus_of(row) for row in rows]
     for prefix in range(1, len(drawn) + 1):
         assert abs(drawn[:prefix].count(1) - prefix / 4) <= 1
     assert all(drawn[step * 4:step * 4 + 4].count(1) == 1 for step in range(12))
 
 
-def test_weighted_packed_corpora_resume_on_another_process_count(monkeypatch, tmp_path):
+def test_weighted_packed_corpora_resume_on_another_process_count(tmp_path):
     spec, _, _ = weighted_packed(tmp_path, (1.0, 1.0))
-    open_stream = lambda: spec.load(batch=4).train()  # noqa: E731  one line, read once
-    whole = pooled(monkeypatch, open_stream, 1, 6, rows=windows_of)
+    open_stream = spec.load(batch=4).train
+    whole = pooled(open_stream, 1, 6, rows=windows_of)
 
-    as_processes(monkeypatch, 2, 0)
-    stopped = open_stream()
+    stopped = open_stream(DataPartition(0, 2))
     packed_rows(stopped, 2)
     state = stopped.get_state()
     for processes in (1, 4):
-        assert pooled(monkeypatch, open_stream, processes, 4, state,
-                      rows=windows_of) == whole[2:]
+        assert pooled(open_stream, processes, 4, state, rows=windows_of) == whole[2:]
 
 
 def test_a_weighted_packed_pass_counts_and_scores_every_corpus(tmp_path):
@@ -463,7 +444,7 @@ def test_a_weighted_packed_pass_counts_and_scores_every_corpus(tmp_path):
     alone = [PackedTokens(path=path, seq_len=8, val_batches=None, packing_bins=2,
                           loading=READ).load(batch=2).records for path in (first, second)]
     assert loaded.records == 2 * max(alone)
-    scored = [row for batch in loaded.val() for row in windows_of([batch])[0]]
+    scored = [row for batch in loaded.val(DataPartition()) for row in windows_of([batch])[0]]
     assert len(scored) == len(set(scored))
     assert {corpus_of(row) for row in scored} == {0, 1}
 
@@ -492,7 +473,7 @@ def test_phases_switch_the_mixture_at_a_step(tmp_path):
     both = {first: 1.0, second: 1.0}
     spec = phased_packed(first, second, (first, 3), (both, None))
 
-    steps = packed_rows(spec.load(batch=4).train(), 7)
+    steps = packed_rows(spec.load(batch=4).train(DataPartition()), 7)
 
     assert all(corpus_of(row) == 0 for step in steps[:3] for row in step)
     assert all([corpus_of(row) for row in step].count(1) == 2 for step in steps[3:])
@@ -508,26 +489,26 @@ def test_mixed_counts_is_grains_own_selection():
         assert mixed_counts(corpora, prefix) == tuple(drawn[:prefix].count(tag) for tag in (1, 2, 3))
 
 
-def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(monkeypatch, tmp_path):
+def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(tmp_path):
     """Resuming onto a changed mixture is refused, but resuming onto a phase
     list whose first phase is the run's mixture, with a boundary it has not
     passed, is the same run with a switch ahead of it, at any process count."""
     spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     both = {first: 1.0, second: 1.0}
     plain = PackedTokens(path=first, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
-    stopped = plain.load(batch=4).train()
+    stopped = plain.load(batch=4).train(DataPartition())
     packed_rows(stopped, 2)
     state = stopped.get_state()
     phases = phased_packed(first, second, (first, 4), (both, None))
-    open_stream = lambda: phases.load(batch=4).train()  # noqa: E731  one line, read once
-    whole = pooled(monkeypatch, open_stream, 1, 7, rows=windows_of)
+    open_stream = phases.load(batch=4).train
+    whole = pooled(open_stream, 1, 7, rows=windows_of)
 
     for processes in (1, 2):
-        assert pooled(monkeypatch, open_stream, processes, 5, state, rows=windows_of) == whole[2:]
+        assert pooled(open_stream, processes, 5, state, rows=windows_of) == whole[2:]
     with pytest.raises(ValueError, match="phase 0 reads something else"):
-        phased_packed(first, second, (both, 4), (first, None)).load(batch=4).train().set_state(state)
+        phased_packed(first, second, (both, 4), (first, None)).load(batch=4).train(DataPartition()).set_state(state)
     with pytest.raises(ValueError, match="past this run's end of phase 0"):
-        phased_packed(first, second, (first, 1), (both, None)).load(batch=4).train().set_state(state)
+        phased_packed(first, second, (first, 1), (both, None)).load(batch=4).train(DataPartition()).set_state(state)
 
 
 def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_path):
@@ -538,7 +519,7 @@ def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_pa
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     both = {first: 1.0, second: 1.0}
     spec = phased_packed(first, second, (first, 3), (both, None))
-    stream = spec.load(batch=4).train()
+    stream = spec.load(batch=4).train(DataPartition())
     packed_rows(stream, 5)
     state = stream.get_state()
     rest = packed_rows(stream, 3)
@@ -546,27 +527,27 @@ def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_pa
     saved = json.loads(state)["dew_global_position"]
     assert saved["records"] == 20 and saved["completed"][0][1] == 12
     for resumed_spec in (spec, phased_packed(first, second, (first, 3), (both, 9), (second, None))):
-        resumed = resumed_spec.load(batch=4).train()
+        resumed = resumed_spec.load(batch=4).train(DataPartition())
         resumed.set_state(state)
         assert packed_rows(resumed, 3) == rest
     for changed in (phased_packed(first, second, (first, 2), (both, None)),
                     phased_packed(first, second, (second, 3), (both, None))):
         with pytest.raises(ValueError, match="cannot change under it"):
-            changed.load(batch=4).train().set_state(state)
+            changed.load(batch=4).train(DataPartition()).set_state(state)
     plain = PackedTokens(path=both, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
     with pytest.raises(ValueError, match="phased run"):
-        plain.load(batch=4).train().set_state(state)
+        plain.load(batch=4).train(DataPartition()).set_state(state)
 
 
 def test_phases_are_a_list_of_ends_and_refuse_a_ramp(tmp_path):
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     with pytest.raises(ValueError, match="ends must increase"):
-        phased_packed(first, second, (first, 3), (second, 3), (first, None)).load(batch=4).train()
+        phased_packed(first, second, (first, 3), (second, 3), (first, None)).load(batch=4).train(DataPartition())
     with pytest.raises(ValueError, match="the last runs on"):
-        phased_packed(first, second, (first, 3), (second, 5)).load(batch=4).train()
+        phased_packed(first, second, (first, 3), (second, 5)).load(batch=4).train(DataPartition())
     spec = phased_packed(first, second, (first, 3), (second, None))
     with pytest.raises(TypeError, match="ramp a run of one order"):
-        ramped(spec.load(batch=4), Ramp(start=2, increment=2, samples=8)).train()
+        ramped(spec.load(batch=4), Ramp(start=2, increment=2, samples=8)).train(DataPartition())
 
 
 # --------------------------------------------------------------------------
@@ -641,10 +622,14 @@ def test_a_schedule_that_cannot_be_run_is_refused(ramp, final, message):
         ramp.stages(final)
 
 
-def test_a_ramp_stage_that_does_not_split_over_the_processes_is_refused(monkeypatch):
-    as_processes(monkeypatch, 4, 0)
-    with pytest.raises(ValueError, match="does not split over 4"):
-        Ramp(start=6, increment=2, samples=48).stages(8)
+def test_a_ramp_stage_that_does_not_split_into_the_shares_is_refused():
+    """A stage of six records a step has no equal share for each of four
+    readers; the stream refuses it at the step that reads it."""
+    stream = ramped(indexed_data(64, 8), Ramp(start=6, increment=2, samples=48)).train(
+        DataPartition(0, 4))
+    with pytest.raises(ValueError, match="batch 6 does not split into 4 equal shares"):
+        next(stream)
+    stream.close()
 
 
 def test_a_pass_over_the_data_is_more_steps_under_a_ramp():
@@ -652,7 +637,7 @@ def test_a_pass_over_the_data_is_more_steps_under_a_ramp():
     steps: sixteen at four, then eight at eight, is twenty-four steps where
     a flat batch of eight is twelve."""
     ramp = Ramp(start=4, increment=4, samples=64)
-    flat = Dataset(train=lambda: iter(()), val=None, records=96, batch=8)
+    flat = Dataset(train=lambda partition: iter(()), val=None, records=96, batch=8)
 
     assert flat.steps_per_epoch == 12
     assert ramped(flat, ramp).steps_per_epoch == 20
@@ -671,14 +656,13 @@ def indexed_data(records: int, batch: int, seed: int = 0) -> Dataset:
                    val=None, records=records, batch=batch)
 
 
-def test_a_ramped_stream_reads_the_records_the_flat_stream_reads(monkeypatch):
+def test_a_ramped_stream_reads_the_records_the_flat_stream_reads():
     """The ramp cuts the same order into different steps, so the records it
     hands over are the flat stream's records in the flat stream's order: a
     stage change neither skips one nor reads one twice."""
-    as_processes(monkeypatch, 1, 0)
-    flat = [value for step in taken(indexed_data(64, 4).train(), 24) for value in step]
+    flat = [value for step in taken(indexed_data(64, 4).train(DataPartition()), 24) for value in step]
 
-    stream = ramped(indexed_data(64, 4), Ramp(start=2, increment=1, samples=6)).train()
+    stream = ramped(indexed_data(64, 4), Ramp(start=2, increment=1, samples=6)).train(DataPartition())
     ramp = taken(stream, 24)
 
     # Two steps of two, one of three, then the run's own four: the schedule
@@ -688,30 +672,28 @@ def test_a_ramped_stream_reads_the_records_the_flat_stream_reads(monkeypatch):
         len(step) for step in ramp)]
 
 
-def test_a_ramped_stream_resumes_on_the_records_it_had_not_read(monkeypatch):
+def test_a_ramped_stream_resumes_on_the_records_it_had_not_read():
     """The rolling buffer holds records the run has not trained on, so they
     are not in the position: a resume reads them, and reads them once."""
-    as_processes(monkeypatch, 1, 0)
     schedule = Ramp(start=2, increment=1, samples=6)
-    stream = ramped(indexed_data(64, 4), schedule).train()
+    stream = ramped(indexed_data(64, 4), schedule).train(DataPartition())
     taken(stream, 4)
     state = stream.get_state()
     rest = taken(stream, 6)
 
-    resumed = ramped(indexed_data(64, 4), schedule).train()
+    resumed = ramped(indexed_data(64, 4), schedule).train(DataPartition())
     resumed.set_state(state)
 
     assert json.loads(state)["dew_global_position"]["records"] == 11
     assert taken(resumed, 6) == rest
 
 
-def test_a_ramped_stream_put_back_mid_read_forgets_its_buffer(monkeypatch):
+def test_a_ramped_stream_put_back_mid_read_forgets_its_buffer():
     """A restore into a stream that is already reading, as the prefetch
     worker restores the stream it opened, hands over the records at the
     saved count and none it had buffered past it."""
-    as_processes(monkeypatch, 1, 0)
     schedule = Ramp(start=2, increment=1, samples=6)
-    stream = ramped(indexed_data(64, 4), schedule).train()
+    stream = ramped(indexed_data(64, 4), schedule).train(DataPartition())
     taken(stream, 1)
     state = stream.get_state()
     rest = taken(stream, 6)
@@ -721,49 +703,44 @@ def test_a_ramped_stream_put_back_mid_read_forgets_its_buffer(monkeypatch):
     assert taken(stream, 6) == rest
 
 
-def test_a_ramped_steps_position_counts_every_process(monkeypatch):
+def test_a_ramped_steps_position_counts_every_process():
     """Each process cuts its own share of a stage's batch, and the position
     is the records all of them handed over: two processes four steps into
     a ramp of two, then four, have read eight records, and the pool's steps
     are the single process's steps with the shares interleaved."""
     schedule = Ramp(start=2, increment=2, samples=8)
 
-    def build():
-        rows = 4 // jax.process_count()
-        data = Dataset(train=train_stream(Indexed(1, 64), [], batch=rows, seed=0, loading=READ),
-                       val=None, records=64, batch=4)
-        return ramped(data, schedule).train()
+    data = Dataset(train=train_stream(Indexed(1, 64), [], batch=4, seed=0, loading=READ),
+                   val=None, records=64, batch=4)
+    build = ramped(data, schedule).train
 
-    whole = pooled(monkeypatch, build, 1, 6)
-    as_processes(monkeypatch, 2, 1)
-    stopped = build()
+    whole = pooled(build, 1, 6)
+    stopped = build(DataPartition(1, 2))
     taken(stopped, 4)
 
     assert [len(step) for step in whole] == [2, 2, 2, 2, 4, 4]
     assert json.loads(stopped.get_state())["dew_global_position"]["records"] == 8
-    assert pooled(monkeypatch, build, 2, 6) == whole
-    assert pooled(monkeypatch, build, 2, 2, stopped.get_state()) == whole[4:]
+    assert pooled(build, 2, 6) == whole
+    assert pooled(build, 2, 2, stopped.get_state()) == whole[4:]
 
 
-def test_a_position_no_step_of_this_ramp_ends_on_is_refused(monkeypatch):
-    as_processes(monkeypatch, 1, 0)
-    stream = ramped(indexed_data(64, 4), Ramp(start=2, increment=1, samples=6)).train()
+def test_a_position_no_step_of_this_ramp_ends_on_is_refused():
+    stream = ramped(indexed_data(64, 4), Ramp(start=2, increment=1, samples=6)).train(DataPartition())
     taken(stream, 3)
     state = stream.get_state()
 
     # Seven records in, which is a step boundary of the ramp that wrote it
     # (2 + 2 + 3) and lands inside a step of the one that reads it.
-    other = ramped(indexed_data(64, 4), Ramp(start=2, increment=2, samples=6)).train()
+    other = ramped(indexed_data(64, 4), Ramp(start=2, increment=2, samples=6)).train(DataPartition())
     with pytest.raises(ValueError, match="ramped differently"):
         other.set_state(state)
 
 
-def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream(monkeypatch):
+def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream():
     """An image or video dataset opens `tokenized` over its global stream, so
     the ramp has to cut the batches that stage hands over and save the
     position it forwards; a ramp that only knew the bare stream refused
     every captioned dataset by the wrapper's name."""
-    as_processes(monkeypatch, 1, 0)
 
     class Captioned(Indexed):
         def __getitem__(self, index: int) -> dict:
@@ -777,9 +754,9 @@ def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream(monkeypatch)
                                                     seed=0, loading=READ), lengths),
                        val=None, records=64, batch=batch)
 
-    flat = [value for step in taken(captioned(4).train(), 12) for value in step]
+    flat = [value for step in taken(captioned(4).train(DataPartition()), 12) for value in step]
     schedule = Ramp(start=2, increment=1, samples=6)
-    stream = ramped(captioned(4), schedule).train()
+    stream = ramped(captioned(4), schedule).train(DataPartition())
     steps = list(itertools.islice(stream, 6))
     state = stream.get_state()
     rest = taken(stream, 3)
@@ -788,7 +765,7 @@ def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream(monkeypatch)
     assert [int(value) for step in steps for value in step["id"]] == flat[:19]
     assert all(len(step["length"]) == len(step["id"]) for step in steps), (
         "the tokenized field was cut to another step than the ids")
-    resumed = ramped(captioned(4), schedule).train()
+    resumed = ramped(captioned(4), schedule).train(DataPartition())
     resumed.set_state(state)
     assert json.loads(state)["dew_global_position"]["records"] == 19
     assert taken(resumed, 3) == rest
@@ -816,9 +793,9 @@ class ShardOffset(OwnBatches):
 
 @pytest.mark.parametrize("stream", [OwnBatches, ShardOffset])
 def test_only_a_stream_whose_position_is_a_global_count_can_ramp(stream):
-    data = Dataset(train=stream, val=None, records=64, batch=8)
+    data = Dataset(train=lambda partition: stream(), val=None, records=64, batch=8)
     with pytest.raises(TypeError, match=stream.__name__):
-        ramped(data, Ramp(start=4, increment=4, samples=16)).train()
+        ramped(data, Ramp(start=4, increment=4, samples=16)).train(DataPartition())
 
 
 # --------------------------------------------------------------------------
@@ -1012,7 +989,7 @@ def test_a_corpus_that_recurs_across_phases_continues_its_order_and_repeats_noth
                 dataclasses.replace(math, weight=25)], 30),
               ([code], None)]
     dataset = phased_dataset(phases, None, [], batch=8, seed=0, loading=READ, val_batches=None)
-    steps = taken(dataset.train(), 40)
+    steps = taken(dataset.train(DataPartition()), 40)
     by_phase = [[value for step in steps[start:end] for value in step]
                 for start, end in ((0, 10), (10, 20), (20, 30), (30, 40))]
     assert all(value // 1000 == 2 for value in by_phase[3])
@@ -1027,13 +1004,13 @@ def test_a_checkpoint_at_a_phase_boundary_names_the_finished_phase(tmp_path):
     a resume may change that phase or extend the finished one."""
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     both = {first: 1.0, second: 1.0}
-    stream = phased_packed(first, second, (first, 3), (both, None)).load(batch=4).train()
+    stream = phased_packed(first, second, (first, 3), (both, None)).load(batch=4).train(DataPartition())
     packed_rows(stream, 3)
     state = stream.get_state()
     assert not json.loads(state)["dew_global_position"].get("completed")
     for changed in (phased_packed(first, second, (first, 3), (second, None)),
                     phased_packed(first, second, (first, 5), (both, None))):
-        changed.load(batch=4).train().set_state(state)
+        changed.load(batch=4).train(DataPartition()).set_state(state)
 
 
 def test_one_corpus_starts_past_its_offset_as_a_mixed_one_does():
@@ -1041,7 +1018,7 @@ def test_one_corpus_starts_past_its_offset_as_a_mixed_one_does():
     phase gives a recurring corpus included, for one corpus as for several."""
     from dew.data.providers import corpora_dataset
     whole = taken(corpora_dataset([Corpus("wiki", Indexed(1, 40), 1.0)], None, [], batch=4, seed=0,
-                                  loading=READ, val_batches=None).train(), 4)
+                                  loading=READ, val_batches=None).train(DataPartition()), 4)
     later = taken(corpora_dataset([Corpus("wiki", Indexed(1, 40), 1.0, offset=8)], None, [], batch=4,
-                                  seed=0, loading=READ, val_batches=None).train(), 2)
+                                  seed=0, loading=READ, val_batches=None).train(DataPartition()), 2)
     assert later == whole[2:]

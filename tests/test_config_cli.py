@@ -92,10 +92,10 @@ def test_steps_and_epochs_are_one_choice():
     with pytest.raises(SystemExit):
         parse(RunConfig, ["--trainer.steps", "5", "--trainer.epochs", "1"])
     config = parse(RunConfig, ["--trainer.epochs", "2"])
-    data = Dataset(train=lambda: iter(()), val=None, records=100, batch=10)
+    data = Dataset(train=lambda partition: iter(()), val=None, records=100, batch=10)
     assert config.trainer.total_steps(data) == 20
     with pytest.raises(ValueError, match="--trainer.steps"):
-        config.trainer.total_steps(Dataset(train=lambda: iter(()), val=None, records=None, batch=10))
+        config.trainer.total_steps(Dataset(train=lambda partition: iter(()), val=None, records=None, batch=10))
 
 
 class _Batches:
@@ -125,7 +125,7 @@ class _Batches:
 
 
 def _batches(batch):
-    return lambda: _Batches(batch)
+    return lambda partition: _Batches(batch)
 
 
 def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_path, monkeypatch):
@@ -134,7 +134,8 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     def load(self, *, batch, tokenize=None):
         train = tokenized(_batches(batch), tokenize)
         return Dataset(train=train,
-                       val=tokenized(lambda: itertools.islice(_batches(batch)(), 1), tokenize),
+                       val=tokenized(lambda partition: itertools.islice(_batches(batch)(partition), 1),
+                                     tokenize),
                        records=4 * batch, batch=batch)
 
     monkeypatch.setattr(OxfordFlowers, "load", load)
@@ -189,7 +190,7 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
             self.count = json.loads(state)["count"]
 
     def load(self, *, batch, tokenize=None):
-        return Dataset(train=lambda: _Images(), val=lambda: _Images(count=1),
+        return Dataset(train=lambda partition: _Images(), val=lambda partition: _Images(count=1),
                        records=4 * batch, batch=batch)
 
     monkeypatch.setattr(OxfordFlowers, "load", load)

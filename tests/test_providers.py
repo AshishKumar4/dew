@@ -27,7 +27,7 @@ if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
 import dew.data
-from dew.data import Checkpointable, HFOptions, Loading, TFDSOptions
+from dew.data import Checkpointable, DataPartition, HFOptions, Loading, TFDSOptions
 
 FIXTURES = Path(__file__).parent / "fixtures" / "tfds"
 PREPARED = FIXTURES / "dew_images" / "1.0.0"
@@ -124,7 +124,7 @@ def test_the_load_function_and_the_spec_read_the_same_dataset():
 
 def indices_of(data, batches):
     """The first pixel of each image of the first `batches` batches."""
-    return [batch["image"][:, 0, 0, 0] for batch in itertools.islice(data.train(), batches)]
+    return [batch["image"][:, 0, 0, 0] for batch in itertools.islice(data.train(DataPartition()), batches)]
 
 
 def test_prepared_records_reach_batches_without_importing_tensorflow():
@@ -137,11 +137,11 @@ def test_prepared_records_reach_batches_without_importing_tensorflow():
                          **READ)
 
     assert data.records == 16 and data.batch == 4 and data.steps_per_epoch == 4
-    batch = next(iter(data.train()))
+    batch = next(iter(data.train(DataPartition())))
     assert sorted(batch) == ["image", "label"]
     assert batch["image"].shape == (4, 8, 8, 3) and batch["image"].dtype == np.uint8
     assert data.val is not None
-    validation = list(data.val())
+    validation = list(data.val(DataPartition()))
     assert [int(v) for v in validation[0]["image"][:, 0, 0, 0]] == [26, 27, 28, 29]
     assert "tensorflow" not in sys.modules
 
@@ -151,7 +151,7 @@ def test_a_pass_over_the_prepared_split_reads_every_record_once():
                          options=TFDSOptions(path=str(PREPARED)),
                          preprocess=image_and_label, **READ)
 
-    epoch = list(itertools.islice(iter(data.train()), data.steps_per_epoch))
+    epoch = list(itertools.islice(iter(data.train(DataPartition())), data.steps_per_epoch))
     pixels = np.concatenate([batch["image"][:, 0, 0, 0] for batch in epoch])
     np.testing.assert_array_equal(np.sort(pixels), np.arange(10, 26))
 
@@ -258,7 +258,7 @@ def test_a_decoder_the_caller_supplies_reaches_the_builder():
                          **READ)
 
     assert data.records == 16
-    assert next(iter(data.train()))["raw"].shape == (4, 4)
+    assert next(iter(data.train(DataPartition())))["raw"].shape == (4, 4)
     assert "tensorflow" not in sys.modules
 
 
@@ -295,12 +295,12 @@ def test_an_arrow_split_reads_by_index_and_carries_its_position(jsonl):
                          options=HFOptions(data_files=jsonl), **READ)
 
     assert data.records == ROWS and data.steps_per_epoch == 6
-    stream = data.train()
+    stream = data.train(DataPartition())
     assert isinstance(stream, Checkpointable), "an Arrow split is random access"
     seen = indices(stream, 3)
     state = stream.get_state()
     rest = indices(stream, 2)
-    resumed = data.train()
+    resumed = data.train(DataPartition())
     resumed.set_state(state)
 
     assert indices(resumed, 2) == rest
@@ -314,7 +314,7 @@ def test_an_arrow_split_holds_a_named_validation_split(jsonl):
                          options=HFOptions(data_files=jsonl), **READ)
 
     assert data.val is not None
-    assert indices(data.val(), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+    assert indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
 
 
 def test_a_record_count_that_disagrees_with_the_split_is_refused(jsonl):
@@ -333,7 +333,7 @@ def test_the_library_own_arguments_are_forwarded_with_their_own_types(jsonl):
             features=datasets.Features({"index": datasets.Value("int32")})), **READ)
 
     assert typed.records == ROWS
-    assert next(iter(typed.train()))["index"].dtype == np.int32
+    assert next(iter(typed.train(DataPartition())))["index"].dtype == np.int32
 
     both = dew.data.load("hf/json", batch=4, preprocess=just_index,
                          options=HFOptions(data_files=[jsonl, jsonl]), **READ)
@@ -349,7 +349,7 @@ def test_a_split_the_caller_already_has_is_read_as_it_is():
                          preprocess=just_index, **READ)
 
     assert data.records == 8
-    assert sorted(i for b in indices(data.train(), 2) for i in b) == list(range(8))
+    assert sorted(i for b in indices(data.train(DataPartition()), 2) for i in b) == list(range(8))
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +363,7 @@ def test_a_streamed_split_reports_no_length(jsonl):
                          preprocess=just_index, options=HFOptions(data_files=jsonl), **READ)
 
     assert data.records is None and data.steps_per_epoch is None
-    stream = data.train()
+    stream = data.train(DataPartition())
     try:
         read = indices(stream, 8)
     finally:
@@ -384,14 +384,14 @@ def test_an_unshuffled_streamed_split_resumes_on_the_record_it_stopped_at(jsonl)
     data = dew.data.load("hf/json", batch=4, split="train", streaming=True,
                          preprocess=just_index, options=HFOptions(data_files=jsonl), **READ)
 
-    stream = data.train()
+    stream = data.train(DataPartition())
     assert isinstance(stream, Checkpointable)
     _drawn(stream, 3)
     state = stream.get_state()
     rest = _drawn(stream, 3)
     stream.close()
 
-    resumed = data.train()
+    resumed = data.train(DataPartition())
     resumed.set_state(state)
     try:
         assert _drawn(resumed, 3) == rest
@@ -407,7 +407,7 @@ def test_a_shuffled_streamed_split_withholds_its_position(jsonl):
                          shuffle_buffer=4, preprocess=just_index, options=HFOptions(data_files=jsonl),
                          **READ)
 
-    stream = data.train()
+    stream = data.train(DataPartition())
     try:
         assert not isinstance(stream, Checkpointable)
         assert not hasattr(stream, "get_state") and not hasattr(stream, "set_state")
@@ -416,19 +416,14 @@ def test_a_shuffled_streamed_split_withholds_its_position(jsonl):
         stream.close()
 
 
-def test_a_streamed_share_with_no_rows_is_refused_rather_than_waited_on(monkeypatch,
-                                                                        one_row):
-    """A split shared out row by row leaves a rank with nothing when the pool
+def test_a_streamed_share_with_no_rows_is_refused_rather_than_waited_on(one_row):
+    """A split shared out row by row leaves a share with nothing when the pool
     is larger than the split. Reopening that share for ever would spin inside
     next(), where a shutdown request cannot be seen."""
-    import jax
-
-    monkeypatch.setattr(jax, "process_count", lambda: 4)
-    monkeypatch.setattr(jax, "process_index", lambda: 3)
     one = dew.data.load("hf/json", batch=4, split="train", streaming=True,
                         preprocess=just_index, options=HFOptions(data_files=one_row), **READ)
 
-    stream = one.train()
+    stream = one.train(DataPartition(3, 4))
     try:
         with pytest.raises(ValueError, match="was given none of the rows"):
             next(iter(stream))
@@ -450,7 +445,7 @@ def test_a_streamed_validation_pass_is_ordered_whatever_the_tuning(
                                          worker_buffer=2))
 
     assert data.val is not None
-    passed = data.val()
+    passed = data.val(DataPartition())
     try:
         assert indices(passed, 3) == [[0, 1, 2, 3], [4, 5, 6, 7]]
     finally:
@@ -463,7 +458,7 @@ def test_a_streamed_pass_ends_and_a_bounded_one_ends_sooner(jsonl):
                          options=HFOptions(data_files=jsonl), **READ)
 
     assert data.val is not None
-    passed = data.val()
+    passed = data.val(DataPartition())
     try:
         assert len(indices(passed, 10)) == 2
     finally:
@@ -476,7 +471,7 @@ def test_a_streamed_row_is_transformed_by_its_own_rng(jsonl):
     def read():
         data = dew.data.load("hf/json", batch=4, split="train", streaming=True,
                              preprocess=just_index, options=HFOptions(data_files=jsonl), **READ)
-        stream = data.train()
+        stream = data.train(DataPartition())
         try:
             return [(int(i), int(d)) for batch in itertools.islice(stream, 3)
                     for i, d in zip(batch["index"], batch["draw"])]
@@ -489,23 +484,18 @@ def test_a_streamed_row_is_transformed_by_its_own_rng(jsonl):
 
 
 @pytest.mark.parametrize("processes", [2, 4])
-def test_a_streamed_split_is_shared_over_the_processes_without_losing_rows(
-        monkeypatch, jsonl, processes):
+def test_a_streamed_split_is_shared_over_the_processes_without_losing_rows(jsonl, processes):
     """`IterableDataset.shard` raises when a split has fewer physical shards
-    than the pool has processes, which would lose the ranks past the shard
+    than the pool has shares, which would lose the ranks past the shard
     count. The public node split keeps one row in `world_size` instead, so
-    every rank reads and the ranks are disjoint."""
-    import jax
-
-    monkeypatch.setattr(jax, "process_count", lambda: processes)
+    every share reads and the shares are disjoint."""
     together = []
     for index in range(processes):
-        monkeypatch.setattr(jax, "process_index", lambda index=index: index)
         data = dew.data.load("hf/json", batch=processes, split="train", streaming=True,
                              shuffle_buffer=4, preprocess=just_index, options=HFOptions(data_files=jsonl),
                              loading=Loading(workers=0, threads=1, read_buffer=4,
                                              worker_buffer=2))
-        stream = data.train()
+        stream = data.train(DataPartition(index, processes))
         try:
             mine = [i for batch in indices(stream, ROWS // processes) for i in batch]
         finally:
@@ -548,7 +538,7 @@ def test_a_given_streamed_dataset_reports_no_position(jsonl):
                                                                      buffer_size=8)):
         data = dew.data.load("hf/given", batch=4, dataset=rows, streaming=True,
                              records=12, preprocess=just_index, **READ)
-        stream = data.train()
+        stream = data.train(DataPartition())
         try:
             assert not isinstance(stream, Checkpointable)
             assert not hasattr(stream, "get_state")
@@ -564,12 +554,12 @@ def test_every_pass_over_a_given_streamed_dataset_starts_at_its_beginning():
     data = dew.data.load("hf/given", batch=4, dataset=rows, streaming=True, records=8,
                          preprocess=just_index, **READ)
 
-    first = data.train()
+    first = data.train(DataPartition())
     try:
         crossing = indices(first, 4)
     finally:
         first.close()
-    again = data.train()
+    again = data.train(DataPartition())
     try:
         fresh = indices(again, 1)
     finally:
@@ -651,7 +641,7 @@ def test_a_streamed_read_over_http_is_bounded_and_its_reader_is_joined(served):
                                          worker_buffer=ahead))
     before = _prefetchers()
 
-    stream = data.train()
+    stream = data.train(DataPartition())
     read = indices(stream, 1)
     readers = _prefetchers() - before
     time.sleep(0.5)

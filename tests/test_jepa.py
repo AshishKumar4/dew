@@ -62,9 +62,10 @@ def step_with(params, key=7, index=0):
 
 class Data:
     def __init__(self, train, val=None, batch=4):
-        self._train, self.val, self.batch, self.records = train, val, batch, None
+        self._train, self.batch, self.records = train, batch, None
+        self.val = None if val is None else lambda partition: val()
 
-    def train(self):
+    def train(self, partition):
         return self._train()
 
     steps_per_epoch = None

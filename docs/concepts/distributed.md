@@ -33,7 +33,11 @@ On eight devices, `MeshSpec(fsdp=4)`, `MeshSpec(fsdp=2, expert=4)` and `MeshSpec
 
 ## Describe parameter placement
 
-Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and `exp`. `Layout` maps those names to mesh axes. The default rules put many large dense dimensions on `fsdp` and expert dimensions on `expert`.
+Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and `exp`. `Layout` maps those names to mesh axes. The default rules put many large dense dimensions on `fsdp` and expert dimensions on `expert`. Under `MeshSpec(tensor=N)` the widths of Megatron's split take the tensor axis as well: the mlp's hidden width, the query and key-value heads, the attention width `o_proj` reads, and the vocabulary. The residual width stays whole on the tensor axis.
+
+The same table places activations. Its `activation_` names put a batch's rows on the `data`, `expert` and `fsdp` axes, its positions on `sequence`, and the heads, the mlp hidden width and the vocabulary of an activation on `tensor`. The model pins the residual stream, the attention's heads and the mlp's hidden width with `dew.nn.sharding.constrain`, and the trainer compiles its step under `flax.linen.logical_axis_rules(layout.rules)`, so a rule you change moves the activations with the parameters. Without those pins GSPMD chooses each activation's placement from the weights around it. On an fsdp mesh it split the residual width and all-reduced every projection's partial products, and on a tensor mesh it gathered every weight, as fsdp does. A batch's rows never split over `tensor`: every tensor shard reads the rows it computes its part of the width for, as in Megatron. A name whose axes do not divide a dimension falls back to its next rule, or stays whole.
+
+The cross entropy scores each device's own tokens: it runs in a `shard_map` over the axes that hold the tokens, plus any other axis the token count divides, with the head whole on every device. Only the head's gradient and the loss's sums cross devices.
 
 Parameters smaller than `min_shard` elements stay replicated. `Layout.check` raises when too many of the parameters that should be sharded end up replicated. If it raises, look at the parameter paths and dimensions it lists before you change the rules. Raising `tolerance` only turns the check off. It does not make the placement any better.
 
@@ -66,7 +70,9 @@ An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_
 
 ## Feed global batches
 
-`Dataset.batch` is the global batch. Each process supplies its own records and Dew assembles the global arrays. For custom data, check that the process slices do not overlap and come out the same every time. If each process repeats the full dataset on its own, the run trains on a different distribution.
+`Dataset.batch` is the global batch. `Dataset.train(partition)` and `Dataset.val(partition)` open a stream over one share of every global batch, and `dew.training.data_partition(mesh)` says which share a process reads: a `DataPartition(index, count, readers)`. The processes whose devices hold the same rows read the same share. Under `stage` or `sequence` axes that span processes, several processes hold one row shard, so they read one share and the partition counts them as `readers`. A loader cuts its records `index::count`, so global batch k holds the same records at every count. `shard_batch` assembles each share into the global arrays, whole rows from each share.
+
+For custom data, take the partition you are handed and read that share alone. Two readers of one share must read the same records in the same order. A source that returns rows in whatever order its fetches finish, such as `ImageStream`, refuses a partition with more than one reader. If each process repeats the full dataset on its own, the run trains on a different distribution.
 
 The placement helper treats rank-two and rank-three arrays as sequences. It can split their second dimension when that dimension divides by the sequence factor. Image and video tensors keep their non-batch dimensions in that helper. Check custom rank-three data yourself: the rank of an array does not tell the helper whether its second dimension really is token positions.
 

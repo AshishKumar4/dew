@@ -55,7 +55,7 @@ def fit(layout, directory, steps):
     # features stands in for the plain regression and a metric reads them.
     trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), layout=layout,
                       checkpoints=checkpoints)
-    data = Dataset(train=Counting, val=val_batches(), records=None, batch=BATCH)
+    data = Dataset(train=lambda partition: Counting(), val=lambda partition: val_batches()(), records=None, batch=BATCH)
     state = trainer.fit(data, steps=steps, log_every=1, eval_every=2, checkpoint_every=2,
                         metrics=(Spread([]),))
     checkpoints.wait()

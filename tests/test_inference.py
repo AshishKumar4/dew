@@ -77,7 +77,7 @@ def make_run(directory, preset=presets.EDM(), encoder="stub_text", checkpoint="s
     checkpoints = Checkpoints(str(directory), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0),
                       checkpoints=checkpoints)
-    state = trainer.fit(Dataset(train=Stream, val=None, records=None, batch=8),
+    state = trainer.fit(Dataset(train=lambda partition: Stream(), val=None, records=None, batch=8),
                         steps=2, log_every=100, checkpoint_every=2)
     checkpoints.wait()
     config.save(str(directory))
@@ -221,7 +221,7 @@ def test_an_unconditional_unet_takes_a_step():
 
     state = Trainer(objective, optax.adam(1e-3),
                     key=jax.random.PRNGKey(0)).fit(
-        Dataset(train=batches, val=None, records=None, batch=8), steps=1, log_every=100)
+        Dataset(train=lambda partition: batches(), val=None, records=None, batch=8), steps=1, log_every=100)
 
     assert int(state.step) == 1
     leaves = jax.tree.leaves(state.params["params"])
@@ -332,7 +332,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9):
     checkpoints = Checkpoints(str(directory), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints,
                       mesh=MeshSpec() if mesh is None else mesh)
-    state = trainer.fit(Dataset(train=Stream, val=None, records=None, batch=8),
+    state = trainer.fit(Dataset(train=lambda partition: Stream(), val=None, records=None, batch=8),
                         steps=2, log_every=100, checkpoint_every=2)
     checkpoints.wait()
     (directory / "run.json").write_text(json.dumps({
@@ -453,7 +453,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
                               eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                               quantization=Quantization()))
     state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),
-                         Dataset(Stream, None, None, batch), name="run")
+                         Dataset(lambda partition: Stream(), None, None, batch), name="run")
     Checkpoints(str(tmp_path / "run")).wait()
 
     record = json.loads((tmp_path / "run" / "run.json").read_text())

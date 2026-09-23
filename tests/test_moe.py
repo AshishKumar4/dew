@@ -874,7 +874,7 @@ class Data:
     def __init__(self, train):
         self._train, self.val, self.batch, self.records = train, None, BATCH, None
 
-    def train(self):
+    def train(self, partition):
         return self._train()
 
     steps_per_epoch = None

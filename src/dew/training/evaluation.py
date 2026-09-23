@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import sys
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -22,10 +22,10 @@ from dew.artifacts import (
     broadcast_from_process_zero,
     collective_host,
 )
-from dew.data.dataset import Closeable
+from dew.data.dataset import Closeable, Reader
 from dew.objectives.base import Batch, Effects, Loss, Metric, Objective, Step, Variables
 
-from .distributed import build_mesh, shard_batch
+from .distributed import build_mesh, data_partition, shard_batch
 
 
 @dataclass(frozen=True)
@@ -74,15 +74,16 @@ def _artifacts(value: Artifacts | None) -> tuple[Artifact, ...]:
 
 
 def evaluate(objective: Objective[Loss, Effects], variables: Variables,
-             batches: Callable[[], Iterator[Batch]] | None, *,
+             batches: Reader | None, *,
              key: jax.Array, metrics: Sequence[Metric] = (),
              step: int | jax.Array = 0, averaged: Variables | None = None,
              preview: bool = False, mesh: Mesh | None = None, split: str = "val",
              schedule_step: int | jax.Array | None = None) -> Evaluation:
     """Evaluate a finite coordinated prefix without an optimizer or tracker.
 
-    batches opens a fresh process-local iterator owned and closed by this
-    call; Dataset.val can be passed directly. Every rank calls evaluate with
+    batches opens a fresh iterator over this process's share of the split
+    (`data_partition` of the mesh), owned and closed by this call;
+    Dataset.val can be passed directly. Every rank calls evaluate with
     the same objective, metrics and numerical settings. Only root's preview
     flag controls the once-per-event display. No consumers means no iterator
     or objective work; preview alone consumes at most the first coordinated batch.
@@ -226,32 +227,35 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             # through still leaves the cleanup below what to close.
             nonlocal mesh, source, iterator
             mesh = build_mesh() if mesh is None else mesh
-            source = batches()
+            source = batches(data_partition(mesh))
             iterator = iter(source)
 
         agreed("iterator construction", open_source)
         assert iterator is not None and mesh is not None
-        while True:
-            batch, available = _next_batch(iterator, scored)
-            if available != jax.process_count():
-                uneven = available > 0
-                batch = None
-                break
-            assert batch is not None
-            batch, rows = _placed_batch(mesh, batch, scored)
-            records += rows
-            produced = None
-            if metrics:
-                produced = _scored_batch(objective, variables, batch, context, scored,
-                                         metrics=metrics, summaries=summaries,
-                                         score_key=score_key, root=root)
-            if scored == 0 and preview_enabled:
-                previews = _previewed(objective, variables, batch, context,
-                                      preview_key=preview_key, scored=produced, root=root)
-            produced = batch = None
-            scored += 1
-            if not metrics:
-                break
+        # The objective scores under the mesh, as the step trains under it:
+        # the model's placements and its sequence and stage splits read it.
+        with jax.set_mesh(mesh):
+            while True:
+                batch, available = _next_batch(iterator, scored)
+                if available != jax.process_count():
+                    uneven = available > 0
+                    batch = None
+                    break
+                assert batch is not None
+                batch, rows = _placed_batch(mesh, batch, scored)
+                records += rows
+                produced = None
+                if metrics:
+                    produced = _scored_batch(objective, variables, batch, context, scored,
+                                             metrics=metrics, summaries=summaries,
+                                             score_key=score_key, root=root)
+                if scored == 0 and preview_enabled:
+                    previews = _previewed(objective, variables, batch, context,
+                                          preview_key=preview_key, scored=produced, root=root)
+                produced = batch = None
+                scored += 1
+                if not metrics:
+                    break
         if scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
     finally:

@@ -54,6 +54,7 @@ from dew.nn.moe import (
     sequence_router_losses,
 )
 from dew.nn.multimodal import MultimodalTransformer
+from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
     Aux,
@@ -995,8 +996,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         assert isinstance(statistics, Mean)
         variables = thaw(params)
         head = self.model.apply(variables, variables["params"], method=type(self.model).head_weight)
-        logits = head_logits(scores.hidden, head, softcap=self.model.final_logit_softcap,
-                             precision=self.model.precision)
+        logits = constrain(head_logits(scores.hidden, head, softcap=self.model.final_logit_softcap,
+                                       precision=self.model.precision), LOGITS)
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()

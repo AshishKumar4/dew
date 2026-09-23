@@ -15,7 +15,7 @@ import pytest
 from test_instrumentation import Regression, batches
 
 from dew.artifacts import Representations
-from dew.data import Dataset
+from dew.data import DataPartition, Dataset
 from dew.data.dataset import tokenized
 from dew.data.tokens import bounded
 from dew.training import Checkpoints, ProfileWindow, Trainer, build_mesh
@@ -176,7 +176,7 @@ def test_tokenized_stop_interrupts_next_then_finalizes_on_its_owner():
             owners.append(threading.get_ident())
             closed.set()
 
-    wrapped = tokenized(Blocking, None)()
+    wrapped = tokenized(lambda partition: Blocking(), None)(DataPartition())
     with DevicePrefetchIterator(wrapped, build_mesh()) as stream:
         consumer = threading.Thread(target=lambda: list(stream))
         consumer.start()
@@ -229,12 +229,12 @@ def test_repeated_bounded_fit_releases_each_source_and_reuses_checkpointer(tmp_p
     checkpoints = Checkpoints(str(tmp_path))
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=checkpoints)
-    data = Dataset(start, None, None, 8)
+    data = Dataset(lambda partition: start(), None, None, 8)
     for target in (1, 3):
         state = trainer.fit(data, steps=target, checkpoint_every=1)
         assert int(state.step) == target
         assert all(source.closed.is_set() for source in opened)
-    _, position = checkpoints.restore()
+    _, position = checkpoints.restore(share=DataPartition())
     assert json.loads(position) == {"position": 3}
     trainer.fit(data, steps=3)
     assert len(opened) == 2
@@ -246,7 +246,7 @@ def test_unexpected_training_eof_still_closes_and_does_not_save_success(tmp_path
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=checkpoints)
     with pytest.raises(StopIteration):
-        trainer.fit(Dataset(lambda: source, None, None, 8), steps=2)
+        trainer.fit(Dataset(lambda partition: source, None, None, 8), steps=2)
     assert source.closed.is_set()
     assert checkpoints.latest is None
 
@@ -278,7 +278,7 @@ def test_metric_failure_closes_owned_iterators_before_it_escapes(steps):
 
     trainer = Trainer(Evaluated(), optax.sgd(0.01), key=jax.random.key(0))
     with pytest.raises(np.linalg.LinAlgError):
-        trainer.fit(Dataset(training, bounded(lambda: validation, 1), None, 8),
+        trainer.fit(Dataset(lambda partition: training(), bounded(lambda partition: validation, 1), None, 8),
                     steps=steps, eval_every=1, metrics=(InvalidMetric(),))
     assert train.closed.is_set() == (steps > 0)
     assert validation.closed.is_set()
@@ -328,7 +328,7 @@ def test_fit_attempts_every_cleanup_without_masking_tracker_error(tmp_path, monk
                       checkpoints=Waiting(str(tmp_path)), tracker=Tracker(),
                       profile=ProfileWindow(str(tmp_path / "trace"), steps=5, warmup=0))
     with pytest.raises(LookupError) as raised:
-        trainer.fit(Dataset(lambda: source, None, None, 8), steps=2, log_every=1)
+        trainer.fit(Dataset(lambda partition: source, None, None, 8), steps=2, log_every=1)
     assert raised.value is primary
     assert source.closed.is_set() and stopped.is_set() and waited.is_set()
     notes = "\n".join(primary.__notes__)
@@ -352,7 +352,7 @@ def test_checkpointability_refusal_finalizes_the_untransferred_source(tmp_path):
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(tmp_path)))
     with pytest.raises(ValueError, match="get_state"):
-        trainer.fit(Dataset(Uncheckpointable, None, None, 8), steps=1, checkpoint_every=1)
+        trainer.fit(Dataset(lambda partition: Uncheckpointable(), None, None, 8), steps=1, checkpoint_every=1)
     assert closed.is_set()
 
 def test_constructor_starts_no_unowned_source_work():
@@ -368,7 +368,7 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
     checkpoints = Checkpoints(str(tmp_path))
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=checkpoints)
-    trainer.fit(Dataset(Source, None, None, 8), steps=1)
+    trainer.fit(Dataset(lambda partition: Source(), None, None, 8), steps=1)
     entered, stopped = threading.Event(), threading.Event()
 
     class Restoring(Source):
@@ -398,7 +398,7 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
     sender.start()
     try:
         with pytest.raises(KeyboardInterrupt):
-            trainer.fit(Dataset(lambda: source, None, None, 8), steps=2)
+            trainer.fit(Dataset(lambda partition: source, None, None, 8), steps=2)
         assert source.closed.is_set()
         assert len(set(source.owners)) == 1
         assert source.owners[0] != threading.get_ident()
@@ -426,7 +426,10 @@ def test_wrapped_cancellation_reaches_source_during_finalization(limited):
             stopped.wait()
             closed.set()
 
-    wrapped = (bounded(Finalizing, 1) if limited else tokenized(Finalizing, None))()
+    def opened(partition):
+        return Finalizing()
+
+    wrapped = (bounded(opened, 1) if limited else tokenized(opened, None))(DataPartition())
     stream = DevicePrefetchIterator(wrapped, build_mesh())
     consumer = threading.Thread(target=lambda: list(stream))
     consumer.start()
@@ -477,7 +480,7 @@ def test_bounded_validation_preserves_records_and_owned_close():
     from contextlib import closing
 
     source = Source()
-    reader = bounded(lambda: source, 2)()
+    reader = bounded(lambda partition: source, 2)(DataPartition())
     with closing(reader):
         values = [float(batch["x"][0, 0]) for batch in reader]
     assert values == [1.0, 2.0]
@@ -486,7 +489,7 @@ def test_bounded_validation_preserves_records_and_owned_close():
 
 
 def test_zero_validation_bound_opens_no_source():
-    def unexpected():
+    def unexpected(partition):
         raise AssertionError("zero bound opened its source")
 
-    assert list(bounded(unexpected, 0)()) == []
+    assert list(bounded(unexpected, 0)(DataPartition())) == []

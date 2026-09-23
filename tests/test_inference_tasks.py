@@ -294,7 +294,7 @@ def test_pipeline_publishes_the_updated_policy_not_the_frozen_reference(kind, tm
         if kind == "ppo":
             values = np.asarray(objective.values(before.params, batch))
             batch.update(old_values=values, returns=values + mask)
-    data = Dataset(train=lambda: iter([batch, batch]), val=None, records=2 * count, batch=count)
+    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
     state = trainer.fit(data, steps=2, log_every=100, checkpoint_every=None)
     sampling = Sampling(temperature=0)
     def draw(weights):

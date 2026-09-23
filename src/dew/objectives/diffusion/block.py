@@ -26,6 +26,7 @@ from dew.artifacts import TokenScores
 from dew.inputs import Field, InputSpec
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
+from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     Aux,
     Batch,
@@ -403,9 +404,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), jnp.float32)
         # The conditioning pass carries no gradient, so its states stop it
         # before the head and nothing of that pass is kept for the backward.
-        first = jax.lax.stop_gradient(head_logits(
+        first = jax.lax.stop_gradient(constrain(head_logits(
             jax.lax.stop_gradient(denoise(zero_logits)), head, softcap=softcap,
-            precision=precision, vocab_major=vocab_major))
+            precision=precision, vocab_major=vocab_major), LOGITS))
         use_sc = jax.random.uniform(sc_key, (tokens.shape[0],)) < self.self_cond_prob
         sc_logits = jnp.where(use_sc[:, None, None], first, zero_logits)
         states = denoise(sc_logits)

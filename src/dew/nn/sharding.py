@@ -28,6 +28,11 @@ The mesh axis names live here too, with the readers of the mesh in context:
 schedule the trainer puts in context around its compiled step,
 `sequence_shards` for how many ways attention and the Mamba-2 mixer split a
 sequence, and `row_axes` for the axes their `shard_map`s split rows over.
+
+`DEFAULT_RULES` maps the logical names onto the mesh, parameters and
+activations alike: `logical_spec` reads it (or the rules a layout puts in
+context) for a parameter's placement and for an activation's, which
+`constrain` pins.
 """
 
 from __future__ import annotations
@@ -35,9 +40,12 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import fnmatch
+import math
 from collections.abc import Iterable, Iterator, Mapping
 
 import jax
+from flax import linen as nn
+from flax.linen import spmd
 
 type LogicalAxes = tuple[str | None, ...]
 type Suffix = tuple[str, ...]
@@ -53,6 +61,96 @@ pipeline mesh adds. They are named here because the attention seam and the
 decoder read them off the mesh in context: the sequence axis attention splits
 its queries over, and the tensor and stage axes, which hold a width and a
 pipeline stage and never a row."""
+
+MESH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
+"""Every mesh's axes, in the order `dew.training.build_mesh` lays them out."""
+
+BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS)
+"""The mesh axes a batch's rows split over, in mesh order. Sequence holds a
+slice of the positions, stage the pipeline's stages that hand one batch's
+microbatches along, and tensor the widths of Megatron's split, so every
+tensor shard computes its share of the width for every row."""
+
+type MeshAxes = str | tuple[str, ...] | None
+type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
+
+# Rule order is precedence when two logical dimensions target the one mesh
+# axis. A name written twice is an ordered pair of choices, the form flax
+# documents for `logical_to_mesh_axes`: the second places a dimension the
+# first could not, because another dimension of the same array took that
+# axis, or because its axes do not divide the dimension (`logical_spec`).
+#
+# The tensor axis carries Megatron's split. That is the mlp's hidden width
+# ('mlp'), the attention's query heads ('heads') and its grouped key and value
+# heads ('kv'), the attention width o_proj reads back ('attention'), and the
+# vocabulary of the embedding table and the output head ('vocab'). Each of
+# those is the output side of one matmul and the input side of the next, so
+# splitting it splits both and leaves the block one reduction.
+#
+# 'embed', the residual width, is the side those matmuls share with every
+# norm, residual add, rotary rotation and the loss. It stays whole on the
+# tensor axis and keeps fsdp, because sharding it would put a collective
+# between every pair of sublayers, the cost tensor parallelism is arranged
+# to avoid. A width that holds fsdp composes the two axes and splits fsdp
+# times tensor ways; a width the residual took fsdp from first takes tensor
+# alone, through the pairs at the end.
+#
+# The activation_ names place what a step computes rather than what it
+# stores, by the same table: rows over the batch axes, positions over the
+# sequence axis, and the widths of Megatron's split over tensor. The residual
+# width (activation_embed) has no rule, so it stays whole.
+DEFAULT_RULES: LogicalAxisRules = (
+    ("vocab", (FSDP_AXIS, TENSOR_AXIS)),
+    ("mlp", (FSDP_AXIS, TENSOR_AXIS)),
+    ("modulation", FSDP_AXIS),
+    ("attention", (FSDP_AXIS, TENSOR_AXIS)),
+    # The gated delta net's projected width (keys, values and their gate),
+    # placed like the attention's: the width over the model dimension.
+    ("linear", FSDP_AXIS),
+    ("embed", FSDP_AXIS),
+    ("head_dim", FSDP_AXIS),
+    ("heads", (FSDP_AXIS, TENSOR_AXIS)),
+    ("kv", (FSDP_AXIS, TENSOR_AXIS)),
+    # The latent widths multi-head latent attention compresses through and
+    # the sparse indexer's head dim: model-width-like, so they ride fsdp.
+    ("index", FSDP_AXIS),
+    ("kvlora", FSDP_AXIS),
+    ("qlora", FSDP_AXIS),
+    ("output", FSDP_AXIS),
+    ("exp", EXPERT_AXIS),
+    # A projection from the residual width to the heads, q_proj's shape: the
+    # rule above gave 'embed' fsdp, so the heads take the tensor axis by
+    # itself rather than fall back to replication. 'attention' has the same
+    # second choice for a table that gives 'embed' fsdp before it.
+    ("heads", TENSOR_AXIS),
+    ("kv", TENSOR_AXIS),
+    ("attention", TENSOR_AXIS),
+    ("activation_batch", BATCH_AXES),
+    ("activation_length", SEQUENCE_AXIS),
+    ("activation_heads", TENSOR_AXIS),
+    ("activation_kv", TENSOR_AXIS),
+    ("activation_mlp", TENSOR_AXIS),
+    ("activation_vocab", TENSOR_AXIS),
+    # Rows too few for every batch axis split over the first ones.
+    ("activation_batch", (DATA_AXIS, EXPERT_AXIS)),
+    ("activation_batch", DATA_AXIS),
+)
+
+RESIDUAL: LogicalAxes = ("activation_batch", "activation_length", "activation_embed")
+"""A `[batch, length, width]` activation between sublayers, and a sublayer's
+input: under a tensor axis every tensor shard reads every row it computes
+its share of the width for."""
+HEADS: LogicalAxes = ("activation_batch", "activation_length", "activation_heads", None)
+"""A `[batch, length, heads, head_dim]` query, or the attention's output."""
+KV_HEADS: LogicalAxes = ("activation_batch", "activation_length", "activation_kv", None)
+"""A `[batch, length, kv_heads, head_dim]` key or value. Grouped heads the
+tensor axis does not divide are computed whole on every tensor shard, the
+way Megatron repeats them."""
+MLP_HIDDEN: LogicalAxes = ("activation_batch", "activation_length", "activation_mlp")
+"""A `[batch, length, hidden]` feed-forward activation."""
+LOGITS: LogicalAxes = ("activation_batch", "activation_length", "activation_vocab")
+"""`[batch, length, vocab]` scores."""
+
 
 DECLARED: dict[Suffix, LogicalAxes] = {}
 """Every decorated module's declarations, merged."""
@@ -112,21 +210,74 @@ def sequence_shards() -> int:
 
 def row_axes(batch: int) -> tuple[str, ...]:
     """The mesh axes a `shard_map` over the sequence axis splits `batch` rows
-    over: every axis still automatic in context but tensor, sequence and
-    stage, which hold a width, a slice of the sequence and a pipeline stage
-    and never a row, taken in mesh order while their product divides the
-    rows. A batch too small for the rest is computed alike on those axes'
-    shards, the way GSPMD replicates a dimension it cannot split."""
-    mesh = jax.sharding.get_abstract_mesh()
-    rows: tuple[str, ...] = ()
-    split = 1
-    for axis in mesh.axis_names:
-        if (axis in mesh.manual_axes or mesh.shape[axis] == 1
-                or axis in (TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)):
-            continue
-        if batch % (split * mesh.shape[axis]) == 0:
-            rows, split = (*rows, axis), split * mesh.shape[axis]
-    return rows
+    over: the ones `activation_batch` takes for `batch` rows in context
+    (`logical_spec`). A batch too small for them is computed alike on those
+    axes' shards, the way GSPMD replicates a dimension it cannot split."""
+    spec = logical_spec(("activation_batch",), (batch,))
+    return mesh_axes(spec[0]) if spec else ()
+
+
+def mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
+    """Read one entry of a spec or a rule as the mesh axes it names."""
+    if assignment is None:
+        return ()
+    return (assignment,) if isinstance(assignment, str) else tuple(assignment)
+
+
+def axis_rules() -> LogicalAxisRules:
+    """The rules in context, `flax.linen.logical_axis_rules`'s, where the
+    trainer puts its layout's; the default table outside one."""
+    return tuple(nn.get_logical_axis_rules()) or DEFAULT_RULES
+
+
+def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
+                 rules: LogicalAxisRules | None = None,
+                 mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None
+                 ) -> jax.sharding.PartitionSpec:
+    """The spec `rules` give an array of `shape` whose dimensions `axes`
+    names, on `mesh`: the rules and the mesh in context by default.
+
+    A mesh axis of size 1 shards nothing, and a manual one belongs to the
+    `shard_map` in context, so both are dropped from the spec. A rule whose
+    axes do not divide its dimension evenly cannot split it, so that rule is
+    set aside for this array and the name takes its next rule, or none, and
+    the axis goes to the next dimension that names it. An odd vocabulary
+    shards the embedding on its width and keeps the table in the layout.
+    """
+    rules = axis_rules() if rules is None else rules
+    mesh = jax.sharding.get_abstract_mesh() if mesh is None else mesh
+    left = list(rules)
+    while True:
+        mapped = spmd.logical_to_mesh_axes(axes, tuple(left))
+        assert mapped is not None, "flax answers None for array_dim_names=None only"
+        assigned = [tuple(axis for axis in mesh_axes(assignment)
+                          if axis not in mesh.manual_axes and mesh.shape[axis] > 1)
+                    for assignment in mapped]
+        blocked = {(name, assignment) for name, assignment, used, size
+                   in zip(axes, mapped, assigned, shape, strict=True)
+                   if size % math.prod(mesh.shape[axis] for axis in used)}
+        if not blocked:
+            break
+        left = [rule for rule in left if rule not in blocked]
+    entries = [used[0] if len(used) == 1 else used or None for used in assigned]
+    while entries and entries[-1] is None:
+        entries.pop()
+    return jax.sharding.PartitionSpec(*entries)
+
+
+def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:
+    """`x` placed as `logical_spec` places the dimensions `axes` names.
+
+    Without it GSPMD picks each activation's placement from the weights
+    around it, and splits the residual width wherever fsdp splits the
+    matrices that read it: every projection then sums partial products
+    across the fsdp axis, rounded before the sum, instead of gathering the
+    weight. With it fsdp gathers weights and splits rows, as fully sharded
+    data parallelism is defined. No mesh in context leaves `x` as it is, and
+    under a pipeline's vmap the stage axis takes the vmapped dimension."""
+    if jax.sharding.get_abstract_mesh().empty:
+        return x
+    return jax.lax.with_sharding_constraint(x, logical_spec(axes, x.shape))
 
 
 def logical_axes(declared: Mapping[Suffix, LogicalAxes], *,

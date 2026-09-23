@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
-from dew.data import ChatMessages, Loading
+from dew.data import ChatMessages, DataPartition, Loading
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
 
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
@@ -98,7 +98,7 @@ def test_a_packed_sft_batch_carries_four_aligned_fields(tmp_path, tokenizer):
                         seq_len=window - 1, packing_bins=2,
                         loading=Loading(workers=0)).load(batch=2)
     assert data.val is not None
-    batches = list(data.val())
+    batches = list(data.val(DataPartition()))
     assert len(batches) == 1
     batch = batches[0]
 
@@ -134,7 +134,7 @@ def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
                         loading=Loading(workers=0)).load(batch=1)
     assert data.records == chunks, "one bin puts every chunk in a window of its own"
     assert data.val is not None
-    batches = list(data.val())
+    batches = list(data.val(DataPartition()))
     assert len(batches) == chunks
     np.testing.assert_array_equal(
         np.concatenate([batch["text"][0] for batch in batches])[:len(ids)], ids)
@@ -154,7 +154,7 @@ def test_the_train_stream_runs_end_to_end(tmp_path, tokenizer):
     data = ChatMessages(tokenizer=str(TOKENIZER), path=path, seq_len=95,
                         packing_bins=2, loading=Loading(workers=2)).load(batch=2)
 
-    batch = next(data.train())
+    batch = next(data.train(DataPartition()))
 
     assert set(columns) <= set(batch)
     assert all(batch[column].shape == (2, 96) for column in columns)

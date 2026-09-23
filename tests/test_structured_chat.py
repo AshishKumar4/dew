@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
-from dew.data import ChatMessages, Checkpointable, HFOptions, Loading, Prompts
+from dew.data import ChatMessages, Checkpointable, DataPartition, HFOptions, Loading, Prompts
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
 
 TOKENIZERS = Path(__file__).resolve().parent / "fixtures" / "tokenizers"
@@ -122,7 +122,7 @@ def test_prompt_sources_keep_structured_chat(tmp_path, tokenizer_path, storage):
         source = Prompts(tokenizer=str(tokenizer_path), records=(json.dumps(row),),
                          max_prompt_len=1024, loading=Loading(workers=0))
 
-    batch = next(source.load(batch=1).train())
+    batch = next(source.load(batch=1).train(DataPartition()))
 
     expected = tokenizer.apply_chat_template(
         reference_messages(), tools=[WEATHER], return_dict=False, add_generation_prompt=True)
@@ -140,7 +140,7 @@ def test_prompt_media_is_refused_before_truncation():
     spec = Prompts(tokenizer=str(TOOLS_TOKENIZER), records=(json.dumps(row),),
                    max_prompt_len=4, loading=Loading(workers=0))
     with pytest.raises(ValueError, match=r"row 0 message 0.*image.*processor"):
-        next(spec.load(batch=1).train())
+        next(spec.load(batch=1).train(DataPartition()))
 
 
 def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_tokenizer):
@@ -176,7 +176,7 @@ def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_token
                         loading=Loading(workers=0))
     data = spec.load(batch=1)
     assert data.val is not None
-    stream = data.val()
+    stream = data.val(DataPartition())
     assert isinstance(stream, Checkpointable)
 
     first = next(stream)
@@ -184,7 +184,7 @@ def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_token
     remaining = list(stream)
     fresh = spec.load(batch=1)
     assert fresh.val is not None
-    restored = fresh.val()
+    restored = fresh.val(DataPartition())
     assert isinstance(restored, Checkpointable)
     restored.set_state(position)
     resumed = list(restored)
@@ -426,7 +426,7 @@ def test_structured_rows_pack_with_their_tools(tmp_path, tools_tokenizer):
                         seq_len=window - 1, packing_bins=1,
                         loading=Loading(workers=0)).load(batch=1)
     assert data.val is not None
-    batches = list(data.val())
+    batches = list(data.val(DataPartition()))
 
     assert len(batches) == 1
     batch = batches[0]
@@ -451,7 +451,7 @@ def test_rows_without_a_tools_column_render_plain(tmp_path, tools_tokenizer):
     data = ChatMessages(tokenizer=str(TOOLS_TOKENIZER), path=str(path), val_path=str(path),
                         seq_len=511, packing_bins=1, loading=Loading(workers=0)).load(batch=1)
     assert data.val is not None
-    batch = next(iter(data.val()))
+    batch = next(iter(data.val(DataPartition())))
 
     np.testing.assert_array_equal(batch["text"][0][:len(ids)], ids)
     np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
@@ -471,7 +471,7 @@ def test_jsonl_rows_pack_the_way_the_same_rows_do_in_parquet(tmp_path, tools_tok
                         seq_len=1023, packing_bins=1, loading=Loading(workers=0)).load(batch=1)
 
     assert data.val is not None
-    batch = next(iter(data.val()))
+    batch = next(iter(data.val(DataPartition())))
     np.testing.assert_array_equal(batch["text"][0][:len(ids)], ids)
     np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
     # Two conversations, one window: the second starts where the first ends.
@@ -503,7 +503,7 @@ def test_a_hub_dataset_id_reads_through_load_dataset(monkeypatch, tools_tokenize
                         seq_len=1023, packing_bins=1, loading=Loading(workers=0)).load(batch=1)
 
     assert data.val is not None
-    batch = next(iter(data.val()))
+    batch = next(iter(data.val(DataPartition())))
     np.testing.assert_array_equal(batch["text"][0][:len(ids)], ids)
     np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
     assert asked["path"] == "allenai/tulu-3-sft-mixture" and asked["split"] == "test"

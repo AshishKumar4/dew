@@ -173,7 +173,7 @@ def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, re
     rows = 2 * jax.device_count()
     objective = LMObjective(adapter.adapt(decoder.model), tokens.shape[1] - 1, pretrained=variables,
                             ema_decay=None, trainable=adapter.trainable)
-    data = Dataset(train=lambda: iter([{"text": tokens[np.arange(rows) % 2]}]), val=None, records=rows, batch=rows)
+    data = Dataset(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}]), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.sgd(meta["learning_rate"]), key=jax.random.key(3),
                       mesh=MeshSpec(), layout=Layout(min_shard=2**30))
     initial = trainer.initial_state()
@@ -541,7 +541,7 @@ def test_a_run_config_adapter_trains_its_factors_and_nothing_else(tmp_path):
                             key=jax.random.key(1))
     rows = 2 * jax.device_count()
     batch = {"text": np.random.RandomState(0).randint(1, 250, (rows, 9)).astype(np.int32)}
-    data = Dataset(train=lambda: iter([batch, batch]), val=None, records=rows, batch=rows)
+    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=rows, batch=rows)
     config = RunConfig(model=config_model, lora=dataclasses.replace(adapter, dropout=0.0),
                        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=rows, steps=2,
                                              eval_every=None, checkpoint_every=None,
@@ -577,7 +577,7 @@ def test_an_objective_that_selects_its_own_leaves_refuses_a_config_adapter():
     adapter, _ = LoRA.fresh(model, variables, {}, rank=2, alpha=4.0, modules=("q_proj",),
                             key=jax.random.key(1))
     rows = jax.device_count()
-    data = Dataset(train=lambda: iter([]), val=None, records=rows, batch=rows)
+    data = Dataset(train=lambda partition: iter([]), val=None, records=rows, batch=rows)
     config = RunConfig(lora=adapter, trainer=TrainerConfig(batch_size=rows, steps=1))
 
     held = LMObjective(model, 8, ema_decay=None, trainable=lambda path: True)

@@ -59,8 +59,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import tyro
+from jax.sharding import Mesh
 
-from dew.data.dataset import local_batch
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
@@ -80,7 +80,7 @@ from dew import models  # naming a registry fills it
 from dew.registry import resolve_dtype, with_precision
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
-from dew.training.distributed import DevicePrefetchIterator
+from dew.training.distributed import DevicePrefetchIterator, data_partition
 from dew.training.runtime import prepare_process
 
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
@@ -133,8 +133,9 @@ class Case:
 
     architecture: str
     config: dict[str, object] = field(default_factory=dict)
-    dtype: str = 'float32'
-    """Compute dtype, written into the model config by the precision policy."""
+    dtype: str | None = None
+    """Compute dtype, written into the model config by the precision policy;
+    None takes the run's --dtype."""
     batch_size: int = 8
     mesh: dict[str, int] = field(default_factory=dict)
     """`MeshSpec` fields, `{"fsdp": 2, "tensor": 2}`; the empty record is
@@ -510,7 +511,8 @@ class BenchmarkConfig:
     """Measured steps per case, timed twice: once dispatched asynchronously for
     ms/step, once waiting per step for the p10/p50/p90 spread."""
     dtype: Literal['bfloat16', 'float32'] = 'bfloat16'
-    """Model compute dtype for --preset small; losses stay fp32 either way."""
+    """Model compute dtype for every case that names none of its own; losses
+    stay fp32 either way."""
     attention_impl: Literal['auto', 'reference', 'xla', 'cudnn', 'tpu'] = 'auto'
     """Attention kernel, through the same precision policy a recipe uses."""
     xla_flags: str | None = None
@@ -568,7 +570,8 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
         frames = {} if config.frames is None or case.frames == 0 else {'frames': config.frames}
         packed = ({'packed_documents': config.packed_documents}
                   if config.packed_documents is not None and case.packs_documents else {})
-        return dataclasses.replace(case, **overrides, **frames, **packed)
+        dtype = {'dtype': config.dtype} if case.dtype is None else {}
+        return dataclasses.replace(case, **overrides, **frames, **packed, **dtype)
 
     return [apply(case) for case in cases]
 
@@ -593,9 +596,13 @@ def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
     loader assembles the same two models (dew.interop.pretrained and
     dew.interop.diffusion_gemma.build).
     """
+    dtype = case.dtype
+    if dtype is None:
+        raise ValueError(f"{case.label} names no dtype; build_cases gives it the run's --dtype")
+
     def built(architecture: str, config: Mapping[str, object]):
         return models.build(architecture, **with_precision(
-            architecture, config, dtype=case.dtype, attention_impl=attention_impl))
+            architecture, config, dtype=dtype, attention_impl=attention_impl))
 
     sample_key = "video" if case.frames else "image"
 
@@ -610,7 +617,7 @@ def build_objective(case: Case, attention_impl: str = 'auto') -> Objective:
         # The decoder carries the attention kernel; the wrapper reads none.
         model = MultimodalTransformer(
             built("causal_transformer", case.config), tower, projector, family, token,
-            dtype=resolve_dtype(case.dtype))
+            dtype=resolve_dtype(dtype))
         objective = lm_objective(case, model)
     elif case.is_lm:
         objective = lm_objective(case, built(case.architecture, case.config))
@@ -725,12 +732,14 @@ def global_batch(case: Case) -> Batch:
     return batch
 
 
-def batches(case: Case) -> Iterator[Batch]:
-    """This process's rows of one host batch, reused: the loader is
+def batches(case: Case, mesh: Mesh) -> Iterator[Batch]:
+    """This process's share of one host batch, reused: the loader is
     benchmarked by benchmark_data.py. Every process draws the same global
-    batch and keeps its own `local_batch` rows, the share a loader reads."""
-    rows = local_batch(case.batch_size)
-    start = jax.process_index() * rows
+    batch and keeps the rows of the share `data_partition` names, as many
+    as a loader would read."""
+    partition = data_partition(mesh)
+    rows = partition.rows(case.batch_size)
+    start = partition.index * rows
     mine = jax.tree.map(lambda leaf: leaf[start:start + rows], global_batch(case))
     while True:
         yield mine
@@ -929,7 +938,7 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
     peak_before = device_peak_bytes()
     trainer = build_trainer(case, config.attention_impl)
 
-    with DevicePrefetchIterator(batches(case), trainer.device_mesh) as source:
+    with DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh) as source:
         abstract = jax.eval_shape(trainer.initial_state)
         state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
         

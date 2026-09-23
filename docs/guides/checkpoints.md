@@ -54,7 +54,7 @@ class Batches:
         self.index = int(state.decode())
 
 
-data = Dataset(train=Batches, val=None, records=None, batch=8)
+data = Dataset(train=lambda partition: Batches(), val=None, records=None, batch=8)
 with tempfile.TemporaryDirectory(prefix="dew-checkpoint-") as directory:
     checkpoints = Checkpoints(directory)
     trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0),
@@ -91,7 +91,7 @@ A plain Python generator usually cannot report its position. To continue the dat
 A persistent checkpoint can restore into a different, compatible placement through the trainer's restore template. Whether the process count can change depends on the saved iterator position:
 
 - A global record count can be read at any process count. Every record dataset built on `train_stream` saves this kind of position.
-- One process's own shard offset, which custom iterators like the one above report, can only be read at the process count that wrote it. Restore refuses a different count and names both counts.
+- One share's own offset, which custom iterators like the one above report, can only be read by a reader of the same share (`DataPartition`), whichever processes those are. Restore refuses any other share and names the shares the checkpoint holds.
 - A checkpoint without a position can change the process count when the tensor layout is compatible.
 
 Local emergency checkpoints hold only the shards each process had, so they restrict placement further. See [resume from a data position](../concepts/data.md#resume-from-a-data-position).

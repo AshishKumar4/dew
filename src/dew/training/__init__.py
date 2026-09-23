@@ -7,7 +7,7 @@
 from dew.checkpoints import Checkpoints
 from dew.objectives.base import Aux, EMASpec, Metric, Objective, Step, everything, under
 
-from .distributed import DEFAULT_RULES, Layout, MeshSpec, build_mesh
+from .distributed import DEFAULT_RULES, Layout, MeshSpec, build_mesh, data_partition
 from .evaluation import Evaluation, evaluate
 from .optim import build_optimizer
 from .quantization import Quantization, apply_quantization
@@ -21,5 +21,6 @@ __all__ = ["DEFAULT_RULES", "Aux", "Checkpoints", "EMASpec", "Evaluation", "Layo
            "MLflowTracker", "MeshSpec", "Metric", "Objective", "ProfileWindow", "Quantization",
            "Rollout", "Step",
            "TensorBoardTracker", "Tracker", "Trackers", "TrainState", "Trainer", "WandbTracker",
-           "apply_quantization", "build_mesh", "build_optimizer", "ema_update", "evaluate", "everything",
+           "apply_quantization", "build_mesh", "build_optimizer", "data_partition", "ema_update",
+           "evaluate", "everything",
            "prepare_process", "run_timestamp", "under", "write_back"]

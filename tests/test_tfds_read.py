@@ -15,7 +15,7 @@ import pytest
 
 pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
-from dew.data import Loading, OxfordFlowers
+from dew.data import DataPartition, Loading, OxfordFlowers
 from dew.data.images import decode_image
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
@@ -57,9 +57,9 @@ def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
         path=str(FIXTURE), image_size=8, augmentation="none", val_batches=1,
         loading=Loading(workers=workers, threads=1, read_buffer=8, worker_buffer=2),
     ).load(batch=4)
-    source = data.train()
+    source = data.train(DataPartition())
     train = list(itertools.islice(source, 4))
-    validation = list(data.val())
+    validation = list(data.val(DataPartition()))
     assert data.records == 16
     train_pixels = np.concatenate([row["image"][:, 0, 0, 0] for row in train])
     val_pixels = np.concatenate([row["image"][:, 0, 0, 0] for row in validation])

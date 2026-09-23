@@ -31,7 +31,7 @@ def train(run: RunConfig) -> float:
     """The loss the trial's own run ends on, through the normal entry point."""
     objective = Regression()
     assert run.trainer.name is not None
-    state = run.train(objective, Dataset(batches, None, None, 8), name=run.trainer.name)
+    state = run.train(objective, Dataset(lambda partition: batches(), None, None, 8), name=run.trainer.name)
     loss, _ = objective.loss(state.params, next(batches()), state.step)
     return float(loss)
 
