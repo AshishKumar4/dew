@@ -327,9 +327,17 @@ def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
 
 
 def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int, anchor: bool,
-        speak: Callable[[str], None]) -> list[dict[str, Any]]:
+        speak: Callable[[str], None], keep: Callable[[list[dict[str, Any]]], None]
+        ) -> list[dict[str, Any]]:
+    """Every layout of every model, one row each, `keep` handed the rows so
+    far after each. A reference and a layout run as agreed phases: a failure
+    on one process fails that row on every process, or, where the others
+    wait in a collective it left, ends the pool within the failure grace
+    (dew.artifacts) with the rows kept so far."""
     import benchmark_step as bench
     import jax
+
+    from dew.artifacts import agreed
 
     jax.config.update("jax_default_matmul_precision", "highest")
     rows = []
@@ -337,8 +345,8 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
         case = dataclasses.replace(zoo()[model], dtype=dtype)
         batch = bench.global_batch(case)
         try:
-            ref_losses, ref_gradient, ref_compiled = trained(case, {}, batch, steps=steps,
-                                                             one_device=True)
+            ref_losses, ref_gradient, ref_compiled = agreed(
+                f"reference of {model}", lambda: trained(case, {}, batch, steps=steps, one_device=True))
             floors, loss_floor = floor(case, batch, ref_gradient, ref_losses[0])
             if anchor and reassociates(case):
                 rounding = exact(case, ref_gradient)
@@ -354,6 +362,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                          "status": "error", "error": f"{type(error).__name__}: {error}"[:2000],
                          "traceback": traceback.format_exc()[-4000:]})
             speak(f"[{model}] reference error {rows[-1]['error'][:300]}")
+            keep(rows)
             continue
         speak(f"[{model}] reference losses {ref_losses}, largest floor {max(floors.values()):.2e}")
         for name in layouts:
@@ -361,7 +370,8 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                                    "reference_losses": ref_losses}
             started = time.perf_counter()
             try:
-                losses, gradient, compiled = trained(case, LAYOUTS[name], batch, steps=steps)
+                losses, gradient, compiled = agreed(
+                    f"{model} on {name}", lambda: trained(case, LAYOUTS[name], batch, steps=steps))
                 row.update(compiled, losses=losses, **judged(
                     leaf_errors(ref_gradient, gradient), floors, abs(losses[0] - ref_losses[0]),
                     loss_floor, ref_losses[0]))
@@ -375,6 +385,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                            traceback=traceback.format_exc()[-4000:])
             row["seconds"] = round(time.perf_counter() - started, 1)
             rows.append(row)
+            keep(rows)
             speak(f"[{model}/{name}] {row['status']} "
                   + (f"leaf {row['worst_ratio']:.2f} of bound at {row['worst_leaf']}, "
                      f"loss {row['loss_error']:.1e} of {row['loss_bound']:.1e}, "
@@ -396,10 +407,13 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
     if anchor and not jax.config.jax_enable_x64:
         raise SystemExit("--anchor computes the step in fp64, which needs JAX_ENABLE_X64=1")
     speaker = jax.process_index() == 0
+
+    def keep(rows: list[dict[str, Any]]) -> None:
+        if speaker and out is not None:
+            out.write_text(json.dumps(rows, indent=1))
+
     rows = run(models, layouts, dtype=dtype, steps=steps, anchor=anchor,
-               speak=lambda line: print(line, flush=True) if speaker else None)
-    if speaker and out is not None:
-        out.write_text(json.dumps(rows, indent=1))
+               speak=lambda line: print(line, flush=True) if speaker else None, keep=keep)
     if any(row["status"] != "works" for row in rows):
         raise SystemExit(1)
 
