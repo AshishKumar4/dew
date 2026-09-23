@@ -66,8 +66,8 @@ class Gemma4Experts(nn.Module):
     top_k: int
     hidden_features: int
     out_features: int
-    activation: str = 'geglu'
-    implementation: str = 'xla'
+    activation: GatedActivation = 'geglu'
+    implementation: str = 'auto'
     dispatch: str = 'global'
     norm_eps: float = 1e-6
     scale_offset: bool = False
