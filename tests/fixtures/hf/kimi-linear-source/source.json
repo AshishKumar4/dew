@@ -1,0 +1,10 @@
+{
+ "repo": "moonshotai/Kimi-Linear-48B-A3B-Instruct",
+ "revision": "e1df551a447157d4658b573f9a695d57658590e9",
+ "tensors": "name -> [safetensors dtype, shape], read from the 20 shard headers of model.safetensors.index.json at that revision",
+ "reference": {
+  "modeling_kimi.py": "e1df551",
+  "fla-core": "0.4.0",
+  "transformers": "4.57.1"
+ }
+}

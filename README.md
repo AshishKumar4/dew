@@ -250,6 +250,7 @@ compute dtype. Non-parameter state retains its declared precision.
 | DeepSeek floating-point checkpoints | `deepseek_v2`, `deepseek_v3`, `deepseek_v32` |
 | Kimi K2 | `kimi_k2` |
 | Kimi K3 text, MXFP4 routed experts | `kimi_k3` |
+| Kimi Linear | `kimi_linear` |
 | Llama 4 text | `llama4_text` |
 
 Kimi K2 keeps its own model type, vocabulary, RoPE settings, and routing widths
@@ -264,6 +265,15 @@ back in the same format. The tower tensors are kept and written back unchanged.
 A tiny fixture from the released remote code covers parity, an update, export
 and greedy decoding; the [source record](tests/fixtures/hf/kimi-k3-source/source.json)
 lists every released tensor's shape.
+
+Kimi Linear loads as its released remote code computes it, KDA and NoPE MLA
+layers with DeepSeek's routed experts, with one exception. The released gate
+adds the balancing bias to its scores in place, so its routing weights carry
+the bias; Dew weighs the chosen experts by the unbiased scores, as K3's
+revision of the same file and vLLM do. A tiny fixture from the released code,
+with that line patched, covers parity, an update, export and greedy decoding;
+the [source record](tests/fixtures/hf/kimi-linear-source/source.json) lists
+every released tensor's shape.
 
 ### Native multimodal models
 
