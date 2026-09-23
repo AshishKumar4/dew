@@ -66,12 +66,13 @@ from dew.nn.attention import (
     document_mask,
     unweighted_rmsnorm,
 )
+from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_inv_freq
 from dew.nn.sharding import logical_axes
-from dew.nn.sparse_selection import top_k_keys
+from dew.nn.sparse_selection import candidate_pool, top_k_keys
 
 COMPRESSORS = ('csa', 'hca', 'csa2')
 CANDIDATES = ('source', 'restrict')
@@ -82,105 +83,6 @@ CSA2_CANDIDATES = 'csa2_candidates'
 """The kv_store names a CSA2 layer publishes under: the latest Full layer's
 rotated entries and index keys, the latest selection and the candidate pool.
 One name each, since every layer reads the latest (section 2.3.1)."""
-E4M3_MAX = 448.0
-E2M1_MAX = 6.0
-_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-
-
-def _power_of_two_ceil(value):
-    """2 ** ceil(log2(value)) off the fp32 bits, as the kernels' fast_round_scale
-    computes it (kernel.py:22-37)."""
-    bits = jax.lax.bitcast_convert_type(value.astype(jnp.float32), jnp.int32)
-    exponent = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).astype(jnp.int32)
-    return jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
-
-
-def round_e4m3fn(values):
-    """Round fp32 values within +-448 to E4M3FN, ties to even, by arithmetic.
-
-    Not `astype(float8_e4m3fn)`: XLA GPU's default xla_allow_excess_precision
-    deletes an f32 -> f8 -> f32 convert pair under jit, so the rounding would
-    silently not happen. Nor `jax.lax.reduce_precision(x, 4, 3)`, which
-    models IEEE-style e4m3 with infinities and a largest finite 240, not the
-    FN format whose largest finite is 448. The quantum is the power of two
-    of the value's binade less three mantissa bits, floored at the subnormal
-    spacing 2**-9; dividing by it is exact and `round` ties to even.
-    """
-    bits = jax.lax.bitcast_convert_type(values.astype(jnp.float32), jnp.int32)
-    exponent = jnp.maximum(((bits >> 23) & 0xFF) - 127, -6) - 3
-    quantum = jax.lax.bitcast_convert_type((exponent + 127) << 23, jnp.float32)
-    return jnp.round(values / quantum) * quantum
-
-
-def _straight_through(x, rounded):
-    """`rounded` forward and the identity's gradient backward. The sum runs
-    in fp32, where `x + (rounded - x)` is exact, so a bf16 `x` gets the
-    rounded value itself and not a bf16 re-rounding of the correction."""
-    wide = x.astype(jnp.float32)
-    return (wide + jax.lax.stop_gradient(rounded.astype(jnp.float32) - wide)).astype(x.dtype)
-
-
-def fake_quant_fp8(x, block: int):
-    """E4M3 per `block` channels under a power-of-two scale (act_quant with
-    scale_fmt ue8m0, kernel.py:40-124): amax floored at 1e-4, scale the
-    ceiling power of two of amax / 448, value clamped to +-448 and rounded."""
-    blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
-    amax = jnp.maximum(jnp.max(jnp.abs(blocks), -1, keepdims=True), 1e-4)
-    scale = _power_of_two_ceil(amax * jnp.float32(1 / E4M3_MAX))
-    rounded = round_e4m3fn(jnp.clip(blocks / scale, -E4M3_MAX, E4M3_MAX))
-    return _straight_through(x, (rounded * scale).reshape(x.shape))
-
-
-def _e2m1(values):
-    """Round values within +-6 to E2M1, ties to the even neighbour."""
-    grid = jnp.asarray(_E2M1, jnp.float32)
-    magnitude = jnp.abs(values)
-    upper = jnp.clip(jnp.searchsorted(grid, magnitude, side='left'), 1, len(_E2M1) - 1)
-    lower = upper - 1
-    below, above = grid[lower], grid[upper]
-    odd = (lower % 2) == 1
-    take_above = (above - magnitude < magnitude - below) | (
-        (above - magnitude == magnitude - below) & odd)
-    return jnp.copysign(jnp.where(take_above, above, below), values)
-
-
-def fake_quant_fp4(x, block: int, e4m3_scale: bool):
-    """E2M1 per `block` channels (fp4_act_quant, kernel.py:127-204): under an
-    E4M3 scale amax / 6 with amax floored at 6 * 2**-9 (the compressed KV),
-    or under the ceiling power of two of amax / 6 with amax floored at
-    6 * 2**-126 (the indexer); the value clamped to +-6 and rounded."""
-    blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
-    amax = jnp.max(jnp.abs(blocks), -1, keepdims=True)
-    if e4m3_scale:
-        # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
-        scale = round_e4m3fn(jnp.minimum(jnp.maximum(amax, E2M1_MAX * 2 ** -9) / E2M1_MAX, E4M3_MAX))
-    else:
-        scale = _power_of_two_ceil(
-            jnp.maximum(amax, E2M1_MAX * 2 ** -126) * jnp.float32(1 / E2M1_MAX))
-    rounded = _e2m1(jnp.clip(blocks / scale, -E2M1_MAX, E2M1_MAX))
-    return _straight_through(x, (rounded * scale).reshape(x.shape))
-
-
-def candidate_pool(scores, visible, blocks: int, block_size: int):
-    """The Hierarchical Sparse Indexer's first level (v41:583-610): the
-    `blocks` blocks of `block_size` entries with the highest best score, the
-    block holding the query's newest entry always among them, as a
-    `[B, S, T]` mask over the entries."""
-    batch, length, total = scores.shape
-    count = -(-total // block_size)
-    ranked = jnp.where(visible, scores, -jnp.inf)
-    ranked = jnp.pad(ranked, ((0, 0), (0, 0), (0, count * block_size - total)),
-                     constant_values=-jnp.inf)
-    best = jnp.max(ranked.reshape(batch, length, count, block_size), axis=-1)
-    newest = (jnp.sum(visible, axis=-1) - 1) // block_size
-    best = jnp.where(jnp.arange(count) == newest[..., None], jnp.inf, best)
-    values, chosen = jax.lax.top_k(best, min(blocks, count))
-    keep = jnp.zeros((batch, length, count), bool).at[
-        jnp.arange(batch)[:, None, None], jnp.arange(length)[None, :, None], chosen
-    ].set(values > -jnp.inf)
-    return jnp.repeat(keep, block_size, axis=-1)[..., :total]
-
-
 def rope_freqs(positions, rope_dim: int, theta: float, yarn: YarnScaling | None):
     """cos/sin per pair over the rope width, `[..., rope_dim // 2]`.
 

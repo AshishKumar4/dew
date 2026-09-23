@@ -26,8 +26,8 @@ import pytest
 
 from dew.interop import load_pretrained
 from dew.interop.hf_decoders import _FAMILIES, _flatten, translate_config
-from dew.nn.deepseek_v4 import fake_quant_fp4, fake_quant_fp8
 from dew.nn.engram import Engram
+from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -90,6 +90,11 @@ def test_the_quantizers_pass_their_gradient_straight_through():
     for quant in (lambda v: fake_quant_fp8(v, 32), lambda v: fake_quant_fp4(v, 16, True)):
         np.testing.assert_array_equal(jax.grad(lambda v: jnp.sum(quant(v) * v))(x),
                                       quant(x) + x)
+    # bf16 input whose E4M3 scale saturates: the forward value is the
+    # rounded one exactly, not a bf16 re-rounding of the correction
+    big = jnp.asarray([[1e4] + [3.0] * 15], jnp.bfloat16)
+    rounded = fake_quant_fp4(big.astype(jnp.float32), 16, True).astype(jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(fake_quant_fp4(big, 16, True)), np.asarray(rounded))
 
 
 def test_the_engram_hash_is_the_releases_int64_arithmetic():
