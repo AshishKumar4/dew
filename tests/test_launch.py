@@ -213,6 +213,8 @@ SLURM_STEP = {"SLURM_JOB_ID": "77", "SLURM_STEP_NODELIST": "gpu[01-02]", "SLURM_
      (), "ompi: process 2 of 4, placed by the cluster"),
     ({"SLURM_JOB_ID": "77", "SLURM_NTASKS_PER_NODE": "8"}, (),
      "srun --kill-on-bad-exit=1 --export=ALL python train.py"),
+    ({"SLURM_JOB_ID": "77", "SLURM_GPUS_PER_NODE": "a100:8"}, (),
+     "srun --kill-on-bad-exit=1 --export=ALL --ntasks-per-node=8 python train.py"),
     (SLURM_STEP, ("--hosts", "localhost", "--processes-per-host", "1", "--port", "5"),
      "DEW_PROCESS_COUNT=1"),
     ({**SLURM_STEP, "SLURM_NTASKS": "1", "SLURM_PROCID": "0", "SLURM_LOCALID": "0",

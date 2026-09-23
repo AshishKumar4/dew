@@ -205,7 +205,8 @@ class Launch:
         """Start the program with srun in this Slurm allocation. jax gives
         each Slurm task the one GPU at its SLURM_LOCALID, so a node runs a
         task per GPU: `--processes-per-host`, else the allocation's own
-        tasks per node, else the GPUs Slurm left this node."""
+        tasks per node, else its GPUs per node, else the GPUs this node
+        sees, which in a batch step are the ones Slurm gave it."""
         if self.devices_per_process is not None or self.port is not None \
                 or self.coordinator is not None:
             raise ValueError(
@@ -214,7 +215,10 @@ class Launch:
                 "--devices-per-process, --port and --coordinator")
         tasks = self.processes_per_host
         if tasks is None and "SLURM_NTASKS_PER_NODE" not in os.environ:
-            tasks = local_gpu_count() or None
+            per_node = os.environ.get("SLURM_GPUS_PER_NODE")
+            # --gpus-per-node reads `[type:]count`, several types separated by commas.
+            tasks = (sum(int(part.rsplit(":", 1)[-1]) for part in per_node.split(","))
+                     if per_node else local_gpu_count()) or None
         argv = ["srun", "--kill-on-bad-exit=1", "--export=ALL"]
         if tasks is not None:
             argv.append(f"--ntasks-per-node={tasks}")
