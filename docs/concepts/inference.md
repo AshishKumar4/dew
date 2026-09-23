@@ -133,4 +133,39 @@ Prepared inputs must belong to the task's mesh. A preparation on the source grid
 
 ## Serving
 
-Dew does not include a server. Export with `Pretrained.save` and serve the checkpoint with vLLM or Ollama. `OllamaCompletion` and `OpenAICompletion` use those projects' official clients. Their results keep the backend's metadata and do not make up native raw-policy or behavior-policy likelihoods.
+`dew.inference.serving.Server` runs continuous batching over one resident KV cache: `Server.from_task(task, slots=, capacity=)` admits queued requests into free rows while the other rows keep decoding. With the default dense cache every served request draws the tokens it would draw alone. The cache layout is `dew.nn.kv_cache.KVCache`, passed as `kv_cache=` to `from_task` (or set as a `CausalTransformer`'s `kv_cache` field for `TextGeneration`):
+
+- `KVCache(page_size=16, pages=N)` pages the cache. All rows share one pool of `N` pages, and a request is admitted once the pool can hold its prompt and budget, so the pool is sized to memory rather than to `slots * capacity`. Outside a server, leave `pages` unset: nothing hands out a smaller pool, and a row that would write past it fails its request.
+- `KVCache(quantized="int8")` stores keys and values in eight bits with one float32 scale per token and head, and rotates the keys by a Hadamard matrix first, which needs a power-of-two `head_dim`. `quantized="float8_e4m3fn"` stores unrotated e4m3 at any `head_dim`. Either works dense or paged. Prefer int8: in the table below it keeps perplexity within the kernel noise floor on both checkpoints, while float8 does not.
+- `chunk=256` prefills a long prompt in pieces, one piece per step, so rows that are already decoding are not held up behind it. It needs a paged cache.
+- `prefix_cache=True` shares full prompt pages between requests that begin with the same tokens, hashing each page together with everything before it. It needs a paged cache. `Server.reload` stops sharing the pages the old weights wrote.
+- `Sample(guided.json_schema(tokenizer, schema, eos_id))` or `Sample(guided.regex(tokenizer, pattern, eos_id))` as the task's strategy keeps every draw inside the grammar, served or not. The automaton comes from `outlines-core` (`pip install dew-ml[guided]`), and a transform that forces a token the grammar forbids fails the request.
+
+On TPU, a paged bfloat16 cache decodes through the Pallas kernel `jax.experimental.pallas.ops.tpu.paged_attention`. It runs when the layer's `attention_impl` is `'auto'` or `'tpu'` and the decode mask is exactly the rows' filled slots: no window, sinks, image groups, pairwise mask or QK-Clip sow. Every other paged decode gathers its pages and runs the ordinary attention kernels. GPUs always take the gather, because jax deprecated its Triton paged kernel (`ops.gpu.paged_attention`), which on an A100 ran at 5967 tokens/s against the gather's 5848.
+
+Quality, measured on one A100-SXM4-40GB with bf16 weights over 51,100 wikitext-2 test tokens (100 sequences of 512). Each sequence prefills its first half and then decodes the second half one token per step through the cache. Every row is compared with the dense bf16 cache. The noise-floor row is the same dense cache under the `'xla'` attention kernel instead of cuDNN. Greedy agreement is over 32 continuations of 256 tokens from 128-token prompts:
+
+| Checkpoint | Cache | Perplexity | Δ perplexity | mean \|Δ log p\| | max \|Δ log p\| | Greedy identical |
+|---|---|---|---|---|---|---|
+| SmolLM2-135M | dense bf16 | 20.397 | | | | |
+| | noise floor (xla kernel) | 20.394 | -0.003 | 0.017 | 0.59 | 20/32 |
+| | paged | 20.397 | 0.000 | 0.000 | 0.00 | 32/32 |
+| | int8 | 20.398 | +0.001 | 0.022 | 1.04 | 16/32 |
+| | float8 | 20.442 | +0.046 | 0.058 | 1.62 | 11/32 |
+| Qwen3-0.6B | dense bf16 | 27.824 | | | | |
+| | noise floor (xla kernel) | 27.832 | +0.008 | 0.019 | 0.80 | 15/32 |
+| | paged | 27.824 | 0.000 | 0.000 | 0.00 | 32/32 |
+| | int8 | 27.832 | +0.008 | 0.052 | 4.01 | 12/32 |
+| | float8 | 27.798 | -0.025 | 0.087 | 3.29 | 3/32 |
+
+Paged and dense int8 give identical numbers, so the paged rows cover both. The float8 rows come from an earlier run of the same protocol (batch 20, no noise-floor row) over the unrotated float8 code that ships. Without the rotation, int8 cost Qwen3-0.6B +0.665 perplexity; rotating float8 keys cost it +1.03.
+
+Throughput, measured on the same A100 with a randomly initialized 12-layer, 1024-wide bf16 decoder (jax 0.11.1):
+
+- Mixed traffic: 48 requests of 32-480 prompt tokens and 128 draws each, 16 slots of 1024. Dense ran at 6360 tokens/s on a 192 MiB cache. Paged ran at 6223 tokens/s on the same memory, and at 4767 tokens/s on a 72 MiB pool, where requests queue for pages. Over the same 192 MiB pool, 48 slots ran at 7540 tokens/s.
+- int8 and float8 took 102 MiB and ran at 5123-5225 and 5034-5101 tokens/s. Over a pool of the same 205 MiB, 48 slots ran at 10716 tokens/s with int8 and 8296 with float8.
+- Chunked prefill: six 1800-token prompts arrived among 16 decoding rows. `chunk=256` cut the longest step from 31.5 ms to 7.6 ms and raised throughput from 2797 to 2952 tokens/s.
+- Prefix cache: 32 requests shared a 1024-token prefix. `prefix_cache` reused 16384 prompt tokens and raised throughput from 1927 to 2562 tokens/s.
+- Guided decoding, with GPT-2's vocabulary and a three-field JSON schema: 16 of 16 guided rows parsed and validated, against 0 of 16 unguided. The automaton compiled in 0.74 s into 192 states by 166 token classes, and a guided step ran at 4278 against 6515 tokens/s.
+
+To serve with vLLM or Ollama instead, export with `Pretrained.save`. `OllamaCompletion` and `OpenAICompletion` use those projects' official clients. Their results keep the backend's metadata and do not make up native raw-policy or behavior-policy likelihoods.
