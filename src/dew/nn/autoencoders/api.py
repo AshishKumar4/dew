@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 
 from dew.objectives.base import Variables
 
@@ -72,3 +73,23 @@ class AutoEncoder(ABC):
                  key: jax.Array | None = None) -> jnp.ndarray:
         """Encode then decode."""
         return self.decode(params, self.encode(params, x, key=key))
+
+
+class ModuleAutoEncoder[M: nn.Module](AutoEncoder):
+    """A frozen flax autoencoder module and the params it loaded. The
+    module's `encode(x, key)` and `decode(z)` each take one batch of frames,
+    and each runs as one jitted `apply`."""
+
+    def __init__(self, model: M, params: Variables):
+        self.model = model
+        self.params = params
+        self.encode_single_frame = jax.jit(lambda params, image, key=None: model.apply(
+            {"params": params}, image, key, method=model.encode))
+        self.decode_single_frame = jax.jit(lambda params, latent: model.apply(
+            {"params": params}, latent, method=model.decode))
+
+    def encode_batch(self, params, x, key=None):
+        return self.encode_single_frame(params, x, key)
+
+    def decode_batch(self, params, z):
+        return self.decode_single_frame(params, z)

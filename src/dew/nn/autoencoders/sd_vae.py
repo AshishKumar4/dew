@@ -2,12 +2,12 @@
 import jax
 import jax.numpy as jnp
 
-from .api import AutoEncoder
+from .api import ModuleAutoEncoder
 from .kl import AutoencoderKL
 from .vae import load_pretrained_vae
 
 
-class StableDiffusionVAE(AutoEncoder):
+class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
     """Frozen native AutoencoderKL variables and their latent normalization."""
 
     def __init__(self, modelname="CompVis/stable-diffusion-v1-4", revision="bf16",
@@ -34,24 +34,13 @@ class StableDiffusionVAE(AutoEncoder):
             latent_scale = config.get("scaling_factor", 0.18215) if latent_scale is None else latent_scale
         if params is None:
             raise ValueError("A native autoencoder requires explicit parameters")
-        self.model = model
-        self.params = params
+        super().__init__(model, params)
         self.latent_shift = 0.0 if latent_shift is None else latent_shift
         self.latent_scale = 0.18215 if latent_scale is None else latent_scale
-        self.encode_single_frame = jax.jit(lambda params, image, key=None: self.model.apply(
-            {"params": params}, image, key, method=self.model.encode))
-        self.decode_single_frame = jax.jit(lambda params, latent: self.model.apply(
-            {"params": params}, latent, method=self.model.decode))
         frame = jax.ShapeDtypeStruct((1, 128, 128, model.image_channels), dtype)
         latent = jax.eval_shape(self.encode_single_frame, self.params, frame)
         self._downscale_factor = frame.shape[1] // latent.shape[1]
         self._latent_channels = latent.shape[-1]
-
-    def encode_batch(self, params, x, key=None):
-        return self.encode_single_frame(params, x, key)
-
-    def decode_batch(self, params, z):
-        return self.decode_single_frame(params, z)
 
     @property
     def downscale_factor(self) -> int:
