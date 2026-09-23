@@ -342,17 +342,22 @@ def parameter_path(path) -> Suffix:
     return tuple(reversed(names))
 
 
-def _matching(table, module: Suffix):
-    for length in range(len(module), 0, -1):
-        if module[-length:] in table:
-            return module[-length:]
+def _matching(table, names: Suffix):
+    for length in range(len(names), 0, -1):
+        if names[-length:] in table:
+            return names[-length:]
     return None
 
 
 def declared_axes(path, ndim: int) -> LogicalAxes | None:
-    """The declared axes of the parameter at `path`, or None for an unnamed one."""
-    module = parameter_path(path)[:-1]
-    suffix = _matching(DECLARED, module)
+    """The declared axes of the parameter at `path`, or None for an unnamed one.
+
+    A declaration names a module, whose parameters share its axes, or one
+    parameter under its module, for a module whose leaves have different
+    axes (GPT OSS's fused experts). The parameter's own path is tried first.
+    """
+    names = parameter_path(path)
+    suffix = _matching(DECLARED, names) or _matching(DECLARED, names[:-1])
     if suffix is None:
         return None
     axes = DECLARED[suffix]
