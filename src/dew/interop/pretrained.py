@@ -1042,14 +1042,20 @@ class Pretrained:
               and not decoders._FAMILIES[family].preserve_source_layout and quantization is None):
             # A family that derives its export from the model is written by
             # the decoder export, which writes the whole directory: weights,
-            # the config it derives, this processor's files and this
-            # generation config. One export path, so a decoder saved here and
-            # one saved directly leave the same files behind. A quantized
-            # source is not derived: its packed format goes back over the
-            # source names, so it takes the layout writer below.
+            # this processor's files and this generation config, and a
+            # config replaced below by the source's. One export path, so a
+            # decoder saved here and one saved directly leave the same
+            # weights behind. A quantized source is not derived: its packed
+            # format goes back over the source names, so it takes the layout
+            # writer below.
             decoders.save_pretrained_decoder(self.model, values, destination,
                                              tokenizer=self.processor,
                                              generation_config=generation_config)
+            # The derived config states this load's runtime context as
+            # max_position_embeddings and respells the rest; the model is
+            # the source's, so its config.json goes back as published.
+            with open(destination / "config.json", "w") as handle:
+                json.dump(dict(self.config), handle, indent=2)
             return
         elif self.weight_layouts:
             # Source names and geometry first; the packed format goes back over them.

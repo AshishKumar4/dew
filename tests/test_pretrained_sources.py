@@ -381,3 +381,21 @@ def test_the_pipeline_places_a_source_in_its_own_dtype(tmp_path):
 
     assert leaf_dtypes(task.variables) == {np.dtype(ml_dtypes.bfloat16)}
 
+
+@pytest.mark.parametrize("name", ["qwen3-tiny", "llama-tiny", "mistral-tiny", "gemma3-tiny",
+                                  "olmo3-yarn-tiny", "mixtral-tiny", "deepseek-v3-tiny"])
+def test_a_saved_source_writes_its_config_back_unchanged(tmp_path, name):
+    """Qwen/Qwen3-0.6B states max_position_embeddings 40960 and loads at the
+    8192-token cache Dew allocates by default; the export's config is the
+    source's, so a server reading it (vLLM's --max-model-len) sees 40960 and
+    every other field as published."""
+    source = tmp_path / "source"
+    shutil.copytree(FIXTURES / name, source)
+    config = {**fixture_config(name), "max_position_embeddings": 40960}
+    (source / "config.json").write_text(json.dumps(config))
+
+    loaded = pretrained.load_pretrained(source, dtype="float32", attention_impl="xla")
+    loaded.save(tmp_path / "saved")
+
+    assert loaded.model.max_seq_len == 8192
+    assert json.loads((tmp_path / "saved" / "config.json").read_text()) == config
