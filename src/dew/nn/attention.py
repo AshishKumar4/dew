@@ -492,7 +492,7 @@ def sequence_parallel_attention(kernel, query, key, value, shards: int, *, causa
     window, which cuDNN and splash skip block by block, while the gather
     hands its kernel a striped explicit mask that no kernel skips: cuDNN runs
     it as a dense bias over every logit, twice the causal work. On a pair of
-    RTX 3090s the gather took 2.0 to 3.9 times the all-to-all's time for
+    RTX 3090s the gather took 2.0 to 4.0 times the all-to-all's time for
     causal grouped-query attention at 4k to 64k tokens (the tables in
     docs/guides/multi-node.md). The all-to-all also never sends more bytes
     for such a call (`all_to_all_moves_less`). A call with no mask does the
