@@ -45,8 +45,15 @@ TRUTH_KEY = "ground_truth"
 INFO_KEY = "extra_info"
 """Batch key holding the reward's extra context as UTF-8 bytes."""
 
-FIELDS = ("prompt", "data_source", "ground_truth", "extra_info", "tools")
-"""The row fields the source reads; anything else raises."""
+FIELDS = ("prompt", "data_source", "ground_truth", "extra_info", "tools", "reward_model", "ability",
+          "agent_name")
+"""The row fields the source reads; anything else raises.
+
+verl's RL parquet (`rl_dataset.py`, `reward_loop/reward_manager/naive.py`
+L42-L46 at 12ebe0c) nests the answer as `reward_model.ground_truth` and
+keeps `tools_kwargs` inside `extra_info`. `ability` and `agent_name` (which
+of verl's agent loops runs the row, a choice a Dew rollout source makes) are
+read and dropped."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,6 +82,18 @@ def _text(value: object) -> str:
     except TypeError:
         raise ValueError(
             f"a reward column holds text or a JSON value, got {value!r}") from None
+
+
+def _ground_truth(row: Mapping[str, object], where: str) -> str:
+    """The reference answer: top-level, or verl's `reward_model.ground_truth`."""
+    nested = row.get("reward_model")
+    if nested is None:
+        return _text(row.get("ground_truth"))
+    if not isinstance(nested, Mapping):
+        raise ValueError(f"{where}: reward_model is an object holding ground_truth, got {nested!r}")
+    if row.get("ground_truth") is not None:
+        raise ValueError(f"{where}: ground_truth is both top-level and in reward_model")
+    return _text(nested.get("ground_truth"))
 
 
 def _prompt_ids(tokenizer: str, prompt: object, tools: object, origin: str,
@@ -155,7 +174,7 @@ class PromptSource:
                 prompt=row["prompt"],
                 tools=row.get("tools"),
                 data_source=_text(row.get("data_source")),
-                ground_truth=_text(row.get("ground_truth")),
+                ground_truth=_ground_truth(row, where),
                 extra_info=_text(row.get("extra_info"))))
         if not normalized:
             raise ValueError(f"{origin} holds no prompts")
