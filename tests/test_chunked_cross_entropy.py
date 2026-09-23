@@ -406,27 +406,36 @@ def test_a_zero_cotangent_leaves_both_gradients_at_zero():
 def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
     """257 tokens is three tiles; rounding per tile would lose the last ones.
 
-    A bf16 head gradient rounds once at the end, which 1e-5 would not admit.
+    Held to an fp32 oracle on the same values: a gradient in `dtype` that
+    rounds once, at the end, is within half its ulp of it, plus fp32 sum
+    noise; rounding each tile's partial sum adds up to half an ulp per tile.
+    The products run at HIGHEST, so the logits' cotangent is not rounded to
+    bf16 inside them, which moves a cancelling sum by more than an ulp.
+    Comparing against a gradient rounded to `dtype` would count two
+    roundings, and a near-tie then differs by a whole ulp.
     """
     hidden, head, targets = inputs(vocab=17, features=7, tokens=(257,), dtype=dtype)
     head = head.astype(dtype)
+    precision = jax.lax.Precision.HIGHEST
 
     def full(states, matrix):
-        return jnp.mean(oracle(states, matrix, targets)[0])
+        return jnp.mean(oracle(states, matrix, targets, precision=precision)[0])
 
     def tiled(states, matrix):
-        return jnp.mean(
-            chunked_cross_entropy(states, matrix, targets, 4, tile=RAGGED)[0])
+        return jnp.mean(chunked_cross_entropy(
+            states, matrix, targets, 4, tile=RAGGED, precision=precision)[0])
 
-    expected = jax.grad(full, argnums=(0, 1))(hidden, head)
+    expected = jax.grad(full, argnums=(0, 1))(hidden.astype(jnp.float32),
+                                              head.astype(jnp.float32))
     got = jax.grad(tiled, argnums=(0, 1))(hidden, head)
 
     assert got[0].dtype == hidden.dtype and got[1].dtype == head.dtype == dtype
     for name, want, have in zip(("hidden", "head"), expected, got):
-        want, have = want.astype(jnp.float32), have.astype(jnp.float32)
         largest = jnp.abs(want).max()
         assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
-        assert jnp.abs(have - want).max() <= 1e-4 * largest, name
+        half_ulp = jnp.spacing(jnp.abs(want).astype(dtype)).astype(jnp.float32) / 2
+        noise = 1e-6 * largest
+        assert bool(jnp.all(jnp.abs(have.astype(jnp.float32) - want) <= half_ulp + noise)), name
 
 
 @pytest.mark.parametrize("tie_embeddings", [True, False])
