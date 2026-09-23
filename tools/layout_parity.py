@@ -58,10 +58,6 @@ sys.path.insert(0, str(REPO / "tools"))
 
 FLOOR_FACTOR = 4.0
 PERMUTATIONS = 16
-ANCHOR_LIMIT = 1e-2
-"""A reference leaf farther than this from the fp64 step, or a floor wider
-than this, is not fp32's rounding but another computation, which no floor
-may absorb."""
 
 LAYOUTS: dict[str, dict[str, int]] = {
     "data4": {},
@@ -315,6 +311,30 @@ def exact(case, reference_gradient) -> dict[str, float]:
     return leaf_errors(gradient, reference_gradient)
 
 
+def rounding_limit(dtype: str) -> float:
+    """The farthest the reference may sit from the fp64 step, and the widest
+    a floor may be, and still be the compute dtype's rounding of the step:
+    the square root of its machine epsilon, where a reassociation has cost
+    half the significand (3.5e-4 for fp32, 8.8e-2 for bf16). Past it, two
+    runs compute different steps, which no floor may absorb."""
+    import jax.numpy as jnp
+
+    return float(jnp.finfo(dtype).eps) ** 0.5
+
+
+def widest_floor(floors: dict[str, float], dtype: str) -> str:
+    """The leaf with the widest floor, refused past `rounding_limit`: a floor
+    that wide passes any layout at its leaf, and where the floor is data
+    parallelism's own deviation, it would pass that layout's own defect."""
+    widest = max(floors, key=floors.__getitem__)
+    limit = rounding_limit(dtype)
+    if floors[widest] > limit:
+        raise ValueError(
+            f"the floor at {widest} is {floors[widest]:.2e}, past {dtype} rounding "
+            f"({limit:.1e}), so no layout of this model can be judged by it")
+    return widest
+
+
 def judged(errors: dict[str, float], floors: dict[str, float], loss: float,
            loss_floor: float, reference_loss: float) -> dict[str, Any]:
     """Every leaf against FLOOR_FACTOR times its floor, fp32 epsilon at least."""
@@ -354,19 +374,13 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
             if anchor and reassociates(case):
                 rounding = exact(case, ref_gradient)
                 farthest = max(rounding, key=rounding.__getitem__)
-                if rounding[farthest] > ANCHOR_LIMIT:
+                if rounding[farthest] > rounding_limit(dtype):
                     raise ValueError(
-                        f"the fp32 reference is {rounding[farthest]:.2e} from the fp64 step at "
-                        f"{farthest}, past fp32 rounding ({ANCHOR_LIMIT:.0e}): the two compute "
-                        f"different steps, so the anchor cannot bound the layouts")
+                        f"the {dtype} reference is {rounding[farthest]:.2e} from the fp64 step at "
+                        f"{farthest}, past {dtype} rounding ({rounding_limit(dtype):.1e}): the two "
+                        f"compute different steps, so the anchor cannot bound the layouts")
                 floors = {leaf: max(value, rounding[leaf]) for leaf, value in floors.items()}
-            widest = max(floors, key=floors.__getitem__)
-            if floors[widest] > ANCHOR_LIMIT:
-                # A floor this wide passes any layout: the reference's own
-                # steps differ by more than fp32 rounding moves a sum.
-                raise ValueError(
-                    f"the floor at {widest} is {floors[widest]:.2e}, past fp32 rounding "
-                    f"({ANCHOR_LIMIT:.0e}), so no layout of this model can be judged by it")
+            widest = widest_floor(floors, dtype)
         except Exception as error:  # no reference judges no layout: the model's one row
             rows.append({"model": model, "layout": "reference", "processes": jax.process_count(),
                          "status": "error", "error": f"{type(error).__name__}: {error}"[:2000],
