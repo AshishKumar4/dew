@@ -30,7 +30,7 @@ from flax.typing import PrecisionLike
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
-from dew.nn.precision import head_product, rounds_to_bf16
+from dew.nn.precision import head_product, rounded_operand, rounds_to_bf16
 
 
 def vocabulary_chunks(vocab_size: int, chunks: int) -> tuple[tuple[int, int], ...]:
@@ -236,13 +236,13 @@ def _bounded_head_bwd(chunks, tile, precision, predict, residuals, cotangents):
 
     def columns(first, gradients, width):
         d_states, d_table, d_cap = gradients
-        matrix = jax.lax.dynamic_slice_in_dim(
-            table, first, width, axis=0).astype(operands).astype(jnp.float32)
+        matrix = rounded_operand(jax.lax.dynamic_slice_in_dim(
+            table, first, width, axis=0).astype(jnp.float32), operands)
 
         def tokens(start, carry, size):
             d_states, d_matrix, d_cap = carry
-            states = jax.lax.dynamic_slice_in_dim(
-                flat, start, size).astype(operands).astype(jnp.float32)
+            states = rounded_operand(jax.lax.dynamic_slice_in_dim(
+                flat, start, size).astype(jnp.float32), operands)
             token_z = jax.lax.dynamic_slice_in_dim(partitions, start, size)
             token_loss = jax.lax.dynamic_slice_in_dim(d_loss, start, size)
             token_partition = jax.lax.dynamic_slice_in_dim(d_partition, start, size)

@@ -107,8 +107,17 @@ def scaled(x: jax.Array, factor: float) -> jax.Array:
 def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype, with a
     straight-through tangent: the rounding is the forward's, and a gradient
-    through it keeps its dtype and is never rounded a second time."""
-    return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
+    through it keeps its dtype and is never rounded a second time.
+
+    `jax.lax.reduce_precision` rounds to nearest even at `dtype`'s exponent
+    and mantissa widths, the value a cast to `dtype` and back gives, as one
+    op: XLA's GPU default `xla_allow_excess_precision` may delete a cast
+    round trip under jit, and then nothing would round.
+    """
+    if jnp.dtype(dtype).itemsize >= jnp.dtype(x.dtype).itemsize:
+        return x
+    info = jnp.finfo(dtype)
+    return jax.lax.reduce_precision(x, exponent_bits=info.nexp, mantissa_bits=info.nmant)
 
 
 @rounded_operand.defjvp
