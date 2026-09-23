@@ -52,7 +52,7 @@ from ..hyper_connections import (
     mix_streams,
 )
 from ..inputs import AttentionMetadata, PredictionPhase
-from ..kv_cache import KVCache
+from ..kv_cache import KVCache, is_paged
 from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..mla import INDEXER_COLLECTION, YarnScaling
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
@@ -2735,8 +2735,7 @@ def gather_cache_rows(cache, rows):
     share through their page tables, so gathered rows would write into each
     other's pages; it is refused.
     """
-    for path, _ in jax.tree_util.tree_leaves_with_path(cache):
-        if any(getattr(entry, "key", None) == "page_table" for entry in path):
-            raise ValueError("beam search and speculative decoding regroup cache rows, which a "
-                             "paged cache's shared pool cannot do; decode them with a dense cache")
+    if is_paged(cache):
+        raise ValueError("beam search and speculative decoding regroup cache rows, which a "
+                         "paged cache's shared pool cannot do; decode them with a dense cache")
     return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)

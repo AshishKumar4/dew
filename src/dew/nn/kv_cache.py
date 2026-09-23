@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from collections.abc import Mapping
 from typing import Literal
 
 import jax
@@ -63,11 +64,16 @@ _LIMITS = {"int8": 127.0, "float8_e4m3fn": float(jnp.finfo(jnp.float8_e4m3fn).ma
 
 def leaf_name(path: tuple[jax.tree_util.KeyEntry, ...]) -> str | None:
     """The variable name a cache leaf's path ends in."""
-    last = path[-1] if path else None
-    return last.key if isinstance(last, jax.tree_util.DictKey) and isinstance(last.key, str) else None
+    if not path:
+        return None
+    last = path[-1]
+    if not isinstance(last, jax.tree_util.DictKey):
+        return None
+    name = last.key
+    return name if isinstance(name, str) else None
 
 
-def is_paged(cache: object) -> bool:
+def is_paged(cache: Mapping[str, object]) -> bool:
     """Whether any layer of `cache` keeps a paged pool."""
     return any(leaf_name(path) == TABLE for path, _ in jax.tree_util.tree_leaves_with_path(cache))
 

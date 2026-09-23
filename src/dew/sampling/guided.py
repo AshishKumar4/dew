@@ -141,18 +141,18 @@ def json_schema(tokenizer: Vocabulary | Referencing | Tokenizing, schema: str | 
     `whitespace` is the regex the separators may match, None taking
     outlines' default of at most one space.
     """
-    from outlines_core.json_schema import build_regex_from_schema
+    from outlines_core import json_schema as schemas
 
     text = schema if isinstance(schema, str) else json.dumps(schema)
-    return regex(tokenizer, build_regex_from_schema(text, whitespace), eos_id, vocab_size)
+    return regex(tokenizer, schemas.build_regex_from_schema(text, whitespace), eos_id, vocab_size)
 
 
 def _tables(transitions: Mapping[int, Mapping[int, int]], initial: int, finals: set[int],
             stops: tuple[int, ...], width: int) -> Grammar:
     """Number the states densely and group tokens with equal columns into classes."""
-    names = [initial] + sorted((set(transitions) | set(finals)
+    names = [initial, *sorted((set(transitions) | set(finals)
                                 | {state for row in transitions.values() for state in row.values()})
-                               - {initial})
+                               - {initial})]
     number = {name: order for order, name in enumerate(names)}
     columns: dict[int, list[tuple[int, int]]] = {}
     for state, row in transitions.items():
