@@ -27,6 +27,7 @@ from dew.objectives.rl.sessions import (
     chains,
     pack,
     sampled_values,
+    session_metrics,
 )
 
 
@@ -171,6 +172,29 @@ def test_sampled_values_scatter_per_call_values_in_call_order():
     batch = pack(rollouts, 64)
     placed = sampled_values(batch, lambda index, number: rollouts[index].calls[number].behavior_log_probs)
     np.testing.assert_array_equal(placed, batch[BEHAVIOR_LOG_PROBS_KEY])
+
+
+def test_session_metrics_report_merge_masking_reward_latency_and_lag():
+    first = Call((1, 2), (3,), (-.1,), "tool_calls", 4)
+    merged = Call((1, 2, 3, 7), (8, 9), (-.2, -.3), "stop", 5)
+    rewritten = Call((1, 5), (6,), (-.4,), "stop", 5)
+    rollouts = [
+        Session("t", "g", 0, 0, (first, merged), Status.COMPLETED, 1.0, {"tests": 1.0}),
+        Session("t", "g", 1, 0, (first, rewritten), Status.AGENT_ERROR, 0.0, {"tests": 0.0}),
+        Session("t", "g", 2, 0, (first,), Status.TRUNCATED, None),
+        Session("u", "g", 3, 0, (first, merged), Status.INFRA_ERROR, None),
+    ]
+    batch = pack(rollouts, 8)
+    metrics = session_metrics(rollouts, batch, source=lambda rollout: rollout.task,
+                              latencies=[1.0, 2.0, 3.0, 40.0], version=6)
+    assert metrics["merge/calls_per_chain"] == pytest.approx(4 / 3)
+    assert metrics["status/completed"] == metrics["status/truncated"] == .25
+    assert metrics["masked/truncated"] == pytest.approx(1 / 9)
+    assert metrics["masked/infra_error"] == pytest.approx(3 / 9)
+    assert metrics["reward/mean"] == .5 and metrics["reward/t"] == .5 and "reward/u" not in metrics
+    assert metrics["reward/component/tests"] == .5
+    assert metrics["latency/max"] == 40.0 and metrics["latency/p50"] == 2.5
+    assert metrics["lag/max"] == 2 and metrics["lag/mean"] == pytest.approx((2 + 1 + 1 + 2 + 1) / 5)
 
 
 def test_each_sampled_id_weighs_one_over_its_rollouts_sampled_count():
