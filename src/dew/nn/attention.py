@@ -23,7 +23,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 from .attention_sinks import attention_with_sinks
 from .kernels.generation import bf16_dot_runs
 from .kv_cache import Append, KVCache, KVStore, filled_slots
-from .precision import precision_names
+from .precision import precision_names, rounded_to
 from .rope import apply_rotary
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, logical_axes, row_axes, sequence_shards
 
@@ -199,8 +199,8 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     else:
         # The reference rounds every step to the input dtype. XLA fuses the
         # chain and carries fp32 between the ops, so each rounding is explicit.
-        y = _rounded(x * _rounded(jax.lax.rsqrt(_rounded(
-            _rounded(jnp.mean(_rounded(jnp.square(x), x.dtype), axis=-1, keepdims=True), x.dtype)
+        y = rounded_to(x * rounded_to(jax.lax.rsqrt(rounded_to(
+            rounded_to(jnp.mean(rounded_to(jnp.square(x), x.dtype), axis=-1, keepdims=True), x.dtype)
             + epsilon, x.dtype)), x.dtype), x.dtype)
     if scale is None:
         # A pure normalization with no learned weight, as Gemma 4 norms
@@ -213,14 +213,8 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
         # that the next layer rounds. Rounding in place keeps both roundings
         # under jit, where XLA drops a narrowing cast that a widening one
         # follows, and keeps the weight's product and gradient in fp32.
-        return _rounded(_rounded(y, dtype) * weight, dtype).astype(dtype)
+        return rounded_to(rounded_to(y, dtype) * weight, dtype).astype(dtype)
     return (y * weight).astype(dtype)
-
-
-def _rounded(x, dtype):
-    """Round `x` to `dtype`'s precision, keeping its own dtype."""
-    bits = jnp.finfo(dtype)
-    return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4))

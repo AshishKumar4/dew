@@ -103,6 +103,23 @@ def scaled(x: jax.Array, factor: float) -> jax.Array:
         return x
     return (x.astype(jnp.promote_types(x.dtype, jnp.float32)) * factor).astype(x.dtype)
 
+
+def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
+    """`x` rounded to `dtype`'s precision and held in `x`'s own dtype: where a
+    torch computation stores a tensor of `dtype`. Under jit XLA's GPU default
+    `xla_allow_excess_precision` deletes a narrowing cast that a widening one
+    follows, so a bare cast does not keep the rounding. `reduce_precision`
+    does, but flushes float16 subnormals, so float16 rounds by the cast
+    itself behind an optimization barrier (`rounded_operand`'s round trip).
+    Either way the derivative rounds as the value does, so a tangent or
+    cotangent rounds where the value does, as the gradient of a torch tensor
+    of `dtype` is one."""
+    if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
+        return jax.lax.optimization_barrier(x.astype(dtype)).astype(x.dtype)
+    bits = jnp.finfo(dtype)
+    return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
+
+
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
 def rounded_operand(x: jax.Array, dtype: Dtype) -> jax.Array:
     """The value `x` takes in `dtype`, held in `x`'s own dtype, with a

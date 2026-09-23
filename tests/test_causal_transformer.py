@@ -9,6 +9,7 @@ layers, the Gemma flags) and the param tree the interop map renames.
 
 import functools
 import math
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -954,6 +955,77 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
     np.testing.assert_array_equal(np.asarray(out), expected)
     grad = np.asarray(jax.jit(jax.grad(loss))(weight), np.float64)
     assert np.max(np.abs(grad - expected_grad)) <= 1e-5 * np.max(np.abs(expected_grad))
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "geglu", "geglu_exact"])
+def test_the_gated_product_rounds_where_transformers_rounds_under_jit(activation):
+    """transformers' gated MLP computes act_fn(gate) * up on bf16 tensors:
+    the activation in fp32 rounded to bf16, then the product rounded again,
+    and its backward rounds the gradient of each bf16 tensor. The fixture is
+    Torch 2.14's product and gradients of gate and up for a bf16 cotangent
+    (tools/gated_product_reference.py), on elements whose roundings no fp32
+    exp, tanh or erf can tip. Under jit XLA kept neither cast of
+    `act(gate) * up`, carrying fp32 through the chain: on Qwen3-0.6B's
+    first three layers a third of the products differed from transformers'
+    by up to 2 ulp while its norms and residual adds matched bit for bit."""
+    from dew.nn.moe import gated_product
+
+    fixture = np.load(Path(__file__).parent / "fixtures" / "gated_product" / "bf16.npz")
+    gate, up, cotangent = (jnp.asarray(fixture[f"{activation}/{key}"], jnp.bfloat16)
+                           for key in ("gate", "up", "cotangent"))
+
+    def forward_and_backward(gate, up, cotangent):
+        output, pull = jax.vjp(gated_product(activation), gate, up)
+        return (output, *pull(cotangent))
+
+    results = jax.jit(forward_and_backward)(gate, up, cotangent)
+    for key, value in zip(("output", "d_gate", "d_up"), results, strict=True):
+        assert value.dtype == jnp.bfloat16
+        np.testing.assert_array_equal(np.asarray(value, np.float32), fixture[f"{activation}/{key}"],
+                                      err_msg=key)
+
+
+@pytest.mark.parametrize("activation", ["swiglu", "geglu", "geglu_exact"])
+def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(activation):
+    """An expert's gate and up come out of `expert_projection`, whose fp32
+    sum XLA can carry into the activation past the sum's bf16 cast. One
+    expert takes the fixture's gate g and up u through projections that sum
+    each with an eighth of its bf16 ulp, which rounds back to g and u only
+    if the projection's rounding survives, and a down projection that hands
+    the product out unchanged: the MLP's output and its input's gradient
+    must be Torch's product and gradients of the same gate and up."""
+    from dew.nn.moe import ExpertMLP
+
+    fixture = np.load(Path(__file__).parent / "fixtures" / "gated_product" / "bf16.npz")
+    tokens, width = 16, 128
+    gate, up, cotangent, output, d_gate, d_up = (
+        np.asarray(fixture[f"{activation}/{key}"], np.float32).reshape(tokens, width)
+        for key in ("gate", "up", "cotangent", "output", "d_gate", "d_up"))
+
+    def eighth_ulp(values):
+        magnitude = np.abs(values)
+        exponent = np.floor(np.log2(np.where(magnitude > 0, magnitude, 1.0)))
+        return np.where(magnitude > 0, np.sign(values) * 2.0 ** (exponent - 10), 0.0).astype(np.float32)
+
+    eye, zero = np.eye(width, dtype=np.float32), np.zeros((width, width), np.float32)
+    kernels = {"gate_proj": np.vstack([eye, eye, zero, zero]), "up_proj": np.vstack([zero, zero, eye, eye]),
+               "down_proj": np.hstack([eye, zero, zero, zero])}
+    variables = {"params": {name: {"kernel": jnp.asarray(np.stack([kernel] * 2))}
+                            for name, kernel in kernels.items()}}
+    model = ExpertMLP(2, width, 4 * width, activation=activation, dtype=jnp.bfloat16)
+    x = jnp.asarray(np.hstack([gate, eighth_ulp(gate), up, eighth_ulp(up)]), jnp.bfloat16)
+    weights, indices = jnp.ones((tokens, 1), jnp.float32), jnp.zeros((tokens, 1), jnp.int32)
+    slot_cotangent = jnp.asarray(np.hstack([cotangent] + [np.zeros_like(cotangent)] * 3), jnp.bfloat16)
+
+    def forward_and_backward(x, cotangent):
+        out, pull = jax.vjp(lambda x: model.apply(variables, x, weights, indices), x)
+        return out, pull(cotangent)[0]
+
+    out, dx = jax.jit(forward_and_backward)(x, slot_cotangent)
+    np.testing.assert_array_equal(np.asarray(out, np.float32),
+                                  np.hstack([output] + [np.zeros_like(output)] * 3), err_msg="output")
+    np.testing.assert_array_equal(np.asarray(dx, np.float32), np.hstack([d_gate, d_gate, d_up, d_up]),
+                                  err_msg="input gradient")
 
 
 def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head():
