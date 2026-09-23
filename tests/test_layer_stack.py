@@ -440,8 +440,12 @@ def test_decoding_under_a_stage_axis_is_refused():
 
 @mesh_lane
 def test_a_layout_rule_onto_the_stage_axis_is_refused():
+    """The stage axis holds the pipeline's stages of the stored tree, so a
+    rule that would place a parameter on it is refused where it would."""
+    variables = jax.eval_shape(tiny().init, jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
     with pytest.raises(ValueError, match="stage axis holds the pipeline"):
-        Layout(rules={"mlp": "stage"})
+        Layout(rules={"mlp": "stage"}, min_shard=1).shardings(
+            build_mesh(MeshSpec(fsdp=4, stage=2)), variables)
 
 
 def test_scanned_dropout_uses_the_supplied_rng():
