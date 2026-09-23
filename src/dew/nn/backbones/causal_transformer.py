@@ -57,6 +57,7 @@ from ..mixers import AttentionMixer, MixerBase, MixerContext, mixer_from_record
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION, YarnScaling
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
+from ..precision import scaled
 from ..sharding import STAGE_AXIS, logical_axes, microbatches, pipeline_stages
 
 
@@ -770,9 +771,7 @@ class DecoderBlock(nn.Module):
     def _scaled_branch(self, branch):
         """A sublayer's output times `residual_multiplier` (lm-engine's
         m_residual, GraniteMoeHybrid's residual_multiplier), in its own dtype."""
-        if self.residual_multiplier == 1.0:
-            return branch
-        return branch * jnp.asarray(self.residual_multiplier, branch.dtype)
+        return scaled(branch, self.residual_multiplier)
 
     def _feedforward_inputs(self, attention_metadata) -> dict:
         """The token ids for a hash-routed feed-forward, nothing for the rest."""
@@ -2340,13 +2339,12 @@ class CausalTransformer(nn.Module):
             # fp32 value and only the product rounds with the activations.
             # A factor rounded to bf16 would be 34.0 at hidden 1152, where
             # sqrt(1152) is 33.94112549695428.
-            scaled = x * jnp.asarray(math.sqrt(self.emb_features),
+            gemma = x * jnp.asarray(math.sqrt(self.emb_features),
                                      self.embed_tokens.embedding.dtype)
-            x = scaled.astype(x.dtype)
-        if self.embedding_multiplier != 1.0:
-            # lm-engine multiplies the looked-up states (`hidden_states *
-            # m_emb`, mixins/dense/base.py at 45b6b57b), in their dtype.
-            x = x * jnp.asarray(self.embedding_multiplier, x.dtype)
+            x = gemma.astype(x.dtype)
+        # lm-engine multiplies the looked-up states (`hidden_states * m_emb`,
+        # mixins/dense/base.py at 45b6b57b), in fp32 opmath.
+        x = scaled(x, self.embedding_multiplier)
         x = self._scatter_inputs(x, tokens, input_embeddings, embedding_positions)
         # A prediction depth reads the embeddings `mtp_hidden_states` pairs
         # with, which are the unscaled ones with any media replacement already
