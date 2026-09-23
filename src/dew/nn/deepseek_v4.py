@@ -531,7 +531,6 @@ def _published(kv_store, name: str, layer: str):
     ("indexer", "gate_proj"): ("embed", None),
     ("indexer", "q_b_proj"): ("qlora", "index"),
     ("indexer", "wq_b"): ("qlora", "index"),
-    ("indexer", "wk"): (None, None),
     ("indexer", "weights_proj"): ("embed", "index"),
     ("scorer", "weights_proj"): ("embed", "index"),
 })

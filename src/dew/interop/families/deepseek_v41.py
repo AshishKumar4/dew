@@ -336,7 +336,7 @@ def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ..
     parts = name.split('.')
     if len(parts) >= 4 and parts[0] == 'layers' and parts[1].isdigit() and parts[2] == 'engram':
         leaf = '.'.join(parts[3:])
-        engram_leaves: dict[str, tuple[str, ...]] = {'embed.weight': ('embed',), 'wkv.weight': ('wkv', 'kernel'),
+        engram_leaves: dict[str, tuple[str, ...]] = {'embed.weight': ('embed', 'embedding'), 'wkv.weight': ('wkv', 'kernel'),
                   'q_weight': ('q_weight',), 'k_weight': ('k_weight',)}
         engram = engram_leaves.get(leaf)
         if engram is None:

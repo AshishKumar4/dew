@@ -269,7 +269,10 @@ class EngramHashes(nn.Module):
 
 
 @logical_axes({
-    ("embed",): ("engram_rows", None),
+    # The table's rows, 384M a layer at release size, shard as a
+    # vocabulary's do; the key weights are model-width rows per stream.
+    ("engram", "embed"): ("vocab", None),
+    ("engram",): (None, "embed"),
     ("wkv",): (None, "embed"),
 })
 class EngramLayer(nn.Module):
@@ -291,9 +294,11 @@ class EngramLayer(nn.Module):
 
     @nn.compact
     def __call__(self, streams, hash_ids, token_mask=None):
-        table = self.param('embed', nn.initializers.normal(1.0), (self.rows, self.head_dim), jnp.float32)
+        # The rows are gathered from the table in its storage dtype and cast
+        # after, so the table itself is never cast whole.
+        table = nn.Embed(self.rows, self.head_dim, embedding_init=nn.initializers.normal(1.0), name='embed')
         dtype = streams.dtype if self.dtype is None else self.dtype
-        looked = jnp.take(table, hash_ids, axis=0).astype(dtype).reshape(*hash_ids.shape[:2], -1)
+        looked = table(hash_ids).astype(dtype).reshape(*hash_ids.shape[:2], -1)
         kv = nn.Dense(self.emb_features * (self.hc_mult + 1), use_bias=False, dtype=self.dtype,
                       precision=self.precision, name='wkv')(looked)
         q_weight = self.param('q_weight', nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32)
