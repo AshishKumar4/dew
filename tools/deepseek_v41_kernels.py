@@ -30,7 +30,8 @@ def _power_of_two_ceil(value: torch.Tensor) -> torch.Tensor:
 
 
 def _straight_through(x: torch.Tensor, rounded: torch.Tensor) -> torch.Tensor:
-    return x + (rounded.to(x.dtype) - x).detach()
+    """`rounded` exactly in any dtype, the identity's gradient backward."""
+    return rounded.to(x.dtype).detach() + (x - x.detach())
 
 
 def _fake_quant(x: torch.Tensor, rounded: torch.Tensor, inplace: bool):

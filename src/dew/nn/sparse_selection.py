@@ -114,3 +114,23 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
     context = jnp.moveaxis(context, 0, 1).reshape(batch, blocks * block, heads, -1)[:, :length]
     return jnp.einsum('bshr,rhv->bshv', context, value_weight.astype(context.dtype),
                       precision=precision)
+
+
+def candidate_pool(scores, visible, blocks: int, block_size: int):
+    """The Hierarchical Sparse Indexer's first level (v41:583-610): the
+    `blocks` blocks of `block_size` entries with the highest best score, the
+    block holding the query's newest entry always among them, as a
+    `[B, S, T]` mask over the entries."""
+    batch, length, total = scores.shape
+    count = -(-total // block_size)
+    ranked = jnp.where(visible, scores, -jnp.inf)
+    ranked = jnp.pad(ranked, ((0, 0), (0, 0), (0, count * block_size - total)),
+                     constant_values=-jnp.inf)
+    best = jnp.max(ranked.reshape(batch, length, count, block_size), axis=-1)
+    newest = (jnp.sum(visible, axis=-1) - 1) // block_size
+    best = jnp.where(jnp.arange(count) == newest[..., None], jnp.inf, best)
+    values, chosen = jax.lax.top_k(best, min(blocks, count))
+    keep = jnp.zeros((batch, length, count), bool).at[
+        jnp.arange(batch)[:, None, None], jnp.arange(length)[None, :, None], chosen
+    ].set(values > -jnp.inf)
+    return jnp.repeat(keep, block_size, axis=-1)[..., :total]
