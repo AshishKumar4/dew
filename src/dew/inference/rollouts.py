@@ -42,6 +42,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.artifacts import agreed, collective_host
 from dew.objectives.base import Variables, thaw
 from dew.records import JSON
 from dew.sampling.text import Generation, Sampling
@@ -228,72 +229,129 @@ def _served(variables: Variables, dtype: jnp.dtype) -> Variables:
 
 @dataclass(frozen=True)
 class SafetensorsReload:
-    """Write the policy as safetensors in its source layout, then hot-reload the engine.
+    """Publish a policy version to a set of engine replicas through safetensors on disk.
 
     `source` is the `Pretrained` the trainer's model was loaded from; its
     `save` writes the weights, the config it derives and the tokenizer
-    files, which is the directory the engine was launched on. Files are
-    staged beside `directory` and moved in with `os.replace`, so the engine
-    never reads a half-written file. `base_url` is the engine's root, not
-    its `/v1` API. A reload call fails the push when it answers other than
-    200, or when its body carries `success` that is not true: both engines
-    report some failures as a 200 with `{"success": false}`.
+    files, which is the directory every replica was launched on (a shared
+    filesystem when the replicas are on several hosts). Files are staged
+    beside `directory` and moved in with `os.replace`, so no engine reads a
+    half-written file. `engines` are the replicas' roots, not their `/v1`
+    APIs. An engine call fails the push when it answers other than 200, or
+    when a call that reports its outcome carries `success` that is not true:
+    both engines report some failures as a 200 with `{"success": false}`.
 
-    vLLM (`engine="vllm"`, checked against v0.30.0) reloads through its
-    development endpoints (`VLLM_SERVER_DEV_MODE=1`): `POST /pause?mode=wait`,
-    which lets in-flight requests finish and schedules no new ones, `POST
+    One push of version `v` writes the directory once, then runs the
+    replica sequence on every replica concurrently. vLLM (`engine="vllm"`,
+    checked against v0.30.0), through its development endpoints
+    (`VLLM_SERVER_DEV_MODE=1`): `POST /pause?mode=wait`, which lets
+    in-flight requests finish and schedules no new ones; `POST
     /collective_rpc {"method": "reload_weights"}`, which reloads from the
-    served directory, `POST /reset_prefix_cache`, which must answer
+    served directory; `POST /reset_prefix_cache`, which must answer
     `{"success": true}` so no cached prefix outlives the weights that
-    computed it, and `POST /resume`. In-flight draws therefore finish wholly
-    on the old weights. A push that fails after the pause leaves the engine
-    paused, so no draw is sampled from weights the push may have half
-    loaded; the next push that succeeds resumes it.
+    computed it; `POST /update_weight_version {"new_version": "v"}`, which
+    must answer `{"success": true}`; and `POST /resume`. In-flight draws
+    therefore finish wholly on the old weights. A replica that fails after
+    the pause stays paused, so no draw is sampled from weights the push may
+    have half loaded; the next push that succeeds resumes it.
 
-    SGLang (`engine="sglang"`, checked against v0.5.20) reloads with one call,
-    `POST /update_weights_from_disk {"model_path": directory, "flush_cache":
-    true}`. SGLang admits it only once every in-flight request has finished,
-    holds new requests until it returns, and flushes the radix cache before
-    answering, so in-flight draws finish wholly on the old weights and no
-    prefix computed by them survives. A load that fails answers 400 with
-    `success: false`; SGLang's rollback re-reads the same directory, so the
-    engine then serves whatever that directory holds.
+    SGLang (`engine="sglang"`, checked against v0.5.20) runs one call per
+    replica, `POST /update_weights_from_disk {"model_path": directory,
+    "flush_cache": true, "weight_version": "v"}`. SGLang admits it only once
+    every in-flight request has finished, holds new requests until it
+    returns, and flushes the radix cache before answering, so in-flight
+    draws finish wholly on the old weights and no prefix computed by them
+    survives. A load that fails answers 400 with `success: false`; SGLang's
+    rollback re-reads the same directory, so the replica then serves
+    whatever that directory holds.
+
+    `gateway`, when set, is a recording gateway's root (rllm-model-gateway):
+    once every replica serves `v`, `POST /admin/weight_version
+    {"weight_version": v}` makes it stamp `v` on the calls it records from
+    then on. The gateway reads its stamp when a request arrives, so the
+    stamp must never run ahead of any replica: a call routed to a replica
+    still on `v - 1` would claim weights it was not sampled from. Stamping
+    after the whole set has moved is conservative instead: a call submitted
+    between a replica's resume and the stamp is recorded as `v - 1`, older
+    than the weights that served it. A push with any failed replica leaves
+    the stamp where it was.
+
+    A multi-process trainer calls the push on every process. The pool
+    gathers the served tree to host memory on every process
+    (`collective_host`), process 0 writes and publishes, and every process
+    learns the outcome at an agreement point, so a failed push raises on
+    all of them instead of leaving the others to hang at the next
+    collective.
     """
 
     source: Pretrained
     directory: Path
-    base_url: str
+    engines: tuple[str, ...]
     engine: Literal["vllm", "sglang"]
+    gateway: str | None = None
     dtype: str = "bfloat16"
     timeout: float = 600.0
 
     def __post_init__(self) -> None:
         if self.engine not in ("vllm", "sglang"):
             raise ValueError("engine must be vllm or sglang")
+        if (not isinstance(self.engines, tuple) or not self.engines
+                or not all(isinstance(root, str) and root for root in self.engines)):
+            raise ValueError("engines is a nonempty tuple of replica root URLs")
+        if len(set(self.engines)) != len(self.engines):
+            raise ValueError("every replica is published to once")
 
     def write(self, variables: Variables) -> None:
-        """Write `variables` into `directory`, file by file atomically."""
+        """Write `variables` into `directory`, file by file atomically; every process of a pool calls it."""
+        served = collective_host(_served(variables, jnp.dtype(self.dtype)), phase="weight export gather")
+        agreed("weight export", lambda: self._save(served) if jax.process_index() == 0 else None)
+
+    def _save(self, variables: Variables) -> None:
         directory = Path(self.directory)
         staging = directory.with_name(f".{directory.name}.staging")
         shutil.rmtree(staging, ignore_errors=True)
-        self.source.save(staging, variables=_served(variables, jnp.dtype(self.dtype)))
+        self.source.save(staging, variables=variables)
         directory.mkdir(parents=True, exist_ok=True)
         for written in staging.iterdir():
             os.replace(written, directory / written.name)
         staging.rmdir()
 
-    def __call__(self, variables: Variables) -> None:
+    def __call__(self, variables: Variables, version: int) -> None:
+        if type(version) is not int or version < 0:
+            raise ValueError("a published policy version is a nonnegative integer")
+        self.write(variables)
+        agreed("weight publication", lambda: self._publish(version) if jax.process_index() == 0 else None)
+
+    def _publish(self, version: int) -> None:
         import httpx
 
-        self.write(variables)
-        root = self.base_url.rstrip("/")
+        with ThreadPoolExecutor(max_workers=len(self.engines), thread_name_prefix="dew-weight-push") as pool:
+            pushes = [(root, pool.submit(self._replica, root, version)) for root in self.engines]
+            failures = [(root, push.exception()) for root, push in pushes if push.exception() is not None]
+        if failures:
+            raise RuntimeError(f"version {version} reached {len(self.engines) - len(failures)} of "
+                               f"{len(self.engines)} replicas; the gateway keeps its stamp. "
+                               + "; ".join(f"{root}: {failure}" for root, failure in failures))
+        if self.gateway is not None:
+            response = httpx.post(self.gateway.rstrip("/") + "/admin/weight_version",
+                                  json={"weight_version": version}, timeout=self.timeout)
+            if response.status_code != 200 or response.json().get("weight_version") != version:
+                raise RuntimeError(f"the gateway refused version {version}: "
+                                   f"{response.status_code} {response.text}")
+
+    def _replica(self, root: str, version: int) -> None:
+        import httpx
+
+        root = root.rstrip("/")
         # (path, JSON body, whether the answer must say {"success": true})
         if self.engine == "vllm":
             calls = (("/pause?mode=wait", None, False), ("/collective_rpc", {"method": "reload_weights"}, False),
-                     ("/reset_prefix_cache", None, True), ("/resume", None, False))
+                     ("/reset_prefix_cache", None, True),
+                     ("/update_weight_version", {"new_version": str(version)}, True), ("/resume", None, False))
         else:
             calls = (("/update_weights_from_disk", {"model_path": str(Path(self.directory).resolve()),
-                                                    "flush_cache": True, "abort_all_requests": False}, True),)
+                                                    "flush_cache": True, "abort_all_requests": False,
+                                                    "weight_version": str(version)}, True),)
         for path, body, reports in calls:
             response = httpx.post(root + path, json=body, timeout=self.timeout)
             if response.status_code != 200 or (reports and not _succeeded(response)):
@@ -309,7 +367,9 @@ def _succeeded(response: httpx.Response) -> bool:
 
 
 class WeightSync(Protocol):
-    def __call__(self, variables: Variables) -> None: ...
+    """Make the engines serve `variables` as policy `version`."""
+
+    def __call__(self, variables: Variables, version: int) -> None: ...
 
 
 # The request field that makes each engine return the sampled ids themselves.
@@ -398,7 +458,7 @@ class OpenAIRolloutServer:
         return Draw(prompt, tokens, probabilities, None, terminated, version).check_stops(stops)
 
     def load(self, variables: Variables, version: int) -> None:
-        self._weights(variables)
+        self._weights(variables, version)
         self._version = version
 
     def close(self) -> None:
