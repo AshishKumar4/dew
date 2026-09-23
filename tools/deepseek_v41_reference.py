@@ -10,9 +10,13 @@ Run it in its own environment, never the project's:
 
     uv venv ~/.cache/dew/reference-venvs/deepseek-v41 --python 3.12
     VIRTUAL_ENV=... uv pip install torch==2.10.0 numpy safetensors sympy \
-        tokenizers transformers huggingface_hub
+        tokenizers transformers huggingface_hub tilelang==0.1.8
     PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
-        tools/deepseek_v41_reference.py [--search N]
+        tools/deepseek_v41_reference.py [--search N | --check-kernels]
+
+`--check-kernels` compares the stand-ins with the release's tilelang kernels
+on a CUDA GPU (`check_kernels`). `--search N` scores N seeds from `--seed`
+(`search`); SEED is the best of the first 119.
 
 It writes tests/fixtures/hf/deepseek-v41-tiny: the release's config.json
 spelling at toy width, a model.safetensors under the release's tensor names,
@@ -43,7 +47,7 @@ from __future__ import annotations
 
 import argparse
 import functools
-import importlib
+import importlib.util
 import json
 import shutil
 import sys
@@ -452,12 +456,151 @@ def run(seed: int, measure: bool):
     return net, state, outputs, margins, gradients
 
 
+# The fp32 noise a margin has to clear, in its own units: a value that sits
+# closer than this to a rounding or selection boundary can round or select
+# differently in two fp32 implementations of the same arithmetic.
+NOISE = {"qat_window": 2e-5, "qat_entries": 2e-5, "qat_index": 5e-6, "qat_selection": 2e-3,
+         "selection": 5e-5}
+SCALE_NOISE = 1e-4
+
+
+def score(margins: dict[str, float]) -> float:
+    """The smallest margin over the noise it has to clear (NOISE, and
+    SCALE_NOISE for every `*_scale` margin); a seed scoring 1 or more keeps
+    every quantizer and selection of the fixture clear of fp32 noise."""
+    return min(value / (SCALE_NOISE if key.endswith("_scale") else NOISE[key])
+               for key, value in margins.items())
+
+
 def search(first: int, count: int):
-    """Report every seed's margins, one JSON line each; SEED is the seed whose
-    smallest margin is the largest."""
+    """Report every seed's margins and `score`, one JSON line each, then the
+    seed that scores highest. SEED is that seed over `--seed 0 --search 119`."""
+    best = None
     for seed in range(first, first + count):
         *_, margins, _ = run(seed, measure=True)
-        print(json.dumps({"seed": seed, **margins}), flush=True)
+        line = {"seed": seed, "score": score(margins), **margins}
+        print(json.dumps(line), flush=True)
+        if best is None or line["score"] > best["score"]:
+            best = line
+    print(json.dumps({"best": best}), flush=True)
+
+
+def official_kernels():
+    """The release's tilelang kernels (inference/kernel.py at the pinned
+    revision), under a name of their own beside the stand-in `kernel`."""
+    from huggingface_hub import hf_hub_download
+
+    path = hf_hub_download(REPO, "inference/kernel.py", revision=DEEPSEEK_V41_REVISION)
+    spec = importlib.util.spec_from_file_location("deepseek_v41_tilelang_kernels", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _bits(x: torch.Tensor) -> torch.Tensor:
+    return x.view(torch.int16) if x.dtype == torch.bfloat16 else x.view(torch.int32)
+
+
+def _emulated_sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
+    """sparse_attn as the kernel rounds it (kernel.py:363-387) for one block
+    of at most 64 indices: the unnormalized probabilities enter the value
+    product in bf16 (acc_s_cast), while their sum stays fp32."""
+    batch = torch.arange(q.size(0), device=q.device)[:, None, None]
+    valid = topk_idxs >= 0
+    keys = kv[batch, topk_idxs.clamp_min(0).long()].float()
+    logits = torch.einsum("bmhd,bmkd->bmhk", q.float(), keys) * softmax_scale
+    logits = logits.masked_fill(~valid[:, :, None, :], float("-inf"))
+    peak = logits.amax(-1, keepdim=True).clamp_min(-1e30)
+    weights = torch.exp(logits - peak)
+    total = weights.sum(-1, keepdim=True) + torch.exp(attn_sink.float()[None, None, :, None] - peak)
+    return (torch.einsum("bmhk,bmkd->bmhd", weights.bfloat16().float(), keys) / total).to(q.dtype)
+
+
+def check_kernels():
+    """Compare tools/deepseek_v41_kernels.py with the tilelang kernels on CUDA.
+
+    The kernels take bf16 activations only ('input X dtype expected
+    bfloat16'), so the comparison runs on bf16 inputs over nine magnitude
+    decades, from blocks under every amax floor to blocks whose E4M3 scale
+    saturates, with an all-zero block and every E2M1 tie. The quantizers
+    must match bit for bit. sparse_attn's stand-in keeps its probabilities
+    in fp32, which defines the fp32 semantics the fixture runs; the kernel
+    rounds them to bf16 before the value product, so the comparison
+    reports the stand-in's difference and then the emulated kernel's, which
+    has to stay within one bf16 ulp (accumulation order). hc_split_sinkhorn
+    has to stay within one fp32 ulp of its unit-scale outputs.
+    """
+    official = official_kernels()
+    kernels = sys.modules["kernel"] = importlib.import_module("tools.deepseek_v41_kernels")
+    device = "cuda"
+    generator = torch.Generator(device=device).manual_seed(0)
+    failures = []
+
+    def report(name, mismatches, total, **extra):
+        print(json.dumps({"check": name, "mismatches": int(mismatches), "of": int(total), **extra}))
+        if mismatches:
+            failures.append(name)
+
+    quantizers = {
+        "act_quant fp8/32 ue8m0": lambda k, x: k.act_quant(x, 32, "ue8m0", torch.float8_e8m0fnu, True),
+        "fp4_act_quant fp4/16 e4m3": lambda k, x: k.fp4_act_quant(x, 16, True, torch.float8_e4m3fn),
+        "fp4_act_quant fp4/32 e8m0": lambda k, x: k.fp4_act_quant(x, 32, True),
+    }
+    magnitudes = (1e-6, 1e-4, 1e-2, 0.3, 3.0, 40.0, 3e2, 3e3, 3e4)
+    blocks = []
+    for magnitude in magnitudes:
+        x = torch.randn(64, 512, device=device, generator=generator) * torch.rand(
+            64, 1, device=device, generator=generator) * (3 * magnitude)
+        blocks.append(x.bfloat16())
+    x = torch.cat(blocks)
+    x[3, :32] = 0
+    saturating = int((x.float().unflatten(-1, (-1, 16)).abs().amax(-1) / kernels.FP4_MAX
+                      > kernels.FP8_MAX).sum())
+    for name, quantize in quantizers.items():
+        theirs, ours = quantize(official, x.clone()), quantize(kernels, x.clone())
+        report(name, (_bits(theirs) != _bits(ours)).sum(), x.numel(),
+               **({"saturating_blocks": saturating} if "e4m3" in name else {}))
+
+    grid = torch.tensor([0, .25, .5, .75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 3.5, 4, 5, 6], device=device)
+    ties = torch.cat([grid, -grid, grid + 1e-3, grid - 1e-3]).clamp(-6, 6).repeat(3)[:64]
+    t = torch.zeros(2, 32, device=device)
+    t.view(-1)[:64] = ties
+    t[:, 0] = 6.0  # each block's amax, so its power-of-two scale is exactly one
+    t = t.bfloat16()
+    theirs, ours = (quantizers["fp4_act_quant fp4/32 e8m0"](k, t.clone()) for k in (official, kernels))
+    report("fp4 E2M1 ties", (_bits(theirs) != _bits(ours)).sum(), t.numel())
+
+    batch, queries, heads, width, keys, top = 2, 5, 16, 512, 40, 24
+    q = torch.randn(batch, queries, heads, width, device=device, generator=generator).bfloat16()
+    kv = torch.randn(batch, keys, width, device=device, generator=generator).bfloat16()
+    sink = torch.randn(heads, device=device, generator=generator)
+    idx = torch.randint(-1, keys, (batch, queries, top), device=device, generator=generator,
+                        dtype=torch.int32)
+    idx[0, 0] = -1  # a query with nothing to attend
+    theirs = official.sparse_attn(q, kv, sink, idx, width ** -0.5).float()
+    port = kernels.sparse_attn(q, kv, sink, idx, width ** -0.5).float()
+    emulated = _emulated_sparse_attn(q, kv, sink, idx, width ** -0.5).float()
+    ulp = torch.exp2(torch.floor(torch.log2(theirs.abs().clamp_min(2 ** -126))) - 7)
+    residual = (emulated - theirs).abs()
+    print(json.dumps({"check": "sparse_attn stand-in, fp32 probabilities",
+                      "differing": int((port != theirs).sum()), "of": theirs.numel(),
+                      "max_abs": float((port - theirs).abs().max()),
+                      "max_output": float(theirs.abs().max())}))
+    report("sparse_attn emulated bf16 probabilities, beyond one bf16 ulp",
+           (residual > ulp).sum(), theirs.numel(), differing=int((residual > 0).sum()),
+           max_abs=float(residual.max()))
+
+    mixes = torch.randn(3, 7, 24, device=device, generator=generator)
+    scale = torch.randn(3, device=device, generator=generator)
+    base = torch.randn(24, device=device, generator=generator)
+    theirs = official.hc_split_sinkhorn(mixes, scale, base, 4, 20, 1e-6)
+    ours = kernels.hc_split_sinkhorn(mixes, scale, base, 4, 20, 1e-6)
+    residual = max(float((a - b).abs().max()) for a, b in zip(theirs, ours, strict=True))
+    report("hc_split_sinkhorn beyond one fp32 ulp", residual > 2 ** -23, 1, max_abs=residual)
+    print(json.dumps({"device": torch.cuda.get_device_name(), "torch": torch.__version__}))
+    if failures:
+        raise SystemExit(f"the stand-ins depart from the kernels: {failures}")
 
 
 # ModelArgs fields onto the release's config.json text_config spelling.
@@ -541,11 +684,15 @@ def write(seed: int):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--search", type=int, default=0, help="report margins over this many seeds")
+    parser.add_argument("--search", type=int, default=0, help="score the margins of this many seeds")
     parser.add_argument("--seed", type=int, default=SEED, help="the fixture's seed, or the first searched")
+    parser.add_argument("--check-kernels", action="store_true",
+                        help="compare the torch stand-ins with the tilelang kernels on CUDA")
     options = parser.parse_args()
     torch.set_default_dtype(torch.float32)
-    if options.search:
+    if options.check_kernels:
+        check_kernels()
+    elif options.search:
         search(options.seed, options.search)
     else:
         write(options.seed)
