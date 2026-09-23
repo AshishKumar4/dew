@@ -1031,7 +1031,8 @@ def test_a_multiplier_scales_bf16_states_in_fp32_opmath():
     assert scaled(x, 0.22).dtype == jnp.bfloat16
 
 
-@pytest.mark.parametrize("extra", [{"laurel_rank": 8}, {"per_layer_input_dim": 4}])
+@pytest.mark.parametrize("extra", [{"laurel_rank": 8}, {"per_layer_input_dim": 4},
+                                   {"altup": {"num_inputs": 2}}])
 def test_mup_fields_refuse_blocks_that_do_not_carry_them(extra):
     """LAuReL, AltUp and per-layer inputs keep their own inits and add their
     branches unscaled, so lm-engine's multipliers cannot be asked of them."""

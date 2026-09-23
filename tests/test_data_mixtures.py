@@ -999,9 +999,9 @@ def test_the_log_tick_reports_the_records_a_ramped_interval_read():
 
 def test_a_corpus_that_recurs_across_phases_continues_its_order_and_repeats_nothing():
     """The reviewer's three-corpus case at Rigel-like shares: a corpus read
-    in phase 0 and again in phases 1 and 2 picks up where the earlier phases
-    left it, so no record of it repeats before its epoch ends, and each phase
-    still reads its own mixture at its own shares."""
+    in phase 0 and again in phases 1 and 2, and alone in phase 3, picks up
+    where the earlier phases left it, so no record of it repeats before its
+    epoch ends, and each phase still reads its own mixture at its own shares."""
     from dew.data.providers import phased_dataset
     web, code, math = (Corpus(name, Indexed(tag, 1000), 1.0)
                        for name, tag in (("web", 1), ("code", 2), ("math", 3)))
@@ -1009,11 +1009,13 @@ def test_a_corpus_that_recurs_across_phases_continues_its_order_and_repeats_noth
                 dataclasses.replace(math, weight=9)], 10),
               ([dataclasses.replace(web, weight=15), dataclasses.replace(code, weight=85)], 20),
               ([dataclasses.replace(web, weight=57), dataclasses.replace(code, weight=18),
-                dataclasses.replace(math, weight=25)], None)]
+                dataclasses.replace(math, weight=25)], 30),
+              ([code], None)]
     dataset = phased_dataset(phases, None, [], batch=8, seed=0, loading=READ, val_batches=None)
-    steps = taken(dataset.train(), 30)
+    steps = taken(dataset.train(), 40)
     by_phase = [[value for step in steps[start:end] for value in step]
-                for start, end in ((0, 10), (10, 20), (20, 30))]
+                for start, end in ((0, 10), (10, 20), (20, 30), (30, 40))]
+    assert all(value // 1000 == 2 for value in by_phase[3])
     for tag in (1, 2, 3):
         read = [value for phase in by_phase for value in phase if value // 1000 == tag]
         assert len(read) == len(set(read)), f"corpus {tag} repeated a record within its epoch"
