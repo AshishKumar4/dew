@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 
 import jax
@@ -236,10 +235,8 @@ class MultimodalTransformer(nn.Module):
             decoder_tokens = jnp.where((tokens >= 0) & (tokens < self.language_model.per_layer_vocab), tokens, 0)
         else:
             decoder_tokens = jnp.where(media, 0, tokens)
-        embeddings = self.language_model.embed_tokens(decoder_tokens)
-        if self.language_model.embedding_scale:
-            embeddings = (embeddings * jnp.asarray(
-                math.sqrt(self.emb_features), self.language_model.embed_tokens.embedding.dtype)).astype(embeddings.dtype)
+        embeddings = self.language_model.scaled_embeddings(
+            self.language_model.embed_tokens(decoder_tokens))
         if self.family == "gemma3n":
             embedders = [self.conditioner.projector]
             if self.audio is not None:
