@@ -302,9 +302,14 @@ def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None,
     of the logprob tokens; text tokens are not reverse-mapped through a
     vocabulary.
     """
+    listed = entry.get("token_ids")
+    if listed is not None and (not isinstance(listed, list) or any(
+            type(token) is not int or token < 0 for token in listed)):
+        raise ValueError("choice token_ids must be a list of nonnegative ids")
+    ids = None if listed is None else tuple(listed)
     logprobs = entry.get("logprobs")
     if logprobs is None:
-        return None, None
+        return ids, None
     record = _object(logprobs, "choice logprobs")
     rendered, values = record.get("tokens"), record.get("token_logprobs")
     if not isinstance(rendered, list) or not isinstance(values, list) or len(rendered) != len(values):
@@ -314,18 +319,16 @@ def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None,
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each reported token log-probability must be a number")
         probabilities.append(float(value))
-    listed = entry.get("token_ids")
-    if listed is not None:
-        if not isinstance(listed, list) or len(listed) != len(values) or any(
-                type(token) is not int or token < 0 for token in listed):
-            raise ValueError("choice token_ids must be nonnegative ids aligned with its token_logprobs")
-        return tuple(listed), tuple(probabilities)
-    ids: list[int] = []
+    if ids is not None:
+        if len(ids) != len(probabilities):
+            raise ValueError("choice token_ids must be aligned with its token_logprobs")
+        return ids, tuple(probabilities)
+    rendered_ids: list[int] = []
     for token in rendered:
         if not isinstance(token, str) or not token.startswith("token_id:"):
             return None, tuple(probabilities)
-        ids.append(int(token.removeprefix("token_id:")))
-    return tuple(ids), tuple(probabilities)
+        rendered_ids.append(int(token.removeprefix("token_id:")))
+    return tuple(rendered_ids), tuple(probabilities)
 
 
 def _openai_result(raw: JSON, response: object, expected: int) -> Completion:

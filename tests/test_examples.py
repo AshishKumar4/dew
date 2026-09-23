@@ -182,6 +182,21 @@ def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
     assert json.loads((export / "generation_config.json").read_text())["tokenizer_name"]
 
 
+@pytest.mark.parametrize("new_tokens", [1, 128])
+def test_train_rlvr_starts_sglang_with_room_for_a_prompt_at_the_window_and_its_full_budget(tmp_path, new_tokens):
+    """SGLang 0.5.20 refuses an input of `context - 6` ids or more
+    (`max_req_input_len`) and caps a budget at `context - 2 - input`
+    (`max_req_len - input - 1`). A prompt truncated to `--prompt-tokens`
+    must pass the first and keep `--new-tokens` under the second, or its
+    draw ends short with a "length" the rollout refuses."""
+    example = load_example("train_rlvr")
+    config = example.Config(backend="sglang", prompt_tokens=128, new_tokens=new_tokens, out=tmp_path)
+    command, _ = example.engine_command(config, tmp_path / "served")
+    context = int(command[command.index("--context-length") + 1])
+    assert config.prompt_tokens < context - 6
+    assert min(new_tokens, context - 2 - config.prompt_tokens) == new_tokens
+
+
 def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):
     """The evaluation report of a run the script trains first: the perplexity
     `evaluate` scores over the held-out split, a greedy continuation, and the
