@@ -124,7 +124,8 @@ def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | No
 
 
 def _check_terms(decoder: CausalTransformer | MultimodalTransformer | None, *,
-                 aux_loss_alpha: float | None, mtp_weight: float | None, z_loss: float) -> None:
+                 aux_loss_alpha: float | None, mtp_weight: float | None, z_loss: float,
+                 router_z_loss: float = 0.0) -> None:
     """Refuse a weight the term it scales cannot carry.
 
     The checks run in the order the constructor takes the arguments. The
@@ -150,6 +151,12 @@ def _check_terms(decoder: CausalTransformer | MultimodalTransformer | None, *,
         raise ValueError(
             f"z_loss weights the squared log partition, so it is finite and "
             f"nonnegative, got {z_loss}; 0 adds nothing")
+    if not (0 <= router_z_loss < float("inf")):
+        raise ValueError(
+            f"router_z_loss weights the routers' squared log partitions, so it is "
+            f"finite and nonnegative, got {router_z_loss}; 0 adds nothing")
+    if router_z_loss and (decoder is None or decoder.mixture is None):
+        raise ValueError("router_z_loss needs a model with a mixture")
 
 
 def _check_indexer(model: nn.Module, indexer: IndexerTraining,
@@ -367,6 +374,22 @@ def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
     return (bias.astype(dtype) + correction).astype(bias.dtype)
 
 
+def router_z_terms(routing: Variables, weight: float) -> tuple[Mean, ...]:
+    """ST-MoE's router z-loss (arXiv 2202.08906, eq. 5), one `Mean` per router:
+    `weight` times the squared log partition of the gate logits, summed over
+    the positions the router saw and divided by their count. The count adds
+    across micro-batches, so a step's term is its routed positions' mean, and
+    the routers' terms add, as lm-engine's `(logsumexp(logits) ** 2).mean()`
+    per layer does (moe/module.py at 45b6b57b, before its 0.1 and
+    `router_aux_loss_coef`)."""
+    terms = []
+    for node in _sown_nodes(routing, "log_z"):
+        (log_z,) = node["log_z"]
+        work = log_z.astype(jnp.promote_types(log_z.dtype, jnp.float32))
+        terms.append(Mean(weight * jnp.sum(jnp.square(work)), jnp.asarray(work.size, work.dtype)))
+    return tuple(terms)
+
+
 def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
     """Collect every router's sown (scores, indices), in the tree's key order."""
     found: list[tuple[jax.Array, jax.Array]] = []
@@ -420,6 +443,7 @@ class LMStatistics:
     prediction: Mean
     sequence: tuple[Mean, ...]
     global_routers: tuple[RouterMoments, ...]
+    router_z: tuple[Mean, ...] = ()
 
 
 @objectives("lm")
@@ -444,6 +468,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         loss_role: Role | None = None,
         mtp_weight: float | None = None,
         z_loss: float = 0.0,
+        router_z_loss: float = 0.0,
         qk_stats: bool = False,
         indexer: IndexerTraining | None = None,
         trainable: PathFilter | None = None,
@@ -507,6 +532,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         keeps the logits from drifting away from normalised log
         probabilities. Zero adds nothing.
 
+        `router_z_loss` is the routers' own z-loss (ST-MoE, arXiv
+        2202.08906): this coefficient times the squared log partition of
+        every router's gate logits, averaged over the positions each router
+        saw in the step and summed over the routers (`router_z_terms`). It
+        sits beside the balance loss; lm-engine's MoE adds 0.1 of it to its
+        switch loss before `router_aux_loss_coef`, which is
+        `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
+
         `trainable` selects the parameter leaves the optimizer moves, by
         their full path (`dew.objectives.base.PathFilter`). The rest of the
         tree is kept under `frozen`, the split the warm-up uses for the
@@ -523,12 +556,14 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.samples = samples
         self.pretrained = pretrained
         self.balance_rate = balance_rate
-        _check_terms(decoder, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss)
+        _check_terms(decoder, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
+                     router_z_loss=router_z_loss)
         self.aux_loss_alpha = aux_loss_alpha
         self.seq_aux = seq_aux
         self.loss_role = loss_role
         self.mtp_weight = mtp_weight
         self.z_loss = z_loss
+        self.router_z_loss = router_z_loss
         self.qk_stats = qk_stats
         self.indexer = indexer
         if indexer is not None and trainable is not None:
@@ -539,7 +574,8 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
             _check_indexer(model, indexer, {"balance_rate": balance_rate,
                                             "aux_loss_alpha": aux_loss_alpha,
                                             "mtp_weight": mtp_weight, "loss_role": loss_role,
-                                            "z_loss": z_loss or None})
+                                            "z_loss": z_loss or None,
+                                            "router_z_loss": router_z_loss or None})
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         # The EMA follows what moves; the frozen collection never does.
         self.ema = None if ema_decay is None else EMASpec(
@@ -889,9 +925,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         """
         if self._warmup:
             raise ValueError("the indexer warm-up scores no token, so it has no prediction")
-        if self.aux_loss_alpha is not None:
+        if self.aux_loss_alpha is not None or self.router_z_loss:
             raise ValueError(
-                "aux_loss_alpha's router terms normalise per router, and a "
+                "aux_loss_alpha's and router_z_loss's router terms normalise per router, and a "
                 "distillation mixes terms over the counted tokens; balance the "
                 "student's routers with balance_rate instead")
         statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers)
@@ -913,7 +949,7 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         scores = self.token_scores(
             params, prepared, train=train, rngs={"dropout": step.key} if train else None,
             segment_ids=segment_ids, positions=positions,
-            routing=rate is not None or alpha is not None,
+            routing=rate is not None or alpha is not None or bool(self.router_z_loss),
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers)
         losses, weights, log_z, correct, _, _, routing, depths, qk, kls = scores
@@ -946,6 +982,11 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         statistics: Mean | LMStatistics = prediction
         if alpha is not None:
             statistics, reported["aux_loss"] = self._router_statistics(prediction, routing, alpha)
+        if self.router_z_loss:
+            router_z = router_z_terms(routing, self.router_z_loss)
+            statistics = (LMStatistics(prediction, (), (), router_z) if isinstance(statistics, Mean)
+                          else statistics.replace(router_z=router_z))
+            reported["router_z_loss"] = sum(mean_loss(term)[0] for term in router_z)
         effects = None
         if rate is not None:
             effects, load = self._router_load(params, routing)
@@ -1007,6 +1048,9 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
                 raise ValueError("global router statistics require aux_loss_alpha")
             value = value + global_router_loss(term, self.aux_loss_alpha)
             active = active | (term.positions > 0)
+        for term in stats.router_z:
+            auxiliary, supported = mean_loss(term)
+            value, active = value + auxiliary, active | supported
         return value, active
 
     def apply_effects(self, variables: Variables, effects: Variables) -> Variables:

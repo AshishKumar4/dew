@@ -243,7 +243,8 @@ class Router(nn.Module):
                 'moe', 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
 
     def __call__(self, x, tokens=None):
-        scores = self.scores(x)
+        logits = self.logits(x)
+        scores = self._activated(logits)
         if self.hash_vocab is not None:
             if tokens is None:
                 raise ValueError("hash routing selects by the token ids, which the caller passes")
@@ -262,16 +263,24 @@ class Router(nn.Module):
             self.sow('router', 'indices', indices)
             # The V2 balance loss reads the scores beside the choices.
             self.sow('router', 'scores', scores)
+            # The router z-loss squares each position's log partition.
+            self.sow('router', 'log_z', jax.nn.logsumexp(logits, axis=-1))
         weights = jnp.take_along_axis(scores, indices, axis=-1)
         if self.normalize_weights:
             weights = weights / (jnp.sum(weights, axis=-1, keepdims=True)
                                  + WEIGHT_SUM_EPSILON)
         return weights * self.routed_scaling_factor, indices
 
+    def logits(self, x):
+        """Each token's fp32 gate logit for every expert: `[..., num_experts]`."""
+        return jnp.einsum('...d,de->...e', x.astype(jnp.float32), self.kernel,
+                          precision=self.precision)
+
     def scores(self, x):
         """Each token's fp32 affinity for every expert: `[..., num_experts]`."""
-        logits = jnp.einsum('...d,de->...e', x.astype(jnp.float32), self.kernel,
-                            precision=self.precision)
+        return self._activated(self.logits(x))
+
+    def _activated(self, logits):
         if self.score_function == 'softmax':
             return jax.nn.softmax(logits, axis=-1)
         if self.score_function == 'sqrtsoftplus':
