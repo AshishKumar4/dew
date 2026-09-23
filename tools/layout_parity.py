@@ -263,19 +263,28 @@ def pooled(case, batches, pieces: int) -> list[tuple[float, Any]]:
     return results
 
 
-def leaf_errors(reference, other) -> dict[str, float]:
-    """Each leaf's L2 distance from the reference over the reference's norm."""
+def leaf_errors(reference, other, dtype: str) -> dict[str, float]:
+    """Each leaf's L2 distance from the reference over the reference leaf's
+    norm, or over the compute dtype's rounding of the whole gradient's norm
+    where the leaf is smaller than that.
+
+    A leaf's reassociation error scales with its terms, not with their sum,
+    and a leaf whose terms cancel has a gradient below the rounding of the
+    step: a scale just ahead of a normalisation that undoes it, as a
+    decoder's last layer scalar is ahead of the final RMSNorm. Relative to
+    its own norm that is noise over noise (DiffusionGemma's read 2.2), so it
+    is measured against what rounding the whole step moves instead; every
+    other leaf is measured against itself.
+    """
     import jax
     import numpy as np
 
-    errors = {}
-    for (path, want), got in zip(jax.tree_util.tree_flatten_with_path(reference)[0],
-                                 jax.tree.leaves(other), strict=True):
-        want, got = np.asarray(want, np.float64), np.asarray(got, np.float64)
-        norm = np.linalg.norm(want)
-        errors[jax.tree_util.keystr(path)] = float(
-            np.linalg.norm(got - want) / norm if norm else np.linalg.norm(got))
-    return errors
+    pairs = [(jax.tree_util.keystr(path), np.asarray(want, np.float64), np.asarray(got, np.float64))
+             for (path, want), got in zip(jax.tree_util.tree_flatten_with_path(reference)[0],
+                                          jax.tree.leaves(other), strict=True)]
+    noise = rounding_limit(dtype) * float(np.sqrt(sum(np.sum(want ** 2) for _, want, _ in pairs)))
+    return {name: float(np.linalg.norm(got - want) / max(float(np.linalg.norm(want)), noise))
+            for name, want, got in pairs}
 
 
 def strided(batch, pieces: int):
@@ -294,14 +303,14 @@ def floor(case, batch, reference, reference_loss: float) -> tuple[dict[str, floa
     reassociation of the batch's sums, and the same of the step-one loss."""
     if not reassociates(case):
         losses, gradient, _ = trained(case, {}, batch, steps=1)
-        return leaf_errors(reference, gradient), abs(losses[0] - reference_loss)
+        return leaf_errors(reference, gradient, case.dtype), abs(losses[0] - reference_loss)
     runs = pooled(case, [reordered(batch, seed) for seed in range(PERMUTATIONS)], 1)
     loss = max(abs(moved - reference_loss) for moved, _ in runs)
     for pieces in (2, 4):
         runs += pooled(case, [batch, strided(batch, pieces)], pieces)
     leaves: dict[str, float] = {}
     for _, gradient in runs:
-        for leaf, error in leaf_errors(reference, gradient).items():
+        for leaf, error in leaf_errors(reference, gradient, case.dtype).items():
             leaves[leaf] = max(leaves.get(leaf, 0.0), error)
     return leaves, loss
 
@@ -329,7 +338,7 @@ def exact(case, reference_gradient) -> dict[str, float]:
         return scalar_loss(objective, {**wide, "params": params}, batch, step)[0]
 
     gradient = jax.jit(jax.grad(loss))(wide["params"], bench.global_batch(case))
-    return leaf_errors(gradient, reference_gradient)
+    return leaf_errors(gradient, reference_gradient, case.dtype)
 
 
 def rounding_limit(dtype: str) -> float:
@@ -432,7 +441,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                 losses, gradient, compiled = agreed(
                     f"{model} on {name}", lambda: trained(case, LAYOUTS[name], batch, steps=steps))
                 row.update(compiled, losses=losses, **judged(
-                    leaf_errors(ref_gradient, gradient), floors, abs(losses[0] - ref_losses[0]),
+                    leaf_errors(ref_gradient, gradient, dtype), floors, abs(losses[0] - ref_losses[0]),
                     loss_floor, ref_losses[0]))
                 devices = jax.device_count()
                 if compiled["flops_per_device"] and ref_compiled["flops_per_device"]:
