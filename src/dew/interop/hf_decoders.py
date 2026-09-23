@@ -1582,7 +1582,60 @@ def _read_shard(path: Path) -> dict[str, np.ndarray]:
 def _load_shards(directory: Path) -> dict[str, np.ndarray]:
     """Read a checkpoint directory's weights, mapped in their stored dtype:
     the shards its index names, or its one model.safetensors."""
+    files = {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
+    if not weight_files(files, "", lambda name: json.loads((directory / name).read_text())):
+        raise FileNotFoundError(_missing_weights(str(directory), files))
     return read_weights(directory)
+
+
+_PICKLES = (".bin", ".pt", ".pth")
+
+
+def _missing_weights(source: str, files: Collection[str], conversion: str | None = None) -> str:
+    """Say what a source without safetensors weights ships instead, and what loads.
+
+    `conversion` is the revision of SFconvertbot's safetensors pull request
+    for the commit, which is what a PyTorch-pickle repo loads from.
+    """
+    gguf = sorted(name for name in files if name.endswith(".gguf"))
+    pickles = sorted(name for name in files if "/" not in name and name.endswith(_PICKLES))
+    if pickles:
+        found = f"{source} ships PyTorch pickles ({', '.join(pickles[:3])}), which Dew does not unpickle"
+        if conversion is not None:
+            return (f"{found}; SFconvertbot's safetensors conversion of this commit is at revision "
+                    f"{conversion!r}: load it with revision={conversion!r}")
+        return (f"{found}; convert them to safetensors (the Hub's safetensors/convert space opens "
+                "that conversion as a pull request whose refs/pr/N revision then loads)")
+    if gguf:
+        return (f"{source} ships GGUF files ({', '.join(gguf[:3])}{', ...' if len(gguf) > 3 else ''}), "
+                "which Dew does not read; load the safetensors repo they were quantized from "
+                "(the model card's base_model)")
+    return f"{source} has no model.safetensors or model.safetensors.index.json"
+
+
+_CONVERSION_TITLE = "Adding `safetensors` variant of this model"
+
+
+def _conversion_revision(name: str, commit: str) -> str | None:
+    """Return SFconvertbot's open safetensors pull request on `commit`, or None.
+
+    transformers' rule (safetensors_conversion.py, `previous_pr` and
+    `get_conversion_pr_reference`): an open pull request by SFconvertbot
+    under this title whose parent is the commit being loaded. Only looked
+    up; nothing is converted or opened.
+    """
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    for discussion in api.get_repo_discussions(name, author="SFconvertbot",
+                                               discussion_type="pull_request",
+                                               discussion_status="open"):
+        if discussion.title != _CONVERSION_TITLE or discussion.git_reference is None:
+            continue
+        commits = api.list_repo_commits(name, revision=discussion.git_reference)
+        if len(commits) > 1 and commits[1].commit_id == commit:
+            return discussion.git_reference
+    return None
 
 
 _METADATA_PATTERNS = ["*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]
@@ -1631,9 +1684,16 @@ def _snapshot(name_or_dir: str, revision: str | None, *,
                 for name in weight_files(files, folder,
                                          lambda name: json.loads((directory / name).read_text()))]
     if weights is True and not selected:
-        raise FileNotFoundError(
-            f"{name_or_dir} at {directory.name} has no model.safetensors or "
-            f"model.safetensors.index.json")
+        from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
+
+        source = f"{name_or_dir} at {directory.name}"
+        try:
+            conversion = (_conversion_revision(name_or_dir, directory.name)
+                          if any("/" not in name and name.endswith(_PICKLES) for name in files) else None)
+        except (HfHubHTTPError, OfflineModeIsEnabled) as error:
+            # The lookup only improves the message; its failure is chained.
+            raise FileNotFoundError(_missing_weights(source, files)) from error
+        raise FileNotFoundError(_missing_weights(source, files, conversion))
     if selected:
         snapshot_download(name_or_dir, revision=directory.name, allow_patterns=selected)
     return directory

@@ -169,3 +169,67 @@ def test_a_sharded_vae_reads_through_its_index(tmp_path):
 
     assert params["encoder"]["conv_in"]["bias"].shape == (2,)
     assert params["decoder"]["conv_out"]["bias"].shape == (3,)
+
+
+class Discussion(SimpleNamespace):
+    pass
+
+
+@pytest.fixture
+def conversion(monkeypatch):
+    """SFconvertbot's pull request on state-spaces/mamba2-130m, as the Hub API
+    lists it: refs/pr/1, whose parent is the main commit 3a5aea0c."""
+    import huggingface_hub
+
+    parents = {"refs/pr/1": "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49"}
+
+    def discussions(self, repo_id, **kwargs):
+        assert kwargs["author"] == "SFconvertbot"
+        return [Discussion(title="Adding `safetensors` variant of this model", git_reference="refs/pr/1")]
+
+    def commits(self, repo_id, *, revision):
+        return [SimpleNamespace(commit_id="ea6060f6"), SimpleNamespace(commit_id=parents[revision])]
+
+    monkeypatch.setattr(huggingface_hub.HfApi, "get_repo_discussions", discussions)
+    monkeypatch.setattr(huggingface_hub.HfApi, "list_repo_commits", commits)
+    return parents
+
+
+def test_a_pickle_repo_names_the_safetensors_conversion_that_loads(hub, conversion):
+    hub("mamba2-130m-ssm")
+
+    with pytest.raises(FileNotFoundError, match=r"pytorch_model\.bin.*revision='refs/pr/1'"):
+        pretrained.load_pretrained("state-spaces/mamba2-130m")
+
+
+def test_a_conversion_of_another_commit_is_not_offered(hub, conversion):
+    """transformers' rule: the pull request's parent is the commit loaded."""
+    hub("mamba2-130m-ssm")
+    conversion["refs/pr/1"] = "0" * 40
+
+    with pytest.raises(FileNotFoundError, match="convert them to safetensors") as error:
+        pretrained.load_pretrained("state-spaces/mamba2-130m")
+    assert "refs/pr/1" not in str(error.value)
+
+
+@pytest.mark.network
+def test_the_hub_lists_the_mamba2_130m_conversion():
+    with pytest.raises(FileNotFoundError, match=r"revision='refs/pr/1'"):
+        hf_decoders._snapshot("state-spaces/mamba2-130m", "3a5aea0c25d0fb43cc360e2c2aac82c26e3eed49")
+
+
+def test_a_gguf_repo_is_named_as_gguf_before_any_weight_downloads(hub):
+    fake = hub("qwen3-4b-gguf")
+
+    with pytest.raises(FileNotFoundError, match=r"GGUF files \(Qwen3-4B-BF16\.gguf, .*base_model"):
+        pretrained.load_pretrained("unsloth/Qwen3-4B-GGUF")
+    assert fake.fetched == []
+
+
+@pytest.mark.parametrize("name, stated", [
+    ("llama-3.1-8b-instruct-mlx-4bit", r"4-bit weights in groups of 64"),
+    ("bonsai-27b-mlx-1bit", r"1-bit weights in groups of 128"),
+])
+def test_mlx_quantization_is_refused_by_name(name, stated):
+    with pytest.raises(ValueError, match=f"is MLX quantization \\({stated}\\)"):
+        pretrained._source_quantization(fixture_config(name))

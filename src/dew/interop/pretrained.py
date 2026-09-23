@@ -845,8 +845,26 @@ class _SourceQuantization:
     read: Callable[[Mapping[str, np.ndarray], str], np.ndarray]
 
 
+def _refuse_mlx(config: Mapping[str, object]) -> None:
+    """Refuse MLX quantization by name.
+
+    mlx-lm writes its affine group quantization as `quantization` (and, in
+    older conversions, the same record as `quantization_config`) with
+    `group_size` and `bits` and no `quant_method`, over MLX's own tensor
+    names (`.scales`, `.biases`).
+    """
+    for key in ("quantization", "quantization_config"):
+        entry = config.get(key)
+        if isinstance(entry, Mapping) and "quant_method" not in entry and {"bits", "group_size"} <= entry.keys():
+            raise ValueError(
+                f"{key} {dict(entry)!r} is MLX quantization ({entry['bits']}-bit weights in groups "
+                f"of {entry['group_size']}), which Dew does not dequantize; load the unquantized "
+                "safetensors repo it was converted from (the model card's base_model)")
+
+
 def _source_quantization(config: Mapping[str, object], *, param_dtype: str = "float32") -> _SourceQuantization | None:
     """Return the format a config's `quantization_config` declares, or None."""
+    _refuse_mlx(config)
     quantization = config.get("quantization_config")
     if quantization is None:
         return None
@@ -2163,7 +2181,10 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
             name for name in index if _present(index, name)))
         return _load_diffusion_source(directory, index, dtype=dtype,
                                       attention_impl=attention_impl, param_dtype=param_dtype)
-    directory = decoders._snapshot(str(name_or_dir), directory.name)
+    if not (directory / "config.json").is_file():
+        # A GGUF or pickle repo often ships no config.json; the weights read
+        # says what it ships instead.
+        decoders._load_shards(decoders._snapshot(str(name_or_dir), directory.name))
     with open(directory / "config.json") as handle:
         config = json.load(handle)
     text_config = config.get("text_config")
@@ -2172,9 +2193,12 @@ def load_pretrained(name_or_dir: str | Path, *, dtype: str = "bfloat16", param_d
         raise ValueError(
             "text_config.quantization_config is not supported for the kimi_k25 text-only loader; "
             "provide dequantized text weights and remove that quantization descriptor")
-    tensors = decoders._load_shards(directory)
     family = config.get("model_type")
+    # Before any weight downloads: a format the codec cannot read is refused
+    # on the config alone.
     quantization = _source_quantization(config, param_dtype=param_dtype)
+    directory = decoders._snapshot(str(name_or_dir), directory.name)
+    tensors = decoders._load_shards(directory)
     quantized_tensors = () if quantization is None else quantization.names(tensors)
     if quantization is not None:
         aliases: tuple[tuple[str, str], ...] = ()
