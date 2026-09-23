@@ -15,6 +15,8 @@ import jax
 import numpy as np
 from flax import struct
 from jax.experimental import multihost_utils
+from jax.typing import ArrayLike
+from numpy.typing import NDArray
 
 T = TypeVar("T")
 
@@ -63,6 +65,18 @@ class TokenScores:
 # pick exactly one scoring artifact by type; previews never satisfy metrics.
 Artifact = ImageGrid | VideoGrid | TextSamples | Representations | TokenScores
 Artifacts = Artifact | tuple[Artifact, ...]
+
+
+def uint8_pixels(images: ArrayLike) -> NDArray[np.uint8]:
+    """[-1, 1] pixels, as `ImageGrid` and `VideoGrid` hold them, as uint8 in [0, 255].
+
+    Each value goes to its nearest level, `(x + 1) * 127.5` in float32
+    rounded half to even (`np.rint`), then clipped, because a sample can
+    leave the range. A metric scores and a tracker previews these bytes, so
+    the two see the same image.
+    """
+    levels = np.rint((np.asarray(images, np.float32) + 1.0) * 127.5)
+    return np.clip(levels, 0, 255).astype(np.uint8)
 
 
 def _addressable(leaf: jax.Array | np.ndarray) -> np.ndarray:
