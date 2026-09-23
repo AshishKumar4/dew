@@ -611,11 +611,6 @@ class WeightLayout:
     not its leaf's: DeepSeek V4's token-to-expert table is int64 on disk
     and int32 in the collection, and the export writes back what the
     checkpoint held.
-
-    `padded` is the length a 1-D source tensor stores past its leaf's, as
-    zeros: Kimi K3 ships each KDA layer's `A_log` for 96 heads padded to 128
-    entries (model-00001-of-000096.safetensors at f831ab6, zeros past 96).
-    The family's prepare step trims and checks the tail, and export pads it back.
     """
 
     name: str
@@ -625,7 +620,6 @@ class WeightLayout:
     concatenate: int | None = None
     expert_index: int | None = None
     dtype: np.dtype | None = None
-    padded: int | None = None
 
     def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
         leaves = []
@@ -656,8 +650,6 @@ class WeightLayout:
         value = leaves[0] if self.concatenate is None else np.concatenate(leaves, axis=self.concatenate)
         if self.transpose is not None:
             value = value.transpose(self.transpose)
-        if self.padded is not None:
-            value = np.pad(np.asarray(value), (0, self.padded - value.shape[0]))
         if value.size != math.prod(self.shape):
             raise ValueError(
                 f"{self.name} assembles {value.shape} from {self.paths}, which does not "
@@ -675,8 +667,6 @@ class WeightLayout:
             raise ValueError(f"{self.name} is assembled from several leaves, so no one leaf restores it")
         if tensor.shape != self.shape:
             raise ValueError(f"{self.name} stores {self.shape}, not {tensor.shape}")
-        if self.padded is not None:
-            return np.ascontiguousarray(tensor[:shape[0]])
         transpose = self.transpose or tuple(range(len(shape)))
         stored = tensor.reshape(tuple(shape[axis] for axis in transpose))
         return np.ascontiguousarray(stored.transpose(sorted(range(len(shape)), key=transpose.__getitem__)))
@@ -770,24 +760,8 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
     # A weight is fp32 in the tree whatever the checkpoint stored it as, so
     # only an index table's own width has to be carried back.
     stored = None if np.issubdtype(tensor.dtype, np.floating) else tensor.dtype
-    padded = None
-    if tensor.ndim == 1 and len(paths) == 1 and expert_index is None:
-        leaf = _leaf(variables, paths[0])
-        if leaf is not None and leaf.ndim == 1 and leaf.shape[0] < tensor.shape[0]:
-            # The family trimmed a zero tail the source pads to (WeightLayout.padded).
-            padded = tensor.shape[0]
     return WeightLayout(name, paths, tensor.shape, transpose, concatenate,
-                        expert_index, stored, padded)
-
-
-def _leaf(variables: Mapping[str, object], path: tuple[str, ...]) -> np.ndarray | jax.Array | None:
-    """The loaded array at `path`, or None where the tree holds none."""
-    node: object = variables
-    for part in path:
-        if not isinstance(node, Mapping) or part not in node:
-            return None
-        node = node[part]
-    return node if isinstance(node, np.ndarray | jax.Array) else None
+                        expert_index, stored)
 
 
 
