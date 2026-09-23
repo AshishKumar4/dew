@@ -241,3 +241,12 @@ def test_chains_report_the_ids_pack_would_place():
     rewritten = Call((1, 9), (6,), (-.3,), "stop", 0)
     session = Session("t", "g", 0, 0, (first, appended, rewritten), Status.COMPLETED, 1.0)
     assert chains(session, 8) == ((1, 2, 3, 4, 5), (1, 9, 6))
+
+
+@pytest.mark.parametrize("value", [None, "1.0", True, float("nan")])
+def test_a_non_number_reward_or_likelihood_is_a_value_error(value):
+    if value is not None:  # None is how an unscored session says it has no reward
+        with pytest.raises(ValueError):
+            Session("t", "g", 0, 0, (), Status.CANCELLED, value)
+    with pytest.raises(ValueError):
+        Call((1,), (2,), (value,), "stop", 0)
