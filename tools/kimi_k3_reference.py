@@ -46,6 +46,7 @@ import json
 import os
 import sys
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -62,20 +63,19 @@ DESTINATION = ROOT / "kimi-k3-tiny"
 LEARNING_RATE = 1e-2
 
 
-def remote_package():
-    """Import the pinned remote code as the package `kimi_k3_remote`."""
-    package = CACHE / "kimi_k3_remote"
-    package.mkdir(parents=True, exist_ok=True)
-    for name in REMOTE:
-        path = package / name
+def remote_modules(repo: str, revision: str, cache: Path, package: str, names: tuple[str, ...]):
+    """Import remote code files pinned at `revision` as the modules of
+    `package`, fetched into `cache` once."""
+    directory = cache / package
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        path = directory / name
         if not path.exists():
-            url = f"https://huggingface.co/{REPO}/resolve/{REVISION}/{name}"
+            url = f"https://huggingface.co/{repo}/resolve/{revision}/{name}"
             path.write_bytes(urllib.request.urlopen(url, timeout=60).read())
-    (package / "__init__.py").touch()
-    sys.path.insert(0, str(CACHE))
-    return (importlib.import_module("kimi_k3_remote.configuration_kimi_k3"),
-            importlib.import_module("kimi_k3_remote.modeling_kimi_k3"),
-            importlib.import_module("kimi_k3_remote.modeling_kimi_linear"))
+    (directory / "__init__.py").touch()
+    sys.path.insert(0, str(cache))
+    return tuple(importlib.import_module(f"{package}.{name.removesuffix('.py')}") for name in names)
 
 
 def tiny_config() -> dict:
@@ -115,6 +115,49 @@ def scatter(model: torch.nn.Module) -> None:
                 parameter.copy_(noise * 0.08)
 
 
+def fixture_batch() -> tuple[np.ndarray, np.ndarray]:
+    """Two rows of 70 ids, past one 64-token KDA chunk, the second left-padded by 9."""
+    rng = np.random.default_rng(3182)
+    ids = rng.integers(3, 512, (2, 70))
+    mask = np.ones_like(ids)
+    ids[1, :9], mask[1, :9] = 0, 0
+    return ids, mask
+
+
+def sgd_step(model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor,
+             trained: Callable[[str], bool]):
+    """The logits, the mean next-token loss over targets whose input and
+    target are valid, and the logits after one SGD step at LEARNING_RATE on
+    each parameter `trained` names that the loss reaches. The step stays in
+    the model's parameters."""
+    logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+    valid = attention_mask.bool()
+    target_valid = valid[:, 1:] & valid[:, :-1]
+    ce = torch.nn.functional.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
+                                           input_ids[:, 1:].reshape(-1), reduction="none")
+    loss = (ce.reshape(target_valid.shape) * target_valid).sum() / target_valid.sum()
+    loss.backward()
+    with torch.no_grad():
+        moved = 0
+        for name, parameter in model.named_parameters():
+            if parameter.grad is not None and trained(name):
+                parameter.add_(parameter.grad, alpha=-LEARNING_RATE)
+                moved += 1
+        updated = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+    print("parameters moved", moved, "loss", float(loss),
+          "update changed logits by", float((updated - logits).abs()[valid].max()))
+    model.zero_grad(set_to_none=True)
+    return logits, loss, updated
+
+
+def greedy(model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    """Four greedy tokens after each row, and the logits each decode step read."""
+    generated = model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=4,
+                               do_sample=False, eos_token_id=None, pad_token_id=0,
+                               output_logits=True, return_dict_in_generate=True)
+    return generated.sequences.cpu().numpy(), torch.stack(generated.logits, 1).cpu().numpy()
+
+
 def mxfp4(weight: torch.Tensor):
     """compressed-tensors' MXFP4 encoding of a Linear weight and its decoding."""
     from compressed_tensors.compressors.mxfp4.base import MXFP4PackedCompressor
@@ -138,7 +181,7 @@ def main() -> None:
     os.environ["TRITON_CACHE_DIR"] = str(CACHE / "triton-ieee")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    configuration, modeling, linear = remote_package()
+    configuration, modeling, linear = remote_modules(REPO, REVISION, CACHE, "kimi_k3_remote", REMOTE)
     from fla.ops.kda import chunk_intra
     from triton.language import constexpr
 
@@ -170,29 +213,10 @@ def main() -> None:
     model = model.cuda().eval()
     moe = linear.KimiSparseMoeBlock
     moe.moe_infer = moe.moe_infer.__wrapped__
-    rng = np.random.default_rng(3182)
-    ids = rng.integers(3, 512, (2, 70))
-    mask = np.ones_like(ids)
-    ids[1, :9], mask[1, :9] = 0, 0
+    ids, mask = fixture_batch()
     input_ids = torch.tensor(ids, device="cuda")
     attention_mask = torch.tensor(mask, device="cuda")
-    logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-    valid = attention_mask.bool()
-    target_valid = valid[:, 1:] & valid[:, :-1]
-    ce = torch.nn.functional.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
-                                           input_ids[:, 1:].reshape(-1), reduction="none")
-    loss = (ce.reshape(target_valid.shape) * target_valid).sum() / target_valid.sum()
-    loss.backward()
-    with torch.no_grad():
-        moved = 0
-        for name, parameter in model.named_parameters():
-            if parameter.grad is not None and name.startswith("language_model."):
-                parameter.add_(parameter.grad, alpha=-LEARNING_RATE)
-                moved += 1
-        updated = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-    print("parameters moved", moved, "loss", float(loss),
-          "update changed logits by", float((updated - logits).abs()[valid].max()))
-    model.zero_grad(set_to_none=True)
+    logits, loss, updated = sgd_step(model, input_ids, attention_mask, lambda name: name.startswith("language_model."))
     for name, parameter in model.named_parameters():
         if name in tensors:
             source = tensors[name]
@@ -208,9 +232,7 @@ def main() -> None:
         # The wrapper carries no GenerationMixin under transformers 4.56.2;
         # without pixels it runs the language model on its embeddings
         # (modeling_kimi_k3.py:1145-1218), so that model generates.
-        generated = model.language_model.generate(input_ids=input_ids, attention_mask=attention_mask, max_new_tokens=4,
-                                   do_sample=False, eos_token_id=None, pad_token_id=0,
-                                   output_logits=True, return_dict_in_generate=True)
+        generated, step_logits = greedy(model.language_model, input_ids, attention_mask)
     grid = torch.linspace(-80, 80, 4001, dtype=torch.float32)
     situ = linear.SituAndMul(config["text_config"]["activation_situ_beta"],
                              config["text_config"]["activation_situ_linear_beta"])
@@ -219,8 +241,7 @@ def main() -> None:
     np.savez(DESTINATION / "reference.npz", input_ids=ids, attention_mask=mask,
              logits=logits.detach().cpu().numpy(), loss=np.float32(loss.detach().cpu()),
              learning_rate=np.float32(LEARNING_RATE), updated_logits=updated.cpu().numpy(),
-             generated=generated.sequences.cpu().numpy(),
-             step_logits=torch.stack(generated.logits, 1).cpu().numpy(),
+             generated=generated, step_logits=step_logits,
              situ_gate=gate.reshape(-1).numpy(), situ_up=up.reshape(-1).numpy(),
              situ=situ_out.reshape(-1).numpy())
     print("wrote", DESTINATION, "tensors", len(tensors))
