@@ -41,9 +41,6 @@ from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
 from .blocks import normal_kernel
-from .precision import rounded_operand
-from .precision import precision_names, rounded_operand
-from .sharding import EXPERT_AXIS, logical_axes
 from .inputs import BATCH_AXES
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs
@@ -571,8 +568,8 @@ class ExpertLinear(nn.Module):
     num_experts: int
     in_features: int
     features: int
-    init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
     implementation: str = 'auto'
+    init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 

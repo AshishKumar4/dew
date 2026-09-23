@@ -409,19 +409,10 @@ OPTIMIZER_MAP = {
     'muonclip': _muonclip_groups,
 }
 
-# The optimizers `OptimConfig.state_dtype='bfloat16'` builds.
-BF16_STATE_OPTIMIZER_MAP = {
-    'adam': _adam_bf16_state,
-    'adamw': _adamw_bf16_state,
-}
-
 
 @dataclasses.dataclass(frozen=True)
 class ParamGroup:
     """Parameters the optimizer moves at their own learning rate and decay.
-
-def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransformation:
-    """Build the solver a config describes, with its schedule and clipping.
 
     `patterns` are `fnmatch` patterns over a parameter's path, its dict keys
     joined by '/' (`layers_3/self_attn/q_proj/kernel`); `*` crosses '/'. A
@@ -643,6 +634,13 @@ def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransforma
         if config.optimizer in ('muon', 'muonclip'):
             # Muon's weight_decay does not cover the AdamW group's norm scales.
             opts.setdefault('adam_weight_decay', config.weight_decay)
+    make = OPTIMIZER_MAP[config.optimizer]
+    if config.state_dtype == 'bfloat16':
+        if config.optimizer not in BF16_STATE_OPTIMIZERS:
+            raise ValueError(
+                f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
+                f"{sorted(BF16_STATE_OPTIMIZERS)} have; {config.optimizer!r} does not")
+        make = BF16_STATE_OPTIMIZERS[config.optimizer]
     if config.param_groups:
         names = [group.name for group in config.param_groups]
         if len(set(names)) != len(names):
@@ -654,18 +652,11 @@ def build_optimizer(config: OptimConfig, steps: int) -> optax.GradientTransforma
                 group_opts['weight_decay'] = group.weight_decay
                 if config.optimizer in ('muon', 'muonclip'):
                     group_opts['adam_weight_decay'] = group.weight_decay
-            solvers[group.name] = OPTIMIZER_MAP[config.optimizer](
+            solvers[group.name] = make(
                 _scaled(learning_rate, group.learning_rate_multiplier), **group_opts)
         solver = optax.multi_transform(solvers, param_labels(config.param_groups))
-    solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
-    if config.state_dtype == 'bfloat16':
-        if config.optimizer not in BF16_STATE_OPTIMIZERS:
-            raise ValueError(
-                f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
-                f"{sorted(BF16_STATE_OPTIMIZERS)} have; {config.optimizer!r} does not")
-        solver = BF16_STATE_OPTIMIZERS[config.optimizer](learning_rate, **opts)
     else:
-        solver = OPTIMIZER_MAP[config.optimizer](learning_rate, **opts)
+        solver = make(learning_rate, **opts)
 
     if config.clip_grads > 0:
         solver = optax.chain(optax.clip_by_global_norm(config.clip_grads), solver)

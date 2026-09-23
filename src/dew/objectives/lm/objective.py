@@ -584,19 +584,10 @@ class LMObjective(Objective[Mean | LMStatistics, Variables]):
         self.qk_stats = qk_stats
         self.token_accuracy = token_accuracy
         self.indexer = indexer
-        if indexer is not None and trainable is not None:
-            raise ValueError("the indexer's phase decides what trains, so trainable is not taken with it")
-        self.trainable: PathFilter | None = (
-            _is_indexer if indexer is not None and indexer.phase == "warmup" else trainable)
-        if indexer is not None:
-            _check_indexer(model, indexer, {"balance_rate": balance_rate,
-                                            "aux_loss_alpha": aux_loss_alpha,
-                                            "mtp_weight": mtp_weight, "loss_role": loss_role,
-                                            "z_loss": z_loss or None,
-                                            "router_z_loss": router_z_loss or None})
         self.trainable = _trainable_with(model, indexer, trainable, {
             "balance_rate": balance_rate, "aux_loss_alpha": aux_loss_alpha,
-            "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None})
+            "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None,
+            "router_z_loss": router_z_loss or None})
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         # The EMA follows what moves; the frozen collection never does.
         self.ema = None if ema_decay is None else EMASpec(
