@@ -33,6 +33,8 @@ A process of a pool that fails does not wait for its peers. It prints the error,
 
 A rank can also stall without failing: blocked on a read, or in a compile that waits for its peers. Then every process stays alive and none reports anything, while the others wait inside a collective or a communicator's setup. For this case a pool bounds each device execution with XLA's execution watchdog. `prepare_process` sets `--xla_gpu_execution_terminate_timeout=30m` unless the run already set it. A process whose step, or whose sampling loop, runs longer than that ends, and the launcher, `srun` or the scheduler stops the rest. If you know how long your steps take, set a tighter value in `XLA_FLAGS` or through the recipe's `xla_flags`.
 
+A GPU pool compiles without JAX's persistent compilation cache. JAX keys a cached executable by a description of the devices that differs between the processes of one GPU pool: on one four-GPU host, ranks 0 and 1 found a step in a shared cache while ranks 2 and 3 compiled it, and the compile waited for results from ranks that never compiled. `prepare_process` turns the cache off in a GPU pool before its first compile. Single processes, and CPU and TPU pools, keep the cache.
+
 To run one process per GPU instead of one per host:
 
 ```bash
@@ -112,7 +114,7 @@ JAX_PLATFORMS=cpu dew launch --processes-per-host 4 \
 
 `/tmp/pool.json` records the losses and, for every fsdp group, the processes its devices sit on. Hybrid sharding shows `"fsdp_groups": [[0, 1], [0, 1], [2, 3], [2, 3]]`: each fsdp group spans the two hosts of its replica. Without `replicas`, `jax.make_mesh` gives `[[0], [1], [2], [3]]`. Run the worker again as one process with `--env XLA_FLAGS=--xla_force_host_platform_device_count=8` and `--mesh '{"fsdp": 8}'`. The two runs print the same losses to within 1e-6.
 
-`tests/test_distribution.py` runs this comparison for hybrid sharding and for a split sequence across processes. It also checks that a failing process stops the pool, including a rank whose loader fails in the middle of `fit`, and that a pool refuses a checkpoint directory its processes do not share. On a GPU run, the tests marked `mesh(devices=2)` take one GPU per process.
+`tests/test_distribution.py` runs this comparison for hybrid sharding and for a split sequence across processes. It also checks that a failing process stops the pool, including a rank whose loader fails in the middle of `fit` and one that stalls without failing, that a pool refuses a checkpoint directory its processes do not share, that two pools started together take a port each, and that a GPU pool leaves the persistent compilation cache alone. On a GPU run, the tests marked `mesh(devices=2)` take one GPU per process.
 
 `tools/layout_parity.py` runs every layout of every model family against one device, in one process or under `dew launch`. It compares the loss and each gradient leaf against the reference's own deviation when the batch's sums are reordered.
 
