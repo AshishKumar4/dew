@@ -52,15 +52,17 @@ def assert_same_generation(served, alone):
     np.testing.assert_allclose(served.raw_log_probs, alone.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
-def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone():
+@pytest.mark.parametrize("decode_steps", [1, 4])
+def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone(decode_steps):
     """Five prompts of different widths and budgets, greedy, one seed per
     row: the texts are byte-identical to the one-row task calls, and so is
-    everything else the generation carries."""
+    everything else the generation carries. With four iterations a call,
+    rows end inside a call and wait for the next one's admission."""
     bound = task()
     alone = [bound(prompt, budget, seed=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     assert len({generation.text for generation in alone}) == len(alone)
-    server = Server.from_task(bound, slots=4, capacity=128, admission=2)
+    server = Server.from_task(bound, slots=4, capacity=128, admission=2, decode_steps=decode_steps)
     tickets = [server.submit(prompt, budget, seed=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
@@ -198,7 +200,8 @@ def served_alongside(bound, slots=4, admission=2, **options):
     {"kv_cache": KVCache(page_size=16, pages=12)},
     {"kv_cache": KVCache(page_size=16, pages=12), "chunk": 2},
     {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True},
-], ids=["paged", "chunked", "prefix"])
+    {"kv_cache": KVCache(page_size=4, pages=40), "chunk": 3, "prefix_cache": True, "decode_steps": 3},
+], ids=["paged", "chunked", "prefix", "prefix-three-steps"])
 def test_a_paged_server_draws_what_each_request_draws_alone(options):
     """A pool of 12 pages holds fewer tokens than the 4 x 128 slots the dense
     server reserves, a prompt prefilled two or three tokens a step
@@ -219,8 +222,8 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
 @pytest.mark.parametrize("mesh, options", [
     (MeshSpec(), {}),
     (MeshSpec(tensor=2), {"kv_cache": KVCache(page_size=4, pages=64), "chunk": 3, "prefix_cache": True}),
-    (MeshSpec(fsdp=2, tensor=2), {"kv_cache": KVCache(page_size=16, pages=16)}),
-], ids=["data", "data-tensor-chunked-prefix", "data-fsdp-tensor-paged"])
+    (MeshSpec(fsdp=2, tensor=2), {"kv_cache": KVCache(page_size=16, pages=16), "decode_steps": 4}),
+], ids=["data", "data-tensor-chunked-prefix", "data-fsdp-tensor-paged-four-steps"])
 def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
     """Weights placed on a mesh serve on it: the slots and the pool's pages
     split over the row axes, one group of rows per device group, the heads
