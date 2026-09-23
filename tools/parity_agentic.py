@@ -46,8 +46,10 @@ OUTPUT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "rl" / "ag
 # Four sequences of six tokens. Row 0 sits inside every band. Row 1 has a
 # token whose proximal/behavior ratio is exp(2) = 7.39, above IcePop's 5 and
 # the TIS cap, and a masked one at exp(-1.2); both sequence masks reject it.
-# Row 2 drifts steadily, so its summed statistic leaves the sequence band
-# while its mean stays inside the geometric one. Row 3 is short.
+# Row 2 drifts steadily: its summed k1 (log behavior - log proximal) is -0.9
+# and its mean -0.15. The sequence and geometric bands are asymmetric in log
+# space, so each rejects row 2 on its negative side and would keep +0.9 and
+# +0.15; a flipped k1 sign keeps row 2. Row 3 is short.
 # Current-minus-old spans both clip sides and the dual clip.
 OLD = np.array([
     [-1.0, -0.5, -2.0, -0.3, -1.2, -0.7],
@@ -82,8 +84,8 @@ EPSILON_HIGH = 0.28
 DUAL_CLIP = 3.0
 TIS_CAP = 2.0
 BAND = (0.5, 5.0)
-SEQUENCE_BAND = (0.5, 2.0)
-GEOMETRIC_BAND = (0.8, 1.25)
+SEQUENCE_BAND = (0.5, 3.0)
+GEOMETRIC_BAND = (0.87, 2.0)
 
 
 def revision(path: Path) -> str:

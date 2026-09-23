@@ -170,8 +170,9 @@ def test_the_bypass_band_masks_tokens_and_weighs_none(reference):
 @pytest.mark.parametrize("name", ["sequence", "geometric"])
 @pytest.mark.parametrize(("aggregation", "suffix"), [("token-mean", "token"), ("session-mean", "sequence")])
 def test_sequence_masks_match_verl_rejection(reference, name, aggregation, suffix):
-    """seq_sum_k1 and seq_mean_k1 reject whole chains; the fixture's bands
-    reject rows 1 and 2 for the sum and row 1 alone for the mean."""
+    """seq_sum_k1 and seq_mean_k1 reject whole chains. The fixture's bands
+    are asymmetric in log space and reject rows 1 and 2 on the negative
+    side, which pins verl's k1 direction, log behavior - log proximal."""
     band = tuple(float(value) for value in reference[f"{name}_band"])
     loss, grad, metrics = _run(reference, aggregation=aggregation, **{f"{name}_mask": band})
     _check(reference, f"ppo_{name}_{suffix}", loss, grad)
