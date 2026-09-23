@@ -16,6 +16,7 @@ from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_ma
 from dew.nn import attention
 from dew.nn.attention import local_attention, scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels import bf16_dot_runs
 
 
 def dense_reference(query, key, value, keep):
@@ -220,9 +221,9 @@ def test_a_kind_reads_a_window_or_a_chunk_not_both():
         model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
 
 
-@pytest.mark.skipif(not attention.cudnn_runs(jnp.zeros((1, 8, 2, 64), jnp.bfloat16), None),
-                    reason="needs a GPU cuDNN attention runs on")
-def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn():
+@pytest.mark.skipif(jax.default_backend() != "gpu" or not bf16_dot_runs(),
+                    reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
+def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_deterministic_ops):
     """'auto' hands the band mask of a packed, windowed bf16 call to cuDNN
     as a bias: finite everywhere, padding rows included, and as close to a
     float64 oracle as the xla band is."""
