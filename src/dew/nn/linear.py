@@ -197,6 +197,43 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     return jnp.where(valid[:, None, :], output, 0), history
 
 
+def chunk_decay(g):
+    """Cumulate per-chunk log decays and build the pairwise decay between positions.
+
+    `g` is `[..., C, F]`: the C positions of a chunk and F decay channels.
+    Returns the inclusive cumulative sum `gc` over C, `[..., C, F]`, and
+    `decay[..., s, t, f] = exp(gc[s, f] - gc[t, f])` for s >= t, zero above
+    the diagonal, `[..., C, C, F]`.
+    """
+    chunk_size = g.shape[-2]
+    gc = jnp.cumsum(g, axis=-2)
+    inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
+    diff = gc[..., :, None, :] - gc[..., None, :, :]
+    # Masked before exp, as the references do. The unused positive
+    # differences can overflow, and an outer where alone leaves 0 * inf in
+    # the decay gradient.
+    diff = jnp.where(inclusive, diff, 0.0)
+    return gc, jnp.where(inclusive, jnp.exp(diff), 0.0)
+
+
+def strictly_lower_inverse(a):
+    """Return (I - A)^-1 = I + A + A^2 + ... for strictly lower triangular `a` `[..., C, C]`.
+
+    The chunked delta rules' reference loop `attn[i, :i] += sum_k attn[i, k]
+    attn[k, :i]`, iterated to the last row, computes exactly this for the
+    nilpotent A (verified against the loop at C=4 and C=64: they agree to
+    4e-15). The series is summed by doubling, S <- S + A^(2^k) S and
+    A <- A^2, which is log2(C) matmuls instead of C row updates.
+    """
+    chunk_size = a.shape[-1]
+    inv = jnp.broadcast_to(jnp.eye(chunk_size, dtype=a.dtype), a.shape)
+    power = a
+    for _ in range(max(1, math.ceil(math.log2(chunk_size)))):
+        inv = inv + power @ inv
+        power = power @ power
+    return inv
+
+
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
                            chunk_size: int = CHUNK_SIZE):
     """The chunked form of the gated delta rule, the reference's math.
@@ -208,9 +245,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
 
     The reference's sequential correction (`for i in range(1, chunk_size)`)
     is the forward substitution that inverts `I - A` for a strictly lower
-    triangular A. Here the series `I + A + A^2 + ...` is summed by doubling,
-    log2(C) matmuls instead of C row updates; the comment at the loop has
-    the verification.
+    triangular A, which `strictly_lower_inverse` sums as a series.
     """
     dtype = query.dtype
     query, key, value, g, beta = (
@@ -237,33 +272,17 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
     kb_c, vb_c, g_c = chunks(k_beta), chunks(v_beta), chunks(g)
 
     # Cumulative log decay within each chunk, the reference's
-    # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417).
-    gc = jnp.cumsum(g_c, axis=-1)  # [B, H, NC, C]
-
-    # decay[i, s, t] = exp(gc[s] - gc[t]) for s >= t else 0, the reference's
-    # `((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp()).tril()`.
-    inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))
-    diff = gc[..., :, None] - gc[..., None, :]  # [B, H, NC, C, C]
-    # The reference masks before exp too. Unused positive differences can
-    # overflow; an outer where alone leaves 0*inf in the decay gradient.
-    diff = jnp.where(inclusive, diff, 0.0)
-    decay = jnp.where(inclusive, jnp.exp(diff), 0.0)
-    # The strictly-lower operator the reference inverts row by row: its loop
-    # `attn[i, :i] += sum_k attn[i, k] attn[k, :i]`, iterated to the last row,
-    # computes exactly (I - A)^-1 = I + A + A^2 + ... for a nilpotent A
-    # (verified against the loop at C=4 and C=64: they agree to 4e-15). The
-    # series is summed by doubling: S <- S + A^(2^k) S, A <- A^2, which is
-    # log2(C) matmuls instead of C row updates. The mask is strictly lower
-    # (tril, -1): the reference's masked_fill zeroes the diagonal too.
+    # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the reference's
+    # `((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp()).tril()`, one decay
+    # channel per head.
+    gc, decay = chunk_decay(g_c[..., None])
+    gc, decay = gc[..., 0], decay[..., 0]  # [NC, B, H, C], [NC, B, H, C, C]
+    # The mask is strictly lower (tril, -1): the reference's masked_fill
+    # zeroes the diagonal too.
     strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
     attn = jnp.where(strict, -(kb_c @ jnp.swapaxes(k_c, -1, -2)) * decay, 0.0)
-    inv = jnp.broadcast_to(jnp.eye(chunk_size, dtype=attn.dtype), attn.shape)
-    power = attn
-    for _ in range(max(1, math.ceil(math.log2(chunk_size)))):
-        inv = inv + power @ inv
-        power = power @ power
-    # inv is (I + A)^-1 where A = attn, the reference's `attn + I` operator
-    # after its row correction loop.
+    # The reference's `attn + I` operator after its row correction loop.
+    inv = strictly_lower_inverse(attn)
     out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
     k_cumdecay = inv @ (kb_c * jnp.exp(gc)[..., None])
 

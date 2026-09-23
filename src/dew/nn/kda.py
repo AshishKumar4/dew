@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -44,7 +43,16 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .inputs import AttentionMetadata
-from .linear import CHUNK_SIZE, DepthwiseConv1d, RMSNormGated, _masked_conv1d, causal_conv1d, l2norm
+from .linear import (
+    CHUNK_SIZE,
+    DepthwiseConv1d,
+    RMSNormGated,
+    _masked_conv1d,
+    causal_conv1d,
+    chunk_decay,
+    l2norm,
+    strictly_lower_inverse,
+)
 from .mixers import MixerBase, MixerContext, mixers
 from .sharding import logical_axes
 
@@ -55,8 +63,8 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
 
     `chunk_kimi_delta_attention` (modeling_glm5_next.py:482-578) line for
     line in fp32. The reference's row correction loop inverts `I - A` for a
-    strictly lower triangular `A`; here the series is summed by doubling, as
-    `dew.nn.linear.chunk_gated_delta_rule` does and explains.
+    strictly lower triangular `A`, which `dew.nn.linear.strictly_lower_inverse`
+    sums as a series.
     """
     dtype = query.dtype
     query, key, value, g, beta = (x.astype(jnp.float32) for x in (query, key, value, g, beta))
@@ -79,21 +87,12 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     # (modeling_glm5_next.py:530), the decay between positions s >= t of
     # `exp(gc[s] - gc[t])` per dimension (modeling_glm5_next.py:532), zero
     # above the diagonal.
-    gc = jnp.cumsum(g_c, axis=-2)
-    inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
-    strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
-    diff = gc[..., :, None, :] - gc[..., None, :, :]  # [NC, B, H, C, C, Dk]
-    # Masked before exp: the unused positive differences overflow otherwise,
-    # and a where outside alone leaves 0 * inf in the gradient.
-    decay = jnp.where(inclusive, jnp.exp(jnp.where(inclusive, diff, 0.0)), 0.0)
+    gc, decay = chunk_decay(g_c)  # [NC, B, H, C, Dk], [NC, B, H, C, C, Dk]
     # attn[s, t] = -sum_d k_beta[s, d] k[t, d] decay[s, t, d], strictly lower
     # (the reference's `masked_fill(triu(0), 0)`, modeling_glm5_next.py:533).
+    strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
     attn = jnp.where(strict, -jnp.einsum('...sd,...td,...std->...st', kb_c, k_c, decay), 0.0)
-    inv = jnp.broadcast_to(jnp.eye(chunk_size, dtype=attn.dtype), attn.shape)
-    power = attn
-    for _ in range(max(1, math.ceil(math.log2(chunk_size)))):
-        inv = inv + power @ inv
-        power = power @ power
+    inv = strictly_lower_inverse(attn)
     out_vals = inv @ vb_c
     k_cumdecay = inv @ (kb_c * jnp.exp(gc))
 
