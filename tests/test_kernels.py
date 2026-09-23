@@ -338,3 +338,22 @@ def test_an_explicit_tpu_call_splash_cannot_describe_refuses_a_softcap(tpu_backe
             lambda q, k, v: attention_kernel(q, k, v, implementation='tpu', softcap=30.0,
                                              bias=bias),
             query, key, value)
+
+
+@pytest.mark.parametrize('generation,runs', [('sm75', False), ('sm80', True), ('sm89', True),
+                                             ('v6e', True), ('cpu', True)])
+def test_a_gpu_older_than_sm80_multiplies_bf16_without_the_bf16_algorithm(monkeypatch,
+                                                                          generation, runs):
+    """sm75 rejects BF16_BF16_F32 at run time, so on it bf16 attention runs
+    the reference path for 'auto' and 'xla' alike, and the bf16 operand
+    precision keeps the caller's."""
+    from dew.nn import kernels
+    from dew.nn.attention import resolve_implementation
+    from dew.nn.precision import bf16_operand_precision
+    monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
+    query = jnp.zeros((1, 16, 2, 64), jnp.bfloat16)
+    assert (bf16_operand_precision(jnp.bfloat16, None)
+            is jax.lax.DotAlgorithmPreset.BF16_BF16_F32) == runs
+    for requested in ('auto', 'xla'):
+        chosen = resolve_implementation(requested, query, query)
+        assert (chosen == 'reference') == (not runs)

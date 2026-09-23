@@ -593,3 +593,20 @@ The head multiplies fp32 states by the table as stored unless `bf16_head=True`, 
 On the v6e the fp32 operands already multiplied in one bf16 pass, so only skipping the argmax (`token_accuracy=False`) moves the head. On the L4 the argmax fuses into the head's own kernels. The lm-dense step on the L4 went from 142.21 ms to 132.43 ms with `bf16_head` (final branch: 138.72 to 129.36 ms); on the RTX 4080 (jax 0.11.2) the head at 4 x 1024 tokens went from 45.25 ms to 28.00 ms.
 
 `bf16_head` stays opt-in because it changes the loss. `tools/lm_step_parity.py`, 100 steps of the 39M-parameter decoder on the RTX 4080, twice each way: two fp32-head runs differ by at most 2.3e-4 relative at any step, two bf16-head runs by 7.7e-4, and a bf16-head run differs from an fp32-head run by 3.4e-4 and 7.2e-4, within the bf16 head's own rerun spread. Final losses 0.0078378 and 0.0078376 (fp32 head), 0.0078368 and 0.0078387 (bf16 head). Rejected: the fused Pallas kernel, 6% slower than the chunked head on the L4, and tokamax's `mosaic_tpu` head, 2.24x slower on the v6e (kernel catalog, 2026-09-22).
+
+### Generations below sm80
+
+A T4 (sm75) rejects the `BF16_BF16_F32` dot algorithm at run time ("UNIMPLEMENTED: Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32"), cuDNN's fused attention refuses bf16 there ("SDPA FP16/BF16 requires SM80"), and Triton does not compile for it. `dew.nn.kernels.generation.bf16_dot_runs` is the one test: below sm80 bf16 attention takes the reference path for `auto` and `xla`, the bf16 operand precision keeps the caller's precision, and the grouped matmul runs XLA.
+
+### Measured winners Dew does not adopt yet
+
+KernelMatrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell checked against float64 (`~/.cache/dew/verification-evidence/kernel-matrix/MATRIX.md`). Each needs a kernel or a dependency Dew does not carry yet:
+
+| op | where it wins | numbers | why not yet |
+|---|---|---|---|
+| tokamax `ragged_dot` `mosaic_tpu_v2` with tokamax's own VJP | TPU v5e and v6e, 8 experts | lm-moe up 0.899 ms against XLA's 1.05 (v5e), 0.395 against 0.48 (v6e); down 0.859 against 1.19 (v5e), 0.345 against 0.383 (v6e) | tokamax 0.0.14 pins typeguard==2.13.3 and tyro needs >=4; its flax.nnx import fails on jax 0.11.2. At 128 experts XLA wins. |
+| tokamax `triton` attention | sm80, sm89, no sliding window | causal 1k: 0.423 ms (A100), 1.06 (L4), 0.570 (RTX 4080); 0-20% faster than cuDNN | tokamax dependency, as above. cuDNN stays faster with a sliding window. |
+| tokamax `triton` RMSNorm | sm80, sm89 | 1.07x (A100), 1.53x (L4), 1.57x (RTX 4080) over XLA | tokamax dependency. |
+| fused-weight SwiGLU (tokamax `xla` formulation, one contraction for gate and up) | every GPU | 1.47x (A100), 1.47x (L4), 1.55x (RTX 4080), 1.21x (T4) over two XLA matmuls; no gain on TPU | a change to the MLP's parameter layout. |
+| tokamax `xla` head plus cross entropy | sm89 speed | 73.0 ms (L4) and 36.8 ms (RTX 4080), 1.55x and 1.58x over Dew's chunked head | tokamax dependency, and it holds 1.6-3.2 GiB where the chunked head holds 131-355 MiB. |
+| JAX's Pallas GPU `paged_attention` | sm80 and later, decode | 1.75-1.84x (A100), 1.85-2.1x (L4), 2.1-2.8x (RTX 4080) over the XLA gather | a decode-path change; on TPU the XLA gather wins at batch 8 and up to 2k context. |

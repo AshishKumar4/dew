@@ -34,23 +34,18 @@ from flax.typing import Dtype, PrecisionLike
 
 from ..precision import asks_default_precision
 from . import ragged_dot
-
-MIN_COMPUTE_CAPABILITY = (8, 0)
-"""The oldest GPU the kernels compile for, the bound JAX's own Pallas
-ragged_dot lowering applies (`_backend_supports_triton`)."""
+from .generation import BF16_GPU
 
 TRITON_DEPRECATION = (r"The Pallas Triton backend is deprecated and will be removed in"
                       r" a future JAX version\.")
 
 
-def _compute_capability(spelled: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in spelled.split('.'))
-
-
 def gpu_runs() -> bool:
-    """Whether this process holds a GPU the kernels compile for."""
+    """Whether this process holds a GPU the kernels compile for: compute
+    capability 8.0 on, the bound JAX's own Pallas ragged_dot lowering applies
+    (`_backend_supports_triton`)."""
     return any(device.platform == 'gpu'
-               and _compute_capability(device.compute_capability) >= MIN_COMPUTE_CAPABILITY
+               and int(device.compute_capability.replace('.', '')) >= BF16_GPU
                for device in jax.devices())
 
 

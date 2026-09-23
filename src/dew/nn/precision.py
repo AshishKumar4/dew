@@ -58,11 +58,17 @@ def bf16_operand_precision(dtype: Dtype | None,
     """The precision that keeps a bf16 dot bf16 in both directions.
 
     A caller that asked for more than the default precision keeps what it
-    asked for, and compute in anything but bf16 is left alone.
+    asked for, and compute in anything but bf16 is left alone. So is a GPU
+    older than sm80, which rejects the algorithm at run time
+    (`dew.nn.kernels.generation.BF16_GPU`).
     """
     if not asks_default_precision(precision) or dtype is None:
         return precision
     if jnp.dtype(dtype) != jnp.bfloat16:
+        return precision
+    # Imported here: dew.nn.kernels imports this module.
+    from .kernels.generation import bf16_dot_runs
+    if not bf16_dot_runs():
         return precision
     return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
 
