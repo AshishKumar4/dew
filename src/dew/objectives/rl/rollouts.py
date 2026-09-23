@@ -41,7 +41,7 @@ import numpy as np
 
 from dew.rl import group_advantage, rloo_advantage
 
-from .rollout import ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, IDS_KEY, RESPONSE_MASK_KEY
+from .rollout import ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, IDS_KEY, OLD_LOG_PROBS_KEY, RESPONSE_MASK_KEY
 
 SEGMENT_IDS_KEY = "text_segment_ids"
 """Which chain of its row each token belongs to, from 1; 0 is padding."""
@@ -254,7 +254,7 @@ def advantages(rollouts: Sequence[Rollout], estimator: str = "group") -> np.ndar
     for index, rollout in enumerate(rollouts):
         if rollout.status.trainable:
             members.setdefault((rollout.task, rollout.group), []).append(index)
-    result = np.zeros(len(rollouts), np.float32)
+    per_rollout = np.zeros(len(rollouts), np.float32)
     by_size: dict[int, list[list[int]]] = {}
     for group in members.values():
         if len(group) >= 2:
@@ -266,8 +266,8 @@ def advantages(rollouts: Sequence[Rollout], estimator: str = "group") -> np.ndar
             values = rloo_advantage(rewards, size)
         else:
             values = group_advantage(rewards, size, normalise_by_std=estimator == "group")
-        result[order] = np.asarray(values, np.float32)
-    return result
+        per_rollout[order] = np.asarray(values, np.float32)
+    return per_rollout
 
 
 def pack(rollouts: Sequence[Rollout], width: int, *, rows: int | None = None,
@@ -374,3 +374,64 @@ def sampled_values(batch: Mapping[str, np.ndarray], rollouts: Sequence[Rollout],
             raise ValueError("values must return one float per sampled id of the call")
         flat[where[group]] = given
     return out
+
+
+def rollout_metrics(rollouts: Sequence[Rollout], batch: Mapping[str, np.ndarray], *,
+                    source: Callable[[Rollout], str] | None = None,
+                    latencies: Sequence[float] | None = None,
+                    version: int | None = None) -> dict[str, float]:
+    """Host-side agentic telemetry for one packed batch and the rollouts behind it.
+
+    - `merge/calls_per_chain`: trainable calls over packed chains, 1.0 when
+      nothing merged; `pack/fill` is the share of row slots holding ids.
+    - `status/<name>`: share of rollouts per status, and
+      `masked/<name>`: share of all sampled ids that status masked.
+    - `reward/mean` over scored rollouts, `reward/<source>` per
+      `source(rollout)`, `reward/component/<name>` per verifier component.
+    - `latency/p50`, `p90`, `p99`, `max` over `latencies`, seconds per rollout.
+    - `lag/mean`, `lag/max`: `version` minus each trainable id's version.
+    - `mismatch/k3_kl`: mean `r - log r - 1` of proximal over behavior on
+      trainable ids, when the batch carries a proximal rescoring.
+    """
+    metrics: dict[str, float] = {}
+    total = max(len(rollouts), 1)
+    sampled = dict.fromkeys(Status, 0)
+    for rollout in rollouts:
+        sampled[rollout.status] += sum(len(call.sampled_ids) for call in rollout.calls)
+    everything = max(sum(sampled.values()), 1)
+    for status in Status:
+        metrics[f"status/{status.value}"] = sum(rollout.status == status for rollout in rollouts) / total
+        if not status.trainable:
+            metrics[f"masked/{status.value}"] = sampled[status] / everything
+    segments = np.asarray(batch[SEGMENT_IDS_KEY])
+    rows = np.arange(segments.shape[0])[:, None] * (segments.shape[1] + 1) + segments
+    chain_count = np.unique(rows[segments > 0]).size
+    calls = sum(len(rollout.calls) for rollout in rollouts if rollout.status.trainable)
+    metrics["merge/calls_per_chain"] = calls / chain_count if chain_count else 0.0
+    metrics["pack/fill"] = float(np.mean(segments > 0))
+    scored = [rollout for rollout in rollouts if rollout.status.trainable and rollout.reward is not None]
+    if scored:
+        metrics["reward/mean"] = float(np.mean([rollout.reward for rollout in scored]))
+        by_source: dict[str, list[float]] = {}
+        components: dict[str, list[float]] = {}
+        for rollout in scored:
+            if source is not None:
+                by_source.setdefault(source(rollout), []).append(float(rollout.reward or 0.0))
+            for name, value in rollout.components.items():
+                components.setdefault(name, []).append(float(value))
+        metrics.update({f"reward/{name}": float(np.mean(values)) for name, values in by_source.items()})
+        metrics.update({f"reward/component/{name}": float(np.mean(values)) for name, values in components.items()})
+    if latencies:
+        seconds = np.asarray(latencies, np.float64)
+        for label, quantile in (("p50", 50), ("p90", 90), ("p99", 99)):
+            metrics[f"latency/{label}"] = float(np.percentile(seconds, quantile))
+        metrics["latency/max"] = float(seconds.max())
+    mask = np.asarray(batch[RESPONSE_MASK_KEY]) != 0
+    if version is not None and mask.any():
+        lag = version - np.asarray(batch[VERSIONS_KEY])[mask]
+        metrics["lag/mean"], metrics["lag/max"] = float(lag.mean()), float(lag.max())
+    if OLD_LOG_PROBS_KEY in batch and mask.any():
+        log_ratio = (np.asarray(batch[OLD_LOG_PROBS_KEY], np.float64)
+                     - np.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], np.float64))[mask]
+        metrics["mismatch/k3_kl"] = float(np.mean(np.exp(log_ratio) - log_ratio - 1))
+    return metrics
