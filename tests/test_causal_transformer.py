@@ -1025,3 +1025,13 @@ def test_nope_and_xsa_are_the_attention_mixers_own_switches():
         mixer_from_record({"kind": "mla", "exclusive_self_attention": True})
     with pytest.raises(TypeError):
         tiny(nope=True)
+
+
+def test_a_multiplier_scales_bf16_states_in_fp32_opmath():
+    """0.22 rounds to 0.2197 in bf16; the multipliers keep the fp32 factor and
+    round only the product, as torch's bf16 * float does in lm-engine."""
+    from dew.nn.precision import scaled
+    x = jax.random.normal(jax.random.key(0), (4096,), jnp.bfloat16)
+    np.testing.assert_array_equal(scaled(x, 0.22), (x.astype(jnp.float32) * 0.22).astype(jnp.bfloat16))
+    assert scaled(x, 0.22).dtype == jnp.bfloat16
+    assert scaled(x, 1.0) is x

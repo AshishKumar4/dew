@@ -37,6 +37,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import Append, KVCache, rotated, write_cache
 from dew.nn.mixers import MixerBase, MixerContext, mixers
 from dew.nn.mla import YarnScaling, mla_rope_freqs
+from dew.nn.precision import scaled
 from dew.nn.sharding import logical_axes
 
 
@@ -401,8 +402,7 @@ class CausalSelfAttention(nn.Module):
             # NoPE rotates nothing; the query still carries the logit scale
             # the checkpoint asks for, which apply_rotary folds in otherwise.
             if self.attention_scale is not None:
-                query = query * jnp.asarray(
-                    self.attention_scale * math.sqrt(self.head_dim), query.dtype)
+                query = scaled(query, self.attention_scale * math.sqrt(self.head_dim))
         else:
             freqs_cos, freqs_sin = self._rotary_angles(rotary_positions)
             # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the

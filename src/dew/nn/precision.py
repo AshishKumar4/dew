@@ -71,3 +71,13 @@ def fp32_result_dot_general(precision: PrecisionLike = None):
             preferred_element_type=jnp.float32)
 
     return dot_general
+
+
+def scaled(x: jax.Array, factor: float) -> jax.Array:
+    """`x * factor` with the factor kept in fp32 and only the product rounded
+    to `x`'s dtype, which is what torch's `bf16_tensor * python_float` does
+    (fp32 opmath) and what Gemma's `embed_scale` here does. Rounding 0.22 to
+    bf16 first would shrink every product by a systematic 0.12%."""
+    if factor == 1.0:
+        return x
+    return (x.astype(jnp.promote_types(x.dtype, jnp.float32)) * factor).astype(x.dtype)
