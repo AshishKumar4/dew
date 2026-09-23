@@ -20,7 +20,7 @@ print(published("The capital of France is", 32, seed=0).text[0])
 
 The signature is `pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None, ema=True, step=None, revision=None)`. `source` is a run directory, a checkpoint directory or a Hub repository. A run's `run.json` must name its objective. Saved diffusion, LM, DPO, GRPO, PPO, block-diffusion and masked-diffusion runs have generation tasks. Other kinds, such as JEPA runs, have no generation task and raise here. Checkpoints in a published layout load through `dew.interop.load_pretrained`, including native latent-diffusion checkpoints described by `model_index.json`.
 
-`step` picks one of a run's checkpoints. `revision` pins a Hub source. `dtype` sets the compute dtype. `param_dtype` sets how parameters are stored: `None` keeps a run's stored dtypes and uses float32 master weights for a published source.
+`step` picks one of a run's checkpoints. `revision` pins a Hub source. `dtype` sets the compute dtype. `param_dtype` sets how parameters are stored: `None` keeps a run's stored dtypes and uses float32 master weights for a published source. `"auto"` keeps the stored dtypes for both: a source's `config.json` `dtype`, or its first floating tensor's.
 
 ## Weights
 
