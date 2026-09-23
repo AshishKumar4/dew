@@ -274,6 +274,26 @@ def stepping_pool(rank_one: str, *, execution_timeout: str | None = None) -> str
             "    x.block_until_ready()\n")
 
 
+@pytest.mark.mesh(devices=0)
+def test_one_slurm_task_joins_no_pool():
+    """srun with one task sets SLURM_JOB_ID, and JAX's Slurm detection then
+    starts a one-process pool whose coordinator is the node's name. A
+    container on the node need not resolve that name (the box's did not):
+    the process waited 300 s to register and aborted. One task is no pool,
+    so the process starts on its own."""
+    env = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu",
+           "SLURM_JOB_ID": "4242", "SLURM_NTASKS": "1", "SLURM_PROCID": "0", "SLURM_LOCALID": "0",
+           "SLURM_STEP_NODELIST": "dew-no-such-host", "SLURM_STEP_NUM_NODES": "1"}
+    program = ("from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "import jax\n"
+               "print('processes', jax.process_count())\n")
+    done = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "processes 1" in done.stdout, done.stdout
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_rank_whose_backend_fails_to_open_after_joining_ends_the_pool():
     """Rank 1 joins the pool and then cannot open its backend, as a GPU with
