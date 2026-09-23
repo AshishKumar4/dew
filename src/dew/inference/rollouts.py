@@ -287,11 +287,6 @@ class SafetensorsReload:
     def __post_init__(self) -> None:
         if self.engine not in ("vllm", "sglang"):
             raise ValueError("engine must be vllm or sglang")
-        if (not isinstance(self.engines, tuple) or not self.engines
-                or not all(isinstance(root, str) and root for root in self.engines)):
-            raise ValueError("engines is a nonempty tuple of replica root URLs")
-        if len(set(self.engines)) != len(self.engines):
-            raise ValueError("every replica is published to once")
 
     def write(self, variables: Variables) -> None:
         """Write `variables` into `directory`, file by file atomically; every process of a pool calls it."""
@@ -309,8 +304,6 @@ class SafetensorsReload:
         staging.rmdir()
 
     def __call__(self, variables: Variables, version: int) -> None:
-        if type(version) is not int or version < 0:
-            raise ValueError("a published policy version is a nonnegative integer")
         self.write(variables)
         agreed("weight publication", lambda: self._publish(version) if jax.process_index() == 0 else None)
 
@@ -375,8 +368,6 @@ class Publication:
     """
 
     def __init__(self, weights: WeightSync, *, version: int = 0, stamp: Callable[[int], None] | None = None):
-        if type(version) is not int or version < 0:
-            raise ValueError("a published policy version is a nonnegative integer")
         self._weights = weights
         self._stamp = stamp
         self._stamped(version)

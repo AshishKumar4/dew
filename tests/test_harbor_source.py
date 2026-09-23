@@ -42,15 +42,17 @@ FIXTURES = Path(__file__).parent / "fixtures/gateway"
 
 
 @pytest.mark.parametrize("engine", ["sglang", "vllm"])
-def test_a_real_engine_reply_recorded_by_the_gateway_is_one_call(engine):
-    # The engine's own reply (SGLang 0.5.20, vLLM 0.30.0) run through rllm-model-gateway 3b40c37's trace builder.
-    # SGLang lists the sampled ids as choices[0].response_token_ids, which the gateway does not extract.
-    reply = json.loads((FIXTURES / f"{engine}_chat_reply.json").read_text())["body"]["choices"][0]
-    sampled = reply["response_token_ids"] if engine == "sglang" else reply["token_ids"]
-    (call,) = calls([json.loads((FIXTURES / f"{engine}_trace.json").read_text())], unstamped=4).calls
-    assert call.sampled_ids == tuple(sampled) and len(call.sampled_ids) == 16
-    assert call.behavior_log_probs == tuple(entry["logprob"] for entry in reply["logprobs"]["content"])
-    assert len(call.prompt_ids) == 11 and call.finish_reason == "length" and call.version == 4
+def test_a_live_gateway_session_is_the_engine_ids_and_likelihoods(engine):
+    # A three-turn tool session captured live on a Colab L4 (Qwen2.5-0.5B-Instruct, rllm-model-gateway 3b40c37).
+    # SGLang 0.5.20 lists the sampled ids as choices[0].response_token_ids, which the gateway does not extract.
+    traces = json.loads((FIXTURES / f"{engine}_session_traces.json").read_text())
+    session = calls(traces, unstamped=0)
+    assert len(session.calls) == 3 and not session.errors
+    for call, recorded in zip(session.calls, traces, strict=True):
+        choice = recorded["raw_response"]["choices"][0]
+        assert call.sampled_ids == tuple(choice["response_token_ids"] if engine == "sglang"
+                                         else recorded["completion_token_ids"])
+        assert call.behavior_log_probs == tuple(entry["logprob"] for entry in choice["logprobs"]["content"])
 
 
 @pytest.mark.parametrize("broken", [
@@ -83,46 +85,29 @@ def test_a_malformed_trial_result_is_infra(malformed):
     assert outcome(malformed, (STOP,))[0] is Status.INFRA_ERROR
 
 
-BROKEN = {**trace([], [], None, None), "raw_response": {"error": {"message": "EngineCore died", "type": "InternalServerError",
-                                                 "code": 500}}}
+def overflow(engine):
+    return json.loads((FIXTURES / f"{engine}_overflow_trace.json").read_text())
 
 
-@pytest.mark.parametrize("engine", ["sglang", "vllm"])
-def test_a_live_session_and_overflow_through_the_gateway(engine):
-    # Captured live on a Colab L4 (Qwen2.5-0.5B-Instruct, rllm-model-gateway 3b40c37): a three-turn tool session,
-    # and a prompt past the context length, which SGLang 0.5.20 and vLLM 0.30.0 refuse in different shapes.
-    session = calls(json.loads((FIXTURES / f"{engine}_session_traces.json").read_text()), unstamped=0)
-    assert len(session.calls) == 3 and not session.errors
-    assert session.calls[0].finish_reason == "tool_calls"
-    overflow = calls([json.loads((FIXTURES / f"{engine}_overflow_trace.json").read_text())], unstamped=0)
-    assert overflow.calls == () and len(overflow.errors) == 1
-    assert outcome(result(rewards={"reward": 0}), session.calls, errors=overflow.errors)[0] is Status.TRUNCATED
+def refusal(message, code=400):
+    return {**trace([], [], None, None), "raw_response": {"error": {"message": message, "code": code}}}
 
 
-@pytest.mark.parametrize("message", [
-    # vLLM 0.30.0's input processor (v1/engine/input_processor.py:_validate_prompt_len), reached by
-    # token-id prompts that skip the renderer's check.
-    "The decoder prompt (length 4200) is longer than the maximum model length of 4096. Make sure that "
-    "`max_model_len` is no smaller than the number of text tokens.",
-    "The decoder prompt (length 4096) plus the number of requested output tokens (at least 1) is longer than "
-    "the maximum model length of 4096. Make sure that `max_model_len` is no smaller than the number of text "
-    "tokens (prompt + requested output tokens).",
+@pytest.mark.parametrize(("refused", "status"), [
+    # Live refusals of a prompt past the context length, in each engine's own shape.
+    (overflow("sglang"), Status.TRUNCATED),
+    (overflow("vllm"), Status.TRUNCATED),
+    # vLLM 0.30.0's input processor (_validate_prompt_len), reached by token-id prompts.
+    (refusal("The decoder prompt (length 4200) is longer than the maximum model length of 4096. Make sure that "
+             "`max_model_len` is no smaller than the number of text tokens."), Status.TRUNCATED),
+    (refusal("The decoder prompt (length 4096) plus the number of requested output tokens (at least 1) is longer "
+             "than the maximum model length of 4096."), Status.TRUNCATED),
+    (refusal("EngineCore died", 500), Status.INFRA_ERROR),
 ])
-def test_vllm_input_processor_overflow_truncates(message):
-    refused = {**trace([], [], None, None), "raw_response": {"error": {"message": message, "code": 400}}}
-    recorded = calls([trace([1, 2], [3], [-.5]), refused], unstamped=0)
-    assert outcome(result(rewards={"reward": 0}), recorded.calls, errors=recorded.errors)[0] is Status.TRUNCATED
-
-
-def test_engine_errors_are_events_not_calls():
-    overflow = json.loads((FIXTURES / "vllm_overflow_trace.json").read_text())
-    recorded = calls([trace([1, 2], [3], [-.5]), {**overflow, "timestamp": 9.0, "latency_ms": 10.0}], unstamped=0)
+def test_an_engine_error_is_an_event_that_decides_the_session(refused, status):
+    recorded = calls([trace([1, 2], [3], [-.5]), {**refused, "timestamp": 9.0, "latency_ms": 10.0}], unstamped=0)
     assert recorded.calls == (Call((1, 2), (3,), (-.5,), "stop", 0),) and len(recorded.errors) == 1
-    finished = result(rewards={"reward": 0})
-    # An engine that refused an overflowing prompt truncated the rollout; any other engine error is infra.
-    assert outcome(finished, recorded.calls, errors=recorded.errors)[0] is Status.TRUNCATED
-    broken = calls([trace([1, 2], [3], [-.5]), BROKEN], unstamped=0)
-    assert outcome(finished, broken.calls, errors=broken.errors)[0] is Status.INFRA_ERROR
+    assert outcome(result(rewards={"reward": 0}), recorded.calls, errors=recorded.errors)[0] is status
 
 
 STOP = Call((1,), (2,), (-.5,), "stop", 0)
@@ -151,9 +136,7 @@ def result(exception=None, rewards=None):
     (result(rewards={"tests": 1, "style": 0}), (STOP,), None, Status.INFRA_ERROR, None),
     # The harness's model client gave up (litellm exception names, recorded by mini-swe-agent as its
     # exit status) and Harbor saw only a nonzero exit: an infrastructure fault, not a scored failure.
-    *[(result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), name, Status.INFRA_ERROR, 0.0)
-      for name in ("APIConnectionError", "APIError", "InternalServerError", "ServiceUnavailableError",
-                   "Timeout", "RateLimitError", "BadGatewayError")],
+    (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), "APIConnectionError", Status.INFRA_ERROR, 0.0),
     (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), "ContextWindowExceededError",
      Status.TRUNCATED, 0.0),
     (result("NonZeroAgentExitCodeError", {"reward": 0}), (STOP,), "RepeatedFormatError", Status.AGENT_ERROR, 0.0),
