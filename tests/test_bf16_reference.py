@@ -30,6 +30,7 @@ The workflow's fp32 rows are tests/test_block_diffusion.py's.
 """
 
 import json
+import os
 from pathlib import Path
 
 import jax
@@ -112,3 +113,43 @@ def test_logits_coarser_than_the_reference_fail_the_rule():
     coarse = jax.lax.reduce_precision(logits, exponent_bits=5, mantissa_bits=2)
     with np.load(directory / "numerics.npz") as exact, pytest.raises(AssertionError, match="ratio"):
         assert_as_exact_as_the_reference(coarse, exact["bf16"], exact["f64"], "coarse")
+
+
+MAMBA2_130M = "AntonV/mamba2-130m-hf"
+MAMBA2_REVISION = "05e8773fc4ac1cd067e8a18a5c45372ce5178405"
+
+
+@pytest.mark.network
+@pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"),
+                    reason=f"DEW_NETWORK_TESTS=1 downloads {MAMBA2_130M}")
+def test_real_mamba2_weights_in_bf16_are_as_exact_as_the_reference():
+    """The published 130M port, 24 layers of width 768, where a bf16 run of
+    either implementation moves the logits by whole units: on a 44-token
+    prompt transformers' bf16 forward (bf16 weights, as `from_pretrained`
+    casts them) sits at RMS 1.11 (largest 5.87) from its float64 run and
+    Dew's with bf16 parameters at 1.05 (5.24), ratio 0.95; the two bf16
+    runs are 1.56 apart at most because each is that far from the truth,
+    not because either computes something else. Dew in bf16 over fp32
+    masters, the training configuration, sits at 0.53. In fp32 Dew is at
+    8.6e-05 and transformers at 4.9e-05 (ratio 1.78: the SSD sums its chunks
+    in another order)."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    text = ("The Cascade Range runs from northern California through Oregon and Washington into "
+            "British Columbia, and its volcanoes include Mount Rainier, Mount Hood and Mount St. "
+            "Helens, which erupted in 1980. The capital of France is")
+    ids = AutoTokenizer.from_pretrained(MAMBA2_130M, revision=MAMBA2_REVISION)(
+        text, return_tensors="np")["input_ids"]
+    runs = {}
+    for name, dtype in (("f64", torch.float64), ("float32", torch.float32), ("bfloat16", torch.bfloat16)):
+        reference = AutoModelForCausalLM.from_pretrained(
+            MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype).eval()
+        with torch.no_grad():
+            runs[name] = reference(torch.from_numpy(ids)).logits.to(torch.float64).numpy()
+    for dtype in ("float32", "bfloat16"):
+        pretrained = load_pretrained(MAMBA2_130M, revision=MAMBA2_REVISION, dtype=dtype,
+                                     param_dtype=dtype, attention_impl="xla")
+        logits = pretrained.model.apply(pretrained.variables, jnp.asarray(ids, jnp.int32))
+        assert_as_exact_as_the_reference(np.asarray(logits, np.float32), runs[dtype], runs["f64"],
+                                         f"{MAMBA2_130M} {dtype}")
