@@ -133,9 +133,9 @@ def main() -> None:
                          clip_ratio_high=EPSILON_HIGH, clip_ratio_c=DUAL_CLIP)
     out: dict[str, np.ndarray] = {}
 
-    def run(name, loss_fn, agg, weights=None, response_mask=mask):
+    def run(name, loss_fn, agg, weights=None, response_mask=mask, proximal=old):
         current = torch.tensor(CURRENT).requires_grad_()
-        loss, metrics = loss_fn(old, current, advantages, response_mask, agg, config, weights)
+        loss, metrics = loss_fn(proximal, current, advantages, response_mask, agg, config, weights)
         loss.backward()
         assert current.grad is not None
         out[f"{name}_loss"] = loss.detach().numpy()
@@ -159,6 +159,17 @@ def main() -> None:
                band_oob=np.float32(band_metrics["rollout_is_oob_ratio"]))
     run("ppo_band_token", core.compute_policy_loss_vanilla, "token-mean", band)
     run("ppo_tis_token", core.compute_policy_loss_vanilla, "token-mean", tis)
+
+    # Bypass mode (compute_policy_loss_bypass_mode, ppo_clip): behavior is the
+    # old policy, no IS weight reaches the loss, and the band is token-level
+    # rejection on the current policy against behavior. verl's k1 is
+    # log(mu / pi), so the ratio band (low, high) is threshold "1/high_1/low".
+    bypass, _ = helper.compute_rollout_rejection_mask(
+        torch.tensor(CURRENT) - behavior, mask, rollout_rs="token_k1",
+        rollout_rs_threshold=f"{1 / BAND[1]}_{1 / BAND[0]}")
+    out["bypass_band_mask"] = bypass.numpy()
+    run("ppo_bypass_band_token", core.compute_policy_loss_vanilla, "token-mean",
+        response_mask=bypass, proximal=behavior)
 
     for option, bounds, name in (("seq_sum_k1", SEQUENCE_BAND, "sequence"),
                                  ("seq_mean_k1", GEOMETRIC_BAND, "geometric")):
