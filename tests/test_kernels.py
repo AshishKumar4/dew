@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from dew.nn import kernels
 from dew.nn.attention import (
     SPLASH_LANES,
     SPLASH_MIN_LENGTH,
@@ -26,11 +27,12 @@ from dew.nn.attention import (
     tpu_runs,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels import bf16_dot_runs
 from dew.telemetry.devices import apply_xla_flags, deterministic_ops_requested, xla_flag
 from dew.training import MeshSpec, build_mesh
 
-on_gpu = pytest.mark.skipif(jax.default_backend() != 'gpu',
-                            reason="needs a cuda device")
+on_gpu = pytest.mark.skipif(jax.default_backend() != 'gpu' or not bf16_dot_runs(),
+                            reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
 
 
 def qkv(shape, seed=0):
@@ -136,6 +138,7 @@ def test_deterministic_ops_keep_the_auto_rule_off_cudnn(monkeypatch):
     a 64-wide head, no softcap), so the flag is what decides."""
     query, _, _ = qkv((1, 8, 2, 64))
     monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm89")
     monkeypatch.setenv("XLA_FLAGS", "--xla_force_host_platform_device_count=8")
     assert cudnn_runs(query)
     monkeypatch.setenv("XLA_FLAGS", "--xla_force_host_platform_device_count=8 "
@@ -347,7 +350,6 @@ def test_a_gpu_older_than_sm80_multiplies_bf16_without_the_bf16_algorithm(monkey
     """sm75 rejects BF16_BF16_F32 at run time, so on it bf16 attention runs
     the reference path for 'auto' and 'xla' alike, and the bf16 operand
     precision keeps the caller's."""
-    from dew.nn import kernels
     from dew.nn.attention import resolve_implementation
     from dew.nn.precision import bf16_operand_precision
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)

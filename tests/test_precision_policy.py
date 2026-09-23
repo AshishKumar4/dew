@@ -287,3 +287,13 @@ def test_default_policy_computes_in_bf16_and_keeps_params_fp32(architecture, rng
     assert jnp.all(jnp.isfinite(out.astype(jnp.float32)))
     if architecture == "unet_2d_condition":
         assert out.dtype == jnp.bfloat16
+
+
+def test_a_rounded_operand_rounds_under_jit_on_this_device():
+    """XLA's GPU default may delete a cast round trip under jit; the rounding
+    has to survive it, on whatever device runs the suite."""
+    from dew.nn.precision import rounded_operand
+    x = jnp.asarray([1 + 2**-10, -3 - 2**-9, 2**-130], jnp.float32)
+    rounded = jax.jit(lambda x: rounded_operand(x, jnp.bfloat16))(x)
+    assert jnp.array_equal(rounded, x.astype(jnp.bfloat16).astype(jnp.float32))
+    assert not jnp.array_equal(rounded, x)

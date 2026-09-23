@@ -58,6 +58,7 @@ from test_precision_policy import build_model, tiny_inputs
 
 from dew import models  # the attribute import is what registers every family
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels import bf16_dot_runs
 from dew.objectives.base import Step, scalar_loss
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import TEXT_KEY
@@ -311,6 +312,8 @@ def family_loss(family: str, rng):
     return loss, variables["params"]
 
 
+@pytest.mark.skipif(not bf16_dot_runs(), reason="a GPU older than sm80 has no bf16 dot "
+                    "algorithm; its bf16 families multiply at the default precision")
 @pytest.mark.parametrize("family", FAMILIES)
 def test_a_bf16_family_runs_its_matmuls_in_bf16(family, rng):
     """Under bf16 compute with fp32 parameters, the fp32 share of a family's
