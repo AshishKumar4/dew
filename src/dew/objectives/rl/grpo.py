@@ -300,24 +300,25 @@ class GRPOObjective(LMObjective):
                                                    geometric=geometric, segments=terms.segments)
                 metrics[f"masked/{name}"] = _fraction(1 - rejected, mask)
                 keep = keep * rejected
-        effective = mask * keep
+        # Weights and diagnostics read every trainable token, as verl's do;
+        # rejection reaches the loss through `effective` alone.
         importance = None
         if terms.behavior is not None:
             if self.behavior_importance_cap is not None:
-                importance = behavior_importance_weights(proximal, terms.behavior, effective,
+                importance = behavior_importance_weights(proximal, terms.behavior, mask,
                                                          self.behavior_importance_cap)
             elif self.behavior_band is not None:
-                importance = behavior_band_weights(proximal, terms.behavior, effective, *self.behavior_band)
-                metrics["masked/band"] = _fraction(importance == 0, effective)
-                if not terms.proximal:
-                    # The ratio already carries current over behavior, so the
-                    # band acts as a keep mask and applies no weight.
-                    keep = keep * (importance != 0)
-                    effective = mask * keep
-                    importance = None
+                importance = behavior_band_weights(proximal, terms.behavior, mask, *self.behavior_band)
+                metrics["masked/band"] = _fraction(importance == 0, mask)
             cap = (self.behavior_importance_cap if self.behavior_band is None else self.behavior_band[1])
-            mismatch = mismatch_metrics(proximal, terms.behavior, effective, importance, cap)
+            mismatch = mismatch_metrics(proximal, terms.behavior, mask, importance, cap)
             metrics.update({f"mismatch/{key}": value for key, value in mismatch.items()})
+            if importance is not None and not terms.proximal:
+                # The ratio already carries current over behavior, so the band
+                # acts as a keep mask and applies no weight.
+                keep = keep * (importance != 0)
+                importance = None
+        effective = mask * keep
         per_token, aux = self._policy_terms(terms, effective)
         if importance is not None:
             per_token = per_token * importance

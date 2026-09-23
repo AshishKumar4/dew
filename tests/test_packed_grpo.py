@@ -153,3 +153,20 @@ def test_corrections_without_proximal_log_probs_read_the_current_policy():
     capped = GRPOObjective(_model(), WIDTH - 1, behavior_importance_cap=2.0)
     with pytest.raises(ValueError, match="old_log_probs"):
         capped.loss(params, packed, step)
+
+
+def test_mismatch_metrics_describe_every_trainable_token_whatever_a_mask_rejects():
+    """verl computes IS weights and off-policy metrics over the response mask
+    and applies rejection to the loss alone."""
+    packed = pack(_rollouts(), WIDTH)
+    model = _model()
+    params = GRPOObjective(model, WIDTH - 1).init(jax.random.key(3))
+    packed[OLD_LOG_PROBS_KEY] = np.asarray(GRPOObjective(model, WIDTH - 1).packed_log_probs(params, packed))
+    step = Step(step=jnp.asarray(0), key=jax.random.key(0), ema=None)
+    _, open_aux = GRPOObjective(model, WIDTH - 1, behavior_band=(0.5, 5.0)).loss(params, packed, step)
+    _, masked_aux = GRPOObjective(model, WIDTH - 1, behavior_band=(0.5, 5.0),
+                                  sequence_mask=(0.99, 1.01)).loss(params, packed, step)
+    assert float(masked_aux.metrics["masked/sequence"]) == 1.0
+    for key in ("mismatch/kl", "mismatch/k3_kl", "mismatch/ess", "masked/band"):
+        assert float(masked_aux.metrics[key]) == pytest.approx(float(open_aux.metrics[key]))
+    assert float(open_aux.metrics["mismatch/kl"]) > 0.1
