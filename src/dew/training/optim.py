@@ -351,12 +351,14 @@ def bf16_moments(inner: optax.GradientTransformation) -> optax.GradientTransform
     expectation. The state keeps optax's `ScaleByAdamState` layout, so
     sharding and checkpoints read it as they read fp32 state.
     """
-    def narrow(moments):
-        return jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), moments)
+    def zeros(moments):
+        return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, jnp.bfloat16), moments)
 
     def init_fn(params):
-        state = inner.init(params)
-        return state._replace(mu=narrow(state.mu), nu=narrow(state.nu))
+        # The fp32 zeros `inner.init` would write are never materialised.
+        state = jax.eval_shape(inner.init, params)
+        return state._replace(count=jnp.zeros(state.count.shape, state.count.dtype),
+                              mu=zeros(state.mu), nu=zeros(state.nu))
 
     def update_fn(updates, state, params=None):
         del params  # scale_by_adam reads none

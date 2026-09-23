@@ -541,7 +541,7 @@ same init). On this card, at these sizes, fp8 gives no speedup to adopt.
 
 ## Kernel choices per generation, 2026-09-22
 
-Each choice below is made in one place per kernel and keyed by hardware generation (`dew.nn.moe.device_generation`: `sm89`, `v6e`); a generation without a measurement here runs the XLA path. `tools/benchmark_kernels.py` and `tools/benchmark_lm_head.py` reproduce the rows. The measurements are one process per row, jax 0.11.1, bf16 compute: a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, and the local RTX 4080 for the kernel-level rows. Step rows are `tools/benchmark_step.py` cases, 30 timed steps after 5 warmup; lm-moe is 321.8M parameters, 8 experts top-2, lm-dense 359.8M, both at sequence 1024. Batch is 4 (moe) and 1 (dense) on the L4, 8 and 8 on the v6e. "before" is main at c1f7e2dd.
+Each choice below is made in one place per kernel and keyed by hardware generation (`dew.nn.moe.device_generation`: `sm89`, `v6e`); a generation without a measurement here runs the XLA path. `tools/benchmark_kernels.py` and `tools/benchmark_lm_head.py` reproduce the rows. The measurements are one process per row, jax 0.11.1, bf16 compute: a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, and the local RTX 4080 for the kernel-level rows. Step rows are `tools/benchmark_kernels.py step` (built on `tools/benchmark_step.py`'s trainer), 30 timed steps after 5 warmup; lm-moe is 321.8M parameters, 8 experts top-2, lm-dense 359.8M, both at sequence 1024. Batch is 4 (moe) and 1 (dense) on the L4, 8 and 8 on the v6e. "before" is main at c1f7e2dd.
 
 ### The MoE grouped matmul: `GROUPED_MATMUL_BY_GENERATION`
 
@@ -554,6 +554,10 @@ Each choice below is made in one place per kernel and keyed by hardware generati
 | v6e | lm-moe after, `auto` = xla | 74.68 | 75.25 | 5.05 |
 | v6e | lm-moe after, tokamax (`mosaic_tpu_v2`) | 75.40 | 76.04 | 5.05 |
 
+Rerun on the final branch, jax 0.11.2, one Colab L4 session (2026-09-22 19:55 to 20:13 CDT), `tools/benchmark_kernels.py step --path lm-moe --batch 4`: `auto` (pallas) 224.90 ms, 8.15 GiB peak; `--implementation xla` 602.36 ms, 12.46 GiB. `projection`: Pallas 3.37 ms, XLA 25.19 ms forward plus backward.
+
+KernelMatrix's rows, forward plus backward, jax 0.11.2, checked against float64: at lm-moe's up projection the Pallas kernels take 1.21 ms against XLA's 6.25 on an A100, 3.15 against 25.9 on an L4 and 1.59 against 15.7 on the RTX 4080; at 128 experts 0.43 against 15.7 (A100), 1.38 against 77.9 (L4) and 0.55 against 33.5 (RTX 4080). On a TPU v5e and v6e XLA wins at 128 experts (v6e 0.346 ms against `mosaic_tpu_v2`'s 0.408). An sm75 card (T4) cannot compile the Triton kernels, and no sm90 or sm120 card was available, so those run XLA.
+
 `expert_projection` alone, 8192 rows, 768 to 2048, 8 experts, forward plus backward: XLA 26.21 ms and Pallas 3.38 ms on the L4; XLA 14.84 ms and Pallas 1.86 ms on the RTX 4080. Errors against a float64 oracle of the rounded operands are the same or lower for Pallas (kernel gradient 4.2e-6 against 6.8e-6 relative). The L4 step is 2.82x faster; JAX's stock Pallas lowering with an out-sharding fix measured 1.97x on the same step, because its tangents run in fp32 and Dew's backward multiplies the bf16 cotangent.
 
 Rejected: a pure-JAX loop of dense per-tile products. On the RTX 4080 it was 2.2x faster than XLA for the projection alone (6.67 ms), but it doubled the step's temporaries (4.22 GiB against 2.17 at batch 1), and on the v6e it was 2.2x slower than XLA (1.71 ms against 0.79). The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them, and called through a custom VJP. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They stay the sm80 to sm89 path: JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, and tokamax's sm80 Mosaic config exceeds Ada's shared memory. Dew filters that one message once the kernels are used. A Mosaic GPU grouped matmul for sm90 and later waits for Hopper hardware to measure it on. Under a mesh the kernels run inside `shard_map` on each device's share of the sorted rows; that path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
@@ -565,6 +569,9 @@ On TPU, tokamax's `mosaic_tpu_v2` is within 1% of XLA on the step; tokamax's def
 | device | measurement | fp32 state | bf16 state, hash rounding | bf16 state, threefry rounding |
 |---|---|---|---|---|
 | L4 | one AdamW update, lm-dense tree | 49.10 ms | 37.20 ms | 51.54 ms |
+| L4, final branch | one AdamW update, lm-dense tree | 55.97 ms | 40.44 ms | |
+| L4, final branch | lm-dense step | 138.72 ms, 7.34 GiB | 126.45 ms, 5.89 GiB | |
+| L4, final branch | lm-moe step | 224.90 ms, 8.15 GiB | 218.15 ms, 6.92 GiB | |
 | v6e | one AdamW update, lm-dense tree | 11.45 ms | 8.89 ms | 20.07 ms |
 | L4 | lm-dense step | 132.43 ms, 7.31 GiB | 120.09 ms, 5.86 GiB | |
 | L4 | lm-moe step | 213.14 ms, 8.15 GiB | 208.52 ms, 6.92 GiB | |
@@ -580,8 +587,9 @@ The head multiplies fp32 states by the table as stored unless `bf16_head=True`, 
 | device | fp32 operands (default) | `bf16_head`, with argmax | `bf16_head`, no argmax | fused linear cross entropy (Pallas port of Liger) |
 |---|---|---|---|---|
 | L4 | 206.16 ms | 134.02 ms | 133.91 ms | 142.63 ms |
+| L4, final branch | 197.35 ms | 128.11 ms | | |
 | v6e | 8.04 ms | 8.03 ms | 7.26 ms | not run |
 
-On the v6e the fp32 operands already multiplied in one bf16 pass, so only skipping the argmax (`token_accuracy=False`) moves the head. On the L4 the argmax fuses into the head's own kernels. The lm-dense step on the L4 went from 142.21 ms to 132.43 ms with `bf16_head`; on the RTX 4080 (jax 0.11.2) the head at 4 x 1024 tokens went from 45.25 ms to 28.00 ms.
+On the v6e the fp32 operands already multiplied in one bf16 pass, so only skipping the argmax (`token_accuracy=False`) moves the head. On the L4 the argmax fuses into the head's own kernels. The lm-dense step on the L4 went from 142.21 ms to 132.43 ms with `bf16_head` (final branch: 138.72 to 129.36 ms); on the RTX 4080 (jax 0.11.2) the head at 4 x 1024 tokens went from 45.25 ms to 28.00 ms.
 
 `bf16_head` stays opt-in because it changes the loss. `tools/lm_step_parity.py`, 100 steps of the 39M-parameter decoder on the RTX 4080, twice each way: two fp32-head runs differ by at most 2.3e-4 relative at any step, two bf16-head runs by 7.7e-4, and a bf16-head run differs from an fp32-head run by 3.4e-4 and 7.2e-4, within the bf16 head's own rerun spread. Final losses 0.0078378 and 0.0078376 (fp32 head), 0.0078368 and 0.0078387 (bf16 head). Rejected: the fused Pallas kernel, 6% slower than the chunked head on the L4, and tokamax's `mosaic_tpu` head, 2.24x slower on the v6e (kernel catalog, 2026-09-22).
