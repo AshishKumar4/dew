@@ -1160,7 +1160,8 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     """Translate a multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, qwen3_5 and gemma3n bundles translate. Records
+    gemma3, llama4, gemma4, qwen3_5 and gemma3n bundles translate, and a
+    bundle a decoder family reads itself (`DecoderFamily.wrapper`). Records
     retain the decoder, tower, projector, image token ID and token count, and
     for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
     audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 3n's
@@ -1178,8 +1179,8 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
         record = _qwen35_wrapper(hf_config, used)
     elif model_type == "gemma3n":
         record = _gemma3n_wrapper(hf_config, used)
-    elif model_type == "deepseek_v41":
-        record = _deepseek_v41_wrapper(hf_config, used)
+    elif isinstance(model_type, str) and model_type in _FAMILIES and (read := _FAMILIES[model_type].wrapper):
+        record = read(hf_config, used)
     else:
         _refuse(f"model_type {model_type!r}",
                 "no supported multimodal wrapper is registered for this model")
@@ -1240,9 +1241,6 @@ _WRAPPER_TOWER_PREFIX = {"siglip": "vision_tower.", "llama4": "vision_model.",
 _WRAPPER_PROJECTOR_PREFIX = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.",
                              "gemma4": "embed_vision.", "qwen3_5": "visual.merger.",
                              "gemma3n": "embed_vision.", "deepseek_v41": "aligner."}
-# DeepSeek-V4.1 keeps its decoder unprefixed and the image span's learned
-# vectors at the top level, beside the aligner (model.py:1201-1222).
-_V41_SPAN = ("image_start", "image_newline", "image_end")
 # Gemma 3n and Gemma 4 nest their audio encoder and embedder beside the vision ones.
 _WRAPPER_AUDIO_PREFIX = "audio_tower."
 _WRAPPER_AUDIO_PROJECTOR_PREFIX = "embed_audio."
@@ -1255,6 +1253,7 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], 
     tower_prefix = _WRAPPER_TOWER_PREFIX[record["tower"]["kind"]]
     projector_prefix = _WRAPPER_PROJECTOR_PREFIX[record["projector"]["kind"]]
     audio = record.get("audio")
+    bundled = _bundled(record["model_type"])
     sources: dict[str, dict[str, str]] = {name: {} for name in (
         "language_model", "tower", "projector", "audio_tower", "audio_projector")}
     aliases: list[tuple[str, str]] = []
@@ -1274,8 +1273,8 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], 
             group, local = "audio_tower", bare[len(_WRAPPER_AUDIO_PREFIX):]
         elif (bare.startswith("mtp.") and record["text_model_type"] == _QWEN35) or bare == "lm_head.weight":
             group, local = "language_model", bare
-        elif record["text_model_type"] == "deepseek_v41":
-            group, local = ("projector" if bare in _V41_SPAN else "language_model"), bare
+        elif bundled is not None:
+            group, local = ("projector" if bare in bundled.wrapper_projector_names else "language_model"), bare
         else:
             raise ValueError(f"unknown tensor name {name!r}")
         previous = sources[group].get(local)
@@ -2341,6 +2340,21 @@ class DecoderFamily:
     """The `constants` collection's entries a family derives from the source
     directory beside its tensors: DeepSeek-V4.1's engram token map, which
     its tokenizer defines."""
+    wrapper: Callable[[Mapping[str, object], set[str]], WrapperFields] | None = None
+    """Reads a multimodal bundle released under the family's own model_type:
+    a config of that type naming a vision_config loads whole through it. The
+    bundle keeps the decoder's tensors under their own names, unprefixed,
+    and `wrapper_projector_names` at its top level."""
+    wrapper_projector_names: tuple[str, ...] = ()
+    """The projector's tensors a bundle keeps at its top level, beside the
+    decoder's."""
+
+
+def _bundled(model_type: str) -> DecoderFamily | None:
+    """The family that reads the bundle released under `model_type`
+    (`DecoderFamily.wrapper`), or None."""
+    family = _FAMILIES.get(model_type)
+    return family if family is not None and family.wrapper is not None else None
 
 
 def _kind_mixers(fields: DecoderFields) -> list[MixerBase]:
@@ -2538,7 +2552,10 @@ _FAMILY_ENTRIES = (
                   'deepseek_v41', 'DeepseekV41ForCausalLM', lambda model: {},
                   weight_path=_deepseek_v41_path, prepare_weights=_deepseek_v4_prepare,
                   preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight'),
-                  constants=_deepseek_v41_constants),
+                  constants=_deepseek_v41_constants, wrapper=_deepseek_v41_wrapper,
+                  # The image span's learned vectors sit at the top level,
+                  # beside the aligner (model.py:1201-1222).
+                  wrapper_projector_names=('image_start', 'image_newline', 'image_end')),
     # V4's block is nothing another family builds: the mixer kind names its
     # window, its compressor and its grouped output projection at once.
     DecoderFamily(('deepseek_v4',), _deepseek_v4_config,
