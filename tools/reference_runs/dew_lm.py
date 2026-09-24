@@ -31,18 +31,17 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from common import (
+    TracedWindow,
+    attach_xplane_profile,
     git_head,
     host,
-    kernel_summary,
     peak_flops,
     sha256,
     steps_for,
     throughput,
     train_flops_per_token,
-    trim_trace,
     window_rows,
     write_record,
-    xplane_kernels,
 )
 
 
@@ -222,23 +221,14 @@ def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tupl
     """Every step in the recorded order: timed from `timing_warmup` to the
     profiled tail, which is traced, with the probes' time taken out."""
     losses, objectives, norms, extras = [], [], [], []
-    profile_from = run.total - args.profile_steps if args.profile_steps else run.total
-    window_start = window_end = None
-    probe_seconds = 0.0
+    window = TracedWindow(run.total, args.timing_warmup, args.profile_steps, trace_directory(args))
     state, loss = run.state, None
     for step in range(run.total):
-        if step in (args.timing_warmup, profile_from):
-            jax.block_until_ready(loss)
-            now = time.perf_counter()
-            if step == args.timing_warmup:
-                window_start = now
-            if step == profile_from:
-                window_end = now
-                jax.profiler.start_trace(str(trace_directory(args)))
+        window.before(step, loss)
         if probe is not None and step % args.probe_every == 0:
             spent = probe(step, state.params)
-            if args.timing_warmup <= step < profile_from:
-                probe_seconds += spent
+            if window.times(step):
+                window.excluded += spent
         state, loss, metrics, _, _ = run.step(state, run.batch(step))
         # The step's loss is the whole objective, balance terms included;
         # the cross entropy the reference records as its loss is `ce`.
@@ -247,17 +237,18 @@ def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tupl
         norms.append(jnp.copy(state.opt_state[0].norm))
         if args.aux_loss_alpha is not None:
             extras.append({"aux_loss": metrics["aux_loss"]})
-    jax.block_until_ready(loss)
-    end = time.perf_counter()
-    if window_end is None:
-        window_end = end
-    else:
-        jax.profiler.stop_trace()
-    return state, Curves(losses, objectives, norms, extras, window_end - window_start - probe_seconds,
-                         profile_from - args.timing_warmup)
+    return state, Curves(losses, objectives, norms, extras, window.close(loss), window.timed_steps)
 
 
-def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProbe | None) -> dict:
+def versions() -> dict:
+    """The versions a record names, read before the run so an untraceable
+    checkout fails at once rather than after it."""
+    return {"jax": jax.__version__, "dew": git_head(Path(__file__).resolve().parents[2]),
+            "optax": optax.__version__, "flax": __import__("flax").__version__}
+
+
+def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProbe | None,
+           built_from: dict) -> dict:
     """The run's curves, conditions, versions, throughput and memory."""
     device_kind = jax.devices()[0].device_kind
     devices = jax.device_count()
@@ -278,8 +269,7 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
                    "schedule": "dew.training.optim.Cosine", "ema": None,
                    "model_config": {k: v for k, v in run.trainer.objective.model.__dict__.items()
                                     if isinstance(v, (int, float, str, bool, type(None)))}},
-        "versions": {"jax": jax.__version__, "dew": git_head(Path(__file__).resolve().parents[2]),
-                     "optax": optax.__version__, "flax": __import__("flax").__version__},
+        "versions": built_from,
         "device": device_kind,
         "host": host(),
         "loss": np.asarray(jax.device_get(curves.losses), np.float64).tolist(),
@@ -301,33 +291,18 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
     return result
 
 
-def attach_profile(args: argparse.Namespace, result: dict) -> None:
-    """The traced tail's kernel summary, beside its trimmed kernel rows. A
-    trace the summary cannot read is recorded as such; the run's curves
-    stand without it."""
-    trace_dir = trace_directory(args)
-    try:
-        kernels, lines = xplane_kernels(trace_dir)
-        result["profile"] = kernel_summary(kernels, args.profile_steps)
-        result["profile"]["kernels"] = str(trim_trace(kernels, trace_dir / "kernels.json.gz"))
-        result["profile"]["device_lines"] = lines
-    except (ValueError, FileNotFoundError) as error:
-        result["profile"] = {"error": str(error)}
-    for raw in trace_dir.rglob("*.xplane.pb"):
-        raw.unlink()
-
-
 def main() -> None:
     args = arguments()
+    built_from = versions()
     run = build(args)
     probe = RouterProbe(run, args.probe_rows) if args.probe_every else None
     state, curves = train(args, run, probe)
     if probe is not None:
         probe(run.total, state.params)
-    result = record(args, run, curves, probe)
+    result = record(args, run, curves, probe, built_from)
     if args.profile_steps:
         write_record(args.out, result)
-        attach_profile(args, result)
+        attach_xplane_profile(result, trace_directory(args), args.profile_steps)
     write_record(args.out, result)
     print(json.dumps({"first_loss": result["loss"][0], "last_loss": result["loss"][-1],
                       "tokens_per_s": result["throughput"]["tokens_per_s"], "mfu": result["mfu"],
