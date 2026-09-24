@@ -1572,9 +1572,11 @@ class CausalTransformer(nn.Module):
     Layers are alike when they share a parameter shape and a computation,
     which is read off the resolved layers and never configured. A body
     compiles once however many layers it runs, so compile time stops growing
-    with depth. The variables tree is the unscanned one leaf for leaf:
-    `init` always runs the plain loop, and the scan reads and writes a
-    stacked view of the same leaves (`StackView`). A stage axis above one on
+    with depth. The variables tree is the unscanned one leaf for leaf: the
+    scan reads and writes a stacked view of the same leaves (`StackView`).
+    `init` builds every run of like layers under the scan whatever
+    `scan_layers` says, so its program draws each run's parameters once
+    rather than once per layer, and unstacks them into that tree. A stage axis above one on
     the mesh runs the stack as a pipeline over that axis (`_pipeline`),
     whether or not the layers scan.
     """
@@ -2801,6 +2803,14 @@ class CausalTransformer(nn.Module):
         one array the store holds.
         """
         stages = pipeline_stages()
+        if self.is_initializing() and stages == 1 and not decode:
+            groups = scan_groups(self.specs, self.bank_layers)
+            if any(count > 1 for _, count in groups):
+                view = StackView(groups)
+                run = nn.map_variables(type(self)._stacked, True, trans_in_fn=view.stack,
+                                       trans_out_fn=view.unstack, init=True, mutable=True)
+                return run(self, view, x, train, decode, positions, segment_ids,
+                           per_layer_input, attention_metadata)
         if self.is_initializing() or (stages == 1 and not self.scan_layers):
             return run_stack(
                 self.layers, self.block, self.specs,
