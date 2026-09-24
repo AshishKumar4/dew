@@ -6,9 +6,11 @@ code, the output, and which processes are left alive.
 """
 
 import os
+import queue
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -32,9 +34,9 @@ def test_training_does_not_import_the_command_line():
     assert done.stdout.strip() == "[]"
 
 
-def launcher(*arguments: str) -> subprocess.Popen:
+def launcher(*arguments: str, env: dict[str, str] = ENV) -> subprocess.Popen:
     return subprocess.Popen([sys.executable, "-m", "dew.cli.main", "launch", *arguments],
-                            cwd=REPO_ROOT, env=ENV, stdout=subprocess.PIPE,
+                            cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, start_new_session=True)
 
 
@@ -79,6 +81,29 @@ def test_a_signalled_launch_stops_its_pool_and_reports_the_signal(tmp_path, sign
     while any(alive(pid) for pid in ranks) and time.monotonic() < deadline:
         time.sleep(0.1)
     assert not any(alive(pid) for pid in ranks)
+
+
+def test_a_ranks_lines_reach_the_launch_while_the_rank_runs():
+    """A Python rank's print arrives while the rank runs on. Its stdout is
+    the launcher's pipe, which Python fills in blocks, so without unbuffered
+    output a run's step lines would reach the log only when the run ends.
+    The launch runs without PYTHONUNBUFFERED, as from a plain shell."""
+    program = "import time\nprint('ready')\ntime.sleep(600)\n"
+    shell = {name: value for name, value in ENV.items() if name != "PYTHONUNBUFFERED"}
+    launch = launcher("--port", "1", "--", sys.executable, "-c", program, env=shell)
+    lines: queue.Queue[str] = queue.Queue()
+    threading.Thread(target=lambda: [lines.put(line.decode()) for line in launch.stdout or ()],
+                     daemon=True).start()
+    seen = []
+    deadline = time.monotonic() + 30
+    try:
+        while "[0] ready" not in seen:
+            seen.append(lines.get(timeout=max(0.0, deadline - time.monotonic())).rstrip())
+    except queue.Empty:
+        pytest.fail(f"the rank's line had not arrived after 30 s; the launch printed {seen}")
+    finally:
+        launch.send_signal(signal.SIGTERM)
+        launch.wait(timeout=60)
 
 
 def test_a_rank_printing_bytes_that_are_not_utf8_still_finishes():
