@@ -12,12 +12,12 @@ import re
 from flax import serialization
 from flax.traverse_util import flatten_dict
 import numpy as np
-from safetensors.numpy import save_file
 
 
 def convert(directory):
     directory = Path(directory)
     from dew.interop.diffusion import write_flax_component
+    from dew.interop.safetensors_io import write_file
     from safetensors.numpy import load_file
     index = json.loads((directory / "model_index.json").read_text())
     for component in ("unet", "vae", "text_encoder", "text_encoder_2", "safety_checker"):
@@ -49,7 +49,7 @@ def convert(directory):
                 names.append(part)
             tensors[".".join(names)] = np.ascontiguousarray(value)
         filename = "diffusion_pytorch_model.safetensors" if component in ("unet", "vae") else "model.safetensors"
-        save_file(tensors, folder / filename)
+        write_file(tensors, folder / filename, {"format": "pt"})
     print(directory, "canonical safetensors ready")
 
 

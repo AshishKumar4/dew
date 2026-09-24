@@ -116,7 +116,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
-from safetensors.numpy import load_file, save_file
+from safetensors.numpy import load_file
 from transformers import (
     DeepseekV2Config, DeepseekV2ForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma3nTextConfig, Gemma4TextConfig, Glm4MoeConfig, Glm4MoeForCausalLM,
@@ -149,6 +149,7 @@ from deepseek_v4_reference import (  # noqa: E402
 )
 from gpt_oss_reference import tiny_gpt_oss  # noqa: E402
 from hf_reference import DEEPSEEK_YARN, FIXTURES, write_released_config, write_tiny  # noqa: E402
+from dew.interop.safetensors_io import write_file
 from dew.interop.verify import BATCH, LENGTH, reference_logits, scatter_weights
 from moe_reference import expert_tensors  # noqa: E402
 from qwen_mtp_reference import QwenMTP  # noqa: E402
@@ -425,7 +426,7 @@ def write_kimi_k25(name: str, repo: str, model: Kimi_K25ForConditionalGeneration
                 tensor_name = release_prefix + tensor_name[len(saved_prefix):]
                 break
         released[tensor_name] = tensor
-    save_file(released, str(weights), metadata={"format": "pt"})
+    write_file(released, weights, {"format": "pt"})
 
     spelling = dict(saved["text_config"])
     for field in ("head_dim", "qk_head_dim", "rope_parameters", "rope_interleave"):
@@ -546,7 +547,7 @@ def write_glm_mtp(name: str, model, depth: GlmMTP, seed: int = 2026) -> None:
         tensors[prefix + tensor_name] = tensor
     tensors[prefix + "embed_tokens.weight"] = tensors["model.embed_tokens.weight"]
     tensors[prefix + "shared_head.head.weight"] = tensors["lm_head.weight"]
-    save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+    write_file(tensors, directory / "model.safetensors", {"format": "pt"})
     np.save(directory / "mtp_logits.npy", logits.to(torch.float32).numpy())
     print(f"{directory}: depth {prefix}* with {len(tensors)} tensors, "
           f"mtp logits {tuple(logits.shape)}")
@@ -615,7 +616,7 @@ def write_qwen3_next_mtp(name: str, model: Qwen3NextForCausalLM, repo: str,
             tensors["mtp." + tensor_name] = tensor.to(torch.float32).numpy()
     for tensor_name, tensor in expert_tensors(depth.layers[0].get_submodule("mlp.experts")).items():
         tensors["mtp.layers.0." + tensor_name] = tensor
-    save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+    write_file(tensors, directory / "model.safetensors", {"format": "pt"})
     np.savez(directory / "mtp_reference.npz", logits=logits.numpy(), hidden=hidden.numpy(),
              embeddings=embeddings.numpy(), positions=positions.numpy(), valid=valid.numpy())
     config = json.loads((directory / "config.json").read_text())
@@ -901,7 +902,7 @@ def write_glm5_next_mtp(name: str, model: Glm5NextTextForCausalLM, depth: Glm5Ne
             tensors[prefix + released] = tensor.to(torch.float32).numpy()
     for tensor_name, tensor in expert_tensors(depth.get_submodule("mlp.experts")).items():
         tensors[prefix + tensor_name] = tensor
-    save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+    write_file(tensors, directory / "model.safetensors", {"format": "pt"})
     np.save(directory / "mtp_logits.npy", logits.to(torch.float32).numpy())
     print(f"{directory}: depth {prefix}* with {len(tensors)} tensors, "
           f"mtp logits {tuple(logits.shape)}")
@@ -1130,7 +1131,7 @@ def add_layer_scalars(name: str) -> None:
               if tensor_name.startswith("model.layers.")}
     for index in layers:
         tensors[f"model.layers.{index}.layer_scalar"] = np.ones((1,), np.float32)
-    save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+    write_file(tensors, directory / "model.safetensors", {"format": "pt"})
 
 
 def write_mirrored_config(name: str, repo: str) -> None:

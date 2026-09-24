@@ -250,15 +250,16 @@ def reference_logits(case: Case, export: Path, ids: np.ndarray,
     have it build the causal one instead.
     """
     import torch
-    from safetensors.numpy import save_file
     from transformers import AutoModelForCausalLM
+
+    from dew.interop.safetensors_io import write_file
 
     config, tensors = case.reference(json.loads((export / "config.json").read_text()),
                                      source_tensors(export))
     view = workspace / f"{case.name}-reference"
     view.mkdir(parents=True, exist_ok=True)
     config.save_pretrained(str(view))
-    save_file(tensors, str(view / "model.safetensors"))
+    write_file(tensors, view / "model.safetensors", {"format": "pt"})
     loaded = AutoModelForCausalLM.from_pretrained(
         str(view), dtype=torch.float32, local_files_only=True, output_loading_info=True)
     if not isinstance(loaded, tuple) or len(loaded) != 2:

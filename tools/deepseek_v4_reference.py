@@ -9,7 +9,7 @@ import safetensors.torch
 import torch
 import transformers
 from safetensors import safe_open
-from safetensors.numpy import load_file, save_file
+from safetensors.numpy import load_file
 from transformers import DeepseekV4Config, DeepseekV4ForCausalLM
 from transformers.masking_utils import create_sliding_window_causal_mask
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import (
@@ -243,6 +243,8 @@ def write_deepseek_v4_source(name: str, seed: int = DEEPSEEK_V4_SEED) -> None:
     """
     from hf_reference import FIXTURES
 
+    from dew.interop.safetensors_io import write_file
+
     directory = FIXTURES / name
     tensors = {deepseek_v4_source_name(key): value
                for key, value in load_file(str(directory / "model.safetensors")).items()}
@@ -271,7 +273,7 @@ def write_deepseek_v4_source(name: str, seed: int = DEEPSEEK_V4_SEED) -> None:
             drawn = 1.0 + noise if "norm" in key else noise * 4.0
         depth[key] = drawn.numpy().astype(np.float32)
     tensors.update(depth)
-    save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+    write_file(tensors, directory / "model.safetensors", {"format": "pt"})
     print(f"{directory}: {len(tensors)} tensors under the release's names, "
           f"{len(depth)} of them the mtp.0 depth")
 
