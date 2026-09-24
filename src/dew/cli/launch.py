@@ -506,7 +506,7 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
             failed = next(((rank, code) for rank, code in enumerate(codes) if code), None)
             if failed is not None:
                 rank, code = failed
-                others = len(running) - 1
+                others = sum(1 for other, returned in enumerate(codes) if other != rank and returned is None)
                 emit(f"rank {rank} on {processes[rank].host} {_exit_text(code)}"
                      + (f"; stopping the other {others}" if others else ""))
                 _stop(running)
