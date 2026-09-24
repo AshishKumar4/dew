@@ -437,9 +437,20 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
             tokens, kernel, group_sizes, precision=precision,
             preferred_element_type=preferred_element_type,
             implementation=TOKAMAX_KERNEL_BY_GENERATION.get(device_generation(), 'xla'))
-    return jax.lax.ragged_dot(
-        tokens, kernel, group_sizes, precision=precision,
+    # A 16-bit product is exact at any precision, and XLA's TPU ragged-dot
+    # kernel refuses 16-bit operands at HIGHEST ("Bad lhs type"), so they
+    # multiply at DEFAULT: the same products, summed in the preferred type.
+    if all(jnp.finfo(operand.dtype).bits == 16 for operand in (tokens, kernel)):
+        precision = jax.lax.Precision.DEFAULT
+    # XLA's TPU kernel writes values into the rows past the groups, where
+    # other backends write zeros, and its lhs cotangent is the same kernel.
+    # Those rows are zeroed going in and coming out, so neither the output
+    # nor a dropped row's gradient carries them.
+    grouped = jnp.arange(tokens.shape[0])[:, None] < jnp.sum(group_sizes)
+    out = jax.lax.ragged_dot(
+        jnp.where(grouped, tokens, 0), kernel, group_sizes, precision=precision,
         preferred_element_type=preferred_element_type)
+    return jnp.where(grouped, out, 0)
 
 
 def _local(value: jax.Array) -> bool:
