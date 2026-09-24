@@ -101,26 +101,46 @@ FEEDBACK_TOKENS = 32
 
 SMOKE_MODEL = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/qwen2-tiny"
 
-# (what to print, how to compute it from a and b, a valid input range).
+
+def _uniform(low: int, high: int) -> Callable[[random.Random], tuple[int, int]]:
+    """a and b drawn independently from low..high."""
+    return lambda draw: (draw.randint(low, high), draw.randint(low, high))
+
+
+def _shared_factor(draw: random.Random) -> tuple[int, int]:
+    """a and b with a common factor from 1..12. Uniform in 1..99 they were
+    coprime 61% of the time, so print(1) passed that share of the cases."""
+    factor = draw.randint(1, 12)
+    return factor * draw.randint(1, 20), factor * draw.randint(1, 20)
+
+
+def _divisor_at_most(draw: random.Random) -> tuple[int, int]:
+    """b from 2..12 and a from b..150. Both uniform in 1..90 put a below b
+    49% of the time, so print(0) passed that share of the cases."""
+    b = draw.randint(2, 12)
+    return draw.randint(b, 150), b
+
+
+# (what to print, how to compute it from a and b, how to draw a and b).
 # Qwen3-0.6B solved the one-line arithmetic of an earlier set on 74% of its
 # first draws and on every draw by update 6, which leaves a curve no signal;
 # these need a loop, a number-theory fact or a careful edge case.
 TASKS = (
     ("the sum of all integers from min(a, b) to max(a, b) inclusive",
-     lambda a, b: sum(range(min(a, b), max(a, b) + 1)), (-30, 30)),
+     lambda a, b: sum(range(min(a, b), max(a, b) + 1)), _uniform(-30, 30)),
     ("the number of multiples of b between 1 and a inclusive (both are positive)",
-     lambda a, b: a // b, (1, 90)),
-    ("the sum of the decimal digits of a times b", lambda a, b: sum(map(int, str(abs(a * b)))), (1, 99)),
-    ("the greatest common divisor of a and b (both are positive)", math.gcd, (1, 99)),
+     lambda a, b: a // b, _divisor_at_most),
+    ("the sum of the decimal digits of a times b", lambda a, b: sum(map(int, str(abs(a * b)))), _uniform(1, 99)),
+    ("the greatest common divisor of a and b (both are positive)", math.gcd, _shared_factor),
     ("the number of primes p with min(a, b) <= p <= max(a, b)",
      lambda a, b: sum(all(p % d for d in range(2, int(p ** 0.5) + 1)) for p in range(max(2, min(a, b)), max(a, b) + 1)),
-     (1, 99)),
+     _uniform(1, 99)),
     ("the a-th Fibonacci number modulo b, where the 0th is 0 and the 1st is 1 (b is never zero)",
-     lambda a, b: _fibonacci(a) % b, (1, 40)),
+     lambda a, b: _fibonacci(a) % b, _uniform(1, 40)),
     ("the number of 1 bits in the binary form of a times b (both are positive)",
-     lambda a, b: bin(a * b).count("1"), (1, 99)),
+     lambda a, b: bin(a * b).count("1"), _uniform(1, 99)),
     ("the integer whose decimal digits are those of a times b in reverse order, without leading zeros",
-     lambda a, b: int(str(a * b)[::-1]), (1, 99)),
+     lambda a, b: int(str(a * b)[::-1]), _uniform(1, 99)),
 )
 
 
@@ -136,10 +156,10 @@ def records(count: int, seed: int) -> tuple[str, ...]:
     draw = random.Random(seed)
     rows = []
     for _ in range(count):
-        text, function, (low, high) = draw.choice(TASKS)
+        text, function, inputs = draw.choice(TASKS)
         cases = []
         for _ in range(3):
-            a, b = draw.randint(low, high), draw.randint(low, high)
+            a, b = inputs(draw)
             cases.append({"stdin": f"{a}\n{b}\n", "stdout": str(function(a, b))})
         prompt = (f"Write a Python program that reads two integers a and b from standard input, "
                   f"one per line, and prints {text}. Print nothing but that number. "
