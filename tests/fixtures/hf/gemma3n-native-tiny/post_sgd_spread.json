@@ -1,0 +1,1 @@
+{"torch": "2.10.0+cu128", "device": "NVIDIA GeForce RTX 4080", "cuda_vs_cpu": 7.522106170654297e-05, "cpu_vs_recorded": 2.9802322387695312e-06}
