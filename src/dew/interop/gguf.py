@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 import ml_dtypes
@@ -218,26 +217,3 @@ def read(path: str | os.PathLike[str]) -> tuple[Mapping[str, object], dict[str, 
     return config, tensors
 
 
-def resolve(name_or_dir: str | Path, directory: Path, gguf_file: str) -> Path:
-    """Return the local path of `gguf_file` in a directory, or download it at the snapshot's commit.
-
-    `directory` is the snapshot the metadata fetch resolved, named by its
-    commit, so the file comes from that commit even if the branch moves.
-    """
-    if os.path.isdir(name_or_dir):
-        path = directory / gguf_file
-        if not path.is_file():
-            present = sorted(entry.relative_to(directory).as_posix() for entry in directory.rglob("*.gguf"))
-            raise FileNotFoundError(f"{path} does not exist; the GGUF files in {directory} are {present}")
-        return path
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError
-
-    try:
-        return Path(hf_hub_download(str(name_or_dir), gguf_file, revision=directory.name))
-    except EntryNotFoundError as error:
-        from dew.interop.hf_decoders import _repo_files
-
-        present = sorted(name for name in _repo_files(str(name_or_dir), directory) if name.endswith(".gguf"))
-        raise FileNotFoundError(f"{name_or_dir} at {directory.name} has no {gguf_file!r}; "
-                                f"its GGUF files are {present}") from error

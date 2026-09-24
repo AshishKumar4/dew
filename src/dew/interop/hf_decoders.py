@@ -1790,6 +1790,32 @@ _METADATA_PATTERNS = ["*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]
 """Configs, indexes, tokenizer and chat-template files: everything a load reads but weights."""
 
 
+def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
+    """The local path of `filename` in a directory, or `filename` downloaded
+    from the repo at the snapshot's commit.
+
+    `directory` is the snapshot the metadata fetch resolved, named by its
+    commit, so the file comes from that commit even if the branch moves. A
+    missing file is refused, naming the files of its kind that are there.
+    """
+    suffix = Path(filename).suffix
+    if os.path.isdir(name_or_dir):
+        path = directory / filename
+        if not path.is_file():
+            present = sorted(entry.relative_to(directory).as_posix() for entry in directory.rglob(f"*{suffix}"))
+            raise FileNotFoundError(f"{path} does not exist; the {suffix} files in {directory} are {present}")
+        return path
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
+
+    try:
+        return Path(hf_hub_download(str(name_or_dir), filename, revision=directory.name))
+    except EntryNotFoundError as error:
+        present = sorted(name for name in _repo_files(str(name_or_dir), directory) if name.endswith(suffix))
+        raise FileNotFoundError(f"{name_or_dir} at {directory.name} has no {filename!r}; "
+                                f"its {suffix} files are {present}") from error
+
+
 def _repo_files(name: str, directory: Path) -> set[str]:
     """Every file of the snapshot's commit, by repo-relative name.
 
