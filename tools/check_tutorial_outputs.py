@@ -5,8 +5,8 @@ last commit that had changed src/dew when its outputs were made
 (`tools/run_tutorials.py --save` writes it). `tools/run_tutorials.py --imports
 FILE` records which of Dew's modules each notebook's kernel had imported by
 the end of a run. A notebook is stale when a commit after the recorded one
-changed the file of any of those modules; the script names the commits and
-files, so outputs that may no longer match the code are flagged instead of
+changed the file of any of those modules, or pyproject.toml, which pins the
+dependencies (JAX among them); the script names the commits and files, so outputs that may no longer match the code are flagged instead of
 trusted. It also flags a notebook with no recorded commit, with a commit that
 is not in this checkout's history (it needs the full history: CI checks out
 with fetch-depth 0), or without recorded imports, which happens when the
@@ -58,13 +58,13 @@ def verdict(path: Path, imports: dict[str, list[str]]) -> tuple[str, list[str]]:
     modules = imports.get(path.name)
     if modules is None:
         return "UNCHECKED", ["the run recorded no imports for it, so it did not finish"]
-    files = sorted({file for name in modules if (file := module_file(name))})
+    files = sorted({file for name in modules if (file := module_file(name))} | {"pyproject.toml"})
     log = git("log", "--format=%h %ad %s", "--date=short", f"{commit}..HEAD", "--", *files).stdout.strip()
     if not log:
         return "current", []
     changed = git("diff", "--name-only", commit, "HEAD", "--", *files).stdout.split()
     return "STALE", [f"its outputs are from {commit[:8]}, and these commits since then changed {len(changed)} of the "
-                     f"{len(files)} files of Dew it imports ({', '.join(changed)}):", *log.splitlines()]
+                     f"{len(files)} files it depends on ({', '.join(changed)}):", *log.splitlines()]
 
 
 def main() -> int:
