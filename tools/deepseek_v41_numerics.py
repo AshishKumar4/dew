@@ -5,7 +5,7 @@ which tools/deepseek_v41_reference.py writes from the release's own code,
 with its float64 truth (reference_f64.npz, `--fp64`). Each mode measures
 one thing, on the backend JAX picks:
 
-    PYTHONPATH=src:. python tools/deepseek_v41_numerics.py residuals
+    PYTHONPATH=src:.:tests python tools/deepseek_v41_numerics.py residuals
 
 (on a GPU with JAX_PLATFORMS=cuda,cpu: the float64 twins' decisions cross
 through host callbacks, which JAX places on a CPU device)
@@ -16,7 +16,7 @@ ratio tests/reference_error.py bounds, and each output's float64 twin's
 (`decided`), which agrees with the truth to float64 rounding: what remains
 in fp32 is rounding;
 
-    PYTHONPATH=src:. python tools/deepseek_v41_numerics.py noise
+    PYTHONPATH=src:.:tests python tools/deepseek_v41_numerics.py noise
 
 how far Dew's inputs to each rounding and selection sit from the ones the
 reference recorded, in the units of its margins (a quantizer's input over
@@ -42,6 +42,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental import io_callback
+from reference_error import distance
 
 from dew.interop import load_pretrained
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8, straight_through
@@ -49,7 +50,6 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from tests.reference_error import distance
 
 TINY = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf" / "deepseek-v41-tiny"
 
