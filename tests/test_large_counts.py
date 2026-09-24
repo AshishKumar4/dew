@@ -67,7 +67,7 @@ def test_diffusion_support_accepts_large_abstract_image_batches():
         def __call__(self, x, t, train=False):
             return x
 
-    objective = DiffusionObjective(Denoiser(), presets.EDM()(),
+    objective = DiffusionObjective(Denoiser(), presets.EDM(regime="pixel")(),
                                    InputSpec(Field("image", (65536, 1, 1))))
     batch = {"image": jax.ShapeDtypeStruct((65536, 65536, 1, 1), jnp.float32)}
     stats, _ = jax.eval_shape(objective.loss, {"encoders": {}}, batch,

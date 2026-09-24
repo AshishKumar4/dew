@@ -221,7 +221,7 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
 
     inputs = InputSpec(sample=Field("image", (height, width, channels)), conditions={keyword: condition})
     params = {**variables, "encoders": {keyword: encoder.params}, "autoencoder": vae.params}
-    return TextToImage(model, EDM()(), inputs, params, vae, steps=200, guidance=CFG(3.0),
+    return TextToImage(model, EDM(regime="latent")(), inputs, params, vae, steps=200, guidance=CFG(3.0),
                        sampler=EulerAncestral())
 
 

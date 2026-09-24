@@ -159,6 +159,14 @@ class DiffusionRunConfig(RunConfig):
         # A record carries every sequence as a JSON list and a command line
         # writes one too; the field is a tuple, so the value is one.
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
+        from dew.diffusion.presets import EDM
+
+        # EDM's sigma draw is the space's: pixels without an autoencoder,
+        # latents with one. A regime or sigmas the preset states win.
+        if (isinstance(self.preset, EDM) and self.preset.regime is None
+                and (self.preset.P_mean is None or self.preset.P_std is None)):
+            regime = "pixel" if self.autoencoder is None else "latent"
+            object.__setattr__(self, "preset", dataclasses.replace(self.preset, regime=regime))
         unknown = [name for name in self.val_metrics if name not in metrics]
         if unknown:
             raise ValueError(

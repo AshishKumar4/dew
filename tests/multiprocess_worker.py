@@ -1089,7 +1089,7 @@ def mode_builtin_preview_failures(args) -> dict:
         else:
             objective = DiffusionObjective(
                 SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
-                presets.EDM()(), InputSpec(Field("image", (RES, RES, 3))),
+                presets.EDM(regime="pixel")(), InputSpec(Field("image", (RES, RES, 3))),
                 steps=2, sampler=Euler(), guidance=None)
             batch = {"image": np.zeros((3, RES, RES, 3), np.uint8)}
         tracker = ScoreRecorder()
