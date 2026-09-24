@@ -127,6 +127,22 @@ def trained(batch):
     return sorted(set(batch["session_index"][mask].tolist())), float(batch["session_weights"].sum())
 
 
+@pytest.mark.parametrize("correction", [2.0, (0.5, 2.0), None], ids=["tis-cap", "icepop-band", "none"])
+def test_stale_rollouts_train_only_through_an_off_policy_correction(correction):
+    """A rollout up to `max_lag` updates old trains through the
+    proximal-to-behavior importance weight, which a TIS cap or an IcePop band
+    of the objective's `behavior_importance` applies: the scheduler takes
+    either, and refuses an objective with neither."""
+    objective = Objective()
+    objective.behavior_importance = correction
+    options = {"groups": 2, "max_lag": 1, "ahead": 1, "width": WIDTH, "rows": ROWS}
+    if correction is None:
+        with pytest.raises(ValueError, match="stale rollouts need"):
+            RolloutScheduler(objective, Scripted(lambda *_: None), Publisher(), **options)
+    else:
+        RolloutScheduler(objective, Scripted(lambda *_: None), Publisher(), **options)
+
+
 def test_complete_groups_are_packed_and_the_next_batch_is_submitted_ahead():
     source = Scripted(lambda task, submission, sample, version: finished(float(sample), version))
     rollout, data, records = scheduler(source, estimator="mean")

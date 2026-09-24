@@ -10,12 +10,15 @@ real Qwen2 export that `load_pretrained` reads back, and posts the reload
 calls to a real local HTTP endpoint in order.
 """
 
+import ctypes
 import json
 import os
 import socket
 import subprocess
 import sys
 import threading
+import time
+import types
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -27,7 +30,7 @@ import pytest
 openai = pytest.importorskip("openai", reason="optional inference-clients extra")
 import httpx2
 
-from dew.inference import OpenAICompletion, OpenAIRolloutServer, Publication, SafetensorsReload
+from dew.inference import NCCLPush, OpenAICompletion, OpenAIRolloutServer, Publication, SafetensorsReload
 from dew.interop import load_pretrained
 from dew.sampling import Sampling
 
@@ -258,14 +261,16 @@ def test_a_failed_push_keeps_the_version():
 
 
 class Engine(BaseHTTPRequestHandler):
-    """Records every POST path, query and body and answers like the engine it stands for.
+    """Records every request's path, query and body and answers like the engine it stands for.
 
     Like vLLM v0.30.0, `/pause` and `/resume` answer a status,
     `/reset_prefix_cache` answers 200 with `{"success": bool}` whether or not
     it reset, and `/update_weight_version` answers `{"success": true}`. Like
     SGLang v0.5.20, a weight update answers `success` in its body, with 400
     when it fails, and flushes the radix cache unless the request says
-    otherwise. The server's `failure` makes the reset or update
+    otherwise. Like vLLM's NCCL weight transfer, `/get_world_size` reports one
+    worker, and opening the group and starting or finishing an update answer
+    200. The server's `failure` makes the reset or update
     fail: "status" with an error status, "body" with 200 and `success: false`.
     Every replica is its own server, so each keeps its own record.
     """
@@ -291,6 +296,10 @@ class Engine(BaseHTTPRequestHandler):
             return self.answer(200, {"weight_version": body["weight_version"]})
         if path == "/update_weight_version":
             return self.answer(200, {"success": True, "new_version": body["new_version"]})
+        if path in ("/init_weight_transfer_engine", "/start_weight_update", "/finish_weight_update"):
+            return self.answer(200, {"success": True})
+        if path == "/update_weights" and failure is None:
+            return self.answer(200, {"success": True})
         if path == "/reset_prefix_cache":
             if failure == "status":
                 return self.answer(500, {"error": "engine dead"})
@@ -301,6 +310,14 @@ class Engine(BaseHTTPRequestHandler):
                                 "num_paused_requests": 0})
         self.server.flushed.append(body.get("flush_cache", True))
         self.answer(200, {"success": True, "message": "Succeeded to update model weights.", "num_paused_requests": 0})
+
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        self.server.seen.append((path, query, None))
+        if path == "/get_world_size":
+            self.answer(200, {"world_size": 1})
+        else:
+            self.answer(404, {"error": f"no route {path}"})
 
     def log_message(self, *args):
         pass
@@ -486,3 +503,121 @@ def test_a_gpu_pool_publication_copies_the_policy_to_process_zeros_host_only(tmp
     copies = {rank: sum(line.startswith(f"[{rank}] ") and "device-to-host transfer" in line and "dtype=BF16" in line
                         for line in lines) for rank in "01"}
     assert copies["0"] > 0 and copies["1"] == 0, copies
+
+
+class Libraries:
+    """libnccl.so.2 and libcuda.so.1 as NCCLPush's ctypes calls reach them, for a push without a GPU.
+
+    Every call succeeds and a communicator is a counted handle, except the
+    first `failing_broadcasts` broadcasts, which answer ncclSystemError (2).
+    `broadcast` runs `on_broadcast` first, so a test can look at the devices
+    mid-send.
+    NCCL's destroy finalizes a group, which waits on the engine's side of it,
+    and an engine keeps that side open until it exits: here a destroy waits
+    `destroy_seconds`.
+    """
+
+    def __init__(self, destroy_seconds=30.0):
+        self.handles, self.aborted, self.on_broadcast, self.failing_broadcasts = 0, [], lambda: None, 0
+        self.destroy_seconds = destroy_seconds
+        # Functions, not bound methods: the push sets `argtypes` and `restype` on each.
+        self.nccl = types.SimpleNamespace(
+            ncclGetErrorString=lambda status: b"fake NCCL error", ncclGetUniqueId=lambda uid: 0,
+            ncclCommInitRank=lambda *args: self.open(*args), ncclAllReduce=lambda *args: 0,
+            ncclBroadcast=lambda *args: self.broadcast(), ncclCommAbort=lambda comm: self.abort(comm),
+            ncclCommDestroy=lambda comm: self.destroy())
+        self.cuda = types.SimpleNamespace(
+            cuInit=lambda flags: 0, cuDeviceGet=lambda device, ordinal: 0,
+            cuDevicePrimaryCtxRetain=lambda context, device: 0, cuCtxSetCurrent=lambda context: 0,
+            cuStreamSynchronize=lambda stream: 0)
+
+    def open(self, comm, world, uid, rank):
+        self.handles += 1
+        comm._obj.value = self.handles
+        return 0
+
+    def broadcast(self):
+        self.on_broadcast()
+        if self.failing_broadcasts:
+            self.failing_broadcasts -= 1
+            return 2
+        return 0
+
+    def abort(self, comm):
+        self.aborted.append(comm.value)
+        return 0
+
+    def destroy(self):
+        time.sleep(self.destroy_seconds)
+        return 0
+
+    def load(self, name):
+        return self.nccl if "nccl" in name else self.cuda
+
+
+@pytest.fixture
+def libraries(monkeypatch):
+    fake = Libraries()
+    monkeypatch.setattr(ctypes, "CDLL", fake.load)
+    return fake
+
+
+@pytest.mark.parametrize("failure", ["update", "broadcast"])
+def test_a_failed_nccl_push_opens_its_group_again_and_a_close_does_not_wait_for_the_engine(
+        tmp_path, replicas, libraries, failure):
+    """A group whose update or broadcast failed cannot carry the next
+    version, so the failed push tears it down and the next push opens a new
+    one with the engine. Teardown aborts: it does not wait for the engine's
+    side of the group, which stays open until the engine exits (a sender on
+    4x RTX 3090 waited out jax.distributed's 300 s shutdown barrier)."""
+    (engine,) = replicas(1)
+    source = load_pretrained(FIXTURE, dtype="float32")
+    library = tmp_path / "libnccl.so.2"
+    library.touch()
+    push = NCCLPush(source, (engine.url,), str(library))
+    if failure == "update":
+        engine.failure = "status"
+    else:
+        libraries.failing_broadcasts = 1
+    with pytest.raises(RuntimeError, match=r"did not reach every replica|NCCL error 2"):
+        push(source.variables, 1)
+    engine.failure = None
+    push(source.variables, 2)
+    assert paths(engine).count("/init_weight_transfer_engine") == 2
+    began = time.monotonic()
+    push.close()
+    assert time.monotonic() - began < 5 and len(libraries.aborted) == 2
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_nccl_push_holds_no_copy_of_the_policy_on_the_devices_that_do_not_send(tmp_path, replicas, libraries):
+    """The pool gathers the policy to host leaf by leaf and sends it from
+    one device, so the others hold nothing of it beyond their own shards.
+    Replicated over the mesh first, each device held the whole policy:
+    gpt-oss-20b is 38.96 GiB in bfloat16, more than a 24 GB GPU."""
+    (engine,) = replicas(1)
+    source = load_pretrained(FIXTURE, dtype="float32")
+    devices = jax.devices()[:2]
+    mesh = jax.sharding.Mesh(np.asarray(devices), ("pool",))
+
+    def sharded(leaf):
+        split = leaf.ndim and leaf.shape[0] % 2 == 0
+        spec = jax.sharding.PartitionSpec("pool") if split else jax.sharding.PartitionSpec()
+        return jax.device_put(leaf, jax.sharding.NamedSharding(mesh, spec))
+
+    variables = jax.tree.map(sharded, source.variables)
+
+    def held(device):
+        # A shard's `data` is an array of its own over the same buffer, so buffers are counted once.
+        buffers = {shard.data.unsafe_buffer_pointer(): shard.data.nbytes for array in jax.live_arrays()
+                   for shard in array.addressable_shards if shard.device == device}
+        return sum(buffers.values())
+
+    resident = held(devices[1])
+    during = []
+    libraries.on_broadcast = lambda: during.append(held(devices[1]))
+    library = tmp_path / "libnccl.so.2"
+    library.touch()
+    NCCLPush(source, (engine.url,), str(library))(variables, 1)
+    policy = sum(leaf.size for leaf in jax.tree.leaves(variables)) * 2  # bfloat16
+    assert during and max(during) - resident < policy / 10, (resident, during, policy)
