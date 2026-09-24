@@ -58,7 +58,9 @@ def prepare_process(wandb: Wandb | None = None,
     jax.distributed.initialize() finds the coordinator from the environment on
     TPU pods and Slurm/GKE/Open MPI clusters. `dew launch` leaves the process
     count and rank in DEW_PROCESS_COUNT and DEW_PROCESS_ID, which jax has no
-    variable for, and those are passed to it. On a machine with no cluster
+    variable for, and those are passed to it with JAX's cluster detection
+    off: the launcher placed its processes, and a Slurm step around it would
+    otherwise pin each to the GPU at SLURM_LOCALID. On a machine with no cluster
     environment it raises a ValueError naming the missing coordinator
     address, the single-host signature. Every other failure propagates,
     since a pod run would otherwise continue on one host. multi_host=True
@@ -106,7 +108,8 @@ def prepare_process(wandb: Wandb | None = None,
         try:
             if PROCESS_COUNT in os.environ:
                 jax.distributed.initialize(num_processes=int(os.environ[PROCESS_COUNT]),
-                                           process_id=int(os.environ[PROCESS_ID]))
+                                           process_id=int(os.environ[PROCESS_ID]),
+                                           cluster_detection_method="deactivate")
             else:
                 jax.distributed.initialize()
         except ValueError as e:
