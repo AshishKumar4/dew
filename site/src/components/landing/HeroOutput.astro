@@ -1,0 +1,34 @@
+---
+// The recorded output of the hero script, and where it was recorded.
+interface Props {
+	stdout: string;
+	seconds: number;
+	meta: { where: string; jax: string; dew: string; date: string; vcpus: number };
+}
+const { stdout, seconds, meta } = Astro.props;
+const lines = stdout.trimEnd().split('\n');
+const liveEndpoint = import.meta.env.PUBLIC_LIVE_ENDPOINT;
+// The trainer's own report of how long the first step took, which is mostly compilation.
+const firstStep = Number(/first step after ([\d.]+) s/.exec(stdout)?.[1] ?? Number.NaN);
+const compiling = Number.isFinite(firstStep) && firstStep > seconds / 2;
+---
+
+<div class="hero-output" data-hero-output>
+	<div class="hero-output-bar">
+		<span class="hero-output-command"><span aria-hidden="true">$</span> python train.py</span>
+		{
+			liveEndpoint && (
+				<button type="button" class="run-live" data-live-hero hidden>
+					<span class="dot" aria-hidden="true" />
+					Run it live
+				</button>
+			)
+		}
+	</div>
+	<pre class="hero-output-text" data-output>{lines.map((line) => <span class="line">{line}{'\n'}</span>)}</pre>
+	<p class="hero-output-meta" data-output-meta>
+		Recorded on {meta.where} with {meta.vcpus} vCPUs, using JAX {meta.jax} and Dew at{' '}
+		<a href={`https://github.com/AshishKumar4/dew/commit/${meta.dew}`}><code>{meta.dew.slice(0, 7)}</code></a>, on {meta.date}. The
+		script took {Math.round(seconds)} s{compiling ? ', most of it compiling' : ''}.
+	</p>
+</div>

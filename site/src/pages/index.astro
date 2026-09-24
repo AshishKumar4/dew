@@ -1,6 +1,291 @@
 ---
 import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
+import { Code } from '@astrojs/starlight/components';
+import capture from '../data/capture.json';
+import objectiveCode from '../data/objective.py?raw';
+import models from '../generated/models.json';
+import outputs from '../generated/notebook-outputs.json';
+import tutorials from '../generated/tutorial-cards.json';
+import MeshDiagram from '../components/landing/MeshDiagram.astro';
+import '../styles/landing.css';
+
+const objective = capture.snippets.objective;
+if (objective.returncode !== 0) throw new Error('src/data/capture.json: the objective snippet did not exit cleanly');
+
+// Real outputs from the tutorials' last complete runs, picked by notebook and cell id.
+function cell(notebook: string, id: string) {
+	const found = (outputs as Record<string, Record<string, { images: { src: string; width: number; height: number }[]; stdout?: string }>>)[notebook]?.[id];
+	if (!found) throw new Error(`landing page: no output for ${notebook} ${id}; the notebook changed, update src/pages/index.astro`);
+	return found;
+}
+const flowers = cell('02-train-a-diffusion-model', 'cell-24').images[0];
+const shakespeare = cell('05-train-a-language-model', 'cell-20').stdout ?? '';
+const samplers = cell('04-samplers-and-schedules', 'cell-15').images[2];
+
+const families = models.groups.reduce((sum, group) => sum + group.families.length, 0);
+
+const workloads = [
+	{
+		title: 'Language models',
+		text: 'Pretraining on token windows or packed documents, chat fine-tuning that counts only the assistant tokens, and cached generation.',
+		links: [
+			['Train a language model', '/tutorials/05-train-a-language-model/'],
+			['Guide', '/guides/language-models/'],
+		],
+	},
+	{
+		title: 'Image and video diffusion',
+		text: 'Diffusion, flow matching and latent diffusion on DiT, U-Net and MMDiT backbones, with 17 solvers and classifier-free guidance.',
+		links: [
+			['Train a diffusion model', '/tutorials/02-train-a-diffusion-model/'],
+			['Processes and solvers', '/concepts/diffusion/'],
+		],
+	},
+	{
+		title: 'Diffusion language models',
+		text: 'Masked diffusion over tokens (MDLM), LLaDA and Dream continued from their released weights, and block diffusion with Diffusion Gemma.',
+		links: [['Guide', '/guides/language-models/#diffusion-language-models-and-media-inputs']],
+	},
+	{
+		title: 'Representation learning',
+		text: 'I-JEPA and V-JEPA: a context encoder, a moving-average target encoder, a predictor and block masks, with linear and k-NN probes.',
+		links: [
+			['Representations with I-JEPA', '/tutorials/06-jepa-representation-learning/'],
+			['Guide', '/guides/jepa/'],
+		],
+	},
+	{
+		title: 'Post-training',
+		text: 'SFT, DPO, GRPO and PPO on the same trainer, asynchronous RL whose rollouts come from Dew, vLLM or SGLang, and Flow-GRPO for images.',
+		links: [['Guide', '/guides/post-training/']],
+	},
+	{
+		title: 'Mixture of experts',
+		text: 'Routed and shared experts, bias balancing, routing replay, grouped-matmul kernels, and expert parallelism over an expert mesh axis.',
+		links: [['Concepts', '/concepts/moe/']],
+	},
+];
 ---
-<StarlightPage frontmatter={{ title: 'Dew', template: 'splash' }} hasSidebar={false}>
-	<p>Landing</p>
+
+<StarlightPage
+	frontmatter={{
+		title: 'Dew: train models with JAX and Flax',
+		description:
+			'Dew is a JAX and Flax framework for training language models, diffusion models and JEPA encoders, on one device or a mesh of GPUs or TPUs.',
+		template: 'splash',
+		hero: { title: 'Dew' },
+		tableOfContents: false,
+		editUrl: false,
+		lastUpdated: false,
+		pagefind: false,
+	}}
+	hasSidebar={false}
+>
+	<div class="landing not-content">
+		<section class="band contract">
+			<div class="band-head">
+				<h2 class="dew-display">A model, an objective, data and a trainer</h2>
+				<p>
+					The model is a plain Flax module. The objective says how to initialize it and what the loss is. The trainer
+					owns everything else, so a new loss is a new objective and the training loop stays as it is.
+				</p>
+			</div>
+			<div class="contract-grid">
+				<ol class="contract-list">
+					<li>
+						<span class="contract-name">Model</span>
+						<span>A <code>flax.linen.Module</code>. Built-in ones come from <code>models.build(name, ...)</code>.</span>
+					</li>
+					<li>
+						<span class="contract-name">Objective</span>
+						<span><code>init(key)</code> returns the variables, <code>loss(variables, batch, step)</code> the loss and metrics.</span>
+					</li>
+					<li>
+						<span class="contract-name">Dataset</span>
+						<span>Two iterator factories, for training batches and one validation pass.</span>
+					</li>
+					<li>
+						<span class="contract-name">Trainer</span>
+						<span>Compiles the step, places the state on the mesh, updates the EMA, writes checkpoints and logs.</span>
+					</li>
+				</ol>
+				<div class="contract-code">
+					<Code code={objectiveCode.trimEnd()} lang="python" title="regression.py" />
+					<div class="plain-output">
+						<span class="plain-output-label">Output</span>
+						<pre>{objective.stdout.trimEnd()}</pre>
+					</div>
+				</div>
+			</div>
+		</section>
+
+		<section class="band workloads">
+			<div class="band-head">
+				<h2 class="dew-display">What you can train</h2>
+				<p>Each of these is an objective in the library, trained by the same trainer on the same mesh.</p>
+			</div>
+			<div class="workload-grid">
+				{
+					workloads.map((workload) => (
+						<article class="workload">
+							<h3>{workload.title}</h3>
+							<p>{workload.text}</p>
+							<p class="workload-links">
+								{workload.links.map(([label, href]) => (
+									<a href={href}>{label}</a>
+								))}
+							</p>
+						</article>
+					))
+				}
+			</div>
+			<div class="evidence-grid">
+				<figure class="evidence">
+					<img src={flowers.src} width={flowers.width} height={flowers.height} alt="A grid of 32 flower images generated from noise by a small diffusion transformer" loading="lazy" />
+					<figcaption>
+						Flowers sampled from noise by the 9M-parameter diffusion transformer that <a href="/tutorials/02-train-a-diffusion-model/">tutorial 02</a> trains in 6,000 steps.
+					</figcaption>
+				</figure>
+				<figure class="evidence text">
+					<pre>{shakespeare.trimEnd()}</pre>
+					<figcaption>
+						Text from the 14M-parameter byte-level model of <a href="/tutorials/05-train-a-language-model/">tutorial 05</a>, after 1,500 steps on Tiny Shakespeare.
+					</figcaption>
+				</figure>
+				<figure class="evidence tall">
+					<img src={samplers.src} width={samplers.width} height={samplers.height} alt="The same four starting noises sampled with seven different solvers at 40 steps" loading="lazy" />
+					<figcaption>
+						Seven solvers on one checkpoint and one set of starting noises, from <a href="/tutorials/04-samplers-and-schedules/">tutorial 04</a>.
+					</figcaption>
+				</figure>
+			</div>
+		</section>
+
+		<section class="band checkpoints">
+			<div class="band-head">
+				<h2 class="dew-display">Pretrained checkpoints, in and out</h2>
+				<p>
+					<code>load_pretrained</code> reads Hugging Face checkpoints of {families} decoder families into Dew's own modules,
+					and <code>Pretrained.save</code> writes trained weights back in the source's layout. This list comes from the code's
+					registries when the site is built.
+				</p>
+			</div>
+			<div class="family-groups">
+				{
+					models.groups.map((group) => (
+						<div class="family-group">
+							<h3>{group.label}</h3>
+							<ul>
+								{group.families.map((family) => (
+									<li>{family}</li>
+								))}
+							</ul>
+						</div>
+					))
+				}
+				<div class="family-group">
+					<h3>Multimodal</h3>
+					<ul>{models.multimodal.map((family) => <li>{family}</li>)}</ul>
+				</div>
+				<div class="family-group">
+					<h3>Diffusion pipelines</h3>
+					<ul>{models.pipelines.map((family) => <li>{family}</li>)}</ul>
+				</div>
+			</div>
+			<p class="band-note">
+				Each port is checked against its reference implementation in float32, most on fixtures with the release's own
+				configuration and tensor shapes. Qwen3-0.6B, SmolLM2-135M and Mamba-2 130M were also compared at full size.{' '}
+				<a href="/reference/models/">Supported models</a> lists every <code>model_type</code> and how it was checked.
+			</p>
+		</section>
+
+		<section class="band distributed">
+			<div class="distributed-grid">
+				<div>
+					<h2 class="dew-display">One trainer, from one device to a mesh</h2>
+					<p>
+						<code>MeshSpec</code> names the axes: <code>data</code>, <code>fsdp</code>, <code>expert</code>,
+						<code>tensor</code>, <code>sequence</code> and <code>stage</code>. The model names the logical axes of its
+						parameters, and <code>Layout</code> maps them onto the mesh, so the model code does not change when the mesh
+						does. Attention picks cuDNN on supported GPUs, Pallas splash attention on TPUs and XLA elsewhere.
+					</p>
+					<Code
+						code={`trainer = Trainer(objective, optax.adamw(3e-4), key=jax.random.key(0),
+                  mesh=MeshSpec(fsdp=4, tensor=2))`}
+						lang="python"
+						frame="none"
+					/>
+					<Code code={`dew launch --hosts 10.0.0.1 10.0.0.2 -- /opt/dew/.venv/bin/python train.py`} lang="bash" frame="none" />
+				</div>
+				<MeshDiagram />
+			</div>
+			<div class="ran">
+				<h3>What has been run</h3>
+				<ul>
+					<li>The tutorials on one GPU or a CPU, and the test suite on a CPU and on pools of local processes.</li>
+					<li>
+						On one host with four RTX 3090s, a process pool launched by <code>dew launch</code>: every layout of the dense,
+						mixture-of-experts, Mamba-2 hybrid and DiT models, each checked against one device.
+					</li>
+					<li>
+						On one TPU v6e chip, the sequence-parallel exchange around the splash attention kernel, forward and backward.
+					</li>
+				</ul>
+				<p>
+					Dew has not been run on two physical nodes yet, and hybrid sharding and the sequence exchanges have no throughput numbers.{' '}
+					<a href="/guides/multi-node/#what-has-and-has-not-been-run">Train on several nodes</a> keeps the full list.
+				</p>
+			</div>
+		</section>
+
+		<section class="band tutorials">
+			<div class="band-head">
+				<h2 class="dew-display">Tutorials</h2>
+				<p>Notebooks that run top to bottom on Colab, shown here with the outputs of their last complete run.</p>
+			</div>
+			<div class="tutorial-grid">
+				{
+					tutorials.map((entry) => (
+						<a class="tutorial-card" href={`/${entry.slug}/`}>
+							<span class="tutorial-card-media">
+								{entry.thumbnail ? (
+									<img src={entry.thumbnail.src} width={entry.thumbnail.width} height={entry.thumbnail.height} alt="" loading="lazy" />
+								) : (
+									<span class="tutorial-card-glyph" aria-hidden="true">
+										{entry.number}
+									</span>
+								)}
+							</span>
+							<span class="tutorial-card-body">
+								<span class="tutorial-card-meta">
+									<span>{entry.number}</span>
+									<span>{entry.accelerator}</span>
+								</span>
+								<span class="tutorial-card-title">{entry.title}</span>
+							</span>
+						</a>
+					))
+				}
+			</div>
+		</section>
+
+		<section class="band closing">
+			<div>
+				<h2 class="dew-display">Built on the JAX stack</h2>
+				<p>
+					Models are <a href="https://flax.readthedocs.io">Flax</a> modules and their variables are JAX pytrees.{' '}
+					Optimizers are <a href="https://optax.readthedocs.io">Optax</a> transformations, checkpoints are written by{' '}
+					<a href="https://orbax.readthedocs.io">Orbax</a>, and data loads through{' '}
+					<a href="https://github.com/google/grain">Grain</a>. Dew grew out of{' '}
+					<a href="https://github.com/AshishKumar4/FlaxDiff">FlaxDiff</a>, and Google's TPU Research Cloud supported the larger
+					experiments.
+				</p>
+			</div>
+			<div class="closing-actions">
+				<a class="button primary" href="/getting-started/installation/">Install Dew</a>
+				<a class="button" href="https://github.com/AshishKumar4/dew">Source on GitHub</a>
+				<p class="closing-note">MIT license. Dew is research software before 1.0: the API and checkpoint formats can change.</p>
+			</div>
+		</section>
+	</div>
 </StarlightPage>

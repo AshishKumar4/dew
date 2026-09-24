@@ -1,0 +1,33 @@
+---
+interface Props {
+	command: string;
+}
+const { command } = Astro.props;
+---
+
+<div class="copy-command">
+	<span class="prompt" aria-hidden="true">$</span>
+	<code>{command}</code>
+	<button type="button" data-copy={command} aria-label="Copy the install command">
+		<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
+			><path
+				fill="currentColor"
+				d="M16 3H8a3 3 0 0 0-3 3v1H4a1 1 0 0 0-1 1v11a3 3 0 0 0 3 3h9a1 1 0 0 0 1-1v-1h1a3 3 0 0 0 3-3V6a3 3 0 0 0-3-3Zm-2 17H6a1 1 0 0 1-1-1V9h9Zm3-4a1 1 0 0 1-1 1h-1V8a1 1 0 0 0-1-1H7V6a1 1 0 0 1 1-1h8a1 1 0 0 1 1 1Z"
+			></path></svg
+		>
+		<span class="copied" aria-live="polite"></span>
+	</button>
+</div>
+
+<script>
+	for (const button of document.querySelectorAll<HTMLButtonElement>('.copy-command button[data-copy]')) {
+		button.addEventListener('click', async () => {
+			await navigator.clipboard.writeText(button.dataset.copy ?? '');
+			const note = button.querySelector('.copied');
+			if (note) {
+				note.textContent = 'Copied';
+				setTimeout(() => (note.textContent = ''), 1600);
+			}
+		});
+	}
+</script>

@@ -63,6 +63,7 @@ export default defineConfig({
 			},
 			components: {
 				Header: './src/components/starlight/Header.astro',
+				Hero: './src/components/starlight/Hero.astro',
 				PageTitle: './src/components/starlight/PageTitle.astro',
 			},
 			head: [

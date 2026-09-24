@@ -1,0 +1,32 @@
+---
+// The hero: what Dew is, how to install it, and a complete run with the
+// output that exact script printed.
+import { Code } from '@astrojs/starlight/components';
+import capture from '../../data/capture.json';
+import heroCode from '../../data/hero.py?raw';
+import CopyCommand from './CopyCommand.astro';
+import HeroOutput from './HeroOutput.astro';
+
+const hero = capture.snippets.hero;
+if (hero.returncode !== 0) throw new Error('src/data/capture.json: the hero snippet did not exit cleanly');
+---
+
+<section class="hero">
+	<div class="hero-copy">
+		<h1 id="_top" class="dew-display">Train models with JAX and&nbsp;Flax.</h1>
+		<p class="hero-lede">
+			Dew trains language models, diffusion models and JEPA encoders. You write a Flax model and an objective, and
+			one trainer compiles the step, shards it over your devices, keeps a moving average and checkpoints the run.
+		</p>
+		<CopyCommand command='uv pip install "dew-ml @ git+https://github.com/AshishKumar4/dew"' />
+		<div class="hero-actions">
+			<a class="button primary" href="/getting-started/quickstart/">Get started</a>
+			<a class="button" href="/tutorials/">Tutorials</a>
+			<a class="button ghost" href="/api/">API reference</a>
+		</div>
+	</div>
+	<div class="hero-demo">
+		<Code code={heroCode.trimEnd()} lang="python" title="train.py" />
+		<HeroOutput stdout={hero.stdout} meta={capture.meta} seconds={hero.seconds} />
+	</div>
+</section>
