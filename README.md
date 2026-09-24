@@ -50,12 +50,12 @@ source .venv/bin/activate
 uv pip install -e ".[tfds,cuda12]"
 ```
 
-Prepare the dataset once in a separate environment. TensorFlow is needed for this TFDS builder, but not for reading the prepared data during training.
+Prepare the dataset once in a separate environment. TensorFlow is needed for this TFDS builder, but not for reading the prepared data during training. TFDS 4.9.10 imports `importlib_resources` while it prepares a dataset but declares it only for Python before 3.9, so the install names it.
 
 ```bash
 uv venv --python 3.13 .venv-data
 uv pip install --python .venv-data/bin/python \
-    "tensorflow-datasets==4.9.10" "tensorflow==2.21.0" scipy
+    "tensorflow-datasets==4.9.10" "tensorflow==2.21.0" scipy importlib_resources
 CUDA_VISIBLE_DEVICES="" .venv-data/bin/python - <<'PY'
 from pathlib import Path
 import tensorflow_datasets as tfds
@@ -246,17 +246,29 @@ compute dtype. Non-parameter state retains its declared precision.
 | OLMo 3 | `olmo3` |
 | gpt-oss | `gpt_oss` |
 | Mixtral, Qwen3-MoE | `mixtral`, `qwen3_moe` |
-| GLM floating-point checkpoints | `glm4_moe` |
+| Qwen3-Next | `qwen3_next` |
+| GLM floating-point checkpoints, GLM-5.3, GLM-5.3-Flash | `glm4_moe`, `glm_moe_dsa`, `glm5_next_text` |
 | DeepSeek floating-point checkpoints | `deepseek_v2`, `deepseek_v3`, `deepseek_v32` |
-| Kimi K2 | `kimi_k2` |
+| Kimi K2, Kimi K2.5 text | `kimi_k2`, `kimi_k25` |
 | Kimi K3 text, MXFP4 routed experts | `kimi_k3` |
 | Kimi Linear | `kimi_linear` |
 | Llama 4 text | `llama4_text` |
+| Mamba 2 | `mamba2` |
 
 Kimi K2 keeps its own model type, vocabulary, RoPE settings, and routing widths
 when exported. Small fixtures cover loading, a `Trainer` update, export, and
 reference reload. Their [source record](tests/fixtures/hf/kimi-k2-tiny/source.json)
-pins the released configuration.
+pins the released configuration. Kimi K2.5 nests the same decoder in a vision
+wrapper: Dew loads and trains the text half, and keeps the tower and projector
+tensors to write them back byte for byte. It runs no vision computation.
+
+Qwen3-Next, GLM-5.3 and GLM-5.3-Flash load from tiny fixtures of the released
+configurations with parity against their transformers classes, including the
+prediction layer, and a `Trainer` update exports back in the source layout.
+Mamba 2 reads the Hugging Face port (`Mamba2ForCausalLM`) and the original
+`mamba_ssm` checkpoints such as `state-spaces/mamba2-130m`, and saves in the
+port's layout. Exporting a decoder whose layers mix sliding and full attention
+on Llama's block writes `ministral`, which transformers reads.
 
 Kimi K3 loads its text decoder from the vision wrapper: KDA and NoPE MLA
 layers, Attention Residuals over blocks of layers, latent routed experts with
@@ -672,7 +684,7 @@ The target encoder follows an EMA of the context encoder. The loss compares pred
 
 ### Loading pretrained weights
 
-Load a supported checkpoint from a Hub repository or local directory. This example downloads Qwen3-0.6B and its tokenizer (about 1.2 GB).
+Load a supported checkpoint from a Hub repository or local directory. This example downloads Qwen3-0.6B and its tokenizer (about 1.5 GB).
 
 ```python
 import jax
@@ -1106,12 +1118,12 @@ runtime can read that directory as it is.
 
 Tokenize a corpus with the tokenizer the export will carry, so the token ids
 and the exported vocabulary are the same one. `tiny-tools` is the small
-byte-level BPE tokenizer committed for the tests, which keeps this runnable in
-a fresh checkout:
+byte-level BPE tokenizer committed for the tests, and the corpus is the
+TinyStories file that [Language modeling](#language-modeling) downloads:
 
 ```bash
 python tools/tokenize_text.py \
-    --input corpus.txt \
+    --input data/TinyStoriesV2-GPT4-valid.txt \
     --out runs/tokens \
     --tokenizer tests/fixtures/tokenizers/tiny-tools
 ```
@@ -1187,6 +1199,8 @@ ollama create dew-decoder -f Modelfile
 
 `num_gpu 0` keeps the runner on the CPU. `TEMPLATE "{{ .Prompt }}"` passes
 the prompt through unchanged, so the served draw is comparable to the local one.
+These steps ran on Ollama 0.32.9 on Linux x86-64. On the same machine, Ollama
+0.34.3's `ollama create` stops at `MLX runtime is not available`.
 
 `OllamaCompletion` and `OpenAICompletion` wrap the vendors' own SDK clients,
 which you construct and own. Pass a `Sampling` to request the same sampling
@@ -1325,7 +1339,7 @@ dew launch --hosts 10.0.0.1 10.0.0.2 \
 
 ### Generating text with Gemma 4 on one GPU
 
-`dew.pipeline` loads a published checkpoint and returns a callable task. For gated Gemma 4 repositories, obtain access and authenticate before downloading. Set `JAX_PLATFORMS=cuda` before starting Python. I have not run this released Gemma 4 checkpoint on the 4080; check loading memory before attempting it.
+`dew.pipeline` loads a published checkpoint and returns a callable task. Set `JAX_PLATFORMS=cuda` before starting Python. I have not run this released Gemma 4 checkpoint on the 4080; check loading memory before attempting it.
 
 ```python
 import dew
@@ -1428,7 +1442,7 @@ Add the extra for your hardware; its accelerator build of JAX matches the JAX De
 
 Installing from the repository without a checkout works the same way: `uv pip install "dew-ml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. Take the accelerator build from these extras, not from `jax[cuda12]`, `jax[cuda13]` or `jax[tpu]`. Dew pins jax to a build with a multi-process cache-key fix ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)). pip can't resolve PyPI's jax extras beside that pin in one install, and a later `-U "jax[...]"` would replace the pin with any newer PyPI jax. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
 
-The optional extras are `av`, `cuda12`, `cuda13`, `eval-harness`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `tpu`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` supplies the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs that the serving section uses. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
+The optional extras are `av`, `cuda12`, `cuda13`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` supplies the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs that the serving section uses. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
 
 ## Documentation and examples
 
