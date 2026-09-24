@@ -1,16 +1,17 @@
 """Report tutorials whose outputs are older than a change to the Dew code they import.
 
 Each executed notebook records in its metadata, under `dew.outputs.commit`, the
-last commit that had changed src/dew when its outputs were made
-(`tools/run_tutorials.py --save` writes it). `tools/run_tutorials.py --imports
-FILE` records which of Dew's modules each notebook's kernel had imported by
-the end of a run. A notebook is stale when a commit after the recorded one
-changed the file of any of those modules, or pyproject.toml, which pins the
-dependencies (JAX among them); the script names the commits and files, so outputs that may no longer match the code are flagged instead of
-trusted. It also flags a notebook with no recorded commit, with a commit that
-is not in this checkout's history (it needs the full history: CI checks out
-with fetch-depth 0), or without recorded imports, which happens when the
-notebook failed.
+last commit that had changed src/dew or pyproject.toml when its outputs were
+made (`tools/run_tutorials.py --save` writes it). `tools/run_tutorials.py
+--imports FILE` records which of Dew's modules each notebook's kernel had
+imported by the end of a run. A notebook is stale when a commit after the
+recorded one changed the file of any of those modules, or pyproject.toml, which
+pins the dependencies (JAX among them); the script names the commits and files,
+so outputs that may no longer match the code are flagged instead of trusted. It
+also flags a notebook with no recorded commit, with a commit that is not in
+this checkout's history (it needs the full history: CI checks out with
+fetch-depth 0), or without recorded imports, which happens when the notebook
+failed.
 
 It exits 1 when it flags anything. With --report it exits 0 and, under GitHub
 Actions, turns each flag into a warning and writes a table to the job summary:
