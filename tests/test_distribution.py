@@ -588,7 +588,7 @@ def test_a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
                " PartitionSpec('fsdp')) for i in range(3)],\n"
                "        'replicated': [placed(np.full((7, 37), i, np.float32), PartitionSpec()) for i in range(3)],\n"
                "        'local': jnp.ones((5, 37))}\n"
-               "with jax.transfer_guard_device_to_host('log'):\n"
+               "with jax.transfer_guard_device_to_host('log_explicit'):\n"
                "    held = artifacts.collective_host(tree, phase='t', held_by='first')\n"
                "print('held', jax.process_index(), held is not None, flush=True)\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
