@@ -236,7 +236,8 @@ class SourceQuantization:
         for name in self.names(tensors):
             out[name] = checkpoint_array(self.decode(tensors, name), param_dtype)
             for partner in self.partners(name):
-                out.pop(partner)
+                # An optional part (compressed-tensors' act-order index) may be absent.
+                out.pop(partner, None)
         return out
 
     def requantize(self, tensors: Mapping[str, np.ndarray], names: Iterable[str]) -> dict[str, np.ndarray]:
@@ -779,8 +780,14 @@ def _codes(words: np.ndarray, bits: int) -> np.ndarray:
     return codes.reshape(*words.shape[:-1], -1).astype(np.int32)
 
 
-def _fp16_product(codes: np.ndarray, zeros: np.ndarray, scales: np.ndarray) -> np.ndarray:
-    return ((codes - zeros).astype(np.float32) * scales.astype(np.float32)).astype(np.float16).astype(np.float32)
+def _scaled_product(codes: np.ndarray, zeros: np.ndarray | int, scales: np.ndarray) -> np.ndarray:
+    """`(codes - zeros) * scales` rounded once to the scales' dtype, returned in float32.
+
+    The libraries take this product in the scales' dtype; for codes of at
+    most 8 bits and scales of at most float32 the float32 product is exact
+    or rounds as theirs does, so one rounding to that dtype is theirs.
+    """
+    return ((codes - zeros).astype(np.float32) * scales.astype(np.float32)).astype(scales.dtype).astype(np.float32)
 
 
 def _encoded_codes(name: str, weight: np.ndarray, zeros: np.ndarray, scales: np.ndarray, bits: int) -> np.ndarray:
@@ -816,7 +823,7 @@ def _awq_decode(tensors: Mapping[str, np.ndarray], name: str, *, bits: int, grou
     codes, zeros = columns(tensors[stem + '.qweight']), columns(tensors[stem + '.qzeros'])
     scales = np.asarray(tensors[stem + '.scales'])
     rows = np.arange(codes.shape[0]) // group
-    return _fp16_product(codes, zeros[rows], scales[rows]).T
+    return _scaled_product(codes, zeros[rows], scales[rows]).T
 
 
 def _awq_encode(name: str, weight: np.ndarray, *, bits: int, group: int,
@@ -862,7 +869,7 @@ def _gptq_decode(tensors: Mapping[str, np.ndarray], name: str, *, bits: int, v1:
     codes = _codes(np.asarray(tensors[stem + '.qweight']).T, bits).T
     zeros = _gptq_zeros(np.asarray(tensors[stem + '.qzeros']), bits, v1)
     groups = np.asarray(tensors[stem + '.g_idx']).astype(np.int64)
-    return _fp16_product(codes, zeros[groups], np.asarray(tensors[stem + '.scales'])[groups]).T
+    return _scaled_product(codes, zeros[groups], np.asarray(tensors[stem + '.scales'])[groups]).T
 
 
 def _gptq_encode(name: str, weight: np.ndarray, *, bits: int, v1: bool,
@@ -916,6 +923,244 @@ def _integer_format(quantization: Mapping[str, object], method: str) -> tuple[in
     if not isinstance(group, int) or isinstance(group, bool):
         raise ValueError(f"{method} group_size {group!r}: an integer")
     return bits, group
+
+
+# --------------------------------------------------------------------------
+# compressed-tensors: pack-quantized, float-quantized, int- and naive-quantized
+# --------------------------------------------------------------------------
+#
+# One weights scheme (`QuantizationArgs`) for every config group. A weight
+# is (code - zero) * scale, taken in the scale's dtype, as compressed-tensors
+# 0.17.1 `dequantize` takes it (quantization/lifecycle/forward_helpers.py
+# `_dequantize`), with one scale (and zero) per tensor, output channel, group
+# of inputs (in `weight_g_idx` order when act-order stored it) or block.
+# `pack-quantized` stores int codes of 1 to 8 bits offset by 2 ** (bits - 1)
+# and packed low bits first into int32 words along the input axis
+# (compressors/pack_quantized/helpers.py `pack_to_int32`), the zero points
+# packed the same way along the output axis, and the unpacked shape as
+# `weight_shape`; the other formats store the codes as the weight itself,
+# float8_e4m3fn or int8. A save quantizes against the scales and zeros the
+# source shipped, as the library's compressor does given them: the weight
+# over its scale, plus the zero, clamped to the code range, then rounded
+# (ints half to even) or cast (fp8). A value outside the range is clamped,
+# as the library clamps it.
+
+COMPRESSED_TENSORS_FORMATS = ('pack-quantized', 'float-quantized', 'int-quantized', 'naive-quantized')
+"""The compressed-tensors formats `compressed_tensors` reads, beside MXFP4."""
+
+
+@dataclass(frozen=True)
+class _WeightScheme:
+    """The fields of compressed-tensors' weight `QuantizationArgs` that say what a code means."""
+
+    format: str
+    bits: int
+    kind: Literal['int', 'float']
+    symmetric: bool
+    strategy: Literal['tensor', 'channel', 'group', 'block']
+    group: int | None
+    block: tuple[int, int] | None
+
+
+def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
+    """The one weights scheme a compressed-tensors config declares, refusing
+    what this loader cannot read. A dynamic activation quantizer holds no
+    state, so the weights alone are the checkpoint; this loader computes the
+    activations in the model's dtype, as it does for DeepSeek's FP8 blocks."""
+    form = quantization.get('format')
+    if form not in COMPRESSED_TENSORS_FORMATS:
+        raise ValueError(f"compressed-tensors format {form!r}: this loader reads "
+                         f"{', '.join(COMPRESSED_TENSORS_FORMATS)} and mxfp4-pack-quantized")
+    if quantization.get('quantization_status', 'compressed') != 'compressed':
+        raise ValueError("compressed-tensors quantization_status must be 'compressed'")
+    if quantization.get('kv_cache_scheme') is not None:
+        raise ValueError("compressed-tensors kv_cache_scheme quantizes the cache, which this loader does not; "
+                         "load a checkpoint without a kv_cache_scheme")
+    groups = quantization.get('config_groups')
+    if not isinstance(groups, Mapping) or not groups:
+        raise ValueError("compressed-tensors config_groups must name the quantized weights")
+    schemes = set()
+    for name, group in groups.items():
+        group = records.record(group, f'config_groups.{name}')
+        if group.get('output_activations') is not None:
+            raise ValueError(f"config_groups.{name}.output_activations quantizes outputs, which this loader does not")
+        activations = group.get('input_activations')
+        if activations is not None and records.record(activations, 'input_activations').get('dynamic') is not True:
+            raise ValueError(f"config_groups.{name}.input_activations are static, with scales stored beside the "
+                             "weights that this loader would drop; load a dynamic or weight-only checkpoint")
+        weights = records.record(group.get('weights'), f'config_groups.{name}.weights')
+        strategy, kind = weights.get('strategy'), weights.get('type')
+        if strategy not in ('tensor', 'channel', 'group', 'block') or kind not in ('int', 'float'):
+            raise ValueError(f"config_groups.{name}.weights: {kind!r} codes by {strategy!r}; this loader reads "
+                             "int or float codes by tensor, channel, group or block")
+        if weights.get('dynamic', False):
+            raise ValueError(f"config_groups.{name}.weights are dynamic, with no stored scales to read")
+        schemes.add(_WeightScheme(
+            str(form), records.integer(weights.get('num_bits'), 'num_bits'), kind,
+            bool(weights.get('symmetric', True)), strategy,
+            None if weights.get('group_size') is None else records.integer(weights['group_size'], 'group_size'),
+            _block_structure(weights)))
+    if len(schemes) != 1:
+        raise ValueError(f"compressed-tensors config_groups declare {len(schemes)} weight schemes; this loader "
+                         "reads one scheme for every quantized Linear")
+    scheme = schemes.pop()
+    fits = {'pack-quantized': scheme.kind == 'int' and 1 <= scheme.bits <= 8,
+            'float-quantized': scheme.kind == 'float' and scheme.bits == 8,
+            'int-quantized': scheme.kind == 'int' and scheme.bits == 8,
+            'naive-quantized': scheme.bits == 8}[scheme.format]
+    if not fits or (scheme.strategy == 'group') != (scheme.group is not None) \
+            or (scheme.strategy == 'block') != (scheme.block is not None):
+        raise ValueError(f"compressed-tensors {scheme.format} with {scheme.bits}-bit {scheme.kind} codes by "
+                         f"{scheme.strategy} (group {scheme.group}, block {scheme.block}) is not a layout the "
+                         "format writes")
+    return scheme
+
+
+def _block_structure(weights: Mapping[str, object]) -> tuple[int, int] | None:
+    block = weights.get('block_structure')
+    if block is None:
+        return None
+    if not isinstance(block, list | tuple) or len(block) != 2:
+        raise ValueError(f"block_structure {block!r}: a [rows, columns] pair")
+    return records.integer(block[0], 'block_structure'), records.integer(block[1], 'block_structure')
+
+
+def _code_range(scheme: _WeightScheme) -> tuple[float, float]:
+    return ((-448.0, 448.0) if scheme.kind == 'float'
+            else (-(1 << (scheme.bits - 1)), (1 << (scheme.bits - 1)) - 1))
+
+
+def _per_input(values: np.ndarray, scheme: _WeightScheme, shape: tuple[int, int],
+               order: np.ndarray | None) -> np.ndarray:
+    """A per-tensor, per-channel, per-group or per-block table spread over an [output, input] weight."""
+    outputs, inputs = shape
+    if scheme.strategy == 'tensor':
+        return values.reshape(())
+    if scheme.strategy == 'channel':
+        return values.reshape(outputs, 1)
+    if scheme.strategy == 'group':
+        assert scheme.group is not None
+        return values[:, np.arange(inputs) // scheme.group if order is None else order.astype(np.int64)]
+    assert scheme.block is not None
+    return values[np.arange(outputs) // scheme.block[0]][:, np.arange(inputs) // scheme.block[1]]
+
+
+def _ct_parts(scheme: _WeightScheme, name: str) -> dict[str, str]:
+    stem = name.removesuffix('.weight')
+    parts = {'scale': stem + '.weight_scale'}
+    if scheme.format == 'pack-quantized':
+        parts |= {'packed': stem + '.weight_packed', 'shape': stem + '.weight_shape'}
+    if not scheme.symmetric:
+        parts['zero'] = stem + '.weight_zero_point'
+    return parts
+
+
+def _ct_names(scheme: _WeightScheme, tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+    """The `<module>.weight` names a checkpoint ships quantized: each module
+    with a `weight_scale`, whose other parts the scheme requires."""
+    names = sorted(name.removesuffix('_scale') for name in tensors if name.endswith('.weight_scale'))
+    for name in names:
+        missing = [part for part in _ct_parts(scheme, name).values() if part not in tensors]
+        if scheme.format != 'pack-quantized' and name not in tensors:
+            missing.append(name)
+        if missing:
+            raise ValueError(f"{name} arrives quantized and the checkpoint holds no {missing}")
+    return tuple(names)
+
+
+def _ct_partners(scheme: _WeightScheme, name: str) -> tuple[str, ...]:
+    """The stored tensors besides `name` itself: act-order's `weight_g_idx`
+    goes with them when the checkpoint carries one."""
+    return (*_ct_parts(scheme, name).values(), name.removesuffix('.weight') + '.weight_g_idx')
+
+
+def _unpacked(words: np.ndarray, bits: int, length: int) -> np.ndarray:
+    """`unpack_from_int32` along the last axis: signed codes, the padding past `length` dropped."""
+    return _codes(words, bits)[..., :length] - (1 << (bits - 1))
+
+
+def _ct_codes(scheme: _WeightScheme, tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
+    parts = _ct_parts(scheme, name)
+    if scheme.format != 'pack-quantized':
+        return np.asarray(tensors[name]).astype(np.float32)
+    outputs, inputs = (int(size) for size in np.asarray(tensors[parts['shape']]).reshape(-1))
+    return _unpacked(np.asarray(tensors[parts['packed']]), scheme.bits, inputs).reshape(outputs, inputs)
+
+
+def _ct_zero(scheme: _WeightScheme, tensors: Mapping[str, np.ndarray], name: str,
+             shape: tuple[int, int]) -> np.ndarray | int:
+    parts = _ct_parts(scheme, name)
+    if 'zero' not in parts:
+        return 0
+    zero = np.asarray(tensors[parts['zero']])
+    if scheme.format == 'pack-quantized' and scheme.strategy in ('channel', 'group'):
+        # Packed along the output axis (packed_dim=0).
+        zero = _unpacked(zero.T, scheme.bits, shape[0]).T
+    return zero
+
+
+def _ct_order(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray | None:
+    order = tensors.get(name.removesuffix('.weight') + '.weight_g_idx')
+    return None if order is None else np.asarray(order)
+
+
+def _ct_decode(tensors: Mapping[str, np.ndarray], name: str, *, scheme: _WeightScheme) -> np.ndarray:
+    """One quantized Linear's weight, float32 [output, input], as the library dequantizes it."""
+    codes = _ct_codes(scheme, tensors, name)
+    shape = (codes.shape[0], codes.shape[1])
+    scales = np.asarray(tensors[_ct_parts(scheme, name)['scale']])
+    order = _ct_order(tensors, name)
+    zero = _ct_zero(scheme, tensors, name, shape)
+    zeros = zero if isinstance(zero, int) else _per_input(zero, scheme, shape, order)
+    return _scaled_product(codes, zeros, np.asarray(_per_input(scales, scheme, shape, order)))
+
+
+def _ct_encode(name: str, weight: np.ndarray, *, scheme: _WeightScheme,
+               grid: Mapping[str, np.ndarray] | None) -> dict[str, np.ndarray]:
+    """`name` quantized against the scales, zeros and order its source shipped,
+    as compressed-tensors' compressor quantizes given them, in the scales' dtype."""
+    parts = _ct_parts(scheme, name)
+    kept = {role: part for role, part in parts.items() if role in ('scale', 'zero', 'shape')}
+    order_name = name.removesuffix('.weight') + '.weight_g_idx'
+    stored = dict(zip(kept, _gridded(grid, name, tuple(kept.values())), strict=True))
+    order = None if grid is None or order_name not in grid else np.asarray(grid[order_name])
+    scales = stored['scale']
+    shape = (weight.shape[0], weight.shape[1])
+    dtype = scales.dtype
+    zero = 0 if 'zero' not in stored else _ct_zero(scheme, {parts['zero']: stored['zero']}, name, shape)
+    zeros = zero if isinstance(zero, int) else _per_input(zero, scheme, shape, order)
+    over = (np.asarray(weight).astype(dtype).astype(np.float32)
+            / np.asarray(_per_input(scales, scheme, shape, order)).astype(np.float32)).astype(dtype)
+    if not isinstance(zeros, int):
+        over = (over.astype(np.float32) + zeros.astype(np.float32)).astype(dtype)
+    low, high = _code_range(scheme)
+    clamped = np.clip(over.astype(np.float32), low, high)
+    out: dict[str, np.ndarray] = {part: stored[role] for role, part in kept.items()}
+    if order is not None:
+        out[order_name] = order
+    if scheme.kind == 'float':
+        out[name] = clamped.astype(ml_dtypes.float8_e4m3fn)
+        return out
+    codes = np.round(clamped).astype(np.int32)
+    if scheme.format != 'pack-quantized':
+        out[name] = codes.astype(np.int8)
+        return out
+    per = 32 // scheme.bits
+    padded = np.pad(codes + (1 << (scheme.bits - 1)), ((0, 0), (0, -codes.shape[1] % per)))
+    out[parts['packed']] = _words(padded, scheme.bits)
+    return out
+
+
+def compressed_tensors(quantization: Mapping[str, object],
+                       grid: Mapping[str, np.ndarray] | None = None) -> SourceQuantization:
+    """compressed-tensors' pack-quantized, float-quantized, int-quantized and
+    naive-quantized weights under the one scheme `quantization` declares."""
+    scheme = _weight_scheme(quantization)
+    return SourceQuantization(
+        partial(_ct_names, scheme), partial(_ct_partners, scheme),
+        partial(_ct_decode, scheme=scheme), partial(_ct_encode, scheme=scheme, grid=grid),
+        grid=lambda name: (*(part for role, part in _ct_parts(scheme, name).items() if role != 'packed'),
+                           name.removesuffix('.weight') + '.weight_g_idx'))
 
 
 # --------------------------------------------------------------------------
@@ -982,6 +1227,8 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
     if method == "mxfp4":
         return MXFP4
     if method == "compressed-tensors":
+        if quantization.get("format") != "mxfp4-pack-quantized":
+            return compressed_tensors(quantization, grid)
         packed_mxfp4_format(quantization)
         return PACKED_MXFP4
     if method == "awq":

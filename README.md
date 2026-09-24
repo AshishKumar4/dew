@@ -336,13 +336,15 @@ all-visible attention mask: `LlamaForCausalLM` for LLaDA and
 `load_pretrained` reads SD, SDXL, SD3, Flux, and Qwen-Image 2.1 pipeline directories.
 SD and SDXL include img2img, inpainting, and the SDXL refiner.
 
-The loader reads six quantized storage formats:
+The loader reads these quantized storage formats:
 
 - DeepSeek's FP8 blocks (`weight_scale_inv`);
 - DeepSeek-V4 and V4.1's `.scale` storage (FP8 layers, FP4 routed experts,
   engram tables);
 - GPT-OSS's MXFP4;
-- compressed-tensors' `mxfp4-pack-quantized`;
+- compressed-tensors' `mxfp4-pack-quantized`, `pack-quantized` (int codes of 1
+  to 8 bits), `float-quantized` (FP8 by tensor, channel or block) and
+  `int-quantized`;
 - AutoAWQ's 4-bit gemm packing;
 - GPTQ at 2, 4 and 8 bits, act-order included.
 
@@ -351,7 +353,10 @@ shipped, so a change smaller than half a grid step is lost and a lightly
 trained model saves back mostly as its source. A trained value outside that
 grid is refused: AutoAWQ's packing would spill it into the neighbouring
 codes and gptqmodel's would clamp it. A substantially trained model saves
-dense instead (the error names the call).
+dense instead (the error names the call). A compressed-tensors weight is saved as the library's own compressor
+writes it against the source's scales, clamping a value past the code range
+as the library does. Activations that a checkpoint quantizes dynamically run
+in the model's dtype; static activation scales are refused.
 
 It decodes them to the same values each release's own dequantization gives.
 `Pretrained.save` writes trained weights back in the source's format and scale
