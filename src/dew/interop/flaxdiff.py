@@ -101,7 +101,10 @@ def fourier_table(features: int, jax_version: str, scale: float = 16) -> np.ndar
     The stream's bits are the same on every backend, but the normal
     transform (`erf_inv`) rounds its last bit the backend's way, so a table
     drawn on a GPU can differ from a CPU's by an ulp in an entry, as
-    FlaxDiff's own draw followed the device the run trained on.
+    FlaxDiff's own draw followed the device the run trained on. A run
+    trained on a TPU or a GPU drew its table there, so loading it on
+    another backend can hand it a table one ulp off the one it trained
+    with in an entry.
     """
     release = tuple(int(part) for part in jax_version.split(".")[:2])
     with jax.threefry_partitionable(release >= (0, 5)):

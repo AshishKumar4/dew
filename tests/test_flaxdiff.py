@@ -67,9 +67,10 @@ def test_the_fourier_table_follows_the_jax_the_run_trained_under(reference):
     the run's stream, on the backend that computes it: every backend draws
     the same bits, but the normal transform rounds its last bit its own way
     (a GPU's table differs from the CPU's by an ulp in one entry). So the
-    table is held exactly to this backend's draw of each stream, and
-    FlaxDiff's recorded table, drawn on the CPU that wrote the fixture, to
-    the stream it came from."""
+    table is held exactly to this backend's draw of each stream, and drawn
+    on the CPU, which every lane keeps beside its accelerator, exactly to
+    the table FlaxDiff's own code recorded on the CPU that wrote the
+    fixture."""
     model_config, _, data = reference
     features = model_config["emb_features"]
 
@@ -81,8 +82,8 @@ def test_the_fourier_table_follows_the_jax_the_run_trained_under(reference):
     streams = {False: drawn(False), True: drawn(True)}
     for version, partitionable in (("0.4.31", False), ("0.5.0", True), ("0.5.3", True), ("0.10.1", True)):
         np.testing.assert_array_equal(fourier_table(features, version), streams[partitionable])
-    recorded = data["fourier_table"]
-    assert np.abs(recorded - streams[True]).max() < np.abs(recorded - streams[False]).max()
+    with jax.default_device(jax.devices("cpu")[0]):
+        np.testing.assert_array_equal(fourier_table(features, "0.5.3"), data["fourier_table"])
 
 
 def test_a_checkpoint_publishes_the_averaged_weights_of_its_last_state(reference, tmp_path):
