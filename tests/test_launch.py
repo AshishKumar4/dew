@@ -15,7 +15,11 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-ENV = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src")}
+# The launches below stand in for Slurm, Open MPI or a plain host. On a Cloud
+# TPU VM, jax's detection reads the VM's metadata and finds a TPU cluster
+# ahead of any of them; TPU_SKIP_MDS_QUERY is jax's own switch for a host
+# that is not one.
+ENV = {**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "TPU_SKIP_MDS_QUERY": "1"}
 
 
 def test_training_does_not_import_the_command_line():
