@@ -314,6 +314,25 @@ def test_a_rank_whose_backend_fails_to_open_after_joining_ends_the_pool():
     assert time.monotonic() - started < 60, done.stdout + done.stderr
 
 
+@pytest.mark.mesh(devices=1)
+def test_a_one_process_pool_that_fails_still_runs_its_exit_handlers(tmp_path):
+    """A pool of one process has no peer waiting in a collective for it, so a
+    failure takes Python's own exit, which runs the atexit handlers: those
+    are where HarborTrials stops its trials. The failure watch leaves through
+    os._exit, which skips them, so only a pool of several processes takes it."""
+    marker = tmp_path / "exited"
+    program = ("import atexit, pathlib, sys\n"
+               "atexit.register(pathlib.Path(sys.argv[1]).write_text, 'ran')\n"
+               "from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "raise RuntimeError('the program fails')\n")
+    done = launch("--processes-per-host", "1", "--", sys.executable, "-c", program, str(marker),
+                  devices=1, timeout=300)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "RuntimeError: the program fails" in done.stdout, done.stdout
+    assert marker.exists(), done.stdout + done.stderr
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_rank_that_raises_between_collectives_stops_the_pool():
     """Rank 1 raises before its fourth step while rank 0 is inside that
