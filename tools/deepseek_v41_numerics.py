@@ -7,6 +7,9 @@ one thing, on the backend JAX picks:
 
     PYTHONPATH=src:. python tools/deepseek_v41_numerics.py residuals
 
+(on a GPU with JAX_PLATFORMS=cuda,cpu: the float64 twins' decisions cross
+through host callbacks, which JAX places on a CPU device)
+
 every compared output's and every quantizer input's and top-k row's RMS
 distance from the float64 truth, Dew's beside the reference's, whose
 ratio tests/reference_error.py bounds, and each output's float64 twin's
