@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import functools
 import json
+import math
 import os
 import random
 import shutil
@@ -100,23 +101,34 @@ FEEDBACK_TOKENS = 32
 
 SMOKE_MODEL = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/qwen2-tiny"
 
-# (what to print, how to compute it from a and b, a valid input range)
+# (what to print, how to compute it from a and b, a valid input range).
+# Qwen3-0.6B solved the one-line arithmetic of an earlier set on 74% of its
+# first draws and on every draw by update 6, which leaves a curve no signal;
+# these need a loop, a number-theory fact or a careful edge case.
 TASKS = (
-    ("the sum of a and b", lambda a, b: a + b, (-50, 50)),
-    ("the product of a and b", lambda a, b: a * b, (-30, 30)),
-    ("a minus b", lambda a, b: a - b, (-50, 50)),
-    ("the larger of a and b", max, (-99, 99)),
-    ("the absolute difference between a and b", lambda a, b: abs(a - b), (-99, 99)),
-    ("the sum of the squares of a and b", lambda a, b: a * a + b * b, (-20, 20)),
     ("the sum of all integers from min(a, b) to max(a, b) inclusive",
      lambda a, b: sum(range(min(a, b), max(a, b) + 1)), (-30, 30)),
-    ("a integer-divided by b, rounded down (b is never zero)", lambda a, b: a // b, (1, 60)),
-    ("the remainder of a divided by b (b is never zero)", lambda a, b: a % b, (1, 60)),
     ("the number of multiples of b between 1 and a inclusive (both are positive)",
      lambda a, b: a // b, (1, 90)),
     ("the sum of the decimal digits of a times b", lambda a, b: sum(map(int, str(abs(a * b)))), (1, 99)),
-    ("2 * a + 3 * b", lambda a, b: 2 * a + 3 * b, (-40, 40)),
+    ("the greatest common divisor of a and b (both are positive)", math.gcd, (1, 99)),
+    ("the number of primes p with min(a, b) <= p <= max(a, b)",
+     lambda a, b: sum(all(p % d for d in range(2, int(p ** 0.5) + 1)) for p in range(max(2, min(a, b)), max(a, b) + 1)),
+     (1, 99)),
+    ("the a-th Fibonacci number modulo b, where the 0th is 0 and the 1st is 1 (b is never zero)",
+     lambda a, b: _fibonacci(a) % b, (1, 40)),
+    ("the number of 1 bits in the binary form of a times b (both are positive)",
+     lambda a, b: bin(a * b).count("1"), (1, 99)),
+    ("the integer whose decimal digits are those of a times b in reverse order, without leading zeros",
+     lambda a, b: int(str(a * b)[::-1]), (1, 99)),
 )
+
+
+def _fibonacci(n: int) -> int:
+    first, second = 0, 1
+    for _ in range(n):
+        first, second = second, first + second
+    return first
 
 
 def records(count: int, seed: int) -> tuple[str, ...]:
