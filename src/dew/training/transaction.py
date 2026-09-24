@@ -287,11 +287,20 @@ class Transaction:
     def finish_attempt(self, state, batch, aux, pending, gradient):
         """Commit the window when it is due, then advance the state's clocks.
 
-        The commit runs under `lax.cond`, so a rejected attempt costs the
-        same trace as an accepted one. With a dynamic scaler an attempt is
-        admitted only when every value it produced is finite, the committed
-        parameters and optimizer state included; a rejected attempt returns
-        `state` untouched and only the scaler moves.
+        A rejected attempt costs the same trace as an accepted one. With a
+        dynamic scaler an attempt is admitted only when every value it
+        produced is finite, the committed parameters and optimizer state
+        included; a rejected attempt returns `state` untouched and only the
+        scaler moves.
+
+        A window of one microbatch commits on every step it can, so its
+        commit is computed and kept by elementwise selects. A longer window
+        commits under `lax.cond`, which skips the optimizer on the
+        microbatches that do not close it. A GPU conditional whose branch
+        holds a collective, as fsdp's gradient norm is, reads its predicate
+        on the host: the host then queues the next step only once the device
+        has reached this one's commit, and the device idles through every
+        step's host work (15.9 ms a 32.5 ms DiT step on four RTX 3090s).
 
         A window that is not due retains this microbatch's batch and read
         snapshots in its slot, so a later replay can reproduce it; a window
@@ -303,6 +312,10 @@ class Transaction:
         accepted = jnp.asarray(True) if scale is None else finite
         numerical = dataclasses.replace(state, params=write_back(state.params, aux.variables),
                                         microstep=state.microstep + 1)
+
+        def chosen(take, taken, kept):
+            """`taken` where `take` holds and `kept` elsewhere, leaf by leaf."""
+            return jax.tree.map(lambda new, old: jnp.where(take, new, old), taken, kept)
 
         def commit(current):
             native = jax.tree.map(lambda g, p: g.astype(p.dtype), gradient, current.params["params"])
@@ -326,12 +339,20 @@ class Transaction:
                 return dataclasses.replace(current, params=params, opt_state=opt_state, ema=averaged,
                                            updates=current.updates + 1)
 
-            current = jax.lax.cond(native_finite if scale is not None else jnp.asarray(True),
-                                   apply, lambda x: x, current)
-            return current, native_finite
+            if scale is None:
+                return apply(current), native_finite
+            if self.size == 1:
+                return chosen(native_finite, apply(current), current), native_finite
+            return jax.lax.cond(native_finite, apply, lambda x: x, current), native_finite
 
-        numerical, native_finite = jax.lax.cond(
-            pending.due & pending.active & accepted, commit, lambda x: (x, jnp.asarray(True)), numerical)
+        due = pending.due & pending.active & accepted
+        if self.size == 1:
+            committed, native_finite = commit(numerical)
+            numerical = chosen(due, committed, numerical)
+            native_finite = native_finite | ~due
+        else:
+            numerical, native_finite = jax.lax.cond(
+                due, commit, lambda x: (x, jnp.asarray(True)), numerical)
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite((numerical.params, numerical.opt_state, numerical.ema))
@@ -356,7 +377,7 @@ class Transaction:
                     else jnp.zeros_like(x), acc.qk_stats))
             numerical = dataclasses.replace(
                 numerical, accumulation=jax.lax.cond(pending.due, clear, retain, candidate))
-        advanced = jax.lax.cond(accepted, lambda _: numerical, lambda _: state, None)
+        advanced = chosen(accepted, numerical, state)
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
         return advanced, loss, aux
