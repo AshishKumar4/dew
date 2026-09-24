@@ -216,6 +216,11 @@ class SimpleUDiT(nn.Module):
     outputs skipping into the second half through a dense layer over the
     concatenation. Position comes from RoPE over the sequence index, so a
     hilbert scan carries the rotation of its curve index and no 2D signal.
+
+    `adaln_silu` False and `text_pooling` "all" are FlaxDiff 0.2's U-DiT: its
+    blocks project the conditioning vector without a SiLU and it averages the
+    text over every position. `dew.interop.flaxdiff` loads its checkpoints
+    with them.
     """
     output_channels: int = 3
     patch_size: int = 16
@@ -231,6 +236,8 @@ class SimpleUDiT(nn.Module):
     remat: RematChoice = False
     norm_epsilon: float = 1e-5
     scan_order: Literal["raster", "hilbert"] = "raster"
+    adaln_silu: bool = True
+    text_pooling: Literal["real", "all"] = "real"
 
     def setup(self):
         assert self.num_layers % 2 == 0, "num_layers must be even for U-Net structure"
@@ -255,6 +262,7 @@ class SimpleUDiT(nn.Module):
             mlp_ratio=self.mlp_ratio,
             dtype=self.dtype,
             precision=self.precision,
+            text_pooling=self.text_pooling,
         )
 
         block = partial(
@@ -268,6 +276,7 @@ class SimpleUDiT(nn.Module):
             force_fp32_for_softmax=self.force_fp32_for_softmax,
             attention_impl=self.attention_impl,
             norm_epsilon=self.norm_epsilon,
+            adaln_silu=self.adaln_silu,
         )
         self.down_blocks = [block(name=f"down_block_{i}") for i in range(half_layers)]
         self.mid_block = block(name="mid_block")

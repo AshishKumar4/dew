@@ -18,13 +18,30 @@ If you are new to the project, start with [getting started](getting-started.md).
 
 [Objectives](concepts/objectives.md) describes the training contract all objectives share. [The diffusion guide](guides/diffusion.md) covers the diffusion pieces, and [recipes](recipes.md) covers command-line configuration. The [core API reference](reference/core-api.md) documents the current interfaces.
 
+## Load a FlaxDiff text-to-image checkpoint
+
+`dew.interop.flaxdiff.load_flaxdiff` loads one kind of FlaxDiff run: a `simple_udit` latent text-to-image model from FlaxDiff 0.2 (the code flaxdiff 0.2.8 shipped), trained on the Stable Diffusion VAE with a CLIP text encoder. It returns a `TextToImage`, the same task a Dew run's `dew.pipeline` gives you.
+
+It needs three things from the old run. The first is one checkpoint step, the directory FlaxDiff's trainer wrote with a `default/` folder inside. The second is the run config the trainer logged to wandb, which names the architecture and its sizes; the checkpoint does not. The third is the jax version the run trained under, from the run's `requirements.txt`. FlaxDiff drew the random frequencies of its time embedding from `jax.random`, whose stream changed in jax 0.5.0, and never saved them, so the loader has to draw them the way that jax did.
+
+```python
+import json
+
+from dew.interop.flaxdiff import load_flaxdiff
+from dew.sampling import Heun
+
+config = json.load(open("run_config.json"))  # wandb.Api().run(path).config
+pipe = load_flaxdiff("checkpoints/350000", config, jax_version="0.5.3")
+images = pipe(["a lighthouse on a rocky coast"], seed=0, steps=25, sampler=Heun()).host().images
+```
+
+`images` is a float array in `[-1, 1]`, `[prompts, 256, 256, 3]` for a 256px run. The text tower (CLIP ViT-L/14) and the VAE download from the Hugging Face Hub under the names the config records. By default a call samples the way FlaxDiff's trainer previewed the run: Euler ancestral over 200 steps, classifier-free guidance 3. The loader reads the averaged (EMA) weights of the last state; `ema=False` and `best=True` choose the others. It builds Dew's own `simple_udit` with `adaln_silu=False` and `text_pooling="all"`, the two places where FlaxDiff 0.2's blocks differ from Dew's defaults, and `tests/test_flaxdiff.py` checks its output against FlaxDiff's own code.
+
+Anything else, including FlaxDiff's UNets and its 2024 checkpoints, has no loader. Keep each of those runs together with the source revision, environment, data and encoder files that produced it.
+
 ## Start in a new run directory
 
-Dew has no converter for FlaxDiff checkpoints and no FlaxDiff import paths. Keep each old run together with the source revision, environment, data, and tokenizer or encoder files that produced it. If you want to inspect or sample an old checkpoint, keep that environment too.
-
-For a Dew run, write a current configuration and use a new output directory. A recipe writes `run.json` next to its checkpoints. The checkpoint state holds the live variables, the optimizer state, the EMA or reference tree when there is one, the step counters, and the random key. The parameter names and the state structure must match the model you rebuild. Renaming a checkpoint directory or changing the package you import does not convert what is inside it.
-
-If you want to move only the parameters across, you need an explicit mapping of names and shapes and a comparison of the two models' outputs. This page does not give you that mapping. Read [checkpoints](guides/checkpoints.md) for how saving and restoring work today. Both projects use Flax, but that does not make their checkpoints compatible.
+For a Dew run, write a current configuration and use a new output directory. A recipe writes `run.json` next to its checkpoints. The checkpoint state holds the live variables, the optimizer state, the EMA or reference tree when there is one, the step counters, and the random key. The parameter names and the state structure must match the model you rebuild. Renaming a checkpoint directory or changing the package you import does not convert what is inside it. Read [checkpoints](guides/checkpoints.md) for how saving and restoring work today.
 
 ## Interpret the older results
 

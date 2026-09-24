@@ -1,0 +1,19 @@
+{
+ "flaxdiff_commit": "3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a",
+ "architecture": "simple_udit",
+ "model": {
+  "output_channels": 4,
+  "patch_size": 2,
+  "emb_features": 32,
+  "num_layers": 4,
+  "num_heads": 4,
+  "mlp_ratio": 4,
+  "dropout_rate": 0.1,
+  "norm_groups": 0,
+  "use_hilbert": false,
+  "use_flash_attention": false,
+  "activation": "jax._src.nn.functions.silu",
+  "dtype": "jax.numpy.float32",
+  "precision": "DEFAULT"
+ }
+}
