@@ -4,52 +4,26 @@ blocks in a configurable ratio. The S5 layers live in ssm.py; the block and
 the patchify/conditioning/output machinery live in dit.py.
 """
 
-from typing import Literal, Sequence
-
-from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
+from collections.abc import Sequence
 
 from dew.registry import models
 
-from ..dit import (
-    ConditioningEmbed,
-    ModulatedBlock,
-    PatchSequenceEmbed,
-    PatchSequenceOutput,
-    RematChoice,
-    build_block_pattern,
-    remat_block,
-    rope_for_scan,
-)
+from ..dit import ModulatedBlock, build_block_pattern, remat_block
+from .dit import SimpleDiT
 
 DEFAULT_SSM_RATIO = "3:1"
 
 
 @models("hybrid_dit")
-class HybridSSMAttentionDiT(nn.Module):
+class HybridSSMAttentionDiT(SimpleDiT):
     """DiT that interleaves SSM blocks with attention blocks.
 
     The mixer of every layer comes from `ssm_attention_ratio`, a shorthand
     that reads the same at any depth ("3:1", "all-ssm"), or from
     `block_pattern`, which names each layer. Setting both raises a ValueError
-    at setup.
+    at setup. Everything around the layers is `SimpleDiT`'s.
     """
-    output_channels: int = 3
-    patch_size: int = 16
-    emb_features: int = 768
-    num_layers: int = 12
-    num_heads: int = 12
-    mlp_ratio: int = 4
     ssm_state_dim: int = 64
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
-    remat: RematChoice = False
-    scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"
     block_pattern: Sequence[str] | None = None  # e.g., ['ssm','ssm','ssm','attn']
     ssm_attention_ratio: str = DEFAULT_SSM_RATIO  # "3:1", "1:1", "all-ssm", "all-attn"
     bidirectional_ssm: bool = True
@@ -93,45 +67,12 @@ class HybridSSMAttentionDiT(nn.Module):
             name=f"dit_block_{index}",
         )
 
-    def setup(self):
+    def stack(self) -> list[ModulatedBlock]:
+        """Layer `i` is the block `ssm_attention_ratio` or `block_pattern` names."""
         if self.block_pattern is not None and self.ssm_attention_ratio != DEFAULT_SSM_RATIO:
             raise ValueError(
                 f"block_pattern names every layer's mixer and ssm_attention_ratio "
                 f"{self.ssm_attention_ratio!r} names them by ratio; set one, not both")
-        self.embed = PatchSequenceEmbed(
-            patch_size=self.patch_size,
-            emb_features=self.emb_features,
-            scan_order=self.scan_order,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
-        self.conditioning = ConditioningEmbed(
-            emb_features=self.emb_features,
-            mlp_ratio=self.mlp_ratio,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
         pattern = build_block_pattern(
             self.num_layers, self.ssm_attention_ratio, self.block_pattern)
-        self.blocks = [self.block(index, block_type)
-                       for index, block_type in enumerate(pattern)]
-
-        self.output = PatchSequenceOutput(
-            patch_size=self.patch_size,
-            output_channels=self.output_channels,
-            norm_epsilon=self.norm_epsilon,
-            dtype=self.dtype,
-            precision=self.precision,
-        )
-
-    def __call__(self, x, temb, textcontext=None, train: bool = False):
-        _, H, W, _ = x.shape
-        x_seq, inv_idx = self.embed(x)
-        cond_emb = self.conditioning(temb, textcontext)
-        freqs_cis = rope_for_scan(x_seq.shape[1], self.emb_features // self.num_heads,
-                                  self.scan_order)
-
-        for block in self.blocks:
-            x_seq = block(x_seq, cond_emb, freqs_cis, train)
-
-        return self.output(x_seq, inv_idx, H, W)
+        return [self.block(index, block_type) for index, block_type in enumerate(pattern)]
