@@ -336,13 +336,22 @@ all-visible attention mask: `LlamaForCausalLM` for LLaDA and
 `load_pretrained` reads SD, SDXL, SD3, Flux, and Qwen-Image 2.1 pipeline directories.
 SD and SDXL include img2img, inpainting, and the SDXL refiner.
 
-The loader reads four quantized storage formats:
+The loader reads six quantized storage formats:
 
 - DeepSeek's FP8 blocks (`weight_scale_inv`);
 - DeepSeek-V4 and V4.1's `.scale` storage (FP8 layers, FP4 routed experts,
   engram tables);
 - GPT-OSS's MXFP4;
-- compressed-tensors' `mxfp4-pack-quantized`.
+- compressed-tensors' `mxfp4-pack-quantized`;
+- AutoAWQ's 4-bit gemm packing;
+- GPTQ at 2, 4 and 8 bits, act-order included.
+
+An AWQ or GPTQ weight is saved back against the scales and zeros the source
+shipped, so a change smaller than half a grid step is lost and a lightly
+trained model saves back mostly as its source. A trained value outside that
+grid is refused: AutoAWQ's packing would spill it into the neighbouring
+codes and gptqmodel's would clamp it. A substantially trained model saves
+dense instead (the error names the call).
 
 It decodes them to the same values each release's own dequantization gives.
 `Pretrained.save` writes trained weights back in the source's format and scale

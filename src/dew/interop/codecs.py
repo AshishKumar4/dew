@@ -16,6 +16,9 @@ one tensor at a time, and encodes dense weights back into those parts for
 - GPT OSS's MXFP4 (`quant_method: mxfp4`): `<stem>_blocks` and `<stem>_scales`.
 - compressed-tensors' `mxfp4-pack-quantized`: `<m>.weight_packed` beside
   `<m>.weight_scale`.
+- AutoAWQ's gemm packing (`quant_method: awq`) and GPTQ (`quant_method:
+  gptq`): int32-packed codes with fp16 scales and packed zeros per group,
+  which save back against the source's own scales and zeros.
 
 Every FP4 format here stores the OCP MX element that `decode_e2m1` and
 `encode_e2m1` read and write: E2M1 codes two to a byte, the even element in
@@ -201,6 +204,9 @@ class SourceQuantization:
     weight)` the stored tensors it writes back. `scale_dtype` reads the
     dtype a source stored its scales in where the format leaves that to the
     checkpoint (DeepSeek-V4), for `source_quantization` to write back.
+    `grid(name)` names the partners an integer format encodes against rather
+    than recomputes (AWQ's and GPTQ's scales and zeros): the loader keeps
+    them, and `source_quantization(..., grid=)` hands them back to `encode`.
     """
 
     names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
@@ -208,6 +214,7 @@ class SourceQuantization:
     decode: Callable[[Mapping[str, np.ndarray], str], np.ndarray]
     encode: Callable[[str, np.ndarray], dict[str, np.ndarray]]
     scale_dtype: Callable[[Mapping[str, np.ndarray]], str | None] = lambda tensors: None
+    grid: Callable[[str], tuple[str, ...]] = lambda name: ()
 
     def tensor_names(self, tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
         """The names left once every quantized weight is decoded."""
@@ -726,6 +733,189 @@ def deepseek_v4(block: int, *, fp4_experts: bool, scale_dtype: str | None = None
 
 
 # --------------------------------------------------------------------------
+# Integer groups: AWQ (quant_method awq) and GPTQ (quant_method gptq)
+# --------------------------------------------------------------------------
+#
+# Both store a Linear's [in, out] weight as `bits`-bit codes packed into int32
+# words, with fp16 scales and packed zeros per group of `group_size` inputs:
+# w = (code - zero) * scale. The product is taken in fp16, as both libraries'
+# torch dequantizers take it (autoawq 0.2.9 awq/utils/packing_utils.py
+# `dequantize_gemm`, gptqmodel 7.5 nn_modules/qlinear `dequantize_weight`):
+# the float32 product of a small integer and an fp16 scale is exact, so one
+# rounding to fp16 is theirs. A trained weight encodes back against the
+# source's own scales and zeros, `round((w + zero * scale) / scale)`, both
+# libraries' pack rule given scales and zeros (autoawq `WQLinear_GEMM.from_linear`,
+# gptqmodel `pack_block`). A weight whose code leaves [0, 2**bits) is refused:
+# AutoAWQ 0.2.9 does not clamp it, so it would spill into the neighbouring
+# nibbles (gemm.py:196-206), and gptqmodel 7.5 clamps it to the grid's edge
+# (`int_block.clamp_(0, maxq)`, qlinear/__init__.py:1284), which saves a
+# different weight than the one trained.
+#
+# Re-encoding against the source grid keeps only changes of half a grid step
+# or more: a lightly trained model saves back mostly as its source. A
+# min/max grid puts codes on 0 and 2**bits - 1 by construction, so a weight
+# at an edge that trains outward past half a step is refused, and a
+# substantially trained model is refused as a whole; it saves dense.
+
+AWQ_ORDER = (0, 2, 4, 6, 1, 3, 5, 7)
+"""The column each nibble of an AWQ gemm word holds, nibble 0 in the low bits."""
+
+GPTQ_SUFFIXES = ('.qweight', '.qzeros', '.scales', '.g_idx')
+AWQ_SUFFIXES = ('.qweight', '.qzeros', '.scales')
+
+
+def _words(values: np.ndarray, bits: int) -> np.ndarray:
+    """Unsigned codes [..., n] packed low bits first into int32 words [..., n * bits / 32]."""
+    per = 32 // bits
+    grouped = values.astype(np.uint32).reshape(*values.shape[:-1], -1, per)
+    shifts = np.arange(per, dtype=np.uint32) * bits
+    return np.bitwise_or.reduce(grouped << shifts, axis=-1).view(np.int32)
+
+
+def _codes(words: np.ndarray, bits: int) -> np.ndarray:
+    """int32 words [..., m] to their unsigned codes [..., m * 32 / bits], low bits first."""
+    shifts = np.arange(32 // bits, dtype=np.uint32) * bits
+    codes = (words.astype(np.int32).view(np.uint32)[..., None] >> shifts) & ((1 << bits) - 1)
+    return codes.reshape(*words.shape[:-1], -1).astype(np.int32)
+
+
+def _fp16_product(codes: np.ndarray, zeros: np.ndarray, scales: np.ndarray) -> np.ndarray:
+    return ((codes - zeros).astype(np.float32) * scales.astype(np.float32)).astype(np.float16).astype(np.float32)
+
+
+def _encoded_codes(name: str, weight: np.ndarray, zeros: np.ndarray, scales: np.ndarray, bits: int) -> np.ndarray:
+    """`round((w + zero * scale) / scale)` for [in, out] `weight` against per-input
+    zeros and scales, refusing codes the packing cannot hold."""
+    w, s = weight.astype(np.float64), scales.astype(np.float64)
+    codes = np.round((w + zeros * s) / s)
+    outside = int(np.count_nonzero((codes < 0) | (codes >= 1 << bits)))
+    if outside:
+        raise ValueError(
+            f"{name}: {outside} trained values fall outside the source's {bits}-bit grid, which the "
+            "libraries' packing would spill or clamp; save dense instead, with dataclasses.replace(pretrained, "
+            "config={k: v for k, v in pretrained.config.items() if k != 'quantization_config'}, "
+            "quantized_tensors=()).save(directory)")
+    return codes.astype(np.int32)
+
+
+def _gridded(grid: Mapping[str, np.ndarray] | None, name: str, parts: tuple[str, ...]) -> tuple[np.ndarray, ...]:
+    if grid is None or any(part not in grid for part in parts):
+        raise ValueError(f"{name} encodes against the scales and zeros it was loaded with, which this "
+                         "codec was not given; save it through the Pretrained that loaded it")
+    return tuple(np.asarray(grid[part]) for part in parts)
+
+
+def _awq_decode(tensors: Mapping[str, np.ndarray], name: str, *, bits: int, group: int) -> np.ndarray:
+    stem = name.removesuffix('.weight')
+    order = np.argsort(AWQ_ORDER)
+
+    def columns(words: np.ndarray) -> np.ndarray:
+        codes = _codes(words, bits)
+        return codes.reshape(*codes.shape[:-1], -1, 32 // bits)[..., order].reshape(codes.shape)
+
+    codes, zeros = columns(tensors[stem + '.qweight']), columns(tensors[stem + '.qzeros'])
+    scales = np.asarray(tensors[stem + '.scales'])
+    rows = np.arange(codes.shape[0]) // group
+    return _fp16_product(codes, zeros[rows], scales[rows]).T
+
+
+def _awq_encode(name: str, weight: np.ndarray, *, bits: int, group: int,
+                grid: Mapping[str, np.ndarray] | None) -> dict[str, np.ndarray]:
+    stem = name.removesuffix('.weight')
+    parts = (stem + '.qzeros', stem + '.scales')
+    packed_zeros, scales = _gridded(grid, name, parts)
+    order = np.argsort(AWQ_ORDER)
+    zeros = _codes(packed_zeros, bits)
+    zeros = zeros.reshape(*zeros.shape[:-1], -1, 32 // bits)[..., order].reshape(zeros.shape)
+    rows = np.arange(weight.shape[1]) // group
+    codes = _encoded_codes(name, np.asarray(weight).T, zeros[rows], scales[rows], bits)
+    packed = codes.reshape(codes.shape[0], -1, 32 // bits)[..., list(AWQ_ORDER)].reshape(codes.shape)
+    return {stem + '.qweight': _words(packed, bits), stem + '.qzeros': packed_zeros, stem + '.scales': scales}
+
+
+def awq(bits: int, group: int, grid: Mapping[str, np.ndarray] | None = None) -> SourceQuantization:
+    """AutoAWQ's gemm packing: `<m>.qweight` int32 [in, out * bits / 32] in
+    `AWQ_ORDER`, `<m>.qzeros` likewise per group, `<m>.scales` fp16 [in / group, out]."""
+    return SourceQuantization(
+        lambda tensors: _paired(tensors, AWQ_SUFFIXES, '.weight'),
+        lambda name: tuple(name.removesuffix('.weight') + suffix for suffix in AWQ_SUFFIXES),
+        partial(_awq_decode, bits=bits, group=group),
+        partial(_awq_encode, bits=bits, group=group, grid=grid),
+        grid=lambda name: tuple(name.removesuffix('.weight') + suffix for suffix in AWQ_SUFFIXES[1:]))
+
+
+_V1_ZERO_OFFSET = {2: 0x55555555, 4: 0x11111111, 8: 0x01010101}
+"""What gptqmodel adds to each packed zero word of a v1 ('gptq') checkpoint:
+one per code, as an integer add over the word (utils/model.py
+`convert_gptq_v1_to_v2_format_module`), carries included."""
+
+
+def _gptq_zeros(packed: np.ndarray, bits: int, v1: bool) -> np.ndarray:
+    words = packed.astype(np.int64)
+    if v1:
+        words = (words + _V1_ZERO_OFFSET[bits]) & 0xFFFFFFFF
+    return _codes(words.astype(np.uint32).view(np.int32), bits)
+
+
+def _gptq_decode(tensors: Mapping[str, np.ndarray], name: str, *, bits: int, v1: bool) -> np.ndarray:
+    stem = name.removesuffix('.weight')
+    codes = _codes(np.asarray(tensors[stem + '.qweight']).T, bits).T
+    zeros = _gptq_zeros(np.asarray(tensors[stem + '.qzeros']), bits, v1)
+    groups = np.asarray(tensors[stem + '.g_idx']).astype(np.int64)
+    return _fp16_product(codes, zeros[groups], np.asarray(tensors[stem + '.scales'])[groups]).T
+
+
+def _gptq_encode(name: str, weight: np.ndarray, *, bits: int, v1: bool,
+                 grid: Mapping[str, np.ndarray] | None) -> dict[str, np.ndarray]:
+    stem = name.removesuffix('.weight')
+    packed_zeros, scales, groups = _gridded(grid, name, (stem + '.qzeros', stem + '.scales', stem + '.g_idx'))
+    rows = groups.astype(np.int64)
+    zeros = _gptq_zeros(packed_zeros, bits, v1)
+    codes = _encoded_codes(name, np.asarray(weight).T, zeros[rows], scales[rows], bits)
+    return {stem + '.qweight': _words(codes.T, bits).T, stem + '.qzeros': packed_zeros,
+            stem + '.scales': scales, stem + '.g_idx': groups}
+
+
+def gptq(bits: int, *, v1: bool, grid: Mapping[str, np.ndarray] | None = None) -> SourceQuantization:
+    """GPTQ's packing: `<m>.qweight` int32 [in * bits / 32, out] along inputs,
+    `<m>.qzeros` int32 [groups, out * bits / 32] (stored one below the zero in
+    a v1 checkpoint), `<m>.scales` fp16 [groups, out] and `<m>.g_idx` [in],
+    the group of each input, which act-order permutes."""
+    return SourceQuantization(
+        lambda tensors: _paired(tensors, GPTQ_SUFFIXES, '.weight'),
+        lambda name: tuple(name.removesuffix('.weight') + suffix for suffix in GPTQ_SUFFIXES),
+        partial(_gptq_decode, bits=bits, v1=v1),
+        partial(_gptq_encode, bits=bits, v1=v1, grid=grid),
+        grid=lambda name: tuple(name.removesuffix('.weight') + suffix for suffix in GPTQ_SUFFIXES[1:]))
+
+
+def _integer_format(quantization: Mapping[str, object], method: str) -> tuple[int, int]:
+    """The `bits` and `group_size` an AWQ or GPTQ config declares, refusing what
+    this loader does not decode."""
+    bits, group = records.integer(quantization.get('bits'), f'{method} bits'), quantization.get('group_size')
+    if method == 'awq':
+        if quantization.get('version', 'gemm') != 'gemm' or quantization.get('zero_point', True) is not True:
+            raise ValueError(f"awq version {quantization.get('version')!r} with zero_point "
+                             f"{quantization.get('zero_point')!r}: this loader reads gemm weights with zero "
+                             "points and nothing else")
+        if bits != 4:
+            raise ValueError(f"awq bits {bits!r}: gemm packs 4-bit weights")
+    else:
+        if bits not in (2, 4, 8):
+            raise ValueError(f"gptq bits {bits!r}: this loader reads 2-, 4- and 8-bit packing")
+        if quantization.get('checkpoint_format', 'gptq') not in ('gptq', 'gptq_v2'):
+            raise ValueError(f"gptq checkpoint_format {quantization.get('checkpoint_format')!r}: this loader "
+                             "reads the gptq and gptq_v2 formats")
+    # GPTQ's decode reads each input's group from g_idx, so any group_size
+    # holds, -1 (one group per row) included; AWQ's reads it from group_size.
+    if method == 'awq' and (not isinstance(group, int) or isinstance(group, bool) or group <= 0):
+        raise ValueError(f"awq group_size {group!r}: a positive group of inputs per scale")
+    if not isinstance(group, int) or isinstance(group, bool):
+        raise ValueError(f"{method} group_size {group!r}: an integer")
+    return bits, group
+
+
+# --------------------------------------------------------------------------
 # Dispatch from quantization_config
 # --------------------------------------------------------------------------
 
@@ -746,15 +936,17 @@ def _refuse_mlx(config: Mapping[str, object]) -> None:
                 "safetensors repo it was converted from (the model card's base_model)")
 
 
-def source_quantization(config: Mapping[str, object], *,
-                        scale_dtype: str | None = None) -> SourceQuantization | None:
+def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None = None,
+                        grid: Mapping[str, np.ndarray] | None = None) -> SourceQuantization | None:
     """Return the format a config's `quantization_config` declares, or None.
 
     A wrapper may declare it on its text_config alone: KimiK3Config lifts
     `text_config.quantization_config` onto itself (configuration_kimi_k3.py:282-283).
     An fp8 config that declares `expert_dtype`, in quantization_config or
     beside it, is DeepSeek-V4's `.scale` storage; `scale_dtype` is the dtype
-    the source stored those scales in, which the codec writes back.
+    the source stored those scales in, which the codec writes back, and
+    `grid` the scales and zeros an integer format encodes against
+    (`SourceQuantization.grid`).
     """
     _refuse_mlx(config)
     quantization = config.get("quantization_config")
@@ -789,7 +981,13 @@ def source_quantization(config: Mapping[str, object], *,
     if method == "compressed-tensors":
         packed_mxfp4_format(quantization)
         return PACKED_MXFP4
+    if method == "awq":
+        bits, group = _integer_format(quantization, method)
+        return awq(bits, group, grid)
+    if method == "gptq":
+        bits, _ = _integer_format(quantization, method)
+        return gptq(bits, v1=quantization.get("checkpoint_format", "gptq") == "gptq", grid=grid)
     raise ValueError(
         f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
-        f"fp8 blocks and V4 `.scale` storage, GPT OSS's mxfp4 and compressed-tensors' "
-        f"mxfp4-pack-quantized and nothing else")
+        f"fp8 blocks and V4 `.scale` storage, GPT OSS's mxfp4, compressed-tensors' "
+        f"mxfp4-pack-quantized, AutoAWQ's gemm and GPTQ and nothing else")
