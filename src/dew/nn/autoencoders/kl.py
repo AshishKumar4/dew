@@ -41,12 +41,9 @@ class AutoencoderKL(nn.Module):
         return 2 ** (len(self.channels) - 1)
 
     def setup(self):
-        levels = len(self.channels)
-        self.encoder = FlaxEncoder(in_channels=self.image_channels, out_channels=self.latent_channels,
-            down_block_types=("DownEncoderBlock2D",) * levels, block_out_channels=self.channels,
+        self.encoder = FlaxEncoder(out_channels=self.latent_channels, block_out_channels=self.channels,
             layers_per_block=self.blocks_per_level, norm_num_groups=self.norm_groups, double_z=True, dtype=jnp.dtype(self.dtype))
-        self.decoder = FlaxDecoder(in_channels=self.latent_channels, out_channels=self.image_channels,
-            up_block_types=("UpDecoderBlock2D",) * levels, block_out_channels=self.channels,
+        self.decoder = FlaxDecoder(out_channels=self.image_channels, block_out_channels=self.channels,
             layers_per_block=self.blocks_per_level, norm_num_groups=self.norm_groups, dtype=jnp.dtype(self.dtype))
         if self.quantize:
             self.quant_conv = nn.Conv(2 * self.latent_channels, (1, 1), padding="VALID", dtype=self.dtype)
