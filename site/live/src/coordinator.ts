@@ -99,8 +99,14 @@ export class Coordinator extends DurableObject<Env> {
 		return { ok: true, id };
 	}
 
-	async started(id: string, now: number): Promise<void> {
-		this.ctx.storage.sql.exec('UPDATE sessions SET started = ? WHERE id = ? AND started IS NULL', now, id);
+	/**
+	 * Record that a session's container is running. False when the session is already
+	 * over, for example swept as unused while its container was still booting: nothing
+	 * counts that container any more, so the Kernel must destroy it.
+	 */
+	async started(id: string, now: number): Promise<boolean> {
+		const cursor = this.ctx.storage.sql.exec('UPDATE sessions SET started = ? WHERE id = ? AND started IS NULL AND ended IS NULL', now, id);
+		return cursor.rowsWritten === 1;
 	}
 
 	async ended(id: string, now: number): Promise<void> {

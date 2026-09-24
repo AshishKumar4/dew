@@ -48,6 +48,7 @@ jobs:
     - run: pnpm install --frozen-lockfile
     - run: pnpm build
     - run: pnpm live:check
+    - run: pnpm live:test
     - uses: actions/upload-artifact@v4
       if: github.event_name == 'push'
       with:
@@ -60,14 +61,15 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
     defaults:
       run:
         working-directory: site
+    # The token reaches only the two deploy steps, not the install scripts or the actions.
     steps:
     - uses: actions/checkout@v4
     - id: token
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       run: echo "present=${{ env.CLOUDFLARE_API_TOKEN != '' }}" >> "$GITHUB_OUTPUT"
     - uses: pnpm/action-setup@v4
       if: steps.token.outputs.present == 'true'
@@ -88,7 +90,11 @@ jobs:
         path: site/dist
     - name: Deploy dewml.dev and the www redirect
       if: steps.token.outputs.present == 'true'
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       run: pnpm run deploy
     - name: Rebuild the live kernel on this commit
       if: steps.token.outputs.present == 'true'
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       run: node live/deploy.mjs "$GITHUB_SHA"

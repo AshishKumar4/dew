@@ -41,7 +41,7 @@ export async function verify(secret: string, token: string, now: number): Promis
 	return valid ? id : null;
 }
 
-/** A keyed digest of the visitor's IP, so the Coordinator never stores the address itself. */
+/** A keyed digest of the visitor (visitor.ts: an IPv4 address or an IPv6 /64), so the Coordinator never stores the address itself. */
 export async function digestIp(secret: string, ip: string): Promise<string> {
 	const mac = await crypto.subtle.sign('HMAC', await key(secret), encoder.encode(`ip:${ip}`));
 	return base64url(mac).slice(0, 22);

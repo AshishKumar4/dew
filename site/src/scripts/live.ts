@@ -72,6 +72,7 @@ async function passTurnstile(holder: HTMLElement): Promise<string> {
 const CLOSE_REASONS: Record<string, string> = {
 	idle: 'The live kernel stopped after five minutes without a request.',
 	time: 'The live kernel reached its 20-minute limit and stopped.',
+	'kernel-failed': 'The live kernel did not start. Try again, or open the notebook in Colab.',
 };
 
 export class LiveSession {

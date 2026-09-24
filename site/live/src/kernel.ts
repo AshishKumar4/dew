@@ -40,7 +40,10 @@ export class Kernel extends Container<Env> {
 	override async onStart(): Promise<void> {
 		const session = await this.ctx.storage.get<string>('session');
 		await this.schedule(limitsOf(this.env).wallSeconds + 15, 'expire');
-		if (session !== undefined) await coordinatorOf(this.env).started(session, Date.now());
+		// A container the Coordinator does not count must not run: it would escape the
+		// session cap, the one-at-a-time rule and the budget.
+		const counted = session !== undefined && (await coordinatorOf(this.env).started(session, Date.now()));
+		if (!counted) await this.expire();
 	}
 
 	override async onStop(): Promise<void> {
