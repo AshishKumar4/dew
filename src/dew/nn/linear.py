@@ -51,6 +51,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.scatter import DROPPED
+
 from .blocks import normal_kernel
 from .inputs import AttentionMetadata
 from .sharding import logical_axes
@@ -140,14 +142,14 @@ def document_conv1d(history, x, history_segments, segments, taps, bias=None):
 def _stream_order(valid):
     """Each slot's index among its row's real tokens (`cumsum(valid) - 1`)
     and, per compact column, the physical slot it holds. A column past the
-    row's real tokens keeps an out-of-range index, so it gathers a zero and
-    scatters no cotangent back onto a padded slot; every real token writes
-    its own column, so no two writers meet."""
+    row's real tokens holds `length`, the zero column `_masked_conv1d` appends,
+    so it gathers a zero and its cotangent lands there, never on a real slot;
+    every real token writes its own column, so no two writers meet."""
     batch, length = valid.shape
     valid = jnp.asarray(valid, bool)
     rank = jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
     source = jnp.full((batch, length), length, jnp.int32).at[
-        jnp.arange(batch)[:, None], jnp.where(valid, rank, length)].set(
+        jnp.arange(batch)[:, None], jnp.where(valid, rank, DROPPED)].set(
             jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length)), mode='drop')
     return rank, source
 
@@ -181,7 +183,11 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
         state = jnp.zeros((batch, channels, width), x.dtype)
     valid = jnp.asarray(valid, bool)
     rank, source = _stream_order(valid)
-    compact = jnp.take_along_axis(x, source[:, None, :], axis=2, mode='fill', fill_value=0)
+    # Gathered in bounds from one appended zero column: an out-of-range 'fill'
+    # gather differentiates into a scatter-add whose dropped index XLA's
+    # deterministic GPU scatter writes onto the next channel (openxla/xla#49380).
+    padded = jnp.pad(x, ((0, 0), (0, 0), (0, 1)))
+    compact = jnp.take_along_axis(padded, source[:, None, :], axis=2, mode='promise_in_bounds')
     stream = jnp.concatenate([state, compact], axis=2)
     if segments is None:
         # The history in front carries the K-1 taps the first real token

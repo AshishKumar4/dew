@@ -55,6 +55,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.nn.scatter import DROPPED
+
 KVDtype = Literal["int8", "float8_e4m3fn"]
 """The storage formats a quantized cache takes."""
 
@@ -177,7 +179,7 @@ def write_cache(buffer: jax.Array, values: jax.Array, positions: jax.Array) -> j
     collective; written as one scatter indexed by an iota over the rows, it
     gathers the values and indices of every row onto every device first.
     """
-    slots = jnp.where(positions >= 0, positions, buffer.shape[1])
+    slots = jnp.where(positions >= 0, positions, DROPPED)
     return jax.vmap(lambda row, incoming, at: row.at[at].set(incoming.astype(row.dtype), mode="drop"))(
         buffer, values, slots)
 
@@ -311,10 +313,9 @@ class KVStore:
         if self.layout.page_size is None:
             return write_cache(buffer, values, positions)
         page_size, groups = self.layout.page_size, self.layout.groups
-        part = buffer.shape[1] // groups
         safe = jnp.maximum(positions, 0)
         page = jnp.take_along_axis(self._get(TABLE), safe // page_size, axis=1)
-        page = jnp.where(positions >= 0, page, part)
+        page = jnp.where(positions >= 0, page, DROPPED)
 
         def stored(pool: jax.Array, page: jax.Array, offset: jax.Array, incoming: jax.Array) -> jax.Array:
             # [rows, tokens, heads, ...] -> [heads, rows, tokens, ...] for the pool's head-major index.
