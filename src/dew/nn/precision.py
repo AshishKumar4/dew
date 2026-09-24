@@ -18,6 +18,7 @@ preset for exactly this reason (jax-ml/jax#24047).
 """
 
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -199,3 +200,37 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
                           preferred_element_type=jnp.float32)
     return jnp.einsum(subscripts, hidden.astype(jnp.float32), head,
                       precision=precision, preferred_element_type=jnp.float32)
+
+
+def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:
+    """`fn` traced, forward and backward, under the default matmul precision.
+
+    Mosaic's TPU kernels refuse a 16-bit matmul at HIGHEST ("Bad lhs type"),
+    and a Pallas kernel's dots read the precision from the configuration
+    when they are traced, which `jax_default_matmul_precision=highest` sets
+    for the whole process. A kernel's dots of 16-bit operands are exact at
+    any precision and accumulate in fp32, so those are unchanged. A dot a
+    kernel runs in fp32 takes one bf16 pass on a TPU at the default instead
+    of HIGHEST's several: splash's forward multiplies the fp32 probabilities
+    by the values cast up to fp32 (splash_attention_kernel.py), so under a
+    HIGHEST setting its P·V now rounds P to bf16, as every default-precision
+    run does. The kernels take no per-dot precision, and their bf16 q·k in
+    the same trace needs the default, so there is no other setting. The
+    backward is traced after the forward returns, so it is held under the
+    same setting by hand: a context manager around the call alone would
+    leave it at HIGHEST."""
+    @jax.custom_vjp
+    def run(*args):
+        with jax.default_matmul_precision('default'):
+            return fn(*args)
+
+    def forward(*args):
+        with jax.default_matmul_precision('default'):
+            return jax.vjp(fn, *args)
+
+    def backward(pullback, cotangent):
+        with jax.default_matmul_precision('default'):
+            return pullback(cotangent)
+
+    run.defvjp(forward, backward)
+    return run
