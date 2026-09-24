@@ -39,6 +39,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
+    _stream_order,
     causal_conv1d,
     chunk_gated_delta_rule,
     l2norm,
@@ -46,6 +47,19 @@ from dew.nn.linear import (
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
+
+
+def test_a_padding_slot_writes_nothing_into_the_next_row():
+    """The masked conv's stream order scatters each real token's slot into
+    its row's compact column and drops the padding slots. XLA's deterministic
+    GPU scatter (the CUDA lane's --xla_gpu_deterministic_ops) drops only an
+    index past the whole [rows, columns] space, so a padding slot dropped at
+    column `length` landed on the next row's first column (openxla/xla#49380,
+    fixed by 54cfa1ba): row 0's padding slot 2 overwrote row 1's column 0,
+    so row 1's first token convolved row 0's third."""
+    valid = jnp.array([[True, True, False, False], [True, False, False, False]])
+    _, source = jax.jit(_stream_order)(valid)
+    np.testing.assert_array_equal(source, [[0, 1, 4, 4], [0, 4, 4, 4]])
 
 
 @pytest.fixture(scope="module")
