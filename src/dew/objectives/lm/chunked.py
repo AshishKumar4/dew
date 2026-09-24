@@ -313,17 +313,25 @@ def _whole_head_terms(hidden, table, targets, softcap, precision, predict, tempe
     raw = _tile_logits(flat, table.astype(operands), precision)
     logits = _capped(raw, softcap, temperature)
     log_z = jax.nn.logsumexp(logits, axis=-1)
-    picked = jnp.take_along_axis(logits, labels[:, None], axis=-1)[:, 0]
+    # A target outside the vocabulary picks no column, as in `_chunk_terms`:
+    # the vocabulary-split head shifts each shard's targets by its first row
+    # and sums the picked logit over shards, so only the owner may add one.
+    inside = (labels >= 0) & (labels < table.shape[0])
+    picked = jnp.where(inside, jnp.take_along_axis(
+        logits, jnp.clip(labels, 0, table.shape[0] - 1)[:, None], axis=-1)[:, 0], 0.0)
     best = (jnp.argmax(logits, axis=-1).astype(jnp.int32).reshape(targets.shape)
             if predict else None)
     return raw, ((log_z - picked).reshape(targets.shape), best, log_z.reshape(targets.shape))
 
 
-def _whole_head_impl(hidden, table, targets, softcap, precision, predict, temperature):
-    return _whole_head_terms(hidden, table, targets, softcap, precision, predict, temperature)[1]
+def _whole_head_impl(hidden, table, targets, softcap, chunks, precision, predict, temperature):
+    """With nothing to differentiate, the tiled forward: no backward needs
+    the whole logits, so an evaluation or a scoring pass stays bounded."""
+    return _forward(hidden, table, targets, chunks, 1024, softcap, precision, predict, temperature)
 
 
-def _whole_head_fwd(hidden, table, targets, softcap, precision, predict, temperature):
+def _whole_head_fwd(hidden, table, targets, softcap, chunks, precision, predict, temperature):
+    del chunks
     raw, outputs = _whole_head_terms(hidden, table, targets, softcap, precision, predict,
                                      temperature)
     # The fp32 logits before the cap are kept, so the backward multiplies
@@ -331,11 +339,11 @@ def _whole_head_fwd(hidden, table, targets, softcap, precision, predict, tempera
     return outputs, (hidden, table, targets, raw, outputs[2], softcap)
 
 
-def _whole_head_bwd(precision, predict, temperature, residuals, cotangents):
+def _whole_head_bwd(chunks, precision, predict, temperature, residuals, cotangents):
     """The same gradient `_bounded_head_bwd` takes tile by tile, from the kept
     logits: the logits' cotangent stays fp32 into the state product
     (`_cotangent_product`), and the head's accumulates in fp32 once."""
-    del predict
+    del chunks, predict
     hidden, table, targets, raw, log_z, softcap = residuals
     loss_cotangent, _, partition_cotangent = cotangents
     operands = _operand_dtype(precision)
@@ -355,7 +363,7 @@ def _whole_head_bwd(precision, predict, temperature, residuals, cotangents):
             None, d_cap)
 
 
-_whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(4, 5, 6))
+_whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(4, 5, 6, 7))
 _whole_head.defvjp(_whole_head_fwd, _whole_head_bwd)
 
 
@@ -367,7 +375,9 @@ the default: on one A100, Qwen3-0.6B's head (vocabulary 151936, 1024 wide,
 
 
 def chunked_tile() -> tuple[int, int]:
-    """The chunked head's tile on this process's hardware generation."""
+    """The chunked head's tile on the pool's hardware generation: read off
+    global device 0 (`device_generation`), which every process sees alike, so
+    a pool's processes agree on the tile and compile one program."""
     return HEAD_TILE_BY_GENERATION.get(device_generation(), (1024, 8192))
 
 
@@ -461,7 +471,8 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
 
     def head(hidden, table, targets, cap):
         if tile is None:
-            return _whole_head(hidden, table, targets, cap, product, predict, float(temperature))
+            return _whole_head(hidden, table, targets, cap, chunks, product, predict,
+                               float(temperature))
         return _bounded_head(hidden, table, targets, chunks, tile, cap, product,
                              predict, float(temperature))
 

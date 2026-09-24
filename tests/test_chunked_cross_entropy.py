@@ -754,6 +754,9 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
     either way, and the head's gradient accumulates in fp32 once."""
     hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16,
                                    tokens=(RAGGED_TOKENS,), dtype=dtype)
+    # Targets outside the vocabulary pick no column, which the
+    # vocabulary-split head relies on for every shard but the owner.
+    targets = targets.at[:2].set(jnp.asarray([-1, RAGGED_VOCAB + 5], targets.dtype))
 
     def run(tile):
         def loss(states, matrix, cap):
@@ -782,3 +785,16 @@ def test_a_step_that_does_not_fit_tiles_the_head_before_it_recomputes_blocks():
     assert recompute_more(objective) and objective.head_tile == chunked.chunked_tile()
     assert objective.model.remat is None
     assert recompute_more(objective) and objective.model.remat is not None
+
+
+def test_a_pass_with_no_backward_never_holds_the_logits_whole():
+    """Whole logits pay only for a backward; an evaluation or a scoring pass
+    runs the tiled forward, whose temporaries hold a tile, not the logits."""
+    hidden, head, targets = inputs(vocab=32768, features=16, tokens=(4096,))
+
+    def temporaries(tile):
+        forward = jax.jit(lambda h, w: chunked_cross_entropy(h, w, targets, 4, tile=tile)[0])
+        return forward.lower(hidden, head).compile().memory_analysis().temp_size_in_bytes
+
+    assert temporaries(None) <= temporaries((1024, 8192))
+    assert temporaries(None) < 4096 * 32768 * 4 // 4
