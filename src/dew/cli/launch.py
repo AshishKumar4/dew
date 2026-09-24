@@ -37,7 +37,20 @@ import tyro
 from dew.cli import tpu_setup
 from dew.cli.gcloud import emit
 from dew.cli.tpu import reach
-from dew.pool import COORDINATOR, LOCAL_DEVICES, PROCESS_COUNT, PROCESS_ID, Cluster, detected_cluster
+from dew.pool import (
+    COORDINATOR,
+    LOCAL_DEVICES,
+    PROCESS_COUNT,
+    PROCESS_ID,
+    Cluster,
+    detected_cluster,
+    listed_gpus,
+    local_gpu_count,
+    refuse_idle_gpus,
+    runs_on_gpu,
+    slurm_tasks_here,
+    visible_gpus,
+)
 
 VARIABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 """What an `--env` name may be: it lands unquoted in the remote shell line."""
@@ -181,11 +194,15 @@ class Launch:
 
     def in_place(self, cluster: Cluster) -> int:
         """Run the program as this process: whatever started it on every
-        node already set what jax reads."""
+        node already set what jax reads. A Slurm step with fewer tasks on
+        this node than the GPUs its task sees is refused, as srun is."""
         refused = self.pool_flags()
         if refused:
             raise ValueError(f"{cluster.name} already placed this process; jax reads the pool "
                              f"from it, so drop {', '.join(refused)}")
+        tasks = slurm_tasks_here()
+        if cluster.name == "slurm" and tasks is not None and runs_on_gpu(os.environ):
+            refuse_idle_gpus(tasks, local_gpu_count(), "this slurm step")
         emit(f"{cluster.name}: process {cluster.process} of {cluster.count}, placed by the "
              f"cluster; running {shlex.join(self.command)}")
         if cluster.count > 1 and cluster.process == 0 and cluster.name in ("gcetpu", "gketpu"):
@@ -197,23 +214,32 @@ class Launch:
         each Slurm task the one GPU at its SLURM_LOCALID, so a node runs a
         task per GPU: `--processes-per-host`, else the allocation's own
         tasks per node, else its GPUs per node, else the GPUs this node
-        sees, which in a batch step are the ones Slurm gave it."""
+        sees, which in a batch step are the ones Slurm gave it. Fewer tasks
+        a node than GPUs is refused: the rest would sit idle."""
         if self.devices_per_process is not None or self.port is not None \
                 or self.coordinator is not None:
             raise ValueError(
                 "under Slurm jax gives each task the GPU at its SLURM_LOCALID and picks the "
                 "coordinator; use --processes-per-host for the GPUs a node has, and drop "
                 "--devices-per-process, --port and --coordinator")
-        tasks = self.processes_per_host
-        if tasks is None and "SLURM_NTASKS_PER_NODE" not in os.environ:
+        allocation = f"slurm allocation {os.environ['SLURM_JOB_ID']}"
+        gpus = 0
+        if runs_on_gpu({**os.environ, **self.extra_env()}):
             per_node = os.environ.get("SLURM_GPUS_PER_NODE")
             # --gpus-per-node reads `[type:]count`, several types separated by commas.
-            tasks = (sum(int(part.rsplit(":", 1)[-1]) for part in per_node.split(","))
-                     if per_node else local_gpu_count()) or None
+            gpus = (sum(int(part.rsplit(":", 1)[-1]) for part in per_node.split(","))
+                    if per_node else local_gpu_count())
+        tasks = self.processes_per_host
+        if tasks is None and "SLURM_NTASKS_PER_NODE" in os.environ:
+            refuse_idle_gpus(int(os.environ["SLURM_NTASKS_PER_NODE"]), gpus, allocation)
+        elif tasks is not None:
+            refuse_idle_gpus(tasks, gpus, allocation)
+        else:
+            tasks = gpus or None
         argv = ["srun", "--kill-on-bad-exit=1", "--export=ALL", "--label"]
         if tasks is not None:
             argv.append(f"--ntasks-per-node={tasks}")
-        emit(f"slurm allocation {os.environ['SLURM_JOB_ID']}: starting the program with srun")
+        emit(f"{allocation}: starting the program with srun")
         return self.execute((*argv, *self.command))
 
     def execute(self, argv: Sequence[str]) -> int:
@@ -251,9 +277,7 @@ class Launch:
         # What the pool's processes will see: the --env values, and on this
         # machine the launcher's own environment, which ssh does not carry.
         env = {**(os.environ if first_host in LOCAL_HOSTS else {}), **self.extra_env()}
-        platforms = env.get("JAX_PLATFORMS", "")
-        on_gpu = not platforms or any(name in platforms for name in ("cuda", "gpu"))
-        gpus = gpu_count(first_host, env.get("CUDA_VISIBLE_DEVICES")) if on_gpu else 0
+        gpus = gpu_count(first_host, env.get("CUDA_VISIBLE_DEVICES")) if runs_on_gpu(env) else 0
         if processes is None:
             processes = max(1, gpus // (devices or 1))
         # More processes than GPUs, as in a rehearsal of programs that do
@@ -346,38 +370,15 @@ def remote_script(command: Sequence[str], env: dict[str, str], cwd: str | None) 
     return f"cd {shlex.quote(cwd)} && {run}" if cwd else run
 
 
-def _listed_gpus(argv: Sequence[str]) -> int:
-    """GPUs in the `nvidia-smi -L` output of `argv`, whose MIG lines are
-    indented; none when it fails or nvidia-smi is not there."""
-    try:
-        found = subprocess.run(argv, capture_output=True, text=True, timeout=60)
-    except FileNotFoundError:
-        return 0
-    if found.returncode != 0:
-        return 0
-    return sum(line.startswith("GPU ") for line in found.stdout.splitlines())
-
-
-def _visible_gpus(visible: str) -> int:
-    return sum(1 for device in visible.split(",") if device.strip())
-
-
-def local_gpu_count() -> int:
-    """GPUs this process may use: CUDA_VISIBLE_DEVICES when it is set,
-    since jax numbers only those, else every GPU nvidia-smi lists."""
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    return _listed_gpus(("nvidia-smi", "-L")) if visible is None else _visible_gpus(visible)
-
-
 def gpu_count(host: str, visible: str | None) -> int:
     """GPUs a pool process on `host` may use: those `visible` lists when
     the pool sets CUDA_VISIBLE_DEVICES itself, else what `host` shows,
     asked over ssh when it is another machine."""
     if visible is not None:
-        return _visible_gpus(visible)
+        return visible_gpus(visible)
     if host in LOCAL_HOSTS:
         return local_gpu_count()
-    return _listed_gpus(("ssh", "-o", "BatchMode=yes", host, "nvidia-smi -L"))
+    return listed_gpus(("ssh", "-o", "BatchMode=yes", host, "nvidia-smi -L"))
 
 
 def free_port(host: str) -> int:

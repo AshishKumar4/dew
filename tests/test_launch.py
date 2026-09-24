@@ -320,7 +320,7 @@ def test_srun_refuses_a_per_process_gpu_count(tmp_path):
 def test_a_bare_launch_runs_one_process_per_gpu_of_this_machine():
     """`dew launch -- python ...` with no flags: every GPU here gets a
     process of its own, and each joins the pool holding one device."""
-    from dew.cli.launch import local_gpu_count
+    from dew.pool import local_gpu_count
 
     gpus = local_gpu_count()
     if gpus < 2:
