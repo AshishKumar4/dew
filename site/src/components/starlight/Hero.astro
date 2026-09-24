@@ -1,6 +1,7 @@
 ---
-// Only the landing page sets `hero`, so the hero is the landing page's own.
+// The landing page's hero on `/`; Starlight's own hero everywhere else, such as the 404 page.
+import Default from '@astrojs/starlight/components/Hero.astro';
 import LandingHero from '../landing/LandingHero.astro';
 ---
 
-<LandingHero />
+{Astro.url.pathname === '/' ? <LandingHero /> : <Default />}
