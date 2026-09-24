@@ -27,7 +27,8 @@ The mesh axis names live here too, with the readers of the mesh in context:
 `pipeline_stages` for the decoder's stage count, `microbatches` for the
 schedule the trainer puts in context around its compiled step,
 `sequence_shards` for how many ways attention and the Mamba-2 mixer split a
-sequence, and `row_axes` for the axes their `shard_map`s split rows over.
+sequence, `row_axes` for the axes their `shard_map`s split rows over, and
+`manual_map` for those maps.
 
 `DEFAULT_RULES` maps the logical names onto the mesh, parameters and
 activations alike: `logical_spec` reads it (or the rules a layout puts in
@@ -232,6 +233,30 @@ def row_axes(batch: int) -> tuple[str, ...]:
     axes' shards, the way GSPMD replicates a dimension it cannot split."""
     spec = logical_spec(("activation_batch",), (batch,))
     return mesh_axes(spec[0]) if spec else ()
+
+
+def manual_map(local, in_specs, out_specs):
+    """`local` in a `shard_map` over every axis the context leaves automatic.
+
+    Those the specs do not name go manual too, and the operands are
+    replicated over them. A Mosaic kernel (splash, the Mamba-2 SSD scan)
+    refuses to lower where any axis is still left to the partitioner,
+    whatever its size, and cuDNN's partitioning rule refuses queries split
+    unlike their keys (`_check_qkv_bias_mask_spec`,
+    jax/_src/cudnn/fused_attention_stablehlo.py), so the kernel has to see
+    local arrays. The pipeline also needs it: it vmaps its stages with
+    spmd_axis_name=stage, and a vmapped shard_map can only split the new
+    dimension over an axis it holds manual.
+
+    Pallas kernels state no varying-manual-axes type for their outputs, so
+    one inside the map needs the check off, as MaxText wraps splash. Every
+    operand is split on the axes the specs name and nothing is reduced over
+    another, so the check has nothing to catch.
+    """
+    mesh = jax.sharding.get_abstract_mesh()
+    manual = {axis for axis in mesh.axis_names if axis not in mesh.manual_axes}
+    return jax.shard_map(local, in_specs=in_specs, out_specs=out_specs, axis_names=manual,
+                         check_vma=False)
 
 
 def mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:

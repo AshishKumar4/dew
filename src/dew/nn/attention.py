@@ -32,6 +32,7 @@ from .sharding import (
     constrain,
     logical_axes,
     logical_spec,
+    manual_map,
     mesh_axes,
     row_axes,
     sequence_shards,
@@ -555,29 +556,6 @@ def _four_dimensional(x):
     return x.reshape((1,) * (4 - x.ndim) + x.shape)
 
 
-def _manual_map(local, in_specs, out_specs):
-    """`local` in a `shard_map` over every axis the context leaves automatic.
-
-    Those the specs do not name go manual too, and the operands are
-    replicated over them. A Mosaic kernel (splash) refuses to lower where any
-    axis is still left to the partitioner, whatever its size, and cuDNN's
-    partitioning rule refuses queries split unlike their keys
-    (`_check_qkv_bias_mask_spec`, jax/_src/cudnn/fused_attention_stablehlo.py),
-    so the kernel has to see local arrays. The pipeline also needs it: it
-    vmaps its stages with spmd_axis_name=stage, and a vmapped shard_map can
-    only split the new dimension over an axis it holds manual.
-
-    Pallas kernels state no varying-manual-axes type for their outputs, so
-    splash inside the map needs the check off, as MaxText wraps it. Every
-    operand is split on the axes the specs name and nothing is reduced over
-    another, so the check has nothing to catch.
-    """
-    mesh = jax.sharding.get_abstract_mesh()
-    manual = {axis for axis in mesh.axis_names if axis not in mesh.manual_axes}
-    return jax.shard_map(local, in_specs=in_specs, out_specs=out_specs, axis_names=manual,
-                         check_vma=False)
-
-
 def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
                               sliding_window, mask, bias, sinks, key_value_seq_lengths=None):
     """DeepSpeed Ulysses: trade a slice of the sequence for a slice of the heads.
@@ -649,7 +627,7 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
                      key_value_seq_lengths=given.get('key_value_seq_lengths'))
         return jax.lax.all_to_all(out, SEQUENCE_AXIS, 1, 2, tiled=True)
 
-    exchanged = _manual_map(
+    exchanged = manual_map(
         local, (queries, keys, keys, *(spec for _, spec in extras.values())), queries)
     return exchanged(query, key, value, *(x for x, _ in extras.values()))
 
@@ -732,7 +710,7 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
                       mask=given.get('mask'), bias=given.get('bias'), sinks=given.get('sinks'),
                       key_value_seq_lengths=given.get('key_value_seq_lengths'))
 
-    attended = _manual_map(
+    attended = manual_map(
         local, (queries, keys, keys, *(spec for _, spec in extras.values())), queries)
     out = attended(query, key, value, *(x for x, _ in extras.values()))
     return unstripe(out, shards) if reordered else out[:, :q_len]
@@ -1312,7 +1290,7 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
             implementation=implementation, masked=masked,
             offset=jax.lax.axis_index(SEQUENCE_AXIS) * local_length, before=before)
 
-    attended = _manual_map(local, (queries, keys, keys, *specs), queries)
+    attended = manual_map(local, (queries, keys, keys, *specs), queries)
     return attended(query, key, value, *fields.values())
 
 
