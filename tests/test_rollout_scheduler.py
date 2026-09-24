@@ -13,6 +13,7 @@ raises stops the batch; and a real `Trainer` trains a tiny model through
 two-turn in-process environments on Dew's own server.
 """
 
+import math
 import threading
 from concurrent.futures import Future
 from contextlib import contextmanager
@@ -527,7 +528,12 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
         return futures
 
     episodes.submit = watched
-    tasks = jax.device_count()
+    # Every step must hold a completed session: a truncated one is masked and trains nothing,
+    # and a step with no trainable token makes no update. This policy completes 32% of its
+    # sessions, so four steps of 64 sessions all have one but for about 4 * 0.68**64 = 8e-11 of
+    # runs; at one task a device (2 sessions a step on one GPU) most runs lost an update. The
+    # count is a multiple of the device count so the rows split evenly.
+    tasks = math.lcm(32, jax.device_count())
     records = []
     scheduler = RolloutScheduler(target, episodes, server, width=width, rows=2 * tasks, groups=2,
                                  max_lag=2, ahead=1, sync_every=2, log=records.append)
