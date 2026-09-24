@@ -295,7 +295,7 @@ def test_a_bf16_checkpoint_still_loads_as_fp32_parameters(tmp_path):
     directory = tmp_path / "checkpoint"
     directory.mkdir()
     (directory / "config.json").write_text((source / "config.json").read_text())
-    safetensors_numpy.save_file(bf16, str(directory / "model.safetensors"))
+    write_file(bf16, directory / "model.safetensors", {"format": "pt"})
 
     loaded = load_pretrained(str(directory), dtype="float32", attention_impl="xla")
 
@@ -570,3 +570,17 @@ def test_the_fid_converter_refuses_a_pickle_that_is_missing_a_key(tmp_path):
     path.write_bytes(pickle.dumps(tree))
     with pytest.raises(ValueError, match="Mixed_7c/branch_pool/bn/var"):
         convert(path)
+
+
+def test_a_written_tensor_reads_back_in_its_own_order_whatever_its_memory_layout(tmp_path):
+    """A column-major or transposed view is written as the values it holds.
+    safetensors writes memory as C order, and a TPU returns column-major host
+    views of some arrays: a bf16 checkpoint written from one read back
+    transposed on the TPU lane (16,364 of 16,384 values wrong)."""
+    values = np.arange(12, dtype=np.float32).reshape(3, 4)
+    layouts = {"fortran": np.asfortranarray(values), "transposed": values.T.copy().T,
+               "bf16": np.asfortranarray(values.astype(ml_dtypes.bfloat16))}
+    write_file(layouts, tmp_path / "model.safetensors", {"format": "pt"})
+    read, _ = read_file(tmp_path / "model.safetensors")
+    for name in layouts:
+        np.testing.assert_array_equal(np.asarray(read[name], np.float32), values, err_msg=name)

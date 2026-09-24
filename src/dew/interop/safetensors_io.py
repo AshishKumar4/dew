@@ -97,7 +97,10 @@ def _publish(
 
     The temporary is on the destination filesystem, so replacement is atomic.
     The source arrays are borrowed, including maps of the destination itself;
-    serialization finishes before its directory entry changes. A failed write
+    serialization finishes before its directory entry changes. Each array is
+    made C-contiguous first: safetensors 0.8.0 writes an array's memory as if
+    it were C-ordered, so a transposed view, or the column-major host view a
+    TPU array can come back as, would be written transposed. A failed write
     or replacement leaves the old file intact and removes the temporary.
     """
     _, backend = _safetensors()
@@ -108,7 +111,7 @@ def _publish(
     try:
         os.close(descriptor)
         backend.save_file(
-            tensors(), temporary, metadata=None if metadata is None else dict(metadata)
+            {name: _host_array(array) for name, array in tensors().items()}, temporary, metadata=None if metadata is None else dict(metadata)
         )
         os.replace(temporary, destination)
     finally:
@@ -132,14 +135,15 @@ def _leaf_name(path) -> str:
 
 
 def _host_array(leaf) -> np.ndarray:
-    """Return a host copy of `leaf`, dense because safetensors writes raw bytes."""
+    """`leaf` on the host, C-contiguous: the one step every safetensors write takes."""
     array = np.asarray(leaf)
     return array if array.flags.c_contiguous else np.ascontiguousarray(array)
 
 
 def _flatten(params) -> dict[str, np.ndarray]:
+    """The leaves under their '/'-joined names; `_publish` brings each to the host."""
     leaves, _ = jax.tree_util.tree_flatten_with_path(params)
-    return {_leaf_name(path): _host_array(leaf) for path, leaf in leaves}
+    return {_leaf_name(path): leaf for path, leaf in leaves}
 
 
 def _unflatten(tensors: Mapping[str, np.ndarray]) -> ParamTree:
@@ -398,7 +402,7 @@ def save_sharded(tensors: Mapping[str, np.ndarray], directory, max_shard_size: i
     names = {filename: (filename.replace("model-", f"model-{token}-", 1) if split.is_sharded else filename)
              for filename in split.filename_to_tensors}
     for filename, members in split.filename_to_tensors.items():
-        _publish(lambda members=members: {name: _host_array(tensors[name]) for name in members},
+        _publish(lambda members=members: {name: tensors[name] for name in members},
                  folder / names[filename], {"format": "pt"})
     if split.is_sharded:
         write_index(folder, {name: names[filename] for name, filename in split.tensor_to_filename.items()},
