@@ -139,7 +139,9 @@ def test_a_matrix_of_rank_above_two_with_undeclared_axes_is_rejected():
     convention, but above it the spec would have to guess which axes are the
     matrix, and a wrong guess shows up only as a worse loss curve."""
     params = decoder_params()
-    params['params']['layers_0']['mixer'] = {'gate': jnp.zeros((4, 8, 16))}
+    # A leaf name no module declares: 'gate' is the router's, whose declared
+    # rank-2 axes would refuse this for another reason.
+    params['params']['layers_0']['mixer'] = {'mixing': jnp.zeros((4, 8, 16))}
 
     with pytest.raises(ValueError, match="mixer.*rank 3.*declared logical axes"):
         muon_weight_dimension_numbers(params)
