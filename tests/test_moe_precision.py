@@ -17,6 +17,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from scipy.special import erfc
 
 from dew.nn.gpt_oss import GptOssExperts
+from dew.nn.kernels.generation import triton_runs
 from dew.nn.moe import ExpertMLP, exact_gelu, expert_dispatch, expert_projection
 from dew.training import MeshSpec, build_mesh
 
@@ -160,6 +161,27 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
                                atol=TOLERANCE, rtol=TOLERANCE)
     np.testing.assert_allclose(np.asarray(dk, np.float64), kernel_oracle, atol=TOLERANCE,
                                rtol=TOLERANCE)
+
+
+@pytest.mark.skipif(not triton_runs(), reason="needs a GPU the Pallas kernels compile for")
+@pytest.mark.parametrize('implementation', ['auto', 'pallas'])
+def test_a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(implementation):
+    """The kernels are chosen where the call lowers, not by the process's
+    default backend. On a GPU host, a projection placed on the CPU runs
+    `jax.lax.ragged_dot` ('auto') or the interpreted kernels ('pallas'), and
+    its forward is the float64 sum of the bf16 operands either way."""
+    rng = np.random.default_rng(88)
+    x = rng.normal(size=(24, 16)).astype(np.float32)
+    kernel = rng.normal(size=(8, 16, 16)).astype(np.float32)
+    cpu = jax.devices('cpu')[0]
+    project = jax.jit(lambda x, kernel, sizes: expert_projection(
+        x, kernel, sizes, jnp.bfloat16, implementation, None))
+
+    y = project(*jax.device_put((x, kernel, np.full(8, 3, np.int32)), cpu))
+
+    assert y.devices() == {cpu}
+    np.testing.assert_allclose(np.asarray(y, np.float64), rounded(grouped(rounded(x), rounded(kernel))),
+                               atol=TOLERANCE, rtol=TOLERANCE)
 
 
 @pytest.mark.parametrize('sizes', [np.full(8, 3), np.array([0, 5, 0, 0, 12, 1, 0, 3])],
