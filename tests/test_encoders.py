@@ -145,3 +145,14 @@ def test_condition_roundtrip_preserves_nondefault_character_embeddings():
     np.testing.assert_array_equal(contexts[0].hidden, contexts[1].hidden)
     np.testing.assert_array_equal(contexts[0].mask, contexts[1].mask)
     assert contexts[1].hidden.dtype == jnp.bfloat16
+
+
+def test_the_char_table_captions_read_back_the_prompts_it_tokenized():
+    """A preview's captions say what its tokens say: the default table holds
+    every ASCII character, so a prompt reads back as written, cut to the
+    table's seven characters after the start token."""
+    from dew.inputs import CharTable
+
+    encoder = CharTable.from_pretrained()
+    tokens = encoder.tokenize(["a red bird", "Dew 2!", ""])
+    assert encoder.captions(tokens) == ("a red b", "Dew 2!", "")
