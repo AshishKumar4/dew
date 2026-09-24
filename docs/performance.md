@@ -16,7 +16,7 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
     --learning-rate <lr> --out <json>
 ```
 
-Conditions: jax 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver
+Measured on jax 0.11.1 / jaxlib 0.11.1 / jax_cuda12_plugin 0.11.1, driver
 595.84, RTX 4080 16 GiB, single device, bf16 compute, adam, 3 warmup and 10
 measured steps, one architecture per process. The card was idle before each
 measurement: `nvidia-smi --query-compute-apps=process_name` showed only

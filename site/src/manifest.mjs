@@ -35,7 +35,7 @@ export const groups = [
 			{ source: 'docs/concepts/objectives.md', slug: 'guides/custom-objective', label: 'Write a custom objective' },
 			{ source: 'docs/guides/evaluation.md', slug: 'guides/evaluation', label: 'Evaluate and track runs' },
 			{ source: 'docs/guides/checkpoints.md', slug: 'guides/checkpoints', label: 'Save and resume' },
-			{ source: 'docs/guides/diffusion.md', slug: 'guides/diffusion', label: 'Train a diffusion model' },
+			{ source: 'docs/guides/diffusion.md', slug: 'guides/diffusion', label: 'Configure diffusion training' },
 			{ source: 'docs/guides/representation-learning.md', slug: 'guides/jepa', label: 'Train a JEPA encoder' },
 			{ source: 'docs/concepts/language_models.md', slug: 'guides/language-models', label: 'Train language models' },
 			{ source: 'docs/concepts/inference.md', slug: 'guides/inference', label: 'Generate and serve' },

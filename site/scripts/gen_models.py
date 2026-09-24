@@ -46,7 +46,7 @@ DECODERS = {
     "deepseek_v32": ("DeepSeek V3.2", "Mixture of experts"),
     "deepseek_v4": ("DeepSeek V4", "Mixture of experts"),
     "kimi_k2": ("Kimi K2", "Mixture of experts"),
-    "kimi_k25": ("Kimi K2.5", "Mixture of experts"),
+    "kimi_k25": ("Kimi K2.5, text", "Mixture of experts"),
     "qwen3_next": ("Qwen3-Next", "Hybrid and linear attention"),
     "glm5_next_text": ("GLM 5 Next, text", "Hybrid and linear attention"),
     "kimi_linear": ("Kimi Linear", "Hybrid and linear attention"),
@@ -61,7 +61,6 @@ WRAPPERS = {
     "gemma3": ("Gemma 3", "Images"),
     "gemma3n": ("Gemma 3n", "Images, audio"),
     "gemma4": ("Gemma 4", "Images, video, audio"),
-    "gemma4_unified": ("Gemma 4, unified", "Images, video, audio"),
     "qwen3_5": ("Qwen 3.5", "Images, video"),
     "llama4": ("Llama 4", "Images"),
 }
@@ -123,7 +122,21 @@ def decoder_families() -> list[tuple[str, str]]:
 
 
 def wrappers() -> list[str]:
-    return list(ast.literal_eval(assigned(module_tree("src/dew/interop/hf_decoders.py"), "_WRAPPERS")))
+    """The multimodal model_types that load: listed in `_WRAPPERS` and translated by `translate_wrapper_config`.
+
+    A type in `_WRAPPERS` that the translator has no branch for is refused at load time, so it is not listed.
+    """
+    tree = module_tree("src/dew/interop/hf_decoders.py")
+    registered = list(ast.literal_eval(assigned(tree, "_WRAPPERS")))
+    translator = next(node for node in tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name == "translate_wrapper_config")
+    translated = {
+        node.comparators[0].value
+        for node in ast.walk(translator)
+        if isinstance(node, ast.Compare) and isinstance(node.left, ast.Name) and node.left.id == "model_type"
+        and isinstance(node.ops[0], ast.Eq) and isinstance(node.comparators[0], ast.Constant)
+    }
+    return [model_type for model_type in registered if model_type in translated]
 
 
 def pipelines() -> list[str]:
@@ -189,7 +202,7 @@ def main() -> None:
             if name in seen:
                 continue
             seen.add(name)
-            checked = FULL_SIZE.get(model_type, "Source-shaped fixture, logits against transformers")
+            checked = FULL_SIZE.get(model_type, "A fixture shaped like the release")
             rows.append([name, ", ".join(f"`{t}`" for t in same), f"`{architecture[model_type]}`", checked])
         sections += [f"## {group}", "", table(["Family", "`model_type`", "Architecture", "Checked with"], rows), ""]
     sections += ["## Multimodal checkpoints", "",
