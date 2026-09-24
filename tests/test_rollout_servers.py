@@ -453,3 +453,36 @@ def test_a_pool_publishes_its_sharded_policy_once_and_every_process_hears_a_fail
     assert "reset_prefix_cache answered 200" in reports[0]["error"]
     assert reports[1]["error"].startswith("PeerFailure") and "reset_prefix_cache" in reports[1]["error"]
     assert paths(engine) == ["/pause", "/collective_rpc", "/reset_prefix_cache"]
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("publication", ["safetensors", "nccl"])
+def test_a_gpu_pool_publication_copies_the_policy_to_process_zeros_host_only(tmp_path, replicas, publication):
+    """Only process 0 writes or sends a publication, so only its host holds
+    the policy. Before 153606d4 every process copied the gathered policy to
+    its host, four copies of gpt-oss-20b's 39 GB at expert=4. A pool of two
+    GPUs, one process each, publishes under JAX's transfer guard, which logs
+    each device-to-host copy: process 1 makes none of the served bfloat16
+    policy, and process 0 makes its own, which shows the log is on. NCCLPush's
+    send is replaced, since no engine joins its group here."""
+    if jax.default_backend() != "gpu":
+        pytest.skip("a CPU array reaches its host without a device-to-host transfer")
+    (engine,) = replicas(1)
+    library = tmp_path / "libnccl.so.2"
+    library.touch()
+    root = Path(__file__).resolve().parents[1]
+    done = subprocess.run(
+        [sys.executable, "-m", "dew.cli.main", "launch", "--processes-per-host", "2", "--devices-per-process", "1",
+         "--", sys.executable, str(WORKER), "--directory", str(tmp_path / "served"), "--engine", engine.url,
+         "--publication", publication, "--library", str(library)],
+        cwd=root, env={**os.environ, "PYTHONPATH": str(root / "src")}, capture_output=True, text=True, timeout=600)
+    lines = (done.stdout + done.stderr).splitlines()
+    assert done.returncode == 0, "\n".join(lines)
+    reports = {line[1]: json.loads(line.split(" report ", 1)[1]) for line in lines if " report {" in line}
+    assert sorted(reports) == ["0", "1"], "\n".join(lines)
+    assert all(report["error"] is None and report["sharded"] for report in reports.values()), reports
+    if publication == "nccl":
+        assert reports["0"]["sent"] > 0 and reports["1"]["sent"] is None, reports
+    copies = {rank: sum(line.startswith(f"[{rank}] ") and "device-to-host transfer" in line and "dtype=BF16" in line
+                        for line in lines) for rank in "01"}
+    assert copies["0"] > 0 and copies["1"] == 0, copies
