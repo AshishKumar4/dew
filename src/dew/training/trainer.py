@@ -185,7 +185,7 @@ def goodput(wall: float, first_step: float | None, other: float) -> dict[str, fl
     return numbers
 
 
-def step_compiler_options(objective) -> dict[str, bool] | None:
+def step_compiler_options(objective) -> jax.stages.CompilerOptions | None:
     """XLA options for this objective's training step on this device: Triton
     GEMM fusions off where `TRITON_GEMM_OFF_GENERATIONS` measured a win and
     no mixer of the model keeps them, unless the run set the flag itself."""
