@@ -13,7 +13,12 @@ export function prefersReducedMotion(): boolean {
 	return matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
-/** A WebGL2 context, or null when the browser has none or it lacks float render targets. */
+/**
+ * A WebGL2 context, or null when the browser has none, lacks float render
+ * targets, or would render in software: a GPU emulated on the CPU runs these
+ * shaders at a few frames a second and blocks the page, so the caller shows a
+ * still frame instead.
+ */
 export function createContext(canvas: HTMLCanvasElement, needFloatTargets = true): Context | null {
 	const gl = canvas.getContext('webgl2', {
 		alpha: false,
@@ -23,8 +28,17 @@ export function createContext(canvas: HTMLCanvasElement, needFloatTargets = true
 		premultipliedAlpha: false,
 		preserveDrawingBuffer: false,
 		powerPreference: 'high-performance',
+		failIfMajorPerformanceCaveat: true,
 	});
 	if (!gl) return null;
+	// Browsers that emulate the GPU without flagging a performance caveat (headless
+	// Chrome's SwiftShader, Mesa's llvmpipe) still name the software renderer.
+	const debug = gl.getExtension('WEBGL_debug_renderer_info');
+	const renderer = String(gl.getParameter(debug ? debug.UNMASKED_RENDERER_WEBGL : gl.RENDERER));
+	if (/swiftshader|llvmpipe|softpipe|software|basic render/i.test(renderer)) {
+		gl.getExtension('WEBGL_lose_context')?.loseContext();
+		return null;
+	}
 	const floatTargets = gl.getExtension('EXT_color_buffer_float') !== null;
 	gl.getExtension('OES_texture_float_linear');
 	if (needFloatTargets && !floatTargets) return null;
