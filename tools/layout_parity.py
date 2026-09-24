@@ -378,12 +378,20 @@ def anchor_gradient(case, batch) -> dict[str, NDArray]:
 
     from dew.objectives.base import Step, scalar_loss
     from dew.registry import models
+    from dew.training.transaction import with_ema
 
     state = jax.jit(_trainer(case, {}, one_device=True).initial_state)()
-    wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
-                        if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, state.params)
-    objective = bench.lm_objective(case, models.build(case.architecture, **case.config, dtype=None))
-    step = Step(step=state.step, key=state.key, ema=None)
+
+    def widened(tree):
+        return jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
+                            if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
+
+    wide = widened(state.params)
+    objective = bench.decoder_objective(case, models.build(case.architecture, **case.config, dtype=None))
+    # The reference DPO and GRPO hold is the objective's frozen EMA, as the
+    # trainer's step hands it over.
+    step = Step(step=state.step, key=state.key,
+                ema=with_ema(wide, None if state.ema is None else widened(state.ema)))
 
     def loss(params, batch):
         return scalar_loss(objective, {**wide, "params": params}, batch, step)[0]
