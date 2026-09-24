@@ -48,13 +48,13 @@ def deterministic_ops_requested() -> bool:
 
 
 # The generations whose training steps compile with XLA's Triton GEMM fusions
-# off, so every dot goes to cuBLAS. Measured on one A100 (sm80, jax 0.11.2,
-# bf16, main 775e68d9 and 8eabe55c) against the default: Qwen3-0.6B at
-# 4 x 1024 tokens 162.1 -> 153.1 ms, a 99M MoE 74.6 -> 69.4 ms, and a DiT
-# 5.8% faster. A Mamba-2 step lost 7.7% (127.9 -> 138.6 ms): its SSD scan's
-# small batched dots gain from the fusions, so a model with an SSD mixer
-# keeps them (`dew.training.trainer.step_compiler_options`). Through the
-# trainer on another A100 VM the Qwen3 step held at 161.5 -> 161.4 ms while
-# its compile fell 47.5 -> 27.1 s, the Triton GEMM autotuning it no longer
-# runs. Unmeasured generations keep XLA's default.
+# off, so every dot goes to cuBLAS. Through the trainer on one A100 (sm80,
+# jax 0.11.2, bf16), Qwen3-0.6B at 4 x 512 tokens: compile 47.5 -> 27.1 s,
+# the Triton GEMM autotuning it no longer runs, step 161.5 -> 161.4 ms.
+# Standalone runs on another A100 VM (main 775e68d9 and 8eabe55c) measured
+# Qwen3-0.6B at 4 x 1024 tokens 162.1 -> 153.1 ms, a 99M MoE 74.6 -> 69.4 ms
+# and a DiT 5.8% faster. A Mamba-2 step lost 7.7% (127.9 -> 138.6 ms): its
+# SSD scan's small batched dots gain from the fusions, so its mixer keeps
+# them (`MixerBase.keeps_triton_gemm`). Unmeasured generations keep XLA's
+# default.
 TRITON_GEMM_OFF_GENERATIONS = frozenset({'sm80'})
