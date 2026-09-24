@@ -167,7 +167,7 @@ def package_spec(source_dir: str, extras: str, version: str) -> tuple[str, bool]
     extra, or a release."""
     suffix = f"[{extras}]" if extras else ""
     if source_dir:
-        names = dict.fromkeys(["tpu", *filter(None, extras.split(","))])
+        names = dict.fromkeys(["tpu", *filter(None, (name.strip() for name in extras.split(",")))])
         return f"{source_dir}[{','.join(names)}]", True
     pin = f"=={version}" if version else ""
     return f"{PACKAGE}{suffix}{pin}", False
