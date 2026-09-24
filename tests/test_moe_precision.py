@@ -57,6 +57,12 @@ def shardings(mesh, rows: bool):
 
 @pytest.fixture(scope='module')
 def x64():
+    # XLA's TPU rewrites float64 into pairs of float32 op by op, and has no
+    # rewrite for a ragged dot ("While rewriting computation to not contain
+    # X64 element types ... ragged-dot"); the fp64 oracle cases run on CPU
+    # and GPU.
+    if jax.default_backend() == "tpu":
+        pytest.skip("XLA's TPU has no float64 ragged dot")
     with jax.enable_x64():
         yield
 
@@ -572,3 +578,43 @@ def test_rows_past_the_groups_stay_zero_where_the_ragged_dot_writes_them(monkeyp
     dx, _ = pullback(jnp.ones_like(y))
     assert not np.any(np.asarray(y[21:], np.float32)), np.asarray(y[21:, :4], np.float32)
     assert not np.any(np.asarray(dx[21:], np.float32)), np.asarray(dx[21:, :4], np.float32)
+
+
+def test_no_16_bit_operand_reaches_the_ragged_dot_at_the_highest_precision():
+    """XLA's TPU ragged dot refuses a 16-bit operand at HIGHEST ("Bad lhs
+    type"), which the suite sets and a user may. Two 16-bit operands multiply
+    at DEFAULT, exact either way; one beside an fp32 operand is widened to it,
+    exactly, so the fp32 side keeps HIGHEST. Every ragged dot the grouped
+    matmul and the kernels' fallback trace, forward and backward, obeys that.
+    Read off the traced program, since only a TPU refuses."""
+    from dew.nn.kernels.grouped_matmul import grouped_projection
+
+    x = jnp.ones((24, 16), jnp.bfloat16)
+    kernel = jnp.ones((8, 16, 16), jnp.float32)
+    sizes = jnp.asarray([0, 5, 0, 0, 12, 1, 0, 3], jnp.int32)
+    projections = {
+        "xla": lambda x, kernel: expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None),
+        "pallas-fallback": lambda x, kernel: grouped_projection(x, kernel, sizes, jnp.bfloat16, False),
+    }
+    for name, project in projections.items():
+        def loss(x, kernel, project=project):
+            return jnp.sum(jnp.asarray(project(x, kernel)).astype(jnp.float32))
+        with jax.default_matmul_precision("highest"):
+            program = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(x, kernel)
+        refused = []
+
+        def walk(jaxpr):
+            for equation in jaxpr.eqns:
+                if equation.primitive.name.startswith("ragged_dot"):
+                    kinds = {jnp.dtype(v.aval.dtype) for v in equation.invars[:2]}
+                    precision = str(equation.params.get("precision"))
+                    if jnp.dtype(jnp.bfloat16) in kinds and "HIGHEST" in precision:
+                        refused.append((sorted(map(str, kinds)), precision))
+                for value in equation.params.values():
+                    for branch in value if isinstance(value, tuple | list) else (value,):
+                        inner = getattr(branch, "jaxpr", branch)
+                        if hasattr(inner, "eqns"):
+                            walk(inner)
+
+        walk(program.jaxpr)
+        assert not refused, (name, refused)
