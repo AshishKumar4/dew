@@ -520,7 +520,7 @@ def test_setup_from_source_syncs_installs_and_counts_the_devices(fake, capsys):
         "--zone=us-central2-b", "--worker=all")]
     assert ssh_commands(fake.gcloud_calls()) == (
         ["bash ~/dew-setup.sh"] * 2 + [tpu_setup.DEVICE_COUNT] * 2)
-    assert f"PACKAGE_SPEC='{REPO.name}[tfds,av]'" in script.read_text()
+    assert f"PACKAGE_SPEC='{REPO.name}[tpu,tfds,av]'" in script.read_text()
     rows = [line.split() for line in capsys.readouterr().out.splitlines()]
     assert ["WORKER", "DEVICES", "LOCAL", "CHECK"] in rows
     assert ["0", "16", "8", "ok"] in rows
@@ -547,13 +547,23 @@ def test_setup_script_renders_for_the_python_version_and_the_source(fake):
                               editable=True, gcs_bucket="bucket-1")
     assert script.startswith("#!/bin/bash\n")
     assert "PYTHON_VERSION=3.11" in script
-    assert "JAX_SPEC='jax[tpu]'" in script
     assert "PACKAGE_SPEC='dew[tfds]'" in script
     assert "EDITABLE=1" in script
     assert "GCS_BUCKET=bucket-1" in script
     assert 'uv venv --python "$PYTHON_VERSION" "$VENV"' in script
-    assert 'uv pip install --quiet --python "$PY" "$JAX_SPEC"' in script
-    assert 'uv pip install --quiet --python "$PY" -e "$HOME/$PACKAGE_SPEC"' in script
+    # A checkout installs alone, its tpu extra bringing the libtpu for the jax it
+    # pins: a jax[tpu] from PyPI can't be resolved beside the pin. A release
+    # installs after jax[tpu].
+    assert ('if [ "$EDITABLE" = 1 ]; then\n'
+            '  step "$PACKAGE_SPEC"\n'
+            '  uv pip install --quiet --python "$PY" -e "$HOME/$PACKAGE_SPEC"\n'
+            'else\n'
+            '  step "$JAX_SPEC"\n'
+            '  uv pip install --quiet --python "$PY" "$JAX_SPEC"\n'
+            '  step "$PACKAGE_SPEC"\n'
+            '  uv pip install --quiet --python "$PY" "$PACKAGE_SPEC"\n'
+            'fi\n') in script
+    assert "JAX_SPEC='jax[tpu]'" in script
     # The three things the old setup_tpu.sh existed for.
     assert "* soft nofile 1048576" in script and "DefaultLimitNOFILE=1048576" in script
     assert "ulimit -n 1048576" in script
@@ -573,7 +583,9 @@ def test_setup_script_is_bash_and_every_step_guards_itself(fake):
 
 
 def test_package_spec_reads_source_extras_and_version():
-    assert tpu_setup.package_spec("dew", "tfds,av", "") == ("dew[tfds,av]", True)
+    assert tpu_setup.package_spec("dew", "tfds,av", "") == ("dew[tpu,tfds,av]", True)
+    assert tpu_setup.package_spec("dew", "", "") == ("dew[tpu]", True)
+    assert tpu_setup.package_spec("dew", "tpu,tfds", "") == ("dew[tpu,tfds]", True)
     assert tpu_setup.package_spec("", "tfds", "0.2.1") == ("dew-ml[tfds]==0.2.1", False)
     assert tpu_setup.package_spec("", "", "") == ("dew-ml", False)
 

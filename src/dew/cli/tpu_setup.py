@@ -2,9 +2,11 @@
 
 The setup script is rendered from the Python version, the extras and the
 source mode. Every step is guarded, so a second run re-creates nothing, but
-the two `uv pip install` lines resolve against PyPI each time: a jax[tpu] or
-dew-ml release since the last run is installed. `setup --version` pins the
-dew-ml side.
+the `uv pip install` lines resolve against PyPI each time. A checkout is
+installed alone with its `tpu` extra, the libtpu for the jax the checkout
+pins, since a jax[tpu] from PyPI beside the pin can't be resolved with it. A
+release installs after jax[tpu], so a jax[tpu] or dew-ml release since the
+last run is installed; `setup --version` pins the dew-ml side.
 """
 
 from __future__ import annotations
@@ -78,13 +80,13 @@ have=$("$VENV/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])'
 [ "$have" = "$PYTHON_VERSION" ] || uv venv --python "$PYTHON_VERSION" "$VENV"
 PY="$VENV/bin/python"
 
-step "$JAX_SPEC"
-uv pip install --quiet --python "$PY" "$JAX_SPEC"
-
-step "$PACKAGE_SPEC"
 if [ "$EDITABLE" = 1 ]; then
+  step "$PACKAGE_SPEC"
   uv pip install --quiet --python "$PY" -e "$HOME/$PACKAGE_SPEC"
 else
+  step "$JAX_SPEC"
+  uv pip install --quiet --python "$PY" "$JAX_SPEC"
+  step "$PACKAGE_SPEC"
   uv pip install --quiet --python "$PY" "$PACKAGE_SPEC"
 fi
 
@@ -161,10 +163,12 @@ def render(
 
 
 def package_spec(source_dir: str, extras: str, version: str) -> tuple[str, bool]:
-    """What to install: a directory under the worker's home, or a release."""
+    """What to install: a directory under the worker's home, with its tpu
+    extra, or a release."""
     suffix = f"[{extras}]" if extras else ""
     if source_dir:
-        return f"{source_dir}{suffix}", True
+        names = dict.fromkeys(["tpu", *filter(None, extras.split(","))])
+        return f"{source_dir}[{','.join(names)}]", True
     pin = f"=={version}" if version else ""
     return f"{PACKAGE}{suffix}{pin}", False
 
