@@ -256,14 +256,18 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
 
 def test_the_headroom_is_the_tightest_devices_free_memory_less_what_the_step_adds():
     """Outputs that alias the donated state take no new memory; the rest of
-    the outputs and the temporaries do. A device or an executable that
-    reports no memory leaves the answer unknown."""
+    the outputs and the temporaries do. The arguments, the state and the
+    batch, are resident already and counted in use, so they are not counted
+    again as the step's (8d578658: they were, against the whole limit). A
+    device or an executable that reports no memory leaves the answer
+    unknown."""
     from types import SimpleNamespace
 
     from dew.training.trainer import step_headroom
 
     step = SimpleNamespace(memory_analysis=lambda: SimpleNamespace(
-        output_size_in_bytes=100, alias_size_in_bytes=40, temp_size_in_bytes=50))
+        argument_size_in_bytes=700, output_size_in_bytes=100, alias_size_in_bytes=40,
+        temp_size_in_bytes=50))
 
     def device(in_use):
         return SimpleNamespace(memory_stats=lambda: {'bytes_limit': 1000, 'bytes_in_use': in_use})
