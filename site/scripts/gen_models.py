@@ -45,6 +45,7 @@ DECODERS = {
     "deepseek_v3": ("DeepSeek V3", "Mixture of experts"),
     "deepseek_v32": ("DeepSeek V3.2", "Mixture of experts"),
     "deepseek_v4": ("DeepSeek V4", "Mixture of experts"),
+    "deepseek_v41": ("DeepSeek V4.1", "Mixture of experts"),
     "kimi_k2": ("Kimi K2", "Mixture of experts"),
     "kimi_k25": ("Kimi K2.5, text", "Mixture of experts"),
     "qwen3_next": ("Qwen3-Next", "Hybrid and linear attention"),
@@ -108,12 +109,33 @@ def assigned(tree: ast.Module, name: str) -> ast.expr:
     raise SystemExit(f"gen_models: {name} is gone from the source; update scripts/gen_models.py")
 
 
+def family_call(tree: ast.Module, element: ast.expr) -> tuple[ast.Call, dict[str, str]]:
+    """The `DecoderFamily(...)` call an entry of `_FAMILY_ENTRIES` stands for, and its module's string constants.
+
+    An entry is either the call itself or a name bound to one, in this module or
+    imported from another module of the package.
+    """
+    if isinstance(element, ast.Call):
+        return element, constants(tree)
+    if not isinstance(element, ast.Name):
+        raise SystemExit(f"gen_models: cannot read _FAMILY_ENTRIES element {ast.dump(element)[:80]}")
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == element.id for t in node.targets):
+            return node.value, constants(tree)
+        if isinstance(node, ast.ImportFrom) and node.module and any(
+                (alias.asname or alias.name) == element.id for alias in node.names):
+            other = module_tree("src/" + node.module.replace(".", "/") + ".py")
+            name = next(alias.name for alias in node.names if (alias.asname or alias.name) == element.id)
+            return family_call(other, ast.Name(id=name))
+    raise SystemExit(f"gen_models: cannot find the definition of {element.id}")
+
+
 def decoder_families() -> list[tuple[str, str]]:
     """(model_type, transformers architecture) for every entry of `_FAMILY_ENTRIES`."""
     tree = module_tree("src/dew/interop/hf_decoders.py")
-    names = constants(tree)
     families = []
-    for call in assigned(tree, "_FAMILY_ENTRIES").elts:
+    for element in assigned(tree, "_FAMILY_ENTRIES").elts:
+        call, names = family_call(tree, element)
         types = [e.value if isinstance(e, ast.Constant) else names[e.id] for e in call.args[0].elts]
         architecture = next(arg.value for arg in call.args[1:] if isinstance(arg, ast.Constant)
                             and isinstance(arg.value, str) and arg.value[0].isupper())
