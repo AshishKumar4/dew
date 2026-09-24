@@ -13,12 +13,13 @@ still run, and the script exits nonzero if any failed.
 `--save DIR` writes each notebook to DIR as the repository keeps it, with the
 run's outputs in place of the old ones and its install cells unexecuted; that
 is how the committed outputs are made, by copying DIR over tutorials/. A cell
-the run did not reach is saved with no output, and the site build refuses it.
-A notebook that ran through also gets `dew.outputs` in its metadata: the last
+the run did not reach is saved with no output, and the site build refuses it. A
+notebook that ran through also gets `dew.outputs` in its metadata: the last
 commit that changed src/dew or pyproject.toml in this checkout (so the record
 survives a rebase of a branch that leaves the library and its dependencies
-alone), the date, the device and the JAX version. The site prints it under the notebook's outputs. It assumes the
-interpreter running this script has Dew installed from this checkout.
+alone), the date, the device and the JAX version. The site prints it under the
+notebook's outputs. It assumes the interpreter running this script has Dew
+installed from this checkout.
 
 `--imports FILE` writes, for each notebook that ran through, the Dew modules
 its kernel had imported by the end. tools/check_tutorial_outputs.py compares
