@@ -56,7 +56,7 @@ The plain install brings JAX for the CPU. For an accelerator, add the extra that
 | NVIDIA GPU, CUDA 12 driver | `uv pip install "dew-ml[cuda12] @ git+https://github.com/AshishKumar4/dew"` |
 | Google TPU VM | `uv pip install "dew-ml[tpu] @ git+https://github.com/AshishKumar4/dew"` |
 
-Extras combine, as in `dew-ml[cuda13,interop,streaming]`, and a checkout takes them the same way: `uv pip install -e ".[cuda12]"`. Each one installs the accelerator build of the JAX that Dew pins, a build of 0.11.2 from GitHub that fixes its compilation cache for pools of processes on different GPUs. pip cannot resolve PyPI's JAX extras, such as `jax[cuda13]`, beside that pin in one install, and a later `-U "jax[...]"` with pip or uv replaces the pin with a newer JAX from PyPI. Use Dew's extras instead.
+Extras combine, as in `dew-ml[cuda13,interop,streaming]`, and a checkout takes them the same way: `uv pip install -e ".[cuda12]"`. Each one installs the accelerator build of the JAX that Dew pins, a build of 0.11.2 from GitHub that fixes its compilation cache for pools of processes on different GPUs. pip cannot resolve PyPI's JAX extras, such as `jax[cuda13]`, beside that pin in one install, and once PyPI has a JAX newer than the pin, a later `-U "jax[...]"` with pip or uv replaces the pin with it. Use Dew's extras instead.
 
 The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. Choose the backend before you import JAX; for example, `JAX_PLATFORMS=cpu python train.py` runs a small smoke test on the CPU even on a GPU machine. On Colab the tutorials install `dew-ml[cuda13]`.
 

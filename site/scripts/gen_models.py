@@ -90,7 +90,7 @@ CHECKPOINT_TYPES = {
 # Families checked against a released checkpoint at full size, with the checkpoint.
 FULL_SIZE = {
     "llama": "SmolLM2-135M, logits against transformers; its GGUF Q8_0 and Q4_K_M files",
-    "qwen3": "Qwen3-0.6B, logits against transformers, on one GPU and streamed onto two",
+    "qwen3": "Qwen3-0.6B, logits against transformers, on one GPU, and streamed onto an 8-device CPU mesh",
     "mamba2": "state-spaces/mamba2-130m against AntonV/mamba2-130m-hf",
 }
 
@@ -253,7 +253,8 @@ def main() -> None:
                  table(["Family", "Pipeline class", "Task"],
                        [[family, f"`{pipe}`", task] for family, entries in by_family.items() for pipe, task in entries]), ""]
     sections += ["## Architectures you can train from scratch", "",
-                 "`models.build(name, ...)` builds these by their registered name. Each links to its API entry.", "",
+                 "`models.build(name, ...)` builds these by their registered name. A class the API reference "
+                 "documents links to its entry.", "",
                  table(["Registered name", "Class"],
                        [[f"`{name}`", api_link(module, cls)] for name, cls, module in native]), ""]
 
