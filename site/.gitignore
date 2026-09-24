@@ -9,8 +9,3 @@ src/assets/repo/
 public/repo/
 public/tutorials/
 
-# Built by `pnpm concepts:build`.
-dist-concepts/
-
-# Concept C's frames, packed by concepts/replay/atlas.py from a trajectory.
-concepts/public/c/

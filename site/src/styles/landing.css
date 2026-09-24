@@ -386,6 +386,62 @@ html[data-has-hero][data-past-hero] header.header {
 	animation: dew-pulse 1s ease-in-out infinite alternate;
 }
 
+/* Text to image: sampling trajectories that run as they scroll past. */
+
+.replay-grid {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr);
+	gap: 1.5rem;
+}
+
+.replay-figure {
+	margin: 0;
+}
+
+.replay-frame {
+	position: relative;
+	aspect-ratio: 1;
+	border-radius: 0.6rem;
+	overflow: hidden;
+	background: var(--dew-output-bg);
+	border: 1px solid var(--dew-rule);
+}
+
+.replay-frame img,
+.replay-frame canvas {
+	position: absolute;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	display: block;
+}
+
+.replay-frame canvas {
+	opacity: 0;
+}
+
+.replay-figure[data-live] canvas {
+	opacity: 1;
+}
+
+.replay-figure figcaption {
+	margin-top: 0.7rem;
+	font: 0.8rem/1.5 var(--__sl-font-mono);
+	color: var(--sl-color-gray-2);
+}
+
+.replay-note {
+	margin: 1.5rem 0 0;
+	font-size: 0.85rem;
+	color: var(--dew-muted);
+}
+
+@media (min-width: 40rem) {
+	.replay-grid {
+		grid-template-columns: repeat(3, minmax(0, 1fr));
+	}
+}
+
 /* Shown: cells from the tutorials and what they printed. */
 
 .shown {

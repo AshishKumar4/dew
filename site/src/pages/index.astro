@@ -3,6 +3,8 @@
 // (Starlight renders it in the splash template's hero slot). Below it, each
 // section shows real code and the output it printed: the page's own script,
 // which also runs live, then cells from the tutorials, then the tutorials.
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
 import { Code } from '@astrojs/starlight/components';
 import HeroOutput from '../components/landing/HeroOutput.astro';
@@ -25,6 +27,18 @@ const shown = [
 	if (!record?.source || !record.stdout) throw new Error(`index.astro: ${entry.notebook} ${entry.cell} has no recorded output`);
 	return { ...entry, source: record.source.trimEnd(), stdout: record.stdout.trimEnd() };
 });
+
+// Sampling trajectories of a text-to-image model, packed into public/hero/replay/ by scripts/replay-atlas.py.
+const replays = ['lake', 'lighthouse', 'fruit'].map((name) => {
+	// Read from the project's public/, where the build runs (the page's own module is bundled elsewhere).
+	const meta = JSON.parse(readFileSync(path.join(process.cwd(), 'public', 'hero', 'replay', name, 'meta.json'), 'utf8'));
+	return { name, prompt: meta.prompt as string, model: meta.model as { model: string; parameters: number } };
+});
+const replayModel = replays[0].model;
+if (!replays.every((replay) => replay.model.model === replayModel.model) || !/^FlaxDiff /.test(replayModel.model)) {
+	throw new Error('index.astro: the replays must come from one model trained with FlaxDiff, as the page says');
+}
+const replayParameters = `${Math.round(replayModel.parameters / 1e6)}M`;
 
 // Short names for the tutorial cards; the tutorials' own titles are on their pages.
 const names: Record<string, string> = {
@@ -65,6 +79,26 @@ const cards = tutorials.map((entry) => {
 				<Code code={heroCode.trimEnd()} lang="python" title="train.py" />
 				<HeroOutput code={heroCode} stdout={hero.stdout} meta={capture.meta} seconds={hero.seconds} />
 			</div>
+		</section>
+
+		<section class="band replay" aria-label="Text to image" data-reveal data-replays>
+			<h3 class="shown-label">
+				<a href="/tutorials/03-text-to-image-with-guidance/">Text to image</a>
+			</h3>
+			<div class="replay-grid">
+				{
+					replays.map((replay) => (
+						<figure class="replay-figure" data-replay={`/hero/replay/${replay.name}`}>
+							<div class="replay-frame">
+								<img src={`/hero/replay/${replay.name}/final.webp`} width="256" height="256" alt="" loading="lazy" decoding="async" />
+								<canvas aria-hidden="true" />
+							</div>
+							<figcaption>“{replay.prompt}”</figcaption>
+						</figure>
+					))
+				}
+			</div>
+			<p class="replay-note">A {replayParameters}-parameter model trained with FlaxDiff, sampled with Dew.</p>
 		</section>
 
 		<section class="band shown" aria-label="From the tutorials">
@@ -109,8 +143,25 @@ const cards = tutorials.map((entry) => {
 </StarlightPage>
 
 <script>
+	const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+	// The replay section's code loads when the section comes near; with reduced motion
+	// its figures keep their finished images.
+	const replays = document.querySelector<HTMLElement>('[data-replays]');
+	if (replays && !still) {
+		const near = new IntersectionObserver(
+			(entries) => {
+				if (!entries.some((entry) => entry.isIntersecting)) return;
+				near.disconnect();
+				import('../hero/replay-section').then(({ startReplays }) => startReplays(replays));
+			},
+			{ rootMargin: '50% 0px' },
+		);
+		near.observe(replays);
+	}
+
 	// Sections rise into place as they reach the viewport; with reduced motion they are simply there.
-	if (!matchMedia('(prefers-reduced-motion: reduce)').matches) {
+	if (!still) {
 		const sections = document.querySelectorAll<HTMLElement>('[data-reveal]');
 		const observer = new IntersectionObserver(
 			(entries) => {
