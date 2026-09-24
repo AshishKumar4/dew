@@ -612,3 +612,18 @@ def test_a_compressed_tensors_config_this_loader_cannot_read_is_refused_by_name(
     config["quantization_config"] |= change
     with pytest.raises(ValueError, match=message):
         codecs.source_quantization(config)
+
+
+def test_an_nvfp4_negative_zero_keeps_code_8_so_a_released_checkpoint_saves_back_whole():
+    """An exact -0.0 is what code 8 decodes to, and released NVFP4 checkpoints
+    store code 8 (3.5% of Qwen3-0.6B-NVFP4A16's codes), so it encodes back as
+    code 8 where the library's compressor would write 0."""
+    stored, _, _, config = ct_case("nvfp4")
+    codec = codecs.source_quantization(config, grid=stored)
+    assert codec is not None
+    weight = codec.decode(stored, "m.weight")
+    weight[0, :2] = [-0.0, 0.0]
+    packed = codec.requantize({"m.weight": weight}, ("m.weight",))["m.weight_packed"]
+    assert (packed[0, 0] & 0xF, packed[0, 0] >> 4) == (8, 0)
+    decoded = codec.decode({**stored, "m.weight_packed": packed}, "m.weight")
+    assert np.signbit(decoded[0, 0]) and not np.signbit(decoded[0, 1])
