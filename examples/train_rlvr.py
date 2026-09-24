@@ -206,20 +206,23 @@ class Config:
     out: Path = Path("runs/rlvr")
     steps: int = 40
     prompts: int = 8
-    """Prompts per update; each gets `groups` completions."""
+    """Prompts per step; each gets `groups` completions, all in the same step."""
     groups: int = 8
+    accumulation: int = 1
+    """Steps pooled into one optimizer update. An update trains on `accumulation * prompts * groups`
+    rows while a step, and the server's slots with it, holds `prompts * groups` of them."""
     prompt_tokens: int = 128
     new_tokens: int = 128
     learning_rate: float = 2e-6
     max_lag: int = 1
     tasks: int = 2048
     turns: int = 1
+    """Attempts per task; above one, a failed program's test count comes back and the model tries again."""
     thinking: bool = False
     """Whether a reasoning template opens a think block (Qwen3's `enable_thinking`); others ignore it.
     Off by default: the task asks for one code block, and a think block eats the budget."""
-    """Attempts per task; above one, a failed program's test count comes back and the model tries again."""
     window: int = 10
-    """Updates averaged at each end of the run for the reward comparison."""
+    """Steps averaged at each end of the run for the reward comparison; an update is `accumulation` steps."""
     runner: str = "process"
     """process: limited local processes; container: network-less Docker containers of --image."""
     image: str = "python:3.12-slim"
@@ -437,7 +440,8 @@ def main(config: Config) -> dict:
                                max_lag=config.max_lag, ahead=config.max_lag, truncation="score", log=log)
     optimizer = optax.chain(optax.clip_by_global_norm(1.0),
                             optax.adamw(config.learning_rate, b2=0.99, weight_decay=0.0))
-    trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed), rollout=rollout)
+    trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed), rollout=rollout,
+                      accumulation=config.accumulation)
     began = time.perf_counter()
     try:
         state = trainer.fit(rollout.tasks(data), steps=config.steps, log_every=1)
@@ -460,7 +464,7 @@ def main(config: Config) -> dict:
         "resubmitted": sum(sum(record.resubmitted.values()) for record in history), "push_seconds": pushes, "history": [asdict(record) for record in history],
     }
     (config.out / "rewards.json").write_text(json.dumps(summary, indent=1))
-    print(f"{config.backend}: reward {summary['first_reward']:.3f} over the first {window} updates, "
+    print(f"{config.backend}: reward {summary['first_reward']:.3f} over the first {window} steps, "
           f"{summary['last_reward']:.3f} over the last {window}; largest lag {summary['max_lag']}"
           + (f"; median weight push {sorted(pushes)[len(pushes) // 2]:.2f}s over {len(pushes)}" if pushes else ""))
     return summary
