@@ -346,6 +346,37 @@ def test_a_pool_that_asks_for_more_gpus_than_the_host_shows_is_refused(arguments
     assert "JAX_COORDINATOR_ADDRESS" not in done.stdout, done.stdout
 
 
+def failing_nvidia_smi(tmp_path: Path) -> dict:
+    """An environment whose PATH finds an nvidia-smi that fails first, as a
+    host without the driver's tools, or an ssh command's non-interactive
+    PATH, gives it: the launcher cannot count this host's GPUs."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    tool = bin_dir / "nvidia-smi"
+    tool.write_text("#!/bin/sh\necho 'NVIDIA-SMI has failed' >&2\nexit 9\n")
+    tool.chmod(0o755)
+    env = {name: value for name, value in ENV.items()
+           if not name.startswith(("SLURM_", "OMPI_")) and name != "CUDA_VISIBLE_DEVICES"}
+    return {**env, "PATH": f"{bin_dir}:{os.environ['PATH']}", "JAX_PLATFORMS": "cuda"}
+
+
+def test_a_host_whose_gpus_cannot_be_counted_starts_its_pool_unchecked(tmp_path):
+    """A failing nvidia-smi counts nothing, which is not zero GPUs: a pool
+    that names two starts as asked, and says the check was skipped. The
+    same host with CUDA_VISIBLE_DEVICES=0 shows one GPU without asking
+    nvidia-smi, and a pool that names two is refused."""
+    env = failing_nvidia_smi(tmp_path)
+    arguments = ("--dry-run", "--processes-per-host", "2", "--devices-per-process", "1",
+                 "--", "python", "train.py")
+    started = launched(*arguments, env=env)
+    assert started.returncode == 0, started.stderr
+    assert "JAX_LOCAL_DEVICE_IDS=1" in started.stdout, started.stdout
+    assert "could not count localhost's GPUs" in started.stderr, started.stderr
+    refused = launched(*arguments, env={**env, "CUDA_VISIBLE_DEVICES": "0"})
+    assert refused.returncode != 0, refused.stdout
+    assert "needs 2 GPUs on localhost, which shows 1" in refused.stderr, refused.stderr
+
+
 def fake_srun(tmp_path: Path) -> dict:
     """An allocation's environment whose `srun` records its arguments and
     the variables it would hand its tasks, in place of Slurm's: four GPUs
