@@ -1,9 +1,9 @@
 /* Dew's colors and type, applied to Starlight's variables and shared with the landing page. */
 
 :root {
-	--dew-font-display: 'Source Serif 4 Variable', 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
-	--sl-font: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
-	--sl-font-mono: 'JetBrains Mono Variable', ui-monospace, SFMono-Regular, Menlo, monospace;
+	--dew-font-display: var(--font-serif);
+	--sl-font: var(--font-inter);
+	--sl-font-mono: var(--font-mono);
 	--sl-line-height: 1.7;
 	--sl-content-width: 46rem;
 	--sl-sidebar-width: 17.5rem;
