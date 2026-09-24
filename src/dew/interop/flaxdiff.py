@@ -34,8 +34,6 @@ import numpy as np
 from dew import records
 
 if TYPE_CHECKING:
-    from flax import linen as nn
-
     from dew.sampling.pipelines import TextToImage
 
 # FlaxDiff 0.2's SimpleUDiT held these at its root; Dew's nests them under the
@@ -155,22 +153,6 @@ def _condition(input_config: Mapping[str, object]) -> tuple[str, str, str]:
             records.text(condition.get("unconditional_input", ""), "unconditional_input"))
 
 
-def _check_tree(model: nn.Module, variables: Mapping, *inputs) -> None:
-    """Raise with every path whose shape disagrees with what `model` builds."""
-    def shapes(tree) -> dict[str, tuple[int, ...]]:
-        return {jax.tree_util.keystr(path): tuple(np.shape(leaf))
-                for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
-
-    expected = shapes(jax.eval_shape(model.init, jax.random.key(0), *inputs))
-    given = shapes(dict(variables))
-    wrong = sorted(name for name in expected.keys() | given.keys()
-                   if expected.get(name) != given.get(name))
-    if wrong:
-        raise ValueError("the FlaxDiff weights do not fit the model their config names: "
-                         + ", ".join(f"{name} {given.get(name)} for {expected.get(name)}"
-                                     for name in wrong[:8]))
-
-
 def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
                   ema: bool = True, best: bool = False, dtype: str | None = None) -> TextToImage:
     """A FlaxDiff text-to-image run as a Dew `TextToImage`.
@@ -189,6 +171,7 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
     from dew.diffusion.presets import EDM
     from dew.inputs import Field, InputSpec
     from dew.nn.dit import TextContext
+    from dew.nn.text_encoders import check_tree
     from dew.objectives.diffusion.config import StableDiffusionAutoencoder, TextCondition
     from dew.registry import resolve_dtype
     from dew.sampling import CFG, EulerAncestral, TextToImage
@@ -224,9 +207,9 @@ def load_flaxdiff(directory: str | os.PathLike, config: Mapping[str, object], *,
     if not isinstance(context, TextContext):
         raise TypeError(f"{clip} encodes to {type(context).__name__}, not a TextContext")
     factor = vae.downscale_factor
-    _check_tree(model, variables,
-                jnp.zeros((1, height // factor, width // factor, vae.latent_channels)), jnp.zeros((1,)),
-                TextContext(jnp.zeros(context.hidden.shape), jnp.ones(context.mask.shape, jnp.int32)))
+    check_tree(variables, model,
+               jnp.zeros((1, height // factor, width // factor, vae.latent_channels)), jnp.zeros((1,)),
+               TextContext(jnp.zeros(context.hidden.shape), jnp.ones(context.mask.shape, jnp.int32)))
 
     inputs = InputSpec(sample=Field("image", (height, width, channels)), conditions={keyword: condition})
     params = {**variables, "encoders": {keyword: encoder.params}, "autoencoder": vae.params}
