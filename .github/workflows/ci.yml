@@ -62,8 +62,11 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.14", "3.12"]
-        # pytest-split balances the shards on tests/test_durations.json;
-        # tools/ci_durations.py rewrites it from a run's reports.
+        # pytest-split cuts the collected order into chunks of equal time by
+        # tests/test_durations.json, which tools/ci_durations.py rewrites from
+        # a run's reports. Contiguous chunks keep a module's tests, and the
+        # fixtures and compilations they share, in one process: splitting
+        # modules across every shard cost 60% more test time (run 35945550831).
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     name: test (${{ matrix.python-version }}, ${{ matrix.shard }}/12)
     steps:
@@ -90,7 +93,7 @@ jobs:
       run: |
         /usr/bin/time -v env JAX_PLATFORMS=cpu PYTHONFAULTHANDLER=1 pytest -m "not network" -vv \
           --capture=tee-sys -ra --junitxml=pytest-report.xml \
-          --splits 12 --group ${{ matrix.shard }} --splitting-algorithm least_duration \
+          --splits 12 --group ${{ matrix.shard }} --splitting-algorithm duration_based_chunks \
           --durations-path tests/test_durations.json
     - name: Save the compilation cache
       if: always() && github.ref == 'refs/heads/main'
