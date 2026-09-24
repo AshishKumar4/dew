@@ -436,23 +436,70 @@ def test_an_export_past_its_shard_size_writes_shards_that_transformers_reads(tmp
     assert sorted(path.name for path in export.glob("model*")) == ["model.safetensors"]
 
 
+@pytest.mark.network
 def test_a_sharded_export_holds_one_shard_on_the_host(tmp_path):
-    """The export builds each host tensor as its shard is written, so the
-    host's traced peak during the save stays near its largest shard (the
-    embedding, 64 KB) plus the writer's own, where building the whole table
-    first peaks near the model's size."""
-    import tracemalloc
+    """Qwen3-0.6B in bfloat16 saved in 200 MB shards, in a fresh process
+    (tools/benchmark_streaming_export.py): each host tensor is built as its
+    shard is written, so RSS over the save stays flat, where building the
+    whole export first raised it by 0.57 GB of the 1.11 GB of weights. A
+    synthetic decoder of the same family does not separate the two writers
+    on CPU, so the gate is the released checkpoint, read from the cache."""
+    import os
+    import subprocess
+    import sys
+
+    from huggingface_hub import try_to_load_from_cache
+
+    repo, revision = "Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca"
+    if not isinstance(try_to_load_from_cache(repo, "model.safetensors", revision=revision), str) \
+            and os.environ.get("DEW_NETWORK_TESTS") != "1":
+        pytest.skip(f"{repo} at {revision[:8]} is neither cached nor DEW_NETWORK_TESTS=1")
+    root = Path(__file__).parents[1]
+    run = subprocess.run([sys.executable, str(root / "tools" / "benchmark_streaming_export.py"), repo, "200MB",
+                          str(tmp_path / "out"), revision], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
+    assert run.returncode == 0, run.stderr[-2000:]
+    measured = json.loads(run.stdout.splitlines()[-1])
+    assert measured["rise_gb"] < 0.1 * measured["weights_gb"], measured
+
+
+def test_an_interrupted_re_export_leaves_the_previous_export_whole(tmp_path, monkeypatch):
+    """A re-export that stops after its first shard leaves the directory
+    reading as the previous export in full, and a completed one removes only
+    the files the previous export named: a precision variant beside it stays."""
+    from dew.interop import safetensors_io
+    from dew.interop.safetensors_io import read_weights
 
     source = load_pretrained(str(FIXTURES / "qwen3-tiny"), dtype="float32", attention_impl="reference")
-    total = sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(source.variables["params"]))
-    shard = total // 16
-    tracemalloc.start()
-    source.save(tmp_path / "export", max_shard_size=shard)
-    _, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    largest = max(path.stat().st_size for path in (tmp_path / "export").glob("model-*.safetensors"))
-    # Measured on qwen3-tiny's 362 KB: 154 KB streamed, 317 KB before.
-    assert peak < total / 2, (peak, total, largest)
+    export = tmp_path / "export"
+    source.save(export, max_shard_size=64 * 1024)
+    first = read_weights(export)
+    (export / "model.fp16.safetensors").write_bytes(b"a variant")
+    trained = jax.tree.map(lambda leaf: np.asarray(leaf) + 1, source.variables)
+    publish, calls = safetensors_io._publish, []
+
+    def stopping(*args, **kwargs):
+        if calls:
+            raise KeyboardInterrupt
+        calls.append(args)
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(safetensors_io, "_publish", stopping)
+    with pytest.raises(KeyboardInterrupt):
+        source.save(export, variables=trained, max_shard_size=64 * 1024)
+    kept = read_weights(export)
+    assert set(kept) == set(first)
+    for name, value in first.items():
+        np.testing.assert_array_equal(kept[name], value, err_msg=name)
+
+    monkeypatch.setattr(safetensors_io, "_publish", publish)
+    source.save(export, variables=trained, max_shard_size=64 * 1024)
+    assert all(not np.array_equal(value, first[name]) for name, value in read_weights(export).items()
+               if np.issubdtype(value.dtype, np.floating) and value.size > 1)
+    assert (export / "model.fp16.safetensors").read_bytes() == b"a variant"
+    source.save(export)
+    assert sorted(path.name for path in export.glob("model*.safetensors*")) == [
+        "model.fp16.safetensors", "model.safetensors"]
 
 
 def test_a_quantized_source_exports_trained_weights_in_its_original_format(tmp_path):

@@ -1,6 +1,6 @@
 """Peak host memory of an export: one shard at a time against the whole model.
 
-    PYTHONPATH=src python tools/benchmark_streaming_export.py <repo> <max_shard_size> <out_dir>
+    PYTHONPATH=src python tools/benchmark_streaming_export.py <repo> <max_shard_size> <out_dir> [revision]
 
 Loads `repo` in bfloat16 onto the default device (the mesh load streams, so
 the host holds no model afterwards), then saves it with `max_shard_size`.
@@ -30,7 +30,8 @@ def _rss_gb() -> float:
 
 def main() -> None:
     repo, shard_size, out = sys.argv[1], sys.argv[2], Path(sys.argv[3])
-    loaded = load_pretrained(repo, param_dtype="bfloat16", mesh=MeshSpec())
+    loaded = load_pretrained(repo, revision=sys.argv[4] if len(sys.argv) > 4 else None, param_dtype="bfloat16",
+                             mesh=MeshSpec())
     before = _rss_gb()
     highest = [before]
     done = threading.Event()
