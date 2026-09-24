@@ -19,7 +19,7 @@ from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.data import Dataset
 from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.registry import Registry, datasets, models
+from dew.registry import Registry, datasets, models, projectors, towers
 from dew.training import Layout, MeshSpec
 
 
@@ -451,7 +451,7 @@ def test_a_saved_model_retains_nested_mixer_behavior(tmp_path):
 def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     import jax
 
-    from dew.nn.vision import GemmaProjector, SiglipVision, projector_from_record, tower_from_record
+    from dew.nn.vision import GemmaProjector, SiglipVision
 
     @dataclasses.dataclass(frozen=True)
     class VisionRun(RunConfig):
@@ -471,8 +471,8 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     expected = projector.apply(projector_params, encoded)
     run.save(str(tmp_path))
     restored = VisionRun.load(str(tmp_path))
-    actual = projector_from_record(restored.vision["projector"]).build().apply(
-        projector_params, tower_from_record(restored.vision["tower"]).build().apply(
+    actual = projectors.from_record(restored.vision["projector"]).build().apply(
+        projector_params, towers.from_record(restored.vision["tower"]).build().apply(
             tower_params, pixels))
     assert jnp.array_equal(actual, expected)
 

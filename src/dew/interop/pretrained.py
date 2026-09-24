@@ -44,10 +44,17 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.text_encoders import ParamTree
-from dew.nn.vision import projector_from_record, tower_from_record
 from dew.objectives.base import Variables
 from dew.records import JSON
-from dew.registry import dtype_name, models, precision_fields, resolve_dtype, with_precision
+from dew.registry import (
+    dtype_name,
+    models,
+    precision_fields,
+    projectors,
+    resolve_dtype,
+    towers,
+    with_precision,
+)
 from dew.sampling import decoding
 from dew.sampling.guidance import CFG
 from dew.sampling.pipelines import TextToImage
@@ -437,7 +444,7 @@ class Processor:
         audio = self.record.get("audio")
         if type(audio_id) is not int or not isinstance(audio, Mapping):
             raise ValueError("this source has no audio tower")
-        encoder = tower_from_record(audio)
+        encoder = towers.from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError("audio conditioning requires a Gemma audio encoder")
         features = np.asarray(values["input_features"])
@@ -794,7 +801,7 @@ def _wrapper_layouts(tensors, record, variables):
     bundled = decoders._bundled(record["model_type"])
     audio_encoder = None
     if record["audio"] is not None:
-        audio_encoder = tower_from_record(record["audio"])
+        audio_encoder = towers.from_record(record["audio"])
         if not isinstance(audio_encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError("source export requires a Gemma audio encoder")
     bindings = []
@@ -2282,17 +2289,17 @@ def _wrapper_model(config: Mapping[str, object], record: decoders.WrapperFields,
     audio_record = record["audio"]
     audio_projector = record["audio_projector"]
     return MultimodalTransformer(
-        language_model, tower_from_record(record["tower"]),
-        projector_from_record(record["projector"]), family,
+        language_model, towers.from_record(record["tower"]),
+        projectors.from_record(record["projector"]), family,
         record["image_token_id"], dtype=resolve_dtype(dtype),
         # A text_config that states a null pad id states none, and the
         # wrapper's own field defaults to 0 for exactly that.
         pad_token_id=records.integer(text_config.get("pad_token_id") or 0, "pad_token_id"),
         extra_placeholder_ids=(tuple(records.integer(config.get(name, default), name) for name, default in
             (("video_token_id", 258884), ("audio_token_id", 258881))) if family == "gemma4" else ()),
-        audio=None if audio_record is None else tower_from_record(audio_record),
+        audio=None if audio_record is None else towers.from_record(audio_record),
         audio_projection=(None if audio_projector is None
-                          else projector_from_record(audio_projector)),
+                          else projectors.from_record(audio_projector)),
         audio_soft_tokens=record["audio_soft_tokens"])
 
 

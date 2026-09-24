@@ -107,58 +107,6 @@ class TowerBase:
         return TowerGeometry()
 
 
-def projector_from_record(record: Mapping[str, object]) -> ProjectorBase:
-    """A `{"kind": ..., ...fields}` record as the kind value it names."""
-    fields = dict(record)
-    try:
-        kind = fields.pop("kind")
-    except KeyError:
-        raise ValueError(
-            f"a projector record names its kind, got {sorted(fields)}; known: "
-            f"{', '.join(sorted(projectors))}") from None
-    if not isinstance(kind, str):
-        raise ValueError(
-            f"a projector kind is a registered name, not {kind!r}; known: "
-            f"{', '.join(sorted(projectors))}")
-    try:
-        built = projectors.build(kind, fields)
-    except KeyError:
-        raise ValueError(
-            f"a projector kind is a registered name, not {kind!r}; known: "
-            f"{', '.join(sorted(projectors))}") from None
-    if not isinstance(built, ProjectorBase):
-        raise ValueError(
-            f"projector {kind!r} built {type(built).__name__}, which is not a "
-            "projector value")
-    return built
-
-
-def tower_from_record(record: Mapping[str, object]) -> TowerBase:
-    """A `{"kind": ..., ...fields}` record as the kind value it names."""
-    fields = dict(record)
-    try:
-        kind = fields.pop("kind")
-    except KeyError:
-        raise ValueError(
-            f"a tower record names its kind, got {sorted(fields)}; known: "
-            f"{', '.join(sorted(towers))}") from None
-    if not isinstance(kind, str):
-        raise ValueError(
-            f"a tower kind is a registered name, not {kind!r}; known: "
-            f"{', '.join(sorted(towers))}")
-    try:
-        built = towers.build(kind, fields)
-    except KeyError:
-        raise ValueError(
-            f"a tower kind is a registered name, not {kind!r}; known: "
-            f"{', '.join(sorted(towers))}") from None
-    if not isinstance(built, TowerBase):
-        raise ValueError(
-            f"tower {kind!r} built {type(built).__name__}, which is not a "
-            "tower value")
-    return built
-
-
 class SiglipEncoderLayer(nn.Module):
     """Pre-norm full attention over pre-norm MLP, both residual.
 

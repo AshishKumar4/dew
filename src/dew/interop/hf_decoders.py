@@ -60,14 +60,14 @@ from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
 from dew.nn.kda import KimiDeltaAttentionMixer
 from dew.nn.kv_cache import KVCache
 from dew.nn.llama4 import Llama4Mixer
-from dew.nn.mixers import AttentionMixer, MixerBase, mixer_from_record
+from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 from dew.nn.moe import GatedActivation, Situ
 from dew.nn.text_encoders import checkpoint_dtype
 from dew.objectives.base import Variables
-from dew.registry import from_record
+from dew.registry import from_record, mixers, towers
 from dew.telemetry.instrumentation import dew_cache_dir
 
 GENERATION_CONFIG_FILE = "generation_config.json"
@@ -1368,7 +1368,7 @@ def translate_wrapper_weights(
         },
     }
     if audio is not None:
-        encoder = vision_nn.tower_from_record(audio)
+        encoder = towers.from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
             raise ValueError(f"audio tower kind {audio['kind']!r} has no weight map here")
         variables["audio_tower"] = audio_nn.audio_weights(audio_tensors, encoder, param_dtype=param_dtype)
@@ -2291,7 +2291,7 @@ def _kind_mixers(fields: DecoderFields) -> list[MixerBase]:
     for kind in (fields.get('kinds') or {}).values():
         mixer = kind.mixer if isinstance(kind, LayerKind) else kind.get('mixer')
         if isinstance(mixer, Mapping):
-            mixer = mixer_from_record(mixer)
+            mixer = mixers.from_record(mixer)
         if mixer is not None:
             found.append(mixer)
     return found
@@ -2299,7 +2299,7 @@ def _kind_mixers(fields: DecoderFields) -> list[MixerBase]:
 
 def _mixer_value(fields: DecoderFields) -> MixerBase | None:
     mixer = fields.get('mixer')
-    return mixer_from_record(mixer) if isinstance(mixer, Mapping) else mixer
+    return mixers.from_record(mixer) if isinstance(mixer, Mapping) else mixer
 
 
 def _mixture_value(fields: DecoderFields) -> Mixture | None:

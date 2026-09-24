@@ -19,15 +19,13 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.vision import (
-    projector_from_record,
-    tower_from_record,
     translate_gemma4_projector_config,
     translate_gemma4_projector_weights,
     translate_gemma4_vision_config,
     translate_gemma4_vision_weights,
 )
 from dew.objectives.base import Variables
-from dew.registry import models, precision_fields
+from dew.registry import models, precision_fields, projectors, towers
 
 
 # The wrapper config states these three with a default this assembly supplies
@@ -67,8 +65,8 @@ def build(config: Mapping[str, object], *, dtype: str = "bfloat16",
         tower = translate_gemma4_vision_config(_section(config, "vision_config"))
         projector = translate_gemma4_projector_config(tower, text.emb_features)
         conditioner = VisionConditioner(
-            family="diffusion_gemma", vision=tower_from_record(tower),
-            projection=projector_from_record(projector), dtype=text.dtype,
+            family="diffusion_gemma", vision=towers.from_record(tower),
+            projection=projectors.from_record(projector), dtype=text.dtype,
             precision=text.precision)
     if config.get("audio_config") is not None:
         raise ValueError("DiffusionGemma publishes no audio encoder")

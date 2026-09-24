@@ -72,12 +72,12 @@ from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
-from dew.nn.vision import ProjectorBase, TowerBase, projector_from_record, tower_from_record
+from dew.nn.vision import ProjectorBase, TowerBase
 from dew.objectives.base import Objective, Variables
 from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
 from dew.objectives.jepa import JepaObjective, multi_block_mask
 from dew.objectives.lm import LMObjective
-from dew.registry import resolve_dtype, with_precision
+from dew.registry import projectors, resolve_dtype, towers, with_precision
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.training import Layout, MeshSpec, Trainer, build_mesh
@@ -285,8 +285,8 @@ def media_values(case: Case) -> tuple[str, TowerBase, ProjectorBase, int]:
     token = media.get("image_token_id")
     if type(token) is not int or token < 0:
         raise ValueError(f"a media case's image_token_id is an id, got {token!r}")
-    return (family, tower_from_record(media["tower"]),
-            projector_from_record(media["projector"]), token)
+    return (family, towers.from_record(media["tower"]),
+            projectors.from_record(media["projector"]), token)
 
 
 def image_tokens(case: Case) -> int:

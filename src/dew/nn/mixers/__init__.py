@@ -19,14 +19,14 @@ mixer through `mixer.build(ctx)`.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.kv_cache import KVCache
 from dew.nn.rope import RopeScaling, YarnScaling
-from dew.registry import mixers
+from dew.registry import mixers as mixers  # the registry every kind module imports from here
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,15 +103,15 @@ class MixerBase:
     """One mixer kind's value: its fields, and how it builds its mixer.
 
     Each kind is a frozen dataclass of the reference's field names, registered
-    under its name (`@mixers("mla")`), dict-constructible through
-    `mixers.build`: an unknown kind or field raises there. `build` turns the
-    value and the layer's context into the `DecoderBlock` factory, the
-    `Callable[..., nn.Module]` the block calls with `name='self_attn'`.
+    under its name (`@mixers("mla")`), and a `{"kind": ...}` record builds it
+    through `mixers.from_record`: an unknown kind or field raises there.
+    `build` turns the value and the layer's context into the `DecoderBlock`
+    factory, the `Callable[..., nn.Module]` the block calls with
+    `name='self_attn'`.
 
     The backbone types its `mixer` field as this base, not the registry
     union, because a union of members that register over time cannot be
-    spelled before they exist. Records still dispatch on their kind through
-    `mixers.build`, and `mixers.union` is the live union for config
+    spelled before they exist. `mixers.union` is the live union for config
     introspection and a tyro subcommand per kind.
     """
 
@@ -123,33 +123,6 @@ class MixerBase:
         """The block's mixer factory for this value at this layer's geometry."""
         raise NotImplementedError(
             f"{type(self).__name__} names a mixer kind but builds no mixer")
-
-
-def mixer_from_record(record: Mapping[str, object]) -> MixerBase:
-    """A `{"kind": ..., ...fields}` record as the kind value it names.
-
-    The backbone's `__post_init__` and anything else that takes a mixer from
-    a config call it, so `mixer={"kind": "mla", ...}` from a CLI and the
-    dataclass from code meet in the same `mixers.build`. A record without a
-    kind, or one naming nothing registered, raises ValueError.
-    """
-    fields = dict(record)
-    try:
-        kind = fields.pop("kind")
-    except KeyError:
-        raise ValueError(
-            f"a mixer record names its kind, got {sorted(fields)}; known: "
-            f"{', '.join(sorted(mixers))}") from None
-    if not isinstance(kind, str):
-        raise ValueError(
-            f"a mixer kind is a registered name, not {kind!r}; known: "
-            f"{', '.join(sorted(mixers))}")
-    built: MixerBase = mixers.build(kind, fields)
-    if not isinstance(built, MixerBase):
-        raise ValueError(
-            f"mixer {kind!r} built {type(built).__name__}, which is not a "
-            "mixer value")
-    return built
 
 
 # The kind modules register where they are defined; this hub imports them,

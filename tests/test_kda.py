@@ -27,7 +27,7 @@ from dew.nn.kda import (
     chunk_kimi_delta_rule,
     recurrent_kimi_delta_rule,
 )
-from dew.nn.mixers import mixer_from_record
+from dew.registry import mixers
 
 BOUND = 1e-4
 B, S, H, D, E, K = 2, 7, 2, 4, 8, 4  # batch, tokens, heads, head dim, model width, conv kernel
@@ -285,7 +285,7 @@ def test_padded_rows_preserve_the_memory_and_the_history():
 
 
 def test_the_kind_builds_from_the_configs_fields():
-    mixer = mixer_from_record({"kind": "kimi_delta_attention", "linear_num_heads": 3,
+    mixer = mixers.from_record({"kind": "kimi_delta_attention", "linear_num_heads": 3,
                                "linear_head_dim": 8, "linear_conv_kernel_dim": 4, "linear_lower_bound": -5.0})
     assert isinstance(mixer, KimiDeltaAttentionMixer)
     assert mixer.linear_num_heads == 3 and mixer.linear_head_dim == 8

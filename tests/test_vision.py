@@ -39,6 +39,7 @@ import pytest
 from safetensors.numpy import load_file
 
 from dew.nn import vision as V
+from dew.registry import projectors, towers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -62,7 +63,7 @@ def test_siglip_tower_matches_the_reference_implementation():
     them zeroed the trunk leaves the reference by more than 0.01."""
     fixture = load_fixture("siglip-tiny")
     record = V.translate_siglip_vision_config(fixture["config"])
-    tower = V.tower_from_record(record).build()
+    tower = towers.from_record(record).build()
     variables = {"params": V.translate_siglip_vision_weights(fixture["tensors"])}
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
@@ -83,7 +84,7 @@ def test_gemma_projector_matches_the_reference_implementation():
     record = V.translate_gemma_projector_config(
         trunk, fixture["projector"]["text_width"],
         fixture["projector"]["mm_tokens_per_image"])
-    projector = V.projector_from_record(record).build()
+    projector = projectors.from_record(record).build()
     variables = {"params": V.translate_gemma_projector_weights(
         fixture["projector_tensors"])}
     assert np.max(np.abs(np.asarray(
@@ -102,7 +103,7 @@ def test_llama4_tower_matches_the_reference_implementation():
     with them zeroed the trunk leaves the reference by more than 0.01."""
     fixture = load_fixture("llama4-vision-tiny")
     record = V.translate_llama4_vision_config(fixture["config"])
-    tower = V.tower_from_record(record).build()
+    tower = towers.from_record(record).build()
     variables = {"params": V.translate_llama4_vision_weights(fixture["tensors"])}
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
@@ -121,7 +122,7 @@ def test_llama4_projector_matches_the_reference_implementation():
     trunk = V.translate_llama4_vision_config(fixture["config"])
     record = V.translate_llama4_projector_config(
         trunk, fixture["projector"]["text_width"])
-    projector = V.projector_from_record(record).build()
+    projector = projectors.from_record(record).build()
     variables = {"params": V.translate_llama4_projector_weights(
         fixture["projector_tensors"])}
     assert np.max(np.abs(np.asarray(
@@ -133,9 +134,9 @@ def test_llama4_projector_matches_the_reference_implementation():
 def test_an_unknown_tower_or_projector_kind_is_refused(record):
     """A kind neither registry holds names itself with the known names."""
     with pytest.raises(ValueError, match="kind"):
-        V.tower_from_record(record)
+        towers.from_record(record)
     with pytest.raises(ValueError, match="kind"):
-        V.projector_from_record(record)
+        projectors.from_record(record)
 
 
 @pytest.mark.parametrize("field,value,message", [
@@ -180,7 +181,7 @@ def test_gemma4_tower_matches_the_reference_implementation():
     reference by more than 12.0, with the scale zeroed by more than 23.0."""
     fixture = load_fixture("gemma4-vision-tiny")
     record = V.translate_gemma4_vision_config(fixture["config"])
-    tower = V.tower_from_record(record).build()
+    tower = towers.from_record(record).build()
     variables = V.translate_gemma4_vision_weights(fixture["tensors"])
     patch = record["patch_size"]
     assert isinstance(patch, int)
@@ -209,7 +210,7 @@ def test_gemma4_projector_matches_the_reference_implementation():
     trunk = V.translate_gemma4_vision_config(fixture["config"])
     record = V.translate_gemma4_projector_config(
         trunk, fixture["projector"]["text_width"])
-    projector = V.projector_from_record(record).build()
+    projector = projectors.from_record(record).build()
     variables = {"params": V.translate_gemma4_projector_weights(
         fixture["projector_tensors"])}
     assert np.max(np.abs(np.asarray(
@@ -229,7 +230,7 @@ def test_qwen35_tower_matches_the_reference_implementation():
     than 0.69."""
     fixture = load_fixture("qwen35-vision-tiny")
     record = V.translate_qwen35_vision_config(fixture["config"])
-    tower = V.tower_from_record(record).build()
+    tower = towers.from_record(record).build()
     variables = {"params": V.translate_qwen35_vision_weights(fixture["tensors"])}
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
@@ -250,7 +251,7 @@ def test_qwen35_projector_matches_the_reference_implementation():
     trunk = V.translate_qwen35_vision_config(fixture["config"])
     record = V.translate_qwen35_projector_config(
         trunk, fixture["projector"]["text_width"])
-    projector = V.projector_from_record(record).build()
+    projector = projectors.from_record(record).build()
     variables = {"params": V.translate_qwen35_projector_weights(
         fixture["projector_tensors"])}
     assert np.max(np.abs(np.asarray(

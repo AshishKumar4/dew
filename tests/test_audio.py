@@ -19,7 +19,6 @@ import pytest
 from safetensors.numpy import load_file
 
 from dew.data.audio import AudioProcessor
-from dew.nn import vision as V
 from dew.nn.audio import Gemma3nAudio, audio_config, audio_weight_path, audio_weights
 from dew.nn.vision import (
     Gemma3nProjectorModule,
@@ -27,6 +26,7 @@ from dew.nn.vision import (
     translate_gemma3n_projector_weights,
     translate_gemma4_projector_weights,
 )
+from dew.registry import towers
 
 FIXTURES = Path(__file__).parent / "fixtures" / "audio"
 
@@ -166,7 +166,7 @@ def test_audio_weight_loading_refuses_unknown_or_missing_computation(audio):
         audio_config({**record, "extra_computational_field": True})
     rebuilt = audio_config({**dataclasses.asdict(config), "model_type": record["model_type"]})
     assert rebuilt == config
-    assert V.tower_from_record({"kind": record["model_type"], **dataclasses.asdict(config)}) == config
+    assert towers.from_record({"kind": record["model_type"], **dataclasses.asdict(config)}) == config
 
 
 def test_audio_weight_paths_round_trip_every_checkpoint_tensor(audio):
