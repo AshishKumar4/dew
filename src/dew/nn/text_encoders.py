@@ -44,7 +44,6 @@ from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
 CONFIG_FILE = "config.json"
-WEIGHTS_FILE = "model.safetensors"
 DEFAULT_MODEL = "openai/clip-vit-large-patch14"
 
 

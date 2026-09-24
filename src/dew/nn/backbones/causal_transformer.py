@@ -233,10 +233,10 @@ def group_layers(name: str) -> range | None:
 
 
 INTERMEDIATES = "intermediates"
+"""The collection flax's `capture_intermediates` fills."""
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
-"""The collection flax's `capture_intermediates` fills."""
 
 
 def layer_outputs(module: nn.Module, method: str) -> bool:

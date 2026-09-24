@@ -98,10 +98,6 @@ Variance = Literal["small", "large"]
 _SPACINGS: tuple[Spacing, ...] = ("leading", "linspace", "trailing")
 _TERMINALS: tuple[Terminal, ...] = ("zero", "sigma_min")
 _SIGMA_SCHEDULES: tuple[Transform, ...] = ("karras", "exponential")
-_DPM_TYPES: tuple[Literal["midpoint", "heun"], ...] = ("midpoint", "heun")
-_UNIPC_TYPES: tuple[Literal["bh1", "bh2"], ...] = ("bh1", "bh2")
-_SINGLE_ALGORITHMS: tuple[Literal["dpmsolver++", "dpmsolver", "sde-dpmsolver++"], ...] = (
-    "dpmsolver++", "dpmsolver", "sde-dpmsolver++")
 # Each sigma transformation with the control that turns it on.
 _TRANSFORM_CONTROLS: tuple[tuple[Transform, str], ...] = (
     ("karras", "use_karras_sigmas"), ("exponential", "use_exponential_sigmas"),
