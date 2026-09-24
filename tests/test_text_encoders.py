@@ -269,6 +269,25 @@ def test_tiny_checkpoint_image_embeddings_match_the_reference():
     assert difference < TOLERANCE, f"max |image embedding difference| {difference:.3e}"
 
 
+@pytest.mark.parametrize("height, width", [(440, 440), (320, 360), (360, 320)])
+def test_clip_image_transform_matches_the_reference_processor(height, width):
+    """The safety checker's preprocessing, against transformers' own. The
+    shorter side resizes to exactly `shortest_edge` and the longer to
+    int(size * long / short), so an image whose side the size does not
+    divide still fills the crop."""
+    from transformers import CLIPImageProcessorPil
+
+    from dew.inputs.diffusion import CLIPImageTransform
+
+    config = {"size": {"shortest_edge": 224}, "crop_size": {"height": 224, "width": 224}, "resample": 3}
+    pixels = np.random.RandomState(0).randint(0, 256, (1, height, width, 3), dtype=np.uint8)
+
+    expected = CLIPImageProcessorPil(**config)(list(pixels), return_tensors="np")["pixel_values"]
+    actual = np.asarray(CLIPImageTransform.from_config(config)(pixels))
+
+    np.testing.assert_allclose(actual, expected, atol=1e-6)
+
+
 def test_vision_attention_reaches_every_patch():
     """The vision tower is not causal: the class row, which is pooled, attends
     to every patch, so changing the pixels moves the pooled row. With the text

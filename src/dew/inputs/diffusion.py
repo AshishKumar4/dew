@@ -478,8 +478,12 @@ class CLIPImageTransform:
         _, height, width, _ = pixels.shape
         if self.resize:
             if isinstance(self.size, int):
-                scale = self.size / min(height, width)
-                target = (int(height * scale), int(width * scale))
+                # transformers' get_resize_output_image_size: the shorter side
+                # takes the size exactly, the longer int(size * long / short).
+                if width <= height:
+                    target = (int(self.size * height / width), self.size)
+                else:
+                    target = (self.size, int(self.size * width / height))
             else:
                 target = self.size
             row_indices, rows = (jnp.asarray(value) for value in _cubic_weights(height, target[0]))
